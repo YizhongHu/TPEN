@@ -116,6 +116,22 @@ def test_spin_tensors_are_validated_and_preserved() -> None:
         Walkers(positions=torch.zeros(2, 4, 3), spins=torch.ones(2, 3))
 
 
+@pytest.mark.parametrize(
+    ("nuclear_positions", "nuclear_charges"),
+    [
+        (torch.zeros(1, 3), None),
+        (None, torch.ones(1)),
+    ],
+)
+def test_walkers_reject_partial_nuclear_context(nuclear_positions, nuclear_charges) -> None:
+    with pytest.raises(ValueError, match="provided together"):
+        Walkers(
+            positions=torch.zeros(2, 2, 3),
+            nuclear_positions=nuclear_positions,
+            nuclear_charges=nuclear_charges,
+        )
+
+
 def test_wavefunction_output_accepts_exact_nodes_and_sample_shapes() -> None:
     logabs = torch.tensor([[0.0, -torch.inf], [-3.0, -4.0]])
     sign = torch.tensor([[1.0, 0.0], [-1.0, 1.0]])

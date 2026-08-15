@@ -402,8 +402,9 @@ class MetropolisSampler(nn.Module):
 
         This is intentionally separate from `torch.nn.Module.state_dict`, which
         keeps its normal module-parameter semantics. MCMC state (walkers,
-        burn-in flag, running acceptance, and generator state) is persisted here
-        instead so checkpointing does not abuse the standard module API.
+        canonical nuclear context, burn-in flag, running acceptance, and
+        generator state) is persisted here instead so checkpointing does not
+        abuse the standard module API.
         """
 
         return {
@@ -412,6 +413,8 @@ class MetropolisSampler(nn.Module):
             "acceptance_rate": float(self.acceptance_rate),
             "generator_state": self._generator.get_state(),
             "generator_device": str(self._generator_device),
+            "nuclear_positions": None if self.nuclear_positions is None else self.nuclear_positions.detach().clone(),
+            "nuclear_charges": None if self.nuclear_charges is None else self.nuclear_charges.detach().clone(),
         }
 
     def load_mcmc_state_dict(self, state: Mapping[str, Any], *, device=None) -> None:
@@ -423,17 +426,86 @@ class MetropolisSampler(nn.Module):
         generators do not share a portable state representation.
         """
 
-        checkpoint_device = _canonical_device(state["generator_device"])
-        self._generator_device = _canonical_device(device) if device is not None else checkpoint_device
-        self._generator = torch.Generator(device=self._generator_device)
-        if self._generator_device == checkpoint_device:
-            self._generator.set_state(state["generator_state"])
-        elif self.seed is not None:
-            self._generator.manual_seed(int(self.seed))
         walkers = state["walkers"]
-        self._walkers = None if walkers is None else walkers.to(device=self._generator_device)
+        if walkers is not None and not isinstance(walkers, Walkers):
+            raise TypeError(f"checkpoint walkers must be Walkers or None, got {type(walkers)!r}")
+        if walkers is not None:
+            walkers.validate()
+        nuclear_positions, nuclear_charges = self._reconcile_restored_nuclear_context(state, walkers)
+
+        checkpoint_device = _canonical_device(state["generator_device"])
+        generator_device = _canonical_device(device) if device is not None else checkpoint_device
+        generator = torch.Generator(device=generator_device)
+        if generator_device == checkpoint_device:
+            generator.set_state(state["generator_state"])
+        elif self.seed is not None:
+            generator.manual_seed(int(self.seed))
+        restored_walkers = None if walkers is None else walkers.to(device=generator_device)
+
+        self.nuclear_positions = nuclear_positions
+        self.nuclear_charges = nuclear_charges
+        self._generator_device = generator_device
+        self._generator = generator
+        self._walkers = restored_walkers
         self._has_burned_in = bool(state["has_burned_in"])
         self.acceptance_rate = float(state.get("acceptance_rate", 0.0))
+
+    def _reconcile_restored_nuclear_context(
+        self,
+        state: Mapping[str, Any],
+        walkers: Walkers | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return canonical nuclear context after validating checkpoint ownership."""
+
+        checkpoint_positions = state.get("nuclear_positions")
+        checkpoint_charges = state.get("nuclear_charges")
+        checkpoint_context = _checkpoint_nuclear_context(
+            checkpoint_positions,
+            checkpoint_charges,
+            spatial_dim=self.spatial_dim,
+            dtype=self.dtype,
+        )
+
+        walker_positions = None if walkers is None else walkers.nuclear_positions
+        walker_charges = None if walkers is None else walkers.nuclear_charges
+        if (walker_positions is None) != (walker_charges is None):
+            raise ValueError("checkpoint walkers contain partial nuclear context")
+        walker_context = None if walker_positions is None else (walker_positions, walker_charges)
+
+        if walkers is not None and checkpoint_context is not None and walker_context is None:
+            raise ValueError("checkpoint sampler and walkers nuclear context mismatch")
+        if checkpoint_context is not None and walker_context is not None:
+            expected_positions = checkpoint_context[0].to(device=walkers.device)
+            expected_charges = checkpoint_context[1].to(device=walkers.device)
+            _require_exact_tensor(walker_context[0], expected_positions, name="nuclear_positions")
+            _require_exact_tensor(walker_context[1], expected_charges, name="nuclear_charges")
+
+        restored_context = walker_context if walker_context is not None else checkpoint_context
+        configured_context = (
+            None
+            if self.nuclear_positions is None
+            else (self.nuclear_positions, self.nuclear_charges)
+        )
+        if (self.nuclear_positions is None) != (self.nuclear_charges is None):
+            raise ValueError("configured sampler contains partial nuclear context")
+        if configured_context is not None:
+            if restored_context is None:
+                raise ValueError("configured sampler and checkpoint nuclear context mismatch")
+            expected_positions = configured_context[0].to(device=restored_context[0].device)
+            expected_charges = configured_context[1].to(device=restored_context[1].device)
+            _require_exact_tensor(restored_context[0], expected_positions, name="nuclear_positions")
+            _require_exact_tensor(restored_context[1], expected_charges, name="nuclear_charges")
+            return configured_context
+        if restored_context is None:
+            return None, None
+
+        # Adopt complete restored walker context so a later reset cannot erase it.
+        return _fixed_nuclear_context(
+            restored_context[0],
+            restored_context[1],
+            spatial_dim=self.spatial_dim,
+            dtype=self.dtype,
+        )
 
 
 def _fixed_nuclear_context(
@@ -466,6 +538,46 @@ def _fixed_nuclear_context(
     if not torch.isfinite(positions).all() or not torch.isfinite(charges).all():
         raise ValueError("MetropolisSampler nuclear context must be finite")
     return positions, charges
+
+
+def _checkpoint_nuclear_context(
+    nuclear_positions: torch.Tensor | None,
+    nuclear_charges: torch.Tensor | None,
+    *,
+    spatial_dim: int,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Validate the canonical nuclear context serialized by a sampler."""
+
+    if (nuclear_positions is None) != (nuclear_charges is None):
+        raise ValueError("checkpoint nuclear_positions and nuclear_charges must be provided together")
+    if nuclear_positions is None:
+        return None
+    if not isinstance(nuclear_positions, torch.Tensor) or not isinstance(nuclear_charges, torch.Tensor):
+        raise TypeError("checkpoint nuclear context must contain tensors")
+    if nuclear_positions.device != torch.device("cpu") or nuclear_charges.device != torch.device("cpu"):
+        raise ValueError("checkpoint canonical nuclear context must be on cpu")
+    if nuclear_positions.dtype != dtype or nuclear_charges.dtype != dtype:
+        raise ValueError("checkpoint canonical nuclear context dtype mismatch")
+    return _fixed_nuclear_context(
+        nuclear_positions,
+        nuclear_charges,
+        spatial_dim=spatial_dim,
+        dtype=dtype,
+    )
+
+
+def _require_exact_tensor(actual: torch.Tensor, expected: torch.Tensor, *, name: str) -> None:
+    """Require exact shape, dtype, device, and value agreement."""
+
+    if actual.shape != expected.shape:
+        raise ValueError(f"checkpoint {name} shape mismatch")
+    if actual.dtype != expected.dtype:
+        raise ValueError(f"checkpoint {name} dtype mismatch")
+    if actual.device != expected.device:
+        raise ValueError(f"checkpoint {name} device mismatch")
+    if not torch.equal(actual, expected):
+        raise ValueError(f"checkpoint {name} value mismatch")
 
 
 def _default_spins(

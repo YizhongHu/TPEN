@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import nn
 
@@ -112,8 +113,6 @@ def test_sampler_propagates_fixed_nuclear_context_through_batches_and_restore() 
 
 
 def test_sampler_rejects_partial_or_malformed_nuclear_context() -> None:
-    import pytest
-
     positions = torch.zeros(1, 3, dtype=torch.float64)
     charges = torch.ones(1, dtype=torch.float64)
     with pytest.raises(ValueError, match="provided together"):
@@ -122,6 +121,102 @@ def test_sampler_rejects_partial_or_malformed_nuclear_context() -> None:
         MetropolisSampler(nuclear_positions=positions, nuclear_charges=charges, spatial_dim=2)
     with pytest.raises(ValueError, match="n_nuclei"):
         MetropolisSampler(nuclear_positions=positions, nuclear_charges=torch.ones(2))
+
+
+def _nuclear_sampler(*, charge: float = 2.0) -> MetropolisSampler:
+    return MetropolisSampler(
+        n_walkers=3,
+        n_electrons=2,
+        spatial_dim=3,
+        seed=7,
+        nuclear_positions=torch.zeros(1, 3, dtype=torch.float64),
+        nuclear_charges=torch.tensor([charge], dtype=torch.float64),
+        dtype=torch.float64,
+    )
+
+
+def _unconfigured_nuclear_sampler() -> MetropolisSampler:
+    return MetropolisSampler(
+        n_walkers=3,
+        n_electrons=2,
+        spatial_dim=3,
+        seed=7,
+        dtype=torch.float64,
+    )
+
+
+def test_sampler_state_load_rejects_partial_checkpoint_nuclear_context() -> None:
+    state = _nuclear_sampler().mcmc_state_dict()
+    state["nuclear_charges"] = None
+
+    with pytest.raises(ValueError, match="checkpoint.*provided together"):
+        _tiny_sampler().load_mcmc_state_dict(state)
+
+
+def test_configured_sampler_rejects_checkpoint_nuclear_context_mismatch() -> None:
+    source = _nuclear_sampler(charge=2.0)
+    source.reset()
+
+    with pytest.raises(ValueError, match="nuclear_charges value mismatch"):
+        _nuclear_sampler(charge=1.0).load_mcmc_state_dict(source.mcmc_state_dict())
+
+
+def test_unconfigured_sampler_adopts_complete_legacy_walker_context() -> None:
+    source = _nuclear_sampler()
+    source.reset()
+    state = source.mcmc_state_dict()
+    state.pop("nuclear_positions")
+    state.pop("nuclear_charges")
+    resumed = _unconfigured_nuclear_sampler()
+
+    resumed.load_mcmc_state_dict(state)
+
+    assert torch.equal(resumed.nuclear_positions, source.nuclear_positions)
+    assert torch.equal(resumed.nuclear_charges, source.nuclear_charges)
+
+
+def test_sampler_checkpoint_retains_canonical_nuclear_context_before_reset() -> None:
+    source = _nuclear_sampler()
+    state = source.mcmc_state_dict()
+    resumed = _unconfigured_nuclear_sampler()
+
+    assert state["walkers"] is None
+    assert torch.equal(state["nuclear_positions"], source.nuclear_positions)
+    assert torch.equal(state["nuclear_charges"], source.nuclear_charges)
+    resumed.load_mcmc_state_dict(state)
+
+    assert resumed.walkers is None
+    assert torch.equal(resumed.nuclear_positions, source.nuclear_positions)
+    assert torch.equal(resumed.nuclear_charges, source.nuclear_charges)
+
+
+def test_adopted_walker_context_survives_sampler_reset() -> None:
+    source = _nuclear_sampler()
+    source.reset()
+    state = source.mcmc_state_dict()
+    state.pop("nuclear_positions")
+    state.pop("nuclear_charges")
+    resumed = _unconfigured_nuclear_sampler()
+    resumed.load_mcmc_state_dict(state)
+
+    reset_walkers = resumed.reset()
+
+    assert torch.equal(reset_walkers.nuclear_positions, source.nuclear_positions)
+    assert torch.equal(reset_walkers.nuclear_charges, source.nuclear_charges)
+
+
+def test_no_context_checkpoint_preserves_hooke_neither_neither() -> None:
+    source = _tiny_sampler()
+    source.reset()
+    resumed = _tiny_sampler()
+
+    resumed.load_mcmc_state_dict(source.mcmc_state_dict())
+    reset_walkers = resumed.reset()
+
+    assert resumed.nuclear_positions is None
+    assert resumed.nuclear_charges is None
+    assert reset_walkers.nuclear_positions is None
+    assert reset_walkers.nuclear_charges is None
 
 
 def test_gaussian_single_electron_move_preserves_shape_and_changes_one_electron_per_walker() -> None:

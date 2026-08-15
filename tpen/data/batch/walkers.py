@@ -30,8 +30,10 @@ class Walkers:
         exactly equal to ``+1`` or ``-1``.
     nuclear_positions : torch.Tensor or None, optional
         Fixed nuclear coordinates with shape ``[n_nuclei, spatial_dim]``.
+        Must be provided together with ``nuclear_charges``.
     nuclear_charges : torch.Tensor or None, optional
-        Fixed nuclear charges with shape ``[n_nuclei]``.
+        Fixed nuclear charges with shape ``[n_nuclei]``. Must be provided
+        together with ``nuclear_positions``.
     aux : dict, optional
         Auxiliary sampler state and metadata.
     """
@@ -53,6 +55,8 @@ class Walkers:
         self.nuclear_charges = _coerce_optional_tensor(self.nuclear_charges, dtype=self.positions.dtype)
         if self.positions.ndim != 3:
             raise ValueError("Walkers.positions must have shape [batch, n_electrons, spatial_dim]")
+        if (self.nuclear_positions is None) != (self.nuclear_charges is None):
+            raise ValueError("Walkers.nuclear_positions and nuclear_charges must be provided together")
         if self.spins is not None:
             if tuple(self.spins.shape) != tuple(self.positions.shape[:2]):
                 raise ValueError("Walkers.spins must have shape [batch, n_electrons]")
