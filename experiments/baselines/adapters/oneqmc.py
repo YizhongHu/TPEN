@@ -618,16 +618,36 @@ def record_from_series(
 
     energy, clipped = huber_mean(tail)
 
-    # `blocking_stderr` stops before its first level when the window holds fewer
-    # than MIN_BLOCKS values, and then returns 0.0 -- a zero bar, which the
-    # record schema accepts as non-negative and which reads as infinite
-    # precision. An Orbformer evaluation pass logs every `--metric-logger-period`
-    # step, so a 2000-step run at period 25 yields 80 rows and a quarter-tail of
-    # 20, i.e. exactly that case. Lower the block floor to the window length so
-    # level one runs, and say in the notes that the resulting bar is the naive
-    # one and understates.
+    # The block floor is lowered to the window length so that blocking's first
+    # level always runs. An Orbformer evaluation pass logs every
+    # `--metric-logger-period` step, so a 2000-step run at period 25 yields 80
+    # rows and a quarter-tail of 20 -- fewer than MIN_BLOCKS. Passing the default
+    # floor on such a window leaves `blocking_stderr` free to stop before
+    # measuring anything, and what it returns then is its business, not this
+    # adapter's. Lowering the floor makes the short case measurable, and the
+    # notes then say the bar is the naive one.
     block_floor = min(MIN_BLOCKS, len(tail))
-    stderr, _ = blocking_stderr(tail, min_blocks=block_floor)
+    try:
+        stderr, _ = blocking_stderr(tail, min_blocks=block_floor)
+    except AdapterError as error:
+        # A zero-variance window is the other route to a zero bar, and it is not
+        # a measurement: every step in the window carries the identical value,
+        # which means the sampler stopped moving or the series was
+        # forward-filled upstream. Refusing is the same stance this module takes
+        # on forward-filling in `gather_molecule`. Caught rather than allowed to
+        # surface raw so the message names the window, and so this adapter
+        # behaves the same whether `blocking_stderr` signals the degenerate case
+        # by raising or by returning zero.
+        raise AdapterError(
+            f"zero-variance window of {len(tail)} steps: every step carries the "
+            f"identical energy, so no error bar can be estimated from it ({error})"
+        ) from error
+    if stderr <= 0.0:
+        raise AdapterError(
+            f"zero-variance window of {len(tail)} steps: blocking returned a "
+            f"non-positive error bar ({stderr!r}), which the record schema would "
+            "accept as non-negative and publish as infinite precision"
+        )
     # `std_elec` is the across-walker spread of the local energy, so its square
     # is the local-energy variance itself -- not the variance of the mean.
     local_variance = statistics.fmean(spread**2 for spread in tail_spreads)
@@ -652,15 +672,16 @@ def record_from_series(
             "sign test, so convergence is UNASSESSED"
         )
 
-    try:
-        inflation = f"{blocking_inflation(tail, min_blocks=block_floor):.2f}x"
-    except AdapterError:
-        inflation = "undefined"
+    # No try/except here on purpose: `blocking_inflation` raises only for a
+    # window below two values or with zero variance, and both are already
+    # refused above. Swallowing an exception that cannot fire would hide a real
+    # regression behind the word "undefined".
+    inflation = f"{blocking_inflation(tail, min_blocks=block_floor):.2f}x"
 
     unblocked = (
         f" The window of {len(tail)} steps is below the {MIN_BLOCKS}-block floor, so "
-        "blocking could not run and this bar is the NAIVE standard error: it ignores "
-        "autocorrelation and therefore UNDERSTATES the uncertainty."
+        "blocking had only its first level and this bar is the NAIVE standard error: "
+        "it ignores autocorrelation and therefore UNDERSTATES the uncertainty."
         if block_floor < MIN_BLOCKS
         else ""
     )

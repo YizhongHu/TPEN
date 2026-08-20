@@ -288,9 +288,10 @@ def test_record_energy_is_the_huber_estimate_of_the_window() -> None:
     """
 
     energies = [0.0] * 100 + _series(100)
-    # `min_tail_steps` has to come down with the fraction: `select_tail` clips
-    # the floor to the run length, so leaving the default 10000 floor in place on
-    # a 200-step run silently widens the window to the whole trace.
+    # The floor comes down with the fraction so the window is exactly the
+    # requested quarter. Leaving the 10000-step default in place on a 200-step
+    # run makes the window whatever `select_tail` resolves a sub-floor run to,
+    # which is not what this test is about.
     record = _record(energies, tail_fraction=0.25, min_tail_steps=2)
 
     expected, _ = huber_mean(energies[-50:])
@@ -518,21 +519,24 @@ def test_short_run_is_refused_unless_explicitly_allowed() -> None:
     assert "provisional" in record.notes
 
 
-def test_short_tail_floor_widens_the_window_to_the_whole_trace() -> None:
-    """With the default floor, a short run's window is the entire trace.
+def test_whole_trace_window_mixes_in_relaxation_and_a_fraction_does_not() -> None:
+    """A full-trace window averages the relaxation steps; a fraction excludes them.
 
-    ``select_tail`` clips the floor to the run length, so on a 200-step run the
-    10000-step floor beats any fraction and the "tail" becomes everything --
-    including the relaxation steps a ``--discard-sampler-state`` evaluation pass
-    starts with. Getting a genuine tail out of a short run therefore requires
-    lowering ``min_tail_steps`` as well, and this test pins both halves so the
-    interaction cannot be rediscovered on a published number.
+    An evaluation pass launched with ``--discard-sampler-state`` spends its first
+    steps relaxing, and those steps are logged like any other. Asking for the
+    whole trace therefore folds relaxation into the published energy. That is why
+    the lane emits with an explicit fraction and an explicit floor rather than
+    letting the window fall out of how a sub-floor run happens to be resolved --
+    a resolution that is ``select_tail``'s business and has changed there before.
+    Both halves are pinned so the difference cannot be rediscovered on a
+    published number.
     """
 
     energies = [0.0] * 150 + _series(50)
 
-    whole = _record(energies, tail_fraction=0.25)
+    whole = _record(energies, tail_fraction=1.0)
     assert whole.notes.count("last 200 of 200 logged steps") == 1
+    assert whole.energy_hartree == pytest.approx(huber_mean(energies)[0])
 
     genuine = _record(energies, tail_fraction=0.25, min_tail_steps=2)
     assert "last 50 of 200 logged steps" in genuine.notes
@@ -574,16 +578,19 @@ def test_window_too_short_for_the_sign_test_says_unassessed() -> None:
     assert "UNASSESSED" in record.notes
 
 
-def test_constant_series_reports_undefined_inflation() -> None:
-    """A zero-variance window gives no inflation ratio, and says so.
+def test_zero_variance_window_is_refused_rather_than_given_a_zero_bar() -> None:
+    """A constant window emits no record at all.
 
-    ``blocking_inflation`` raises on a constant series; swallowing that into a
-    1.00x would claim a measured decorrelation that was never computed.
+    Every step carrying the identical energy means the sampler stopped moving or
+    the series was forward-filled upstream. Such a window has no inflation ratio
+    and no standard error, and the record schema only requires the bar to be
+    non-negative -- so a zero would be published as infinite precision on a
+    number that was never measured. This is the same stance the reader takes on a
+    forward-filled trace, applied to the estimator.
     """
 
-    record = _record([HE_EXACT_HARTREE] * 200)
-
-    assert "inflation undefined" in record.notes
+    with pytest.raises(AdapterError, match="zero-variance window"):
+        _record([HE_EXACT_HARTREE] * 200)
 
 
 def test_estimator_text_distinguishes_inference_from_training_tail() -> None:
