@@ -618,7 +618,14 @@ def test_notes_window_is_the_window_actually_averaged(
     this one.
     """
 
-    energies = _series(total)
+    # A relaxation prefix half a hartree above the plateau, so a window that
+    # mis-reports its own length disagrees with the energy by far more than
+    # float noise. On a flat series the difference between a quarter-tail mean
+    # and a whole-trace mean is ~1e-6 relative, which pytest.approx's default
+    # tolerance accepts -- that looseness let a mutant that reported the whole
+    # trace while averaging the tail pass this test.
+    plateau = total - max(2, round(0.25 * total))
+    energies = [HE_EXACT_HARTREE + 0.5] * plateau + _series(total - plateau)
     record = _record(
         energies,
         tail_fraction=fraction,
@@ -630,7 +637,11 @@ def test_notes_window_is_the_window_actually_averaged(
 
     assert reported_total == total
     assert 2 <= window <= total
-    assert record.energy_hartree == pytest.approx(huber_mean(energies[-window:])[0])
+    # Exact rather than approximate: the same slice through the same estimator
+    # is the same float.
+    assert record.energy_hartree == pytest.approx(
+        huber_mean(energies[-window:])[0], rel=0.0, abs=1e-12
+    )
     assert ("provisional" in record.notes) == (window < min_tail_steps)
 
 
