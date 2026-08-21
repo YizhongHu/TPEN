@@ -647,7 +647,9 @@ def test_notes_window_is_the_window_actually_averaged(
 
 @pytest.mark.parametrize(
     "total, min_tail_steps",
-    [(200, MIN_TAIL_STEPS), (PILOT_LOGGED_STEPS, MIN_TAIL_STEPS), (200, 2)],
+    # The last case is the short-window regime, where the block floor is
+    # lowered and any "no blocks measured" sentinel would come from.
+    [(200, MIN_TAIL_STEPS), (PILOT_LOGGED_STEPS, MIN_TAIL_STEPS), (200, 2), (20, 2)],
 )
 def test_notes_never_render_a_literal_none(total: int, min_tail_steps: int) -> None:
     """No notes field may contain the literal string "None".
@@ -705,7 +707,10 @@ def test_lowering_the_block_floor_is_what_keeps_the_ladder_running() -> None:
 
     # And the adapter's own output on such a window: a numeric inflation ratio,
     # never a sentinel.
-    record = _record(tail, min_tail_steps=2)
+    # tail_fraction=1.0 so the record's window is the same 20 steps the
+    # blocking assertions above were made on.
+    record = _record(tail, min_tail_steps=2, tail_fraction=1.0)
+    assert _window_from_notes(record.notes) == (len(tail), len(tail))
     assert re.search(r"inflation \d+\.\d\dx", record.notes)
     assert "None" not in record.notes
 
