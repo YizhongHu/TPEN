@@ -18,12 +18,20 @@ from __future__ import annotations
 import json
 import math
 import random
+import re
 import sys
 from pathlib import Path
 
 import pytest
 
 from experiments.baselines.errors import AdapterError
+from experiments.baselines.statistics import (
+    MIN_BLOCKS,
+    MIN_TAIL_STEPS,
+    blocking_inflation,
+    blocking_stderr,
+    select_tail,
+)
 from experiments.baselines.adapters.oneqmc import (
     DEFAULT_TAIL_FRACTION,
     ENERGY_DATASET,
@@ -34,6 +42,7 @@ from experiments.baselines.adapters.oneqmc import (
     build_record,
     gather_molecule,
     huber_mean,
+    main,
     metadata_from_attrs,
     read_attrs,
     read_series,
@@ -543,6 +552,220 @@ def test_whole_trace_window_mixes_in_relaxation_and_a_fraction_does_not() -> Non
     genuine = _record(energies, tail_fraction=0.25, min_tail_steps=2)
     assert "last 50 of 200 logged steps" in genuine.notes
     assert genuine.energy_hartree == pytest.approx(huber_mean(energies[-50:])[0])
+
+
+#: Shape of this lane's Orbformer pilot: 2000 logged evaluation steps, the
+#: default fraction, and the standard floor it cannot reach. Named constants
+#: because the tripwire below reads as arbitrary numbers otherwise.
+PILOT_LOGGED_STEPS = 2000
+PILOT_WINDOW_AT_PIN = 2000
+
+#: Exact objects the pilot expectation was measured against, so a future reader
+#: can tell a stale expectation from a regression. The blob is the more precise
+#: of the two: it is the file whose rule produced the number.
+STATISTICS_BLOB_AT_PIN = "fb0cec1ae1afc4795a1ba7a18c84b9481f0a226d"
+DEV_COMMIT_AT_PIN = "e139a10f33c8866460264db0323887e4a38dbf26"
+
+#: The window sentence the adapter writes, e.g. "the last 50 of 200 logged
+#: steps". Anchored on "last " because the coverage sentence also ends in
+#: "logged steps" and would otherwise match.
+_WINDOW_SENTENCE = re.compile(r"last (\d+) of (\d+) logged steps")
+
+
+def _window_from_notes(notes: str) -> tuple[int, int]:
+    """Return the (window, total) the notes report, requiring exactly one match.
+
+    Raises rather than returning a best guess when the count is not one: an
+    ambiguous parse here would silently compare the wrong number, and this
+    check is meant to fail loudly instead.
+    """
+
+    matches = _WINDOW_SENTENCE.findall(notes)
+    assert len(matches) == 1, f"expected one window sentence, found {matches}: {notes}"
+    window, total = matches[0]
+    return int(window), int(total)
+
+
+@pytest.mark.parametrize(
+    "total, fraction, min_tail_steps",
+    [
+        # Floor reachable, fraction governs.
+        (200, 0.25, 2),
+        # Whole trace requested explicitly.
+        (200, 1.0, 2),
+        # Sub-floor run: how select_tail resolves this is its business and has
+        # changed there, so nothing here pins the value -- only the invariants.
+        (200, 0.25, MIN_TAIL_STEPS),
+        (PILOT_LOGGED_STEPS, DEFAULT_TAIL_FRACTION, MIN_TAIL_STEPS),
+    ],
+)
+def test_notes_window_is_the_window_actually_averaged(
+    total: int, fraction: float, min_tail_steps: int
+) -> None:
+    """The reported window is the averaged window, whatever select_tail resolves to.
+
+    These are the properties this adapter owns, stated without pinning
+    ``select_tail``'s resolution rule: the window lies inside the run, the
+    sentence in the notes names the window the energy was actually computed
+    from, and the provisional caveat appears exactly when the window is below
+    the floor the caller asked for. Written this way so a change in
+    ``select_tail`` moves the numbers without falsifying the assertions -- the
+    previous version of these tests pinned nothing at all here, which is why a
+    help string could go stale unnoticed.
+
+    The energy comparison is what makes the parsed window trustworthy: a notes
+    sentence that disagreed with the slice would pass a substring check and fail
+    this one.
+    """
+
+    energies = _series(total)
+    record = _record(
+        energies,
+        tail_fraction=fraction,
+        min_tail_steps=min_tail_steps,
+        allow_short_tail=True,
+    )
+
+    window, reported_total = _window_from_notes(record.notes)
+
+    assert reported_total == total
+    assert 2 <= window <= total
+    assert record.energy_hartree == pytest.approx(huber_mean(energies[-window:])[0])
+    assert ("provisional" in record.notes) == (window < min_tail_steps)
+
+
+@pytest.mark.parametrize(
+    "total, min_tail_steps",
+    [(200, MIN_TAIL_STEPS), (PILOT_LOGGED_STEPS, MIN_TAIL_STEPS), (200, 2)],
+)
+def test_notes_never_render_a_literal_none(total: int, min_tail_steps: int) -> None:
+    """No notes field may contain the literal string "None".
+
+    A bare replacement field holding ``None`` -- ``f"from {count} blocks"`` --
+    renders "from None blocks" without raising, which reads as a forgotten
+    count rather than as "blocking never ran". That silent branch is the shared
+    failure mode across the adapters in this program, so it is asserted at the
+    output rather than trusted to the call sites.
+    """
+
+    record = _record(
+        _series(total),
+        min_tail_steps=min_tail_steps,
+        allow_short_tail=True,
+    )
+
+    assert "None" not in record.notes
+
+
+def test_lowering_the_block_floor_is_what_keeps_the_ladder_running() -> None:
+    """``min(MIN_BLOCKS, len(tail))`` is load-bearing; do not simplify it away.
+
+    A short Orbformer window is shorter than ``MIN_BLOCKS``, so with the default
+    floor blocking's loop condition is false before its first level and the
+    function never measures anything -- it either returns a degenerate bar or
+    refuses, depending on the ``statistics`` version. Lowering the floor to the
+    window length makes the first level run, which is what gives this adapter a
+    real number and what makes any "no blocks measured" sentinel unreachable
+    from here.
+
+    Both halves are asserted, because the second is the reason for the first.
+    """
+
+    tail = _series(20)
+    assert len(tail) < MIN_BLOCKS
+
+    lowered = min(MIN_BLOCKS, len(tail))
+    stderr, blocks = blocking_stderr(tail, min_blocks=lowered)
+    assert stderr > 0.0
+    assert blocks == len(tail)
+    assert blocking_inflation(tail, min_blocks=lowered) >= 1.0
+
+    # The unlowered floor, for contrast. Which way it fails is the shared
+    # module's business; that it yields nothing usable is the point.
+    try:
+        degenerate, _ = blocking_stderr(tail, min_blocks=MIN_BLOCKS)
+    except AdapterError:
+        pass
+    else:
+        assert degenerate <= 0.0, (
+            "blocking measured something at the unlowered floor, so this test no "
+            "longer demonstrates why the adapter lowers it"
+        )
+
+    # And the adapter's own output on such a window: a numeric inflation ratio,
+    # never a sentinel.
+    record = _record(tail, min_tail_steps=2)
+    assert re.search(r"inflation \d+\.\d\dx", record.notes)
+    assert "None" not in record.notes
+
+
+def test_pilot_window_is_still_the_whole_trace() -> None:
+    """Deliberate merge-order tripwire on ``select_tail``'s sub-floor resolution.
+
+    This is the only test here that pins a resolved window, and it is pinned on
+    purpose: the ``--allow-short-tail`` help used to describe the resolution
+    rule, went stale when the rule changed, and nothing caught it because
+    nothing pinned the value. The failure message below carries the whole
+    diagnosis, so a future reader does not have to reconstruct it.
+    """
+
+    window = select_tail(
+        PILOT_LOGGED_STEPS,
+        DEFAULT_TAIL_FRACTION,
+        min_steps=MIN_TAIL_STEPS,
+        allow_below_floor=True,
+    )
+
+    assert window == PILOT_WINDOW_AT_PIN, (
+        f"select_tail resolved the pilot shape (total_steps={PILOT_LOGGED_STEPS}, "
+        f"fraction={DEFAULT_TAIL_FRACTION}, min_steps={MIN_TAIL_STEPS}, "
+        f"allow_below_floor=True) to {window}, not {PILOT_WINDOW_AT_PIN}. "
+        "This is a deliberate merge-order alarm, not a flaky test. The "
+        "expectation was pinned against experiments/baselines/statistics.py at "
+        f"blob {STATISTICS_BLOB_AT_PIN} (origin/dev commit {DEV_COMMIT_AT_PIN}), "
+        "where the floor is clipped to the run length so a sub-floor run keeps "
+        f"its whole trace. {PILOT_WINDOW_AT_PIN} is ALSO the value a corrected "
+        "sub-floor fallback should produce: when the floor cannot be met, the "
+        "fallback that maximises information is the whole trace, not the "
+        "requested fraction. So a smaller number here means PR #291 "
+        "(claude/statistics-short-window) landed with its as-written fallback, "
+        "which returns round(fraction * total_steps) instead -- a shorter "
+        "estimator window and a wider bar for identical flags, in the one "
+        "regime where the run is definitionally short. Correct response: fix "
+        "the fallback in statistics.py, not this expectation. Change the "
+        "expectation only if the program has decided the fraction is the right "
+        "sub-floor fallback, and record that decision here."
+    )
+
+
+def test_short_tail_help_does_not_state_a_resolution_rule(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The flag's help must describe the decision, not select_tail's arithmetic.
+
+    It previously promised that "the floor is clipped to the run length, so on
+    a short run this widens the window to the whole trace", which is a claim
+    about ``select_tail`` rather than about this flag, and would become false
+    the moment that rule changed. Help text is the one part of this adapter an
+    operator reads instead of the code, so a false sentence there is acted on.
+    """
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--help"])
+    assert exit_info.value.code == 0
+
+    # argparse re-wraps help to the terminal width, so compare on collapsed
+    # whitespace rather than on the emitted line breaks.
+    help_text = " ".join(capsys.readouterr().out.split())
+
+    assert "--allow-short-tail" in help_text
+    assert "provisional" in help_text
+    assert "select_tail" in help_text
+    for stale in (
+        "clipped to the run length",
+        "widens the window to the whole trace",
+    ):
+        assert stale not in help_text
 
 
 def test_drifting_series_is_flagged_monotone() -> None:
