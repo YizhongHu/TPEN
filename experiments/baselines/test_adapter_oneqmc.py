@@ -559,15 +559,19 @@ def test_whole_trace_window_mixes_in_relaxation_and_a_fraction_does_not() -> Non
 #: because the tripwire below reads as arbitrary numbers otherwise.
 PILOT_LOGGED_STEPS = 2000
 PILOT_WINDOW_AT_PIN = 2000
-# The competing sub-floor rule, measured by the statistics lane at PR #291's
-# tip. Pinned as a named constant rather than folded into the message so the
-# tripwire says which alternative it is discriminating against. The pin stays
-# 2000 and not this value because this branch descends from dev, where 2000 is
-# what select_tail actually returns; pinning the disputed value would make the
-# test red today for a reason a reader would misread as a regression.
-PILOT_WINDOW_DISPUTED_ALTERNATIVE = 500
-DISPUTE_ITEM_ID = "573509bb-58ef-45f7-a34d-3f5b110597e0"
-DISPUTE_AS_OF = "2026-08-21"
+# The window PR #291's sub-floor fallback returns for this shape, measured by
+# the statistics lane at its tip. Named rather than folded into the message so
+# the tripwire says which value it discriminates against. On 2026-08-21 the
+# program ruled that this fallback -- the requested fraction, not the whole
+# trace -- is the correct one, and left #291 unchanged; see DECISION_ITEM_ID.
+# The pin below is nevertheless still 2000, because this branch descends from
+# dev, where select_tail clips the floor to the run length. Flipping the pin
+# before #291 merges would make the test red today for a reason a reader would
+# misread as a regression, so the flip belongs in the commit that rebases this
+# branch onto a dev containing #291.
+PILOT_WINDOW_AFTER_291 = 500
+DECISION_ITEM_ID = "573509bb-58ef-45f7-a34d-3f5b110597e0"
+DECISION_DATE = "2026-08-21"
 
 #: Exact objects the pilot expectation was measured against, so a future reader
 #: can tell a stale expectation from a regression. The blob is the more precise
@@ -745,28 +749,29 @@ def test_pilot_window_is_still_the_whole_trace() -> None:
         f"select_tail resolved the pilot shape (total_steps={PILOT_LOGGED_STEPS}, "
         f"fraction={DEFAULT_TAIL_FRACTION}, min_steps={MIN_TAIL_STEPS}, "
         f"allow_below_floor=True) to {window}, not {PILOT_WINDOW_AT_PIN}. "
-        "This is a deliberate merge-order alarm, not a flaky test. The "
-        "expectation was pinned against experiments/baselines/statistics.py at "
-        f"blob {STATISTICS_BLOB_AT_PIN} (origin/dev commit {DEV_COMMIT_AT_PIN}), "
-        "where the floor is clipped to the run length so a sub-floor run keeps "
-        f"its whole trace. {PILOT_WINDOW_AT_PIN} is ALSO the value a corrected "
-        "sub-floor fallback should produce: when the floor cannot be met, the "
-        "fallback that maximises information is the whole trace, not the "
-        "requested fraction. So a smaller number here means PR #291 "
-        "(claude/statistics-short-window) landed with its as-written fallback, "
-        "which returns round(fraction * total_steps) instead -- a shorter "
-        "estimator window and a wider bar for identical flags, in the one "
-        "regime where the run is definitionally short. Correct response: fix "
-        "the fallback in statistics.py, not this expectation. Change the "
-        "expectation only if the program has decided the fraction is the right "
-        "sub-floor fallback, and record that decision here. As of "
-        f"{DISPUTE_AS_OF}, {PILOT_WINDOW_DISPUTED_ALTERNATIVE} is exactly what "
-        "PR #291 at 4e10ad9c5055976dc31b45c8b01a565028d2c143 resolves this "
-        "shape to, and which of the two rules is correct is an OPEN decision "
-        "escalated on Task Orchestrator item "
-        f"{DISPUTE_ITEM_ID} -- so read a failure here as 'that decision "
-        "landed', check the item, and only then decide whether this line or "
-        "statistics.py is the thing that is wrong."
+        "This is a deliberate merge-order alarm, not a flaky test, and as of "
+        f"{DECISION_DATE} the expected response to it is to CHANGE THIS LINE. "
+        "The expectation was pinned against experiments/baselines/statistics.py "
+        f"at blob {STATISTICS_BLOB_AT_PIN} (origin/dev commit "
+        f"{DEV_COMMIT_AT_PIN}), where the floor is clipped to the run length so "
+        "a sub-floor run keeps its whole trace. PR #291 "
+        "(claude/statistics-short-window, tip "
+        "4e10ad9c5055976dc31b45c8b01a565028d2c143) returns the requested "
+        f"fraction instead, which is {PILOT_WINDOW_AFTER_291} for this shape. "
+        "This lane argued for the whole trace, on the grounds that it maximises "
+        "information in the one regime where the run is definitionally short; "
+        f"the program ruled against that on {DECISION_DATE} and left #291 as "
+        "written, in part because select_tail takes no estimator argument, so a "
+        "single hard-coded fallback is necessarily wrong for one of its two "
+        f"callers. A window of {PILOT_WINDOW_AFTER_291} here therefore does NOT "
+        "mean statistics.py is broken: it means #291 reached dev and this "
+        "branch was rebased onto it. Correct response: flip "
+        f"PILOT_WINDOW_AT_PIN to {PILOT_WINDOW_AFTER_291} in the rebase commit "
+        "itself and name the flip in that commit message, so it reads as the "
+        "sanctioned consequence of a merge rather than as drift. The decision "
+        f"and its reasoning are on Task Orchestrator item {DECISION_ITEM_ID}. "
+        "Any OTHER value is a real regression in select_tail and must be fixed "
+        "there, not here."
     )
 
 
