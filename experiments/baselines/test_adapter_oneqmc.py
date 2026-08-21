@@ -559,6 +559,15 @@ def test_whole_trace_window_mixes_in_relaxation_and_a_fraction_does_not() -> Non
 #: because the tripwire below reads as arbitrary numbers otherwise.
 PILOT_LOGGED_STEPS = 2000
 PILOT_WINDOW_AT_PIN = 2000
+# The competing sub-floor rule, measured by the statistics lane at PR #291's
+# tip. Pinned as a named constant rather than folded into the message so the
+# tripwire says which alternative it is discriminating against. The pin stays
+# 2000 and not this value because this branch descends from dev, where 2000 is
+# what select_tail actually returns; pinning the disputed value would make the
+# test red today for a reason a reader would misread as a regression.
+PILOT_WINDOW_DISPUTED_ALTERNATIVE = 500
+DISPUTE_ITEM_ID = "573509bb-58ef-45f7-a34d-3f5b110597e0"
+DISPUTE_AS_OF = "2026-08-21"
 
 #: Exact objects the pilot expectation was measured against, so a future reader
 #: can tell a stale expectation from a regression. The blob is the more precise
@@ -750,7 +759,14 @@ def test_pilot_window_is_still_the_whole_trace() -> None:
         "regime where the run is definitionally short. Correct response: fix "
         "the fallback in statistics.py, not this expectation. Change the "
         "expectation only if the program has decided the fraction is the right "
-        "sub-floor fallback, and record that decision here."
+        "sub-floor fallback, and record that decision here. As of "
+        f"{DISPUTE_AS_OF}, {PILOT_WINDOW_DISPUTED_ALTERNATIVE} is exactly what "
+        "PR #291 at 4e10ad9c5055976dc31b45c8b01a565028d2c143 resolves this "
+        "shape to, and which of the two rules is correct is an OPEN decision "
+        "escalated on Task Orchestrator item "
+        f"{DISPUTE_ITEM_ID} -- so read a failure here as 'that decision "
+        "landed', check the item, and only then decide whether this line or "
+        "statistics.py is the thing that is wrong."
     )
 
 
