@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import sys
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,7 @@ from experiments.baselines.adapters.oneqmc import (
     gather_molecule,
     huber_mean,
     metadata_from_attrs,
+    read_attrs,
     read_series,
     record_from_series,
     result_path,
@@ -766,6 +768,89 @@ def test_missing_result_file_raises(tmp_path: Path) -> None:
 
     with pytest.raises(AdapterError, match="result.h5"):
         read_series(tmp_path)
+
+
+class _BlockH5py:
+    """Meta-path finder that makes ``import h5py`` fail and nothing else.
+
+    A finder rather than a patched :func:`builtins.__import__`, because the
+    latter intercepts every import in the process for the duration of the test,
+    including pytest's own. A finder is consulted only for the module it claims.
+
+    Returning ``None`` from ``find_spec`` is not enough on its own -- that just
+    defers to the next finder -- so this one raises, which surfaces as the
+    :class:`ModuleNotFoundError` the adapter catches. Assigning ``None`` into
+    ``sys.modules`` would NOT work here: that raises plain
+    :class:`ImportError`, which is the parent class, so the adapter's
+    ``except ModuleNotFoundError`` would not catch it and the test would pass
+    for the wrong reason.
+    """
+
+    def find_spec(self, fullname: str, path: object = None, target: object = None) -> None:
+        if fullname == "h5py" or fullname.startswith("h5py."):
+            raise ModuleNotFoundError(f"No module named {fullname!r}", name=fullname)
+        return None
+
+
+def _block_h5py(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``import h5py`` raise for the rest of the test, installed or not.
+
+    Both directions matter. On an interpreter without h5py the block is a no-op
+    and the test still asserts the right thing; on one with h5py it is what
+    makes the assertion meaningful at all. That is the point: the ordering
+    property must hold in both closures, and it was the closure difference that
+    hid the defect.
+    """
+
+    monkeypatch.delitem(sys.modules, "h5py", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [_BlockH5py(), *sys.meta_path])
+
+
+@pytest.mark.parametrize("reader", [read_series, read_attrs])
+def test_missing_file_is_diagnosed_before_the_missing_dependency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: object
+) -> None:
+    """With h5py unimportable, an empty run directory still reports the file.
+
+    Both errors are correct, so the only question is which one the caller sees
+    first, and the ordering is not cosmetic. A caller who pointed at the wrong
+    directory needs to be told the file is missing; telling them to install
+    h5py sends them to fix an environment that was never the problem.
+
+    This test previously did not exist, and its absence let the reverse ordering
+    through. The two closures disagreed: the local interpreter carried h5py so
+    ``test_missing_result_file_raises`` passed, while the project venv does not
+    ship h5py, so the same test failed on the cluster with the dependency
+    message instead of the filename. Blocking the import here pins the ordering
+    in BOTH closures, which is the property that was actually wanted.
+    """
+
+    _block_h5py(monkeypatch)
+
+    with pytest.raises(AdapterError, match="result.h5"):
+        reader(tmp_path)  # type: ignore[operator]
+
+
+@pytest.mark.parametrize("reader", [read_series, read_attrs])
+def test_missing_dependency_is_reported_when_the_file_does_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: object
+) -> None:
+    """The h5py branch stays reachable: a present file plus no h5py says h5py.
+
+    Guards the other half of the reordering. Moving the existence check first
+    would be a regression if it made the dependency message unreachable, so this
+    asserts the branch still fires on the input that should reach it. The file
+    is created empty on purpose -- it is never opened, because the import fails
+    before any read.
+    """
+
+    _block_h5py(monkeypatch)
+    training = tmp_path / "training"
+    training.mkdir()
+    (training / "result.h5").write_bytes(b"")
+
+    with pytest.raises(AdapterError, match="h5py"):
+        reader(tmp_path)  # type: ignore[operator]
 
 
 @pytest.mark.parametrize("mol_idx", [0, 1])

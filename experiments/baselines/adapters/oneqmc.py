@@ -300,6 +300,17 @@ def read_series(run_dir: Path, mol_idx: int = 0) -> MoleculeSeries:
     looks identical. Ask the scheduler for that.
     """
 
+    # Existence is checked BEFORE h5py is imported, and the order is the whole
+    # point. When a caller points at the wrong directory, "no result.h5 under
+    # <dir>" is the actionable diagnosis and "you need h5py" is a distraction
+    # that sends them to fix an environment that was never the problem. The
+    # reverse order also made this function's error depend on whether the
+    # interpreter happened to carry h5py, which is how it reached a cluster
+    # verification green locally and red in the project venv.
+    path = result_path(run_dir)
+    if not path.is_file():
+        raise AdapterError(f"no {RESULT_FILENAME} under {run_dir}")
+
     try:
         import h5py
     except ModuleNotFoundError as error:  # pragma: no cover - environment-dependent
@@ -307,10 +318,6 @@ def read_series(run_dir: Path, mol_idx: int = 0) -> MoleculeSeries:
             "reading OneQMC output needs h5py, which is not a TPEN dependency; run "
             "this adapter with the OneQMC virtualenv that already provides it"
         ) from error
-
-    path = result_path(run_dir)
-    if not path.is_file():
-        raise AdapterError(f"no {RESULT_FILENAME} under {run_dir}")
 
     try:
         with h5py.File(path, "r", swmr=True, libver="v110") as handle:
@@ -345,14 +352,17 @@ def read_attrs(run_dir: Path) -> dict[str, Any]:
     reading the trace.
     """
 
+    # Same ordering as read_series, for the same reason: a missing file is the
+    # more actionable diagnosis, and it must not depend on whether h5py is
+    # installed.
+    path = result_path(run_dir)
+    if not path.is_file():
+        raise AdapterError(f"no {RESULT_FILENAME} under {run_dir}")
+
     try:
         import h5py
     except ModuleNotFoundError as error:  # pragma: no cover - environment-dependent
         raise AdapterError("reading OneQMC output needs h5py") from error
-
-    path = result_path(run_dir)
-    if not path.is_file():
-        raise AdapterError(f"no {RESULT_FILENAME} under {run_dir}")
     try:
         with h5py.File(path, "r", swmr=True, libver="v110") as handle:
             return dict(handle.attrs)
