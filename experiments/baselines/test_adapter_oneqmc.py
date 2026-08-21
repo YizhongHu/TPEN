@@ -759,13 +759,15 @@ def test_short_tail_help_does_not_state_a_resolution_rule(
     help_text = " ".join(capsys.readouterr().out.split())
 
     assert "--allow-short-tail" in help_text
-    assert "provisional" in help_text
-    assert "select_tail" in help_text
+    # Asserted before the positive checks so that a reverted help string fails
+    # on the false claim itself rather than on a missing word.
     for stale in (
         "clipped to the run length",
         "widens the window to the whole trace",
     ):
-        assert stale not in help_text
+        assert stale not in help_text, f"help still asserts {stale!r}: {help_text}"
+    assert "provisional" in help_text
+    assert "select_tail" in help_text
 
 
 def test_drifting_series_is_flagged_monotone() -> None:
