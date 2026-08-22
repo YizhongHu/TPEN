@@ -10,11 +10,26 @@ traits:
         required: true
         description: "Artifact retention, recovery, and disposition policy."
         guidance: "Define the artifact lifecycle policy, including retention, recovery expectations, and disposition boundaries."
-      - key: artifact-disposition-summary
+      - key: artifact-inventory
+        role: work
+        required: true
+        description: "Inventory of artifacts covered by the lifecycle decision."
+        guidance: "Inventory the artifacts and identify what is retained, backed up to Holystore, archived to HPSS, or eligible for lifecycle-gated cleanup."
+      - key: disposition-contract
+        role: queue
+        required: true
+        description: "Contract for artifact disposition and recovery."
+        guidance: "Define whether artifacts are retained, backed up to Holystore, archived to HPSS, or cleanup-eligible, including the recovery proof required before lifecycle-gated cleanup."
+      - key: disposition-receipt
+        role: work
+        required: true
+        description: "Receipt for the artifact disposition actions."
+        guidance: "Record what was retained, backed up to Holystore, archived to HPSS, or held for lifecycle-gated cleanup, with artifact identifiers and recovery evidence."
+      - key: disposition-verification
         role: review
         required: true
-        description: "Summary of the final artifact disposition."
-        guidance: "Summarize what happened to the artifacts, including the disposition decision and supporting evidence."
+        description: "Verification of artifact disposition and recovery proof."
+        guidance: "Verify retention, Holystore backup, HPSS archive, recovery proof, and that any cleanup is lifecycle-gated and supported by the recorded evidence."
 
 work_item_schemas:
   implementation-slice:
