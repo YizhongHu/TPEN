@@ -938,10 +938,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--allow-short-tail",
         action="store_true",
         help=(
-            "accept a window below the floor for a short run; the record says so. "
-            "Note the floor is clipped to the run length, so on a short run this "
-            "widens the window to the whole trace unless --min-tail-steps is lowered "
-            "too"
+            "accept an estimator window below --min-tail-steps when the run is "
+            "too short to fill it, instead of refusing the run; the notes then "
+            "say the estimate is provisional. How wide the accepted window ends "
+            "up is select_tail's rule in experiments/baselines/statistics.py, "
+            "not this flag's, and that rule has changed there before -- read it "
+            "there rather than assuming a value"
         ),
     )
     parser.add_argument("--code-commit", default=None)
