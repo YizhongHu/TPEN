@@ -15,21 +15,11 @@ traits:
         required: true
         description: "Inventory of artifacts covered by the lifecycle decision."
         guidance: "Inventory the artifacts and identify what is retained, backed up to Holystore, archived to HPSS, or eligible for lifecycle-gated cleanup."
-      - key: disposition-contract
-        role: queue
-        required: true
-        description: "Contract for artifact disposition and recovery."
-        guidance: "Define whether artifacts are retained, backed up to Holystore, archived to HPSS, or cleanup-eligible, including the recovery proof required before lifecycle-gated cleanup."
-      - key: disposition-receipt
-        role: work
-        required: true
-        description: "Receipt for the artifact disposition actions."
-        guidance: "Record what was retained, backed up to Holystore, archived to HPSS, or held for lifecycle-gated cleanup, with artifact identifiers and recovery evidence."
-      - key: disposition-verification
+      - key: artifact-disposition-summary
         role: review
         required: true
-        description: "Verification of artifact disposition and recovery proof."
-        guidance: "Verify retention, Holystore backup, HPSS archive, recovery proof, and that any cleanup is lifecycle-gated and supported by the recorded evidence."
+        description: "Summary of the final artifact disposition."
+        guidance: "Summarize exact output paths, disposition child IDs, and any directly retained paths."
 
 work_item_schemas:
   implementation-slice:
@@ -57,18 +47,18 @@ work_item_schemas:
   artifact-disposition:
     lifecycle: auto
     notes:
-      - key: archive-contract
+      - key: disposition-contract
         role: queue
         required: true
-        description: "Contract for archiving and recovering the artifacts."
-        guidance: "Define the archive target, recovery expectations, and acceptance criteria for the artifact disposition."
-      - key: archive-receipt
+        description: "Contract for artifact disposition and recovery."
+        guidance: "Define retain, Holystore backup, HPSS archive, recovery proof, and lifecycle-gated cleanup criteria."
+      - key: disposition-receipt
         role: work
         required: true
-        description: "Receipt proving the artifact archive operation."
-        guidance: "Record the archive action, exact artifact scope, destination identifier, and validation evidence."
-      - key: recovery-receipt
+        description: "Receipt for artifact disposition actions."
+        guidance: "Record retain, Holystore backup, HPSS archive, recovery proof, and lifecycle-gated cleanup evidence."
+      - key: disposition-verification
         role: review
         required: true
-        description: "Receipt proving artifact recovery or recovery validation."
-        guidance: "Record the recovery test or validation, its outcome, and any remaining limitations."
+        description: "Verification of artifact disposition and recovery."
+        guidance: "Verify retain, Holystore backup, HPSS archive, recovery proof, and lifecycle-gated cleanup."
