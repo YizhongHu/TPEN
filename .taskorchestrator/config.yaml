@@ -2,6 +2,25 @@ project:
   rootId: 58348558-a4c8-4ed7-8f7b-829ef8163145
   name: TPEN
 
+traits:
+  artifact-lifecycle:
+    notes:
+      - key: artifact-policy
+        role: queue
+        required: true
+        description: "Artifact retention, recovery, and disposition policy."
+        guidance: "Define the artifact lifecycle policy, including retention, recovery expectations, and disposition boundaries."
+      - key: artifact-inventory
+        role: work
+        required: true
+        description: "Inventory of artifacts covered by the lifecycle decision."
+        guidance: "Inventory the artifacts and identify what is retained, backed up to Holystore, archived to HPSS, or eligible for lifecycle-gated cleanup."
+      - key: artifact-disposition-summary
+        role: review
+        required: true
+        description: "Summary of the final artifact disposition."
+        guidance: "Summarize exact output paths, disposition child IDs, and any directly retained paths."
+
 work_item_schemas:
   implementation-slice:
     lifecycle: auto
@@ -25,3 +44,21 @@ work_item_schemas:
         guidance: "Verify the exact full head SHA from a clean environment. Record verifier identity, commands, exit codes, pass/fail/skip counts, job ID when applicable, durable log locations, and the verified PR base/predecessor. Confirm every gh-stack layer is linear and needsRebase is false. Any changed SHA, moved predecessor, failing check, or unexecuted required check keeps the item in work or blocked. Human-confirmed merge is required before terminalization."
         skill: clean-final-verifier
         maxLength: 4000
+  artifact-disposition:
+    lifecycle: auto
+    notes:
+      - key: disposition-contract
+        role: queue
+        required: true
+        description: "Contract for artifact disposition and recovery."
+        guidance: "Define retain, Holystore backup, HPSS archive, recovery proof, and lifecycle-gated cleanup criteria."
+      - key: disposition-receipt
+        role: work
+        required: true
+        description: "Receipt for artifact disposition actions."
+        guidance: "Record retain, Holystore backup, HPSS archive, recovery proof, and lifecycle-gated cleanup evidence."
+      - key: disposition-verification
+        role: review
+        required: true
+        description: "Verification of artifact disposition and recovery."
+        guidance: "Verify retain, Holystore backup, HPSS archive, recovery proof, and lifecycle-gated cleanup."
