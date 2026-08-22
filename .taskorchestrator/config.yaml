@@ -2,6 +2,20 @@ project:
   rootId: 58348558-a4c8-4ed7-8f7b-829ef8163145
   name: TPEN
 
+traits:
+  artifact-lifecycle:
+    notes:
+      - key: artifact-policy
+        role: queue
+        required: true
+        description: "Artifact retention, recovery, and disposition policy."
+        guidance: "Define the artifact lifecycle policy, including retention, recovery expectations, and disposition boundaries."
+      - key: artifact-disposition-summary
+        role: review
+        required: true
+        description: "Summary of the final artifact disposition."
+        guidance: "Summarize what happened to the artifacts, including the disposition decision and supporting evidence."
+
 work_item_schemas:
   implementation-slice:
     lifecycle: auto
@@ -25,3 +39,21 @@ work_item_schemas:
         guidance: "Verify the exact full head SHA from a clean environment. Record verifier identity, commands, exit codes, pass/fail/skip counts, job ID when applicable, durable log locations, and the verified PR base/predecessor. Confirm every gh-stack layer is linear and needsRebase is false. Any changed SHA, moved predecessor, failing check, or unexecuted required check keeps the item in work or blocked. Human-confirmed merge is required before terminalization."
         skill: clean-final-verifier
         maxLength: 4000
+  artifact-disposition:
+    lifecycle: auto
+    notes:
+      - key: archive-contract
+        role: queue
+        required: true
+        description: "Contract for archiving and recovering the artifacts."
+        guidance: "Define the archive target, recovery expectations, and acceptance criteria for the artifact disposition."
+      - key: archive-receipt
+        role: work
+        required: true
+        description: "Receipt proving the artifact archive operation."
+        guidance: "Record the archive action, exact artifact scope, destination identifier, and validation evidence."
+      - key: recovery-receipt
+        role: review
+        required: true
+        description: "Receipt proving artifact recovery or recovery validation."
+        guidance: "Record the recovery test or validation, its outcome, and any remaining limitations."
