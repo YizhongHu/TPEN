@@ -39,10 +39,23 @@ for reproducibility.
 
 ## Treating Data with Care
 
-Unless otherwise specified, removal of run result data (untracked by git included) is strictly forbidden.
-This may include data from `outputs/`, `results/`, `reports/`, `slurm/`, etc. The agent should not
-automatically remove these data even when requested by the user. Instead, it gives the user a list of
-things to remove, after which the user does all of this manually.
+Run-result data (including untracked data in `outputs/`, `results/`, `reports/`, `slurm/`, etc.) is
+governed by lifecycle class:
+
+- Ephemeral smoke, staging, and temporary data may be removed only by the task-owning agent after
+  confirming exact-path ownership, quiescence (no active job, process, or writer references), and
+  capturing a durable receipt.
+- Disposable agent worktrees follow workspace/cohort safety rules and must never be confused with
+  scientific output.
+- Scientific outputs, checkpoints, and results remain protected until an explicit Task Orchestrator
+  lifecycle disposition names the exact paths and any required backup or archive, and recovery
+  verification has passed.
+- Failure evidence, logs, and receipts remain preserved until their lifecycle disposition explicitly
+  permits cleanup.
+- Never delete broad roots or inferred paths; agents must not delete user-owned or unrelated run data.
+
+Paths not authorized by a lifecycle disposition remain subject to the manual deletion fallback: the
+agent gives the user a list of items to remove, and the user removes them manually.
 
 ## TODO.md
 
