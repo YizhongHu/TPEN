@@ -15,6 +15,7 @@ built so that a positional read returns a plausible energy rather than an error.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -558,26 +559,32 @@ def test_whole_trace_window_mixes_in_relaxation_and_a_fraction_does_not() -> Non
 #: default fraction, and the standard floor it cannot reach. Named constants
 #: because the tripwire below reads as arbitrary numbers otherwise.
 PILOT_LOGGED_STEPS = 2000
-PILOT_WINDOW_AT_PIN = 2000
-# The window PR #291's sub-floor fallback returns for this shape, measured by
-# the statistics lane at its tip. Named rather than folded into the message so
-# the tripwire says which value it discriminates against. On 2026-08-21 the
-# program ruled that this fallback -- the requested fraction, not the whole
-# trace -- is the correct one, and left #291 unchanged; see DECISION_ITEM_ID.
-# The pin below is nevertheless still 2000, because this branch descends from
-# dev, where select_tail clips the floor to the run length. Flipping the pin
-# before #291 merges would make the test red today for a reason a reader would
-# misread as a regression, so the flip belongs in the commit that rebases this
-# branch onto a dev containing #291.
-PILOT_WINDOW_AFTER_291 = 500
+PILOT_WINDOW_AT_PIN = 500
+
+#: The window this shape resolved to BEFORE #291: the whole trace. Kept named
+#: after the flip rather than deleted, so the tripwire can say which value it
+#: discriminates against in *each* direction. 2000 now means this branch was
+#: rebased BACKWARD onto a dev predating #291, which is a different diagnosis
+#: from "select_tail regressed" and wants a different repair.
+PILOT_WINDOW_BEFORE_291 = 2000
+
+#: PR #291's squash-merge commit on dev. The merge commit is quoted rather than
+#: the branch head because a squash merge leaves the head an ancestor of
+#: nothing, so the head binds nothing; the merge commit is immutable and does.
+MERGE_COMMIT_291 = "bec0219f5cf87dd008c3d40c34b7256cff9b9e0b"
 DECISION_ITEM_ID = "573509bb-58ef-45f7-a34d-3f5b110597e0"
 DECISION_DATE = "2026-08-21"
 
-#: Exact objects the pilot expectation was measured against, so a future reader
+#: Exact objects the pilot expectation is measured against, so a future reader
 #: can tell a stale expectation from a regression. The blob is the more precise
 #: of the two: it is the file whose rule produced the number.
-STATISTICS_BLOB_AT_PIN = "fb0cec1ae1afc4795a1ba7a18c84b9481f0a226d"
-DEV_COMMIT_AT_PIN = "e139a10f33c8866460264db0323887e4a38dbf26"
+STATISTICS_BLOB_AT_PIN = "5d4fa8eb38878bd2ccb22e3230c7ad26b63d3808"
+DEV_COMMIT_AT_PIN = "7d8391a750e1e4b97421ffdfb53e3ef7a2e0b12c"
+
+#: The file whose rule produces :data:`PILOT_WINDOW_AT_PIN`. Resolved as a
+#: sibling of this test rather than from the repository root, so the blob check
+#: below does not depend on the directory pytest was launched from.
+STATISTICS_SOURCE = Path(__file__).with_name("statistics.py")
 
 #: The window sentence the adapter writes, e.g. "the last 50 of 200 logged
 #: steps". Anchored on "last " because the coverage sentence also ends in
@@ -728,7 +735,64 @@ def test_lowering_the_block_floor_is_what_keeps_the_ladder_running() -> None:
     assert "None" not in record.notes
 
 
-def test_pilot_window_is_still_the_whole_trace() -> None:
+def _git_blob_sha1(path: Path) -> str:
+    """Return the git blob SHA-1 of ``path``, computed without invoking git.
+
+    Git hashes a blob as ``sha1(b"blob <bytelength>\\0" + content)``, so the
+    result is directly comparable to a ``git rev-parse <ref>:<path>`` value and
+    can be pinned as a constant.
+
+    Computed in process on purpose. Shelling out to ``git`` would make the
+    check depend on the tree being a git checkout, and the only graceful
+    response to a missing checkout is a skip -- which would switch the alarm
+    off in precisely the environments (sdist, exported tree, CI cache) where a
+    silently stale pin is hardest to notice. A hash of the bytes on disk needs
+    nothing but the file.
+
+    Kept local to this test module rather than promoted into
+    ``experiments.baselines``: git object hashing is not a concept that package
+    owns, and its only consumer is the tripwire below.
+    """
+
+    data = path.read_bytes()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def test_pilot_window_pin_still_describes_the_statistics_it_was_measured_against() -> None:
+    """Alarm on the *condition* that invalidates the pin below, not on its effect.
+
+    The previous shape of this tripwire pinned only the resolved window, so the
+    fact that ``statistics.py`` had changed underneath it was observable solely
+    through a downstream arithmetic assertion. That is an indirect instrument:
+    it fires late, it reports a number rather than a cause, and it cannot fire
+    at all if some other edit happens to restore the same window by a different
+    rule. This check fires on the blob itself.
+
+    A failure here is not a defect in ``statistics.py``. It means the file whose
+    rule produced :data:`PILOT_WINDOW_AT_PIN` is no longer the file that was
+    measured, so the pin's provenance has lapsed and must be re-measured and
+    re-recorded -- both constants, in the commit that moves the blob.
+    """
+
+    actual = _git_blob_sha1(STATISTICS_SOURCE)
+
+    assert actual == STATISTICS_BLOB_AT_PIN, (
+        f"experiments/baselines/statistics.py hashes to {actual}, but "
+        f"{PILOT_WINDOW_AT_PIN} was measured against blob "
+        f"{STATISTICS_BLOB_AT_PIN} (dev commit {DEV_COMMIT_AT_PIN}). The rule "
+        "that produces the pinned window has moved, so the pin is unprovenanced "
+        "until someone re-derives it. Correct response: re-measure "
+        "select_tail for the pilot shape at the new blob, update "
+        "STATISTICS_BLOB_AT_PIN, DEV_COMMIT_AT_PIN and PILOT_WINDOW_AT_PIN "
+        "together in the same commit, and name the move in that commit "
+        f"message. Decision history is on Task Orchestrator item "
+        f"{DECISION_ITEM_ID}. Do not silence this by widening the assertion: "
+        "the whole point is that a stale pin should be visible as a stale pin "
+        "rather than as an arithmetic surprise somewhere downstream."
+    )
+
+
+def test_pilot_window_is_the_requested_fraction() -> None:
     """Deliberate merge-order tripwire on ``select_tail``'s sub-floor resolution.
 
     This is the only test here that pins a resolved window, and it is pinned on
@@ -736,6 +800,11 @@ def test_pilot_window_is_still_the_whole_trace() -> None:
     rule, went stale when the rule changed, and nothing caught it because
     nothing pinned the value. The failure message below carries the whole
     diagnosis, so a future reader does not have to reconstruct it.
+
+    The pin was ``PILOT_WINDOW_BEFORE_291`` until #291 reached dev. It fired
+    exactly as designed and was flipped in the commit that names the flip; the
+    history is kept in the message rather than deleted, because a bare ``== 500``
+    is what made the previous stale value invisible.
     """
 
     window = select_tail(
@@ -749,34 +818,32 @@ def test_pilot_window_is_still_the_whole_trace() -> None:
         f"select_tail resolved the pilot shape (total_steps={PILOT_LOGGED_STEPS}, "
         f"fraction={DEFAULT_TAIL_FRACTION}, min_steps={MIN_TAIL_STEPS}, "
         f"allow_below_floor=True) to {window}, not {PILOT_WINDOW_AT_PIN}. "
-        "This is a deliberate merge-order alarm, not a flaky test, and as of "
-        f"{DECISION_DATE} the expected response to it is to CHANGE THIS LINE. "
-        "The expectation was pinned against experiments/baselines/statistics.py "
-        f"at blob {STATISTICS_BLOB_AT_PIN} (origin/dev commit "
-        f"{DEV_COMMIT_AT_PIN}), where the floor is clipped to the run length so "
-        "a sub-floor run keeps its whole trace. PR #291 "
-        "(branch claude/statistics-short-window) returns the requested "
-        f"fraction instead, which is {PILOT_WINDOW_AFTER_291} for this shape. "
-        "No tip SHA is quoted for #291 on purpose: an open PR's head moves, so "
-        "a SHA here would decay into a false statement. The blob and dev pins "
-        "above are immutable and safe to quote; the exact #291 SHA these "
-        "numbers were measured against lives in this layer's Task Orchestrator "
-        "receipt, which is versioned per SHA. "
-        "This lane argued for the whole trace, on the grounds that it maximises "
-        "information in the one regime where the run is definitionally short; "
-        f"the program ruled against that on {DECISION_DATE} and left #291's "
-        "below-floor behaviour unchanged, in part because select_tail takes no "
-        "estimator argument, so a "
-        "single hard-coded fallback is necessarily wrong for one of its two "
-        f"callers. A window of {PILOT_WINDOW_AFTER_291} here therefore does NOT "
-        "mean statistics.py is broken: it means #291 reached dev and this "
-        "branch was rebased onto it. Correct response: flip "
-        f"PILOT_WINDOW_AT_PIN to {PILOT_WINDOW_AFTER_291} in the rebase commit "
-        "itself and name the flip in that commit message, so it reads as the "
-        "sanctioned consequence of a merge rather than as drift. The decision "
-        f"and its reasoning are on Task Orchestrator item {DECISION_ITEM_ID}. "
-        "Any OTHER value is a real regression in select_tail and must be fixed "
-        "there, not here."
+        "This is a deliberate alarm, not a flaky test. Read the value before "
+        "changing anything, because the two failing values mean different "
+        "things and want different repairs.\n"
+        f"  window == {PILOT_WINDOW_BEFORE_291}: this branch is sitting on a "
+        "dev that PREDATES #291, where select_tail clipped the floor to the run "
+        "length so a sub-floor run kept its whole trace. That is a rebase "
+        "problem, not a statistics problem. #291 merged to dev as "
+        f"{MERGE_COMMIT_291}; confirm with `git merge-base --is-ancestor "
+        f"{MERGE_COMMIT_291} HEAD` before concluding anything, since a squash "
+        "merge leaves #291's own branch head an ancestor of nothing.\n"
+        "  any OTHER value: a real regression in select_tail, to be fixed "
+        "there and not here.\n"
+        f"For provenance: {PILOT_WINDOW_AT_PIN} was measured against "
+        f"experiments/baselines/statistics.py at blob {STATISTICS_BLOB_AT_PIN} "
+        f"(dev commit {DEV_COMMIT_AT_PIN}), where a below-floor run returns the "
+        "requested fraction. This lane argued for the whole trace instead, on "
+        "the grounds that it maximises information in the one regime where the "
+        f"run is definitionally short; the program ruled against that on "
+        f"{DECISION_DATE} and left #291's below-floor behaviour unchanged, in "
+        "part because select_tail takes no estimator argument, so a single "
+        "hard-coded fallback is necessarily wrong for one of its two callers. "
+        "No branch tip is quoted anywhere above: an open PR's head moves, so a "
+        "tip SHA here would decay into a false statement without anyone editing "
+        "this file. Blobs and merge commits are immutable and are what is "
+        f"quoted. Decision history is on Task Orchestrator item "
+        f"{DECISION_ITEM_ID}."
     )
 
 
