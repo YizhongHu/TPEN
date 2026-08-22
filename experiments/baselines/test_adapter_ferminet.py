@@ -430,12 +430,24 @@ def test_window_too_short_to_block_raises_rather_than_reporting_none_blocks(
     # thing left that can refuse is the adapter.
     #
     # Derive the window from the same call the adapter makes rather than
-    # hand-slicing energies[-20:]. A hand slice coincides with the path's tail
-    # only while the fixture keeps producing exactly 20 samples, and it
-    # decouples SILENTLY: for any total in [2, 314] the hand window and the
-    # real one both block to None, so the control stops covering the path under
-    # test while every assertion here still passes. From 315 up the real window
-    # reaches 32 blocks and the pytest.raises below fails loudly instead.
+    # hand-slicing energies[-20:]. A hand slice decouples SILENTLY when the
+    # fixture size moves. Measured over every total in [2, 4000], the domain
+    # partitions into exactly three parts (11 + 302 + 3686 = 3999 = the domain
+    # size):
+    #
+    #   [195, 205]   n=11    the derived window is itself 20, so a hand slice
+    #                        still coincides with the real one and the control
+    #                        keeps covering the path under test.
+    #   [2, 314] minus the above
+    #                n=302   both windows block to None, so a hand slice stops
+    #                        covering the path while every assertion here still
+    #                        passes. NOT contiguous: [195, 205] is a hole in it.
+    #   [315, 4000]  n=3686  the real window reaches 32 blocks and the
+    #                        pytest.raises below fails loudly instead.
+    #
+    # The silent part is the hazard, and it is the majority of the low band:
+    # loudness gates on filling 32 blocks, not on the window being 20, so the
+    # 109 totals in [206, 314] grow the window and stay silent anyway.
     window = select_tail(len(energies), 0.1, allow_below_floor=True)
     _, n_blocks = blocking_stderr(energies[-window:], allow_below_floor=True)
     assert n_blocks is None
@@ -451,11 +463,55 @@ def test_window_too_short_to_block_raises_rather_than_reporting_none_blocks(
             allow_short_tail=True,
         )
 
-    # Attribute the refusal to the adapter rather than to the layer below, two
-    # independent ways. Each alone kills a mutant that rewords this adapter's
-    # guard to statistics' wording; deleting BOTH lets that mutant survive, so
-    # neither is redundant even though neither is what kills a mutant that
-    # deletes the guard outright (that one dies on DID NOT RAISE above).
+    # Attribute the refusal to the adapter rather than to the layer below.
+    # Three mechanisms are in play here - the match= above, the negative assert
+    # below, and the traceback assert below that. Each one is the SOLE detector
+    # of at least one way the attribution can break, so none is dispensable.
+    # Every row below was measured by applying the edit and running this test.
+    #
+    #   guard deleted outright         dies above on DID NOT RAISE; none of the
+    #                                  three mechanisms is involved.
+    #   guard reworded to statistics'  killed by match= alone AND by the
+    #     text                         negative assert alone, so neither one is
+    #                                  the sole detector here.
+    #   guard wraps the lower error    match= still PASSES, because
+    #     and re-raises, concatenating  pytest.raises(match=) is re.search and a
+    #     both texts                   superstring satisfies the pin. NEGATIVE
+    #                                  ASSERT IS SOLE DETECTOR.
+    #   adapter stops forwarding the   all THREE refuse, not one. statistics'
+    #     opt-in at the blocking_stderr blocking-floor message carries both
+    #     call, so the LOWER layer      substrings the negative assert conjoins,
+    #     refuses                       carries none of the match= pin, and the
+    #                                  traceback names the other file.
+    #   adapter stops forwarding at    negative assert is BLIND here:
+    #     the select_tail call          select_tail's own message has "cannot
+    #     instead                       fill the" but not "-block minimum", and
+    #                                  the assert conjoins them. match= kills
+    #                                  it. Two call sites forward this opt-in
+    #                                  and only one reaches the blocking floor,
+    #                                  so a one-site mutation leaves the other
+    #                                  untested.
+    #   adapter's own message          negative assert passes - neither of its
+    #     reworded, semantics kept     substrings appears - and the traceback
+    #                                  still names this file. MATCH= IS SOLE
+    #                                  DETECTOR.
+    #   COMPOUND: stop forwarding AND  match= passes, because the pin is
+    #     give statistics' floor the   present in the rendered text, and the
+    #     adapter's own wording        negative assert passes, because both of
+    #                                  its substrings are gone. Only the file
+    #                                  the exception came from still differs.
+    #                                  TRACEBACK ASSERT IS SOLE DETECTOR.
+    #
+    # Two general shapes, worth keeping straight: a positive regex pin cannot
+    # see ADDED text, and a negative "not in" assert cannot see text whose
+    # SPELLING changes. Neither form dominates the other, which is why both are
+    # here alongside a check that does not read the message at all.
+    #
+    # Dispensability is scoped to the mutant SPACE as well as to the mutant
+    # SET. The traceback assert's sole-detection case needs TWO simultaneous
+    # edits, so any single-edit sweep reports it as sole detector of nothing -
+    # which reads as evidence the check is decorative when it is only evidence
+    # that the space was too small to contain its target.
     #
     # Assert the invariant substrings separately rather than the span
     # "cannot fill the 32-block minimum", which crosses statistics'
