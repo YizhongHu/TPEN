@@ -66,6 +66,7 @@ def test_world_size_one_self_test_all_phases_succeed(tmp_path):
     assert result.watchdog_fired is False
     assert result.all_reaped is True
     assert result.publication_observed is True
+    assert result.exit_codes == (0,)
     assert len(result.receipts) == 1
     receipt = result.receipts[0]
     assert receipt is not None
@@ -113,6 +114,7 @@ def test_world_size_two_self_test_all_phases_succeed(tmp_path):
     assert result.watchdog_fired is False
     assert result.all_reaped is True
     assert result.publication_observed is True
+    assert result.exit_codes == (0, 0)
     assert len(result.receipts) == 2
     for receipt in result.receipts:
         assert receipt is not None
@@ -202,6 +204,10 @@ def test_world_size_two_raise_after_optimizer_step_respects_configured_phase(tmp
     assert result.publication_observed is False
     assert result.all_reaped is True
     assert result.culprit_rank == 1
+    # Discriminates AFTER_OPTIMIZER_STEP (this plan's phase) from
+    # BEFORE_OPTIMIZER_STEP: the marker is written only if the fake
+    # optimizer-style update ran before rank 1's raise fired.
+    assert (tmp_path / "state_1.json.optimizer_done").exists()
 
 
 def test_world_size_two_watchdog_reap_also_kills_worker_spawned_grandchild(tmp_path):
@@ -227,6 +233,7 @@ def test_world_size_three_self_test_all_phases_succeed(tmp_path):
     assert result.watchdog_fired is False
     assert result.all_reaped is True
     assert result.publication_observed is True
+    assert result.exit_codes == (0, 0, 0)
     assert len(result.receipts) == 3
     for receipt in result.receipts:
         assert receipt is not None

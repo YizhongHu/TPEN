@@ -120,6 +120,12 @@ def run_worker(args: argparse.Namespace) -> int:
     _enter_phase(FaultPhase.BEFORE_OPTIMIZER_STEP, rank, plan, phase_sequence)
     param = torch.tensor([1.0], dtype=torch.float64)
     param -= 0.01  # fake optimizer-style in-place update; not a real optimizer
+    # Marker distinguishing a fault that fired at BEFORE_OPTIMIZER_STEP (never
+    # written) from one at AFTER_OPTIMIZER_STEP (written first, since the
+    # update above already ran) -- the two hook points are otherwise
+    # observationally identical from outside the process if a fault crashes
+    # the rank at either one.
+    Path(f"{args.state_path}.optimizer_done").write_text("1")
     _enter_phase(FaultPhase.AFTER_OPTIMIZER_STEP, rank, plan, phase_sequence)
 
     _enter_phase(FaultPhase.BEFORE_STATE_WRITE, rank, plan, phase_sequence)

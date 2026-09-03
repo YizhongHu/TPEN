@@ -98,6 +98,9 @@ class HarnessResult:
     rendezvous_path : str
         The fresh, invocation-unique file used for this call's rendezvous.
         Never reused across calls, and never a fixed name.
+    exit_codes : tuple of int or None
+        One slot per rank, in rank order. ``None`` means the rank was still
+        outstanding when the watchdog window closed (and was then killed).
     """
 
     receipts: tuple[RankReceipt | None, ...]
@@ -106,6 +109,7 @@ class HarnessResult:
     culprit_rank: int | None
     publication_observed: bool
     rendezvous_path: str
+    exit_codes: tuple[int | None, ...]
 
 
 def run_gloo_subprocess_group(
@@ -242,6 +246,7 @@ def run_gloo_subprocess_group(
         culprit_rank=culprit_rank,
         publication_observed=complete_marker_path.exists(),
         rendezvous_path=rendezvous_path_str,
+        exit_codes=tuple(exit_codes),
     )
 
 
