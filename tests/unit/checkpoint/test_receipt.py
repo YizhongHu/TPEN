@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from tpen.checkpoint.artifact import COMPLETE_MARKER
+from tpen.checkpoint.artifact import COMPLETE_MARKER, read_latest
+from tpen.checkpoint.catalog import publication_catalog_path, read_publications
 from tpen.checkpoint.reference import CheckpointRef
 from tpen.checkpoint.receipt import (
     PUBLICATION_RECEIPT_SCHEMA,
@@ -187,3 +188,75 @@ def test_append_publication_receipt_is_append_only_jsonl(tmp_path: Path) -> None
     assert first_record["summary"]["content_id"] == ref.content_id
     second_record = json.loads(rows[1])
     assert second_record["summary"]["content_id"] == second_ref.content_id
+
+
+def test_receipt_append_failure_does_not_fail_a_committed_save(tmp_path: Path) -> None:
+    """A failed receipt append must not turn a committed save into a failed save.
+
+    The receipt is telemetry: :mod:`tpen.checkpoint.receipt` frames it as a
+    size/duration fact *about* a publication that already happened.  It is
+    appended after ``tmp_dir.rename`` (the commit), after ``catalog.publish``,
+    and after ``write_latest``; unlike those two it is not load-bearing for
+    restore and has no ``reconcile_publication`` repair path.  An ``OSError``
+    from the append -- in production, a quota/ENOSPC failure on the receipts
+    log -- therefore reports a *failed* save for a checkpoint that is durably
+    committed, published, and pointed at by ``latest.json``.
+
+    The append is made to fail without patching the subject: the receipts log
+    path is pre-created as a DIRECTORY, so ``append_jsonl``'s ``path.open("a")``
+    raises ``IsADirectoryError`` (an ``OSError``).  The step directory, the
+    publication catalog, and ``latest.json`` are separately named entries in
+    the same root, so the induced failure cannot reach the checkpoint write.
+
+    Assertions (2)-(5) deliberately execute in the red arm as well as the green
+    one: in the red arm they *are* the evidence for the finding, recording that
+    today's raise leaves a committed, published, latest-pointed checkpoint
+    behind a save the trainer was told had failed.
+    """
+
+    # The real save path, exactly as the publication-receipt integration tests
+    # in tests/unit/callback/test_checkpoint.py exercise it.  Imported rather
+    # than re-implemented so this test cannot drift from the checkpoint that
+    # suite builds, and imported inside the function so the rest of this module
+    # keeps its existing torch-free import surface.
+    from tests.unit.callback.test_checkpoint import _write_checkpoint as _save_real_checkpoint
+
+    root = tmp_path / "checkpoints"
+    root.mkdir(parents=True)
+    receipt_path = publication_receipt_path(root)
+    # A directory at the receipts log path: appendable-as-a-file is exactly the
+    # property the receipt step needs and nothing else in the save path does.
+    receipt_path.mkdir()
+
+    returned: Path | None = None
+    raised: BaseException | None = None
+    try:
+        returned = _save_real_checkpoint(tmp_path)
+    except Exception as error:  # noqa: BLE001 - the failure mode under test
+        raised = error
+
+    step_dir = root / "step_000003"
+
+    # (2) The checkpoint committed: the step directory exists and is COMPLETE.
+    assert step_dir.is_dir()
+    assert (step_dir / COMPLETE_MARKER).is_file()
+
+    # (3) The publication catalog carries exactly the new checkpoint's row.
+    published = read_publications(publication_catalog_path(root))
+    assert [ref.checkpoint_dir.name for ref in published] == [step_dir.name]
+
+    # (4) latest.json points at the new step.
+    assert read_latest(root)["checkpoint_dir"] == step_dir.name
+
+    # (5) No receipt line was appended -- the induced failure is real, not a
+    # partially written record.
+    assert receipt_path.is_dir()
+    assert list(receipt_path.iterdir()) == []
+
+    # (1) The save reported success.  RED at 406f461b: the OSError from the
+    # telemetry append propagates out of save_checkpoint instead.
+    assert raised is None, (
+        "receipt append failure aborted an already-committed, published save: "
+        f"{type(raised).__name__}: {raised}"
+    )
+    assert returned == step_dir
