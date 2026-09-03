@@ -11,6 +11,18 @@ the caller's Slurm wall-time budget).
 A communicator that has timed out or mismatched is poisoned and is never
 reused: every call to :func:`run_gloo_subprocess_group` derives a fresh,
 invocation-unique rendezvous file and launches brand-new subprocesses.
+
+SCOPE NOTE, load-bearing: ``HarnessResult.publication_observed`` refers to a
+``COMPLETE`` marker file written by rank 0 in ``tmp_path``, behind a
+``dist.barrier()``, inside the synthetic worker run by
+:mod:`tests.helpers.ddp_worker_entrypoint`. It is not, and does not
+exercise, TPEN's real checkpoint publication path under
+``tpen/checkpoint/`` (owned by a different, concurrent lane) -- this module
+touches no file under ``tpen/``. The fault names shared with that
+machinery (``CRASH_AFTER_PUBLISH``, ``CRASH_DURING_CHECKPOINT``, and the
+``*_STATE_WRITE``/``*_PUBLICATION`` phases in
+:mod:`tests.helpers.ddp_fault_injection`) describe this synthetic sequence
+only; see that module's own SCOPE NOTE.
 """
 
 from __future__ import annotations

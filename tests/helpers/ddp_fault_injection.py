@@ -4,6 +4,18 @@ Test-only. Immutable ``FaultPlan``, closed ``FaultKind``/``FaultPhase``
 enums, explicit target rank, explicit trigger phase, bounded delay. No
 string member lookup via ``getattr``, no reflection, no arbitrary dict
 dispatch (``ddp-fault-injection-observability-2026-08-31``).
+
+SCOPE NOTE, load-bearing: several member names below (``CRASH_AFTER_PUBLISH``,
+``CRASH_DURING_CHECKPOINT``, ``BEFORE_STATE_WRITE``/``AFTER_STATE_WRITE``,
+``BEFORE_PUBLICATION``/``AFTER_PUBLICATION``) echo names that also exist for
+real in TPEN's checkpoint machinery under ``tpen/checkpoint/`` (owned by a
+different, concurrent lane). This module does not touch that code and
+injects nothing into it. Every phase and fault here targets ONLY the
+synthetic step sequence run by :mod:`tests.helpers.ddp_worker_entrypoint`:
+"publication" there is a ``COMPLETE`` marker file written behind a
+``dist.barrier()`` in a throwaway worker process, not a TPEN checkpoint
+publish. No test in this slice exercises the real checkpoint publication
+path.
 """
 
 from __future__ import annotations
@@ -22,6 +34,12 @@ class FaultKind(Enum):
     and ``WRONG_DEVICE`` need a real reducer or a real accelerator, neither
     of which exists in this harness-only slice. ``MISMATCH_SHAPE`` is
     included because it is a pure collective-level fault, needs neither.
+
+    ``CRASH_AFTER_PUBLISH`` and ``CRASH_DURING_CHECKPOINT`` name the
+    synthetic worker's own fake publication/state-write steps ONLY -- see
+    the module-level SCOPE NOTE. Neither reaches, nor is named after
+    coverage of, TPEN's real checkpoint machinery under
+    ``tpen/checkpoint/``.
     """
 
     NONE = "none"
@@ -35,7 +53,14 @@ class FaultKind(Enum):
 
 
 class FaultPhase(Enum):
-    """Typed hook points inside one worker's synthetic step sequence."""
+    """Typed hook points inside one worker's synthetic step sequence.
+
+    ``BEFORE_STATE_WRITE``/``AFTER_STATE_WRITE`` and
+    ``BEFORE_PUBLICATION``/``AFTER_PUBLICATION`` name points in THIS
+    module's synthetic self-test only -- a throwaway per-rank JSON file and
+    a ``COMPLETE`` marker behind a ``dist.barrier()``, both in ``tmp_path``.
+    They are not TPEN checkpoint events; see the module-level SCOPE NOTE.
+    """
 
     BEFORE_COLLECTIVE = "before_collective"
     AFTER_COLLECTIVE = "after_collective"
