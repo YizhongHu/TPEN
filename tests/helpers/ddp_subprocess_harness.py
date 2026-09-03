@@ -215,14 +215,34 @@ def run_gloo_subprocess_group(
         except _GONE:
             pass
 
-    # The all_reaped verification happens IMMEDIATELY after the kill sweep,
-    # before any further reaping of direct children below -- every extra
-    # moment (and every extra os.waitpid this process performs elsewhere)
-    # is a moment in which the OS could recycle one of these exact PIDs for
-    # an unrelated process, which would make a bare killpg(pid, 0) probe a
-    # false positive for "still alive". A short grace period lets SIGKILL
-    # actually land before the first probe; this narrows the race, it does
-    # not eliminate it in principle.
+    # Reap the DIRECT children before probing liveness below. A killed but
+    # not-yet-waited-on child is a ZOMBIE: on Linux, killpg(pid, 0) against
+    # a zombie's process group succeeds (the process-table entry still
+    # exists until its parent reaps it), which reads as "still alive" even
+    # though SIGKILL has already landed. Measured on Cannon: a sole,
+    # already-killed rank (exit_codes=(-9,)) still failed the liveness
+    # check until this reordering. Reaping our own children first removes
+    # that false positive for them; it does nothing for a grandchild, which
+    # is the actual thing the liveness check below still needs to catch.
+    reap_deadline = time.monotonic() + _REAP_WAIT_SECONDS
+    while time.monotonic() < reap_deadline and any(code is None for code in exit_codes):
+        for i, proc in enumerate(procs):
+            if exit_codes[i] is None:
+                exit_codes[i] = proc.poll()
+        if any(code is None for code in exit_codes):
+            time.sleep(0.05)
+
+    # A brief grace period before the liveness check below: an orphaned
+    # grandchild (reparented once its own parent, one of our direct
+    # children, has been reaped above) is itself a zombie until whatever
+    # subreaper it lands on reaps it, which is not instantaneous. This is
+    # the same zombie hazard as above, for a process we cannot reap
+    # ourselves. PID reuse is the residual risk this whole ordering trades
+    # for: once a child is reaped, the OS is free to recycle its PID (and,
+    # more rarely, a new unrelated session could even reuse its exact
+    # PGID), which would make a bare killpg(pid, 0) probe a false positive
+    # for "still alive". Neither race is eliminated in principle, only
+    # narrowed.
     time.sleep(0.2)
     all_reaped = True
     for proc in procs:
@@ -231,14 +251,6 @@ def run_gloo_subprocess_group(
             all_reaped = False
         except _GONE:
             pass
-
-    reap_deadline = time.monotonic() + _REAP_WAIT_SECONDS
-    while time.monotonic() < reap_deadline and any(code is None for code in exit_codes):
-        for i, proc in enumerate(procs):
-            if exit_codes[i] is None:
-                exit_codes[i] = proc.poll()
-        if any(code is None for code in exit_codes):
-            time.sleep(0.05)
 
     receipts: list[RankReceipt | None] = []
     for receipt_path in receipt_paths:
