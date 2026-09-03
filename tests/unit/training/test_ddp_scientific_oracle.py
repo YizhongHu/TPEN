@@ -210,8 +210,10 @@ def test_oracle_partition_invariance_across_shard_splits() -> None:
         assert abs(candidate.variance - single.variance) <= atol
 
 
-def test_oracle_invariance_under_shard_merge_order_and_within_shard_sample_permutation() -> None:
-    """Oracle-note M7 rank permutation + M8 sample permutation, as two sub-cases."""
+def test_oracle_invariance_under_shard_merge_order() -> None:
+    """Oracle-note M7 rank (shard-order) permutation, split from the within-shard
+    sample-permutation case below (R5): a combined test cannot tell a reviewer
+    which invariance broke."""
 
     torch.manual_seed(1)
     shard_a = torch.randn(4, dtype=torch.float64)
@@ -227,9 +229,21 @@ def test_oracle_invariance_under_shard_merge_order_and_within_shard_sample_permu
     assert abs(reordered.mean - forward.mean) <= atol
     assert abs(reordered.variance - forward.variance) <= atol
 
+
+def test_oracle_invariance_under_within_shard_sample_permutation() -> None:
+    """Oracle-note M8 sample permutation, split from the shard-order case above (R5)."""
+
+    torch.manual_seed(1)
+    shard_a = torch.randn(4, dtype=torch.float64)
+    shard_b = torch.randn(3, dtype=torch.float64)
+    shard_c = torch.randn(5, dtype=torch.float64)
+    all_values = torch.cat([shard_a, shard_b, shard_c])
+    atol = loss_tolerance_envelope(all_values.abs())
+
+    forward = reduce_energy_shards([shard_a, shard_b, shard_c])
     # A fixed reversal, not `torch.randperm`: a random permutation of a
     # length-3 tensor has a 1-in-6 chance of landing on the identity, which
-    # would make this sub-case invariant to any mutation by pure luck rather
+    # would make this case invariant to any mutation by pure luck rather
     # than by construction.
     permuted_b = shard_b.flip(0)
     within_shard = reduce_energy_shards([shard_a, permuted_b, shard_c])
