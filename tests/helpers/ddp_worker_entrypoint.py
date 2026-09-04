@@ -148,7 +148,16 @@ def run_worker(args: argparse.Namespace) -> int:
         "collective_result": collective_result,
         "fault_kind": plan.kind.name if plan is not None else FaultKind.NONE.name,
     }
-    Path(args.receipt_path).write_text(json.dumps(receipt))
+    # Atomic write: a tmp file in the same directory, then os.replace. A kill
+    # landing mid-write can only ever leave the tmp path truncated -- never
+    # the receipt path itself -- since os.replace is a single rename syscall
+    # on the filesystems this harness runs on. Defence in depth alongside the
+    # collector's own tolerance for a malformed receipt: this file cannot
+    # assume the collector will always be the one reading it.
+    receipt_path = Path(args.receipt_path)
+    tmp_receipt_path = receipt_path.with_suffix(receipt_path.suffix + ".tmp")
+    tmp_receipt_path.write_text(json.dumps(receipt))
+    os.replace(tmp_receipt_path, receipt_path)
     # Deliberately NOT wrapped in a blanket try/finally: on any failure path
     # above (raise, or a collective that timed out) the process is exiting
     # anyway, and a poisoned communicator must never be reused, so there is

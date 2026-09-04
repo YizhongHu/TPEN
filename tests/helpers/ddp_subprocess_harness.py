@@ -84,15 +84,30 @@ class RankReceipt:
 
 
 @dataclass(frozen=True)
+class MalformedReceipt:
+    """A receipt file existed but could not be parsed into a :class:`RankReceipt`.
+
+    Distinguished from ``None`` (never written) because the two have
+    different diagnostic meaning: ``None`` means the rank died before
+    reaching the write at all, while this means a write was in progress (or
+    the file is otherwise corrupt) when collection ran.
+    """
+
+    error: str
+
+
+@dataclass(frozen=True)
 class HarnessResult:
     """Deterministic result of one :func:`run_gloo_subprocess_group` invocation.
 
     Parameters
     ----------
-    receipts : tuple of RankReceipt or None
+    receipts : tuple of RankReceipt, MalformedReceipt, or None
         One slot per rank, in rank order. ``None`` means that rank never
-        wrote its receipt (crashed, killed, or raised before reaching it) --
-        never silently omitted from the tuple.
+        wrote its receipt (crashed, killed, or raised before reaching it).
+        ``MalformedReceipt`` means a receipt file existed but could not be
+        parsed (e.g. truncated by a kill mid-write) -- collection never
+        raises past a bad receipt, never silently omitted from the tuple.
     watchdog_fired : bool
         Whether the outer watchdog had to force-kill any child (as opposed
         to every child exiting on its own, including via its own
@@ -112,10 +127,12 @@ class HarnessResult:
         Never reused across calls, and never a fixed name.
     exit_codes : tuple of int or None
         One slot per rank, in rank order. ``None`` means the rank was still
-        outstanding when the watchdog window closed (and was then killed).
+        outstanding when the watchdog window closed; the subsequent reap
+        loop then back-fills ``-9`` for a killed rank once its exit is
+        observed, so ``None`` survives only if the reap window also expires.
     """
 
-    receipts: tuple[RankReceipt | None, ...]
+    receipts: tuple[RankReceipt | MalformedReceipt | None, ...]
     watchdog_fired: bool
     all_reaped: bool
     culprit_rank: int | None
@@ -252,12 +269,22 @@ def run_gloo_subprocess_group(
         except _GONE:
             pass
 
-    receipts: list[RankReceipt | None] = []
+    receipts: list[RankReceipt | MalformedReceipt | None] = []
     for receipt_path in receipt_paths:
-        if receipt_path.exists():
-            receipts.append(RankReceipt(**json.loads(receipt_path.read_text())))
-        else:
+        if not receipt_path.exists():
             receipts.append(None)
+            continue
+        try:
+            receipts.append(RankReceipt(**json.loads(receipt_path.read_text())))
+        except (json.JSONDecodeError, TypeError, ValueError, OSError) as exc:
+            # Narrow catch only: a rank killed mid-write (now impossible for
+            # this worker's own atomic write, but still possible for any
+            # future writer of this file, or a filesystem without rename
+            # atomicity) leaves truncated/invalid JSON on disk. Collection
+            # must report that as data, not raise -- but must never widen to
+            # bare Exception, which would hide defects this harness exists
+            # to surface.
+            receipts.append(MalformedReceipt(error=f"{type(exc).__name__}: {exc}"))
 
     culprit_rank = (
         fault_plan.target_rank if fault_plan is not None and fault_plan.kind != FaultKind.NONE else None
@@ -277,6 +304,7 @@ def run_gloo_subprocess_group(
 __all__ = [
     "HarnessBounds",
     "HarnessResult",
+    "MalformedReceipt",
     "RankReceipt",
     "run_gloo_subprocess_group",
 ]
