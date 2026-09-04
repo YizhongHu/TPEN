@@ -146,11 +146,21 @@ def test_r4_topology_refusal_precedes_dcp_load_and_preserves_state(tmp_path: Pat
     checkpoint_dir = tmp_path / "generations" / "gen-000001"
     checkpoint_dir.mkdir(parents=True)
     (checkpoint_dir / "COMPLETE").write_text("COMPLETE\n")
+    sidecar = checkpoint_dir / "sidecars" / "rank-00001.json"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text(json.dumps({"rank": 1, "world_size": 3}))
+    sidecar_digest = checkpoint_module._digest(sidecar, root=checkpoint_dir).as_dict()
     (checkpoint_dir / "manifest.json").write_text(
-        json.dumps({"world_size": 2, "path": "generations/gen-000001"})
+        json.dumps({
+            "world_size": 2,
+            "path": "generations/gen-000001",
+            "files": [sidecar_digest],
+        })
     )
     runtime = Mock(rank=1, world_size=3)
     runtime.broadcast_object.return_value = {"world_size": 2, "path": "generations/gen-000001"}
+    runtime.broadcast_object.return_value["files"] = [sidecar_digest]
+    runtime.all_gather_objects.return_value = [None, None, None]
     store = CheckpointPayloadStore(root=tmp_path, runtime=runtime)
     load = Mock(side_effect=AssertionError("DCP load must not be entered"))
     apply = Mock(side_effect=AssertionError("set_state_dict must not be entered"))
