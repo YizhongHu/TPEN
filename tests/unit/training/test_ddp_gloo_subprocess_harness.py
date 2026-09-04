@@ -98,6 +98,21 @@ def test_world_size_one_rank_exception_before_optimizer_step_fails_cleanly(tmp_p
     assert result.culprit_rank == 0
 
 
+def test_success_then_fault_in_same_tmp_path_does_not_reuse_success_artifacts(tmp_path):
+    _require_gloo_capability()
+    success = run_gloo_subprocess_group(1, None, _default_bounds(), tmp_path)
+    assert success.publication_observed is True
+    plan = FaultPlan(
+        target_rank=0,
+        kind=FaultKind.CRASH_DURING_CHECKPOINT,
+        phase=FaultPhase.BEFORE_STATE_WRITE,
+    )
+    failed = run_gloo_subprocess_group(1, plan, _default_bounds(), tmp_path)
+    assert failed.publication_observed is False
+    assert failed.all_reaped is True
+    assert failed.receipts == (None,)
+
+
 def test_world_size_one_watchdog_kills_stall_before_process_group_init(tmp_path):
     _require_gloo_capability()
     plan = FaultPlan(
@@ -149,6 +164,50 @@ def test_world_size_two_mismatched_tensor_shape_fails_with_structured_evidence(t
     result = run_gloo_subprocess_group(2, plan, _default_bounds(), tmp_path)
     assert result.publication_observed is False
     assert result.all_reaped is True
+
+
+def test_rank_exception_preserves_attributable_diagnostic_artifact(tmp_path):
+    _require_gloo_capability()
+    plan = FaultPlan(
+        target_rank=0,
+        kind=FaultKind.RAISE_BEFORE_BACKWARD,
+        phase=FaultPhase.BEFORE_OPTIMIZER_STEP,
+    )
+    result = run_gloo_subprocess_group(1, plan, _default_bounds(), tmp_path)
+    assert result.publication_observed is False
+    assert result.all_reaped is True
+    artifacts = [path for path in tmp_path.iterdir() if path.is_file()]
+    diagnostics = [path.read_text() for path in artifacts if path.name != "fault_plan.json"]
+    assert any(
+        "ddp harness injected fault" in text
+        and "rank 0" in text
+        and "BEFORE_OPTIMIZER_STEP" in text
+        for text in diagnostics
+    )
+
+
+@pytest.mark.parametrize("fault_kind", [FaultKind.MISMATCH_COLLECTIVE, FaultKind.MISMATCH_SHAPE])
+def test_collective_mismatch_reports_nonzero_exit_evidence(tmp_path, fault_kind):
+    _require_gloo_capability()
+    plan = FaultPlan(target_rank=1, kind=fault_kind, phase=FaultPhase.BEFORE_COLLECTIVE)
+    result = run_gloo_subprocess_group(2, plan, _default_bounds(), tmp_path)
+    assert result.publication_observed is False
+    assert result.all_reaped is True
+    assert result.culprit_rank == 1
+    assert any(code is not None and code != 0 for code in result.exit_codes)
+
+
+def test_consecutive_successful_invocations_report_disjoint_worker_pids(tmp_path):
+    _require_gloo_capability()
+    first = run_gloo_subprocess_group(2, None, _default_bounds(), tmp_path)
+    second = run_gloo_subprocess_group(2, None, _default_bounds(), tmp_path)
+    assert first.publication_observed is True
+    assert second.publication_observed is True
+    first_pids = {receipt.pid for receipt in first.receipts if isinstance(receipt, RankReceipt)}
+    second_pids = {receipt.pid for receipt in second.receipts if isinstance(receipt, RankReceipt)}
+    assert len(first_pids) == 2
+    assert len(second_pids) == 2
+    assert first_pids.isdisjoint(second_pids)
 
 
 def test_world_size_two_bounded_stall_under_process_group_timeout_still_succeeds(tmp_path):

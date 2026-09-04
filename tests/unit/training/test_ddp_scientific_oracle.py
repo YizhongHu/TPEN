@@ -282,6 +282,24 @@ def test_oracle_duplicate_data_invariance_halves_stderr() -> None:
     assert abs(doubled.metrics["energy_stderr"] - single.metrics["energy_stderr"] / (2**0.5)) <= atol
 
 
+def test_oracle_duplicate_data_preserves_shared_parameter_gradient() -> None:
+    parameter = torch.nn.Parameter(torch.tensor(0.7, dtype=torch.float64))
+    features = torch.tensor([0.2, 0.8, 1.4], dtype=torch.float64)
+    energy = torch.tensor([-1.0, 0.5, 2.0], dtype=torch.float64)
+
+    single_logabs = parameter * features
+    single = oracle_vmc_objective([single_logabs], [energy])
+    single.loss.backward()
+    single_gradient = parameter.grad.detach().clone()
+
+    parameter.grad = None
+    duplicated = oracle_vmc_objective(
+        [parameter * features, parameter * features.clone()], [energy, energy.clone()]
+    )
+    duplicated.loss.backward()
+    _assert_tensor_close(parameter.grad, single_gradient, atol=loss_tolerance_envelope(energy.abs()))
+
+
 def test_oracle_affine_energy_transform_matches_analytic_prediction() -> None:
     """Oracle-note M8: ``E' = aE + b``."""
 
@@ -776,6 +794,22 @@ def test_full_trainer_step_matches_oracle_closure_based_custom_update_method() -
     atol = _parameter_tolerance_envelope(state.local_energy.abs())
     for control_param, shadow_param in zip(model.parameters(), shadow_model.parameters(), strict=True):
         _assert_tensor_close(control_param.detach(), shadow_param.detach(), atol=atol)
+
+
+def test_closure_shape_matches_oracle_full_optimizer_state() -> None:
+    pre_step_model, model, optimizer, state, _ = _run_control(
+        optimizer_factory=_lbfgs_optimizer_factory,
+        update_method_factory=_closure_update_method_factory,
+    )
+    shadow_model = copy.deepcopy(pre_step_model)
+    output = shadow_model(state.batch)
+    result = oracle_vmc_objective([output.logabs], [state.local_energy])
+    shadow_optimizer = _lbfgs_optimizer_factory(shadow_model.parameters())
+    shadow_optimizer.zero_grad(set_to_none=True)
+    result.loss.backward()
+    cached_loss = result.loss.detach()
+    shadow_optimizer.step(lambda: cached_loss)
+    _assert_nested_close(optimizer.state_dict(), shadow_optimizer.state_dict(), atol=0.0)
 
 
 def test_typed_event_sequence_identical_between_ordinary_and_closure_update_methods() -> None:
