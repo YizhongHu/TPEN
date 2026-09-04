@@ -48,3 +48,40 @@ def count_raw_model_calls(*, mcmc_steps: int, kinetic_forwards: int) -> RawCallC
 
 
 __all__ = ["RawCallCounts", "count_raw_model_calls"]
+
+
+def main() -> int:
+    """Run the reviewed worker with an execution-bound raw-call counter."""
+
+    import json
+    import sys
+
+    original_forward = SemanticWavefunction.forward
+    observed_models: list[SemanticWavefunction] = []
+
+    def counted_forward(model, coordinates):
+        if model not in observed_models:
+            observed_models.append(model)
+        model._review_raw_model_calls = getattr(model, "_review_raw_model_calls", 0) + 1
+        return original_forward(model, coordinates)
+
+    SemanticWavefunction.forward = counted_forward
+    from tests.spikes.native_ddp import worker
+
+    result = worker.main()
+    state_arg = sys.argv[sys.argv.index("--state-path") + 1]
+    state_path = __import__("pathlib").Path(state_arg)
+    state = json.loads(state_path.read_text())
+    # The worker creates one SemanticWavefunction, so the counter is attached
+    # to its instance through the class-level forwarding wrapper.
+    state["review_raw_model_calls"] = sum(
+        getattr(model, "_review_raw_model_calls", 0) for model in observed_models
+    )
+    state_path.write_text(json.dumps(state, sort_keys=True))
+    return result
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())

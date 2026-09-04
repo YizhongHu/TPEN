@@ -17,16 +17,28 @@ import torch
 
 from tests.helpers.ddp_capability import missing_capability_reason, probe_gloo_capability
 from tests.helpers.ddp_fault_injection import FaultKind, FaultPhase, FaultPlan
-from tests.helpers.ddp_subprocess_harness import HarnessBounds
+from tests.helpers.ddp_subprocess_harness import HarnessBounds, run_gloo_subprocess_group
 from tests.spikes.native_ddp import checkpoint as checkpoint_module
 from tests.spikes.native_ddp.checkpoint import CheckpointPayloadStore, CheckpointTopologyMismatch
 from tests.spikes.native_ddp.model_access import SemanticWavefunction
-from tests.spikes.native_ddp.review_probe import count_raw_model_calls
-from tests.unit.training.test_ds_n_native_ddp_spike import _run_native, _state, _states
+from tests.unit.training.test_ds_n_native_ddp_spike import _decode, _run_native, _states
 
 
 _CAPABILITY = probe_gloo_capability()
 _FAULT_BOUNDS = HarnessBounds(process_group_timeout=2.0, watchdog_timeout=12.0)
+
+
+def _run_review_native(tmp_path: Path, *, extra_args: tuple[str, ...] = ()):
+    """Run the reviewed worker through the independent call-counting wrapper."""
+
+    return run_gloo_subprocess_group(
+        2,
+        None,
+        HarnessBounds(process_group_timeout=6.0, watchdog_timeout=20.0),
+        tmp_path,
+        worker_module="tests.spikes.native_ddp.review_probe",
+        worker_extra_args=extra_args,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -63,6 +75,30 @@ def test_r1_closure_state_is_globally_equal_on_nonidentical_shards(tmp_path: Pat
     assert states[0]["parameters_after"] == states[1]["parameters_after"]
     assert states[0]["optimizer_state_after"] == states[1]["optimizer_state_after"]
     assert states[0]["ddp_gradient_reductions_per_update"] == states[1]["ddp_gradient_reductions_per_update"]
+
+    features = torch.tensor(
+        [[0.2, 0.1], [-0.5, 0.3], [0.7, -0.2], [0.4, 0.9],
+         [-0.3, 0.8], [0.4, -0.1], [1.1, 0.2]], dtype=torch.float64
+    )
+    energy = torch.tensor([1.0, 2.0, 0.5, float("nan"), 3.0, -1.0, 2.0], dtype=torch.float64)
+    finite = torch.isfinite(energy)
+    reference_model = SemanticWavefunction()
+    reference_optimizer = torch.optim.LBFGS(
+        reference_model.parameters(), lr=0.25, max_iter=3, history_size=5,
+        tolerance_grad=0.0, tolerance_change=0.0,
+    )
+    def closure() -> torch.Tensor:
+        reference_optimizer.zero_grad()
+        logabs = reference_model(features)
+        mean = energy[finite].mean()
+        loss = 2.0 * ((energy[finite] - mean) * logabs[finite]).sum() / finite.sum()
+        loss.backward()
+        return loss
+    reference_optimizer.step(closure)
+    for state in states:
+        assert state["parameters_after"]["weight"] == pytest.approx(reference_model.weight.detach().tolist())
+        assert state["parameters_after"]["bias"] == pytest.approx(reference_model.bias.detach().tolist())
+        _assert_nested_equal(_decode(state["optimizer_state_after"]), reference_optimizer.state_dict())
 
 
 def test_r2_m2_observes_each_rank_energy_tensor_and_finite_mask(tmp_path: Path) -> None:
@@ -113,7 +149,7 @@ def test_r4_topology_refusal_precedes_dcp_load_and_preserves_state(tmp_path: Pat
     (checkpoint_dir / "manifest.json").write_text(
         json.dumps({"world_size": 2, "path": "generations/gen-000001"})
     )
-    runtime = Mock(rank=0, world_size=3)
+    runtime = Mock(rank=1, world_size=3)
     runtime.broadcast_object.return_value = {"world_size": 2, "path": "generations/gen-000001"}
     store = CheckpointPayloadStore(root=tmp_path, runtime=runtime)
     load = Mock(side_effect=AssertionError("DCP load must not be entered"))
@@ -175,7 +211,7 @@ def test_r6_post_digest_sidecar_corruption_blocks_publication(tmp_path: Path, mo
     monkeypatch.setattr(
         checkpoint_module.dcp,
         "save",
-        lambda payload, storage_writer: Path(storage_writer.path).mkdir(parents=True, exist_ok=True),
+        lambda payload, storage_writer: None,
     )
     with pytest.raises(checkpoint_module.CheckpointCorrupt, match="digest changed"):
         CheckpointPayloadStore(root=tmp_path, runtime=runtime).save(
@@ -184,17 +220,22 @@ def test_r6_post_digest_sidecar_corruption_blocks_publication(tmp_path: Path, mo
     assert not (tmp_path / "generations" / "gen-000001" / "COMPLETE").exists()
 
 
-def test_r7_probe_counts_executed_sampling_and_kinetic_raw_calls() -> None:
-    """Observed raw calls scale with actual short/long workloads."""
+def test_r7_probe_counts_executed_sampling_and_kinetic_raw_calls(tmp_path: Path) -> None:
+    """Worker-path raw calls scale with actual short/long workloads."""
 
-    short = count_raw_model_calls(mcmc_steps=1, kinetic_forwards=1)
-    long = count_raw_model_calls(mcmc_steps=5, kinetic_forwards=5)
-    assert short.sampling == 2
-    assert long.sampling == 6
-    assert short.kinetic == 1
-    assert long.kinetic == 5
-    assert long.sampling > short.sampling
-    assert long.kinetic > short.kinetic
+    short = _run_review_native(
+        tmp_path,
+        extra_args=("--experiment", "scientific", "--fixture", "regular", "--mcmc-steps", "1", "--kinetic-forwards", "1"),
+    )
+    long = _run_review_native(
+        tmp_path,
+        extra_args=("--experiment", "scientific", "--fixture", "regular", "--mcmc-steps", "5", "--kinetic-forwards", "5"),
+    )
+    short_states = _states(short)
+    long_states = _states(long)
+    assert [state["review_raw_model_calls"] for state in short_states] == [4, 4]
+    assert [state["review_raw_model_calls"] for state in long_states] == [12, 12]
+    assert all(long_state["review_raw_model_calls"] > short_state["review_raw_model_calls"] for short_state, long_state in zip(short_states, long_states, strict=True))
 
 
 def test_r8_delay_beyond_outer_bound_fires_watchdog(tmp_path: Path) -> None:
