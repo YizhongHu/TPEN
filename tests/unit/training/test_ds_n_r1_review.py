@@ -179,13 +179,15 @@ def test_r5_peer_fault_has_no_successful_rank_or_checkpoint_publication(tmp_path
     """A peer fault invalidates provisional local success globally."""
 
     root = tmp_path / "peer-fault"
-    plan = FaultPlan(target_rank=1, kind=FaultKind.RAISE_BEFORE_BACKWARD, phase=FaultPhase.BEFORE_OPTIMIZER_STEP)
     result = _run_native(
         tmp_path,
         world_size=2,
-        fault_plan=plan,
         bounds=_FAULT_BOUNDS,
-        extra_args=("--experiment", "resume", "--iterations", "1", "--checkpoint-root", str(root), "--checkpoint-generation", "1"),
+        extra_args=(
+            "--experiment", "scientific", "--fixture", "regular", "--iterations", "1",
+            "--checkpoint-root", str(root), "--checkpoint-generation", "1",
+            "--checkpoint-failure-rank", "1",
+        ),
     )
     _assert_no_rank_success(_states(result))
     assert result.publication_observed is False
