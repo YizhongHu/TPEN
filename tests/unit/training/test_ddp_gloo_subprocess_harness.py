@@ -12,12 +12,17 @@ Ramp: world_size 1, then 2, then 3.
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
 from tests.helpers.ddp_capability import missing_capability_reason, probe_gloo_capability
 from tests.helpers.ddp_fault_injection import FaultKind, FaultPhase, FaultPlan
-from tests.helpers.ddp_subprocess_harness import HarnessBounds, run_gloo_subprocess_group
+from tests.helpers.ddp_subprocess_harness import (
+    HarnessBounds,
+    RankReceipt,
+    run_gloo_subprocess_group,
+)
 
 _CAPABILITY = probe_gloo_capability()
 
@@ -257,3 +262,84 @@ def test_world_size_three_crash_during_checkpoint_leaves_no_publication_marker(t
     assert result.publication_observed is False
     assert result.all_reaped is True
     assert result.culprit_rank == 2
+
+
+# --- Round-1 review tests (reviewer-designed; planner 7f1d8dde) -----------
+#
+# Deterministic stand-in for a torn receipt write. The worker's receipt write
+# is a bare, non-atomic ``Path.write_text``, and the harness's ``killpg`` is
+# unconditional, so a rank killed mid-write leaves truncated JSON on disk.
+# Rather than racing a real kill against a real write, this pre-seeds the
+# exact on-disk artefact that race produces, with zero modification to the
+# subject.
+_TRUNCATED_RECEIPT_JSON = '{"rank": 0, "world_'
+
+
+def test_malformed_receipt_degrades_to_none_instead_of_crashing_collection(tmp_path):
+    _require_gloo_capability()
+    # Pre-seed rank 0's receipt path with a truncated write. The fault below
+    # fires at BEFORE_STATE_WRITE -- after process-group init, but before the
+    # worker's own receipt write -- so this garbage is never overwritten and
+    # is exactly what the harness's collection loop reads back.
+    receipt_path = tmp_path / "receipt_0.json"
+    receipt_path.write_text(_TRUNCATED_RECEIPT_JSON)
+
+    plan = FaultPlan(
+        target_rank=0,
+        kind=FaultKind.CRASH_DURING_CHECKPOINT,
+        phase=FaultPhase.BEFORE_STATE_WRITE,
+    )
+    result = run_gloo_subprocess_group(1, plan, _default_bounds(), tmp_path)
+
+    # Premise guards: the crash fired where intended (os._exit(1)) and the
+    # pre-seeded truncation survived, so a pass here cannot come from the
+    # worker having quietly written a well-formed receipt instead.
+    assert result.exit_codes == (1,)
+    assert receipt_path.read_text() == _TRUNCATED_RECEIPT_JSON
+
+    # The documented semantic is one slot per rank, never a raise during
+    # collection. Asserted as "not a valid RankReceipt" rather than "is None"
+    # so the test does not dictate the fix's representation: None and a
+    # distinct malformed marker both satisfy it.
+    assert len(result.receipts) == 1
+    assert not isinstance(result.receipts[0], RankReceipt)
+
+    # Cleanup reporting must survive the malformed receipt, not be skipped
+    # by an exception raised earlier in collection.
+    assert result.all_reaped is True
+    assert result.publication_observed is False
+
+
+def test_missing_gloo_capability_produces_explicit_attributable_skip():
+    from tests.helpers.ddp_capability import GlooSubprocessCapability
+
+    # Force the capability this module's gate actually consults. The gate
+    # reads the module-global probed at import time, so patching the probe
+    # function itself would not be observed by ``_require_gloo_capability``.
+    unavailable = GlooSubprocessCapability(
+        gloo_available=False,
+        subprocess_spawn_available=True,
+        reasons={"gloo_available": "synthetic: gloo backend absent from this torch build"},
+    )
+    module = sys.modules[__name__]
+    original = module._CAPABILITY
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(module, "_CAPABILITY", unavailable)
+    try:
+        # Execute the real gate, not a reimplementation of it.
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            _require_gloo_capability()
+    finally:
+        monkeypatch.undo()
+
+    # Explicit and attributable: the skip names the missing capability and
+    # carries the probe's own reason, so it can never read as a silent pass.
+    expected_reason = missing_capability_reason(unavailable, "gloo_available")
+    assert str(excinfo.value) == expected_reason
+    assert "gloo_available" in str(excinfo.value)
+    assert "synthetic: gloo backend absent from this torch build" in str(excinfo.value)
+
+    # Restoration guard, compared against a reference captured before the
+    # patch so it cannot pass vacuously: the patch must not leak into the
+    # capability gate the other tests in this module depend on.
+    assert module._CAPABILITY is original
