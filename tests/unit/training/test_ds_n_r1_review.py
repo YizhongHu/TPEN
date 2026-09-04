@@ -111,6 +111,7 @@ def test_r2_m2_observes_each_rank_energy_tensor_and_finite_mask(tmp_path: Path) 
     )
     states = _states(result)
     raw = [json.loads((Path(result.invocation_dir) / f"state_{rank}.json").read_text())["energy"] for rank in range(3)]
+    assert [len(item["__tensor__"]) for item in raw] == [5, 3, 7]
     expected = [[1.0, 2.0, -1.0], [], [3.0, -2.0, 1.0, 0.5, 2.5]]
     for item, expected_finite in zip(raw, expected, strict=True):
         finite = [value for value in item["__tensor__"] if not (isinstance(value, float) and math.isnan(value))]
