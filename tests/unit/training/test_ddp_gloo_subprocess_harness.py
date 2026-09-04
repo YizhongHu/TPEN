@@ -136,6 +136,30 @@ def test_world_size_two_skip_collective_triggers_process_group_timeout_and_group
     assert result.culprit_rank == 1
 
 
+def test_collective_fault_does_not_apply_before_configured_phase(tmp_path):
+    """A collective fault's effect and attribution must honor its phase."""
+    _require_gloo_capability()
+    plan = FaultPlan(target_rank=1, kind=FaultKind.SKIP_COLLECTIVE, phase=FaultPhase.AFTER_COLLECTIVE)
+
+    # A helper may reject this unsupported combination before launching
+    # workers, but it must not silently reinterpret AFTER_COLLECTIVE as the
+    # BEFORE_COLLECTIVE injection point.
+    try:
+        result = run_gloo_subprocess_group(2, plan, _default_bounds(), tmp_path)
+    except ValueError as exc:
+        message = str(exc)
+        assert "SKIP_COLLECTIVE" in message
+        assert "AFTER_COLLECTIVE" in message
+    else:
+        assert result.publication_observed is True
+        assert result.exit_codes == (0, 0)
+        assert result.culprit_rank is None
+        assert len(result.receipts) == 2
+        for receipt in result.receipts:
+            assert receipt is not None
+            assert receipt.collective_result == pytest.approx(2.0)
+
+
 def test_world_size_two_mismatched_collective_type_fails_with_structured_evidence(tmp_path):
     _require_gloo_capability()
     plan = FaultPlan(target_rank=1, kind=FaultKind.MISMATCH_COLLECTIVE, phase=FaultPhase.BEFORE_COLLECTIVE)
