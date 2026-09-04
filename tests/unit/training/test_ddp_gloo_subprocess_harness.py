@@ -110,6 +110,7 @@ def test_success_then_fault_in_same_tmp_path_does_not_reuse_success_artifacts(tm
     failed = run_gloo_subprocess_group(1, plan, _default_bounds(), tmp_path)
     assert failed.publication_observed is False
     assert failed.all_reaped is True
+    assert failed.exit_codes == (1,)
     assert failed.receipts == (None,)
 
 
@@ -177,7 +178,11 @@ def test_rank_exception_preserves_attributable_diagnostic_artifact(tmp_path):
     assert result.publication_observed is False
     assert result.all_reaped is True
     artifacts = [path for path in tmp_path.iterdir() if path.is_file()]
-    diagnostics = [path.read_text() for path in artifacts if path.name != "fault_plan.json"]
+    diagnostics = [
+        path.read_bytes().decode("utf-8", errors="replace")
+        for path in artifacts
+        if path.name != "fault_plan.json"
+    ]
     assert any(
         "ddp harness injected fault" in text
         and "rank 0" in text
