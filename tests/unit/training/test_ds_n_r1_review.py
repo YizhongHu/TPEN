@@ -233,22 +233,32 @@ def test_r7_probe_counts_executed_sampling_and_kinetic_raw_calls(tmp_path: Path)
     )
     short_states = _states(short)
     long_states = _states(long)
-    assert [state["review_raw_model_calls"] for state in short_states] == [4, 4]
-    assert [state["review_raw_model_calls"] for state in long_states] == [12, 12]
+    assert [state["review_raw_model_calls"] for state in short_states] == [6, 6]
+    assert [state["review_raw_model_calls"] for state in long_states] == [14, 14]
     assert all(long_state["review_raw_model_calls"] > short_state["review_raw_model_calls"] for short_state, long_state in zip(short_states, long_states, strict=True))
 
 
 def test_r8_delay_beyond_outer_bound_fires_watchdog(tmp_path: Path) -> None:
-    """A delay beyond the watchdog is distinguishable from the nominal path."""
+    """The reviewed 2/12-second bounds distinguish nominal and over-bound work."""
 
-    bounds = HarnessBounds(process_group_timeout=2.0, watchdog_timeout=3.0)
-    plan = FaultPlan(
+    nominal_plan = FaultPlan(
         target_rank=1,
         kind=FaultKind.STALL_BEFORE_COLLECTIVE,
         phase=FaultPhase.BEFORE_COLLECTIVE,
-        delay_seconds=4.0,
+        delay_seconds=6.0,
     )
-    result = _run_native(tmp_path, world_size=2, fault_plan=plan, bounds=bounds)
+    nominal = _run_native(tmp_path, world_size=2, fault_plan=nominal_plan, bounds=_FAULT_BOUNDS)
+    assert nominal.watchdog_fired is False
+    assert nominal.all_reaped is True
+    assert nominal.publication_observed is False
+
+    over_bound_plan = FaultPlan(
+        target_rank=1,
+        kind=FaultKind.STALL_BEFORE_COLLECTIVE,
+        phase=FaultPhase.BEFORE_COLLECTIVE,
+        delay_seconds=13.0,
+    )
+    result = _run_native(tmp_path, world_size=2, fault_plan=over_bound_plan, bounds=_FAULT_BOUNDS)
     assert result.watchdog_fired is True
     assert result.all_reaped is True
     assert result.publication_observed is False
