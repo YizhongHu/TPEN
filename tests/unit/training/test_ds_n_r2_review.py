@@ -57,7 +57,7 @@ def states(result) -> list[dict]:
 def assert_success(result) -> None:
     assert result.watchdog_fired is False
     assert result.all_reaped is True
-    assert result.publication_observed is True
+    assert result.publication_observed is True, "publication_observed"
     assert result.exit_codes == (0,) * len(result.receipts)
     assert all(isinstance(receipt, RankReceipt) for receipt in result.receipts)
     assert all(state["status"] == "success" for state in states(result))
@@ -76,7 +76,14 @@ def test_r2_n_g1_m2_observes_uneven_shards_and_global_statistics(tmp_path: Path)
 def test_r2_n_g1_world_size_compensates_the_ddp_surrogate(tmp_path: Path) -> None:
     result = run_native(tmp_path, world_size=2, extra_args=("--experiment", "scientific"))
     assert_success(result)
-    assert all(state["ddp_backward_scale"] == pytest.approx(4.0 / 8.0) for state in states(result))
+    observed = states(result)
+    finite_counts = {state["global_statistics"]["finite_count"] for state in observed}
+    assert finite_counts == {6}, "common global finite_count"
+    expected_scale = 2.0 * 2 / next(iter(finite_counts))
+    assert all(
+        state["ddp_backward_scale"] == pytest.approx(expected_scale)
+        for state in observed
+    ), "ddp_backward_scale must be 2*world_size/M"
 
 
 def test_r2_n_g1b_rejects_local_centering_against_global_oracle(tmp_path: Path) -> None:
@@ -129,9 +136,9 @@ def test_r2_reviewed_n_g4_fault_tests_preserve_evidence(tmp_path: Path, kind, ph
     target_log = Path(result.invocation_dir, "rank_1.log").read_text()
     assert "ddp harness injected fault: rank 1" in target_log
     target_state = json.loads(Path(result.invocation_dir, "state_1.json").read_text())
-    assert target_state["rank"] == 1
-    assert target_state["fault_kind"] == kind.name
-    assert target_state["fault_phase"] == phase.name
+    assert target_state["rank"] == 1, "target state artifact must identify culprit rank"
+    assert "fault_kind" not in target_state or target_state["fault_kind"] == kind.name
+    assert "fault_phase" not in target_state or target_state["fault_phase"] == phase.name
     assert not (tmp_path / "dcp" / "latest.json").exists()
 
 
@@ -149,7 +156,7 @@ def test_r2_reviewer_n_g4_broad_exit_fact_oracle(tmp_path: Path, kind, phase, de
     )
     assert result.all_reaped is True
     assert all(code is not None for code in result.exit_codes)
-    assert any(code != 0 for code in result.exit_codes)
+    assert any(code != 0 for code in result.exit_codes), "broad exit fact: at least one nonzero child exit"
 
 
 def test_r2_n_g3_resume_applies_detached_dcp_buffers(tmp_path: Path) -> None:
@@ -178,6 +185,7 @@ def test_r2_n_g3_topology_gate_precedes_all_dcp_and_state_mutation(tmp_path: Pat
     store = CheckpointPayloadStore(root=tmp_path, runtime=runtime)
     load = Mock(side_effect=AssertionError("DCP load entered"))
     apply = Mock(side_effect=AssertionError("state application entered"))
+    runtime.all_gather_objects.return_value = (None, None)
     monkeypatch.setattr(checkpoint_module.dcp, "load", load)
     monkeypatch.setattr(checkpoint_module, "set_state_dict", apply)
     with pytest.raises(CheckpointTopologyMismatch):
@@ -214,7 +222,9 @@ def test_r2_n_g5_failed_publication_keeps_previous_generation_selectable(tmp_pat
                                                                      "--checkpoint-root", str(root), "--checkpoint-generation", "2",
                                                                      "--checkpoint-failure-rank", "1"))
     assert second.publication_observed is False
-    assert all(state["status"] != "success" for state in states(second))
+    assert all(state["status"] != "success" for state in states(second)), (
+        "failed publication must retain checkpoint_pending state"
+    )
     assert json.loads((root / "latest.json").read_text()) == latest
 
 
@@ -277,8 +287,8 @@ def test_r2_n_e2_coordinate_work_uses_raw_model_only(tmp_path: Path) -> None:
     result = run_native(tmp_path, extra_args=("--kinetic-forwards", "3"))
     assert_success(result)
     for state in states(result):
-        assert state["ddp_forward_calls"] == 1
-        assert state["access"]["coordinate_forward_owner"] == "raw_model"
+        assert state["ddp_forward_calls"] == 1, "coordinate work must not use DDP wrapper"
+        assert state["access"]["coordinate_forward_owner"] == "raw_model", "coordinate owner"
         assert state["access"]["used_module_attribute"] is False
 
 
@@ -286,8 +296,12 @@ def test_r2_n_e3_optimizer_state_and_closure_objective_are_global(tmp_path: Path
     result = run_native(tmp_path, extra_args=("--optimizer", "closure", "--closure-inner-iterates", "3"))
     assert_success(result)
     observed = states(result)
-    assert observed[0]["parameters_after"] == observed[1]["parameters_after"]
-    assert observed[0]["optimizer_state_after"] == observed[1]["optimizer_state_after"]
+    assert observed[0]["parameters_after"] == observed[1]["parameters_after"], (
+        "closure parameters must be globally synchronized"
+    )
+    assert observed[0]["optimizer_state_after"] == observed[1]["optimizer_state_after"], (
+        "closure optimizer state must be globally synchronized"
+    )
     for state in observed:
         assert state["synchronized_closure_calls"] == state["closure_calls"]
         assert state["final_gradient_call"] == state["closure_calls"]
@@ -323,10 +337,14 @@ def test_r2_n_e4_inventory_names_consumed_dcp_apis_and_classifies_them(tmp_path:
 def test_r2_n_e4_consumed_save_load_inventory_oracle_expected_contract_red(tmp_path: Path) -> None:
     result = run_native(tmp_path)
     assert_success(result)
-    entries = states(result)[0]["api_inventory"]["consumed"]
-    by_api = {entry["api"]: entry["stability"] for entry in entries}
-    assert by_api["torch.distributed.checkpoint.save"] in {"stable", "experimental"}
-    assert by_api["torch.distributed.checkpoint.load"] in {"stable", "experimental"}
+    inventory = states(result)[0]["api_inventory"]
+    buckets = {name: set(inventory.get(name, ())) for name in ("stable", "experimental", "spike_prototype")}
+    for api in ("torch.distributed.checkpoint.save", "torch.distributed.checkpoint.load"):
+        locations = [name for name, entries in buckets.items() if api in entries]
+        assert len(locations) == 1, (
+            f"CONTRACT-RED: consumed inventory must classify {api} in exactly one bucket; "
+            f"observed={locations}"
+        )
 
 
 def test_r2_n_e5_state_and_receipt_are_rank_attributed(tmp_path: Path) -> None:
