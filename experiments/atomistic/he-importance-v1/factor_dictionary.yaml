@@ -1,0 +1,268 @@
+schema: tpen-he-importance-factor-dictionary-v1
+version: 1
+experiment_id: he-importance-v1
+vocabularies:
+  mixing_packages:
+  - tensor
+  - k-GNN-like-linear
+  - hybrid-additive
+  activation_packages:
+  - pointwise
+  - MLP-mixing
+  - MLP-aggregation
+  - MLP-both
+  optimizer_families:
+  - Adam
+  - RAdam
+  - RMSprop
+  - SGD-Nesterov
+  lr_multipliers:
+  - 0.5
+  - 1.0
+  - 2.0
+  binary_factors:
+  - A
+  - B
+  - C
+  - D
+  - E
+  - F
+  - G
+  - H
+  - I
+  - J
+  - K
+  - L
+  anchors:
+  - Q0
+  - Q1
+  - Q2
+  - Q3
+stage_0:
+  optimizer_families:
+  - Adam
+  - RAdam
+  - RMSprop
+  - SGD-Nesterov
+  families:
+    Adam:
+      target: torch.optim.Adam
+      fixed:
+        betas:
+        - 0.9
+        - 0.999
+        eps: 1.0e-08
+      lr_candidates:
+      - 0.00125
+      - 0.0025
+      - 0.005
+      - 0.01
+    RAdam:
+      target: torch.optim.RAdam
+      fixed:
+        betas:
+        - 0.9
+        - 0.999
+        eps: 1.0e-08
+      lr_candidates:
+      - 0.00125
+      - 0.0025
+      - 0.005
+      - 0.01
+    RMSprop:
+      target: torch.optim.RMSprop
+      fixed:
+        alpha: 0.99
+        eps: 1.0e-08
+        momentum: 0.0
+      lr_candidates:
+      - 0.0001
+      - 0.0003
+      - 0.001
+      - 0.003
+    SGD-Nesterov:
+      target: torch.optim.SGD
+      fixed:
+        momentum: 0.9
+        nesterov: true
+      lr_candidates:
+      - 0.001
+      - 0.003
+      - 0.01
+      - 0.03
+  center_policy:
+    Adam: fixed 0.005 control centre regardless of calibration ranking
+    non_Adam: selected later by a Stage 0 mechanics score and requires a signed center
+core:
+  body_max_order: 2
+  parameter_count: endpoint
+  causal_warning: core package effects are NOT parameter-count-matched causal effects
+  absent_factor_label: not evaluated
+  mixing_packages:
+    tensor:
+      interaction_mode: tensor_product
+      mixing_target: tpen.nn.EquivariantMixing
+      producer_targets:
+      - tpen.nn.EquivariantMixing
+    k-GNN-like-linear:
+      interaction_mode: linear
+      mixing_target: tpen.nn.LinearEquivariantMixing
+      producer_targets:
+      - tpen.nn.LinearEquivariantMixing
+    hybrid-additive:
+      interaction_mode: hybrid
+      mixing_target: tpen.nn.CompositeMixing
+      producer_targets:
+      - tpen.nn.LinearEquivariantMixing
+      - tpen.nn.EquivariantMixing
+      composition: separate linear and tensor producers concatenated before shared activation/aggregation
+  activation_packages:
+    pointwise:
+      mixing_slot: torch.nn.SiLU
+      aggregation_slot: torch.nn.SiLU
+      cpmlp_slots: []
+    MLP-mixing:
+      mixing_slot: tpen.nn.ChannelPreservingMLPActivation
+      aggregation_slot: torch.nn.SiLU
+      cpmlp_slots:
+      - mixing
+    MLP-aggregation:
+      mixing_slot: torch.nn.SiLU
+      aggregation_slot: tpen.nn.ChannelPreservingMLPActivation
+      cpmlp_slots:
+      - aggregation
+    MLP-both:
+      mixing_slot: tpen.nn.ChannelPreservingMLPActivation
+      aggregation_slot: tpen.nn.ChannelPreservingMLPActivation
+      cpmlp_slots:
+      - mixing
+      - aggregation
+  cpmlp:
+    per_order: true
+    hidden_layers: 1
+    hidden_width: 2C
+    hidden_activation: torch.nn.Tanh
+    output_channels: C
+breadth:
+  independent_columns:
+  - A
+  - B
+  - C
+  - D
+  - E
+  - F
+  - G
+  - H
+  derived_columns:
+    I: ABCD
+    J: ABEF
+    K: ACEG
+    L: BDFH
+  columns:
+    A:
+      name: channels
+      minus: 16
+      plus: 32
+    B:
+      name: TPEN layers
+      minus: 1
+      plus: 2
+    C:
+      name: interaction/path max_virtual_order
+      minus: 1
+      plus: 2
+      body_max_order: 2
+      amendment: user decision 2026-09-04 (Q1)
+    D:
+      name: path family
+      minus: canonical
+      plus: full
+    E:
+      name: completion aggregation
+      minus: sum
+      plus: completion mean
+    F:
+      name: mixing initial weight
+      minus: 0.25
+      plus: 0.5
+    G:
+      name: Pfaffian readout
+      minus: fixed uniform
+      plus: trainable from uniform
+    H:
+      name: electron-electron cusp range
+      minus: fixed
+      plus: trainable
+    I:
+      name: electron-nucleus cusp law
+      minus: fixed linear
+      plus: trainable curvature law
+    J:
+      name: gradient clip
+      minus: none
+      plus: global norm 10.0
+    K:
+      name: proposal scale
+      minus: 0.35
+      plus: 0.5
+    L:
+      name: MCMC steps/update
+      minus: 5
+      plus: 10
+anchors:
+  Q0:
+    mixing: tensor
+    activation: pointwise
+    optimizer: Adam
+    lr_multiplier: 1.0
+  Q1:
+    mixing: k-GNN-like-linear
+    activation: pointwise
+    optimizer: RAdam
+    lr_multiplier: 1.0
+  Q2:
+    mixing: hybrid-additive
+    activation: MLP-both
+    optimizer: RMSprop
+    lr_multiplier: 1.0
+  Q3:
+    mixing: tensor
+    activation: MLP-both
+    optimizer: SGD-Nesterov
+    lr_multiplier: 1.0
+shared_choice_surface:
+  default_width: 2
+  default_body_max_order: 2
+  default_max_virtual_order: 2
+  default_path_family: canonical
+  default_aggregation: completion_mean
+  default_initial_weight: 0.5
+  path_layout_target: tpen.data.paths.compose_path_layout
+  normalized_orders_target: tpen.data.paths.NormalizedOrders
+  normalized_channels_target: tpen.data.paths.NormalizedChannels
+  producer_targets:
+  - tpen.nn.LinearEquivariantMixing
+  - tpen.nn.EquivariantMixing
+  - tpen.nn.CompositeMixing
+  path_aggregation_target: tpen.nn.PathAggregation
+  activation_slots:
+    mixing_tuple_axes_start: 3
+    aggregation_tuple_axes_start: 2
+  cpmlp_initializer_defaults:
+    mixing_seed: 701
+    aggregation_seed: 702
+    stream_template: he-importance/cpmlp/layer_{layer_index}/{slot}
+control_reference:
+  coordinates: CONTROL_COORDINATES=PENDING-USER-DETAILED-REVIEW
+  owner: S1b/S1c
+  note: S1a defines levels and a symbolic reference; it does not freeze control coordinates.
+invariants:
+  c_amendment: feature/body max_order=2 in every cell; C selects only interaction/path max_virtual_order=1 or 2
+  no_reference_energy: true
+  no_reference_error: true
+  no_chemical_accuracy_decision: true
+  no_clip_probe: true
+  no_production_planner: true
+  no_deduplication: retain science-assignment identity separately from structural signature
+  no_core_rename: never rename an existing operation linear
+  missing_factor_status: not evaluated, never unimportant

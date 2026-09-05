@@ -18,6 +18,23 @@
 # and the immutable PathLayout is passed directly to each consumer.
 
 choices:
+  # Shared Hooke choice surface.  The standalone opt-in defaults retain the
+  # historical C=2 fixture.  Host configs may override width (and its explicit
+  # CPMLP hidden width), path family, aggregation, initial weight, and runtime
+  # seed; CPMLP seed streams remain distinct by consumer slot and layer identity.
+  shared:
+    channels: 2
+    max_order: 2
+    max_virtual_order: 2
+    path_family: canonical
+    aggregation: completion_mean
+    initial_weight: 0.5
+    cpmlp:
+      hidden_channels: 4
+      mixing_seed: ${oc.select:runtime.seed,701}
+      aggregation_seed: ${oc.select:runtime.seed,702}
+      layer_index: 0
+
   activation:
     channel_mlp:
       mixing:
@@ -33,23 +50,24 @@ choices:
           specs:
             - _target_: tpen.nn.OrderMLPSpec
               order: 1
-              channels: 2
-              hidden_channels: 4
+              channels: ${choices.shared.channels}
+              hidden_channels: ${choices.shared.cpmlp.hidden_channels}
               num_hidden_layers: 1
               activation:
                 _target_: torch.nn.Tanh
               bias: true
             - _target_: tpen.nn.OrderMLPSpec
               order: 2
-              channels: 2
-              hidden_channels: 4
+              channels: ${choices.shared.channels}
+              hidden_channels: ${choices.shared.cpmlp.hidden_channels}
               num_hidden_layers: 1
               activation:
                 _target_: torch.nn.Tanh
               bias: true
         initializer:
           _target_: tpen.nn.TorchInitializer
-          seed: 701
+          seed: ${choices.shared.cpmlp.mixing_seed}
+          stream: he-importance/cpmlp/layer_${choices.shared.cpmlp.layer_index}/mixing
 
       aggregation:
         _target_: tpen.nn.ChannelPreservingMLPActivation
@@ -64,30 +82,31 @@ choices:
           specs:
             - _target_: tpen.nn.OrderMLPSpec
               order: 1
-              channels: 2
-              hidden_channels: 4
+              channels: ${choices.shared.channels}
+              hidden_channels: ${choices.shared.cpmlp.hidden_channels}
               num_hidden_layers: 1
               activation:
                 _target_: torch.nn.Tanh
               bias: true
             - _target_: tpen.nn.OrderMLPSpec
               order: 2
-              channels: 2
-              hidden_channels: 4
+              channels: ${choices.shared.channels}
+              hidden_channels: ${choices.shared.cpmlp.hidden_channels}
               num_hidden_layers: 1
               activation:
                 _target_: torch.nn.Tanh
               bias: true
         initializer:
           _target_: tpen.nn.TorchInitializer
-          seed: 702
+          seed: ${choices.shared.cpmlp.aggregation_seed}
+          stream: he-importance/cpmlp/layer_${choices.shared.cpmlp.layer_index}/aggregation
 
   interaction:
     linear:
       mode: linear
       linear_metadata:
         _target_: tpen.data.paths.LinearPathMetadata.generate
-        max_order: 2
+        max_order: ${choices.shared.max_order}
       layout:
         _target_: tpen.data.paths.compose_path_layout
         linear: ${choices.interaction.linear.linear_metadata}
@@ -100,24 +119,26 @@ choices:
           values: [1, 2]
         input_channels:
           _target_: tpen.data.paths.NormalizedChannels
-          values: [[1, 2], [2, 2]]
+          values: [[1, "${choices.shared.channels}"], [2, "${choices.shared.channels}"]]
         output_channels:
           _target_: tpen.data.paths.NormalizedChannels
-          values: [[1, 2], [2, 2]]
+          values: [[1, "${choices.shared.channels}"], [2, "${choices.shared.channels}"]]
       mixing:
         _target_: tpen.nn.CompositeMixing
         layout: ${choices.interaction.linear.layout}
         producers:
           - _target_: tpen.nn.LinearEquivariantMixing
-            max_order: 2
-            channels: 2
+            max_order: ${choices.shared.max_order}
+            channels: ${choices.shared.channels}
             metadata: ${choices.interaction.linear.linear_metadata}
+            aggregation: ${choices.shared.aggregation}
+            initial_weight: ${choices.shared.initial_weight}
             implementation: vectorized
         activation: ${choices.activation.channel_mlp.mixing}
       path_aggregation:
         _target_: tpen.nn.PathAggregation
-        max_order: 2
-        channels: 2
+        max_order: ${choices.shared.max_order}
+        channels: ${choices.shared.channels}
         layout: ${choices.interaction.linear.layout}
         activation: ${choices.activation.channel_mlp.aggregation}
       layer:
@@ -132,12 +153,12 @@ choices:
       mode: hybrid
       linear_metadata:
         _target_: tpen.data.paths.LinearPathMetadata.generate
-        max_order: 2
+        max_order: ${choices.shared.max_order}
       tensor_product_metadata:
         _target_: tpen.data.paths.PathMetadata.generate
-        max_order: 2
-        max_virtual_order: 2
-        output_embedding: canonical
+        max_order: ${choices.shared.max_order}
+        max_virtual_order: ${choices.shared.max_virtual_order}
+        output_embedding: ${choices.shared.path_family}
       layout:
         _target_: tpen.data.paths.compose_path_layout
         linear: ${choices.interaction.hybrid.linear_metadata}
@@ -150,31 +171,35 @@ choices:
           values: [1, 2]
         input_channels:
           _target_: tpen.data.paths.NormalizedChannels
-          values: [[1, 2], [2, 2]]
+          values: [[1, "${choices.shared.channels}"], [2, "${choices.shared.channels}"]]
         output_channels:
           _target_: tpen.data.paths.NormalizedChannels
-          values: [[1, 2], [2, 2]]
+          values: [[1, "${choices.shared.channels}"], [2, "${choices.shared.channels}"]]
       mixing:
         _target_: tpen.nn.CompositeMixing
         layout: ${choices.interaction.hybrid.layout}
         producers:
           - _target_: tpen.nn.LinearEquivariantMixing
-            max_order: 2
-            channels: 2
+            max_order: ${choices.shared.max_order}
+            channels: ${choices.shared.channels}
             metadata: ${choices.interaction.hybrid.linear_metadata}
+            aggregation: ${choices.shared.aggregation}
+            initial_weight: ${choices.shared.initial_weight}
             implementation: vectorized
           - _target_: tpen.nn.EquivariantMixing
-            max_order: 2
-            max_virtual_order: 2
-            channels: 2
+            max_order: ${choices.shared.max_order}
+            max_virtual_order: ${choices.shared.max_virtual_order}
+            channels: ${choices.shared.channels}
             paths: ${choices.interaction.hybrid.tensor_product_metadata}
+            aggregation: ${choices.shared.aggregation}
+            initial_weight: ${choices.shared.initial_weight}
             implementation: vectorized
             activation: null
         activation: ${choices.activation.channel_mlp.mixing}
       path_aggregation:
         _target_: tpen.nn.PathAggregation
-        max_order: 2
-        channels: 2
+        max_order: ${choices.shared.max_order}
+        channels: ${choices.shared.channels}
         layout: ${choices.interaction.hybrid.layout}
         activation: ${choices.activation.channel_mlp.aggregation}
       layer:
@@ -189,9 +214,9 @@ choices:
       mode: tensor_product
       tensor_product_metadata:
         _target_: tpen.data.paths.PathMetadata.generate
-        max_order: 2
-        max_virtual_order: 2
-        output_embedding: canonical
+        max_order: ${choices.shared.max_order}
+        max_virtual_order: ${choices.shared.max_virtual_order}
+        output_embedding: ${choices.shared.path_family}
       layout:
         _target_: tpen.data.paths.compose_path_layout
         linear: null
@@ -204,26 +229,28 @@ choices:
           values: [1, 2]
         input_channels:
           _target_: tpen.data.paths.NormalizedChannels
-          values: [[1, 2], [2, 2]]
+          values: [[1, "${choices.shared.channels}"], [2, "${choices.shared.channels}"]]
         output_channels:
           _target_: tpen.data.paths.NormalizedChannels
-          values: [[1, 2], [2, 2]]
+          values: [[1, "${choices.shared.channels}"], [2, "${choices.shared.channels}"]]
       mixing:
         _target_: tpen.nn.CompositeMixing
         layout: ${choices.interaction.tensor_product.layout}
         producers:
           - _target_: tpen.nn.EquivariantMixing
-            max_order: 2
-            max_virtual_order: 2
-            channels: 2
+            max_order: ${choices.shared.max_order}
+            max_virtual_order: ${choices.shared.max_virtual_order}
+            channels: ${choices.shared.channels}
             paths: ${choices.interaction.tensor_product.tensor_product_metadata}
+            aggregation: ${choices.shared.aggregation}
+            initial_weight: ${choices.shared.initial_weight}
             implementation: vectorized
             activation: null
         activation: ${choices.activation.channel_mlp.mixing}
       path_aggregation:
         _target_: tpen.nn.PathAggregation
-        max_order: 2
-        channels: 2
+        max_order: ${choices.shared.max_order}
+        channels: ${choices.shared.channels}
         layout: ${choices.interaction.tensor_product.layout}
         activation: ${choices.activation.channel_mlp.aggregation}
       layer:
