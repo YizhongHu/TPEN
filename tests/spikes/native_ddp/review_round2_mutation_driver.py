@@ -102,7 +102,11 @@ def run_arm(root: Path, arm: MutationArm, *, python: str, pytest_args: list[str]
     original = apply_once(path, arm.old, arm.new)
     before = hashlib.sha256(original).hexdigest()
     try:
-        completed = subprocess.run([python, "-m", "pytest", "-q", f"{arm.test}", *pytest_args], cwd=root, check=False)
+        completed = subprocess.run(
+            [python, "-m", "pytest", "-q", f"tests/unit/training/test_ds_n_r2_review.py::{arm.test}", *pytest_args],
+            cwd=root,
+            check=False,
+        )
         return completed.returncode
     finally:
         path.write_bytes(original)
