@@ -27,10 +27,15 @@ class Updater(EquivariantMap):
 
 
 class ReplaceUpdater(Updater):
-    """Experimental strategy replacing persistent features with update proposals.
+    """Replace persistent features with the update proposal: ``x_next = u``.
 
-    This class is not part of the baseline TPEN API and is intentionally not
-    exported from ``tpen.nn`` or this module's ``__all__``.
+    The A8 "replacement" feature-update arm. It asks whether the initial
+    embedding must survive directly, or whether each layer may discard it.
+
+    Previously carried as experimental and unexported. Nothing about its
+    behaviour changed when it was admitted -- only its status. The formula was
+    already the one the study wants, which is why this is exposure rather than
+    reimplementation.
     """
 
     def forward_impl(self, x: Feature, u: Update) -> Feature:
@@ -69,6 +74,21 @@ class NormGatedUpdater(Updater):
 
     This class is not part of the baseline TPEN API and is intentionally not
     exported from ``tpen.nn`` or this module's ``__all__``.
+
+    IT IS ALSO NOT AN A8 ARM, AND MUST NOT BE SUBSTITUTED FOR ONE. The study
+    admits exactly three feature updates: ``x + u``
+    (:class:`ResidualUpdater`), ``u`` (:class:`ReplaceUpdater`), and
+    ``x + g(R) u`` (:class:`ResidualUpdater` plus
+    :class:`~tpen.nn.coordinate_envelopes.GaussianCoordinateEnvelope`). The design
+    explicitly rules out an RMS or norm-gate substitute for the third.
+
+    The confusion is easy to fall into and is why this paragraph exists: this
+    class and the Gaussian arm both multiply the update by a gate in ``(0, 1)``,
+    so a plot of either looks like "the update is being damped". They ask
+    different questions. This gate reads the UPDATE's own magnitude, so it damps
+    wherever the network is already confident. The Gaussian gate reads the
+    ELECTRON COORDINATES, so it damps far from the nucleus regardless of what
+    the network is doing. Only the second is a physical hypothesis.
     """
 
     def __init__(self, step: float = 1.0, eps: float = 1.0e-12, **kwargs) -> None:
@@ -212,4 +232,4 @@ def _normalize_positive_channels(
     return dict(sorted(channels.items()))
 
 
-__all__ = ["ResidualUpdater", "Updater"]
+__all__ = ["ReplaceUpdater", "ResidualUpdater", "Updater"]

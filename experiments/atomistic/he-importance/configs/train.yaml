@@ -82,6 +82,16 @@ model:
     hidden_channels: 128
     num_hidden_layers: 1
     include_spins: true
+    # NAMED INITIALIZATION STREAM, not a global-RNG draw. The authority is
+    # explicit that "no construction-order global-RNG accident is a seed
+    # definition": without this the embedding MLPs fall back to the legacy
+    # PyTorch global-RNG initializer, and every module's initial values then
+    # depend on how many draws were consumed before it. Widening an unrelated
+    # module would silently re-initialize this one.
+    initializer:
+      _target_: tpen.nn.initialization.TorchInitializer
+      seed: ${runtime.seed}
+      stream: embedding
   layers:
     # ONE layer. Not a scan coordinate -- the schema refuses a second.
     - _target_: tpen.nn.TPENLayer
@@ -102,6 +112,13 @@ model:
         channels: 32
         activation:
           _target_: torch.nn.SiLU
+        # Named-stream Xavier uniform, gain 1, per the literal control. Absent
+        # this the path weights use the legacy global-RNG Xavier initializer;
+        # PathAggregation's own docstring says so at the `initializer` argument.
+        initializer:
+          _target_: tpen.nn.initialization.TorchInitializer
+          seed: ${runtime.seed}
+          stream: layer0/path_aggregation
       # A8 control level: x_next = x + u, with no normalization and no
       # coordinate gate. Replacement and Gaussian-gated residual are the other
       # two arms.

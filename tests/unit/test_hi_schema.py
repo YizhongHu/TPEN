@@ -441,7 +441,7 @@ class TestFrozenArchitecture:
             ("model", {"layers": [{"mixing": {"channels": 48}}]}),
             ("model", {"layers": [{"mixing": {"activation": {"_target_": "torch.nn.Tanh"}}}]}),
             ("model", {"embedding": {"hidden_channels": 256, "num_hidden_layers": 2}}),
-            ("model", {"layers": [{"update": {"_target_": "tpen.nn.ReplacementUpdater"}}]}),
+            ("model", {"layers": [{"update": {"_target_": "tpen.nn.ReplaceUpdater"}}]}),
             ("model", {"layers": [{"mixing": {"initial_weight": 1.0}}]}),
         ],
     )

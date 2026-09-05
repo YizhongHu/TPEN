@@ -30,4 +30,29 @@ def test_spenn_nn_namespace_keeps_baseline_surface() -> None:
     assert not hasattr(spenn_nn, "ActivationByIrrep")
     assert not hasattr(spenn_nn, "ChannelMappedUpdater")
     assert not hasattr(spenn_nn, "NormGatedUpdater")
-    assert not hasattr(spenn_nn, "ReplaceUpdater")
+
+
+def test_replace_updater_is_now_public() -> None:
+    """``ReplaceUpdater`` was ADMITTED, and this pin was updated deliberately.
+
+    It used to be asserted absent here, alongside ``NormGatedUpdater`` and
+    ``ChannelMappedUpdater``, as one of three experimental updaters kept off
+    the public surface. It is no longer experimental: the helium-importance
+    study's A8 coordinate admits exactly three feature updates -- ``x + u``,
+    ``u``, and ``x + g(R) u`` -- and ``u`` is this class. A config cannot name
+    it without the export.
+
+    Nothing about its behaviour changed, only its status. The other two
+    assertions above are untouched and must stay: ``NormGatedUpdater`` in
+    particular is NOT an A8 arm and must not become reachable as a substitute
+    for the Gaussian one, which is a coordinate gate rather than a norm gate.
+
+    Split into its own test rather than flipped in place so that the change is
+    visible in the diff as an addition with a reason, instead of a deleted
+    line.
+    """
+
+    from tpen.nn.update import ReplaceUpdater
+
+    assert spenn_nn.ReplaceUpdater is ReplaceUpdater
+    assert "ReplaceUpdater" in spenn_nn.__all__
