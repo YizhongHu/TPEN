@@ -309,6 +309,10 @@ def test_r2_n_g5_digest_change_blocks_publication(tmp_path: Path, monkeypatch) -
         CheckpointPayloadStore(root=tmp_path, runtime=runtime).save(
             model, optimizer, generation=1, sampler_state={}, rng_state={}, completed_updates=1
         )
+    assert not (tmp_path / "latest.json").exists(), "R2-G5 digest failure has no latest publication"
+    generation = tmp_path / "generations" / "gen-000001"
+    assert not (generation / "COMPLETE").exists(), "R2-G5 digest failure has no COMPLETE publication"
+    assert not any(generation.glob("final*")), "R2-G5 digest failure has no final publication"
 
 
 def test_r2_n_g5_delayed_writer_does_not_publish_partial_generation(tmp_path: Path) -> None:
