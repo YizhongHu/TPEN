@@ -147,7 +147,11 @@ _BROKEN = re.compile(
 
 def _assert_green(result: subprocess.CompletedProcess[str], label: str) -> None:
     output = _output(result)
-    if result.returncode != 0 or re.search(r"(?:no tests ran|collected 0 items)", output, re.IGNORECASE):
+    if result.returncode != 0 or re.search(
+        r"(?:no tests ran|collected 0 items|\bskipped\b|\bxfailed\b|\bxpassed\b)",
+        output,
+        re.IGNORECASE,
+    ) or not re.search(r"\b[1-9]\d* passed\b", output):
         raise RuntimeError(f"{label}: expected green\n{_output(result)}")
 
 
