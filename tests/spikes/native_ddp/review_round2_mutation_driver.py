@@ -80,15 +80,16 @@ ARMS = (
     MutationArm(14, "test_r2_n_g5_delayed_writer_does_not_publish_partial_generation", "tests/spikes/native_ddp/checkpoint.py", "            time.sleep(delay_seconds)\n", "            time.sleep(0.0)\n", "R2-G5 delayed writer blocks publication"),
     MutationArm(15, "test_r2_n_g6_reduction_count_does_not_scale_with_sampling_work", "tests/spikes/native_ddp/vmc_step.py", "    access.ddp_model.register_comm_hook(counter, counter.communication_hook)\n", "", "R2-G6 update reduction count"),
     MutationArm(16, "test_r2_n_e2_coordinate_work_uses_raw_model_only", "tests/spikes/native_ddp/model_access.py", "        logabs = self.raw_model(coordinates)\n", "        logabs = self.ddp_model(coordinates)\n", "R2-ARM-16 coordinate work must not use DDP wrapper"),
-    MutationArm(17, "test_r2_n_e3_sgd_and_adam_have_nonempty_independent_optimizer_evidence", "tests/spikes/native_ddp/worker.py", "        return torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)\n", "        return torch.optim.SGD(model.parameters(), lr=0.04, momentum=0.9)\n", "R2-ARM-17 parameters match independent reference"),
-    MutationArm(18, "test_r2_n_e3_optimizer_state_and_closure_objective_are_global", "tests/spikes/native_ddp/vmc_step.py", "        return torch.tensor(global_loss, dtype=local_surrogate.dtype)\n", "        return local_surrogate\n", "R2-ARM-18 closure parameters must be globally synchronized"),
+    MutationArm(17, "test_r2_n_e3_sgd_and_adam_have_nonempty_independent_optimizer_evidence", "tests/spikes/native_ddp/worker.py", "        return torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)\n", "        return torch.optim.SGD(model.parameters(), lr=0.04, momentum=0.9)\n", "R2-ARM-17 sgd parameters match independent reference"),
+    MutationArm(18, "test_r2_n_e3_optimizer_state_and_closure_objective_are_global", "tests/spikes/native_ddp/vmc_step.py", "        return torch.tensor(global_loss, dtype=local_surrogate.dtype)\n", "        return local_surrogate\n", "R2-ARM-18 closure optimizer state must be globally synchronized"),
     MutationArm(19, "test_r2_n_e4_inventory_names_consumed_dcp_apis_and_classifies_them", "tests/spikes/native_ddp/worker.py", "                \"torch.distributed.checkpoint.state_dict.get_state_dict\",\n", "                \"torch.distributed.checkpoint.state_dict.get_state_dict_broken\",\n", "R2-ARM-19 consumed DCP API inventory"),
     MutationArm(20, "test_r2_n_e5_state_and_receipt_are_rank_attributed", "tests/spikes/native_ddp/worker.py", "        \"hostname\": os.uname().nodename,\n        \"pid\": os.getpid(),\n        \"access\": {\n", "        \"hostname\": os.uname().nodename,\n        \"access\": {\n", "R2-ARM-20 pid field"),
     MutationArm(21, "test_r2_n_g1_m2_observes_uneven_shards_and_global_statistics", "tests/helpers/ddp_subprocess_harness.py", "            worker_module,\n", "            \"tests.helpers.ddp_worker_entrypoint\",\n", "R2-ARM-21 worker entrypoint publication"),
     # Supplemental probes preserve the original lane-4 and lane-6 mutations;
-    # reviewer arms 4 and 7 remain the independent raw/guard probes.
-    MutationArm(22, "test_r2_n_g2_all_invalid_has_no_backward_or_parameter_gradient_event", "tests/spikes/native_ddp/worker.py", "        if stats.finite_count == 0:\n", "        ddp_features = last_coordinates.detach().clone().requires_grad_(True)\n        access.score_forward(ddp_features).sum().backward()\n        optimizer.zero_grad(set_to_none=True)\n        if stats.finite_count == 0:\n", "R2-ARM-04 parameter-gradient event", "tests/unit/training/test_ds_n_native_ddp_spike.py::test_native_global_zero_valid_energy_refuses_before_backward_and_optimizer_mutation"),
-    MutationArm(23, "test_r2_n_g3_topology_gate_precedes_all_dcp_and_state_mutation", "tests/spikes/native_ddp/checkpoint.py", "        if int(metadata[\"world_size\"]) != self.runtime.world_size:\n", "        with torch.no_grad():\n            model.weight.add_(1.0)\n        if int(metadata[\"world_size\"]) != self.runtime.world_size:\n", "R2-ARM-07 model unchanged", "tests/unit/training/test_ds_n_native_ddp_spike.py::test_native_topology_change_is_refused_before_any_resume_mutation"),
+    # reviewer arms 4 and 6 remain independent raw/guard probes; arms 22/23
+    # are the original lane mutations and must make their lane oracles RED.
+    MutationArm(22, "test_r2_n_g2_all_invalid_has_no_backward_or_parameter_gradient_event", "tests/spikes/native_ddp/worker.py", "        if stats.finite_count == 0:\n", "        optimizer.zero_grad(set_to_none=True)\n        access.score_forward(last_coordinates).sum().backward()\n        optimizer.zero_grad(set_to_none=True)\n        if stats.finite_count == 0:\n", "R2-ARM-22 no DDP forward before refusal"),
+    MutationArm(23, "test_r2_n_g3_integrated_topology_refusal_keeps_pristine_state", "tests/spikes/native_ddp/checkpoint.py", "        if int(metadata[\"world_size\"]) != self.runtime.world_size:\n", "        with torch.no_grad():\n            model.weight.add_(1.0)\n        if int(metadata[\"world_size\"]) != self.runtime.world_size:\n", "R2-ARM-23 integrated topology model unchanged"),
 )
 
 
@@ -96,9 +97,9 @@ LANE_ARM_MAPPING = {
     1: "reviewer arm 1 scale oracle",
     2: "reviewer arm 2 M2 statistics oracle",
     3: "reviewer arm 3 global-centering oracle",
-    4: "reviewer arm 4 raw-model differential; supplemental arm 22 original lane DDP backward",
+    4: "reviewer arm 4 raw-model differential (supplemental; lane arm 4 is reviewer arm 22)",
     5: "reviewer arm 5 detached DCP restore",
-    6: "reviewer arm 6 topology-guard boundary; supplemental arm 23 integrated lane topology refusal",
+    6: "reviewer arm 6 topology-guard boundary (supplemental; lane arm 6 is reviewer arm 23)",
     7: "reviewer arm 7 pre-guard model invariance",
     8: "reviewer arm 8 sampler-shard digest validation",
     9: "reviewer arm 9 raise fault publication gate",

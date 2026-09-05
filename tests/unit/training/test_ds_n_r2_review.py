@@ -129,7 +129,7 @@ def test_r2_n_g2_all_invalid_has_no_backward_or_parameter_gradient_event(tmp_pat
     assert result.exit_codes == (0, 0)
     for state in states(result):
         assert state["status"] == "refused"
-        assert state["ddp_forward_calls"] == 0
+        assert state["ddp_forward_calls"] == 0, "R2-ARM-22 no DDP forward before refusal"
         assert state["ddp_gradient_reductions"] == 0
         assert state["review_parameter_gradient_events"] == 0, "R2-ARM-04 parameter-gradient event"
         assert state["review_backward_calls"] == 0, "R2-ARM-04 backward event"
@@ -289,6 +289,32 @@ def test_r2_n_g3_topology_gate_precedes_all_dcp_and_state_mutation(tmp_path: Pat
     assert apply.call_count == 0
     assert all(torch.equal(model.state_dict()[key], value) for key, value in model_before.items()), "R2-ARM-07 model unchanged"
     assert optimizer.state_dict() == optimizer_before, "R2-ARM-07 optimizer unchanged"
+
+
+def test_r2_n_g3_integrated_topology_refusal_keeps_pristine_state(tmp_path: Path) -> None:
+    """Reproduce lane arm 6 through the complete multi-rank refusal path."""
+    root = tmp_path / "integrated-topology"
+    saved = run_native(
+        tmp_path, world_size=2,
+        extra_args=("--experiment", "resume", "--iterations", "1",
+                     "--checkpoint-root", str(root), "--checkpoint-generation", "1"),
+    )
+    assert_success(saved)
+    refused = run_native(
+        tmp_path, world_size=3, bounds=FAULT_BOUNDS,
+        extra_args=("--experiment", "resume", "--iterations", "2",
+                     "--checkpoint-root", str(root), "--resume-generation", "1"),
+    )
+    assert refused.all_reaped is True
+    assert refused.publication_observed is False
+    assert refused.exit_codes == (0, 0, 0)
+    for state in states(refused):
+        assert state["status"] == "topology_refused"
+        assert state["parameters_before"] == state["parameters_after"], (
+            "R2-ARM-23 integrated topology model unchanged"
+        )
+        assert state["optimizer_state_before"] == state["optimizer_state_after"]
+        assert state["counter_before"] == state["counter_after"] == 0
 
 
 def test_r2_n_g3b_perturbed_rank_sidecar_is_rejected(tmp_path: Path) -> None:
