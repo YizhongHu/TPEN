@@ -209,6 +209,8 @@ def test_r2_n_g4_watchdog_distinguishes_nominal_and_over_bound_stalls(tmp_path: 
         bounds=FAULT_BOUNDS,
     )
     assert nominal.watchdog_fired is False, "R2-G4 6-second nominal stall stays below watchdog"
+    assert nominal.all_reaped is True, "R2-G4 nominal stall all ranks reaped"
+    assert nominal.publication_observed is False, "R2-G4 nominal stall no publication"
     over_bound = run_native(
         tmp_path,
         fault_plan=FaultPlan(target_rank=1, kind=FaultKind.STALL_BEFORE_COLLECTIVE,
@@ -217,6 +219,7 @@ def test_r2_n_g4_watchdog_distinguishes_nominal_and_over_bound_stalls(tmp_path: 
     )
     assert over_bound.watchdog_fired is True, "R2-G4 13-second stall exceeds watchdog"
     assert over_bound.all_reaped is True, "R2-G4 over-bound stall is fully reaped"
+    assert over_bound.publication_observed is False, "R2-G4 over-bound stall no publication"
 
 
 def test_r2_reviewer_n_g4_skip_collective_broad_exit_is_clean_and_proven(tmp_path: Path) -> None:
@@ -296,7 +299,7 @@ def test_r2_n_g3b_perturbed_rank_sidecar_is_rejected(tmp_path: Path) -> None:
     latest = json.loads((root / "latest.json").read_text())
     sidecar = root / latest["path"] / "sidecars" / "rank-00001.json"
     payload = json.loads(sidecar.read_text())
-    payload["completed_updates"] += 1
+    payload["sampler_state"]["walkers"]["__tensor__"][0][0] += 1.0
     sidecar.write_text(json.dumps(payload, sort_keys=True))
     failed = run_native(tmp_path, extra_args=("--experiment", "resume", "--iterations", "2",
                                                "--checkpoint-root", str(root), "--resume-generation", "1"))
@@ -314,13 +317,15 @@ def test_r2_n_g5_failed_publication_keeps_previous_generation_selectable(tmp_pat
                                                                      "--checkpoint-root", str(root), "--checkpoint-generation", "2",
                                                                      "--checkpoint-failure-rank", "1"))
     assert second.publication_observed is False, "R2-G5 failed writer blocks publication"
+    assert second.all_reaped is True, "R2-G5 failed writer all ranks reaped"
+    assert all(code is not None for code in second.exit_codes), "R2-G5 failed writer exit codes collected"
     assert any(code != 0 for code in second.exit_codes), "R2-G5 failed writer must exit nonzero"
     assert all(state["status"] != "success" for state in states(second)), (
         "R2-G5 failed publication must retain checkpoint_pending state"
     )
     assert json.loads((root / "latest.json").read_text()) == latest
     assert (root / latest["path"] / "COMPLETE").exists(), "R2-G5 previous generation remains complete"
-    assert not (root / "generations" / "gen-000002" / "COMPLETE").exists(), "R2-G5 failed generation is unpublished"
+    assert not (root / "generations" / "gen-000002").exists(), "R2-G5 failed final generation is absent"
 
 
 def test_r2_n_g5_digest_change_blocks_publication(tmp_path: Path, monkeypatch) -> None:
@@ -374,7 +379,7 @@ def test_r2_n_g5_delayed_writer_does_not_publish_partial_generation(tmp_path: Pa
     assert second.publication_observed is False, "R2-G5 delayed writer blocks publication"
     assert json.loads((root / "latest.json").read_text()) == latest
     assert (root / latest["path"] / "COMPLETE").exists(), "R2-G5 delayed writer preserves prior COMPLETE"
-    assert not (root / "generations" / "gen-000002" / "COMPLETE").exists(), "R2-G5 delayed generation unpublished"
+    assert not (root / "generations" / "gen-000002").exists(), "R2-G5 delayed final generation is absent"
 
 
 def test_r2_n_g6_reduction_count_does_not_scale_with_sampling_work(tmp_path: Path) -> None:
@@ -403,11 +408,11 @@ def test_r2_n_e3_optimizer_state_and_closure_objective_are_global(tmp_path: Path
     result = run_native(tmp_path, extra_args=("--optimizer", "closure", "--closure-inner-iterates", "3"))
     assert_success(result)
     observed = states(result)
-    assert observed[0]["parameters_after"] == observed[1]["parameters_after"], (
-        "R2-ARM-18 closure parameters must be globally synchronized"
-    )
     assert observed[0]["optimizer_state_after"] == observed[1]["optimizer_state_after"], (
         "R2-ARM-18 closure optimizer state must be globally synchronized"
+    )
+    assert observed[0]["parameters_after"] == observed[1]["parameters_after"], (
+        "R2-ARM-18 closure parameters must be globally synchronized"
     )
     for state in observed:
         assert state["synchronized_closure_calls"] == state["closure_calls"]

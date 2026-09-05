@@ -85,7 +85,36 @@ ARMS = (
     MutationArm(19, "test_r2_n_e4_inventory_names_consumed_dcp_apis_and_classifies_them", "tests/spikes/native_ddp/worker.py", "                \"torch.distributed.checkpoint.state_dict.get_state_dict\",\n", "                \"torch.distributed.checkpoint.state_dict.get_state_dict_broken\",\n", "R2-ARM-19 consumed DCP API inventory"),
     MutationArm(20, "test_r2_n_e5_state_and_receipt_are_rank_attributed", "tests/spikes/native_ddp/worker.py", "        \"hostname\": os.uname().nodename,\n        \"pid\": os.getpid(),\n        \"access\": {\n", "        \"hostname\": os.uname().nodename,\n        \"access\": {\n", "R2-ARM-20 pid field"),
     MutationArm(21, "test_r2_n_g1_m2_observes_uneven_shards_and_global_statistics", "tests/helpers/ddp_subprocess_harness.py", "            worker_module,\n", "            \"tests.helpers.ddp_worker_entrypoint\",\n", "R2-ARM-21 worker entrypoint publication"),
+    # Supplemental probes preserve the original lane-4 and lane-6 mutations;
+    # reviewer arms 4 and 7 remain the independent raw/guard probes.
+    MutationArm(22, "test_r2_n_g2_all_invalid_has_no_backward_or_parameter_gradient_event", "tests/spikes/native_ddp/worker.py", "        if stats.finite_count == 0:\n", "        ddp_features = last_coordinates.detach().clone().requires_grad_(True)\n        access.score_forward(ddp_features).sum().backward()\n        optimizer.zero_grad(set_to_none=True)\n        if stats.finite_count == 0:\n", "R2-ARM-04 parameter-gradient event", "tests/unit/training/test_ds_n_native_ddp_spike.py::test_native_global_zero_valid_energy_refuses_before_backward_and_optimizer_mutation"),
+    MutationArm(23, "test_r2_n_g3_topology_gate_precedes_all_dcp_and_state_mutation", "tests/spikes/native_ddp/checkpoint.py", "        if int(metadata[\"world_size\"]) != self.runtime.world_size:\n", "        with torch.no_grad():\n            model.weight.add_(1.0)\n        if int(metadata[\"world_size\"]) != self.runtime.world_size:\n", "R2-ARM-07 model unchanged", "tests/unit/training/test_ds_n_native_ddp_spike.py::test_native_topology_change_is_refused_before_any_resume_mutation"),
 )
+
+
+LANE_ARM_MAPPING = {
+    1: "reviewer arm 1 scale oracle",
+    2: "reviewer arm 2 M2 statistics oracle",
+    3: "reviewer arm 3 global-centering oracle",
+    4: "reviewer arm 4 raw-model differential; supplemental arm 22 original lane DDP backward",
+    5: "reviewer arm 5 detached DCP restore",
+    6: "reviewer arm 6 topology-guard boundary; supplemental arm 23 integrated lane topology refusal",
+    7: "reviewer arm 7 pre-guard model invariance",
+    8: "reviewer arm 8 sampler-shard digest validation",
+    9: "reviewer arm 9 raise fault publication gate",
+    10: "reviewer arm 10 skip/crash fault publication gate",
+    11: "reviewer arm 11 stall fault publication gate",
+    12: "reviewer arm 12 failed publication state",
+    13: "reviewer arm 13 digest guard",
+    14: "reviewer arm 14 delayed publication",
+    15: "reviewer arm 15 reducer count",
+    16: "reviewer arm 16 raw coordinate ownership",
+    17: "reviewer arm 17 SGD/Adam reference",
+    18: "reviewer arm 18 global closure state",
+    19: "reviewer arm 19 DCP inventory",
+    20: "reviewer arm 20 rank PID attribution",
+    21: "reviewer arm 21 worker entrypoint selection",
+}
 
 
 def apply_once(path: Path, old: str, new: str) -> bytes:
@@ -99,8 +128,9 @@ def apply_once(path: Path, old: str, new: str) -> bytes:
 
 def _run(root: Path, python: str, test: str) -> subprocess.CompletedProcess[str]:
     selector = test if "::" in test else f"tests/unit/training/test_ds_n_r2_review.py::{test}"
+    verbosity = ["-s"] if "skip_collective_broad_exit" in test else []
     return subprocess.run(
-        [python, "-m", "pytest", "-q", selector],
+        [python, "-m", "pytest", "-q", *verbosity, selector],
         cwd=root, text=True, capture_output=True, check=False,
     )
 
@@ -191,8 +221,15 @@ def run_arm(root: Path, arm: MutationArm, *, python: str) -> int:
 
 
 def run_composite(root: Path, mutation: CompositeMutation, *, python: str) -> int:
+    print("LANE_ARM_MAPPING_BEGIN", flush=True)
+    for number in range(1, 22):
+        print(f"LANE_ARM_{number}={LANE_ARM_MAPPING[number]}", flush=True)
+    print("LANE_ARM_MAPPING_END", flush=True)
     for test in (*mutation.reviewed_tests, mutation.oracle_test):
-        _assert_green(_run(root, python, test), f"{mutation.name} baseline {test}")
+        baseline = _run(root, python, test)
+        _assert_green(baseline, f"{mutation.name} baseline {test}")
+        if "skip_collective_broad_exit" in test:
+            print(f"{mutation.name} SKIP_BASELINE_OUTPUT_BEGIN\n{_output(baseline)}{mutation.name} SKIP_BASELINE_OUTPUT_END", flush=True)
     originals: dict[Path, bytes] = {}
     original_digests: dict[Path, str] = {}
     mutated_digests: list[str] = []
@@ -224,6 +261,7 @@ def run_composite(root: Path, mutation: CompositeMutation, *, python: str) -> in
         f"SIGNATURE={mutation.expected!r} RESTORED_GREEN=1",
         flush=True,
     )
+    print(f"COMPOSITE={mutation.name} MUTATED_OUTPUT_BEGIN\n{_output(red)}COMPOSITE={mutation.name} MUTATED_OUTPUT_END", flush=True)
     return 0
 
 
