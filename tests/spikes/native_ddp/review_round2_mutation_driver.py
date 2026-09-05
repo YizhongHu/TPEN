@@ -52,8 +52,13 @@ CLEAN_ALL_RANK_EARLY_ABORT = CompositeMutation(
             "        reductions_before = counter.count\n",
         ),
     ),
-    reviewed_tests=("test_r2_reviewed_n_g4_fault_tests_preserve_evidence",),
-    oracle_test="test_r2_reviewer_n_g4_broad_exit_fact_oracle",
+    reviewed_tests=(
+        "test_r2_reviewed_n_g4_fault_tests_preserve_evidence",
+        "tests/unit/training/test_ds_n_native_ddp_spike.py::test_native_raise_before_backward_preserves_culprit_and_nonpublication",
+        "tests/unit/training/test_ds_n_native_ddp_spike.py::test_native_skip_collective_preserves_culprit_and_nonpublication",
+        "tests/unit/training/test_ds_n_native_ddp_spike.py::test_native_stall_before_collective_is_bounded_and_nonpublishing",
+    ),
+    oracle_test="test_r2_reviewer_n_g4_broad_exit_fact_oracle_raise",
     expected="R2-G4 broad exit fact: at least one nonzero child exit",
 )
 
@@ -71,14 +76,14 @@ ARMS = (
     MutationArm(10, "test_r2_reviewed_n_g4_fault_tests_preserve_evidence", "tests/spikes/native_ddp/worker.py", "        os._exit(2)\n", "        return\n", "R2-G4 no publication after configured fault"),
     MutationArm(11, "test_r2_reviewed_n_g4_fault_tests_preserve_evidence", "tests/spikes/native_ddp/worker.py", "        time.sleep(plan.delay_seconds)\n", "        time.sleep(0.0)\n", "R2-G4 no publication after configured fault"),
     MutationArm(12, "test_r2_n_g5_failed_publication_keeps_previous_generation_selectable", "tests/spikes/native_ddp/worker.py", "        state[\"status\"] = \"checkpoint_pending\"\n", "        state[\"status\"] = \"success\"\n", "R2-G5 failed publication must retain checkpoint_pending state"),
-    MutationArm(13, "test_r2_n_g5_digest_change_blocks_publication", "tests/spikes/native_ddp/checkpoint.py", "                if payload != actual.as_dict():\n", "                if False:\n", "digest changed"),
+    MutationArm(13, "test_r2_n_g5_digest_change_blocks_publication", "tests/spikes/native_ddp/checkpoint.py", "                if payload != actual.as_dict():\n", "                if False:\n", "R2-ARM-13 digest guard did not raise"),
     MutationArm(14, "test_r2_n_g5_delayed_writer_does_not_publish_partial_generation", "tests/spikes/native_ddp/checkpoint.py", "            time.sleep(delay_seconds)\n", "            time.sleep(0.0)\n", "R2-G5 delayed writer blocks publication"),
     MutationArm(15, "test_r2_n_g6_reduction_count_does_not_scale_with_sampling_work", "tests/spikes/native_ddp/vmc_step.py", "    access.ddp_model.register_comm_hook(counter, counter.communication_hook)\n", "", "R2-G6 update reduction count"),
-    MutationArm(16, "test_r2_n_e2_coordinate_work_uses_raw_model_only", "tests/spikes/native_ddp/model_access.py", "        logabs = self.raw_model(coordinates)\n", "        logabs = self.ddp_model(coordinates)\n", "coordinate work must not use DDP wrapper"),
-    MutationArm(17, "test_r2_n_e3_sgd_and_adam_have_nonempty_independent_optimizer_evidence", "tests/spikes/native_ddp/worker.py", "        return torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)\n", "        return torch.optim.SGD(model.parameters(), lr=0.04, momentum=0.9)\n", "R2-E3 sgd complete optimizer state matches independent reference"),
-    MutationArm(18, "test_r2_n_e3_optimizer_state_and_closure_objective_are_global", "tests/spikes/native_ddp/vmc_step.py", "        return torch.tensor(global_loss, dtype=local_surrogate.dtype)\n", "        return local_surrogate\n", "closure parameters must be globally synchronized"),
+    MutationArm(16, "test_r2_n_e2_coordinate_work_uses_raw_model_only", "tests/spikes/native_ddp/model_access.py", "        logabs = self.raw_model(coordinates)\n", "        logabs = self.ddp_model(coordinates)\n", "R2-ARM-16 coordinate work must not use DDP wrapper"),
+    MutationArm(17, "test_r2_n_e3_sgd_and_adam_have_nonempty_independent_optimizer_evidence", "tests/spikes/native_ddp/worker.py", "        return torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)\n", "        return torch.optim.SGD(model.parameters(), lr=0.04, momentum=0.9)\n", "R2-ARM-17 parameters match independent reference"),
+    MutationArm(18, "test_r2_n_e3_optimizer_state_and_closure_objective_are_global", "tests/spikes/native_ddp/vmc_step.py", "        return torch.tensor(global_loss, dtype=local_surrogate.dtype)\n", "        return local_surrogate\n", "R2-ARM-18 closure parameters must be globally synchronized"),
     MutationArm(19, "test_r2_n_e4_inventory_names_consumed_dcp_apis_and_classifies_them", "tests/spikes/native_ddp/worker.py", "                \"torch.distributed.checkpoint.state_dict.get_state_dict\",\n", "                \"torch.distributed.checkpoint.state_dict.get_state_dict_broken\",\n", "R2-ARM-19 consumed DCP API inventory"),
-    MutationArm(20, "test_r2_n_e5_state_and_receipt_are_rank_attributed", "tests/spikes/native_ddp/worker.py", "        \"hostname\": os.uname().nodename,\n        \"pid\": os.getpid(),\n        \"access\": {\n", "        \"hostname\": os.uname().nodename,\n        \"access\": {\n", "pid"),
+    MutationArm(20, "test_r2_n_e5_state_and_receipt_are_rank_attributed", "tests/spikes/native_ddp/worker.py", "        \"hostname\": os.uname().nodename,\n        \"pid\": os.getpid(),\n        \"access\": {\n", "        \"hostname\": os.uname().nodename,\n        \"access\": {\n", "R2-ARM-20 pid field"),
     MutationArm(21, "test_r2_n_g1_m2_observes_uneven_shards_and_global_statistics", "tests/helpers/ddp_subprocess_harness.py", "            worker_module,\n", "            \"tests.helpers.ddp_worker_entrypoint\",\n", "R2-ARM-21 worker entrypoint publication"),
 )
 
@@ -111,7 +116,8 @@ _BROKEN = re.compile(
 
 
 def _assert_green(result: subprocess.CompletedProcess[str], label: str) -> None:
-    if result.returncode != 0:
+    output = _output(result)
+    if result.returncode != 0 or re.search(r"(?:no tests ran|collected 0 items)", output, re.IGNORECASE):
         raise RuntimeError(f"{label}: expected green\n{_output(result)}")
 
 
@@ -123,7 +129,11 @@ def _assert_semantic_red(result: subprocess.CompletedProcess[str], arm: Mutation
         raise RuntimeError(f"arm {arm.number}: broken mutation/setup failure\n{output}")
     if any(token in output for token in ("TypeError", "AttributeError")):
         raise RuntimeError(f"arm {arm.number}: TypeError/AttributeError is not semantic evidence\n{output}")
-    if arm.expected not in output:
+    diagnostic = re.compile(
+        rf"^E\s+(?:AssertionError|Failed):.*{re.escape(arm.expected)}",
+        re.MULTILINE,
+    )
+    if not diagnostic.search(output):
         raise RuntimeError(f"arm {arm.number}: missing semantic signature {arm.expected!r}\n{output}")
 
 
@@ -135,7 +145,11 @@ def _assert_composite_semantic_red(
         raise RuntimeError(f"{mutation.name}: expected semantic red, got green")
     if _BROKEN.search(output) or any(token in output for token in ("TypeError", "AttributeError")):
         raise RuntimeError(f"{mutation.name}: broken mutation/setup failure\n{output}")
-    if mutation.expected not in output:
+    diagnostic = re.compile(
+        rf"^E\s+(?:AssertionError|Failed):.*{re.escape(mutation.expected)}",
+        re.MULTILINE,
+    )
+    if not diagnostic.search(output):
         raise RuntimeError(f"{mutation.name}: missing semantic signature {mutation.expected!r}\n{output}")
 
 
@@ -168,7 +182,8 @@ def run_arm(root: Path, arm: MutationArm, *, python: str) -> int:
         raise RuntimeError(f"arm {arm.number}: no complete mutation/red proof")
     print(
         f"ARM={arm.number} BASELINE_RC=0 MUTATED_DIGEST={mutated_digest} "
-        f"RED_RC={red.returncode} SIGNATURE={arm.expected!r} RESTORED_GREEN=1",
+        f"RED_RC={red.returncode} SIGNATURE={arm.expected!r} "
+        f"ORIGINAL_DIGEST={original_digest} RESTORED_DIGEST={original_digest} RESTORED_GREEN=1",
         flush=True,
     )
     print(f"ARM={arm.number} MUTATED_OUTPUT_BEGIN\n{_output(red)}ARM={arm.number} MUTATED_OUTPUT_END", flush=True)
@@ -179,12 +194,14 @@ def run_composite(root: Path, mutation: CompositeMutation, *, python: str) -> in
     for test in (*mutation.reviewed_tests, mutation.oracle_test):
         _assert_green(_run(root, python, test), f"{mutation.name} baseline {test}")
     originals: dict[Path, bytes] = {}
+    original_digests: dict[Path, str] = {}
     mutated_digests: list[str] = []
     try:
         for relative_path, old, new in mutation.replacements:
             path = root / relative_path
             if path not in originals:
                 originals[path] = path.read_bytes()
+                original_digests[path] = hashlib.sha256(originals[path]).hexdigest()
             apply_once(path, old, new)
             mutated_digests.append(hashlib.sha256(path.read_bytes()).hexdigest())
         for test in mutation.reviewed_tests:
@@ -202,6 +219,8 @@ def run_composite(root: Path, mutation: CompositeMutation, *, python: str) -> in
     print(
         f"COMPOSITE={mutation.name} BASELINE_GREEN=1 REVIEWED_GREEN=1 "
         f"MUTATED_DIGESTS={','.join(mutated_digests)} RED_RC={red_rc} "
+        f"ORIGINAL_DIGESTS={','.join(original_digests.values())} "
+        f"RESTORED_DIGESTS={','.join(original_digests.values())} "
         f"SIGNATURE={mutation.expected!r} RESTORED_GREEN=1",
         flush=True,
     )

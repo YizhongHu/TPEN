@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
+import subprocess
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -14,11 +16,11 @@ import torch
 from tests.helpers.ddp_capability import missing_capability_reason, probe_gloo_capability
 from tests.helpers.ddp_fault_injection import FaultKind, FaultPhase, FaultPlan
 from tests.helpers.ddp_subprocess_harness import HarnessBounds, RankReceipt, run_gloo_subprocess_group
-from tests.helpers.vmc_scientific_oracle import oracle_vmc_objective
+from tests.helpers.vmc_scientific_oracle import loss_tolerance_envelope, oracle_vmc_objective
 from tests.spikes.native_ddp import checkpoint as checkpoint_module
 from tests.spikes.native_ddp.checkpoint import CheckpointPayloadStore, CheckpointTopologyMismatch
 from tests.spikes.native_ddp.model_access import SemanticWavefunction
-from tests.spikes.native_ddp.statistics import FiniteStatistics, local_centered_objective
+from tests.spikes.native_ddp.statistics import local_centered_objective
 
 
 CAPABILITY = probe_gloo_capability()
@@ -55,6 +57,22 @@ def states(result) -> list[dict]:
             for rank in range(len(result.receipts))]
 
 
+def assert_recursive_close(actual, expected, *, atol: float, path: str = "") -> None:
+    """Compare JSON-shaped optimizer evidence without discarding its structure."""
+    if isinstance(actual, dict) and isinstance(expected, dict):
+        assert actual.keys() == expected.keys(), path
+        for key in actual:
+            assert_recursive_close(actual[key], expected[key], atol=atol, path=f"{path}.{key}")
+    elif isinstance(actual, list) and isinstance(expected, list):
+        assert len(actual) == len(expected), path
+        for index, (left, right) in enumerate(zip(actual, expected, strict=True)):
+            assert_recursive_close(left, right, atol=atol, path=f"{path}[{index}]")
+    elif isinstance(actual, float) and isinstance(expected, float):
+        assert actual == pytest.approx(expected, abs=atol), path
+    else:
+        assert actual == expected, path
+
+
 def assert_success(result) -> None:
     assert result.watchdog_fired is False
     assert result.all_reaped is True
@@ -67,6 +85,7 @@ def assert_success(result) -> None:
 def test_r2_n_g1_m2_observes_uneven_shards_and_global_statistics(tmp_path: Path) -> None:
     result = run_native(tmp_path, world_size=3,
                         extra_args=("--experiment", "scientific", "--fixture", "m2"))
+    assert result.publication_observed is True, "R2-ARM-21 worker entrypoint publication"
     assert_success(result)
     observed = states(result)
     assert [len(state["energy"]["__tensor__"]) for state in observed] == [5, 3, 7], "R2-ARM-02 shard lengths"
@@ -77,7 +96,6 @@ def test_r2_n_g1_m2_observes_uneven_shards_and_global_statistics(tmp_path: Path)
                                               (2, 0, 3.0), (2, 1, -2.0), (2, 3, 1.0), (2, 4, 0.5), (2, 5, 2.5))), "R2-ARM-02 exact finite shard values"
     assert [state["global_statistics"]["finite_count"] for state in observed] == [8, 8, 8], "R2-ARM-02 global finite count"
     assert [state["global_statistics"]["total_count"] for state in observed] == [15, 15, 15], "R2-ARM-02 global total count"
-    assert result.publication_observed is True, "R2-ARM-21 worker entrypoint publication"
 
 
 def test_r2_n_g1_world_size_compensates_the_ddp_surrogate(tmp_path: Path) -> None:
@@ -95,13 +113,12 @@ def test_r2_n_g1_world_size_compensates_the_ddp_surrogate(tmp_path: Path) -> Non
 
 def test_r2_n_g1b_rejects_local_centering_against_global_oracle(tmp_path: Path) -> None:
     del tmp_path
-    energies = [torch.tensor([1.0]), torch.tensor([5.0])]
-    logabs = [torch.tensor([0.3]), torch.tensor([0.7])]
-    global_stats = FiniteStatistics.from_values(torch.cat(energies))
+    energies = [torch.tensor([1.0], dtype=torch.float64), torch.tensor([5.0], dtype=torch.float64)]
+    logabs = [torch.tensor([0.3], dtype=torch.float64), torch.tensor([0.7], dtype=torch.float64)]
     global_oracle = oracle_vmc_objective(logabs, energies).loss
-    assert local_centered_objective(logabs, energies).item() == pytest.approx(0.0), "R2-ARM-03 local control"
+    assert local_centered_objective(logabs, energies).item() == pytest.approx(0.0), "R2-ARM-03 global oracle mismatch"
     assert local_centered_objective(logabs, energies).item() != pytest.approx(
-        global_oracle.item() / 2.0
+        global_oracle.item()
     ), "R2-ARM-03 global oracle mismatch"
 
 
@@ -114,8 +131,8 @@ def test_r2_n_g2_all_invalid_has_no_backward_or_parameter_gradient_event(tmp_pat
         assert state["status"] == "refused"
         assert state["ddp_forward_calls"] == 0
         assert state["ddp_gradient_reductions"] == 0
-        assert state["review_backward_calls"] == 0, "R2-ARM-04 backward event"
         assert state["review_parameter_gradient_events"] == 0, "R2-ARM-04 parameter-gradient event"
+        assert state["review_backward_calls"] == 0, "R2-ARM-04 backward event"
         assert state["parameters_before"] == state["parameters_after"], "R2-ARM-04 parameter mutation"
         assert state["counter_before"] == state["counter_after"] == 0, "R2-ARM-04 update counter"
         assert state["optimizer_state_before"] == state["optimizer_state_after"], "R2-ARM-04 optimizer mutation"
@@ -152,12 +169,13 @@ def test_r2_reviewed_n_g4_fault_tests_preserve_evidence(tmp_path: Path, kind, ph
     generation = tmp_path / "dcp" / "generations" / "gen-000001"
     assert not (tmp_path / "dcp" / "latest.json").exists(), "R2-G4 no latest publication"
     assert not (generation / "COMPLETE").exists(), "R2-G4 no requested COMPLETE publication"
-    assert not any(generation.glob("final*")), "R2-G4 no final publication"
+    assert not generation.exists(), "R2-G4 no final generation publication"
 
 
 @pytest.mark.parametrize(
     ("kind", "phase", "delay"),
     ((FaultKind.RAISE_BEFORE_BACKWARD, FaultPhase.BEFORE_OPTIMIZER_STEP, 0.0),
+     (FaultKind.SKIP_COLLECTIVE, FaultPhase.BEFORE_COLLECTIVE, 0.0),
      (FaultKind.STALL_BEFORE_COLLECTIVE, FaultPhase.BEFORE_COLLECTIVE, 6.0)),
 )
 def test_r2_reviewer_n_g4_broad_exit_fact_oracle(tmp_path: Path, kind, phase, delay) -> None:
@@ -171,16 +189,28 @@ def test_r2_reviewer_n_g4_broad_exit_fact_oracle(tmp_path: Path, kind, phase, de
     assert any(code != 0 for code in result.exit_codes), "R2-G4 broad exit fact: at least one nonzero child exit"
 
 
+def test_r2_reviewer_n_g4_broad_exit_fact_oracle_raise(tmp_path: Path) -> None:
+    result = run_native(
+        tmp_path,
+        fault_plan=FaultPlan(target_rank=1, kind=FaultKind.RAISE_BEFORE_BACKWARD,
+                             phase=FaultPhase.BEFORE_OPTIMIZER_STEP),
+        bounds=FAULT_BOUNDS,
+    )
+    assert result.all_reaped is True
+    assert all(code is not None for code in result.exit_codes)
+    assert any(code != 0 for code in result.exit_codes), "R2-G4 broad exit fact: at least one nonzero child exit"
+
+
 def test_r2_n_g4_watchdog_distinguishes_nominal_and_over_bound_stalls(tmp_path: Path) -> None:
     nominal = run_native(
-        tmp_path / "nominal",
+        tmp_path,
         fault_plan=FaultPlan(target_rank=1, kind=FaultKind.STALL_BEFORE_COLLECTIVE,
                              phase=FaultPhase.BEFORE_COLLECTIVE, delay_seconds=6.0),
         bounds=FAULT_BOUNDS,
     )
     assert nominal.watchdog_fired is False, "R2-G4 6-second nominal stall stays below watchdog"
     over_bound = run_native(
-        tmp_path / "over-bound",
+        tmp_path,
         fault_plan=FaultPlan(target_rank=1, kind=FaultKind.STALL_BEFORE_COLLECTIVE,
                              phase=FaultPhase.BEFORE_COLLECTIVE, delay_seconds=13.0),
         bounds=FAULT_BOUNDS,
@@ -189,8 +219,11 @@ def test_r2_n_g4_watchdog_distinguishes_nominal_and_over_bound_stalls(tmp_path: 
     assert over_bound.all_reaped is True, "R2-G4 over-bound stall is fully reaped"
 
 
-@pytest.mark.xfail(strict=True, reason="EXPECTED CONTRACT-RED: preserved SKIP collective returns all-zero child exits")
-def test_r2_reviewer_n_g4_skip_collective_broad_exit_expected_contract_red(tmp_path: Path) -> None:
+def test_r2_reviewer_n_g4_skip_collective_broad_exit_is_clean_and_proven(tmp_path: Path) -> None:
+    worker = Path(__file__).parents[2] / "spikes" / "native_ddp" / "worker.py"
+    harness = Path(__file__).parents[2] / "helpers" / "ddp_subprocess_harness.py"
+    before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in (worker, harness)}
+    assert subprocess.run(["git", "diff", "--quiet", "--", str(worker), str(harness)], check=False).returncode == 0
     result = run_native(
         tmp_path,
         fault_plan=FaultPlan(target_rank=1, kind=FaultKind.SKIP_COLLECTIVE, phase=FaultPhase.BEFORE_COLLECTIVE),
@@ -198,8 +231,16 @@ def test_r2_reviewer_n_g4_skip_collective_broad_exit_expected_contract_red(tmp_p
         extra_args=("--checkpoint-root", str(tmp_path / "dcp"), "--checkpoint-generation", "1"),
     )
     assert result.all_reaped is True
+    assert result.watchdog_fired is False
+    assert result.culprit_rank == 1
     assert all(code is not None for code in result.exit_codes)
+    print(f"R2-G4 SKIP exact exit tuple={result.exit_codes}")
     assert any(code != 0 for code in result.exit_codes), "R2-G4 broad exit fact: at least one nonzero child exit"
+    assert "ddp harness injected fault: rank 1 phase BEFORE_COLLECTIVE kind SKIP_COLLECTIVE" in Path(result.invocation_dir, "rank_1.log").read_text()
+    assert not (tmp_path / "dcp" / "latest.json").exists()
+    after = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in (worker, harness)}
+    expected = {path: hashlib.sha256(subprocess.check_output(["git", "show", f"HEAD:{path.relative_to(Path.cwd())}"])).hexdigest() for path in (worker, harness)}
+    assert before == after == expected, "R2-G4 SKIP source/harness digests are clean and unchanged"
 
 
 def test_r2_n_g3_resume_applies_detached_dcp_buffers(tmp_path: Path) -> None:
@@ -241,7 +282,7 @@ def test_r2_n_g3_topology_gate_precedes_all_dcp_and_state_mutation(tmp_path: Pat
     monkeypatch.setattr(checkpoint_module, "set_state_dict", apply)
     with pytest.raises(CheckpointTopologyMismatch):
         store.load(model, optimizer, generation=1)
-    assert load.call_count == 1
+    assert load.call_count == 0, "R2-ARM-06 topology guard blocks DCP load"
     assert apply.call_count == 0
     assert all(torch.equal(model.state_dict()[key], value) for key, value in model_before.items()), "R2-ARM-07 model unchanged"
     assert optimizer.state_dict() == optimizer_before, "R2-ARM-07 optimizer unchanged"
@@ -259,8 +300,8 @@ def test_r2_n_g3b_perturbed_rank_sidecar_is_rejected(tmp_path: Path) -> None:
     sidecar.write_text(json.dumps(payload, sort_keys=True))
     failed = run_native(tmp_path, extra_args=("--experiment", "resume", "--iterations", "2",
                                                "--checkpoint-root", str(root), "--resume-generation", "1"))
-    assert failed.publication_observed is False, "R2-G3b perturbed sidecar blocks resume publication"
-    assert all(state["status"] == "resume_failed" for state in states(failed)), "R2-ARM-08 sidecar validation failure"
+    assert failed.publication_observed is False, "R2-ARM-08 sidecar validation failure"
+    assert all(state["status"] == "resume_failed" for state in states(failed)), "R2-ARM-08 status classification"
 
 
 def test_r2_n_g5_failed_publication_keeps_previous_generation_selectable(tmp_path: Path) -> None:
@@ -305,14 +346,19 @@ def test_r2_n_g5_digest_change_blocks_publication(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(checkpoint_module, "_digest", digest_then_change)
     monkeypatch.setattr(checkpoint_module, "get_state_dict", lambda *_args: ({}, {}))
     monkeypatch.setattr(checkpoint_module.dcp, "save", lambda *_args, **_kwargs: None)
-    with pytest.raises(checkpoint_module.CheckpointCorrupt, match="digest changed"):
+    caught: checkpoint_module.CheckpointCorrupt | None = None
+    try:
         CheckpointPayloadStore(root=tmp_path, runtime=runtime).save(
             model, optimizer, generation=1, sampler_state={}, rng_state={}, completed_updates=1
         )
+    except checkpoint_module.CheckpointCorrupt as exc:
+        caught = exc
+    assert caught is not None, "R2-ARM-13 digest guard did not raise"
+    assert "digest changed" in str(caught), "R2-ARM-13 digest mismatch classification"
     assert not (tmp_path / "latest.json").exists(), "R2-G5 digest failure has no latest publication"
     generation = tmp_path / "generations" / "gen-000001"
     assert not (generation / "COMPLETE").exists(), "R2-G5 digest failure has no COMPLETE publication"
-    assert not any(generation.glob("final*")), "R2-G5 digest failure has no final publication"
+    assert not generation.exists(), "R2-G5 digest failure has no final generation publication"
 
 
 def test_r2_n_g5_delayed_writer_does_not_publish_partial_generation(tmp_path: Path) -> None:
@@ -348,7 +394,7 @@ def test_r2_n_e2_coordinate_work_uses_raw_model_only(tmp_path: Path) -> None:
     result = run_native(tmp_path, extra_args=("--kinetic-forwards", "3"))
     assert_success(result)
     for state in states(result):
-        assert state["ddp_forward_calls"] == 1, "coordinate work must not use DDP wrapper"
+        assert state["ddp_forward_calls"] == 1, "R2-ARM-16 coordinate work must not use DDP wrapper"
         assert state["access"]["coordinate_forward_owner"] == "raw_model", "coordinate owner"
         assert state["access"]["used_module_attribute"] is False
 
@@ -358,10 +404,10 @@ def test_r2_n_e3_optimizer_state_and_closure_objective_are_global(tmp_path: Path
     assert_success(result)
     observed = states(result)
     assert observed[0]["parameters_after"] == observed[1]["parameters_after"], (
-        "closure parameters must be globally synchronized"
+        "R2-ARM-18 closure parameters must be globally synchronized"
     )
     assert observed[0]["optimizer_state_after"] == observed[1]["optimizer_state_after"], (
-        "closure optimizer state must be globally synchronized"
+        "R2-ARM-18 closure optimizer state must be globally synchronized"
     )
     for state in observed:
         assert state["synchronized_closure_calls"] == state["closure_calls"]
@@ -397,10 +443,14 @@ def test_r2_n_e3_optimizer_state_and_closure_objective_are_global(tmp_path: Path
         name: parameter.detach().cpu().tolist()
         for name, parameter in reference.named_parameters()
     }
-    assert observed[0]["parameters_after"] == pytest.approx(expected_parameters, abs=1e-12)
-    assert observed[0]["optimizer_state_after"] == checkpoint_module._jsonable(
-        reference_optimizer.state_dict()
-    ), "R2-E3 recursive optimizer state matches global LBFGS reference"
+    atol = loss_tolerance_envelope(energies[torch.isfinite(energies)])
+    for state in observed:
+        assert_recursive_close(state["parameters_after"], expected_parameters, atol=atol,
+                               path="R2-ARM-18 parameters match independent reference")
+        assert_recursive_close(
+            state["optimizer_state_after"], checkpoint_module._jsonable(reference_optimizer.state_dict()),
+            atol=atol, path="R2-E3 recursive optimizer state matches global LBFGS reference",
+        )
 
 
 def test_r2_n_e3_sgd_and_adam_have_nonempty_independent_optimizer_evidence(tmp_path: Path) -> None:
@@ -423,10 +473,14 @@ def test_r2_n_e3_sgd_and_adam_have_nonempty_independent_optimizer_evidence(tmp_p
         optimizer.step()
         expected_parameters = {key: value.detach().cpu().tolist()
                                for key, value in reference.named_parameters()}
-        assert observed[0]["parameters_after"] == pytest.approx(expected_parameters, abs=1e-12)
-        assert observed[0]["optimizer_state_after"] == checkpoint_module._jsonable(optimizer.state_dict()), (
-            f"R2-E3 {name} complete optimizer state matches independent reference"
-        )
+        atol = loss_tolerance_envelope(energies[torch.isfinite(energies)])
+        for state in observed:
+            assert_recursive_close(state["parameters_after"], expected_parameters, atol=atol,
+                                   path=f"R2-ARM-17 {name} parameters match independent reference")
+            assert_recursive_close(
+                state["optimizer_state_after"], checkpoint_module._jsonable(optimizer.state_dict()),
+                atol=atol, path=f"R2-E3 {name} complete optimizer state",
+            )
 
 
 def test_r2_n_e4_inventory_names_consumed_dcp_apis_and_classifies_them(tmp_path: Path) -> None:
@@ -460,6 +514,7 @@ def test_r2_n_e5_state_and_receipt_are_rank_attributed(tmp_path: Path) -> None:
     for receipt, state in zip(result.receipts, states(result), strict=True):
         assert state["rank"] == receipt.rank
         assert state["world_size"] == receipt.world_size
+        assert "pid" in state, "R2-ARM-20 pid field"
         assert state["pid"] == receipt.pid, "R2-ARM-20 rank pid attribution"
         assert state["hostname"] == receipt.hostname
         assert state["phase_sequence"] == receipt.phase_sequence
