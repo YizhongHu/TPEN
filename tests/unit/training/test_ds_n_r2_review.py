@@ -16,7 +16,7 @@ from tests.helpers.ddp_subprocess_harness import HarnessBounds, RankReceipt, run
 from tests.spikes.native_ddp import checkpoint as checkpoint_module
 from tests.spikes.native_ddp.checkpoint import CheckpointPayloadStore, CheckpointTopologyMismatch
 from tests.spikes.native_ddp.model_access import SemanticWavefunction
-from tests.spikes.native_ddp.statistics import local_centered_objective
+from tests.spikes.native_ddp.statistics import FiniteStatistics, centered_terms, local_centered_objective
 from tests.spikes.native_ddp.vmc_step import make_local_surrogate
 
 
@@ -79,13 +79,18 @@ def test_r2_n_g1_world_size_compensates_the_ddp_surrogate(tmp_path: Path) -> Non
     assert all(state["ddp_backward_scale"] == pytest.approx(4.0 / 8.0) for state in states(result))
 
 
-def test_r2_n_g1b_rejects_local_centering_and_local_clipping_controls(tmp_path: Path) -> None:
+def test_r2_n_g1b_rejects_local_centering_against_global_oracle(tmp_path: Path) -> None:
     del tmp_path
     energies = [torch.tensor([1.0]), torch.tensor([5.0])]
     logabs = [torch.tensor([0.3]), torch.tensor([0.7])]
-    assert local_centered_objective(logabs, energies).item() == 0.0
+    global_stats = FiniteStatistics.from_values(torch.cat(energies))
+    global_oracle = sum(
+        centered_terms(log, energy, global_stats).sum()
+        for log, energy in zip(logabs, energies, strict=True)
+    )
+    assert local_centered_objective(logabs, energies).item() == pytest.approx(0.0)
     assert local_centered_objective(logabs, energies).item() != pytest.approx(
-        sum((energy * value).item() for energy, value in zip(energies, logabs, strict=True))
+        global_oracle.item()
     )
 
 
@@ -120,7 +125,13 @@ def test_r2_reviewed_n_g4_fault_tests_preserve_evidence(tmp_path: Path, kind, ph
     assert result.culprit_rank == 1
     assert result.publication_observed is False
     assert all(Path(result.invocation_dir, f"state_{rank}.json").exists() for rank in (0, 1))
-    assert all(Path(result.invocation_dir, f"receipt_{rank}.json").exists() for rank in (0, 1))
+    assert all(Path(result.invocation_dir, f"rank_{rank}.log").exists() for rank in (0, 1))
+    target_log = Path(result.invocation_dir, "rank_1.log").read_text()
+    assert "ddp harness injected fault: rank 1" in target_log
+    target_state = json.loads(Path(result.invocation_dir, "state_1.json").read_text())
+    assert target_state["rank"] == 1
+    assert target_state["fault_kind"] == kind.name
+    assert target_state["fault_phase"] == phase.name
     assert not (tmp_path / "dcp" / "latest.json").exists()
 
 
@@ -289,11 +300,12 @@ def test_r2_n_e3_sgd_and_adam_have_nonempty_independent_optimizer_evidence(tmp_p
         assert all(state["optimizer_state_after"]["state"] for state in states(result))
         if name == "sgd":
             for state in states(result):
-                expected = {
-                    key: [value - 0.05 * state["gradients"][key]["__tensor__"][0]]
-                    for key, value in state["parameters_before"].items()
-                }
-                assert state["parameters_after"] == pytest.approx(expected, abs=1e-12)
+                for key, values in state["parameters_before"].items():
+                    expected = [
+                        value - 0.05 * state["gradients"][key]["__tensor__"][0]
+                        for value in values
+                    ]
+                    assert state["parameters_after"][key] == pytest.approx(expected, abs=1e-12)
 
 
 def test_r2_n_e4_inventory_names_consumed_dcp_apis_and_classifies_them(tmp_path: Path) -> None:
@@ -305,6 +317,16 @@ def test_r2_n_e4_inventory_names_consumed_dcp_apis_and_classifies_them(tmp_path:
     assert consumed <= set(inventory["experimental"])
     assert set(inventory["stable"]).isdisjoint(consumed)
     assert states(result)[0]["accelerator_execution"] is False
+
+
+@pytest.mark.xfail(strict=True, reason="EXPECTED CONTRACT-RED: worker inventory omits consumed save/load")
+def test_r2_n_e4_consumed_save_load_inventory_oracle_expected_contract_red(tmp_path: Path) -> None:
+    result = run_native(tmp_path)
+    assert_success(result)
+    entries = states(result)[0]["api_inventory"]["consumed"]
+    by_api = {entry["api"]: entry["stability"] for entry in entries}
+    assert by_api["torch.distributed.checkpoint.save"] in {"stable", "experimental"}
+    assert by_api["torch.distributed.checkpoint.load"] in {"stable", "experimental"}
 
 
 def test_r2_n_e5_state_and_receipt_are_rank_attributed(tmp_path: Path) -> None:
@@ -324,5 +346,9 @@ def test_r2_checkpoint_load_uses_no_state_application_on_topology_mismatch(tmp_p
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
     runtime = Mock(rank=0, world_size=2)
     runtime.broadcast_object.return_value = {"world_size": 3, "path": "generations/gen-000001", "files": []}
+    generation = tmp_path / "generations" / "gen-000001"
+    generation.mkdir(parents=True)
+    (generation / "COMPLETE").write_text("COMPLETE\n")
+    (generation / "manifest.json").write_text(json.dumps({"world_size": 3, "files": []}))
     with pytest.raises(CheckpointTopologyMismatch):
         CheckpointPayloadStore(root=tmp_path, runtime=runtime).load(model, optimizer, generation=1)
