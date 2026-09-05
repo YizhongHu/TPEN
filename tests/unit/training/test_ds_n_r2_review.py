@@ -287,6 +287,13 @@ def test_r2_n_e3_sgd_and_adam_have_nonempty_independent_optimizer_evidence(tmp_p
         result = run_native(tmp_path, extra_args=("--optimizer", name))
         assert_success(result)
         assert all(state["optimizer_state_after"]["state"] for state in states(result))
+        if name == "sgd":
+            for state in states(result):
+                expected = {
+                    key: [value - 0.05 * state["gradients"][key]["__tensor__"][0]]
+                    for key, value in state["parameters_before"].items()
+                }
+                assert state["parameters_after"] == pytest.approx(expected, abs=1e-12)
 
 
 def test_r2_n_e4_inventory_names_consumed_dcp_apis_and_classifies_them(tmp_path: Path) -> None:
