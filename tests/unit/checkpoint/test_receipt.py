@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -311,6 +312,27 @@ def test_checkpoint_published_still_rejects_negative_durations_when_present() ->
             write_duration_sec=None,
             publish_duration_sec=-1.0,
         )
+
+
+def test_k_receipt_owned_code_uses_no_reflection_or_string_selected_access() -> None:
+    """Enforce K's recorded source invariant independently of behavior.
+
+    This is deliberately a source-contract adversary: the K ruling names
+    direct serializers and no reflection, so a passing behavioral suite alone
+    cannot establish it.  The test reports every direct getattr/hasattr call,
+    including calls inside decorated definitions.
+    """
+
+    source_path = Path(__file__).parents[3] / "tpen" / "checkpoint" / "receipt.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    violations = [
+        f"{source_path}:{call.lineno}:{call.col_offset}: {call.func.id}"
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id in {"getattr", "hasattr"}
+    ]
+    assert violations == [], "reflection in K receipt-owned code: " + ", ".join(violations)
 
 
 def test_has_publication_receipt_true_only_for_a_matching_valid_row(tmp_path: Path) -> None:

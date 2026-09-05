@@ -182,19 +182,27 @@ class CheckpointPublished:
     def __post_init__(self) -> None:
         if self.file_count < 0:
             raise ValueError(f"file_count must be nonnegative, got {self.file_count}")
-        for name in ("payload_bytes", "metadata_bytes", "total_bytes"):
-            value = getattr(self, name)
-            if value < 0:
-                raise ValueError(f"{name} must be nonnegative, got {value}")
+        if self.payload_bytes < 0:
+            raise ValueError(f"payload_bytes must be nonnegative, got {self.payload_bytes}")
+        if self.metadata_bytes < 0:
+            raise ValueError(f"metadata_bytes must be nonnegative, got {self.metadata_bytes}")
+        if self.total_bytes < 0:
+            raise ValueError(f"total_bytes must be nonnegative, got {self.total_bytes}")
         if self.payload_bytes + self.metadata_bytes != self.total_bytes:
             raise ValueError(
                 "total_bytes must equal payload_bytes + metadata_bytes, got "
                 f"{self.total_bytes} != {self.payload_bytes} + {self.metadata_bytes}"
             )
-        for name in ("write_duration_sec", "publish_duration_sec"):
-            value = getattr(self, name)
-            if value is not None and value < 0:
-                raise ValueError(f"{name} must be nonnegative or None, got {value}")
+        if self.write_duration_sec is not None and self.write_duration_sec < 0:
+            raise ValueError(
+                "write_duration_sec must be nonnegative or None, got "
+                f"{self.write_duration_sec}"
+            )
+        if self.publish_duration_sec is not None and self.publish_duration_sec < 0:
+            raise ValueError(
+                "publish_duration_sec must be nonnegative or None, got "
+                f"{self.publish_duration_sec}"
+            )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable mapping of this scalar summary."""

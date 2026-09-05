@@ -200,6 +200,7 @@ def test_resource_usage_isolates_nonfinite_allocator_metric_at_terminal_boundary
         for line in context.profile_writer.path.read_text(encoding="utf-8").splitlines()
     ]
     assert [line["scope"] for line in profile_lines] == ["device", "process"]
+    assert "metrics" in profile_lines[0], "finite allocator siblings must survive in the device profile metrics"
     assert profile_lines[0]["metrics"] == {
         "allocated_mb_unavailable": True,
         "device_count": 2,
