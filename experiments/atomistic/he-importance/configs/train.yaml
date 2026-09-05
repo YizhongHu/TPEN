@@ -1,0 +1,266 @@
+# Helium-importance CONTROL training configuration.
+#
+# This file is the compliant counterpart to the frozen historical fixture at
+# `experiments/atomistic/he-v1/configs/train.yaml`. That file carries
+# `system.reference_energy` and is preserved as a record; this one declares the
+# closed HI train schema and therefore cannot carry a reference at all.
+#
+# THE REFERENCE LIVES IN `../manifests/evaluation.yaml` AND NOWHERE ELSE. It is
+# loaded by a separate process, after training is over. Nothing on the training
+# path reads that file, and `tests/unit/test_hi_reference_separation.py` asserts
+# the import separation rather than trusting it.
+#
+# Every value below is the literal control protocol. The scan varies producer
+# and path policy, channels, activations, embedding width and depth, the
+# feature update rule, and five initializations; those arms are materialized by
+# L2 from this file, so a value that an arm varies is a STARTING POINT here and
+# not a frozen coordinate. The frozen coordinates -- spatial dimension 3,
+# float64, Coulomb floor 0.0, one layer, body order 2, virtual support 2,
+# vectorized kernels, no global gradient clip -- are enforced by the schema and
+# a change here would be refused before construction.
+
+schema: tpen.hi.train.v1
+
+experiment:
+  name: tpen_he_importance
+  sector: atomistic
+  run_name: tpen_he_importance_control
+
+run:
+  root: experiments/atomistic/he-importance/outputs
+  # EXPLICIT ON PURPOSE, and the schema refuses null. `generate_run_id` ends in
+  # `uuid4().hex[:6]`, so a null run id is drawn independently by every process
+  # and each rank of a distributed launch would write to its own directory.
+  # L2 assigns the real per-row identifier; this is the control's.
+  run_id: he_importance_control_0001
+  dir: null
+  timezone: America/New_York
+
+runtime:
+  seed: 0
+  device: cuda
+  dtype: float64
+
+system:
+  id: he_atom
+  n_particles: 2
+  spatial_dim: 3
+  spin:
+    n_up: 1
+    n_down: 1
+  nuclei:
+    positions: [[0.0, 0.0, 0.0]]
+    charges: [2.0]
+
+atoms:
+  _target_: tpen.data.atomic_configuration.AtomicConfiguration
+  positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+
+runner:
+  _target_: tpen.runner.Train
+  model: ${model}
+  sampler: ${sampler}
+  hamiltonian_terms: ${hamiltonian_terms}
+  optimizer: ${optimizer}
+  trainer: ${trainer}
+
+model:
+  _target_: tpen.nn.TPENWaveFunction
+  trace_name: tpen
+  embedding:
+    _target_: tpen.nn.Embedding
+    max_order: 2
+    spatial_dim: ${system.spatial_dim}
+    # C1 = C2 = 32, each hidden width 128, one hidden layer (A4 balanced point,
+    # A7 first level). Both are scan coordinates; these are their control values.
+    out_channels: 32
+    hidden_channels: 128
+    num_hidden_layers: 1
+    include_spins: true
+  layers:
+    # ONE layer. Not a scan coordinate -- the schema refuses a second.
+    - _target_: tpen.nn.TPENLayer
+      mixing:
+        _target_: tpen.nn.EquivariantMixing
+        max_order: 2
+        max_virtual_order: 2
+        channels: 32
+        # The slow implementation is an oracle, not a scientific arm.
+        implementation: vectorized
+        initial_weight: 0.5
+        activation:
+          _target_: torch.nn.SiLU
+      path_aggregation:
+        _target_: tpen.nn.PathAggregation
+        max_order: 2
+        max_virtual_order: 2
+        channels: 32
+        activation:
+          _target_: torch.nn.SiLU
+      # A8 control level: x_next = x + u, with no normalization and no
+      # coordinate gate. Replacement and Gaussian-gated residual are the other
+      # two arms.
+      update:
+        _target_: tpen.nn.ResidualUpdater
+  factors:
+    # TRAINABILITY IS DECLARED, NEVER INHERITED, on every factor below. The
+    # schema requires the declaration because each of these defaults to the
+    # wrong value, and an inherited false is invisible: the parameter appears in
+    # neither named_parameters() nor state_dict(), so nothing logs it and no
+    # gradient touches it.
+    - _target_: tpen.nn.ElectronElectronCusp
+      trainable_range: true
+    - _target_: tpen.nn.ElectronNucleusCusp
+      atoms: ${atoms}
+      law:
+        _target_: tpen.nn.CurvatureElectronNucleusCuspLaw
+        # A11 control level (c, d) = (.01, 1). c is nonzero because at exactly
+        # c = 0 the gradient with respect to d is identically zero, so a
+        # defaults-instantiated trainable range cannot move on step one.
+        curvature_coefficient: 0.01
+        curvature_range: 1.0
+        trainable: true
+  readout:
+    _target_: tpen.nn.readout.PfaffianReadout
+    channels: 32
+    # Declared, and the class default is the OPPOSITE. Under the default the
+    # channel weights are a non-persistent buffer: absent from
+    # named_parameters(), absent from state_dict(), unlearnable and unlogged.
+    trainable: true
+
+hamiltonian_terms:
+  kinetic:
+    _target_: tpen.physics.kinetic.KineticEnergy
+  electron_nucleus:
+    _target_: tpen.physics.potential.ElectronNucleusPotential
+    atoms: ${atoms}
+    # Coulomb distance floor 0.0. A floor would mask the near-nucleus
+    # cancellation the local-energy qualification has to measure.
+    eps: 0.0
+  electron_electron:
+    _target_: tpen.physics.potential.ElectronElectronInteraction
+  nucleus_nucleus:
+    _target_: tpen.physics.potential.NucleusNucleusPotential
+    atoms: ${atoms}
+
+sampler:
+  _target_: tpen.sampling.metropolis.MetropolisSampler
+  n_walkers: 4096
+  burn_in: 100
+  n_steps: 10
+  proposal_scale: 0.5
+  seed: ${runtime.seed}
+  n_electrons: ${system.n_particles}
+  spatial_dim: ${system.spatial_dim}
+  n_up: ${system.spin.n_up}
+  n_down: ${system.spin.n_down}
+  nuclear_positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  nuclear_charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+  dtype: ${runtime.dtype}
+
+optimizer:
+  # Adam is the only ADMITTED method today. SR, KFAC, SPRING and the linear
+  # method are UNAVAILABLE, not absent, and the schema refuses a config naming
+  # one rather than silently substituting this block -- a substitution would let
+  # a run report that it compared a method it never ran.
+  _target_: torch.optim.Adam
+  _partial_: true
+  # lr and beta2 are the scanned coordinates; beta1, eps and weight decay are
+  # fixed for every cell and the schema checks them.
+  lr: 0.005
+
+trainer:
+  _target_: tpen.training.trainer.VMCTrainer
+  # The declared horizon is a stage parameter that L2 materializes per row.
+  # This is the control's value and is not itself a scientific decision.
+  max_steps: 100000
+  log_every_n_steps: 1
+  return_terms: true
+  # No global gradient clip. SR's and SPRING's squared update-norm bounds are
+  # parameter-coordinate-dependent protections and are a different thing; the
+  # schema refuses a non-null value here.
+  gradient_clip_norm: null
+
+callbacks:
+  # Every entry is on the schema's admitted allowlist, which means it carries no
+  # reference and reports no energy. Adding a callback here that does either
+  # requires changing tpen.hi_schema.ADMITTED_CALLBACK_TARGETS, which is the
+  # point: the change becomes visible in review instead of arriving silently.
+  - _target_: tpen.callback.ConfigSnapshot
+    output_path: ${run.dir}/config.yaml
+  - _target_: tpen.callback.ResolvedConfigSnapshot
+    output_path: ${run.dir}/resolved_config.yaml
+  - _target_: tpen.callback.Metadata
+    output_path: ${run.dir}/metadata.json
+  - _target_: tpen.callback.Status
+    output_path: ${run.dir}/status.json
+  - _target_: tpen.callback.DataIntegrity
+    every_n_steps: 1
+    fail_fast: true
+    max_nonfinite_energy_fraction: 0.0
+    max_nonfinite_logabs_fraction: 0.0
+    check_loss: true
+    check_wavefunction_output: true
+    check_batch: true
+    strict_sign_values: true
+  - _target_: tpen.callback.GradientStats
+    every_n_steps: 5
+    fail_fast: true
+    check_finite: true
+  - _target_: tpen.callback.SamplerHealth
+    every_n_steps: 5
+    fail_fast: false
+  - _target_: tpen.callback.FactorScalars
+    every_n_steps: 5
+    fail_fast: false
+  - _target_: tpen.callback.RuntimeEquivariance
+    every_n_steps: 5
+    probability: 1.0
+    fail_fast: true
+    artifact_dir: ${run.dir}/checks/equivariance
+    checkers:
+      - _target_: tpen.equivariance.checks.FullModelEquivarianceChecker
+        permutation_fraction: 1.0
+        max_permutations: 1
+        seed: ${runtime.seed}
+        atol: 1.0e-06
+        rtol: 1.0e-06
+      - _target_: tpen.equivariance.checks.TraceEquivarianceChecker
+        permutation_fraction: 1.0
+        max_permutations: 1
+        seed: ${runtime.seed}
+        compare_output: false
+        atol: 1.0e-06
+        rtol: 1.0e-06
+  - _target_: tpen.callback.Checkpoint
+    terminal: false
+    schedule:
+      _target_: tpen.checkpoint.EveryNUpdates
+      # Dense checkpoints at every 1000 completed updates. They are
+      # OBSERVATIONS, not decision points: which ones get evaluated is fixed
+      # before the run by the evaluation manifest, never chosen after seeing a
+      # result.
+      every_n: 1000
+    payload:
+      _target_: tpen.checkpoint.TrainResume
+    keep_last: null
+    output_dir: ${run.dir}/checkpoints
+  - _target_: tpen.callback.ResourceUsage
+    allocator_probe:
+      _target_: tpen.accelerator.TorchAllocatorPeakProbe
+      device: ${runtime.device}
+
+loggers:
+  - _target_: tpen.logging.CSV
+    path: ${run.dir}/metrics.csv
+  - _target_: tpen.logging.JSONL
+    path: ${run.dir}/metrics.jsonl

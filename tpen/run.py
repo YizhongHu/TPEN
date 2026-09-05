@@ -31,6 +31,7 @@ from tpen.callback import configure_terminal_logging
 from tpen.config import register_resolvers
 from tpen.dependencies import OptionalDependencyError, require_torch
 from tpen.events import Event as TypedEvent
+from tpen.hi_schema import validate_hi_train_config
 from tpen.run_events import RunCompleted, RunFailed, RunStarted
 from tpen.runner import Runner
 
@@ -219,6 +220,16 @@ def run_from_config(
     context: RunContext | None = None
     runner: Runner | None = None
     try:
+        # PRECONSTRUCTION FIREWALL. This is the first statement in the try on
+        # purpose: `prepare_run_context` below already creates the run
+        # directory and instantiates every logger and callback, so a check
+        # placed after it would be enforcing a rule against a run that had
+        # already begun to exist. Nothing above this line constructs anything,
+        # so a refusal here leaves no directory, no callback and no model.
+        #
+        # A configuration that declares no HI schema passes straight through --
+        # see `tpen.hi_schema` on why the firewall is opt-in.
+        validate_hi_train_config(cfg)
         context = prepare_run_context(cfg, config_path=config_path, command=command, bootstrap=bootstrap)
         _seed_runtime_rngs(context.cfg)
         context.emit(RunStarted())
