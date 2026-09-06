@@ -346,19 +346,34 @@ def test_a_disconnected_parameter_scores_exact_zero_instead_of_failing(chunk_siz
 
 
 def test_the_two_score_routes_agree_on_a_substituted_zero() -> None:
-    """Both implementations substitute, and they substitute the same thing.
+    """Both routes substitute, and they substitute BITWISE the same thing.
 
-    The slow route materializes one gradient per sample and the chunked route
-    uses batched VJPs. They are separate code paths, so a substitution added to
-    one and not the other would leave the seam silently route-dependent.
+    The slow route materializes one gradient per sample; the chunked route uses
+    batched VJPs. They accumulate in different orders, so their ORDINARY blocks
+    agree only to floating-point precision -- measured at 8.9e-16 on one block
+    of this model (Cannon job 44898289), which is float64 behaving normally and
+    not a defect. A SUBSTITUTED block is not a computed quantity at all, so it
+    must agree exactly, and separating the two claims is what makes this test
+    about the substitution rather than about summation order.
     """
 
     model = _build_model(InteractionMode.TENSOR_PRODUCT, readout=_UnusedPfaffianReadout())
     batch = _batch()
+    substituted = disconnected_parameter_names(model, batch)
+    assert substituted, "nothing was substituted, so this test would assert nothing"
+
+    names_by_identity = {id(parameter): name for name, parameter in model.named_parameters()}
     slow = model(batch, request=MaterializedParameterScoreRequest()).parameter_scores
     chunked = model(batch, request=MaterializedParameterScoreRequest(chunk_size=2)).parameter_scores
-    for slow_block, chunked_block in zip(slow.blocks, chunked.blocks, strict=True):
-        torch.testing.assert_close(slow_block, chunked_block, rtol=0.0, atol=0.0)
+    for parameter, slow_block, chunked_block in zip(
+        model.parameter_binding.parameters, slow.blocks, chunked.blocks, strict=True
+    ):
+        name = names_by_identity[id(parameter)]
+        if name in substituted:
+            assert torch.equal(slow_block, chunked_block), f"{name} substituted differently per route"
+            assert int(torch.count_nonzero(slow_block)) == 0
+        else:
+            torch.testing.assert_close(slow_block, chunked_block, rtol=1.0e-12, atol=1.0e-12)
 
 
 def test_the_zeroed_parameter_log_names_them_and_fires_once(

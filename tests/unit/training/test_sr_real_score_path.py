@@ -311,7 +311,16 @@ def test_euclidean_limit_on_real_scores_matches_the_real_objective_gradient() ->
     for parameter in model.parameters():
         parameter.grad = None
 
-    method = _method(model, relative=1.0e10)
+    # The Euclidean limit is APPROACHED, not attained: with a uniform damping
+    # shift lambda the direction deviates from the plain gradient by order
+    # ||S||/lambda, and lambda = relative * trace(S) / P, so the relative
+    # deviation is bounded by roughly P / relative. This fixture has P = 2156,
+    # so the previous relative=1e10 left ~2e-7 -- measured at 1.1e-6, and the
+    # reason this assertion failed once the model grew. Raising `relative`
+    # SHARPENS the limit being asserted; loosening the tolerance below would
+    # have weakened it. At 1e13 the predicted bound is ~2e-10, well inside the
+    # 1e-8 asserted here.
+    method = _method(model, relative=1.0e13)
     method.update(_score_input(model, batch, packet, energies))
     direction = _flat_gradients(model)
 
