@@ -7,10 +7,13 @@ checkpoint round trip, and that a declined step no longer looks to the trainer
 like a disconnected loss.
 
 The model is a real `TPENWaveFunction` driven through the real score-request
-provider, not a stub that could agree with a wrong contract.  It is NOT the
-tiny Hooke model the existing trainer smoke uses, and the reason is a genuine
-blocker rather than a convenience: see
-`test_score_seam_blocks_sr_on_a_two_electron_tpen_model`, which pins it.
+provider, not a stub that could agree with a wrong contract.  Most of these
+tests use a THREE-electron model, which keeps the odd-electron Pfaffian path in
+the loop; the two-electron Hooke fixture -- the shape of the helium target -- is
+driven end to end by
+`test_sr_trains_a_two_electron_tpen_model_through_the_trainer` at the bottom.
+That test used to assert the opposite, because the score seam refused any even
+electron count outright.
 """
 
 from __future__ import annotations
@@ -32,10 +35,12 @@ from tpen.training.update import (
     VMCUpdateResult,
 )
 from tests.helpers.hooke_models import (
+    INACTIVE_PAIR_PARAMETERS,
     build_tiny_hamiltonian_terms,
     build_tiny_sampler,
     build_tiny_spenn,
 )
+from tests.helpers.score_reachability import disconnected_parameter_names
 from tests.unit.nn.test_tpen_wavefunction_parameter_scores import _build_model
 from tests.unit.training.test_vmc_trainer_tpen_smoke import _StubContext
 from tpen.data.batch import ElectronBatch
@@ -47,13 +52,12 @@ LEARNING_RATE = 1.0e-3
 def build_connected_model():
     """Build a real TPENWaveFunction whose parameters are ALL score-connected.
 
-    `build_tiny_spenn()` is the obvious model to use here and cannot be: 16 of
-    its 39 parameters are structurally inactive at its 2-electron count, so the
-    score provider refuses the whole request. That is a real blocker, pinned by
-    `test_score_seam_blocks_sr_on_a_two_electron_tpen_model`, and it belongs to
-    the score seam rather than to this method. Using a model whose parameters
-    are all reachable keeps THIS file testing the SR integration rather than
-    re-testing that blocker.
+    Three electrons, so the odd-electron Pfaffian padding block is present and
+    every parameter is autograd-reachable. That WAS a workaround -- the seam
+    refused even counts outright -- and is now a deliberate choice: with no
+    substituted zeros anywhere in the packet, a failure in these tests is a
+    failure of the SR integration and cannot be a failure of the substitution.
+    The two-electron fixture is covered separately at the bottom of this file.
 
     It is still a genuine `TPENWaveFunction` driven through the genuine score
     provider, not a stub that could agree with a wrong contract.
@@ -459,88 +463,67 @@ def test_score_methods_declare_a_request_and_legacy_does_not() -> None:
     assert _sr_method(model).forward_request() is not None
 
 
-def test_score_seam_blocks_sr_on_a_two_electron_tpen_model() -> None:
-    """PINS A BLOCKER: the score seam refuses a 2-electron TPEN model outright.
+def test_sr_trains_a_two_electron_tpen_model_through_the_trainer() -> None:
+    """WAS A PINNED BLOCKER: SR now runs end to end on the helium-shaped fixture.
 
-    Measured on Cannon job 44572987: of the 39 trainable parameters in
-    `build_tiny_spenn()`, 16 are structurally disconnected from ``logabs`` at
-    its 2-electron count -- `stack.layers.0.mixing.weights.g0` through `g14`
-    and `stack.layers.0.path_aggregation.weights.o1`. The equivariant mixing
-    allocates a weight per tensor path, and at two electrons most of those
-    paths carry nothing, so autograd never reaches them.
+    This test previously required `VMCTrainer.fit` to RAISE. The score seam
+    passed ``allow_unused=False``, and 16 of this model's 39 parameters have no
+    autograd path into ``logabs`` at an even electron count, so the whole score
+    request failed and SR could not run on any two-electron system. Helium is
+    two electrons, so that was the blocker for the target programme.
 
-    `_slow_parameter_score_blocks` and `_chunked_parameter_score_blocks` both
-    pass ``allow_unused=False`` and convert the resulting RuntimeError into
-    "materialized parameter scores found an unused or disconnected parameter".
-    That guard is right about the case it was built for -- a parameter no code
-    path consumes, as in `_UnusedPfaffianReadout` -- but it cannot tell that
-    case apart from a parameter whose path is simply empty at this particle
-    count. So the whole score request fails and SR cannot run.
-
-    This is NOT a defect in the SR method, and it is not fixed here: the fix
-    belongs to whoever owns the score seam, and flipping ``allow_unused`` would
-    destroy the guard's real purpose. It matters beyond a test fixture because
-    helium is a two-electron system, so the target programme hits it.
-
-    The mathematically correct score for a structurally inactive parameter is
-    exactly zero, so a seam that distinguished "inactive for this system" from
-    "never consumed" could return zero blocks and SR would work unchanged.
-
-    This test asserts the CURRENT behaviour, so it fails loudly the moment the
-    seam is fixed -- at which point `build_connected_model` above can be
-    replaced by `build_tiny_spenn` and the restriction disappears.
+    The remaining risk after the fix is not a crash but a silent one: an update
+    that quietly moves the structurally inactive coordinates on damping or
+    solver noise. So completing the fit is only half of what is asserted. The
+    inactive parameters must be BITWISE unchanged, and something else must have
+    moved, or "unchanged" would be satisfied by an update that did nothing.
     """
 
     torch.manual_seed(0)
     model = build_tiny_spenn()
     method = _sr_method(model)
+    before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
 
-    with pytest.raises(RuntimeError, match="unused or disconnected"):
-        VMCTrainer(max_steps=1, update_method=method).fit(
-            model=model,
-            sampler=build_tiny_sampler(),
-            hamiltonian_terms=build_tiny_hamiltonian_terms(),
-            optimizer=method.optimizer,
-            context=_StubContext(),
-            emit=lambda **_: None,
-        )
+    VMCTrainer(max_steps=1, update_method=method).fit(
+        model=model,
+        sampler=build_tiny_sampler(),
+        hamiltonian_terms=build_tiny_hamiltonian_terms(),
+        optimizer=method.optimizer,
+        context=_StubContext(),
+        emit=lambda **_: None,
+    )
+
+    for name, parameter in model.named_parameters():
+        if name in INACTIVE_PAIR_PARAMETERS:
+            torch.testing.assert_close(parameter.detach(), before[name], rtol=0.0, atol=0.0)
+    moved = [
+        name
+        for name, parameter in model.named_parameters()
+        if not torch.equal(parameter.detach(), before[name])
+    ]
+    assert moved, "the fit completed but moved nothing, so the check above is vacuous"
 
 
-def test_the_blocked_model_is_blocked_only_by_disconnected_parameters() -> None:
-    """The blocker is exactly disconnection, not something else about the model.
+def test_the_pair_disconnection_is_exactly_the_order_one_output_weights() -> None:
+    """Name the cause, so the test above cannot keep passing for a new reason.
 
-    Without this, the test above would pass for any reason the model failed,
-    and would keep passing if the real cause changed. Counting the unreachable
-    parameters directly separates "structurally inactive at this particle
-    count" from a general breakage.
+    Without this, the test above would pass for any reason the fit happened to
+    succeed, and would go on passing if the substituted set silently grew to
+    swallow parameters that ought to be trained. Comparing the reachability
+    probe to a literal set owned by the fixture module names the cause directly.
+
+    The second half is the parity claim: the SAME architecture at an ODD count
+    has nothing disconnected, so this is not a property of the number two, and
+    the strict CI guard is correctly placed at odd n.
     """
 
     torch.manual_seed(0)
     model = build_tiny_spenn()
-    walkers, _ = build_tiny_sampler().collect_samples(model, device=torch.device("cpu"))
-    batch = walkers.make_batch()
-    parameters = model.parameter_binding.parameters
+    batch = build_tiny_sampler().collect_samples(model, device=torch.device("cpu"))[0].make_batch()
+    assert batch.n_electrons == 2
+    assert disconnected_parameter_names(model, batch) == INACTIVE_PAIR_PARAMETERS
 
-    with torch.enable_grad():
-        logabs = model(batch).logabs
-        grads = torch.autograd.grad(logabs.sum(), parameters, allow_unused=True)
-
-    unreachable = [
-        slot.ordinal
-        for slot, grad in zip(model.parameter_binding.layout.slots, grads, strict=True)
-        if grad is None
-    ]
-
-    assert unreachable, "the blocker is disconnection; if none is found it is fixed"
-    assert len(unreachable) < len(parameters), "some parameters must still be reachable"
-    # The connected model used by every other test in this file must NOT be
-    # subject to the same blocker, or those tests prove nothing.
     connected = build_connected_model()
     connected_batch = _FixedSampler().collect_samples(connected, device=None)[0].make_batch()
-    with torch.enable_grad():
-        connected_grads = torch.autograd.grad(
-            connected(connected_batch).logabs.sum(),
-            connected.parameter_binding.parameters,
-            allow_unused=True,
-        )
-    assert all(grad is not None for grad in connected_grads)
+    assert connected_batch.n_electrons % 2 == 1
+    assert disconnected_parameter_names(connected, connected_batch) == frozenset()

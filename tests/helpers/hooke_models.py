@@ -19,6 +19,24 @@ from tpen.sampling.metropolis import MetropolisSampler
 
 PAIR_TRAIN_CONFIG = Path(__file__).resolve().parents[1] / "integration" / "artifacts" / "hooke" / "pair_train.yaml"
 
+# The order-1-OUTPUT path weights of the one-layer pair fixture: 16 of its 39
+# trainable parameters. Order-1 features reach ``logabs`` ONLY through the
+# odd-electron Pfaffian padding block
+# (`tpen.nn.readout.pfaffian._odd_padding_block`), so at an EVEN electron count
+# that whole subtree dead-ends at the readout and autograd never reaches it.
+#
+# The set is PARITY- and DEPTH-dependent, not a property of "two electrons":
+# an odd count connects it, and a second layer would reconnect layer 0's copy.
+# Any reasoning keyed to ``n == 2`` is wrong for that reason.
+#
+# Spelled out as a literal and owned by the module that owns the fixture.
+# Deriving it from the model would re-apply the same reachability reasoning the
+# score seam applies, and would then agree with itself for any value.
+INACTIVE_PAIR_PARAMETERS = frozenset(
+    [f"stack.layers.0.mixing.weights.g{index}" for index in range(15)]
+    + ["stack.layers.0.path_aggregation.weights.o1"]
+)
+
 
 def _config() -> OmegaConf:
     return OmegaConf.load(PAIR_TRAIN_CONFIG)

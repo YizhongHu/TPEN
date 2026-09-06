@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from collections import OrderedDict
 from dataclasses import replace
+from typing import NamedTuple
 
 from tpen.data.batch import (
     CoordinateForwardPacket,
@@ -29,6 +31,8 @@ from tpen.nn.tpen_stack import TPENStack
 
 torch = require_torch(feature="TPEN wavefunction modules")
 nn = require_torch_nn(feature="TPEN wavefunction modules")
+
+_LOGGER = logging.getLogger("tpen")
 
 
 class TPENWaveFunction(EquivariantMap):
@@ -122,6 +126,10 @@ class TPENWaveFunction(EquivariantMap):
         # been registered.  The tuple order is PyTorch's deterministic module
         # traversal order, and the binding is refreshed by model-owned casts.
         self._parameter_binding = self._make_parameter_binding()
+        # Latch for the once-per-instance score-inactive parameter log below.
+        # A plain bool, so it is neither a parameter nor a buffer and never
+        # reaches ``state_dict``.
+        self._logged_zeroed_score_parameters = False
 
     _LAYOUT_STATE_KEY = "_tpen_layout_fingerprint"
 
@@ -318,19 +326,57 @@ class TPENWaveFunction(EquivariantMap):
             if not output.logabs.requires_grad:
                 raise RuntimeError("parameter score request requires a differentiable logabs output")
             if request.chunk_size is None:
-                blocks = _slow_parameter_score_blocks(output.logabs, binding.parameters)
+                result = _slow_parameter_score_blocks(output.logabs, binding.parameters)
             else:
-                blocks = _chunked_parameter_score_blocks(
+                result = _chunked_parameter_score_blocks(
                     output.logabs,
                     binding.parameters,
                     chunk_size=request.chunk_size,
                 )
-        scores = MaterializedParameterLogScores(layout=binding.layout, blocks=blocks)
+        self._log_zeroed_score_parameters(result.zeroed_ordinals)
+        scores = MaterializedParameterLogScores(layout=binding.layout, blocks=result.blocks)
         return ParameterScoreForwardPacket(
             output=_detach_wavefunction_output(output),
             parameter_scores=scores,
         )
 
+
+    def _log_zeroed_score_parameters(self, zeroed_ordinals: frozenset[int]) -> None:
+        """Name the score-inactive parameters once per model instance.
+
+        :class:`~tpen.data.batch.ParameterBinding` deliberately stores no names,
+        module-member paths, or reconstruction metadata, so the score blocks can
+        only report ORDINALS. Resolving those back to names belongs here, the
+        one place that both owns the binding and can call
+        ``named_parameters()``; identity is the join key, because a name lookup
+        by value would be ambiguous between tied or equal parameters.
+
+        Emitted once, on the first request that substitutes any zero: which
+        parameters are structurally inactive is a property of the architecture
+        and the particle count, so repeating it per optimizer step would flood a
+        run log with an invariant fact.
+
+        Parameters
+        ----------
+        zeroed_ordinals : frozenset of int
+            Layout ordinals for which autograd reported no path into ``logabs``.
+            An empty set is not logged and does not consume the latch.
+        """
+
+        if self._logged_zeroed_score_parameters or not zeroed_ordinals:
+            return
+        self._logged_zeroed_score_parameters = True
+        bound = self._parameter_binding.parameters
+        names_by_identity = {id(parameter): name for name, parameter in self.named_parameters()}
+        names = tuple(
+            names_by_identity.get(id(bound[ordinal]), f"<unnamed ordinal {ordinal}>")
+            for ordinal in sorted(zeroed_ordinals)
+        )
+        _LOGGER.info(
+            "parameter scores substituted exact zeros for %d structurally inactive parameter(s): %s",
+            len(names),
+            ", ".join(names),
+        )
 
     def factorized_local_energy_input(self, batch: ElectronBatch) -> FactorizedLocalEnergyInput:
         """Return the regular output and analytic data for local-energy evaluation.
@@ -391,19 +437,53 @@ def _detach_wavefunction_output(output: WavefunctionOutput) -> WavefunctionOutpu
     )
 
 
+class _ScoreBlockResult(NamedTuple):
+    """Carry score blocks alongside the ordinals autograd could not reach.
+
+    The two fields answer two DIFFERENT questions and must not be collapsed
+    into one. ``blocks`` is what the score consumer needs; a zero column in it
+    may be a computed zero or a substituted one, and nothing in the values
+    distinguishes them. ``zeroed_ordinals`` records only the substituted case --
+    autograd returning ``None``, meaning no path from the parameter into
+    ``logabs`` exists at all. A parameter whose gradient genuinely evaluates to
+    zero is absent from this set.
+
+    Parameters
+    ----------
+    blocks : tuple of torch.Tensor
+        One block per layout slot, shaped ``sample_shape + parameter.shape``.
+    zeroed_ordinals : frozenset of int
+        Layout ordinals whose blocks are substituted exact zeros.
+    """
+
+    blocks: tuple[torch.Tensor, ...]
+    zeroed_ordinals: frozenset[int]
+
+
 def _slow_parameter_score_blocks(
     logabs: torch.Tensor,
     parameters: tuple[nn.Parameter, ...],
-) -> tuple[torch.Tensor, ...]:
-    """Materialize one ordinary autograd gradient per flattened sample."""
+) -> _ScoreBlockResult:
+    """Materialize one ordinary autograd gradient per flattened sample.
+
+    A parameter with no path into ``logabs`` receives exact zeros rather than
+    failing the whole request: zero IS its score, so the numerics are unchanged
+    by construction. See `_ScoreBlockResult` for why the substitution is
+    reported separately from the values it produces.
+    """
 
     sample_shape = tuple(logabs.shape)
     values = logabs.reshape(-1)
     if values.numel() == 0:
-        return tuple(
-            logabs.new_empty(sample_shape + tuple(parameter.shape)) for parameter in parameters
+        # No autograd call is made, so nothing can have been substituted.
+        return _ScoreBlockResult(
+            blocks=tuple(
+                logabs.new_empty(sample_shape + tuple(parameter.shape)) for parameter in parameters
+            ),
+            zeroed_ordinals=frozenset(),
         )
     gradients = [[] for _ in parameters]
+    zeroed_ordinals: set[int] = set()
     for sample_index, value in enumerate(values):
         try:
             sample_gradients = torch.autograd.grad(
@@ -411,17 +491,32 @@ def _slow_parameter_score_blocks(
                 parameters,
                 retain_graph=sample_index + 1 < values.numel(),
                 create_graph=False,
-                allow_unused=False,
+                allow_unused=True,
             )
         except RuntimeError as exc:
+            # Retained deliberately. ``allow_unused=True`` no longer routes a
+            # disconnected parameter here, but any other autograd RuntimeError
+            # still must surface under this contract's wording.
             raise RuntimeError(
                 "materialized parameter scores found an unused or disconnected parameter"
             ) from exc
-        for parameter_gradients, sample_gradient in zip(gradients, sample_gradients):
+        for ordinal, (parameter, parameter_gradients, sample_gradient) in enumerate(
+            zip(parameters, gradients, sample_gradients, strict=True)
+        ):
+            if sample_gradient is None:
+                # Union across samples: structural disconnection is the same on
+                # every sample, so a per-sample disagreement would mean a
+                # data-dependent graph, and reporting the ordinal is then the
+                # conservative record. The substituted value stays exact either way.
+                zeroed_ordinals.add(ordinal)
+                sample_gradient = parameter.new_zeros(parameter.shape)
             parameter_gradients.append(sample_gradient)
-    return tuple(
-        torch.stack(parameter_gradients).reshape(sample_shape + tuple(parameter.shape))
-        for parameter_gradients, parameter in zip(gradients, parameters)
+    return _ScoreBlockResult(
+        blocks=tuple(
+            torch.stack(parameter_gradients).reshape(sample_shape + tuple(parameter.shape))
+            for parameter_gradients, parameter in zip(gradients, parameters)
+        ),
+        zeroed_ordinals=frozenset(zeroed_ordinals),
     )
 
 
@@ -430,16 +525,26 @@ def _chunked_parameter_score_blocks(
     parameters: tuple[nn.Parameter, ...],
     *,
     chunk_size: int,
-) -> tuple[torch.Tensor, ...]:
-    """Materialize score blocks using batched vector-Jacobian products."""
+) -> _ScoreBlockResult:
+    """Materialize score blocks using batched vector-Jacobian products.
+
+    Applies the same exact-zero substitution as
+    `_slow_parameter_score_blocks`, one chunk-shaped zero block at a time, so
+    the two implementations agree on both the values and the reported ordinals.
+    """
 
     sample_shape = tuple(logabs.shape)
     values = logabs.reshape(-1)
     if values.numel() == 0:
-        return tuple(
-            logabs.new_empty(sample_shape + tuple(parameter.shape)) for parameter in parameters
+        # No autograd call is made, so nothing can have been substituted.
+        return _ScoreBlockResult(
+            blocks=tuple(
+                logabs.new_empty(sample_shape + tuple(parameter.shape)) for parameter in parameters
+            ),
+            zeroed_ordinals=frozenset(),
         )
     gradients = [[] for _ in parameters]
+    zeroed_ordinals: set[int] = set()
     for start in range(0, values.numel(), chunk_size):
         stop = min(start + chunk_size, values.numel())
         grad_outputs = values.new_zeros((stop - start, values.numel()))
@@ -453,18 +558,27 @@ def _chunked_parameter_score_blocks(
                 grad_outputs=grad_outputs,
                 retain_graph=stop < values.numel(),
                 create_graph=False,
-                allow_unused=False,
+                allow_unused=True,
                 is_grads_batched=True,
             )
         except RuntimeError as exc:
+            # Retained for the same reason as in the slow path above.
             raise RuntimeError(
                 "materialized parameter scores found an unused or disconnected parameter"
             ) from exc
-        for parameter_gradients, chunk_gradient in zip(gradients, chunk_gradients):
+        for ordinal, (parameter, parameter_gradients, chunk_gradient) in enumerate(
+            zip(parameters, gradients, chunk_gradients, strict=True)
+        ):
+            if chunk_gradient is None:
+                zeroed_ordinals.add(ordinal)
+                chunk_gradient = parameter.new_zeros((stop - start, *parameter.shape))
             parameter_gradients.append(chunk_gradient)
-    return tuple(
-        torch.cat(parameter_gradients, dim=0).reshape(sample_shape + tuple(parameter.shape))
-        for parameter_gradients, parameter in zip(gradients, parameters)
+    return _ScoreBlockResult(
+        blocks=tuple(
+            torch.cat(parameter_gradients, dim=0).reshape(sample_shape + tuple(parameter.shape))
+            for parameter_gradients, parameter in zip(gradients, parameters)
+        ),
+        zeroed_ordinals=frozenset(zeroed_ordinals),
     )
 
 
