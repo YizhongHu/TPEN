@@ -351,3 +351,232 @@ def test_a_g2_global_zero_finite_count_refuses_before_backward(tmp_path: Path) -
         assert observed["optimizer_state_empty"] is True, (
             f"rank {rank} advanced optimizer state despite refusing"
         )
+
+
+# --- A-G3 / A-G3b -----------------------------------------------------------
+
+
+def _run_phase(world_size: int, tmp_path: Path, checkpoint_root: Path, *extra: str) -> tuple:
+    """Run one resume phase as its OWN harness invocation.
+
+    Separate invocations are the point of the gate: every process is genuinely
+    torn down between phases. An in-process reload would be a much weaker claim
+    than the contract makes, and would pass even if nothing were persisted.
+    """
+
+    result = run_gloo_subprocess_group(
+        world_size=world_size,
+        fault_plan=None,
+        bounds=_BOUNDS,
+        tmp_path=tmp_path,
+        worker_module=WORKER_MODULE,
+        worker_extra_args=["--scenario", "resume", "--checkpoint-root", str(checkpoint_root), *extra],
+    )
+    invocation = Path(result.invocation_dir)
+    states = []
+    for rank in range(world_size):
+        state_path = invocation / f"state_{rank}.json"
+        assert state_path.exists(), f"rank {rank} wrote no state; exit_codes={result.exit_codes}"
+        states.append(json.loads(state_path.read_text()))
+    return result, states
+
+
+def test_a_g3_teardown_and_resume_equals_continuous(tmp_path: Path) -> None:
+    """A-G3: K+L continuous == K, checkpoint, tear down ALL processes, restore, L.
+
+    EXACTLY, not approximately: the same arithmetic in the same order on the same
+    inputs must reproduce bit-identical parameters and optimizer momentum. A
+    tolerance here would hide precisely the kind of partial restore this gate
+    exists to catch.
+    """
+
+    _require_capabilities()
+    world_size = 2
+    k, ell = 2, 3
+
+    continuous_root = tmp_path / "ckpt-continuous"
+    split_root = tmp_path / "ckpt-split"
+
+    _, continuous = _run_phase(
+        world_size, tmp_path, continuous_root,
+        "--phase", "continuous", "--k", str(k), "--l", str(ell),
+    )
+    _, first = _run_phase(
+        world_size, tmp_path, split_root,
+        "--phase", "first-half", "--k", str(k), "--l", str(ell),
+    )
+    _, second = _run_phase(
+        world_size, tmp_path, split_root,
+        "--phase", "second-half", "--k", str(k), "--l", str(ell),
+    )
+
+    for label, states in (("continuous", continuous), ("first", first), ("second", second)):
+        for rank, state in enumerate(states):
+            assert state["ok"], f"{label} rank {rank} failed: {state.get('failure_message')}"
+
+    for rank in range(world_size):
+        assert second[rank]["result"]["completed_updates_restored"] == k, (
+            f"rank {rank} restored the wrong update counter"
+        )
+        # Canonical model state carries NO `module.` prefix: the keys are the raw
+        # semantic module's, not the wrapper's.
+        keys = second[rank]["result"]["canonical_model_keys"]
+        assert keys and not any(key.startswith("module.") for key in keys), (
+            f"rank {rank} canonical keys carry a wrapper prefix: {keys}"
+        )
+        # Rank-local sampler state must come back RANK-DISTINCT, not broadcast.
+        walkers = second[rank]["result"]["sampler_walkers"]
+        assert walkers == [rank * 100.0 + i for i in range(4)], (
+            f"rank {rank} restored walkers {walkers}, which are not its own"
+        )
+        assert second[rank]["result"]["sampler_proposal_count"] == 7 + rank
+
+        assert second[rank]["result"]["parameters"] == continuous[rank]["result"]["parameters"], (
+            f"rank {rank}: resumed parameters differ from the continuous run"
+        )
+        assert (
+            second[rank]["result"]["optimizer_momentum"]
+            == continuous[rank]["result"]["optimizer_momentum"]
+        ), f"rank {rank}: resumed optimizer momentum differs from the continuous run"
+
+
+def test_a_g3b_perturbing_one_rank_sidecar_makes_resume_fail(tmp_path: Path) -> None:
+    """A-G3b: the resume must FAIL when one rank's sampler shard is perturbed.
+
+    Non-vacuity for A-G3. The perturbation is verified to have actually changed
+    the bytes before the reload is attempted -- a no-op edit would make this arm
+    pass while demonstrating nothing.
+    """
+
+    _require_capabilities()
+    world_size = 2
+    root = tmp_path / "ckpt-perturbed"
+
+    _run_phase(world_size, tmp_path, root, "--phase", "first-half", "--k", "2", "--l", "3")
+
+    sidecar = root / "generations" / "gen-000001" / "sidecars" / "rank-00001.json"
+    assert sidecar.exists(), "the published generation must contain rank 1's sidecar"
+    before = sidecar.read_bytes()
+    payload = json.loads(before)
+    payload["sampler_state"]["proposal_count"] = 999999
+    sidecar.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    assert sidecar.read_bytes() != before, "the perturbation must actually change the bytes"
+
+    _, states = _run_phase(world_size, tmp_path, root, "--phase", "second-half", "--k", "2", "--l", "3")
+
+    # Rank 1 must refuse. Fail-closed on a digest mismatch is a STRONGER outcome
+    # than a silently different result, and it is what the store implements.
+    assert states[1]["ok"] is False, "rank 1 accepted a perturbed sidecar"
+    assert states[1]["failure_type"] == "CheckpointCorrupt", (
+        f"rank 1 failed for the wrong reason: {states[1].get('failure_type')} "
+        f"{states[1].get('failure_message')}"
+    )
+
+
+# --- A-G5 -------------------------------------------------------------------
+
+
+def test_a_g5_failed_shard_writer_leaves_no_selectable_generation(tmp_path: Path) -> None:
+    """A-G5: a rank dying mid-save must leave NO selectable COMPLETE generation.
+
+    Checked from the PARENT against the filesystem, not from a worker's report: a
+    worker that died cannot testify, and the claim is about what a later reader
+    would find on disk.
+    """
+
+    _require_capabilities()
+    world_size = 2
+    root = tmp_path / "ckpt-failed-writer"
+
+    result = run_gloo_subprocess_group(
+        world_size=world_size,
+        fault_plan=None,
+        bounds=_BOUNDS,
+        tmp_path=tmp_path,
+        worker_module=WORKER_MODULE,
+        worker_extra_args=[
+            "--scenario", "publication", "--checkpoint-root", str(root), "--failure-rank", "1",
+        ],
+    )
+
+    # The failure must be visible in the process exit codes, separately from any
+    # scheduler or harness status.
+    assert result.exit_codes[1] not in (0, None), (
+        f"rank 1 was supposed to die during save; exit_codes={result.exit_codes}"
+    )
+    assert result.all_reaped, "the harness must leave no survivor even on this path"
+
+    published = root / "generations"
+    selectable = []
+    if published.exists():
+        selectable = [
+            p.name for p in published.iterdir() if (p / "COMPLETE").exists()
+        ]
+    assert selectable == [], (
+        f"a failed shard writer left a selectable generation: {selectable}"
+    )
+    # And the marker must not be lurking in staging either, since a reader that
+    # globbed one level up would then find it.
+    staged_complete = list((root / "staging").rglob("COMPLETE")) if (root / "staging").exists() else []
+    assert staged_complete == [], f"a COMPLETE marker survives in staging: {staged_complete}"
+
+
+# --- A-G6 -------------------------------------------------------------------
+
+
+def test_a_g6_reduction_count_does_not_grow_with_sampling(tmp_path: Path) -> None:
+    """A-G6: gradient reductions per update do not grow with MCMC proposal count.
+
+    MEASURED at two different step counts, not asserted by inspection. The count
+    is also required to be NONZERO: a counter reading zero under both workloads
+    would satisfy "does not grow" vacuously, which is exactly what this gate is
+    for.
+    """
+
+    _require_capabilities()
+    world_size = 2
+
+    def reductions_at(mcmc_steps: int) -> list[dict]:
+        result = run_gloo_subprocess_group(
+            world_size=world_size,
+            fault_plan=None,
+            bounds=_BOUNDS,
+            tmp_path=tmp_path,
+            worker_module=WORKER_MODULE,
+            worker_extra_args=["--scenario", "comm-count", "--mcmc-steps", str(mcmc_steps)],
+        )
+        invocation = Path(result.invocation_dir)
+        states = [
+            json.loads((invocation / f"state_{rank}.json").read_text())
+            for rank in range(world_size)
+        ]
+        for rank, state in enumerate(states):
+            assert state["ok"], f"rank {rank} failed: {state.get('failure_message')}"
+        return [state["result"] for state in states]
+
+    short = reductions_at(1)
+    long = reductions_at(5)
+
+    for rank in range(world_size):
+        # Sampling alone performs NO gradient collectives.
+        assert short[rank]["reductions_after_sampling_only"] == 0
+        assert long[rank]["reductions_after_sampling_only"] == 0
+        # The raw-module work actually happened, so the zero above is meaningful.
+        assert long[rank]["raw_forwards"] > short[rank]["raw_forwards"], (
+            "the long workload must genuinely do more sampling work"
+        )
+        # Non-vacuity: the counter must be able to count.
+        assert short[rank]["reductions_after_one_update"] > 0, (
+            "zero reductions under both workloads would satisfy this gate vacuously"
+        )
+        assert (
+            short[rank]["reductions_after_one_update"]
+            == long[rank]["reductions_after_one_update"]
+        ), (
+            f"rank {rank}: reductions grew with MCMC steps "
+            f"({short[rank]['reductions_after_one_update']} -> "
+            f"{long[rank]['reductions_after_one_update']})"
+        )
+        assert long[rank]["prepared_forwards"] == 1, (
+            "exactly one prepared forward per update, regardless of sampling work"
+        )
