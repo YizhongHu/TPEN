@@ -85,14 +85,17 @@ def test_tensor_blocks_cover_the_parameter_layout_once() -> None:
 
 @pytest.mark.parametrize(
     ("solve_dtype", "rtol", "atol"),
-    # Cannon job 44953824 measured a maximum float32 absolute error of
-    # 1.63e-4 against the float64 NumPy oracle; 2e-4 retains a small margin.
     [(torch.float64, 1.0e-11, 1.0e-11), (torch.float32, 2.0e-4, 2.0e-4)],
 )
-def test_three_electron_blocks_match_independent_numpy_oracle(
+def test_three_electron_block_ng_float64_oracle_and_float32_sentinels(
     solve_dtype: torch.dtype, rtol: float, atol: float
 ) -> None:
-    """Each real TPEN tensor block equals its independent NumPy dense solve."""
+    """Check float64 correctness and frozen-fixture float32 sentinels.
+
+    The float32 arm is not an oracle-equivalence claim.  Its all-block error
+    sentinels are specific to this frozen fixture; changing its seeds, sample
+    count, damping, or width invalidates them and requires re-measurement.
+    """
 
     model = _connected_model()
     batch = _batch()
@@ -107,32 +110,71 @@ def test_three_electron_blocks_match_independent_numpy_oracle(
     )
 
     assert method.update(_input(model, batch, packet, energies)).applied
-    for before_block, parameter, score_block in zip(
-        before, model.parameters(), packet.parameter_scores.blocks, strict=True
-    ):
-        expected = _numpy_block_oracle(
-            score_block.detach().numpy().reshape(6, -1), energies.numpy(), damping
+    # Build reference and observed pairings independently by slot ordinal. A
+    # same-shape block permutation must therefore disagree with its owner.
+    scores_by_ordinal = {
+        slot.ordinal: block
+        for slot, block in zip(
+            packet.parameter_scores.layout.slots,
+            packet.parameter_scores.blocks,
+            strict=True,
         )
-        actual = (before_block - parameter.detach()).numpy().reshape(-1)
-        np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol)
+    }
+    updates_by_ordinal = {
+        slot.ordinal: (before[slot.ordinal] - tuple(model.parameters())[slot.ordinal].detach())
+        for slot in model.parameter_binding.layout.slots
+    }
+    absolute_errors = []
+    relative_errors = []
+    for slot in model.parameter_binding.layout.slots:
+        expected = _numpy_block_oracle(
+            scores_by_ordinal[slot.ordinal].detach().numpy().reshape(6, -1),
+            energies.numpy(),
+            damping,
+        )
+        actual = updates_by_ordinal[slot.ordinal].numpy().reshape(-1)
+        if solve_dtype == torch.float64:
+            np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol)
+        else:
+            error = np.abs(actual - expected)
+            absolute_errors.append(float(error.max()))
+            relative_errors.append(
+                float(
+                    np.divide(
+                        error,
+                        np.abs(expected),
+                        out=np.zeros_like(error),
+                        where=np.abs(expected) > 0.0,
+                    ).max()
+                )
+            )
+    if solve_dtype == torch.float32:
+        # Measured independently across ALL blocks: max abs lives in a P=4
+        # block, while max relative lives in a different P=32 block.
+        assert max(absolute_errors) <= 1.664e-4
+        assert max(relative_errors) <= 8.93e-3
     assert method.last_telemetry is not None
     assert method.last_telemetry.solve_dtype == str(solve_dtype)
 
 
-def test_zero_score_dead_tensor_has_an_exactly_zero_direction() -> None:
-    """A dead tensor stays still rather than receiving damping-amplified noise."""
+def test_zero_score_column_stays_exactly_zero_with_a_live_block_direction() -> None:
+    """A dead coordinate is zero while its tensor's live route exercises the solve."""
 
     scores = (
-        torch.tensor([[1.0], [2.0], [4.0], [8.0]], dtype=torch.float64),
-        torch.zeros((4, 3), dtype=torch.float64),
+        torch.tensor(
+            [[1.0, 0.0], [2.0, 0.0], [4.0, 0.0], [8.0, 0.0]], dtype=torch.float64
+        ),
     )
     directions, gradients = build_block_ng_directions(
         scores,
         torch.tensor([2.0, -1.0, 3.0, 0.5], dtype=torch.float64),
         damping=1.0e-2,
     )
-    assert torch.equal(gradients[1], torch.zeros_like(gradients[1]))
-    assert torch.equal(directions[1], torch.zeros_like(directions[1]))
+    assert torch.equal(gradients[0][1:], torch.zeros_like(gradients[0][1:]))
+    assert torch.equal(directions[0][1:], torch.zeros_like(directions[0][1:]))
+    # The first coordinate has a genuine Fisher solve, so replacing the whole
+    # method with gradient/damping cannot satisfy this fixture.
+    assert not torch.equal(directions[0][:1], gradients[0][:1] / 1.0e-2)
 
 
 def test_identical_block_builds_are_bitwise_deterministic() -> None:

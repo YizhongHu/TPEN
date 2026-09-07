@@ -254,7 +254,6 @@ def build_block_ng_directions(
     if n_samples < 2:
         raise ValueError("build_block_ng_directions requires at least two samples")
 
-    centered_energy = energies - energies.mean()
     directions = []
     gradients = []
     for block in score_blocks:
@@ -264,8 +263,9 @@ def build_block_ng_directions(
         if not bool(torch.isfinite(rows).all()):
             raise RuntimeError("Block-NG refuses non-finite score samples")
         centered_scores = rows - rows.mean(dim=0, keepdim=True)
-        # This is the real-VMC gradient convention used by compute_vmc_objective.
-        gradient = (2.0 / n_samples) * (centered_scores.transpose(0, 1) @ centered_energy)
+        # Sc.T @ 1 == 0, so explicitly centering energies is algebraically
+        # redundant: Sc.T @ (E - mean(E)) == Sc.T @ E.
+        gradient = (2.0 / n_samples) * (centered_scores.transpose(0, 1) @ energies)
         fisher = (centered_scores.transpose(0, 1) @ centered_scores) / n_samples
         eigenvalues, eigenvectors = torch.linalg.eigh(fisher)
         inverse = (eigenvalues + damping).reciprocal()
