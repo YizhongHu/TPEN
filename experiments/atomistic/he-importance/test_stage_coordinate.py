@@ -317,10 +317,11 @@ def test_seed_namespaces_encode_the_new_8_12_48_policy() -> None:
     assert all(0 < value < 2**63 for value in streams.values())
 
 
-def test_each_seed_label_has_pairwise_distinct_rng_streams() -> None:
-    namespaces = stage_coordinate.seed_namespaces("O1")
+@pytest.mark.parametrize("stage", ["O1", "R", "F"])
+def test_each_seed_label_has_pairwise_distinct_rng_streams(stage: str) -> None:
+    namespaces = stage_coordinate.seed_namespaces(stage)
     signatures = {tuple(streams.items()) for streams in namespaces.values()}
-    assert len(namespaces) == stage_coordinate.stage_definition("O1").seeds_per_point == 8
+    assert len(namespaces) == stage_coordinate.stage_definition(stage).seeds_per_point
     assert len(signatures) == len(namespaces)
 
 
@@ -339,7 +340,7 @@ def test_materialized_union_deduplicates_only_resolved_scientific_identity(tmp_p
     assert len({cell.output_path for cell in cells}) == 16
     assert all(cell.output_path.is_absolute() for cell in cells)
     assert all(
-        cell.manifest["payload"]["optimizer"] == {"method": "adam", "status": "available"}
+        cell.manifest["scientific_identity"]["optimizer_cell"] == {"method": "adam", "status": "available"}
         for cell in cells
     )
     with pytest.raises(TypeError):
@@ -382,7 +383,7 @@ def test_unavailable_optimizer_is_explicit_and_never_becomes_adam(tmp_path: Path
     )
     assert len(cells) == 8
     assert all(
-        cell.manifest["payload"]["optimizer"]
+        cell.manifest["scientific_identity"]["optimizer_cell"]
         == {
             "method": "linear_method",
             "status": "unavailable",
@@ -392,6 +393,32 @@ def test_unavailable_optimizer_is_explicit_and_never_becomes_adam(tmp_path: Path
     )
     with pytest.raises(stage_coordinate.MaterializationError, match="need a reason"):
         stage_coordinate.OptimizerCell("linear_method", "unavailable")
+
+
+def test_l2a_content_screen_reaches_frozen_delegated_configuration(tmp_path: Path) -> None:
+    forbidden = {
+        "scientific_identity": MappingProxyType({"architecture": "control"}),
+        "payload": {
+            "updates": 50_000,
+            "nested": MappingProxyType({"values": (-2.903724377034119598,)}),
+        },
+    }
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match="reference energy"):
+        stage_coordinate.materialize_stage(
+            "O1", [forbidden], stage_coordinate.OptimizerCell("adam", "available"), tmp_path
+        )
+
+
+def test_l2b_closes_its_seed_identity_vocabulary() -> None:
+    manifest = {
+        "schema": stage_coordinate.TRAIN_MANIFEST_SCHEMA,
+        "stage": "O1",
+        "scientific_identity": {"architecture": "control"},
+        "seed_identity": {"stage": "O1", "label": 820_001, "namespace": "fresh-training", "rank": 0},
+        "payload": {"updates": 50_000, "configuration": {"updates": 50_000}},
+    }
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match="seed_identity keys mismatch"):
+        stage_coordinate.validate_materialized_manifest(manifest)
 
 
 def test_content_hash_is_canonical_and_rejects_nonfinite_values() -> None:
@@ -420,4 +447,5 @@ def test_real_hi_namespace_family_exposes_the_materialization_api() -> None:
     from tpen.hi.train import v1
 
     assert "materialize_stage" in v1.__all__
+    assert "validate_materialized_manifest" in v1.__all__
     assert v1.content_hash({"a": 1, "b": [2, 3]}) == stage_coordinate.content_hash({"a": 1, "b": [2, 3]})

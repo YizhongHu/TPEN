@@ -315,18 +315,20 @@ def materialize_stage(
                 raise MaterializationError("one scientific identity has conflicting resolved content")
             continue
         identities[identity_hash] = configuration
-        optimizer_payload = {"method": optimizer.method, "status": optimizer.status}
+        optimizer_identity = {"method": optimizer.method, "status": optimizer.status}
         if optimizer.reason is not None:
-            optimizer_payload["unavailable_reason"] = optimizer.reason
+            optimizer_identity["unavailable_reason"] = optimizer.reason
         for label in seed_labels(stage):
+            if not isinstance(payload.get("updates"), int):
+                raise MaterializationError("payload updates must be an integer")
             manifest = {
                 "schema": TRAIN_MANIFEST_SCHEMA,
                 "stage": stage,
-                "scientific_identity": dict(identity),
+                "scientific_identity": {**identity, "optimizer_cell": optimizer_identity},
                 "seed_identity": {"stage": stage, "label": label, "namespace": "fresh-training"},
-                "payload": {"configuration": dict(payload), "optimizer": optimizer_payload},
+                "payload": {"updates": payload["updates"], "configuration": dict(payload)},
             }
-            _validate_l2b_materialized_manifest(manifest)
+            validate_materialized_manifest(manifest)
             digest = content_hash(manifest)
             cells.append(
                 MaterializedCell(
@@ -339,20 +341,15 @@ def materialize_stage(
     return tuple(cells)
 
 
-def _validate_l2b_materialized_manifest(manifest: Mapping[str, Any]) -> None:
-    """Validate L2b-owned structure without closing caller-owned subtrees.
+def validate_materialized_manifest(manifest: Mapping[str, Any]) -> None:
+    """Validate the L2b materializer interface on top of L2a's firewall.
 
-    L2a closes its own fixture schema.  The scientific identity and payload
-    configuration mappings are deliberately delegated because their legal keys
-    are caller-owned; L2b owns and closes the seed-identity vocabulary.
+    L2a's train validator owns structural sanity and reference-content screening
+    at every depth. Scientific identity and payload configuration keys remain
+    caller-owned; L2b owns and closes only seed identity.
     """
 
-    _require_exact_keys(manifest, _TRAIN_KEYS, "materialized manifest")
-    if manifest["schema"] != TRAIN_MANIFEST_SCHEMA or not isinstance(manifest["stage"], str):
-        raise MaterializationError("materialized manifest has an invalid common coordinate")
-    stage_definition(manifest["stage"])
-    if not isinstance(manifest["scientific_identity"], Mapping):
-        raise MaterializationError("scientific_identity must be a mapping")
+    validate_train_manifest(manifest)
     _require_exact_keys(manifest["seed_identity"], _L2B_SEED_IDENTITY_KEYS, "seed_identity")
     if manifest["seed_identity"]["stage"] != manifest["stage"]:
         raise MaterializationError("seed identity stage does not match manifest stage")
@@ -360,11 +357,6 @@ def _validate_l2b_materialized_manifest(manifest: Mapping[str, Any]) -> None:
         raise MaterializationError("seed identity label is outside the stage namespace")
     if manifest["seed_identity"]["namespace"] != "fresh-training":
         raise MaterializationError("seed identity namespace is not declared")
-    if not isinstance(manifest["payload"], Mapping):
-        raise MaterializationError("payload must be a mapping")
-    _require_exact_keys(manifest["payload"], frozenset({"configuration", "optimizer"}), "payload")
-    if not isinstance(manifest["payload"]["configuration"], Mapping):
-        raise MaterializationError("payload configuration must be a mapping")
 
 
 def intended_configurations() -> tuple[Mapping[str, Any], ...]:

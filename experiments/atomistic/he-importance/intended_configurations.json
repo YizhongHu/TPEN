@@ -39,7 +39,7 @@
     "configurations": [
       {
         "scientific_identity": {"architecture": "control", "optimizer": "adam"},
-        "payload": {"final_horizon": "frozen-before-confirmation"}
+        "payload": {"updates": 50000, "final_horizon": "frozen-before-confirmation"}
       }
     ]
   }

@@ -20,6 +20,7 @@ materialize_stage = _coordinate.materialize_stage
 seed_labels = _coordinate.seed_labels
 seed_namespace = _coordinate.seed_namespace
 seed_namespaces = _coordinate.seed_namespaces
+validate_materialized_manifest = _coordinate.validate_materialized_manifest
 
 __all__ = [
     "MaterializationError",
@@ -33,4 +34,5 @@ __all__ = [
     "seed_labels",
     "seed_namespace",
     "seed_namespaces",
+    "validate_materialized_manifest",
 ]
