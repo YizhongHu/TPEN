@@ -25,8 +25,8 @@ def _train_manifest() -> dict[str, object]:
         "schema": stage_coordinate.TRAIN_MANIFEST_SCHEMA,
         "stage": "O1",
         "scientific_identity": {"architecture": "control", "optimizer": "adam"},
-        "seed_identity": {"stage_seed": 820001, "lineage": 0},
-        "payload": {"updates": 50_000},
+        "seed_identity": {"stage": "O1", "label": "000001", "namespace": "hi-v2"},
+        "payload": {"updates": 50_000, "configuration": {"model": ("control",)}},
     }
 
 
@@ -65,12 +65,15 @@ def test_all_35_transcribed_stage_fields_are_pinned_against_committed_authority(
 )
 def test_train_manifest_refuses_realized_falsifier_spellings_at_nested_levels(spelling: str) -> None:
     manifest = _train_manifest()
-    manifest["payload"] = {"updates": 50_000, spelling: -2.903724377034119598}
-    with pytest.raises(stage_coordinate.ManifestSchemaError, match="payload keys mismatch"):
+    manifest["payload"] = {
+        "updates": 50_000,
+        "configuration": MappingProxyType({"nested": ({spelling: -2.903724377034119598},)}),
+    }
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match="reference energy|forbidden train content"):
         stage_coordinate.validate_train_manifest(manifest)
 
 
-@pytest.mark.parametrize("container", ["scientific_identity", "seed_identity", "payload"])
+@pytest.mark.parametrize("container", ["payload"])
 def test_train_manifest_refuses_unknown_keys_at_every_nested_level(container: str) -> None:
     manifest = _train_manifest()
     nested = dict(manifest[container])
@@ -83,9 +86,8 @@ def test_train_manifest_refuses_unknown_keys_at_every_nested_level(container: st
 @pytest.mark.parametrize(
     ("container", "missing_key"),
     [
-        ("scientific_identity", "architecture"),
-        ("seed_identity", "lineage"),
         ("payload", "updates"),
+        ("payload", "configuration"),
     ],
 )
 def test_train_manifest_refuses_missing_keys_at_every_nested_level(
@@ -117,6 +119,32 @@ def test_train_manifest_accepts_mapping_proxies_at_each_enumerated_level() -> No
         }
     )
     stage_coordinate.validate_train_manifest(proxied)
+
+
+def test_delegated_subtrees_accept_l2b_vocabulary_without_closing_it() -> None:
+    manifest = _train_manifest()
+    manifest["scientific_identity"] = MappingProxyType({"caller_choice": ("A", "B")})
+    manifest["seed_identity"] = MappingProxyType({"stage": "O1", "label": "one", "namespace": "n"})
+    manifest["payload"] = {
+        "updates": 50_000,
+        "configuration": MappingProxyType({"caller_config": (MappingProxyType({"depth": 2}),)}),
+    }
+    stage_coordinate.validate_train_manifest(manifest)
+
+
+def test_delegated_subtrees_reject_non_string_keys_and_accuracy_content() -> None:
+    manifest = _train_manifest()
+    manifest["scientific_identity"] = MappingProxyType({1: "not structural"})
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match="keys must be strings"):
+        stage_coordinate.validate_train_manifest(manifest)
+
+    manifest = _train_manifest()
+    manifest["payload"] = {
+        "updates": 50_000,
+        "configuration": MappingProxyType({"nested": ({"accuracyBand": "forbidden"},)}),
+    }
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match="forbidden train content"):
+        stage_coordinate.validate_train_manifest(manifest)
 
 
 @pytest.mark.parametrize(
@@ -160,7 +188,7 @@ def test_evaluation_manifest_refuses_missing_keys_at_every_nested_level(containe
 @pytest.mark.parametrize("invalid_updates", [[50_000], (50_000,)])
 def test_train_manifest_refuses_list_and_tuple_payloads(invalid_updates: object) -> None:
     manifest = _train_manifest()
-    manifest["payload"] = {"updates": invalid_updates}
+    manifest["payload"] = {"updates": invalid_updates, "configuration": {}}
     with pytest.raises(stage_coordinate.ManifestSchemaError, match="updates must be int"):
         stage_coordinate.validate_train_manifest(manifest)
 
