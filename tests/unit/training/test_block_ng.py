@@ -151,9 +151,14 @@ def test_three_electron_block_ng_float64_oracle_and_float32_sentinels(
             )
     if solve_dtype == torch.float32:
         # Measured independently across ALL blocks: max abs lives in a P=4
-        # block, while max relative lives in a different P=32 block.
+        # block, while max relative lives in a different P=32 block. The
+        # full-precision relative measurement was 0.008931180836996507; 9e-3
+        # rounds upward with enough portability headroom while still rejecting
+        # the 0.01021 regression caused by removing energy centering.
+        # The absolute calibration was 1.663939e-4, so this bound also rounds
+        # upward rather than excluding its own observation.
         assert max(absolute_errors) <= 1.664e-4
-        assert max(relative_errors) <= 8.93e-3
+        assert max(relative_errors) <= 9.0e-3
     assert method.last_telemetry is not None
     assert method.last_telemetry.solve_dtype == str(solve_dtype)
 
