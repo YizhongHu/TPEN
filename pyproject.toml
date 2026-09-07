@@ -76,7 +76,10 @@ finite-difference = [
 # (verified: `uv sync --extra cpu --extra accelerate` resolves torch 2.12.0 from
 # the cpu index). Adding `accelerate` to the conflict set would be wrong — it is
 # complementary to those extras, not mutually exclusive with them — and routing
-# it to one index would force a device choice on every consumer.
+# it to one index would force a device choice on every consumer. This is an
+# instruction, not a mechanism: nothing enforces the pairing. Tracked with the
+# full analysis, the observed transitive pull, and why both obvious fixes are
+# worse, as Task Orchestrator item 62b636c6-bde3-4bc0-841c-4aa34db7136e.
 accelerate = [
   "accelerate",
 ]
