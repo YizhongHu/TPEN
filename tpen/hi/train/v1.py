@@ -12,10 +12,17 @@ _coordinate = import_module("experiments.atomistic.he-importance.stage_coordinat
 MaterializationError = _coordinate.MaterializationError
 MaterializedCell = _coordinate.MaterializedCell
 OptimizerCell = _coordinate.OptimizerCell
+CheckpointCadence = _coordinate.CheckpointCadence
+TrainingPacket = _coordinate.TrainingPacket
+RankingPacket = _coordinate.RankingPacket
+IndependentSamplerTestPacket = _coordinate.IndependentSamplerTestPacket
+PacketMaterialization = _coordinate.PacketMaterialization
+RankingStatistic = _coordinate.RankingStatistic
 canonical_json = _coordinate.canonical_json
 content_hash = _coordinate.content_hash
 intended_configurations = _coordinate.intended_configurations
 materialize_intended_configurations = _coordinate.materialize_intended_configurations
+materialize_job_packets = _coordinate.materialize_job_packets
 materialize_stage = _coordinate.materialize_stage
 seed_labels = _coordinate.seed_labels
 seed_namespace = _coordinate.seed_namespace
@@ -26,10 +33,17 @@ __all__ = [
     "MaterializationError",
     "MaterializedCell",
     "OptimizerCell",
+    "CheckpointCadence",
+    "TrainingPacket",
+    "RankingPacket",
+    "IndependentSamplerTestPacket",
+    "PacketMaterialization",
+    "RankingStatistic",
     "canonical_json",
     "content_hash",
     "intended_configurations",
     "materialize_intended_configurations",
+    "materialize_job_packets",
     "materialize_stage",
     "seed_labels",
     "seed_namespace",

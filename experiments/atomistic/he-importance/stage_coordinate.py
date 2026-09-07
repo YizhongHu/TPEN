@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -187,7 +188,7 @@ class CheckpointCadence:
 
 @dataclass(frozen=True)
 class TrainingPacket:
-    """One train job packet with no persisted evaluation callback."""
+    """One train packet; construction accepts no callback operation."""
 
     cell: MaterializedCell
     checkpoint_cadence: CheckpointCadence
@@ -196,12 +197,16 @@ class TrainingPacket:
 
 @dataclass(frozen=True)
 class RankingPacket:
-    """Cheap checkpoint ranking packet that is structurally unable to emit energy."""
+    """Cheap ranking packet with construction-time-only metric restrictions.
+
+    This describes packet construction, not the runtime behavior of an
+    evaluator. Runtime emission enforcement belongs to the evaluator layer.
+    """
 
     checkpoint_path: Path
     source_content_hash: str
     ranking_inputs: Mapping[str, Any]
-    emitted_metrics: tuple[str, ...]
+    emitted_metrics: tuple["RankingStatistic", ...]
     ddp_provenance: Mapping[str, Any]
 
 
@@ -222,6 +227,13 @@ class PacketMaterialization:
     train: tuple[TrainingPacket, ...]
     ranking: tuple[RankingPacket, ...]
     independent_sampler_test: tuple[IndependentSamplerTestPacket, ...]
+
+
+class RankingStatistic(Enum):
+    """The closed, non-energy statistics available to a ranking packet."""
+
+    LOGABS_VARIANCE = "logabs_variance"
+    ACCEPTANCE_RATE = "acceptance_rate"
 
 
 def canonical_json(value: Any) -> bytes:
@@ -428,11 +440,12 @@ def materialize_stage(
 def _immutable_packet_inputs(
     inputs: Mapping[str, Any], label: str, *, require_nonempty: bool = True
 ) -> Mapping[str, Any]:
-    """Freeze a non-empty packet input block before it is handed to a job."""
+    """Screen then freeze a packet input block before it is handed to a job."""
 
     if not isinstance(inputs, Mapping) or (require_nonempty and not inputs):
         requirement = "a non-empty mapping" if require_nonempty else "a mapping"
         raise MaterializationError(f"{label} must be {requirement}")
+    _refuse_packet_content(inputs, label)
     try:
         canonical_json(inputs)
     except MaterializationError as error:
@@ -446,17 +459,40 @@ def _checkpoint_path(cell: MaterializedCell, update: int) -> Path:
     return cell.output_path / "checkpoints" / f"update-{update:08d}"
 
 
-def _is_energy_metric(metric: str) -> bool:
-    """Recognize energy-bearing metric names without allowing spelling bypasses."""
+def _refuse_packet_content(value: Any, label: str) -> None:
+    """Refuse callable or reference-bearing values on train-side packet routes."""
 
-    return "energy" in _tokens(metric)
+    if callable(value):
+        raise MaterializationError(f"{label} cannot contain a callable")
+    if type(value) is float and value == _REFERENCE_ENERGY:
+        raise MaterializationError(f"{label} contains the evaluation reference energy")
+    if type(value) is str and value == _REFERENCE_ENERGY_TEXT:
+        raise MaterializationError(f"{label} contains the evaluation reference energy")
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise MaterializationError(f"{label} keys must be strings")
+            _refuse_packet_content(nested, f"{label}.{key}")
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, nested in enumerate(value):
+            _refuse_packet_content(nested, f"{label}[{index}]")
+
+
+def _validate_packet_cell(cell: MaterializedCell) -> StageDefinition:
+    """Validate the train artifact embedded wholesale in a train packet."""
+
+    _refuse_packet_content(cell.manifest, "cell manifest")
+    validate_materialized_manifest(cell.manifest)
+    if content_hash(cell.manifest) != cell.content_hash:
+        raise MaterializationError("cell content hash does not bind its manifest")
+    return stage_definition(cell.manifest["stage"])
 
 
 def materialize_job_packets(
     cells: Iterable[MaterializedCell],
     checkpoint_cadence: CheckpointCadence,
     ranking_inputs: Mapping[str, Any],
-    ranking_metrics: Iterable[str],
+    ranking_metrics: Iterable[RankingStatistic],
     independent_sampler_inputs: Mapping[str, Any],
     *,
     ddp_provenance: Mapping[str, Any],
@@ -466,7 +502,8 @@ def materialize_job_packets(
     The returned packets deliberately contain no scheduler, facility, device,
     or launch defaults. Those are operator-supplied execution concerns. DDP
     information is retained as provenance only and is not used to derive a
-    scientific identity, packet multiplicity, or start dependency.
+    scientific identity or packet multiplicity. This construction boundary
+    does not establish a cheap evaluator's runtime behavior.
     """
 
     frozen_ranking_inputs = _immutable_packet_inputs(ranking_inputs, "ranking inputs")
@@ -477,16 +514,19 @@ def materialize_job_packets(
         ddp_provenance, "DDP provenance", require_nonempty=False
     )
     metrics = tuple(ranking_metrics)
-    if not metrics or any(not isinstance(metric, str) or not metric for metric in metrics):
-        raise MaterializationError("ranking metrics must be non-empty strings")
-    if any(_is_energy_metric(metric) for metric in metrics):
-        raise MaterializationError("cheap ranking packets cannot emit energy")
+    if not metrics or any(type(metric) is not RankingStatistic for metric in metrics):
+        raise MaterializationError("ranking metrics must be RankingStatistic values")
 
     train: list[TrainingPacket] = []
     ranking: list[RankingPacket] = []
     independent_sampler_test: list[IndependentSamplerTestPacket] = []
     seen_cells: set[str] = set()
     for cell in cells:
+        stage = _validate_packet_cell(cell)
+        if stage.updates is None:
+            raise MaterializationError("packet stages require a fixed training horizon")
+        if any(update > stage.updates for update in checkpoint_cadence.selected_updates):
+            raise MaterializationError("selected checkpoints exceed the stage horizon")
         if cell.content_hash in seen_cells:
             raise MaterializationError("train cells must be unique by content identity")
         seen_cells.add(cell.content_hash)

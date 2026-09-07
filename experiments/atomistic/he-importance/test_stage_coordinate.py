@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from dataclasses import fields
 from pathlib import Path
 from types import MappingProxyType
 
@@ -560,6 +561,8 @@ def test_real_hi_namespace_family_exposes_the_materialization_api() -> None:
 
     assert "materialize_stage" in v1.__all__
     assert "validate_materialized_manifest" in v1.__all__
+    assert "materialize_job_packets" in v1.__all__
+    assert v1.RankingStatistic.LOGABS_VARIANCE.value == "logabs_variance"
     assert v1.content_hash({"a": 1, "b": [2, 3]}) == stage_coordinate.content_hash({"a": 1, "b": [2, 3]})
 
 
@@ -578,32 +581,55 @@ def test_job_packets_are_separate_and_checkpoint_cadence_is_science_input(tmp_pa
         _packet_source_cells(tmp_path),
         cadence,
         {"statistic": "logabs_variance"},
-        ("logabs_variance", "acceptance_rate"),
+        (
+            stage_coordinate.RankingStatistic.LOGABS_VARIANCE,
+            stage_coordinate.RankingStatistic.ACCEPTANCE_RATE,
+        ),
         {"walkers": 4_096, "burn_in_sweeps": 100},
         ddp_provenance={"launcher": "operator-supplied"},
     )
 
-    assert len(packets.train) == 8
-    assert len(packets.ranking) == 16
-    assert len(packets.independent_sampler_test) == 16
-    assert all(not hasattr(packet, "callbacks") for packet in packets.train)
+    assert len(packets.train) == len(_packet_source_cells(tmp_path / "count"))
+    assert len(packets.ranking) == len(packets.train) * len(cadence.selected_updates)
+    assert len(packets.independent_sampler_test) == len(packets.ranking)
+    assert tuple(field.name for field in fields(stage_coordinate.TrainingPacket)) == (
+        "cell",
+        "checkpoint_cadence",
+        "ddp_provenance",
+    )
     assert cadence.science_parameters() == {
         "every_n_updates": 1_000,
         "selected_updates": (1_000, 2_000),
     }
-    assert {packet.checkpoint_path.name for packet in packets.ranking} == {
-        "update-00001000",
-        "update-00002000",
-    }
+    cell_paths = {packet.cell.content_hash: packet.cell.output_path for packet in packets.train}
+    for packet in (*packets.ranking, *packets.independent_sampler_test):
+        assert packet.checkpoint_path.parent.name == "checkpoints"
+        assert packet.checkpoint_path.parent.parent == cell_paths[packet.source_content_hash]
 
 
-def test_cheap_ranking_packet_rejects_energy_metrics(tmp_path: Path) -> None:
-    with pytest.raises(stage_coordinate.MaterializationError, match="cannot emit energy"):
+@pytest.mark.parametrize(
+    "metric",
+    [
+        "eloc",
+        "E_local",
+        "elocal",
+        "e_loc",
+        "localEnergy",
+        "variationalEnergy",
+        "energies",
+        "mean_E",
+        "E_var",
+        "E0",
+        "hamiltonian",
+    ],
+)
+def test_ranking_packet_refuses_untyped_energy_spellings(tmp_path: Path, metric: str) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="RankingStatistic"):
         stage_coordinate.materialize_job_packets(
             _packet_source_cells(tmp_path),
             stage_coordinate.CheckpointCadence(1_000, (1_000,)),
             {"statistic": "logabs_variance"},
-            ("local_energy",),
+            (metric,),  # type: ignore[arg-type]
             {"walkers": 4_096},
             ddp_provenance={"launcher": "operator-supplied"},
         )
@@ -614,7 +640,7 @@ def test_expensive_packet_receives_immutable_independent_sampler_inputs(tmp_path
         _packet_source_cells(tmp_path),
         stage_coordinate.CheckpointCadence(1_000, (1_000,)),
         {"statistic": "logabs_variance"},
-        ("logabs_variance",),
+        (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
         {"sampler": {"walkers": 4_096}, "burn_in_sweeps": 100},
         ddp_provenance={"launcher": "operator-supplied"},
     )
@@ -624,25 +650,105 @@ def test_expensive_packet_receives_immutable_independent_sampler_inputs(tmp_path
         inputs["sampler"]["walkers"] = 1  # type: ignore[index]
 
 
-def test_ddp_is_provenance_not_a_new_scientific_row(tmp_path: Path) -> None:
-    cells = _packet_source_cells(tmp_path)
+@pytest.mark.parametrize(
+    ("packet_route", "key"),
+    [
+        ("ranking", key)
+        for key in ("e0", "target", "E_exact", "benchmark", "gold", "threshold", "reference_energy", "energy")
+    ]
+    + [
+        ("independent", key)
+        for key in ("e0", "target", "E_exact", "benchmark", "gold", "threshold", "reference_energy", "energy")
+    ],
+)
+def test_job_inputs_refuse_reference_content_by_value(
+    tmp_path: Path, packet_route: str, key: str
+) -> None:
+    ranking_inputs = {"statistic": "logabs_variance"}
+    independent_inputs = {"walkers": 4_096}
+    (ranking_inputs if packet_route == "ranking" else independent_inputs)[key] = -2.903724377034119598
+    with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            ranking_inputs,
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            independent_inputs,
+            ddp_provenance={"launcher": "operator-supplied"},
+    )
+
+
+@pytest.mark.parametrize(
+    "key", ["e0", "target", "E_exact", "benchmark", "gold", "threshold", "reference_energy", "energy"]
+)
+def test_embedded_cell_manifest_refuses_reference_content(tmp_path: Path, key: str) -> None:
+    cell = _packet_source_cells(tmp_path)[0]
+    contaminated = stage_coordinate.MaterializedCell(
+        manifest={
+            **cell.manifest,
+            "scientific_identity": {**cell.manifest["scientific_identity"], key: -2.903724377034119598},
+        },
+        content_hash=cell.content_hash,
+        output_path=cell.output_path,
+        seed_streams=cell.seed_streams,
+    )
+    with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
+        stage_coordinate.materialize_job_packets(
+            (contaminated,),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"walkers": 4_096},
+            ddp_provenance={},
+        )
+
+
+def test_job_packet_refuses_callable_payload(tmp_path: Path) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="callable"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": lambda: None},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"walkers": 4_096},
+            ddp_provenance={},
+        )
+
+
+def test_packet_refuses_checkpoints_beyond_stage_horizon(tmp_path: Path) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="stage horizon"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (999_000_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"walkers": 4_096},
+            ddp_provenance={},
+        )
+
+
+def test_ddp_provenance_is_preserved_across_distinct_packet_arms(tmp_path: Path) -> None:
+    first_cells = _packet_source_cells(tmp_path / "first")
+    second_cells = _packet_source_cells(tmp_path / "second")
+    cadence = stage_coordinate.CheckpointCadence(1_000, (1_000,))
     first = stage_coordinate.materialize_job_packets(
-        cells,
-        stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+        first_cells,
+        cadence,
         {"statistic": "logabs_variance"},
-        ("logabs_variance",),
+        (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
         {"walkers": 4_096},
-        ddp_provenance={"world_size": 1},
+        ddp_provenance={"world_size": 1, "launcher": "first"},
     )
     second = stage_coordinate.materialize_job_packets(
-        cells,
-        stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+        second_cells,
+        cadence,
         {"statistic": "logabs_variance"},
-        ("logabs_variance",),
+        (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
         {"walkers": 4_096},
-        ddp_provenance={"world_size": 8},
+        ddp_provenance={"world_size": 8, "launcher": "second"},
     )
-    assert [packet.cell.content_hash for packet in first.train] == [
-        packet.cell.content_hash for packet in second.train
-    ]
-    assert len(first.ranking) == len(second.ranking)
+    assert [packet.cell.content_hash for packet in first.train] == [packet.cell.content_hash for packet in second.train]
+    for packet in (*first.train, *first.ranking, *first.independent_sampler_test):
+        assert packet.ddp_provenance == {"world_size": 1, "launcher": "first"}
+    for packet in (*second.train, *second.ranking, *second.independent_sampler_test):
+        assert packet.ddp_provenance == {"world_size": 8, "launcher": "second"}
