@@ -8,16 +8,26 @@ because only there is there anything to construct.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from omegaconf import OmegaConf
 
-from tpen.config_schema import ClosedSchemaError
+from tpen.config_schema import (
+    ClosedSchemaError,
+    iter_interpolations,
+    iter_nodes,
+    split_resolver,
+)
 from tpen.hi_schema import (
     ADMITTED_CALLBACK_TARGETS,
     ADMITTED_METHOD_TARGETS,
     HI_EXPERIMENT_NAME,
     HI_METHOD_ROSTER,
+    ADMITTED_UPDATE_METHOD_TARGETS,
+    HI_TRAIN_POLICY,
     HI_TRAIN_SCHEMA,
+    REFERENCE_MANIFEST_MODULE,
     canonical_train_identity,
     declared_schema,
     is_hi_family,
@@ -51,6 +61,36 @@ def _validate(cfg, env: dict[str, str] | None = None) -> None:
     """
 
     validate_hi_train_config(cfg, env={} if env is None else env)
+
+
+# Anchored to this file, not to the process working directory. The tests above
+# use bare relative paths, which pins them to being run from the repository
+# root; from anywhere else they read a different tree or none at all. Fixing
+# that everywhere is outside this slice, so the new cases below at least do not
+# add to it.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_CONTROL_CONFIG = _REPO_ROOT / "experiments/atomistic/he-importance/configs/train.yaml"
+
+
+def _control_with_literal_runner_copy(section: str):
+    """Load the control config and give ``runner.<section>`` its own copy.
+
+    The shipped config writes ``runner.model: ${model}``, so the runner's view
+    and the root are the same node and no divergence is expressible. Replacing
+    the interpolation with a literal copy of the resolved section is what makes
+    the two independently editable -- which is the shape the finding is about.
+
+    Returns
+    -------
+    tuple
+        ``(cfg, section_node)``, where mutating ``section_node`` leaves every
+        root field compliant.
+    """
+
+    cfg = OmegaConf.load(_CONTROL_CONFIG)
+    resolved = OmegaConf.to_container(cfg, resolve=True)
+    cfg.runner[section] = OmegaConf.create(resolved[section])
+    return cfg, cfg.runner[section]
 
 
 def _rules(error: ClosedSchemaError) -> set[str]:
@@ -292,6 +332,1345 @@ class TestForbiddenSurfaces:
             )
 
 
+class TestFrozenScalarsAreCheckedWhereTheyAreCONSUMED:
+    """A dotted rule checked where the value is DECLARED, not where it is used.
+
+    ``system.spatial_dim`` and ``runtime.dtype`` are the study's canonical
+    declarations, but components are built from ``model.embedding.spatial_dim``,
+    ``sampler.spatial_dim`` and ``sampler.dtype``. The shipped config wires
+    those with interpolations, and nothing required it to.
+
+    MEASURED: with ``system.spatial_dim: 3`` left compliant, each of those three
+    consumption sites accepted a divergent value, and the model would have been
+    built in TWO dimensions. That is F5's own shape -- the schema validating
+    ROOT fields while what is actually constructed carries its own copy --
+    applied to a scalar instead of a component, which is the finding this slice
+    exists for.
+
+    FOUND BY THE AUTHOR while auditing what remained anchored after the reviewer
+    showed the class was still open twice over.
+    """
+
+    @pytest.mark.parametrize(
+        ("dotted", "value"),
+        [
+            ("model.embedding.spatial_dim", 2),
+            ("sampler.spatial_dim", 2),
+            ("sampler.dtype", "float32"),
+        ],
+    )
+    def test_a_divergent_value_at_a_consumption_site_is_refused(
+        self, dotted: str, value: object
+    ) -> None:
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        OmegaConf.update(cfg, dotted, value)
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert dotted in _paths(caught.value)
+
+    def test_the_canonical_declaration_is_still_checked(self) -> None:
+        """Non-regression: widening must not lose the case the rule had."""
+
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        cfg.system.spatial_dim = 2
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "system.spatial_dim" in _paths(caught.value)
+
+    def test_an_absent_coordinate_is_not_a_violation(self) -> None:
+        """Absence inherits a correct default; only a VALUE is refused.
+
+        A rule that refused the KEY rather than a value would refuse every
+        component that simply does not mention the coordinate.
+        """
+
+        _validate(_config(run={"run_id": "x"}, model={"embedding": {"out_channels": 32}}))
+
+    def test_the_shipped_config_declares_these_consistently(self) -> None:
+        """The over-restriction measurement, asserted rather than remembered.
+
+        This rule refuses a divergent ``spatial_dim`` or ``dtype`` ANYWHERE. It
+        is only defensible while every such node in a shipped config resolves to
+        the study value, so that is a test rather than a comment.
+        """
+
+        resolved = OmegaConf.to_container(OmegaConf.load(_CONTROL_CONFIG), resolve=True)
+        seen = {
+            path: value
+            for path, key, value in iter_nodes(resolved)
+            if key in ("spatial_dim", "dtype")
+        }
+        assert seen, "no frozen-scalar nodes found; this test would pass vacuously"
+        for path, value in seen.items():
+            assert value in (3, "float64"), (path, value)
+
+
+class TestTheTrainerRulesSurviveAFactoryWrapper:
+    """`trainer.update_method` and the policy were anchored to ``trainer``.
+
+    With the trainer written as a Hydra factory wrapper, the rules found nothing
+    on the wrapper and returned while the real spec sat one level down.
+
+    THE TRAP WORTH RECORDING is that this first LOOKED closed. The wrapper also
+    hid ``nonfinite_local_energy_policy``, so a DIFFERENT rule fired and the
+    config was refused for an unrelated reason. Restating the policy on the
+    wrapper removed that accident and an unadmitted
+    ``StochasticReconfigurationUpdate`` validated. **A refusal is only evidence
+    for the rule that produced it.**
+    """
+
+    SR = {"_target_": "tpen.training.sr.StochasticReconfigurationUpdate", "_partial_": True}
+    LEGACY = {"_target_": "tpen.training.update.LegacyAutogradUpdate", "_partial_": True}
+
+    def _wrapped_trainer(self, mutate, wrapper_extra=None):
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        trainer = OmegaConf.to_container(cfg.trainer, resolve=True)
+        mutate(trainer)
+        body = {"_target_": "hydra.utils.instantiate", "_recursive_": False, "config": trainer}
+        if wrapper_extra:
+            body.update(wrapper_extra)
+        cfg.trainer = OmegaConf.create(body)
+        return cfg
+
+    def test_an_unadmitted_update_rule_behind_the_wrapper_is_refused(self) -> None:
+        cfg = self._wrapped_trainer(
+            lambda tr: tr.__setitem__("update_method", self.SR),
+            {"nonfinite_local_energy_policy": "fail"},
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "unadmitted-update-method" in _rules(caught.value), (
+            "must be refused BY THE UPDATE-METHOD RULE; a refusal from any other "
+            "rule is the accident this test exists to rule out"
+        )
+
+    def test_an_admitted_update_rule_behind_the_wrapper_validates(self) -> None:
+        """The over-restriction control: the wrapper itself is admissible."""
+
+        _validate(
+            self._wrapped_trainer(
+                lambda tr: tr.__setitem__("update_method", self.LEGACY),
+                {"nonfinite_local_energy_policy": "fail"},
+            )
+        )
+
+    def test_an_inadmissible_policy_behind_the_wrapper_is_refused(self) -> None:
+        """The inner policy is what the constructed trainer uses."""
+
+        cfg = self._wrapped_trainer(
+            lambda tr: tr.__setitem__("nonfinite_local_energy_policy", "drop"),
+            {"nonfinite_local_energy_policy": "fail"},
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "undeclared-nonfinite-policy" in _rules(caught.value)
+
+    def test_an_omitted_policy_is_still_refused(self) -> None:
+        """Non-regression on the required-declaration half of that rule."""
+
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        del cfg.trainer.nonfinite_local_energy_policy
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "undeclared-nonfinite-policy" in _rules(caught.value)
+
+
+class TestTheReadoutRuleHasTwoNets:
+    """A path rule was escapable by INDIRECTION, so a shape net was added.
+
+    Hydra's own ``hydra.utils.instantiate`` can be a ``_target_``::
+
+        model:
+          _target_: hydra.utils.instantiate
+          _recursive_: false
+          config: { ...the real model, readout frozen... }
+
+    That constructs the same model with the whole subtree one level down, so
+    ``model.readout.trainable`` names nothing. MEASURED by an independent
+    verifier: this validated and constructed a real ``TPENWaveFunction`` whose
+    ``PfaffianReadout`` had ZERO parameters and forwarded finitely -- a run that
+    trains for its whole budget with a permanently frozen readout, which is the
+    exact he-v1 defect this rule exists to prevent.
+
+    THE DIAGNOSIS IS NARROWER THAN "BAN THE WRAPPER". Through the SAME wrapper
+    an unadmitted cusp law, a moved ``max_order``, an omitted non-finite policy
+    and an unadmitted optimizer were all still refused, because those rules
+    identify a thing by what it IS or by key at any depth. The indirection only
+    defeated the last rule that identified a thing by where it SITS.
+    """
+
+    def _wrapped(self, mutate=None):
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        model = OmegaConf.to_container(cfg.model, resolve=True)
+        if mutate is not None:
+            mutate(model)
+        cfg.model = OmegaConf.create(
+            {"_target_": "hydra.utils.instantiate", "_recursive_": False, "config": model}
+        )
+        return cfg
+
+    def test_a_frozen_readout_behind_the_indirection_is_refused(self) -> None:
+        cfg = self._wrapped(lambda m: m["readout"].__setitem__("trainable", False))
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "model.config.readout.trainable" in _paths(caught.value)
+
+    def test_an_omitted_declaration_behind_the_indirection_is_refused(self) -> None:
+        cfg = self._wrapped(lambda m: m["readout"].pop("trainable"))
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "undeclared-trainability" in _rules(caught.value)
+
+    def test_the_indirection_is_closed_by_DEPTH_not_by_target_matching(self) -> None:
+        """Attribution, pinned, because the obvious reading is wrong.
+
+        The wrapped readout still arrives under the key ``readout``, at
+        ``model.config.readout``. What closed the escape is the key net walking
+        the model subtree at ANY DEPTH -- not the shape net. A mutant removing
+        the shape net left the wrapped case refused and changed no behaviour on
+        that probe, which is how the misattribution was caught before it
+        shipped.
+
+        This test states the property the fix actually relies on, so a later
+        reader optimising the shape net away does not believe they are removing
+        what holds the indirection closed.
+        """
+
+        cfg = self._wrapped(lambda m: m["readout"].__setitem__("trainable", False))
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        offending = {r.path for r in caught.value.rejections if "trainab" in r.rule}
+        assert "model.config.readout.trainable" in offending
+        # The key is unchanged by the wrapper; only the DEPTH changed.
+        assert all(path.endswith(".readout.trainable") for path in offending), offending
+
+    def test_the_shape_net_catches_a_readout_under_another_key(self) -> None:
+        """The case only the SHAPE net catches, recorded with its real severity.
+
+        A ``PfaffianReadout`` under a key that is not ``readout`` is invisible to
+        the key net. This is a PRECONSTRUCTION gap rather than a live escape --
+        ``TPENWaveFunction`` takes ``**kwargs`` so the key is swallowed, and
+        ``readout`` is a required keyword, so moving the readout there fails at
+        construction. Closed anyway, for the reason F2's SR case was: "another
+        component happens to refuse it" is a property of today's constructors,
+        not a rule.
+
+        Without this arm the shape net is unguarded -- a mutant removing it
+        passes the whole suite, which is exactly what happened before this test
+        existed.
+        """
+
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        readout = OmegaConf.to_container(cfg.model.readout, resolve=True)
+        readout["trainable"] = False
+        OmegaConf.update(cfg, "model.head", readout, force_add=True)
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "model.head.trainable" in _paths(caught.value)
+
+    def test_a_compliant_model_behind_the_indirection_validates(self) -> None:
+        """The over-restriction control: refuse the FREEZE, not the wrapper.
+
+        Banning ``hydra.utils.instantiate`` outright would pass both red arms
+        above while forbidding a Hydra feature that, as measured, defeats none
+        of the shape-based rules.
+        """
+
+        _validate(self._wrapped())
+
+    def test_the_key_net_still_catches_a_readout_with_no_target(self) -> None:
+        """The net that was KEPT, and why keeping it was not sentimentality.
+
+        A readout written without a ``_target_`` matches no shape rule. Unlike a
+        Hamiltonian term -- which ``_validate_hamiltonian_term`` refuses loudly
+        for lacking a callable ``local_energy`` -- a bare readout mapping has no
+        comparably crisp construction-time backstop, so dropping the key net to
+        make the design uniform would have removed real coverage.
+        """
+
+        cfg = _config(model={"readout": {"channels": 32, "trainable": False}})
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "undeclared-trainability" in _rules(caught.value)
+
+    def test_one_readout_is_not_reported_twice_by_the_two_nets(self) -> None:
+        """The shipped readout matches BOTH nets; it must yield one finding.
+
+        Two rejections for one field read as two defects. De-duplication is by
+        PATH, so a genuinely second readout elsewhere is still reported.
+        """
+
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        cfg.model.readout.trainable = False
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        hits = [r for r in caught.value.rejections if r.path == "model.readout.trainable"]
+        assert len(hits) == 1, [r.path for r in caught.value.rejections]
+
+
+class TestHamiltonianTermsAreFoundByShapeNotByKey:
+    """The terms may be a Mapping OR a Sequence, and the keys are the author's.
+
+    ``normalize_hamiltonian_terms`` accepts either, and a sequence falls back to
+    snake-case class names. So a dotted rule on
+    ``hamiltonian_terms.electron_nucleus.eps`` checks a NAME the config author
+    was never obliged to use.
+
+    MEASURED BEFORE THE CHANGE: with ``eps: 0.01`` the mapping form spelled
+    ``electron_nucleus`` was correctly refused, while the same Hamiltonian
+    written as a SEQUENCE, or as a mapping keyed ``en``, VALIDATED. No
+    ``_args_``, no wrapper -- ordinary keyword configuration.
+
+    The floor is not cosmetic: a nonzero one masks the near-nucleus
+    cancellation the local-energy qualification has to measure.
+
+    FOUND BY THE AUTHOR, not by the reviewer, while auditing whether the
+    name-shaped CLASS was closed after four instances of it had been fixed. It
+    was not. That is the answer to the question, and it is recorded here rather
+    than in a commit message because the next person to add a dotted rule to
+    this module needs it.
+    """
+
+    def _terms(self, shape: str, eps: float):
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        terms = OmegaConf.to_container(cfg.hamiltonian_terms, resolve=True)
+        terms["electron_nucleus"]["eps"] = eps
+        if shape == "mapping":
+            cfg.hamiltonian_terms = OmegaConf.create(terms)
+        elif shape == "renamed":
+            terms["en"] = terms.pop("electron_nucleus")
+            cfg.hamiltonian_terms = OmegaConf.create(terms)
+        elif shape == "sequence":
+            cfg.hamiltonian_terms = OmegaConf.create(
+                [
+                    terms["kinetic"],
+                    terms["electron_nucleus"],
+                    terms["electron_electron"],
+                    terms["nucleus_nucleus"],
+                ]
+            )
+        else:  # pragma: no cover - guards a typo in a parametrization
+            raise AssertionError(shape)
+        return cfg
+
+    # Spelled out rather than derived from the rule, so narrowing the rule
+    # cannot silently remove the arm that proves the escape is closed.
+    SHAPES = ["mapping", "renamed", "sequence"]
+
+    @pytest.mark.parametrize("shape", SHAPES)
+    def test_a_nonzero_coulomb_floor_is_refused_in_any_shape(self, shape: str) -> None:
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(self._terms(shape, 0.01))
+        assert "frozen-coordinate" in _rules(caught.value)
+
+    @pytest.mark.parametrize("shape", SHAPES)
+    def test_the_study_floor_validates_in_any_shape(self, shape: str) -> None:
+        """The over-restriction control: refuse the VALUE, never the shape."""
+
+        _validate(self._terms(shape, 0.0))
+
+    @pytest.mark.parametrize(
+        ("shape", "expected_path"),
+        [
+            ("mapping", "hamiltonian_terms.electron_nucleus.eps"),
+            ("renamed", "hamiltonian_terms.en.eps"),
+            ("sequence", "hamiltonian_terms[1].eps"),
+        ],
+    )
+    def test_the_reported_path_names_where_the_term_actually_is(
+        self, shape: str, expected_path: str
+    ) -> None:
+        """A path assuming one shape points at nothing in the other two."""
+
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(self._terms(shape, 0.01))
+        assert expected_path in _paths(caught.value)
+
+    def test_an_omitted_floor_is_not_a_violation(self) -> None:
+        """Absence applies the constructor default, and that default IS 0.0.
+
+        Requiring the declaration would refuse configs that simply omit it,
+        which is the frozen-scalar precedent rather than the trainability one --
+        the distinction being whether the inherited value is the right one.
+        """
+
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        del cfg.hamiltonian_terms.electron_nucleus.eps
+        _validate(cfg)
+
+    def test_a_term_without_a_target_is_not_constructible_anyway(self) -> None:
+        """The NARROWING this change makes, stated and pinned rather than hidden.
+
+        The old dotted rule fired on any node at
+        ``hamiltonian_terms.electron_nucleus.eps``, including one with no
+        ``_target_``. The shape-based rule identifies a term by its target, so
+        such a node is no longer matched. That loses no real coverage, and this
+        asserts WHY rather than asking a reader to trust it:
+        ``normalize_hamiltonian_terms`` requires every term to expose a callable
+        ``local_energy``, so a bare mapping fails loudly at construction.
+
+        A narrowing justified by "the other layer catches it" is exactly the
+        claim this slice got wrong about transitive imports, so the other layer
+        is exercised here rather than cited.
+        """
+
+        pytest.importorskip("torch", reason="tpen.physics.hamiltonian imports torch")
+        from tpen.physics.hamiltonian import normalize_hamiltonian_terms
+
+        with pytest.raises(TypeError, match="local_energy"):
+            normalize_hamiltonian_terms({"electron_nucleus": {"eps": 1e-8}})
+
+    def test_the_electron_electron_floor_is_deliberately_unpinned(self) -> None:
+        """Scope control: this fixed an ESCAPE, it did not add a constraint.
+
+        ``ElectronElectronInteraction`` also takes ``eps`` and also defaults to
+        0.0, but no slice has pinned it and its own docstring records the
+        finite-eps electron-electron case as UNMEASURED. Pinning it here would
+        be a new scientific constraint smuggled in under a bug fix. If a later
+        slice decides to pin it, this test is the one to delete, and deleting it
+        should require saying why.
+        """
+
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        cfg.hamiltonian_terms.electron_electron.eps = 0.01
+        _validate(cfg)
+
+
+class TestFactorsAreFoundByShapeNotByContainer:
+    """A factor is what its ``_target_`` says, not where the config puts it.
+
+    Both factor rules used to read ``model.factors`` and return unless it was a
+    LIST. ``TPENWaveFunction`` accepts any iterable and normalizes it, so a
+    ``torch.nn.ModuleList`` block is a valid, constructible configuration in
+    which ``model.factors`` is a MAPPING -- and every factor rule skipped it.
+
+    MEASURED BEFORE THE CHANGE: an unadmitted ``CurvatureElectronNucleusCuspLaw``
+    and a frozen electron-electron factor both VALIDATED inside that wrapper,
+    with no ``_args_`` anywhere. This is the residual the `_args_` family
+    refusal did not reach: ordinary keyword configuration, existing public API.
+    """
+
+    OLD_LAW = "tpen.nn.CurvatureElectronNucleusCuspLaw"
+
+    def _with_factors(self, container: str, mutate=None):
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        factors = OmegaConf.to_container(cfg.model.factors, resolve=True)
+        if mutate is not None:
+            mutate(factors)
+        if container == "list":
+            cfg.model.factors = OmegaConf.create(factors)
+        elif container == "modulelist":
+            cfg.model.factors = OmegaConf.create(
+                {"_target_": "torch.nn.ModuleList", "modules": factors}
+            )
+        elif container == "nested":
+            cfg.model.factors = OmegaConf.create(
+                {
+                    "_target_": "torch.nn.ModuleList",
+                    "modules": {"_target_": "torch.nn.ModuleList", "modules": factors},
+                }
+            )
+        else:  # pragma: no cover - guards a typo in a parametrization
+            raise AssertionError(container)
+        return cfg
+
+    # The containers are SPELLED OUT rather than read from the schema, so a rule
+    # that stopped recognising one would remove the escape without removing the
+    # arm that proves it is closed.
+    CONTAINERS = ["list", "modulelist", "nested"]
+
+    @pytest.mark.parametrize("container", CONTAINERS)
+    def test_an_unadmitted_cusp_law_is_refused_in_any_container(self, container: str) -> None:
+        cfg = self._with_factors(
+            container, lambda f: f[1]["law"].__setitem__("_target_", self.OLD_LAW)
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "unadmitted-cusp-law" in _rules(caught.value)
+
+    @pytest.mark.parametrize("container", CONTAINERS)
+    def test_a_frozen_factor_is_refused_in_any_container(self, container: str) -> None:
+        cfg = self._with_factors(container, lambda f: f[0].__setitem__("trainable_range", False))
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "undeclared-trainability" in _rules(caught.value)
+
+    @pytest.mark.parametrize("container", CONTAINERS)
+    def test_a_compliant_configuration_validates_in_any_container(self, container: str) -> None:
+        """The over-restriction control, one arm per container.
+
+        The rule must refuse the DIVERGENCE, not the wrapper. Refusing
+        ``ModuleList`` outright would pass both red tests above while
+        forbidding a legitimate way to write the model.
+        """
+
+        _validate(self._with_factors(container))
+
+    def test_the_reported_path_names_where_the_factor_actually_IS(self) -> None:
+        """A path that assumes the list shape sends the reader to nothing.
+
+        The old rule hard-coded ``model.factors[i]``. Inside a wrapper the
+        factor lives at ``model.factors.modules[i]``, and a rejection naming the
+        first would point at a key that does not exist.
+        """
+
+        cfg = self._with_factors(
+            "modulelist", lambda f: f[1]["law"].__setitem__("_target_", self.OLD_LAW)
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "model.factors.modules[1].law._target_" in _paths(caught.value)
+
+    def test_a_factor_class_outside_the_model_is_not_given_a_factor_rule(self) -> None:
+        """Scoped to ``model``: a factor is a factor where the model is built.
+
+        The same class named in a diagnostic's arguments is not the model's
+        factor and carries no trainability contract. Without this the rule would
+        reach into unrelated sections and refuse them for missing a declaration
+        they never owed.
+        """
+
+        _validate(
+            _config(
+                run={"run_id": "x"},
+                sampler={
+                    "_target_": "tpen.sampling.metropolis.MetropolisSampler",
+                    "warmup_probe": {"_target_": "tpen.nn.ElectronElectronCusp"},
+                },
+            )
+        )
+
+
+class TestPositionalConstructionIsRefused:
+    """`_args_` builds the same components with no key for any rule to match.
+
+    Every component rule identifies what it judges by the KEY the component
+    hangs from. ``tpen.runner.Train`` takes
+    ``(model, sampler, hamiltonian_terms, optimizer, trainer)`` positionally, so
+    ``runner._args_`` constructs all five with an index instead of a name.
+
+    MEASURED BEFORE THE RULE EXISTED: all five divergences the component views
+    refuse by keyword were ACCEPTED when the same content was passed
+    positionally. This is the key-versus-value failure that produced the
+    target-allowlist gap, one level up.
+    """
+
+    def _positional_runner(self, mutate=None):
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        resolved = OmegaConf.to_container(cfg, resolve=True)
+        args = [
+            resolved["model"],
+            resolved["sampler"],
+            resolved["hamiltonian_terms"],
+            resolved["optimizer"],
+            resolved["trainer"],
+        ]
+        if mutate is not None:
+            mutate(args)
+        cfg.runner = OmegaConf.create({"_target_": "tpen.runner.Train", "_args_": args})
+        return cfg
+
+    def test_an_unmodified_positional_runner_is_refused(self) -> None:
+        """Refused even when it diverges in NO way.
+
+        This is the point of a family refusal: the schema cannot tell a benign
+        positional runner from a divergent one, because it cannot tell which
+        slot is which. Admitting the benign case would require exactly the
+        name-matching that positional construction removes.
+        """
+
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(self._positional_runner())
+        assert "positional-construction" in _rules(caught.value)
+        assert "runner._args_" in _paths(caught.value)
+
+    @pytest.mark.parametrize(
+        ("label", "mutate"),
+        [
+            ("frozen readout", lambda a: a[0]["readout"].__setitem__("trainable", False)),
+            ("global clip", lambda a: a[4].__setitem__("gradient_clip_norm", 1.0)),
+            ("omitted nonfinite policy", lambda a: a[4].pop("nonfinite_local_energy_policy")),
+            (
+                "old cusp law",
+                lambda a: a[0]["factors"][1]["law"].__setitem__(
+                    "_target_", "tpen.nn.CurvatureElectronNucleusCuspLaw"
+                ),
+            ),
+            ("unadmitted optimizer", lambda a: a[3].__setitem__("_target_", "torch.optim.SGD")),
+        ],
+    )
+    def test_every_divergence_that_escaped_positionally_is_now_refused(
+        self, label: str, mutate
+    ) -> None:
+        """One arm per divergence, each measured as ACCEPTED before the rule.
+
+        Read as a set these would be one assertion naming none of them; the
+        point of five arms is that a later narrowing of the rule says which
+        escape it reopened.
+        """
+
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(self._positional_runner(mutate))
+        assert "positional-construction" in _rules(caught.value), label
+
+    def test_positional_construction_is_refused_outside_the_runner_too(self) -> None:
+        """The weakness is path-shaped rules generally, not the runner section.
+
+        A readout passed positionally under ``model`` defeats
+        ``model.readout.trainable`` exactly as a trainer passed positionally
+        under ``runner`` defeats ``trainer.gradient_clip_norm``.
+        """
+
+        cfg = _config(
+            run={"run_id": "x"},
+            model={"_target_": "tpen.nn.TPENWaveFunction", "_args_": [{"channels": 32}]},
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "model._args_" in _paths(caught.value)
+
+    def test_the_shipped_configs_use_no_positional_construction(self) -> None:
+        """The over-restriction measurement, asserted rather than remembered.
+
+        The rule refuses a Hydra feature outright. That is only defensible while
+        nothing shipped uses it, so the claim is a test rather than a comment --
+        a comment would keep saying so after it stopped being true.
+        """
+
+        for path in sorted(_CONTROL_CONFIG.parent.glob("*.yaml")):
+            assert "_args_" not in path.read_text(encoding="utf-8"), path
+            _validate(OmegaConf.load(path))
+
+
+class TestTheGradientClipKnobIsCheckedByKey:
+    """Clipping is not owned by the trainer, so a dotted path cannot bound it.
+
+    ``LegacyAutogradUpdate.__init__`` takes ``gradient_clip_norm`` and is the
+    object that APPLIES it. An ``update_method`` block naming that admitted
+    class with a clip therefore clipped every update while
+    ``trainer.gradient_clip_norm`` sat compliantly at null -- the rule checked
+    the field the study happens to spell, not the knob.
+    """
+
+    def test_the_admitted_update_method_may_not_carry_a_clip(self) -> None:
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        cfg.trainer.update_method = OmegaConf.create(
+            {
+                "_target_": "tpen.training.update.LegacyAutogradUpdate",
+                "_partial_": True,
+                "gradient_clip_norm": 1.0,
+            }
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "trainer.update_method.gradient_clip_norm" in _paths(caught.value)
+
+    def test_the_canonical_trainer_path_is_still_refused(self) -> None:
+        """Non-regression: widening the rule must not lose the case it had."""
+
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        cfg.trainer.gradient_clip_norm = 2.0
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "trainer.gradient_clip_norm" in _paths(caught.value)
+
+    def test_an_explicit_null_clip_on_the_update_method_is_admitted(self) -> None:
+        """The over-restriction control: null and absent both say NO clipping.
+
+        The control config writes ``gradient_clip_norm: null`` deliberately, to
+        state the policy rather than inherit it. A rule that refused the KEY
+        rather than a VALUE would refuse the shipped config itself.
+        """
+
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        cfg.trainer.update_method = OmegaConf.create(
+            {
+                "_target_": "tpen.training.update.LegacyAutogradUpdate",
+                "_partial_": True,
+                "gradient_clip_norm": None,
+            }
+        )
+        _validate(cfg)
+
+    def test_an_interpolated_clip_is_reported_at_every_path_it_reaches(self) -> None:
+        """One CONFIGURED clip, two RESOLVED paths, and both are named.
+
+        The control writes ``runner.trainer: ${trainer}``, so the resolved tree
+        contains the field twice and the sweep reports it twice. That is the
+        honest behaviour, not a defect: when a runner carries a LITERAL copy
+        rather than an interpolation those are two independent fields, and a
+        rule that de-duplicated by value would name only one and send the reader
+        to the wrong place.
+
+        Written after asserting the opposite. The first version of this test
+        claimed one rejection, on the theory that sweeping whole-tree instead of
+        per-view removed a duplicate. It does not -- interpolation duplicates
+        the CONTENT, so both traversals see two -- and the docstring on
+        `_sweep_gradient_clip` was corrected with it.
+        """
+
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        cfg.trainer.gradient_clip_norm = 2.0
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        clips = {r.path for r in caught.value.rejections if r.path.endswith("gradient_clip_norm")}
+        assert clips == {"trainer.gradient_clip_norm", "runner.trainer.gradient_clip_norm"}
+
+
+class TestAdmittedUpdateMethods:
+    """The optimizer roster qualifies ``optimizer._target_`` and nothing else.
+
+    A configuration selects its update RULE at ``trainer.update_method`` and its
+    optimizer at ``optimizer``. Those are two surfaces and only the second was
+    qualified, so a config could name Adam -- admitted, roster-clean -- and an
+    unadmitted update rule beside it.
+
+    SEVERITY, RECORDED HONESTLY: the observed example is a PRECONSTRUCTION gap
+    rather than a successful unadmitted run, because SR with Adam is refused
+    later by the SR constructor. "Some other component happens to refuse it" is
+    a property of today's constructors and not a rule, which is why it is closed
+    here rather than left to them.
+    """
+
+    SR_UPDATE = "tpen.training.sr.StochasticReconfigurationUpdate"
+
+    def _trainer(self, **extra: object) -> dict[str, object]:
+        return {
+            "_target_": "tpen.training.trainer.VMCTrainer",
+            "nonfinite_local_energy_policy": "fail",
+            **extra,
+        }
+
+    def test_the_roster_and_the_update_allowlist_are_different_surfaces(self) -> None:
+        """Pins the SCOPE claim rather than the prose that states it.
+
+        A reader meeting ``ADMITTED_METHOD_TARGETS`` has to know it governs
+        optimizers only. Asserting the two sets are disjoint, and that SR's
+        update class is in neither, is what keeps that true if either set moves.
+        """
+
+        assert ADMITTED_METHOD_TARGETS.isdisjoint(ADMITTED_UPDATE_METHOD_TARGETS)
+        assert self.SR_UPDATE not in ADMITTED_METHOD_TARGETS
+        assert self.SR_UPDATE not in ADMITTED_UPDATE_METHOD_TARGETS
+
+    def test_rejects_an_unadmitted_update_rule_beside_an_admitted_optimizer(self) -> None:
+        """The finding's exact shape: the roster passes and the rule does not."""
+
+        cfg = _config(
+            run={"run_id": "x"},
+            trainer=self._trainer(update_method={"_target_": self.SR_UPDATE, "_partial_": True}),
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "unadmitted-update-method" in _rules(caught.value)
+        assert "unadmitted-method" not in _rules(caught.value), (
+            "the optimizer roster must NOT have fired -- Adam is admitted. If it did, "
+            "this arm is measuring the wrong rule"
+        )
+        assert "trainer.update_method._target_" in _paths(caught.value)
+
+    def test_the_refusal_states_what_the_roster_says(self) -> None:
+        cfg = _config(
+            run={"run_id": "x"},
+            trainer=self._trainer(update_method={"_target_": self.SR_UPDATE}),
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        detail = " ".join(r.detail for r in caught.value.rejections)
+        assert "EXCLUDED from the helium-importance scan" in detail
+        assert "optimizer._target_ only" in detail
+
+    def test_rejects_an_update_method_that_declares_no_target(self) -> None:
+        cfg = _config(
+            run={"run_id": "x"},
+            trainer=self._trainer(update_method={"damping": 0.001}),
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "trainer.update_method._target_" in _paths(caught.value)
+
+    def test_rejects_an_update_method_that_is_not_a_config_block(self) -> None:
+        cfg = _config(run={"run_id": "x"}, trainer=self._trainer(update_method="sr"))
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "trainer.update_method" in _paths(caught.value)
+
+    def test_rejects_an_unadmitted_update_rule_in_the_runner_view(self) -> None:
+        """The two fixes compose: an unqualified rule under `runner` is caught."""
+
+        cfg, trainer = _control_with_literal_runner_copy("trainer")
+        trainer.update_method = OmegaConf.create({"_target_": self.SR_UPDATE})
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "runner.trainer.update_method._target_" in _paths(caught.value)
+
+    def test_an_omitted_update_method_is_admitted(self) -> None:
+        """What every shipped configuration does.
+
+        Absence resolves to `LegacyAutogradUpdate`, the plain optimizer step,
+        which IS the admitted Adam method. Requiring the declaration would
+        refuse the control config.
+        """
+
+        _validate(_config(run={"run_id": "x"}, trainer=self._trainer()))
+
+    def test_an_explicitly_null_update_method_is_admitted(self) -> None:
+        _validate(_config(run={"run_id": "x"}, trainer=self._trainer(update_method=None)))
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            # SPELLED OUT, NOT DRAWN FROM THE SET UNDER TEST. Parametrizing over
+            # `ADMITTED_UPDATE_METHOD_TARGETS` made the arms vary WITH the
+            # subject: removing a spelling from the allowlist removed the arm
+            # that would have caught it, and a mutant that dropped the alias
+            # left the whole suite green. The arms have to vary independently of
+            # the thing they measure or they measure nothing.
+            "tpen.training.update.LegacyAutogradUpdate",
+            "tpen.training.LegacyAutogradUpdate",
+        ],
+    )
+    def test_accepts_every_admitted_spelling(self, target: str) -> None:
+        """One arm per spelling, because `tpen.training` re-exports the class.
+
+        Hydra resolves either path to the same object, so an allowlist naming
+        one would refuse a configuration that is correct -- an over-restriction
+        that surfaces as a run that cannot start.
+        """
+
+        assert target in ADMITTED_UPDATE_METHOD_TARGETS
+        _validate(
+            _config(
+                run={"run_id": "x"},
+                trainer=self._trainer(update_method={"_target_": target, "_partial_": True}),
+            )
+        )
+
+    def test_the_admitted_spellings_name_the_same_class(self) -> None:
+        """Guards the allowlist against an entry that resolves nowhere.
+
+        Two strings in a set look equally valid; only importing them shows that
+        both name the class the trainer actually falls back to. Skipped where
+        torch is absent, because importing `tpen.training` needs it.
+        """
+
+        torch_backed = pytest.importorskip("tpen.training", reason="needs torch")
+        from importlib import import_module
+
+        resolved = set()
+        for target in ADMITTED_UPDATE_METHOD_TARGETS:
+            module_path, _, attribute = target.rpartition(".")
+            resolved.add(getattr(import_module(module_path), attribute))
+        assert len(resolved) == 1
+        assert resolved == {torch_backed.LegacyAutogradUpdate}
+
+
+class TestTheRunnerViewIsValidatedToo:
+    """What Hydra constructs is `cfg.runner`, and `instantiate` is recursive.
+
+    Every component rule reads a path from the configuration ROOT. A runner
+    section carrying its own literal copies was therefore accepted with a
+    frozen readout, a global gradient clip, an unadmitted cusp law and an
+    omitted non-finite policy, while every root field stayed compliant. This is
+    not a new class of rule failing -- it is the SAME rules, applied to what is
+    actually built.
+
+    THE PATH IS PART OF EACH ASSERTION. A finding reported at
+    ``trainer.gradient_clip_norm`` when the offending value is at
+    ``runner.trainer.gradient_clip_norm`` sends the reader to a compliant
+    field, and asserting only the rule name would not tell the two apart.
+    """
+
+    def test_the_control_config_still_validates(self) -> None:
+        """The over-restriction control, run FIRST because it is load-bearing.
+
+        The shipped config carries `runner.model: ${model}`, so every component
+        is now swept twice. If the second pass refused anything the real run
+        would not start.
+        """
+
+        _validate(OmegaConf.load(_CONTROL_CONFIG))
+
+    def test_a_runner_copy_may_still_equal_the_root(self) -> None:
+        """A literal copy that DIVERGES IN NO WAY is admissible.
+
+        Root-equality was the other candidate remedy and would also have passed
+        every red arm below, by refusing any runner section that is not the
+        root. This arm is what separates the two: it must pass under
+        component validation and would pass under equality as well, whereas
+        the next one distinguishes them.
+        """
+
+        cfg, _model = _control_with_literal_runner_copy("model")
+        _validate(cfg)
+
+    def test_a_runner_may_carry_a_component_the_root_does_not_spell(self) -> None:
+        """The divergence nobody cares about, which equality would refuse.
+
+        Adding an inert annotation to the runner's own copy leaves every rule
+        satisfied. Whole-config root-equality would reject it, and the failure
+        would arrive as a run that cannot start rather than as a red test --
+        which is why the ratified contract prefers closing over the components
+        actually constructed.
+        """
+
+        cfg, model = _control_with_literal_runner_copy("model")
+        model.trace_name = "tpen_runner_view"
+        _validate(cfg)
+
+    def test_a_frozen_readout_in_the_runner_copy_is_refused(self) -> None:
+        cfg, model = _control_with_literal_runner_copy("model")
+        model.readout.trainable = False
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "runner.model.readout.trainable" in _paths(caught.value)
+
+    def test_a_global_gradient_clip_in_the_runner_copy_is_refused(self) -> None:
+        cfg, trainer = _control_with_literal_runner_copy("trainer")
+        trainer.gradient_clip_norm = 1.0
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "runner.trainer.gradient_clip_norm" in _paths(caught.value)
+
+    def test_an_unadmitted_cusp_law_in_the_runner_copy_is_refused(self) -> None:
+        """A CONSTRUCTOR-VALID law: it builds fine and trains into a bad tail."""
+
+        cfg, model = _control_with_literal_runner_copy("model")
+        model.factors[1].law._target_ = "tpen.nn.CurvatureElectronNucleusCuspLaw"
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "runner.model.factors[1].law._target_" in _paths(caught.value)
+
+    def test_an_omitted_nonfinite_policy_in_the_runner_copy_is_refused(self) -> None:
+        """OMISSION, not a bad value: the inherited behaviour is to mask."""
+
+        cfg, trainer = _control_with_literal_runner_copy("trainer")
+        del trainer.nonfinite_local_energy_policy
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "runner.trainer.nonfinite_local_energy_policy" in _paths(caught.value)
+
+    def test_an_unadmitted_method_in_the_runner_copy_is_refused(self) -> None:
+        cfg, optimizer = _control_with_literal_runner_copy("optimizer")
+        optimizer._target_ = "tpen.training.sr.StochasticReconfigurationUpdate"
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "runner.optimizer._target_" in _paths(caught.value)
+
+    def test_a_moved_model_coordinate_in_the_runner_copy_is_refused(self) -> None:
+        cfg, model = _control_with_literal_runner_copy("model")
+        model.embedding.max_order = 3
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "runner.model.embedding.max_order" in _paths(caught.value)
+
+    def test_a_runner_view_with_no_optimizer_is_not_a_missing_method_violation(self) -> None:
+        """The presence-scoping control for the method rule.
+
+        An evaluation runner constructs a model and declares no optimizer.
+        Demanding one of every component view would refuse it, and the refusal
+        would arrive as a run that cannot start. The ROOT still requires one,
+        which the existing ``test_rejects_a_config_with_no_optimizer`` pins.
+
+        THE ``model`` KEY IS LOAD-BEARING AND MEASURED. An earlier version of
+        this arm used ``tasks: []``, which carries no component key at all, so
+        the runner was never made into a view and the arm passed whether the
+        rule was presence-scoped or not. It was VACUOUS: flipping
+        ``require_optimizer`` to ``True`` left the whole suite green while
+        genuinely changing behaviour. With ``model`` present the runner is a
+        view, and that mutation turns this arm red.
+        """
+
+        cfg = _config(
+            run={"run_id": "x"},
+            runner={
+                "_target_": "tpen.runner.Evaluate",
+                "model": {"_target_": "tpen.nn.TPENWaveFunction", "trace_name": "tpen"},
+            },
+        )
+        _validate(cfg)
+
+    def test_a_component_nested_deeper_than_one_level_is_still_swept(self) -> None:
+        """The view is any node carrying a component key, not `runner.*` alone.
+
+        A fixed one-level path list would have passed this while leaving the
+        shape it does not name unjudged -- the same failure as reading the root
+        only, one level down.
+        """
+
+        cfg = _config(
+            run={"run_id": "x"},
+            runner={
+                "_target_": "tpen.runner.Train",
+                "stages": {
+                    "warmup": {
+                        "trainer": {
+                            "_target_": "tpen.training.trainer.VMCTrainer",
+                            "nonfinite_local_energy_policy": "fail",
+                            "gradient_clip_norm": 2.0,
+                        }
+                    }
+                },
+            },
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "runner.stages.warmup.trainer.gradient_clip_norm" in _paths(caught.value)
+
+
+class TestResolverAdmissionIsAnAllowlist:
+    """A denylist was beaten TWICE here, which is why the instrument changed.
+
+    First by nesting: a forbidden resolver inside a permitted one was invisible
+    to a pattern that stopped at the first closing brace. Then by an unnamed
+    sibling: ``oc.decode`` was refused BY NAME for evaluating arbitrary text,
+    and ``oc.create`` does the same job under a name nobody had listed, and
+    additionally RE-RESOLVES interpolations in its output.
+
+    MEASURED before the change, at head ``38edc53``: a config carrying
+    ``oc.create`` around a YAML string whose unicode escape hid the
+    interpolation opener from the raw sweep resolved ``run.run_id`` to
+    ``rank_7`` from ``SLURM_PROCID``. Every rank would resolve a DIFFERENT run
+    identity while the rank-divergence rule passed -- it only asks that
+    ``run_id`` be non-null -- and the canonical digest would faithfully report a
+    difference it could not explain.
+
+    That is this slice's own class applied to the resolver rule: a rule that
+    reads NAMES, defeated by something supplying the same capability without
+    that name.
+    """
+
+    def test_the_unnamed_sibling_of_a_denied_resolver_is_refused(self) -> None:
+        cfg = _config(
+            run={"run_id": "x"},
+            runtime={"blob": "${oc.create:'a: 1'}"},
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "unadmitted-resolver" in _rules(caught.value)
+
+    def test_the_escape_that_motivated_this_is_refused_end_to_end(self) -> None:
+        """The exhibit, spelled the way it was measured.
+
+        The YAML text carries a unicode escape so the raw tree contains no
+        literal interpolation opener at all -- which is what made every
+        pre-existing raw sweep pass.
+        """
+
+        hidden = 'a: "\u0024{oc.env:SLURM_PROCID}"'
+        cfg = _config(
+            run={"blob": "${oc.create:'" + hidden + "'}", "run_id": "rank_${run.blob.a}"},
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "unadmitted-resolver" in _rules(caught.value)
+
+    def test_a_named_forbidden_resolver_keeps_its_specific_reason(self) -> None:
+        """The denylist is retained for MESSAGES and must actually still fire.
+
+        A config reaching for ``oc.env`` should be told that it reads
+        process-local state, not merely that some resolver is unadmitted. The
+        denylist is therefore checked FIRST -- and this test is what makes that
+        claim true rather than a comment, since the allowlist alone would
+        refuse the same config with a generic reason.
+        """
+
+        cfg = _config(run={"run_id": "x"}, runtime={"seed": "${oc.env:RANK,0}"})
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        rules = _rules(caught.value)
+        assert "forbidden-resolver" in rules
+        assert "unadmitted-resolver" not in rules, (
+            "one expression must yield one finding; reporting both reads as two defects"
+        )
+
+
+class TestTheReferenceModuleCannotArriveAsDATA:
+    """A generic importer carries the module path under a key nobody tokenizes.
+
+    MEASURED at ``38edc53``: ``{_target_: importlib.import_module, name:
+    tpen.hi_manifest}`` and ``{_target_: hydra.utils.get_method, path:
+    tpen.hi_manifest.load_evaluation_manifest}`` both VALIDATED in a free-form
+    runner slot, while the direct spelling in the same slot was refused.
+
+    ENUMERATING THE IMPORTERS WOULD BE THE SAME MISTAKE AGAIN -- ``get_class``,
+    ``get_object``, ``pydoc.locate``, ``pkgutil.resolve_name``, and whatever
+    lands next. Whatever the importer, the module path must appear SOMEWHERE as
+    a string, so the string is what is checked.
+    """
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            {"_target_": "importlib.import_module", "name": "tpen.hi_manifest"},
+            {
+                "_target_": "hydra.utils.get_method",
+                "path": "tpen.hi_manifest.load_evaluation_manifest",
+            },
+            {"_target_": "pydoc.locate", "name": "tpen.hi_manifest.reference_energy"},
+            # Not an importer at all -- the path as a plain string argument.
+            {"_target_": "tpen.callback.Metadata", "note": "tpen.hi_manifest"},
+        ],
+    )
+    def test_the_module_path_is_refused_wherever_it_appears(self, spec: dict) -> None:
+        cfg = _config(run={"run_id": "x"}, runner={"_target_": "tpen.runner.Train", "load": spec})
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "forbidden-target:reference-module" in _rules(caught.value)
+
+    def test_the_token_check_stays_scoped_to_target(self) -> None:
+        """Only MODULE IDENTITY widened; the token check did not.
+
+        Widening the token check to every value would refuse a run directory
+        named ``outputs/baseline``, which executes nothing. Exact module
+        identity is safe to widen precisely because it is not a token.
+        """
+
+        _validate(_config(run={"root": "outputs/baseline_sweep", "run_id": "x"}))
+
+    def test_the_spellings_this_check_does_NOT_match_are_unimportable(self) -> None:
+        """Pins the premise of a deliberate NON-decision.
+
+        Auditing the widened identity check found three spellings it does not
+        match. TWO of them -- a bare ``hi_manifest`` and an upper-case
+        ``TPEN.HI_MANIFEST`` -- cannot import the module, and this test pins
+        that. The third, a filesystem path, CAN, and is filed rather than
+        pinned; see the paragraph below.
+
+        MEASURED rather than reasoned: the first two raise ``ModuleNotFoundError``
+        -- Python's finder is case-sensitive for module NAMES regardless of the
+        filesystem's case sensitivity, which is why the upper-case form fails
+        even on macOS.
+
+        **THE PATH FORM IS NOT COVERED BY THIS TEST AND IS NOT UNREACHABLE.**
+        The first version of this docstring said reaching it would need
+        ``spec_from_file_location`` chained into ``module_from_spec``, which
+        needs ``_args_`` and is therefore refused. That was WRONG:
+        ``runpy.run_path`` takes the path directly as a keyword and executes the
+        module source, and a reviewer measured it validating. The error was
+        testing ONE mechanism, ``importlib``, and generalising to a
+        class-level negative -- the same census-versus-reachability mistake this
+        lane inherited a warning about. The filesystem spelling is tracked as
+        its own filed item.
+
+        This test exists because "I checked and there was nothing reachable" is
+        a claim that decays silently: a package rename, a new top-level module,
+        or a ``sys.path`` change could make one of these importable while every
+        other test stays green. Then this one fails and the non-decision gets
+        revisited.
+
+        The alternative -- refusing these spellings anyway -- was rejected as
+        exactly the error this slice has made three times: naming residuals that
+        are real but unreachable, which reads as thoroughness while costing
+        real coverage nowhere.
+        """
+
+        import importlib
+
+        for unreachable in ("hi_manifest", "TPEN.HI_MANIFEST"):
+            with pytest.raises(ModuleNotFoundError):
+                importlib.import_module(unreachable)
+        # The control: the spelling the check DOES match is the one that works.
+        assert importlib.import_module(REFERENCE_MANIFEST_MODULE) is not None
+
+    @pytest.mark.parametrize(
+        ("label", "spec"),
+        [
+            (
+                "relative import splits the path across two arguments",
+                {"_target_": "importlib.import_module", "name": ".hi_manifest", "package": "tpen"},
+            ),
+            (
+                "filesystem spelling, which EXECUTES the module source",
+                {"_target_": "runpy.run_path", "path_name": "tpen/hi_manifest.py"},
+            ),
+            (
+                # VALIDATION-GAP ARM ONLY: accepted by the schema, but does NOT
+                # reach the module through Hydra (DictConfig != dict).
+                "import hook with a relative level (does not reach, via Hydra)",
+                {
+                    "_target_": "builtins.__import__",
+                    "name": "hi_manifest",
+                    "globals": {"__package__": "tpen"},
+                    "level": 1,
+                },
+            ),
+        ],
+    )
+    def test_KNOWN_OPEN_a_path_never_written_whole_is_not_caught(
+        self, label: str, spec: dict
+    ) -> None:
+        """A RED-BY-DESIGN record of a known-open escape, filed as `fb70cf90`.
+
+        This test asserts the CURRENT, WRONG behaviour on purpose. Every spec
+        below VALIDATES, which is the defect under record.
+
+        **THEY DO NOT ALL REACH THE MODULE, and the earlier wording here said
+        they did.** Measured through Hydra, which is the path that matters:
+        the relative-import and ``runpy.run_path`` specs REACH it; the
+        ``builtins.__import__`` spec does NOT -- it dies
+        ``TypeError('globals must be a dict')``, because OmegaConf hands Hydra a
+        ``DictConfig`` for that argument rather than a real dict. It reaches the
+        module when called directly from Python with a real dict, which is how
+        the wrong claim was made: **the mechanism was verified in a shell and
+        the CONSTRUCTION PATH was not.**
+
+        The third spec is kept, as a validation-gap arm rather than a
+        reachability arm, and labelled so.
+
+        Why assert the defect rather than delete the case: a known-open hole
+        with no executable trace is indistinguishable from one nobody found. If
+        a later slice closes `fb70cf90`, this test goes RED and whoever fixed it
+        is pointed at the item and at this docstring, rather than discovering a
+        mysterious passing assertion about a config that should be refused.
+
+        THE CLASS IS NOT THESE THREE SPELLINGS. It is "a path that is never
+        written whole": split across arguments, or in filesystem form. String
+        identity cannot close the filesystem half at all -- absolute paths,
+        ``./`` prefixes, symlinks and case-insensitive filesystems all spell the
+        same file -- so the remedy must govern the SLOT or the CONSUMER. Do not
+        close this by adding three more strings to a list.
+
+        Impact bound, and it should stay bounded: the holder becomes reachable,
+        which is the hazard the rule names. The reference NUMBERS live in
+        manifest files, and with ``_args_`` refused no config-only shape can
+        CALL the loader.
+        """
+
+        cfg = OmegaConf.load(_CONTROL_CONFIG)
+        OmegaConf.update(cfg, "runner.load", spec, force_add=True)
+        _validate(cfg)  # known-open: this SHOULD refuse and does not
+
+        # The control that keeps this honest: the dotted spelling in the very
+        # same slot IS refused, so the gap is the spelling and not the slot.
+        dotted = OmegaConf.load(_CONTROL_CONFIG)
+        OmegaConf.update(
+            dotted,
+            "runner.load",
+            {"_target_": "importlib.import_module", "name": REFERENCE_MANIFEST_MODULE},
+            force_add=True,
+        )
+        with pytest.raises(ClosedSchemaError):
+            _validate(dotted)
+
+    def test_a_similarly_named_module_is_not_caught(self) -> None:
+        """The identity check must not fire on a prefix that merely looks alike."""
+
+        _validate(
+            _config(
+                run={"run_id": "x"},
+                runner={"_target_": "tpen.runner.Train", "note": "tpen.hi_manifesto.thing"},
+            )
+        )
+
+
+class TestExecutableTargets:
+    """A ``_target_`` is executable, so its VALUE is checked, not only its key.
+
+    ``ForbiddenSurface.matches`` tokenizes keys. That is right for data: a value
+    is inert and the key names what it is. A ``_target_`` inverts it -- the
+    value names the code that will run, and the key is always the same word.
+    """
+
+    def test_rejects_a_target_naming_the_reference_module(self) -> None:
+        cfg = _config(model={"probe": {"_target_": f"{REFERENCE_MANIFEST_MODULE}.reference_energy"}})
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "forbidden-target:reference-module" in _rules(caught.value)
+
+    @pytest.mark.parametrize(
+        ("target", "rule"),
+        [
+            ("tpen.diagnostics.energy.ReferenceGapProbe", "forbidden-target:reference"),
+            ("tpen.callback.BaselineEnergy", "forbidden-target:reference"),
+            ("tpen.callback.AccuracyBandReporter", "forbidden-target:band"),
+            ("tpen.training.EarlyStoppingRule", "forbidden-target:stop-rule"),
+            ("tpen.training.ContinuationLadder", "forbidden-target:continuation"),
+        ],
+    )
+    def test_rejects_a_target_whose_tokens_name_a_forbidden_family(
+        self, target: str, rule: str
+    ) -> None:
+        """The token rule, on targets OUTSIDE the reference module.
+
+        Every one of these lives somewhere the module rule cannot see, so this
+        arm measures the token rule rather than re-measuring the module rule.
+        """
+
+        cfg = _config(model={"probe": {"_target_": target}})
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert rule in _rules(caught.value)
+
+    def test_the_two_rules_do_not_subsume_each_other(self) -> None:
+        """Each rule is measured against the case the other misses.
+
+        ``load_evaluation_manifest`` carries no forbidden token, so the token
+        rule alone would admit the function that reads the reference file.
+        ``ReferenceGapProbe`` is outside the manifest module, so the module rule
+        alone would admit it. Neither rule is redundant.
+        """
+
+        token_blind = f"{REFERENCE_MANIFEST_MODULE}.load_evaluation_manifest"
+        assert not any(
+            surface.matches(token_blind) for surface in HI_TRAIN_POLICY.forbidden_surfaces
+        ), "the token rule was expected to be blind to this target; if it now sees it, this test no longer measures what it claims"
+
+        module_blind = "tpen.diagnostics.energy.ReferenceGapProbe"
+        assert not module_blind.startswith(f"{REFERENCE_MANIFEST_MODULE}.")
+
+        for target in (token_blind, module_blind):
+            with pytest.raises(ClosedSchemaError):
+                _validate(_config(model={"probe": {"_target_": target}}))
+
+    def test_rejects_a_target_at_any_depth(self) -> None:
+        """Depth is not a defence: the sweep walks the whole resolved tree."""
+
+        cfg = _config(
+            model={"a": {"b": {"c": {"_target_": f"{REFERENCE_MANIFEST_MODULE}.reference_energy"}}}}
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "forbidden-target:reference-module" in _rules(caught.value)
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            # Every one of these is a real target in the shipped control config.
+            "tpen.nn.TPENWaveFunction",
+            "tpen.nn.initialization.TorchInitializer",
+            "tpen.data.atomic_configuration.AtomicConfiguration",
+            "tpen.physics.potential.NucleusNucleusPotential",
+            "tpen.sampling.metropolis.MetropolisSampler",
+            "tpen.equivariance.checks.FullModelEquivarianceChecker",
+            "tpen.accelerator.TorchAllocatorPeakProbe",
+            "tpen.checkpoint.TrainResume",
+            "torch.optim.Adam",
+        ],
+    )
+    def test_accepts_the_targets_the_study_actually_constructs(self, target: str) -> None:
+        """The over-restriction control, one arm per target.
+
+        A token set one word too wide would refuse a real component. Read as a
+        set they would be one assertion and the failure would name none of
+        them; one arm each is what makes a refusal say WHICH target it refused.
+        """
+
+        _validate(_config(model={"probe": {"_target_": target}}))
+
+    def test_a_forbidden_token_in_an_ordinary_value_is_still_permitted(self) -> None:
+        """The rule is scoped to ``_target_``, not to every string in the tree.
+
+        Widening it to all values would refuse a run directory named
+        ``outputs/baseline`` and a docstring-like comment field, neither of
+        which executes anything.
+        """
+
+        _validate(
+            _config(run={"root": "outputs/baseline_sweep", "run_id": "control_0001"})
+        )
+
+
 class TestClosedSections:
     def test_rejects_an_undeclared_top_level_section(self) -> None:
         cfg = _config(diagnostics={"kind": "energy"})
@@ -332,6 +1711,103 @@ class TestForbiddenResolvers:
         _validate(
             _config(system={"spatial_dim": 3}, model={"spatial_dim": "${system.spatial_dim}"})
         )
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "${oc.select:missing,${oc.env:HI_LANE_NUMBER}}",
+            "${oc.select:a,${oc.select:b,${oc.env:HI_LANE_NUMBER}}}",
+            "${${oc.env:HI_LANE_NUMBER}}",
+            "${oc.select:missing,${now:%S}}",
+        ],
+    )
+    def test_rejects_a_forbidden_resolver_nested_inside_a_permitted_one(
+        self, expression: str
+    ) -> None:
+        """The policy-level half of the nested-resolver rule.
+
+        ``oc.select`` is not forbidden and never should be. What is forbidden is
+        the ``oc.env`` INSIDE it, which resolves to whatever the launching
+        process happens to carry -- so the same file resolves to different
+        values on two ranks and produces two canonical train identities. The
+        mechanism is exercised in ``tests/unit/test_config_schema.py``; this
+        asserts the HI policy actually consumes it.
+        """
+
+        cfg = _config(runtime={"seed": expression})
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "forbidden-resolver" in _rules(caught.value)
+
+    def test_a_permitted_resolver_is_now_refused_by_the_ALLOWLIST(self) -> None:
+        """DELIBERATE WIDENING, and this test was inverted rather than deleted.
+
+        It previously asserted that ``oc.select`` is ACCEPTED, as the
+        over-restriction control for the nested-resolver rule under a DENYLIST.
+        The policy has since moved to an allowlist, and the allowlist is empty,
+        so every resolver CALL is refused and this configuration no longer
+        validates.
+
+        Inverted rather than removed on purpose. A deleted test leaves no trace
+        that the behaviour changed; this one records that the change was a
+        decision, names the rule that now fires, and will fail loudly if
+        somebody re-admits ``oc.select`` without saying why.
+
+        The doctrine change is not a preference. A denylist was beaten twice
+        here -- once by nesting, once by ``oc.create`` supplying ``oc.decode``'s
+        text-evaluation capability under a name nobody had listed.
+        """
+
+        cfg = _config(
+            system={"spatial_dim": 3},
+            model={"spatial_dim": "${oc.select:model.missing,${system.spatial_dim}}"},
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "unadmitted-resolver" in _rules(caught.value)
+
+    def test_plain_node_references_are_untouched_by_the_allowlist(self) -> None:
+        """THE over-restriction control, and the one that now carries the weight.
+
+        An empty resolver allowlist would be catastrophic if it also refused
+        node references: the shipped config contains 32 of them and would not
+        validate. The discriminator is that a reference names CONFIGURATION and
+        a call names a RESOLVER, so nesting and computed paths stay writable.
+        """
+
+        _validate(
+            _config(
+                system={"spatial_dim": 3},
+                runtime={"seed": 0},
+                model={
+                    "spatial_dim": "${system.spatial_dim}",
+                    "seed": "${runtime.seed}",
+                    "nested": "${model.spatial_dim}",
+                },
+            )
+        )
+
+    def test_the_shipped_config_uses_no_resolver_calls(self) -> None:
+        """The measurement that makes an EMPTY allowlist defensible.
+
+        Refusing every resolver call is only reasonable while nothing shipped
+        makes one. That is asserted here rather than written in a comment,
+        because a comment keeps saying so after it stops being true.
+        """
+
+        raw = OmegaConf.to_container(OmegaConf.load(_CONTROL_CONFIG), resolve=False)
+        calls, references = [], 0
+        for path, _key, value in iter_nodes(raw):
+            if not isinstance(value, str):
+                continue
+            for expression in iter_interpolations(value):
+                name, is_call = split_resolver(expression)
+                if is_call:
+                    calls.append((path, name))
+                else:
+                    references += 1
+        assert calls == [], calls
+        assert references > 0, "no interpolations found at all; this test would pass vacuously"
 
 
 class TestAdmittedMethods:
@@ -492,7 +1968,20 @@ class TestFrozenArchitecture:
         [
             ("system", {"spatial_dim": 2}),
             ("runtime", {"dtype": "float32"}),
-            ("hamiltonian_terms", {"electron_nucleus": {"eps": 1e-8}}),
+            # Carries a ``_target_`` because that is what identifies a TERM.
+            # See TestHamiltonianTermsAreFoundByShapeNotByKey for why the rule
+            # matches on the target rather than on the key, and
+            # test_a_term_without_a_target_is_not_constructible_anyway for why
+            # narrowing to targets loses no real coverage.
+            (
+                "hamiltonian_terms",
+                {
+                    "electron_nucleus": {
+                        "_target_": "tpen.physics.potential.ElectronNucleusPotential",
+                        "eps": 1e-8,
+                    }
+                },
+            ),
         ],
     )
     def test_rejects_a_moved_scalar(self, section: str, body: dict) -> None:
@@ -505,7 +1994,12 @@ class TestFrozenArchitecture:
             _config(
                 system={"spatial_dim": 3},
                 runtime={"dtype": "float64"},
-                hamiltonian_terms={"electron_nucleus": {"eps": 0.0}},
+                hamiltonian_terms={
+                    "electron_nucleus": {
+                        "_target_": "tpen.physics.potential.ElectronNucleusPotential",
+                        "eps": 0.0,
+                    }
+                },
             )
         )
 

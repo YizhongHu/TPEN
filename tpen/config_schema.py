@@ -69,10 +69,18 @@ _NON_TOKEN = re.compile(r"[^0-9a-z]+")
 # tokenizes the same way ``reference_energy`` does. Applied before lowercasing.
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
-# An OmegaConf interpolation expression, e.g. ``${oc.env:RANK}`` or
-# ``${system.spatial_dim}``. Only the raw tree contains these; the resolved tree
-# has had them replaced by values.
-_INTERPOLATION = re.compile(r"\$\{([^}]*)\}")
+# The opening delimiter of an OmegaConf interpolation, e.g. ``${oc.env:RANK}``
+# or ``${system.spatial_dim}``. Only the raw tree contains these; the resolved
+# tree has had them replaced by values.
+#
+# A REGEX CANNOT DO THIS JOB, which is why only the opener is one. The obvious
+# pattern ``\$\{([^}]*)\}`` stops at the FIRST closing brace, so on
+# ``${oc.select:missing,${oc.env:X}}`` it captures
+# ``oc.select:missing,${oc.env`` and reports the resolver as ``oc.select`` --
+# the nested ``oc.env`` is consumed into the argument text of the outer
+# expression and never examined. Brace nesting is not a regular language, so
+# :func:`iter_interpolations` walks the braces instead.
+_INTERPOLATION_OPEN = "${"
 
 
 def tokens_of(name: object) -> tuple[str, ...]:
@@ -199,13 +207,29 @@ class SchemaPolicy:
         Interpolation resolver names refused in the raw tree. These are the
         mechanism by which process-local facts (environment, clock, randomness)
         would otherwise reach a resolved configuration and make it differ
-        between ranks.
+        between ranks. A DENYLIST, and see ``allowed_resolvers`` for when that
+        is the wrong instrument.
+    allowed_resolvers : frozenset of str or None
+        When not ``None``, the CLOSED set of resolver names a configuration may
+        call; every other resolver call is refused. ``None`` leaves the policy
+        on ``forbidden_resolvers`` alone.
+
+        A DENYLIST CANNOT WORK HERE AND THIS PROJECT HAS THE MEASUREMENTS.
+        ``oc.decode`` was refused by name because it evaluates arbitrary text;
+        ``oc.create`` does the same job, is not on any list, and additionally
+        RE-RESOLVES interpolations in its output -- so a config carrying
+        ``${oc.create:...}`` around a YAML string whose unicode escapes hide the
+        interpolation opener reached the environment while every raw sweep
+        passed. Refusing that one name would leave the next sibling. The set of
+        resolvers that can evaluate text is open-ended and grows with OmegaConf;
+        the set a study actually needs is small, closed, and known.
     """
 
     name: str
     forbidden_surfaces: tuple[ForbiddenSurface, ...] = ()
     allowed_sections: frozenset[str] = field(default_factory=frozenset)
     forbidden_resolvers: frozenset[str] = field(default_factory=frozenset)
+    allowed_resolvers: frozenset[str] | None = None
 
 
 def iter_nodes(tree: Any, prefix: str = "") -> Iterator[tuple[str, Any, Any]]:
@@ -288,6 +312,154 @@ def _sweep_unknown_sections(tree: Any, label: str, policy: SchemaPolicy) -> list
     ]
 
 
+def iter_interpolations(text: str) -> Iterator[str]:
+    """Yield every interpolation expression in ``text``, at every nesting depth.
+
+    Parameters
+    ----------
+    text : str
+        A raw configuration value, which may contain zero or more
+        ``${...}`` expressions, each of which may itself contain more.
+
+    Yields
+    ------
+    str
+        The body of one interpolation, without its ``${`` and ``}``. Outer
+        expressions are yielded before the expressions nested inside them, and
+        siblings in source order.
+
+    Notes
+    -----
+    NESTING IS THE WHOLE POINT. ``${oc.select:missing,${oc.env:X}}`` is two
+    expressions, not one: the outer selects, and the inner reads the process
+    environment. A caller that sees only the outer one sees a resolver nobody
+    forbids while the forbidden resolver runs inside it.
+
+    An UNTERMINATED expression yields the remainder of the string AND is
+    scanned in turn. That is deliberate: a value ending in ``${oc.env:X`` is
+    malformed and OmegaConf will refuse it, but refusing it HERE, by name, beats
+    letting a malformed expression be the one shape a firewall does not look at.
+    The recursion is not decoration -- ``${oc.select:a,${oc.env:X}`` is
+    malformed on the OUTSIDE and carries a well-formed forbidden resolver
+    inside, and an earlier version of this function reported only the outer
+    text.
+
+    Examples
+    --------
+    >>> list(iter_interpolations("${system.spatial_dim}"))
+    ['system.spatial_dim']
+    >>> list(iter_interpolations("${oc.select:missing,${oc.env:X}}"))
+    ['oc.select:missing,${oc.env:X}', 'oc.env:X']
+    """
+
+    index = 0
+    length = len(text)
+    while True:
+        start = text.find(_INTERPOLATION_OPEN, index)
+        if start < 0:
+            return
+        # ESCAPED OPENERS RUN NO RESOLVER, so reporting one is a false refusal.
+        # MEASURED against OmegaConf rather than read off the documentation:
+        # ``\${oc.env:VAR,0}`` resolves to the literal text ``${oc.env:VAR,0}``
+        # and never touches the environment. An ODD number of preceding
+        # backslashes escapes the opener; an EVEN number is an escaped backslash
+        # followed by a REAL interpolation (``\\${oc.env:VAR}`` resolved to
+        # ``\7`` with the variable set), so parity is the test, not presence.
+        backslashes = 0
+        probe = start - 1
+        while probe >= 0 and text[probe] == "\\":
+            backslashes += 1
+            probe -= 1
+        if backslashes % 2 == 1:
+            # Resume just past THIS opener rather than past the whole escaped
+            # expression, and that distinction is load-bearing: a real
+            # interpolation nested inside an escaped one still resolves.
+            # ``\${oc.select:a,${oc.env:VAR}}`` came back as ``${oc.select:a,7}``
+            # -- the outer is literal text, the inner RAN. Skipping to the
+            # closing brace would admit exactly that.
+            index = start + len(_INTERPOLATION_OPEN)
+            continue
+        # Walk forward counting braces so the expression ends at ITS OWN closing
+        # brace rather than at the first one belonging to something nested.
+        depth = 0
+        cursor = start
+        end = -1
+        while cursor < length:
+            if text.startswith(_INTERPOLATION_OPEN, cursor):
+                depth += 1
+                cursor += len(_INTERPOLATION_OPEN)
+                continue
+            if text[cursor] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = cursor
+                    break
+            cursor += 1
+        if end < 0:
+            # Unterminated. Yield the remainder AND recurse into it: an
+            # expression can be malformed on the OUTSIDE while carrying a
+            # well-formed forbidden resolver inside, as in
+            # ``${oc.select:a,${oc.env:X}``. Returning after the single yield
+            # reported only the outer text and let the inner resolver through.
+            remainder = text[start + len(_INTERPOLATION_OPEN) :]
+            yield remainder
+            yield from iter_interpolations(remainder)
+            return
+        expression = text[start + len(_INTERPOLATION_OPEN) : end]
+        yield expression
+        # Recurse into the body, which is where a nested resolver hides. The
+        # scan then resumes AFTER this expression so siblings are found too.
+        yield from iter_interpolations(expression)
+        index = end + 1
+
+
+def split_resolver(expression: str) -> tuple[str, bool]:
+    """Split an interpolation body at ITS OWN resolver colon.
+
+    Parameters
+    ----------
+    expression : str
+        One interpolation body, as yielded by :func:`iter_interpolations`.
+
+    Returns
+    -------
+    resolver : str
+        The text before the expression's own colon, stripped. Empty when there
+        is none.
+    is_resolver_call : bool
+        Whether the expression is a resolver call at all. ``False`` means it is
+        a node reference such as ``${system.dim}``.
+
+    Notes
+    -----
+    THE FIRST COLON IN THE TEXT IS NOT NECESSARILY THIS EXPRESSION'S COLON.
+    ``str.partition`` reads ``model.${oc.select:model.missing,embedding}.channels``
+    as resolver ``model.${oc.select`` -- but that colon belongs to the NESTED
+    ``oc.select``, and the outer expression is a plain node reference whose PATH
+    happens to be computed. MEASURED: OmegaConf resolves that form to ``32``
+    against the shipped config, so refusing it refuses valid configuration.
+
+    Only a colon at nesting depth ZERO is this expression's own, so the scan
+    steps over nested ``${...}`` rather than counting characters.
+    """
+
+    depth = 0
+    cursor = 0
+    length = len(expression)
+    while cursor < length:
+        if expression.startswith(_INTERPOLATION_OPEN, cursor):
+            depth += 1
+            cursor += len(_INTERPOLATION_OPEN)
+            continue
+        character = expression[cursor]
+        if character == "}" and depth > 0:
+            depth -= 1
+        elif character == ":" and depth == 0:
+            return expression[:cursor].strip(), True
+        cursor += 1
+    return "", False
+
+
 def _sweep_forbidden_resolvers(raw_tree: Any, policy: SchemaPolicy) -> list[Rejection]:
     """Reject interpolations that read process-local state, in the raw tree only.
 
@@ -296,22 +468,60 @@ def _sweep_forbidden_resolvers(raw_tree: Any, policy: SchemaPolicy) -> list[Reje
     was always there. This is precisely the check that makes a resolved
     configuration a pure function of the file and its overrides, and therefore
     identical on every rank.
+
+    NESTED expressions are swept, not only outermost ones. A forbidden resolver
+    nested inside a permitted one runs exactly as it would on its own:
+    ``${oc.select:missing,${oc.env:X}}`` resolves to the environment value
+    whenever the selected key is absent, so two ranks with different
+    environments resolve one file differently -- which is the property this
+    check exists to protect. See :func:`iter_interpolations` for why the sweep
+    walks braces instead of matching a pattern.
     """
 
-    if not policy.forbidden_resolvers:
+    if not policy.forbidden_resolvers and policy.allowed_resolvers is None:
         return []
 
     rejections: list[Rejection] = []
     for path, _key, value in iter_nodes(raw_tree):
         if not isinstance(value, str):
             continue
-        for expression in _INTERPOLATION.findall(value):
+        for expression in iter_interpolations(value):
             # ``oc.env:RANK`` -> resolver ``oc.env``; a plain node reference such
             # as ``system.spatial_dim`` has no colon and no resolver name.
-            resolver, separator, _argument = expression.partition(":")
-            if not separator:
+            resolver, is_resolver_call = split_resolver(expression)
+            if not is_resolver_call:
+                # No colon AT THIS EXPRESSION'S OWN NESTING DEPTH: a plain
+                # node reference such as ``${system.dim}``, which names no
+                # resolver. This stays true when the reference PATH is itself
+                # interpolated -- ``${model.${arch}.channels}`` reads
+                # configuration, never process-local state -- including when the
+                # nested part is a permitted resolver CALL carrying its own
+                # colon. Any resolver nested inside is reached by recursion and
+                # judged on its own terms; see :func:`split_resolver`.
                 continue
-            resolver = resolver.strip()
+            if _INTERPOLATION_OPEN in resolver:
+                # THE RESOLVER NAME IS COMPUTED AT RESOLVE TIME, so it cannot be
+                # compared against any list here. ``${oc.${leaf}:VAR,0}`` with
+                # ``leaf: env`` is ``oc.env`` by the time OmegaConf runs it, and
+                # a static check sees only ``oc.${leaf}``. Unqualifiable is
+                # refused rather than admitted: an allowlist that cannot read
+                # the name it is checking is not a check.
+                rejections.append(
+                    Rejection(
+                        rule="uncheckable-resolver",
+                        tree="raw",
+                        path=path,
+                        detail=(
+                            f"interpolation ${{{expression}}} builds its RESOLVER NAME from "
+                            f"another interpolation ({resolver!r}), so which resolver runs is "
+                            "decided at resolution time and cannot be qualified before it. "
+                            "Spell the resolver literally. This is refused rather than "
+                            "admitted because the forbidden-resolver list can only refuse "
+                            "names it can read"
+                        ),
+                    )
+                )
+                continue
             if resolver in policy.forbidden_resolvers:
                 rejections.append(
                     Rejection(
@@ -326,6 +536,30 @@ def _sweep_forbidden_resolvers(raw_tree: Any, policy: SchemaPolicy) -> list[Reje
                         ),
                     )
                 )
+                # The named reason is the more useful one, so it stands alone.
+                # Reporting the generic refusal beside it would be two findings
+                # for one expression, which reads as two defects.
+                continue
+            if policy.allowed_resolvers is not None and resolver not in policy.allowed_resolvers:
+                admitted = sorted(policy.allowed_resolvers)
+                rejections.append(
+                    Rejection(
+                        rule="unadmitted-resolver",
+                        tree="raw",
+                        path=path,
+                        detail=(
+                            f"interpolation ${{{expression}}} calls resolver {resolver!r}, which "
+                            f"is not in this schema's closed set of admitted resolvers "
+                            f"({admitted or 'none'}). Resolver calls are ADMITTED, not merely "
+                            "screened: the set that can evaluate text or read process-local "
+                            "state is open-ended and grows with OmegaConf, while the set a "
+                            "study needs is small and known. Plain node references such as "
+                            "${section.key} are unaffected -- they name configuration, not a "
+                            "resolver"
+                        ),
+                    )
+                )
+                continue
     return rejections
 
 

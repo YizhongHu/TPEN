@@ -33,12 +33,17 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
+from tpen.config_schema import ClosedSchemaError
 from tpen.hi_manifest import (
     HI_EVALUATION_SCHEMA,
     load_evaluation_manifest,
     reference_energy,
 )
-from tpen.hi_schema import HI_TRAIN_SCHEMA, validate_hi_train_config
+from tpen.hi_schema import (
+    HI_TRAIN_SCHEMA,
+    REFERENCE_MANIFEST_MODULE,
+    validate_hi_train_config,
+)
 
 # Anchored to this file rather than to the process working directory. A bare
 # relative path silently pins the whole module to being run from the repository
@@ -513,3 +518,129 @@ class TestTheManifestHoldsTheReference:
         )
         with pytest.raises(ValueError, match="qualification"):
             reference_energy(load_evaluation_manifest(path))
+
+
+class TestNoTargetCanNameTheReferenceModule:
+    """The third net: an executable ``_target_`` that loads the reference.
+
+    The import test asks what the SOURCE reaches. This asks what the CONFIG can
+    ask Hydra to construct, which no source-level scan can see because the
+    module path is a string in a YAML file until the moment it is imported.
+
+    MEASURED BEFORE THE RULE EXISTED: injecting
+    ``_target_: tpen.hi_manifest.reference_energy`` at the eight points below
+    was ACCEPTED at six of them. ``ForbiddenSurface.matches`` tests keys, so the
+    value was never tokenized even though it literally contains ``reference``.
+    Only ``callbacks`` and ``optimizer`` refused it, and each for its own
+    unrelated reason.
+    """
+
+    BAD_TARGET = f"{REFERENCE_MANIFEST_MODULE}.reference_energy"
+
+    def test_the_schema_and_this_test_name_the_same_module(self) -> None:
+        """`tpen.hi_schema` may not IMPORT the manifest, so it copies the name.
+
+        Importing it would put the reference on the training path, which is the
+        reachability every other test in this file asserts is absent. The copy
+        is the price, and this control is what keeps the two from drifting into
+        a rule that points at a module nobody loads.
+        """
+
+        assert REFERENCE_MANIFEST_MODULE == REFERENCE_MODULE
+
+    @pytest.mark.parametrize(
+        "dotted",
+        [
+            "sampler.probe",
+            "model.probe",
+            "model.embedding.probe",
+            "runner.probe",
+            "trainer.probe",
+            "optimizer.probe",
+        ],
+    )
+    def test_a_reference_target_is_refused_in_every_root_section(self, dotted: str) -> None:
+        cfg = OmegaConf.load(CONTROL_CONFIG)
+        OmegaConf.update(cfg, dotted, {"_target_": self.BAD_TARGET}, force_add=True)
+        with pytest.raises(ClosedSchemaError) as caught:
+            validate_hi_train_config(cfg, env={})
+        assert any(
+            rejection.rule == "forbidden-target:reference-module"
+            for rejection in caught.value.rejections
+        ), sorted({rejection.rule for rejection in caught.value.rejections})
+
+    @pytest.mark.parametrize("section", ["loggers", "callbacks"])
+    def test_a_reference_target_is_refused_in_every_list_section(self, section: str) -> None:
+        """The two list-valued sections, which ``OmegaConf.update`` cannot reach.
+
+        ``callbacks`` was already refused before this rule, by the allowlist.
+        It is kept as an arm because the allowlist governs a callback's OWN
+        target and this rule governs any target at any depth; asserting the
+        rule NAME rather than merely that something was refused is what keeps
+        the two apart.
+        """
+
+        cfg = OmegaConf.load(CONTROL_CONFIG)
+        cfg[section].append(OmegaConf.create({"_target_": self.BAD_TARGET}))
+        with pytest.raises(ClosedSchemaError) as caught:
+            validate_hi_train_config(cfg, env={})
+        assert any(
+            rejection.rule == "forbidden-target:reference-module"
+            for rejection in caught.value.rejections
+        ), sorted({rejection.rule for rejection in caught.value.rejections})
+
+    def test_a_nested_target_under_an_admitted_callback_is_refused(self) -> None:
+        """The finding this rule was filed under, kept as its own arm.
+
+        An admitted callback carrying a nested reference target passed both
+        nets: the allowlist judges the callback's own target and deliberately
+        treats a nested one as a constructor argument, and the import test sees
+        no source-level import. That boundary is UNCHANGED -- the nested target
+        is still a constructor argument -- and it is this separate rule that
+        refuses it.
+        """
+
+        cfg = OmegaConf.load(CONTROL_CONFIG)
+        cfg.callbacks[0].payload = OmegaConf.create({"_target_": self.BAD_TARGET})
+        with pytest.raises(ClosedSchemaError) as caught:
+            validate_hi_train_config(cfg, env={})
+        rules = {rejection.rule for rejection in caught.value.rejections}
+        assert "forbidden-target:reference-module" in rules
+        assert "unadmitted-callback" not in rules, (
+            "the allowlist must NOT have fired: the callback itself is admitted, "
+            "and a rejection from it here would mean the boundary moved rather "
+            "than that a separate rule caught the nested target"
+        )
+
+    def test_an_innocuously_named_manifest_target_is_still_refused(self) -> None:
+        """The module rule earning its place against the token rule.
+
+        ``load_evaluation_manifest`` tokenizes to
+        ``tpen, hi, manifest, load, evaluation, manifest`` and hits no forbidden
+        family at all, so a value-side token check alone would admit it -- and
+        it is the function that reads the reference file.
+        """
+
+        cfg = OmegaConf.load(CONTROL_CONFIG)
+        OmegaConf.update(
+            cfg,
+            "model.probe",
+            {"_target_": f"{REFERENCE_MANIFEST_MODULE}.load_evaluation_manifest"},
+            force_add=True,
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            validate_hi_train_config(cfg, env={})
+        assert any(
+            rejection.rule == "forbidden-target:reference-module"
+            for rejection in caught.value.rejections
+        )
+
+    def test_the_unmodified_control_config_still_validates(self) -> None:
+        """The over-restriction control, on the config that actually ships.
+
+        Every ``_target_`` in the control is now tokenized and compared. A rule
+        one token too wide would refuse the real run, and the failure would
+        first appear as a run that cannot start rather than as a red test.
+        """
+
+        validate_hi_train_config(OmegaConf.load(CONTROL_CONFIG), env={})

@@ -6,9 +6,22 @@
 # closed HI train schema and therefore cannot carry a reference at all.
 #
 # THE REFERENCE LIVES IN `../manifests/evaluation.yaml` AND NOWHERE ELSE. It is
-# loaded by a separate process, after training is over. Nothing on the training
-# path reads that file, and `tests/unit/test_hi_reference_separation.py` asserts
-# the import separation rather than trusting it.
+# loaded by a separate process, after training is over.
+#
+# WHAT IS ACTUALLY ASSERTED, stated narrowly because the previous wording here
+# claimed more than anything checks. This file used to say "Nothing on the
+# training path reads that file" in the same breath as conceding that the test
+# only censuses IMPORTS. Those are different claims and the stronger one is not
+# true: an independent verifier measured a configuration that validates and
+# reads this manifest through a generic loader, returning the reference energy,
+# without naming any module or tripping any token.
+#
+# So: `tests/unit/test_hi_reference_separation.py` asserts that no swept module
+# IMPORTS the reference holder, and `tpen.hi_schema` refuses the holder's dotted
+# path wherever it appears as a string in a configuration. Neither establishes
+# that nothing on the training path can read this file. That gap is tracked as
+# its own work item, and this comment will be narrowed further or widened when
+# it lands.
 #
 # Every value below is the literal control protocol. The scan varies producer
 # and path policy, channels, activations, embedding width and depth, the
