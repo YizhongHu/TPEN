@@ -36,6 +36,7 @@ NODE_A_G1_W3 = "tests/unit/training/test_ds_a_accelerate_spike.py::test_a_g1_mat
 NODE_A_G1B_CENTERING = "tests/unit/training/test_ds_a_accelerate_spike.py::test_a_g1b_local_centering_disagrees_with_the_global_oracle"
 NODE_A_G1B_CLIPPING = "tests/unit/training/test_ds_a_accelerate_spike.py::test_a_g1b_per_shard_clipping_disagrees_with_global_clipping"
 NODE_A_G2 = "tests/unit/training/test_ds_a_accelerate_spike.py::test_a_g2_global_zero_finite_count_refuses_before_backward"
+NODE_A_G4_SKIP = "tests/unit/training/test_ds_a_accelerate_spike.py::test_a_g4_collective_failure_is_bounded_and_attributed[skip-collective]"
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,23 @@ MUTATIONS: tuple[Mutation, ...] = (
             "DF0 substrate rather than spike-local code, because that is where the "
             "wrong-comparison-point lives. It is restored byte-identically and the "
             "restoration is verified by sha256 like every other arm."
+        ),
+    ),
+    Mutation(
+        name="A-G4/break-the-culprit-self-report",
+        path="tests/spikes/accelerate_ddp/worker.py",
+        anchor='        f"ddp harness injected fault: rank {rank} phase {phase_name} kind {plan.kind.name}",',
+        replacement='        f"fault applied on rank {rank} at {phase_name} ({plan.kind.name})",',
+        node_id=NODE_A_G4_SKIP,
+        defect=(
+            "Reformatting the culprit self-report. The harness derives "
+            "culprit_rank by matching this EXACT line, so a reformat silently "
+            "destroys attribution while the run still fails and every other "
+            "assertion still passes. Chosen deliberately on the skip-collective "
+            "path, where the culprit exits CLEANLY and an innocent peer dies on "
+            "timeout -- so exit codes alone would finger the wrong rank and the "
+            "self-report is the only thing standing between the gate and a "
+            "confident wrong answer."
         ),
     ),
     Mutation(

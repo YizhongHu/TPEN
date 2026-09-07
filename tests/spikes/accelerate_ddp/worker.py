@@ -22,6 +22,7 @@ from pathlib import Path
 
 import torch
 
+from tests.helpers.ddp_fault_injection import FaultKind, FaultPhase, FaultPlan, read_fault_plan
 from tests.spikes.accelerate_ddp.checkpoint import (
     CheckpointPayloadStore,
     CheckpointTopologyMismatch,
@@ -40,12 +41,14 @@ SCENARIO_ALL_INVALID = "all-invalid"
 SCENARIO_RESUME = "resume"
 SCENARIO_PUBLICATION = "publication"
 SCENARIO_COMM_COUNT = "comm-count"
+SCENARIO_FAULT = "fault"
 SCENARIOS = (
     SCENARIO_SCORE_STEP,
     SCENARIO_ALL_INVALID,
     SCENARIO_RESUME,
     SCENARIO_PUBLICATION,
     SCENARIO_COMM_COUNT,
+    SCENARIO_FAULT,
 )
 
 
@@ -351,6 +354,77 @@ def _run_comm_count(runtime, args: argparse.Namespace) -> dict:
     }
 
 
+
+def _report_fault_applied(rank: int, phase_name: str, plan: FaultPlan) -> None:
+    """Self-attribute this rank as the fault's true target, to stderr.
+
+    This exact line is the ONLY evidence the harness uses to derive
+    ``HarnessResult.culprit_rank``. Emitted the instant this rank's own code path
+    matches the plan, BEFORE the fault's effect can take hold, so it survives even
+    when the rank never reaches its own receipt write. A peer that merely fails as
+    a downstream consequence -- blocked on a collective the culprit skipped until
+    its own timeout fires -- never emits this about itself, so an innocent rank is
+    never mistaken for the culprit even when its exit code looks identical.
+
+    The format is DF1's, verbatim. Reformatting it would silently break culprit
+    attribution while every other assertion still passed.
+    """
+
+    print(
+        f"ddp harness injected fault: rank {rank} phase {phase_name} kind {plan.kind.name}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _run_fault(runtime, args: argparse.Namespace) -> dict:
+    """A-G4: inject a DF1 fault into the REAL Accelerate worker, not a synthetic one.
+
+    Uses DF1's FaultPlan/FaultKind/FaultPhase UNCHANGED. The whole point is that
+    the fault lands in a worker that is genuinely running an Accelerate-backed VMC
+    step, so what is measured is how failures propagate through THIS runtime.
+    """
+
+    plan = read_fault_plan(Path(args.fault_plan_path)) if args.fault_plan_path else None
+    features, energy, access, counter, optimizer = _build(runtime, args)
+    targets_this_rank = plan is not None and plan.target_rank == args.rank
+
+    stats = prepare_statistics(runtime, energy)
+
+    if targets_this_rank and plan.kind == FaultKind.SKIP_COLLECTIVE:
+        # Exit cleanly WITHOUT participating. The innocent peer is the one that
+        # pays, blocking until its process-group timeout -- which is why the
+        # culprit must self-report before leaving.
+        _report_fault_applied(args.rank, plan.phase.name, plan)
+        return {"skipped_collective": True}
+
+    if targets_this_rank and plan.kind == FaultKind.STALL_BEFORE_COLLECTIVE:
+        import time
+
+        _report_fault_applied(args.rank, plan.phase.name, plan)
+        time.sleep(plan.delay_seconds)
+
+    def before_backward() -> None:
+        if targets_this_rank and plan.kind == FaultKind.RAISE_BEFORE_BACKWARD:
+            _report_fault_applied(args.rank, FaultPhase.BEFORE_OPTIMIZER_STEP.name, plan)
+            raise RuntimeError(
+                f"ddp harness injected fault: rank {args.rank} before backward"
+            )
+
+    observation = run_score_function_step(
+        access, runtime, optimizer, features, energy, stats, counter,
+        before_backward=before_backward,
+    )
+
+    # Reached only when this rank was not the target. A checkpoint is deliberately
+    # NOT published on any fault path: the gate requires that a run with a failed
+    # rank leaves nothing selectable.
+    return {
+        "completed": True,
+        "gradient_reductions": observation.gradient_reductions,
+    }
+
+
 def run_worker(args: argparse.Namespace) -> int:
     """Run one scenario, write the DF1 receipt, and record what was observed."""
 
@@ -387,6 +461,8 @@ def run_worker(args: argparse.Namespace) -> int:
             state["result"] = _run_publication(runtime, args)
         elif args.scenario == SCENARIO_COMM_COUNT:
             state["result"] = _run_comm_count(runtime, args)
+        elif args.scenario == SCENARIO_FAULT:
+            state["result"] = _run_fault(runtime, args)
         else:  # pragma: no cover - guarded by argparse choices
             raise ValueError(f"unknown scenario {args.scenario!r}")
         state["ok"] = True

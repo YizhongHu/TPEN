@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from tests.helpers.ddp_capability import probe_gloo_capability
+from tests.helpers.ddp_fault_injection import FaultKind, FaultPhase, FaultPlan
 from tests.helpers.ddp_subprocess_harness import HarnessBounds, run_gloo_subprocess_group
 from tests.helpers.vmc_scientific_oracle import (
     loss_tolerance_envelope,
@@ -580,3 +581,126 @@ def test_a_g6_reduction_count_does_not_grow_with_sampling(tmp_path: Path) -> Non
         assert long[rank]["prepared_forwards"] == 1, (
             "exactly one prepared forward per update, regardless of sampling work"
         )
+
+
+# --- A-G4 -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        FaultKind.RAISE_BEFORE_BACKWARD,
+        FaultKind.SKIP_COLLECTIVE,
+        FaultKind.STALL_BEFORE_COLLECTIVE,
+    ],
+    ids=["raise-before-backward", "skip-collective", "stall-before-collective"],
+)
+def test_a_g4_collective_failure_is_bounded_and_attributed(kind: FaultKind, tmp_path: Path) -> None:
+    """A-G4: DF1 faults injected into the REAL Accelerate worker.
+
+    Against the genuine Accelerate-backed step, not DF1's synthetic worker. What
+    is measured is how a failure propagates through THIS runtime: whether it stays
+    inside the nested bounds, whether the culprit is correctly attributed, and
+    whether the harness still leaves no survivor.
+
+    THE CULPRIT ASSERTION IS THE INTERESTING ONE. On the skip-collective path the
+    target rank exits CLEANLY while an innocent peer blocks until its own timeout
+    and dies -- so exit codes alone would finger the wrong rank. Attribution rests
+    on the culprit's own self-report, emitted before the fault takes effect.
+    """
+
+    _require_capabilities()
+    world_size = 2
+    target_rank = 1
+
+    plan = FaultPlan(
+        kind=kind,
+        target_rank=target_rank,
+        phase=FaultPhase.BEFORE_COLLECTIVE,
+        delay_seconds=90.0 if kind is FaultKind.STALL_BEFORE_COLLECTIVE else 0.0,
+    )
+
+    result = run_gloo_subprocess_group(
+        world_size=world_size,
+        fault_plan=plan,
+        bounds=_BOUNDS,
+        tmp_path=tmp_path,
+        worker_module=WORKER_MODULE,
+        worker_extra_args=["--scenario", "fault"],
+    )
+
+    # Bounded: the harness resolved this without the run hanging.
+    assert result.all_reaped, "the harness must confirm no survivor after a fault"
+
+    # Attribution: the rank the plan targeted, derived from its own self-report
+    # rather than echoed back from the plan.
+    assert result.culprit_rank == target_rank, (
+        f"culprit_rank={result.culprit_rank}, expected {target_rank}; "
+        f"exit_codes={result.exit_codes}"
+    )
+
+    # Process exit codes are captured SEPARATELY from any harness or scheduler
+    # status, and at least one rank must have failed -- a fault that left every
+    # rank exiting zero would mean the fault never bit.
+    assert all(code is not None for code in result.exit_codes), (
+        f"every rank must have an observed exit code: {result.exit_codes}"
+    )
+    assert any(code != 0 for code in result.exit_codes), (
+        f"no rank failed, so the injected fault never took effect: {result.exit_codes}"
+    )
+
+    # No checkpoint may be published on a failed run.
+    assert not result.publication_observed, "a failed run published a checkpoint"
+
+    # Evidence is preserved: each rank's log survives for diagnosis.
+    invocation = Path(result.invocation_dir)
+    for rank in range(world_size):
+        assert (invocation / f"rank_{rank}.log").exists(), (
+            f"rank {rank} log was not preserved for diagnosis"
+        )
+
+
+def test_a_g4_rank1_failure_after_rank0_success_fails_globally(tmp_path: Path) -> None:
+    """A-G4: rank 1 failing after rank 0 succeeds locally is a GLOBAL failure.
+
+    A rank-local success must never be mistaken for a completed run. This is the
+    shape where a naive implementation reports success because the coordinator
+    happened to finish its own work.
+    """
+
+    _require_capabilities()
+    world_size = 2
+
+    result = run_gloo_subprocess_group(
+        world_size=world_size,
+        fault_plan=FaultPlan(
+            kind=FaultKind.RAISE_BEFORE_BACKWARD,
+            target_rank=1,
+            phase=FaultPhase.BEFORE_COLLECTIVE,
+        ),
+        bounds=_BOUNDS,
+        tmp_path=tmp_path,
+        worker_module=WORKER_MODULE,
+        worker_extra_args=["--scenario", "fault"],
+    )
+
+    assert result.exit_codes[1] != 0, f"rank 1 was supposed to fail: {result.exit_codes}"
+    assert not result.publication_observed, (
+        "rank 0's local progress must not produce a completed run"
+    )
+    assert result.all_reaped
+
+    # CLOSES A PREVIOUSLY UNEXECUTED PATH. Until this arm, every scenario and every
+    # mutation exercised success paths or test-level assertion failures, so the
+    # worker's OWN exception handler had never run -- an undefined name there
+    # would have stayed invisible until the first real failure. Asserting the
+    # recorded failure fields proves that branch executed, which is stronger
+    # evidence than a linter would give.
+    invocation = Path(result.invocation_dir)
+    state = json.loads((invocation / "state_1.json").read_text())
+    assert state["ok"] is False
+    assert state["failure_type"] == "RuntimeError", state.get("failure_type")
+    assert "injected fault" in state["failure_message"]
+    assert "Traceback" in state["failure_traceback"], (
+        "the worker's exception handler must have recorded a real traceback"
+    )
