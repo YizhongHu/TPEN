@@ -55,6 +55,31 @@ parsl = [
 finite-difference = [
   "numdifftools==0.10.1",
 ]
+# Hugging Face Accelerate, consumed ONLY by the DS-A0 runtime spike under
+# tests/spikes/accelerate_ddp/. Deliberately an optional extra and not a runtime
+# dependency or a dev group member: nothing installs it by default, so `tpen`
+# itself never gains an Accelerate import path. Left unpinned to match the CUDA
+# torch extras; the spike records the resolved version and `accelerate.__file__`
+# in its evidence, because a version-blind receipt cannot be compared later.
+# Because nothing installs it, the spike's tests skip when it is absent — so the
+# spike carries a gate (A-G0) asserting the capability was actually PRESENT and
+# that no arm skipped. A green run of a fully skipped suite is the failure mode
+# this extra creates, and that gate is what closes it.
+#
+# PAIR THIS EXTRA WITH A TORCH EXTRA: `--extra cpu --extra accelerate`, never
+# `--extra accelerate` alone. Accelerate depends on torch, but `accelerate` is
+# absent from the `[tool.uv.sources]` torch routing below and from the
+# cpu/cu126/cu128/cu130/rocm71 conflict set, so an accelerate-only resolution has
+# no index to route torch to and falls back to PyPI — adding a seventh torch
+# entry to the lock that drags cuda-bindings and cuda-toolkit on Linux. Paired
+# with a torch extra the routed build wins and that PyPI entry stays unselected
+# (verified: `uv sync --extra cpu --extra accelerate` resolves torch 2.12.0 from
+# the cpu index). Adding `accelerate` to the conflict set would be wrong — it is
+# complementary to those extras, not mutually exclusive with them — and routing
+# it to one index would force a device choice on every consumer.
+accelerate = [
+  "accelerate",
+]
 
 [dependency-groups]
 dev = [

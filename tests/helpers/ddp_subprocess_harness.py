@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -164,6 +165,8 @@ def run_gloo_subprocess_group(
     bounds: HarnessBounds,
     tmp_path: Path,
     *,
+    worker_module: str = "tests.helpers.ddp_worker_entrypoint",
+    worker_extra_args: Sequence[str] = (),
     decoy_grandchild_rank: int | None = None,
     invocation_dir: Path | None = None,
 ) -> HarnessResult:
@@ -208,7 +211,7 @@ def run_gloo_subprocess_group(
         argv = [
             sys.executable,
             "-m",
-            "tests.helpers.ddp_worker_entrypoint",
+            worker_module,
             "--rank",
             str(rank),
             "--world-size",
@@ -224,6 +227,7 @@ def run_gloo_subprocess_group(
             "--pg-timeout",
             str(bounds.process_group_timeout),
         ]
+        argv.extend(worker_extra_args)
         if fault_plan_path is not None:
             argv += ["--fault-plan-path", str(fault_plan_path)]
         if decoy_grandchild_rank == rank:
