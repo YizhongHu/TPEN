@@ -13,7 +13,13 @@ its output straight into the update method.  No trainer is involved -- the
 trainer's own integration is a later slice -- so this establishes that the seam
 is consumable at THIS layer, where a mismatch is cheap to find.
 
-It found one.  See `test_score_seam_refuses_a_two_electron_tpen_model`.
+It found one: at two electrons the seam refused the whole request, because 16
+of `build_tiny_spenn`'s 39 parameters have no autograd path into ``logabs`` at
+an even electron count and ``allow_unused=False`` could not tell that apart from
+a parameter no code path consumes.  That is fixed at the seam, and this file now
+drives the TWO-ELECTRON fixture directly -- the shape of the helium target --
+rather than the three-electron stand-in it used while the blocker stood.  See
+`test_the_pair_model_scores_exact_zeros_for_its_inactive_parameters`.
 """
 
 from __future__ import annotations
@@ -22,11 +28,16 @@ import numpy as np
 import pytest
 import torch
 
-from tests.helpers.hooke_models import build_tiny_spenn
+from tests.helpers.hooke_models import (
+    INACTIVE_PAIR_PARAMETERS,
+    build_tiny_spenn,
+    pair_parameters_by_name,
+    tiny_pair_batch,
+)
+from tests.helpers.score_reachability import disconnected_parameter_names
 from tests.helpers.sr_dense_oracle import energy_gradient, sr_direction
-from tests.unit.nn.test_tpen_wavefunction_parameter_scores import _build_model
 from tpen.data.batch import ElectronBatch, ParameterScoreForwardPacket
-from tpen.nn import InteractionMode, MaterializedParameterScoreRequest
+from tpen.nn import MaterializedParameterScoreRequest
 from tpen.training.qgt import DampingPolicy
 from tpen.training.score_geometry import ScoreConventions
 from tpen.training.sr import SRPolicy, StochasticReconfigurationUpdate
@@ -37,25 +48,53 @@ LEARNING_RATE = 1.0e-3
 SOLVE_TOLERANCE = 1.0e-9
 
 
-def _connected_model():
-    """Build a real TPENWaveFunction whose parameters are all score-reachable.
+def _pair_model():
+    """Build the real two-electron smoke fixture -- the helium-shaped model.
 
-    Deliberately NOT `build_tiny_spenn()`: at its two-electron count 16 of its
-    39 parameters are unreachable and the provider refuses outright, which is
-    the blocker pinned at the bottom of this file.
+    Promoted from the three-electron stand-in this file used while the score
+    seam refused even electron counts. Its 16 structurally inactive parameters
+    are now served exact-zero score columns, so SR consumes it unchanged, and
+    the tests below therefore exercise the particle count the target programme
+    actually has.
     """
 
     torch.manual_seed(0)
-    return _build_model(InteractionMode.TENSOR_PRODUCT)
+    return build_tiny_spenn()
 
 
-def _batch(n_walkers: int = 6, *, seed: int = 5) -> ElectronBatch:
-    """Return a flat-sample-shape three-electron batch."""
+def _batch(n_walkers: int = 6) -> ElectronBatch:
+    """Return a flat-sample-shape TWO-electron batch from the owning helper."""
+
+    return tiny_pair_batch(n_walkers)
+
+
+def _odd_batch(n_walkers: int = 6, *, seed: int = 5) -> ElectronBatch:
+    """Return a flat-sample-shape three-electron batch for the parity check."""
 
     generator = torch.Generator().manual_seed(seed)
     return ElectronBatch(
         positions=torch.randn(n_walkers, 3, 3, generator=generator, dtype=torch.float64),
         spins=torch.tensor([[1.0, -1.0, 1.0]] * n_walkers, dtype=torch.float64),
+    )
+
+
+def _flat_gradients(model) -> np.ndarray:
+    """Flatten ``.grad`` over the model's parameters, zero-filling ``None``.
+
+    A parameter with no path into ``logabs`` gets no ``.grad`` from
+    ``backward()`` at all, and its true gradient is exactly zero, so the
+    zero-fill is the value rather than a convenience.
+    """
+
+    return np.concatenate(
+        [
+            (
+                np.zeros(parameter.numel())
+                if parameter.grad is None
+                else parameter.grad.detach().numpy().reshape(-1)
+            )
+            for parameter in model.parameters()
+        ]
     )
 
 
@@ -141,9 +180,17 @@ def test_the_emitted_blocks_are_the_uncentered_scores_the_engine_assumes() -> No
     The engine's entire geometry rests on that convention. Recomputing the same
     quantity with an independent per-sample autograd loop checks the emitted
     payload against its stated meaning rather than against the engine.
+
+    SCOPE LIMIT, stated because the reference is not independent everywhere.
+    For the 16 parameters in `INACTIVE_PAIR_PARAMETERS` this reference applies
+    the SAME zero-substitution rule as the seam, so for those columns the
+    comparison is vacuous by construction. Those columns are witnessed instead
+    by `test_the_pair_model_scores_exact_zeros_for_its_inactive_parameters`,
+    which checks them against an autograd reachability probe and a literal name
+    set. The 23 remaining columns are genuinely independently derived here.
     """
 
-    model = _connected_model()
+    model = _pair_model()
     batch = _batch()
     packet = _emit(model, batch)
     emitted = _independent_flatten(packet)
@@ -157,8 +204,20 @@ def test_the_emitted_blocks_are_the_uncentered_scores_the_engine_assumes() -> No
                 logabs.reshape(-1)[index],
                 parameters,
                 retain_graph=index + 1 < int(logabs.numel()),
+                allow_unused=True,
             )
-            rows.append(np.concatenate([g.detach().numpy().reshape(-1) for g in grads]))
+            rows.append(
+                np.concatenate(
+                    [
+                        (
+                            np.zeros(parameter.numel())
+                            if gradient is None
+                            else gradient.detach().numpy().reshape(-1)
+                        )
+                        for parameter, gradient in zip(parameters, grads, strict=True)
+                    ]
+                )
+            )
     reference = np.vstack(rows)
 
     assert emitted.shape == reference.shape
@@ -179,7 +238,7 @@ def test_sr_consumes_a_real_emitted_packet_and_matches_the_oracle() -> None:
     between the two modules shows up here.
     """
 
-    model = _connected_model()
+    model = _pair_model()
     batch = _batch()
     packet = _emit(model, batch)
     energies = _energies(int(packet.output.logabs.numel()))
@@ -218,7 +277,7 @@ def test_minsr_agrees_with_dense_sr_on_real_emitted_scores() -> None:
     batch = _batch()
     results = {}
     for space in ("parameter", "sample"):
-        model = _connected_model()
+        model = _pair_model()
         packet = _emit(model, batch)
         energies = _energies(int(packet.output.logabs.numel()))
         method = _method(model, solve_space=space)
@@ -241,7 +300,7 @@ def test_euclidean_limit_on_real_scores_matches_the_real_objective_gradient() ->
     convention loop end to end rather than assuming the emitted sign.
     """
 
-    model = _connected_model()
+    model = _pair_model()
     batch = _batch()
     packet = _emit(model, batch)
     energies = _energies(int(packet.output.logabs.numel()))
@@ -249,17 +308,32 @@ def test_euclidean_limit_on_real_scores_matches_the_real_objective_gradient() ->
     with torch.enable_grad():
         logabs = model(batch).logabs
         compute_vmc_objective(logabs, energies).loss.backward()
-    reference = np.concatenate(
-        [p.grad.detach().numpy().reshape(-1) for p in model.parameters()]
-    )
+    reference = _flat_gradients(model)
     for parameter in model.parameters():
         parameter.grad = None
 
-    method = _method(model, relative=1.0e10)
+    # The Euclidean limit is APPROACHED, not attained: with a uniform damping
+    # shift lambda the direction deviates from the plain gradient by order
+    # ||S||/lambda, and lambda = relative * trace(S) / P, so the relative
+    # deviation is bounded by roughly P / relative. This fixture has P = 2156,
+    # so the previous relative=1e10 left ~2e-7 -- measured at 1.1e-6, and the
+    # reason this assertion failed once the model grew. Raising `relative`
+    # SHARPENS the limit being asserted; loosening the tolerance below would
+    # have weakened it. At 1e13 the predicted bound is ~2e-10, well inside the
+    # 1e-8 asserted here.
+    #
+    # WHICH HALF CARRIES THE ASSERTION: `assert_allclose` tests
+    # `atol + rtol*|desired|`, and this site passes on ATOL. Measured max_abs
+    # 2.07e-11 but max_REL 3.46e-8, which EXCEEDS rtol=1e-8, so the relative
+    # half is not what holds. The P/relative bound above is about the
+    # VECTOR-NORM deviation (~9.6e-10) and is sound there; it is not a
+    # per-element bound. `atol` is legitimate here only because both sides are
+    # UNIT-NORMALISED, so its entries are dimensionless and bounded by 1 --
+    # on a raw dimensionful quantity an absolute floor would be a magnitude
+    # claim rather than an accuracy one.
+    method = _method(model, relative=1.0e13)
     method.update(_score_input(model, batch, packet, energies))
-    direction = np.concatenate(
-        [p.grad.detach().numpy().reshape(-1) for p in model.parameters()]
-    )
+    direction = _flat_gradients(model)
 
     np.testing.assert_allclose(
         direction / np.linalg.norm(direction),
@@ -288,7 +362,7 @@ def test_chunked_emission_is_consumable_and_gives_the_same_step() -> None:
     batch = _batch()
     steps = []
     for chunk_size in (None, 2):
-        model = _connected_model()
+        model = _pair_model()
         packet = _emit(model, batch, chunk_size=chunk_size)
         energies = _energies(int(packet.output.logabs.numel()))
         method = _method(model)
@@ -300,81 +374,122 @@ def test_chunked_emission_is_consumable_and_gives_the_same_step() -> None:
     np.testing.assert_allclose(steps[0], steps[1], rtol=1.0e-9, atol=1.0e-9)
 
 
-def test_score_seam_refuses_a_two_electron_tpen_model() -> None:
-    """PINS A BLOCKER: SR cannot run on a two-electron TPEN model, so not on helium.
+@pytest.mark.parametrize("chunk_size", [None, 2])
+def test_the_pair_model_scores_exact_zeros_for_its_inactive_parameters(
+    chunk_size: int | None,
+) -> None:
+    """WAS A PINNED BLOCKER; NOW ASSERTS THE PROPERTY THAT REPLACED IT.
 
-    Measured on Cannon job 44572987: of the 39 trainable parameters in
-    `build_tiny_spenn()`, 16 are structurally disconnected from ``logabs`` at
-    its two-electron count -- `stack.layers.0.mixing.weights.g0` through `g14`
-    and `stack.layers.0.path_aggregation.weights.o1`. The equivariant mixing
-    allocates a weight per tensor path, and at two electrons most of those
-    paths carry nothing, so autograd never reaches them.
+    This test used to require ``pytest.raises(RuntimeError)``: the seam passed
+    ``allow_unused=False`` and refused the entire request because 16 of this
+    model's 39 parameters have no autograd path into ``logabs`` at an even
+    electron count. Helium is two electrons, so that refusal blocked SR for the
+    target programme outright.
 
-    Both `_slow_parameter_score_blocks` and `_chunked_parameter_score_blocks`
-    pass ``allow_unused=False`` and convert the resulting error into
-    "materialized parameter scores found an unused or disconnected parameter",
-    failing the ENTIRE request.
+    The score of a parameter with no path into ``logabs`` is analytically
+    exactly zero, so the seam now substitutes zeros. Three separate things are
+    checked here, because the interesting failure mode is a seam that zeroes too
+    much rather than one that raises:
 
-    The guard is right about the case it was built for -- a parameter no code
-    path consumes, its own `_UnusedPfaffianReadout` test -- and cannot tell that
-    apart from a tensor path that is simply empty at this particle count.
-    Flipping ``allow_unused`` would destroy its real purpose, and `tpen/nn/` is
-    outside this lane's write surface, so the fix belongs to the seam's owner.
-    The correct score for a structurally inactive parameter is exactly zero, so
-    a seam that made that distinction would need no change on the SR side.
+    1. Every parameter in the literal `INACTIVE_PAIR_PARAMETERS` set has an
+       exactly-zero block -- counted nonzeros, not a tolerance, since any
+       nonzero entry would be wrong rather than imprecise.
+    2. An INDEPENDENT autograd reachability probe agrees that exactly that set
+       is unreachable, so the set is pinned by something other than the seam.
+    3. Some other block is nonzero, which a seam that zeroed everything fails.
 
-    Asserts the CURRENT behaviour, so it fails the moment the seam is fixed --
-    at which point `_connected_model` above can become `build_tiny_spenn`.
+    ``chunk_size=2`` over four samples splits the batch, so the batched-VJP
+    route is exercised across a chunk boundary rather than in one shot.
     """
 
-    model = build_tiny_spenn()
-    batch = ElectronBatch(
-        positions=torch.zeros((4, 2, 3), dtype=torch.float64),
-        spins=torch.tensor([[1.0, -1.0]] * 4, dtype=torch.float64),
-    )
+    model = _pair_model()
+    batch = _batch(4)
+    packet = _emit(model, batch, chunk_size=chunk_size)
+    scores = packet.parameter_scores
 
-    for chunk_size in (None, 2):
-        with pytest.raises(RuntimeError, match="unused or disconnected"):
-            _emit(model, batch, chunk_size=chunk_size)
+    # Refuses with a message naming the cause if the literal does not describe
+    # this model's parameter names, rather than a bare KeyError on `g0`.
+    pair_parameters_by_name(model)
+    names_by_identity = {id(parameter): name for name, parameter in model.named_parameters()}
+    blocks_by_name = {
+        names_by_identity[id(parameter)]: block
+        for parameter, block in zip(
+            model.parameter_binding.parameters, scores.blocks, strict=True
+        )
+    }
+
+    for name in sorted(INACTIVE_PAIR_PARAMETERS):
+        block = blocks_by_name[name]
+        assert int(torch.count_nonzero(block)) == 0, f"{name} scored nonzero"
+
+    assert disconnected_parameter_names(model, batch) == INACTIVE_PAIR_PARAMETERS
+    assert any(
+        int(torch.count_nonzero(block)) > 0
+        for name, block in blocks_by_name.items()
+        if name not in INACTIVE_PAIR_PARAMETERS
+    ), "every active block came back zero"
 
 
-def test_the_two_electron_refusal_is_caused_by_disconnection_specifically() -> None:
-    """The blocker is disconnection, not some other breakage of that model.
+@pytest.mark.parametrize("solve_space", ["parameter", "sample"])
+def test_sr_leaves_the_inactive_pair_parameters_bitwise_unchanged(solve_space: str) -> None:
+    """A zero score column must produce a zero update, not a small one.
 
-    Without this, the test above would pass for any reason the emission failed
-    and would keep passing if the cause changed. Counting unreachable
-    parameters names the cause directly, and the second half confirms the model
-    the rest of this file uses is NOT subject to it -- otherwise those tests
-    would prove nothing.
+    Exact-zero scores make the corresponding QGT rows and gradient entries zero,
+    so the solve should return exactly zero for those coordinates and the
+    optimizer should write nothing. ``rtol=atol=0.0`` is the point: a 1e-18 drift
+    would mean the dead coordinates are being driven by damping or solver noise,
+    which over a long run is a random walk in a direction the physics does not
+    define.
+
+    Run through both solve spaces, because dense SR and sample-space minSR reach
+    the same update by different linear algebra and only one is the default.
     """
 
-    blocked = build_tiny_spenn()
-    blocked_batch = ElectronBatch(
-        positions=torch.zeros((4, 2, 3), dtype=torch.float64),
-        spins=torch.tensor([[1.0, -1.0]] * 4, dtype=torch.float64),
-    )
-    parameters = blocked.parameter_binding.parameters
-    with torch.enable_grad():
-        grads = torch.autograd.grad(
-            blocked(blocked_batch).logabs.sum(), parameters, allow_unused=True
-        )
-    unreachable = [
-        slot.ordinal
-        for slot, grad in zip(
-            blocked.parameter_binding.layout.slots, grads, strict=True
-        )
-        if grad is None
+    model = _pair_model()
+    batch = _batch()
+    packet = _emit(model, batch)
+    energies = _energies(int(packet.output.logabs.numel()))
+    before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+
+    method = _method(model, solve_space=solve_space)
+    assert method.update(_score_input(model, batch, packet, energies)).applied is True
+
+    for name, parameter in model.named_parameters():
+        if name in INACTIVE_PAIR_PARAMETERS:
+            torch.testing.assert_close(parameter.detach(), before[name], rtol=0.0, atol=0.0)
+    moved = [
+        name
+        for name, parameter in model.named_parameters()
+        if not torch.equal(parameter.detach(), before[name])
     ]
+    assert moved, "the update applied but moved nothing, so the check above is vacuous"
 
-    assert unreachable, "the blocker is disconnection; finding none means it is fixed"
-    assert len(unreachable) < len(parameters), "some parameters must remain reachable"
 
-    connected = _connected_model()
-    connected_batch = _batch()
-    with torch.enable_grad():
-        connected_grads = torch.autograd.grad(
-            connected(connected_batch).logabs.sum(),
-            connected.parameter_binding.parameters,
-            allow_unused=True,
-        )
-    assert all(grad is not None for grad in connected_grads)
+def test_the_inactive_set_is_a_parity_property_not_a_two_electron_one() -> None:
+    """The disconnection follows the ELECTRON COUNT'S PARITY, not the number 2.
+
+    The original report described these weights as tensor paths that "carry
+    nothing at two electrons". That gloss is wrong and would license a fix keyed
+    to ``n == 2``. What actually happens is that the order-1 OUTPUT subtree
+    reaches ``logabs`` only through the odd-electron Pfaffian padding block, so
+    it is disconnected whenever there is no padding -- at every even count, in a
+    one-layer model. Measured at n=2, 4 and 6 (16 each, byte-identical) and
+    n=3, 5 and 7 (0 each).
+
+    DEPTH IS NOT A MITIGATION, and the premise is citable rather than argued.
+    Of the fixture's 29 mixing paths, ``g15`` and ``g16`` carry order-1 input to
+    order-2 output (m=2, m1=1, m2=1), and the readout consumes order-2
+    unconditionally at every parity -- so a second layer does reconnect layer 0.
+    But the count is INVARIANT at 16 and merely RELOCATES to the deepest layer,
+    so a deeper model still serves sixteen silently-zeroed parameters.
+
+    ONE model construction, TWO electron counts. Two different models would
+    leave any difference attributable to the models; varying only the batch
+    makes the electron count the sole difference, which is the claim. The odd
+    arm is also why the strict CI guard in
+    `tests/unit/nn/test_tpen_wavefunction_parameter_scores.py` sits at odd n:
+    there, and only there, an unreachable parameter is unambiguously a defect.
+    """
+
+    assert disconnected_parameter_names(_pair_model(), _batch()) == INACTIVE_PAIR_PARAMETERS
+    assert disconnected_parameter_names(_pair_model(), _odd_batch()) == frozenset()
