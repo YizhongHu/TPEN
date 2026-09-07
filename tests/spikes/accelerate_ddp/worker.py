@@ -33,6 +33,7 @@ from tests.spikes.accelerate_ddp.runtime import DistributedRuntime
 from tests.spikes.accelerate_ddp.vmc_step import (
     install_gradient_counter,
     prepare_statistics,
+    run_closure_step,
     run_score_function_step,
 )
 
@@ -42,6 +43,8 @@ SCENARIO_RESUME = "resume"
 SCENARIO_PUBLICATION = "publication"
 SCENARIO_COMM_COUNT = "comm-count"
 SCENARIO_FAULT = "fault"
+SCENARIO_OPTIMIZERS = "optimizers"
+SCENARIO_CLOSURE = "closure"
 SCENARIOS = (
     SCENARIO_SCORE_STEP,
     SCENARIO_ALL_INVALID,
@@ -49,6 +52,8 @@ SCENARIOS = (
     SCENARIO_PUBLICATION,
     SCENARIO_COMM_COUNT,
     SCENARIO_FAULT,
+    SCENARIO_OPTIMIZERS,
+    SCENARIO_CLOSURE,
 )
 
 
@@ -425,6 +430,115 @@ def _run_fault(runtime, args: argparse.Namespace) -> dict:
     }
 
 
+
+def _recursive_jsonable_state(optimizer) -> dict:
+    """Full optimizer state_dict, recursively JSON-safe.
+
+    RECURSIVE and COMPLETE on purpose (oracle-note M10): comparing only the
+    parameter values would miss momentum buffers, Adam's step counters and its
+    first/second moments -- exactly the state that makes a resumed or replicated
+    optimizer behave differently on the NEXT step while looking identical now.
+    """
+
+    inner = getattr(optimizer, "optimizer", optimizer)
+    return _jsonable_any(inner.state_dict())
+
+
+def _jsonable_any(value):
+    if isinstance(value, torch.Tensor):
+        return {"__tensor__": True, "dtype": str(value.dtype), "data": value.tolist()}
+    if isinstance(value, dict):
+        return {str(k): _jsonable_any(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_any(v) for v in value]
+    return value
+
+
+def _run_optimizers(runtime, args: argparse.Namespace) -> dict:
+    """A-E3: ordinary optimizers, full recursive state, under Accelerate."""
+
+    results: dict = {}
+    for name in ("sgd-momentum", "adam"):
+        features, energy, access, counter, _ = _build(runtime, args)
+        raw = access.raw_model
+        if name == "sgd-momentum":
+            base = torch.optim.SGD(raw.parameters(), lr=0.05, momentum=0.9)
+        else:
+            base = torch.optim.Adam(raw.parameters(), lr=0.05)
+        optimizer = runtime.accelerator.prepare(base)
+        for _ in range(3):
+            stats = prepare_statistics(runtime, energy)
+            run_score_function_step(access, runtime, optimizer, features, energy, stats, counter)
+        results[name] = {
+            "state": _recursive_jsonable_state(optimizer),
+            "parameters": {n: _tensor_to_list(p) for n, p in raw.named_parameters()},
+            "gradient_reductions": counter.count,
+            "prepared_type": type(optimizer).__name__,
+        }
+    return results
+
+
+def _run_closure(runtime, args: argparse.Namespace) -> dict:
+    """A-E3: what does Accelerate do with a closure-driven optimizer?
+
+    Establishes, rather than inherits from the sibling lane, whether the
+    abstraction HIDES, EXPOSES, or FORBIDS the re-entrant backward, and what
+    `no_sync` does to the reduction count on this path.
+    """
+
+    features, energy, access, counter, _ = _build(runtime, args)
+    optimizer = torch.optim.LBFGS(
+        access.raw_model.parameters(), max_iter=args.closure_iterations, lr=0.05
+    )
+    stats = prepare_statistics(runtime, energy)
+
+    before = counter.count
+    observation, closure_calls, synchronized_calls = run_closure_step(
+        access, runtime, optimizer, features, energy, stats, counter
+    )
+    closure_reductions = counter.count - before
+
+    # What `no_sync` ACTUALLY does here, measured rather than assumed. It is not
+    # used by the closure policy above -- suppressing synchronization while LBFGS
+    # mutates parameters and history per rank is unsafe -- but its cost must be
+    # recorded because it is the affordance an adopter would reach for.
+    no_sync_supported = hasattr(runtime.accelerator, "no_sync")
+    no_sync_reductions = None
+    if no_sync_supported:
+        mark = counter.count
+        try:
+            with runtime.accelerator.no_sync(access.prepared_model):
+                logabs = access.score_forward(features)
+                surrogate, _ = make_local_surrogate_for_probe(
+                    logabs, energy, stats, runtime.world_size
+                )
+                runtime.accelerator.backward(surrogate)
+            no_sync_reductions = counter.count - mark
+        except Exception as exc:  # noqa: BLE001 - a refusal is itself the finding
+            no_sync_reductions = f"raised {type(exc).__name__}: {exc}"
+
+    return {
+        "closure_calls": closure_calls,
+        "synchronized_calls": synchronized_calls,
+        "closure_reductions": closure_reductions,
+        "reductions_per_closure_call": (
+            closure_reductions / closure_calls if closure_calls else None
+        ),
+        "global_loss": observation.global_loss,
+        "parameters": {n: _tensor_to_list(p) for n, p in access.raw_model.named_parameters()},
+        "no_sync_supported": no_sync_supported,
+        "no_sync_reductions_for_one_backward": no_sync_reductions,
+    }
+
+
+def make_local_surrogate_for_probe(logabs, energy, stats, world_size):
+    """Local import shim so the no_sync probe uses the same surrogate as the step."""
+
+    from tests.spikes.accelerate_ddp.vmc_step import make_local_surrogate
+
+    return make_local_surrogate(logabs, energy, stats, world_size=world_size)
+
+
 def run_worker(args: argparse.Namespace) -> int:
     """Run one scenario, write the DF1 receipt, and record what was observed."""
 
@@ -463,6 +577,10 @@ def run_worker(args: argparse.Namespace) -> int:
             state["result"] = _run_comm_count(runtime, args)
         elif args.scenario == SCENARIO_FAULT:
             state["result"] = _run_fault(runtime, args)
+        elif args.scenario == SCENARIO_OPTIMIZERS:
+            state["result"] = _run_optimizers(runtime, args)
+        elif args.scenario == SCENARIO_CLOSURE:
+            state["result"] = _run_closure(runtime, args)
         else:  # pragma: no cover - guarded by argparse choices
             raise ValueError(f"unknown scenario {args.scenario!r}")
         state["ok"] = True
@@ -518,6 +636,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--delay-rank", type=int, default=None)
     parser.add_argument("--delay-seconds", type=float, default=0.0)
     parser.add_argument("--mcmc-steps", type=int, default=1)
+    parser.add_argument("--closure-iterations", type=int, default=3)
     return parser
 
 

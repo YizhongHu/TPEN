@@ -205,11 +205,93 @@ def run_score_function_step(
     )
 
 
+def run_closure_step(
+    access: ModelAccess,
+    runtime: DistributedRuntime,
+    optimizer: torch.optim.LBFGS,
+    features: torch.Tensor,
+    energy: torch.Tensor,
+    stats: FiniteStatistics,
+    counter: GradientReductionCounter,
+) -> tuple[StepObservation, int, int]:
+    """Run a globally synchronized closure through ``accelerator.backward``.
+
+    A-E3's question, and the reason it must be ESTABLISHED rather than inherited
+    from the sibling lane: what does Accelerate's abstraction do with a
+    closure-driven optimizer -- does it HIDE, EXPOSE, or FORBID the re-entrant
+    backward?
+
+    What is measured here: whether ``accelerator.backward`` can be called
+    repeatedly inside one ``optimizer.step(closure)``, and how many gradient
+    reductions that costs per closure call.
+
+    THE POLICY IS DELIBERATE, not incidental. LBFGS mutates parameters and its
+    history after EVERY closure return, so a rank whose gradient was not globally
+    reduced would diverge from its peers immediately, and a later synchronized
+    backward cannot repair optimizer state that has already advanced. Suppressing
+    synchronization -- via ``no_sync`` or otherwise -- is therefore unsafe on this
+    path, and early stopping is safe only because there is no specially designated
+    unsynchronized final call to miss. Every state-mutating iterate pays one
+    reduction. That cost is a DG0 input, not something to hide.
+    """
+
+    closure_calls = 0
+    synchronized_calls = 0
+
+    def closure() -> torch.Tensor:
+        nonlocal closure_calls, synchronized_calls
+        closure_calls += 1
+        optimizer.zero_grad(set_to_none=True)
+        logabs = access.score_forward(features)
+        local_surrogate, _ = make_local_surrogate(
+            logabs, energy, stats, world_size=runtime.world_size
+        )
+        runtime.accelerator.backward(local_surrogate)
+        local_term = float(centered_terms(logabs.detach(), energy, stats).sum().item())
+        global_term = sum(float(v) for v in runtime.all_gather_objects(local_term))
+        synchronized_calls += 1
+        # Return the GLOBAL objective, so every rank's optimizer sees the same
+        # value and cannot take a different search direction from its peers.
+        return torch.tensor(
+            2.0 * global_term / stats.finite_count, dtype=local_surrogate.dtype
+        )
+
+    optimizer.step(closure)
+
+    gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in access.raw_model.named_parameters()
+        if parameter.grad is not None
+    }
+    raw_logabs, coordinate_gradient = access.coordinate_forward(features)
+    local_surrogate, scale = make_local_surrogate(
+        raw_logabs, energy, stats, world_size=runtime.world_size
+    )
+    local_term = float(centered_terms(raw_logabs.detach(), energy, stats).sum().item())
+    global_term = sum(float(v) for v in runtime.all_gather_objects(local_term))
+    observation = StepObservation(
+        stats=stats,
+        global_loss=2.0 * global_term / stats.finite_count,
+        local_surrogate_loss=float(local_surrogate.detach().item()),
+        scale_factor=scale,
+        local_gradients={},
+        gradients=gradients,
+        gradient_reductions=counter.count,
+        coordinate_gradient=coordinate_gradient.detach(),
+        logabs=raw_logabs.detach(),
+        gradient_accumulation_steps=int(
+            getattr(runtime.accelerator, "gradient_accumulation_steps", 1)
+        ),
+    )
+    return observation, closure_calls, synchronized_calls
+
+
 __all__ = [
     "GradientReductionCounter",
     "StepObservation",
     "install_gradient_counter",
     "make_local_surrogate",
     "prepare_statistics",
+    "run_closure_step",
     "run_score_function_step",
 ]

@@ -704,3 +704,136 @@ def test_a_g4_rank1_failure_after_rank0_success_fails_globally(tmp_path: Path) -
     assert "Traceback" in state["failure_traceback"], (
         "the worker's exception handler must have recorded a real traceback"
     )
+
+
+# --- A-E3 -------------------------------------------------------------------
+
+
+def test_a_e3_ordinary_optimizer_state_matches_an_independent_reference(tmp_path: Path) -> None:
+    """A-E3: SGD-momentum and Adam, full state compared RECURSIVELY (M10).
+
+    The reference optimizers are constructed INDEPENDENTLY in this process and
+    driven by the oracle's own gradients over the concatenation. Comparing only
+    parameter values would miss momentum buffers, Adam's step counter and its
+    first/second moments -- the state that makes a replicated optimizer behave
+    differently on the NEXT step while looking identical now.
+    """
+
+    _require_capabilities()
+    world_size = 2
+    result, states = _run_scenario(world_size, "optimizers", tmp_path)
+    assert result.exit_codes == tuple([0] * world_size), result.exit_codes
+    for rank, state in enumerate(states):
+        assert state["ok"], f"rank {rank} failed: {state.get('failure_message')}"
+
+    for name in ("sgd-momentum", "adam"):
+        reference_model = SemanticWavefunction()
+        if name == "sgd-momentum":
+            reference = torch.optim.SGD(reference_model.parameters(), lr=0.05, momentum=0.9)
+        else:
+            reference = torch.optim.Adam(reference_model.parameters(), lr=0.05)
+
+        for _ in range(3):
+            feature_shards = []
+            energy_shards = []
+            for rank in range(world_size):
+                features, energy = scientific_fixture(world_size, rank, kind="regular")
+                feature_shards.append(features)
+                energy_shards.append(energy)
+            logabs_shards = [reference_model(f) for f in feature_shards]
+            oracle = oracle_vmc_objective(logabs_shards, energy_shards)
+            reference.zero_grad(set_to_none=True)
+            oracle.loss.backward()
+            reference.step()
+
+        expected_parameters = {
+            n: p.detach().flatten().tolist() for n, p in reference_model.named_parameters()
+        }
+        for rank, state in enumerate(states):
+            observed = state["result"][name]
+            for key, expected in expected_parameters.items():
+                got = observed["parameters"][key]
+                # DERIVED, not chosen. The two sides do the same float64
+                # arithmetic in a DIFFERENT summation order (the distributed side
+                # reduces across ranks), so per-step relative error is O(eps) with
+                # eps ~ 2.2e-16 on O(1) values. Three compounding steps under
+                # momentum 0.9 amplify by at most 1/(1-0.9) = 10, giving a worst
+                # case near 1e-14. 1e-10 leaves four orders of margin.
+                #
+                # It still DISCRIMINATES what matters: the defects this comparison
+                # exists to catch -- a missing world-size factor, a rank-local
+                # mean, a wrong optimizer -- move parameters by O(1) relative,
+                # which is ten orders above this bound. A tolerance that admitted
+                # those would be worthless, and this one cannot.
+                assert torch.allclose(
+                    torch.tensor(got, dtype=torch.float64),
+                    torch.tensor(expected, dtype=torch.float64),
+                    atol=1e-10, rtol=0.0,
+                ), f"{name} rank {rank} parameter {key}: {got} != {expected}"
+
+            # Recursive state: every param group entry and every per-parameter
+            # buffer, not just the values.
+            groups = observed["state"]["param_groups"]
+            assert groups and isinstance(groups, list)
+            per_param = observed["state"]["state"]
+            assert per_param, f"{name} rank {rank} reported an EMPTY optimizer state"
+            for slot in per_param.values():
+                if name == "sgd-momentum":
+                    assert "momentum_buffer" in slot, f"{name}: momentum buffer missing"
+                else:
+                    for required in ("step", "exp_avg", "exp_avg_sq"):
+                        assert required in slot, f"adam: {required} missing from state"
+
+        # Every rank must hold IDENTICAL optimizer state; a divergence would mean
+        # the replicas are no longer one optimizer.
+        first = states[0]["result"][name]["state"]
+        for rank in range(1, world_size):
+            assert states[rank]["result"][name]["state"] == first, (
+                f"{name}: rank {rank} optimizer state diverged from rank 0"
+            )
+
+
+def test_a_e3_closure_costs_one_reduction_per_state_mutating_call(tmp_path: Path) -> None:
+    """A-E3: what Accelerate does with a closure-driven optimizer.
+
+    ESTABLISHED here, not inherited from the native spike. The sibling lane found
+    that suppressing synchronization is unsafe on this path and that correctness
+    costs one gradient reduction per state-mutating closure call. Whether that
+    transfers to Accelerate is exactly what this measures, and an untested
+    assumption carried across would be worse than a stated gap.
+    """
+
+    _require_capabilities()
+    world_size = 2
+    result, states = _run_scenario(world_size, "closure", tmp_path)
+    assert result.exit_codes == tuple([0] * world_size), result.exit_codes
+    for rank, state in enumerate(states):
+        assert state["ok"], f"rank {rank} failed: {state.get('failure_message')}"
+
+    for rank, state in enumerate(states):
+        observed = state["result"]
+        # The re-entrant backward is not FORBIDDEN: the closure ran more than once
+        # and accelerator.backward worked inside it.
+        assert observed["closure_calls"] >= 2, (
+            f"rank {rank}: the closure ran {observed['closure_calls']} times; a "
+            "single call would not exercise re-entrancy at all"
+        )
+        # Every state-mutating call was synchronized. There is no unsynchronized
+        # 'final' call to miss, which is what makes early stopping safe.
+        assert observed["synchronized_calls"] == observed["closure_calls"], (
+            f"rank {rank}: {observed['synchronized_calls']} synchronized of "
+            f"{observed['closure_calls']} closure calls -- an unsynchronized "
+            "iterate would let ranks diverge irrecoverably"
+        )
+        # The COST, recorded rather than hidden.
+        assert observed["reductions_per_closure_call"] == pytest.approx(1.0), (
+            f"rank {rank}: {observed['reductions_per_closure_call']} reductions per "
+            "closure call"
+        )
+
+    # Ranks must agree on parameters after the closure step.
+    first = states[0]["result"]["parameters"]
+    for rank in range(1, world_size):
+        assert states[rank]["result"]["parameters"] == first, (
+            f"rank {rank} diverged from rank 0 across the closure step"
+        )
