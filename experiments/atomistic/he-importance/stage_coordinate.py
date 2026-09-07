@@ -12,9 +12,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from hashlib import sha256
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+from types import MappingProxyType
 
 
 TRAIN_MANIFEST_SCHEMA = "he-importance/train/v1"
@@ -76,6 +78,202 @@ _FORBIDDEN_TRAIN_CONTENT_KEYS = frozenset(
         "accuracy_band",
     }
 )
+
+
+# These labels are scientific namespaces, rather than an inventory of rows.
+# In particular, no stage materializer may use the historical fixed breadth
+# count as a substitute for expanding its literal factor union.
+STAGE_SEED_LABELS = {
+    "Q": tuple(range(810_001, 810_003)),
+    "O1": tuple(range(820_001, 820_009)),
+    "O2": tuple(range(821_001, 821_009)),
+    "A": tuple(range(830_001, 830_009)),
+    "B": tuple(range(840_001, 840_009)),
+    "R": tuple(range(850_001, 850_013)),
+    "F": tuple(range(860_001, 860_049)),
+}
+SEED_STREAMS = (
+    "model_initialization",
+    "training_sampler",
+    "method_randomness",
+    "diagnostic",
+    "evaluation_calibration",
+    "evaluation_inference",
+)
+
+
+class MaterializationError(ValueError):
+    """A requested HI configuration cannot become an immutable row."""
+
+
+@dataclass(frozen=True)
+class OptimizerCell:
+    """A literal optimizer cell, including an explicit unavailable state.
+
+    Parameters
+    ----------
+    method
+        Declared method name.  This is preserved even when unavailable.
+    status
+        Either ``"available"`` or ``"unavailable"``.
+    reason
+        Required only for unavailable cells.  It makes an implementation
+        qualification failure visible instead of silently selecting Adam.
+    """
+
+    method: str
+    status: str
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {"available", "unavailable"}:
+            raise MaterializationError(f"unknown optimizer status {self.status!r}")
+        if self.status == "unavailable" and not self.reason:
+            raise MaterializationError("unavailable optimizer cells need a reason")
+        if self.status == "available" and self.reason is not None:
+            raise MaterializationError("available optimizer cells cannot carry an unavailable reason")
+
+
+@dataclass(frozen=True)
+class MaterializedCell:
+    """One content-addressed train row without an attempt identity."""
+
+    manifest: Mapping[str, Any]
+    content_hash: str
+    output_path: Path
+    seed_streams: Mapping[str, int]
+
+
+def canonical_json(value: Any) -> bytes:
+    """Return the version-independent canonical bytes used for identities."""
+
+    try:
+        return json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    except (TypeError, ValueError) as error:
+        raise MaterializationError("identity values must be finite JSON data") from error
+
+
+def content_hash(value: Any) -> str:
+    """Return the SHA-256 identity of canonical literal content."""
+
+    return sha256(canonical_json(value)).hexdigest()
+
+
+def _freeze(value: Any) -> Any:
+    """Recursively freeze a JSON-shaped manifest after it has been hashed."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(nested) for key, nested in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(nested) for nested in value)
+    return value
+
+
+def seed_labels(stage: str) -> tuple[int, ...]:
+    """Return the fixed fresh-seed namespace for one stage."""
+
+    stage_definition(stage)
+    return STAGE_SEED_LABELS[stage]
+
+
+def seed_namespace(stage: str, label: int, *, cohort: str = "he-importance/v2") -> dict[str, int]:
+    """Derive collision-resistant named streams for one scientific seed label.
+
+    A digest, not Python's process-randomized ``hash()``, maps each semantic
+    stream to a positive signed-63-bit integer accepted by common RNG APIs.
+    """
+
+    if label not in seed_labels(stage):
+        raise MaterializationError(f"seed label {label} is outside the {stage} namespace")
+    if not cohort:
+        raise MaterializationError("seed cohorts must be explicit")
+    streams = {
+        stream: int.from_bytes(
+            sha256(canonical_json({"cohort": cohort, "stage": stage, "label": label, "stream": stream})).digest()[:8],
+            "big",
+        )
+        & ((1 << 63) - 1)
+        for stream in SEED_STREAMS
+    }
+    if 0 in streams.values() or len(set(streams.values())) != len(streams):
+        raise MaterializationError("seed namespace collision")
+    return streams
+
+
+def _absolute_unique_path(output_root: Path, stage: str, digest: str, seen: set[Path]) -> Path:
+    root = output_root.resolve()
+    if not root.is_absolute():  # pragma: no cover - Path.resolve is absolute by contract.
+        raise MaterializationError("output root must resolve to an absolute path")
+    path = root / stage / digest
+    if path in seen:
+        raise MaterializationError(f"output path reused: {path}")
+    seen.add(path)
+    return path
+
+
+def materialize_stage(
+    stage: str,
+    configurations: Iterable[Mapping[str, Any]],
+    optimizer: OptimizerCell,
+    output_root: Path,
+) -> tuple[MaterializedCell, ...]:
+    """Materialize one exact resolved union as immutable, content-addressed rows.
+
+    ``configurations`` are literal resolved configurations: each must provide a
+    non-empty ``scientific_identity`` and a complete ``payload`` mapping.  A
+    duplicate is removed only when its resolved scientific identity is exactly
+    equal.  Conflicting definitions of that identity fail rather than choosing
+    an arbitrary display-name representative.
+    """
+
+    stage_definition(stage)
+    identities: dict[str, Mapping[str, Any]] = {}
+    seen_paths: set[Path] = set()
+    cells: list[MaterializedCell] = []
+    for configuration in configurations:
+        if frozenset(configuration) != frozenset({"scientific_identity", "payload"}):
+            raise MaterializationError("resolved configurations require exactly scientific_identity and payload")
+        identity = configuration["scientific_identity"]
+        payload = configuration["payload"]
+        if not isinstance(identity, Mapping) or not identity:
+            raise MaterializationError("scientific_identity must be a non-empty mapping")
+        if not isinstance(payload, Mapping):
+            raise MaterializationError("payload must be a literal mapping")
+        identity_hash = content_hash(identity)
+        previous = identities.get(identity_hash)
+        if previous is not None:
+            if canonical_json(previous) != canonical_json(configuration):
+                raise MaterializationError("one scientific identity has conflicting resolved content")
+            continue
+        identities[identity_hash] = configuration
+        optimizer_payload = {"method": optimizer.method, "status": optimizer.status}
+        if optimizer.reason is not None:
+            optimizer_payload["unavailable_reason"] = optimizer.reason
+        for label in seed_labels(stage):
+            manifest = {
+                "schema": TRAIN_MANIFEST_SCHEMA,
+                "stage": stage,
+                "scientific_identity": dict(identity),
+                "seed_identity": {"stage": stage, "label": label, "namespace": "fresh-training"},
+                "payload": {"configuration": dict(payload), "optimizer": optimizer_payload},
+            }
+            validate_train_manifest(manifest)
+            digest = content_hash(manifest)
+            cells.append(
+                MaterializedCell(
+                    manifest=_freeze(manifest),
+                    content_hash=digest,
+                    output_path=_absolute_unique_path(output_root, stage, digest, seen_paths),
+                    seed_streams=_freeze(seed_namespace(stage, label)),
+                )
+            )
+    return tuple(cells)
 
 
 def stage_definition(code: str) -> StageDefinition:

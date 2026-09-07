@@ -305,3 +305,74 @@ def test_schema_string_equality_is_enforced() -> None:
     manifest["schema"] = "he-importance/train/v0"
     with pytest.raises(stage_coordinate.ManifestSchemaError, match="expected schema"):
         stage_coordinate.validate_train_manifest(manifest)
+
+
+def test_seed_namespaces_encode_the_new_8_12_48_policy() -> None:
+    assert stage_coordinate.seed_labels("O1") == tuple(range(820_001, 820_009))
+    assert stage_coordinate.seed_labels("R") == tuple(range(850_001, 850_013))
+    assert stage_coordinate.seed_labels("F") == tuple(range(860_001, 860_049))
+    streams = stage_coordinate.seed_namespace("O1", 820_001)
+    assert tuple(streams) == stage_coordinate.SEED_STREAMS
+    assert len(set(streams.values())) == len(streams)
+    assert all(0 < value < 2**63 for value in streams.values())
+
+
+def test_materialized_union_deduplicates_only_resolved_scientific_identity(tmp_path: Path) -> None:
+    control = {"scientific_identity": {"model": "control"}, "payload": {"updates": 50_000}}
+    duplicate = {"scientific_identity": {"model": "control"}, "payload": {"updates": 50_000}}
+    variant = {"scientific_identity": {"model": "hybrid"}, "payload": {"updates": 50_000}}
+    cells = stage_coordinate.materialize_stage(
+        "O1",
+        [control, duplicate, variant],
+        stage_coordinate.OptimizerCell("adam", "available"),
+        tmp_path,
+    )
+    assert len(cells) == 16
+    assert len({cell.content_hash for cell in cells}) == 16
+    assert len({cell.output_path for cell in cells}) == 16
+    assert all(cell.output_path.is_absolute() for cell in cells)
+    assert all(
+        cell.manifest["payload"]["optimizer"] == {"method": "adam", "status": "available"}
+        for cell in cells
+    )
+    with pytest.raises(TypeError):
+        cells[0].manifest["stage"] = "F"  # type: ignore[index]
+
+
+def test_materializer_rejects_conflicting_resolved_scientific_identity(tmp_path: Path) -> None:
+    first = {"scientific_identity": {"model": "control"}, "payload": {"updates": 50_000}}
+    conflict = {"scientific_identity": {"model": "control"}, "payload": {"updates": 25_000}}
+    with pytest.raises(stage_coordinate.MaterializationError, match="conflicting"):
+        stage_coordinate.materialize_stage(
+            "O1", [first, conflict], stage_coordinate.OptimizerCell("adam", "available"), tmp_path
+        )
+
+
+def test_unavailable_optimizer_is_explicit_and_never_becomes_adam(tmp_path: Path) -> None:
+    unavailable = stage_coordinate.OptimizerCell("linear_method", "unavailable", "full tangent unavailable")
+    cells = stage_coordinate.materialize_stage(
+        "O1",
+        [{"scientific_identity": {"model": "control"}, "payload": {"updates": 50_000}}],
+        unavailable,
+        tmp_path,
+    )
+    assert len(cells) == 8
+    assert all(
+        cell.manifest["payload"]["optimizer"]
+        == {
+            "method": "linear_method",
+            "status": "unavailable",
+            "unavailable_reason": "full tangent unavailable",
+        }
+        for cell in cells
+    )
+    with pytest.raises(stage_coordinate.MaterializationError, match="need a reason"):
+        stage_coordinate.OptimizerCell("linear_method", "unavailable")
+
+
+def test_content_hash_is_canonical_and_rejects_nonfinite_values() -> None:
+    assert stage_coordinate.content_hash({"a": 1, "b": [2, 3]}) == stage_coordinate.content_hash(
+        {"b": [2, 3], "a": 1}
+    )
+    with pytest.raises(stage_coordinate.MaterializationError, match="finite JSON"):
+        stage_coordinate.content_hash({"bad": float("nan")})
