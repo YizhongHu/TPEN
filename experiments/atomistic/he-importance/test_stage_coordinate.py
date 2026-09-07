@@ -6,6 +6,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -103,6 +104,19 @@ def test_train_manifest_refuses_unknown_top_level_key() -> None:
     manifest["reference"] = {"energy": -2.903724377034119598}
     with pytest.raises(stage_coordinate.ManifestSchemaError, match="manifest keys mismatch"):
         stage_coordinate.validate_train_manifest(manifest)
+
+
+def test_train_manifest_accepts_mapping_proxies_at_each_enumerated_level() -> None:
+    manifest = _train_manifest()
+    proxied = MappingProxyType(
+        {
+            **manifest,
+            "scientific_identity": MappingProxyType(manifest["scientific_identity"]),
+            "seed_identity": MappingProxyType(manifest["seed_identity"]),
+            "payload": MappingProxyType(manifest["payload"]),
+        }
+    )
+    stage_coordinate.validate_train_manifest(proxied)
 
 
 @pytest.mark.parametrize(
