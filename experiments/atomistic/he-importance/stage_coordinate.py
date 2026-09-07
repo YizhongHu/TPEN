@@ -146,6 +146,84 @@ class MaterializedCell:
     seed_streams: Mapping[str, int]
 
 
+@dataclass(frozen=True)
+class CheckpointCadence:
+    """Science-selected dense checkpoint observations.
+
+    Parameters
+    ----------
+    every_n_updates
+        Dense persistence cadence. This is scientific study input, not a
+        scheduler setting.
+    selected_updates
+        Immutable checkpoint observations to materialize into evaluation
+        packets. Their selection is fixed before training and cannot be
+        replaced by an in-training callback.
+    """
+
+    every_n_updates: int
+    selected_updates: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.every_n_updates <= 0:
+            raise MaterializationError("checkpoint cadence must be positive")
+        if not self.selected_updates:
+            raise MaterializationError("at least one checkpoint observation is required")
+        if tuple(sorted(set(self.selected_updates))) != self.selected_updates:
+            raise MaterializationError("selected checkpoints must be unique and increasing")
+        if any(update <= 0 or update % self.every_n_updates for update in self.selected_updates):
+            raise MaterializationError("selected checkpoints must lie on the dense cadence")
+
+    def science_parameters(self) -> Mapping[str, Any]:
+        """Return the immutable scientific checkpoint parameter block."""
+
+        return _freeze(
+            {
+                "every_n_updates": self.every_n_updates,
+                "selected_updates": list(self.selected_updates),
+            }
+        )
+
+
+@dataclass(frozen=True)
+class TrainingPacket:
+    """One train job packet with no persisted evaluation callback."""
+
+    cell: MaterializedCell
+    checkpoint_cadence: CheckpointCadence
+    ddp_provenance: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class RankingPacket:
+    """Cheap checkpoint ranking packet that is structurally unable to emit energy."""
+
+    checkpoint_path: Path
+    source_content_hash: str
+    ranking_inputs: Mapping[str, Any]
+    emitted_metrics: tuple[str, ...]
+    ddp_provenance: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class IndependentSamplerTestPacket:
+    """Expensive test packet fed only immutable independent-sampler inputs."""
+
+    checkpoint_path: Path
+    source_content_hash: str
+    independent_sampler_inputs: Mapping[str, Any]
+    ddp_provenance: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class PacketMaterialization:
+    """Separate train, ranking, and independent-sampler packet collections."""
+
+    train: tuple[TrainingPacket, ...]
+    ranking: tuple[RankingPacket, ...]
+    independent_sampler_test: tuple[IndependentSamplerTestPacket, ...]
+
+
 def canonical_json(value: Any) -> bytes:
     """Return canonical identity bytes for a value or an HI train manifest.
 
@@ -345,6 +423,104 @@ def materialize_stage(
                 )
             )
     return tuple(cells)
+
+
+def _immutable_packet_inputs(
+    inputs: Mapping[str, Any], label: str, *, require_nonempty: bool = True
+) -> Mapping[str, Any]:
+    """Freeze a non-empty packet input block before it is handed to a job."""
+
+    if not isinstance(inputs, Mapping) or (require_nonempty and not inputs):
+        requirement = "a non-empty mapping" if require_nonempty else "a mapping"
+        raise MaterializationError(f"{label} must be {requirement}")
+    try:
+        canonical_json(inputs)
+    except MaterializationError as error:
+        raise MaterializationError(f"{label} must contain finite JSON data") from error
+    return _freeze(dict(inputs))
+
+
+def _checkpoint_path(cell: MaterializedCell, update: int) -> Path:
+    """Name one immutable observation beneath its content-addressed train row."""
+
+    return cell.output_path / "checkpoints" / f"update-{update:08d}"
+
+
+def _is_energy_metric(metric: str) -> bool:
+    """Recognize energy-bearing metric names without allowing spelling bypasses."""
+
+    return "energy" in _tokens(metric)
+
+
+def materialize_job_packets(
+    cells: Iterable[MaterializedCell],
+    checkpoint_cadence: CheckpointCadence,
+    ranking_inputs: Mapping[str, Any],
+    ranking_metrics: Iterable[str],
+    independent_sampler_inputs: Mapping[str, Any],
+    *,
+    ddp_provenance: Mapping[str, Any],
+) -> PacketMaterialization:
+    """Materialize the three disjoint HI job-packet classes.
+
+    The returned packets deliberately contain no scheduler, facility, device,
+    or launch defaults. Those are operator-supplied execution concerns. DDP
+    information is retained as provenance only and is not used to derive a
+    scientific identity, packet multiplicity, or start dependency.
+    """
+
+    frozen_ranking_inputs = _immutable_packet_inputs(ranking_inputs, "ranking inputs")
+    frozen_independent_inputs = _immutable_packet_inputs(
+        independent_sampler_inputs, "independent sampler inputs"
+    )
+    frozen_ddp_provenance = _immutable_packet_inputs(
+        ddp_provenance, "DDP provenance", require_nonempty=False
+    )
+    metrics = tuple(ranking_metrics)
+    if not metrics or any(not isinstance(metric, str) or not metric for metric in metrics):
+        raise MaterializationError("ranking metrics must be non-empty strings")
+    if any(_is_energy_metric(metric) for metric in metrics):
+        raise MaterializationError("cheap ranking packets cannot emit energy")
+
+    train: list[TrainingPacket] = []
+    ranking: list[RankingPacket] = []
+    independent_sampler_test: list[IndependentSamplerTestPacket] = []
+    seen_cells: set[str] = set()
+    for cell in cells:
+        if cell.content_hash in seen_cells:
+            raise MaterializationError("train cells must be unique by content identity")
+        seen_cells.add(cell.content_hash)
+        train.append(
+            TrainingPacket(
+                cell=cell,
+                checkpoint_cadence=checkpoint_cadence,
+                ddp_provenance=frozen_ddp_provenance,
+            )
+        )
+        for update in checkpoint_cadence.selected_updates:
+            checkpoint_path = _checkpoint_path(cell, update)
+            ranking.append(
+                RankingPacket(
+                    checkpoint_path=checkpoint_path,
+                    source_content_hash=cell.content_hash,
+                    ranking_inputs=frozen_ranking_inputs,
+                    emitted_metrics=metrics,
+                    ddp_provenance=frozen_ddp_provenance,
+                )
+            )
+            independent_sampler_test.append(
+                IndependentSamplerTestPacket(
+                    checkpoint_path=checkpoint_path,
+                    source_content_hash=cell.content_hash,
+                    independent_sampler_inputs=frozen_independent_inputs,
+                    ddp_provenance=frozen_ddp_provenance,
+                )
+            )
+    return PacketMaterialization(
+        train=tuple(train),
+        ranking=tuple(ranking),
+        independent_sampler_test=tuple(independent_sampler_test),
+    )
 
 
 def validate_materialized_manifest(manifest: Mapping[str, Any]) -> None:
