@@ -137,6 +137,10 @@ def test_designated_topology_subtree_accepts_generated_spellings_without_lexical
             "num_gpus": 8,
             "device_mesh": ("x", "y"),
             "visible_devices": MappingProxyType({"CUDA_VISIBLE_DEVICES": "0,1"}),
+            "global_rank": 7,
+            "tp_size": 2,
+            "node_rank": 1,
+            "gpu_id": 0,
         }
     )
     manifest["topology"] = MappingProxyType(generated)
@@ -155,6 +159,25 @@ def test_topology_is_required_and_mesh_outside_it_remains_caller_declared_scienc
     fine["payload"] = {"updates": 50_000, "configuration": {"mesh": "fine"}}
     stage_coordinate.validate_train_manifest(coarse)
     stage_coordinate.validate_train_manifest(fine)
+
+
+@pytest.mark.parametrize(
+    "topology",
+    [
+        {"energy": -2.903724377034119598},
+        {"energy": "-2.903724377034119598"},
+        MappingProxyType({"nested": (MappingProxyType({"energy": -2.903724377034119598}),)}),
+        {"nested": {-2.903724377034119598}},
+        {"referenceEnergy": "forbidden"},
+    ],
+)
+def test_topology_subtree_keeps_the_train_content_screen(topology: object) -> None:
+    """Pin the content firewall inside the L2b-excluded topology subtree."""
+
+    manifest = _train_manifest()
+    manifest["topology"] = topology
+    with pytest.raises(stage_coordinate.ManifestSchemaError):
+        stage_coordinate.validate_train_manifest(manifest)
 
 
 def test_delegated_subtrees_accept_l2b_vocabulary_without_closing_it() -> None:
@@ -231,7 +254,7 @@ def test_train_manifest_refuses_an_unknown_stage() -> None:
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda manifest: manifest.__setitem__("stage", 1),
+        lambda manifest: manifest.__setitem__("stage", ["O1"]),
         lambda manifest: manifest.__setitem__("scientific_identity", ("not", "a", "mapping")),
         lambda manifest: manifest.__setitem__("seed_identity", ("not", "a", "mapping")),
         lambda manifest: manifest.__setitem__("topology", ("not", "a", "mapping")),
