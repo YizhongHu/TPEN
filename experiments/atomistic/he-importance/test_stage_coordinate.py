@@ -105,6 +105,19 @@ def test_train_manifest_refuses_unknown_top_level_key() -> None:
         stage_coordinate.validate_train_manifest(manifest)
 
 
+@pytest.mark.parametrize(
+    "missing_key",
+    ["schema", "stage", "scientific_identity", "seed_identity", "payload"],
+)
+def test_train_manifest_requires_each_top_level_key_with_typed_failure(missing_key: str) -> None:
+    """Kill the exact-membership-to-subset mutant with every common key."""
+
+    manifest = _train_manifest()
+    del manifest[missing_key]
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match="manifest keys mismatch"):
+        stage_coordinate.validate_train_manifest(manifest)
+
+
 def test_train_manifest_refuses_an_unknown_stage() -> None:
     manifest = _train_manifest()
     manifest["stage"] = "legacy-256-breadth"
