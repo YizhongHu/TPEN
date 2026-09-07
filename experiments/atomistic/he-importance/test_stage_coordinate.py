@@ -317,6 +317,13 @@ def test_seed_namespaces_encode_the_new_8_12_48_policy() -> None:
     assert all(0 < value < 2**63 for value in streams.values())
 
 
+def test_each_seed_label_has_pairwise_distinct_rng_streams() -> None:
+    namespaces = stage_coordinate.seed_namespaces("O1")
+    signatures = {tuple(streams.items()) for streams in namespaces.values()}
+    assert len(namespaces) == stage_coordinate.stage_definition("O1").seeds_per_point == 8
+    assert len(signatures) == len(namespaces)
+
+
 def test_materialized_union_deduplicates_only_resolved_scientific_identity(tmp_path: Path) -> None:
     control = {"scientific_identity": {"model": "control"}, "payload": {"updates": 50_000}}
     duplicate = {"scientific_identity": {"model": "control"}, "payload": {"updates": 50_000}}
@@ -337,6 +344,23 @@ def test_materialized_union_deduplicates_only_resolved_scientific_identity(tmp_p
     )
     with pytest.raises(TypeError):
         cells[0].manifest["stage"] = "F"  # type: ignore[index]
+    assert stage_coordinate.content_hash(cells[0].manifest) == cells[0].content_hash
+
+
+def test_topology_projection_keeps_hash_and_path_invariant_in_open_routes(tmp_path: Path) -> None:
+    base = {
+        "scientific_identity": {"architecture": "control", "width": 16},
+        "payload": {"updates": 50_000, "input_features": ("r12",)},
+    }
+    topology_variant = {
+        "scientific_identity": {"architecture": "control", "width": 16, "deviceId": 7},
+        "payload": {"updates": 50_000, "input_features": ("r12",), "hostName": "node-1"},
+    }
+    optimizer = stage_coordinate.OptimizerCell("adam", "available")
+    baseline = stage_coordinate.materialize_stage("O1", [base], optimizer, tmp_path)
+    varied = stage_coordinate.materialize_stage("O1", [topology_variant], optimizer, tmp_path)
+    assert [cell.content_hash for cell in varied] == [cell.content_hash for cell in baseline]
+    assert [cell.output_path for cell in varied] == [cell.output_path for cell in baseline]
 
 
 def test_materializer_rejects_conflicting_resolved_scientific_identity(tmp_path: Path) -> None:
@@ -371,8 +395,29 @@ def test_unavailable_optimizer_is_explicit_and_never_becomes_adam(tmp_path: Path
 
 
 def test_content_hash_is_canonical_and_rejects_nonfinite_values() -> None:
-    assert stage_coordinate.content_hash({"a": 1, "b": [2, 3]}) == stage_coordinate.content_hash(
-        {"b": [2, 3], "a": 1}
+    assert stage_coordinate.content_hash({"a": 1, "b": [2, 3]}) == (
+        "efbd0040190fb0871831e606c581f8a66db79d8e2bb836745a70051306956070"
+    )
+    assert stage_coordinate.content_hash(MappingProxyType({"b": (2, 3), "a": 1})) == (
+        "efbd0040190fb0871831e606c581f8a66db79d8e2bb836745a70051306956070"
     )
     with pytest.raises(stage_coordinate.MaterializationError, match="finite JSON"):
         stage_coordinate.content_hash({"bad": float("nan")})
+
+
+def test_committed_intended_configuration_inventory_materializes_completely(tmp_path: Path) -> None:
+    inventory = json.loads(Path(__file__).with_name("intended_configurations.json").read_text())
+    cells = stage_coordinate.materialize_intended_configurations(tmp_path)
+    expected = sum(
+        len(entry["configurations"]) * stage_coordinate.stage_definition(entry["stage"]).seeds_per_point
+        for entry in inventory
+    )
+    assert len(cells) == expected
+    assert {cell.manifest["stage"] for cell in cells} == {entry["stage"] for entry in inventory}
+
+
+def test_real_hi_namespace_family_exposes_the_materialization_api() -> None:
+    from tpen.hi.train import v1
+
+    assert "materialize_stage" in v1.__all__
+    assert v1.content_hash({"a": 1, "b": [2, 3]}) == stage_coordinate.content_hash({"a": 1, "b": [2, 3]})

@@ -1,0 +1,46 @@
+[
+  {
+    "stage": "Q",
+    "optimizer": {"method": "adam", "status": "available"},
+    "configurations": [
+      {
+        "scientific_identity": {"architecture": "control", "optimizer": "adam"},
+        "payload": {"updates": 2000}
+      }
+    ]
+  },
+  {
+    "stage": "O1",
+    "optimizer": {"method": "adam", "status": "available"},
+    "configurations": [
+      {
+        "scientific_identity": {"architecture": "control", "optimizer": "adam"},
+        "payload": {"updates": 50000}
+      },
+      {
+        "scientific_identity": {"architecture": "hybrid", "optimizer": "adam"},
+        "payload": {"updates": 50000}
+      }
+    ]
+  },
+  {
+    "stage": "R",
+    "optimizer": {"method": "linear_method", "status": "unavailable", "reason": "qualification pending"},
+    "configurations": [
+      {
+        "scientific_identity": {"architecture": "control", "optimizer": "linear_method"},
+        "payload": {"updates": 50000}
+      }
+    ]
+  },
+  {
+    "stage": "F",
+    "optimizer": {"method": "adam", "status": "available"},
+    "configurations": [
+      {
+        "scientific_identity": {"architecture": "control", "optimizer": "adam"},
+        "payload": {"final_horizon": "frozen-before-confirmation"}
+      }
+    ]
+  }
+]

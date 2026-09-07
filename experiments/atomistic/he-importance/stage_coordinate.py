@@ -78,19 +78,43 @@ _FORBIDDEN_TRAIN_CONTENT_KEYS = frozenset(
         "accuracy_band",
     }
 )
+_L2B_SEED_IDENTITY_KEYS = frozenset({"stage", "label", "namespace"})
+_TOPOLOGY_KEYS = frozenset(
+    {
+        "rank",
+        "ranks",
+        "device",
+        "deviceid",
+        "devices",
+        "gpu",
+        "gpus",
+        "world",
+        "worldsize",
+        "node",
+        "nodecount",
+        "nodes",
+        "worker",
+        "workerindex",
+        "workers",
+        "host",
+        "hostname",
+        "topology",
+    }
+)
+_INTENDED_CONFIGURATIONS_PATH = Path(__file__).with_name("intended_configurations.json")
 
 
 # These labels are scientific namespaces, rather than an inventory of rows.
 # In particular, no stage materializer may use the historical fixed breadth
 # count as a substitute for expanding its literal factor union.
-STAGE_SEED_LABELS = {
-    "Q": tuple(range(810_001, 810_003)),
-    "O1": tuple(range(820_001, 820_009)),
-    "O2": tuple(range(821_001, 821_009)),
-    "A": tuple(range(830_001, 830_009)),
-    "B": tuple(range(840_001, 840_009)),
-    "R": tuple(range(850_001, 850_013)),
-    "F": tuple(range(860_001, 860_049)),
+SEED_NAMESPACE_STARTS = {
+    "Q": 810_001,
+    "O1": 820_001,
+    "O2": 821_001,
+    "A": 830_001,
+    "B": 840_001,
+    "R": 850_001,
+    "F": 860_001,
 }
 SEED_STREAMS = (
     "model_initialization",
@@ -145,11 +169,16 @@ class MaterializedCell:
 
 
 def canonical_json(value: Any) -> bytes:
-    """Return the version-independent canonical bytes used for identities."""
+    """Return canonical identity bytes after topology projection.
+
+    Identity-bearing callers may supply open scientific/configuration mappings.
+    Physical execution topology is not scientific content and is therefore
+    removed before both hashing and path derivation.
+    """
 
     try:
         return json.dumps(
-            value,
+            _project_identity(value),
             allow_nan=False,
             ensure_ascii=True,
             sort_keys=True,
@@ -175,11 +204,34 @@ def _freeze(value: Any) -> Any:
     return value
 
 
+def _normalized_key(key: str) -> str:
+    """Normalize a mapping key without treating spelling as scientific content."""
+
+    return "".join(character.lower() for character in key if character.isalnum())
+
+
+def _project_identity(value: Any) -> Any:
+    """Convert frozen containers to JSON and exclude physical topology facts."""
+
+    if isinstance(value, Mapping):
+        projected: dict[str, Any] = {}
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise MaterializationError("identity mapping keys must be strings")
+            if _normalized_key(key) not in _TOPOLOGY_KEYS:
+                projected[key] = _project_identity(nested)
+        return projected
+    if isinstance(value, (list, tuple)):
+        return [_project_identity(nested) for nested in value]
+    return value
+
+
 def seed_labels(stage: str) -> tuple[int, ...]:
     """Return the fixed fresh-seed namespace for one stage."""
 
-    stage_definition(stage)
-    return STAGE_SEED_LABELS[stage]
+    definition = stage_definition(stage)
+    start = SEED_NAMESPACE_STARTS[stage]
+    return tuple(range(start, start + definition.seeds_per_point))
 
 
 def seed_namespace(stage: str, label: int, *, cohort: str = "he-importance/v2") -> dict[str, int]:
@@ -204,6 +256,16 @@ def seed_namespace(stage: str, label: int, *, cohort: str = "he-importance/v2") 
     if 0 in streams.values() or len(set(streams.values())) != len(streams):
         raise MaterializationError("seed namespace collision")
     return streams
+
+
+def seed_namespaces(stage: str, *, cohort: str = "he-importance/v2") -> dict[int, dict[str, int]]:
+    """Return the complete, pairwise-distinct stream namespace for a stage."""
+
+    namespaces = {label: seed_namespace(stage, label, cohort=cohort) for label in seed_labels(stage)}
+    signatures = {canonical_json(streams) for streams in namespaces.values()}
+    if len(signatures) != len(namespaces):
+        raise MaterializationError(f"seed labels in {stage} do not have distinct RNG streams")
+    return namespaces
 
 
 def _absolute_unique_path(output_root: Path, stage: str, digest: str, seen: set[Path]) -> Path:
@@ -233,6 +295,7 @@ def materialize_stage(
     """
 
     stage_definition(stage)
+    namespaces = seed_namespaces(stage)
     identities: dict[str, Mapping[str, Any]] = {}
     seen_paths: set[Path] = set()
     cells: list[MaterializedCell] = []
@@ -263,16 +326,75 @@ def materialize_stage(
                 "seed_identity": {"stage": stage, "label": label, "namespace": "fresh-training"},
                 "payload": {"configuration": dict(payload), "optimizer": optimizer_payload},
             }
-            validate_train_manifest(manifest)
+            _validate_l2b_materialized_manifest(manifest)
             digest = content_hash(manifest)
             cells.append(
                 MaterializedCell(
                     manifest=_freeze(manifest),
                     content_hash=digest,
                     output_path=_absolute_unique_path(output_root, stage, digest, seen_paths),
-                    seed_streams=_freeze(seed_namespace(stage, label)),
+                    seed_streams=_freeze(namespaces[label]),
                 )
             )
+    return tuple(cells)
+
+
+def _validate_l2b_materialized_manifest(manifest: Mapping[str, Any]) -> None:
+    """Validate L2b-owned structure without closing caller-owned subtrees.
+
+    L2a closes its own fixture schema.  The scientific identity and payload
+    configuration mappings are deliberately delegated because their legal keys
+    are caller-owned; L2b owns and closes the seed-identity vocabulary.
+    """
+
+    _require_exact_keys(manifest, _TRAIN_KEYS, "materialized manifest")
+    if manifest["schema"] != TRAIN_MANIFEST_SCHEMA or not isinstance(manifest["stage"], str):
+        raise MaterializationError("materialized manifest has an invalid common coordinate")
+    stage_definition(manifest["stage"])
+    if not isinstance(manifest["scientific_identity"], Mapping):
+        raise MaterializationError("scientific_identity must be a mapping")
+    _require_exact_keys(manifest["seed_identity"], _L2B_SEED_IDENTITY_KEYS, "seed_identity")
+    if manifest["seed_identity"]["stage"] != manifest["stage"]:
+        raise MaterializationError("seed identity stage does not match manifest stage")
+    if manifest["seed_identity"]["label"] not in seed_labels(manifest["stage"]):
+        raise MaterializationError("seed identity label is outside the stage namespace")
+    if manifest["seed_identity"]["namespace"] != "fresh-training":
+        raise MaterializationError("seed identity namespace is not declared")
+    if not isinstance(manifest["payload"], Mapping):
+        raise MaterializationError("payload must be a mapping")
+    _require_exact_keys(manifest["payload"], frozenset({"configuration", "optimizer"}), "payload")
+    if not isinstance(manifest["payload"]["configuration"], Mapping):
+        raise MaterializationError("payload configuration must be a mapping")
+
+
+def intended_configurations() -> tuple[Mapping[str, Any], ...]:
+    """Load the committed, literal L2b configuration enumeration."""
+
+    raw = json.loads(_INTENDED_CONFIGURATIONS_PATH.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise MaterializationError("intended configuration inventory must be a list")
+    for entry in raw:
+        if not isinstance(entry, Mapping) or frozenset(entry) != frozenset(
+            {"stage", "optimizer", "configurations"}
+        ):
+            raise MaterializationError("intended configuration entry has an invalid schema")
+    return tuple(raw)
+
+
+def materialize_intended_configurations(output_root: Path) -> tuple[MaterializedCell, ...]:
+    """Materialize every configuration in the committed L2b inventory."""
+
+    cells: list[MaterializedCell] = []
+    for entry in intended_configurations():
+        optimizer_data = entry["optimizer"]
+        if not isinstance(optimizer_data, Mapping):
+            raise MaterializationError("intended optimizer must be a mapping")
+        optimizer = OptimizerCell(
+            method=optimizer_data["method"],
+            status=optimizer_data["status"],
+            reason=optimizer_data.get("reason"),
+        )
+        cells.extend(materialize_stage(entry["stage"], entry["configurations"], optimizer, output_root))
     return tuple(cells)
 
 
