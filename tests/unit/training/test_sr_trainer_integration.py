@@ -393,7 +393,7 @@ def test_legacy_still_raises_on_a_genuinely_disconnected_loss() -> None:
         torch.optim.Adam([parameter], lr=LEARNING_RATE),
         model_parameters=ModelParameterBinding(parameters=(parameter,)),
     )
-    from tests.unit.training.test_vmc_update import _batch, _output
+    from tests.unit.training.test_vmc_update import _batch, _output, _reevaluation
 
     batch = _batch(n_electrons=2)
     detached_objective = torch.tensor(1.0, dtype=torch.float64)
@@ -405,6 +405,13 @@ def test_legacy_still_raises_on_a_genuinely_disconnected_loss() -> None:
         local_energy=torch.zeros(1, dtype=torch.float64),
         step=0,
         objective=detached_objective,
+        # `reevaluate` is required and has no default: an objective with no
+        # means to recompute it is the defect the field exists to close. This
+        # test never CALLS it -- it asserts the disconnected-loss guard fires
+        # before any re-evaluation could matter -- so the synthetic helper is
+        # the honest value here, not a real trainer-built re-evaluation that
+        # would imply this test exercises the recompute path.
+        reevaluate=_reevaluation(batch),
     )
 
     with pytest.raises(RuntimeError, match="disconnected from model parameters"):
