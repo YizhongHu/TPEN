@@ -33,6 +33,7 @@ import tpen.training.update as update_module
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.physics.hamiltonian import LocalEnergyResult, local_energy
 from tpen.sampling.metropolis import MetropolisSampler
+from tpen.training.vmc import compute_vmc_objective
 from tpen.training.trainer import VMCTrainer
 from tpen.training.update import (
     AutogradUpdateInput,
@@ -86,7 +87,14 @@ class _CountingModel(torch.nn.Module):
     def forward(self, batch: ElectronBatch) -> WavefunctionOutput:
         self.seen_batches.append(batch)
         shape = (batch.batch_size,)
-        logabs = (self.weight * batch.positions.sum()).expand(shape)
+        # PER-ROW, deliberately.  An identical logabs on every row makes the
+        # score-function objective identically zero for ANY row subset: mu is
+        # the subset mean, so sum_i m_i (E_i - mu) is exactly 0 and the logabs
+        # factors straight out.  A row-selection test built on a constant
+        # logabs therefore compares 0.0 with 0.0 and cannot discriminate --
+        # measured, not hypothesised (Cannon job 44953686).
+        per_row = batch.positions.reshape(batch.batch_size, -1).sum(dim=-1)
+        logabs = self.weight * per_row
         return WavefunctionOutput(logabs=logabs, sign=torch.ones(shape, dtype=batch.dtype))
 
 
@@ -101,6 +109,44 @@ class _ConstantTerm:
         del wavefunction
         self.calls += 1
         return LocalEnergyResult(total=self.values.expand(batch.batch_size).clone(), terms={})
+
+
+class _VaryingTerm:
+    """Per-row DISTINCT local energies, so a row subset changes the estimator.
+
+    Needed for the row-selection test: with a constant local energy every
+    subset shares one mean and the centred residuals vanish, so the objective
+    would not move however the selection was applied.
+    """
+
+    def __init__(self, offset: float = 0.0) -> None:
+        self.offset = float(offset)
+        self.calls = 0
+
+    def local_energy(self, wavefunction, batch: ElectronBatch) -> LocalEnergyResult:
+        del wavefunction
+        self.calls += 1
+        values = torch.arange(batch.batch_size, dtype=batch.dtype) * 0.75 + self.offset
+        return LocalEnergyResult(total=values, terms={})
+
+
+class _AlwaysNonFiniteTerm:
+    """Non-finite from the FIRST call.
+
+    Distinct from `_NonFiniteAfterFirstCallTerm` for a reason worth stating:
+    that one exists so a TRAINER step can succeed and only the re-evaluation
+    meet a non-finite row.  A test that calls the factory DIRECTLY has no
+    primary step, so its first call is the re-evaluation -- and the
+    after-first-call term would still be finite there.  Using the wrong one
+    silently produced a DID NOT RAISE on the propagation test (Cannon job
+    44953686).
+    """
+
+    def local_energy(self, wavefunction, batch: ElectronBatch) -> LocalEnergyResult:
+        del wavefunction
+        total = torch.full((batch.batch_size,), 1.5, dtype=batch.dtype)
+        total[0] = float("inf")
+        return LocalEnergyResult(total=total, terms={})
 
 
 class _NonFiniteAfterFirstCallTerm:
@@ -602,7 +648,7 @@ def test_nonfinite_reevaluation_under_fail_propagates_out_of_optimizer_step() ->
     optimizer = torch.optim.LBFGS(model.parameters(), lr=0.05, max_iter=4)
     reevaluate = vmc_objective_reevaluation(
         model=model,
-        hamiltonian_terms=[_NonFiniteAfterFirstCallTerm()],
+        hamiltonian_terms=[_AlwaysNonFiniteTerm()],
         batch=batch,
         primary_local_energy=_finite_primary(batch),
         nonfinite_policy="fail",
@@ -736,7 +782,7 @@ def test_a_row_selection_returned_by_the_decision_point_is_actually_applied() ->
 
     batch = _batch(n_walkers=4)
     model = _CountingModel()
-    terms = [_ConstantTerm(torch.tensor([3.0], dtype=torch.float64))]
+    terms = [_VaryingTerm()]
     # Row 2 was non-finite when the primary objective was formed.
     primary = torch.tensor([1.5, 1.5, float("inf"), 1.5], dtype=torch.float64)
     reevaluate = vmc_objective_reevaluation(
@@ -766,7 +812,19 @@ def test_a_row_selection_returned_by_the_decision_point_is_actually_applied() ->
     assert observed_energy.shape == (4,)
     assert observed_policy == "mask"
 
-    # The pinned objective reduces over three rows; the unselected default
-    # reduces over four, so the two must differ or the selection did nothing.
+    # Asserted against an EXPLICIT three-row reduction, not merely "the two
+    # differ".  The first version of this test only checked difference, and
+    # difference was structurally impossible for its fixture -- so it went red
+    # on a true statement while measuring nothing about the selection.
+    reference_output = model(batch)
+    reference_energy = local_energy(terms, model, batch, return_terms=False)
+    mask = torch.tensor([True, True, False, True])
+    expected = compute_vmc_objective(
+        reference_output.logabs[mask],
+        reference_energy[mask],
+        nonfinite_policy="mask",
+    ).loss
+    assert torch.equal(pinned.detach(), expected.detach())
+
     unpinned = reevaluate()
     assert not torch.equal(pinned.detach(), unpinned.detach())
