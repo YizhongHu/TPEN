@@ -382,7 +382,7 @@ def test_reevaluation_does_not_advance_sampler_or_global_rng_state() -> None:
     with them.
     """
 
-    _, model, sampler, method, _ = _run_trainer(update_method_factory=_CapturingUpdate)
+    _, _, sampler, method, _ = _run_trainer(update_method_factory=_CapturingUpdate)
     update_input = method.captured
     assert update_input is not None
 
@@ -395,7 +395,6 @@ def test_reevaluation_does_not_advance_sampler_or_global_rng_state() -> None:
 
     assert torch.equal(torch.random.get_rng_state(), global_before)
     assert torch.equal(sampler.mcmc_state_dict()["generator_state"], sampler_before)
-    del model
 
 
 def test_repeated_reevaluation_at_unchanged_parameters_is_bitwise_equal() -> None:
@@ -715,7 +714,11 @@ def test_reevaluation_rejects_a_recomputed_objective_of_the_wrong_shape_or_dtype
         dtype=torch.float64,
         device=torch.device("cpu"),
     )
-    with pytest.raises(ValueError, match="dtype"):
+    # NARROW on purpose. `match="dtype"` matched THREE guard messages raised
+    # from three different functions, so it confirmed only that something
+    # mentioning dtype went wrong -- not that this recompute's own check fired.
+    # Cannot-distinguish reads as coverage exactly like cannot-fail does.
+    with pytest.raises(ValueError, match="must recompute an objective with dtype"):
         wrong_dtype()
 
 
@@ -760,14 +763,12 @@ def test_row_selection_decision_point_defaults_to_no_selection() -> None:
     this line deliberately instead of being read into the seam by accident.
     """
 
-    batch = _batch(n_walkers=4)
     selection = update_module.select_reevaluation_rows(
         primary_finite_mask=torch.tensor([True, True, False, True]),
         recomputed_local_energy=torch.ones(4, dtype=torch.float64),
         policy="mask",
     )
     assert selection is None
-    del batch
 
 
 def test_a_row_selection_returned_by_the_decision_point_is_actually_applied() -> None:
@@ -808,7 +809,7 @@ def test_a_row_selection_returned_by_the_decision_point_is_actually_applied() ->
     assert len(seen) == 1
     observed_mask, observed_energy, observed_policy = seen[0]
     assert torch.equal(observed_mask, torch.tensor([True, True, False, True]))
-    assert not observed_mask.requires_grad
+    assert observed_mask.dtype == torch.bool
     assert observed_energy.shape == (4,)
     assert observed_policy == "mask"
 
@@ -828,3 +829,115 @@ def test_a_row_selection_returned_by_the_decision_point_is_actually_applied() ->
 
     unpinned = reevaluate()
     assert not torch.equal(pinned.detach(), unpinned.detach())
+
+
+# ---------------------------------------------------------------------------
+# Guards on NON-FACTORY construction (E2), and the construction-time mask (E3)
+# ---------------------------------------------------------------------------
+
+
+def _detached_input(
+    batch: ElectronBatch,
+    reevaluate: ObjectiveReevaluation,
+) -> AutogradUpdateInput:
+    """Build an input directly, bypassing the trainer and the factory."""
+
+    return AutogradUpdateInput(
+        batch=batch,
+        wavefunction=WavefunctionOutput(
+            logabs=torch.zeros(batch.batch_size, dtype=torch.float64),
+            sign=torch.ones(batch.batch_size, dtype=torch.float64),
+        ),
+        local_energy=torch.zeros(batch.batch_size, dtype=torch.float64),
+        step=0,
+        objective=torch.tensor(1.0, dtype=torch.float64),
+        reevaluate=reevaluate,
+    )
+
+
+def test_input_rejects_a_reevaluation_disagreeing_with_the_objective_dtype() -> None:
+    """Guards the NON-FACTORY route, which is the only one that can reach here.
+
+    Through `vmc_objective_reevaluation` these checks cannot fire: it derives
+    dtype and device from the batch, and `VMCStepData.validate` already forces
+    batch/logabs/objective agreement.  `ObjectiveReevaluation` is directly
+    constructible though, and the suite's own `_reevaluation` helper builds one
+    without the factory -- so the guard protects a real route and the defect
+    was that nothing exercised it.  Recorded because "unreachable via the
+    factory" answers a narrower question than "unreachable", and concluding
+    the latter from the former would delete live protection.
+    """
+
+    batch = _batch()
+    wrong_dtype = ObjectiveReevaluation(
+        recompute=lambda: torch.zeros((), dtype=torch.float32),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(ValueError, match="reevaluation and objective must share one dtype"):
+        _detached_input(batch, wrong_dtype)
+
+
+def test_input_rejects_a_reevaluation_disagreeing_with_the_objective_device() -> None:
+    """The device half of the same guard, isolated by matching dtype.
+
+    The device is never dereferenced by this check, only compared, so naming a
+    device absent from the machine is a legitimate way to reach the branch on
+    a CPU-only runner rather than a skip.
+    """
+
+    batch = _batch()
+    wrong_device = ObjectiveReevaluation(
+        recompute=lambda: torch.zeros((), dtype=torch.float64),
+        dtype=torch.float64,
+        device=torch.device("cuda"),
+    )
+    with pytest.raises(ValueError, match="reevaluation and objective must share one device"):
+        _detached_input(batch, wrong_device)
+
+
+def test_the_retained_primary_mask_is_fixed_at_construction() -> None:
+    """The mask describes the PRIMARY step, not the caller's tensor now.
+
+    Replaces a vacuous `assert not mask.requires_grad`: `torch.isfinite`
+    returns a bool tensor, which can never require grad even from a
+    grad-requiring input, so that assertion could not fail for any input. This
+    asserts the property the code actually needs and that a plausible
+    implementation would break -- storing `primary_local_energy` and computing
+    `isfinite` lazily inside `recompute` would make the mask follow the
+    caller's later mutations.
+    """
+
+    batch = _batch(n_walkers=4)
+    primary = torch.tensor([1.5, 1.5, float("inf"), 1.5], dtype=torch.float64)
+    reevaluate = vmc_objective_reevaluation(
+        model=_CountingModel(),
+        hamiltonian_terms=[_VaryingTerm()],
+        batch=batch,
+        primary_local_energy=primary,
+    )
+
+    # Mutate the caller's tensor IN PLACE after construction, in both
+    # directions, so a lazily recomputed mask would differ in two entries
+    # rather than one and could not coincide with the correct answer.
+    with torch.no_grad():
+        primary[0] = float("inf")
+        primary[2] = 0.0
+
+    seen: list[torch.Tensor] = []
+
+    def capture(*, primary_finite_mask, recomputed_local_energy, policy):
+        del recomputed_local_energy, policy
+        seen.append(primary_finite_mask)
+        return None
+
+    original = update_module.select_reevaluation_rows
+    update_module.select_reevaluation_rows = capture
+    try:
+        reevaluate()
+    finally:
+        update_module.select_reevaluation_rows = original
+
+    assert len(seen) == 1
+    assert seen[0].dtype == torch.bool
+    assert torch.equal(seen[0], torch.tensor([True, True, False, True]))

@@ -164,13 +164,40 @@ class ObjectiveReevaluation:
     :class:`~tpen.training.trainer.VMCTrainer` exists to prevent.
 
     DECLARED PRECONDITION -- RNG-INERTNESS HOLDS BY ABSENCE, NOT BY A GUARD.
-    Nothing on the recompute path (``model(batch)``,
-    :func:`~tpen.physics.hamiltonian.local_energy`,
-    :func:`~tpen.training.vmc.compute_vmc_objective`) draws from an RNG today,
-    because ``tpen/physics/`` contains no generator at all.  The named tests
-    are the enforcement.  TRIGGER: the day ``tpen/physics/`` acquires a
-    generator -- a stochastic kinetic estimator being the obvious candidate --
-    the same-function test is the one that must go red.
+    Nothing on the recompute path draws from an RNG today.  The precondition
+    is stated as the property's actual dependency rather than as a directory
+    being empty, because the recompute path spans two trees:
+
+    (i) NO STOCHASTIC LAYER IN ANY FORWARD reached by ``model(batch)``.  The
+        model is a ``tpen/nn/`` object, so a claim scoped to ``tpen/physics/``
+        could not see a stochastic layer added here at all.  Measured: the
+        only RNG in ``tpen/nn/`` is in ``initialization.py``, resolved by AST
+        to ``uniform_``, ``xavier_uniform_``, and ``linear_kaiming_uniform_``
+        -- all initialization, none a forward -- and there is no ``Dropout``
+        anywhere in the package.
+    (ii) NO RNG DRAW ON THE LOCAL-ENERGY PATH
+        (:func:`~tpen.physics.hamiltonian.local_energy`,
+        :func:`~tpen.training.vmc.compute_vmc_objective`).  Measured: zero
+        draws in ``tpen/physics/``.
+
+    INITIALIZATION-TIME RNG IS OUT OF SCOPE, deliberately: it runs before the
+    step, so no re-evaluation can reach it.  That distinction is why (i) is
+    worded as "in a forward" and not "in the package".
+
+    A NOTE ON HOW THIS WAS GOT WRONG ONCE, because the failure is reusable.  An
+    earlier version of this precondition claimed ``tpen/physics/`` "contains no
+    generator".  That tree contains the word ``generator`` ten times, in
+    ``validate_for_generator`` methods, where generator means a SAMPLER and not
+    an RNG -- so the literal claim was false while the property was true.
+    Stating a precondition as "directory contains no X" invites exactly that
+    error when X is an overloaded word.  Read the hits you dismissed before
+    publishing an absence, and resolve matches to their enclosing function
+    before classifying them.
+
+    The named tests are the enforcement.  TRIGGER: the day a forward acquires a
+    stochastic layer, or the local-energy path acquires a draw -- a stochastic
+    kinetic estimator being the obvious candidate for the latter -- the
+    same-function test is the one that must go red.
 
     ``torch.random.fork_rng()`` was considered and rejected.  It would make
     RNG-inertness true by construction, and would thereby HIDE the day that
@@ -377,7 +404,13 @@ def vmc_objective_reevaluation(
     if not isinstance(primary_local_energy, torch.Tensor):
         raise TypeError("vmc_objective_reevaluation requires a primary_local_energy tensor")
     resolved_policy = resolve_nonfinite_local_energy_policy(nonfinite_policy)
-    primary_finite_mask = torch.isfinite(primary_local_energy).detach().clone()
+    # No ``.detach().clone()``: ``torch.isfinite`` returns a FRESH bool tensor
+    # (measured ``_base is None``), and a bool tensor can never require grad --
+    # even from a grad-requiring input.  Both calls were provable no-ops.  The
+    # property they appeared to provide, that this mask is fixed at
+    # construction and immune to later in-place mutation of the caller's
+    # tensor, is now asserted by a test that can actually fail instead.
+    primary_finite_mask = torch.isfinite(primary_local_energy)
 
     def recompute() -> torch.Tensor:
         # Both the forward and the local energy are recomputed, because a
@@ -457,6 +490,17 @@ class AutogradUpdateInput(VMCStepData):
         # A re-evaluation returning float32 where the step is float64 would not
         # fail loudly; it would quietly degrade an optimizer's curvature
         # history one closure call at a time.
+        #
+        # THESE TWO GUARD NON-FACTORY CONSTRUCTION, which is a real route and
+        # not a hypothetical: `vmc_objective_reevaluation` derives dtype and
+        # device from the batch, and `VMCStepData.validate` already forces
+        # batch/logabs/objective agreement, so through the factory they cannot
+        # fire.  `ObjectiveReevaluation` is directly constructible, and the
+        # test suite constructs it that way (see `_reevaluation` in
+        # tests/unit/training/test_vmc_update.py, which never touches the
+        # factory).  Anyone re-deriving the reachability question through the
+        # factory alone will conclude these are dead and delete real
+        # protection -- stated here so that conclusion is not reached twice.
         if self.reevaluate.dtype != self.objective.dtype:
             raise ValueError("AutogradUpdateInput reevaluation and objective must share one dtype")
         if self.reevaluate.device != self.objective.device:
