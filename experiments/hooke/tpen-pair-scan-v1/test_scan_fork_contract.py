@@ -56,22 +56,42 @@ for _module_name in list(sys.modules):
         del sys.modules[_module_name]
 
 
-def _load_script(name: str, *, bind_direct: bool = False) -> ModuleType:
+def _load_script(name: str) -> ModuleType:
     path = STUDY_DIR / f"{name}.py"
     spec = importlib.util.spec_from_file_location(f"tpen_pair_scan_v1_contract_{name}", path)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    if bind_direct:
-        sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
 
-from utils import config as study_config  # noqa: E402
+# Siblings are loaded study-scoped, not by bare import: experiments/ has several
+# same-named modules and the first study loaded would otherwise own the bare name
+# for every study after it. See experiments/toolkit/study_imports.py.
+#
+# The loader is reached BY PATH rather than by putting the repository root on
+# sys.path. A study directory that mutates sys.path is the mechanism behind the
+# very defect this import exists to fix, and he-cutover's gateway test forbids it
+# outright -- so the fix must not reintroduce it in order to install itself.
+import importlib.util as _tpen_importlib  # noqa: E402
+import sys as _tpen_sys  # noqa: E402
+from pathlib import Path as _TpenPath  # noqa: E402
 
-launch = _load_script("launch", bind_direct=True)
+if "_tpen_study_imports" not in _tpen_sys.modules:
+    _tpen_spec = _tpen_importlib.spec_from_file_location(
+        "_tpen_study_imports",
+        _TpenPath(__file__).resolve().parents[3] / "experiments" / "toolkit" / "study_imports.py",
+    )
+    _tpen_module = _tpen_importlib.module_from_spec(_tpen_spec)
+    _tpen_sys.modules["_tpen_study_imports"] = _tpen_module
+    _tpen_spec.loader.exec_module(_tpen_module)
+sibling = _tpen_sys.modules["_tpen_study_imports"].sibling
+
+study_config = sibling(__file__, 'utils.config')
+
+launch = _load_script("launch")
 plan = _load_script("plan")
 final_collect = _load_script("final_collect")
 

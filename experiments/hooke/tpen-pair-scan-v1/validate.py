@@ -15,22 +15,55 @@ from typing import Any, Sequence
 
 from omegaconf import OmegaConf
 
-import launch
-from utils.config import config_snapshot_names
-from utils.io import read_json, write_json
-from utils.layout import (
-    STAGE_VALIDATION,
-    grid_attempt_dir,
-    latest_attempt_id,
-    stage_dir,
-    train_attempt_dir,
-    train_run_dir,
-    validation_attempt_dir,
-    write_latest,
-)
-from utils.naming import experiment_run_name, log_prefix, stage_job_name, study_name_from_manifest
-from utils.overrides import AxisOverrideSpec, axis_value_overrides, normalize_axis_override_specs
-from utils.seeds import scan_seed_values, seed_override_values
+# Siblings are loaded study-scoped, not by bare import: experiments/ has several
+# same-named modules and the first study loaded would otherwise own the bare name
+# for every study after it. See experiments/toolkit/study_imports.py.
+#
+# The loader is reached BY PATH rather than by putting the repository root on
+# sys.path. A study directory that mutates sys.path is the mechanism behind the
+# very defect this import exists to fix, and he-cutover's gateway test forbids it
+# outright -- so the fix must not reintroduce it in order to install itself.
+import importlib.util as _tpen_importlib  # noqa: E402
+import sys as _tpen_sys  # noqa: E402
+from pathlib import Path as _TpenPath  # noqa: E402
+
+if "_tpen_study_imports" not in _tpen_sys.modules:
+    _tpen_spec = _tpen_importlib.spec_from_file_location(
+        "_tpen_study_imports",
+        _TpenPath(__file__).resolve().parents[3] / "experiments" / "toolkit" / "study_imports.py",
+    )
+    _tpen_module = _tpen_importlib.module_from_spec(_tpen_spec)
+    _tpen_sys.modules["_tpen_study_imports"] = _tpen_module
+    _tpen_spec.loader.exec_module(_tpen_module)
+sibling = _tpen_sys.modules["_tpen_study_imports"].sibling
+
+launch = sibling(__file__, 'launch')
+_tpen_utils_config = sibling(__file__, 'utils.config')
+config_snapshot_names = _tpen_utils_config.config_snapshot_names
+_tpen_utils_io = sibling(__file__, 'utils.io')
+read_json = _tpen_utils_io.read_json
+write_json = _tpen_utils_io.write_json
+_tpen_utils_layout = sibling(__file__, 'utils.layout')
+STAGE_VALIDATION = _tpen_utils_layout.STAGE_VALIDATION
+grid_attempt_dir = _tpen_utils_layout.grid_attempt_dir
+latest_attempt_id = _tpen_utils_layout.latest_attempt_id
+stage_dir = _tpen_utils_layout.stage_dir
+train_attempt_dir = _tpen_utils_layout.train_attempt_dir
+train_run_dir = _tpen_utils_layout.train_run_dir
+validation_attempt_dir = _tpen_utils_layout.validation_attempt_dir
+write_latest = _tpen_utils_layout.write_latest
+_tpen_utils_naming = sibling(__file__, 'utils.naming')
+experiment_run_name = _tpen_utils_naming.experiment_run_name
+log_prefix = _tpen_utils_naming.log_prefix
+stage_job_name = _tpen_utils_naming.stage_job_name
+study_name_from_manifest = _tpen_utils_naming.study_name_from_manifest
+_tpen_utils_overrides = sibling(__file__, 'utils.overrides')
+AxisOverrideSpec = _tpen_utils_overrides.AxisOverrideSpec
+axis_value_overrides = _tpen_utils_overrides.axis_value_overrides
+normalize_axis_override_specs = _tpen_utils_overrides.normalize_axis_override_specs
+_tpen_utils_seeds = sibling(__file__, 'utils.seeds')
+scan_seed_values = _tpen_utils_seeds.scan_seed_values
+seed_override_values = _tpen_utils_seeds.seed_override_values
 
 STUDY_DIR = Path(__file__).resolve().parent
 REPO_ROOT = STUDY_DIR.parents[2]

@@ -17,27 +17,50 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
 
-from utils.layout import (
-    STAGE_FINAL_COLLECT,
-    STAGE_FINAL_EVAL,
-    STAGE_FINAL_GRID,
-    latest_attempt_id,
-    stage_dir,
-    write_latest,
-)
-from utils.naming import log_prefix, study_name_from_manifest
-from utils.time import new_attempt_id
-from stats import (
-    as_bool as _as_bool,
-    as_float as _as_float,
-    finite_max as _max,
-    finite_sum as _sum,
-    format_number as _format_number,
-    mean as _mean,
-    median as _median,
-    quantile as _quantile,
-    variance as _variance,
-)
+# Siblings are loaded study-scoped, not by bare import: experiments/ has several
+# same-named modules and the first study loaded would otherwise own the bare name
+# for every study after it. See experiments/toolkit/study_imports.py.
+#
+# The loader is reached BY PATH rather than by putting the repository root on
+# sys.path. A study directory that mutates sys.path is the mechanism behind the
+# very defect this import exists to fix, and he-cutover's gateway test forbids it
+# outright -- so the fix must not reintroduce it in order to install itself.
+import importlib.util as _tpen_importlib  # noqa: E402
+import sys as _tpen_sys  # noqa: E402
+from pathlib import Path as _TpenPath  # noqa: E402
+
+if "_tpen_study_imports" not in _tpen_sys.modules:
+    _tpen_spec = _tpen_importlib.spec_from_file_location(
+        "_tpen_study_imports",
+        _TpenPath(__file__).resolve().parents[3] / "experiments" / "toolkit" / "study_imports.py",
+    )
+    _tpen_module = _tpen_importlib.module_from_spec(_tpen_spec)
+    _tpen_sys.modules["_tpen_study_imports"] = _tpen_module
+    _tpen_spec.loader.exec_module(_tpen_module)
+sibling = _tpen_sys.modules["_tpen_study_imports"].sibling
+
+_tpen_utils_layout = sibling(__file__, 'utils.layout')
+STAGE_FINAL_COLLECT = _tpen_utils_layout.STAGE_FINAL_COLLECT
+STAGE_FINAL_EVAL = _tpen_utils_layout.STAGE_FINAL_EVAL
+STAGE_FINAL_GRID = _tpen_utils_layout.STAGE_FINAL_GRID
+latest_attempt_id = _tpen_utils_layout.latest_attempt_id
+stage_dir = _tpen_utils_layout.stage_dir
+write_latest = _tpen_utils_layout.write_latest
+_tpen_utils_naming = sibling(__file__, 'utils.naming')
+log_prefix = _tpen_utils_naming.log_prefix
+study_name_from_manifest = _tpen_utils_naming.study_name_from_manifest
+_tpen_utils_time = sibling(__file__, 'utils.time')
+new_attempt_id = _tpen_utils_time.new_attempt_id
+_tpen_stats = sibling(__file__, 'stats')
+_as_bool = _tpen_stats.as_bool
+_as_float = _tpen_stats.as_float
+_max = _tpen_stats.finite_max
+_sum = _tpen_stats.finite_sum
+_format_number = _tpen_stats.format_number
+_mean = _tpen_stats.mean
+_median = _tpen_stats.median
+_quantile = _tpen_stats.quantile
+_variance = _tpen_stats.variance
 
 STUDY_DIR = Path(__file__).resolve().parent
 REPO_ROOT = STUDY_DIR.parents[2]
