@@ -94,7 +94,8 @@ def test_three_electron_block_ng_float64_oracle_and_float32_sentinels(
 
     The float32 arm is not an oracle-equivalence claim.  Its all-block error
     sentinels are specific to this frozen fixture; changing its seeds, sample
-    count, damping, or width invalidates them and requires re-measurement.
+    count, damping, width, or arithmetic sequence invalidates them and
+    requires re-measurement.
     """
 
     model = _connected_model()
