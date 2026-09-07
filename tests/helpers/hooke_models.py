@@ -25,9 +25,23 @@ PAIR_TRAIN_CONFIG = Path(__file__).resolve().parents[1] / "integration" / "artif
 # (`tpen.nn.readout.pfaffian._odd_padding_block`), so at an EVEN electron count
 # that whole subtree dead-ends at the readout and autograd never reaches it.
 #
-# The set is PARITY- and DEPTH-dependent, not a property of "two electrons":
-# an odd count connects it, and a second layer would reconnect layer 0's copy.
-# Any reasoning keyed to ``n == 2`` is wrong for that reason.
+# "Order-1-OUTPUT" is EXACT, not a gloss. The fixture's mixing carries 29 paths
+# and each declares an output order: g0..g14 are the fifteen at output order 1
+# and are exactly the fifteen mixing names below, while g15..g28 are the
+# FOURTEEN at output order 2 and stay LIVE at every parity. So roughly half the
+# tensor-product mixing dies at an even count -- NOT all of it -- and the
+# fifteen are identified by output order rather than by any name pattern.
+#
+# PARITY: measured 16 disconnected at n=2, 4 and 6, byte-identical each time,
+# and 0 at n=3, 5 and 7. Any reasoning keyed to ``n == 2`` is wrong.
+#
+# DEPTH: a second layer DOES reconnect layer 0, because g15 and g16 carry
+# order-1 input to order-2 output (m=2, m1=1, m2=1) and the readout consumes
+# order-2 unconditionally at every parity. BUT THE COUNT IS INVARIANT AND
+# MERELY RELOCATES: measured 16 disconnected at one, two and three layers, at
+# ``stack.layers.0``, ``.1`` and ``.2`` respectively. ADDING LAYERS IS
+# THEREFORE NOT A MITIGATION -- a deeper model still serves exactly sixteen
+# silently-zeroed parameters, just at ``stack.layers.<last>``.
 #
 # Spelled out as a literal and owned by the module that owns the fixture.
 # Deriving it from the model would re-apply the same reachability reasoning the
@@ -36,6 +50,52 @@ INACTIVE_PAIR_PARAMETERS = frozenset(
     [f"stack.layers.0.mixing.weights.g{index}" for index in range(15)]
     + ["stack.layers.0.path_aggregation.weights.o1"]
 )
+
+
+def pair_parameters_by_name(model: TPENWaveFunction) -> dict[str, torch.nn.Parameter]:
+    """Return trainable parameters by name, refusing a name-shape mismatch loudly.
+
+    `INACTIVE_PAIR_PARAMETERS` was measured against a layer that mixes with
+    `EquivariantMixing` DIRECTLY. A `CompositeMixing` model spells the same
+    weights ``stack.layers.0.mixing.producers.0.weights.gN``, so a bare lookup
+    raises ``KeyError('stack.layers.0.mixing.weights.g0')`` and names nothing
+    that would let a reader work out why.
+
+    The miss is also PARTIAL, which is harder to diagnose than a clean total
+    one: ``path_aggregation.weights.o1`` exists under BOTH constructions, so 15
+    of the 16 names miss and one hits.
+
+    Parameters
+    ----------
+    model : TPENWaveFunction
+        Model whose trainable parameter names are checked against the literal.
+
+    Returns
+    -------
+    dict of str to torch.nn.Parameter
+        Every named parameter, once the literal is known to apply.
+
+    Raises
+    ------
+    KeyError
+        If any name in `INACTIVE_PAIR_PARAMETERS` is absent, with the count
+        missing, the first missing name, the likely cause, and the mixing
+        parameter names actually present.
+    """
+
+    named = dict(model.named_parameters())
+    missing = tuple(sorted(name for name in INACTIVE_PAIR_PARAMETERS if name not in named))
+    if missing:
+        present = tuple(sorted(name for name in named if ".mixing." in name))
+        raise KeyError(
+            f"INACTIVE_PAIR_PARAMETERS does not describe this model: {len(missing)} of "
+            f"{len(INACTIVE_PAIR_PARAMETERS)} names absent, first {missing[0]!r}. "
+            "The literal was measured against a layer using EquivariantMixing directly; "
+            "a CompositeMixing model spells the same weights as "
+            "'stack.layers.0.mixing.producers.0.weights.gN'. "
+            f"Mixing parameters actually present: {present}"
+        )
+    return named
 
 
 def _config() -> OmegaConf:

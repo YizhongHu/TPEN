@@ -373,28 +373,52 @@ def test_the_two_score_routes_agree_on_a_substituted_zero() -> None:
             assert torch.equal(slow_block, chunked_block), f"{name} substituted differently per route"
             assert int(torch.count_nonzero(slow_block)) == 0
         else:
-            torch.testing.assert_close(slow_block, chunked_block, rtol=1.0e-12, atol=1.0e-12)
+            # Relative tolerance plus a floor derived from THIS BLOCK'S OWN
+            # scale. A fixed absolute `atol` is a claim about MAGNITUDES, not
+            # about accuracy: at 1e-12 it tolerated a thousandfold degradation
+            # of the measured 8.9e-16 route spread for order-one score entries,
+            # and would be entirely vacuous for a model whose scores sit near
+            # 1e-12 themselves. Scaling the floor keeps the check equally strict
+            # at any magnitude, which a constant cannot do.
+            scale = float(slow_block.abs().max())
+            torch.testing.assert_close(
+                slow_block, chunked_block, rtol=1.0e-12, atol=1.0e-12 * scale
+            )
 
 
+@pytest.mark.parametrize("chunk_size", [None, 2])
 def test_the_zeroed_parameter_log_names_them_and_fires_once(
+    chunk_size: int | None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Setup logs the substituted parameters by NAME, exactly once per model.
+    """Setup logs the substituted parameters by NAME, once per model, PER ROUTE.
 
     Names, not a count: a count cannot be checked against anything, while a name
     can be compared to an independent probe, which is the second assertion here.
     Once, because which parameters are structurally inactive is fixed by the
     architecture and the particle count, so a per-step line would bury a run log
-    under an invariant fact. Two requests are issued to make "once" observable
-    at all -- with a single request the assertion would hold for a seam that
-    logged on every call.
+    under an invariant fact. Two requests make "once" observable at all -- with
+    one request the assertion would hold for a seam that logged on every call.
+
+    PARAMETRIZED PER ROUTE, AND THAT IS THE WHOLE POINT. This test previously
+    issued one slow request and one chunked request against the SAME model, so
+    whichever route still reported repaired the log and ``len(messages) == 1``
+    still held. Two mutants -- each neutering the reported ordinals in ONE route
+    only -- survived the entire 4047-test suite byte-for-byte as a result
+    (Cannon jobs 44964577 and 45016357). ONE OBSERVATION WAS ABSORBING TWO
+    ROUTES. Now both requests use the SAME route, so a route that stops
+    reporting produces zero lines and fails on its own arm.
+
+    A FRESH MODEL PER PARAMETRIZATION IS LOAD-BEARING, not hygiene: the
+    once-per-run latch lives on the instance, so a shared model would let the
+    first arm consume the latch and leave the second asserting nothing.
     """
 
     model = _build_model(InteractionMode.TENSOR_PRODUCT, readout=_UnusedPfaffianReadout())
     batch = _batch()
     with caplog.at_level("INFO", logger="tpen"):
-        model(batch, request=MaterializedParameterScoreRequest())
-        model(batch, request=MaterializedParameterScoreRequest(chunk_size=2))
+        model(batch, request=MaterializedParameterScoreRequest(chunk_size=chunk_size))
+        model(batch, request=MaterializedParameterScoreRequest(chunk_size=chunk_size))
 
     messages = _zeroed_log_messages(caplog)
     assert len(messages) == 1, f"expected exactly one substitution log line, got {messages}"
