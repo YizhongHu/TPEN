@@ -27,6 +27,7 @@ def _train_manifest() -> dict[str, object]:
         "scientific_identity": {"architecture": "control", "optimizer": "adam"},
         "seed_identity": {"stage": "O1", "label": "000001", "namespace": "hi-v2"},
         "payload": {"updates": 50_000, "configuration": {"model": ("control",)}},
+        "topology": MappingProxyType({"launcher": ("single",)}),
     }
 
 
@@ -116,9 +117,44 @@ def test_train_manifest_accepts_mapping_proxies_at_each_enumerated_level() -> No
             "scientific_identity": MappingProxyType(manifest["scientific_identity"]),
             "seed_identity": MappingProxyType(manifest["seed_identity"]),
             "payload": MappingProxyType(manifest["payload"]),
+            "topology": MappingProxyType(manifest["topology"]),
         }
     )
     stage_coordinate.validate_train_manifest(proxied)
+
+
+def test_designated_topology_subtree_accepts_generated_spellings_without_lexical_policy() -> None:
+    """Topology is structurally isolated; L2b owns its wholesale hash exclusion."""
+
+    manifest = _train_manifest()
+    generated = {
+        f"execution_fact_{index:02d}_{chr(65 + index % 26)}": index
+        for index in range(32)
+    }
+    generated.update(
+        {
+            "local_rank": 3,
+            "num_gpus": 8,
+            "device_mesh": ("x", "y"),
+            "visible_devices": MappingProxyType({"CUDA_VISIBLE_DEVICES": "0,1"}),
+        }
+    )
+    manifest["topology"] = MappingProxyType(generated)
+    stage_coordinate.validate_train_manifest(manifest)
+
+
+def test_topology_is_required_and_mesh_outside_it_remains_caller_declared_science() -> None:
+    manifest = _train_manifest()
+    del manifest["topology"]
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match="manifest keys mismatch"):
+        stage_coordinate.validate_train_manifest(manifest)
+
+    coarse = _train_manifest()
+    fine = _train_manifest()
+    coarse["payload"] = {"updates": 50_000, "configuration": {"mesh": "coarse"}}
+    fine["payload"] = {"updates": 50_000, "configuration": {"mesh": "fine"}}
+    stage_coordinate.validate_train_manifest(coarse)
+    stage_coordinate.validate_train_manifest(fine)
 
 
 def test_delegated_subtrees_accept_l2b_vocabulary_without_closing_it() -> None:
@@ -147,6 +183,31 @@ def test_delegated_subtrees_reject_non_string_keys_and_accuracy_content() -> Non
         stage_coordinate.validate_train_manifest(manifest)
 
 
+class _AttributeCarrier:
+    """Unsupported caller object used to pin the D9 structural backstop."""
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+
+@pytest.mark.parametrize(
+    "smuggled",
+    [
+        "-2.903724377034119598",
+        {-2.903724377034119598},
+        _AttributeCarrier(-2.903724377034119598),
+    ],
+)
+def test_delegated_content_screen_rejects_string_set_and_attribute_smuggling(smuggled: object) -> None:
+    manifest = _train_manifest()
+    manifest["payload"] = {
+        "updates": 50_000,
+        "configuration": MappingProxyType({"nested": (smuggled,)}),
+    }
+    with pytest.raises(stage_coordinate.ManifestSchemaError):
+        stage_coordinate.validate_train_manifest(manifest)
+
+
 @pytest.mark.parametrize(
     "missing_key",
     ["schema", "stage", "scientific_identity", "seed_identity", "payload"],
@@ -164,6 +225,24 @@ def test_train_manifest_refuses_an_unknown_stage() -> None:
     manifest = _train_manifest()
     manifest["stage"] = "legacy-256-breadth"
     with pytest.raises(stage_coordinate.ManifestSchemaError, match="unknown HI stage"):
+        stage_coordinate.validate_train_manifest(manifest)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda manifest: manifest.__setitem__("stage", 1),
+        lambda manifest: manifest.__setitem__("scientific_identity", ("not", "a", "mapping")),
+        lambda manifest: manifest.__setitem__("seed_identity", ("not", "a", "mapping")),
+        lambda manifest: manifest.__setitem__("topology", ("not", "a", "mapping")),
+        lambda manifest: manifest.__setitem__("payload", {"updates": "50k", "configuration": {}}),
+        lambda manifest: manifest.__setitem__("payload", {"updates": 50_000, "configuration": ()}),
+    ],
+)
+def test_every_structural_guard_raises_the_typed_error(mutate: object) -> None:
+    manifest = _train_manifest()
+    mutate(manifest)
+    with pytest.raises(stage_coordinate.ManifestSchemaError):
         stage_coordinate.validate_train_manifest(manifest)
 
 

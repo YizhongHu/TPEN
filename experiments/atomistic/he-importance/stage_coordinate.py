@@ -3,7 +3,9 @@
 The committed JSON authority is the executable transcription of section 2.8 of
 the consolidated HI design. This module owns only coordinate and schema
 closedness; content-addressed identities and seed-stream derivation belong to
-L2b.
+L2b. ``topology`` is the sole caller-open execution subtree: L2b excludes it
+wholesale from canonical identity, while facts outside it are science by
+caller declaration and therefore identity-significant.
 """
 
 from __future__ import annotations
@@ -55,11 +57,10 @@ def _load_stage_definitions() -> tuple[StageDefinition, ...]:
 STAGE_DEFINITIONS = _load_stage_definitions()
 STAGES = {definition.code: definition for definition in STAGE_DEFINITIONS}
 
-_COMMON_KEYS = frozenset({"schema", "stage", "scientific_identity", "seed_identity", "payload"})
+TOPOLOGY_KEY = "topology"
+_COMMON_KEYS = frozenset({"schema", "stage", "scientific_identity", "seed_identity", "payload", TOPOLOGY_KEY})
 _TRAIN_KEYS = _COMMON_KEYS
 _EVALUATION_KEYS = _COMMON_KEYS | {"reference", "accuracy"}
-_SCIENTIFIC_IDENTITY_KEYS = frozenset({"architecture", "optimizer"})
-_SEED_IDENTITY_KEYS = frozenset({"stage_seed", "lineage"})
 _PAYLOAD_KEYS = frozenset({"updates", "configuration"})
 _REFERENCE_KEYS = frozenset({"energy"})
 _ACCURACY_KEYS = frozenset({"conventional_band"})
@@ -138,6 +139,8 @@ def _validate_common(manifest: Mapping[str, Any], schema: str, expected_keys: fr
         raise ManifestSchemaError("scientific_identity must be a mapping")
     if not isinstance(manifest["seed_identity"], Mapping):
         raise ManifestSchemaError("seed_identity must be a mapping")
+    if not isinstance(manifest[TOPOLOGY_KEY], Mapping):
+        raise ManifestSchemaError("topology must be a mapping")
     _require_exact_keys(manifest["payload"], _PAYLOAD_KEYS, "payload")
     _require_scalar(manifest["payload"]["updates"], int, "updates")
     if not isinstance(manifest["payload"]["configuration"], Mapping):
@@ -145,6 +148,7 @@ def _validate_common(manifest: Mapping[str, Any], schema: str, expected_keys: fr
     _validate_delegated_subtree(manifest["scientific_identity"], "scientific_identity")
     _validate_delegated_subtree(manifest["seed_identity"], "seed_identity")
     _validate_delegated_subtree(manifest["payload"]["configuration"], "payload.configuration")
+    _validate_delegated_subtree(manifest[TOPOLOGY_KEY], TOPOLOGY_KEY)
 
 
 def validate_train_manifest(manifest: Mapping[str, Any]) -> None:
