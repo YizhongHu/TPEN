@@ -40,6 +40,33 @@ RUN_START_ENV_ALLOWLIST = (
     "CUDA_VISIBLE_DEVICES",
 )
 
+#: Environment variables consulted, and RECORDED, as launcher announcements of
+#: process multiplicity. Fixed allowlist, so no secret-bearing variable can be
+#: captured by widening: every name here is a launcher-set count or index.
+#:
+#: The list is deliberately broader than any one launcher's vocabulary, because
+#: its purpose is to record which vocabulary was in use -- including none.
+MULTIPLICITY_ANNOUNCEMENT_KEYS = (
+    "SLURM_NTASKS",
+    "SLURM_NPROCS",
+    "SLURM_PROCID",
+    "SLURM_LOCALID",
+    "SLURM_STEP_NUM_TASKS",
+    "SLURM_STEP_TASKS_PER_NODE",
+    "SLURM_JOB_NUM_NODES",
+    "PMI_SIZE",
+    "PMI_RANK",
+    "PMIX_RANK",
+    "OMPI_COMM_WORLD_SIZE",
+    "OMPI_COMM_WORLD_RANK",
+    "MPI_LOCALRANKID",
+    "WORLD_SIZE",
+    "RANK",
+    "LOCAL_RANK",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+)
+
 _EventT = TypeVar("_EventT", bound=TypedEvent)
 _OperationT = TypeVar("_OperationT", bound=Operation)
 
@@ -341,13 +368,246 @@ class RunContext:
                 callback.handle_occurrence(occurrence, self)
 
 
+class RunIdentityError(RuntimeError):
+    """Raised when the ranks of one launch cannot agree on a single run id.
+
+    Always raised before any run directory exists: a refusal that fired after
+    ``make_dirs`` would leave exactly the scattered per-rank directories the
+    agreement exists to prevent.
+
+    Raised identically on every rank WHEN A CHANNEL COVERS THEM, because the
+    decision is then taken from gathered inputs that are byte-identical on every
+    rank. Without a channel the ranks decide independently, so a launch in which
+    only some ranks configure an explicit id raises on the others alone -- see
+    :func:`resolve_run_id`, which documents why that shape is undetectable
+    rather than claiming it cannot happen.
+    """
+
+
 def generate_run_id(run_name: str, *, clock: RunClock | None = None) -> str:
-    """Return a timestamped run identifier."""
+    """Return a timestamped run identifier.
+
+    PROCESS-LOCAL, and deliberately so: the ``uuid4`` suffix is drawn fresh on
+    every call, which is what keeps ids collision-resistant across runs. It also
+    means two processes never agree, so this is NOT the function a distributed
+    launch may call. Every rank calling it derives a different id and writes to
+    its own artifact root. Run setup must go through :func:`resolve_run_id`,
+    which calls this exactly once, on the coordinator, and broadcasts the result.
+    """
 
     run_clock = _default_run_clock() if clock is None else clock
     timestamp = run_clock.now().strftime("%Y-%m-%d_%H%M%S")
     slug = _slugify(run_name)
     return f"{timestamp}_{slug}_{uuid4().hex[:6]}"
+
+
+def resolve_run_id(
+    configured: object | None,
+    run_name: str,
+    *,
+    clock: RunClock | None = None,
+    topology: ExecutionTopology | None = None,
+) -> str:
+    """Return the one run id every rank of this launch agrees on.
+
+    Must be reached UNCONDITIONALLY by run setup -- including when the id is
+    already explicit. Entering this resolution only on the ``configured is
+    None`` branch would leave a rank whose config carries an explicit id outside
+    the collective below, so the ranks that did enter it would block until the
+    process-group timeout. That trades a visible scattered-output bug for an
+    invisible hang, which is worse.
+
+    Parameters
+    ----------
+    configured : object or None
+        The configured ``run.run_id``, or ``None`` when the config leaves it to
+        be derived. A non-``None`` value is compared and returned as text.
+    run_name : str
+        Durable run name, slugified into a derived id.
+    clock : RunClock or None, optional
+        Run clock used for a derived id's timestamp. Only the coordinator's
+        clock is ever read, so the ranks' clocks need not agree.
+    topology : ExecutionTopology or None, optional
+        Launcher-supplied topology, when one is known this early. Its
+        ``global_size`` is how many ranks MUST agree; see the refusal below.
+
+    Returns
+    -------
+    str
+        The agreed run id, byte-identical on every rank.
+
+    Raises
+    ------
+    RunIdentityError
+        When the ranks' configured ids disagree, when some ranks configure an
+        explicit id and others do not, when an id has to be derived for a
+        multi-rank launch that provides no channel to agree over, when the
+        supplied topology and the initialized process group describe different
+        world sizes, or when the initialized backend cannot carry a CPU
+        collective. The first two are detected only when a channel covers the
+        ranks; see the no-channel branch for what is knowingly not detectable.
+    """
+
+    configured_text = None if configured is None else str(configured)
+    channel = _run_id_agreement_channel()
+
+    # How many ranks must agree. The launcher-supplied topology is authoritative
+    # when present precisely because it can describe a multi-rank launch that
+    # has NOT initialized a process group -- that combination is the reachable
+    # scatter path, and reading only the process group would report world size 1
+    # and silently derive a per-rank id.
+    required = topology.global_size if topology is not None else (1 if channel is None else channel[0])
+
+    if channel is not None and topology is not None and channel[0] != topology.global_size:
+        # The launcher contradicts itself: the topology it supplied and the
+        # process group it initialized describe different worlds. Refused on its
+        # own terms and BEFORE the null/explicit split, because neither answer
+        # below is trustworthy -- deriving would agree across the wrong set, and
+        # accepting an explicit id would silently ratify the contradiction. Every
+        # rank that sees the mismatch refuses, so the refusal is symmetric.
+        raise RunIdentityError(
+            f"launcher disagrees with itself: the supplied topology declares "
+            f"{topology.global_size} ranks but the initialized process group covers "
+            f"{channel[0]}. Refusing before any run directory exists."
+        )
+
+    if required == 1 and (channel is None or channel[0] == 1):
+        # Serial path, byte-compatible with a single-process run: an explicit id
+        # is honored as-is, a null id is derived locally.
+        return configured_text if configured_text is not None else generate_run_id(run_name, clock=clock)
+
+    if channel is None:
+        # A multi-rank launch with nothing to agree over.
+        #
+        # An explicit id is accepted here UNVERIFIED, and that is an assumption
+        # rather than a fact: it is common to every rank only if every rank
+        # resolved the same config to the same value. Two shapes break that and
+        # neither is detectable without a channel -- a mixed launch where only
+        # some ranks configure an id, and a per-rank interpolation such as
+        # ``run_id: ${oc.env:SLURM_PROCID}`` or a per-rank override, which makes
+        # every rank's "explicit" id different. Both ARE caught when a channel
+        # exists, by the comparison in `_agree_on_run_id`. Without one, this
+        # branch cannot see them.
+        #
+        # A derived id, by contrast, is knowably divergent -- each rank would
+        # draw its own suffix -- so it is refused rather than scattered.
+        if configured_text is not None:
+            return configured_text
+        raise RunIdentityError(
+            f"cannot agree on a run id across {required} ranks: run.run_id is null "
+            "and no distributed process group is initialized. Initialize the process "
+            "group before run setup, or set an explicit run.run_id."
+        )
+
+    return _agree_on_run_id(configured_text, run_name, clock=clock, channel=channel)
+
+
+def _run_id_agreement_channel() -> tuple[int, int] | None:
+    """Return ``(world_size, global_rank)`` when ranks can agree, else ``None``.
+
+    Deliberately lazy and tolerant: `tpen.artifacts` is importable, and run
+    setup usable, in a torch-free environment, so an absent or unusable
+    ``torch.distributed`` is a serial run rather than an error.
+
+    This is a PRIVATE, single-purpose seam, not a distributed-runtime
+    abstraction: run identity lives in this module, and agreeing on it is
+    run-identity logic that happens to need a collective. When the typed
+    distributed runtime lands (DP0), these two helpers are the seam it replaces.
+    """
+
+    try:
+        import torch.distributed as dist
+
+        if not dist.is_available() or not dist.is_initialized():
+            return None
+        return dist.get_world_size(), dist.get_rank()
+    except Exception:  # pragma: no cover - torch-free and broken-install paths
+        # Broad, and it covers the PROBE calls as well as the import, which is
+        # what makes the docstring's "unusable" true: a partially installed torch
+        # raises OSError or AttributeError from its extension loader rather than
+        # ImportError, and a torch whose distributed module imports but whose
+        # state queries fail is equally unusable. Every one of those means the
+        # same thing here -- no channel, so this is a serial run.
+        return None
+
+
+def _cpu_object_group(dist: Any) -> Any:
+    """Return a process group whose object collectives are safe here, or ``None``.
+
+    ``None`` means "use the default group", which is correct when the default
+    backend is already Gloo.
+
+    WHY THIS EXISTS. ``all_gather_object`` and ``broadcast_object_list`` pickle to
+    a tensor and move it to the CURRENT device under an accelerator backend, and
+    torch makes pinning that device the caller's job. Run identity is resolved at
+    the very top of run setup, before any device selection has happened, and
+    nothing in TPEN calls ``set_device``, so under NCCL every rank would collect
+    on device 0 -- which hangs or corrupts rather than failing. Doing the
+    agreement over Gloo keeps it on the CPU, where it belongs: this is a
+    two-string handshake, not tensor work.
+
+    Not cached. The group is created once per resolution, and resolution happens
+    once per process; a module-level cache would instead have to stay correct
+    across a process group being destroyed and re-initialized, which is a
+    stale-handle hazard for no measurable gain.
+    """
+
+    if dist.get_backend().lower() == "gloo":
+        return None
+    if not dist.is_gloo_available():
+        # Symmetric and immediate. Every rank evaluates the same condition, so
+        # this refuses the launch rather than hanging one rank inside a
+        # collective it cannot complete safely.
+        raise RunIdentityError(
+            f"run identity needs a CPU collective, but the initialized backend is "
+            f"{dist.get_backend()!r} and this torch build has no Gloo backend to fall "
+            "back to. Set an explicit run.run_id, or build torch with Gloo."
+        )
+    # Collective: every rank reaches this line, because the resolution above it
+    # is entered unconditionally.
+    return dist.new_group(backend="gloo")
+
+
+def _agree_on_run_id(
+    configured_text: str | None,
+    run_name: str,
+    *,
+    clock: RunClock | None,
+    channel: tuple[int, int],
+) -> str:
+    """Agree on one run id over an initialized process group.
+
+    Every rank gathers every rank's configured value, so the accept/derive/refuse
+    decision is taken from identical inputs on every rank. A refusal therefore
+    raises on all of them, rather than on the coordinator alone while its peers
+    block on a collective that will never come.
+    """
+
+    import torch.distributed as dist
+
+    world_size, global_rank = channel
+    group = _cpu_object_group(dist)
+    gathered: list[str | None] = [None] * world_size
+    dist.all_gather_object(gathered, configured_text, group=group)
+
+    if all(value is None for value in gathered):
+        # Exactly one derivation, on the coordinator, then broadcast. `clock` and
+        # the `uuid4` draw are read only here, so the peers' clocks and entropy
+        # never enter the result.
+        payload = [generate_run_id(run_name, clock=clock) if global_rank == 0 else None]
+        dist.broadcast_object_list(payload, src=0, group=group)
+        return str(payload[0])
+
+    if len(set(gathered)) != 1:
+        # Covers both disagreeing explicit ids and a mixed null/explicit launch.
+        # `gathered` is rank-indexed and identical on every rank, so the message
+        # names the offending ranks and reads the same in all of their logs.
+        raise RunIdentityError(
+            "ranks disagree on run.run_id and no run directory was created; "
+            f"by rank: {gathered!r}"
+        )
+    # One distinct value, and it is not None: the all-None launch returned above.
+    return str(gathered[0])
 
 
 def build_run_metadata(
@@ -641,6 +901,9 @@ def write_run_start_artifact(context: RunContext) -> None:
         },
         "slurm": _collect_slurm_metadata(),
         "environment": _collect_allowed_environment(),
+        # Recorded, never read. See the collector's docstring for what this
+        # deliberately does not establish.
+        "launcher_multiplicity": collect_launcher_multiplicity_announcements(),
         "start_time_unix": context.now().timestamp(),
     }
     write_json(context.path("run_start.json"), data)
@@ -854,6 +1117,47 @@ def _available_cpu_count() -> int | None:
         return None
 
 
+def collect_launcher_multiplicity_announcements() -> dict[str, Any]:
+    """Record what this process's environment announces about multiplicity.
+
+    OBSERVATION ONLY. This function records; it does not decide. No control flow
+    anywhere reads its result -- run identity is resolved from the supplied
+    topology and the initialized process group, never from this.
+
+    WHAT IT DOES NOT DO, stated because the temptation to read more into it is
+    the reason it exists. It does NOT detect, prevent, bound, or warn about an
+    undeclared multi-rank launch. A launch in which four processes each announce
+    ``SLURM_NTASKS=4`` and each derive their own run id will be RECORDED here
+    accurately and will not be stopped. Closing that gap needs a launcher-to-
+    topology bootstrap, which is the typed distributed runtime's slice, not this
+    function; this exists so that when it happens the artifact says so instead
+    of the scattering being invisible.
+
+    Why absence is recorded alongside presence: the launch shapes are told apart
+    by which vocabulary is MISSING as much as by which is set. Measured on FASRC
+    Cannon, 2026-09-06 -- ``SLURM_NTASKS`` is allocation-scoped and reads 4 for a
+    genuinely single process inside a 4-task allocation, while
+    ``SLURM_STEP_NUM_TASKS`` appears only inside an ``srun`` step. A record of
+    just the counts would therefore be actively misleading; a record of which
+    names were consulted, which answered, and which did not is evidence.
+
+    Returns
+    -------
+    dict
+        ``consulted`` lists every name asked about, in a fixed order.
+        ``present`` maps the names that were set to their raw values.
+        ``absent`` lists the names that were not set.
+    """
+
+    return {
+        "consulted": list(MULTIPLICITY_ANNOUNCEMENT_KEYS),
+        "present": {
+            key: os.environ[key] for key in MULTIPLICITY_ANNOUNCEMENT_KEYS if key in os.environ
+        },
+        "absent": [key for key in MULTIPLICITY_ANNOUNCEMENT_KEYS if key not in os.environ],
+    }
+
+
 def _collect_slurm_metadata() -> dict[str, str]:
     keys = {
         "job_id": "SLURM_JOB_ID",
@@ -874,16 +1178,20 @@ def _collect_allowed_environment() -> dict[str, str]:
 __all__ = [
     "ArtifactManager",
     "DEFAULT_RUN_TIMEZONE",
+    "MULTIPLICITY_ANNOUNCEMENT_KEYS",
     "REQUIRED_RUN_DIRS",
     "RunClock",
     "RunContext",
+    "RunIdentityError",
     "RunMetadata",
     "RunResult",
     "build_run_metadata",
     "collect_hardware_metadata",
     "collect_git_metadata",
+    "collect_launcher_multiplicity_announcements",
     "generate_run_id",
     "resolve_run_clock",
+    "resolve_run_id",
     "write_json",
     "write_error_artifact",
     "write_occurrence_artifact",

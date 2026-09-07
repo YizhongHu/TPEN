@@ -21,8 +21,8 @@ from tpen.artifacts import (
     RunContext,
     RunResult,
     build_run_metadata,
-    generate_run_id,
     resolve_run_clock,
+    resolve_run_id,
     write_error_artifact,
     write_run_start_artifact,
 )
@@ -151,9 +151,30 @@ def prepare_run_context(
         or "tpen_run"
     )
     OmegaConf.update(resolved_cfg, "experiment.run_name", run_name, merge=False, force_add=True)
-    run_id = OmegaConf.select(resolved_cfg, "run.run_id", default=None)
-    if run_id is None:
-        run_id = generate_run_id(run_name, clock=run_clock)
+    # Run identity is AGREED wherever a launch declares itself, rather than
+    # generated per process. `generate_run_id` is process-local, so a
+    # distributed launch derived a different id on every rank and wrote to its
+    # own artifact root instead of one converged run root.
+    #
+    # HONEST SCOPE, because the comment would otherwise overclaim: nothing in
+    # `tpen/` yet initializes a process group or supplies a multi-rank
+    # `ExecutionTopology`, so on the launches TPEN can perform TODAY this still
+    # resolves through the serial branch. The agreement is the mechanism the
+    # distributed runtime will use, tested against real multi-rank process
+    # groups; it is not yet reached by a production caller.
+    #
+    # `resolve_run_id` is reached unconditionally, including when the id is
+    # already explicit, and that is load-bearing rather than tidiness: a
+    # resolution entered only on the null branch would leave a rank whose config
+    # carries an explicit id outside the collective, so its peers would block
+    # until the process-group timeout. Reaching it on every path also means the
+    # ranks' explicit ids are checked for agreement instead of being trusted.
+    #
+    # It runs here, above every construction below, so a disagreeing launch is
+    # refused while the run directory still does not exist.
+    configured_run_id = OmegaConf.select(resolved_cfg, "run.run_id", default=None)
+    run_id = resolve_run_id(configured_run_id, run_name, clock=run_clock, topology=topology)
+    if configured_run_id is None:
         OmegaConf.update(resolved_cfg, "run.run_id", run_id, merge=False, force_add=True)
     experiment_name = experiment_name or "experiment"
     sector = str(OmegaConf.select(resolved_cfg, "experiment.sector", default="default"))
