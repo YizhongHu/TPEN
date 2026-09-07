@@ -5,7 +5,8 @@
     "configurations": [
       {
         "scientific_identity": {"architecture": "control", "optimizer": "adam"},
-        "payload": {"updates": 2000}
+        "payload": {"updates": 2000},
+        "topology": {}
       }
     ]
   },
@@ -15,11 +16,13 @@
     "configurations": [
       {
         "scientific_identity": {"architecture": "control", "optimizer": "adam"},
-        "payload": {"updates": 50000}
+        "payload": {"updates": 50000},
+        "topology": {}
       },
       {
         "scientific_identity": {"architecture": "hybrid", "optimizer": "adam"},
-        "payload": {"updates": 50000}
+        "payload": {"updates": 50000},
+        "topology": {}
       }
     ]
   },
@@ -29,7 +32,8 @@
     "configurations": [
       {
         "scientific_identity": {"architecture": "control", "optimizer": "linear_method"},
-        "payload": {"updates": 50000}
+        "payload": {"updates": 50000},
+        "topology": {}
       }
     ]
   },
@@ -39,7 +43,8 @@
     "configurations": [
       {
         "scientific_identity": {"architecture": "control", "optimizer": "adam"},
-        "payload": {"updates": 50000, "final_horizon": "frozen-before-confirmation"}
+        "payload": {"updates": 50000, "final_horizon": "frozen-before-confirmation"},
+        "topology": {}
       }
     ]
   }

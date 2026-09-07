@@ -79,28 +79,6 @@ _FORBIDDEN_TRAIN_CONTENT_KEYS = frozenset(
     }
 )
 _L2B_SEED_IDENTITY_KEYS = frozenset({"stage", "label", "namespace"})
-_TOPOLOGY_KEYS = frozenset(
-    {
-        "rank",
-        "ranks",
-        "device",
-        "deviceid",
-        "devices",
-        "gpu",
-        "gpus",
-        "world",
-        "worldsize",
-        "node",
-        "nodecount",
-        "nodes",
-        "worker",
-        "workerindex",
-        "workers",
-        "host",
-        "hostname",
-        "topology",
-    }
-)
 _INTENDED_CONFIGURATIONS_PATH = Path(__file__).with_name("intended_configurations.json")
 
 
@@ -169,21 +147,29 @@ class MaterializedCell:
 
 
 def canonical_json(value: Any) -> bytes:
-    """Return canonical identity bytes after topology projection.
+    """Return canonical identity bytes for a value or an HI train manifest.
 
-    Identity-bearing callers may supply open scientific/configuration mappings.
-    Physical execution topology is not scientific content and is therefore
-    removed before both hashing and path derivation.
+    The L2a-designated topology member is structurally excluded only from a
+    manifest root.  A caller-owned mapping passed alone may legitimately use
+    the same word as a scientific fact, so it remains literal content.
     """
+
+    return _canonical_json(value, exclude_root_topology=_is_manifest_root(value))
+
+
+def _canonical_json(value: Any, *, exclude_root_topology: bool) -> bytes:
+    """Serialize an identity with an explicit structural-boundary decision."""
 
     try:
         return json.dumps(
-            _project_identity(value),
+            _project_identity(value, exclude_root_topology=exclude_root_topology),
             allow_nan=False,
             ensure_ascii=True,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("ascii")
+    except MaterializationError:
+        raise
     except (TypeError, ValueError) as error:
         raise MaterializationError("identity values must be finite JSON data") from error
 
@@ -194,35 +180,46 @@ def content_hash(value: Any) -> str:
     return sha256(canonical_json(value)).hexdigest()
 
 
+def _is_manifest_root(value: Any) -> bool:
+    """Recognize the sole L2a-owned position where topology is execution data."""
+
+    return (
+        isinstance(value, Mapping)
+        and value.get("schema") in {TRAIN_MANIFEST_SCHEMA, EVALUATION_MANIFEST_SCHEMA}
+        and TOPOLOGY_KEY in value
+    )
+
+
 def _freeze(value: Any) -> Any:
     """Recursively freeze a JSON-shaped manifest after it has been hashed."""
 
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze(nested) for key, nested in value.items()})
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return tuple(_freeze(nested) for nested in value)
     return value
 
 
-def _normalized_key(key: str) -> str:
-    """Normalize a mapping key without treating spelling as scientific content."""
+def _project_identity(value: Any, *, exclude_root_topology: bool, is_root: bool = True) -> Any:
+    """Convert frozen containers to JSON, omitting only root execution topology.
 
-    return "".join(character.lower() for character in key if character.isalnum())
-
-
-def _project_identity(value: Any) -> Any:
-    """Convert frozen containers to JSON and exclude physical topology facts."""
+    L2a declares ``topology`` as the one top-level execution subtree.  Its
+    contents are deliberately unenumerable: this structural boundary removes
+    the whole subtree, while an identically named nested caller fact remains
+    scientific content and therefore contributes to the identity.
+    """
 
     if isinstance(value, Mapping):
         projected: dict[str, Any] = {}
         for key, nested in value.items():
             if not isinstance(key, str):
                 raise MaterializationError("identity mapping keys must be strings")
-            if _normalized_key(key) not in _TOPOLOGY_KEYS:
-                projected[key] = _project_identity(nested)
+            if is_root and exclude_root_topology and key == TOPOLOGY_KEY:
+                continue
+            projected[key] = _project_identity(nested, exclude_root_topology=False, is_root=False)
         return projected
     if isinstance(value, (list, tuple)):
-        return [_project_identity(nested) for nested in value]
+        return [_project_identity(nested, exclude_root_topology=False, is_root=False) for nested in value]
     return value
 
 
@@ -288,7 +285,8 @@ def materialize_stage(
     """Materialize one exact resolved union as immutable, content-addressed rows.
 
     ``configurations`` are literal resolved configurations: each must provide a
-    non-empty ``scientific_identity`` and a complete ``payload`` mapping.  A
+    non-empty ``scientific_identity``, a complete ``payload`` mapping, and the
+    caller-supplied execution ``topology`` mapping.  A
     duplicate is removed only when its resolved scientific identity is exactly
     equal.  Conflicting definitions of that identity fail rather than choosing
     an arbitrary display-name representative.
@@ -300,18 +298,25 @@ def materialize_stage(
     seen_paths: set[Path] = set()
     cells: list[MaterializedCell] = []
     for configuration in configurations:
-        if frozenset(configuration) != frozenset({"scientific_identity", "payload"}):
-            raise MaterializationError("resolved configurations require exactly scientific_identity and payload")
+        if frozenset(configuration) != frozenset({"scientific_identity", "payload", TOPOLOGY_KEY}):
+            raise MaterializationError(
+                "resolved configurations require exactly scientific_identity, payload, and topology"
+            )
         identity = configuration["scientific_identity"]
         payload = configuration["payload"]
+        topology = configuration[TOPOLOGY_KEY]
         if not isinstance(identity, Mapping) or not identity:
             raise MaterializationError("scientific_identity must be a non-empty mapping")
         if not isinstance(payload, Mapping):
             raise MaterializationError("payload must be a literal mapping")
+        if not isinstance(topology, Mapping):
+            raise MaterializationError("topology must be a literal mapping")
         identity_hash = content_hash(identity)
         previous = identities.get(identity_hash)
         if previous is not None:
-            if canonical_json(previous) != canonical_json(configuration):
+            if _canonical_json(previous, exclude_root_topology=True) != _canonical_json(
+                configuration, exclude_root_topology=True
+            ):
                 raise MaterializationError("one scientific identity has conflicting resolved content")
             continue
         identities[identity_hash] = configuration
@@ -327,6 +332,7 @@ def materialize_stage(
                 "scientific_identity": {**identity, "optimizer_cell": optimizer_identity},
                 "seed_identity": {"stage": stage, "label": label, "namespace": "fresh-training"},
                 "payload": {"updates": payload["updates"], "configuration": dict(payload)},
+                TOPOLOGY_KEY: topology,
             }
             validate_materialized_manifest(manifest)
             digest = content_hash(manifest)
