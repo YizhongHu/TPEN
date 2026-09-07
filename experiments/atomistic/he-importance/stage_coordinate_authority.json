@@ -1,0 +1,9 @@
+[
+  {"code": "Q", "purpose": "mechanics", "seeds_per_point": 2, "maximum_lineages": 480, "updates": 2000},
+  {"code": "O1", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 1920, "updates": 50000},
+  {"code": "O2", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 320, "updates": 50000},
+  {"code": "A", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 4064, "updates": 50000},
+  {"code": "B", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 960, "updates": 50000},
+  {"code": "R", "purpose": "scientific", "seeds_per_point": 12, "maximum_lineages": 768, "updates": 50000},
+  {"code": "F", "purpose": "confirmation", "seeds_per_point": 48, "maximum_lineages": 96, "updates": null}
+]
