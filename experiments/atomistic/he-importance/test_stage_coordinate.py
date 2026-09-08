@@ -732,6 +732,18 @@ def test_decimal_rule_reaches_reference_value_at_legal_top_level_key(
         )
 
 
+def test_decimal_rule_reaches_reference_value_at_legal_sampler_depth(tmp_path: Path) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"sampler": {"walkers": -2.9037244}},
+            ddp_provenance={},
+        )
+
+
 @pytest.mark.parametrize(
     "key", ["e0", "target", "E_exact", "benchmark", "gold", "threshold", "reference_energy", "energy"]
 )
