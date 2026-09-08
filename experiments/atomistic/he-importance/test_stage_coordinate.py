@@ -712,6 +712,26 @@ def test_job_inputs_refuse_reference_representations_at_frozen_depth(
         )
 
 
+@pytest.mark.parametrize("packet_route", ["ranking", "independent"])
+def test_decimal_rule_reaches_reference_value_at_legal_top_level_key(
+    tmp_path: Path, packet_route: str
+) -> None:
+    ranking_inputs: dict[str, object] = {"statistic": "logabs_variance"}
+    independent_inputs: dict[str, object] = {"walkers": 4_096}
+    (ranking_inputs if packet_route == "ranking" else independent_inputs)[
+        "statistic" if packet_route == "ranking" else "walkers"
+    ] = -2.9037244
+    with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            ranking_inputs,
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            independent_inputs,
+            ddp_provenance={},
+        )
+
+
 @pytest.mark.parametrize(
     "key", ["e0", "target", "E_exact", "benchmark", "gold", "threshold", "reference_energy", "energy"]
 )
