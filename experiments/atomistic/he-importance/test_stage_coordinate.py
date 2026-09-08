@@ -744,6 +744,54 @@ def test_decimal_rule_reaches_reference_value_at_legal_sampler_depth(tmp_path: P
         )
 
 
+def test_allowlist_disable_control_accepts_unknown_benign_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(stage_coordinate, "_validate_packet_input_schema", lambda *args: None)
+    packets = stage_coordinate.materialize_job_packets(
+        _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+        {"statistic": "logabs_variance", "unknown": "benign"},
+        (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,), {"walkers": 4_096}, ddp_provenance={},
+    )
+    assert packets.ranking
+
+
+def test_decimal_rule_alone_refuses_rounded_reference_when_allowlist_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(stage_coordinate, "_validate_packet_input_schema", lambda *args: None)
+    with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": -2.9037244},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,), {"walkers": 4_096}, ddp_provenance={},
+        )
+
+
+def test_decimal_disable_control_accepts_reference_at_legal_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(stage_coordinate, "_is_reference_energy_representation", lambda value: False)
+    packets = stage_coordinate.materialize_job_packets(
+        _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+        {"statistic": -2.9037244},
+        (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,), {"walkers": 4_096}, ddp_provenance={},
+    )
+    assert packets.ranking
+
+
+def test_allowlist_alone_refuses_unknown_nested_key_when_decimal_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(stage_coordinate, "_is_reference_energy_representation", lambda value: False)
+    with pytest.raises(stage_coordinate.MaterializationError, match="unknown input key 'unknown'"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,), {"sampler": {"unknown": "benign"}}, ddp_provenance={},
+        )
+
+
 @pytest.mark.parametrize(
     "key", ["e0", "target", "E_exact", "benchmark", "gold", "threshold", "reference_energy", "energy"]
 )
