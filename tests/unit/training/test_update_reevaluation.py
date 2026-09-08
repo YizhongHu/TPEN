@@ -612,35 +612,65 @@ def test_true_closure_lbfgs_differs_from_the_cached_loss_workaround() -> None:
 def test_reevaluation_uses_the_trainers_resolved_nonfinite_policy() -> None:
     """One step must never run under two estimators.
 
-    Both arms use the same term, which is finite for the primary objective and
-    non-finite on re-evaluation, so the ONLY difference between them is the
-    policy the seam carried.  A re-evaluation that fell back to the module
-    default would leave the ``"fail"`` arm silently green.
+    THIS PROPERTY CHANGED SHAPE UNDER RULING 377f6b0f, and the reason is worth
+    stating rather than quietly rewriting the assertion.  It used to be
+    observed through OUTCOME: a mid-step non-finite row made the ``"fail"`` arm
+    raise and the ``"mask"`` arm return a masked value, so the two arms
+    differed only by the policy the seam carried.
+
+    The pinned-row rule now PRE-EMPTS that.  A row that goes non-finite
+    mid-step is refused under every policy, before `compute_vmc_objective` is
+    reached, so both arms raise for the same reason and the outcome no longer
+    discriminates.  Worse, the policy is now UNREACHABLE at compute time in the
+    ordinary case: the selection contains exactly the rows that were finite
+    when the mask was pinned, and any of those going bad raises, so the sliced
+    tensors handed to `compute_vmc_objective` are always all-finite and neither
+    policy branch can fire.
+
+    So the property is now observed at the point where the policy is still
+    live: it must ARRIVE at the decision point unchanged.  That is a real
+    claim, not a weakened one -- a recompute that passed the module default
+    here would still be running one step under two estimators the moment any
+    future ruling makes the policy load-bearing again.
     """
 
-    failing_terms = [_NonFiniteAfterFirstCallTerm()]
-    _, _, _, fail_method, _ = _run_trainer(
-        update_method_factory=_CapturingUpdate,
-        hamiltonian_terms=failing_terms,
-        nonfinite_local_energy_policy="fail",
-    )
-    assert fail_method.captured is not None
-    with pytest.raises(ValueError, match="the active policy is 'fail'"):
-        fail_method.captured.reevaluate()
+    seen: list[str] = []
 
-    masking_terms = [_NonFiniteAfterFirstCallTerm()]
-    _, _, _, mask_method, _ = _run_trainer(
-        update_method_factory=_CapturingUpdate,
-        hamiltonian_terms=masking_terms,
-        nonfinite_local_energy_policy="mask",
+    def capture(*, primary_finite_mask, recomputed_local_energy, policy):
+        del recomputed_local_energy
+        seen.append(policy)
+        return primary_finite_mask
+
+    for policy in ("fail", "mask"):
+        _, _, _, method, _ = _run_trainer(
+            update_method_factory=_CapturingUpdate,
+            hamiltonian_terms=[_ConstantTerm(torch.tensor([1.25], dtype=torch.float64))],
+            nonfinite_local_energy_policy=policy,
+        )
+        assert method.captured is not None
+        original = update_module.select_reevaluation_rows
+        update_module.select_reevaluation_rows = capture
+        try:
+            method.captured.reevaluate()
+        finally:
+            update_module.select_reevaluation_rows = original
+
+    assert seen == ["fail", "mask"], (
+        "the trainer's resolved policy must reach the decision point unchanged; "
+        f"got {seen}"
     )
-    assert mask_method.captured is not None
-    masked = mask_method.captured.reevaluate()
-    assert torch.isfinite(masked).all()
 
 
 def test_nonfinite_reevaluation_under_fail_propagates_out_of_optimizer_step() -> None:
-    """P8: the seam propagates a refusal; it does not swallow or downgrade it."""
+    """P8: the seam propagates a refusal; it does not swallow or downgrade it.
+
+    The refusal now comes from the PINNED-ROW rule of ruling 377f6b0f rather
+    than from the ``"fail"`` policy -- the row is finite when the mask is
+    pinned and non-finite at the trial point, so it is refused before the
+    policy is consulted.  The property under test is unchanged and is the one
+    that matters: whatever raises inside the closure must escape
+    ``optimizer.step(closure)`` rather than be swallowed by LBFGS.
+    """
 
     batch = _batch(n_walkers=4)
     model = _CountingModel()
@@ -659,7 +689,7 @@ def test_nonfinite_reevaluation_under_fail_propagates_out_of_optimizer_step() ->
         objective.backward()
         return objective
 
-    with pytest.raises(ValueError, match="the active policy is 'fail'"):
+    with pytest.raises(ValueError, match=r"row\(s\) \[0\]"):
         optimizer.step(closure)
 
 
@@ -755,12 +785,13 @@ def test_live_reevaluation_and_its_input_cannot_be_serialized() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_row_selection_decision_point_defaults_to_no_selection() -> None:
-    """The status quo is the DEFAULT, and it is explicit rather than emergent.
+def test_the_decision_point_pins_the_step_mask_rather_than_re_masking() -> None:
+    """RULING 377f6b0f PART 1. Replaces the None-returning status quo.
 
-    Returning ``None`` preserves the declared per-call policy semantics while
-    the row-set question is open.  Asserted so that a future ruling changes
-    this line deliberately instead of being read into the seam by accident.
+    This test previously asserted ``selection is None`` and existed so that a
+    ruling would have to change the line deliberately.  It did; this is that
+    change, and the assertion is inverted rather than deleted so the history
+    reads as a decision.
     """
 
     selection = update_module.select_reevaluation_rows(
@@ -768,7 +799,8 @@ def test_row_selection_decision_point_defaults_to_no_selection() -> None:
         recomputed_local_energy=torch.ones(4, dtype=torch.float64),
         policy="mask",
     )
-    assert selection is None
+    assert selection is not None
+    assert torch.equal(selection, torch.tensor([True, True, False, True]))
 
 
 def test_a_row_selection_returned_by_the_decision_point_is_actually_applied() -> None:
@@ -941,3 +973,168 @@ def test_the_retained_primary_mask_is_fixed_at_construction() -> None:
     assert len(seen) == 1
     assert seen[0].dtype == torch.bool
     assert torch.equal(seen[0], torch.tensor([True, True, False, True]))
+
+
+# ---------------------------------------------------------------------------
+# Ruling 377f6b0f: fixed row mask per step, refuse a pinned row that goes bad
+#
+# Four claims, and each dies to a mutant that kills IT AND NOTHING ELSE:
+#   M1 pin-not-applied  (`return None`, RAISE KEPT)          -> only the first
+#   M2 raise-suppressed (delete the raise)                   -> only the second
+#   M4 repin-to-current (`return isfinite(recomputed)`)      -> only the third
+#   M3 raise-too-broad  (drop the `primary_finite_mask &`)   -> only the fourth
+# Getting there required a design change, not bookkeeping: the stability test
+# asserts the row set is stable ACROSS TRIAL POINTS rather than equal to the
+# primary mask, so M4 passes it and the third test owns the equality claim
+# alone.  The obvious version had two tests dying to one mutant.
+# ---------------------------------------------------------------------------
+
+
+_F = torch.float64
+
+
+def _select(primary: torch.Tensor, recomputed: torch.Tensor, policy: str = "mask"):
+    """Call the decision point the way the recompute does."""
+
+    return update_module.select_reevaluation_rows(
+        primary_finite_mask=torch.isfinite(primary),
+        recomputed_local_energy=recomputed,
+        policy=policy,
+    )
+
+
+def test_the_row_set_is_stable_across_trial_points_within_one_step() -> None:
+    """A closure optimizer moves the parameters; the scored rows must not."""
+
+    primary = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=_F)
+    first = _select(primary, torch.tensor([1.5, 2.5, 3.5, 4.5], dtype=_F))
+    second = _select(primary, torch.tensor([9.0, -3.0, 0.25, 7.0], dtype=_F))
+
+    assert first is not None and second is not None
+    assert torch.equal(first, second)
+
+
+def test_a_pinned_row_going_non_finite_raises_and_names_the_row() -> None:
+    """The message must identify the rows, not merely be an exception.
+
+    A bare ``pytest.raises(ValueError)`` would pass on an unrelated ValueError
+    raised nearby, which is a defect this project has paid for before.
+    """
+
+    primary = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=_F)
+    recomputed = torch.tensor([1.0, float("inf"), 3.0, float("nan")], dtype=_F)
+
+    with pytest.raises(ValueError, match=r"row\(s\) \[1, 3\]"):
+        _select(primary, recomputed)
+
+
+def test_a_row_excluded_at_the_step_start_stays_excluded_when_it_recovers() -> None:
+    """Pinning is per STEP, not per call: recovery must not widen the mask.
+
+    Widening mid-search changes the estimator exactly as shrinking does, and it
+    is the direction a naive ``isfinite(recomputed)`` gets wrong.
+    """
+
+    primary = torch.tensor([1.0, float("inf"), 3.0, 4.0], dtype=_F)
+    recomputed = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=_F)
+
+    selection = _select(primary, recomputed)
+
+    assert selection is not None
+    assert torch.equal(selection, torch.tensor([True, False, True, True]))
+
+
+def test_a_row_already_non_finite_at_the_step_start_does_not_raise() -> None:
+    """Only rows that WERE finite and went bad are a failure.
+
+    A row non-finite from the outset was never pinned in, so it is excluded by
+    the mask and must not trigger the refusal.  Dropping the
+    ``primary_finite_mask &`` conjunct turns this benign case into a raise.
+    """
+
+    primary = torch.tensor([1.0, float("nan"), 3.0, 4.0], dtype=_F)
+    recomputed = torch.tensor([1.0, float("nan"), 3.0, 4.0], dtype=_F)
+
+    selection = _select(primary, recomputed)
+
+    assert selection is not None
+    assert torch.equal(selection, torch.tensor([True, False, True, True]))
+
+
+def test_no_propagate_opt_out_is_reachable_from_this_seam() -> None:
+    """The proof obligation is structural: there is no channel to enable it.
+
+    Ruling 377f6b0f permits ``propagate-non-finite`` only where an optimizer's
+    admission carries a test proving its search rejects non-finite trial values
+    and terminates.  No such admission exists, so no channel does either.  This
+    pins that, so a later change adding a boolean anyone can set fails here
+    before it reaches review.
+
+    DELIBERATELY HAS NO MUTANT.  It guards a CLASS of change rather than a
+    behaviour, so a mutant for it would be theatre -- and inventing one to keep
+    the table symmetrical is how a suite acquires tests that pass for reasons
+    nobody checked.
+    """
+
+    import inspect
+
+    signature = inspect.signature(update_module.select_reevaluation_rows)
+    assert set(signature.parameters) == {
+        "primary_finite_mask",
+        "recomputed_local_energy",
+        "policy",
+    }
+
+
+def test_the_default_mask_policy_now_refuses_rather_than_re_masking() -> None:
+    """The behaviour change, pinned as a test rather than only described.
+
+    Runs under the DEFAULT policy -- no ``"fail"`` anywhere -- because the
+    change people will actually meet is under ``"mask"``.  Before the ruling
+    this returned a value with row 0 quietly dropped mid-search.
+    """
+
+    batch = _batch(n_walkers=4)
+    reevaluate = vmc_objective_reevaluation(
+        model=_CountingModel(),
+        hamiltonian_terms=[_NonFiniteAfterFirstCallTerm()],
+        batch=batch,
+        primary_local_energy=_finite_primary(batch),
+    )
+    with pytest.raises(ValueError, match=r"row\(s\) \[0\]"):
+        reevaluate()
+
+
+def test_the_pinned_row_raise_escapes_the_trainer_through_optimizer_step() -> None:
+    """Testing the seam is not testing the seam's effect.
+
+    Every other test here calls the decision point or the factory directly, so
+    none shows the raise reaching a caller.  That is the whole point of the
+    ruling: a refusal that never escapes is indistinguishable from the silent
+    masking it replaces.  Every hop below is production code --
+    ``VMCTrainer.fit`` -> update method -> ``optimizer.step(closure)`` ->
+    ``reevaluate()`` -> ``select_reevaluation_rows``.
+    """
+
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    sampler = build_tiny_sampler()
+    optimizer = torch.optim.LBFGS(model.parameters(), lr=0.05, max_iter=4)
+    method = _TrueClosureLBFGSUpdate(
+        optimizer, ModelParameterBinding(parameters=tuple(model.parameters()))
+    )
+    trainer = VMCTrainer(max_steps=1, update_method=method)
+
+    with pytest.raises(ValueError, match=r"row\(s\) \[0\]"):
+        trainer.fit(
+            model=model,
+            sampler=sampler,
+            hamiltonian_terms=[_NonFiniteAfterFirstCallTerm()],
+            optimizer=optimizer,
+            context=_StubContext(),
+            emit=lambda name, *, state=None, payload=None, step=None: None,
+        )
+
+    assert method.closure_calls >= 1, (
+        "the closure never ran, so this proved nothing about the escape path"
+    )

@@ -215,15 +215,15 @@ class ObjectiveReevaluation:
     functions.  That is not a defect of this seam: it is the known-biased
     estimator that ``"mask"`` explicitly selects, meeting a line search.
 
-    WHETHER A LINE SEARCH OVER A MASK-BIASED ESTIMATOR IS SOUND AT ALL IS AN
-    OPEN QUESTION THIS SEAM SURFACES AND DOES NOT ANSWER.  It is tracked as
-    item ``377f6b0f``, and :func:`select_reevaluation_rows` is the ONE place a
-    ruling on it changes -- deliberately a named decision rather than a
-    property that falls out of how the recompute is wired.  Scoping the
-    same-function property to unchanged parameters records the boundary; it
-    does not dispose of the question.  The decision belongs to whoever admits
-    the optimizers that consume this seam (the staged optimizer-admission lane
-    covering SPRING, KFAC, and the linear method).  Under ``"fail"`` the
+    THAT QUESTION IS NOW ANSWERED.  Operator ruling ``377f6b0f`` settles it:
+    the finite-row mask is FIXED PER STEP, pinned at the step's first
+    evaluation, and a pinned row going non-finite at a later trial point
+    RAISES rather than being re-masked.  Silent re-mask is rejected.  So the
+    subsample no longer shifts between closure calls, and a line search
+    compares one function for the whole step.
+    :func:`select_reevaluation_rows` is where that lands, which is what the
+    seam was shaped for.  See the ``operator-ruling`` note on ``377f6b0f`` for
+    the ruling itself rather than any paraphrase.  Under ``"fail"`` the
     situation is different and simpler: a re-evaluation that meets a
     non-finite row raises out of the closure, from inside ``step(closure)``,
     and the step does not apply.
@@ -295,8 +295,9 @@ def select_reevaluation_rows(
     Which finite-row set a re-evaluation uses is a DESIGN DECISION, not a
     consequence of how the recompute happens to be wired, and this function is
     the single place it is made.  It exists so that implementing a ruling on
-    open question ``377f6b0f`` is a small change here rather than a rederivation
-    of the seam.
+    ``377f6b0f`` would be a small change here rather than a rederivation of the
+    seam -- and that is how it played out: the ruling landed as eight lines in
+    this body and nothing else.
 
     The question it answers: under policy ``"mask"``,
     :func:`~tpen.training.vmc.compute_vmc_objective` excludes non-finite
@@ -318,41 +319,79 @@ def select_reevaluation_rows(
 
     Returns
     -------
-    torch.Tensor or None
-        ``None`` -- the current behaviour -- means make no selection here and
-        let `compute_vmc_objective` apply `policy` to the recomputed rows,
-        per call.  A boolean mask means restrict this re-evaluation to exactly
-        those rows.
+    torch.Tensor
+        Boolean mask restricting this re-evaluation to exactly the rows that
+        were finite when the step's mask was pinned.  ``None`` is no longer
+        returned; the signature keeps the optional type so a future ruling can
+        reintroduce a no-selection mode without a signature change.
+
+    Raises
+    ------
+    ValueError
+        If a row that was finite when the mask was pinned is non-finite at this
+        trial point.  The message names the offending row indices.
 
     Notes
     -----
-    HOW EACH POSSIBLE RULING LANDS HERE, so an implementer does not have to
-    re-derive it:
+    NO OPT-OUT IS SHIPPED, AND THAT IS THE RULING HONOURED RATHER THAN
+    NARROWED.  ``377f6b0f`` permits ``propagate-non-finite`` only where an
+    optimizer's admission carries a test proving its search rejects non-finite
+    trial values and terminates.  There is no channel from an optimizer or an
+    update method to this function -- ``policy`` arrives from the TRAINER --
+    so building one now could only end in a boolean any optimizer could set,
+    which is the flag the ruling forbids.  With no channel, "only where
+    proven" means NO CHANNEL UNTIL SOMETHING PROVES IT, which makes the
+    obligation structural rather than documented.  When SPRING or the linear
+    method needs it, it builds the channel TOGETHER WITH its proof test, and
+    the thing that travels it should be a typed capability carrying the node
+    id of that test -- never a boolean.
 
-    - FIXED ROW MASK PER STEP (the recommendation before the operator at time
-      of writing): ``return primary_finite_mask``.  Every re-evaluation within
-      one step then scores the same rows, and the objective is one function of
-      the parameters for the whole step.  Note the consequence that must be
-      stated alongside it: rows that go non-finite mid-step are then INCLUDED
-      by the mask and their non-finite values reach the reduction, so a fixed
-      mask needs its own answer for that case -- most likely raising, since a
-      pinned row that has become non-finite is a genuine failure rather than a
-      row to quietly drop.
-    - ``"fail"``-ONLY STRICT MODE: no change here.  ``policy == "fail"`` already
-      raises inside `compute_vmc_objective` the moment a recomputed row is
-      non-finite, which is the refusal, and it surfaces from inside
-      ``optimizer.step(closure)``.
-    - ACCEPT THE BIAS: no change here.  ``None`` is exactly that answer.
+    CONSEQUENCE, stated so it is not discovered at first use: this is a
+    behaviour change under the DEFAULT ``"mask"`` policy, not only under
+    ``"fail"``.  A mid-search non-finite row used to be dropped silently and
+    the step completed; it now refuses.  Every closure optimizer feels it,
+    including stock ``torch.optim.LBFGS``, which has no escape hatch until an
+    admission builds one.  That is intended: LBFGS does not robustly reject
+    non-finite trial values, and a refusal is recoverable where a silently
+    shifted objective is not.
 
-    Returning ``None`` today is deliberately the status quo and NOT an implicit
-    ruling: it preserves #483's declared semantics unchanged while the question
-    is open.  Tracked as item ``377f6b0f`` under the SR/minSR program,
-    cross-linked to ``02859027`` (the parameter-score row drop, which has the
-    same selection-bias character and a different cost).
+    A SIDE EFFECT WORTH KNOWING: ``policy`` is now inert at compute time in
+    the ordinary case.  The selection contains exactly the rows finite at
+    pinning, and any of those going bad raises, so the tensors reaching
+    `compute_vmc_objective` are always all-finite and neither policy branch
+    can fire.  It is still threaded through and still asserted to arrive
+    unchanged, because a future ruling could make it load-bearing again and a
+    recompute quietly substituting the module default would then be running
+    one step under two estimators.
+
+    The ruling itself lives in the ``operator-ruling`` note on ``377f6b0f``,
+    cross-linked from ``02859027``.  Read it there rather than any paraphrase;
+    a third copy is a third thing that can decay.
     """
 
-    del primary_finite_mask, recomputed_local_energy, policy
-    return None
+    del policy
+    # PART 1 of ruling 377f6b0f: a FIXED ROW MASK PER STEP, pinned at the step's
+    # FIRST evaluation. `primary_finite_mask` already IS that first evaluation,
+    # so pinning needs no new input.
+    #
+    # PART 2: a row that was finite when the mask was pinned and is non-finite
+    # at a later trial point is a genuine failure, not a row to drop quietly.
+    # Re-masking here would change the estimator mid-step, so a line search
+    # would compare different functions and return a plausible number -- the
+    # expensive kind of error. A refusal is recoverable; a silently shifted
+    # objective is not. SILENT RE-MASK IS REJECTED by the ruling, and this
+    # raise is what makes it unreachable rather than merely discouraged.
+    pinned_gone_bad = primary_finite_mask & ~torch.isfinite(recomputed_local_energy)
+    if bool(pinned_gone_bad.any()):
+        rows = pinned_gone_bad.nonzero(as_tuple=False).flatten().tolist()
+        raise ValueError(
+            "re-evaluation produced a non-finite local energy at row(s) "
+            f"{rows}, which were finite when this step's mask was pinned. "
+            "The step is refused rather than re-masked: dropping them now "
+            "would change the estimator mid-search, so a line search would "
+            "compare different functions"
+        )
+    return primary_finite_mask
 
 
 def vmc_objective_reevaluation(
