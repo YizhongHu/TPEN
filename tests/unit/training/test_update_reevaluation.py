@@ -827,9 +827,17 @@ def test_a_row_selection_returned_by_the_decision_point_is_actually_applied() ->
 
     seen: list[tuple[torch.Tensor, torch.Tensor, str]] = []
 
+    # Deliberately NOT `primary_finite_mask`. Ruling 377f6b0f made that the
+    # real function's own answer, so returning it here would compare the
+    # recompute against itself and the difference assertion below could not
+    # fail. Dropping row 0 as well keeps the injected answer distinguishable
+    # from the production one, which is the only way this test can still show
+    # that the recompute HONOURS what the decision point returns.
     def fixed_mask(*, primary_finite_mask, recomputed_local_energy, policy):
         seen.append((primary_finite_mask, recomputed_local_energy, policy))
-        return primary_finite_mask
+        narrower = primary_finite_mask.clone()
+        narrower[0] = False
+        return narrower
 
     original = update_module.select_reevaluation_rows
     update_module.select_reevaluation_rows = fixed_mask
@@ -851,7 +859,7 @@ def test_a_row_selection_returned_by_the_decision_point_is_actually_applied() ->
     # on a true statement while measuring nothing about the selection.
     reference_output = model(batch)
     reference_energy = local_energy(terms, model, batch, return_terms=False)
-    mask = torch.tensor([True, True, False, True])
+    mask = torch.tensor([False, True, False, True])
     expected = compute_vmc_objective(
         reference_output.logabs[mask],
         reference_energy[mask],
@@ -1097,7 +1105,10 @@ def test_the_default_mask_policy_now_refuses_rather_than_re_masking() -> None:
     batch = _batch(n_walkers=4)
     reevaluate = vmc_objective_reevaluation(
         model=_CountingModel(),
-        hamiltonian_terms=[_NonFiniteAfterFirstCallTerm()],
+        # ALWAYS non-finite, not after-first-call: a direct factory call has no
+        # primary evaluation, so its first call IS the re-evaluation. The
+        # after-first-call term stays finite there and the refusal never fires.
+        hamiltonian_terms=[_AlwaysNonFiniteTerm()],
         batch=batch,
         primary_local_energy=_finite_primary(batch),
     )
