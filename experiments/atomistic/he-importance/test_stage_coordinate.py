@@ -870,6 +870,27 @@ def test_packet_refuses_unknown_nested_sampler_key(tmp_path: Path) -> None:
         )
 
 
+def test_packet_refuses_unknown_key_in_mapping_nested_by_sampler_tuple(tmp_path: Path) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="unknown input key 'undeclared_key'"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"sampler": ({"undeclared_key": "payload", "another": 123},)}, ddp_provenance={},
+        )
+
+
+@pytest.mark.parametrize("sampler", [5, "x", (1, 2)])
+def test_packet_refuses_non_mapping_declared_sampler_subschema(tmp_path: Path, sampler: object) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="sampler.*must be a mapping"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"sampler": sampler}, ddp_provenance={},
+        )
+
+
 def test_topology_collision_is_reported_but_scientific_control_is_silent(tmp_path: Path) -> None:
     optimizer = stage_coordinate.OptimizerCell("adam", "available")
     base = {"scientific_identity": {"model": "control"}, "payload": {"updates": 50_000}}

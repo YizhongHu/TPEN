@@ -533,6 +533,10 @@ def _is_reference_energy_representation(value: Any) -> bool:
 def _validate_packet_input_schema(value: Any, schema: Mapping[str, Any], label: str) -> None:
     """Refuse undeclared mappings; ``None`` is a declared caller-open value."""
 
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, item in enumerate(value):
+            _validate_packet_input_schema(item, schema, f"{label}[{index}]")
+        return
     if not isinstance(value, Mapping):
         raise MaterializationError(f"{label} must be a mapping")
     for key, nested in value.items():
@@ -541,7 +545,7 @@ def _validate_packet_input_schema(value: Any, schema: Mapping[str, Any], label: 
         if key not in schema:
             raise MaterializationError(f"{label} contains unknown input key {key!r}")
         child_schema = schema[key]
-        if child_schema is not None and isinstance(nested, Mapping):
+        if child_schema is not None:
             _validate_packet_input_schema(nested, child_schema, f"{label}.{key}")
 
 
