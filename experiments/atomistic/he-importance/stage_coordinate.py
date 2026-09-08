@@ -69,6 +69,9 @@ _REFERENCE_KEYS = frozenset({"energy"})
 _ACCURACY_KEYS = frozenset({"conventional_band"})
 _REFERENCE_ENERGY = -2.903724377034119598
 _REFERENCE_ENERGY_TEXT = "-2.903724377034119598"
+_REFERENCE_ENERGY_DIGITS = _REFERENCE_ENERGY_TEXT.removeprefix("-").replace(".", "")
+_RANKING_INPUT_KEYS = frozenset({"statistic"})
+_INDEPENDENT_SAMPLER_INPUT_KEYS = frozenset({"sampler", "walkers", "burn_in_sweeps"})
 _FORBIDDEN_TRAIN_CONTENT_KEYS = frozenset(
     {
         "reference",
@@ -438,13 +441,25 @@ def materialize_stage(
 
 
 def _immutable_packet_inputs(
-    inputs: Mapping[str, Any], label: str, *, require_nonempty: bool = True
+    inputs: Mapping[str, Any],
+    label: str,
+    *,
+    allowed_keys: frozenset[str] | None = None,
+    require_nonempty: bool = True,
 ) -> Mapping[str, Any]:
     """Screen then freeze a packet input block before it is handed to a job."""
 
     if not isinstance(inputs, Mapping) or (require_nonempty and not inputs):
         requirement = "a non-empty mapping" if require_nonempty else "a mapping"
         raise MaterializationError(f"{label} must be {requirement}")
+    if allowed_keys is not None:
+        if any(not isinstance(key, str) for key in inputs):
+            raise MaterializationError(f"{label} keys must be strings")
+        unknown_keys = frozenset(inputs).difference(allowed_keys)
+        if unknown_keys:
+            raise MaterializationError(
+                f"{label} contains unknown input keys: {sorted(unknown_keys)}"
+            )
     _refuse_packet_content(inputs, label)
     try:
         canonical_json(inputs)
@@ -460,13 +475,18 @@ def _checkpoint_path(cell: MaterializedCell, update: int) -> Path:
 
 
 def _refuse_packet_content(value: Any, label: str) -> None:
-    """Refuse callable or reference-bearing values on train-side packet routes."""
+    """Refuse callable and reference-bearing packet values recursively.
+
+    Exact reference values and textual decimal truncations with at least seven
+    significant digits are refused through frozen mappings and sequences.
+    Numerically perturbed values are not inferable from their representation.
+    The primary input-key allowlists limit which packet-input channels exist;
+    this backstop makes no false claim to recognize perturbed values there.
+    """
 
     if callable(value):
         raise MaterializationError(f"{label} cannot contain a callable")
-    if type(value) is float and value == _REFERENCE_ENERGY:
-        raise MaterializationError(f"{label} contains the evaluation reference energy")
-    if type(value) is str and value == _REFERENCE_ENERGY_TEXT:
+    if _is_reference_energy_representation(value):
         raise MaterializationError(f"{label} contains the evaluation reference energy")
     if isinstance(value, Mapping):
         for key, nested in value.items():
@@ -476,6 +496,25 @@ def _refuse_packet_content(value: Any, label: str) -> None:
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for index, nested in enumerate(value):
             _refuse_packet_content(nested, f"{label}[{index}]")
+
+
+def _is_reference_energy_representation(value: Any) -> bool:
+    """Recognize exact and seven-significant-digit decimal forms of the reference."""
+
+    if type(value) is float:
+        if value == _REFERENCE_ENERGY:
+            return True
+        text = repr(value)
+    elif type(value) is str:
+        text = value
+    else:
+        return False
+    if text == _REFERENCE_ENERGY_TEXT:
+        return True
+    if not text.startswith("-2."):
+        return False
+    digits = text.removeprefix("-").replace(".", "")
+    return len(digits) >= 7 and _REFERENCE_ENERGY_DIGITS.startswith(digits)
 
 
 def _validate_packet_cell(cell: MaterializedCell) -> StageDefinition:
@@ -506,9 +545,13 @@ def materialize_job_packets(
     does not establish a cheap evaluator's runtime behavior.
     """
 
-    frozen_ranking_inputs = _immutable_packet_inputs(ranking_inputs, "ranking inputs")
+    frozen_ranking_inputs = _immutable_packet_inputs(
+        ranking_inputs, "ranking inputs", allowed_keys=_RANKING_INPUT_KEYS
+    )
     frozen_independent_inputs = _immutable_packet_inputs(
-        independent_sampler_inputs, "independent sampler inputs"
+        independent_sampler_inputs,
+        "independent sampler inputs",
+        allowed_keys=_INDEPENDENT_SAMPLER_INPUT_KEYS,
     )
     frozen_ddp_provenance = _immutable_packet_inputs(
         ddp_provenance, "DDP provenance", require_nonempty=False

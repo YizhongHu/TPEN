@@ -567,9 +567,19 @@ def test_real_hi_namespace_family_exposes_the_materialization_api() -> None:
 
 
 def _packet_source_cells(tmp_path: Path) -> tuple[object, ...]:
+    # Source-cell construction has no launch or allocation inputs.  This fixture
+    # therefore records deliberately empty execution topology; a future
+    # caller that knows rank/device/world-size facts must supply them here,
+    # under L2a's designated non-scientific subtree.
     return stage_coordinate.materialize_stage(
         "O1",
-        [{"scientific_identity": {"model": "control"}, "payload": {"updates": 50_000}}],
+        [
+            {
+                "scientific_identity": {"model": "control"},
+                "payload": {"updates": 50_000},
+                "topology": {},
+            }
+        ],
         stage_coordinate.OptimizerCell("adam", "available"),
         tmp_path,
     )
@@ -650,23 +660,46 @@ def test_expensive_packet_receives_immutable_independent_sampler_inputs(tmp_path
         inputs["sampler"]["walkers"] = 1  # type: ignore[index]
 
 
-@pytest.mark.parametrize(
-    ("packet_route", "key"),
-    [
-        ("ranking", key)
-        for key in ("e0", "target", "E_exact", "benchmark", "gold", "threshold", "reference_energy", "energy")
-    ]
-    + [
-        ("independent", key)
-        for key in ("e0", "target", "E_exact", "benchmark", "gold", "threshold", "reference_energy", "energy")
-    ],
-)
-def test_job_inputs_refuse_reference_content_by_value(
-    tmp_path: Path, packet_route: str, key: str
-) -> None:
+@pytest.mark.parametrize("packet_route", ["ranking", "independent"])
+def test_job_inputs_refuse_unknown_keys(tmp_path: Path, packet_route: str) -> None:
     ranking_inputs = {"statistic": "logabs_variance"}
     independent_inputs = {"walkers": 4_096}
-    (ranking_inputs if packet_route == "ranking" else independent_inputs)[key] = -2.903724377034119598
+    (ranking_inputs if packet_route == "ranking" else independent_inputs)["unknown"] = "value"
+    with pytest.raises(stage_coordinate.MaterializationError, match="unknown input keys"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            ranking_inputs,
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            independent_inputs,
+            ddp_provenance={"launcher": "operator-supplied"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("packet_route", "reference_value"),
+    [
+        ("ranking", -2.903724377034119598),
+        ("ranking", "-2.903724377034119598"),
+        ("ranking", str(-2.903724377034119598)),
+        ("ranking", repr(-2.903724377034119598)),
+        ("ranking", "-2.903724"),
+        ("independent", -2.903724377034119598),
+        ("independent", "-2.903724377034119598"),
+        ("independent", str(-2.903724377034119598)),
+        ("independent", repr(-2.903724377034119598)),
+        ("independent", "-2.903724"),
+    ],
+)
+def test_job_inputs_refuse_reference_representations_at_frozen_depth(
+    tmp_path: Path, packet_route: str, reference_value: object
+) -> None:
+    ranking_inputs: dict[str, object] = {"statistic": "logabs_variance"}
+    independent_inputs: dict[str, object] = {"walkers": 4_096}
+    if packet_route == "ranking":
+        ranking_inputs["statistic"] = MappingProxyType({"nested": (reference_value,)})
+    else:
+        independent_inputs["sampler"] = MappingProxyType({"nested": (reference_value,)})
     with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
         stage_coordinate.materialize_job_packets(
             _packet_source_cells(tmp_path),
@@ -675,7 +708,7 @@ def test_job_inputs_refuse_reference_content_by_value(
             (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
             independent_inputs,
             ddp_provenance={"launcher": "operator-supplied"},
-    )
+        )
 
 
 @pytest.mark.parametrize(
