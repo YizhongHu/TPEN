@@ -12,12 +12,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from hashlib import sha256
 import json
 from pathlib import Path
 from typing import Any, Iterable
 from types import MappingProxyType
+import warnings
 
 
 TRAIN_MANIFEST_SCHEMA = "he-importance/train/v1"
@@ -70,8 +72,12 @@ _ACCURACY_KEYS = frozenset({"conventional_band"})
 _REFERENCE_ENERGY = -2.903724377034119598
 _REFERENCE_ENERGY_TEXT = "-2.903724377034119598"
 _REFERENCE_ENERGY_DIGITS = _REFERENCE_ENERGY_TEXT.removeprefix("-").replace(".", "")
-_RANKING_INPUT_KEYS = frozenset({"statistic"})
-_INDEPENDENT_SAMPLER_INPUT_KEYS = frozenset({"sampler", "walkers", "burn_in_sweeps"})
+_RANKING_INPUT_SCHEMA = {"statistic": None}
+_INDEPENDENT_SAMPLER_INPUT_SCHEMA = {
+    "sampler": {"walkers": None},
+    "walkers": None,
+    "burn_in_sweeps": None,
+}
 _FORBIDDEN_TRAIN_CONTENT_KEYS = frozenset(
     {
         "reference",
@@ -407,10 +413,14 @@ def materialize_stage(
         identity_hash = content_hash(identity)
         previous = identities.get(identity_hash)
         if previous is not None:
-            if _canonical_json(previous, exclude_root_topology=True) != _canonical_json(
-                configuration, exclude_root_topology=True
-            ):
+            if _canonical_json(previous, exclude_root_topology=True) != _canonical_json(configuration, exclude_root_topology=True):
                 raise MaterializationError("one scientific identity has conflicting resolved content")
+            if _canonical_json(previous, exclude_root_topology=False) != _canonical_json(configuration, exclude_root_topology=False):
+                warnings.warn(
+                    f"execution-topology collision for scientific identity {identity_hash}: "
+                    f"{previous!r} and {configuration!r}",
+                    stacklevel=2,
+                )
             continue
         identities[identity_hash] = configuration
         optimizer_identity = {"method": optimizer.method, "status": optimizer.status}
@@ -444,7 +454,7 @@ def _immutable_packet_inputs(
     inputs: Mapping[str, Any],
     label: str,
     *,
-    allowed_keys: frozenset[str] | None = None,
+    schema: Mapping[str, Any] | None = None,
     require_nonempty: bool = True,
 ) -> Mapping[str, Any]:
     """Screen then freeze a packet input block before it is handed to a job."""
@@ -452,14 +462,8 @@ def _immutable_packet_inputs(
     if not isinstance(inputs, Mapping) or (require_nonempty and not inputs):
         requirement = "a non-empty mapping" if require_nonempty else "a mapping"
         raise MaterializationError(f"{label} must be {requirement}")
-    if allowed_keys is not None:
-        if any(not isinstance(key, str) for key in inputs):
-            raise MaterializationError(f"{label} keys must be strings")
-        unknown_keys = frozenset(inputs).difference(allowed_keys)
-        if unknown_keys:
-            raise MaterializationError(
-                f"{label} contains unknown input keys: {sorted(unknown_keys)}"
-            )
+    if schema is not None:
+        _validate_packet_input_schema(inputs, schema, label)
     _refuse_packet_content(inputs, label)
     try:
         canonical_json(inputs)
@@ -499,7 +503,7 @@ def _refuse_packet_content(value: Any, label: str) -> None:
 
 
 def _is_reference_energy_representation(value: Any) -> bool:
-    """Recognize exact and seven-significant-digit decimal forms of the reference."""
+    """Recognize decimal agreement with the reference at seven-plus figures."""
 
     if type(value) is float:
         if value == _REFERENCE_ENERGY:
@@ -509,12 +513,34 @@ def _is_reference_energy_representation(value: Any) -> bool:
         text = value
     else:
         return False
-    if text == _REFERENCE_ENERGY_TEXT:
-        return True
-    if not text.startswith("-2."):
+    try:
+        decimal = Decimal(text)
+    except (InvalidOperation, ValueError):
         return False
-    digits = text.removeprefix("-").replace(".", "")
-    return len(digits) >= 7 and _REFERENCE_ENERGY_DIGITS.startswith(digits)
+    if decimal >= 0 or not decimal.is_finite():
+        return False
+    digits = decimal.as_tuple().digits
+    first = next((index for index, digit in enumerate(digits) if digit), len(digits))
+    significant = len(digits) - first
+    if significant < 7:
+        return False
+    reference = Decimal(_REFERENCE_ENERGY_TEXT)
+    return decimal.adjusted() == reference.adjusted() and digits[first : first + 7] == reference.as_tuple().digits[:7]
+
+
+def _validate_packet_input_schema(value: Any, schema: Mapping[str, Any], label: str) -> None:
+    """Refuse undeclared mappings; ``None`` is a declared caller-open value."""
+
+    if not isinstance(value, Mapping):
+        raise MaterializationError(f"{label} must be a mapping")
+    for key, nested in value.items():
+        if not isinstance(key, str):
+            raise MaterializationError(f"{label} keys must be strings")
+        if key not in schema:
+            raise MaterializationError(f"{label} contains unknown input key {key!r}")
+        child_schema = schema[key]
+        if child_schema is not None and isinstance(nested, Mapping):
+            _validate_packet_input_schema(nested, child_schema, f"{label}.{key}")
 
 
 def _validate_packet_cell(cell: MaterializedCell) -> StageDefinition:
@@ -546,12 +572,12 @@ def materialize_job_packets(
     """
 
     frozen_ranking_inputs = _immutable_packet_inputs(
-        ranking_inputs, "ranking inputs", allowed_keys=_RANKING_INPUT_KEYS
+        ranking_inputs, "ranking inputs", schema=_RANKING_INPUT_SCHEMA
     )
     frozen_independent_inputs = _immutable_packet_inputs(
         independent_sampler_inputs,
         "independent sampler inputs",
-        allowed_keys=_INDEPENDENT_SAMPLER_INPUT_KEYS,
+        schema=_INDEPENDENT_SAMPLER_INPUT_SCHEMA,
     )
     frozen_ddp_provenance = _immutable_packet_inputs(
         ddp_provenance, "DDP provenance", require_nonempty=False

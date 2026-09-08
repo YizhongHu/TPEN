@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import warnings
 from dataclasses import fields
 from pathlib import Path
 from types import MappingProxyType
@@ -665,7 +666,7 @@ def test_job_inputs_refuse_unknown_keys(tmp_path: Path, packet_route: str) -> No
     ranking_inputs = {"statistic": "logabs_variance"}
     independent_inputs = {"walkers": 4_096}
     (ranking_inputs if packet_route == "ranking" else independent_inputs)["unknown"] = "value"
-    with pytest.raises(stage_coordinate.MaterializationError, match="unknown input keys"):
+    with pytest.raises(stage_coordinate.MaterializationError, match="unknown input key"):
         stage_coordinate.materialize_job_packets(
             _packet_source_cells(tmp_path),
             stage_coordinate.CheckpointCadence(1_000, (1_000,)),
@@ -699,7 +700,7 @@ def test_job_inputs_refuse_reference_representations_at_frozen_depth(
     if packet_route == "ranking":
         ranking_inputs["statistic"] = MappingProxyType({"nested": (reference_value,)})
     else:
-        independent_inputs["sampler"] = MappingProxyType({"nested": (reference_value,)})
+        independent_inputs["sampler"] = MappingProxyType({"walkers": (reference_value,)})
     with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
         stage_coordinate.materialize_job_packets(
             _packet_source_cells(tmp_path),
@@ -758,6 +759,50 @@ def test_packet_refuses_checkpoints_beyond_stage_horizon(tmp_path: Path) -> None
             {"walkers": 4_096},
             ddp_provenance={},
         )
+
+
+def test_packet_accepts_checkpoint_at_exact_stage_horizon(tmp_path: Path) -> None:
+    packets = stage_coordinate.materialize_job_packets(
+        _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1, (50_000,)),
+        {"statistic": "logabs_variance"}, (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+        {"walkers": 4_096}, ddp_provenance={},
+    )
+    assert packets.ranking
+
+
+@pytest.mark.parametrize("significant_figures", range(7, 17))
+def test_packet_refuses_decimal_agreement_after_rounding(tmp_path: Path, significant_figures: int) -> None:
+    rounded = format(-2.903724377034119598, f".{significant_figures}g")
+    with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": rounded}, (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"walkers": 4_096}, ddp_provenance={},
+        )
+
+
+def test_packet_refuses_unknown_nested_sampler_key(tmp_path: Path) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="unknown input key 'unknown'"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"}, (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"sampler": {"unknown": 1}}, ddp_provenance={},
+        )
+
+
+def test_topology_collision_is_reported_but_scientific_control_is_silent(tmp_path: Path) -> None:
+    optimizer = stage_coordinate.OptimizerCell("adam", "available")
+    base = {"scientific_identity": {"model": "control"}, "payload": {"updates": 50_000}}
+    with pytest.warns(UserWarning, match="execution-topology collision"):
+        stage_coordinate.materialize_stage(
+            "O1", [{**base, "topology": {"world_size": 8}}, {**base, "topology": {"world_size": 16}}], optimizer, tmp_path
+        )
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        stage_coordinate.materialize_stage(
+            "O1", [{**base, "scientific_identity": {"model": "eight"}, "topology": {}}, {**base, "scientific_identity": {"model": "sixteen"}, "topology": {}}], optimizer, tmp_path / "control"
+        )
+    assert not captured
 
 
 def test_ddp_provenance_is_preserved_across_distinct_packet_arms(tmp_path: Path) -> None:
