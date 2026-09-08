@@ -462,6 +462,8 @@ def _immutable_packet_inputs(
     if not isinstance(inputs, Mapping) or (require_nonempty and not inputs):
         requirement = "a non-empty mapping" if require_nonempty else "a mapping"
         raise MaterializationError(f"{label} must be {requirement}")
+    # Schema refusal precedes content screening: clause-2 reach probes must use
+    # accepted keys, or an unknown reference-bearing key reports only the schema error.
     if schema is not None:
         _validate_packet_input_schema(inputs, schema, label)
     _refuse_packet_content(inputs, label)
