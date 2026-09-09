@@ -61,6 +61,7 @@ from tpen.config_schema import (
 
 __all__ = [
     "ADMITTED_CALLBACK_TARGETS",
+    "ADMITTED_CONSTRUCTION_TARGETS",
     "ADMITTED_METHOD_TARGETS",
     "ADMITTED_UPDATE_METHOD_TARGETS",
     "REFERENCE_MANIFEST_MODULE",
@@ -469,12 +470,60 @@ HI_TRAIN_POLICY = SchemaPolicy(
 )
 
 
-# Free-form construction slots are closed at their consumer boundary. A target
-# admitted for one slot is not thereby admitted for another.
-_FREE_FORM_TARGET_ALLOWLISTS: Mapping[str, frozenset[str]] = {
-    "runner.load": frozenset(),
-    "loggers[]": frozenset({"tpen.logging.CSV", "tpen.logging.JSONL"}),
-}
+# Exact construction identities for the complete HI configuration tree. The
+# shipped control supplies the component vocabulary; the schema's existing
+# admission contracts and valid-target tests supply the additional variants.
+# Adding an executable capability requires explicit review here. These are
+# strings, never imports: validation must not execute a target to qualify it.
+ADMITTED_CONSTRUCTION_TARGETS = (
+    ADMITTED_CALLBACK_TARGETS
+    | ADMITTED_METHOD_TARGETS
+    | ADMITTED_UPDATE_METHOD_TARGETS
+    | frozenset(
+        {
+            # Control geometry, training, and Hamiltonian components.
+            "torch.tensor",
+            "tpen.data.atomic_configuration.AtomicConfiguration",
+            "tpen.runner.Train",
+            "tpen.training.trainer.VMCTrainer",
+            "tpen.sampling.metropolis.MetropolisSampler",
+            "tpen.physics.kinetic.KineticEnergy",
+            "tpen.physics.potential.ElectronNucleusPotential",
+            "tpen.physics.potential.ElectronElectronInteraction",
+            "tpen.physics.potential.NucleusNucleusPotential",
+            # Control architecture and the variants exercised by HI tests.
+            "tpen.nn.TPENWaveFunction",
+            "tpen.nn.Embedding",
+            "tpen.nn.TPENLayer",
+            "tpen.nn.EquivariantMixing",
+            "tpen.nn.PathAggregation",
+            "tpen.nn.ResidualUpdater",
+            "tpen.nn.ReplaceUpdater",
+            "tpen.nn.ElectronElectronCusp",
+            "tpen.nn.ElectronNucleusCusp",
+            "tpen.nn.TailSafeElectronNucleusCuspLaw",
+            "tpen.nn.BoundedTwoCoefficientJastrow",
+            "tpen.nn.readout.PfaffianReadout",
+            "tpen.nn.initialization.TorchInitializer",
+            "torch.nn.SiLU",
+            "torch.nn.Tanh",
+            # Existing valid wrapper tests require these identities. Their
+            # arguments remain subject to the same recursive target sweep,
+            # including when construction is partial or recursion is deferred.
+            "torch.nn.ModuleList",
+            "hydra.utils.instantiate",
+            "tpen.runner.Evaluate",
+            # Control bookkeeping and nested callback arguments.
+            "tpen.logging.CSV",
+            "tpen.logging.JSONL",
+            "tpen.checkpoint.EveryNUpdates",
+            "tpen.checkpoint.TrainResume",
+            "tpen.equivariance.checks.FullModelEquivarianceChecker",
+            "tpen.equivariance.checks.TraceEquivarianceChecker",
+            "tpen.accelerator.TorchAllocatorPeakProbe",
+        }
+    )
+)
 
 
 def declared_schema(cfg: Any) -> str | None:
@@ -557,11 +606,8 @@ def _sweep_callbacks(resolved_tree: Any) -> list[Rejection]:
         # Only the callback's own ``_target_`` is a callback identity; a nested
         # ``_target_`` is a constructor argument (a schedule, a payload, a
         # probe) and is governed by its owning callback, not by this allowlist.
-        # THE BOUNDARY IS UNCHANGED AND THE REASON STILL HOLDS. What changed is
-        # that a nested target is no longer ungoverned: `_sweep_target_values`
-        # refuses an executable target that names the evaluation reference,
-        # anywhere in the tree and at any depth. See its docstring for why that
-        # is a separate rule rather than a wider allowlist here.
+        # Every construction identity, including constructor arguments, also
+        # passes the global admission sweep. This rule adds callback semantics.
         owner = path.rsplit("._target_", 1)[0]
         if owner.count(".") != 0 or not owner.startswith("callbacks["):
             continue
@@ -581,42 +627,38 @@ def _sweep_callbacks(resolved_tree: Any) -> list[Rejection]:
     return rejections
 
 
-def _sweep_free_form_targets(resolved_tree: Any) -> list[Rejection]:
-    """Refuse unadmitted construction in free-form loader slots.
+def _sweep_free_form_targets(config_tree: Any, *, tree: str = "resolved") -> list[Rejection]:
+    """Require explicit admission for every construction identity in the tree.
 
-    The boundary is the consumer slot: ``runner.load`` and each ``loggers``
-    entry may construct only a target explicitly admitted for that slot.  This
-    makes the set of executable configurations closed without attempting to
-    recognize names, import mechanisms, or file spellings that could reach a
-    reference by some other route.
+    Traverse every mapping and sequence before Hydra construction, including
+    arguments beneath admitted targets and deferred or partial constructions.
+    Admission is exact membership, independent of the key or depth at which a
+    target occurs. Existing component rules still qualify its scientific use.
+
+    On the raw tree, collect literal findings without resolving interpolations.
+    Interpolated identities must pass the same allowlist on the resolved tree;
+    the raw pass alone never establishes admission for them. Keeping raw
+    findings separate preserves them when resolution fails or is refused.
     """
 
-    if not isinstance(resolved_tree, Mapping):
-        return []
-
-    candidates: list[tuple[str, Any, str]] = []
-    runner = resolved_tree.get("runner")
-    if isinstance(runner, Mapping) and runner.get("load") is not None:
-        candidates.append(("runner.load", runner["load"], "runner.load"))
-
-    loggers = resolved_tree.get("loggers")
-    if isinstance(loggers, Sequence) and not isinstance(loggers, (str, bytes)):
-        candidates.extend(("loggers[]", value, f"loggers[{index}]") for index, value in enumerate(loggers))
-
     rejections: list[Rejection] = []
-    for slot, specification, path in candidates:
-        target = specification.get("_target_") if isinstance(specification, Mapping) else None
-        if isinstance(target, str) and target in _FREE_FORM_TARGET_ALLOWLISTS[slot]:
+    for path, key, target in iter_nodes(config_tree):
+        if key != "_target_":
             continue
+        if isinstance(target, str):
+            if tree == "raw" and "${" in target:
+                continue
+            if target in ADMITTED_CONSTRUCTION_TARGETS:
+                continue
         rejections.append(
             Rejection(
                 rule="unadmitted-free-form-target",
-                tree="resolved",
-                path=f"{path}._target_",
+                tree=tree,
+                path=path,
                 detail=(
-                    f"{slot} may construct only an admitted target; got {target!r}. "
-                    "This slot is closed by its target allowlist so that configuration "
-                    "cannot introduce an alternate route to evaluation-only material."
+                    f"construction target {target!r} is not explicitly admitted for HI. "
+                    "Every target must belong to ADMITTED_CONSTRUCTION_TARGETS before "
+                    "construction, including targets in arguments of admitted objects."
                 ),
             )
         )
@@ -2180,6 +2222,9 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
     # config that both fails to resolve and carries a reference must report the
     # reference, because that is the finding that stops a run from happening.
     rejections = list(sweep_raw(raw_tree, HI_TRAIN_POLICY))
+    # Literal construction findings must survive any resolution failure or
+    # early refusal. Collect them alongside the other raw findings.
+    rejections.extend(_sweep_free_form_targets(raw_tree, tree="raw"))
     rejections.extend(sweep_environment(environment, HI_TRAIN_POLICY))
 
     # Resolution failure is itself a rejection, which keeps every
@@ -2199,7 +2244,16 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
 
     rejections.extend(sweep_resolved(resolved_tree, HI_TRAIN_POLICY))
     rejections.extend(_sweep_callbacks(resolved_tree))
-    rejections.extend(_sweep_free_form_targets(resolved_tree))
+    # A resolved interpolation can introduce a new target anywhere. Avoid
+    # duplicating literal findings already reported from the raw tree.
+    raw_target_paths = {
+        finding.path for finding in rejections
+        if finding.rule == "unadmitted-free-form-target"
+    }
+    rejections.extend(
+        finding for finding in _sweep_free_form_targets(resolved_tree)
+        if finding.path not in raw_target_paths
+    )
     rejections.extend(_sweep_target_values(resolved_tree))
     rejections.extend(_sweep_constructed_components(resolved_tree))
     rejections.extend(_sweep_frozen_scalars(resolved_tree))
