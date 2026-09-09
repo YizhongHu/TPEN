@@ -469,6 +469,14 @@ HI_TRAIN_POLICY = SchemaPolicy(
 )
 
 
+# Free-form construction slots are closed at their consumer boundary. A target
+# admitted for one slot is not thereby admitted for another.
+_FREE_FORM_TARGET_ALLOWLISTS: Mapping[str, frozenset[str]] = {
+    "runner.load": frozenset(),
+    "loggers[]": frozenset({"tpen.logging.CSV", "tpen.logging.JSONL"}),
+}
+
+
 def declared_schema(cfg: Any) -> str | None:
     """Return the schema a configuration opts in to, if any.
 
@@ -570,6 +578,48 @@ def _sweep_callbacks(resolved_tree: Any) -> list[Rejection]:
                     ),
                 )
             )
+    return rejections
+
+
+def _sweep_free_form_targets(resolved_tree: Any) -> list[Rejection]:
+    """Refuse unadmitted construction in free-form loader slots.
+
+    The boundary is the consumer slot: ``runner.load`` and each ``loggers``
+    entry may construct only a target explicitly admitted for that slot.  This
+    makes the set of executable configurations closed without attempting to
+    recognize names, import mechanisms, or file spellings that could reach a
+    reference by some other route.
+    """
+
+    if not isinstance(resolved_tree, Mapping):
+        return []
+
+    candidates: list[tuple[str, Any, str]] = []
+    runner = resolved_tree.get("runner")
+    if isinstance(runner, Mapping) and runner.get("load") is not None:
+        candidates.append(("runner.load", runner["load"], "runner.load"))
+
+    loggers = resolved_tree.get("loggers")
+    if isinstance(loggers, Sequence) and not isinstance(loggers, (str, bytes)):
+        candidates.extend(("loggers[]", value, f"loggers[{index}]") for index, value in enumerate(loggers))
+
+    rejections: list[Rejection] = []
+    for slot, specification, path in candidates:
+        target = specification.get("_target_") if isinstance(specification, Mapping) else None
+        if isinstance(target, str) and target in _FREE_FORM_TARGET_ALLOWLISTS[slot]:
+            continue
+        rejections.append(
+            Rejection(
+                rule="unadmitted-free-form-target",
+                tree="resolved",
+                path=f"{path}._target_",
+                detail=(
+                    f"{slot} may construct only an admitted target; got {target!r}. "
+                    "This slot is closed by its target allowlist so that configuration "
+                    "cannot introduce an alternate route to evaluation-only material."
+                ),
+            )
+        )
     return rejections
 
 
@@ -2149,6 +2199,7 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
 
     rejections.extend(sweep_resolved(resolved_tree, HI_TRAIN_POLICY))
     rejections.extend(_sweep_callbacks(resolved_tree))
+    rejections.extend(_sweep_free_form_targets(resolved_tree))
     rejections.extend(_sweep_target_values(resolved_tree))
     rejections.extend(_sweep_constructed_components(resolved_tree))
     rejections.extend(_sweep_frozen_scalars(resolved_tree))
