@@ -167,6 +167,22 @@ def test_block_ng_float32_config_resolves_to_its_own_dtype_object() -> None:
     assert method.policy.solve_dtype is not torch.float64
 
 
+def test_block_ng_hydra_config_refuses_an_unknown_solve_dtype_name() -> None:
+    """Hydra must not turn an unknown dtype spelling into a valid solve policy."""
+
+    cfg = OmegaConf.create(_load(BLOCK_NG))
+    cfg.trainer.update_method.policy.solve_dtype = "not_a_torch_dtype"
+    parameters = _parameters()
+    optimizer = make_optimizer(cfg.optimizer, parameters)
+
+    with pytest.raises(ValueError, match="not a torch dtype name"):
+        make_update_method(
+            cfg.trainer.update_method,
+            optimizer=optimizer,
+            model_parameters=ModelParameterBinding(parameters=parameters),
+        )
+
+
 def test_block_ng_preset_names_targets_and_keeps_learning_rates_equal() -> None:
     """The preset must carry explicit construction and one agreed step size."""
 
