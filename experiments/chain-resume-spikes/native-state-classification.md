@@ -116,6 +116,95 @@ configurations whose callback state cannot be replayed. TPEN already refuses a
 
 ---
 
+## Checkpoint-index hazards found by this lane
+
+These are not callback state, but they are mutable state outside the payload
+that a chain depends on, and they belong in the same disclosure.
+
+### The resume pointer has no monotonicity guard
+
+`reconcile_publication` builds its expected pointer from the directory it is
+**handed** (catalog.py:216-233) and, on any mismatch with `read_latest`, writes
+the pointer at that directory. There is **no comparison of step numbers**, so
+handing it an older generation while `latest.json` names a newer one moves the
+pointer backwards. Resume follows the pointer (`restore.py:118` ->
+`resolve_checkpoint_dir` -> `read_latest`), so the chain re-runs committed
+science.
+
+Classification: **scientifically active**. The pointer decides which state a
+continued run starts from.
+
+Not a defect in current usage — the only caller today passes the newest
+directory — but the hazard is held off by an **accident of usage, not a guard**,
+and the trigger is precisely the pattern this program is evaluating: a
+controller that restarts and reconciles the generation it *remembers* handing
+off. The subsystem documents the hazard about itself in
+`iter_publications`' torn-row repair message, which warns that
+`reconcile_publication` rewrites `latest.json` unconditionally and would point
+it at an older checkpoint.
+
+Pinned non-destructively for DIRECTION in
+`test_typed_outcomes_and_ledger.py::test_reconciling_an_older_generation_rewinds_the_resume_pointer`,
+which also asserts both committed payloads are byte-unchanged. **No guard was
+added to `tpen/`.**
+
+### An orphaned post-rename generation blocks the next commit
+
+An interruption between `tmp_dir.rename` (save.py:211) and the catalog append
+leaves a complete generation on disk that `latest.json` does not name. Resume
+correctly takes the older generation and replays the tail — and then
+`save_checkpoint` refuses to commit, because the directory name is already
+occupied (`FileExistsError`, save.py:142-143). The chain advances zero further
+generations.
+
+Classification: **scientifically active**, in the sense that it halts the
+science. Direction is fail-closed; nothing is corrupted.
+
+### Two selection surfaces that disagree
+
+`list_complete_checkpoints` and the `latest.json` pointer return **different**
+generations in both pre-`latest.json` fault windows. Production resume consults
+only the pointer. Classification: **reconstructible**, but only if a controller
+knows which surface is authoritative — which is why it is written down here.
+
+Owners for all three: the `tpen/checkpoint` owner, and `3b9b736a` for
+interruption safety. The planner has the path-spelling sibling filed as a gated
+input to R4.
+
+---
+
+## Provenance of the validation boundary the G6 assertions rest on
+
+Recorded because a misstated provenance claims a guarantee in a form the code
+does not give. `CheckpointRef` validation is closed in **both** directions, but
+the two directions get their closure from **different places**:
+
+- **CONSTRUCT — LOCAL closure.** `reference.py` `__post_init__` (72-86) runs
+  `_nonnegative_int`, `_nonempty_text`, `_require_sha256` and `_freeze` directly
+  on the fields. `_freeze` (322-336) traverses `Mapping` and `list`/`tuple` to
+  scalars and raises `TypeError` on anything that is not `None`, `str`, `bool`,
+  `int` or `float`. The check is at the point of use.
+- **DESERIALIZE — DOWNSTREAM closure.** `_thaw` (338-343) **validates nothing
+  itself**. The path is safe only because `deserialize_checkpoint_ref` (296)
+  routes through `CheckpointRef.from_mapping`, which constructs the dataclass
+  and re-runs the same `__post_init__`.
+
+A downstream closure holds only **while the routing holds**. A future caller
+reaching `_thaw` directly, or a deserialize path refactored to build a
+`CheckpointRef` by any route bypassing `__post_init__`, removes the validation
+**silently** — no validator is edited and no test of the validators goes red.
+The regression would appear as a change in call routing, which is not where
+anyone looks for a validation failure.
+
+**`_freeze` is NOT the caller-open-leaf pattern.** Its `None` is a legitimate
+terminal JSON scalar — `None` is valid JSON and there is nothing beneath it to
+descend into — not a position left open. Accepting a terminal `None` is correct
+there, and a shared remedy phrased as "a screen must not stop at `None`" would
+break correct allowlists like this one. The discriminator is whether anything
+remains **below** the leaf to traverse to, not the token.
+
+---
+
 ## Owners
 
 - **HI L5a `e2e512eb`** — factor-rich method and callback replay. Owns the

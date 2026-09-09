@@ -91,6 +91,25 @@ the checkpoint path requires — not `VMCTrainer`, `MetropolisSampler` or a real
 wavefunction. Standing those up would make a failure ambiguous between the
 checkpoint path and the physics setup.
 
+**EXECUTED ON CANNON, AND IT FAILED. ARM N REMAINS UNMEASURED FOR G0.** Slurm
+job 45615268, requested `seas_compute,kozinsky,sapphire`, delivered `kozinsky`,
+node holy8a29106, 4 CPU / 32 GiB / 30 min, elapsed 00:03:09. Scheduler state
+`FAILED 1:0`; inner `PYTEST_RC=1`. Both are EARNED — nothing exits 0
+deliberately. In-job assertions passed: Python 3.12.13, torch 2.12.0+cpu, CUDA
+unavailable, numpy 2.4.6, checkout SHA verified in-job. Result: **2 passed, 3
+failed.** The two that passed are the provenance and channel-map nodes, **neither
+of which is a parity claim — do not read "2 passed" as evidence about native
+resume.**
+
+Root cause, and it **exonerates production**: `restore.py:137` calls
+`_verify_hash` for `model_config` and raises *manifest missing model_config*.
+The arm calls the real `save_checkpoint`, which builds hashes from
+`checkpoint_hashes(cfg)`, and the shared test run context supplies an **empty**
+config — so no `model_config` hash was ever written and restore correctly
+refused. **A restore path that fails closed on an under-specified manifest is
+exactly the behaviour R1/R2/R3 will want to rely on.** The fix is in this lane's
+own fixture, not in `tpen/`.
+
 **MONKEYPATCH DISCLOSURE.** Production exposes no flag to skip one restore limb.
 The ARM N mutation arms rebind `tpen.checkpoint.restore.apply_rng_state` and
 `tpen.checkpoint.restore._load_sampler` at their call sites, from test code.
@@ -231,6 +250,145 @@ current note chain before any facility action; interpreter, workspace root and
 cache locations are runtime inputs and are never hardcoded in this repository.
 Assert `sys.executable` and the torch version **in-job** — `native_probe`
 records both into its evidence file for exactly that reason.
+
+---
+
+## The selection surface, and why it is the one to assert on
+
+**Production resume follows `latest.json` and nothing else.**
+`restore_checkpoint` reaches its checkpoint through exactly one path:
+`restore.py:118` calls `resolve_checkpoint_dir`, which reads `latest.json`
+(artifact.py:68 and :71). Measured at this revision: `list_complete_checkpoints`
+has **no caller** anywhere in `tpen/checkpoint` outside its own definition and
+the package re-export. **The production resume path never lists directories.**
+
+That matters because the two surfaces **disagree** in the two pre-`latest.json`
+fault windows. After a fault in `after_rename_before_catalog` or
+`after_catalog_before_latest`, generation 2 is complete on disk — it has its
+`COMPLETE` marker and no `.tmp` suffix — so a directory listing returns it,
+while `latest.json` still names generation 1 and resume therefore takes
+generation 1 and replays the tail.
+
+The outcome is safe, but **it is safe because of which surface is consulted, not
+because of the directory state.** The fixture therefore selects through
+`resume_generation` (the pointer), keeps `newest_listed_generation` as a
+separate named function, and pins the disagreement as an explicit property.
+
+**USAGE RULE FOR R1/R2/R3.** A controller that picks up "the newest complete
+directory" selects a generation the production resume path would not. Read the
+pointer.
+
+## Two hazards found by this lane. Disclosed, pinned, NOT fixed
+
+Both are in `tpen/checkpoint`, which is outside this lane's write surface. No
+`resolve()` and no monotonicity guard were added to `tpen/`.
+
+### 1. An orphaned post-rename generation deadlocks the chain
+
+After an interruption between the rename and the catalog append, resume does the
+right thing at every individual step and still cannot make progress:
+
+1. it follows `latest.json` to generation 1, correctly;
+2. it replays the tail, correctly, reproducing the same stream;
+3. it then tries to commit generation 2 — **whose directory already exists**,
+   because the interrupted attempt renamed it into place.
+
+`save_checkpoint` refuses with `FileExistsError: checkpoint already exists`
+(save.py:142-143). The direction is **fail-closed** — loud, nothing
+overwritten — but a chain that cannot advance a single further generation is
+exactly the failure this program exists to prevent, and **nothing performs the
+recovery automatically.**
+
+**USAGE RULE FOR R1/R2/R3.** Before resuming, reconcile any complete generation
+newer than the one `latest.json` names. Otherwise the chain restores, replays,
+and then dies on the collision.
+
+### 2. `reconcile_publication` rewinds the resume pointer
+
+`reconcile_publication` builds its expected pointer from the directory it is
+**handed** (catalog.py:216-233), compares `read_latest` against it, and on any
+mismatch writes the pointer at that directory — **with no monotonicity guard on
+step.** Handed an older generation while `latest.json` names a newer one, it
+moves the pointer backwards, and since resume follows the pointer, that means
+re-running committed science.
+
+**This is not a defect in current usage** — today's only caller reaches it with
+the newest directory, so the hazard is held off by an accident of usage rather
+than by a guard. **The trigger is the usage pattern this program is
+evaluating:** a chain controller that restarts and reconciles the generation it
+*remembers* handing off can hand it an older one and silently rewind past a
+newer committed generation.
+
+The subsystem documents this about itself. `CheckpointCatalog.iter_publications`'
+torn-row repair message says, in production code, that `reconcile_publication`
+*"rewrites latest.json unconditionally and would point it at an older
+checkpoint"*, and tells operators **"Do NOT reconcile older directories to be
+safe."**
+
+**USAGE RULE FOR R1/R2/R3.** Never call `reconcile_publication` with a
+generation older than the one `latest.json` currently names. A controller that
+must reconcile a remembered generation has to compare it against `read_latest`
+first.
+
+## Path spelling: restore is spelling-independent, publish is not
+
+Nothing in `tpen/checkpoint` canonicalises a path — no `resolve`, `realpath`,
+`samefile`, `abspath` or `absolute` in any of its seven modules. (Naming trap:
+`artifact.resolve_checkpoint_dir` does *pointer* resolution, not path
+canonicalisation.)
+
+Equivalent spellings open the same file, so spelling is harmless wherever a path
+is merely opened or stat-ed — and `write_latest` stores a **basename** only, so
+**the resume pointer is spelling-independent**. But `CheckpointCatalog.publish`
+compares the **full serialized mapping**, which includes `checkpoint_dir`, so a
+differently-spelled path to the same directory conflicts. The guard is
+deliberate — a relocation must not create two locations for one catalog
+identity — but it **conflates a genuine relocation with the same directory
+reached by an equivalent spelling**, because nothing resolves.
+
+**The asymmetry is the finding: a chain attempt reaching the same root by a
+different spelling restores fine and then refuses to commit its next
+generation.** Fresh processes are exactly where spelling diverges — different
+cwd, relative versus absolute, symlinked scratch roots, a mount presenting
+differently in a later allocation — and every resume attempt here is a fresh OS
+process.
+
+Measured once, deliberately, in `test_path_spelling.py`, which **exercises
+production `publish`, `reference` and pointer code directly** — those modules
+are torch-free at runtime, so no replica is in the path. The arm asserts the
+exact `ValueError` naming the actual `content_id`, asserts the pointer still
+resolves under the same spelling, and includes a control showing that
+republishing the *identical* spelling is idempotent — without that control the
+refusal would be equally consistent with "republishing anything conflicts".
+**Every other arm supplies absolute, already-resolved roots** so this fragility
+cannot contaminate the parity or G6 results.
+
+## The torch-free property is enforced by a test, not a convention
+
+`test_torch_free_import.py` imports each shared module **in a subprocess with a
+clean `sys.modules`** and asserts torch is absent afterwards. An in-process
+check would be vacuous exactly when it matters, because the native arm imports
+torch into the same pytest process — the same failure class as an in-process
+resume. `native_probe` is exempt and keeps its torch imports function-local,
+matching the `tpen/checkpoint/rng.py` 100/150/222/271 precedent.
+
+This is a test rather than a note because the property dies **silently**:
+measured in the previous round, an `import torch` inserted into shared
+`fixture.py` left all 88 unit tests green.
+
+## How the fixture's own checks are kept honest
+
+Three of this lane's checks previously observed a **proxy** rather than the
+property, and all three were replaced with runtime observation:
+
+| Check | Old mechanism | Why it failed | Now |
+|---|---|---|---|
+| Fault coverage | scan test sources for `FaultPoint.MEMBER` | an unused enum expression counted as an exercise; an equivalent set alias exercised a point invisibly | each point is **driven and observed firing**, recorded at injection time |
+| Replica order | compare the declaration against `save.py` source | a mutant reordering the replica's **actual** publish/latest calls survived | `publish_generation` **records each boundary as it executes**; observed == declared == production-derived |
+| Torch-free | (absent) | — | subprocess import with a clean `sys.modules` |
+
+A mention cannot fire, and an alias fires identically, so runtime observation
+closes both coverage defects at once.
 
 ---
 
