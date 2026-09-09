@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import warnings
+from dataclasses import fields
 from pathlib import Path
 from types import MappingProxyType
 
@@ -560,4 +562,372 @@ def test_real_hi_namespace_family_exposes_the_materialization_api() -> None:
 
     assert "materialize_stage" in v1.__all__
     assert "validate_materialized_manifest" in v1.__all__
+    assert "materialize_job_packets" in v1.__all__
+    assert v1.RankingStatistic.LOGABS_VARIANCE.value == "logabs_variance"
     assert v1.content_hash({"a": 1, "b": [2, 3]}) == stage_coordinate.content_hash({"a": 1, "b": [2, 3]})
+
+
+def _packet_source_cells(tmp_path: Path) -> tuple[object, ...]:
+    # Source-cell construction has no launch or allocation inputs.  This fixture
+    # therefore records deliberately empty execution topology; a future
+    # caller that knows rank/device/world-size facts must supply them here,
+    # under L2a's designated non-scientific subtree.
+    return stage_coordinate.materialize_stage(
+        "O1",
+        [
+            {
+                "scientific_identity": {"model": "control"},
+                "payload": {"updates": 50_000},
+                "topology": {},
+            }
+        ],
+        stage_coordinate.OptimizerCell("adam", "available"),
+        tmp_path,
+    )
+
+
+def test_job_packets_are_separate_and_checkpoint_cadence_is_science_input(tmp_path: Path) -> None:
+    cadence = stage_coordinate.CheckpointCadence(1_000, (1_000, 2_000))
+    packets = stage_coordinate.materialize_job_packets(
+        _packet_source_cells(tmp_path),
+        cadence,
+        {"statistic": "logabs_variance"},
+        (
+            stage_coordinate.RankingStatistic.LOGABS_VARIANCE,
+            stage_coordinate.RankingStatistic.ACCEPTANCE_RATE,
+        ),
+        {"walkers": 4_096, "burn_in_sweeps": 100},
+        ddp_provenance={"launcher": "operator-supplied"},
+    )
+
+    assert len(packets.train) == len(_packet_source_cells(tmp_path / "count"))
+    assert len(packets.ranking) == len(packets.train) * len(cadence.selected_updates)
+    assert len(packets.independent_sampler_test) == len(packets.ranking)
+    assert tuple(field.name for field in fields(stage_coordinate.TrainingPacket)) == (
+        "cell",
+        "checkpoint_cadence",
+        "ddp_provenance",
+    )
+    assert cadence.science_parameters() == {
+        "every_n_updates": 1_000,
+        "selected_updates": (1_000, 2_000),
+    }
+    cell_paths = {packet.cell.content_hash: packet.cell.output_path for packet in packets.train}
+    for packet in (*packets.ranking, *packets.independent_sampler_test):
+        assert packet.checkpoint_path.parent.name == "checkpoints"
+        assert packet.checkpoint_path.parent.parent == cell_paths[packet.source_content_hash]
+
+
+@pytest.mark.parametrize(
+    "metric",
+    [
+        "eloc",
+        "E_local",
+        "elocal",
+        "e_loc",
+        "localEnergy",
+        "variationalEnergy",
+        "energies",
+        "mean_E",
+        "E_var",
+        "E0",
+        "hamiltonian",
+    ],
+)
+def test_ranking_packet_refuses_untyped_energy_spellings(tmp_path: Path, metric: str) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="RankingStatistic"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"},
+            (metric,),  # type: ignore[arg-type]
+            {"walkers": 4_096},
+            ddp_provenance={"launcher": "operator-supplied"},
+        )
+
+
+def test_expensive_packet_receives_immutable_independent_sampler_inputs(tmp_path: Path) -> None:
+    packets = stage_coordinate.materialize_job_packets(
+        _packet_source_cells(tmp_path),
+        stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+        {"statistic": "logabs_variance"},
+        (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+        {"sampler": {"walkers": 4_096}, "burn_in_sweeps": 100},
+        ddp_provenance={"launcher": "operator-supplied"},
+    )
+    inputs = packets.independent_sampler_test[0].independent_sampler_inputs
+    assert inputs["sampler"]["walkers"] == 4_096
+    with pytest.raises(TypeError):
+        inputs["sampler"]["walkers"] = 1  # type: ignore[index]
+
+
+@pytest.mark.parametrize("packet_route", ["ranking", "independent"])
+def test_job_inputs_refuse_unknown_keys(tmp_path: Path, packet_route: str) -> None:
+    ranking_inputs = {"statistic": "logabs_variance"}
+    independent_inputs = {"walkers": 4_096}
+    (ranking_inputs if packet_route == "ranking" else independent_inputs)["unknown"] = "value"
+    with pytest.raises(stage_coordinate.MaterializationError, match="unknown input key"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            ranking_inputs,
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            independent_inputs,
+            ddp_provenance={"launcher": "operator-supplied"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("packet_route", "reference_value"),
+    [
+        ("ranking", -2.903724377034119598),
+        ("ranking", "-2.903724377034119598"),
+        ("ranking", str(-2.903724377034119598)),
+        ("ranking", repr(-2.903724377034119598)),
+        ("ranking", "-2.903724"),
+        ("independent", -2.903724377034119598),
+        ("independent", "-2.903724377034119598"),
+        ("independent", str(-2.903724377034119598)),
+        ("independent", repr(-2.903724377034119598)),
+        ("independent", "-2.903724"),
+    ],
+)
+def test_job_inputs_refuse_reference_representations_at_frozen_depth(
+    tmp_path: Path, packet_route: str, reference_value: object
+) -> None:
+    ranking_inputs: dict[str, object] = {"statistic": "logabs_variance"}
+    independent_inputs: dict[str, object] = {"walkers": 4_096}
+    if packet_route == "ranking":
+        ranking_inputs["statistic"] = MappingProxyType({"nested": (reference_value,)})
+    else:
+        independent_inputs["sampler"] = MappingProxyType({"walkers": (reference_value,)})
+    with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            ranking_inputs,
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            independent_inputs,
+            ddp_provenance={"launcher": "operator-supplied"},
+        )
+
+
+@pytest.mark.parametrize("packet_route", ["ranking", "independent"])
+def test_decimal_rule_reaches_reference_value_at_legal_top_level_key(
+    tmp_path: Path, packet_route: str
+) -> None:
+    ranking_inputs: dict[str, object] = {"statistic": "logabs_variance"}
+    independent_inputs: dict[str, object] = {"walkers": 4_096}
+    (ranking_inputs if packet_route == "ranking" else independent_inputs)[
+        "statistic" if packet_route == "ranking" else "walkers"
+    ] = -2.9037244
+    with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            ranking_inputs,
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            independent_inputs,
+            ddp_provenance={},
+        )
+
+
+def test_decimal_rule_reaches_reference_value_at_legal_sampler_depth(tmp_path: Path) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"sampler": {"walkers": -2.9037244}},
+            ddp_provenance={},
+        )
+
+
+def test_allowlist_disable_control_accepts_unknown_benign_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(stage_coordinate, "_validate_packet_input_schema", lambda *args: None)
+    packets = stage_coordinate.materialize_job_packets(
+        _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+        {"statistic": "logabs_variance", "unknown": "benign"},
+        (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,), {"walkers": 4_096}, ddp_provenance={},
+    )
+    assert packets.ranking
+
+
+def test_decimal_rule_alone_refuses_rounded_reference_when_allowlist_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(stage_coordinate, "_validate_packet_input_schema", lambda *args: None)
+    with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": -2.9037244},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,), {"walkers": 4_096}, ddp_provenance={},
+        )
+
+
+def test_decimal_disable_control_accepts_reference_at_legal_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(stage_coordinate, "_is_reference_energy_representation", lambda value: False)
+    packets = stage_coordinate.materialize_job_packets(
+        _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+        {"statistic": -2.9037244},
+        (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,), {"walkers": 4_096}, ddp_provenance={},
+    )
+    assert packets.ranking
+
+
+def test_allowlist_alone_refuses_unknown_nested_key_when_decimal_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(stage_coordinate, "_is_reference_energy_representation", lambda value: False)
+    with pytest.raises(stage_coordinate.MaterializationError, match="unknown input key 'unknown'"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,), {"sampler": {"unknown": "benign"}}, ddp_provenance={},
+        )
+
+
+@pytest.mark.parametrize(
+    "key", ["e0", "target", "E_exact", "benchmark", "gold", "threshold", "reference_energy", "energy"]
+)
+def test_embedded_cell_manifest_refuses_reference_content(tmp_path: Path, key: str) -> None:
+    cell = _packet_source_cells(tmp_path)[0]
+    contaminated = stage_coordinate.MaterializedCell(
+        manifest={
+            **cell.manifest,
+            "scientific_identity": {**cell.manifest["scientific_identity"], key: -2.903724377034119598},
+        },
+        content_hash=cell.content_hash,
+        output_path=cell.output_path,
+        seed_streams=cell.seed_streams,
+    )
+    with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
+        stage_coordinate.materialize_job_packets(
+            (contaminated,),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"walkers": 4_096},
+            ddp_provenance={},
+        )
+
+
+def test_job_packet_refuses_callable_payload(tmp_path: Path) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="callable"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": lambda: None},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"walkers": 4_096},
+            ddp_provenance={},
+        )
+
+
+def test_packet_refuses_checkpoints_beyond_stage_horizon(tmp_path: Path) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="stage horizon"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path),
+            stage_coordinate.CheckpointCadence(1_000, (999_000_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"walkers": 4_096},
+            ddp_provenance={},
+        )
+
+
+def test_packet_accepts_checkpoint_at_exact_stage_horizon(tmp_path: Path) -> None:
+    packets = stage_coordinate.materialize_job_packets(
+        _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1, (50_000,)),
+        {"statistic": "logabs_variance"}, (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+        {"walkers": 4_096}, ddp_provenance={},
+    )
+    assert packets.ranking
+
+
+@pytest.mark.parametrize("significant_figures", range(7, 17))
+def test_packet_refuses_decimal_agreement_after_rounding(tmp_path: Path, significant_figures: int) -> None:
+    rounded = format(-2.903724377034119598, f".{significant_figures}g")
+    with pytest.raises(stage_coordinate.MaterializationError, match="reference energy"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": rounded}, (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"walkers": 4_096}, ddp_provenance={},
+        )
+
+
+def test_packet_refuses_unknown_nested_sampler_key(tmp_path: Path) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="unknown input key 'unknown'"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"}, (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"sampler": {"unknown": 1}}, ddp_provenance={},
+        )
+
+
+def test_packet_refuses_unknown_key_in_mapping_nested_by_sampler_tuple(tmp_path: Path) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="unknown input key 'undeclared_key'"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"sampler": ({"undeclared_key": "payload", "another": 123},)}, ddp_provenance={},
+        )
+
+
+@pytest.mark.parametrize("sampler", [5, "x", (1, 2)])
+def test_packet_refuses_non_mapping_declared_sampler_subschema(tmp_path: Path, sampler: object) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="sampler.*must be a mapping"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"sampler": sampler}, ddp_provenance={},
+        )
+
+
+def test_topology_collision_is_reported_but_scientific_control_is_silent(tmp_path: Path) -> None:
+    optimizer = stage_coordinate.OptimizerCell("adam", "available")
+    base = {"scientific_identity": {"model": "control"}, "payload": {"updates": 50_000}}
+    with pytest.warns(UserWarning, match="execution-topology collision"):
+        stage_coordinate.materialize_stage(
+            "O1", [{**base, "topology": {"world_size": 8}}, {**base, "topology": {"world_size": 16}}], optimizer, tmp_path
+        )
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        stage_coordinate.materialize_stage(
+            "O1", [{**base, "scientific_identity": {"model": "eight"}, "topology": {}}, {**base, "scientific_identity": {"model": "sixteen"}, "topology": {}}], optimizer, tmp_path / "control"
+        )
+    assert not captured
+
+
+def test_ddp_provenance_is_preserved_across_distinct_packet_arms(tmp_path: Path) -> None:
+    first_cells = _packet_source_cells(tmp_path / "first")
+    second_cells = _packet_source_cells(tmp_path / "second")
+    cadence = stage_coordinate.CheckpointCadence(1_000, (1_000,))
+    first = stage_coordinate.materialize_job_packets(
+        first_cells,
+        cadence,
+        {"statistic": "logabs_variance"},
+        (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+        {"walkers": 4_096},
+        ddp_provenance={"world_size": 1, "launcher": "first"},
+    )
+    second = stage_coordinate.materialize_job_packets(
+        second_cells,
+        cadence,
+        {"statistic": "logabs_variance"},
+        (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+        {"walkers": 4_096},
+        ddp_provenance={"world_size": 8, "launcher": "second"},
+    )
+    assert [packet.cell.content_hash for packet in first.train] == [packet.cell.content_hash for packet in second.train]
+    for packet in (*first.train, *first.ranking, *first.independent_sampler_test):
+        assert packet.ddp_provenance == {"world_size": 1, "launcher": "first"}
+    for packet in (*second.train, *second.ranking, *second.independent_sampler_test):
+        assert packet.ddp_provenance == {"world_size": 8, "launcher": "second"}

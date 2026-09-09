@@ -12,11 +12,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from enum import Enum
 from hashlib import sha256
 import json
 from pathlib import Path
 from typing import Any, Iterable
 from types import MappingProxyType
+import warnings
 
 
 TRAIN_MANIFEST_SCHEMA = "he-importance/train/v1"
@@ -68,6 +71,13 @@ _REFERENCE_KEYS = frozenset({"energy"})
 _ACCURACY_KEYS = frozenset({"conventional_band"})
 _REFERENCE_ENERGY = -2.903724377034119598
 _REFERENCE_ENERGY_TEXT = "-2.903724377034119598"
+_REFERENCE_ENERGY_DIGITS = _REFERENCE_ENERGY_TEXT.removeprefix("-").replace(".", "")
+_RANKING_INPUT_SCHEMA = {"statistic": None}
+_INDEPENDENT_SAMPLER_INPUT_SCHEMA = {
+    "sampler": {"walkers": None},
+    "walkers": None,
+    "burn_in_sweeps": None,
+}
 _FORBIDDEN_TRAIN_CONTENT_KEYS = frozenset(
     {
         "reference",
@@ -144,6 +154,95 @@ class MaterializedCell:
     content_hash: str
     output_path: Path
     seed_streams: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class CheckpointCadence:
+    """Science-selected dense checkpoint observations.
+
+    Parameters
+    ----------
+    every_n_updates
+        Dense persistence cadence. This is scientific study input, not a
+        scheduler setting.
+    selected_updates
+        Immutable checkpoint observations to materialize into evaluation
+        packets. Their selection is fixed before training and cannot be
+        replaced by an in-training callback.
+    """
+
+    every_n_updates: int
+    selected_updates: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.every_n_updates <= 0:
+            raise MaterializationError("checkpoint cadence must be positive")
+        if not self.selected_updates:
+            raise MaterializationError("at least one checkpoint observation is required")
+        if tuple(sorted(set(self.selected_updates))) != self.selected_updates:
+            raise MaterializationError("selected checkpoints must be unique and increasing")
+        if any(update <= 0 or update % self.every_n_updates for update in self.selected_updates):
+            raise MaterializationError("selected checkpoints must lie on the dense cadence")
+
+    def science_parameters(self) -> Mapping[str, Any]:
+        """Return the immutable scientific checkpoint parameter block."""
+
+        return _freeze(
+            {
+                "every_n_updates": self.every_n_updates,
+                "selected_updates": list(self.selected_updates),
+            }
+        )
+
+
+@dataclass(frozen=True)
+class TrainingPacket:
+    """One train packet; construction accepts no callback operation."""
+
+    cell: MaterializedCell
+    checkpoint_cadence: CheckpointCadence
+    ddp_provenance: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class RankingPacket:
+    """Cheap ranking packet with construction-time-only metric restrictions.
+
+    This describes packet construction, not the runtime behavior of an
+    evaluator. Runtime emission enforcement belongs to the evaluator layer.
+    """
+
+    checkpoint_path: Path
+    source_content_hash: str
+    ranking_inputs: Mapping[str, Any]
+    emitted_metrics: tuple["RankingStatistic", ...]
+    ddp_provenance: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class IndependentSamplerTestPacket:
+    """Expensive test packet fed only immutable independent-sampler inputs."""
+
+    checkpoint_path: Path
+    source_content_hash: str
+    independent_sampler_inputs: Mapping[str, Any]
+    ddp_provenance: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class PacketMaterialization:
+    """Separate train, ranking, and independent-sampler packet collections."""
+
+    train: tuple[TrainingPacket, ...]
+    ranking: tuple[RankingPacket, ...]
+    independent_sampler_test: tuple[IndependentSamplerTestPacket, ...]
+
+
+class RankingStatistic(Enum):
+    """The closed, non-energy statistics available to a ranking packet."""
+
+    LOGABS_VARIANCE = "logabs_variance"
+    ACCEPTANCE_RATE = "acceptance_rate"
 
 
 def canonical_json(value: Any) -> bytes:
@@ -314,10 +413,14 @@ def materialize_stage(
         identity_hash = content_hash(identity)
         previous = identities.get(identity_hash)
         if previous is not None:
-            if _canonical_json(previous, exclude_root_topology=True) != _canonical_json(
-                configuration, exclude_root_topology=True
-            ):
+            if _canonical_json(previous, exclude_root_topology=True) != _canonical_json(configuration, exclude_root_topology=True):
                 raise MaterializationError("one scientific identity has conflicting resolved content")
+            if _canonical_json(previous, exclude_root_topology=False) != _canonical_json(configuration, exclude_root_topology=False):
+                warnings.warn(
+                    f"execution-topology collision for scientific identity {identity_hash}: "
+                    f"{previous!r} and {configuration!r}",
+                    stacklevel=2,
+                )
             continue
         identities[identity_hash] = configuration
         optimizer_identity = {"method": optimizer.method, "status": optimizer.status}
@@ -345,6 +448,194 @@ def materialize_stage(
                 )
             )
     return tuple(cells)
+
+
+def _immutable_packet_inputs(
+    inputs: Mapping[str, Any],
+    label: str,
+    *,
+    schema: Mapping[str, Any] | None = None,
+    require_nonempty: bool = True,
+) -> Mapping[str, Any]:
+    """Screen then freeze a packet input block before it is handed to a job."""
+
+    if not isinstance(inputs, Mapping) or (require_nonempty and not inputs):
+        requirement = "a non-empty mapping" if require_nonempty else "a mapping"
+        raise MaterializationError(f"{label} must be {requirement}")
+    # Schema refusal precedes content screening: clause-2 reach probes must use
+    # accepted keys, or an unknown reference-bearing key reports only the schema error.
+    if schema is not None:
+        _validate_packet_input_schema(inputs, schema, label)
+    _refuse_packet_content(inputs, label)
+    try:
+        canonical_json(inputs)
+    except MaterializationError as error:
+        raise MaterializationError(f"{label} must contain finite JSON data") from error
+    return _freeze(dict(inputs))
+
+
+def _checkpoint_path(cell: MaterializedCell, update: int) -> Path:
+    """Name one immutable observation beneath its content-addressed train row."""
+
+    return cell.output_path / "checkpoints" / f"update-{update:08d}"
+
+
+def _refuse_packet_content(value: Any, label: str) -> None:
+    """Refuse callable and reference-bearing packet values recursively.
+
+    Exact reference values and textual decimal truncations with at least seven
+    significant digits are refused through frozen mappings and sequences.
+    Numerically perturbed values are not inferable from their representation.
+    The primary input-key allowlists limit which packet-input channels exist;
+    this backstop makes no false claim to recognize perturbed values there.
+    """
+
+    if callable(value):
+        raise MaterializationError(f"{label} cannot contain a callable")
+    if _is_reference_energy_representation(value):
+        raise MaterializationError(f"{label} contains the evaluation reference energy")
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise MaterializationError(f"{label} keys must be strings")
+            _refuse_packet_content(nested, f"{label}.{key}")
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, nested in enumerate(value):
+            _refuse_packet_content(nested, f"{label}[{index}]")
+
+
+def _is_reference_energy_representation(value: Any) -> bool:
+    """Recognize decimal agreement with the reference at seven-plus figures."""
+
+    if type(value) is float:
+        if value == _REFERENCE_ENERGY:
+            return True
+        text = repr(value)
+    elif type(value) is str:
+        text = value
+    else:
+        return False
+    try:
+        decimal = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return False
+    if decimal >= 0 or not decimal.is_finite():
+        return False
+    digits = decimal.as_tuple().digits
+    first = next((index for index, digit in enumerate(digits) if digit), len(digits))
+    significant = len(digits) - first
+    if significant < 7:
+        return False
+    reference = Decimal(_REFERENCE_ENERGY_TEXT)
+    return decimal.adjusted() == reference.adjusted() and digits[first : first + 7] == reference.as_tuple().digits[:7]
+
+
+def _validate_packet_input_schema(value: Any, schema: Mapping[str, Any], label: str) -> None:
+    """Refuse undeclared mappings; ``None`` is a declared caller-open value."""
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, item in enumerate(value):
+            _validate_packet_input_schema(item, schema, f"{label}[{index}]")
+        return
+    if not isinstance(value, Mapping):
+        raise MaterializationError(f"{label} must be a mapping")
+    for key, nested in value.items():
+        if not isinstance(key, str):
+            raise MaterializationError(f"{label} keys must be strings")
+        if key not in schema:
+            raise MaterializationError(f"{label} contains unknown input key {key!r}")
+        child_schema = schema[key]
+        if child_schema is not None:
+            _validate_packet_input_schema(nested, child_schema, f"{label}.{key}")
+
+
+def _validate_packet_cell(cell: MaterializedCell) -> StageDefinition:
+    """Validate the train artifact embedded wholesale in a train packet."""
+
+    _refuse_packet_content(cell.manifest, "cell manifest")
+    validate_materialized_manifest(cell.manifest)
+    if content_hash(cell.manifest) != cell.content_hash:
+        raise MaterializationError("cell content hash does not bind its manifest")
+    return stage_definition(cell.manifest["stage"])
+
+
+def materialize_job_packets(
+    cells: Iterable[MaterializedCell],
+    checkpoint_cadence: CheckpointCadence,
+    ranking_inputs: Mapping[str, Any],
+    ranking_metrics: Iterable[RankingStatistic],
+    independent_sampler_inputs: Mapping[str, Any],
+    *,
+    ddp_provenance: Mapping[str, Any],
+) -> PacketMaterialization:
+    """Materialize the three disjoint HI job-packet classes.
+
+    The returned packets deliberately contain no scheduler, facility, device,
+    or launch defaults. Those are operator-supplied execution concerns. DDP
+    information is retained as provenance only and is not used to derive a
+    scientific identity or packet multiplicity. This construction boundary
+    does not establish a cheap evaluator's runtime behavior.
+    """
+
+    frozen_ranking_inputs = _immutable_packet_inputs(
+        ranking_inputs, "ranking inputs", schema=_RANKING_INPUT_SCHEMA
+    )
+    frozen_independent_inputs = _immutable_packet_inputs(
+        independent_sampler_inputs,
+        "independent sampler inputs",
+        schema=_INDEPENDENT_SAMPLER_INPUT_SCHEMA,
+    )
+    frozen_ddp_provenance = _immutable_packet_inputs(
+        ddp_provenance, "DDP provenance", require_nonempty=False
+    )
+    metrics = tuple(ranking_metrics)
+    if not metrics or any(type(metric) is not RankingStatistic for metric in metrics):
+        raise MaterializationError("ranking metrics must be RankingStatistic values")
+
+    train: list[TrainingPacket] = []
+    ranking: list[RankingPacket] = []
+    independent_sampler_test: list[IndependentSamplerTestPacket] = []
+    seen_cells: set[str] = set()
+    for cell in cells:
+        stage = _validate_packet_cell(cell)
+        if stage.updates is None:
+            raise MaterializationError("packet stages require a fixed training horizon")
+        if any(update > stage.updates for update in checkpoint_cadence.selected_updates):
+            raise MaterializationError("selected checkpoints exceed the stage horizon")
+        if cell.content_hash in seen_cells:
+            raise MaterializationError("train cells must be unique by content identity")
+        seen_cells.add(cell.content_hash)
+        train.append(
+            TrainingPacket(
+                cell=cell,
+                checkpoint_cadence=checkpoint_cadence,
+                ddp_provenance=frozen_ddp_provenance,
+            )
+        )
+        for update in checkpoint_cadence.selected_updates:
+            checkpoint_path = _checkpoint_path(cell, update)
+            ranking.append(
+                RankingPacket(
+                    checkpoint_path=checkpoint_path,
+                    source_content_hash=cell.content_hash,
+                    ranking_inputs=frozen_ranking_inputs,
+                    emitted_metrics=metrics,
+                    ddp_provenance=frozen_ddp_provenance,
+                )
+            )
+            independent_sampler_test.append(
+                IndependentSamplerTestPacket(
+                    checkpoint_path=checkpoint_path,
+                    source_content_hash=cell.content_hash,
+                    independent_sampler_inputs=frozen_independent_inputs,
+                    ddp_provenance=frozen_ddp_provenance,
+                )
+            )
+    return PacketMaterialization(
+        train=tuple(train),
+        ranking=tuple(ranking),
+        independent_sampler_test=tuple(independent_sampler_test),
+    )
 
 
 def validate_materialized_manifest(manifest: Mapping[str, Any]) -> None:
