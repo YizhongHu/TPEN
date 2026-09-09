@@ -19,13 +19,22 @@ the three dimensions that test does not cover:
 3. **which stream is load-bearing**, derived from source and then measured.
 
 THE SOURCE-DERIVED EXPECTATION, stated before any run. Every sampling draw
-passes the sampler's private generator (``metropolis.py`` 182 and 294;
-``moves.py`` 39, 93, 98, whose docstring says the move "does not own an RNG ...
-all Markov-chain randomness belongs to the sampler"). Nothing in a training step
-draws from the process globals. So skipping ``_load_sampler`` must move the
-trajectory and skipping ``apply_rng_state`` should not. **If a run contradicts
-either, that is a finding about production, not a licence to edit the
-expectation.**
+passes the sampler's private generator (``metropolis.py`` 188, 255 and 298;
+``moves.py`` 39, 93, 98, which owns no RNG). The STEP-level claim is
+production's own, not an inference from the sampler: ``update.py`` 166-185
+declares, AST-resolved, that no forward reached by ``model(batch)`` is
+stochastic and that the local-energy path draws nothing.
+
+So skipping ``_load_sampler`` must move the trajectory and skipping
+``apply_rng_state`` should not. **If a run contradicts either, that is a finding
+about production, not a licence to edit the expectation.**
+
+PRECISION: the global stream IS consumed at CONSTRUCTION --
+``path_aggregation.py:211`` calls ``nn.init.xavier_uniform_`` bare. The claim is
+"no global draw DURING A STEP", not "nothing draws from the globals". Construction
+precedes restore and its weights are overwritten, so trajectory is unaffected;
+but **if any future code draws from the globals after construction, the
+asymmetry flips** and the inert arm below becomes wrong.
 
 Both mutation arms assert on a **witness that the no-op was actually invoked**,
 so neither can pass because a patch silently failed to apply -- which would make
@@ -216,8 +225,11 @@ def test_skipping_the_global_rng_restore_leaves_the_native_trajectory_unchanged(
     """The inert stream, and the finding worth carrying to R1/R2/R3.
 
     Derived from source before measuring: every sampling draw uses the sampler's
-    private generator, so nothing in a training step consumes the process
-    globals ``apply_rng_state`` restores. This arm asserts that, and it is only
+    private generator (metropolis.py 188/255/298), and ``update.py`` 166-185
+    declares no stochastic forward and no local-energy draw, so no training step
+    consumes the process globals ``apply_rng_state`` restores. Construction does
+    (path_aggregation.py:211, a bare ``xavier_uniform_``), but that precedes
+    restore and is overwritten by the restored ``state_dict``. This arm asserts that, and it is only
     meaningful because the witness proves the seam was genuinely reached and
     bypassed -- otherwise "unchanged" would be equally consistent with a patch
     that never applied.
@@ -228,8 +240,9 @@ def test_skipping_the_global_rng_restore_leaves_the_native_trajectory_unchanged(
     process globals alone are not what has to survive a job boundary.
 
     If this arm ever goes red, something in the training path has begun drawing
-    from the process globals. That is a finding about production and must be
-    reported, not silenced by relaxing this assertion.
+    from the process globals AFTER construction, and the asymmetry has flipped.
+    That is a finding about production and must be reported, not silenced by
+    relaxing this assertion.
     """
 
     evidence, source = uninterrupted

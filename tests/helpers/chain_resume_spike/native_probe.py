@@ -27,14 +27,37 @@ restore seam that depends on. It does NOT establish anything about factor-rich
 method or callback replay, which is HI L5a (``e2e512eb``).
 
 WHICH STREAM IS LOAD-BEARING, derived from the source BEFORE any run rather than
-fitted to a measurement. Every draw in the sampling path passes an explicit
-private generator: ``metropolis.py:182`` (initial positions) and
-``metropolis.py:294`` (acceptance uniforms) both pass
-``generator=self._generator``, and ``moves.py`` (39, 93, 98) takes the generator
-as a parameter, its docstring stating outright that "the move owns the proposal
-shape/rules; it does not own an RNG ... all Markov-chain randomness belongs to
-the sampler". Nothing in the training step draws from the PROCESS-GLOBAL torch
-stream. Therefore:
+fitted to a measurement.
+
+Every draw in the sampling path passes an explicit private generator:
+``metropolis.py`` 188 (initial positions), 255 (the ``move.propose`` call) and
+298 (acceptance uniforms) all pass ``generator=self._generator``, and
+``moves.py`` 39, 93 and 98 take the generator as a parameter -- that module owns
+no RNG at all, and says so.
+
+The step-level claim is PRODUCTION'S OWN, not an inference of mine from the
+sampler. ``tpen/training/update.py`` 166-185 states it as a declared
+precondition, AST-resolved: (i) no stochastic layer in any forward reached by
+``model(batch)`` -- the only RNG in ``tpen/nn/`` is ``initialization.py``, all
+initialization, and there is no ``Dropout`` in the package; (ii) no RNG draw on
+the local-energy path, zero draws in ``tpen/physics/``. That docstring also
+names the scoping trap this arm would otherwise have fallen into: a claim scoped
+to ``tpen/physics/`` could not see a stochastic layer added in ``tpen/nn/``.
+
+PRECISION THAT MATTERS, and it makes the claim true rather than merely
+convenient. The global stream IS consumed -- at CONSTRUCTION.
+``path_aggregation.py:211`` calls ``nn.init.xavier_uniform_(weight)`` bare, with
+no generator, so it draws from the torch global. The correct statement is
+therefore **no global draw occurs DURING A TRAINING STEP**, never "nothing draws
+from the process globals", which is false. ``update.py`` puts initialization-time
+RNG out of scope for the same reason: it runs before the step.
+
+That does not weaken the asymmetry -- construction precedes restore and the
+restored ``state_dict`` overwrites those weights, so trajectory is unaffected --
+but it does mean the global stream's POSITION differs between attempts. **IF ANY
+FUTURE CODE DRAWS FROM THE GLOBALS AFTER CONSTRUCTION, THE ASYMMETRY FLIPS.** The
+finding is a latent property held in place by the absence of a post-construction
+global consumer, not a guarantee. Therefore:
 
 * skipping ``_load_sampler`` (restore.py:207) MUST move the trajectory, and
 * skipping ``apply_rng_state`` (restore.py:208) should NOT, because no step
@@ -94,9 +117,12 @@ DISABLEABLE_SEAMS = ("apply_rng_state", "_load_sampler")
 #: to edit the expectation.
 SEAM_TRAJECTORY_EXPECTATION: dict[str, str] = {
     # The operative stream: every sampling draw uses the sampler's private
-    # generator, and _load_sampler restores it along with the walkers.
+    # generator (metropolis.py 188/255/298), and _load_sampler restores it
+    # along with the walkers.
     "_load_sampler": "diverges",
-    # Nothing in a training step draws from the process globals this restores.
+    # No training step draws from the process globals this restores; see
+    # update.py 166-185. Construction DOES draw (path_aggregation.py:211), but
+    # that precedes restore and is overwritten by the restored state_dict.
     "apply_rng_state": "inert",
 }
 

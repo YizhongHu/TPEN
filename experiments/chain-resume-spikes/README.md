@@ -105,10 +105,32 @@ dimensions that test does not cover:
 
 Derived from the source **before** any run, not fitted to a measurement. Every
 draw in the sampling path passes the sampler's own private generator —
-`metropolis.py:182` (initial positions), `metropolis.py:294` (acceptance
-uniforms), and `moves.py` 39/93/98, whose docstring states that the move *"does
-not own an RNG … all Markov-chain randomness belongs to the sampler"*. Nothing
-in a training step draws from the process-global torch stream.
+`metropolis.py` **188** (initial positions), **255** (the `move.propose` call)
+and **298** (acceptance uniforms) — and `moves.py` 39/93/98 take the generator as
+a parameter, that module owning no RNG at all.
+
+The **step-level** claim is production's own, not an inference from the sampler.
+`tpen/training/update.py` **166-185** declares it as a precondition, AST-resolved:
+no forward reached by `model(batch)` is stochastic (the only RNG in `tpen/nn/` is
+`initialization.py`, and there is no `Dropout` in the package), and the
+local-energy path draws nothing. That docstring also names the scoping trap this
+arm would otherwise have fallen into — a claim scoped to `tpen/physics/` could
+not see a stochastic layer added in `tpen/nn/`.
+
+**Precision, and it makes the claim true rather than merely convenient.** The
+global stream *is* consumed — at **construction**. `path_aggregation.py:211`
+calls `nn.init.xavier_uniform_(weight)` bare, with no generator. So the correct
+statement is **"no global draw occurs during a training step"**, never "nothing
+draws from the process globals", which is false. `update.py` puts
+initialization-time RNG out of scope for exactly that reason: it runs before the
+step.
+
+This does not weaken the asymmetry — construction precedes restore and the
+restored `state_dict` overwrites those weights — but the global stream's
+*position* does differ between attempts, and **if any future code draws from the
+globals after construction, the asymmetry flips.** The finding is a latent
+property held in place by the absence of a post-construction global consumer,
+not a guarantee.
 
 | Seam skipped | Expected | Why |
 |---|---|---|
@@ -127,6 +149,13 @@ rather than something to silence.
 Both mutation arms assert a **witness that the no-op was actually invoked**.
 Without it, a genuinely inert seam and a patch that never applied are
 indistinguishable, and the `inert` arm would pass for entirely the wrong reason.
+
+**And the witness has its own control**, because otherwise its correctness is
+itself unwitnessed — the same recursion as the disable-verification problem.
+`tests/unit/chain_resume_spike/test_native_probe_witness.py` proves the witness
+stays **empty** when a bypass that is *not* the instrumented one runs. That is
+what makes "the witness fired" falsifiable, and therefore what makes the
+non-divergence arm mean anything.
 
 **MONKEYPATCH DISCLOSURE.** Production exposes no flag to skip one restore limb,
 so the arms rebind `tpen.checkpoint.restore.apply_rng_state` and
