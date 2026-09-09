@@ -9,14 +9,25 @@ that defines a resumed update.
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from tpen.training.block_ng import BlockDiagonalNaturalGradientUpdate, BlockNGPolicy
 from tpen.training.trainer import VMCTrainer
 from tpen.training.update import ModelParameterBinding
+from tests.integration.training.test_train_runner import (
+    EQUIVALENCE_MAX_STEPS,
+    RESUME_STEP,
+    _checkpoint_dir,
+    _diverged_parameters,
+    _equivalence_config,
+    _run as _run_configured_training,
+    _train_metric_lines,
+)
 from tests.unit.training.test_sr_trainer_integration import (
     _FixedSampler,
     _StubContext,
@@ -27,6 +38,7 @@ from tests.unit.training.test_sr_trainer_integration import (
 
 LEARNING_RATE = 1.0e-3
 DAMPING = 1.0e-2
+BLOCK_NG_PRESET = Path(__file__).resolve().parents[3] / "experiments/configs/updater/block_ng.yaml"
 
 
 def _method(model: Any, *, solve_dtype: torch.dtype = torch.float64) -> BlockDiagonalNaturalGradientUpdate:
@@ -80,6 +92,22 @@ def _clone_parameters(model: Any) -> tuple[torch.Tensor, ...]:
     return tuple(parameter.detach().clone() for parameter in model.parameters())
 
 
+def _rng_sensitive_block_ng_config(*, load: dict[str, str] | None = None):
+    """Use the persisted MCMC stream before each resumed Block-NG update.
+
+    The trainer-only fixed sampler below is intentionally deterministic and is
+    retained for method-state guards.  Resume parity instead uses the real
+    checkpointed Metropolis sampler: its first post-resume draw consumes the
+    restored generator, then supplies the score packet for the compared update.
+    """
+
+    config = _equivalence_config(load=load)
+    preset = OmegaConf.load(BLOCK_NG_PRESET)
+    config.optimizer = preset.optimizer
+    config.trainer.update_method = preset.trainer.update_method
+    return config
+
+
 def test_block_ng_runs_through_the_trainer_and_logs_solve_dtype() -> None:
     """A bounded trainer smoke reaches a real block-NG update and its telemetry."""
 
@@ -100,6 +128,38 @@ def test_block_ng_runs_through_the_trainer_and_logs_solve_dtype() -> None:
         not torch.equal(old, new.detach())
         for old, new in zip(before, model.parameters(), strict=True)
     )
+
+
+def test_block_ng_resume_after_sampler_draw_is_bitwise(tmp_path) -> None:
+    """A resumed MCMC draw must reproduce the uninterrupted Block-NG update.
+
+    This is deliberately a runner/checkpoint fixture, not a fixed-batch
+    trainer fixture: disabling sampler or global RNG restoration changes the
+    first post-resume draw, hence its scores and the update this test compares.
+    """
+
+    uninterrupted = _run_configured_training(
+        tmp_path / "uninterrupted", _rng_sensitive_block_ng_config()
+    )
+    source = _checkpoint_dir(uninterrupted, RESUME_STEP)
+    assert (source / "COMPLETE").exists()
+
+    resumed = _run_configured_training(
+        tmp_path / "resumed",
+        _rng_sensitive_block_ng_config(load={"mode": "train_resume", "path": str(source)}),
+    )
+    final_uninterrupted = _checkpoint_dir(uninterrupted, EQUIVALENCE_MAX_STEPS)
+    final_resumed = _checkpoint_dir(resumed, EQUIVALENCE_MAX_STEPS)
+    assert _diverged_parameters(final_uninterrupted, final_resumed) == []
+    assert (final_uninterrupted / "trainer.json").read_bytes() == (
+        final_resumed / "trainer.json"
+    ).read_bytes()
+    resumed_lines = _train_metric_lines(resumed)
+    assert [step for step, _ in resumed_lines] == list(range(RESUME_STEP, EQUIVALENCE_MAX_STEPS))
+    uninterrupted_tail = [
+        line for step, line in _train_metric_lines(uninterrupted) if step >= RESUME_STEP
+    ]
+    assert [line for _, line in resumed_lines] == uninterrupted_tail
 
 
 def test_block_ng_resume_is_bitwise_and_state_sensitive() -> None:
