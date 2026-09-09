@@ -413,6 +413,95 @@ recovery automatically.**
 newer than the one `latest.json` names. Otherwise the chain restores, replays,
 and then dies on the collision.
 
+#### This hazard defeats its own owner's acceptance predicates
+
+The interruption-safety item (`3b9b736a`) specifies its layer-3 acceptance
+experiment as: **no `step_` directory lacks `COMPLETE` or `manifest.json`, and
+no `.tmp` residue survives.**
+
+**Both predicates pass on the orphan.** Measured, by constructing the state and
+evaluating them:
+
+```
+step dirs: ['step_000002', 'step_000004']
+PREDICATE 1 (no malformed step dir): violations = []  -> PASSES
+PREDICATE 2 (no .tmp residue):       residue    = []  -> PASSES
+pointer still names step_000002, newest complete dir is step_000004
+```
+
+The reason is structural. `save.py` writes `manifest.json` (209) and `COMPLETE`
+(210) **before** the rename (211), and `write_latest` does not run until 229. So
+the orphan is a **fully formed final directory carrying both files**, and there
+is no `.tmp` anywhere because the tmp directory *was* the thing renamed.
+
+**That item would have run its own acceptance experiment, reported clean, and
+shipped the deadlock.** Its predicates look for a *malformed* directory and for
+*residue*. The orphan is neither — it is a well-formed directory that is simply
+unreferenced. An acceptance contract that enumerates the damage shapes its
+author imagined cannot see a shape that is not damage at all.
+
+**And the remedy that looks like it covers this does not.** That item's layer-2
+work on `SIGTERM` unwinding **does not narrow this class at all**: the `finally`
+at save.py:245 removes `tmp_dir`, and post-rename `tmp_dir` does not exist —
+save.py's own comment at 252 says so, *"the rename above moves the directory, so
+`exists()` is already False"*. Making unwinding reliable is a **no-op** for this
+state. Stated explicitly because a reader who knows a `SIGTERM` fix is planned
+would otherwise assume this class is already covered by it.
+
+For citation accuracy: that `finally` **is** present at `dev` and the item's
+layer-1 fix **is landed** — the comment at 246-250 records that it was changed
+*from* `except Exception` precisely because `KeyboardInterrupt` and `SystemExit`
+derive from `BaseException`. Layer 1 is not open.
+
+#### Two routes to "cannot advance", enumerated rather than counted
+
+Evidenced at `4a580e6` **by state construction**. Completeness is **UNMEASURED**.
+Stated as an enumeration with discriminators, not a tally: a count cannot be
+checked by a reader, so they can spot neither a missing route nor an over-folded
+one.
+
+**ROUTE 1 — PUBLISH CONFLICT.** catalog.py:77-80, `ValueError conflicting
+checkpoint publication for content_id`. Fires ONLY when `existing.content_id ==
+ref.content_id` **and** `existing.to_dict() != serialized_ref`. Trigger:
+republishing the same content identity under a **different path spelling**. It
+never consults the filesystem.
+
+**ROUTE 2 — ORPHAN NAME COLLISION.** save.py:142-143, `FileExistsError checkpoint
+already exists`. Fires on `final_dir.exists()` **alone** — a filesystem name
+collision with **no content comparison**. Trigger: an interrupt between the
+rename at 211 and the pointer update at 229, with no path weirdness at all.
+
+**They are not one mechanism at two altitudes**, and the discriminator is a
+control-flow fact rather than a judgement: **line 142 precedes 211, 226 and
+229**, so in the orphan state `save_checkpoint` raises at 143 and **never
+reaches** `catalog.publish` at 226. Route 1 is structurally unreachable from
+route 2's state. Two failures cannot be the same mechanism when one preempts the
+other.
+
+The reconcile **rewind** is deliberately **not** counted here: it does not fail
+to advance, it **advances from the wrong place**, re-running committed science.
+Different signature, different cost.
+
+**How to look for a third**, because this is the part that transfers: **both
+routes were found by BUILDING REAL STATES, not by reading the source.** Route 2
+surfaced only because a repair item forced construction of a genuine
+overlapping-generation state — the hand-sliced ledger test it replaced could not
+have produced it. A reader who wants to know whether a third route exists must
+construct states, not grep.
+
+#### Bounds on these pins — limits, not defects
+
+* The orphan-deadlock node establishes **failure to advance at the collision**.
+  It does **not** compare the failed replay's trace, and it does **not**
+  byte-hash both generations.
+* The recovery node establishes **manual reconciliation recovery, NOT automatic
+  recovery** — it calls production `reconcile_publication` on the orphan
+  explicitly. **Do not read it as the chain self-healing.** For a candidate lane
+  deciding whether its controller must do this itself, that distinction is the
+  whole decision.
+* The rewind node does assert complete before/after byte maps of **both**
+  generations unchanged.
+
 ### 2. `reconcile_publication` rewinds the resume pointer
 
 `reconcile_publication` builds its expected pointer from the directory it is
@@ -486,6 +575,16 @@ This is a test rather than a note because the property dies **silently**:
 measured in the previous round, an `import torch` inserted into shared
 `fixture.py` left all 88 unit tests green.
 
+**LIMITATION OF THE LOCAL ARM, and it inverts the usual assumption: the
+torch-free property is only properly tested WHERE TORCH EXISTS.** On a host
+without torch, a stray `import torch` in a shared module fails as a **missing
+module** — so the test goes red for the *wrong reason*, and would go red
+identically for a typo. Only where torch is **present** does the import land in
+`sys.modules` and get caught as the property violation it is. The development
+workstation cannot reproduce the condition this test exists for; Cannon job
+45645515 re-ran the arm under torch 2.12.0+cpu for exactly that reason
+(112/112, 0 skipped).
+
 ## How the fixture's own checks are kept honest
 
 Three of this lane's checks previously observed a **proxy** rather than the
@@ -499,6 +598,29 @@ property, and all three were replaced with runtime observation:
 
 A mention cannot fire, and an alias fires identically, so runtime observation
 closes both coverage defects at once.
+
+**AND THEN TWO OF THOSE THREE REPAIRS WERE THEMSELVES STILL PROXIES**, which is
+the more useful lesson: replacing a declaration with a self-report is not the
+same as observing the thing.
+
+* **Order.** The runtime pin recorded boundaries the fixture *emitted about
+  itself*, and those emissions are separable from the operations: a mutant that
+  moved the real `catalog.publish` past `write_latest` while leaving the labels
+  in place passed the static pin, the runtime pin, and all 112 nodes. The order
+  is now derived from **inside a wrapper around the real production callable**,
+  so displacing the call necessarily displaces its record, and separately from
+  **observable filesystem state** — at the moment `latest.json` is published,
+  the catalog row must already be on disk. Neither reads a label. On that same
+  mutant the two self-report checks still pass while both new checks fail.
+* **Fault coverage.** The fire record proves **injection-site entry, not effect
+  completion**: a mutant keeping `record_fire` and returning instead of raising
+  passes every coverage node. That claim is now **re-scoped to reachability**
+  rather than annotated, because an artefact saying "exercised" while proving
+  only entry is false in the thing downstream lanes read. Effect delivery for
+  the seven RAISE-boundary points is established by named nodes in
+  `test_generation_preservation.py`; `TORN_CATALOG_ROW`'s effect delivery is a
+  **named UNMEASURED limit**, since only a suppressed-RAISE mutant exists and it
+  cannot reach a node that truncates the catalog directly.
 
 ---
 

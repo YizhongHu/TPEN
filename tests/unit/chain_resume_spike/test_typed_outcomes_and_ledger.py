@@ -322,10 +322,22 @@ def test_an_orphaned_post_rename_generation_deadlocks_the_chain(tmp_path) -> Non
     documented and is exercised by the next test; what is NOT present is
     anything that performs it automatically.
 
+    THIS STATE DEFEATS ITS OWN OWNER'S ACCEPTANCE PREDICATES, which is why the
+    disclosure is worth more than the deadlock alone. ``3b9b736a``'s layer-3
+    acceptance experiment asks whether any ``step_`` directory lacks ``COMPLETE``
+    or ``manifest.json``, and whether any ``.tmp`` residue survives. BOTH PASS
+    HERE: ``save.py`` writes the manifest (209) and the marker (210) BEFORE the
+    rename (211), so the orphan is a fully formed directory carrying both, and
+    no ``.tmp`` exists because the tmp directory WAS what got renamed. The
+    predicates look for a malformed directory and for residue; this is neither.
+    Nor does that item's ``SIGTERM``-unwinding remedy narrow this class: the
+    ``finally`` at save.py:245 removes ``tmp_dir``, and post-rename ``tmp_dir``
+    does not exist -- save.py:252 says so itself.
+
     NOT FIXED HERE. ``tpen/checkpoint`` is outside this lane's write surface.
     Attributed to the ``tpen/checkpoint`` owner and to ``3b9b736a``
-    (interruption safety), whose open scope is exactly scheduler termination and
-    real storage commit.
+    (interruption safety), whose open scope is scheduler termination and real
+    storage commit. Its layer-1 fix is landed and is not implicated.
     """
 
     root, _, _ = _drive_to_the_overlapping_state(tmp_path)

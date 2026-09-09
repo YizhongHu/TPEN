@@ -64,6 +64,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers.chain_resume_spike import fixture as fixture_module
 from tests.helpers.chain_resume_spike.faults import (
     COMMITTED_BUT_UNACKNOWLEDGED_POINTS,
     FaultAction,
@@ -94,6 +95,7 @@ from tpen.checkpoint.artifact import (
     read_latest,
 )
 from tpen.checkpoint.catalog import (
+    CheckpointCatalog,
     IncompletePublicationRecordError,
     publication_catalog_path,
     read_publications,
@@ -752,3 +754,150 @@ def test_committing_a_generation_does_not_disturb_any_random_stream(tmp_path) ->
     assert first_divergence(reference.run(2), committed_tail) is None, (
         "the post-commit trajectory diverged from an uncommitted one"
     )
+
+
+# ----------------------------------------------------------------------
+# C10: the ACTUAL operation order, observed where the operations happen.
+# ----------------------------------------------------------------------
+#
+# The two tests above compare DECLARATIONS and EMITTED RECORDS. Both are
+# self-reports, and a self-report is separable from the thing it reports: a
+# mutant that moves the real ``catalog.publish`` past ``write_latest`` while
+# leaving the ``_boundary`` calls where they were satisfies both of them and
+# every other node in the suite. Measured, not hypothesised.
+#
+# So the two checks below never read a label. One derives the order from INSIDE
+# a wrapper around the real production callable, so displacing the call
+# necessarily displaces its record -- there is no separate emission statement to
+# leave behind. The other reads the FILESYSTEM at the instant the pointer is
+# published, which is a property of the world that no breadcrumb can lie about.
+
+
+def _observe_real_operation_order(monkeypatch) -> list[str]:
+    """Wrap the real publish and write_latest; return the order they took effect.
+
+    The record is emitted BY THE WRAPPER, AFTER the wrapped call returns, so it
+    reports completion rather than intent and cannot be separated from the
+    operation. Patching the names the fixture actually resolves --
+    ``CheckpointCatalog.publish`` on the class, and the module-level
+    ``write_latest`` the fixture imported -- means a reordering of the call
+    sites reorders these records too.
+
+    Returns the observed sequence, which the caller asserts against production's
+    own order.
+    """
+
+    observed: list[str] = []
+    real_publish = CheckpointCatalog.publish
+    real_write_latest = fixture_module.write_latest
+
+    def wrapped_publish(self, ref):
+        result = real_publish(self, ref)
+        observed.append("catalog_published")
+        return result
+
+    def wrapped_write_latest(root, checkpoint_dir, **kwargs):
+        # THE FILESYSTEM PRECONDITION, checked at the production call site: at
+        # the moment the pointer is about to exist, the catalog row for this
+        # generation must ALREADY be on disk. Read from publications.jsonl, not
+        # from anything this test recorded.
+        rows = []
+        catalog_path = publication_catalog_path(root)
+        if catalog_path.is_file():
+            rows = [ref.checkpoint_dir.name for ref in read_publications(catalog_path)]
+        observed.append(f"latest_written(catalog_rows={sorted(rows)})")
+        result = real_write_latest(root, checkpoint_dir, **kwargs)
+        return result
+
+    monkeypatch.setattr(CheckpointCatalog, "publish", wrapped_publish)
+    monkeypatch.setattr(fixture_module, "write_latest", wrapped_write_latest)
+    return observed
+
+
+def test_the_real_publish_takes_effect_before_the_real_latest_write(
+    tmp_path, monkeypatch
+) -> None:
+    """C10. Observed at the operations themselves, not at any label.
+
+    This is the check that rejects a reversed execution EVEN WHEN the
+    declaration and the emitted boundary records still show the expected order.
+    Agreement among self-reports cannot establish the property, so this reads
+    none of them.
+    """
+
+    observed = _observe_real_operation_order(monkeypatch)
+
+    root = tmp_path / "root"
+    system = ContinuationSystem.fresh(seed=909)
+    system.run(CHECKPOINT_EVERY)
+    declared: list[str] = []
+    publish_generation(
+        root,
+        system,
+        new_attempt("real-order", 0, None),
+        credited_steps=(0, 1),
+        boundary_log=declared,
+    )
+
+    assert len(observed) == 2, f"expected both operations to run once: {observed}"
+    assert observed[0] == "catalog_published", (
+        "the real catalog publication did not take effect before the real "
+        f"latest-pointer write. Observed order: {observed}"
+    )
+    assert observed[1].startswith("latest_written"), observed
+
+    # AND THE FILESYSTEM PROPERTY, read at the production call site: when the
+    # pointer was about to be written, this generation's row was already there.
+    assert observed[1] == "latest_written(catalog_rows=['step_000002'])", (
+        "at the moment latest.json was published the catalog did not already "
+        f"contain this generation's row: {observed[1]}"
+    )
+
+    # The declaration agreed here -- but that agreement is NOT what this test
+    # rests on, and a mutant can preserve it while reversing the operations.
+    assert declared.index("catalog_published") < declared.index("latest_written")
+
+
+def test_the_pointer_is_never_visible_before_its_catalog_row(tmp_path) -> None:
+    """The same property as durable state, with no wrapper and no record at all.
+
+    Asserted over what is ON DISK after a completed publish and after an
+    interruption in each post-commit window: there is no reachable state in
+    which ``latest.json`` names a generation the catalog does not carry. This
+    is deliberately instrument-free -- nothing here can be displaced by a
+    mutant, because nothing here is emitted by the code under test.
+    """
+
+    root = tmp_path / "root"
+    system = ContinuationSystem.fresh(seed=1_009)
+    system.run(CHECKPOINT_EVERY)
+    publish_generation(root, system, new_attempt("fs-order", 0, None), credited_steps=(0, 1))
+
+    def _pointer_is_backed_by_a_row() -> bool:
+        named = pointer_target_name(root)
+        if named is None:
+            return True  # no pointer yet: nothing to be unbacked
+        catalog_path = publication_catalog_path(root)
+        if not catalog_path.is_file():
+            return False
+        return named in {ref.checkpoint_dir.name for ref in read_publications(catalog_path)}
+
+    assert _pointer_is_backed_by_a_row(), "a completed publish left an unbacked pointer"
+
+    # Every post-commit interruption window, checked on disk. The pointer must
+    # either still name the previous generation (itself backed) or name one the
+    # catalog carries -- never a generation with no row.
+    for point in _UNACKNOWLEDGED_ARMS:
+        window_root = tmp_path / f"window-{point.value}"
+        _publish_two_generations(window_root, FaultPlan(point, FaultAction.RAISE))
+        named = pointer_target_name(window_root)
+        catalog_path = publication_catalog_path(window_root)
+        rows = (
+            {ref.checkpoint_dir.name for ref in read_publications(catalog_path)}
+            if catalog_path.is_file()
+            else set()
+        )
+        assert named in rows, (
+            f"after an interruption at {point.value} the pointer names {named!r} "
+            f"but the catalog carries {sorted(rows)} - a pointer with no row"
+        )

@@ -1,23 +1,58 @@
-"""Every registered fault point is OBSERVED FIRING, or declared UNMEASURED.
+"""Every registered fault point is REACHED when injected. REACHABILITY, NOT EFFECT.
 
-THE MECHANISM CHANGED, AND THE REASON MATTERS MORE THAN THE CHANGE. The previous
-version of this module scanned test sources for ``FaultPoint.MEMBER`` attributes
-and treated a reference as coverage. That is a proxy, and it failed in both
-directions when it was measured:
+## WHAT THIS MODULE ESTABLISHES, AND WHAT IT DOES NOT
 
-* a test containing only an unused ``FaultPoint.DURING_PAYLOAD_WRITE``
-  expression COUNTED AS AN EXERCISE while injecting nothing;
-* replacing three explicit members with an equivalent sorted set alias made the
-  registry nodes FAIL while the real fault tests still passed.
+It establishes **INJECTION-SITE ENTRY**: that each registered fault point is
+reached and its injection runs. **IT DOES NOT ESTABLISH EFFECT COMPLETION.**
+Recording that control arrived at an injection point is not evidence that the
+injection did anything, and the claim is scoped accordingly rather than
+annotated -- an artefact that says "exercised" while proving only entry is a
+false claim in the thing downstream lanes read.
 
-A mention cannot fire, and an alias fires identically. So coverage is now
-established by RECORDING WHICH POINT ACTUALLY FIRED AT INJECTION TIME
-(:func:`tests.helpers.chain_resume_spike.faults.record_fire`) and asserting the
-set of fired points equals the registry. Neither defect survives that.
+MEASURED, not argued: a mutant that keeps ``record_fire(fault.point)`` and
+RETURNS instead of raising ``InjectedFault`` passes every node in this module.
+That mutant causes no damage at all. So these nodes are a reachability
+instrument and are named as one.
 
-The record is written and ``fsync``-ed BEFORE the fault's effect, so it survives
-``os._exit`` and ``SIGKILL`` -- actions whose entire purpose is that nothing runs
-afterwards.
+## WHERE EFFECT DELIVERY *IS* ESTABLISHED
+
+For the seven RAISE-boundary points, by these nodes in
+``test_generation_preservation.py`` -- all inside the standard suite, and all
+measured to FAIL under that same no-effect mutant because ``raised`` was
+``None``:
+
+* ``test_a_precommit_fault_leaves_generation_one_selectable`` for
+  ``during_payload_write``, ``after_payload_before_manifest``,
+  ``after_manifest_before_complete``, ``after_complete_before_rename``
+* ``test_a_committed_but_unacknowledged_generation_is_valid_and_reconcilable``
+  for ``after_rename_before_catalog``, ``after_catalog_before_latest``,
+  ``after_latest_before_receipt``
+
+A downstream reader wanting effect evidence for a point should follow those
+node ids, not this module.
+
+## THE ONE NAMED LIMIT
+
+**``TORN_CATALOG_ROW``'s EFFECT DELIVERY IS UNMEASURED.** Only a
+suppressed-RAISE mutant has ever been built, and it cannot reach that point:
+``test_a_torn_final_catalog_row_is_diagnosed_and_repairable`` truncates the
+catalog directly rather than injecting through ``FaultAction.RAISE``, so that
+mutant is INAPPLICABLE to it rather than defeated by it. Six of the seven
+points have RAISE-boundary effect evidence; the torn row has none.
+
+## A RESIDUAL IN NAMING, DISCLOSED RATHER THAN FIXED
+
+The constant is still called ``MEASURED_POINTS`` in ``faults.py``. That name
+overstates what this module proves, and it is left alone deliberately:
+``faults.py`` sits inside the verified surface of the torch-free import clause,
+and renaming it there would void that clause's independent PASS to fix a word.
+Read ``MEASURED_POINTS`` as "points this lane registers and reaches", and take
+effect evidence from the nodes named above.
+
+The mechanism itself is sound for what it now claims: a record written and
+``fsync``-ed at the moment of injection cannot be produced by a mere mention,
+and is produced identically by an equivalent set alias -- the two defects that
+sank the previous source-scanning version.
 """
 
 from __future__ import annotations
@@ -134,15 +169,18 @@ def test_a_mere_mention_of_a_fault_point_records_nothing(
 @pytest.mark.parametrize(
     "point", sorted(MEASURED_POINTS, key=lambda point: point.value), ids=lambda p: p.value
 )
-def test_every_measured_fault_point_actually_fires_when_injected(
+def test_every_registered_fault_point_is_reached_when_injected(
     tmp_path, monkeypatch, point: FaultPoint
 ) -> None:
-    """The coverage clause: each registered point is driven and observed firing.
+    """REACHABILITY, one node per point so a gap names itself.
 
-    One node per point, so a gap names itself. Asserting the fired set EQUALS
-    ``{point}`` rather than merely containing it also catches a fault dispatched
-    at the wrong boundary -- a point that fired when a different one was
-    requested is a defect the previous mechanism could not see at all.
+    Asserts the reached set EQUALS ``{point}`` rather than merely containing it,
+    which also catches a fault dispatched at the WRONG BOUNDARY -- a point that
+    fired when a different one was requested. That is a real property and this
+    module does establish it.
+
+    It does NOT establish that the injection had an effect. See the module
+    docstring for where effect delivery is established.
     """
 
     log = tmp_path / "fires.log"
@@ -151,16 +189,18 @@ def test_every_measured_fault_point_actually_fires_when_injected(
     _drive(point, tmp_path / "root")
 
     assert fired_points(log) == {point}, (
-        f"injecting {point.value} recorded {sorted(f.value for f in fired_points(log))}"
+        f"injecting {point.value} reached {sorted(f.value for f in fired_points(log))}"
     )
 
 
-def test_the_measured_registry_is_exactly_what_fires(tmp_path, monkeypatch) -> None:
+def test_the_registry_is_exactly_the_set_of_reachable_points(tmp_path, monkeypatch) -> None:
     """Set equality across the whole registry, in one shared log.
 
-    The per-point nodes above prove each point CAN fire. This proves the
-    registry has no member that never fires and no firing member that is
-    unregistered -- the two halves a per-point loop cannot establish on its own.
+    The per-point nodes prove each point CAN be reached. This proves the
+    registry has no member that is never reached and no reached member that is
+    unregistered -- the two halves a per-point loop cannot establish alone.
+
+    Still reachability. No effect is asserted here.
     """
 
     log = tmp_path / "fires.log"
