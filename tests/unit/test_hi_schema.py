@@ -2163,11 +2163,14 @@ class TestDeclaredTrainability:
 
         ``BoundedTwoCoefficientJastrow`` now HAS a rule, registered when the
         factor landed rather than when a config first used it. This test keeps
-        using a genuinely unregistered name, so it still measures the absence
-        of guessing rather than the absence of that one entry.
+        using an unregistered name: the trainability rule must not guess at
+        its semantics, while the global construction allowlist must refuse it.
         """
 
-        _validate(_config(model={"factors": [{"_target_": "tpen.nn.SomeFutureJastrow"}]}))
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(_config(model={"factors": [{"_target_": "tpen.nn.SomeFutureJastrow"}]}))
+        assert "undeclared-trainability" not in _rules(caught.value)
+        assert "unadmitted-free-form-target" in _rules(caught.value)
 
     def test_rejects_a_jastrow_that_omits_trainable(self) -> None:
         """Both coefficients start at zero, so an inherited false is invisible.
@@ -2283,20 +2286,16 @@ class TestTheElectronNucleusLawIsAdmitted:
         assert "undeclared-nonfinite-policy" in _rules(caught.value)
 
     def test_a_factor_that_is_not_the_en_cusp_is_left_alone(self) -> None:
-        """The rule is scoped to the electron-nucleus cusp, not to any 'law' key."""
+        """Unknown constructions fail admission without acquiring a cusp-law rule."""
 
-        _validate(
-            _config(
-                model={
-                    "factors": [
-                        {
-                            "_target_": "tpen.nn.SomeFutureFactor",
-                            "law": {"_target_": "tpen.nn.CurvatureElectronNucleusCuspLaw"},
-                        }
-                    ]
-                }
-            )
-        )
+        cfg = _config(model={"factors": [{
+            "_target_": "tpen.nn.SomeFutureFactor",
+            "law": {"_target_": "tpen.nn.CurvatureElectronNucleusCuspLaw"},
+        }]})
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "unadmitted-cusp-law" not in _rules(caught.value)
+        assert "unadmitted-free-form-target" in _rules(caught.value)
 
 
 class TestRankInvariance:
