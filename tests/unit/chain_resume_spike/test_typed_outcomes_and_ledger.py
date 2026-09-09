@@ -16,10 +16,24 @@ than absorbing it, so the failure is loud at the moment it happens.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
-from tests.helpers.chain_resume_spike.fixture import spawn_attempt
+from tests.helpers.chain_resume_spike.faults import (
+    FaultAction,
+    FaultPlan,
+    FaultPoint,
+)
+from tests.helpers.chain_resume_spike.fixture import (
+    pointer_target_name,
+    read_generation_provenance,
+    resume_generation,
+    spawn_attempt,
+)
+from tests.helpers.chain_resume_spike.parity import first_divergence
+from tpen.checkpoint.artifact import is_complete_checkpoint_dir
+from tpen.checkpoint.catalog import reconcile_publication
 from tests.helpers.chain_resume_spike.identity import (
     ChainIdentity,
     CreditedLedger,
@@ -232,3 +246,243 @@ def test_a_step_already_credited_by_its_parent_is_replayed_not_recredited(
     assert receipt.credited_steps == (4, 5)
     assert set(receipt.replayed_steps) & set(receipt.credited_steps) == set()
     assert receipt.outcome.kind is OutcomeKind.FINAL
+
+
+# ----------------------------------------------------------------------
+# G8 under OVERLAPPING committed generations. Fresh processes throughout.
+# ----------------------------------------------------------------------
+
+OVERLAP_TARGET = 6
+OVERLAP_EVERY = 2
+#: Cold-start seed shared by the reference run and the chain's first link, so
+#: the two arms have the SAME initial condition. Only the cold start is
+#: pinned; every resumed link still draws its own OS entropy, which is what
+#: keeps the parity comparison non-vacuous.
+OVERLAP_COLD_START_SEED = 20_260_909
+
+
+def _drive_to_the_overlapping_state(tmp_path) -> tuple[Path, object, object]:
+    """Build the two-overlapping-generations state, in fresh processes.
+
+    Link 1 commits generation 1 cleanly. Link 2 is interrupted in the
+    ``after_rename_before_catalog`` window, so generation 2 lands on disk
+    complete, carrying credit for steps 0-3, while ``latest.json`` still names
+    generation 1, which carries credit for 0-1 only.
+    """
+
+    root = tmp_path / "root"
+    first = spawn_attempt(
+        tmp_path / "a0", root=root, run_id="overlap", attempt_index=0,
+        steps=OVERLAP_EVERY, total_target=OVERLAP_TARGET, checkpoint_every=OVERLAP_EVERY,
+        seed=OVERLAP_COLD_START_SEED,
+    )
+    assert first.exit_code == 0, first.log_path.read_text(encoding="utf-8")
+    first_receipt = read_receipt(first.receipt_path)
+    assert first_receipt.outcome.kind is OutcomeKind.YIELD
+    assert first_receipt.credited_steps == (0, 1)
+
+    second = spawn_attempt(
+        tmp_path / "a1", root=root, run_id="overlap", attempt_index=1,
+        steps=OVERLAP_EVERY, total_target=OVERLAP_TARGET, checkpoint_every=OVERLAP_EVERY,
+        fault=FaultPlan(FaultPoint.AFTER_RENAME_BEFORE_CATALOG, FaultAction.RAISE),
+    )
+    assert second.exit_code == 1, "the injected fault did not fail the attempt"
+    second_receipt = read_receipt(second.receipt_path)
+    assert second_receipt.outcome.kind is OutcomeKind.TRANSIENT
+
+    assert is_complete_checkpoint_dir(root / "step_000002")
+    assert is_complete_checkpoint_dir(root / "step_000004")
+    assert pointer_target_name(root) == "step_000002", (
+        "the pointer moved, so no overlap exists and these tests are not testing it"
+    )
+    assert read_generation_provenance(root / "step_000004")["credited_steps"] == [
+        0, 1, 2, 3
+    ], "generation 2 does not claim overlapping progress"
+    return root, first_receipt, second_receipt
+
+
+def test_an_orphaned_post_rename_generation_deadlocks_the_chain(tmp_path) -> None:
+    """DISCOVERED HAZARD, PINNED AND NOT FIXED. The chain cannot continue.
+
+    After an interruption between the rename and the catalog append, resume does
+    the right thing at every individual step and still cannot make progress:
+
+      * it follows ``latest.json`` to generation 1, correctly;
+      * it replays steps 2-3, correctly, reproducing the same stream;
+      * and it then tries to commit generation 2 -- whose directory ALREADY
+        EXISTS, because the interrupted attempt renamed it into place.
+
+    ``save_checkpoint`` refuses with ``FileExistsError: checkpoint already
+    exists`` (save.py:142-143). The replica mirrors that guard line for line, so
+    the refusal observed here is production's own rule, not the replica's.
+
+    THE DIRECTION IS FAIL-CLOSED, which is safe -- loud, no corruption, nothing
+    overwritten -- but a chain that cannot advance a single further generation
+    is exactly the failure this R0-R4 program exists to prevent. The recovery is
+    documented and is exercised by the next test; what is NOT present is
+    anything that performs it automatically.
+
+    NOT FIXED HERE. ``tpen/checkpoint`` is outside this lane's write surface.
+    Attributed to the ``tpen/checkpoint`` owner and to ``3b9b736a``
+    (interruption safety), whose open scope is exactly scheduler termination and
+    real storage commit.
+    """
+
+    root, _, _ = _drive_to_the_overlapping_state(tmp_path)
+
+    third = spawn_attempt(
+        tmp_path / "a2", root=root, run_id="overlap", attempt_index=2,
+        steps=OVERLAP_TARGET, total_target=OVERLAP_TARGET, checkpoint_every=OVERLAP_EVERY,
+    )
+
+    assert third.exit_code == 1, (
+        "the resumed attempt committed a generation whose directory already "
+        "existed; the collision guard is gone"
+    )
+    log = third.log_path.read_text(encoding="utf-8")
+    assert "FileExistsError" in log and "checkpoint already exists" in log, (
+        f"the attempt failed for some other reason:\n{log}"
+    )
+    assert "step_000004" in log, "the collision was not on the orphaned generation"
+
+    # Nothing was damaged: both generations survive and the pointer is unmoved.
+    assert is_complete_checkpoint_dir(root / "step_000002")
+    assert is_complete_checkpoint_dir(root / "step_000004")
+    assert pointer_target_name(root) == "step_000002"
+
+
+def test_reconciling_the_orphan_lets_the_chain_finish_and_credit_once(
+    tmp_path,
+) -> None:
+    """The documented recovery, and the real G8 property once it is applied.
+
+    ``reconcile_publication`` is production's repair for a committed-but-
+    unacknowledged generation: it appends the missing catalog row, advances
+    ``latest.json`` to that directory, and backfills the receipt
+    (catalog.py:189-208). Applied to the orphan, it turns the deadlock above
+    into a chain that finishes.
+
+    Two things must then hold at once, and either is satisfiable while the other
+    fails -- a chain can credit the right COUNT of the wrong steps, or replay
+    correctly and count the tail twice:
+
+      * the durable credited ledger totals the fixed target EXACTLY once, and
+      * the credited trace equals the uninterrupted trace, step for step.
+
+    The previous version of this test asserted neither: it sliced two entries
+    off a receipt by hand and compared sets, which checks the arithmetic the
+    test itself just performed.
+    """
+
+    reference_launch = spawn_attempt(
+        tmp_path / "reference",
+        root=tmp_path / "reference-root",
+        run_id="overlap-reference",
+        attempt_index=0,
+        steps=OVERLAP_TARGET,
+        total_target=OVERLAP_TARGET,
+        checkpoint_every=OVERLAP_EVERY,
+        seed=OVERLAP_COLD_START_SEED,
+    )
+    assert reference_launch.exit_code == 0, reference_launch.log_path.read_text(
+        encoding="utf-8"
+    )
+    reference = read_receipt(reference_launch.receipt_path)
+    assert reference.outcome.kind is OutcomeKind.FINAL
+
+    root, first_receipt, second_receipt = _drive_to_the_overlapping_state(tmp_path)
+
+    # THE RECOVERY. Reconciling the NEWEST complete directory is what
+    # catalog.py's own torn-row message prescribes; reconciling an older one
+    # would rewind the pointer, which the next test pins.
+    reconcile_publication(root, root / "step_000004")
+    assert pointer_target_name(root) == "step_000004"
+
+    third = spawn_attempt(
+        tmp_path / "a2", root=root, run_id="overlap", attempt_index=2,
+        steps=OVERLAP_TARGET, total_target=OVERLAP_TARGET, checkpoint_every=OVERLAP_EVERY,
+    )
+    assert third.exit_code == 0, third.log_path.read_text(encoding="utf-8")
+    third_receipt = read_receipt(third.receipt_path)
+    assert third_receipt.outcome.kind is OutcomeKind.FINAL
+    assert third_receipt.identity.parent_generation == 4
+
+    # (1) EXACTLY ONCE, read from the durable record rather than reassembled here.
+    durable_credit = read_generation_provenance(resume_generation(root))["credited_steps"]
+    assert durable_credit == list(range(OVERLAP_TARGET)), (
+        f"the chain's durable credited set is {durable_credit}, not the fixed target"
+    )
+    assert len(durable_credit) == len(set(durable_credit)), "a step was credited twice"
+
+    # The tail was EXECUTED twice across the chain and CREDITED once.
+    assert {row["step"] for row in second_receipt.trace} == {2, 3}
+    assert set(third_receipt.credited_steps) == {4, 5}
+    assert set(first_receipt.credited_steps).isdisjoint(second_receipt.credited_steps)
+    assert set(second_receipt.credited_steps).isdisjoint(third_receipt.credited_steps)
+
+    # (2) THE CREDITED TRACE EQUALS THE UNINTERRUPTED TRACE, step for step. The
+    # tail is contributed by the attempt whose generation the chain adopted.
+    credited_rows = (
+        [row for row in first_receipt.trace if row["step"] in first_receipt.credited_steps]
+        + [row for row in second_receipt.trace if row["step"] in second_receipt.credited_steps]
+        + [row for row in third_receipt.trace if row["step"] in third_receipt.credited_steps]
+    )
+    assert [row["step"] for row in credited_rows] == list(range(OVERLAP_TARGET))
+    divergence = first_divergence(reference.trace, credited_rows)
+    assert divergence is None, (
+        "the credited trace is not the uninterrupted trajectory: "
+        + divergence.describe()
+    )
+
+
+def test_reconciling_an_older_generation_rewinds_the_resume_pointer(tmp_path) -> None:
+    """REWIND HAZARD, PINNED FOR DIRECTION AND NOT FIXED.
+
+    ``reconcile_publication`` builds its expected pointer from the directory it
+    is HANDED (catalog.py:216-233), compares ``read_latest`` against it, and on
+    any mismatch writes the pointer at THAT directory -- with no monotonicity
+    guard on step. Handed an older generation while ``latest.json`` names a
+    newer one, it moves the pointer BACKWARDS. Since resume follows the pointer,
+    that means re-running committed science.
+
+    THIS IS NOT A DEFECT IN CURRENT USAGE: today's only caller reaches it with
+    the newest directory, so the hazard is held off by an accident of usage
+    rather than by a guard. THE TRIGGER IS THE USAGE PATTERN THIS PROGRAM IS
+    EVALUATING -- a chain controller that restarts and reconciles the generation
+    it REMEMBERS handing off can hand it an older one and silently rewind past a
+    newer committed generation.
+
+    The subsystem documents the hazard about itself: the torn-row repair message
+    in ``iter_publications`` warns that ``reconcile_publication`` rewrites
+    ``latest.json`` unconditionally and would point it at an older checkpoint,
+    and tells operators not to reconcile older directories "to be safe".
+
+    Non-destructive: this asserts the DIRECTION and checks both payloads are
+    untouched. No monotonicity guard is added to ``tpen/``.
+    """
+
+    root, _, _ = _drive_to_the_overlapping_state(tmp_path)
+    reconcile_publication(root, root / "step_000004")
+    assert pointer_target_name(root) == "step_000004"
+
+    def _payloads(name: str) -> dict[str, bytes]:
+        return {
+            path.name: path.read_bytes()
+            for path in sorted((root / name).iterdir())
+            if path.is_file()
+        }
+
+    before = {"step_000002": _payloads("step_000002"), "step_000004": _payloads("step_000004")}
+
+    # Hand it the OLDER generation while the pointer names the newer one.
+    reconcile_publication(root, root / "step_000002")
+
+    assert pointer_target_name(root) == "step_000002", (
+        "reconcile_publication no longer rewinds; if a monotonicity guard was "
+        "added upstream, retire this pin rather than weakening it"
+    )
+    assert resume_generation(root).name == "step_000002", (
+        "resume follows the pointer, so the chain would now re-run committed steps"
+    )
+    after = {"step_000002": _payloads("step_000002"), "step_000004": _payloads("step_000004")}
+    assert before == after, "the rewind altered committed checkpoint payloads"
