@@ -502,6 +502,9 @@ ADMITTED_CONSTRUCTION_TARGETS = (
             "tpen.nn.ElectronElectronCusp",
             "tpen.nn.ElectronNucleusCusp",
             "tpen.nn.TailSafeElectronNucleusCuspLaw",
+            "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
+            # Preserve the existing schema-test identity too. The constructor
+            # exists in jastrow.py but has no package-root re-export at baseline.
             "tpen.nn.BoundedTwoCoefficientJastrow",
             "tpen.nn.readout.PfaffianReadout",
             "tpen.nn.initialization.TorchInitializer",
@@ -695,16 +698,10 @@ def _sweep_target_values(resolved_tree: Any) -> list[Rejection]:
     ``TestNoTargetCanNameTheReferenceModule``, which asserts the rule name and
     not merely that something was refused.
 
-    WHY A DENYLIST HERE AND AN ALLOWLIST FOR CALLBACKS. The callback allowlist
-    is enumerable: the study installs a fixed set of bookkeeping and health
-    callbacks and a new one is a review event. The targets in ``model``,
-    ``sampler`` and ``trainer`` are NOT enumerable at schema time -- the scan
-    varies producers, activations, update rules and five initializations, so an
-    allowlist would have to list every arm the materializer may emit and would
-    refuse a legitimate arm the day one is added. That is the over-restriction
-    Amendment A warns about, and it surfaces as a run that cannot start rather
-    than as a red test. The hazard being closed is narrow and nameable -- an
-    executable that loads the evaluation reference -- so it is named.
+    These name checks retain their specific diagnostics. They supplement the
+    global recursive construction allowlist; they are not the admission rule.
+    Changes to the study's executable vocabulary require explicit admission,
+    while scientific coordinates remain governed by the component rules.
 
     TWO RULES, AND NEITHER SUBSUMES THE OTHER. The module rule catches
     ``tpen.hi_manifest.load_evaluation_manifest``, whose tokens are
@@ -786,8 +783,8 @@ def _sweep_target_values(resolved_tree: Any) -> list[Rejection]:
         #
         # So the honest bound is only this: this RULE refuses the dotted module
         # spelling wherever it appears as a string. It does not bound what a
-        # configuration can read. Tracked as its own item; see the residual list
-        # on :func:`_sweep_positional_construction`.
+        # configuration can read. Executable capabilities are separately
+        # qualified by the global recursive construction allowlist.
         if target == REFERENCE_MANIFEST_MODULE or target.startswith(
             f"{REFERENCE_MANIFEST_MODULE}."
         ):
@@ -1250,69 +1247,12 @@ def _sweep_positional_construction(resolved_tree: Any) -> list[Rejection]:
     resolution-time ``_args_``, materialised through a resolver, is refused as
     well, because the resolved sweep walks materialised containers.
 
-    RESIDUAL, CORRECTED. An earlier version of this paragraph named a model hung
-    from ``runner.net``. **That was the comfortable member and it is not
-    reachable at all**: ``Train`` has no such parameter, so it is a TypeError at
-    construction. Naming it read as candour while leaving the reachable
-    residuals unstated -- the second time in this slice that happened, and the
-    reviewer caught both.
-
-    The reachable residuals of this same class, as of this commit, are:
-
-    - **Generic importers carrying a module path as DATA. NARROWED, NOT
-      CLOSED, and the earlier text here said "Closed" -- which was wrong.**
-      Widening the module-identity check to every string value (see
-      :func:`_sweep_target_values`) catches the DOTTED spelling wherever it
-      appears. It does not catch a path that is never spelled dotted. MEASURED
-      at head ``745de1e``, all three validating end-to-end:
-      ``import_module(name=".hi_manifest", package="tpen")`` splits the path
-      across two strings; ``runpy.run_path(path_name="tpen/hi_manifest.py")``
-      uses the FILESYSTEM spelling and executes the module source outright;
-      ``builtins.__import__(name="hi_manifest", globals={"__package__": "tpen"},
-      level=1)`` does the same through the import hook.
-
-      The false step was the doctrine sentence, not the code: "the module path
-      has to appear SOMEWHERE as a string" is true only if it appears WHOLE.
-      Split across two arguments, or written as a file path, it does not.
-
-      Filed as its own item rather than patched here: the filesystem class is
-      not closable by string identity at all -- absolute paths, ``./`` prefixes,
-      symlinks and case-insensitive filesystems all spell the same file -- so
-      the remedy has to govern the SLOT or the CONSUMER rather than enumerate
-      spellings, and that is a new production surface.
-
-      Impact: the module is imported or executed on the training path, which is
-      the hazard the rule names.
-
-      **THE OLD BOUND HERE WAS FALSE AND IS RETRACTED.** It said the reference
-      NUMBERS were safe because ``_args_`` is refused so "no config-only shape
-      can CALL the loader". That bounded a hazard by ONE LOADER'S NAME -- the
-      same failure this whole slice is about, committed in an impact bound
-      instead of in a rule, and it shipped. MEASURED by an independent verifier
-      at ``96f64f6``::
-
-          runner:
-            load:
-              _target_: omegaconf.OmegaConf.load
-              file_: experiments/atomistic/he-importance/manifests/evaluation.yaml
-
-      That VALIDATES, and instantiating it returns ``reference.energy ==
-      -2.9037243770341195``. It needs no module path and trips no token: the
-      manifest's own file path tokenizes to nothing this schema denies. The
-      numbers are reachable without touching ``tpen.hi_manifest`` at all.
-
-      Filed as its own item under Amendment C rather than fixed here. It does
-      not falsify the acceptance contract, which explicitly excludes runtime
-      isolation of the reference -- but nothing in this module may claim the
-      numbers are out of reach, and until that item lands, they are not.
-    - **Resolvers supplying a denied capability under an undenied name.** Closed
-      by moving to an allowlist; see ``allowed_resolvers`` on
-      :data:`HI_TRAIN_POLICY`.
-    - **Still open: a component reached through a keyword no rule names, in a
-      slot whose consumer does NOT have a strict signature.** No such slot is
-      known on the constructed path today, and the strict-signature audit above
-      is what makes that a bounded claim rather than an assumption. It is an
-      assumption about every consumer ADDED LATER, and nothing enforces it.
+    Construction admission is independent of this positional-argument policy.
+    Earlier name and location checks left executable capabilities unqualified;
+    the global recursive allowlist now qualifies every declared target before
+    Hydra construction. This positional rule still constrains how admitted
+    components receive their scientific coordinates. Resolution safety is a
+    separate phase; see :func:`validate_hi_train_config`.
     """
 
     rejections: list[Rejection] = []
