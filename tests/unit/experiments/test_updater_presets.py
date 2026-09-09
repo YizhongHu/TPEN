@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
+from hydra.errors import InstantiationException
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
@@ -175,7 +176,7 @@ def test_block_ng_hydra_config_refuses_an_unknown_solve_dtype_name() -> None:
     parameters = _parameters()
     optimizer = make_optimizer(cfg.optimizer, parameters)
 
-    with pytest.raises(ValueError, match="not a torch dtype name"):
+    with pytest.raises(InstantiationException, match="not a torch dtype name"):
         make_update_method(
             cfg.trainer.update_method,
             optimizer=optimizer,
