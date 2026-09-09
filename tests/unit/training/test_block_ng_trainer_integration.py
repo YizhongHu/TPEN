@@ -142,8 +142,10 @@ def test_block_ng_resume_after_sampler_draw_is_bitwise(tmp_path, monkeypatch) ->
     """A resumed MCMC draw must reproduce the uninterrupted Block-NG update.
 
     This is deliberately a runner/checkpoint fixture, not a fixed-batch
-    trainer fixture: disabling sampler or global RNG restoration changes the
-    first post-resume draw, hence its scores and the update this test compares.
+    trainer fixture: the first post-resume Metropolis draw consumes the
+    sampler's private generator, then supplies the scores and update this test
+    compares.  It does not exercise global Torch RNG restoration: the compared
+    Block-NG update does not flow through that channel.
     """
 
     uninterrupted = _run_configured_training(
