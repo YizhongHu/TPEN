@@ -16,6 +16,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from tpen.sampling.metropolis import MetropolisSampler
 from tpen.training.block_ng import BlockDiagonalNaturalGradientUpdate, BlockNGPolicy
 from tpen.training.trainer import VMCTrainer
 from tpen.training.update import ModelParameterBinding
@@ -137,7 +138,7 @@ def test_block_ng_runs_through_the_trainer_and_logs_solve_dtype() -> None:
     )
 
 
-def test_block_ng_resume_after_sampler_draw_is_bitwise(tmp_path) -> None:
+def test_block_ng_resume_after_sampler_draw_is_bitwise(tmp_path, monkeypatch) -> None:
     """A resumed MCMC draw must reproduce the uninterrupted Block-NG update.
 
     This is deliberately a runner/checkpoint fixture, not a fixed-batch
@@ -150,11 +151,34 @@ def test_block_ng_resume_after_sampler_draw_is_bitwise(tmp_path) -> None:
     )
     source = _checkpoint_dir(uninterrupted, RESUME_STEP)
     assert (source / "COMPLETE").exists()
+    # The checkpoint payload is the state handed to the checkpoint writer at
+    # its sampler boundary.  Inspect it directly rather than assuming the
+    # configured spin partition survived construction.
+    source_sampler_state = torch.load(source / "sampler.pt", map_location="cpu", weights_only=False)
+    saved_walkers = source_sampler_state["walkers"]
+    assert saved_walkers is not None
+    assert saved_walkers.spins is not None
+    saved_spins = saved_walkers.spins.detach().clone()
+
+    restored_spins: list[torch.Tensor] = []
+    load_mcmc_state_dict = MetropolisSampler.load_mcmc_state_dict
+
+    def record_restored_spins(self, state, *, device=None) -> None:
+        load_mcmc_state_dict(self, state, device=device)
+        assert self._walkers is not None
+        assert self._walkers.spins is not None
+        restored_spins.append(self._walkers.spins.detach().clone())
+
+    monkeypatch.setattr(MetropolisSampler, "load_mcmc_state_dict", record_restored_spins)
 
     resumed = _run_configured_training(
         tmp_path / "resumed",
         _rng_sensitive_block_ng_config(load={"mode": "train_resume", "path": str(source)}),
     )
+    # This is immediately after the restore call, before the resumed loop can
+    # draw or otherwise repair a malformed ElectronBatch.
+    assert len(restored_spins) == 1
+    assert torch.equal(restored_spins[0], saved_spins)
     final_uninterrupted = _checkpoint_dir(uninterrupted, EQUIVALENCE_MAX_STEPS)
     final_resumed = _checkpoint_dir(resumed, EQUIVALENCE_MAX_STEPS)
     assert _diverged_parameters(final_uninterrupted, final_resumed) == []
