@@ -102,6 +102,11 @@ def _rng_sensitive_block_ng_config(*, load: dict[str, str] | None = None):
     """
 
     config = _equivalence_config(load=load)
+    # Compose the score-capable TPEN test model with the runner's existing
+    # persisted MCMC/checkpoint path; no fixture invents score semantics.
+    config.model._target_ = "tests.unit.training.test_sr_trainer_integration.build_connected_model"
+    config.system.n_particles = 3
+    config.sampler.n_electrons = 3
     preset = OmegaConf.load(BLOCK_NG_PRESET)
     config.optimizer = preset.optimizer
     config.trainer.update_method = preset.trainer.update_method
