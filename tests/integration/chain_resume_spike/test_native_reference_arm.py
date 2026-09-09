@@ -1,23 +1,35 @@
-"""ARM N: G0 reproduced against the REAL ``tpen.checkpoint`` save/restore path.
+"""ARM N: fresh-process native resume on the REAL VMCTrainer and MetropolisSampler.
 
-SKIPPED WHERE TORCH IS ABSENT, WHICH INCLUDES THE DEVELOPMENT WORKSTATION.
-``torch`` is not installed in the project venv on this host, so every test in
-this module skips locally and only executes inside a Cannon allocation. A skip
-is UNMEASURED. It is never a pass, and a green local run says nothing whatever
-about the native surfaces.
+SKIPPED WHERE TORCH IS ABSENT, WHICH INCLUDES THE DEVELOPMENT WORKSTATION. Every
+node here skips locally and executes only inside a Cannon allocation. **A skip is
+UNMEASURED. It is never a pass, and a green local run says nothing whatever
+about the native surfaces.**
 
-What this arm adds over ARM T: ARM T drives production's selection and validity
-code but writes its payload without ``torch``. Here the payload writes, the
-manifest, the rename, the catalog sequence AND the whole of
-``restore_checkpoint`` are production's own. The two apply seams under test are
-``restore.py:207`` (``_load_sampler``) and ``restore.py:208``
-(``apply_rng_state``).
+WHAT THIS ARM ADDS, AND WHAT IT DELIBERATELY DOES NOT RE-PROVE.
+``tests/integration/training/test_train_runner.py`` already establishes native
+bitwise resume equivalence on real components, compared on values and on
+byte-identical ``train`` metric lines. This module does not repeat that. It adds
+the three dimensions that test does not cover:
 
-What this arm may NOT claim is in
-``tests.helpers.chain_resume_spike.native_probe``'s module docstring, and it is
-repeated in the recipe README: the domain objects are stand-ins, factor-rich
-method and callback replay is HI L5a's (e2e512eb), and the mutation arms use a
-MONKEYPATCH, which is not a production seam.
+1. **every resume is a FRESH OS PROCESS** -- that test runs its arms inside one
+   pytest process, where a live sampler and generator survive in memory;
+2. **a per-limb disable at the APPLY SEAM with attribution** -- that test
+   perturbs the saved sampler bytes, which is a different mechanism from
+   skipping the restore call, and skipping the call is what DS-A0 actually did;
+3. **which stream is load-bearing**, derived from source and then measured.
+
+THE SOURCE-DERIVED EXPECTATION, stated before any run. Every sampling draw
+passes the sampler's private generator (``metropolis.py`` 182 and 294;
+``moves.py`` 39, 93, 98, whose docstring says the move "does not own an RNG ...
+all Markov-chain randomness belongs to the sampler"). Nothing in a training step
+draws from the process globals. So skipping ``_load_sampler`` must move the
+trajectory and skipping ``apply_rng_state`` should not. **If a run contradicts
+either, that is a finding about production, not a licence to edit the
+expectation.**
+
+Both mutation arms assert on a **witness that the no-op was actually invoked**,
+so neither can pass because a patch silently failed to apply -- which would make
+the ``inert`` arm green for entirely the wrong reason.
 """
 
 from __future__ import annotations
@@ -30,9 +42,10 @@ from pathlib import Path
 import pytest
 
 from tests.helpers.chain_resume_spike.native_probe import (
-    NATIVE_CHANNELS,
-    NATIVE_SEAM_CHANNELS,
-    first_native_divergence,
+    DISABLEABLE_SEAMS,
+    SEAM_TRAJECTORY_EXPECTATION,
+    VMC_MAX_STEPS,
+    VMC_RESUME_STEP,
     torch_is_available,
 )
 
@@ -47,28 +60,19 @@ pytestmark = [
     ),
 ]
 
-#: Steps the uninterrupted native arm runs.
-TOTAL_STEPS = 4
-#: Step at which it commits the generation the resumed arm restores.
-CHECKPOINT_AT = 2
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _run_native_attempt(
+def _run_arm(
     workspace: Path,
     *,
-    steps: int,
-    checkpoint_at: int | None = None,
-    restore_from: Path | None = None,
+    resume_from: Path | None = None,
     disabled_seams: tuple[str, ...] = (),
 ) -> dict:
-    """Run one native attempt in a FRESH OS PROCESS and return its evidence.
+    """Run one native VMC arm in a FRESH OS PROCESS and return its evidence.
 
-    The native arm is held to the same rule as the torch-free one: no
-    in-process resume. Reseeding globals inside a surviving interpreter cannot
-    perturb module state or caches, so only a new process starts from nothing.
-    ``sys.executable`` is absolute; a bare interpreter name is forbidden here by
+    ``sys.executable`` is absolute; a bare interpreter name is forbidden across
+    this package and enforced by
     ``tests/unit/chain_resume_spike/test_spawn_uses_absolute_interpreter.py``.
     """
 
@@ -78,45 +82,49 @@ def _run_native_attempt(
         sys.executable,
         "-m",
         "tests.helpers.chain_resume_spike.native_probe",
-        "--workspace",
-        str(workspace),
-        "--steps",
-        str(steps),
+        "--run-root",
+        str(workspace / "runs"),
         "--output",
         str(output),
     ]
-    if checkpoint_at is not None:
-        argv += ["--checkpoint-at", str(checkpoint_at)]
-    if restore_from is not None:
-        argv += ["--restore-from", str(restore_from)]
+    if resume_from is not None:
+        argv += ["--resume-from", str(resume_from)]
     for seam in disabled_seams:
         argv += ["--disable-seam", seam]
 
     completed = subprocess.run(
-        argv, cwd=str(_REPO_ROOT), capture_output=True, text=True, timeout=600
+        argv, cwd=str(_REPO_ROOT), capture_output=True, text=True, timeout=1800
     )
     assert completed.returncode == 0, (
-        f"native attempt failed (rc={completed.returncode})\n"
+        f"native arm failed (rc={completed.returncode})\n"
         f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
     )
     return json.loads(output.read_text(encoding="utf-8"))
 
 
+def _tail(evidence: dict) -> list[list]:
+    """Return the metric lines from the resume step onward."""
+
+    return [row for row in evidence["train_metric_lines"] if row[0] >= VMC_RESUME_STEP]
+
+
 @pytest.fixture(scope="module")
-def uninterrupted_native(tmp_path_factory) -> tuple[dict, Path]:
-    """Run the uninterrupted native arm once; return its evidence and gen K."""
+def uninterrupted(tmp_path_factory) -> tuple[dict, Path]:
+    """ARM A: one uninterrupted native run; returns its evidence and gen K.
 
-    base = tmp_path_factory.mktemp("native-uninterrupted")
-    evidence = _run_native_attempt(
-        base / "arm-a", steps=TOTAL_STEPS, checkpoint_at=CHECKPOINT_AT
-    )
-    assert evidence["committed"], "the native arm committed no generation"
-    return evidence, Path(evidence["committed"])
+    Module-scoped so every resume arm restores from the identical baseline,
+    which is what makes each mutation arm a single-variable change rather than
+    two runs differing in an unknown number of ways.
+    """
+
+    workspace = tmp_path_factory.mktemp("native-uninterrupted")
+    evidence = _run_arm(workspace)
+    source = Path(evidence["run_dir"]) / "checkpoints" / f"step_{VMC_RESUME_STEP:06d}"
+    assert (source / "COMPLETE").exists(), "arm A wrote no resume source"
+    return evidence, source
 
 
-def test_the_job_reports_its_own_interpreter_and_torch_version(
-    uninterrupted_native,
-) -> None:
+def test_the_job_reports_its_own_interpreter_and_torch_version(uninterrupted) -> None:
     """Provenance is read IN-JOB, not inferred from the submitting shell.
 
     On a facility host the two routinely disagree about which interpreter is
@@ -124,75 +132,119 @@ def test_the_job_reports_its_own_interpreter_and_torch_version(
     claim about which environment produced it.
     """
 
-    evidence, _ = uninterrupted_native
+    evidence, _ = uninterrupted
     runtime = evidence["runtime"]
     assert Path(runtime["executable"]).is_absolute()
     assert runtime["torch_version"], "the job recorded no torch version"
     assert runtime["python_version"].startswith("3.")
 
 
-def test_native_resume_reproduces_the_uninterrupted_subsequent_draws(
-    uninterrupted_native, tmp_path
-) -> None:
-    """GREEN ARM, run first. Real save, real restore, compared on later draws."""
+def test_the_seam_expectation_map_covers_every_disableable_seam() -> None:
+    """Precondition for attribution: every seam has a stated expected direction.
 
-    evidence, generation = uninterrupted_native
-    resumed = _run_native_attempt(
-        tmp_path / "arm-b", steps=TOTAL_STEPS - CHECKPOINT_AT, restore_from=generation
-    )
-
-    assert resumed["pid"] != evidence["pid"], "the native resume was not a fresh process"
-    assert resumed["process_seed"] != evidence["process_seed"], (
-        "the resumed native process drew the same seed as its parent, so parity "
-        "cannot distinguish a restore from a reinitialization"
-    )
-    assert resumed["restored_from"]["next_iteration"] == CHECKPOINT_AT
-
-    divergence = first_native_divergence(evidence["trace"][CHECKPOINT_AT:], resumed["trace"])
-    assert divergence is None, (
-        f"native restore did not reproduce the uninterrupted stream at {divergence}"
-    )
-
-
-@pytest.mark.parametrize("seam", sorted(NATIVE_SEAM_CHANNELS), ids=lambda seam: seam)
-def test_disabling_one_native_restore_seam_diverges_in_its_own_channel(
-    uninterrupted_native, tmp_path, seam: str
-) -> None:
-    """One production apply seam skipped per arm, with channel attribution.
-
-    Reproduces the DS-A0 defect deliberately: DS-A0 saved RNG state and never
-    applied it, and its parity assertion could not see that. Here, skipping
-    ``apply_rng_state`` must show up in the process-global channels and
-    skipping ``_load_sampler`` in the sampler channel -- redness alone would
-    not distinguish them.
+    A seam with no stated expectation could not have a mutation arm that means
+    anything -- whatever it did would be consistent with the map.
     """
 
-    evidence, generation = uninterrupted_native
-    resumed = _run_native_attempt(
-        tmp_path / f"arm-{seam}",
-        steps=TOTAL_STEPS - CHECKPOINT_AT,
-        restore_from=generation,
-        disabled_seams=(seam,),
-    )
-
-    divergence = first_native_divergence(evidence["trace"][CHECKPOINT_AT:], resumed["trace"])
-    assert divergence is not None, (
-        f"skipping the real {seam} did not perturb the continuation, so the native "
-        "parity gate is blind to that seam"
-    )
-    _, channel = divergence
-    assert channel in NATIVE_SEAM_CHANNELS[seam], (
-        f"skipping {seam} diverged in {channel!r}, which it does not feed "
-        f"(it feeds {sorted(NATIVE_SEAM_CHANNELS[seam])})"
+    assert set(SEAM_TRAJECTORY_EXPECTATION) == set(DISABLEABLE_SEAMS)
+    assert set(SEAM_TRAJECTORY_EXPECTATION.values()) == {"diverges", "inert"}, (
+        "the map must contain both directions, or it asserts nothing by contrast"
     )
 
 
-def test_the_native_channel_map_is_disjoint_and_total() -> None:
-    """Precondition for the attribution above, asserted rather than assumed."""
+def test_a_fresh_process_native_resume_reproduces_the_uninterrupted_trajectory(
+    uninterrupted, tmp_path
+) -> None:
+    """GREEN ARM, run first. Real save, real restore, fresh process, later draws.
 
-    seen: set[str] = set()
-    for seam, channels in NATIVE_SEAM_CHANNELS.items():
-        assert channels, f"{seam} feeds no channel, so its mutation arm is vacuous"
-        assert not (seen & channels), f"{seam} shares a channel with another seam"
-        seen |= channels
-    assert seen == set(NATIVE_CHANNELS)
+    Compared on the ``train`` metric lines the resumed arm emits, which are a
+    function of the batch sampled at each step and therefore an observation of
+    SUBSEQUENT DRAWS -- not of a restored value read back. The final model
+    digests and the durable counters are compared as well, so a run that
+    reproduced the metrics while diverging in weights could not pass.
+    """
+
+    evidence, source = uninterrupted
+    resumed = _run_arm(tmp_path / "resumed", resume_from=source)
+
+    assert resumed["pid"] != evidence["pid"], "the native resume was not a fresh process"
+    assert resumed["seams_invoked"] == [], "a seam was bypassed in the green arm"
+
+    # The resumed arm runs only the steps it actually has left.
+    assert [row[0] for row in resumed["train_metric_lines"]] == list(
+        range(VMC_RESUME_STEP, VMC_MAX_STEPS)
+    )
+    assert resumed["train_metric_lines"] == _tail(evidence), (
+        "the resumed native trajectory is not byte-identical to the uninterrupted one"
+    )
+    assert resumed["model_digests"] == evidence["model_digests"]
+    assert resumed["trainer_state"] == evidence["trainer_state"]
+    assert resumed["trainer_state"]["next_iteration"] == VMC_MAX_STEPS
+    assert resumed["trainer_state"]["completed_updates"] == VMC_MAX_STEPS
+
+
+def test_skipping_the_sampler_restore_moves_the_native_trajectory(
+    uninterrupted, tmp_path
+) -> None:
+    """The operative stream. Skipping restore.py:207 must change what is drawn.
+
+    This is the DS-A0 shape reproduced on real components: the state is present
+    in the checkpoint and simply never applied. If this arm did not diverge, the
+    green arm above would be passing without depending on the sampler state at
+    all.
+    """
+
+    evidence, source = uninterrupted
+    resumed = _run_arm(
+        tmp_path / "no-sampler", resume_from=source, disabled_seams=("_load_sampler",)
+    )
+
+    assert resumed["seams_invoked"] == ["_load_sampler"], (
+        "the sampler seam was never reached, so this arm skipped nothing and its "
+        "result says nothing about that seam"
+    )
+    assert SEAM_TRAJECTORY_EXPECTATION["_load_sampler"] == "diverges"
+    assert resumed["train_metric_lines"] != _tail(evidence), (
+        "skipping the real _load_sampler did not perturb the trajectory; the "
+        "native parity gate is blind to the sampler stream"
+    )
+
+
+def test_skipping_the_global_rng_restore_leaves_the_native_trajectory_unchanged(
+    uninterrupted, tmp_path
+) -> None:
+    """The inert stream, and the finding worth carrying to R1/R2/R3.
+
+    Derived from source before measuring: every sampling draw uses the sampler's
+    private generator, so nothing in a training step consumes the process
+    globals ``apply_rng_state`` restores. This arm asserts that, and it is only
+    meaningful because the witness proves the seam was genuinely reached and
+    bypassed -- otherwise "unchanged" would be equally consistent with a patch
+    that never applied.
+
+    CONSEQUENCE, stated as a property rather than a reassurance: ``rng.pt`` is
+    load-bearing for the restore-REFUSAL gate but not for TRAJECTORY in this
+    configuration. A chain backend must preserve the sampler's own state; the
+    process globals alone are not what has to survive a job boundary.
+
+    If this arm ever goes red, something in the training path has begun drawing
+    from the process globals. That is a finding about production and must be
+    reported, not silenced by relaxing this assertion.
+    """
+
+    evidence, source = uninterrupted
+    resumed = _run_arm(
+        tmp_path / "no-global-rng", resume_from=source, disabled_seams=("apply_rng_state",)
+    )
+
+    assert resumed["seams_invoked"] == ["apply_rng_state"], (
+        "the global-RNG seam was never reached, so 'unchanged' below would be "
+        "vacuous -- it would be measuring a patch that never applied"
+    )
+    assert SEAM_TRAJECTORY_EXPECTATION["apply_rng_state"] == "inert"
+    assert resumed["train_metric_lines"] == _tail(evidence), (
+        "skipping apply_rng_state changed the native trajectory, so a training "
+        "step now consumes the process-global RNG stream. This CONTRADICTS the "
+        "source-derived expectation and is a finding about production."
+    )
+    assert resumed["model_digests"] == evidence["model_digests"]
