@@ -34,7 +34,10 @@ that R1/R2/R3 can drive them against a real backend. R0 drives none of them.
 
 **Any skipped or unexecuted required arm is UNMEASURED, never PASS.** ARM N
 skips wholesale on any host without `torch`, which includes the development
-workstation. A green local run establishes nothing about the native surfaces.
+workstation, so a green LOCAL run establishes nothing about the native surfaces.
+It has now been EXECUTED in Cannon job 45645515 (5/5, no skips) — see the
+measured section below. Read the local skip and the Cannon result as two
+different facts.
 
 ---
 
@@ -80,42 +83,120 @@ about this fixture, not about production TPEN.**
 `tests/helpers/chain_resume_spike/native_probe.py` plus
 `tests/integration/chain_resume_spike/test_native_reference_arm.py`.
 
-Drives the real `save_checkpoint` and the real `restore_checkpoint` in
-`train_resume` mode, including the `torch.save` payload writes and the two
-production apply seams `restore.py:207` (`_load_sampler`) and `restore.py:208`
-(`apply_rng_state`).
+Drives the shipped VMC smoke configuration through `run_from_config` with the
+**real `VMCTrainer`, real `MetropolisSampler`**, real model and real optimizer —
+`max_steps=6`, a checkpoint at step 3, and a resumed arm continuing from it.
 
-**ARM N may not claim toy-level exact resume of a real TPEN run.** Its model,
-optimizer, trainer and sampler are minimal stand-ins satisfying the interfaces
-the checkpoint path requires — not `VMCTrainer`, `MetropolisSampler` or a real
-wavefunction. Standing those up would make a failure ambiguous between the
-checkpoint path and the physics setup.
+**WHAT THIS ARM DOES NOT RE-PROVE, stated so it claims no credit for existing
+coverage.** `tests/integration/training/test_train_runner.py` already
+establishes native bitwise resume equivalence on real components, compared on
+values and on byte-identical `train` metric lines. ARM N adds the three
+dimensions that test does not cover:
 
-**EXECUTED ON CANNON, AND IT FAILED. ARM N REMAINS UNMEASURED FOR G0.** Slurm
-job 45615268, requested `seas_compute,kozinsky,sapphire`, delivered `kozinsky`,
-node holy8a29106, 4 CPU / 32 GiB / 30 min, elapsed 00:03:09. Scheduler state
-`FAILED 1:0`; inner `PYTEST_RC=1`. Both are EARNED — nothing exits 0
-deliberately. In-job assertions passed: Python 3.12.13, torch 2.12.0+cpu, CUDA
-unavailable, numpy 2.4.6, checkout SHA verified in-job. Result: **2 passed, 3
-failed.** The two that passed are the provenance and channel-map nodes, **neither
-of which is a parity claim — do not read "2 passed" as evidence about native
-resume.**
+1. **Every resume is a fresh OS process.** That test runs all of its arms inside
+   one pytest process, where a live sampler and its generator survive in memory.
+   A chain link is a new process on a new allocation.
+2. **The disable is at the apply seam.** That test perturbs the *saved* sampler
+   bytes; ARM N skips the *restore call itself*, which is what a code omission
+   does and what DS-A0 actually did.
+3. **Which stream is load-bearing**, below.
+
+#### Which stream has to survive a job boundary
+
+Derived from the source **before** any run, not fitted to a measurement. Every
+draw in the sampling path passes the sampler's own private generator —
+`metropolis.py:182` (initial positions), `metropolis.py:294` (acceptance
+uniforms), and `moves.py` 39/93/98, whose docstring states that the move *"does
+not own an RNG … all Markov-chain randomness belongs to the sampler"*. Nothing
+in a training step draws from the process-global torch stream.
+
+| Seam skipped | Expected | Why |
+|---|---|---|
+| `_load_sampler` (restore.py:207) | **diverges** | restores the operative stream and the walkers |
+| `apply_rng_state` (restore.py:208) | **inert** | no training step consumes the globals it restores |
+
+**The second row is a finding, not a nuisance.** `rng.pt` is load-bearing for
+the restore-*refusal* gate (`require_restorable_rng_state`, and
+`test_train_runner`'s missing-RNG arm) but **not** for trajectory in this
+configuration. A chain backend must preserve the sampler's own state; restoring
+the process globals alone would not be enough. If that arm ever goes red,
+something in the training path has begun drawing from the globals — the test
+says so in its own failure message, and that is a finding about production
+rather than something to silence.
+
+Both mutation arms assert a **witness that the no-op was actually invoked**.
+Without it, a genuinely inert seam and a patch that never applied are
+indistinguishable, and the `inert` arm would pass for entirely the wrong reason.
+
+**MONKEYPATCH DISCLOSURE.** Production exposes no flag to skip one restore limb,
+so the arms rebind `tpen.checkpoint.restore.apply_rng_state` and
+`tpen.checkpoint.restore._load_sampler` at their call sites, from test code. **A
+monkeypatch is not a production seam.** It reproduces what a code omission would
+do; it does not show that production has, or should have, a switch there. No
+file under `tpen/` is modified.
+
+#### MEASURED ON CANNON — ARM N IS NOW COVERED FOR G0
+
+Slurm job **45645515**, partition `test` (requested and delivered), node
+`holy8a24401`, 4 CPU / 32 GiB / 45 min wall, elapsed **00:04:50**. Scheduler
+state **COMPLETED**, `ExitCode 0:0`; inner `NATIVE_PYTEST_RC=0` and
+`ARMT_PYTEST_RC=0`. Scheduler state and inner exit are recorded as separate
+fields; both are **EARNED** — the script exits with the test status and nothing
+exits 0 deliberately.
+
+In-job provenance, asserted inside the allocation rather than inferred from the
+submitting shell: `CHECKOUT_SHA=179eb0b965860b217be39670c3cd49e041e627fc`,
+Python 3.12.13, torch 2.12.0+cpu, CUDA unavailable, numpy 2.4.6, interpreter
+under the job-local Netscratch venv with no interpreter pinned and `uv` invoked
+by absolute path.
+
+**Native arm: `tests=5 failures=0 errors=0 skipped=0`** (junitxml). All five
+nodes executed — no skips, because torch is present:
+
+| Node | Result |
+|---|---|
+| in-job interpreter and torch provenance | PASS |
+| seam expectation map covers every seam | PASS |
+| **fresh-process native resume reproduces the uninterrupted trajectory** | **PASS** |
+| **skipping `_load_sampler` moves the trajectory** | **PASS** |
+| **skipping `apply_rng_state` leaves it unchanged** | **PASS** |
+
+**The source-derived prediction held in both directions.** The sampler seam is
+the operative stream and the global-RNG seam is inert for trajectory — measured,
+not assumed, and predicted before the run rather than fitted to it. Each
+mutation arm's witness confirmed the seam was genuinely reached and bypassed, so
+the inert result is not a patch that failed to apply.
+
+**ARM T re-run in the same allocation under torch PRESENT:
+`tests=112 failures=0 errors=0 skipped=0`.** This matters specifically for the
+torch-free import test: on the workstation torch is absent, so a stray
+`import torch` in a shared module would fail as a *missing module*; here it
+would land in `sys.modules` and be caught as the *property violation* it is.
+That condition cannot be reproduced locally, and it cost no extra allocation.
+
+Evidence preserved under the job's Netscratch log directory (`.out`, `.err`, and
+both junitxml files) and under the superseded job 45615268's directory. No
+cleanup without an explicit lifecycle disposition.
+
+#### The earlier stand-in arm, and why it was replaced rather than repaired
+
+The first ARM N used minimal stand-ins and executed on Cannon as job 45615268
+(delivered `kozinsky`, scheduler `FAILED 1:0`, inner `PYTEST_RC=1`, 2 passed / 3
+failed). **The two that passed were the provenance and seam-map nodes — neither
+is a parity claim, so "2 passed" was never evidence about native resume.**
 
 Root cause, and it **exonerates production**: `restore.py:137` calls
-`_verify_hash` for `model_config` and raises *manifest missing model_config*.
-The arm calls the real `save_checkpoint`, which builds hashes from
-`checkpoint_hashes(cfg)`, and the shared test run context supplies an **empty**
-config — so no `model_config` hash was ever written and restore correctly
-refused. **A restore path that fails closed on an under-specified manifest is
-exactly the behaviour R1/R2/R3 will want to rely on.** The fix is in this lane's
-own fixture, not in `tpen/`.
+`_verify_hash` for `model_config` unconditionally, `hashing.py:94-99` builds that
+hash from the model config, and the shared test run context supplies an *empty*
+config — so no `model_config` hash was written and restore correctly refused. **A
+restore path that fails closed on an under-specified manifest is exactly the
+behaviour the candidate lanes will want to rely on**, and it is recorded here as
+a positive result rather than buried as the cause of a red.
 
-**MONKEYPATCH DISCLOSURE.** Production exposes no flag to skip one restore limb.
-The ARM N mutation arms rebind `tpen.checkpoint.restore.apply_rng_state` and
-`tpen.checkpoint.restore._load_sampler` at their call sites, from test code.
-**A monkeypatch is not a production seam.** It reproduces what a code omission
-would do; it does not show that production has, or should have, a switch there.
-No file under `tpen/` is modified by this lane.
+That arm was replaced rather than patched: a real config supplies `model_config`
+naturally, and patching the stand-in would have produced a green arm whose
+greenness meant nothing about native trajectory exactness — the toy-only claim
+the shared contract forbids.
 
 ---
 
