@@ -283,8 +283,30 @@ def test_the_detector_does_not_fire_on_a_correct_spawn() -> None:
 @pytest.mark.parametrize(
     "module", _package_modules(), ids=lambda path: path.name
 )
-def test_no_module_in_this_package_spawns_a_bare_interpreter(module: Path) -> None:
-    """The clause itself, module by module so a failure names the file."""
+def test_no_module_spawns_a_bare_interpreter_by_its_literal_initial_binding(
+    module: Path,
+) -> None:
+    """No module spawns a bare interpreter BY ITS LITERAL INITIAL BINDING.
+
+    RE-SCOPED, because the earlier wording claimed a universal a static scan
+    cannot carry. The NAME carried that same universal one round longer than
+    this docstring did, which is why the sweep renamed it too: a node id is
+    the interface a downstream reader sees, and re-scoping the prose while
+    leaving the name is the defect this lane already recorded once. The checker resolves ``argv`` through its INITIAL list
+    binding, so a RUNTIME REASSIGNMENT of ``argv[0]`` after the list is
+    constructed is **NOT DETECTED**. The claim is therefore about statically
+    determinable argv, not about every reachable spawn.
+
+    NO LIVE DEFECT: every launcher in this package builds its argv literally and
+    passes ``sys.executable``, verified by the nodes above and by
+    ``test_sys_executable_is_absolute_at_runtime``.
+
+    REMEDY, NAMED AND NOT BUILT: either dataflow analysis over reassignments, or
+    assert the launched interpreter's identity IN-JOB and compare it against the
+    one intended -- which is what
+    ``test_the_child_reports_the_same_absolute_interpreter_it_was_launched_with``
+    does for one launcher and does not generalise to all of them.
+    """
 
     violations = _spawn_violations(module.read_text(encoding="utf-8"), str(module))
     assert violations == [], "\n".join(violations)

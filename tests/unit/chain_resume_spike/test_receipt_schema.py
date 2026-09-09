@@ -76,13 +76,20 @@ def test_the_write_leaves_no_temporary_file_behind(tmp_path) -> None:
     assert sorted(item.name for item in tmp_path.iterdir()) == ["receipt.json"]
 
 
-def test_a_partially_written_receipt_is_never_observable(tmp_path) -> None:
-    """A reader sees the whole receipt or no receipt, never a prefix.
+def test_the_committed_receipt_parses_as_one_whole_document(tmp_path) -> None:
+    """The committed file is a complete document, read once after the write.
 
-    Guaranteed by writing to a sibling and renaming, the same discipline
-    ``tpen.checkpoint.save`` uses for a checkpoint directory. Asserted by
-    reading the committed file back as strict JSON: a truncated write would
-    not parse.
+    The write goes to a sibling and renames, the same discipline
+    ``tpen.checkpoint.save`` uses for a checkpoint directory, and the
+    committed file parses as strict JSON: a truncated write would not.
+
+    WHAT IT DOES NOT ESTABLISH, and the earlier name asserted otherwise: **A
+    TORN READ IS NOT EXCLUDED.** This node constructs no partial state and
+    runs no concurrent reader, so it never looks while a write is in flight.
+    It samples one instant after the rename. The rename is what makes a torn
+    read unreachable; this node observes the rename's RESULT and does not
+    exercise the window the claim is about. Found by the round-5 claims sweep,
+    in a file nobody had flagged.
     """
 
     path = tmp_path / "receipt.json"

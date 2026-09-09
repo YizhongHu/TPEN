@@ -2,12 +2,15 @@
 
 ## WHAT THIS MODULE ESTABLISHES, AND WHAT IT DOES NOT
 
-It establishes **INJECTION-SITE ENTRY**: that each registered fault point is
-reached and its injection runs. **IT DOES NOT ESTABLISH EFFECT COMPLETION.**
-Recording that control arrived at an injection point is not evidence that the
-injection did anything, and the claim is scoped accordingly rather than
-annotated -- an artefact that says "exercised" while proving only entry is a
-false claim in the thing downstream lanes read.
+It establishes that **AN INJECTION WAS REQUESTED UNDER THAT IDENTITY**. It does
+NOT establish effect completion, and it does NOT establish the *site*: the
+record derives from the fault PLAN, not from where the injection landed.
+
+The earlier wording here said "injection-site entry", which is too strong --
+*entry* implies the site, and the site is precisely what is unobserved. The
+claim is re-scoped rather than annotated, because an artefact that says
+"exercised" while proving only that a request was made is a false claim in the
+thing downstream lanes read.
 
 MEASURED, not argued: a mutant that keeps ``record_fire(fault.point)`` and
 RETURNS instead of raising ``InjectedFault`` passes every node in this module.
@@ -31,14 +34,33 @@ measured to FAIL under that same no-effect mutant because ``raised`` was
 A downstream reader wanting effect evidence for a point should follow those
 node ids, not this module.
 
-## THE ONE NAMED LIMIT
+## THREE NAMED LIMITS
 
-**``TORN_CATALOG_ROW``'s EFFECT DELIVERY IS UNMEASURED.** Only a
-suppressed-RAISE mutant has ever been built, and it cannot reach that point:
+**1. BOUNDARY ATTRIBUTION IS NOT OBSERVED, AND AMONG THE PRECOMMIT POINTS IT IS
+UNACHIEVABLE UNDER ``RAISE``.** Not merely unmeasured -- unachievable, and the
+reason is structural. Every point here is driven with ``FaultAction.RAISE``. The
+four precommit points all abort before the rename (save.py:211), and the
+replicated ``finally`` (save.py:245) removes ``tmp_dir`` on unwind, so all four
+leave an **identical end state**: no committed generation and no residue. No
+observation after the fact can tell them apart. Distinguishing them would need a
+non-unwinding action, which this module does not use.
+
+**2. GENERATION ATTRIBUTION IS NOT OBSERVED.** Tearing an EARLIER generation's
+catalog row while the final generation's row stands passes every node here.
+Nothing in this module binds a recorded point to the generation it damaged.
+
+**3. ``TORN_CATALOG_ROW``'s EFFECT DELIVERY IS UNMEASURED**, and this is now
+confirmed by a measured mutant rather than only disclosed: suppressing the
+actual torn-row write while leaving the recorder and ``RAISE`` intact passes all
+of this module's nodes and the whole unit arm. The suppressed-RAISE mutant
+cannot reach that point either --
 ``test_a_torn_final_catalog_row_is_diagnosed_and_repairable`` truncates the
 catalog directly rather than injecting through ``FaultAction.RAISE``, so that
-mutant is INAPPLICABLE to it rather than defeated by it. Six of the seven
-points have RAISE-boundary effect evidence; the torn row has none.
+mutant is INAPPLICABLE to it rather than defeated by it.
+
+``MEASURED_POINTS`` has **EIGHT** members: the seven RAISE-boundary points, all
+of which have effect evidence in the nodes named above, plus
+``TORN_CATALOG_ROW``, which has none.
 
 ## A RESIDUAL IN NAMING, DISCLOSED RATHER THAN FIXED
 
@@ -174,13 +196,16 @@ def test_every_registered_fault_point_is_reached_when_injected(
 ) -> None:
     """REACHABILITY, one node per point so a gap names itself.
 
-    Asserts the reached set EQUALS ``{point}`` rather than merely containing it,
-    which also catches a fault dispatched at the WRONG BOUNDARY -- a point that
-    fired when a different one was requested. That is a real property and this
-    module does establish it.
+    Set equality establishes that the RECORDED name matches the REQUESTED name.
+    **IT DOES NOT ESTABLISH THAT THE INJECTION OCCURRED AT THE SITE THAT NAME
+    DENOTES**, because the record derives from the plan: ``_apply_fault`` calls
+    ``record_fire(fault.point)``, which is the requested identity. Exchanging
+    two real injection sites while leaving the plan intact leaves this set
+    unchanged, and every node here passes.
 
-    It does NOT establish that the injection had an effect. See the module
-    docstring for where effect delivery is established.
+    It does not establish that the injection had an effect either. See the
+    module docstring for where effect delivery is established, and for the two
+    attribution limits.
     """
 
     log = tmp_path / "fires.log"

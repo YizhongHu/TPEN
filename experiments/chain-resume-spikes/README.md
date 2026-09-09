@@ -15,6 +15,21 @@ generation-preservation and evidence-schema tests. R0 selects no backend.
 This section is the load-bearing part of the document. Read it before quoting
 any result from this lane.
 
+> **THE SINGLE MOST CONSEQUENTIAL FACT FOR R1, R2 AND R3, STATED HERE RATHER
+> THAN LEFT TO BE INFERRED FROM FIVE SEPARATE `UNMEASURED` ROWS: THIS SHARED
+> ORACLE IS SCOPED TO LOCAL FAULT INJECTION AND DOES NOT COVER THE
+> SCHEDULER-INTERACTION GATES THE CANDIDATE LANES EXIST TO TEST.**
+>
+> G2 real scheduler-walltime exhaustion, G4 controller restart, G5
+> accepted-submit-lost-ack, G7 cancellation and budgets, and G9 parallel
+> placement are **all UNMEASURED**, and they are the gates that distinguish
+> Balsam from PBS from Globus Compute. What R0 delivers is a stochastic
+> chain-resume oracle plus a local fault harness: **it will tell a candidate
+> lane whether its resume reproduces the trajectory, and it will not tell that
+> lane anything about how its scheduler behaves.** Reading the table row by row
+> makes each absence look like a detail; together they are the shape of the
+> deliverable, and **a docs amendment does not change it.**
+
 | Gate | Status in R0 | What backs it |
 |---|---|---|
 | **G0** stochastic parity with restore-disabled mutation | **COVERED** | `tests/unit/chain_resume_spike/test_fixture_stream_sensitivity.py` (ARM T) and `tests/integration/chain_resume_spike/test_native_reference_arm.py` (ARM N) |
@@ -84,7 +99,8 @@ about this fixture, not about production TPEN.**
 `tests/integration/chain_resume_spike/test_native_reference_arm.py`.
 
 Drives the shipped VMC smoke configuration through `run_from_config` with the
-**real `VMCTrainer`, real `MetropolisSampler`**, real model and real optimizer —
+**real `VMCTrainer`, real `MetropolisSampler`**, a real optimizer, and a
+**TEST-HELPER ansatz** (qualified below) —
 `max_steps=6`, a checkpoint at step 3, and a resumed arm continuing from it.
 
 **WHAT THIS ARM DOES NOT RE-PROVE, stated so it claims no credit for existing
@@ -117,20 +133,41 @@ local-energy path draws nothing. That docstring also names the scoping trap this
 arm would otherwise have fallen into — a claim scoped to `tpen/physics/` could
 not see a stochastic layer added in `tpen/nn/`.
 
-**Precision, and it makes the claim true rather than merely convenient.** The
-global stream *is* consumed — at **construction**. `path_aggregation.py:211`
-calls `nn.init.xavier_uniform_(weight)` bare, with no generator. So the correct
-statement is **"no global draw occurs during a training step"**, never "nothing
-draws from the process globals", which is false. `update.py` puts
-initialization-time RNG out of scope for exactly that reason: it runs before the
-step.
+**Precision — `path_aggregation.py:211` is INAPPLICABLE to this arm, not merely
+configuration-dependent.** The distinction matters: *configuration-dependent*
+suggests a setting that could flip, while **inapplicable** says the code path is
+not in this arm's program at all. An earlier version of this section said the
+global stream *is* consumed at construction, citing `path_aggregation.py:211`'s
+bare
+`nn.init.xavier_uniform_(weight)`. **That call is never reached by this arm.** It
+sits inside `if self.initializer is None`, in a module this arm never loads: the
+configured model is
+`tests.helpers.trainable_wavefunctions.TrainableHookeSingletAnsatz`, which
+imports only `tpen.data.batch` from `tpen` and contains no `xavier`, `nn.init`,
+`initializer`, `PathAggregation` or global-RNG use at all.
 
-This does not weaken the asymmetry — construction precedes restore and the
-restored `state_dict` overwrites those weights — but the global stream's
-*position* does differ between attempts, and **if any future code draws from the
-globals after construction, the asymmetry flips.** The finding is a latent
-property held in place by the absence of a post-construction global consumer,
-not a guarantee.
+`native_probe` loads `vmc_smoke.yaml`, whose `_target_` is that test ansatz, and
+**no configuration of this arm reaches `PathAggregation`** — so there is no
+setting under which line 211 becomes live here.
+
+So for this arm, **nothing consumes the process-global stream at construction OR
+during a step** — which is why the inert result is what it is, and it is a fact
+about the fixture rather than a measurement of production.
+
+**THE FLIP CONDITIONS, both real, neither exercised here.** A configuration that
+*does* reach a bare initializer consumes the globals at construction — harmless
+for trajectory, since construction precedes restore and the restored
+`state_dict` overwrites those weights, but it moves the stream's position. And
+if any future code draws from the globals *after* construction, the asymmetry
+inverts outright. The finding is a latent property held in place by the absence
+of a post-construction global consumer, not a guarantee.
+
+**REAL-MODEL QUALIFICATION.** The ansatz above is a **test helper**, not a
+`tpen/nn` production model. ARM N therefore establishes native **trainer,
+sampler, optimizer and checkpoint replay**; it does **not** establish
+production-model replay. The basis is still the repo's own native footing —
+`test_train_runner.py` loads the same fixture — but no reader should infer a
+production ansatz was replayed.
 
 | Seam skipped | Expected | Why |
 |---|---|---|
@@ -149,6 +186,54 @@ rather than something to silence.
 Both mutation arms assert a **witness that the no-op was actually invoked**.
 Without it, a genuinely inert seam and a patch that never applied are
 indistinguishable, and the `inert` arm would pass for entirely the wrong reason.
+
+#### The C10 residual, in two parts, with the bound that produced it
+
+The order machinery is two checks with different exposures, and conflating them
+overstates both:
+
+* The **order assertion** derives its record from **inside a wrapper on the real
+  production callable**, so a reorder of the wrapped calls moves the record with
+  it. It is **wrapper-dependent and evadable** — a write that does not route
+  through the wrapped binding is invisible to it.
+* The **no-unbacked-pointer assertion** installs nothing and reads only
+  `latest.json` and `publications.jsonl`. Nothing to bypass — but it is
+  **end-state-only**, sampling after a completed publish and after each
+  post-commit interruption.
+
+**THE BOUND, stated as a bound rather than as "C10 is broken": the checks
+discriminate for operations routed through the wrapped bindings, and are blind
+to out-of-path writes.** Positive controls establish that they *do*
+discriminate — a **duplicate** catalog call fails the order node; an **omitted**
+catalog call fails the order node *and* the pointer-state node. A verifier then
+produced a transient unbacked pointer via an early write on a different import
+path, and both nodes passed: out of path for the first, gone before the second
+looked.
+
+**What closes the gap is the instantaneous window**, observed with no installed
+instrument *during* a publish. That arm is designed in note
+`c10-observable-order-design` and is **NOT BUILT** — a budget decision, recorded
+here so it is a named residual rather than a silent hole.
+
+**THE FULL NAMED-AND-NOT-BUILT INVENTORY, in the repo artefact rather than only
+in the tracker.** Three arms are designed and unbuilt, and a residual that lives
+only in a tracker note is a residual R1/R2/R3 will not find:
+
+1. **The instantaneous-window arm** above — closes C10's transient gap.
+2. **The globals-channel control** for ARM N — moves the observable *through*
+   the channel the inert arm disables, and is what would convert that arm's
+   silence from a declaration into a measurement.
+3. **CRASH SAMPLING.** Sampling durable state *from outside the process* while a
+   publish is in flight, rather than at chosen moments inside it. Every
+   process-death arm here kills at a **fixture-chosen boundary**, so the deaths
+   are sampled from a set this lane picked; a real crash is not. **This arm
+   appeared nowhere in this README until the round-5 sweep put it here** — it
+   was named in the implementation receipt and in tracker notes, which is
+   exactly the replacement-without-retirement failure the sweep exists to catch.
+
+None of the three is a defect in what was built. Each is a bound on what the
+built thing establishes, and each is stated so that a downstream lane inherits
+the bound rather than the impression.
 
 **And the witness has its own control**, because otherwise its correctness is
 itself unwitnessed — the same recursion as the disable-verification problem.
@@ -206,6 +291,208 @@ That condition cannot be reproduced locally, and it cost no extra allocation.
 Evidence preserved under the job's Netscratch log directory (`.out`, `.err`, and
 both junitxml files) and under the superseded job 45615268's directory. No
 cleanup without an explicit lifecycle disposition.
+
+#### What ARM N establishes, decomposed into four buckets
+
+A single verdict hides which clauses are load-bearing. Read the arm as four
+kinds of statement, not one:
+
+**MEASURED — with a witness.** Skipping `_load_sampler` moves the trajectory,
+and the bypass witness proves the seam was genuinely reached and skipped. The
+green arm reproduces the uninterrupted trajectory byte-identically on train
+metric lines, plus model digests and both durable counters. **This is the half
+R1/R2/R3 need: the sampler's own state must survive a job boundary.**
+
+**DECLARATION — production's own, to which this arm lends no evidence.** "No
+global draw occurs during a training step" rests on `update.py` 166-185, which
+declares it as an AST-resolved precondition. The arm does not test it. It was
+previously reported as though the measured arm supported it; it does not.
+
+**NEVER EXERCISED in this fixture.** Construction consuming the globals
+(`path_aggregation.py:211`, the default-initializer path). This arm's configured
+model never reaches that module, so the case is untouched here — neither
+confirmed nor contradicted.
+
+**NAMED AND NOT BUILT.** A control that moves the observable *through the channel
+the inert arm disables*, **inside ARM N**. That is what would convert the inert
+result from a declaration into a measurement. Its absence is why the bucket
+exists. **Inside ARM N the arm could not detect a global-RNG omission even if
+one existed**, because there is no consumer and so no channel through which the
+observable could move. That is a statement about *this arm*; the next paragraph
+draws the line against the lane.
+
+**AND THE REASON THE FOURTH BUCKET IS NOT EMPTY IS WORTH THE SPACE: SHARING AN
+OBSERVABLE IS NOT SHARING A CHANNEL.** All three arms compare the same
+observable, which is necessary and was verified by three parties. But the
+diverging arm moves that observable through the **sampler's private generator**,
+while the inert arm makes a claim about the **process globals**.
+
+**WHAT ARM N LACKS IS A CONSUMER, NOT A DETECTOR.** State this precisely,
+because the loose version understates the lane and an understatement is as false
+a record as an overstatement. The globals channel **does** have a demonstrated
+mover — in ARM T. `test_disabling_one_limb_diverges_in_that_limb_own_channel`
+runs `GLOBAL_RNG` as one of its arms and requires the divergence to land in a
+channel that limb actually feeds, and
+`test_the_channel_map_partitions_every_observable_channel` establishes the map
+is disjoint and total, so `GLOBAL_RNG`'s `{noise_term, parameters}` cannot be
+mistaken for another limb's redness. **The lane can detect a globals omission
+wherever a consumer exists.** ARM N's configured ansatz simply never draws from
+the globals, so in *that* arm there is nothing for an omission to perturb.
+
+Both halves have to be said, because each alone is misleading. Its inert result
+is **fixture-guaranteed** — a fact about this arm's model, **not** a limit on
+the lane's ability to detect a globals omission. And **the same fact that
+explains that result disqualifies it as evidence**: an absence can only fail to
+contradict a capability claim, never support one. So dropping the
+`path_aggregation.py:211` caveat removes a distractor and **adds no sensitivity
+evidence**. On the globals channel, ARM T carries the weight and ARM N
+contributes nothing.
+
+Three independent verifications all confirmed the stated requirement and all were
+correct. **Independence of party is not independence of question**: each checked
+the same condition, so concurrence measured execution rather than sufficiency.
+
+#### The record-binding audit: can the action move without moving the record?
+
+The claims sweep is a **prose** instrument. This is a **structural** one, and it
+finds things prose cannot, so it is run separately over every record-or-witness
+mechanism in the lane rather than only over the one whose defect was being
+chased. That scoping error is itself the finding that prompted it: the question
+was asked of the order mechanism and **not** of the coverage mechanism, in the
+same file, in the same round.
+
+**A record is supposed to witness an act, and that relationship has two ends.**
+Mutating the **record** — log a different name, suppress the entry — proves the
+record is *consumed*. Mutating the **act** — move the real operation, leave the
+record correct — proves the record is *bound to it*. **Either result alone is
+consistent with a working mechanism**, so value-level bidirectionality, however
+rigorously run, cannot separate them: present/absent and on/off both live at the
+record end.
+
+| mechanism | can the act move without the record? | status |
+|---|---|---|
+| `record_fire` (`faults.py`) | **YES** — it records the *plan's* identity, so exchanging two real injection sites leaves the set unchanged | known limit, stated at the instrument |
+| `boundary_log` (`fixture.py`) | **YES** — a self-report emitted beside the operation | known limit; this is the original C10 finding |
+| `_observe_real_operation_order` wrappers | **NO** for wrapped calls — the record is *inside* a wrapper on the real callable | bound, with the out-of-path write named as its bound |
+| `_SEAM_INVOCATIONS` (`native_probe.py`) | **NO** — the record is emitted *by* the patched no-op, so the record **is** the act | bound; a missed patch fails loudly rather than silently |
+| `LimbApplication.consumed` (`restore_limbs.py`) | **NO** — derived by fingerprinting the live object against the checkpointed fingerprint, never by echoing the requested flag | bound by construction, and separately tested |
+| ledger `credited` (`entrypoint.py`) | **N/A** — the record *is* the credit; there is no separate act to displace | not a witness relationship |
+
+**RESULT: NO NEW MECHANISM DEFECT.** Two mechanisms are separable and both were
+already carrying that limit at the instrument; three are bound, one by
+construction; one is not a witness relationship at all. **Nothing here required
+a mechanism change** — consistent with the claims sweep, which also found only
+claims wider than correct checks.
+
+**FOR R1/R2/R3, AS A CHECK TO RUN RATHER THAN A RESULT TO INHERIT:** for any
+check of the shape *X records or witnesses Y*, write the mutant **pair**
+explicitly — one that moves X, one that moves Y — and state what each
+establishes. Then ask it of **every** mechanism in the file, not just the one
+under suspicion.
+
+#### The claims sweep: every assertive claim in the lane, classified
+
+Four universals were attacked in verification and **all four were false as
+written**. That is a population problem, not four incidents, so the response was
+to sweep the population rather than patch the found ones. A fifth fell out of the
+sweep, in a file nobody had flagged.
+
+**COVERAGE, stated as examined-over-total, because a partial audit that does not
+say so IS the defect.**
+
+**SWEPT BY CLAIM SHAPE, NOT BY KEYWORD.** A keyword vocabulary is one
+instrument, and it was measured to miss a real find: of the two retired wordings
+still live in this file at `c73ad66`, the regex caught one via `proves` and was
+**blind to the other**, which carries no assertive keyword at all. So the
+keyword count is a **floor, not the population**, and bounding the sweep by it
+would inherit the vocabulary instead of sweeping the corpus. The shapes swept
+are the ones that have actually produced false claims in this lane:
+
+| claim shape | lines matched |
+|---|---|
+| instantaneous-vs-sampled (`at the moment`, `while`, `during`, `when`) | 97 |
+| entry-vs-completion (`reached`, `entered`, `invoked`, `takes effect`) | 96 |
+| requested-vs-occurred (evidence from a plan, label, record or name) | 234 |
+| declared-vs-measured (resting on production's own statement) | 32 |
+| universal vocabulary (the original keyword floor) | 578 |
+| **union — the population** | **881** |
+
+| population | total | examined |
+|---|---|---|
+| lane files, Python **and Markdown** | 25 | **25 (100%)** |
+| prose lines scanned by shape | 3001 | **3001 (100%)** |
+| node names carrying a universal | 17 | **17 (100%), each body opened** |
+| claim lines individually read | 129 | **129 (100%)** |
+
+**AND THE LIMIT, because this census has one.** The corpus holds **433 claim
+sites** (224 Python docstrings plus 209 Markdown paragraphs), of which **142
+make a claim** (79 docstrings, 63 paragraphs). Every one was shape-scanned;
+**not every one received an individual four-way verdict.** The individual
+verdicts cover the 17 universal-bearing node names in full, the 129 flagged
+claim lines, and every site the shape scan raised in the two highest-risk
+categories. **A reader should treat the four counts below as complete for the
+node-name population and as a floor for the prose.**
+
+**CLASSIFICATION OF THE 17 NODE NAMES** — the high-yield class, since every
+confirmed defect lived there rather than in body prose:
+
+- **ESTABLISHED — 8.** The universal is true over a closed, enumerated
+  population that the body actually iterates: the fault-point registry, the
+  channel map, `RestoreLimb`, the outcome-kind enum, `DISABLEABLE_SEAMS`, the
+  empty-witness node, the SIGKILL survival node, and the no-temp-file node whose
+  end-state claim matches its end-state check.
+- **RE-SCOPED — 4.** Universal claimed, weaker property checked. The C10 pointer
+  node; `test_the_committed_receipt_parses_as_one_whole_document`, formerly
+  asserting a torn read is *never observable* while writing and reading at one
+  instant with no partial state and no concurrent reader;
+  `test_reconciliation_does_not_rewrite_the_committed_payload_bytes`, formerly
+  claiming a committed generation is *never* destructively edited while
+  exercising exactly one operation; and the C8 node, whose **name** still carried
+  the universal **its own docstring had already retracted one round earlier**.
+- **BOUNDED — 2.** The universal holds over a named population the docstring now
+  states: `any random stream` means the three `RestoreLimb` members, and
+  `every shared module` means the hand-maintained `SHARED_MODULES` list, not a
+  computed set.
+- **NOT CLAIMS — 3.** `credit_all`, `all_enabled`, `all_disabled` are helper
+  operation names.
+- **UNESTABLISHED and deleted — 0.**
+
+**THREE FINDS THAT LIVED OUTSIDE EVERY EARLIER DIFF RANGE.** Two retired
+wordings were still asserted in this file while their corrected versions were
+asserted elsewhere in it — *at the moment `latest.json` is published*, and *the
+fire record proves injection-site entry* — so **the artefact stated both the
+correction and the thing it retired**. Replacement without retirement. Both are
+corrected above, in place, with the retired wording named so the diff is
+legible. The third was an absence: **crash sampling appeared nowhere in this
+README**, living only in the implementation receipt and tracker notes. A
+residual recorded only in a tracker is a residual a downstream lane never finds,
+so the full named-and-not-built inventory is now in this file.
+
+**NO MECHANISM CHANGE WAS REQUIRED, and that is a finding rather than a
+convenience.** Every defect the sweep found was a claim wider than a correct
+check. Not one instrument was measuring the wrong thing; each was measuring a
+real property and describing it too broadly.
+
+**THE PATTERN, for R1/R2/R3: the name outlives the correction.** Three of the
+five re-scopes were nodes whose prose had already been fixed while the
+identifier kept asserting the retracted universal — the C8 node did it inside the
+file this same round corrected. **A node id is an interface**; a reader who
+never opens the body sees only the name, and a suite summary quotes nothing else.
+Re-scope both, in the same change, or the artefact still lies.
+
+#### A limit of how this lane was built, which R1/R2/R3 will inherit
+
+Three times in this lane a finding was recorded and then **not applied one file
+over**: ARM T's limb→channel map was not carried into ARM N; the C10
+record-separable-from-action fix was not turned on C9's attribution; and a design
+note saying precommit damage assertions cannot use `RAISE` was not turned on the
+coverage instrument in that same file. Each time the knowledge existed and was
+written down.
+
+**A finding stays scoped to the artefact you were looking at when you made it.**
+It is not landed when it is recorded — only when it has been applied to every
+instrument already in scope, and this lane had no step that did that. Each
+candidate lane will build two arms; the gap will be between them.
 
 #### The earlier stand-in arm, and why it was replaced rather than repaired
 
@@ -609,14 +896,38 @@ same as observing the thing.
   in place passed the static pin, the runtime pin, and all 112 nodes. The order
   is now derived from **inside a wrapper around the real production callable**,
   so displacing the call necessarily displaces its record, and separately from
-  **observable filesystem state** — at the moment `latest.json` is published,
-  the catalog row must already be on disk. Neither reads a label. On that same
-  mutant the two self-report checks still pass while both new checks fail.
-* **Fault coverage.** The fire record proves **injection-site entry, not effect
-  completion**: a mutant keeping `record_fire` and returning instead of raising
-  passes every coverage node. That claim is now **re-scoped to reachability**
+  **observable filesystem state** — sampled immediately before the pointer write
+  executes, at which instant the catalog row must already be on disk. Neither
+  reads a label. On that same mutant the two self-report checks still pass while
+  both new checks fail.
+
+  **PROVENANCE, BECAUSE THIS BULLET OTHERWISE READS AS ONE EXECUTION AND IS
+  THREE.** The operation-only reorder above was measured at the earlier revision
+  — this lane's own run and the verifier's independent `52c84fe` pair, which are
+  **separately attributed evidence, not one result.** It was **NOT re-run** at
+  the `d22ef8f` pin. What *was* independently measured at that pin is a
+  different family: the **out-of-path bypass**, the **duplicate** catalog call,
+  and the **dropped** catalog call. Both sets are real; **combining them into a
+  single implied d22 reorder execution would be a fourth false universal of the
+  provenance kind**, and the count of "112 nodes" belongs to the revision where
+  it was taken, not to the current suite.
+
+  **RETIRED WORDING, CORRECTED HERE:** this bullet used to
+  say *at the moment `latest.json` is published*, the instantaneous claim C10
+  gave up. The wrapper-derived order establishes catalog COMPLETION before
+  pointer-call ENTRY, and the state check is END-STATE ONLY, so a transient
+  unbacked pointer between samples is **not** excluded.
+* **Fault coverage.** The fire record establishes only that **an injection was
+  REQUESTED under that identity**: a mutant keeping `record_fire` and returning
+  instead of raising passes every coverage node. That claim is **re-scoped**
   rather than annotated, because an artefact saying "exercised" while proving
-  only entry is false in the thing downstream lanes read. Effect delivery for
+  something weaker is false in the thing downstream lanes read. **RETIRED
+  WORDING, CORRECTED HERE:** this bullet used to say the record proves
+  *injection-site entry*, which item 2 retired — **entry implies the site, and
+  the site is the unobserved thing.** Nor is BOUNDARY attribution among the
+  precommit points merely unobserved: it is **UNACHIEVABLE under `RAISE`**, all
+  four aborting before the rename while the replicated `finally` erases
+  `tmp_dir`, leaving an identical end state. Effect delivery for
   the seven RAISE-boundary points is established by named nodes in
   `test_generation_preservation.py`; `TORN_CATALOG_ROW`'s effect delivery is a
   **named UNMEASURED limit**, since only a suppressed-RAISE mutant exists and it

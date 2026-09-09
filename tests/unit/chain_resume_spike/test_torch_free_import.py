@@ -148,6 +148,12 @@ def test_importing_every_shared_module_together_stays_torch_free() -> None:
     Per-module nodes cannot see an import that only happens when two modules are
     loaded together -- a conditional import keyed on another module being
     present, for instance.
+
+    THE POPULATION IS ``SHARED_MODULES``, A HAND-MAINTAINED LIST, not a
+    computed set of this package's modules. "Every shared module" in the node
+    name means every member of that list; a shared module absent from it is
+    outside the claim and this node cannot report it. Bounded by the round-5
+    claims sweep.
     """
 
     joint = "; ".join(f"import {name}" for name in SHARED_MODULES)

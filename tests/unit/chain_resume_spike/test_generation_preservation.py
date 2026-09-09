@@ -570,12 +570,21 @@ def test_a_torn_final_catalog_row_is_diagnosed_and_repairable(tmp_path) -> None:
     assert [ref.next_iteration for ref in read_publications(catalog_path)] == [2, 4]
 
 
-def test_a_committed_generation_is_never_destructively_edited(tmp_path) -> None:
-    """Reconciliation repairs indexes only; the payload bytes must not move.
+def test_reconciliation_does_not_rewrite_the_committed_payload_bytes(
+    tmp_path,
+) -> None:
+    """ONE operation, sampled either side of it. Reconciliation repairs indexes
+    only; the payload bytes must not move.
 
     ``reconcile_publication``'s contract says so explicitly (catalog.py:199-201).
     Pinned here because a repair that rewrote a committed scientific artifact
     would be a far worse failure than the missing row it fixed.
+
+    WHAT IT DOES NOT ESTABLISH, and the earlier name asserted otherwise: this
+    exercises ``reconcile_publication`` and nothing else, comparing bytes
+    before and after that single call. **IMMUTABILITY UNDER ANY OTHER
+    OPERATION IS NOT ESTABLISHED HERE**, and neither is immutability between
+    the two samples. Re-scoped by the round-5 claims sweep.
     """
 
     root = tmp_path / "root"
@@ -716,7 +725,12 @@ def test_generation_one_survives_a_process_death_that_never_unwinds(
 
 
 def test_committing_a_generation_does_not_disturb_any_random_stream(tmp_path) -> None:
-    """SAVE IS RNG-NEUTRAL. Pinned directly, because G0 does not pin it.
+    """SAVE IS RNG-NEUTRAL over the fixture's OWN enumerated streams.
+
+    The population is ``RestoreLimb``, a closed enum of this fixture's three
+    limbs, and the loop below covers it exactly. "Any random stream" in the
+    node name is bounded by that enum -- a stream this fixture does not hold
+    is outside the claim. Pinned directly, because G0 does not pin it.
 
     G0 compares draws taken after a restore, so it detects a mismatch between
     what was CAPTURED and what is live afterwards. It does not detect a save
@@ -769,19 +783,34 @@ def test_committing_a_generation_does_not_disturb_any_random_stream(tmp_path) ->
 # So the two checks below never read a label. One derives the order from INSIDE
 # a wrapper around the real production callable, so displacing the call
 # necessarily displaces its record -- there is no separate emission statement to
-# leave behind. The other reads the FILESYSTEM at the instant the pointer is
-# published, which is a property of the world that no breadcrumb can lie about.
+# leave behind. The other reads the FILESYSTEM immediately before the pointer
+# write executes, which is a property of the world that no breadcrumb can lie
+# about -- and immediately before, not after, because the precondition is only
+# meaningful while the pointer does not yet exist.
 
 
 def _observe_real_operation_order(monkeypatch) -> list[str]:
     """Wrap the real publish and write_latest; return the order they took effect.
 
-    The record is emitted BY THE WRAPPER, AFTER the wrapped call returns, so it
-    reports completion rather than intent and cannot be separated from the
-    operation. Patching the names the fixture actually resolves --
-    ``CheckpointCatalog.publish`` on the class, and the module-level
-    ``write_latest`` the fixture imported -- means a reordering of the call
-    sites reorders these records too.
+    Each record is emitted BY THE WRAPPER, so displacing a call displaces its
+    record -- there is no separate emission statement to leave behind. Patching
+    the names the fixture actually resolves -- ``CheckpointCatalog.publish`` on
+    the class, and the module-level ``write_latest`` the fixture imported --
+    means a reordering of the call sites reorders these records too.
+
+    THE TWO RECORDS ARE NOT TAKEN AT THE SAME POINT, and the earlier wording,
+    which said both were taken after the wrapped call returned, was FALSE of
+    the second one. ``wrapped_publish`` records AFTER ``real_publish`` returns,
+    so it reports COMPLETION. ``wrapped_write_latest`` records BEFORE
+    ``real_write_latest`` is called, and deliberately so: the filesystem
+    precondition it samples is only meaningful while the pointer does not yet
+    exist, and sampling it after the return would read a world in which the
+    pointer is already published.
+
+    So the sequence establishes CATALOG COMPLETION BEFORE POINTER-CALL ENTRY --
+    which is what the caller asserts, and what a reordering breaks -- and NOT
+    the completion of both operations. THE POINTER WRITE'S OWN COMPLETION IS
+    NOT OBSERVED HERE; the end-state node is what covers it.
 
     Returns the observed sequence, which the caller asserts against production's
     own order.
@@ -858,14 +887,32 @@ def test_the_real_publish_takes_effect_before_the_real_latest_write(
     assert declared.index("catalog_published") < declared.index("latest_written")
 
 
-def test_the_pointer_is_never_visible_before_its_catalog_row(tmp_path) -> None:
-    """The same property as durable state, with no wrapper and no record at all.
+def test_no_completed_publish_or_post_commit_interruption_leaves_an_unbacked_pointer(
+    tmp_path,
+) -> None:
+    """DURABLE state only, at the moments this samples. Instrument-free.
 
-    Asserted over what is ON DISK after a completed publish and after an
-    interruption in each post-commit window: there is no reachable state in
-    which ``latest.json`` names a generation the catalog does not carry. This
-    is deliberately instrument-free -- nothing here can be displaced by a
-    mutant, because nothing here is emitted by the code under test.
+    WHAT IT ESTABLISHES: at each moment it looks, ``latest.json`` does not name
+    a generation the catalog fails to carry. It samples exactly twice per
+    scenario -- once after a COMPLETED publish, and once after an injected
+    interruption in each post-commit window.
+
+    WHAT IT DOES NOT ESTABLISH, and the earlier name asserted otherwise: **A
+    TRANSIENT UNBACKED POINTER BETWEEN THOSE MOMENTS IS NOT EXCLUDED.** This
+    node was previously called ``..._is_never_visible_...``, which claims a
+    universal over every instant while the implementation examines one instant
+    after the fact. A verifier produced exactly that transient state --
+    ``latest.json`` naming ``step_000002`` with an empty catalog, mid-publish,
+    via a write that did not route through the wrapped bindings -- and this node
+    passed, correctly, because the state was gone before it looked.
+
+    Closing the instantaneous window needs an observation with no installed
+    instrument taken DURING a publish; that arm is designed in note
+    ``c10-observable-order-design`` and is NOT BUILT.
+
+    It remains instrument-free in the sense that matters for the order check
+    beside it: nothing here is emitted by the code under test, so no mutant can
+    displace a record -- there is no record.
     """
 
     root = tmp_path / "root"
