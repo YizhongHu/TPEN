@@ -17,6 +17,42 @@ writes the catalog BEFORE ``latest.json`` (save.py:226 then save.py:229), so
 ``after_rename_before_catalog``, ``after_catalog_before_latest`` and
 ``after_latest_before_receipt`` are the three committed-but-unacknowledged
 states production can actually be interrupted in.
+
+**SELECTION IS ASSERTED ON THE SURFACE THAT GOVERNS RESUME.** Production reaches
+its checkpoint through ``restore.py:118`` -> ``resolve_checkpoint_dir`` ->
+``read_latest`` (artifact.py:68/71) and never lists directories:
+``list_complete_checkpoints`` has no caller in ``tpen/checkpoint`` outside its
+own definition and the package re-export. A clause proved only on the listing
+would be measured on a surface that decides nothing about resume, so these tests
+select through ``resume_generation`` and additionally PIN THE DISAGREEMENT
+between the two surfaces in both pre-``latest.json`` windows.
+
+**PROVENANCE OF THE VALIDATION BOUNDARY THESE ASSERTIONS REST ON.** The
+selection, validity and torn-row assertions rest on ``CheckpointRef``
+validation, which is closed in both directions BUT FROM DIFFERENT PLACES, and
+the distinction changes the failure mode:
+
+* CONSTRUCT direction -- **LOCAL** closure. ``reference.py`` ``__post_init__``
+  (72-86) runs ``_nonnegative_int``, ``_nonempty_text``, ``_require_sha256`` and
+  ``_freeze`` directly on the fields; ``_freeze`` (322-336) raises on anything
+  that is not ``None``, ``str``, ``bool``, ``int`` or ``float``. The check is at
+  the point of use.
+* DESERIALIZE direction -- **DOWNSTREAM** closure. ``_thaw`` (338-343)
+  VALIDATES NOTHING ITSELF. That path is safe only because
+  ``deserialize_checkpoint_ref`` (296) routes through
+  ``CheckpointRef.from_mapping``, which constructs the dataclass and re-runs the
+  SAME ``__post_init__``.
+
+A downstream closure holds only WHILE THE ROUTING HOLDS. A future caller
+reaching ``_thaw`` directly, or a deserialize path refactored to build a
+``CheckpointRef`` by any route bypassing ``__post_init__``, removes the
+validation silently -- no validator is edited and no test of the validators goes
+red. So these assertions depend on the ROUTE, not only on the checks.
+
+Note also that ``_freeze``'s acceptance of ``None`` is NOT the caller-open-leaf
+pattern: ``None`` is a legitimate terminal JSON scalar with nothing beneath it
+to descend into. The discriminator is whether anything remains BELOW the leaf,
+not the token itself.
 """
 
 from __future__ import annotations
@@ -40,14 +76,18 @@ from tests.helpers.chain_resume_spike.fixture import (
     BOUNDARY_ORDER,
     spawn_attempt,
     ContinuationSystem,
-    newest_valid_generation,
+    newest_listed_generation,
+    pointer_target_name,
+    resume_generation,
     publish_generation,
-    read_generation_payload,
-    restore_system,
 )
 from tests.helpers.chain_resume_spike.identity import new_attempt
 from tests.helpers.chain_resume_spike.parity import first_divergence
-from tests.helpers.chain_resume_spike.restore_limbs import RestorePolicy
+from tests.helpers.chain_resume_spike.receipt import read_receipt
+from tests.helpers.chain_resume_spike.restore_limbs import (
+    RestoreLimb,
+    live_limb_fingerprints,
+)
 from tpen.checkpoint.artifact import (
     is_complete_checkpoint_dir,
     list_complete_checkpoints,
@@ -154,12 +194,45 @@ def test_the_replica_boundary_order_matches_production_save_py() -> None:
         "tpen/checkpoint/save.py no longer performs these boundaries in the order "
         f"this fixture replicates: {located}"
     )
-    # The specific correction, asserted by name so a reader sees it directly.
-    catalog_line = dict(located)["catalog_published"]
-    latest_line = dict(located)["latest_written"]
-    assert catalog_line < latest_line, (
-        "production writes latest.json before the catalog; the committed-but-"
-        "unacknowledged fault points in faults.py are named the wrong way round"
+    # No separate catalog-before-latest assertion here: the ascending-order
+    # assertion above already entails it, since both names are in the anchor
+    # table. A second assertion of an implied fact reads like extra coverage and
+    # is not.
+
+
+def test_the_replica_executes_the_order_it_declares(tmp_path) -> None:
+    """RUNTIME pin. The static test above compares two DESCRIPTIONS; this runs the code.
+
+    The static test catches a drift in production's order and a drift in the
+    declaration, and it MISSES a drift in the third thing -- the executable
+    sequence inside ``publish_generation`` that the declaration stands for. A
+    mutant that reorders the actual publish and latest calls survives the static
+    test entirely, which was measured in the previous round.
+
+    So ``publish_generation`` records each boundary AS IT EXECUTES, and the
+    three orders are asserted equal in one place: observed == declared ==
+    derived from production source.
+    """
+
+    root = tmp_path / "root"
+    system = ContinuationSystem.fresh(seed=606)
+    system.run(CHECKPOINT_EVERY)
+    observed: list[str] = []
+    publish_generation(
+        root,
+        system,
+        new_attempt("replica-order", 0, None),
+        credited_steps=(0, 1),
+        boundary_log=observed,
+    )
+
+    assert observed == list(BOUNDARY_ORDER), (
+        "the replica did not execute the boundary sequence it declares:\n"
+        f"  observed: {observed}\n  declared: {list(BOUNDARY_ORDER)}"
+    )
+    production_order = [name for name, _ in PRODUCTION_ANCHORS]
+    assert observed == production_order, (
+        "the replica's executed order no longer matches production's source order"
     )
 
 
@@ -213,7 +286,7 @@ def test_a_precommit_fault_leaves_generation_one_selectable(tmp_path, point) -> 
     assert [path.name for path in complete] == ["step_000002"], (
         f"an interrupted pre-commit generation became selectable: {complete}"
     )
-    assert newest_valid_generation(root).name == "step_000002"
+    assert resume_generation(root).name == "step_000002"
     # latest.json still names generation 1, so a resume that trusts the pointer
     # lands on the last good generation rather than on nothing.
     assert read_latest(root)["checkpoint_dir"] == "step_000002"
@@ -260,7 +333,19 @@ def test_a_committed_but_unacknowledged_generation_is_valid_and_reconcilable(
         "the rename committed the checkpoint, so it must be selectable even "
         "though an acknowledgement is missing"
     )
-    assert newest_valid_generation(root).name == "step_000004"
+    # Listing always sees the committed directory: it is complete on disk.
+    assert newest_listed_generation(root).name == "step_000004"
+
+    # But the pointer is written LATER than the rename, so before it is written
+    # the two surfaces disagree -- and resume follows the pointer.
+    if point is FaultPoint.AFTER_LATEST_BEFORE_RECEIPT:
+        assert pointer_target_name(root) == "step_000004"
+        assert resume_generation(root).name == "step_000004"
+    else:
+        assert pointer_target_name(root) == "step_000002"
+        assert resume_generation(root).name == "step_000002", (
+            "resume must follow latest.json, which still names generation 1"
+        )
 
     reconcile_publication(root, generation_two)
 
@@ -268,10 +353,53 @@ def test_a_committed_but_unacknowledged_generation_is_valid_and_reconcilable(
     assert [ref.next_iteration for ref in published] == [2, 4]
     assert read_latest(root)["checkpoint_dir"] == "step_000004"
     assert publication_receipt_path(root).is_file()
+    # After reconciliation the two surfaces agree again.
+    assert resume_generation(root).name == newest_listed_generation(root).name
 
     # Idempotent: reconciling again must not append a duplicate row.
     reconcile_publication(root, generation_two)
     assert len(read_publications(publication_catalog_path(root))) == 2
+
+
+@pytest.mark.parametrize(
+    "point",
+    [FaultPoint.AFTER_RENAME_BEFORE_CATALOG, FaultPoint.AFTER_CATALOG_BEFORE_LATEST],
+    ids=lambda point: point.value,
+)
+def test_listing_and_the_resume_pointer_disagree_before_latest_is_written(
+    tmp_path, point
+) -> None:
+    """PIN THE DISAGREEMENT. This is a property, not an incident.
+
+    In both pre-``latest.json`` windows a newer generation is complete on disk
+    while the pointer still names the older one. Production resume reaches its
+    checkpoint through ``restore.py:118`` -> ``resolve_checkpoint_dir`` ->
+    ``read_latest`` (artifact.py:68/71) and NEVER lists:
+    ``list_complete_checkpoints`` has no caller in ``tpen/checkpoint`` outside
+    its own definition and the package re-export.
+
+    Pinned because R1/R2/R3 will build chain controllers. A controller that
+    picks up "the newest complete directory" selects generation 2 here, while
+    the production resume path selects generation 1 and replays the tail. Both
+    are defensible in isolation; together they are two controllers disagreeing
+    about what the chain's state is. The safe behaviour observed here is safe
+    BECAUSE OF WHICH SURFACE IS CONSULTED, not because of the directory state.
+    """
+
+    root = tmp_path / "root"
+    _, raised = _publish_two_generations(root, FaultPlan(point, FaultAction.RAISE))
+    assert isinstance(raised, InjectedFault)
+
+    listed = newest_listed_generation(root)
+    resumed = resume_generation(root)
+
+    assert listed.name == "step_000004", "the committed generation is not on disk"
+    assert resumed.name == "step_000002", "resume did not follow the pointer"
+    assert listed != resumed, (
+        "the two selection surfaces agreed, so this window no longer exercises "
+        "the disagreement this test exists to pin"
+    )
+    assert pointer_target_name(root) == "step_000002"
 
 
 def test_a_stale_tmp_directory_is_not_selectable_and_a_retry_does_not_collide(
@@ -320,39 +448,78 @@ def test_a_stale_tmp_directory_is_not_selectable_and_a_retry_does_not_collide(
     assert not stale.exists(), "the retry did not sweep the stale tmp directory"
 
 
+#: Cold-start seed shared by a reference run and a chain's first link. Only the
+#: COLD START is pinned; every resumed attempt still draws its own OS entropy.
+G6_COLD_START_SEED = 5_150_926
+
+
 def test_restoring_generation_one_after_a_failed_generation_two_reproduces_the_stream(
     tmp_path,
 ) -> None:
-    """The point of preserving generation 1: it still continues correctly.
+    """The point of preserving generation 1: it still CONTINUES correctly.
 
     Survival on disk is not the claim. The claim is that restoring generation 1
     and taking further draws reproduces what an uninterrupted run would have
     drawn -- so the comparison is on subsequent draws, as everywhere else.
+
+    THE RESTORE RUNS IN A FRESH OS PROCESS. An in-process restore leaves the
+    parent's live RNG objects in memory, so the comparison can pass without
+    anything having been restored -- the same vacuity the G0 arms exist to rule
+    out, and it was still present in this module in the previous round.
     """
 
-    root = tmp_path / "root"
-    reference = ContinuationSystem.fresh(seed=13_579)
-    identity = new_attempt("g6-parity", 0, None)
-    reference.run(CHECKPOINT_EVERY)
-    publish_generation(root, reference, identity, credited_steps=(0, 1))
-    expected_tail = reference.run(CHECKPOINT_EVERY)
+    total, every = 4, CHECKPOINT_EVERY
 
-    with pytest.raises(InjectedFault):
-        publish_generation(
-            root,
-            reference,
-            identity,
-            credited_steps=(0, 1, 2, 3),
-            fault=FaultPlan(FaultPoint.DURING_PAYLOAD_WRITE, FaultAction.RAISE),
-        )
-
-    survivor = newest_valid_generation(root)
-    assert survivor.name == "step_000002"
-    replacement = ContinuationSystem.fresh(seed=24_680)
-    restore_system(
-        replacement, read_generation_payload(survivor), RestorePolicy.all_enabled()
+    # ARM A: uninterrupted, from a pinned cold start so the two arms share an
+    # initial condition. Two independent cold starts share no trajectory.
+    reference_launch = spawn_attempt(
+        tmp_path / "reference",
+        root=tmp_path / "reference-root",
+        run_id="g6-parity",
+        attempt_index=0,
+        steps=total,
+        total_target=total,
+        checkpoint_every=every,
+        seed=G6_COLD_START_SEED,
     )
-    divergence = first_divergence(expected_tail, replacement.run(CHECKPOINT_EVERY))
+    assert reference_launch.exit_code == 0, reference_launch.log_path.read_text(
+        encoding="utf-8"
+    )
+    reference = read_receipt(reference_launch.receipt_path)
+
+    # ARM B: the same cold start, committing generation 1 and stopping.
+    root = tmp_path / "root"
+    first = spawn_attempt(
+        tmp_path / "a0", root=root, run_id="g6-parity", attempt_index=0,
+        steps=every, total_target=total, checkpoint_every=every,
+        seed=G6_COLD_START_SEED,
+    )
+    assert first.exit_code == 0, first.log_path.read_text(encoding="utf-8")
+    survivor = resume_generation(root)
+    assert survivor.name == "step_000002"
+
+    # Generation 2 fails before it is ever committed.
+    faulted = spawn_attempt(
+        tmp_path / "a1", root=root, run_id="g6-parity", attempt_index=1,
+        steps=every, total_target=total, checkpoint_every=every,
+        fault=FaultPlan(FaultPoint.DURING_PAYLOAD_WRITE, FaultAction.RAISE),
+    )
+    assert faulted.exit_code == 1
+    assert resume_generation(root).name == "step_000002", (
+        "the failed generation displaced the surviving one"
+    )
+
+    # Generation 1 still continues the stream, from a fresh process whose own
+    # seed differs from both arms above.
+    resumed = spawn_attempt(
+        tmp_path / "a2", root=root, run_id="g6-parity", attempt_index=2,
+        steps=total - every, total_target=total, checkpoint_every=every,
+    )
+    assert resumed.exit_code == 0, resumed.log_path.read_text(encoding="utf-8")
+    resumed_receipt = read_receipt(resumed.receipt_path)
+    assert resumed_receipt.process_seed != reference.process_seed
+
+    divergence = first_divergence(reference.trace[every:], resumed_receipt.trace)
     assert divergence is None, (
         "generation 1 survived on disk but no longer continues the stream: "
         + divergence.describe()
@@ -392,7 +559,7 @@ def test_a_torn_final_catalog_row_is_diagnosed_and_repairable(tmp_path) -> None:
         read_publications(catalog_path)
 
     # The committed directory is untouched by the torn index; selection still works.
-    assert newest_valid_generation(root).name == "step_000004"
+    assert resume_generation(root).name == "step_000004"
 
     # The repair the error message names: drop the unterminated final line, then
     # reconcile the newest complete directory that now has no row.
@@ -491,7 +658,7 @@ def test_generation_one_survives_a_process_death_that_never_unwinds(
         steps=2, total_target=6, checkpoint_every=2,
     )
     assert first.exit_code == 0, first.log_path.read_text(encoding="utf-8")
-    assert newest_valid_generation(root).name == "step_000002"
+    assert resume_generation(root).name == "step_000002"
 
     second = spawn_attempt(
         tmp_path / "a1", root=root, run_id="hardkill", attempt_index=1,
@@ -518,7 +685,7 @@ def test_generation_one_survives_a_process_death_that_never_unwinds(
     )
 
     # The property that must hold anyway.
-    assert newest_valid_generation(root).name == "step_000002"
+    assert resume_generation(root).name == "step_000002"
     assert [path.name for path in list_complete_checkpoints(root)] == ["step_000002"]
     assert read_latest(root)["checkpoint_dir"] == "step_000002"
     # Unconditional, not ``if residue.exists()``. All three of these actions
@@ -544,3 +711,44 @@ def test_generation_one_survives_a_process_death_that_never_unwinds(
     )
     assert third.exit_code == 0, third.log_path.read_text(encoding="utf-8")
     assert not residue.exists(), "the retry did not sweep the residue"
+
+
+def test_committing_a_generation_does_not_disturb_any_random_stream(tmp_path) -> None:
+    """SAVE IS RNG-NEUTRAL. Pinned directly, because G0 does not pin it.
+
+    G0 compares draws taken after a restore, so it detects a mismatch between
+    what was CAPTURED and what is live afterwards. It does not detect a save
+    that perturbs the streams BEFORE capturing them: measured in the previous
+    round, a mutant drawing all three streams before capture leaves G0 green,
+    while the same draws after capture turn G0 red. Neutrality therefore needs
+    its own assertion rather than being inferred from parity.
+
+    It matters for the chain because generations are committed mid-run. A save
+    that consumed entropy would make the trajectory depend on the checkpoint
+    CADENCE, so a run interrupted at a different point would not reproduce.
+    """
+
+    root = tmp_path / "root"
+    system = ContinuationSystem.fresh(seed=31_415)
+    system.run(3)
+
+    before = live_limb_fingerprints(system)
+    publish_generation(
+        root, system, new_attempt("neutrality", 0, None), credited_steps=(0, 1, 2)
+    )
+    after = live_limb_fingerprints(system)
+
+    for limb in RestoreLimb:
+        assert before[limb] == after[limb], (
+            f"committing a generation advanced the {limb.value} stream; the "
+            "trajectory would then depend on checkpoint cadence"
+        )
+
+    # And the stronger end-to-end form: the draws that FOLLOW a commit are the
+    # draws that would have followed no commit at all.
+    committed_tail = system.run(2)
+    reference = ContinuationSystem.fresh(seed=31_415)
+    reference.run(3)
+    assert first_divergence(reference.run(2), committed_tail) is None, (
+        "the post-commit trajectory diverged from an uncommitted one"
+    )

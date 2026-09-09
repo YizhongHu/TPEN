@@ -53,6 +53,8 @@ import numpy as np
 from tpen.checkpoint.artifact import (
     checkpoint_step_dir_name,
     list_complete_checkpoints,
+    read_latest,
+    resolve_checkpoint_dir,
     write_latest,
 )
 from tpen.checkpoint.catalog import CheckpointCatalog, publication_catalog_path
@@ -65,7 +67,7 @@ from tpen.checkpoint.manifest import (
 from tpen.checkpoint.receipt import publication_receipt_path, record_publication_receipt
 from tpen.checkpoint.reference import CheckpointRef
 
-from .faults import FaultAction, FaultPlan, FaultPoint, InjectedFault
+from .faults import FaultAction, FaultPlan, FaultPoint, InjectedFault, record_fire
 from .identity import ChainIdentity
 from .restore_limbs import (
     RestorePolicy,
@@ -361,6 +363,7 @@ def publish_generation(
     *,
     credited_steps: tuple[int, ...],
     fault: FaultPlan | None = None,
+    boundary_log: list[str] | None = None,
 ) -> Path:
     """Commit one checkpoint generation, reproducing ``save_checkpoint`` order.
 
@@ -377,6 +380,13 @@ def publish_generation(
         so the next attempt can rebuild the ledger without double counting.
     fault : FaultPlan or None, optional
         Interruption to inject. ``None`` runs the whole sequence.
+    boundary_log : list of str or None, optional
+        When supplied, each boundary name is appended AS IT EXECUTES. This is
+        what lets a test pin the order this function actually performs, rather
+        than the order :data:`BOUNDARY_ORDER` merely declares. A static
+        comparison of the declaration against production catches a drift in
+        either of those two, and misses a drift in the third thing -- the
+        executable code here that the declaration stands for.
 
     Returns
     -------
@@ -384,23 +394,35 @@ def publish_generation(
         The committed generation directory.
     """
 
+    def _boundary(name: str) -> None:
+        """Record that a boundary executed, in execution order."""
+
+        if boundary_log is not None:
+            boundary_log.append(name)
+
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     created_at = time.time()
     # Real production naming helper, not a local f-string.
     final_dir = root / checkpoint_step_dir_name(system.step)
     tmp_dir = root / f"{final_dir.name}.tmp"          # save.py:141
+    _boundary("tmp_dir_named")
     if final_dir.exists():                            # save.py:142
         raise FileExistsError(f"checkpoint already exists: {final_dir}")
+    # Recorded when the SWEEP RUNS, not when it removes something: the
+    # ``if`` itself is the boundary, and production executes it every time.
     if tmp_dir.exists():                              # save.py:144
         shutil.rmtree(tmp_dir)
+    _boundary("stale_tmp_removed")
     files: dict[str, str] = {}
     try:
         tmp_dir.mkdir(parents=True)                   # save.py:157
+        _boundary("tmp_dir_created")
         (tmp_dir / "resolved_config.yaml").write_text(
             "fixture: chain_resume_spike\n", encoding="utf-8"
         )                                             # save.py:158
         files["resolved_config"] = "resolved_config.yaml"
+        _boundary("resolved_config_written")
 
         # save.py:161/167/179/186 write these with ``torch.save``. THIS is the
         # replica: a torch-free byte writer, same files, same order.
@@ -417,12 +439,14 @@ def publish_generation(
             json.dumps({"note": "limbs travel in sampler.pt"}, sort_keys=True).encode("utf-8")
         )
         files["rng"] = "rng.pt"
+        _boundary("payload_written")
         _fire_if(fault, FaultPoint.AFTER_PAYLOAD_BEFORE_MANIFEST)
 
         # Real production hashing, over the real written bytes.
         hashes: dict[str, str | None] = {
             f"{key}_sha256": file_sha256(tmp_dir / name) for key, name in files.items()
         }                                             # save.py:194
+        _boundary("component_hashes_computed")
 
         manifest = CheckpointManifest(
             schema_version=CHECKPOINT_SCHEMA_VERSION,
@@ -442,22 +466,28 @@ def publish_generation(
             },
         )
         manifest.write(tmp_dir / "manifest.json")     # save.py:209
+        _boundary("manifest_written")
         _fire_if(fault, FaultPoint.AFTER_MANIFEST_BEFORE_COMPLETE)
 
         (tmp_dir / "COMPLETE").write_text("complete\n", encoding="utf-8")  # save.py:210
+        _boundary("complete_marker_written")
         _fire_if(fault, FaultPoint.AFTER_COMPLETE_BEFORE_RENAME)
 
         tmp_dir.rename(final_dir)                     # save.py:211  THE COMMIT
+        _boundary("renamed")
         _fire_if(fault, FaultPoint.AFTER_RENAME_BEFORE_CATALOG)
 
         ref = CheckpointRef.from_directory(final_dir)  # save.py:216
+        _boundary("ref_built")
         catalog = CheckpointCatalog(publication_catalog_path(root))
         catalog.publish(ref)                          # save.py:226
+        _boundary("catalog_published")
         _fire_if(fault, FaultPoint.AFTER_CATALOG_BEFORE_LATEST)
 
         write_latest(
             root, final_dir, step=int(system.step), created_at_unix=created_at
         )                                             # save.py:229
+        _boundary("latest_written")
         _fire_if(fault, FaultPoint.AFTER_LATEST_BEFORE_RECEIPT)
 
         record_publication_receipt(
@@ -468,6 +498,14 @@ def publish_generation(
             write_duration_sec=0.0,
             publish_duration_sec=0.0,
         )                                             # save.py:237
+        _boundary("receipt_recorded")
+
+        # TORN_CATALOG_ROW is damage to the INDEX after a clean commit, not an
+        # interruption of the commit, so it is applied here rather than by
+        # aborting mid-sequence. Making it a real registered injection -- rather
+        # than something a test arranges by hand -- is what lets the coverage
+        # check observe it FIRING like every other point.
+        _fire_torn_catalog_row(fault, root)
     finally:
         # ``finally``, matching save.py:245. Note what it does NOT cover, in
         # production or here: ``os._exit`` and an unhandled ``SIGTERM``/
@@ -485,6 +523,26 @@ def _fire_if(fault: FaultPlan | None, point: FaultPoint) -> None:
         _apply_fault(fault)
 
 
+def _fire_torn_catalog_row(fault: FaultPlan | None, root: Path) -> None:
+    """Tear the catalog's final row, if ``fault`` targets that point.
+
+    Truncates the last line and drops its terminating newline -- exactly what an
+    append interrupted mid-write leaves behind, and the shape
+    ``CheckpointCatalog.iter_publications`` diagnoses as recoverable
+    (catalog.py:127-150). The committed directory is untouched.
+    """
+
+    if fault is None or fault.point is not FaultPoint.TORN_CATALOG_ROW:
+        return
+    record_fire(FaultPoint.TORN_CATALOG_ROW)
+    catalog_path = publication_catalog_path(root)
+    rows = catalog_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    if not rows:
+        raise InjectedFault("cannot tear an empty catalog")
+    torn = rows[-1][: max(1, len(rows[-1]) // 2)].rstrip("\n")
+    catalog_path.write_text("".join(rows[:-1]) + torn, encoding="utf-8")
+
+
 def _apply_fault(fault: FaultPlan) -> None:
     """Terminate the attempt the way ``fault`` asks.
 
@@ -492,6 +550,10 @@ def _apply_fault(fault: FaultPlan) -> None:
     signal no handler can run for and still be the thing being tested. It
     writes a ready marker and blocks; the parent kills the process group.
     """
+
+    # Recorded FIRST, and durably. ``os._exit`` and ``SIGKILL`` below leave no
+    # chance to record anything afterwards, which is exactly their purpose.
+    record_fire(fault.point)
 
     if fault.action is FaultAction.RAISE:
         raise InjectedFault(f"injected fault at {fault.point.value}")
@@ -516,17 +578,61 @@ def _apply_fault(fault: FaultPlan) -> None:
 # ----------------------------------------------------------------------
 
 
-def newest_valid_generation(root: Path) -> Path | None:
-    """Return the newest selectable generation under ``root``, or ``None``.
+def resume_generation(root: Path) -> Path | None:
+    """Return the generation PRODUCTION RESUME would continue from, or ``None``.
 
-    Delegates entirely to ``tpen.checkpoint.artifact.list_complete_checkpoints``,
-    which is the production selector: it rejects ``.tmp`` directories and any
-    directory lacking ``manifest.json`` or ``COMPLETE``. Nothing about
-    selectability is reimplemented here.
+    THIS IS THE SELECTION SURFACE THAT GOVERNS RESUME, and it is the one the
+    fixture uses. ``restore_checkpoint`` reaches its checkpoint through exactly
+    one path: ``restore.py:118`` calls
+    ``tpen.checkpoint.artifact.resolve_checkpoint_dir``, which reads
+    ``latest.json`` (artifact.py:68 and :71). Measured at this revision:
+    ``list_complete_checkpoints`` has NO caller anywhere in ``tpen/checkpoint``
+    outside its own definition and the package ``__init__`` re-export. **The
+    production resume path never lists directories.**
+
+    Returns ``None`` when no pointer exists yet, which is a cold start.
+    """
+
+    root = Path(root)
+    if not (root / "latest.json").is_file():
+        return None
+    return resolve_checkpoint_dir(root)
+
+
+def newest_listed_generation(root: Path) -> Path | None:
+    """Return the newest generation a DIRECTORY LISTING would select.
+
+    Delegates to ``tpen.checkpoint.artifact.list_complete_checkpoints``, which
+    rejects ``.tmp`` names and directories lacking ``manifest.json`` or
+    ``COMPLETE``.
+
+    KEPT DELIBERATELY, AND DELIBERATELY NOT USED FOR RESUME. This function
+    exists so the DISAGREEMENT between the two surfaces can be pinned as an
+    explicit property. In the ``after_rename_before_catalog`` and
+    ``after_catalog_before_latest`` windows a newer generation is complete on
+    disk while ``latest.json`` still names the older one, so listing and the
+    pointer return DIFFERENT directories. R1/R2/R3 will build controllers, and
+    a controller that lists instead of reading the pointer selects a generation
+    the production resume path would not.
     """
 
     complete = list_complete_checkpoints(root)
     return complete[-1] if complete else None
+
+
+def pointer_target_name(root: Path) -> str | None:
+    """Return the bare directory name ``latest.json`` records, or ``None``.
+
+    Reads through production ``read_latest``. Exposed separately from
+    :func:`resume_generation` so a test can observe the pointer's CONTENT
+    without also exercising the validity checks ``resolve_checkpoint_dir``
+    applies on the way.
+    """
+
+    root = Path(root)
+    if not (root / "latest.json").is_file():
+        return None
+    return str(read_latest(root)["checkpoint_dir"])
 
 
 def read_generation_payload(checkpoint_dir: Path) -> dict[str, Any]:
@@ -587,6 +693,7 @@ def spawn_attempt(
     policy: RestorePolicy | None = None,
     fault: FaultPlan | None = None,
     restore_from: Path | None = None,
+    seed: int | None = None,
     timeout: float = 120.0,
 ) -> AttemptLaunch:
     """Run one continuation attempt in a FRESH OS PROCESS and collect its receipt.
@@ -622,6 +729,17 @@ def spawn_attempt(
         Restore policy. ``None`` means all limbs enabled.
     fault : FaultPlan or None, optional
         Fault to inject.
+    seed : int or None, optional
+        Pin this attempt's seed instead of drawing OS entropy. TEST-ONLY, and
+        legitimate for exactly one purpose: giving a COLD START a reproducible
+        initial condition, so an uninterrupted reference run and a chain can be
+        compared at all. Two independent cold starts share no trajectory, and
+        comparing them measures nothing.
+
+        Never pin it on a RESUMED attempt. Seed distinctness between a parent
+        and its resume is what stops parity from being satisfiable by
+        reinitialization, and it is asserted directly in
+        ``test_fixture_stream_sensitivity.py``.
     restore_from : pathlib.Path or None, optional
         Explicit committed generation to continue from. ``None`` selects the
         newest valid generation under ``root``. Naming it explicitly lets the
@@ -667,6 +785,13 @@ def spawn_attempt(
     ]
     if restore_from is not None:
         argv += ["--restore-from", str(restore_from)]
+    if seed is not None:
+        if restore_from is not None:
+            raise ValueError(
+                "refusing to pin the seed of a resumed attempt: seed distinctness "
+                "from the parent is what makes the parity gate non-vacuous"
+            )
+        argv += ["--seed", str(seed)]
     for token in policy.to_tokens():
         argv += ["--disable-limb", token]
     if fault is not None:
@@ -705,6 +830,96 @@ def spawn_attempt(
         log_path=log_path,
         killed_by_parent=killed_by_parent,
     )
+
+
+def spawn_publish_only(
+    workspace: Path,
+    *,
+    root: Path,
+    generation: Path,
+    cwd: Path,
+    timeout: float = 120.0,
+) -> dict[str, Any]:
+    """Publish an already-committed generation from a FRESH PROCESS at ``cwd``.
+
+    The path-spelling arm's launcher. ``generation`` and ``root`` are passed
+    exactly as written -- relative, absolute, or through a symlink -- and the
+    child runs with ``cwd`` as its working directory, so a relative spelling is
+    genuinely resolved by the child against a different directory rather than
+    being normalised by the parent on the way.
+
+    A separate process is not decoration here. Spelling divergence is precisely
+    a per-process property: cwd, relative-versus-absolute argv, and a symlinked
+    or remounted scratch root all differ between allocations, which is the real
+    situation a chain meets on its second link.
+
+    Returns
+    -------
+    dict
+        The child's JSON report: the spelling it used, the ``content_id``, the
+        serialized ``checkpoint_dir``, whether publish succeeded, the exact
+        exception type and message if not, and what the resume pointer resolved
+        to under the same spelling.
+    """
+
+    workspace = Path(workspace)
+    workspace.mkdir(parents=True, exist_ok=True)
+    output = workspace / "publish_only.json"
+    log_path = workspace / "publish_only.log"
+
+    argv = [
+        sys.executable,
+        "-m",
+        "tests.helpers.chain_resume_spike.entrypoint",
+        "--root",
+        str(root),
+        "--run-id",
+        "spelling-probe",
+        "--attempt-index",
+        "0",
+        "--steps",
+        "0",
+        "--total-target",
+        "1",
+        "--checkpoint-every",
+        "1",
+        "--receipt-path",
+        str(output),
+        "--publish-only",
+        str(generation),
+    ]
+    # The repo root goes on PYTHONPATH rather than being the cwd. The whole
+    # point of this launcher is that the child's WORKING DIRECTORY differs, and
+    # cwd is normally what puts the repo on sys.path -- so the import path has
+    # to be supplied explicitly or the child cannot import its own entrypoint.
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = (
+        str(_REPO_ROOT) + os.pathsep + environment.get("PYTHONPATH", "")
+    )
+
+    with open(log_path, "wb") as log_file:
+        process = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            env=environment,
+            start_new_session=True,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            exit_code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(process)
+            exit_code = process.wait(timeout=10.0)
+        finally:
+            _kill_group(process)
+
+    if exit_code != 0 or not output.is_file():
+        raise AssertionError(
+            f"publish-only probe failed (rc={exit_code}):\n"
+            + log_path.read_text(encoding="utf-8", errors="replace")
+        )
+    return json.loads(output.read_text(encoding="utf-8"))
 
 
 def _kill_when_ready(
@@ -755,10 +970,13 @@ __all__ = [
     "N_WALKERS",
     "AttemptLaunch",
     "ContinuationSystem",
-    "newest_valid_generation",
+    "newest_listed_generation",
+    "pointer_target_name",
+    "resume_generation",
     "publish_generation",
     "read_generation_payload",
     "read_generation_provenance",
     "restore_system",
     "spawn_attempt",
+    "spawn_publish_only",
 ]

@@ -1,86 +1,84 @@
-"""Every registered fault point is either exercised or declared UNMEASURED.
+"""Every registered fault point is OBSERVED FIRING, or declared UNMEASURED.
 
-A named fault point nobody drives rots: it keeps looking like coverage in the
-registry while testing nothing. So the registry is closed, and it is partitioned
-into exactly two sets whose members are checked differently:
+THE MECHANISM CHANGED, AND THE REASON MATTERS MORE THAN THE CHANGE. The previous
+version of this module scanned test sources for ``FaultPoint.MEMBER`` attributes
+and treated a reference as coverage. That is a proxy, and it failed in both
+directions when it was measured:
 
-* :data:`MEASURED_POINTS` -- each must be referenced by at least one test module
-  in this lane, and the scan deliberately EXCLUDES this module so the coverage
-  test cannot satisfy itself by naming the points it is checking.
-* :data:`INSTRUMENT_ONLY_POINTS` -- provided for R1/R2/R3 and not measured here.
-  Providing an instrument is not covering a gate, and these must NOT appear in
-  the measured set.
+* a test containing only an unused ``FaultPoint.DURING_PAYLOAD_WRITE``
+  expression COUNTED AS AN EXERCISE while injecting nothing;
+* replacing three explicit members with an equivalent sorted set alias made the
+  registry nodes FAIL while the real fault tests still passed.
 
-The scanner is shown to detect an absence before its clean result is believed.
+A mention cannot fire, and an alias fires identically. So coverage is now
+established by RECORDING WHICH POINT ACTUALLY FIRED AT INJECTION TIME
+(:func:`tests.helpers.chain_resume_spike.faults.record_fire`) and asserting the
+set of fired points equals the registry. Neither defect survives that.
+
+The record is written and ``fsync``-ed BEFORE the fault's effect, so it survives
+``os._exit`` and ``SIGKILL`` -- actions whose entire purpose is that nothing runs
+afterwards.
 """
 
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 
 import pytest
 
 from tests.helpers.chain_resume_spike.faults import (
     COMMITTED_BUT_UNACKNOWLEDGED_POINTS,
+    FIRE_LOG_ENV,
     INSTRUMENT_ONLY_POINTS,
     MEASURED_POINTS,
     FaultAction,
     FaultPlan,
     FaultPoint,
+    InjectedFault,
+    fired_points,
+    record_fire,
 )
-
-#: Directories whose test modules count as exercising a point.
-TEST_DIRS = (
-    Path("tests/unit/chain_resume_spike"),
-    Path("tests/integration/chain_resume_spike"),
+from tests.helpers.chain_resume_spike.fixture import (
+    ContinuationSystem,
+    publish_generation,
 )
+from tests.helpers.chain_resume_spike.identity import new_attempt
 
-#: This module is excluded from the scan. It necessarily names every point it
-#: checks, so including it would make the coverage assertion self-satisfying.
-_THIS_MODULE = Path(__file__).name
+CHECKPOINT_EVERY = 2
 
 
-def _referenced_points(sources: dict[str, str]) -> set[str]:
-    """Return every ``FaultPoint.MEMBER`` attribute named in ``sources``.
+def _drive(point: FaultPoint, root: Path) -> None:
+    """Actually inject ``point`` into a real publish sequence.
 
-    Parsed rather than grepped: a substring search would count a member named
-    inside a docstring or a comment as coverage, and a point that is only
-    talked about is exactly the rot this test exists to catch.
+    Generation 1 is committed cleanly first, so that every post-commit point has
+    a predecessor to be interrupted after, and so the torn-row point has a
+    catalog with more than one row to tear.
     """
 
-    referenced: set[str] = set()
-    for label, source in sources.items():
-        for node in ast.walk(ast.parse(source)):
-            if (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id == "FaultPoint"
-            ):
-                referenced.add(node.attr)
-        del label
-    return referenced
-
-
-def _lane_test_sources() -> dict[str, str]:
-    """Return the lane's test modules, excluding this one."""
-
-    sources: dict[str, str] = {}
-    for directory in TEST_DIRS:
-        for path in sorted(directory.glob("test_*.py")):
-            if path.name == _THIS_MODULE:
-                continue
-            sources[str(path)] = path.read_text(encoding="utf-8")
-    assert sources, "no lane test modules found; the coverage scan would be vacuous"
-    return sources
+    system = ContinuationSystem.fresh(seed=2718)
+    identity = new_attempt("coverage", 0, None)
+    system.run(CHECKPOINT_EVERY)
+    publish_generation(root, system, identity, credited_steps=(0, 1))
+    system.run(CHECKPOINT_EVERY)
+    try:
+        publish_generation(
+            root,
+            system,
+            identity,
+            credited_steps=(0, 1, 2, 3),
+            fault=FaultPlan(point, FaultAction.RAISE),
+        )
+    except InjectedFault:
+        # Expected for every point that aborts the sequence. TORN_CATALOG_ROW
+        # damages the index after a clean commit and therefore does not raise.
+        pass
 
 
 def test_the_registry_is_partitioned_with_nothing_left_over() -> None:
     """Measured and instrument-only must cover the enum, disjointly.
 
-    A point in neither set would be silently uncovered AND silently
-    undeclared -- the worst of both, since no test would drive it and no
-    document would admit that.
+    A point in neither set would be silently uncovered AND silently undeclared:
+    no test would drive it and no document would admit that.
     """
 
     assert MEASURED_POINTS | INSTRUMENT_ONLY_POINTS == set(FaultPoint)
@@ -88,42 +86,90 @@ def test_the_registry_is_partitioned_with_nothing_left_over() -> None:
     assert COMMITTED_BUT_UNACKNOWLEDGED_POINTS <= MEASURED_POINTS
 
 
-def test_the_scanner_detects_an_absence() -> None:
-    """Instrument check. A scanner that never reports a gap cannot prove one absent.
+def test_the_fire_recorder_distinguishes_fired_from_not_fired(
+    tmp_path, monkeypatch
+) -> None:
+    """INSTRUMENT CHECK, run before the coverage assertion is believed.
 
-    Three separate false-zero defects in this repository came from harnesses
-    that could not see the thing they were counting.
+    Both directions. A recorder that recorded everything, or nothing, would make
+    the coverage result below meaningless in opposite ways.
     """
 
-    referenced = _referenced_points({"synthetic": "FaultPoint.TORN_CATALOG_ROW\n"})
-    assert referenced == {"TORN_CATALOG_ROW"}
-    assert "DURING_PAYLOAD_WRITE" not in referenced, (
-        "the scanner reported a point that the source never named"
+    log = tmp_path / "fires.log"
+    monkeypatch.setenv(FIRE_LOG_ENV, str(log))
+
+    assert fired_points(log) == set(), "a fresh log already reports fires"
+    record_fire(FaultPoint.TORN_CATALOG_ROW)
+    assert fired_points(log) == {FaultPoint.TORN_CATALOG_ROW}
+    assert FaultPoint.DURING_PAYLOAD_WRITE not in fired_points(log), (
+        "the recorder reported a point that never fired"
     )
+    record_fire(FaultPoint.DURING_PAYLOAD_WRITE)
+    assert fired_points(log) == {
+        FaultPoint.TORN_CATALOG_ROW,
+        FaultPoint.DURING_PAYLOAD_WRITE,
+    }
 
 
-def test_the_scanner_ignores_a_point_named_only_in_prose() -> None:
-    """A mention in a docstring is not an exercise.
+def test_a_mere_mention_of_a_fault_point_records_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    """The defect the old scanner had, pinned as a property of the new one.
 
-    This is the difference between the AST scan and a grep, and it is the whole
-    reason the scan is worth writing.
+    Naming a member is not injecting it. Under the source-scanning mechanism the
+    statement below counted as coverage; under this one it records nothing,
+    which is the whole reason the mechanism was replaced.
     """
 
-    prose_only = '"""This module talks about FaultPoint.BUDGET_EXHAUSTED."""\n'
-    assert _referenced_points({"prose": prose_only}) == set()
+    log = tmp_path / "fires.log"
+    monkeypatch.setenv(FIRE_LOG_ENV, str(log))
+
+    FaultPoint.AFTER_RENAME_BEFORE_CATALOG  # noqa: B018 - a mention, deliberately
+
+    assert fired_points(log) == set(), (
+        "merely naming a FaultPoint produced a coverage record"
+    )
 
 
 @pytest.mark.parametrize(
     "point", sorted(MEASURED_POINTS, key=lambda point: point.value), ids=lambda p: p.value
 )
-def test_every_measured_fault_point_is_exercised_by_a_lane_test(point: FaultPoint) -> None:
-    """The coverage clause itself, one node per point so a gap names itself."""
+def test_every_measured_fault_point_actually_fires_when_injected(
+    tmp_path, monkeypatch, point: FaultPoint
+) -> None:
+    """The coverage clause: each registered point is driven and observed firing.
 
-    referenced = _referenced_points(_lane_test_sources())
-    assert point.name in referenced, (
-        f"{point.name} is registered as MEASURED but no lane test module outside "
-        f"{_THIS_MODULE} references it"
+    One node per point, so a gap names itself. Asserting the fired set EQUALS
+    ``{point}`` rather than merely containing it also catches a fault dispatched
+    at the wrong boundary -- a point that fired when a different one was
+    requested is a defect the previous mechanism could not see at all.
+    """
+
+    log = tmp_path / "fires.log"
+    monkeypatch.setenv(FIRE_LOG_ENV, str(log))
+
+    _drive(point, tmp_path / "root")
+
+    assert fired_points(log) == {point}, (
+        f"injecting {point.value} recorded {sorted(f.value for f in fired_points(log))}"
     )
+
+
+def test_the_measured_registry_is_exactly_what_fires(tmp_path, monkeypatch) -> None:
+    """Set equality across the whole registry, in one shared log.
+
+    The per-point nodes above prove each point CAN fire. This proves the
+    registry has no member that never fires and no firing member that is
+    unregistered -- the two halves a per-point loop cannot establish on its own.
+    """
+
+    log = tmp_path / "fires.log"
+    monkeypatch.setenv(FIRE_LOG_ENV, str(log))
+
+    for index, point in enumerate(sorted(MEASURED_POINTS, key=lambda p: p.value)):
+        _drive(point, tmp_path / f"root-{index}")
+
+    assert fired_points(log) == set(MEASURED_POINTS)
 
 
 @pytest.mark.parametrize(
@@ -143,14 +189,13 @@ def test_an_instrument_only_point_is_not_claimed_as_measured(point: FaultPoint) 
     assert point in INSTRUMENT_ONLY_POINTS
 
 
-def test_a_fault_plan_round_trips_without_reflective_dispatch(tmp_path) -> None:
+def test_a_fault_plan_round_trips_without_reflective_dispatch() -> None:
     """Enum members cross the process boundary by value, against the closed set."""
 
     for point in FaultPoint:
         for action in FaultAction:
             plan = FaultPlan(point, action, exit_code=71)
             assert FaultPlan.from_mapping(plan.to_dict()) == plan
-    del tmp_path
 
 
 def test_a_fault_plan_rejects_a_string_where_a_member_belongs() -> None:

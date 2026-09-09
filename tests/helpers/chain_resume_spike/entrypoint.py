@@ -30,7 +30,7 @@ from tpen.checkpoint.artifact import require_complete_checkpoint_dir
 from .faults import FaultPlan, read_fault_plan
 from .fixture import (
     ContinuationSystem,
-    newest_valid_generation,
+    resume_generation,
     publish_generation,
     read_generation_payload,
     read_generation_provenance,
@@ -72,6 +72,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--publish-only",
+        default=None,
+        help=(
+            "Path-spelling probe. Publish an ALREADY-COMMITTED generation to the "
+            "catalog under whatever spelling this path is written in, then exit. "
+            "Runs no steps and commits nothing new."
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -91,6 +100,9 @@ def main(argv: list[str] | None = None) -> int:
         None if args.fault_plan_path is None else read_fault_plan(Path(args.fault_plan_path))
     )
 
+    if args.publish_only is not None:
+        return _publish_only(Path(args.publish_only), root, receipt_path)
+
     # Fresh OS entropy, drawn before anything is restored. Distinct from the
     # parent with overwhelming probability, and RECORDED, so that "the fresh
     # process did not accidentally reproduce the parent's stream" is a checked
@@ -109,7 +121,11 @@ def main(argv: list[str] | None = None) -> int:
         # missing manifest and a missing COMPLETE marker alike.
         parent_dir = require_complete_checkpoint_dir(Path(args.restore_from))
     else:
-        parent_dir = newest_valid_generation(root)
+        # THE PRODUCTION POINTER PATH, not a directory listing. ``restore.py:118``
+        # resolves through ``latest.json`` and never lists, so a fixture that
+        # listed here would select a generation production would not -- measured
+        # to differ in both pre-latest fault windows.
+        parent_dir = resume_generation(root)
     if parent_dir is not None:
         provenance = read_generation_provenance(parent_dir)
         payload = read_generation_payload(parent_dir)
@@ -213,10 +229,64 @@ def main(argv: list[str] | None = None) -> int:
     return exit_status
 
 
-def _newest_step(root: Path) -> int | None:
-    """Return the step of the newest selectable generation, or ``None``."""
+def _publish_only(generation: Path, root: Path, output: Path) -> int:
+    """Publish one already-committed generation and report what production did.
 
-    newest = newest_valid_generation(root)
+    The whole point of running this in a SEPARATE PROCESS with a caller-chosen
+    working directory is that the *spelling* of ``generation`` is then genuinely
+    this process's own -- a relative path resolved against a different cwd, or a
+    symlinked root -- rather than a string the parent constructed. Nothing in
+    ``tpen/checkpoint`` canonicalises a path, so spelling is preserved all the
+    way into the catalog comparison.
+
+    Reports the outcome as JSON instead of raising, so the caller can assert on
+    the EXACT exception type and message rather than on a process exit code.
+    """
+
+    from tpen.checkpoint.catalog import CheckpointCatalog, publication_catalog_path
+    from tpen.checkpoint.reference import CheckpointRef
+
+    result: dict[str, object] = {"spelling": str(generation), "cwd": os.getcwd()}
+    try:
+        ref = CheckpointRef.from_directory(generation)
+        result["content_id"] = ref.content_id
+        result["serialized_checkpoint_dir"] = ref.to_dict()["checkpoint_dir"]
+        CheckpointCatalog(publication_catalog_path(root)).publish(ref)
+        result["published"] = True
+        result["error_type"] = None
+        result["error"] = None
+    except Exception as exc:  # noqa: BLE001 - the exception IS the measurement
+        result["published"] = False
+        result["error_type"] = type(exc).__name__
+        result["error"] = str(exc)
+
+    # The asymmetry this probe exists to show: the pointer path is spelling
+    # independent, so restore still selects, under the very same spelling that
+    # publish refused.
+    try:
+        resolved = resume_generation(root)
+        result["pointer_resolves_to"] = None if resolved is None else resolved.name
+        result["pointer_error"] = None
+    except Exception as exc:  # noqa: BLE001
+        result["pointer_resolves_to"] = None
+        result["pointer_error"] = f"{type(exc).__name__}: {exc}"
+
+    with open(output, "w", encoding="utf-8") as handle:
+        json.dump(result, handle, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return 0
+
+
+def _newest_step(root: Path) -> int | None:
+    """Return the step the resume pointer currently names, or ``None``.
+
+    Reads the same surface a resume would, so a receipt's
+    ``next_parent_generation`` names what the next attempt will actually get.
+    """
+
+    newest = resume_generation(root)
     if newest is None:
         return None
     return int(json.loads((newest / "manifest.json").read_text(encoding="utf-8"))["next_iteration"])

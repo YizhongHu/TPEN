@@ -35,6 +35,7 @@ rather than guessing them.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -198,14 +199,62 @@ class InjectedFault(RuntimeError):
     """Raised by :attr:`FaultAction.RAISE`, so a real bug is never mistaken for one."""
 
 
+#: Environment variable naming the durable log of points that ACTUALLY FIRED.
+FIRE_LOG_ENV = "CHAIN_RESUME_SPIKE_FIRE_LOG"
+
+
+def record_fire(point: FaultPoint) -> None:
+    """Record that ``point`` actually fired, durably, BEFORE the fault takes effect.
+
+    This is the coverage mechanism, and it replaces a source scan deliberately.
+    A static scan for ``FaultPoint.MEMBER`` counts a MENTION as coverage: an
+    unused enum expression in a test satisfies it while injecting nothing, and
+    an equivalent set alias exercises a point while remaining invisible to it.
+    Both defects were found in the previous round. A record written at the
+    moment of injection cannot be produced by a mention and is produced
+    identically by an alias, so it kills both at once.
+
+    Written and ``fsync``-ed BEFORE the fault's effect, because ``os._exit`` and
+    ``SIGKILL`` leave no opportunity afterwards -- the whole point of those
+    actions is that nothing runs after them.
+
+    Silently does nothing when the environment variable is unset, so production
+    fixture use is unaffected; a test that wants the record sets it.
+    """
+
+    path = os.environ.get(FIRE_LOG_ENV)
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(point.value + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def fired_points(path: Path) -> set[FaultPoint]:
+    """Return the set of points recorded by :func:`record_fire` at ``path``."""
+
+    path = Path(path)
+    if not path.is_file():
+        return set()
+    return {
+        FaultPoint(token)
+        for token in path.read_text(encoding="utf-8").split()
+        if token
+    }
+
+
 __all__ = [
     "COMMITTED_BUT_UNACKNOWLEDGED_POINTS",
+    "FIRE_LOG_ENV",
     "INSTRUMENT_ONLY_POINTS",
     "MEASURED_POINTS",
     "FaultAction",
     "FaultPlan",
     "FaultPoint",
     "InjectedFault",
+    "fired_points",
     "read_fault_plan",
+    "record_fire",
     "write_fault_plan",
 ]
