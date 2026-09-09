@@ -99,6 +99,11 @@ def test_hooke_models_initialize_and_train_for_small_electron_counts(
             "next_iteration",
             "completed_updates",
             "parameter_layout",
+            "nonfinite_local_energy_policy",
         }
         assert trainer_state["next_iteration"] == 1
         assert trainer_state["completed_updates"] == 1
+        # Pinned to the literal, not to the module default: see the note in
+        # test_train_runner.py. This one line serves all three electron-count
+        # parametrizations.
+        assert trainer_state["nonfinite_local_energy_policy"] == "mask"

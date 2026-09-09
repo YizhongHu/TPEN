@@ -100,9 +100,15 @@ def test_train_runner_writes_standard_artifacts(tmp_path) -> None:
         "next_iteration",
         "completed_updates",
         "parameter_layout",
+        "nonfinite_local_energy_policy",
     }
     assert trainer_state["next_iteration"] == 3
     assert trainer_state["completed_updates"] == 3
+    # The ACTIVE estimator, recorded beside the numbers it produced. Pinned to
+    # the literal rather than to the module default: an assertion that reads
+    # the default and compares it to itself passes for ANY default, including
+    # one nobody chose -- which is the failure the policy key exists to catch.
+    assert trainer_state["nonfinite_local_energy_policy"] == "mask"
 
     # The v2 manifest names both counters instead of one ambiguous `step`, and
     # the directory the run wrote is the one `next_iteration` names.
@@ -332,11 +338,17 @@ def test_resume_reproduces_the_uninterrupted_run_bitwise(uninterrupted_run, tmp_
     }
     trainer_a = json.loads((final_a / "trainer.json").read_text())
     trainer_b = json.loads((final_b / "trainer.json").read_text())
-    expected_keys = {*expected_progress, "parameter_layout"}
+    expected_keys = {*expected_progress, "parameter_layout", "nonfinite_local_energy_policy"}
     assert set(trainer_a) == expected_keys
     assert set(trainer_b) == expected_keys
     assert trainer_a == trainer_b
     assert {key: trainer_a[key] for key in expected_progress} == expected_progress
+    # Both arms must have run under the SAME estimator, and under the one
+    # intended. `trainer_a == trainer_b` already forces agreement between the
+    # arms; this pins WHICH policy they agreed on, so a run that silently
+    # switched estimators cannot satisfy a bitwise-resume test by having both
+    # halves switch together.
+    assert trainer_a["nonfinite_local_energy_policy"] == "mask"
 
     # The resumed arm logs only the steps it actually ran, and every one of them
     # is byte-identical to the same step in the run that never stopped.
