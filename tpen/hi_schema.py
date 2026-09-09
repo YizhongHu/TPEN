@@ -2100,26 +2100,10 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
     A configuration that declares no schema, or a different one, is returned
     unvalidated -- see the module docstring on why the firewall is opt-in.
 
-    KNOWN AND DEFERRED, stated here because this is where a reader meets the
-    "refuse before anything is constructed" claim and that claim is narrower
-    than it sounds. **Resolution is not a read.** A registered OmegaConf
-    resolver RUNS during ``to_container(resolve=True)`` below, and
-    ``tpen.config`` registers ``tpen.basis_feature_dim``, which calls
-    ``hydra.utils.instantiate`` on its argument. MEASURED at head ``38edc53``:
-    a configuration pointing that resolver at ``builtins.open`` was correctly
-    REFUSED -- and the file it named had already been created, because the
-    callable ran while the tree was being resolved for the sweeps that would
-    refuse it.
-
-    So the claim holds for CONSTRUCTION and not for RESOLUTION. The closed
-    resolver allowlist means every such configuration IS refused; what is not
-    guaranteed is that it is refused BEFORE the resolver runs.
-
-    Deliberately NOT fixed in this slice. It is a new production surface rather
-    than one of the four construction-path holes this slice was scoped to, so
-    it is FILED rather than absorbed -- the remedy is a handful of lines and is
-    available, but scope is the manager's call and not this lane's to widen.
-    Found by an independent reviewer and labelled independent.
+    Resolver calls can execute configuration-named callables while OmegaConf
+    resolves the tree. Raw resolver findings are therefore collected before
+    resolution and, when any such call is refused, reported immediately. This
+    preserves every raw finding while preventing the refused call from running.
 
     The launch environment is audited alongside the configuration because the
     reference-energy firewall names it as one of the surfaces a reference must
@@ -2166,6 +2150,17 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
     # early refusal. Collect them alongside the other raw findings.
     rejections.extend(_sweep_free_form_targets(raw_tree, tree="raw"))
     rejections.extend(sweep_environment(environment, HI_TRAIN_POLICY))
+
+    # A raw resolver finding is unsafe to carry into resolution: evaluating the
+    # tree would invoke the very callable this policy has already refused. Raw
+    # findings are collected before this decision so they remain visible with
+    # the ordering refusal.
+    if any(
+        rejection.rule
+        in {"forbidden-resolver", "unadmitted-resolver", "uncheckable-resolver"}
+        for rejection in rejections
+    ):
+        raise ClosedSchemaError(rejections)
 
     # Resolution failure is itself a rejection, which keeps every
     # preconstruction failure a single exception type for the caller.
