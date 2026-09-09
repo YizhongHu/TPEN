@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import pickle
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from io import BytesIO
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from tpen.training.update import (
     AutogradUpdateInput,
     LegacyAutogradUpdate,
     ModelParameterBinding,
+    ObjectiveReevaluation,
     ScoreUpdateInput,
     VMCStepData,
     VMCUpdateMethod,
@@ -55,6 +57,39 @@ def _output(batch: ElectronBatch, value: torch.Tensor | None = None) -> Wavefunc
     return WavefunctionOutput(logabs=logabs, sign=torch.ones(shape, dtype=batch.dtype))
 
 
+def _reevaluation(
+    batch: ElectronBatch,
+    *,
+    recompute: Callable[[], torch.Tensor] | None = None,
+) -> ObjectiveReevaluation:
+    """Build a re-evaluation for a SYNTHETIC update input.
+
+    The adapter contracts in this module form objectives directly from a bare
+    parameter rather than from a model and a Hamiltonian, so they need the seam
+    record without the trainer's construction path.  The properties of the real
+    construction path -- fixed sample, RNG inertness, policy continuity, true
+    closure semantics -- are tested in ``test_update_reevaluation.py`` against
+    the real ``VMCTrainer``; nothing here should be read as covering them.
+
+    Parameters
+    ----------
+    batch : ElectronBatch
+        The step's batch, which fixes the required dtype and device.
+    recompute : callable, optional
+        Recompute to install.  Defaults to a detached zero, which is enough for
+        an adapter contract that never calls the re-evaluation.
+    """
+
+    if recompute is None:
+
+        def recompute() -> torch.Tensor:
+            return torch.zeros((), dtype=batch.dtype, device=batch.device)
+
+    return ObjectiveReevaluation(
+        recompute=recompute, dtype=batch.dtype, device=batch.device
+    )
+
+
 def _optimizer_update_input(parameter: torch.nn.Parameter, *, step: int) -> AutogradUpdateInput:
     """Build the same differentiable update input at a given model state."""
 
@@ -66,6 +101,7 @@ def _optimizer_update_input(parameter: torch.nn.Parameter, *, step: int) -> Auto
         local_energy=torch.zeros(1, dtype=torch.float64),
         step=step,
         objective=objective,
+        reevaluate=_reevaluation(batch),
     )
 
 
@@ -126,6 +162,7 @@ def test_step_records_are_frozen_and_accept_flattened_sample_axes() -> None:
         local_energy=data.local_energy,
         step=4,
         objective=objective,
+        reevaluate=_reevaluation(batch),
     )
     assert autograd_input.step == 4
 
@@ -204,6 +241,7 @@ def test_legacy_adapter_matches_current_zero_grad_backward_clip_step_sequence() 
         local_energy=torch.zeros(1, dtype=torch.float64),
         step=0,
         objective=adapted_objective,
+        reevaluate=_reevaluation(batch),
     )
     result = LegacyAutogradUpdate(
         adapted_optimizer,
@@ -232,6 +270,7 @@ def test_legacy_adapter_matches_pre_f4_model_gradient_domain_for_subset_optimize
         local_energy=torch.zeros(1, dtype=torch.float64),
         step=0,
         objective=clipped_objective,
+        reevaluate=_reevaluation(clipped_batch),
     )
     clipped_result = LegacyAutogradUpdate(
         clipped_optimizer,
@@ -263,6 +302,7 @@ def test_legacy_adapter_matches_pre_f4_model_gradient_domain_for_subset_optimize
         local_energy=torch.zeros(1, dtype=torch.float64),
         step=0,
         objective=unclipped_objective,
+        reevaluate=_reevaluation(unclipped_batch),
     )
     unclipped_result = LegacyAutogradUpdate(
         unclipped_optimizer,
@@ -333,6 +373,7 @@ def test_legacy_adapter_skips_vacuum_and_errors_for_disconnected_nonvacuum() -> 
             local_energy=torch.zeros(1, dtype=torch.float64),
             step=0,
             objective=torch.tensor(1.0, dtype=torch.float64),
+            reevaluate=_reevaluation(vacuum),
         )
     )
     assert skipped == VMCUpdateResult(applied=False, grad_norm=0.0)
@@ -347,6 +388,7 @@ def test_legacy_adapter_skips_vacuum_and_errors_for_disconnected_nonvacuum() -> 
                 local_energy=torch.zeros(1, dtype=torch.float64),
                 step=1,
                 objective=torch.tensor(1.0, dtype=torch.float64),
+                reevaluate=_reevaluation(nonvacuum),
             )
         )
     assert parameter.grad is None
@@ -616,6 +658,7 @@ def test_live_update_inputs_cannot_be_serialized() -> None:
         local_energy=torch.zeros(1, dtype=torch.float64),
         step=0,
         objective=objective,
+        reevaluate=_reevaluation(batch),
     )
 
     with pytest.raises(RuntimeError, match="graph-bearing"):

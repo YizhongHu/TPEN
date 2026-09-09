@@ -34,6 +34,7 @@ from tpen.training.update import (
     serialize_parameter_layout,
     VMCUpdateMethod,
     VMCUpdateState,
+    vmc_objective_reevaluation,
 )
 from tpen.training.vmc import (
     DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
@@ -581,6 +582,23 @@ class VMCTrainer:
                         local_energy=total_local_energy,
                         step=step,
                         objective=loss,
+                        # A TRUE closure optimizer re-evaluates the objective
+                        # one or more times per step at parameters it has
+                        # already mutated in place, so it cannot use `loss`:
+                        # backward on that retained graph raises once the
+                        # saved-tensor versions have moved. The re-evaluation
+                        # is built over THIS step's fixed `batch` and carries
+                        # the SAME resolved non-finite policy, so a second
+                        # evaluation cannot resample, cannot advance the
+                        # sampler RNG the resume path depends on, and cannot
+                        # switch estimators midway through one step.
+                        reevaluate=vmc_objective_reevaluation(
+                            model=model,
+                            hamiltonian_terms=hamiltonian_terms,
+                            batch=batch,
+                            primary_local_energy=total_local_energy,
+                            nonfinite_policy=self.nonfinite_local_energy_policy,
+                        ),
                     )
                 update_result = selected_update_method.update(update_input)
                 optimizer_step = False

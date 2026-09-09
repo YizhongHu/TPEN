@@ -17,6 +17,12 @@ from tpen.data.batch import (
     WavefunctionOutput,
 )
 from tpen.dependencies import require_torch
+from tpen.physics.hamiltonian import local_energy
+from tpen.training.vmc import (
+    DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
+    compute_vmc_objective,
+    resolve_nonfinite_local_energy_policy,
+)
 
 torch = require_torch(feature="VMC update methods")
 
@@ -98,11 +104,404 @@ class VMCStepData:
 
 
 @dataclass(frozen=True, kw_only=True)
+class ObjectiveReevaluation:
+    """Recompute one step's objective at the CURRENT parameter values.
+
+    A TRUE closure optimizer -- ``torch.optim.LBFGS`` is the archetype -- calls
+    its closure repeatedly inside a single ``step()`` and mutates parameters in
+    place between those calls.  Calling ``backward()`` a second time on the
+    retained graph of an already-materialized objective raises after such a
+    mutation: the graph's saved tensors are versioned, and the in-place step
+    bumps that version out from under the retained backward.  A materialized
+    scalar objective with no means to recompute it is therefore not merely
+    inconvenient for such an optimizer, it is unusable by one.  This record is
+    the seam that removes the limit; every call builds a NEW graph from the
+    step's fixed sample.
+
+    Parameters
+    ----------
+    recompute : callable
+        Zero-argument callable returning a fresh scalar objective for this
+        step's fixed sample at the parameters live at call time.
+    dtype : torch.dtype
+        Real floating dtype every recomputed objective must have.
+    device : torch.device
+        Device every recomputed objective must be on.
+
+    Notes
+    -----
+    WHAT THIS DELIBERATELY DOES NOT DO.  It does not zero gradients, call
+    ``backward()``, or step an optimizer.  Those belong to the update method,
+    which is where :class:`LegacyAutogradUpdate` already keeps them; a seam
+    that ran them would move optimizer policy into the trainer.  A method
+    builds its own closure around this callable.
+
+    STATED PROPERTIES.  These are properties of the seam, not incidental
+    behavior, and each is covered by a named test in
+    ``tests/unit/training/test_update_reevaluation.py``:
+
+    FIXED-SAMPLE.  Every re-evaluation within one step uses the identical
+    sample.  This record holds no sampler and no walker source, so it cannot
+    resample even by mistake -- the guarantee is structural rather than a rule
+    a caller must remember.
+
+    RNG-INERT.  A re-evaluation advances neither the sampler-local generator
+    nor the global torch RNG.  This matters beyond tidiness: TPEN's rank-local
+    sampler/walker/RNG resume policy is tested for bitwise reproducibility, so
+    a seam that advanced RNG per re-evaluation would make a resumed run diverge
+    from the uninterrupted one purely because an optimizer looked at the
+    objective twice.
+
+    SAME-FUNCTION, SCOPED TO UNCHANGED PARAMETERS.  At unchanged parameters,
+    repeated re-evaluations return bitwise-equal objectives.  The scope is not
+    a hedge; see the mask caveat below for why the property is not claimed at
+    mutated parameters.
+
+    POLICY-CONTINUOUS.  The recomputed objective uses the SAME resolved
+    non-finite local-energy policy as the step's primary objective.  Falling
+    back to the module default here would run one step under two estimators,
+    which is exactly what the checkpoint continuity check in
+    :class:`~tpen.training.trainer.VMCTrainer` exists to prevent.
+
+    DECLARED PRECONDITION -- RNG-INERTNESS HOLDS BY ABSENCE, NOT BY A GUARD.
+    Nothing on the recompute path draws from an RNG today.  The precondition
+    is stated as the property's actual dependency rather than as a directory
+    being empty, because the recompute path spans two trees:
+
+    (i) NO STOCHASTIC LAYER IN ANY FORWARD reached by ``model(batch)``.  The
+        model is a ``tpen/nn/`` object, so a claim scoped to ``tpen/physics/``
+        could not see a stochastic layer added here at all.  Measured: the
+        only RNG in ``tpen/nn/`` is in ``initialization.py``, resolved by AST
+        to ``uniform_``, ``xavier_uniform_``, and ``linear_kaiming_uniform_``
+        -- all initialization, none a forward -- and there is no ``Dropout``
+        anywhere in the package.
+    (ii) NO RNG DRAW ON THE LOCAL-ENERGY PATH
+        (:func:`~tpen.physics.hamiltonian.local_energy`,
+        :func:`~tpen.training.vmc.compute_vmc_objective`).  Measured: zero
+        draws in ``tpen/physics/``.
+
+    INITIALIZATION-TIME RNG IS OUT OF SCOPE, deliberately: it runs before the
+    step, so no re-evaluation can reach it.  That distinction is why (i) is
+    worded as "in a forward" and not "in the package".
+
+    A NOTE ON HOW THIS WAS GOT WRONG ONCE, because the failure is reusable.  An
+    earlier version of this precondition claimed ``tpen/physics/`` "contains no
+    generator".  That tree contains the word ``generator`` ten times, in
+    ``validate_for_generator`` methods, where generator means a SAMPLER and not
+    an RNG -- so the literal claim was false while the property was true.
+    Stating a precondition as "directory contains no X" invites exactly that
+    error when X is an overloaded word.  Read the hits you dismissed before
+    publishing an absence, and resolve matches to their enclosing function
+    before classifying them.
+
+    The named tests are the enforcement.  TRIGGER: the day a forward acquires a
+    stochastic layer, or the local-energy path acquires a draw -- a stochastic
+    kinetic estimator being the obvious candidate for the latter -- the
+    same-function test is the one that must go red.
+
+    ``torch.random.fork_rng()`` was considered and rejected.  It would make
+    RNG-inertness true by construction, and would thereby HIDE the day that
+    premise stops holding: a future stochastic local-energy estimator should
+    fail the same-function test loudly rather than be silently pinned.  A loud
+    failure is chosen over a silent correctness.
+
+    DECLARED PRECONDITION -- UNDER POLICY ``"mask"`` THE ESTIMATOR'S SUBSAMPLE
+    IS PARAMETER-DEPENDENT.  :func:`~tpen.training.vmc.compute_vmc_objective`
+    excludes non-finite local-energy rows, and which rows are non-finite
+    depends on the parameter values.  A closure optimizer re-evaluates at
+    DIFFERENT parameters, so the finite-row set can SHIFT between closure
+    calls and successive calls may return values drawn from different
+    subsamples -- meaning a line search would be comparing different
+    functions.  That is not a defect of this seam: it is the known-biased
+    estimator that ``"mask"`` explicitly selects, meeting a line search.
+
+    THAT QUESTION IS NOW ANSWERED.  Operator ruling ``377f6b0f`` settles it:
+    the finite-row mask is FIXED PER STEP, pinned at the step's first
+    evaluation, and a pinned row going non-finite at a later trial point
+    RAISES rather than being re-masked.  Silent re-mask is rejected.  So the
+    subsample no longer shifts between closure calls, and a line search
+    compares one function for the whole step.
+    :func:`select_reevaluation_rows` is where that lands, which is what the
+    seam was shaped for.  See the ``operator-ruling`` note on ``377f6b0f`` for
+    the ruling itself rather than any paraphrase.  Under ``"fail"`` the
+    situation is different and simpler: a re-evaluation that meets a
+    non-finite row raises out of the closure, from inside ``step(closure)``,
+    and the step does not apply.
+    """
+
+    recompute: Callable[[], torch.Tensor]
+    dtype: torch.dtype
+    device: torch.device
+
+    def __post_init__(self) -> None:
+        if not callable(self.recompute):
+            raise TypeError("ObjectiveReevaluation.recompute must be callable")
+        if not isinstance(self.dtype, torch.dtype) or not self.dtype.is_floating_point:
+            raise TypeError("ObjectiveReevaluation.dtype must be a real floating torch.dtype")
+        if not isinstance(self.device, torch.device):
+            raise TypeError("ObjectiveReevaluation.device must be a torch.device")
+
+    def __call__(self) -> torch.Tensor:
+        """Return a fresh scalar objective at the parameters live right now.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar objective on a newly built graph.
+
+        Notes
+        -----
+        ``requires_grad`` is deliberately NOT required here.  A vacuum batch
+        legitimately produces a disconnected objective, and the update method
+        already distinguishes that case from a genuinely disconnected loss;
+        requiring a live graph at the seam would turn the method's considered
+        decision into a seam-level crash.
+        """
+
+        objective = self.recompute()
+        if not isinstance(objective, torch.Tensor):
+            raise TypeError("ObjectiveReevaluation must recompute a torch.Tensor")
+        if objective.ndim != 0:
+            raise ValueError(
+                "ObjectiveReevaluation must recompute a scalar objective, "
+                f"got shape {tuple(objective.shape)}"
+            )
+        if objective.dtype != self.dtype:
+            raise ValueError(
+                "ObjectiveReevaluation must recompute an objective with dtype "
+                f"{self.dtype}, got {objective.dtype}"
+            )
+        if objective.device != self.device:
+            raise ValueError(
+                "ObjectiveReevaluation must recompute an objective on device "
+                f"{self.device}, got {objective.device}"
+            )
+        return objective
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Reject serialization of a callable closed over a live model."""
+
+        raise RuntimeError("live ObjectiveReevaluation cannot be serialized")
+
+
+def select_reevaluation_rows(
+    *,
+    primary_finite_mask: torch.Tensor,
+    recomputed_local_energy: torch.Tensor,
+    policy: str,
+) -> torch.Tensor | None:
+    """THE MASK DECISION POINT for re-evaluation.  One line owns it.
+
+    Which finite-row set a re-evaluation uses is a DESIGN DECISION, not a
+    consequence of how the recompute happens to be wired, and this function is
+    the single place it is made.  It exists so that implementing a ruling on
+    ``377f6b0f`` would be a small change here rather than a rederivation of the
+    seam -- and that is how it played out: the ruling landed as eight lines in
+    this body and nothing else.
+
+    The question it answers: under policy ``"mask"``,
+    :func:`~tpen.training.vmc.compute_vmc_objective` excludes non-finite
+    local-energy rows, and which rows are non-finite depends on the parameter
+    values.  A closure optimizer re-evaluates at DIFFERENT parameters, so the
+    excluded set can shift between closure calls and a line search may compare
+    values drawn from different subsamples -- that is, different functions.
+
+    Parameters
+    ----------
+    primary_finite_mask : torch.Tensor
+        Boolean mask of the rows that were finite when the step's PRIMARY
+        objective was formed.  Detached at construction, so it carries no
+        graph and cannot be moved by a re-evaluation.
+    recomputed_local_energy : torch.Tensor
+        Local energy just recomputed at the current parameters.
+    policy : str
+        The step's resolved non-finite local-energy policy.
+
+    Returns
+    -------
+    torch.Tensor
+        Boolean mask restricting this re-evaluation to exactly the rows that
+        were finite when the step's mask was pinned.  ``None`` is no longer
+        returned; the signature keeps the optional type so a future ruling can
+        reintroduce a no-selection mode without a signature change.
+
+    Raises
+    ------
+    ValueError
+        If a row that was finite when the mask was pinned is non-finite at this
+        trial point.  The message names the offending row indices.
+
+    Notes
+    -----
+    NO OPT-OUT IS SHIPPED, AND THAT IS THE RULING HONOURED RATHER THAN
+    NARROWED.  ``377f6b0f`` permits ``propagate-non-finite`` only where an
+    optimizer's admission carries a test proving its search rejects non-finite
+    trial values and terminates.  There is no channel from an optimizer or an
+    update method to this function -- ``policy`` arrives from the TRAINER --
+    so building one now could only end in a boolean any optimizer could set,
+    which is the flag the ruling forbids.  With no channel, "only where
+    proven" means NO CHANNEL UNTIL SOMETHING PROVES IT, which makes the
+    obligation structural rather than documented.  When SPRING or the linear
+    method needs it, it builds the channel TOGETHER WITH its proof test, and
+    the thing that travels it should be a typed capability carrying the node
+    id of that test -- never a boolean.
+
+    CONSEQUENCE, stated so it is not discovered at first use: this is a
+    behaviour change under the DEFAULT ``"mask"`` policy, not only under
+    ``"fail"``.  A mid-search non-finite row used to be dropped silently and
+    the step completed; it now refuses.  Every closure optimizer feels it,
+    including stock ``torch.optim.LBFGS``, which has no escape hatch until an
+    admission builds one.  That is intended: LBFGS does not robustly reject
+    non-finite trial values, and a refusal is recoverable where a silently
+    shifted objective is not.
+
+    A SIDE EFFECT WORTH KNOWING: ``policy`` is now inert at compute time in
+    the ordinary case.  The selection contains exactly the rows finite at
+    pinning, and any of those going bad raises, so the tensors reaching
+    `compute_vmc_objective` are always all-finite and neither policy branch
+    can fire.  It is still threaded through and still asserted to arrive
+    unchanged, because a future ruling could make it load-bearing again and a
+    recompute quietly substituting the module default would then be running
+    one step under two estimators.
+
+    The ruling itself lives in the ``operator-ruling`` note on ``377f6b0f``,
+    cross-linked from ``02859027``.  Read it there rather than any paraphrase;
+    a third copy is a third thing that can decay.
+    """
+
+    del policy
+    # PART 1 of ruling 377f6b0f: a FIXED ROW MASK PER STEP, pinned at the step's
+    # FIRST evaluation. `primary_finite_mask` already IS that first evaluation,
+    # so pinning needs no new input.
+    #
+    # PART 2: a row that was finite when the mask was pinned and is non-finite
+    # at a later trial point is a genuine failure, not a row to drop quietly.
+    # Re-masking here would change the estimator mid-step, so a line search
+    # would compare different functions and return a plausible number -- the
+    # expensive kind of error. A refusal is recoverable; a silently shifted
+    # objective is not. SILENT RE-MASK IS REJECTED by the ruling, and this
+    # raise is what makes it unreachable rather than merely discouraged.
+    pinned_gone_bad = primary_finite_mask & ~torch.isfinite(recomputed_local_energy)
+    if bool(pinned_gone_bad.any()):
+        rows = pinned_gone_bad.nonzero(as_tuple=False).flatten().tolist()
+        raise ValueError(
+            "re-evaluation produced a non-finite local energy at row(s) "
+            f"{rows}, which were finite when this step's mask was pinned. "
+            "The step is refused rather than re-masked: dropping them now "
+            "would change the estimator mid-search, so a line search would "
+            "compare different functions"
+        )
+    return primary_finite_mask
+
+
+def vmc_objective_reevaluation(
+    *,
+    model,
+    hamiltonian_terms: Any,
+    batch: ElectronBatch,
+    primary_local_energy: torch.Tensor,
+    nonfinite_policy: str = DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
+) -> ObjectiveReevaluation:
+    """Build the canonical VMC re-evaluation for one step's fixed sample.
+
+    Parameters
+    ----------
+    model : callable
+        Wavefunction model returning a
+        :class:`~tpen.data.batch.WavefunctionOutput`.
+    hamiltonian_terms : Mapping or Sequence of HamiltonianTerm
+        The step's Hamiltonian contributions, passed through unchanged.
+    batch : ElectronBatch
+        The step's FIXED sample.  The same object is reused by every call.
+    primary_local_energy : torch.Tensor
+        Local energy of the step's PRIMARY objective.  Only its finite mask is
+        retained, detached, so this argument contributes no graph and cannot
+        keep the primary step's graph alive.  It exists to give
+        :func:`select_reevaluation_rows` the one input it cannot recompute.
+    nonfinite_policy : str, optional
+        Resolved non-finite local-energy policy, which must be the one the
+        step's primary objective used.
+
+    Returns
+    -------
+    ObjectiveReevaluation
+        Callable recomputing this step's objective at current parameters.
+
+    Notes
+    -----
+    ``return_terms=False`` is used deliberately.  Per-term local energies are
+    metrics, never objective components, and a re-evaluation exists to feed an
+    optimizer rather than the metrics record; asking for the decomposition
+    would do extra work whose result nothing reads.  The summed total is
+    identical either way.
+    """
+
+    if not isinstance(batch, ElectronBatch):
+        raise TypeError("vmc_objective_reevaluation requires an ElectronBatch")
+    if not callable(model):
+        raise TypeError("vmc_objective_reevaluation requires a callable model")
+    if not isinstance(primary_local_energy, torch.Tensor):
+        raise TypeError("vmc_objective_reevaluation requires a primary_local_energy tensor")
+    resolved_policy = resolve_nonfinite_local_energy_policy(nonfinite_policy)
+    # No ``.detach().clone()``: ``torch.isfinite`` returns a FRESH bool tensor
+    # (measured ``_base is None``), and a bool tensor can never require grad --
+    # even from a grad-requiring input.  Both calls were provable no-ops.  The
+    # property they appeared to provide, that this mask is fixed at
+    # construction and immune to later in-place mutation of the caller's
+    # tensor, is now asserted by a test that can actually fail instead.
+    primary_finite_mask = torch.isfinite(primary_local_energy)
+
+    def recompute() -> torch.Tensor:
+        # Both the forward and the local energy are recomputed, because a
+        # closure optimizer has moved the parameters since the primary
+        # objective was formed and a stale factor would silently mix two
+        # parameter versions into one scalar.
+        output = model(batch)
+        total_local_energy = local_energy(
+            hamiltonian_terms,
+            model,
+            batch,
+            return_terms=False,
+        )
+        # The row-set decision is delegated, never inlined: see
+        # `select_reevaluation_rows` for why it is a decision and how a ruling
+        # on it lands.  Looked up through the module so the decision has one
+        # definition and one call site.
+        logabs = output.logabs
+        selection = select_reevaluation_rows(
+            primary_finite_mask=primary_finite_mask,
+            recomputed_local_energy=total_local_energy,
+            policy=resolved_policy,
+        )
+        if selection is not None:
+            logabs = logabs[selection]
+            total_local_energy = total_local_energy[selection]
+        return compute_vmc_objective(
+            logabs,
+            total_local_energy,
+            nonfinite_policy=resolved_policy,
+        ).loss
+
+    return ObjectiveReevaluation(
+        recompute=recompute,
+        dtype=batch.dtype,
+        device=batch.device,
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class AutogradUpdateInput(VMCStepData):
     """Typed input for an autograd-backed VMC update."""
 
     step: int
     objective: torch.Tensor
+    # REQUIRED, deliberately not ``| None``.  A materialized objective with no
+    # means to recompute it is the exact defect this field exists to close, and
+    # an optional field re-admits it: every caller could once again hand an
+    # update method an objective no closure optimizer can use.  The cost is a
+    # keyword at each construction site; the benefit is that the unusable
+    # shape is no longer expressible.
+    reevaluate: ObjectiveReevaluation
 
     def __post_init__(self) -> None:
         self.validate()
@@ -124,15 +523,43 @@ class AutogradUpdateInput(VMCStepData):
             raise ValueError("AutogradUpdateInput objective and wavefunction must share one device")
         if self.objective.dtype != self.wavefunction.logabs.dtype:
             raise ValueError("AutogradUpdateInput objective and wavefunction must share one dtype")
+        if not isinstance(self.reevaluate, ObjectiveReevaluation):
+            raise TypeError("AutogradUpdateInput.reevaluate must be an ObjectiveReevaluation")
+        # The re-evaluation must agree with the primary objective it replaces.
+        # A re-evaluation returning float32 where the step is float64 would not
+        # fail loudly; it would quietly degrade an optimizer's curvature
+        # history one closure call at a time.
+        #
+        # THESE TWO GUARD NON-FACTORY CONSTRUCTION, which is a real route and
+        # not a hypothetical: `vmc_objective_reevaluation` derives dtype and
+        # device from the batch, and `VMCStepData.validate` already forces
+        # batch/logabs/objective agreement, so through the factory they cannot
+        # fire.  `ObjectiveReevaluation` is directly constructible, and the
+        # test suite constructs it that way (see `_reevaluation` in
+        # tests/unit/training/test_vmc_update.py, which never touches the
+        # factory).  Anyone re-deriving the reachability question through the
+        # factory alone will conclude these are dead and delete real
+        # protection -- stated here so that conclusion is not reached twice.
+        if self.reevaluate.dtype != self.objective.dtype:
+            raise ValueError("AutogradUpdateInput reevaluation and objective must share one dtype")
+        if self.reevaluate.device != self.objective.device:
+            raise ValueError("AutogradUpdateInput reevaluation and objective must share one device")
         return self
 
     def __getstate__(self) -> dict[str, Any]:
-        """Reject serialization while an objective or common value is live."""
+        """Reject serialization: the record holds a live re-evaluation.
+
+        The graph-bearing checks run first so a graph-live record still
+        reports that more specific reason, which is the one a caller can act
+        on.  The unconditional refusal that follows matches
+        :class:`ScoreUpdateInput`: this record now closes over a live model,
+        so no instance of it may cross an artifact boundary.
+        """
 
         super().__getstate__()
         if self.objective.requires_grad:
             raise RuntimeError("graph-bearing AutogradUpdateInput cannot be serialized")
-        return self.__dict__
+        raise RuntimeError("live AutogradUpdateInput cannot be serialized")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -634,11 +1061,14 @@ __all__ = [
     "AutogradUpdateInput",
     "LegacyAutogradUpdate",
     "ModelParameterBinding",
+    "ObjectiveReevaluation",
     "ScoreUpdateInput",
     "VMCStepData",
     "VMCUpdateMethod",
     "VMCUpdateResult",
     "VMCUpdateState",
     "deserialize_parameter_layout",
+    "select_reevaluation_rows",
     "serialize_parameter_layout",
+    "vmc_objective_reevaluation",
 ]
