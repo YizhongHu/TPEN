@@ -15,6 +15,7 @@ keeps the scores and energy gradient at one fixed parameter value.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,9 +27,13 @@ from tpen.training.update import (
     VMCUpdateMethod,
     VMCUpdateResult,
     VMCUpdateState,
+    serialize_parameter_layout,
 )
 
 torch = require_torch(feature="block-diagonal natural-gradient updates")
+
+
+BLOCK_NG_STATE_VERSION = 1
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -79,6 +84,16 @@ class BlockNGPolicy:
             raise ValueError("BlockNGPolicy.score_chunk_size must be a positive integer or None")
         return self
 
+    def fingerprint(self) -> dict[str, Any]:
+        """Return the JSON-safe numerical policy identity for resume checks."""
+
+        return {
+            "damping": self.damping,
+            "learning_rate": self.learning_rate,
+            "solve_dtype": str(self.solve_dtype),
+            "score_chunk_size": self.score_chunk_size,
+        }
+
 
 @dataclass(frozen=True, kw_only=True)
 class BlockNGTelemetry:
@@ -95,6 +110,19 @@ class BlockNGTelemetry:
     energy_gradient_norm: float
     update_direction_norm: float
     solve_dtype: str
+
+    def as_metrics(self) -> dict[str, float | int | str | bool]:
+        """Return bounded telemetry under method-owned metric names."""
+
+        return {
+            "block_ng_applied": self.applied,
+            "block_ng_step": self.step,
+            "block_ng_n_samples": self.n_samples,
+            "block_ng_n_blocks": self.n_blocks,
+            "block_ng_energy_gradient_norm": self.energy_gradient_norm,
+            "block_ng_update_direction_norm": self.update_direction_norm,
+            "block_ng_solve_dtype": self.solve_dtype,
+        }
 
 
 class BlockDiagonalNaturalGradientUpdate(VMCUpdateMethod[ScoreUpdateInput]):
@@ -137,6 +165,7 @@ class BlockDiagonalNaturalGradientUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         self.optimizer = optimizer
         self.model_parameters = model_parameters
         self.policy = policy
+        self.completed_updates = 0
         self.last_telemetry: BlockNGTelemetry | None = None
 
     def forward_request(self) -> MaterializedParameterScoreRequest:
@@ -155,6 +184,43 @@ class BlockDiagonalNaturalGradientUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         if not isinstance(model_parameters, ModelParameterBinding):
             raise TypeError("Block-NG model parameters must be a ModelParameterBinding")
         self.model_parameters = model_parameters
+
+    def method_state_dict(self) -> dict[str, Any]:
+        """Return persistent state needed to continue the same block-NG method.
+
+        The optimizer owns its own tensor state in ``optimizer.pt``.  This
+        envelope instead records the method's update count and the exact
+        layout and numerical policy under which its directions are defined.
+        A resume that silently changes any of these facts is not parity.
+        """
+
+        return {
+            "version": BLOCK_NG_STATE_VERSION,
+            "parameter_layout": serialize_parameter_layout(self.model_parameters.layout),
+            "policy": self.policy.fingerprint(),
+            "completed_updates": self.completed_updates,
+        }
+
+    def load_method_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore persistent method state, rejecting a different method identity."""
+
+        if not isinstance(state, Mapping):
+            raise TypeError("Block-NG method state must be a mapping")
+        if state.get("version") != BLOCK_NG_STATE_VERSION:
+            raise ValueError(
+                f"unsupported Block-NG state version {state.get('version')!r}, "
+                f"expected {BLOCK_NG_STATE_VERSION!r}"
+            )
+        if state.get("parameter_layout") != serialize_parameter_layout(
+            self.model_parameters.layout
+        ):
+            raise ValueError("Block-NG checkpoint parameter layout does not match the live model")
+        if state.get("policy") != self.policy.fingerprint():
+            raise ValueError("Block-NG checkpoint policy does not match the live method")
+        completed_updates = state.get("completed_updates")
+        if type(completed_updates) is not int or completed_updates < 0:
+            raise ValueError("Block-NG completed_updates must be a non-negative integer")
+        self.completed_updates = completed_updates
 
     def update(self, update_input: ScoreUpdateInput) -> VMCUpdateResult:
         """Build current Fisher blocks, solve them, and apply one SGD step."""
@@ -187,6 +253,7 @@ class BlockDiagonalNaturalGradientUpdate(VMCUpdateMethod[ScoreUpdateInput]):
                 dtype=parameter.dtype, device=parameter.device
             )
         self.optimizer.step()
+        self.completed_updates += 1
 
         flat_gradient = torch.cat([gradient.reshape(-1) for gradient in gradients])
         flat_direction = torch.cat([direction.reshape(-1) for direction in directions])
@@ -294,6 +361,7 @@ def _validate_plain_sgd(optimizer: Any, *, learning_rate: float) -> None:
 
 
 __all__ = [
+    "BLOCK_NG_STATE_VERSION",
     "BlockDiagonalNaturalGradientUpdate",
     "BlockNGPolicy",
     "BlockNGTelemetry",

@@ -1,0 +1,27 @@
+# Exact block-diagonal natural gradient (block-NG).
+#
+# This has the same optimizer/update-method preset shape as SR/minSR: plain
+# SGD is the sole applier, while the configured method supplies the direction
+# from per-sample scores.  Keep the two learning-rate spellings equal; the
+# method rejects drift rather than reporting a misleading step size.
+
+optimizer:
+  _target_: torch.optim.SGD
+  _partial_: true
+  lr: 0.01
+
+trainer:
+  update_method:
+    _target_: tpen.training.block_ng.BlockDiagonalNaturalGradientUpdate
+    _partial_: true
+    policy:
+      _target_: tpen.training.block_ng.BlockNGPolicy
+      # The Fisher block solve is sensitive to roundoff; float64 is the
+      # default. Select float32 only as an explicitly lower-precision run.
+      solve_dtype: float64
+      # Required, with no hidden regularization default.
+      damping: 0.001
+      # Must equal optimizer.lr above; construction verifies this.
+      learning_rate: 0.01
+      # null lets the score provider choose its materialization chunking.
+      score_chunk_size: null
