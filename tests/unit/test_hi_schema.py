@@ -1812,6 +1812,39 @@ class TestForbiddenResolvers:
         assert references > 0, "no interpolations found at all; this test would pass vacuously"
 
 
+class TestResolverRefusalPrecedesResolution:
+    def test_registered_resolver_has_no_execution_witness_when_refused(self) -> None:
+        """A rejected resolver call must not run while validation inspects it."""
+
+        import tpen.config as config_module
+
+        BASIS_FEATURE_DIM_RESOLVER = config_module.BASIS_FEATURE_DIM_RESOLVER
+        basis_feature_dim = config_module.basis_feature_dim
+
+        calls: list[object] = []
+
+        def witness(argument: object) -> int:
+            calls.append(argument)
+            return 1
+
+        assert OmegaConf.has_resolver(BASIS_FEATURE_DIM_RESOLVER)
+        OmegaConf.register_new_resolver(BASIS_FEATURE_DIM_RESOLVER, witness, replace=True)
+        try:
+            cfg = _config(
+                system={"reference_energy": -2.9},
+                runtime={"probe": "${tpen.basis_feature_dim:${system}}"},
+            )
+            with pytest.raises(ClosedSchemaError) as caught:
+                _validate(cfg)
+        finally:
+            OmegaConf.register_new_resolver(
+                BASIS_FEATURE_DIM_RESOLVER, basis_feature_dim, replace=True
+            )
+
+        assert calls == []
+        assert {"unadmitted-resolver", "forbidden-surface:reference"} <= _rules(caught.value)
+
+
 class TestAdmittedMethods:
     """An unavailable method must stay visibly unavailable, never become Adam."""
 
