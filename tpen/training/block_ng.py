@@ -47,10 +47,12 @@ class BlockNGPolicy:
         has no default because a silent choice would hide conditioning policy.
     learning_rate : float
         SGD learning rate used to apply the preconditioned direction.
-    solve_dtype : torch.dtype, optional
+    solve_dtype : torch.dtype or str, optional
         Dtype used for score centering, block construction, and the eigensolve.
         ``float64`` is the default; ``float32`` is selectable for a deliberately
-        lower-precision run.
+        lower-precision run.  A bare dtype name is accepted at this policy's
+        configuration seam so Hydra YAML resolves to the same concrete object
+        as programmatic construction.
     score_chunk_size : int, optional
         Chunk size forwarded to the materialized-score forward request.
     """
@@ -63,6 +65,13 @@ class BlockNGPolicy:
     def __post_init__(self) -> None:
         object.__setattr__(self, "damping", float(self.damping))
         object.__setattr__(self, "learning_rate", float(self.learning_rate))
+        if isinstance(self.solve_dtype, str):
+            resolved = getattr(torch, self.solve_dtype, None)
+            if not isinstance(resolved, torch.dtype):
+                raise ValueError(
+                    f"BlockNGPolicy.solve_dtype {self.solve_dtype!r} is not a torch dtype name"
+                )
+            object.__setattr__(self, "solve_dtype", resolved)
         self.validate()
 
     def validate(self) -> "BlockNGPolicy":

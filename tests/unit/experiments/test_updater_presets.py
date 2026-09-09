@@ -145,8 +145,26 @@ def test_block_ng_preset_resolves_to_exact_objects() -> None:
     assert isinstance(optimizer, torch.optim.SGD)
     assert isinstance(method, BlockDiagonalNaturalGradientUpdate)
     assert isinstance(method.policy, BlockNGPolicy)
-    assert method.policy.solve_dtype == torch.float64
+    assert method.policy.solve_dtype is torch.float64
     assert method.forward_request() is not None
+
+
+def test_block_ng_float32_config_resolves_to_its_own_dtype_object() -> None:
+    """A float32 configuration must not be silently coerced to float64."""
+
+    cfg = OmegaConf.create(_load(BLOCK_NG))
+    cfg.trainer.update_method.policy.solve_dtype = "float32"
+    parameters = _parameters()
+    optimizer = make_optimizer(cfg.optimizer, parameters)
+    method = make_update_method(
+        cfg.trainer.update_method,
+        optimizer=optimizer,
+        model_parameters=ModelParameterBinding(parameters=parameters),
+    )
+
+    assert isinstance(method, BlockDiagonalNaturalGradientUpdate)
+    assert method.policy.solve_dtype is torch.float32
+    assert method.policy.solve_dtype is not torch.float64
 
 
 def test_block_ng_preset_names_targets_and_keeps_learning_rates_equal() -> None:
