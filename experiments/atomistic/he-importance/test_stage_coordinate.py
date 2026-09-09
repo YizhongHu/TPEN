@@ -40,6 +40,20 @@ def _evaluation_manifest() -> dict[str, object]:
     }
 
 
+def _configuration(
+    scientific_identity: dict[str, object],
+    payload: dict[str, object],
+    topology: object = None,
+) -> dict[str, object]:
+    """Build the complete caller-owned materializer input shape."""
+
+    return {
+        "scientific_identity": scientific_identity,
+        "payload": payload,
+        "topology": {} if topology is None else topology,
+    }
+
+
 def test_all_35_transcribed_stage_fields_are_pinned_against_committed_authority() -> None:
     expected = [
         {"code": "Q", "purpose": "mechanics", "seeds_per_point": 2, "maximum_lineages": 480, "updates": 2_000},
@@ -305,3 +319,245 @@ def test_schema_string_equality_is_enforced() -> None:
     manifest["schema"] = "he-importance/train/v0"
     with pytest.raises(stage_coordinate.ManifestSchemaError, match="expected schema"):
         stage_coordinate.validate_train_manifest(manifest)
+
+
+def test_seed_namespaces_encode_the_new_8_12_48_policy() -> None:
+    assert stage_coordinate.seed_labels("O1") == tuple(range(820_001, 820_009))
+    assert stage_coordinate.seed_labels("R") == tuple(range(850_001, 850_013))
+    assert stage_coordinate.seed_labels("F") == tuple(range(860_001, 860_049))
+    streams = stage_coordinate.seed_namespace("O1", 820_001)
+    assert tuple(streams) == stage_coordinate.SEED_STREAMS
+    assert len(set(streams.values())) == len(streams)
+    assert all(0 < value < 2**63 for value in streams.values())
+
+
+@pytest.mark.parametrize("stage", ["O1", "R", "F"])
+def test_each_seed_label_has_pairwise_distinct_rng_streams(stage: str) -> None:
+    namespaces = stage_coordinate.seed_namespaces(stage)
+    signatures = {tuple(streams.items()) for streams in namespaces.values()}
+    assert len(namespaces) == stage_coordinate.stage_definition(stage).seeds_per_point
+    assert len(signatures) == len(namespaces)
+
+
+def test_materialized_union_deduplicates_only_resolved_scientific_identity(tmp_path: Path) -> None:
+    control = _configuration({"model": "control"}, {"updates": 50_000})
+    duplicate = _configuration({"model": "control"}, {"updates": 50_000})
+    variant = _configuration({"model": "hybrid"}, {"updates": 50_000})
+    cells = stage_coordinate.materialize_stage(
+        "O1",
+        [control, duplicate, variant],
+        stage_coordinate.OptimizerCell("adam", "available"),
+        tmp_path,
+    )
+    assert len(cells) == 16
+    assert len({cell.content_hash for cell in cells}) == 16
+    assert len({cell.output_path for cell in cells}) == 16
+    assert all(cell.output_path.is_absolute() for cell in cells)
+    assert all(
+        cell.manifest["scientific_identity"]["optimizer_cell"] == {"method": "adam", "status": "available"}
+        for cell in cells
+    )
+    with pytest.raises(TypeError):
+        cells[0].manifest["stage"] = "F"  # type: ignore[index]
+    assert stage_coordinate.content_hash(cells[0].manifest) == cells[0].content_hash
+
+
+def _topology_probe_keys() -> tuple[str, ...]:
+    """Generate a spelling-independent structural-exclusion corpus.
+
+    These names are deliberately derived from an index rather than a topology
+    vocabulary.  The property is positional: any key under the designated
+    subtree is execution data, and the same key outside it is science.
+    """
+
+    return (
+        *(f"generated_execution_fact_{index:02d}" for index in range(28)),
+        # Both are required same-repository collisions: execution names inside
+        # the topology boundary and scientific facts in the paired outer arm.
+        "rank",
+        "node",
+    )
+
+
+def _paired_configuration(route: str, key: str, *, inside_topology: bool) -> dict[str, object]:
+    scientific_identity: dict[str, object] = {"architecture": "control", "width": 16}
+    payload: dict[str, object] = {"updates": 50_000, "input_features": ("r12",)}
+    topology: dict[str, object] = {}
+    if inside_topology:
+        topology[key] = ("execution", 1)
+    elif route == "scientific_identity":
+        scientific_identity[key] = ("science", 1)
+    else:
+        payload[key] = ("science", 1)
+    return _configuration(scientific_identity, payload, MappingProxyType(topology))
+
+
+@pytest.mark.parametrize("route", ["scientific_identity", "payload.configuration"])
+@pytest.mark.parametrize("key", _topology_probe_keys())
+def test_topology_exclusion_is_structural_and_open_routes_remain_science(
+    tmp_path: Path, route: str, key: str
+) -> None:
+    """Each generated key runs in both positions, without lexical policy."""
+
+    optimizer = stage_coordinate.OptimizerCell("adam", "available")
+    baseline = stage_coordinate.materialize_stage(
+        "O1", [_configuration({"architecture": "control", "width": 16}, {"updates": 50_000, "input_features": ("r12",)})], optimizer, tmp_path / "base"
+    )
+    inside = stage_coordinate.materialize_stage(
+        "O1", [_paired_configuration(route, key, inside_topology=True)], optimizer, tmp_path / "inside"
+    )
+    outside = stage_coordinate.materialize_stage(
+        "O1", [_paired_configuration(route, key, inside_topology=False)], optimizer, tmp_path / "outside"
+    )
+    assert [cell.content_hash for cell in inside] == [cell.content_hash for cell in baseline]
+    assert [cell.output_path.name for cell in inside] == [cell.output_path.name for cell in baseline]
+    assert [cell.content_hash for cell in outside] != [cell.content_hash for cell in baseline]
+    assert [cell.output_path.name for cell in outside] != [cell.output_path.name for cell in baseline]
+
+
+_SCIENCE_FACT_CASES = (
+    # Repository evidence: these are caller-declared scientific coordinates.
+    ("max_order", "rg: 130 hits across 8 files; tpen/hi_schema.py:755"),
+    ("max_virtual_order", "rg: 36 hits across 4 files; tpen/hi_schema.py:756"),
+    ("channels", "rg: 127 hits across 18 files; tpen/hi_schema.py:743"),
+    ("n_walkers", "rg: 115 hits across 13 files; tpen/sampling/mala.py:55"),
+    ("stage", "intended_configurations.json:3 committed HI coordinate"),
+    # The word is topology-related in distributed execution, but this position
+    # is caller-declared science: `tpen/config.py:52` names config-tree nodes.
+    ("node", "tpen/config.py:52 config-tree node collision"),
+    (
+        "rank",
+        "rg: 15 tpen/distributed.py hits; tensor/matrix rank at tpen/nn/readout/pfaffian.py:128",
+    ),
+    ("topology", "L2a V6 contract: only the manifest-root member is execution data"),
+    # `rg --fixed-strings mesh|shard tpen experiments` found no HI-coordinate
+    # declaration; retain these explicitly labeled speculative science probes.
+    ("mesh", "speculative: no HI-coordinate repository hit"),
+    ("shard", "speculative: no HI-coordinate repository hit"),
+)
+
+
+@pytest.mark.parametrize(("key", "classification_evidence"), _SCIENCE_FACT_CASES)
+def test_facts_outside_designated_topology_fork_identity(
+    tmp_path: Path, key: str, classification_evidence: str
+) -> None:
+    """Outside topology, every caller-supplied fact is identity-significant."""
+
+    assert classification_evidence
+    optimizer = stage_coordinate.OptimizerCell("adam", "available")
+    base = stage_coordinate.materialize_stage(
+        "O1", [_configuration({"architecture": "control"}, {"updates": 50_000})], optimizer, tmp_path / "base"
+    )
+    science = stage_coordinate.materialize_stage(
+        "O1",
+        [_configuration({"architecture": "control", key: "science-value"}, {"updates": 50_000})],
+        optimizer,
+        tmp_path / "science",
+    )
+    assert [cell.content_hash for cell in science] != [cell.content_hash for cell in base]
+    assert [cell.output_path.name for cell in science] != [cell.output_path.name for cell in base]
+
+
+def test_materializer_rejects_conflicting_resolved_scientific_identity(tmp_path: Path) -> None:
+    first = _configuration({"model": "control"}, {"updates": 50_000})
+    conflict = _configuration({"model": "control"}, {"updates": 25_000})
+    with pytest.raises(stage_coordinate.MaterializationError, match="conflicting"):
+        stage_coordinate.materialize_stage(
+            "O1", [first, conflict], stage_coordinate.OptimizerCell("adam", "available"), tmp_path
+        )
+
+
+def test_unavailable_optimizer_is_explicit_and_never_becomes_adam(tmp_path: Path) -> None:
+    unavailable = stage_coordinate.OptimizerCell("linear_method", "unavailable", "full tangent unavailable")
+    cells = stage_coordinate.materialize_stage(
+        "O1",
+        [_configuration({"model": "control"}, {"updates": 50_000})],
+        unavailable,
+        tmp_path,
+    )
+    assert len(cells) == 8
+    assert all(
+        cell.manifest["scientific_identity"]["optimizer_cell"]
+        == {
+            "method": "linear_method",
+            "status": "unavailable",
+            "unavailable_reason": "full tangent unavailable",
+        }
+        for cell in cells
+    )
+    with pytest.raises(stage_coordinate.MaterializationError, match="need a reason"):
+        stage_coordinate.OptimizerCell("linear_method", "unavailable")
+
+
+def test_l2a_content_screen_reaches_frozen_delegated_configuration(tmp_path: Path) -> None:
+    forbidden = {
+        "scientific_identity": MappingProxyType({"architecture": "control"}),
+        "payload": {
+            "updates": 50_000,
+            "nested": MappingProxyType({"values": (-2.903724377034119598,)}),
+        },
+        "topology": MappingProxyType({}),
+    }
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match="reference energy"):
+        stage_coordinate.materialize_stage(
+            "O1", [forbidden], stage_coordinate.OptimizerCell("adam", "available"), tmp_path
+        )
+
+
+def test_l2b_closes_its_seed_identity_vocabulary() -> None:
+    manifest = {
+        "schema": stage_coordinate.TRAIN_MANIFEST_SCHEMA,
+        "stage": "O1",
+        "scientific_identity": {"architecture": "control"},
+        "seed_identity": {"stage": "O1", "label": 820_001, "namespace": "fresh-training", "rank": 0},
+        "payload": {"updates": 50_000, "configuration": {"updates": 50_000}},
+        "topology": {},
+    }
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match="seed_identity keys mismatch"):
+        stage_coordinate.validate_materialized_manifest(manifest)
+
+
+def test_content_hash_is_canonical_and_rejects_nonfinite_values() -> None:
+    assert stage_coordinate.content_hash({"a": 1, "b": [2, 3]}) == (
+        "efbd0040190fb0871831e606c581f8a66db79d8e2bb836745a70051306956070"
+    )
+    assert stage_coordinate.content_hash(MappingProxyType({"b": (2, 3), "a": 1})) == (
+        "efbd0040190fb0871831e606c581f8a66db79d8e2bb836745a70051306956070"
+    )
+    with pytest.raises(stage_coordinate.MaterializationError, match="finite JSON"):
+        stage_coordinate.content_hash({"bad": float("nan")})
+
+
+def test_canonical_hash_recurses_through_frozen_sequences_and_keeps_them_immutable() -> None:
+    plain = {"nested": ({"tuple": [1, {"leaf": 2}]},)}
+    frozen = stage_coordinate._freeze(plain)
+    assert isinstance(frozen, MappingProxyType)
+    assert isinstance(frozen["nested"], tuple)
+    assert isinstance(frozen["nested"][0], MappingProxyType)
+    assert stage_coordinate.content_hash(frozen) == stage_coordinate.content_hash(plain)
+    with pytest.raises(TypeError):
+        frozen["nested"][0]["tuple"] = ()  # type: ignore[index]
+
+
+def test_canonical_hash_preserves_the_typed_non_string_key_failure() -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="identity mapping keys must be strings"):
+        stage_coordinate.content_hash({1: "not-json"})
+
+
+def test_committed_intended_configuration_inventory_materializes_completely(tmp_path: Path) -> None:
+    inventory = json.loads(Path(__file__).with_name("intended_configurations.json").read_text())
+    cells = stage_coordinate.materialize_intended_configurations(tmp_path)
+    expected = sum(
+        len(entry["configurations"]) * stage_coordinate.stage_definition(entry["stage"]).seeds_per_point
+        for entry in inventory
+    )
+    assert len(cells) == expected
+    assert {cell.manifest["stage"] for cell in cells} == {entry["stage"] for entry in inventory}
+
+
+def test_real_hi_namespace_family_exposes_the_materialization_api() -> None:
+    from tpen.hi.train import v1
+
+    assert "materialize_stage" in v1.__all__
+    assert "validate_materialized_manifest" in v1.__all__
+    assert v1.content_hash({"a": 1, "b": [2, 3]}) == stage_coordinate.content_hash({"a": 1, "b": [2, 3]})

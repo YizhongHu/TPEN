@@ -1,0 +1,51 @@
+[
+  {
+    "stage": "Q",
+    "optimizer": {"method": "adam", "status": "available"},
+    "configurations": [
+      {
+        "scientific_identity": {"architecture": "control", "optimizer": "adam"},
+        "payload": {"updates": 2000},
+        "topology": {}
+      }
+    ]
+  },
+  {
+    "stage": "O1",
+    "optimizer": {"method": "adam", "status": "available"},
+    "configurations": [
+      {
+        "scientific_identity": {"architecture": "control", "optimizer": "adam"},
+        "payload": {"updates": 50000},
+        "topology": {}
+      },
+      {
+        "scientific_identity": {"architecture": "hybrid", "optimizer": "adam"},
+        "payload": {"updates": 50000},
+        "topology": {}
+      }
+    ]
+  },
+  {
+    "stage": "R",
+    "optimizer": {"method": "linear_method", "status": "unavailable", "reason": "qualification pending"},
+    "configurations": [
+      {
+        "scientific_identity": {"architecture": "control", "optimizer": "linear_method"},
+        "payload": {"updates": 50000},
+        "topology": {}
+      }
+    ]
+  },
+  {
+    "stage": "F",
+    "optimizer": {"method": "adam", "status": "available"},
+    "configurations": [
+      {
+        "scientific_identity": {"architecture": "control", "optimizer": "adam"},
+        "payload": {"updates": 50000, "final_horizon": "frozen-before-confirmation"},
+        "topology": {}
+      }
+    ]
+  }
+]

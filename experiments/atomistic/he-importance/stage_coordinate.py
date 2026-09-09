@@ -12,9 +12,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from hashlib import sha256
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+from types import MappingProxyType
 
 
 TRAIN_MANIFEST_SCHEMA = "he-importance/train/v1"
@@ -76,6 +78,322 @@ _FORBIDDEN_TRAIN_CONTENT_KEYS = frozenset(
         "accuracy_band",
     }
 )
+_L2B_SEED_IDENTITY_KEYS = frozenset({"stage", "label", "namespace"})
+_INTENDED_CONFIGURATIONS_PATH = Path(__file__).with_name("intended_configurations.json")
+
+
+# These labels are scientific namespaces, rather than an inventory of rows.
+# In particular, no stage materializer may use the historical fixed breadth
+# count as a substitute for expanding its literal factor union.
+SEED_NAMESPACE_STARTS = {
+    "Q": 810_001,
+    "O1": 820_001,
+    "O2": 821_001,
+    "A": 830_001,
+    "B": 840_001,
+    "R": 850_001,
+    "F": 860_001,
+}
+SEED_STREAMS = (
+    "model_initialization",
+    "training_sampler",
+    "method_randomness",
+    "diagnostic",
+    "evaluation_calibration",
+    "evaluation_inference",
+)
+
+
+class MaterializationError(ValueError):
+    """A requested HI configuration cannot become an immutable row."""
+
+
+@dataclass(frozen=True)
+class OptimizerCell:
+    """A literal optimizer cell, including an explicit unavailable state.
+
+    Parameters
+    ----------
+    method
+        Declared method name.  This is preserved even when unavailable.
+    status
+        Either ``"available"`` or ``"unavailable"``.
+    reason
+        Required only for unavailable cells.  It makes an implementation
+        qualification failure visible instead of silently selecting Adam.
+    """
+
+    method: str
+    status: str
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in {"available", "unavailable"}:
+            raise MaterializationError(f"unknown optimizer status {self.status!r}")
+        if self.status == "unavailable" and not self.reason:
+            raise MaterializationError("unavailable optimizer cells need a reason")
+        if self.status == "available" and self.reason is not None:
+            raise MaterializationError("available optimizer cells cannot carry an unavailable reason")
+
+
+@dataclass(frozen=True)
+class MaterializedCell:
+    """One content-addressed train row without an attempt identity."""
+
+    manifest: Mapping[str, Any]
+    content_hash: str
+    output_path: Path
+    seed_streams: Mapping[str, int]
+
+
+def canonical_json(value: Any) -> bytes:
+    """Return canonical identity bytes for a value or an HI train manifest.
+
+    The L2a-designated topology member is structurally excluded only from a
+    manifest root.  A caller-owned mapping passed alone may legitimately use
+    the same word as a scientific fact, so it remains literal content.
+    """
+
+    return _canonical_json(value, exclude_root_topology=_is_manifest_root(value))
+
+
+def _canonical_json(value: Any, *, exclude_root_topology: bool) -> bytes:
+    """Serialize an identity with an explicit structural-boundary decision."""
+
+    try:
+        return json.dumps(
+            _project_identity(value, exclude_root_topology=exclude_root_topology),
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    except MaterializationError:
+        raise
+    except (TypeError, ValueError) as error:
+        raise MaterializationError("identity values must be finite JSON data") from error
+
+
+def content_hash(value: Any) -> str:
+    """Return the SHA-256 identity of canonical literal content."""
+
+    return sha256(canonical_json(value)).hexdigest()
+
+
+def _is_manifest_root(value: Any) -> bool:
+    """Recognize the sole L2a-owned position where topology is execution data."""
+
+    return (
+        isinstance(value, Mapping)
+        and value.get("schema") in {TRAIN_MANIFEST_SCHEMA, EVALUATION_MANIFEST_SCHEMA}
+        and TOPOLOGY_KEY in value
+    )
+
+
+def _freeze(value: Any) -> Any:
+    """Recursively freeze a JSON-shaped manifest after it has been hashed."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(nested) for key, nested in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(nested) for nested in value)
+    return value
+
+
+def _project_identity(value: Any, *, exclude_root_topology: bool, is_root: bool = True) -> Any:
+    """Convert frozen containers to JSON, omitting only root execution topology.
+
+    L2a declares ``topology`` as the one top-level execution subtree.  Its
+    contents are deliberately unenumerable: this structural boundary removes
+    the whole subtree, while an identically named nested caller fact remains
+    scientific content and therefore contributes to the identity.
+    """
+
+    if isinstance(value, Mapping):
+        projected: dict[str, Any] = {}
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise MaterializationError("identity mapping keys must be strings")
+            if is_root and exclude_root_topology and key == TOPOLOGY_KEY:
+                continue
+            projected[key] = _project_identity(nested, exclude_root_topology=False, is_root=False)
+        return projected
+    if isinstance(value, (list, tuple)):
+        return [_project_identity(nested, exclude_root_topology=False, is_root=False) for nested in value]
+    return value
+
+
+def seed_labels(stage: str) -> tuple[int, ...]:
+    """Return the fixed fresh-seed namespace for one stage."""
+
+    definition = stage_definition(stage)
+    start = SEED_NAMESPACE_STARTS[stage]
+    return tuple(range(start, start + definition.seeds_per_point))
+
+
+def seed_namespace(stage: str, label: int, *, cohort: str = "he-importance/v2") -> dict[str, int]:
+    """Derive collision-resistant named streams for one scientific seed label.
+
+    A digest, not Python's process-randomized ``hash()``, maps each semantic
+    stream to a positive signed-63-bit integer accepted by common RNG APIs.
+    """
+
+    if label not in seed_labels(stage):
+        raise MaterializationError(f"seed label {label} is outside the {stage} namespace")
+    if not cohort:
+        raise MaterializationError("seed cohorts must be explicit")
+    streams = {
+        stream: int.from_bytes(
+            sha256(canonical_json({"cohort": cohort, "stage": stage, "label": label, "stream": stream})).digest()[:8],
+            "big",
+        )
+        & ((1 << 63) - 1)
+        for stream in SEED_STREAMS
+    }
+    if 0 in streams.values() or len(set(streams.values())) != len(streams):
+        raise MaterializationError("seed namespace collision")
+    return streams
+
+
+def seed_namespaces(stage: str, *, cohort: str = "he-importance/v2") -> dict[int, dict[str, int]]:
+    """Return the complete, pairwise-distinct stream namespace for a stage."""
+
+    namespaces = {label: seed_namespace(stage, label, cohort=cohort) for label in seed_labels(stage)}
+    signatures = {canonical_json(streams) for streams in namespaces.values()}
+    if len(signatures) != len(namespaces):
+        raise MaterializationError(f"seed labels in {stage} do not have distinct RNG streams")
+    return namespaces
+
+
+def _absolute_unique_path(output_root: Path, stage: str, digest: str, seen: set[Path]) -> Path:
+    root = output_root.resolve()
+    if not root.is_absolute():  # pragma: no cover - Path.resolve is absolute by contract.
+        raise MaterializationError("output root must resolve to an absolute path")
+    path = root / stage / digest
+    if path in seen:
+        raise MaterializationError(f"output path reused: {path}")
+    seen.add(path)
+    return path
+
+
+def materialize_stage(
+    stage: str,
+    configurations: Iterable[Mapping[str, Any]],
+    optimizer: OptimizerCell,
+    output_root: Path,
+) -> tuple[MaterializedCell, ...]:
+    """Materialize one exact resolved union as immutable, content-addressed rows.
+
+    ``configurations`` are literal resolved configurations: each must provide a
+    non-empty ``scientific_identity``, a complete ``payload`` mapping, and the
+    caller-supplied execution ``topology`` mapping.  A
+    duplicate is removed only when its resolved scientific identity is exactly
+    equal.  Conflicting definitions of that identity fail rather than choosing
+    an arbitrary display-name representative.
+    """
+
+    stage_definition(stage)
+    namespaces = seed_namespaces(stage)
+    identities: dict[str, Mapping[str, Any]] = {}
+    seen_paths: set[Path] = set()
+    cells: list[MaterializedCell] = []
+    for configuration in configurations:
+        if frozenset(configuration) != frozenset({"scientific_identity", "payload", TOPOLOGY_KEY}):
+            raise MaterializationError(
+                "resolved configurations require exactly scientific_identity, payload, and topology"
+            )
+        identity = configuration["scientific_identity"]
+        payload = configuration["payload"]
+        topology = configuration[TOPOLOGY_KEY]
+        if not isinstance(identity, Mapping) or not identity:
+            raise MaterializationError("scientific_identity must be a non-empty mapping")
+        if not isinstance(payload, Mapping):
+            raise MaterializationError("payload must be a literal mapping")
+        if not isinstance(topology, Mapping):
+            raise MaterializationError("topology must be a literal mapping")
+        identity_hash = content_hash(identity)
+        previous = identities.get(identity_hash)
+        if previous is not None:
+            if _canonical_json(previous, exclude_root_topology=True) != _canonical_json(
+                configuration, exclude_root_topology=True
+            ):
+                raise MaterializationError("one scientific identity has conflicting resolved content")
+            continue
+        identities[identity_hash] = configuration
+        optimizer_identity = {"method": optimizer.method, "status": optimizer.status}
+        if optimizer.reason is not None:
+            optimizer_identity["unavailable_reason"] = optimizer.reason
+        for label in seed_labels(stage):
+            if not isinstance(payload.get("updates"), int):
+                raise MaterializationError("payload updates must be an integer")
+            manifest = {
+                "schema": TRAIN_MANIFEST_SCHEMA,
+                "stage": stage,
+                "scientific_identity": {**identity, "optimizer_cell": optimizer_identity},
+                "seed_identity": {"stage": stage, "label": label, "namespace": "fresh-training"},
+                "payload": {"updates": payload["updates"], "configuration": dict(payload)},
+                TOPOLOGY_KEY: topology,
+            }
+            validate_materialized_manifest(manifest)
+            digest = content_hash(manifest)
+            cells.append(
+                MaterializedCell(
+                    manifest=_freeze(manifest),
+                    content_hash=digest,
+                    output_path=_absolute_unique_path(output_root, stage, digest, seen_paths),
+                    seed_streams=_freeze(namespaces[label]),
+                )
+            )
+    return tuple(cells)
+
+
+def validate_materialized_manifest(manifest: Mapping[str, Any]) -> None:
+    """Validate the L2b materializer interface on top of L2a's firewall.
+
+    L2a's train validator owns structural sanity and reference-content screening
+    at every depth. Scientific identity and payload configuration keys remain
+    caller-owned; L2b owns and closes only seed identity.
+    """
+
+    validate_train_manifest(manifest)
+    _require_exact_keys(manifest["seed_identity"], _L2B_SEED_IDENTITY_KEYS, "seed_identity")
+    if manifest["seed_identity"]["stage"] != manifest["stage"]:
+        raise MaterializationError("seed identity stage does not match manifest stage")
+    if manifest["seed_identity"]["label"] not in seed_labels(manifest["stage"]):
+        raise MaterializationError("seed identity label is outside the stage namespace")
+    if manifest["seed_identity"]["namespace"] != "fresh-training":
+        raise MaterializationError("seed identity namespace is not declared")
+
+
+def intended_configurations() -> tuple[Mapping[str, Any], ...]:
+    """Load the committed, literal L2b configuration enumeration."""
+
+    raw = json.loads(_INTENDED_CONFIGURATIONS_PATH.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise MaterializationError("intended configuration inventory must be a list")
+    for entry in raw:
+        if not isinstance(entry, Mapping) or frozenset(entry) != frozenset(
+            {"stage", "optimizer", "configurations"}
+        ):
+            raise MaterializationError("intended configuration entry has an invalid schema")
+    return tuple(raw)
+
+
+def materialize_intended_configurations(output_root: Path) -> tuple[MaterializedCell, ...]:
+    """Materialize every configuration in the committed L2b inventory."""
+
+    cells: list[MaterializedCell] = []
+    for entry in intended_configurations():
+        optimizer_data = entry["optimizer"]
+        if not isinstance(optimizer_data, Mapping):
+            raise MaterializationError("intended optimizer must be a mapping")
+        optimizer = OptimizerCell(
+            method=optimizer_data["method"],
+            status=optimizer_data["status"],
+            reason=optimizer_data.get("reason"),
+        )
+        cells.extend(materialize_stage(entry["stage"], entry["configurations"], optimizer, output_root))
+    return tuple(cells)
 
 
 def stage_definition(code: str) -> StageDefinition:
