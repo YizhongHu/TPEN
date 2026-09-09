@@ -66,7 +66,8 @@ class BlockNGPolicy:
         object.__setattr__(self, "damping", float(self.damping))
         object.__setattr__(self, "learning_rate", float(self.learning_rate))
         if isinstance(self.solve_dtype, str):
-            resolved = getattr(torch, self.solve_dtype, None)
+            dtype_name = self.solve_dtype.removeprefix("torch.")
+            resolved = getattr(torch, dtype_name, None)
             if not isinstance(resolved, torch.dtype):
                 raise ValueError(
                     f"BlockNGPolicy.solve_dtype {self.solve_dtype!r} is not a torch dtype name"

@@ -151,10 +151,10 @@ def test_block_ng_preset_resolves_to_exact_objects() -> None:
 
 
 def test_block_ng_float32_config_resolves_to_its_own_dtype_object() -> None:
-    """A float32 configuration must not be silently coerced to float64."""
+    """A torch-prefixed float32 config must not be silently widened."""
 
     cfg = OmegaConf.create(_load(BLOCK_NG))
-    cfg.trainer.update_method.policy.solve_dtype = "float32"
+    cfg.trainer.update_method.policy.solve_dtype = "torch.float32"
     parameters = _parameters()
     optimizer = make_optimizer(cfg.optimizer, parameters)
     method = make_update_method(
