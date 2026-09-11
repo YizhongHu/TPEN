@@ -15,10 +15,12 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
+from hydra.errors import InstantiationException
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from tpen.training.optim import make_optimizer, make_update_method
+from tpen.training.block_ng import BlockDiagonalNaturalGradientUpdate, BlockNGPolicy
 from tpen.training.qgt import DampingPolicy
 from tpen.training.score_geometry import ScoreConventions
 from tpen.training.sr import SRPolicy, StochasticReconfigurationUpdate
@@ -29,8 +31,9 @@ PRESETS = ROOT / "experiments" / "configs" / "updater"
 LEGACY = PRESETS / "legacy_adam.yaml"
 SR_DENSE = PRESETS / "sr_dense.yaml"
 MINSR = PRESETS / "minsr.yaml"
+BLOCK_NG = PRESETS / "block_ng.yaml"
 
-ALL_PRESETS = (LEGACY, SR_DENSE, MINSR)
+ALL_PRESETS = (LEGACY, SR_DENSE, MINSR, BLOCK_NG)
 SR_PRESETS = (SR_DENSE, MINSR)
 
 
@@ -133,6 +136,64 @@ def test_sr_presets_resolve_to_exact_objects(path: Path, expected_space: str) ->
     # An SR method must ask for the score payload, or it would be handed an
     # autograd input it cannot consume.
     assert method.forward_request() is not None
+
+
+def test_block_ng_preset_resolves_to_exact_objects() -> None:
+    """Block-NG uses the same factory shape as SR without a name registry."""
+
+    optimizer, method = _build(BLOCK_NG)
+
+    assert isinstance(optimizer, torch.optim.SGD)
+    assert isinstance(method, BlockDiagonalNaturalGradientUpdate)
+    assert isinstance(method.policy, BlockNGPolicy)
+    assert method.policy.solve_dtype is torch.float64
+    assert method.forward_request() is not None
+
+
+def test_block_ng_float32_config_resolves_to_its_own_dtype_object() -> None:
+    """A torch-prefixed float32 config must not be silently widened."""
+
+    cfg = OmegaConf.create(_load(BLOCK_NG))
+    cfg.trainer.update_method.policy.solve_dtype = "torch.float32"
+    parameters = _parameters()
+    optimizer = make_optimizer(cfg.optimizer, parameters)
+    method = make_update_method(
+        cfg.trainer.update_method,
+        optimizer=optimizer,
+        model_parameters=ModelParameterBinding(parameters=parameters),
+    )
+
+    assert isinstance(method, BlockDiagonalNaturalGradientUpdate)
+    assert method.policy.solve_dtype is torch.float32
+    assert method.policy.solve_dtype is not torch.float64
+
+
+def test_block_ng_hydra_config_refuses_an_unknown_solve_dtype_name() -> None:
+    """Hydra must not turn an unknown dtype spelling into a valid solve policy."""
+
+    cfg = OmegaConf.create(_load(BLOCK_NG))
+    cfg.trainer.update_method.policy.solve_dtype = "not_a_torch_dtype"
+    parameters = _parameters()
+    optimizer = make_optimizer(cfg.optimizer, parameters)
+
+    with pytest.raises(InstantiationException, match="not a torch dtype name"):
+        make_update_method(
+            cfg.trainer.update_method,
+            optimizer=optimizer,
+            model_parameters=ModelParameterBinding(parameters=parameters),
+        )
+
+
+def test_block_ng_preset_names_targets_and_keeps_learning_rates_equal() -> None:
+    """The preset must carry explicit construction and one agreed step size."""
+
+    preset = _load(BLOCK_NG)
+    method = preset["trainer"]["update_method"]
+
+    assert method["_target_"] == "tpen.training.block_ng.BlockDiagonalNaturalGradientUpdate"
+    assert method["_partial_"] is True
+    assert method["policy"]["_target_"] == "tpen.training.block_ng.BlockNGPolicy"
+    assert method["policy"]["learning_rate"] == preset["optimizer"]["lr"]
 
 
 @pytest.mark.parametrize("path", SR_PRESETS, ids=lambda p: p.stem)
