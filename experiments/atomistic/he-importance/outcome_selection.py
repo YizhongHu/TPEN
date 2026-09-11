@@ -16,6 +16,8 @@ import json
 from types import MappingProxyType
 from typing import Any
 
+from content_traversal import walk
+
 
 class OutcomeSelectionError(ValueError):
     """A preregistration, outcome attachment, or reporting boundary failed."""
@@ -46,6 +48,23 @@ def _canonical_digest(value: Mapping[str, Any]) -> str:
     except (TypeError, ValueError) as error:
         raise OutcomeSelectionError("commitment criteria must be canonical JSON data") from error
     return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+_REFERENCE_ROUTE_TOKENS = frozenset(
+    {"reference", "reference_energy", "ref_energy", "e_ref", "exact_energy", "target_energy"}
+)
+
+
+def _reject_reference_named_routes(value: Any, label: str) -> None:
+    """Reject names routed through arbitrary records, not just mappings."""
+
+    matches = walk(
+        value,
+        lambda path, _: any(token.lower() in _REFERENCE_ROUTE_TOKENS for token in path),
+    )
+    if matches:
+        path, _ = matches[0]
+        raise OutcomeSelectionError(f"{label} contains a prohibited reference-bearing route: {'.'.join(path)}")
 
 
 @dataclass(frozen=True)
@@ -104,6 +123,7 @@ class SelectionCommitment:
         if not isinstance(criteria, Mapping):
             raise OutcomeSelectionError("selection criteria must be a mapping")
         criteria_copy = dict(criteria)
+        _reject_reference_named_routes(criteria_copy, "selection criteria")
         return cls(identifiers, _freeze(criteria_copy), interval, _canonical_digest(criteria_copy))
 
     def verify(self) -> None:
@@ -129,6 +149,7 @@ class CellOutcome:
             raise OutcomeSelectionError("outcome must carry every recorded chain state")
         if not isinstance(self.independent_sampler_inputs, Mapping):
             raise OutcomeSelectionError("outcome must retain immutable independent sampler inputs")
+        _reject_reference_named_routes(self.independent_sampler_inputs, "independent sampler inputs")
         object.__setattr__(self, "chain_states", tuple(self.chain_states))
         object.__setattr__(self, "independent_sampler_inputs", _freeze(dict(self.independent_sampler_inputs)))
 

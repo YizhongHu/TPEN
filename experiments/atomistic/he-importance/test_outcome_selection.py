@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,13 @@ _SPEC = importlib.util.spec_from_file_location(
     "he_importance_outcome_selection", Path(__file__).with_name("outcome_selection.py")
 )
 assert _SPEC is not None and _SPEC.loader is not None
+_TRAVERSAL_SPEC = importlib.util.spec_from_file_location(
+    "content_traversal", Path(__file__).with_name("content_traversal.py")
+)
+assert _TRAVERSAL_SPEC is not None and _TRAVERSAL_SPEC.loader is not None
+traversal = importlib.util.module_from_spec(_TRAVERSAL_SPEC)
+sys.modules[_TRAVERSAL_SPEC.name] = traversal
+_TRAVERSAL_SPEC.loader.exec_module(traversal)
 selection = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = selection
 _SPEC.loader.exec_module(selection)
@@ -28,6 +36,23 @@ def _commitment() -> object:
 
 def _outcome(identifier: str, states: tuple[str, ...], value: float | None) -> object:
     return selection.CellOutcome(identifier, states, {"sampler": {"walkers": 4096}}, value)
+
+
+@dataclass
+class SelectionRow:
+    reference_energy: object
+
+
+def test_outcome_screen_reaches_reference_name_inside_its_own_record_type() -> None:
+    with pytest.raises(selection.OutcomeSelectionError, match="reference-bearing route"):
+        selection.CellOutcome("cell-a", ("completed",), {"sampler": SelectionRow(3.0)}, 1.0)
+
+
+def test_commitment_screen_reaches_reference_name_inside_its_own_record_type() -> None:
+    with pytest.raises(selection.OutcomeSelectionError, match="reference-bearing route"):
+        selection.SelectionCommitment.create(
+            ("cell-a",), {"criteria": SelectionRow(3.0)}, selection.IntervalContract("mean", "t", 0.95, "holm")
+        )
 
 
 def test_complete_selection_is_invariant_to_outcome_values_and_kills_peek_mutant() -> None:
