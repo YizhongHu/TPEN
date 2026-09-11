@@ -8,6 +8,7 @@ because only there is there anything to construct.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -1814,7 +1815,7 @@ class TestForbiddenResolvers:
 
 class TestResolverRefusalPrecedesResolution:
     def test_registered_resolver_has_no_execution_witness_when_refused(self) -> None:
-        """A rejected resolver call must not run while validation inspects it."""
+        """A rejected resolver call with a construction argument must not run."""
 
         import tpen.config as config_module
 
@@ -1832,7 +1833,12 @@ class TestResolverRefusalPrecedesResolution:
         try:
             cfg = _config(
                 system={"reference_energy": -2.9},
-                runtime={"probe": "${tpen.basis_feature_dim:${system}}"},
+                runtime={
+                    "probe": (
+                        "${tpen.basis_feature_dim:"
+                        "{_target_: builtins.open, file: refused, mode: w}}"
+                    )
+                },
             )
             with pytest.raises(ClosedSchemaError) as caught:
                 _validate(cfg)
@@ -1843,6 +1849,63 @@ class TestResolverRefusalPrecedesResolution:
 
         assert calls == []
         assert {"unadmitted-resolver", "forbidden-surface:reference"} <= _rules(caught.value)
+
+    def test_admitted_resolver_cannot_construct_an_unadmitted_callable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Admitting the resolver must not admit targets in its arguments."""
+
+        import hydra.utils
+        import tpen.config as config_module
+        import tpen.hi_schema as hi_schema_module
+
+        resolver = config_module.BASIS_FEATURE_DIM_RESOLVER
+        admitted_policy = replace(
+            HI_TRAIN_POLICY,
+            allowed_resolvers=frozenset({resolver}),
+        )
+        monkeypatch.setattr(hi_schema_module, "HI_TRAIN_POLICY", admitted_policy)
+        print(f"allowed_resolvers={sorted(hi_schema_module.HI_TRAIN_POLICY.allowed_resolvers)}")
+        assert hi_schema_module.HI_TRAIN_POLICY.allowed_resolvers == frozenset({resolver})
+        assert OmegaConf.has_resolver(resolver)
+
+        original_instantiate = hydra.utils.instantiate
+        marker = tmp_path / "resolver-construction-ran"
+        cfg = _config(
+            runtime={
+                "probe": (
+                    "${tpen.basis_feature_dim:{_target_: builtins.open, file: "
+                    + str(marker)
+                    + ", mode: w}}"
+                )
+            }
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+
+        assert not marker.exists(), "the refused construction callable ran during resolution"
+        assert "unadmitted-resolver" not in _rules(caught.value)
+        assert "unadmitted-free-form-target" in _rules(caught.value)
+        assert hydra.utils.instantiate is original_instantiate
+
+    def test_reports_when_resolved_tree_sweeps_do_not_run(self) -> None:
+        """D4 stays unresolved, but the unavailable finding is made visible."""
+
+        sections = {
+            "runtime": {
+                "probe": "${oc.env:HOME}",
+                "callable_target": "builtins.open",
+            },
+            "runner": {"_target_": "${runtime.callable_target}"},
+        }
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(_config(**sections))
+        assert _rules(caught.value) == {"forbidden-resolver", "resolved-sweep-skipped"}
+
+        del sections["runtime"]["probe"]
+        with pytest.raises(ClosedSchemaError) as control:
+            _validate(_config(**sections))
+        assert _rules(control.value) == {"unadmitted-free-form-target"}
 
 
 class TestAdmittedMethods:
