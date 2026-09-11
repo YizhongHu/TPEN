@@ -42,8 +42,9 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Iterator
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -666,6 +667,74 @@ def _sweep_free_form_targets(config_tree: Any, *, tree: str = "resolved") -> lis
             )
         )
     return rejections
+
+
+class _ResolutionConstructionRefused(RuntimeError):
+    """Carry a consumer-side construction refusal through OmegaConf."""
+
+    def __init__(self, rejection: Rejection) -> None:
+        self.rejection = rejection
+        super().__init__(str(rejection))
+
+
+@contextmanager
+def _guard_resolution_construction() -> Iterator[None]:
+    """Apply the HI target allowlist where Hydra resolves construction targets.
+
+    A construction specification inside a resolver argument is opaque to the
+    raw configuration sweep. Hydra's target-resolution function is the common
+    consumer for recursive ``instantiate`` calls, including calls made through
+    an alias captured before validation, so guard that function for the narrow
+    duration of OmegaConf resolution.
+    """
+
+    from hydra._internal.instantiate import _instantiate2
+
+    original_resolve_target = _instantiate2._resolve_target
+
+    def resolve_admitted_target(target: Any, full_key: str) -> Any:
+        if not isinstance(target, str) or target not in ADMITTED_CONSTRUCTION_TARGETS:
+            path = f"<resolver-construction>.{full_key}" if full_key else "<resolver-construction>"
+            raise _ResolutionConstructionRefused(
+                Rejection(
+                    rule="unadmitted-free-form-target",
+                    tree="resolved",
+                    path=f"{path}._target_",
+                    detail=(
+                        f"construction target {target!r} is not explicitly admitted for HI. "
+                        "Resolver-driven construction is governed at Hydra's target "
+                        "consumer, at every depth, before the callable is imported or run"
+                    ),
+                )
+            )
+        return original_resolve_target(target, full_key)
+
+    _instantiate2._resolve_target = resolve_admitted_target
+    try:
+        yield
+    finally:
+        _instantiate2._resolve_target = original_resolve_target
+
+
+def _resolution_construction_refusal(
+    error: BaseException,
+) -> _ResolutionConstructionRefused | None:
+    """Find a consumer-side refusal wrapped by Hydra or OmegaConf."""
+
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, _ResolutionConstructionRefused):
+            return current
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return None
 
 
 def _sweep_target_values(resolved_tree: Any) -> list[Rejection]:
@@ -2100,10 +2169,14 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
     A configuration that declares no schema, or a different one, is returned
     unvalidated -- see the module docstring on why the firewall is opt-in.
 
-    Resolver calls can execute configuration-named callables while OmegaConf
-    resolves the tree. Raw resolver findings are therefore collected before
-    resolution and, when any such call is refused, reported immediately. This
-    preserves every raw finding while preventing the refused call from running.
+    Raw findings are collected before resolution. If a resolver finding makes
+    resolution unsafe, the refusal also records that resolved-tree sweeps were
+    skipped; findings available only after resolution are then inherently
+    unavailable. When resolution is permitted, Hydra construction reached
+    during it is guarded at the target consumer: every configuration-supplied
+    target must be explicitly admitted before it is imported or run, at any
+    depth. This bounds construction, not arbitrary non-construction work an
+    admitted resolver may perform.
 
     The launch environment is audited alongside the configuration because the
     reference-energy firewall names it as one of the surfaces a reference must
@@ -2160,21 +2233,38 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
         in {"forbidden-resolver", "unadmitted-resolver", "uncheckable-resolver"}
         for rejection in rejections
     ):
+        rejections.append(
+            Rejection(
+                rule="resolved-sweep-skipped",
+                tree="raw",
+                path="<root>",
+                detail=(
+                    "resolved-tree sweeps were not run because a raw resolver finding "
+                    "made resolution unsafe. Resolved-only findings are unavailable "
+                    "until the resolver finding is removed or admitted"
+                ),
+            )
+        )
         raise ClosedSchemaError(rejections)
 
     # Resolution failure is itself a rejection, which keeps every
     # preconstruction failure a single exception type for the caller.
     try:
-        resolved_tree = OmegaConf.to_container(cfg, resolve=True)
+        with _guard_resolution_construction():
+            resolved_tree = OmegaConf.to_container(cfg, resolve=True)
     except Exception as error:  # noqa: BLE001 - OmegaConf raises several unrelated types
-        rejections.append(
-            Rejection(
-                rule="unresolvable",
-                tree="resolved",
-                path="<root>",
-                detail=f"configuration does not resolve: {type(error).__name__}: {error}",
+        construction_refusal = _resolution_construction_refusal(error)
+        if construction_refusal is not None:
+            rejections.append(construction_refusal.rejection)
+        else:
+            rejections.append(
+                Rejection(
+                    rule="unresolvable",
+                    tree="resolved",
+                    path="<root>",
+                    detail=f"configuration does not resolve: {type(error).__name__}: {error}",
+                )
             )
-        )
         raise ClosedSchemaError(rejections) from error
 
     rejections.extend(sweep_resolved(resolved_tree, HI_TRAIN_POLICY))
