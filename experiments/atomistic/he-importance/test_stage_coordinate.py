@@ -72,6 +72,31 @@ def test_all_35_transcribed_stage_fields_are_pinned_against_committed_authority(
 
 
 @pytest.mark.parametrize(
+    ("authority", "message"),
+    [
+        ({"code": "O1"}, "stage authority must be a list"),
+        ([{"code": "O1"}], "stage authority entry has an invalid schema"),
+        (
+            [
+                {"code": "O1", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 1, "updates": 50_000},
+                {"code": "O1", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 2, "updates": 50_000},
+            ],
+            "stage authority repeats a code",
+        ),
+    ],
+    ids=["root-not-list", "entry-schema", "duplicate-code"],
+)
+def test_authority_loader_refuses_malformed_committed_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, authority: object, message: str
+) -> None:
+    authority_path = tmp_path / "authority.json"
+    authority_path.write_text(json.dumps(authority), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_AUTHORITY_PATH", authority_path)
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match=message):
+        stage_coordinate._load_stage_definitions()
+
+
+@pytest.mark.parametrize(
     "spelling",
     [
         "worldSize", "deviceId", "nodeCount", "workerIndex", "referenceEnergy", "accuracyBand",
@@ -267,6 +292,14 @@ def test_train_manifest_refuses_an_unknown_stage() -> None:
         stage_coordinate.validate_train_manifest(manifest)
 
 
+@pytest.mark.parametrize("stage", [[], 1])
+def test_train_manifest_refuses_unhashable_and_hashable_non_string_stages(stage: object) -> None:
+    manifest = _train_manifest()
+    manifest["stage"] = stage
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match="stage must be a string"):
+        stage_coordinate.validate_train_manifest(manifest)
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -376,6 +409,7 @@ def _topology_probe_keys() -> tuple[str, ...]:
         *(f"generated_execution_fact_{index:02d}" for index in range(28)),
         # Both are required same-repository collisions: execution names inside
         # the topology boundary and scientific facts in the paired outer arm.
+        "stage",
         "rank",
         "node",
     )
@@ -683,7 +717,6 @@ def test_job_inputs_refuse_unknown_keys(tmp_path: Path, packet_route: str) -> No
         ("ranking", -2.903724377034119598),
         ("ranking", "-2.903724377034119598"),
         ("ranking", str(-2.903724377034119598)),
-        ("ranking", repr(-2.903724377034119598)),
         ("ranking", "-2.903724"),
         ("independent", -2.903724377034119598),
         ("independent", "-2.903724377034119598"),
@@ -850,6 +883,15 @@ def test_packet_accepts_checkpoint_at_exact_stage_horizon(tmp_path: Path) -> Non
     assert packets.ranking
 
 
+def test_packet_refuses_checkpoint_one_past_stage_horizon_at_cadence_one(tmp_path: Path) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="stage horizon"):
+        stage_coordinate.materialize_job_packets(
+            _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1, (50_001,)),
+            {"statistic": "logabs_variance"}, (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"walkers": 4_096}, ddp_provenance={},
+        )
+
+
 @pytest.mark.parametrize("significant_figures", range(7, 17))
 def test_packet_refuses_decimal_agreement_after_rounding(tmp_path: Path, significant_figures: int) -> None:
     rounded = format(-2.903724377034119598, f".{significant_figures}g")
@@ -870,14 +912,46 @@ def test_packet_refuses_unknown_nested_sampler_key(tmp_path: Path) -> None:
         )
 
 
-def test_packet_refuses_unknown_key_in_mapping_nested_by_sampler_tuple(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "sampler",
+    [
+        ({"undeclared_key": "payload", "another": 123},),
+        [{"undeclared_key": "payload", "another": 123}],
+        [({"undeclared_key": "payload", "another": 123},)],
+    ],
+    ids=["tuple", "list", "two-deep-list-tuple"],
+)
+def test_packet_refuses_unknown_key_in_mapping_nested_by_sampler_sequence(
+    tmp_path: Path, sampler: object
+) -> None:
     with pytest.raises(stage_coordinate.MaterializationError, match="unknown input key 'undeclared_key'"):
         stage_coordinate.materialize_job_packets(
             _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
             {"statistic": "logabs_variance"},
             (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
-            {"sampler": ({"undeclared_key": "payload", "another": 123},)}, ddp_provenance={},
+            {"sampler": sampler}, ddp_provenance={},
         )
+
+
+@pytest.mark.parametrize(
+    "sampler",
+    [
+        ({"walkers": 4_096},),
+        [{"walkers": 4_096}],
+        [({"walkers": 4_096},)],
+    ],
+    ids=["tuple", "list", "two-deep-list-tuple"],
+)
+def test_packet_accepts_declared_sampler_mapping_nested_by_sequence(
+    tmp_path: Path, sampler: object
+) -> None:
+    packets = stage_coordinate.materialize_job_packets(
+        _packet_source_cells(tmp_path), stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+        {"statistic": "logabs_variance"},
+        (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+        {"sampler": sampler}, ddp_provenance={},
+    )
+    assert packets.independent_sampler_test
 
 
 @pytest.mark.parametrize("sampler", [5, "x", (1, 2)])
