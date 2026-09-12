@@ -789,10 +789,14 @@ def identity_without_execution(cfg: Any, path: str) -> Identity:
     THE OPEN AXIS, stated as a decision rather than left to discovery. A
     MISSING sentinel resolves to the literal ``'???'``, which is not the
     family name, so a configuration whose identity is ``???`` receives no
-    enforcement. This is PRE-EXISTING and not introduced here: the reader
-    this replaced returned ``None`` or raised for the same inputs and reached
-    the same not-this-family conclusion. It is pinned by a strict xfail so
-    the marker cannot outlive the defect.
+    enforcement. DISPOSED TO FOLLOW-UP ITEM
+    ``1efc8552-800e-4248-9b8b-984549f0e3dc``. This is PRE-EXISTING and not
+    introduced here: the reader this replaced returned ``None`` or raised for
+    the same inputs and reached the same not-this-family conclusion. It needs
+    no adversarial construction either -- ``???`` is the standard placeholder
+    for a value a template requires its caller to supply, so an omitted
+    override reaches it by itself. Pinned by a strict xfail so the marker
+    cannot outlive the defect.
     """
 
     raw_tree = _raw_config_mapping(cfg)

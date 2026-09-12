@@ -1411,17 +1411,27 @@ def test_hi_firewall_review_r1_omegaconf_does_not_resolve_keys() -> None:
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "OPEN AXIS, named as a decision rather than left to discovery. A MISSING "
-        "sentinel resolves to the literal '???', which is not the family name, so a "
-        "config whose identity is ??? receives no enforcement. PRE-EXISTING, not "
-        "introduced by this layer: the reader this replaced returned None or raised "
-        "for the same inputs and reached the same not-this-family conclusion. strict "
-        "is deliberate -- closing it makes this XPASS and FAIL, so the marker cannot "
-        "outlive the defect it documents"
+        "OPEN AXIS, DISPOSED TO FOLLOW-UP ITEM "
+        "1efc8552-800e-4248-9b8b-984549f0e3dc. A MISSING sentinel resolves to the "
+        "literal '???', which is not the family name, so a config whose identity is "
+        "??? receives no enforcement at all. PRE-EXISTING, not introduced by this "
+        "layer: the reader this replaced returned None for a ??? identity node and "
+        "raised InterpolationToMissingValueError for a ??? target, reaching the same "
+        "not-this-family conclusion by two different routes. strict is deliberate -- "
+        "closing it makes this XPASS and FAIL, so whoever turns it green is told "
+        "which item they just closed and the marker cannot outlive the defect"
     ),
 )
 def test_hi_firewall_review_r1_missing_sentinel_identity_is_refused() -> None:
-    """The MISSING sentinel should not buy a config zero enforcement."""
+    """The MISSING sentinel should not buy a config zero enforcement.
+
+    FOLLOW-UP ITEM: 1efc8552-800e-4248-9b8b-984549f0e3dc.
+
+    This needs NO adversarial construction. ``???`` is the STANDARD
+    PLACEHOLDER for a value a template requires its caller to supply, so an
+    omitted override reaches this state by itself -- which is what makes it
+    worth an item rather than a footnote.
+    """
 
     cfg = OmegaConf.create(
         {"experiment": {"name": "???"}, "reference_energy": REFERENCE_ENERGY}
