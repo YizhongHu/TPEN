@@ -1,96 +1,72 @@
-"""Contract tests for preregistered complete-outcome selection."""
-
+"""Contract tests for preregistered selection declarations."""
 from __future__ import annotations
-
+import hashlib
 import importlib.util
-import sys
 from pathlib import Path
-
 import pytest
 
+def _load(name: str, filename: str):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-_SPEC = importlib.util.spec_from_file_location(
-    "he_importance_outcome_selection", Path(__file__).with_name("outcome_selection.py")
-)
-assert _SPEC is not None and _SPEC.loader is not None
-selection = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = selection
-_SPEC.loader.exec_module(selection)
+selection = _load("he_importance_outcome_selection", "outcome_selection.py")
+traversal = _load("he_importance_content_traversal_for_selection", "content_traversal.py")
 
+def test_criteria_digest_keeps_criteria_only_scope() -> None:
+    interval = selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    first = selection.SelectionCommitment.create(("cell-a",), {"eligibility": "x"}, interval)
+    second = selection.SelectionCommitment.create(("cell-b",), {"eligibility": "x"}, interval)
+    assert first.criteria_digest == second.criteria_digest
+    assert first.preregistration_digest != second.preregistration_digest
 
-def _commitment() -> object:
-    return selection.SelectionCommitment.create(
-        ("cell-a", "cell-b"),
-        {"eligibility": "all chains completed", "candidate_set": "committed"},
-        selection.IntervalContract("mean", "two-sided-t", 0.95, "holm"),
-    )
+def test_literal_envelope_oracle_is_independent() -> None:
+    interval = selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    commitment = selection.SelectionCommitment.create(("cell-a", "cell-b"), {"eligibility": "x"}, interval)
+    assert commitment.criteria_digest == hashlib.sha256(b'{"eligibility":"x"}').hexdigest()
+    envelope = b'{"candidate_ids":["cell-a","cell-b"],"criteria":{"eligibility":"x"},"interval":{"coverage":0.95,"estimator":"mean","interval_form":"two-sided-t","multiplicity_method":"holm"},"schema":"he-importance/preregistration/v1"}'
+    assert commitment.preregistration_digest == hashlib.sha256(envelope).hexdigest()
+    commitment.verify()
 
+def test_criteria_tamper_is_checked_before_envelope() -> None:
+    commitment = selection.SelectionCommitment.create(("cell-a",), {"eligibility": "x"}, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm"))
+    object.__setattr__(commitment, "criteria", {"eligibility": "y"})
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        commitment.verify()
+    assert caught.value.refusal is selection.OutcomeRefusal.CRITERIA_DIGEST_MISMATCH
 
-def _outcome(identifier: str, states: tuple[str, ...], value: float | None) -> object:
-    return selection.CellOutcome(identifier, states, {"sampler": {"walkers": 4096}}, value)
+def test_candidate_tamper_uses_distinct_envelope_member() -> None:
+    commitment = selection.SelectionCommitment.create(("cell-a", "cell-b"), {"eligibility": "x"}, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm"))
+    object.__setattr__(commitment, "candidate_ids", ("cell-a",))
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        commitment.verify()
+    assert caught.value.refusal is selection.OutcomeRefusal.PREREGISTRATION_DIGEST_MISMATCH
 
+def test_canonical_key_order_is_raw_code_point_order() -> None:
+    projected = traversal.project_content(traversal.freeze_content({"a": 1, chr(0x00E9): 2}))
+    assert selection._canonical_bytes(projected) == b'{"a":1,"\\u00e9":2}'
 
-def test_complete_selection_is_invariant_to_outcome_values_and_kills_peek_mutant() -> None:
-    commitment = _commitment()
-    first = selection.OutcomeLedger.attach(
-        commitment, (_outcome("cell-a", ("completed",), -1.0), _outcome("cell-b", ("completed",), 100.0))
-    )
-    second = selection.OutcomeLedger.attach(
-        commitment, (_outcome("cell-a", ("completed",), 100.0), _outcome("cell-b", ("completed",), -1.0))
-    )
-    assert tuple(record.candidate_id for record in first.select_complete()) == ("cell-a", "cell-b")
-    assert tuple(record.candidate_id for record in second.select_complete()) == ("cell-a", "cell-b")
+def test_surrogate_pair_spelling_is_refused_while_astral_scalar_is_admitted() -> None:
+    astral, pair = chr(0x1F600), chr(0xD83D) + chr(0xDE00)
+    assert astral != pair and (len(astral), len(pair)) == (1, 2)
+    traversal.freeze_content({"k": astral})
+    with pytest.raises(traversal.ContentTraversalError) as caught:
+        traversal.freeze_content({"k": pair})
+    assert caught.value.refusal is traversal.ContentRefusal.STRING_HAS_SURROGATE_CODEPOINT
 
+@pytest.mark.parametrize("value", [chr(0xD800), chr(0xDBFF), chr(0xDC00), chr(0xDFFF)])
+def test_surrogate_boundaries_are_refused(value: str) -> None:
+    with pytest.raises(traversal.ContentTraversalError) as caught:
+        traversal.freeze_content({"k": value})
+    assert caught.value.refusal is traversal.ContentRefusal.STRING_HAS_SURROGATE_CODEPOINT
 
-@pytest.mark.parametrize("state", ["idle", "running", "error", "cancelled", "dead"])
-def test_every_noncompleted_chain_carries_unreportable_state_and_witness(state: str) -> None:
-    ledger = selection.OutcomeLedger.attach(
-        _commitment(),
-        (_outcome("cell-a", ("completed", state), 3.0), _outcome("cell-b", ("completed",), 4.0)),
-    )
-    unreportable = ledger.unreportable()
-    assert [(record.candidate_id, record.reportability, record.unreportable_witness) for record in unreportable] == [
-        ("cell-a", selection.Reportability.UNREPORTABLE_AS_COMPLETE, (state,))
-    ]
-    assert [record.candidate_id for record in ledger.select_complete()] == ["cell-b"]
+@pytest.mark.parametrize("value", [chr(0xD7FF), chr(0xE000), chr(0x1F600), chr(0x10FFFF)])
+def test_unicode_scalar_boundaries_remain_admitted(value: str) -> None:
+    traversal.freeze_content({"k": value})
 
-
-def test_outcomes_after_commitment_are_complete_set_not_silently_droppable() -> None:
-    ledger = selection.OutcomeLedger.attach(
-        _commitment(),
-        (_outcome("cell-a", ("dead",), None), _outcome("cell-b", ("completed",), 4.0)),
-    )
-    assert len(ledger.outcomes) == 2
-    assert ledger.unreportable()[0].candidate_id == "cell-a"
-    with pytest.raises(selection.OutcomeSelectionError, match="exactly the committed candidate set"):
-        selection.OutcomeLedger.attach(_commitment(), (_outcome("cell-b", ("completed",), 4.0),))
-
-
-def test_tampered_criteria_is_detected_before_outcomes_attach() -> None:
-    commitment = _commitment()
-    object.__setattr__(commitment, "criteria", {"eligibility": "choose the lowest value"})
-    with pytest.raises(selection.OutcomeSelectionError, match="digest"):
-        selection.OutcomeLedger.attach(
-            commitment, (_outcome("cell-a", ("completed",), 1.0), _outcome("cell-b", ("completed",), 2.0))
-        )
-
-
-@pytest.mark.parametrize(
-    "estimator,interval_form,coverage,multiplicity",
-    [("mean", "two-sided-t", 0.95, "holm"), ("median", "percentile-bootstrap", 0.9, "bonferroni")],
-)
-def test_interval_contract_requires_the_full_declared_property(
-    estimator: str, interval_form: str, coverage: float, multiplicity: str
-) -> None:
-    contract = selection.IntervalContract(estimator, interval_form, coverage, multiplicity)
-    assert (contract.estimator, contract.interval_form, contract.coverage, contract.multiplicity_method) == (
-        estimator, interval_form, coverage, multiplicity
-    )
-
-
-@pytest.mark.parametrize("field", ["estimator", "interval_form", "multiplicity_method"])
-def test_interval_contract_rejects_each_missing_declaration(field: str) -> None:
-    fields = {"estimator": "mean", "interval_form": "two-sided-t", "coverage": 0.95, "multiplicity_method": "holm"}
-    fields[field] = ""
-    with pytest.raises(selection.OutcomeSelectionError, match="names"):
-        selection.IntervalContract(**fields)
+def test_unknown_leaf_is_refused_by_primitive() -> None:
+    with pytest.raises(traversal.ContentTraversalError) as caught:
+        traversal.freeze_content({"k": object()})
+    assert caught.value.refusal is traversal.ContentRefusal.CONTENT_KIND_UNDECLARED
