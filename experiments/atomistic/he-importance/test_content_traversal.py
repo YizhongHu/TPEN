@@ -37,6 +37,42 @@ def test_alias_is_read_once_and_cycle_is_refused() -> None:
         content.freeze_content(cycle)
     assert caught.value.refusal is content.ContentRefusal.CONTENT_CYCLE
 
+class EmittedMapping(Mapping):
+    """Stable mapping adapter whose first emitted stream is its only stream."""
+    def __init__(self, duplicate: bool):
+        self.duplicate = duplicate
+
+    def __getitem__(self, key):
+        return 1
+
+    def __iter__(self):
+        return iter(("a",))
+
+    def __len__(self):
+        return 1
+
+    def items(self):
+        entries = [("a", 1)]
+        if self.duplicate:
+            entries.append(("a", 2))
+        return entries
+
+def test_stable_unique_mapping_is_admitted() -> None:
+    source = EmittedMapping(duplicate=False)
+    frozen = content.freeze_content(source)
+    assert content.project_content(frozen) == {"a": 1}
+    selection_spec = importlib.util.spec_from_file_location(
+        "he_importance_selection_commit_control", Path(__file__).with_name("outcome_selection.py")
+    )
+    assert selection_spec is not None and selection_spec.loader is not None
+    selection = importlib.util.module_from_spec(selection_spec)
+    sys.modules.update({selection_spec.name: selection})
+    selection_spec.loader.exec_module(selection)
+    commitment = selection.SelectionCommitment.create(
+        ("cell-a",), source, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    )
+    commitment.verify()
+
 def test_declaration_is_closed_before_source_read() -> None:
     class Exploding(dict):
         def items(self):
@@ -46,15 +82,9 @@ def test_declaration_is_closed_before_source_read() -> None:
     assert caught.value.refusal is content.ContentRefusal.DECLARATION_NOT_CLOSED
 
 def test_duplicate_and_non_string_keys_are_not_silently_overwritten() -> None:
-    class Duplicate(Mapping):
-        def __getitem__(self, key):
-            return 1
-        def __iter__(self):
-            return iter(("a",))
-        def __len__(self):
-            return 1
-        def items(self):
-            return [("a", 1), ("a", 2)]
+    class Duplicate(EmittedMapping):
+        def __init__(self):
+            super().__init__(duplicate=True)
     with pytest.raises(content.ContentTraversalError) as caught:
         content.freeze_content(Duplicate())
     assert caught.value.refusal is content.ContentRefusal.MAPPING_KEY_REPEATED
