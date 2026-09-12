@@ -1075,7 +1075,7 @@ def test_chain_ids_are_unique_by_underlying_plain_string_content(
                 valid.interval,
                 valid.status,
             )
-        _assert_refusal(excinfo, inference_packet.PacketRefusal.CHAIN_ID_EMPTY)
+        _assert_refusal(excinfo, inference_packet.PacketRefusal.CHAIN_ID_NOT_A_STRING)
 
 
 def test_chain_id_empty_check_cannot_be_redirected_by_str_subclass_strip() -> None:
@@ -1084,7 +1084,16 @@ def test_chain_id_empty_check_cannot_be_redirected_by_str_subclass_strip() -> No
         inference_packet.IndependentChain(
             _WhitespaceLooksValid("   "), valid.seeds, valid.interval, valid.status
         )
-    _assert_refusal(excinfo, inference_packet.PacketRefusal.CHAIN_ID_EMPTY)
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.CHAIN_ID_NOT_A_STRING)
+
+
+def test_chain_id_type_violation_has_distinct_refusal() -> None:
+    valid = _chain(0)
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.IndependentChain(
+            5, valid.seeds, valid.interval, valid.status
+        )
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.CHAIN_ID_NOT_A_STRING)
 
 
 def test_disposed_topology_key_subclass_is_retained_as_residual_measurement(
@@ -2002,7 +2011,7 @@ def test_packet_chain_seeds_must_be_unique(tmp_path: Path) -> None:
 
 
 def test_the_refusal_coverage_census_over_the_whole_enum() -> None:
-    """The review census ratchet is closed after all six members are pinned."""
+    """The review census ratchet is closed after all members are pinned."""
     contract_text = Path(__file__).read_text()
     assert "match" + "=" not in contract_text
     uncovered = {
