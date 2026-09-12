@@ -1486,3 +1486,87 @@ def test_hi_firewall_review_r1_unparsable_interpolation_fails_closed() -> None:
 
     assert not identity.determined
     assert "cannot parse" in (identity.reason or "")
+
+
+def test_hi_firewall_review_r1_resolver_call_identity_runs_nothing() -> None:
+    """Classifying a resolver call must not INVOKE it.
+
+    The witness is the whole point: a classifier that decided by trying to
+    resolve would give the same verdict and would already have run the
+    payload.
+    """
+
+    calls: list[Any] = []
+
+    def witness(argument: Any) -> str:
+        calls.append(argument)
+        return HI_TRAIN_SCHEMA
+
+    original = config_module.basis_feature_dim
+    OmegaConf.register_new_resolver(RESOLVER, witness, replace=True)
+    try:
+        cfg = OmegaConf.create({"experiment": {"name": f"${{{RESOLVER}:probe}}"}})
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+    finally:
+        OmegaConf.register_new_resolver(RESOLVER, original, replace=True)
+
+    assert calls == [], "classification invoked the resolver it was classifying"
+    assert "undeterminable-identity" in _rules(caught.value)
+
+
+def test_hi_firewall_review_r1_shipped_interpolated_name_shape_still_passes() -> None:
+    """The four tracked configs that interpolate experiment.name must pass.
+
+    This is the shape of ``pair_stability.yaml``, ``pair_validation.yaml`` and
+    both ``tpen-pair-scan-v1`` configs: ``experiment.name`` is ``${study.name}``
+    and the target is a literal in the same file.  Following it costs nothing
+    and identifies them, correctly, as not this family.  Two of the four are
+    frozen provenance records whose protected property is that they still
+    resolve, so this pin is what keeps that true.
+    """
+
+    cfg = OmegaConf.create(
+        {"study": {"name": "pair_stability_v3"}, "experiment": {"name": "${study.name}"}}
+    )
+
+    _validate(cfg)
+
+
+def test_hi_firewall_review_r1_readable_identity_paths_are_unchanged() -> None:
+    """Literal identities behave exactly as before.
+
+    Three arms that were already correct and must stay that way, so the new
+    following is shown to be additive rather than a rewrite.
+    """
+
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(_identity_config(schema=None, name="tpen_he_importance", reference=True))
+    assert _rules(caught.value) == {"undeclared-schema"}
+
+    # A readable foreign name is still returned unvalidated: opt-in firewall.
+    _validate(OmegaConf.create({"experiment": {"name": "some_other_study"}}))
+
+    # No experiment section at all is ABSENT, which is a determined fact and
+    # must not be confused with undeterminable.
+    _validate(OmegaConf.create({"runtime": {"probe": "plain"}}))
+
+
+def test_hi_firewall_review_r1_declared_schema_still_validates_an_interpolated_name() -> None:
+    """Opting in literally must not be short-circuited by identity handling."""
+
+    cfg = OmegaConf.create(
+        {
+            "schema": HI_TRAIN_SCHEMA,
+            "runtime": {"real": "tpen_he_importance"},
+            "experiment": {"name": "${runtime.real}"},
+            "reference_energy": REFERENCE_ENERGY,
+        }
+    )
+
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(cfg)
+
+    rules = _rules(caught.value)
+    assert "undeterminable-identity" not in rules, rules
+    assert "forbidden-surface:reference" in rules, rules
