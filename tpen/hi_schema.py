@@ -623,11 +623,14 @@ def _names_a_resolver_call(text: str) -> bool:
 
 
 def _raw_lookup(raw_tree: Mapping[str, Any], path: str) -> tuple[bool, Any]:
-    """Look one dotted path up in a RAW container. Mappings only.
+    """Look one dotted path up in a RAW container. Mapping keys only.
 
-    A segment that is not a mapping key -- a list index, or a scalar reached
-    too early -- reports "not found" rather than being indexed. Fail closed:
-    an identity this function cannot address is one it must not guess at.
+    Segments are split on ``.`` and matched as whole keys, with no pattern
+    applied to the key text: OmegaConf keys carry hyphens and other
+    characters an identifier-shaped regex would reject, and such a regex
+    misclassified nine real node references in this repository when it was
+    tried. A segment that is not a mapping key -- a list index, or a scalar
+    reached too early -- reports "not found" rather than being indexed.
     """
 
     cursor: Any = raw_tree
@@ -636,6 +639,78 @@ def _raw_lookup(raw_tree: Mapping[str, Any], path: str) -> tuple[bool, Any]:
             return False, None
         cursor = cursor[segment]
     return True, cursor
+
+
+def _expand_without_execution(
+    raw_tree: Mapping[str, Any], text: str, visiting: list[str], budget: list[int]
+) -> tuple[bool, Any]:
+    """Resolve raw ``text`` to a literal by following node references only.
+
+    Returns ``(True, value)`` or ``(False, reason)``.
+
+    Recursion happens on BOTH sides of a reference. The target's value is
+    followed, and so is the reference's own PATH: a path such as
+    ``choices.basis.${slot}.basis`` must have its inner interpolation
+    resolved before the lookup can happen at all. That shape is in active use
+    in this repository -- 34 of its 1053 tracked interpolations -- so a
+    follower that recursed only into values would refuse configurations it
+    could have read. A resolver call anywhere on either side, at any depth,
+    ends in refusal rather than evaluation.
+    """
+
+    budget[0] -= 1
+    if budget[0] < 0:
+        return False, (
+            f"following exceeded {IDENTITY_FOLLOW_LIMIT} steps; refused AT the bound "
+            "rather than truncated, because a guard that stops early without saying "
+            "so is indistinguishable from one that succeeded"
+        )
+    if _names_a_resolver_call(text):
+        return False, (
+            f"{text!r} reaches a resolver-call interpolation, which cannot be followed "
+            "without running a configured callable"
+        )
+    bodies = list(iter_interpolations(text))
+    if not bodies:
+        return True, text
+
+    resolved: list[tuple[str, Any]] = []
+    for body in bodies:
+        # THE PATH ITSELF MAY INTERPOLATE. Resolve it before looking it up.
+        followed, path = _expand_without_execution(raw_tree, body, visiting, budget)
+        if not followed:
+            return False, path
+        path = path if isinstance(path, str) else str(path)
+        if path in visiting:
+            return False, f"cycle through {path!r}"
+        found, target = _raw_lookup(raw_tree, path)
+        if not found:
+            return False, f"{path!r} does not exist in the raw tree"
+        if isinstance(target, (Mapping, list, tuple)):
+            return False, f"{path!r} is a container, not a scalar identity"
+        if isinstance(target, str):
+            visiting.append(path)
+            try:
+                followed, value = _expand_without_execution(
+                    raw_tree, target, visiting, budget
+                )
+            finally:
+                visiting.pop()
+            if not followed:
+                return False, value
+        else:
+            value = target
+        resolved.append((body, value))
+
+    # A value that is EXACTLY one interpolation keeps its target's type; an
+    # interpolation embedded in literal text is concatenated as text, which is
+    # what OmegaConf itself does.
+    if len(resolved) == 1 and text == "${" + resolved[0][0] + "}":
+        return True, resolved[0][1]
+    expanded = text
+    for body, value in resolved:
+        expanded = expanded.replace("${" + body + "}", str(value))
+    return True, expanded
 
 
 def identity_without_execution(cfg: Any, path: str) -> Identity:
@@ -660,69 +735,36 @@ def identity_without_execution(cfg: Any, path: str) -> Identity:
     identity is literal. A node reference names another node in the same
     tree, so following it is a dictionary lookup and nothing runs. A
     resolver-call interpolation cannot be followed without invoking a
-    configured callable, which is precisely the thing that must not happen
-    before a refusal, so reaching one at ANY depth ends in refusal rather
-    than in evaluation.
+    configured callable, which is exactly what must not happen before a
+    refusal, so reaching one at ANY depth on EITHER side of a reference ends
+    in refusal.
 
-    Every branch that cannot establish a value fails closed, including a
-    dangling target, an interpolation this cannot address such as a list
-    index, a target that is a container rather than a scalar, a value that
-    mixes literal text with interpolation, a path whose own segments
-    interpolate, a cycle, and exceeding the follow limit.
+    Every branch that cannot establish a value fails closed: a dangling
+    target, an interpolation this cannot address such as a list index, a
+    container target, a cycle, and exceeding the follow budget.
     """
 
     raw_tree = _raw_config_mapping(cfg)
     if raw_tree is None:
         return Identity(determined=True, value=None)
 
-    seen: list[str] = []
-    current = path
-    for hop in range(IDENTITY_FOLLOW_LIMIT):
-        if current in seen:
-            return Identity(False, reason=f"cycle through {current!r}")
-        seen.append(current)
-        found, value = _raw_lookup(raw_tree, current)
-        if not found:
-            # An ABSENT identity node is a determined fact: the config simply
-            # does not declare it. A DANGLING target one hop in is not -- the
-            # config asked for something that is not there, so what it meant
-            # cannot be established.
-            if hop == 0:
-                return Identity(determined=True, value=None)
-            return Identity(False, reason=f"{current!r} does not exist in the raw tree")
-        if isinstance(value, (Mapping, list, tuple)):
-            return Identity(False, reason=f"{current!r} is a container, not a scalar identity")
-        if not isinstance(value, str):
-            return Identity(determined=True, value=value)
-        bodies = list(iter_interpolations(value))
-        if not bodies:
-            return Identity(determined=True, value=value)
-        if _names_a_resolver_call(value):
-            return Identity(
-                False,
-                reason=(
-                    f"{current!r} reaches a resolver-call interpolation, which cannot be "
-                    "followed without running a configured callable"
-                ),
-            )
-        if len(bodies) != 1 or value != "${" + bodies[0] + "}":
-            return Identity(
-                False,
-                reason=f"{current!r} mixes literal text with interpolation",
-            )
-        if "${" in bodies[0]:
-            return Identity(
-                False,
-                reason=f"{current!r} interpolates its own path segments",
-            )
-        current = bodies[0]
-    return Identity(
-        False,
-        reason=(
-            f"identity following exceeded {IDENTITY_FOLLOW_LIMIT} hops from {path!r}; "
-            "refused at the bound rather than truncated"
-        ),
+    found, value = _raw_lookup(raw_tree, path)
+    if not found:
+        # ABSENT is a DETERMINED fact: the config does not declare this node.
+        # Confusing it with undeterminable would refuse every configuration
+        # that simply has no experiment section.
+        return Identity(determined=True, value=None)
+    if isinstance(value, (Mapping, list, tuple)):
+        return Identity(False, reason=f"{path!r} is a container, not a scalar identity")
+    if not isinstance(value, str):
+        return Identity(determined=True, value=value)
+
+    followed, outcome = _expand_without_execution(
+        raw_tree, value, [path], [IDENTITY_FOLLOW_LIMIT]
     )
+    if not followed:
+        return Identity(False, reason=str(outcome))
+    return Identity(determined=True, value=outcome)
 
 
 def declared_schema(cfg: Any) -> str | None:

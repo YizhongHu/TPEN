@@ -1087,10 +1087,13 @@ def test_hi_firewall_review_r1_transitive_node_reference_is_followed() -> None:
             {"items": [1, 2], "experiment": {"name": "${items.0}"}},
             "list-index",
         ),
-        ({"experiment": {"name": "prefix_${runtime.real}"}}, "mixed-literal-and-interpolation"),
+        ({"experiment": {"name": "${experiment.name}"}}, "self-cycle"),
         (
-            {"slot": "real", "runtime": {"real": "x"}, "experiment": {"name": "${runtime.${slot}}"}},
-            "interpolated-path-segment",
+            {
+                "choices": {"x": {"basis": "y"}},
+                "experiment": {"name": "${choices.${runtime.witness:1}.basis}"},
+            },
+            "resolver-call-inside-a-path",
         ),
     ],
     ids=[
@@ -1100,8 +1103,8 @@ def test_hi_firewall_review_r1_transitive_node_reference_is_followed() -> None:
         "dangling-target",
         "container-target",
         "list-index",
-        "mixed-literal-and-interpolation",
-        "interpolated-path-segment",
+        "self-cycle",
+        "resolver-call-inside-a-path",
     ],
 )
 def test_hi_firewall_review_r1_undeterminable_identity_is_refused(
@@ -1128,6 +1131,58 @@ def test_hi_firewall_review_r1_undeterminable_identity_is_refused(
     assert "undeterminable-identity" in _rules(caught.value), (
         f"{shape} did not refuse: {sorted(_rules(caught.value))}"
     )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (
+            {
+                "slot": "hooke-axiswise-v1",
+                "choices": {"hooke-axiswise-v1": {"basis": "tpen_he_importance"}},
+                "experiment": {"name": "${choices.${slot}.basis}"},
+            },
+            "tpen_he_importance",
+        ),
+        (
+            {
+                "choices": {"hooke-axiswise-v1": {"basis": "tpen_he_importance"}},
+                "experiment": {"name": "${choices.hooke-axiswise-v1.basis}"},
+            },
+            "tpen_he_importance",
+        ),
+        (
+            {
+                "runtime": {"real": "tpen_he_importance"},
+                "experiment": {"name": "prefix_${runtime.real}"},
+            },
+            "prefix_tpen_he_importance",
+        ),
+    ],
+    ids=["nested-path", "hyphenated-key", "mixed-literal-and-interpolation"],
+)
+def test_hi_firewall_review_r1_following_recurses_into_the_path_itself(
+    body: dict[str, Any], expected: str
+) -> None:
+    """A reference's own PATH may interpolate, and must be followed too.
+
+    ``choices.basis.${slot}.basis`` is a shape in active use in this
+    repository -- 34 of its 1053 tracked interpolations -- so a follower that
+    recursed only into VALUES would refuse configurations it could have read
+    without executing anything.
+
+    The hyphenated arm pins the key charset: OmegaConf keys carry hyphens, so
+    lookup splits on ``.`` and matches whole keys with no pattern applied to
+    the key text.  A key regex shaped like a Python identifier misclassified
+    nine real node references in this repository when it was tried.
+    """
+
+    from tpen.hi_schema import identity_without_execution
+
+    identity = identity_without_execution(OmegaConf.create(body), "experiment.name")
+
+    assert identity.determined, identity.reason
+    assert identity.value == expected
 
 
 def test_hi_firewall_review_r1_identity_following_refuses_at_its_bound() -> None:
