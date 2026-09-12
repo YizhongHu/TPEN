@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from inspect import getattr_static
 from math import isfinite
@@ -125,6 +125,12 @@ class ChainState(str, Enum):
 _TERMINAL_STATES = frozenset(
     {ChainState.COMPLETED, ChainState.ERROR, ChainState.CANCELLED, ChainState.DEAD}
 )
+
+
+def _instant_order(value: datetime) -> datetime:
+    """Compare aware timestamps by their represented UTC instant."""
+
+    return value.astimezone(UTC)
 
 _SAMPLER_INPUT_SPEC = MappingProxyType(
     {
@@ -350,13 +356,14 @@ class ChainStatus:
                 "terminal reason must be a string",
                 refusal=PacketRefusal.STATUS_TERMINAL_MISSING_REASON,
             )
-        if self.last_activity_at < self.created_at:
+        if _instant_order(self.last_activity_at) < _instant_order(self.created_at):
             raise InferencePacketError(
                 "chain activity cannot precede creation",
                 refusal=PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION,
             )
         if any(
-            timestamp is not None and timestamp < self.created_at
+            timestamp is not None
+            and _instant_order(timestamp) < _instant_order(self.created_at)
             for timestamp in (
                 self.started_at,
                 self.finished_at,
@@ -379,12 +386,12 @@ class ChainStatus:
                     "terminal chain status requires start and finish records",
                     refusal=PacketRefusal.STATUS_TERMINAL_MISSING_RECORDS,
                 )
-            if self.finished_at < self.started_at:
+            if _instant_order(self.finished_at) < _instant_order(self.started_at):
                 raise InferencePacketError(
                     "chain finish cannot precede start",
                     refusal=PacketRefusal.STATUS_FINISH_PRECEDES_START,
                 )
-            if self.last_activity_at < self.finished_at:
+            if _instant_order(self.last_activity_at) < _instant_order(self.finished_at):
                 raise InferencePacketError(
                     "chain activity cannot precede finish",
                     refusal=PacketRefusal.STATUS_FINISH_PRECEDES_START,
@@ -411,7 +418,9 @@ class ChainStatus:
                     "finish notification requires a terminal status",
                     refusal=PacketRefusal.STATUS_NOTIFICATION_WITHOUT_TERMINATION,
                 )
-            if self.finish_notification_at < self.finished_at:
+            if _instant_order(self.finish_notification_at) < _instant_order(
+                self.finished_at
+            ):
                 raise InferencePacketError(
                     "finish notification cannot precede termination",
                     refusal=PacketRefusal.STATUS_NOTIFICATION_PRECEDES_TERMINATION,
@@ -508,7 +517,7 @@ class IndependentChain:
     status: ChainStatus
 
     def __post_init__(self) -> None:
-        if not isinstance(self.chain_id, str) or not self.chain_id.strip():
+        if type(self.chain_id) is not str or not self.chain_id.strip():
             raise InferencePacketError(
                 "chain_id must be non-empty",
                 refusal=PacketRefusal.CHAIN_ID_EMPTY,
@@ -605,7 +614,10 @@ def launch_inference_packet(
             "source packet checkpoint does not match checkpoint reference",
             refusal=PacketRefusal.SOURCE_CHECKPOINT_MISMATCH,
         )
-    if source_hash != checkpoint.source_content_hash:
+    if (
+        type(source_hash) is not str
+        or source_hash != checkpoint.source_content_hash
+    ):
         raise InferencePacketError(
             "source packet content hash does not match checkpoint reference",
             refusal=PacketRefusal.SOURCE_HASH_MISMATCH,
