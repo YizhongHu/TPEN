@@ -23,6 +23,12 @@ single-arm boundary admits only the declared mapping there.  A sequence-
 wrapped mapping can therefore be accepted by L2 and refused here; widening
 this boundary is out of scope.
 
+The provenance extent has two separate axes.  Its leaf capacity is 8192
+JSON-shaped scalar leaves at depth 6.  Its container axis has no separate
+count budget: empty mappings and sequences cost zero leaves, so their breadth
+is bounded only by available process memory and the depth limit.  The latter
+is an accepted residual and is not priced as part of the sampler declaration.
+
 The status record is an audit record, not a probe of a live process.  In
 particular, idle, dead, and completed chains have different required fields,
 and every terminal state records a finish time even where no finish
@@ -35,6 +41,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from inspect import getattr_static
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
@@ -141,7 +148,7 @@ def _require_declared_sampler_inputs(value: Any, spec: Any, label: str) -> Any:
         # This is the only read of the caller-owned mapping.  In particular,
         # do not screen and then freeze it through a second items()/dict pass.
         for key, nested in value.items():
-            if not isinstance(key, str):
+            if type(key) is not str:
                 raise InferencePacketError(
                     f"{label} keys must be strings",
                     refusal=PacketRefusal.SAMPLER_KEY_NOT_A_STRING,
@@ -230,17 +237,20 @@ class SamplingInterval:
     retained_draws: int
 
     def __post_init__(self) -> None:
-        if self.burn_in_proposals < 0:
+        if type(self.burn_in_proposals) is not int or self.burn_in_proposals < 0:
             raise InferencePacketError(
                 "burn_in_proposals must be non-negative",
                 refusal=PacketRefusal.INTERVAL_BURN_IN_NEGATIVE,
             )
-        if self.proposals_between_draws < 1:
+        if (
+            type(self.proposals_between_draws) is not int
+            or self.proposals_between_draws < 1
+        ):
             raise InferencePacketError(
                 "proposals_between_draws must be positive",
                 refusal=PacketRefusal.INTERVAL_SPACING_NOT_POSITIVE,
             )
-        if self.retained_draws < 1:
+        if type(self.retained_draws) is not int or self.retained_draws < 1:
             raise InferencePacketError(
                 "retained_draws must be positive",
                 refusal=PacketRefusal.INTERVAL_DRAWS_NOT_POSITIVE,
@@ -298,9 +308,46 @@ class ChainStatus:
                 f"unknown chain state {self.state!r}",
                 refusal=PacketRefusal.STATUS_UNKNOWN_STATE,
             )
+        timestamps = (
+            self.created_at,
+            self.last_activity_at,
+            self.started_at,
+            self.finished_at,
+            self.finish_notification_at,
+        )
+        if any(
+            timestamp is not None
+            and (
+                type(timestamp) is not datetime
+                or timestamp.tzinfo is None
+                or timestamp.utcoffset() is None
+            )
+            for timestamp in timestamps
+        ):
+            raise InferencePacketError(
+                "chain status timestamps must be exact aware datetimes",
+                refusal=PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION,
+            )
+        if self.terminal_reason is not None and type(self.terminal_reason) is not str:
+            raise InferencePacketError(
+                "terminal reason must be a string",
+                refusal=PacketRefusal.STATUS_TERMINAL_MISSING_REASON,
+            )
         if self.last_activity_at < self.created_at:
             raise InferencePacketError(
                 "chain activity cannot precede creation",
+                refusal=PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION,
+            )
+        if any(
+            timestamp is not None and timestamp < self.created_at
+            for timestamp in (
+                self.started_at,
+                self.finished_at,
+                self.finish_notification_at,
+            )
+        ):
+            raise InferencePacketError(
+                "chain status cannot precede creation",
                 refusal=PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION,
             )
         if self.state is ChainState.IDLE:
@@ -318,6 +365,11 @@ class ChainStatus:
             if self.finished_at < self.started_at:
                 raise InferencePacketError(
                     "chain finish cannot precede start",
+                    refusal=PacketRefusal.STATUS_FINISH_PRECEDES_START,
+                )
+            if self.last_activity_at < self.finished_at:
+                raise InferencePacketError(
+                    "chain activity cannot precede finish",
                     refusal=PacketRefusal.STATUS_FINISH_PRECEDES_START,
                 )
             if self.state is ChainState.COMPLETED:
@@ -366,12 +418,21 @@ class CheckpointReference:
                 "checkpoint and parent cell paths must be absolute",
                 refusal=PacketRefusal.CHECKPOINT_PATH_NOT_ABSOLUTE,
             )
+        parent = parent.resolve()
+        checkpoint = checkpoint.resolve()
         if checkpoint.parent.parent != parent or checkpoint.parent.name != "checkpoints":
             raise InferencePacketError(
                 "checkpoint must be bound beneath its parent cell checkpoints directory",
                 refusal=PacketRefusal.CHECKPOINT_NOT_BOUND_TO_PARENT_CELL,
             )
-        if len(self.source_content_hash) != 64 or any(character not in "0123456789abcdef" for character in self.source_content_hash):
+        if (
+            type(self.source_content_hash) is not str
+            or len(self.source_content_hash) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.source_content_hash
+            )
+        ):
             raise InferencePacketError("source_content_hash must be lowercase sha256", refusal=PacketRefusal.CHECKPOINT_HASH_NOT_SHA256)
         topology = _freeze_provenance(self.topology_provenance, "topology provenance")
         object.__setattr__(self, "parent_cell_path", parent)
@@ -397,13 +458,21 @@ class DistributedCheckpointProvenance:
                 "distributed checkpoint rank_artifacts must be a mapping",
                 refusal=PacketRefusal.DDP_RANK_ARTIFACTS_NOT_A_MAPPING,
             )
+        rank_artifacts = dict(self.rank_artifacts.items())
+        if any(type(rank) is not int for rank in rank_artifacts):
+            raise InferencePacketError(
+                "distributed checkpoint ranks must be exact integers",
+                refusal=PacketRefusal.DDP_RANK_MEMBERSHIP_INCOMPLETE,
+            )
         expected = set(range(self.world_size))
-        if set(self.rank_artifacts) != expected:
+        if set(rank_artifacts) != expected:
             raise InferencePacketError(
                 "distributed checkpoint artifacts must contain each rank exactly once",
                 refusal=PacketRefusal.DDP_RANK_MEMBERSHIP_INCOMPLETE,
             )
-        artifacts = {rank: Path(path) for rank, path in self.rank_artifacts.items()}
+        artifacts = {
+            rank: Path(path).resolve() for rank, path in rank_artifacts.items()
+        }
         if len(set(artifacts.values())) != self.world_size:
             raise InferencePacketError(
                 "distributed checkpoint rank artifacts must be unambiguous",
@@ -445,6 +514,7 @@ class InferencePacket:
     distributed_checkpoint: DistributedCheckpointProvenance | None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "chains", tuple(self.chains))
         frozen_inputs = _require_declared_sampler_inputs(
             self.independent_sampler_inputs,
             _SAMPLER_INPUT_SPEC,
@@ -476,7 +546,9 @@ class InferencePacket:
             )
         if self.distributed_checkpoint is not None:
             for artifact in self.distributed_checkpoint.rank_artifacts.values():
-                if not artifact.is_relative_to(self.checkpoint.checkpoint_path):
+                if not artifact.resolve().is_relative_to(
+                    self.checkpoint.checkpoint_path.resolve()
+                ):
                     raise InferencePacketError(
                         "distributed artifact lies outside its checkpoint directory",
                         refusal=PacketRefusal.DDP_ARTIFACT_OUTSIDE_CHECKPOINT,
@@ -498,15 +570,19 @@ def launch_inference_packet(
     independent-sampler input block.
     """
 
-    try:
-        source_checkpoint = Path(source_packet.checkpoint_path)
-        source_hash = source_packet.source_content_hash
-        sampler_inputs = source_packet.independent_sampler_inputs
-    except AttributeError as error:
-        raise InferencePacketError(
-            "source packet must be an independent-sampler test packet",
-            refusal=PacketRefusal.SOURCE_PACKET_NOT_A_PACKET,
-        ) from error
+    def read_source_attribute(name: str) -> Any:
+        try:
+            getattr_static(source_packet, name)
+        except AttributeError as error:
+            raise InferencePacketError(
+                "source packet must be an independent-sampler test packet",
+                refusal=PacketRefusal.SOURCE_PACKET_NOT_A_PACKET,
+            ) from error
+        return getattr(source_packet, name)
+
+    source_checkpoint = Path(read_source_attribute("checkpoint_path"))
+    source_hash = read_source_attribute("source_content_hash")
+    sampler_inputs = read_source_attribute("independent_sampler_inputs")
     if source_checkpoint != checkpoint.checkpoint_path:
         raise InferencePacketError(
             "source packet checkpoint does not match checkpoint reference",
