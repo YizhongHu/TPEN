@@ -580,6 +580,10 @@ except (ImportError, AttributeError) as _grammar_error:  # pragma: no cover
     ) from _grammar_error
 
 
+class _UnparsableInterpolation(Exception):
+    """OmegaConf's grammar could not parse a value that holds an interpolation."""
+
+
 IDENTITY_FOLLOW_LIMIT = 16
 
 
@@ -609,9 +613,27 @@ def _names_a_resolver_call(text: str) -> bool:
     Decided by THE GRAMMAR, never by searching for a colon or any other
     substring: a colon appears inside quoted values and inside nested
     expressions, and a string test would both over- and under-report.
+
+    Raises
+    ------
+    _UnparsableInterpolation
+        When OmegaConf's own grammar cannot parse ``text``. Callers must fail
+        CLOSED on that: a value this cannot classify is one whose safety it
+        cannot vouch for, and returning "no resolver call" would be the
+        fail-OPEN direction.
+
+    Notes
+    -----
+    CALL ONLY ON TEXT KNOWN TO CONTAIN AN INTERPOLATION. The grammar's
+    ``configValue`` rule does not accept every Python string -- the EMPTY
+    STRING is a parse error -- so parsing plain literals both wastes work and
+    raises on inputs that are perfectly ordinary configuration values.
     """
 
-    tree = _grammar_parser.parse(text)
+    try:
+        tree = _grammar_parser.parse(text)
+    except Exception as error:  # noqa: BLE001 - ANTLR raises several types
+        raise _UnparsableInterpolation(str(error)) from error
     pending = [tree]
     while pending:
         node = pending.pop()
@@ -665,14 +687,27 @@ def _expand_without_execution(
             "rather than truncated, because a guard that stops early without saying "
             "so is indistinguishable from one that succeeded"
         )
-    if _names_a_resolver_call(text):
+    # ORDER IS LOAD-BEARING. Establish that there IS an interpolation before
+    # asking the grammar to classify one. The grammar does not accept every
+    # string -- the empty string is a parse error -- so classifying plain
+    # literals first turned an ordinary blank configuration value into a
+    # GrammarParseError out of validation.
+    bodies = list(iter_interpolations(text))
+    if not bodies:
+        return True, text
+    try:
+        names_resolver = _names_a_resolver_call(text)
+    except _UnparsableInterpolation as error:
+        return False, (
+            f"{text!r} holds an interpolation OmegaConf's own grammar cannot parse "
+            f"({error}), so whether it would run a configured callable cannot be "
+            "established; refused rather than assumed safe"
+        )
+    if names_resolver:
         return False, (
             f"{text!r} reaches a resolver-call interpolation, which cannot be followed "
             "without running a configured callable"
         )
-    bodies = list(iter_interpolations(text))
-    if not bodies:
-        return True, text
 
     resolved: list[tuple[str, Any]] = []
     for body in bodies:

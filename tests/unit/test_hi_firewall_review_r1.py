@@ -225,11 +225,16 @@ def test_hi_firewall_review_r1_real_preflight_carrier_stays_inert_in_validate(
     else:
         validation_cfg = _config(schema=validation_carrier)
 
-    _validate(validation_cfg)
+    # The carrier is literal text plus a RESOLVER CALL. Following the literal
+    # part is free, but the resolver cannot be followed without running it, so
+    # the schema cannot be established and validation refuses.
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(validation_cfg)
 
     assert not validation_marker.exists(), (
         "validation executed a config-named callable while identifying its policy"
     )
+    assert "undeterminable-identity" in _rules(caught.value)
 
 
 def test_hi_firewall_review_r1_absent_schema_family_getter_does_not_resolve(
@@ -242,12 +247,18 @@ def test_hi_firewall_review_r1_absent_schema_family_getter_does_not_resolve(
         {"experiment": {"name": _resolver_carrier(marker)}}
     )
 
-    _validate(cfg)
+    # The identity is a RESOLVER CALL, so it cannot be established without
+    # running the very callable this refuses. That is now a refusal rather
+    # than a silent "not my family" -- but the assertion that matters is
+    # unchanged and comes first: the payload did not run.
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(cfg)
 
     assert not marker.exists(), (
         "absent-schema family detection resolved an unadmitted carrier; this is "
         "an observational guard, not evidence that an absent-schema config is HI"
     )
+    assert "undeterminable-identity" in _rules(caught.value)
 
 
 def test_hi_firewall_review_r1_family_entry_eager_default_stays_inert(
@@ -263,11 +274,15 @@ def test_hi_firewall_review_r1_family_entry_eager_default_stays_inert(
         }
     )
 
-    _validate(cfg)
+    # oc.select IS a resolver call, even though it only reads another node,
+    # so the identity cannot be established without execution and refuses.
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(cfg)
 
     assert not marker.exists(), (
         "validation executed a config-named callable while identifying its policy"
     )
+    assert "undeterminable-identity" in _rules(caught.value)
 
 
 def test_hi_firewall_review_r1_manifest_locator_stays_out_of_process_before_refusal() -> None:
@@ -1508,3 +1523,48 @@ def test_hi_firewall_review_r1_every_tracked_config_survives_the_firewall() -> N
         f"only {validated} of {len(tracked)} tracked configs could be loaded and "
         f"validated, so this sweep covers less than it appears to: {unloadable}"
     )
+
+
+def test_hi_firewall_review_r1_blank_identity_is_an_ordinary_value() -> None:
+    """A blank or whitespace identity must not reach the grammar at all.
+
+    REGRESSION PIN. The classifier asked OmegaConf's grammar to parse the
+    identity value BEFORE establishing that the value held an interpolation.
+    The grammar's ``configValue`` rule does not accept the EMPTY STRING, so an
+    ordinary blank name raised ``GrammarParseError`` out of validation and
+    broke three parametrizations of a test in a file this layer never touched.
+
+    Order is the fix: find the interpolations first, classify only if there
+    are any.  These arms are the ones that were red.
+    """
+
+    for name in (None, "", "   ", "metadata"):
+        cfg = OmegaConf.create(
+            {"experiment": {"name": name, "run_name": None}, "run": {"run_id": None}}
+        )
+        _validate(cfg)
+
+
+def test_hi_firewall_review_r1_unparsable_interpolation_fails_closed() -> None:
+    """A value whose interpolation OmegaConf cannot parse must be refused.
+
+    The fail-closed direction is the whole point: returning "no resolver call"
+    for a value that could not be classified would treat an unclassifiable
+    interpolation as safe.
+
+    REACHABILITY, checked rather than assumed. ``OmegaConf.create`` REFUSES to
+    build a ``DictConfig`` holding an unparsable interpolation, so this branch
+    is unreachable by that route.  It is reachable through a plain mapping,
+    which :func:`identity_without_execution` accepts, so the branch is live
+    rather than vacuous -- and this arm uses that route deliberately.
+    """
+
+    from tpen.hi_schema import identity_without_execution
+
+    with pytest.raises(Exception):
+        OmegaConf.create({"experiment": {"name": "${unclosed"}})
+
+    identity = identity_without_execution({"experiment": {"name": "${unclosed"}}, "experiment.name")
+
+    assert not identity.determined
+    assert "cannot parse" in (identity.reason or "")
