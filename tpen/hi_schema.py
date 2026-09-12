@@ -556,30 +556,6 @@ def _raw_config_mapping(cfg: Any) -> Mapping[str, Any] | None:
 # chain, though, so it is bounded and REFUSES at the bound rather than
 # truncating: a silent truncation is a caller-open leaf, and a guard that
 # stops early without saying so is indistinguishable from one that succeeded.
-# INTERNAL OMEGACONF API, declared here rather than reached for inline.
-# ``grammar_parser`` and the generated parser contexts are not public, so this
-# binding is resolved ONCE AT IMPORT: a rename in a future OmegaConf must
-# break loudly here rather than be absorbed at a call site. The failure
-# direction is what makes that the right trade -- if this class could not be
-# found and the code fell back to "no resolver call", every resolver call
-# would be classified as a followable node reference, which fails OPEN into
-# exactly the execution-before-refusal hole this module exists to close.
-try:  # pragma: no cover - exercised by the pin below, not by branch coverage
-    from omegaconf.grammar.gen.OmegaConfGrammarParser import (
-        OmegaConfGrammarParser as _OmegaConfGrammarParser,
-    )
-
-    _RESOLVER_CONTEXT = _OmegaConfGrammarParser.InterpolationResolverContext
-except (ImportError, AttributeError) as _grammar_error:  # pragma: no cover
-    raise ImportError(
-        "tpen.hi_schema classifies interpolations with OmegaConf's generated "
-        "grammar contexts, which are internal API. The expected context class "
-        "could not be resolved, and guessing would silently treat every "
-        "resolver call as a followable node reference. Pin the OmegaConf "
-        "version or update this binding"
-    ) from _grammar_error
-
-
 @dataclass(frozen=True)
 class Identity:
     """The outcome of determining one identity node WITHOUT EXECUTION.
