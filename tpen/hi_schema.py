@@ -52,6 +52,7 @@ from tpen.config_schema import (
     ClosedSchemaError,
     canonical_digest,
     ForbiddenSurface,
+    is_interpolated,
     Rejection,
     RESOLVER_REFUSAL_RULES,
     SchemaPolicy,
@@ -75,6 +76,7 @@ __all__ = [
     "SCHEMA_KEY",
     "canonical_train_identity",
     "declared_schema",
+    "hidden_identity_paths",
     "is_hi_family",
     "validate_hi_train_config",
 ]
@@ -573,6 +575,42 @@ def declared_schema(cfg: Any) -> str | None:
         return None
     value = raw_tree.get(SCHEMA_KEY)
     return None if value is None else str(value)
+
+
+def hidden_identity_paths(cfg: Any) -> tuple[str, ...]:
+    """Return the identity paths whose RAW content is an interpolation.
+
+    Parameters
+    ----------
+    cfg : Any
+        A ``DictConfig`` or plain mapping, read without resolving.
+
+    Returns
+    -------
+    tuple of str
+        The identity paths that cannot be read, in a stable order. Empty when
+        every identity node is literal.
+
+    Notes
+    -----
+    The two identity nodes decide whether this policy applies at all, so a
+    value that cannot be read without resolving cannot be allowed to mean
+    "some other family". Resolving one to find out is the defect this module
+    already closed. Reporting it here lets the caller fail closed instead.
+    """
+
+    raw_tree = _raw_config_mapping(cfg)
+    if raw_tree is None:
+        return ()
+    experiment = raw_tree.get("experiment")
+    candidates = (
+        (SCHEMA_KEY, raw_tree.get(SCHEMA_KEY)),
+        (
+            "experiment.name",
+            experiment.get("name") if isinstance(experiment, Mapping) else None,
+        ),
+    )
+    return tuple(path for path, value in candidates if is_interpolated(value))
 
 
 def is_hi_family(cfg: Any) -> bool:
@@ -2201,6 +2239,32 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
 
     declared = declared_schema(cfg)
     if declared != HI_TRAIN_SCHEMA:
+        # A config that hides an identity node behind an interpolation is
+        # refusable on its face. Falling through to "not this family" would
+        # hand it ZERO enforcement, which is strictly worse than any ordering
+        # defect: no refusal happens at all and the runner trains on it.
+        # Decided on the RAW value, so nothing resolves to reach this.
+        hidden = hidden_identity_paths(cfg)
+        if hidden:
+            raise ClosedSchemaError(
+                [
+                    Rejection(
+                        rule="interpolated-identity",
+                        tree="raw",
+                        path=path,
+                        detail=(
+                            f"{path} is an interpolation, so whether this is a "
+                            f"helium-importance configuration cannot be decided without "
+                            "resolving it -- and resolving to decide is exactly what lets "
+                            "a config-named callable run before refusal. An unreadable "
+                            "identity is refused rather than read as a foreign family, "
+                            "because the alternative is no enforcement at all. Declare "
+                            f"{SCHEMA_KEY} and experiment.name as literals"
+                        ),
+                    )
+                    for path in hidden
+                ]
+            )
         if is_hi_family(cfg):
             # The config says it is helium-importance but did not declare the
             # schema. Refusing loudly here is the whole point: silently
