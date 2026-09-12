@@ -907,3 +907,109 @@ def test_hi_firewall_review_r1_every_carrier_builder_is_well_formed(tmp_path: Pa
     # check above is not merely asserting that OmegaConf accepts everything.
     with pytest.raises(Exception):
         OmegaConf.create({"probe": _resolver_carrier(tmp_path / "d")[:-1]})
+
+
+# A config may hide its own identity behind an interpolation. Reading the
+# identity nodes raw means an interpolated value matches no literal, so
+# without a refusal the config is simply "not this family" and receives NO
+# ENFORCEMENT AT ALL. These carriers each carry a reference energy, which is
+# the thing the firewall exists to keep out of a training configuration.
+REFERENCE_ENERGY = -2.903724
+
+
+def _hidden_identity_config(*, schema: str | None, name: str) -> DictConfig:
+    """Build a config whose identity nodes may be interpolations."""
+
+    body: dict[str, Any] = {
+        "runtime": {"real": "tpen_he_importance", "sch": HI_TRAIN_SCHEMA},
+        "experiment": {"name": name},
+        "reference_energy": REFERENCE_ENERGY,
+    }
+    if schema is not None:
+        body["schema"] = schema
+    return OmegaConf.create(body)
+
+
+@pytest.mark.parametrize(
+    ("schema", "name", "shape"),
+    [
+        ("${runtime.sch}", "${runtime.real}", "both-interpolated"),
+        (None, "${runtime.real}", "name-interpolated-no-schema"),
+        ("${runtime.sch}", "tpen_he_importance", "schema-interpolated-literal-name"),
+    ],
+    ids=["both-interpolated", "name-interpolated-no-schema", "schema-interpolated-literal-name"],
+)
+def test_hi_firewall_review_r1_interpolated_identity_is_refused(
+    schema: str | None, name: str, shape: str
+) -> None:
+    """A configuration that hides its identity must be refused, not ignored.
+
+    Reading the identity nodes raw is required -- resolving them is what let
+    a config-named callable run before refusal.  But a raw read cannot tell
+    an interpolated name from a foreign one, so falling through to "not my
+    family" hands a config with a reference energy ZERO ENFORCEMENT and
+    ``tpen.run`` then resolves it and trains on it.  That is worse than a
+    payload running before a refusal, because no refusal happens at all.
+
+    Fail closed on the face of the raw value.  Nothing here resolves.
+    """
+
+    cfg = _hidden_identity_config(schema=schema, name=name)
+
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(cfg)
+
+    assert "interpolated-identity" in _rules(caught.value), (
+        f"shape {shape} was not refused on its hidden identity; "
+        f"rules={sorted(_rules(caught.value))}"
+    )
+
+
+def test_hi_firewall_review_r1_literal_identity_paths_are_unchanged(tmp_path: Path) -> None:
+    """The identity refusal must not fire on a readable identity.
+
+    Three arms that were already correct and must stay that way, so the new
+    refusal is shown to be narrow rather than merely present.
+    """
+
+    # A readable HI name with no schema is still the undeclared-schema
+    # refusal, on the same rule it always used.
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(OmegaConf.create({"experiment": {"name": "tpen_he_importance"}}))
+    assert _rules(caught.value) == {"undeclared-schema"}
+
+    # A readable foreign name with no schema is still returned unvalidated:
+    # the firewall is opt-in and this config never opted in.
+    _validate(OmegaConf.create({"experiment": {"name": "some_other_study"}}))
+
+    # An ESCAPED opener is literal text that runs no resolver, so refusing it
+    # would be a false refusal. This is the discrimination arm for the
+    # interpolation predicate itself.
+    _validate(OmegaConf.create({"experiment": {"name": r"\${runtime.real}"}}))
+
+
+def test_hi_firewall_review_r1_declared_schema_still_validates_an_interpolated_name() -> None:
+    """Opting in literally must not be short-circuited by the new refusal.
+
+    A config that declares the schema as a LITERAL has opted in, so the full
+    policy applies and an interpolated ``experiment.name`` is just another
+    node the sweep sees. The identity refusal exists only for a config whose
+    opt-in cannot be read at all; firing it here would replace a complete
+    validation with a single early rejection.
+    """
+
+    cfg = OmegaConf.create(
+        {
+            "schema": HI_TRAIN_SCHEMA,
+            "runtime": {"real": "tpen_he_importance"},
+            "experiment": {"name": "${runtime.real}"},
+            "reference_energy": REFERENCE_ENERGY,
+        }
+    )
+
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(cfg)
+
+    rules = _rules(caught.value)
+    assert "interpolated-identity" not in rules, rules
+    assert any(rule.startswith("forbidden-surface") for rule in rules), rules
