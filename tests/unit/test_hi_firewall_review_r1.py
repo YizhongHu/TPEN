@@ -985,6 +985,21 @@ def _identity_config(
     return OmegaConf.create(body)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "OPEN DEFECT, mechanism HELD pending a manager decision on item "
+        "847dfff4. Reading the identity nodes raw closed an ordering defect "
+        "and opened this one: an interpolated identity matches no literal, so "
+        "the config is read as a foreign family and gets NO enforcement. Two "
+        "candidate mechanisms were measured and both cost a shipped config -- "
+        "refusing every unreadable identity refuses four hooke configs, and "
+        "sweeping the raw tree for a reference surface refuses "
+        "tpen-pair-scan-v1/configs/eval.yaml, whose reference_energy sits at "
+        "line 351. strict=True is deliberate: when a mechanism lands these go "
+        "XPASS and FAIL, so the marker cannot outlive the defect"
+    ),
+)
 @pytest.mark.parametrize(
     ("schema", "name"),
     [("${runtime.sch}", "${runtime.real}"), (None, "${runtime.real}")],
@@ -1016,6 +1031,21 @@ def test_hi_firewall_review_r1_unreadable_family_carrying_a_reference_is_refused
     assert "forbidden-surface:reference" in rules, rules
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "OPEN DEFECT, mechanism HELD pending a manager decision on item "
+        "847dfff4. Reading the identity nodes raw closed an ordering defect "
+        "and opened this one: an interpolated identity matches no literal, so "
+        "the config is read as a foreign family and gets NO enforcement. Two "
+        "candidate mechanisms were measured and both cost a shipped config -- "
+        "refusing every unreadable identity refuses four hooke configs, and "
+        "sweeping the raw tree for a reference surface refuses "
+        "tpen-pair-scan-v1/configs/eval.yaml, whose reference_energy sits at "
+        "line 351. strict=True is deliberate: when a mechanism lands these go "
+        "XPASS and FAIL, so the marker cannot outlive the defect"
+    ),
+)
 def test_hi_firewall_review_r1_unreadable_family_reaching_the_manifest_is_refused() -> None:
     """The reference's own route counts, not only a reference-shaped key.
 
@@ -1059,17 +1089,17 @@ def test_hi_firewall_review_r1_shipped_interpolated_name_shape_still_passes() ->
     _validate(cfg)
 
 
-def test_hi_firewall_review_r1_unreadable_family_residual_stays_visible() -> None:
-    """Pin the residual this mechanism deliberately accepts.
+def test_hi_firewall_review_r1_unreadable_family_gets_no_enforcement_today() -> None:
+    """Pin the CURRENT extent of the open defect, so its shape stays visible.
 
-    The guarantee is bounded by the REFERENCE SURFACE, not by identity. An
-    unreadable-identity config carrying some OTHER schema violation and no
-    reference still returns unvalidated. That is narrower than refusing every
-    unreadable identity and it is the price of not breaking four tracked
-    configs -- so it is pinned rather than described, because an accepted
-    residual that nothing detects becomes an undetectable one.
+    An unreadable identity does not merely lose the reference check: it loses
+    the WHOLE policy.  A forbidden surface that is refused outright for a
+    config which declares the schema is not looked at all when the family
+    cannot be read.
 
-    Widening the refusal to other surfaces is what would turn this red.
+    This is the open state, not a design.  It is pinned because the size of a
+    hole decides which mechanism is worth its cost, and a hole nobody
+    measures gets argued about from memory.
     """
 
     cfg = _identity_config(
@@ -1079,7 +1109,7 @@ def test_hi_firewall_review_r1_unreadable_family_residual_stays_visible() -> Non
         extra={"training": {"patience": 5}},
     )
 
-    # A stop-rule surface IS forbidden for a declared HI config...
+    # A stop-rule surface IS refused for a config that declares the schema...
     with pytest.raises(ClosedSchemaError) as caught:
         _validate(
             OmegaConf.create(
@@ -1088,7 +1118,9 @@ def test_hi_firewall_review_r1_unreadable_family_residual_stays_visible() -> Non
         )
     assert "forbidden-surface:stop-rule" in _rules(caught.value)
 
-    # ...and is NOT refused when the family cannot be read. Residual, by design.
+    # ...and is NOT looked at when the family cannot be read. Same surface,
+    # same value, no enforcement. This arm is what makes the hole's size
+    # concrete rather than described.
     _validate(cfg)
 
 
