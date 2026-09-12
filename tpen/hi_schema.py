@@ -739,9 +739,60 @@ def identity_without_execution(cfg: Any, path: str) -> Identity:
     refusal, so reaching one at ANY depth on EITHER side of a reference ends
     in refusal.
 
-    Every branch that cannot establish a value fails closed: a dangling
-    target, an interpolation this cannot address such as a list index, a
-    container target, a cycle, and exceeding the follow budget.
+    AXIS ENUMERATION -- THE CONTRACT
+    --------------------------------
+    Derived from OmegaConf's parser production rules rather than from
+    imagination, because two gaps in this operation were previously found BY
+    ACCIDENT on different axes. Each axis is marked CONSTRUCTION (cannot
+    arise), TEST (an arm pins it), or OPEN (knowingly not closed). An unnamed
+    gap is indistinguishable from an unconsidered one.
+
+    ===========================  =========================  ==============
+    axis                         grammar                    status
+    ===========================  =========================  ==============
+    node reference               interpolationNode          TEST follow
+    chained value                interpolationNode          TEST follow
+    interpolation in the PATH    configKey                  TEST follow
+    dotted multi-segment path    configKey                  TEST follow
+    mixed literal+interpolation  text                       TEST follow
+    non-string scalar target     primitive                  TEST follow
+    list index, [0] and .0       INTER_BRACKET, DOT         TEST refuse
+    resolver call                interpolationResolver      TEST refuse
+    interpolated resolver name   resolverName               TEST refuse
+    builtin resolver, oc.select  interpolationResolver      TEST refuse
+    quoted arg containing colon  quotedValue                TEST refuse
+    list/dict in resolver arg    listContainer, dict-       TEST refuse
+                                 Container
+    interpolation in an arg      element, interpolation     TEST refuse
+    container target             listContainer, dict-       TEST refuse
+                                 Container
+    dangling target              --                         TEST refuse
+    cycle                        --                         TEST refuse
+    depth bound                  --                         TEST refuse
+    escaped interpolation        ESC_INTER, TOP_ESC         CONSTRUCTION
+    interpolation in a KEY       dictKey                    CONSTRUCTION
+    MISSING sentinel, ``???``    --                         **OPEN**
+    ===========================  =========================  ==============
+
+    CONSTRUCTION notes. An escaped opener is literal text that runs no
+    resolver, and :func:`~tpen.config_schema.iter_interpolations` is
+    escape-aware by backslash parity, so it is never followed. One bounded
+    deviation: the escape is not UNESCAPED, so the value retains its
+    backslash where OmegaConf would drop it. That cannot change a family
+    decision, because neither spelling equals the family name. An
+    interpolation in a KEY cannot hide a section: OmegaConf does not resolve
+    keys, so ``${k}`` stays the literal three-character key ``${k}`` even
+    after full resolution -- measured, and pinned by a test so that a future
+    OmegaConf which DID resolve keys would surface here rather than silently
+    open a hole.
+
+    THE OPEN AXIS, stated as a decision rather than left to discovery. A
+    MISSING sentinel resolves to the literal ``'???'``, which is not the
+    family name, so a configuration whose identity is ``???`` receives no
+    enforcement. This is PRE-EXISTING and not introduced here: the reader
+    this replaced returned ``None`` or raised for the same inputs and reached
+    the same not-this-family conclusion. It is pinned by a strict xfail so
+    the marker cannot outlive the defect.
     """
 
     raw_tree = _raw_config_mapping(cfg)
