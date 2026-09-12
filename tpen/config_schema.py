@@ -52,7 +52,6 @@ __all__ = [
     "Rejection",
     "RESOLVER_REFUSAL_RULES",
     "SchemaPolicy",
-    "is_interpolated",
     "iter_nodes",
     "sweep",
     "sweep_environment",
@@ -318,33 +317,6 @@ def _sweep_unknown_sections(tree: Any, label: str, policy: SchemaPolicy) -> list
         for key in tree
         if str(key) not in policy.allowed_sections
     ]
-
-
-def is_interpolated(value: object) -> bool:
-    """Return whether a RAW configuration value carries an interpolation.
-
-    Parameters
-    ----------
-    value : object
-        A configuration value read WITHOUT resolving. Non-strings are never
-        interpolations and are reported as such.
-
-    Returns
-    -------
-    bool
-        ``True`` when ``value`` is a string holding at least one unescaped
-        ``${...}`` expression.
-
-    Notes
-    -----
-    Delegates to :func:`iter_interpolations` rather than searching for the
-    opener, so an ESCAPED opener is not reported. ``\\${oc.env:VAR}``
-    resolves to literal text and runs no resolver; treating it as an
-    interpolation would be a false positive for any caller that refuses on
-    this predicate.
-    """
-
-    return isinstance(value, str) and any(iter_interpolations(value))
 
 
 def iter_interpolations(text: str) -> Iterator[str]:
