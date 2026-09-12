@@ -821,6 +821,30 @@ def identity_without_execution(cfg: Any, path: str) -> Identity:
     OmegaConf which DID resolve keys would surface here rather than silently
     open a hole.
 
+    A LIMIT ON THIS ENUMERATION, recorded because a complete-looking table
+    invites more trust than it has earned.
+
+    Every axis above is a kind of INTERPOLATION -- that is what qualified it
+    as an axis. So the enumeration's domain is "things that are
+    interpolations", and it never varies the one input class that is NOT one:
+    a plain literal. A defect reachable only by a literal is therefore
+    invisible to it, however complete the table looks.
+
+    That is not hypothetical. The path-recursion rewrite moved the grammar
+    call AHEAD of the interpolation scan, so every plain literal was handed
+    to a parser whose ``configValue`` rule does not accept the EMPTY STRING,
+    and an ordinary blank ``experiment.name`` raised out of validation. The
+    rewrite preserved every individual check and broke by REORDERING them --
+    which no per-check test covers and no axis enumeration covers either. It
+    was caught by a test in a file this module's authors never chose, during
+    a FULL UNSELECTED suite run. A selection scoped to the code under change
+    would have been a blind one.
+
+    TWO THINGS FOLLOW FOR ANYONE EXTENDING THIS. Vary the complement of your
+    enumeration's domain, not only its members. And re-run the whole suite
+    after a refactor that only moves code, because ordering is a property no
+    single check can hold.
+
     THE OPEN AXIS, stated as a decision rather than left to discovery. A
     MISSING sentinel resolves to the literal ``'???'``, which is not the
     family name, so a configuration whose identity is ``???`` receives no
