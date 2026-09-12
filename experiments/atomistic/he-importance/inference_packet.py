@@ -93,6 +93,7 @@ class PacketRefusal(str, Enum):
     DDP_ARTIFACT_OUTSIDE_CHECKPOINT = "ddp_artifact_outside_checkpoint"
     DDP_NOT_A_DECLARED_TYPE = "ddp_not_a_declared_type"
     CHAIN_ID_EMPTY = "chain_id_empty"
+    CHAIN_ID_NOT_A_STRING = "chain_id_not_a_string"
     CHAIN_COMPONENT_NOT_DECLARED_TYPE = "chain_component_not_declared_type"
     PACKET_CHAIN_NOT_DECLARED_TYPE = "packet_chain_not_declared_type"
     PACKET_HAS_NO_CHAIN = "packet_has_no_chain"
@@ -517,7 +518,12 @@ class IndependentChain:
     status: ChainStatus
 
     def __post_init__(self) -> None:
-        if type(self.chain_id) is not str or not self.chain_id.strip():
+        if type(self.chain_id) is not str:
+            raise InferencePacketError(
+                "chain_id must be a string",
+                refusal=PacketRefusal.CHAIN_ID_NOT_A_STRING,
+            )
+        if not self.chain_id.strip():
             raise InferencePacketError(
                 "chain_id must be non-empty",
                 refusal=PacketRefusal.CHAIN_ID_EMPTY,
