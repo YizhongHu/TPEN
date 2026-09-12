@@ -961,91 +961,174 @@ def test_hi_firewall_review_r1_every_carrier_builder_is_well_formed(tmp_path: Pa
 
 # A config may hide its own identity behind an interpolation. Reading the
 # identity nodes raw means an interpolated value matches no literal, so
-# without a refusal the config is simply "not this family" and receives NO
-# ENFORCEMENT AT ALL. These carriers each carry a reference energy, which is
-# the thing the firewall exists to keep out of a training configuration.
+# without some refusal the config is simply "not this family" and receives NO
+# ENFORCEMENT AT ALL. The refusal is on the PAYLOAD, not on the identity:
+# tracked configurations legitimately interpolate experiment.name.
 REFERENCE_ENERGY = -2.903724
 
 
-def _hidden_identity_config(*, schema: str | None, name: str) -> DictConfig:
+def _identity_config(
+    *, schema: str | None, name: str, reference: bool, extra: dict[str, Any] | None = None
+) -> DictConfig:
     """Build a config whose identity nodes may be interpolations."""
 
     body: dict[str, Any] = {
         "runtime": {"real": "tpen_he_importance", "sch": HI_TRAIN_SCHEMA},
         "experiment": {"name": name},
-        "reference_energy": REFERENCE_ENERGY,
     }
     if schema is not None:
         body["schema"] = schema
+    if reference:
+        body["reference_energy"] = REFERENCE_ENERGY
+    if extra:
+        body.update(extra)
     return OmegaConf.create(body)
 
 
 @pytest.mark.parametrize(
-    ("schema", "name", "shape"),
-    [
-        ("${runtime.sch}", "${runtime.real}", "both-interpolated"),
-        (None, "${runtime.real}", "name-interpolated-no-schema"),
-        ("${runtime.sch}", "tpen_he_importance", "schema-interpolated-literal-name"),
-    ],
-    ids=["both-interpolated", "name-interpolated-no-schema", "schema-interpolated-literal-name"],
+    ("schema", "name"),
+    [("${runtime.sch}", "${runtime.real}"), (None, "${runtime.real}")],
+    ids=["both-interpolated", "name-interpolated-no-schema"],
 )
-def test_hi_firewall_review_r1_interpolated_identity_is_refused(
-    schema: str | None, name: str, shape: str
+def test_hi_firewall_review_r1_unreadable_family_carrying_a_reference_is_refused(
+    schema: str | None, name: str
 ) -> None:
-    """A configuration that hides its identity must be refused, not ignored.
+    """A reference must not reach training behind an unreadable identity.
 
     Reading the identity nodes raw is required -- resolving them is what let
-    a config-named callable run before refusal.  But a raw read cannot tell
-    an interpolated name from a foreign one, so falling through to "not my
-    family" hands a config with a reference energy ZERO ENFORCEMENT and
-    ``tpen.run`` then resolves it and trains on it.  That is worse than a
-    payload running before a refusal, because no refusal happens at all.
+    a config-named callable run before refusal -- but a raw read cannot tell
+    an interpolated name from a foreign one.  Treating the unreadable case as
+    foreign handed a config carrying a reference energy ZERO enforcement, and
+    ``tpen.run`` then resolved it and trained on it.  That is worse than a
+    payload running before a refusal, because no refusal happened at all.
 
-    Fail closed on the face of the raw value.  Nothing here resolves.
+    The refusal is decided on the RAW tree, so nothing resolves to reach it.
     """
 
-    cfg = _hidden_identity_config(schema=schema, name=name)
+    cfg = _identity_config(schema=schema, name=name, reference=True)
 
     with pytest.raises(ClosedSchemaError) as caught:
         _validate(cfg)
 
-    assert "interpolated-identity" in _rules(caught.value), (
-        f"shape {shape} was not refused on its hidden identity; "
-        f"rules={sorted(_rules(caught.value))}"
-    )
+    rules = _rules(caught.value)
+    assert "unreadable-family-carries-reference" in rules, rules
+    # The specific surface is named too, so the refusal says WHICH node.
+    assert "forbidden-surface:reference" in rules, rules
 
 
-def test_hi_firewall_review_r1_literal_identity_paths_are_unchanged(tmp_path: Path) -> None:
-    """The identity refusal must not fire on a readable identity.
+def test_hi_firewall_review_r1_unreadable_family_reaching_the_manifest_is_refused() -> None:
+    """The reference's own route counts, not only a reference-shaped key.
 
-    Three arms that were already correct and must stay that way, so the new
-    refusal is shown to be narrow rather than merely present.
+    A key named ``reference_energy`` and a target that reaches the manifest
+    module are two different carriers of the same value.  Guarding the name
+    channel while leaving the value channel open would be a guard on the
+    label rather than on the payload.
     """
 
-    # A readable HI name with no schema is still the undeclared-schema
-    # refusal, on the same rule it always used.
+    cfg = _identity_config(
+        schema=None,
+        name="${runtime.real}",
+        reference=False,
+        extra={"probe": {"_target_": "tpen.hi_manifest.reference_energy"}},
+    )
+
     with pytest.raises(ClosedSchemaError) as caught:
-        _validate(OmegaConf.create({"experiment": {"name": "tpen_he_importance"}}))
+        _validate(cfg)
+
+    rules = _rules(caught.value)
+    assert "unreadable-family-carries-reference" in rules, rules
+    assert "forbidden-target:reference-module" in rules, rules
+
+
+def test_hi_firewall_review_r1_shipped_interpolated_name_shape_still_passes() -> None:
+    """The four tracked configs that interpolate experiment.name must pass.
+
+    This is the shape of ``pair_stability.yaml``, ``pair_validation.yaml``
+    and both ``tpen-pair-scan-v1`` configs: ``experiment.name`` interpolates
+    ``${study.name}``, no schema key is declared, and no reference surface is
+    present.  Refusing on the unreadable identity ALONE would refuse all
+    four, two of which are frozen provenance records whose protected property
+    is that they still resolve.  Failing closed on the payload instead costs
+    them nothing, and this pin is what keeps that true.
+    """
+
+    cfg = OmegaConf.create(
+        {"study": {"name": "pair_stability_v3"}, "experiment": {"name": "${study.name}"}}
+    )
+
+    _validate(cfg)
+
+
+def test_hi_firewall_review_r1_unreadable_family_residual_stays_visible() -> None:
+    """Pin the residual this mechanism deliberately accepts.
+
+    The guarantee is bounded by the REFERENCE SURFACE, not by identity. An
+    unreadable-identity config carrying some OTHER schema violation and no
+    reference still returns unvalidated. That is narrower than refusing every
+    unreadable identity and it is the price of not breaking four tracked
+    configs -- so it is pinned rather than described, because an accepted
+    residual that nothing detects becomes an undetectable one.
+
+    Widening the refusal to other surfaces is what would turn this red.
+    """
+
+    cfg = _identity_config(
+        schema=None,
+        name="${runtime.real}",
+        reference=False,
+        extra={"training": {"patience": 5}},
+    )
+
+    # A stop-rule surface IS forbidden for a declared HI config...
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(
+            OmegaConf.create(
+                {"schema": HI_TRAIN_SCHEMA, "training": {"patience": 5}}
+            )
+        )
+    assert "forbidden-surface:stop-rule" in _rules(caught.value)
+
+    # ...and is NOT refused when the family cannot be read. Residual, by design.
+    _validate(cfg)
+
+
+def test_hi_firewall_review_r1_readable_identity_paths_are_unchanged() -> None:
+    """The new refusal must not fire where the identity is readable.
+
+    Four arms that were already correct and must stay that way, so the new
+    behaviour is shown to be narrow rather than merely present.
+    """
+
+    # A readable HI name with no schema keeps its existing refusal, on the
+    # same rule it always used, even though it carries a reference.
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(_identity_config(schema=None, name="tpen_he_importance", reference=True))
     assert _rules(caught.value) == {"undeclared-schema"}
 
-    # A readable foreign name with no schema is still returned unvalidated:
-    # the firewall is opt-in and this config never opted in.
+    # A readable HI name outranks an interpolated schema key: the family is
+    # determinable, so the precise diagnosis is kept.
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(
+            _identity_config(schema="${runtime.sch}", name="tpen_he_importance", reference=True)
+        )
+    assert _rules(caught.value) == {"undeclared-schema"}
+
+    # A readable foreign name is still returned unvalidated: opt-in firewall.
     _validate(OmegaConf.create({"experiment": {"name": "some_other_study"}}))
 
-    # An ESCAPED opener is literal text that runs no resolver, so refusing it
-    # would be a false refusal. This is the discrimination arm for the
-    # interpolation predicate itself.
+    # An ESCAPED opener is literal text that runs no resolver, so treating it
+    # as an interpolation would be a false positive. Discrimination arm for
+    # the predicate itself.
     _validate(OmegaConf.create({"experiment": {"name": r"\${runtime.real}"}}))
 
 
 def test_hi_firewall_review_r1_declared_schema_still_validates_an_interpolated_name() -> None:
-    """Opting in literally must not be short-circuited by the new refusal.
+    """Opting in literally must not be short-circuited.
 
     A config that declares the schema as a LITERAL has opted in, so the full
     policy applies and an interpolated ``experiment.name`` is just another
-    node the sweep sees. The identity refusal exists only for a config whose
-    opt-in cannot be read at all; firing it here would replace a complete
-    validation with a single early rejection.
+    node the sweep sees. Firing the unreadable-family path here would replace
+    a complete validation with a single early rejection.
     """
 
     cfg = OmegaConf.create(
@@ -1061,5 +1144,5 @@ def test_hi_firewall_review_r1_declared_schema_still_validates_an_interpolated_n
         _validate(cfg)
 
     rules = _rules(caught.value)
-    assert "interpolated-identity" not in rules, rules
-    assert any(rule.startswith("forbidden-surface") for rule in rules), rules
+    assert "unreadable-family-carries-reference" not in rules, rules
+    assert "forbidden-surface:reference" in rules, rules
