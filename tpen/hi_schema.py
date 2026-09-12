@@ -53,6 +53,7 @@ from tpen.config_schema import (
     canonical_digest,
     ForbiddenSurface,
     Rejection,
+    RESOLVER_REFUSAL_RULES,
     SchemaPolicy,
     iter_nodes,
     sweep_environment,
@@ -530,6 +531,19 @@ ADMITTED_CONSTRUCTION_TARGETS = (
 )
 
 
+def _raw_config_mapping(cfg: Any) -> Mapping[str, Any] | None:
+    """Return configuration content without evaluating interpolations.
+
+    Every validation decision made before raw resolver refusal must preserve
+    this property, so no config-named callable can execute before refusal.
+    """
+
+    if isinstance(cfg, DictConfig):
+        raw_tree = OmegaConf.to_container(cfg, resolve=False)
+        return raw_tree if isinstance(raw_tree, Mapping) else None
+    return cfg if isinstance(cfg, Mapping) else None
+
+
 def declared_schema(cfg: Any) -> str | None:
     """Return the schema a configuration opts in to, if any.
 
@@ -545,12 +559,10 @@ def declared_schema(cfg: Any) -> str | None:
         configuration declares none.
     """
 
-    if isinstance(cfg, DictConfig):
-        value = OmegaConf.select(cfg, SCHEMA_KEY, default=None)
-    elif isinstance(cfg, Mapping):
-        value = cfg.get(SCHEMA_KEY)
-    else:
+    raw_tree = _raw_config_mapping(cfg)
+    if raw_tree is None:
         return None
+    value = raw_tree.get(SCHEMA_KEY)
     return None if value is None else str(value)
 
 
@@ -569,23 +581,17 @@ def is_hi_family(cfg: Any) -> bool:
 
     Notes
     -----
-    Read WITHOUT resolving, so a config whose interpolations are broken is
-    still recognised as belonging to the family and still refused for omitting
-    the schema key. Resolving here would make an unrelated typo silently
-    downgrade a helium-importance config to an unenforced one -- the finding
-    and the thing that hides it would share a failure domain.
+    Read raw configuration nodes without evaluating interpolations. Every
+    validation decision made before raw resolver refusal must preserve this
+    property, so no config-named callable can execute before refusal. An
+    interpolated name therefore does not itself identify this family.
     """
 
-    if isinstance(cfg, DictConfig):
-        try:
-            name = OmegaConf.select(cfg, "experiment.name", default=None)
-        except Exception:  # noqa: BLE001 - a broken tree must not grant an exemption
-            return False
-    elif isinstance(cfg, Mapping):
-        experiment = cfg.get("experiment")
-        name = experiment.get("name") if isinstance(experiment, Mapping) else None
-    else:
+    raw_tree = _raw_config_mapping(cfg)
+    if raw_tree is None:
         return False
+    experiment = raw_tree.get("experiment")
+    name = experiment.get("name") if isinstance(experiment, Mapping) else None
     return name == HI_EXPERIMENT_NAME
 
 
@@ -2228,11 +2234,7 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
     # tree would invoke the very callable this policy has already refused. Raw
     # findings are collected before this decision so they remain visible with
     # the ordering refusal.
-    if any(
-        rejection.rule
-        in {"forbidden-resolver", "unadmitted-resolver", "uncheckable-resolver"}
-        for rejection in rejections
-    ):
+    if any(rejection.rule in RESOLVER_REFUSAL_RULES for rejection in rejections):
         rejections.append(
             Rejection(
                 rule="resolved-sweep-skipped",

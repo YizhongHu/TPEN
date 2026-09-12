@@ -1,0 +1,578 @@
+"""Reviewer probes for HI firewall ordering and admission.
+
+These tests intentionally live apart from the ordinary HI schema suite.  They
+exercise process-global effects (files, Torch RNG, and Hydra's target guard)
+that a refusal must contain, so a red result is evidence about the reviewed
+implementation rather than a production fix hidden in the test.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+import json
+from pathlib import Path
+import subprocess
+import sys
+from typing import Any
+
+import hydra.utils
+import pytest
+import torch
+from omegaconf import DictConfig, OmegaConf
+
+import tpen.config as config_module
+import tpen.hi_schema as hi_schema_module
+from tpen.config_schema import ClosedSchemaError
+from tpen.hi_schema import (
+    HI_TRAIN_POLICY,
+    HI_TRAIN_SCHEMA,
+    validate_hi_train_config,
+)
+
+
+RESOLVER = config_module.BASIS_FEATURE_DIM_RESOLVER
+
+
+def _config(**sections: object) -> DictConfig:
+    """Build a minimal schema-declaring config for the probes."""
+
+    base: dict[str, object] = {
+        "schema": HI_TRAIN_SCHEMA,
+        "optimizer": {"_target_": "torch.optim.Adam", "lr": 0.005},
+    }
+    base.update(sections)
+    return OmegaConf.create(base)
+
+
+def _rules(error: ClosedSchemaError) -> set[str]:
+    return {rejection.rule for rejection in error.rejections}
+
+
+def _validate(cfg: DictConfig) -> None:
+    validate_hi_train_config(cfg, env={})
+
+
+def _resolver_carrier(marker: Path) -> str:
+    return (
+        f"${{{RESOLVER}:{{_target_: builtins.open, file: {marker}, mode: w}}}}"
+    )
+
+
+def _real_preflight_carrier(marker: Path) -> str:
+    """Build a live prefix carrier that resolves to the real HI schema."""
+
+    # The outer mapping deliberately has no ``out_features`` key.  The basis
+    # resolver must therefore instantiate it; the nested Hydra call returns a
+    # mapping with out_features=1 after constructing the open() payload.
+    return (
+        "tpen.hi.train.v${"
+        + RESOLVER
+        + ":{_target_: hydra.utils.instantiate, _recursive_: false, "
+        "config: {out_features: 1, payload: "
+        + f"{{_target_: builtins.open, file: {marker}, mode: w}}"
+        + "}}"
+    )
+
+
+def _family_entry_carrier(marker: Path) -> str:
+    """Build the shipped nested-default carrier used by family entry."""
+
+    return (
+        "${oc.select:runtime.family,${"
+        + RESOLVER
+        + ":{_target_: hydra.utils.instantiate, _recursive_: false, "
+        "config: {out_features: -1, payload: "
+        + f"{{_target_: builtins.open, file: {marker}, mode: w}}"
+        + "}}}}"
+    )
+
+
+def _embedding_resolver_carrier() -> str:
+    return (
+        f"${{{RESOLVER}:{{_target_: tpen.nn.Embedding, spatial_dim: 3, "
+        "max_order: 1, out_channels: 2, hidden_channels: 2, "
+        "num_hidden_layers: 0}}"
+    )
+
+
+def _embedding_resolver_trampoline() -> str:
+    """Return one through Hydra while constructing an Embedding payload."""
+
+    return (
+        "${"
+        + RESOLVER
+        + ":{_target_: hydra.utils.instantiate, _recursive_: false, "
+        "config: {out_features: 1, payload: "
+        "{_target_: tpen.nn.Embedding, spatial_dim: 3, max_order: 1, "
+        "out_channels: 2, hidden_channels: 2, num_hidden_layers: 0}}"
+        + "}}"
+    )
+
+
+def _constructor_carrier(
+    kind: str, *, initializer: dict[str, object] | None = None
+) -> dict[str, object]:
+    if kind == "embedding":
+        carrier: dict[str, object] = {
+            "_target_": "tpen.nn.Embedding",
+            "spatial_dim": 3,
+            "max_order": 1,
+            "out_channels": 2,
+            "hidden_channels": 2,
+            "num_hidden_layers": 0,
+        }
+    elif kind == "path-aggregation":
+        carrier = {
+            "_target_": "tpen.nn.PathAggregation",
+            "max_order": 1,
+            "channels": 2,
+            "path_counts_by_order": {1: 1},
+        }
+    else:
+        raise AssertionError(f"unknown constructor probe: {kind}")
+    if initializer is not None:
+        carrier["initializer"] = initializer
+    return carrier
+
+
+@pytest.mark.parametrize("indirection", [False, True], ids=["direct", "plain-reference"])
+def test_hi_firewall_review_r1_schema_select_precedes_refusal(
+    indirection: bool, tmp_path: Path
+) -> None:
+    """Refusal must precede every config-named callable in validation."""
+
+    marker = tmp_path / ("schema-indirect" if indirection else "schema-direct")
+    carrier = _resolver_carrier(marker)
+    if indirection:
+        cfg = _config(
+            experiment={"name": "tpen_he_importance"},
+            runtime={"schema_ref": carrier},
+            schema="${runtime.schema_ref}",
+        )
+    else:
+        cfg = _config(
+            experiment={"name": "tpen_he_importance"},
+            schema=carrier,
+        )
+
+    observed: BaseException | None = None
+    try:
+        _validate(cfg)
+    except BaseException as error:  # assert the side effect before exception shape
+        observed = error
+
+    assert not marker.exists(), (
+        "schema selection executed the rejected resolver carrier before refusal; "
+        f"observed={type(observed).__name__ if observed else 'no exception'}"
+    )
+    assert isinstance(observed, ClosedSchemaError)
+    assert _rules(observed) == {"undeclared-schema"}
+
+
+def test_hi_firewall_review_r1_real_resolver_control_outside_validate_fires_marker(
+    tmp_path: Path,
+) -> None:
+    """The carrier is live: only validation's ordering should contain it."""
+
+    marker = tmp_path / "outside-validation-control"
+    cfg = _config(schema=_resolver_carrier(marker))
+    selected: object | None = None
+    try:
+        selected = OmegaConf.select(cfg, "schema")
+    except Exception:
+        # The carrier is expected to fail after opening the marker: the
+        # control proves that the resolver/constructor path is live even when
+        # the carrier cannot produce a valid scalar schema value.
+        pass
+    if hasattr(selected, "close"):
+        selected.close()
+    assert marker.exists()
+
+
+@pytest.mark.parametrize("indirection", [False, True], ids=["direct", "plain-reference"])
+def test_hi_firewall_review_r1_real_preflight_carrier_stays_inert_in_validate(
+    indirection: bool, tmp_path: Path
+) -> None:
+    """Validation must not execute a live config-named prefix carrier."""
+
+    assert OmegaConf.has_resolver(RESOLVER)
+    control_marker = tmp_path / ("real-control-indirect" if indirection else "real-control-direct")
+    control_carrier = _real_preflight_carrier(control_marker)
+    if indirection:
+        control_cfg = _config(
+            runtime={"schema_value": control_carrier}, schema="${runtime.schema_value}"
+        )
+    else:
+        control_cfg = _config(schema=control_carrier)
+
+    selected = OmegaConf.select(control_cfg, "schema")
+    assert selected == HI_TRAIN_SCHEMA
+    assert control_marker.exists(), "the actual registered resolver did not fire"
+
+    validation_marker = tmp_path / (
+        "real-validation-indirect" if indirection else "real-validation-direct"
+    )
+    validation_carrier = _real_preflight_carrier(validation_marker)
+    if indirection:
+        validation_cfg = _config(
+            runtime={"schema_value": validation_carrier}, schema="${runtime.schema_value}"
+        )
+    else:
+        validation_cfg = _config(schema=validation_carrier)
+
+    _validate(validation_cfg)
+
+    assert not validation_marker.exists(), (
+        "validation executed a config-named callable while identifying its policy"
+    )
+
+
+def test_hi_firewall_review_r1_absent_schema_family_getter_does_not_resolve(
+    tmp_path: Path,
+) -> None:
+    """Validation must not execute config-named callables outside the family."""
+
+    marker = tmp_path / "family-getter"
+    cfg = OmegaConf.create(
+        {"experiment": {"name": _resolver_carrier(marker)}}
+    )
+
+    _validate(cfg)
+
+    assert not marker.exists(), (
+        "absent-schema family detection resolved an unadmitted carrier; this is "
+        "an observational guard, not evidence that an absent-schema config is HI"
+    )
+
+
+def test_hi_firewall_review_r1_family_entry_eager_default_stays_inert(
+    tmp_path: Path,
+) -> None:
+    """Validation must not execute a config-named eager default."""
+
+    marker = tmp_path / "family-entry-default"
+    cfg = OmegaConf.create(
+        {
+            "runtime": {"family": "tpen_he_importance"},
+            "experiment": {"name": _family_entry_carrier(marker)},
+        }
+    )
+
+    _validate(cfg)
+
+    assert not marker.exists(), (
+        "validation executed a config-named callable while identifying its policy"
+    )
+
+
+def test_hi_firewall_review_r1_manifest_locator_stays_out_of_process_before_refusal() -> None:
+    """Refusal must keep config-named manifest data out of process memory."""
+
+    probe = """
+import json
+import sys
+
+from omegaconf import OmegaConf
+
+import tpen.config as config_module
+from tpen.hi_schema import validate_hi_train_config
+
+resolver = config_module.BASIS_FEATURE_DIM_RESOLVER
+carrier = (
+    "tpen.hi.train.v${" + resolver + ":{_target_: hydra.utils.instantiate, "
+    "_recursive_: false, config: {out_features: 1, payload: "
+    "{_target_: hydra.utils.get_object, "
+    "path: tpen.hi_manifest.reference_energy}}}}"
+)
+before = sorted(
+    name for name in sys.modules
+    if name == "tpen.hi_manifest" or name.startswith("tpen.hi_manifest.")
+)
+error = None
+try:
+    validate_hi_train_config(
+        OmegaConf.create({
+            "schema": carrier,
+            "experiment": {"name": "tpen_he_importance"},
+        }),
+        env={},
+    )
+except BaseException as caught:
+    error = {
+        "type": type(caught).__name__,
+        "rules": sorted(
+            rejection.rule for rejection in getattr(caught, "rejections", ())
+        ),
+    }
+after = sorted(
+    name for name in sys.modules
+    if name == "tpen.hi_manifest" or name.startswith("tpen.hi_manifest.")
+)
+print(json.dumps({
+    "before": before,
+    "after": after,
+    "error": error,
+}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    observations = json.loads(completed.stdout.strip())
+
+    assert observations["before"] == [], observations
+    assert observations["after"] == [], observations
+    assert observations["error"] == {
+        "type": "ClosedSchemaError",
+        "rules": ["undeclared-schema"],
+    }, observations
+
+
+def test_hi_firewall_review_r1_recording_resolver_is_refused_before_witness(
+) -> None:
+    """Refusal must precede every config-named resolver witness."""
+
+    calls: list[Any] = []
+
+    def witness(argument: Any) -> str:
+        calls.append(argument)
+        return HI_TRAIN_SCHEMA
+
+    assert RESOLVER not in HI_TRAIN_POLICY.allowed_resolvers
+    original = config_module.basis_feature_dim
+    OmegaConf.register_new_resolver(RESOLVER, witness, replace=True)
+    try:
+        cfg = _config(schema=f"${{{RESOLVER}:x}}")
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+    finally:
+        OmegaConf.register_new_resolver(RESOLVER, original, replace=True)
+    assert calls == []
+    assert "unadmitted-resolver" in _rules(caught.value)
+    assert RESOLVER not in HI_TRAIN_POLICY.allowed_resolvers
+
+
+def test_hi_firewall_review_r1_uncheckable_resolver_pairs_skip_recording() -> None:
+    """A computed resolver name is uncheckable without invoking its witness."""
+
+    calls: list[Any] = []
+
+    def witness(argument: Any) -> int:
+        calls.append(argument)
+        return 1
+
+    assert OmegaConf.has_resolver(RESOLVER)
+    original = config_module.basis_feature_dim
+    OmegaConf.register_new_resolver(RESOLVER, witness, replace=True)
+    try:
+        cfg = _config(
+            runtime={
+                "leaf": "basis_feature_dim",
+                "probe": "${tpen.${runtime.leaf}:3}",
+            }
+        )
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+    finally:
+        OmegaConf.register_new_resolver(RESOLVER, original, replace=True)
+
+    assert calls == []
+    assert "uncheckable-resolver" in _rules(caught.value)
+    assert "resolved-sweep-skipped" in _rules(caught.value)
+
+
+def test_hi_firewall_review_r1_guard_refusal_restores_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resolver-driven unadmitted target refuses and restores Hydra's hook."""
+
+    from hydra._internal.instantiate import _instantiate2
+
+    monkeypatch.setattr(
+        hi_schema_module,
+        "HI_TRAIN_POLICY",
+        replace(HI_TRAIN_POLICY, allowed_resolvers=frozenset({RESOLVER})),
+    )
+    original_resolve_target = _instantiate2._resolve_target
+    marker = tmp_path / "guard-refusal"
+    cfg = _config(runtime={"probe": _resolver_carrier(marker)})
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(cfg)
+
+    assert not marker.exists()
+    assert "unadmitted-free-form-target" in _rules(caught.value)
+    assert _instantiate2._resolve_target is original_resolve_target
+
+
+def test_known_residual_admitted_trampoline_effect_survives_raw_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin undesired RNG consumption under a future resolver widening.
+
+    FOLLOW-UP ITEM: b4992cc8-dfa1-4a43-8944-a1a9e448f123.
+    This does not weaken the invariant for shipped policy: no config-named
+    callable may execute before refusal on any validation path.
+    """
+
+    admitted_policy = replace(HI_TRAIN_POLICY, allowed_resolvers=frozenset({RESOLVER}))
+    monkeypatch.setattr(hi_schema_module, "HI_TRAIN_POLICY", admitted_policy)
+    cfg = _config(
+        runtime={
+            "probe": _embedding_resolver_trampoline(),
+            "raw_reference": {"_target_": "tpen.hi_manifest.reference_energy"},
+        }
+    )
+    state_before = torch.get_rng_state().clone()
+    state_after: torch.Tensor | None = None
+    try:
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        state_after = torch.get_rng_state().clone()
+    finally:
+        torch.set_rng_state(state_before)
+
+    assert "forbidden-target:reference-module" in _rules(caught.value)
+    assert state_after is not None
+    assert not torch.equal(state_after, state_before)
+
+
+@pytest.mark.parametrize("kind", ["embedding", "path-aggregation"])
+def test_hi_firewall_review_r1_admitted_constructor_consumes_rng_control(kind: str) -> None:
+    """The positive controls prove both default constructor paths are RNG-live."""
+
+    cfg = OmegaConf.create(_constructor_carrier(kind))
+    state_before = torch.get_rng_state().clone()
+    try:
+        hydra.utils.instantiate(cfg)
+        state_after = torch.get_rng_state().clone()
+    finally:
+        torch.set_rng_state(state_before)
+    assert not torch.equal(state_after, state_before)
+
+
+@pytest.mark.parametrize("kind", ["embedding", "path-aggregation"])
+def test_hi_firewall_review_r1_seeded_initializer_is_rng_neutral_control(kind: str) -> None:
+    """A nested admitted TorchInitializer supplies both green RNG controls."""
+
+    cfg = OmegaConf.create(
+        _constructor_carrier(
+            kind,
+            initializer={
+                "_target_": "tpen.nn.initialization.TorchInitializer",
+                "seed": 17,
+            }
+        )
+    )
+    state_before = torch.get_rng_state().clone()
+    try:
+        hydra.utils.instantiate(cfg)
+        state_after = torch.get_rng_state().clone()
+    finally:
+        torch.set_rng_state(state_before)
+    assert torch.equal(state_after, state_before)
+
+
+def test_hi_firewall_review_r1_empty_allowlist_blocks_embedding_before_rng(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The empty allowlist control must refuse before the resolver runs."""
+
+    monkeypatch.setattr(hi_schema_module, "HI_TRAIN_POLICY", replace(HI_TRAIN_POLICY))
+    assert hi_schema_module.HI_TRAIN_POLICY.allowed_resolvers == frozenset()
+    cfg = _config(
+        runtime={
+            "probe": (
+                _embedding_resolver_carrier()
+            )
+        }
+    )
+    state_before = torch.get_rng_state().clone()
+    state_after: torch.Tensor | None = None
+    try:
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        state_after = torch.get_rng_state().clone()
+    finally:
+        torch.set_rng_state(state_before)
+    assert "unadmitted-resolver" in _rules(caught.value)
+    assert state_after is not None
+    assert torch.equal(state_after, state_before)
+
+
+def test_hi_firewall_review_r1_sequential_green_control_restores_guard() -> None:
+    """A normal validation leaves Hydra's process-global target resolver intact."""
+
+    from hydra._internal.instantiate import _instantiate2
+
+    original = _instantiate2._resolve_target
+    _validate(_config(runtime={"probe": "plain"}))
+    assert _instantiate2._resolve_target is original
+
+
+def test_hi_firewall_review_r1_exception_control_restores_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception during resolution must also restore the original target hook."""
+
+    from hydra._internal.instantiate import _instantiate2
+
+    monkeypatch.setattr(
+        hi_schema_module,
+        "HI_TRAIN_POLICY",
+        replace(HI_TRAIN_POLICY, allowed_resolvers=frozenset({RESOLVER})),
+    )
+    original = _instantiate2._resolve_target
+    cfg = _config(
+        runtime={
+            "probe": (
+                f"${{{RESOLVER}:{{_target_: tpen.nn.Embedding}}}}"
+            )
+        }
+    )
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(cfg)
+    assert "unresolvable" in _rules(caught.value)
+    assert _instantiate2._resolve_target is original
+
+
+def test_known_residual_swallowing_admitted_resolver_erases_refusal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pin the known residual; this is not desired behaviour.
+
+    FOLLOW-UP ITEM: b4992cc8-dfa1-4a43-8944-a1a9e448f123.
+    The trigger is a future widening that admits a resolver which catches
+    ``Exception`` around its own work. It is not constructible today because
+    ``allowed_resolvers`` is empty and ``tpen.basis_feature_dim`` propagates
+    the guard refusal. This red pin names the known residual so the eventual
+    hardening has an explicit test to close; it does not bless the behaviour.
+    """
+
+    def swallowing_resolver(argument: Any) -> int:
+        try:
+            return int(hydra.utils.instantiate(argument).out_features)
+        except Exception:
+            return 1
+
+    admitted_policy = replace(HI_TRAIN_POLICY, allowed_resolvers=frozenset({RESOLVER}))
+    monkeypatch.setattr(hi_schema_module, "HI_TRAIN_POLICY", admitted_policy)
+    original = config_module.basis_feature_dim
+    marker = tmp_path / "swallowed-resolver"
+    OmegaConf.register_new_resolver(RESOLVER, swallowing_resolver, replace=True)
+    try:
+        cfg = _config(
+            runtime={
+                "probe": (
+                    f"${{{RESOLVER}:{{_target_: builtins.open, file: {marker}, mode: w}}}}"
+                )
+            }
+        )
+        _validate(cfg)
+        assert not marker.exists()
+        OmegaConf.to_container(cfg, resolve=True)
+        assert marker.exists()
+    finally:
+        OmegaConf.register_new_resolver(RESOLVER, original, replace=True)
