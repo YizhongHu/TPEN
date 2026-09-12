@@ -10,7 +10,16 @@ from omegaconf import OmegaConf
 
 import tpen.hi_schema as H
 
-assert "claude-hi-firewall-r2-review-tests" in H.__file__, H.__file__
+import os
+import sys
+
+# The checkout this probe must be reading is named by TPEN_EXPECTED_ROOT, or by
+# the working directory.  A shared venv in this project carries an editable tpen
+# install pointing at ANOTHER worktree, so an unpinned probe silently measures
+# somebody else's branch.
+_EXPECTED_ROOT = os.path.realpath(os.environ.get("TPEN_EXPECTED_ROOT", os.getcwd()))
+assert os.path.realpath(H.__file__).startswith(_EXPECTED_ROOT), (H.__file__, _EXPECTED_ROOT)
+print("hi_schema source:", H.__file__, "| python:", sys.executable)
 print("python", sys.version.split()[0], "| omegaconf", omegaconf.__version__)
 print("hi_schema", H.__file__)
 
