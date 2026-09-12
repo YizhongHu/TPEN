@@ -64,13 +64,18 @@ def _real_preflight_carrier(marker: Path) -> str:
     # The outer mapping deliberately has no ``out_features`` key.  The basis
     # resolver must therefore instantiate it; the nested Hydra call returns a
     # mapping with out_features=1 after constructing the open() payload.
+    #
+    # Four closers are required and all four are load-bearing: the payload
+    # mapping, the ``config`` mapping, the resolver argument mapping, and the
+    # interpolation itself.  One short and OmegaConf rejects the string while
+    # BUILDING the config, before any assertion in the probe runs.
     return (
         "tpen.hi.train.v${"
         + RESOLVER
         + ":{_target_: hydra.utils.instantiate, _recursive_: false, "
         "config: {out_features: 1, payload: "
         + f"{{_target_: builtins.open, file: {marker}, mode: w}}"
-        + "}}"
+        + "}}}"
     )
 
 
@@ -862,3 +867,43 @@ def test_hi_firewall_review_r1_no_shipped_config_interpolates_the_schema_key() -
         f"{len(tracked)} tracked YAML files interpolate, so reading the schema "
         f"key raw is a behaviour change for them: {interpolating}"
     )
+
+
+def test_hi_firewall_review_r1_every_carrier_builder_is_well_formed(tmp_path: Path) -> None:
+    """Every hand-built carrier must survive config construction.
+
+    These carriers are assembled by string concatenation, so a miscounted
+    closing brace is easy to write and hard to see.  OmegaConf rejects such a
+    string while BUILDING the config, which means the probe that uses it dies
+    before reaching any assertion -- and a GrammarParseError deep in the
+    OmegaConf stack reads like a defect in the code under test rather than a
+    typo in the probe's own fixture.  One of these was in fact one closer
+    short and cost a full verification cycle.
+
+    This asserts the fixture is well formed, not that anything is contained;
+    the containment probes each carry their own liveness control.
+    """
+
+    builders = {
+        "_resolver_carrier": _resolver_carrier(tmp_path / "a"),
+        "_real_preflight_carrier": _real_preflight_carrier(tmp_path / "b"),
+        "_family_entry_carrier": _family_entry_carrier(tmp_path / "c"),
+        "_embedding_resolver_carrier": _embedding_resolver_carrier(),
+        "_embedding_resolver_trampoline": _embedding_resolver_trampoline(),
+    }
+    assert len(builders) == 5, builders
+
+    unparsable: dict[str, str] = {}
+    for name, carrier in builders.items():
+        try:
+            # Construction alone must succeed. Nothing here resolves, so this
+            # never runs a payload.
+            OmegaConf.create({"probe": carrier})
+        except Exception as error:  # noqa: BLE001 - OmegaConf raises several types
+            unparsable[name] = f"{type(error).__name__}: {error}"
+    assert not unparsable, unparsable
+
+    # Discrimination: a genuinely malformed carrier must be rejected, so the
+    # check above is not merely asserting that OmegaConf accepts everything.
+    with pytest.raises(Exception):
+        OmegaConf.create({"probe": _resolver_carrier(tmp_path / "d")[:-1]})
