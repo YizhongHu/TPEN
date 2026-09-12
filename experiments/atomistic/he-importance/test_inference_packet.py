@@ -6,7 +6,7 @@ import importlib.util
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from enum import IntEnum
 from pathlib import Path
 from typing import NamedTuple
@@ -164,6 +164,46 @@ class _MutableProvenanceKey(str):
         result = str.__new__(cls, value)
         result.marker = marker
         return result
+
+
+class _CountingOffset(tzinfo):
+    def __init__(self, offset: object) -> None:
+        self.offset = offset
+        self.calls = 0
+
+    def utcoffset(self, value: datetime | None) -> object:
+        self.calls += 1
+        return self.offset if self.calls == 1 else None
+
+
+class _RaisingOffset(tzinfo):
+    def utcoffset(self, value: datetime | None) -> timedelta:
+        raise RuntimeError("offset probe failed")
+
+
+class _ItemsMapping(Mapping):
+    def __init__(self, entries: list[object]) -> None:
+        self.entries = entries
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, key: object) -> object:
+        raise KeyError(key)
+
+    def items(self):
+        return iter(self.entries)
+
+
+class _PathLike:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def __fspath__(self) -> str:
+        return str(self.path)
 
 
 class _TwoFacedMapping(Mapping[str, object]):
@@ -428,6 +468,19 @@ def test_sampler_input_keys_must_be_strings(tmp_path: Path) -> None:
             _source(checkpoint, {1: 4_096}), checkpoint, (_chain(0),)
         )
     _assert_refusal(excinfo, inference_packet.PacketRefusal.SAMPLER_KEY_NOT_A_STRING)
+
+
+def test_sampler_mapping_items_must_be_pairs(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path)
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.InferencePacket(
+            checkpoint,
+            _ItemsMapping([("walkers", 4_096, "extra")]),
+            (_chain(0),),
+            None,
+        )
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.SAMPLER_ITEMS_NOT_PAIRS)
+
 
 
 @pytest.mark.parametrize("value", [[], "sampler", 4_096, None], ids=["list", "str", "int", "None"])
@@ -873,6 +926,27 @@ def test_source_packet_checkpoint_path_accepts_a_symlinked_spelling(tmp_path: Pa
     assert packet.checkpoint is checkpoint
 
 
+def test_source_checkpoint_path_wrong_type_has_distinct_refusal(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path)
+    source = _source(checkpoint)
+    source.checkpoint_path = 5
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.launch_inference_packet(source, checkpoint, (_chain(0),))
+    _assert_refusal(
+        excinfo, inference_packet.PacketRefusal.SOURCE_CHECKPOINT_PATH_NOT_PATHLIKE
+    )
+
+
+def test_source_checkpoint_path_accepts_an_os_pathlike_value(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path)
+    source = _source(checkpoint)
+    source.checkpoint_path = _PathLike(checkpoint.checkpoint_path)
+    packet = inference_packet.launch_inference_packet(
+        source, checkpoint, (_chain(0),)
+    )
+    assert packet.checkpoint is checkpoint
+
+
 def test_source_packet_content_hash_is_binding(tmp_path: Path) -> None:
     checkpoint = _checkpoint(tmp_path)
     source = _source(checkpoint)
@@ -1144,6 +1218,233 @@ def _completed_status(started_at: datetime, finished_at: datetime) -> object:
     )
 
 
+def test_chain_status_stores_all_timestamps_as_canonical_utc_instants() -> None:
+    zone = ZoneInfo("America/New_York")
+    created = datetime(2026, 11, 1, 0, 0, tzinfo=zone)
+    started = datetime(2026, 11, 1, 1, 45, fold=0, tzinfo=zone)
+    finished = datetime(2026, 11, 1, 1, 30, fold=1, tzinfo=zone)
+    notification = datetime(2026, 11, 1, 1, 30, fold=1, tzinfo=zone)
+    assert created.astimezone(UTC) == datetime(2026, 11, 1, 4, 0, tzinfo=UTC)
+    assert started.astimezone(UTC) == datetime(2026, 11, 1, 5, 45, tzinfo=UTC)
+    assert finished.astimezone(UTC) == datetime(2026, 11, 1, 6, 30, tzinfo=UTC)
+    status = inference_packet.ChainStatus(
+        state=inference_packet.ChainState.ERROR,
+        created_at=created,
+        last_activity_at=finished,
+        started_at=started,
+        finished_at=finished,
+        terminal_reason="fold test",
+        finish_notification_at=notification,
+    )
+    expected = (
+        datetime(2026, 11, 1, 4, 0, tzinfo=UTC),
+        datetime(2026, 11, 1, 6, 30, tzinfo=UTC),
+        datetime(2026, 11, 1, 5, 45, tzinfo=UTC),
+        datetime(2026, 11, 1, 6, 30, tzinfo=UTC),
+        datetime(2026, 11, 1, 6, 30, tzinfo=UTC),
+    )
+    for stored, literal in zip(
+        (
+            status.created_at,
+            status.last_activity_at,
+            status.started_at,
+            status.finished_at,
+            status.finish_notification_at,
+        ),
+        expected,
+    ):
+        assert type(stored) is datetime
+        assert stored.tzinfo is UTC
+        assert stored.fold == 0
+        assert stored == literal
+    assert status.created_at.tzinfo is not zone
+    assert status.started_at.tzinfo is not zone
+    assert status.finished_at.tzinfo is not zone
+
+
+def test_chain_status_reads_each_timestamp_tzinfo_once_and_detaches_it() -> None:
+    offsets = [_CountingOffset(timedelta(hours=-5)) for _ in range(5)]
+    values = (
+        datetime(2026, 1, 1, 0, 0, tzinfo=offsets[0]),
+        datetime(2026, 1, 1, 0, 4, tzinfo=offsets[1]),
+        datetime(2026, 1, 1, 0, 1, tzinfo=offsets[2]),
+        datetime(2026, 1, 1, 0, 2, tzinfo=offsets[3]),
+        datetime(2026, 1, 1, 0, 3, tzinfo=offsets[4]),
+    )
+    status = inference_packet.ChainStatus(
+        inference_packet.ChainState.ERROR,
+        values[0],
+        values[1],
+        values[2],
+        values[3],
+        "counted offset",
+        values[4],
+    )
+    assert [counter.calls for counter in offsets] == [1, 1, 1, 1, 1]
+    for stored in (
+        status.created_at,
+        status.last_activity_at,
+        status.started_at,
+        status.finished_at,
+        status.finish_notification_at,
+    ):
+        assert stored.tzinfo is UTC
+        stored.astimezone(UTC)
+    assert [counter.calls for counter in offsets] == [1, 1, 1, 1, 1]
+
+
+@pytest.mark.parametrize("field", ["created_at", "last_activity_at"])
+def test_required_missing_status_timestamp_has_declared_refusal(field: str) -> None:
+    values: dict[str, object] = {
+        "state": inference_packet.ChainState.IDLE,
+        "created_at": _CREATED,
+        "last_activity_at": _CREATED,
+    }
+    values[field] = None
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.ChainStatus(**values)
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME)
+
+
+@pytest.mark.parametrize(
+    "tz_value", [None, "raises"], ids=["none-offset", "ordinary-exception"]
+)
+def test_unavailable_status_timestamp_offset_has_declared_refusal(tz_value: object) -> None:
+    offset: tzinfo = _CountingOffset(None) if tz_value is None else _RaisingOffset()
+    value = datetime(2026, 1, 1, tzinfo=offset)
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.ChainStatus(
+            inference_packet.ChainState.IDLE, value, value
+        )
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME)
+
+
+@pytest.mark.parametrize(
+    "offset", [0, timedelta(hours=24)], ids=["non-timedelta", "out-of-range"]
+)
+def test_datetime_method_rejects_invalid_timestamp_offsets(offset: object) -> None:
+    value = datetime(2026, 1, 1, tzinfo=_CountingOffset(offset))
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.ChainStatus(
+            inference_packet.ChainState.IDLE, value, value
+        )
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        datetime.min.replace(tzinfo=timezone(timedelta(hours=1))),
+        datetime.max.replace(tzinfo=timezone(-timedelta(hours=1))),
+    ],
+    ids=["minimum-plus-one-hour", "maximum-minus-one-hour"],
+)
+def test_status_timestamp_utc_range_overflow_has_distinct_refusal(value: datetime) -> None:
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.ChainStatus(
+            inference_packet.ChainState.IDLE, value, value
+        )
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_TIMESTAMP_OUT_OF_UTC_RANGE)
+
+
+@pytest.mark.parametrize("value", [datetime.min, datetime.max], ids=["min-utc", "max-utc"])
+def test_utc_boundary_timestamps_remain_accepted(value: datetime) -> None:
+    value = value.replace(tzinfo=UTC)
+    status = inference_packet.ChainStatus(
+        inference_packet.ChainState.IDLE, value, value
+    )
+    assert status.created_at == value
+    assert status.last_activity_at == value
+    assert status.created_at.tzinfo is UTC
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("idle-creation", inference_packet.PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION),
+        ("running-creation", inference_packet.PacketRefusal.STATUS_NON_ACTIVITY_PRECEDES_CREATION),
+        ("terminal-creation", inference_packet.PacketRefusal.STATUS_NON_ACTIVITY_PRECEDES_CREATION),
+        ("error-notification-creation", inference_packet.PacketRefusal.STATUS_NON_ACTIVITY_PRECEDES_CREATION),
+        ("finish-start", inference_packet.PacketRefusal.STATUS_FINISH_PRECEDES_START),
+        ("activity-finish", inference_packet.PacketRefusal.STATUS_ACTIVITY_PRECEDES_FINISH),
+        ("notification-finish", inference_packet.PacketRefusal.STATUS_NOTIFICATION_PRECEDES_TERMINATION),
+        ("running-activity-start", inference_packet.PacketRefusal.STATUS_ACTIVITY_PRECEDES_START),
+    ],
+    ids=[
+        "idle-creation",
+        "running-creation",
+        "terminal-creation",
+        "error-notification-creation",
+        "finish-start",
+        "activity-finish",
+        "notification-finish",
+        "running-activity-start",
+    ],
+)
+def test_dst_fold_pins_each_declared_chronology_refusal(
+    case: str, expected: object
+) -> None:
+    zone = ZoneInfo("America/New_York")
+    boundary = datetime(2026, 11, 1, 0, 0, tzinfo=zone)
+    early = datetime(2026, 11, 1, 1, 45, fold=0, tzinfo=zone)
+    late = datetime(2026, 11, 1, 1, 30, fold=1, tzinfo=zone)
+    assert boundary.astimezone(UTC) == datetime(2026, 11, 1, 4, tzinfo=UTC)
+    assert early.astimezone(UTC) == datetime(2026, 11, 1, 5, 45, tzinfo=UTC)
+    assert late.astimezone(UTC) == datetime(2026, 11, 1, 6, 30, tzinfo=UTC)
+    values: dict[str, object] = {
+        "state": inference_packet.ChainState.IDLE,
+        "created_at": late,
+        "last_activity_at": early,
+        "started_at": None,
+        "finished_at": None,
+        "terminal_reason": None,
+        "finish_notification_at": None,
+    }
+    if case == "running-creation":
+        values.update(state=inference_packet.ChainState.RUNNING, started_at=early, last_activity_at=late)
+    elif case == "terminal-creation":
+        values.update(state=inference_packet.ChainState.COMPLETED, started_at=late, finished_at=early, last_activity_at=late)
+    elif case == "error-notification-creation":
+        values.update(state=inference_packet.ChainState.ERROR, started_at=late, finished_at=late, last_activity_at=late, terminal_reason="failure", finish_notification_at=early)
+    elif case == "finish-start":
+        values.update(state=inference_packet.ChainState.COMPLETED, created_at=boundary, started_at=late, finished_at=early, last_activity_at=late)
+    elif case == "activity-finish":
+        values.update(state=inference_packet.ChainState.COMPLETED, created_at=boundary, started_at=early, finished_at=late, last_activity_at=early)
+    elif case == "notification-finish":
+        values.update(state=inference_packet.ChainState.ERROR, created_at=boundary, started_at=early, finished_at=late, last_activity_at=late, terminal_reason="failure", finish_notification_at=early)
+    elif case == "running-activity-start":
+        values.update(state=inference_packet.ChainState.RUNNING, created_at=boundary, started_at=late, last_activity_at=early)
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.ChainStatus(**values)
+    _assert_refusal(excinfo, expected)
+
+
+def test_equal_finish_and_start_are_accepted() -> None:
+    instant = _CREATED + timedelta(seconds=1)
+    status = inference_packet.ChainStatus(
+        inference_packet.ChainState.COMPLETED,
+        _CREATED,
+        instant,
+        instant,
+        instant,
+    )
+    assert status.started_at == status.finished_at
+
+
+def test_equal_notification_and_finish_are_accepted() -> None:
+    instant = _CREATED + timedelta(seconds=2)
+    status = inference_packet.ChainStatus(
+        inference_packet.ChainState.ERROR,
+        _CREATED,
+        instant,
+        _CREATED + timedelta(seconds=1),
+        instant,
+        "failure",
+        instant,
+    )
+    assert status.finish_notification_at == status.finished_at
+
+
 @pytest.mark.parametrize(
     ("started_at", "finished_at", "should_refuse"),
     [
@@ -1171,7 +1472,9 @@ def test_dst_fold_status_order_is_chronological(
     else:
         assert started_at.astimezone(UTC) < finished_at.astimezone(UTC)
         status = _completed_status(started_at, finished_at)
-        assert status.finished_at is finished_at
+        assert status.finished_at == finished_at.astimezone(UTC)
+        assert status.finished_at.tzinfo is UTC
+        assert status.finished_at.fold == 0
 
 
 def test_plain_aware_chronology_controls_remain_directional() -> None:
@@ -1184,7 +1487,8 @@ def test_plain_aware_chronology_controls_remain_directional() -> None:
         started_at=earlier,
         finished_at=later,
     )
-    assert status.finished_at is later
+    assert status.finished_at == later
+    assert status.finished_at.tzinfo is UTC
     with pytest.raises(inference_packet.InferencePacketError) as excinfo:
         inference_packet.ChainStatus(
             state=inference_packet.ChainState.COMPLETED,
@@ -1252,7 +1556,7 @@ def test_each_valid_terminal_status_is_accepted(state: object, notified: bool) -
     )
     assert status.state is state
     assert status.terminal_reason is reason
-    assert status.finish_notification_at is notification
+    assert status.finish_notification_at == notification
 
 
 @pytest.mark.parametrize("depth", [6, 7], ids=["depth-6", "depth-7"])
@@ -1298,6 +1602,41 @@ def test_ddp_rank_artifacts_are_independently_immutable(tmp_path: Path) -> None:
         provenance.rank_artifacts[0] = tmp_path / "checkpoint" / "other"  # type: ignore[index]
 
 
+def test_ddp_rank_artifact_value_wrong_type_has_distinct_refusal() -> None:
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.DistributedCheckpointProvenance(1, {0: 5})
+    _assert_refusal(
+        excinfo, inference_packet.PacketRefusal.DDP_RANK_ARTIFACT_NOT_PATHLIKE
+    )
+
+
+def test_ddp_rank_artifact_accepts_an_os_pathlike_value(tmp_path: Path) -> None:
+    path = tmp_path / "rank-0"
+    provenance = inference_packet.DistributedCheckpointProvenance(
+        1, {0: _PathLike(path)}
+    )
+    assert provenance.rank_artifacts[0] == path.resolve()
+
+
+def test_ddp_rank_artifact_mapping_items_must_be_pairs(tmp_path: Path) -> None:
+    malformed = _ItemsMapping([(0, tmp_path / "rank-0", "extra")])
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.DistributedCheckpointProvenance(1, malformed)
+    _assert_refusal(
+        excinfo, inference_packet.PacketRefusal.DDP_RANK_ARTIFACT_ITEMS_NOT_PAIRS
+    )
+
+
+def test_ddp_rank_artifact_pair_shape_is_distinct_from_path_type(tmp_path: Path) -> None:
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.DistributedCheckpointProvenance(
+            1, _ItemsMapping([(0, 5)])
+        )
+    _assert_refusal(
+        excinfo, inference_packet.PacketRefusal.DDP_RANK_ARTIFACT_NOT_PATHLIKE
+    )
+
+
 def test_valid_packet_accepts_complete_ddp_artifacts_inside_checkpoint(tmp_path: Path) -> None:
     checkpoint = _checkpoint(tmp_path)
     artifacts = {
@@ -1317,6 +1656,17 @@ def test_topology_mapping_is_independently_immutable(tmp_path: Path) -> None:
     assert type(checkpoint.topology_provenance) is MappingProxyType
     with pytest.raises(TypeError):
         checkpoint.topology_provenance["launcher"] = "mutated"  # type: ignore[index]
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["root", "nested"])
+def test_topology_provenance_mapping_items_must_be_pairs(
+    tmp_path: Path, nested: bool
+) -> None:
+    malformed = _ItemsMapping([("launcher", "test", "extra")])
+    topology = {"outer": malformed} if nested else malformed
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        _checkpoint(tmp_path, topology=topology)
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.PROVENANCE_ITEMS_NOT_PAIRS)
 
 
 def test_caller_open_sampler_leaf_refuses_actual_mapping_payload(
@@ -1551,7 +1901,7 @@ def test_a_checkpoint_outside_its_parent_cell_checkpoints_directory_is_refused(
     _assert_refusal(excinfo, inference_packet.PacketRefusal.CHECKPOINT_NOT_BOUND_TO_PARENT_CELL)
 
 
-def test_a_list_of_chains_is_stored_unconverted_and_stays_mutable(tmp_path: Path) -> None:
+def test_a_list_of_chains_is_materialized_and_immutable(tmp_path: Path) -> None:
     """Direct construction freezes a list of chains into a tuple."""
     packet = _review_packet(_checkpoint(tmp_path), [_chain(0)])
     assert type(packet.chains) is tuple
@@ -1559,13 +1909,46 @@ def test_a_list_of_chains_is_stored_unconverted_and_stays_mutable(tmp_path: Path
         packet.chains.append("not a chain")
 
 
-def test_an_iterator_of_chains_escapes_the_empty_chain_guard_and_raises_typeerror(
+def test_an_iterator_of_chains_is_materialized_and_admitted(
     tmp_path: Path,
 ) -> None:
     """Direct construction accepts an iterator after eagerly tuple-ing it."""
     packet = _review_packet(_checkpoint(tmp_path), iter([_chain(0)]))
     assert type(packet.chains) is tuple
     assert len(packet.chains) == 1
+
+
+@pytest.mark.parametrize("route", ["direct", "launch"], ids=["direct", "launch"])
+def test_non_iterable_chains_has_declared_refusal(tmp_path: Path, route: str) -> None:
+    checkpoint = _checkpoint(tmp_path)
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        if route == "direct":
+            _review_packet(checkpoint, 5)
+        else:
+            inference_packet.launch_inference_packet(
+                _source(checkpoint), checkpoint, 5  # type: ignore[arg-type]
+            )
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.PACKET_CHAINS_NOT_ITERABLE)
+
+
+class _OneShotChains:
+    def __init__(self, chain: object) -> None:
+        self.chain = chain
+        self.iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        if self.iterations > 1:
+            raise AssertionError("chains were iterated more than once")
+        return iter((self.chain,))
+
+
+def test_a_one_shot_chain_iterable_is_consumed_once(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path)
+    chains = _OneShotChains(_chain(0))
+    packet = _review_packet(checkpoint, chains)
+    assert type(packet.chains) is tuple
+    assert chains.iterations == 1
 
 
 def test_an_empty_sequence_of_chains_is_refused_with_its_declared_member(tmp_path: Path) -> None:
@@ -1720,7 +2103,7 @@ def test_mixing_naive_and_aware_timestamps_raises_typeerror_instead_of_a_declare
     _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME)
 
 
-def test_a_fully_naive_status_record_is_admitted() -> None:
+def test_a_fully_naive_status_record_is_refused() -> None:
     """A status record requires aware timestamps."""
     created = datetime(2026, 1, 1)
     with pytest.raises(inference_packet.InferencePacketError) as excinfo:
@@ -1876,7 +2259,7 @@ def test_an_attributeerror_raised_inside_a_source_packet_property_is_misattribut
         "notified_wholly_before_creation",
     ],
 )
-def test_status_records_may_precede_the_creation_they_are_attached_to(
+def test_status_records_refuse_precedence_violations(
     state: object,
     created_at: datetime,
     last_activity_at: datetime,
@@ -1899,7 +2282,7 @@ def test_status_records_may_precede_the_creation_they_are_attached_to(
             notified_at,
         )
     expected = (
-        inference_packet.PacketRefusal.STATUS_FINISH_PRECEDES_START
+        inference_packet.PacketRefusal.STATUS_ACTIVITY_PRECEDES_FINISH
         if finished_at is not None and last_activity_at < finished_at
         else inference_packet.PacketRefusal.STATUS_NON_ACTIVITY_PRECEDES_CREATION
     )
@@ -2020,6 +2403,16 @@ def test_the_refusal_coverage_census_over_the_whole_enum() -> None:
         if member.name not in contract_text
     }
     assert uncovered == set()
+
+
+def test_refusal_member_names_and_values_are_pairwise_substring_free() -> None:
+    members = tuple(inference_packet.PacketRefusal)
+    for index, left in enumerate(members):
+        for right in members[index + 1 :]:
+            assert left.name not in right.name
+            assert right.name not in left.name
+            assert left.value not in right.value
+            assert right.value not in left.value
 
 
 def test_review_module_is_the_same_object_as_the_contract_suite_loads() -> None:
