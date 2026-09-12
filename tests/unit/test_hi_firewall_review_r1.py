@@ -1439,3 +1439,72 @@ def test_hi_firewall_review_r1_missing_sentinel_identity_is_refused() -> None:
 
     with pytest.raises(ClosedSchemaError):
         _validate(cfg)
+
+
+# Deliberately empty. A tracked configuration that the firewall must refuse
+# would be named here WITH ITS REASON, so adding one is a visible decision
+# rather than a silent relaxation of the sweep below.
+CONFIGS_EXPECTED_TO_BE_REFUSED: frozenset[str] = frozenset()
+
+
+def test_hi_firewall_review_r1_every_tracked_config_survives_the_firewall() -> None:
+    """No tracked configuration may be refused by the train-config firewall.
+
+    THIS EXISTS BECAUSE THE SUITE WAS BLIND TO THE COST THAT MATTERED. A
+    candidate mechanism that refused every unreadable identity would have
+    refused four tracked hooke configs, two of them frozen provenance
+    records -- and NO node in this suite would have gone red, because no test
+    ran ``validate_hi_train_config`` over the tracked configs at all.  The
+    cost was measured only by a one-off probe in a verification job, and a
+    one-off probe is perishable in a way a repo test is not.
+
+    ``validate_hi_train_config`` runs unconditionally on the live path in
+    ``tpen/run.py``, for EVERY config and not only helium-importance ones, so
+    the blast radius of any change to it is exactly this corpus.
+
+    Nothing here resolves: refusal is decided on the raw tree, so loading and
+    validating a config runs none of its configured callables.
+    """
+
+    repo_root = Path(__file__).resolve().parents[2]
+    listing = subprocess.run(
+        ["git", "ls-files", "-z", "*.yaml", "*.yml"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tracked = [name for name in listing.stdout.split("\0") if name]
+    assert len(tracked) > 20, f"the tracked config corpus looks wrong: {len(tracked)}"
+
+    refused: dict[str, list[str]] = {}
+    unloadable: dict[str, str] = {}
+    validated = 0
+    for name in tracked:
+        try:
+            cfg = OmegaConf.load(repo_root / name)
+        except Exception as error:  # noqa: BLE001 - a YAML this cannot load is not in scope
+            unloadable[name] = f"{type(error).__name__}: {error}"
+            continue
+        validated += 1
+        try:
+            validate_hi_train_config(cfg, env={})
+        except ClosedSchemaError as refusal:
+            refused[name] = sorted(_rules(refusal))
+
+    unexpected = {
+        name: rules
+        for name, rules in refused.items()
+        if name not in CONFIGS_EXPECTED_TO_BE_REFUSED
+    }
+    assert not unexpected, (
+        f"{len(unexpected)} of {validated} tracked configs are now refused by the "
+        f"firewall: {unexpected}. tpen/run.py validates every config on the live "
+        "path, so each of these is a run that stops working"
+    )
+    # Report coverage: a sweep that quietly skipped most of the corpus would
+    # pass while proving nothing.
+    assert validated >= len(tracked) - 2, (
+        f"only {validated} of {len(tracked)} tracked configs could be loaded and "
+        f"validated, so this sweep covers less than it appears to: {unloadable}"
+    )
