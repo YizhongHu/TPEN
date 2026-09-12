@@ -820,6 +820,10 @@ def test_hi_firewall_review_r1_resolving_reads_stay_pinned() -> None:
     assert omegaconf_imports == {
         ("omegaconf", "DictConfig", None),
         ("omegaconf", "OmegaConf", None),
+        # INTERNAL API, pinned deliberately rather than smuggled in. The
+        # identity follower classifies interpolations with the grammar, and a
+        # string test for a colon would both over- and under-report.
+        ("omegaconf", "grammar_parser", "_grammar_parser"),
     }, (
         "the omegaconf import form changed; an alias would make every call "
         f"below invisible to this census. Imports: {sorted(omegaconf_imports)}"
@@ -830,6 +834,24 @@ def test_hi_firewall_review_r1_resolving_reads_stay_pinned() -> None:
         if isinstance(node, ast.Import)
         and any(alias.name.split(".")[0] == "omegaconf" for alias in node.names)
     ], "omegaconf gained a plain import, which can bind any name"
+
+    # The generated grammar contexts live deeper than the top-level package.
+    # Pinned as its own entry so the internal dependency is visible in one
+    # place and cannot grow without this test naming it.
+    deep = {
+        (node.module, alias.name, alias.asname)
+        for node in ast.walk(module)
+        if isinstance(node, ast.ImportFrom)
+        and (node.module or "").startswith("omegaconf.")
+        for alias in node.names
+    }
+    assert deep == {
+        (
+            "omegaconf.grammar.gen.OmegaConfGrammarParser",
+            "OmegaConfGrammarParser",
+            "_OmegaConfGrammarParser",
+        )
+    }, f"the internal OmegaConf grammar dependency changed: {sorted(deep)}"
 
     # Each entry must stay justified by the ORDERING, not by its location:
     # a raw read may run at any time, and a resolving read may run only after
@@ -959,18 +981,22 @@ def test_hi_firewall_review_r1_every_carrier_builder_is_well_formed(tmp_path: Pa
         OmegaConf.create({"probe": _resolver_carrier(tmp_path / "d")[:-1]})
 
 
-# A config may hide its own identity behind an interpolation. Reading the
-# identity nodes raw means an interpolated value matches no literal, so
-# without some refusal the config is simply "not this family" and receives NO
-# ENFORCEMENT AT ALL. The refusal is on the PAYLOAD, not on the identity:
-# tracked configurations legitimately interpolate experiment.name.
+# IDENTITY DETERMINED WITHOUT EXECUTION. A node reference names another node
+# in the same tree, so following it is a dictionary lookup in the raw tree and
+# nothing runs. A resolver-call interpolation cannot be followed without
+# invoking a configured callable, so reaching one at ANY depth refuses.
+#
+# The carrier below is closed by being CORRECTLY IDENTIFIED and then properly
+# validated -- not by being refused for concealment. A mechanism that refuses
+# concealment punishes a shape; one that determines identity without executing
+# gets the right answer.
 REFERENCE_ENERGY = -2.903724
 
 
 def _identity_config(
     *, schema: str | None, name: str, reference: bool, extra: dict[str, Any] | None = None
 ) -> DictConfig:
-    """Build a config whose identity nodes may be interpolations."""
+    """Build a config whose identity nodes may be node references."""
 
     body: dict[str, Any] = {
         "runtime": {"real": "tpen_he_importance", "sch": HI_TRAIN_SCHEMA},
@@ -985,101 +1011,182 @@ def _identity_config(
     return OmegaConf.create(body)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "OPEN DEFECT, mechanism HELD pending a manager decision on item "
-        "847dfff4. Reading the identity nodes raw closed an ordering defect "
-        "and opened this one: an interpolated identity matches no literal, so "
-        "the config is read as a foreign family and gets NO enforcement. Two "
-        "candidate mechanisms were measured and both cost a shipped config -- "
-        "refusing every unreadable identity refuses four hooke configs, and "
-        "sweeping the raw tree for a reference surface refuses "
-        "tpen-pair-scan-v1/configs/eval.yaml, whose reference_energy sits at "
-        "line 351. strict=True is deliberate: when a mechanism lands these go "
-        "XPASS and FAIL, so the marker cannot outlive the defect"
-    ),
-)
-@pytest.mark.parametrize(
-    ("schema", "name"),
-    [("${runtime.sch}", "${runtime.real}"), (None, "${runtime.real}")],
-    ids=["both-interpolated", "name-interpolated-no-schema"],
-)
-def test_hi_firewall_review_r1_unreadable_family_carrying_a_reference_is_refused(
-    schema: str | None, name: str
-) -> None:
-    """A reference must not reach training behind an unreadable identity.
+def test_hi_firewall_review_r1_node_reference_identity_is_followed_and_validated() -> None:
+    """The both-interpolated carrier is identified, then refused on its payload.
 
-    Reading the identity nodes raw is required -- resolving them is what let
-    a config-named callable run before refusal -- but a raw read cannot tell
-    an interpolated name from a foreign one.  Treating the unreadable case as
-    foreign handed a config carrying a reference energy ZERO enforcement, and
-    ``tpen.run`` then resolved it and trained on it.  That is worse than a
-    payload running before a refusal, because no refusal happened at all.
-
-    The refusal is decided on the RAW tree, so nothing resolves to reach it.
+    This is the escape the raw read opened: at ``cbc4c06`` both identity nodes
+    read as non-literal, the config was taken for a foreign family, and a
+    reference energy reached a training configuration that validated with ZERO
+    rejections.  Following the references identifies it as helium-importance,
+    the full policy runs, and the reference is refused on the ordinary rule.
     """
 
-    cfg = _identity_config(schema=schema, name=name, reference=True)
+    cfg = _identity_config(schema="${runtime.sch}", name="${runtime.real}", reference=True)
 
     with pytest.raises(ClosedSchemaError) as caught:
         _validate(cfg)
 
     rules = _rules(caught.value)
-    assert "unreadable-family-carries-reference" in rules, rules
-    # The specific surface is named too, so the refusal says WHICH node.
+    # Refused by the ORDINARY rule, because it was correctly identified.
     assert "forbidden-surface:reference" in rules, rules
+    assert "undeterminable-identity" not in rules, rules
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "OPEN DEFECT, mechanism HELD pending a manager decision on item "
-        "847dfff4. Reading the identity nodes raw closed an ordering defect "
-        "and opened this one: an interpolated identity matches no literal, so "
-        "the config is read as a foreign family and gets NO enforcement. Two "
-        "candidate mechanisms were measured and both cost a shipped config -- "
-        "refusing every unreadable identity refuses four hooke configs, and "
-        "sweeping the raw tree for a reference surface refuses "
-        "tpen-pair-scan-v1/configs/eval.yaml, whose reference_energy sits at "
-        "line 351. strict=True is deliberate: when a mechanism lands these go "
-        "XPASS and FAIL, so the marker cannot outlive the defect"
-    ),
-)
-def test_hi_firewall_review_r1_unreadable_family_reaching_the_manifest_is_refused() -> None:
-    """The reference's own route counts, not only a reference-shaped key.
+def test_hi_firewall_review_r1_node_reference_name_without_schema_is_undeclared() -> None:
+    """The second escape: a followable name and no schema key.
 
-    A key named ``reference_energy`` and a target that reaches the manifest
-    module are two different carriers of the same value.  Guarding the name
-    channel while leaving the value channel open would be a guard on the
-    label rather than on the payload.
+    Refused ``undeclared-schema``, the rule that already existed for a config
+    that is in the family and forgot to opt in.
     """
 
-    cfg = _identity_config(
-        schema=None,
-        name="${runtime.real}",
-        reference=False,
-        extra={"probe": {"_target_": "tpen.hi_manifest.reference_energy"}},
+    cfg = _identity_config(schema=None, name="${runtime.real}", reference=True)
+
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(cfg)
+
+    assert _rules(caught.value) == {"undeclared-schema"}
+
+
+def test_hi_firewall_review_r1_transitive_node_reference_is_followed() -> None:
+    """Following is transitive: a reference to a reference resolves."""
+
+    cfg = OmegaConf.create(
+        {
+            "a": "${b}",
+            "b": "${c}",
+            "c": "tpen_he_importance",
+            "experiment": {"name": "${a}"},
+            "reference_energy": REFERENCE_ENERGY,
+        }
     )
 
     with pytest.raises(ClosedSchemaError) as caught:
         _validate(cfg)
 
-    rules = _rules(caught.value)
-    assert "unreadable-family-carries-reference" in rules, rules
-    assert "forbidden-target:reference-module" in rules, rules
+    assert _rules(caught.value) == {"undeclared-schema"}
+
+
+@pytest.mark.parametrize(
+    ("body", "shape"),
+    [
+        ({"experiment": {"name": "${runtime.witness:1}"}}, "resolver-call-direct"),
+        (
+            {"hop": "${runtime.witness:1}", "experiment": {"name": "${hop}"}},
+            "resolver-call-at-depth-2",
+        ),
+        (
+            {"a": "${b}", "b": "${a}", "experiment": {"name": "${a}"}},
+            "cycle",
+        ),
+        ({"experiment": {"name": "${nowhere.at.all}"}}, "dangling-target"),
+        (
+            {"container": {"inner": 1}, "experiment": {"name": "${container}"}},
+            "container-target",
+        ),
+        (
+            {"items": [1, 2], "experiment": {"name": "${items.0}"}},
+            "list-index",
+        ),
+        ({"experiment": {"name": "prefix_${runtime.real}"}}, "mixed-literal-and-interpolation"),
+        (
+            {"slot": "real", "runtime": {"real": "x"}, "experiment": {"name": "${runtime.${slot}}"}},
+            "interpolated-path-segment",
+        ),
+    ],
+    ids=[
+        "resolver-call-direct",
+        "resolver-call-at-depth-2",
+        "cycle",
+        "dangling-target",
+        "container-target",
+        "list-index",
+        "mixed-literal-and-interpolation",
+        "interpolated-path-segment",
+    ],
+)
+def test_hi_firewall_review_r1_undeterminable_identity_is_refused(
+    body: dict[str, Any], shape: str
+) -> None:
+    """Every identity that cannot be established without execution refuses.
+
+    Reaching a resolver call at ANY depth is the security-critical arm: the
+    alternative to refusing is running a configured callable to find out what
+    the config is, which is the defect this module exists to close.
+
+    The rest are fail-closed branches with no security story of their own,
+    and they are here because a guard that silently returns "not my family"
+    for an input it did not understand is the same hole wearing a different
+    hat.  The cycle arm also pins TERMINATION: a validator that hangs is not
+    a validator that refuses.
+    """
+
+    cfg = OmegaConf.create(dict(body))
+
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(cfg)
+
+    assert "undeterminable-identity" in _rules(caught.value), (
+        f"{shape} did not refuse: {sorted(_rules(caught.value))}"
+    )
+
+
+def test_hi_firewall_review_r1_identity_following_refuses_at_its_bound() -> None:
+    """A long chain refuses AT the bound; it never truncates and guesses.
+
+    A guard that stops early without saying so is indistinguishable from one
+    that succeeded, and this stack has already shipped one caller-open leaf.
+    """
+
+    from tpen.hi_schema import IDENTITY_FOLLOW_LIMIT
+
+    depth = IDENTITY_FOLLOW_LIMIT + 4
+    body: dict[str, Any] = {"experiment": {"name": "${n0}"}}
+    for index in range(depth):
+        body[f"n{index}"] = "${n%d}" % (index + 1)
+    body[f"n{depth}"] = "tpen_he_importance"
+
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(OmegaConf.create(body))
+
+    assert "undeterminable-identity" in _rules(caught.value)
+
+
+def test_hi_firewall_review_r1_resolver_call_identity_runs_nothing() -> None:
+    """Classifying a resolver call must not INVOKE it.
+
+    The witness is the whole point: a classifier that decided by trying to
+    resolve would give the same verdict and would already have run the
+    payload.
+    """
+
+    calls: list[Any] = []
+
+    def witness(argument: Any) -> str:
+        calls.append(argument)
+        return HI_TRAIN_SCHEMA
+
+    original = config_module.basis_feature_dim
+    OmegaConf.register_new_resolver(RESOLVER, witness, replace=True)
+    try:
+        cfg = OmegaConf.create({"experiment": {"name": f"${{{RESOLVER}:probe}}"}})
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+    finally:
+        OmegaConf.register_new_resolver(RESOLVER, original, replace=True)
+
+    assert calls == [], "classification invoked the resolver it was classifying"
+    assert "undeterminable-identity" in _rules(caught.value)
 
 
 def test_hi_firewall_review_r1_shipped_interpolated_name_shape_still_passes() -> None:
     """The four tracked configs that interpolate experiment.name must pass.
 
-    This is the shape of ``pair_stability.yaml``, ``pair_validation.yaml``
-    and both ``tpen-pair-scan-v1`` configs: ``experiment.name`` interpolates
-    ``${study.name}``, no schema key is declared, and no reference surface is
-    present.  Refusing on the unreadable identity ALONE would refuse all
-    four, two of which are frozen provenance records whose protected property
-    is that they still resolve.  Failing closed on the payload instead costs
-    them nothing, and this pin is what keeps that true.
+    This is the shape of ``pair_stability.yaml``, ``pair_validation.yaml`` and
+    both ``tpen-pair-scan-v1`` configs: ``experiment.name`` is ``${study.name}``
+    and the target is a literal in the same file.  Following it costs nothing
+    and identifies them, correctly, as not this family.  Two of the four are
+    frozen provenance records whose protected property is that they still
+    resolve, so this pin is what keeps that true.
     """
 
     cfg = OmegaConf.create(
@@ -1089,79 +1196,27 @@ def test_hi_firewall_review_r1_shipped_interpolated_name_shape_still_passes() ->
     _validate(cfg)
 
 
-def test_hi_firewall_review_r1_unreadable_family_gets_no_enforcement_today() -> None:
-    """Pin the CURRENT extent of the open defect, so its shape stays visible.
-
-    An unreadable identity does not merely lose the reference check: it loses
-    the WHOLE policy.  A forbidden surface that is refused outright for a
-    config which declares the schema is not looked at all when the family
-    cannot be read.
-
-    This is the open state, not a design.  It is pinned because the size of a
-    hole decides which mechanism is worth its cost, and a hole nobody
-    measures gets argued about from memory.
-    """
-
-    cfg = _identity_config(
-        schema=None,
-        name="${runtime.real}",
-        reference=False,
-        extra={"training": {"patience": 5}},
-    )
-
-    # A stop-rule surface IS refused for a config that declares the schema...
-    with pytest.raises(ClosedSchemaError) as caught:
-        _validate(
-            OmegaConf.create(
-                {"schema": HI_TRAIN_SCHEMA, "training": {"patience": 5}}
-            )
-        )
-    assert "forbidden-surface:stop-rule" in _rules(caught.value)
-
-    # ...and is NOT looked at when the family cannot be read. Same surface,
-    # same value, no enforcement. This arm is what makes the hole's size
-    # concrete rather than described.
-    _validate(cfg)
-
-
 def test_hi_firewall_review_r1_readable_identity_paths_are_unchanged() -> None:
-    """The new refusal must not fire where the identity is readable.
+    """Literal identities behave exactly as before.
 
-    Four arms that were already correct and must stay that way, so the new
-    behaviour is shown to be narrow rather than merely present.
+    Three arms that were already correct and must stay that way, so the new
+    following is shown to be additive rather than a rewrite.
     """
 
-    # A readable HI name with no schema keeps its existing refusal, on the
-    # same rule it always used, even though it carries a reference.
     with pytest.raises(ClosedSchemaError) as caught:
         _validate(_identity_config(schema=None, name="tpen_he_importance", reference=True))
-    assert _rules(caught.value) == {"undeclared-schema"}
-
-    # A readable HI name outranks an interpolated schema key: the family is
-    # determinable, so the precise diagnosis is kept.
-    with pytest.raises(ClosedSchemaError) as caught:
-        _validate(
-            _identity_config(schema="${runtime.sch}", name="tpen_he_importance", reference=True)
-        )
     assert _rules(caught.value) == {"undeclared-schema"}
 
     # A readable foreign name is still returned unvalidated: opt-in firewall.
     _validate(OmegaConf.create({"experiment": {"name": "some_other_study"}}))
 
-    # An ESCAPED opener is literal text that runs no resolver, so treating it
-    # as an interpolation would be a false positive. Discrimination arm for
-    # the predicate itself.
-    _validate(OmegaConf.create({"experiment": {"name": r"\${runtime.real}"}}))
+    # No experiment section at all is ABSENT, which is a determined fact and
+    # must not be confused with undeterminable.
+    _validate(OmegaConf.create({"runtime": {"probe": "plain"}}))
 
 
 def test_hi_firewall_review_r1_declared_schema_still_validates_an_interpolated_name() -> None:
-    """Opting in literally must not be short-circuited.
-
-    A config that declares the schema as a LITERAL has opted in, so the full
-    policy applies and an interpolated ``experiment.name`` is just another
-    node the sweep sees. Firing the unreadable-family path here would replace
-    a complete validation with a single early rejection.
-    """
+    """Opting in literally must not be short-circuited by identity handling."""
 
     cfg = OmegaConf.create(
         {
@@ -1176,5 +1231,5 @@ def test_hi_firewall_review_r1_declared_schema_still_validates_an_interpolated_n
         _validate(cfg)
 
     rules = _rules(caught.value)
-    assert "unreadable-family-carries-reference" not in rules, rules
+    assert "undeterminable-identity" not in rules, rules
     assert "forbidden-surface:reference" in rules, rules
