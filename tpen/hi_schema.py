@@ -47,6 +47,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Iterator
 
 from omegaconf import DictConfig, OmegaConf
+from omegaconf import grammar_parser as _grammar_parser
 
 from tpen.config_schema import (
     ClosedSchemaError,
@@ -55,6 +56,7 @@ from tpen.config_schema import (
     Rejection,
     RESOLVER_REFUSAL_RULES,
     SchemaPolicy,
+    iter_interpolations,
     iter_nodes,
     sweep_environment,
     sweep_raw,
@@ -75,6 +77,7 @@ __all__ = [
     "SCHEMA_KEY",
     "canonical_train_identity",
     "declared_schema",
+    "identity_without_execution",
     "is_hi_family",
     "validate_hi_train_config",
 ]
@@ -548,6 +551,180 @@ def _raw_config_mapping(cfg: Any) -> Mapping[str, Any] | None:
     return cfg if isinstance(cfg, Mapping) else None
 
 
+# Following a node reference is a dictionary lookup in the RAW tree, so a
+# chain of them terminates without evaluating anything. A chain is still a
+# chain, though, so it is bounded and REFUSES at the bound rather than
+# truncating: a silent truncation is a caller-open leaf, and a guard that
+# stops early without saying so is indistinguishable from one that succeeded.
+# INTERNAL OMEGACONF API, declared here rather than reached for inline.
+# ``grammar_parser`` and the generated parser contexts are not public, so this
+# binding is resolved ONCE AT IMPORT: a rename in a future OmegaConf must
+# break loudly here rather than be absorbed at a call site. The failure
+# direction is what makes that the right trade -- if this class could not be
+# found and the code fell back to "no resolver call", every resolver call
+# would be classified as a followable node reference, which fails OPEN into
+# exactly the execution-before-refusal hole this module exists to close.
+try:  # pragma: no cover - exercised by the pin below, not by branch coverage
+    from omegaconf.grammar.gen.OmegaConfGrammarParser import (
+        OmegaConfGrammarParser as _OmegaConfGrammarParser,
+    )
+
+    _RESOLVER_CONTEXT = _OmegaConfGrammarParser.InterpolationResolverContext
+except (ImportError, AttributeError) as _grammar_error:  # pragma: no cover
+    raise ImportError(
+        "tpen.hi_schema classifies interpolations with OmegaConf's generated "
+        "grammar contexts, which are internal API. The expected context class "
+        "could not be resolved, and guessing would silently treat every "
+        "resolver call as a followable node reference. Pin the OmegaConf "
+        "version or update this binding"
+    ) from _grammar_error
+
+
+IDENTITY_FOLLOW_LIMIT = 16
+
+
+@dataclass(frozen=True)
+class Identity:
+    """The outcome of determining one identity node WITHOUT EXECUTION.
+
+    Parameters
+    ----------
+    determined : bool
+        Whether the node's value was established without evaluating anything.
+    value : object
+        The established value, or ``None`` when the node is simply absent.
+        Meaningful only when ``determined`` is ``True``.
+    reason : str or None
+        Why the value could not be established, when it could not.
+    """
+
+    determined: bool
+    value: object = None
+    reason: str | None = None
+
+
+def _names_a_resolver_call(text: str) -> bool:
+    """Return whether ``text`` contains a resolver-call interpolation.
+
+    Decided by THE GRAMMAR, never by searching for a colon or any other
+    substring: a colon appears inside quoted values and inside nested
+    expressions, and a string test would both over- and under-report.
+    """
+
+    tree = _grammar_parser.parse(text)
+    pending = [tree]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, _RESOLVER_CONTEXT):
+            return True
+        for index in range(getattr(node, "getChildCount", lambda: 0)()):
+            pending.append(node.getChild(index))
+    return False
+
+
+def _raw_lookup(raw_tree: Mapping[str, Any], path: str) -> tuple[bool, Any]:
+    """Look one dotted path up in a RAW container. Mappings only.
+
+    A segment that is not a mapping key -- a list index, or a scalar reached
+    too early -- reports "not found" rather than being indexed. Fail closed:
+    an identity this function cannot address is one it must not guess at.
+    """
+
+    cursor: Any = raw_tree
+    for segment in path.split("."):
+        if not isinstance(cursor, Mapping) or segment not in cursor:
+            return False, None
+        cursor = cursor[segment]
+    return True, cursor
+
+
+def identity_without_execution(cfg: Any, path: str) -> Identity:
+    """Determine one identity node by following RAW node references only.
+
+    Parameters
+    ----------
+    cfg : Any
+        A ``DictConfig`` or plain mapping.
+    path : str
+        Dotted path of the identity node, e.g. ``"experiment.name"``.
+
+    Returns
+    -------
+    Identity
+        ``determined`` with the literal value, ``determined`` with ``None``
+        when the node is absent, or undetermined with a reason.
+
+    Notes
+    -----
+    The property is IDENTITY DETERMINED WITHOUT EXECUTION -- not that the
+    identity is literal. A node reference names another node in the same
+    tree, so following it is a dictionary lookup and nothing runs. A
+    resolver-call interpolation cannot be followed without invoking a
+    configured callable, which is precisely the thing that must not happen
+    before a refusal, so reaching one at ANY depth ends in refusal rather
+    than in evaluation.
+
+    Every branch that cannot establish a value fails closed, including a
+    dangling target, an interpolation this cannot address such as a list
+    index, a target that is a container rather than a scalar, a value that
+    mixes literal text with interpolation, a path whose own segments
+    interpolate, a cycle, and exceeding the follow limit.
+    """
+
+    raw_tree = _raw_config_mapping(cfg)
+    if raw_tree is None:
+        return Identity(determined=True, value=None)
+
+    seen: list[str] = []
+    current = path
+    for hop in range(IDENTITY_FOLLOW_LIMIT):
+        if current in seen:
+            return Identity(False, reason=f"cycle through {current!r}")
+        seen.append(current)
+        found, value = _raw_lookup(raw_tree, current)
+        if not found:
+            # An ABSENT identity node is a determined fact: the config simply
+            # does not declare it. A DANGLING target one hop in is not -- the
+            # config asked for something that is not there, so what it meant
+            # cannot be established.
+            if hop == 0:
+                return Identity(determined=True, value=None)
+            return Identity(False, reason=f"{current!r} does not exist in the raw tree")
+        if isinstance(value, (Mapping, list, tuple)):
+            return Identity(False, reason=f"{current!r} is a container, not a scalar identity")
+        if not isinstance(value, str):
+            return Identity(determined=True, value=value)
+        bodies = list(iter_interpolations(value))
+        if not bodies:
+            return Identity(determined=True, value=value)
+        if _names_a_resolver_call(value):
+            return Identity(
+                False,
+                reason=(
+                    f"{current!r} reaches a resolver-call interpolation, which cannot be "
+                    "followed without running a configured callable"
+                ),
+            )
+        if len(bodies) != 1 or value != "${" + bodies[0] + "}":
+            return Identity(
+                False,
+                reason=f"{current!r} mixes literal text with interpolation",
+            )
+        if "${" in bodies[0]:
+            return Identity(
+                False,
+                reason=f"{current!r} interpolates its own path segments",
+            )
+        current = bodies[0]
+    return Identity(
+        False,
+        reason=(
+            f"identity following exceeded {IDENTITY_FOLLOW_LIMIT} hops from {path!r}; "
+            "refused at the bound rather than truncated"
+        ),
+    )
+
+
 def declared_schema(cfg: Any) -> str | None:
     """Return the schema a configuration opts in to, if any.
 
@@ -559,24 +736,26 @@ def declared_schema(cfg: Any) -> str | None:
     Returns
     -------
     str or None
-        The value of the top-level ``schema`` key, or ``None`` when the
-        configuration declares none.
+        The schema this configuration declares, or ``None`` when it declares
+        none OR when the declaration cannot be established without execution.
 
     Notes
     -----
-    Read raw configuration nodes without evaluating interpolations. Every
-    validation decision made before raw resolver refusal must preserve this
-    property, so no config-named callable can execute before refusal. The
-    value returned is therefore the literal node content: a schema key that
-    interpolates does not match any schema and is not treated as declaring
-    one, because deciding otherwise would require running the interpolation.
+    IDENTITY DETERMINED WITHOUT EXECUTION. A node reference names another
+    node in the same tree, so it is followed by raw lookup and nothing runs;
+    a resolver-call interpolation is not followed, because following it means
+    running a configured callable before any refusal.
+
+    This collapses "declares none" and "cannot be established" into ``None``.
+    A caller that must tell those apart -- and validation must, because the
+    second is refusable and the first is not -- uses
+    :func:`identity_without_execution` instead.
     """
 
-    raw_tree = _raw_config_mapping(cfg)
-    if raw_tree is None:
+    identity = identity_without_execution(cfg, SCHEMA_KEY)
+    if not identity.determined or identity.value is None:
         return None
-    value = raw_tree.get(SCHEMA_KEY)
-    return None if value is None else str(value)
+    return str(identity.value)
 
 
 def is_hi_family(cfg: Any) -> bool:
@@ -590,22 +769,21 @@ def is_hi_family(cfg: Any) -> bool:
     Returns
     -------
     bool
-        ``True`` when ``experiment.name`` is :data:`HI_EXPERIMENT_NAME`.
+        ``True`` when ``experiment.name`` is established, without execution,
+        as :data:`HI_EXPERIMENT_NAME`.
 
     Notes
     -----
-    Read raw configuration nodes without evaluating interpolations. Every
-    validation decision made before raw resolver refusal must preserve this
-    property, so no config-named callable can execute before refusal. An
-    interpolated name therefore does not itself identify this family.
+    IDENTITY DETERMINED WITHOUT EXECUTION, the same property
+    :func:`declared_schema` holds. A name that cannot be established is NOT
+    this family as far as this predicate is concerned, which is why a caller
+    deciding whether to enforce anything must consult
+    :func:`identity_without_execution` for the undetermined case rather than
+    reading a ``False`` here as "some other family".
     """
 
-    raw_tree = _raw_config_mapping(cfg)
-    if raw_tree is None:
-        return False
-    experiment = raw_tree.get("experiment")
-    name = experiment.get("name") if isinstance(experiment, Mapping) else None
-    return name == HI_EXPERIMENT_NAME
+    identity = identity_without_execution(cfg, "experiment.name")
+    return identity.determined and identity.value == HI_EXPERIMENT_NAME
 
 
 def _sweep_callbacks(resolved_tree: Any) -> list[Rejection]:
@@ -2203,9 +2381,15 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
     decision logic. A config-only check would leave one of the five open.
     """
 
-    declared = declared_schema(cfg)
+    schema_identity = identity_without_execution(cfg, SCHEMA_KEY)
+    name_identity = identity_without_execution(cfg, "experiment.name")
+    declared = (
+        None
+        if not schema_identity.determined or schema_identity.value is None
+        else str(schema_identity.value)
+    )
     if declared != HI_TRAIN_SCHEMA:
-        if is_hi_family(cfg):
+        if name_identity.determined and name_identity.value == HI_EXPERIMENT_NAME:
             # The config says it is helium-importance but did not declare the
             # schema. Refusing loudly here is the whole point: silently
             # returning would give a real HI run zero enforcement.
@@ -2224,6 +2408,41 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
                             "closed, and the omission would otherwise be silent"
                         ),
                     )
+                ]
+            )
+
+        # Whether this policy applies at all is now known for every config
+        # whose identity can be established WITHOUT EXECUTION -- which
+        # includes every node reference, at any depth. What remains is a
+        # config whose identity could only be established by RUNNING
+        # something, and running it is the defect this module exists to
+        # prevent. Neither read it as a foreign family nor evaluate it.
+        undetermined = [
+            (path, identity)
+            for path, identity in (
+                (SCHEMA_KEY, schema_identity),
+                ("experiment.name", name_identity),
+            )
+            if not identity.determined
+        ]
+        if undetermined:
+            raise ClosedSchemaError(
+                [
+                    Rejection(
+                        rule="undeterminable-identity",
+                        tree="raw",
+                        path=path,
+                        detail=(
+                            f"whether this is a helium-importance configuration cannot be "
+                            f"decided from {path} without execution: {identity.reason}. "
+                            "Reading it as a foreign family would hand a configuration "
+                            "that might be helium-importance ZERO enforcement, and "
+                            "evaluating it to find out is what lets a config-named "
+                            "callable run before any refusal. Name the identity with a "
+                            "literal, or with a reference this can follow"
+                        ),
+                    )
+                    for path, identity in undetermined
                 ]
             )
         return
