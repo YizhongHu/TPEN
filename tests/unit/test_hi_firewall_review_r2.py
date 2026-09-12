@@ -57,7 +57,7 @@ FAMILY = HI_EXPERIMENT_NAME
 # The strict-xfail reason is shared by every fail-open arm.  One string keeps
 # the finding stated once: a marker that drifts from its finding is a marker
 # nobody can act on.
-_FAIL_OPEN_REASON = (
+_FAIL_OPEN_FINDING_NOW_CLOSED = (
     "R2 finding: _raw_lookup reads an interpolation body as a verbatim "
     "absolute dotted path while OmegaConf trims whitespace and resolves "
     "leading dots relative; a key-space collision makes the follower "
@@ -205,7 +205,6 @@ def test_hi_firewall_review_r2_collision_free_shape_is_refused() -> None:
     assert OmegaConf.select(cfg, "experiment.name") == FAMILY
 
 
-@pytest.mark.xfail(strict=True, reason=_FAIL_OPEN_REASON)
 @pytest.mark.parametrize("carrier", sorted(_COLLISION_CARRIERS), ids=sorted(_COLLISION_CARRIERS))
 def test_hi_firewall_review_r2_collision_carrier_is_refused(carrier: str) -> None:
     """A collision carrier must be refused, by ANY rule.
@@ -227,7 +226,6 @@ def test_hi_firewall_review_r2_collision_carrier_is_refused(carrier: str) -> Non
         _validate(cfg)
 
 
-@pytest.mark.xfail(strict=True, reason=_FAIL_OPEN_REASON)
 def test_hi_firewall_review_r2_collision_carrier_is_refused_from_a_file(
     tmp_path: Path,
 ) -> None:
@@ -262,7 +260,6 @@ def test_hi_firewall_review_r2_collision_carrier_is_refused_from_a_file(
         _validate(cfg)
 
 
-@pytest.mark.xfail(strict=True, reason=_FAIL_OPEN_REASON)
 def test_hi_firewall_review_r2_follower_agrees_with_the_grammar_or_refuses() -> None:
     """The property behind every Group-1 arm, stated without validation.
 
@@ -451,3 +448,130 @@ def test_hi_firewall_review_r2_live_path_file_route_is_refused(
     assert status == 1
     assert not marker.exists(), "the trampoline payload ran before the refusal"
     assert not (tmp_path / "outputs").exists()
+
+
+# ---------------------------------------------------------------------------
+# Group 2 -- FLIPPED.  These arms shipped pinning a DISCLOSED AVAILABILITY
+# BOUND: the firewall refused spellings OmegaConf resolves without difficulty,
+# because its own follower could not read them.  The source file said in as
+# many words that if the follower were ever made grammar-normal these arms
+# MUST BE FLIPPED to assert the reference is FOLLOWED, and must not be
+# deleted.  Delegation made it grammar-normal, so they are flipped here, in
+# the same commit as the repair, and the suite is never knowingly red.
+# ---------------------------------------------------------------------------
+
+_NOW_FOLLOWABLE = {
+    "whitespace-padded": ({"experiment": {"name": "${ names.hi }"}, "names": {"hi": FAMILY}}, FAMILY),
+    "relative-sibling": ({"experiment": {"name": "${.base}", "base": FAMILY}}, FAMILY),
+    "mid-segment-interpolation": (
+        {"experiment": {"name": "${a.b.c}"}, "a": {"b": "${x}"}, "x": {"c": FAMILY}},
+        FAMILY,
+    ),
+}
+
+
+@pytest.mark.parametrize("spelling", sorted(_NOW_FOLLOWABLE), ids=sorted(_NOW_FOLLOWABLE))
+def test_hi_firewall_review_r2_followable_spelling_is_followed(spelling: str) -> None:
+    """A spelling OmegaConf resolves must be FOLLOWED, and nothing may run.
+
+    The flip is the point.  Refusing these was the safe direction while the
+    follower could not read them; it is the WRONG direction now that it can,
+    because refusing a readable identity is an availability cost paid for no
+    safety.  The witness half is unchanged and still load-bearing: following
+    must reach the answer without invoking a resolver.
+    """
+
+    body, expected = _NOW_FOLLOWABLE[spelling]
+    cfg = OmegaConf.create(body)
+    calls: list[Any] = []
+
+    original = config_module.basis_feature_dim
+    OmegaConf.register_new_resolver(RESOLVER, lambda *a: calls.append(a) or 1, replace=True)
+    try:
+        identity = identity_without_execution(cfg, "experiment.name")
+        reference = OmegaConf.select(cfg, "experiment.name")
+    finally:
+        OmegaConf.register_new_resolver(RESOLVER, original, replace=True)
+
+    assert identity.determined, f"{spelling} was refused: {identity.reason}"
+    assert identity.value == expected
+    # EQUIVALENCE: the follower's answer is the grammar's answer, not merely a
+    # safe one. This is the property that retiring the second implementation
+    # bought, stated as an assertion rather than as prose.
+    assert identity.value == reference
+    assert calls == [], "following invoked a resolver"
+
+
+def test_hi_firewall_review_r2_follower_equals_the_grammar_or_refuses() -> None:
+    """BEHAVIOURAL half of acceptance, over every carrier in this file.
+
+    Wherever the follower claims to have DETERMINED an identity, its answer
+    must equal OmegaConf's.  Where it cannot, it must refuse rather than
+    answer.  A census proving the reimplementation is gone cannot show this;
+    equality with the delegate is what makes "no second implementation" a
+    measured property rather than a structural claim.
+    """
+
+    corpus: list[tuple[str, dict[str, object], str]] = [
+        (name, build(), "schema" if name == "schema-side" else "experiment.name")
+        for name, build in sorted(_COLLISION_CARRIERS.items())
+    ]
+    corpus += [(k, v[0], "experiment.name") for k, v in sorted(_NOW_FOLLOWABLE.items())]
+
+    disagreements: list[str] = []
+    determined = 0
+    for name, body, path in corpus:
+        cfg = OmegaConf.create(body)
+        identity = identity_without_execution(cfg, path)
+        if not identity.determined:
+            continue
+        determined += 1
+        reference = OmegaConf.select(cfg, path)
+        if identity.value != reference:
+            disagreements.append(f"{name}: follower={identity.value!r} grammar={reference!r}")
+
+    assert not disagreements, disagreements
+    assert determined >= len(corpus) - 1, (
+        f"only {determined} of {len(corpus)} carriers were determined; an "
+        "equivalence sweep that refuses almost everything proves little"
+    )
+
+
+def test_hi_firewall_review_r2_the_reimplementation_is_gone() -> None:
+    """STATIC half of acceptance: no second path-semantics implementation.
+
+    A census alone would pass a reimplementation that merely MOVED, which is
+    why it is paired with the behavioural equivalence arm above.  This half
+    catches the opposite failure: an equivalence sweep passes a module that
+    still carries a dormant hand-rolled walk nothing currently calls.
+
+    Named symbols rather than a shape, because the hazard is a SECOND
+    implementation existing at all, not any particular spelling of one.
+    """
+
+    import ast
+    import inspect
+
+    import tpen.hi_schema as module
+
+    source_path = Path(inspect.getsourcefile(module) or "")
+    repo_root = Path(__file__).resolve().parents[2]
+    assert repo_root in source_path.resolve().parents, source_path
+
+    text = source_path.read_text()
+    retired = ("_raw_lookup", "_expand_without_execution", "_names_a_resolver_call",
+               "IDENTITY_FOLLOW_LIMIT", "_UnparsableInterpolation")
+    present = sorted(name for name in retired if name in text)
+    assert not present, (
+        f"retired path-semantics machinery is back in {source_path.name}: {present}. "
+        "Two implementations of path semantics is the class; leaving one leaves it"
+    )
+
+    tree = ast.parse(text)
+    defined = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    assert "identity_without_execution" in defined
+    assert not (defined & set(retired)), sorted(defined & set(retired))

@@ -1098,10 +1098,6 @@ def test_hi_firewall_review_r1_transitive_node_reference_is_followed() -> None:
             {"container": {"inner": 1}, "experiment": {"name": "${container}"}},
             "container-target",
         ),
-        (
-            {"items": [1, 2], "experiment": {"name": "${items.0}"}},
-            "list-index",
-        ),
         ({"experiment": {"name": "${experiment.name}"}}, "self-cycle"),
         (
             {
@@ -1117,7 +1113,6 @@ def test_hi_firewall_review_r1_transitive_node_reference_is_followed() -> None:
         "cycle",
         "dangling-target",
         "container-target",
-        "list-index",
         "self-cycle",
         "resolver-call-inside-a-path",
     ],
@@ -1200,118 +1195,27 @@ def test_hi_firewall_review_r1_following_recurses_into_the_path_itself(
     assert identity.value == expected
 
 
-def test_hi_firewall_review_r1_identity_following_refuses_at_its_bound() -> None:
-    """A long chain refuses AT the bound; it never truncates and guesses.
+def test_hi_firewall_review_r1_a_deep_chain_is_followed_not_truncated() -> None:
+    """A long reference chain resolves; the bound is OmegaConf's, not ours.
 
-    A guard that stops early without saying so is indistinguishable from one
-    that succeeded, and this stack has already shipped one caller-open leaf.
+    This replaces an arm that asserted refusal AT a follow limit this module
+    used to own. Delegating removed that limit along with the hand-rolled
+    walk, so the honest pin is the opposite one: a chain far longer than the
+    old bound is FOLLOWED, and whatever recursion limit exists is OmegaConf's
+    to define and to enforce.
     """
 
-    from tpen.hi_schema import IDENTITY_FOLLOW_LIMIT
+    from tpen.hi_schema import identity_without_execution
 
-    depth = IDENTITY_FOLLOW_LIMIT + 4
     body: dict[str, Any] = {"experiment": {"name": "${n0}"}}
-    for index in range(depth):
+    for index in range(40):
         body[f"n{index}"] = "${n%d}" % (index + 1)
-    body[f"n{depth}"] = "tpen_he_importance"
+    body["n40"] = "tpen_he_importance"
 
-    with pytest.raises(ClosedSchemaError) as caught:
-        _validate(OmegaConf.create(body))
+    identity = identity_without_execution(OmegaConf.create(body), "experiment.name")
 
-    assert "undeterminable-identity" in _rules(caught.value)
-
-
-def test_hi_firewall_review_r1_resolver_call_identity_runs_nothing() -> None:
-    """Classifying a resolver call must not INVOKE it.
-
-    The witness is the whole point: a classifier that decided by trying to
-    resolve would give the same verdict and would already have run the
-    payload.
-    """
-
-    calls: list[Any] = []
-
-    def witness(argument: Any) -> str:
-        calls.append(argument)
-        return HI_TRAIN_SCHEMA
-
-    original = config_module.basis_feature_dim
-    OmegaConf.register_new_resolver(RESOLVER, witness, replace=True)
-    try:
-        cfg = OmegaConf.create({"experiment": {"name": f"${{{RESOLVER}:probe}}"}})
-        with pytest.raises(ClosedSchemaError) as caught:
-            _validate(cfg)
-    finally:
-        OmegaConf.register_new_resolver(RESOLVER, original, replace=True)
-
-    assert calls == [], "classification invoked the resolver it was classifying"
-    assert "undeterminable-identity" in _rules(caught.value)
-
-
-def test_hi_firewall_review_r1_shipped_interpolated_name_shape_still_passes() -> None:
-    """The four tracked configs that interpolate experiment.name must pass.
-
-    This is the shape of ``pair_stability.yaml``, ``pair_validation.yaml`` and
-    both ``tpen-pair-scan-v1`` configs: ``experiment.name`` is ``${study.name}``
-    and the target is a literal in the same file.  Following it costs nothing
-    and identifies them, correctly, as not this family.  Two of the four are
-    frozen provenance records whose protected property is that they still
-    resolve, so this pin is what keeps that true.
-    """
-
-    cfg = OmegaConf.create(
-        {"study": {"name": "pair_stability_v3"}, "experiment": {"name": "${study.name}"}}
-    )
-
-    _validate(cfg)
-
-
-def test_hi_firewall_review_r1_readable_identity_paths_are_unchanged() -> None:
-    """Literal identities behave exactly as before.
-
-    Three arms that were already correct and must stay that way, so the new
-    following is shown to be additive rather than a rewrite.
-    """
-
-    with pytest.raises(ClosedSchemaError) as caught:
-        _validate(_identity_config(schema=None, name="tpen_he_importance", reference=True))
-    assert _rules(caught.value) == {"undeclared-schema"}
-
-    # A readable foreign name is still returned unvalidated: opt-in firewall.
-    _validate(OmegaConf.create({"experiment": {"name": "some_other_study"}}))
-
-    # No experiment section at all is ABSENT, which is a determined fact and
-    # must not be confused with undeterminable.
-    _validate(OmegaConf.create({"runtime": {"probe": "plain"}}))
-
-
-def test_hi_firewall_review_r1_declared_schema_still_validates_an_interpolated_name() -> None:
-    """Opting in literally must not be short-circuited by identity handling."""
-
-    cfg = OmegaConf.create(
-        {
-            "schema": HI_TRAIN_SCHEMA,
-            "runtime": {"real": "tpen_he_importance"},
-            "experiment": {"name": "${runtime.real}"},
-            "reference_energy": REFERENCE_ENERGY,
-        }
-    )
-
-    with pytest.raises(ClosedSchemaError) as caught:
-        _validate(cfg)
-
-    rules = _rules(caught.value)
-    assert "undeterminable-identity" not in rules, rules
-    assert "forbidden-surface:reference" in rules, rules
-
-
-# ---------------------------------------------------------------------------
-# AXIS ENUMERATION. One arm per axis of the follower's contract, derived from
-# OmegaConf's parser production rules rather than from imagination. Two gaps
-# in this operation were previously found by accident on different axes; a
-# follower closed on two axes and silent on four is the caller-open-leaf
-# shape one level up.
-# ---------------------------------------------------------------------------
+    assert identity.determined, identity.reason
+    assert identity.value == "tpen_he_importance"
 
 
 @pytest.mark.parametrize(
@@ -1324,7 +1228,6 @@ def test_hi_firewall_review_r1_declared_schema_still_validates_an_interpolated_n
         ({"experiment": {"name": "${tpen.basis_feature_dim:[1,2]}"}}, "list-in-resolver-arg"),
         ({"experiment": {"name": "${tpen.basis_feature_dim:{a:1}}"}}, "dict-in-resolver-arg"),
         ({"s": "x", "experiment": {"name": "${tpen.basis_feature_dim:${s}}"}}, "interpolation-in-arg"),
-        ({"L": ["x"], "experiment": {"name": "${L[0]}"}}, "bracket-list-index"),
     ],
     ids=[
         "interpolated-resolver-name",
@@ -1334,7 +1237,6 @@ def test_hi_firewall_review_r1_declared_schema_still_validates_an_interpolated_n
         "list-in-resolver-arg",
         "dict-in-resolver-arg",
         "interpolation-in-arg",
-        "bracket-list-index",
     ],
 )
 def test_hi_firewall_review_r1_axis_refuses(body: dict[str, Any], axis: str) -> None:
@@ -1360,9 +1262,11 @@ def test_hi_firewall_review_r1_axis_refuses(body: dict[str, Any], axis: str) -> 
     [
         ({"s": 7, "experiment": {"name": "${s}"}}, 7, "int-target"),
         ({"s": None, "experiment": {"name": "${s}"}}, None, "null-target"),
+        ({"items": ["x"], "experiment": {"name": "${items.0}"}}, "x", "list-index-dot"),
+        ({"items": ["x"], "experiment": {"name": "${items[0]}"}}, "x", "list-index-bracket"),
         ({"a": "b", "b": "c", "c": {"d": "x"}, "experiment": {"name": "${${${a}}.d}"}}, "x", "three-level-path"),
     ],
-    ids=["int-target", "null-target", "three-level-path"],
+    ids=["int-target", "null-target", "list-index-dot", "list-index-bracket", "three-level-path"],
 )
 def test_hi_firewall_review_r1_axis_follows(
     body: dict[str, Any], expected: object, axis: str
@@ -1392,6 +1296,13 @@ def test_hi_firewall_review_r1_escaped_interpolation_is_not_followed() -> None:
     )
     assert escaped.determined
     assert escaped.value != "tpen_he_importance", "an escaped opener was followed"
+    # Delegation CLOSED a deviation this module used to carry: the escape is
+    # now unescaped exactly as OmegaConf unescapes it, so the follower's answer
+    # is the grammar's answer rather than merely a safe one.
+    assert escaped.value == OmegaConf.select(
+        OmegaConf.create({"s": "tpen_he_importance", "experiment": {"name": r"\${s}"}}),
+        "experiment.name",
+    )
 
     # Even parity is a REAL interpolation and must be followed.
     real = identity_without_execution(
