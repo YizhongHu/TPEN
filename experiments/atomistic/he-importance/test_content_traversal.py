@@ -1,6 +1,7 @@
 """Focused tests for the declaration-driven two-backend traversal."""
 from __future__ import annotations
 import importlib.util
+from collections.abc import Mapping
 from pathlib import Path
 import pytest
 import sys
@@ -45,7 +46,13 @@ def test_declaration_is_closed_before_source_read() -> None:
     assert caught.value.refusal is content.ContentRefusal.DECLARATION_NOT_CLOSED
 
 def test_duplicate_and_non_string_keys_are_not_silently_overwritten() -> None:
-    class Duplicate:
+    class Duplicate(Mapping):
+        def __getitem__(self, key):
+            return 1
+        def __iter__(self):
+            return iter(("a",))
+        def __len__(self):
+            return 1
         def items(self):
             return [("a", 1), ("a", 2)]
     with pytest.raises(content.ContentTraversalError) as caught:
