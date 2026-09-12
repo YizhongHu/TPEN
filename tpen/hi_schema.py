@@ -46,8 +46,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Iterator
 
-from omegaconf import DictConfig, OmegaConf
-from omegaconf import grammar_parser as _grammar_parser
+from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf.basecontainer import BaseContainer
 
 from tpen.config_schema import (
     ClosedSchemaError,
@@ -580,13 +580,6 @@ except (ImportError, AttributeError) as _grammar_error:  # pragma: no cover
     ) from _grammar_error
 
 
-class _UnparsableInterpolation(Exception):
-    """OmegaConf's grammar could not parse a value that holds an interpolation."""
-
-
-IDENTITY_FOLLOW_LIMIT = 16
-
-
 @dataclass(frozen=True)
 class Identity:
     """The outcome of determining one identity node WITHOUT EXECUTION.
@@ -596,8 +589,8 @@ class Identity:
     determined : bool
         Whether the node's value was established without evaluating anything.
     value : object
-        The established value, or ``None`` when the node is simply absent.
-        Meaningful only when ``determined`` is ``True``.
+        The established value, or ``None`` when the node is absent. Meaningful
+        only when ``determined`` is ``True``.
     reason : str or None
         Why the value could not be established, when it could not.
     """
@@ -607,145 +600,27 @@ class Identity:
     reason: str | None = None
 
 
-def _names_a_resolver_call(text: str) -> bool:
-    """Return whether ``text`` contains a resolver-call interpolation.
+@contextmanager
+def _no_resolvers() -> Iterator[None]:
+    """Swap OmegaConf's resolver registry for an empty one, then restore it.
 
-    Decided by THE GRAMMAR, never by searching for a colon or any other
-    substring: a colon appears inside quoted values and inside nested
-    expressions, and a string test would both over- and under-report.
+    Node references need no resolver, so they still resolve. A resolver CALL
+    finds nothing registered and raises instead of running, which is exactly
+    the boundary this module needs: identity determined without execution.
 
-    Raises
-    ------
-    _UnparsableInterpolation
-        When OmegaConf's own grammar cannot parse ``text``. Callers must fail
-        CLOSED on that: a value this cannot classify is one whose safety it
-        cannot vouch for, and returning "no resolver call" would be the
-        fail-OPEN direction.
-
-    Notes
-    -----
-    CALL ONLY ON TEXT KNOWN TO CONTAIN AN INTERPOLATION. The grammar's
-    ``configValue`` rule does not accept every Python string -- the EMPTY
-    STRING is a parse error -- so parsing plain literals both wastes work and
-    raises on inputs that are perfectly ordinary configuration values.
+    The registry is a CLASS attribute and therefore PROCESS-GLOBAL, so this is
+    not safe against concurrent validation in another thread -- the same
+    residual the construction guard already carries, and reachable only if
+    this module is ever called off the main thread. Restoration is in a
+    ``finally`` so an exception cannot leave the registry emptied.
     """
 
+    saved = BaseContainer._resolvers
+    BaseContainer._resolvers = {}
     try:
-        tree = _grammar_parser.parse(text)
-    except Exception as error:  # noqa: BLE001 - ANTLR raises several types
-        raise _UnparsableInterpolation(str(error)) from error
-    pending = [tree]
-    while pending:
-        node = pending.pop()
-        if isinstance(node, _RESOLVER_CONTEXT):
-            return True
-        for index in range(getattr(node, "getChildCount", lambda: 0)()):
-            pending.append(node.getChild(index))
-    return False
-
-
-def _raw_lookup(raw_tree: Mapping[str, Any], path: str) -> tuple[bool, Any]:
-    """Look one dotted path up in a RAW container. Mapping keys only.
-
-    Segments are split on ``.`` and matched as whole keys, with no pattern
-    applied to the key text: OmegaConf keys carry hyphens and other
-    characters an identifier-shaped regex would reject, and such a regex
-    misclassified nine real node references in this repository when it was
-    tried. A segment that is not a mapping key -- a list index, or a scalar
-    reached too early -- reports "not found" rather than being indexed.
-    """
-
-    cursor: Any = raw_tree
-    for segment in path.split("."):
-        if not isinstance(cursor, Mapping) or segment not in cursor:
-            return False, None
-        cursor = cursor[segment]
-    return True, cursor
-
-
-def _expand_without_execution(
-    raw_tree: Mapping[str, Any], text: str, visiting: list[str], budget: list[int]
-) -> tuple[bool, Any]:
-    """Resolve raw ``text`` to a literal by following node references only.
-
-    Returns ``(True, value)`` or ``(False, reason)``.
-
-    Recursion happens on BOTH sides of a reference. The target's value is
-    followed, and so is the reference's own PATH: a path such as
-    ``choices.basis.${slot}.basis`` must have its inner interpolation
-    resolved before the lookup can happen at all. That shape is in active use
-    in this repository -- 34 of its 1053 tracked interpolations -- so a
-    follower that recursed only into values would refuse configurations it
-    could have read. A resolver call anywhere on either side, at any depth,
-    ends in refusal rather than evaluation.
-    """
-
-    budget[0] -= 1
-    if budget[0] < 0:
-        return False, (
-            f"following exceeded {IDENTITY_FOLLOW_LIMIT} steps; refused AT the bound "
-            "rather than truncated, because a guard that stops early without saying "
-            "so is indistinguishable from one that succeeded"
-        )
-    # ORDER IS LOAD-BEARING. Establish that there IS an interpolation before
-    # asking the grammar to classify one. The grammar does not accept every
-    # string -- the empty string is a parse error -- so classifying plain
-    # literals first turned an ordinary blank configuration value into a
-    # GrammarParseError out of validation.
-    bodies = list(iter_interpolations(text))
-    if not bodies:
-        return True, text
-    try:
-        names_resolver = _names_a_resolver_call(text)
-    except _UnparsableInterpolation as error:
-        return False, (
-            f"{text!r} holds an interpolation OmegaConf's own grammar cannot parse "
-            f"({error}), so whether it would run a configured callable cannot be "
-            "established; refused rather than assumed safe"
-        )
-    if names_resolver:
-        return False, (
-            f"{text!r} reaches a resolver-call interpolation, which cannot be followed "
-            "without running a configured callable"
-        )
-
-    resolved: list[tuple[str, Any]] = []
-    for body in bodies:
-        # THE PATH ITSELF MAY INTERPOLATE. Resolve it before looking it up.
-        followed, path = _expand_without_execution(raw_tree, body, visiting, budget)
-        if not followed:
-            return False, path
-        path = path if isinstance(path, str) else str(path)
-        if path in visiting:
-            return False, f"cycle through {path!r}"
-        found, target = _raw_lookup(raw_tree, path)
-        if not found:
-            return False, f"{path!r} does not exist in the raw tree"
-        if isinstance(target, (Mapping, list, tuple)):
-            return False, f"{path!r} is a container, not a scalar identity"
-        if isinstance(target, str):
-            visiting.append(path)
-            try:
-                followed, value = _expand_without_execution(
-                    raw_tree, target, visiting, budget
-                )
-            finally:
-                visiting.pop()
-            if not followed:
-                return False, value
-        else:
-            value = target
-        resolved.append((body, value))
-
-    # A value that is EXACTLY one interpolation keeps its target's type; an
-    # interpolation embedded in literal text is concatenated as text, which is
-    # what OmegaConf itself does.
-    if len(resolved) == 1 and text == "${" + resolved[0][0] + "}":
-        return True, resolved[0][1]
-    expanded = text
-    for body, value in resolved:
-        expanded = expanded.replace("${" + body + "}", str(value))
-    return True, expanded
+        yield
+    finally:
+        BaseContainer._resolvers = saved
 
 
 def identity_without_execution(cfg: Any, path: str) -> Identity:
@@ -774,111 +649,92 @@ def identity_without_execution(cfg: Any, path: str) -> Identity:
     refusal, so reaching one at ANY depth on EITHER side of a reference ends
     in refusal.
 
-    AXIS ENUMERATION -- THE CONTRACT
-    --------------------------------
-    Derived from OmegaConf's parser production rules rather than from
-    imagination, because two gaps in this operation were previously found BY
-    ACCIDENT on different axes. Each axis is marked CONSTRUCTION (cannot
-    arise), TEST (an arm pins it), or OPEN (knowingly not closed). An unnamed
-    gap is indistinguishable from an unconsidered one.
+    HOW IT WORKS, AND WHY IT DELEGATES
+    ----------------------------------
+    OmegaConf decides what a path MEANS; this module decides only what may
+    RUN while it is decided. Resolution happens with the resolver registry
+    swapped to an EMPTY one, so a node reference still resolves and a
+    resolver CALL finds nothing registered and raises instead of running.
 
-    ===========================  =========================  ==============
-    axis                         grammar                    status
-    ===========================  =========================  ==============
-    node reference               interpolationNode          TEST follow
-    chained value                interpolationNode          TEST follow
-    interpolation in the PATH    configKey                  TEST follow
-    dotted multi-segment path    configKey                  TEST follow
-    mixed literal+interpolation  text                       TEST follow
-    non-string scalar target     primitive                  TEST follow
-    list index, [0] and .0       INTER_BRACKET, DOT         TEST refuse
-    resolver call                interpolationResolver      TEST refuse
-    interpolated resolver name   resolverName               TEST refuse
-    builtin resolver, oc.select  interpolationResolver      TEST refuse
-    quoted arg containing colon  quotedValue                TEST refuse
-    list/dict in resolver arg    listContainer, dict-       TEST refuse
-                                 Container
-    interpolation in an arg      element, interpolation     TEST refuse
-    container target             listContainer, dict-       TEST refuse
-                                 Container
-    dangling target              --                         TEST refuse
-    cycle                        --                         TEST refuse
-    depth bound                  --                         TEST refuse
-    escaped interpolation        ESC_INTER, TOP_ESC         CONSTRUCTION
-    interpolation in a KEY       dictKey                    CONSTRUCTION
-    MISSING sentinel, ``???``    --                         **OPEN**
-    ===========================  =========================  ==============
+    THIS REPLACED A HAND-ROLLED WALK AND THE WALK WAS DELETED, not kept
+    alongside. The walk read an interpolation body as a VERBATIM ABSOLUTE
+    dotted path; OmegaConf trims whitespace and resolves a leading dot
+    RELATIVE. Wherever a key-space COLLISION put the verbatim path on a
+    different node, the follower determined a WRONG identity and a
+    configuration carrying a reference energy validated clean. The class was
+    not those carriers -- it was that TWO IMPLEMENTATIONS OF PATH SEMANTICS
+    EXISTED, so every divergence between them was a carrier waiting to be
+    constructed. Patching the measured carriers would have left the class
+    open; only retiring one implementation closes it.
 
-    CONSTRUCTION notes. An escaped opener is literal text that runs no
-    resolver, and :func:`~tpen.config_schema.iter_interpolations` is
-    escape-aware by backslash parity, so it is never followed. One bounded
-    deviation: the escape is not UNESCAPED, so the value retains its
-    backslash where OmegaConf would drop it. That cannot change a family
-    decision, because neither spelling equals the family name. An
-    interpolation in a KEY cannot hide a section: OmegaConf does not resolve
-    keys, so ``${k}`` stays the literal three-character key ``${k}`` even
-    after full resolution -- measured, and pinned by a test so that a future
-    OmegaConf which DID resolve keys would surface here rather than silently
-    open a hole.
+    WHAT DELEGATION BOUGHT, beyond the collisions: whitespace-padded bodies,
+    relative references, interpolated mid-path segments, list indices in both
+    spellings, and arbitrarily long chains are now all FOLLOWED rather than
+    refused, because they are followable without executing anything. A
+    deviation this module used to carry -- an escaped opener kept its
+    backslash where OmegaConf drops it -- is closed too: the follower's answer
+    is now the grammar's answer.
 
-    A LIMIT ON THIS ENUMERATION, recorded because a complete-looking table
-    invites more trust than it has earned.
+    WHAT STILL REFUSES: a resolver call at any depth, on either side of a
+    reference; a cycle; a dangling target; a container where a scalar
+    identity is required. Each is refused because it cannot be established
+    without execution, or is not an identity at all.
 
-    Every axis above is a kind of INTERPOLATION -- that is what qualified it
-    as an axis. So the enumeration's domain is "things that are
-    interpolations", and it never varies the one input class that is NOT one:
-    a plain literal. A defect reachable only by a literal is therefore
-    invisible to it, however complete the table looks.
+    LIMITS, recorded so the residual stays detectable rather than implied.
 
-    That is not hypothetical. The path-recursion rewrite moved the grammar
-    call AHEAD of the interpolation scan, so every plain literal was handed
-    to a parser whose ``configValue`` rule does not accept the EMPTY STRING,
-    and an ordinary blank ``experiment.name`` raised out of validation. The
-    rewrite preserved every individual check and broke by REORDERING them --
-    which no per-check test covers and no axis enumeration covers either. It
-    was caught by a test in a file this module's authors never chose, during
-    a FULL UNSELECTED suite run. A selection scoped to the code under change
-    would have been a blind one.
+    The enumeration of interpolation shapes this module used to carry was
+    complete on its own terms and structurally blind to its own complement:
+    its domain was "things that are interpolations", so a plain literal was
+    never varied, and a defect reachable only by a literal was invisible to
+    it. That is not hypothetical -- a refactor once reordered a grammar call
+    ahead of the interpolation scan and an ordinary blank name raised out of
+    validation. Delegation removes that particular blindness by removing the
+    enumeration's subject, but the lesson stands for any successor: VARY THE
+    COMPLEMENT OF YOUR DOMAIN, and re-run the whole suite after a refactor
+    that only moves code.
 
-    TWO THINGS FOLLOW FOR ANYONE EXTENDING THIS. Vary the complement of your
-    enumeration's domain, not only its members. And re-run the whole suite
-    after a refactor that only moves code, because ordering is a property no
-    single check can hold.
+    THE ENUMERATION WAS ALSO BLIND TO ITS SECOND INPUT. It varied the
+    interpolation, never the RAW TREE'S KEY SPACE -- and the collisions above
+    are constructed entirely in the key space, with the interpolation held
+    ordinary. A carrier is a pair, a spelling AND a set of keys, and varying
+    one member cannot expose a defect that needs both. NOT WIDENED HERE; a
+    follow-up item owns that, and this paragraph exists so the gap is named
+    rather than discovered again.
 
-    THE OPEN AXIS, stated as a decision rather than left to discovery. A
-    MISSING sentinel resolves to the literal ``'???'``, which is not the
-    family name, so a configuration whose identity is ``???`` receives no
-    enforcement. DISPOSED TO FOLLOW-UP ITEM
-    ``1efc8552-800e-4248-9b8b-984549f0e3dc``. This is PRE-EXISTING and not
-    introduced here: the reader this replaced returned ``None`` or raised for
-    the same inputs and reached the same not-this-family conclusion. It needs
-    no adversarial construction either -- ``???`` is the standard placeholder
-    for a value a template requires its caller to supply, so an omitted
-    override reaches it by itself. Pinned by a strict xfail so the marker
-    cannot outlive the defect.
+    The registry swap is PROCESS-GLOBAL, so this is not safe against
+    concurrent validation on another thread -- the same residual the
+    construction guard already carries.
     """
 
-    raw_tree = _raw_config_mapping(cfg)
-    if raw_tree is None:
-        return Identity(determined=True, value=None)
+    if not isinstance(cfg, DictConfig):
+        raw_tree = _raw_config_mapping(cfg)
+        if raw_tree is None:
+            return Identity(determined=True, value=None)
+        cfg = OmegaConf.create(raw_tree)
 
-    found, value = _raw_lookup(raw_tree, path)
-    if not found:
-        # ABSENT is a DETERMINED fact: the config does not declare this node.
-        # Confusing it with undeterminable would refuse every configuration
-        # that simply has no experiment section.
-        return Identity(determined=True, value=None)
-    if isinstance(value, (Mapping, list, tuple)):
+    # DELEGATE. OmegaConf decides what a path means; this module decides only
+    # what may RUN while it is decided. Anything else reimplements path
+    # semantics, and every divergence between the two readings is an identity
+    # mismatch waiting to be constructed.
+    with _no_resolvers():
+        try:
+            value = OmegaConf.select(
+                cfg, path, default=None, throw_on_resolution_failure=True
+            )
+        except Exception as error:  # noqa: BLE001 - OmegaConf raises several types
+            return Identity(
+                False,
+                reason=(
+                    f"{path} cannot be resolved without executing something "
+                    f"({type(error).__name__}: {error}); a resolver call is not "
+                    "followable, because following it means running a configured "
+                    "callable before any refusal"
+                ),
+            )
+
+    if isinstance(value, (Mapping, list, tuple, DictConfig, ListConfig)):
         return Identity(False, reason=f"{path!r} is a container, not a scalar identity")
-    if not isinstance(value, str):
-        return Identity(determined=True, value=value)
-
-    followed, outcome = _expand_without_execution(
-        raw_tree, value, [path], [IDENTITY_FOLLOW_LIMIT]
-    )
-    if not followed:
-        return Identity(False, reason=str(outcome))
-    return Identity(determined=True, value=outcome)
+    return Identity(determined=True, value=value)
 
 
 def declared_schema(cfg: Any) -> str | None:
