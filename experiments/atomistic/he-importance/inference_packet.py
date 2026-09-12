@@ -63,11 +63,16 @@ class PacketRefusal(str, Enum):
     PROVENANCE_LEAF_BUDGET_EXCEEDED = "provenance_leaf_budget_exceeded"
     PROVENANCE_DEPTH_BUDGET_EXCEEDED = "provenance_depth_budget_exceeded"
     INTERVAL_BURN_IN_NEGATIVE = "interval_burn_in_negative"
+    INTERVAL_BURN_IN_NOT_INT = "interval_burn_in_not_int"
     INTERVAL_SPACING_NOT_POSITIVE = "interval_spacing_not_positive"
+    INTERVAL_SPACING_NOT_INT = "interval_spacing_not_int"
     INTERVAL_DRAWS_NOT_POSITIVE = "interval_draws_not_positive"
+    INTERVAL_DRAWS_NOT_INT = "interval_draws_not_int"
     SEED_NOT_POSITIVE_INT = "seed_not_positive_int"
     SEEDS_NOT_DISJOINT = "seeds_not_disjoint"
     STATUS_ACTIVITY_PRECEDES_CREATION = "status_activity_precedes_creation"
+    STATUS_TIMESTAMP_NOT_AWARE_DATETIME = "status_timestamp_not_aware_datetime"
+    STATUS_NON_ACTIVITY_PRECEDES_CREATION = "status_non_activity_precedes_creation"
     STATUS_UNKNOWN_STATE = "status_unknown_state"
     STATUS_IDLE_CLAIMS_START_OR_TERMINATION = "status_idle_claims_start_or_termination"
     STATUS_RUNNING_NOT_ONLY_A_START = "status_running_not_only_a_start"
@@ -237,20 +242,32 @@ class SamplingInterval:
     retained_draws: int
 
     def __post_init__(self) -> None:
-        if type(self.burn_in_proposals) is not int or self.burn_in_proposals < 0:
+        if type(self.burn_in_proposals) is not int:
+            raise InferencePacketError(
+                "burn_in_proposals must be an integer",
+                refusal=PacketRefusal.INTERVAL_BURN_IN_NOT_INT,
+            )
+        if self.burn_in_proposals < 0:
             raise InferencePacketError(
                 "burn_in_proposals must be non-negative",
                 refusal=PacketRefusal.INTERVAL_BURN_IN_NEGATIVE,
             )
-        if (
-            type(self.proposals_between_draws) is not int
-            or self.proposals_between_draws < 1
-        ):
+        if type(self.proposals_between_draws) is not int:
+            raise InferencePacketError(
+                "proposals_between_draws must be an integer",
+                refusal=PacketRefusal.INTERVAL_SPACING_NOT_INT,
+            )
+        if self.proposals_between_draws < 1:
             raise InferencePacketError(
                 "proposals_between_draws must be positive",
                 refusal=PacketRefusal.INTERVAL_SPACING_NOT_POSITIVE,
             )
-        if type(self.retained_draws) is not int or self.retained_draws < 1:
+        if type(self.retained_draws) is not int:
+            raise InferencePacketError(
+                "retained_draws must be an integer",
+                refusal=PacketRefusal.INTERVAL_DRAWS_NOT_INT,
+            )
+        if self.retained_draws < 1:
             raise InferencePacketError(
                 "retained_draws must be positive",
                 refusal=PacketRefusal.INTERVAL_DRAWS_NOT_POSITIVE,
@@ -326,7 +343,7 @@ class ChainStatus:
         ):
             raise InferencePacketError(
                 "chain status timestamps must be exact aware datetimes",
-                refusal=PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION,
+                refusal=PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME,
             )
         if self.terminal_reason is not None and type(self.terminal_reason) is not str:
             raise InferencePacketError(
@@ -348,7 +365,7 @@ class ChainStatus:
         ):
             raise InferencePacketError(
                 "chain status cannot precede creation",
-                refusal=PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION,
+                refusal=PacketRefusal.STATUS_NON_ACTIVITY_PRECEDES_CREATION,
             )
         if self.state is ChainState.IDLE:
             if any(value is not None for value in (self.started_at, self.finished_at, self.terminal_reason)):
