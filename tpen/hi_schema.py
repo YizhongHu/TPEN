@@ -710,7 +710,23 @@ def identity_without_execution(cfg: Any, path: str) -> Identity:
         raw_tree = _raw_config_mapping(cfg)
         if raw_tree is None:
             return Identity(determined=True, value=None)
-        cfg = OmegaConf.create(raw_tree)
+        try:
+            cfg = OmegaConf.create(raw_tree)
+        except Exception as error:  # noqa: BLE001 - OmegaConf raises several types
+            # A plain mapping can hold text OmegaConf will not even BUILD --
+            # an unclosed interpolation is rejected at construction, which a
+            # DictConfig caller could never have reached. Refuse rather than
+            # let the construction error escape as an unhandled exception:
+            # a value this cannot classify is one whose safety it cannot
+            # vouch for, and crashing is not refusing.
+            return Identity(
+                False,
+                reason=(
+                    f"{path} sits in a mapping OmegaConf cannot parse into a config "
+                    f"({type(error).__name__}: {error}); whether it would run a "
+                    "configured callable cannot be established"
+                ),
+            )
 
     # DELEGATE. OmegaConf decides what a path means; this module decides only
     # what may RUN while it is decided. Anything else reimplements path
