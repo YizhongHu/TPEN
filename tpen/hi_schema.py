@@ -77,6 +77,7 @@ __all__ = [
     "canonical_train_identity",
     "declared_schema",
     "hidden_identity_paths",
+    "raw_reference_surface_findings",
     "is_hi_family",
     "validate_hi_train_config",
 ]
@@ -206,6 +207,10 @@ STOP_RULE_SURFACE = ForbiddenSurface(
 # agree, because a silent divergence would leave the rule below pointing at a
 # module nobody loads.
 REFERENCE_MANIFEST_MODULE = "tpen.hi_manifest"
+
+# The rule reporting a target that reaches the reference manifest. Named once
+# so the refusal below selects it by identity rather than by retyping it.
+REFERENCE_MODULE_TARGET_RULE = "forbidden-target:reference-module"
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +582,46 @@ def declared_schema(cfg: Any) -> str | None:
     return None if value is None else str(value)
 
 
+def raw_reference_surface_findings(cfg: Any) -> list[Rejection]:
+    """Return RAW-tree findings that this config carries a reference surface.
+
+    Parameters
+    ----------
+    cfg : Any
+        A ``DictConfig`` or plain mapping, read without resolving.
+
+    Returns
+    -------
+    list of Rejection
+        Every raw finding whose rule reports the reference family, by key or
+        by target. Empty when the raw tree carries no reference surface.
+
+    Notes
+    -----
+    Bounded to the REFERENCE surface specifically, by rule identity derived
+    from :data:`REFERENCE_SURFACE` and :data:`REFERENCE_MODULE_TARGET_RULE`
+    rather than from retyped strings. Both carriers are covered: a forbidden
+    KEY and a forbidden TARGET reaching the manifest module. Covering only
+    one would guard the label while leaving the value's own route open.
+
+    Other forbidden surfaces are deliberately NOT reported here. This runs
+    for a configuration whose family could not be read, where the question is
+    only whether a reference value is present, and widening it would refuse
+    tracked configurations that are legitimately not of this family.
+    """
+
+    raw_tree = _raw_config_mapping(cfg)
+    if raw_tree is None:
+        return []
+    reference_rules = {
+        f"forbidden-surface:{REFERENCE_SURFACE.name}",
+        REFERENCE_MODULE_TARGET_RULE,
+    }
+    findings = list(sweep_raw(raw_tree, HI_TRAIN_POLICY))
+    findings.extend(_sweep_free_form_targets(raw_tree, tree="raw"))
+    return [finding for finding in findings if finding.rule in reference_rules]
+
+
 def hidden_identity_paths(cfg: Any) -> tuple[str, ...]:
     """Return the identity paths whose RAW content is an interpolation.
 
@@ -596,7 +641,12 @@ def hidden_identity_paths(cfg: Any) -> tuple[str, ...]:
     The two identity nodes decide whether this policy applies at all, so a
     value that cannot be read without resolving cannot be allowed to mean
     "some other family". Resolving one to find out is the defect this module
-    already closed. Reporting it here lets the caller fail closed instead.
+    already closed.
+
+    This reports only that the family is UNDETERMINABLE. It is not itself a
+    refusal and must not be read as one: tracked configurations legitimately
+    interpolate ``experiment.name``, so the caller decides on the PAYLOAD --
+    see :func:`raw_reference_surface_findings` -- rather than on this.
     """
 
     raw_tree = _raw_config_mapping(cfg)
@@ -912,7 +962,7 @@ def _sweep_target_values(resolved_tree: Any) -> list[Rejection]:
         ):
             rejections.append(
                 Rejection(
-                    rule="forbidden-target:reference-module",
+                    rule=REFERENCE_MODULE_TARGET_RULE,
                     tree="resolved",
                     path=path,
                     detail=(
@@ -2239,32 +2289,6 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
 
     declared = declared_schema(cfg)
     if declared != HI_TRAIN_SCHEMA:
-        # A config that hides an identity node behind an interpolation is
-        # refusable on its face. Falling through to "not this family" would
-        # hand it ZERO enforcement, which is strictly worse than any ordering
-        # defect: no refusal happens at all and the runner trains on it.
-        # Decided on the RAW value, so nothing resolves to reach this.
-        hidden = hidden_identity_paths(cfg)
-        if hidden:
-            raise ClosedSchemaError(
-                [
-                    Rejection(
-                        rule="interpolated-identity",
-                        tree="raw",
-                        path=path,
-                        detail=(
-                            f"{path} is an interpolation, so whether this is a "
-                            f"helium-importance configuration cannot be decided without "
-                            "resolving it -- and resolving to decide is exactly what lets "
-                            "a config-named callable run before refusal. An unreadable "
-                            "identity is refused rather than read as a foreign family, "
-                            "because the alternative is no enforcement at all. Declare "
-                            f"{SCHEMA_KEY} and experiment.name as literals"
-                        ),
-                    )
-                    for path in hidden
-                ]
-            )
         if is_hi_family(cfg):
             # The config says it is helium-importance but did not declare the
             # schema. Refusing loudly here is the whole point: silently
@@ -2286,6 +2310,41 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
                     )
                 ]
             )
+
+        # The family is UNDETERMINABLE when an identity node is an unresolved
+        # interpolation: a raw read cannot tell an interpolated name from a
+        # foreign one. Reading it as foreign is what let a config carrying a
+        # reference energy through with no enforcement at all.
+        #
+        # FAIL CLOSED ON THE PAYLOAD, NOT ON THE IDENTITY. Refusing every
+        # unreadable identity would also refuse tracked configurations that
+        # legitimately interpolate experiment.name and carry no reference.
+        # Sweeping the RAW tree resolves nothing, so the ordering guarantee is
+        # untouched.
+        unreadable = hidden_identity_paths(cfg)
+        if unreadable:
+            carried = raw_reference_surface_findings(cfg)
+            if carried:
+                raise ClosedSchemaError(
+                    [
+                        Rejection(
+                            rule="unreadable-family-carries-reference",
+                            tree="raw",
+                            path=", ".join(unreadable),
+                            detail=(
+                                f"{', '.join(unreadable)} is an interpolation, so whether "
+                                "this is a helium-importance configuration cannot be decided "
+                                "without resolving it -- and resolving to decide is exactly "
+                                "what lets a config-named callable run before refusal. This "
+                                "configuration also carries a reference surface, so it is "
+                                "refused rather than read as a foreign family. Declare "
+                                f"{SCHEMA_KEY} and experiment.name as literals, or remove "
+                                "the reference surface"
+                            ),
+                        )
+                    ]
+                    + carried
+                )
         return
 
     environment = os.environ if env is None else env
