@@ -1323,10 +1323,10 @@ def test_unavailable_status_timestamp_offset_has_declared_refusal(tz_value: obje
     "offset", [0, timedelta(hours=24)], ids=["non-timedelta", "out-of-range"]
 )
 def test_datetime_method_rejects_invalid_timestamp_offsets(offset: object) -> None:
-    value = datetime(2026, 1, 1, tzinfo=_CountingOffset(offset))
     with pytest.raises(inference_packet.InferencePacketError) as excinfo:
         inference_packet.ChainStatus(
-            inference_packet.ChainState.IDLE, value, value
+            inference_packet.ChainState.IDLE,
+            *[datetime(2026, 1, 1, tzinfo=_CountingOffset(offset)) for _ in range(2)],
         )
     _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME)
 
