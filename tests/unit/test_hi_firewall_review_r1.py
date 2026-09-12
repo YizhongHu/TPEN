@@ -1288,3 +1288,144 @@ def test_hi_firewall_review_r1_declared_schema_still_validates_an_interpolated_n
     rules = _rules(caught.value)
     assert "undeterminable-identity" not in rules, rules
     assert "forbidden-surface:reference" in rules, rules
+
+
+# ---------------------------------------------------------------------------
+# AXIS ENUMERATION. One arm per axis of the follower's contract, derived from
+# OmegaConf's parser production rules rather than from imagination. Two gaps
+# in this operation were previously found by accident on different axes; a
+# follower closed on two axes and silent on four is the caller-open-leaf
+# shape one level up.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("body", "axis"),
+    [
+        ({"n": "spike", "experiment": {"name": "${${n}.w:1}"}}, "interpolated-resolver-name"),
+        ({"s": "x", "experiment": {"name": "${oc.select:s}"}}, "builtin-oc-select"),
+        ({"experiment": {"name": "${oc.env:HOME,x}"}}, "builtin-oc-env"),
+        ({"experiment": {"name": "${tpen.basis_feature_dim:'a:b'}"}}, "quoted-arg-with-colon"),
+        ({"experiment": {"name": "${tpen.basis_feature_dim:[1,2]}"}}, "list-in-resolver-arg"),
+        ({"experiment": {"name": "${tpen.basis_feature_dim:{a:1}}"}}, "dict-in-resolver-arg"),
+        ({"s": "x", "experiment": {"name": "${tpen.basis_feature_dim:${s}}"}}, "interpolation-in-arg"),
+        ({"L": ["x"], "experiment": {"name": "${L[0]}"}}, "bracket-list-index"),
+    ],
+    ids=[
+        "interpolated-resolver-name",
+        "builtin-oc-select",
+        "builtin-oc-env",
+        "quoted-arg-with-colon",
+        "list-in-resolver-arg",
+        "dict-in-resolver-arg",
+        "interpolation-in-arg",
+        "bracket-list-index",
+    ],
+)
+def test_hi_firewall_review_r1_axis_refuses(body: dict[str, Any], axis: str) -> None:
+    """Axes the follower must refuse because following would execute.
+
+    ``quoted-arg-with-colon`` is the arm that justifies classifying by the
+    GRAMMAR: a colon inside a quoted value is not a resolver separator, and a
+    string test for ``:`` would misread it.  ``builtin-oc-select`` is the
+    sharp one -- it takes a PATH and reaches further than a plain node
+    reference, and it is still a resolver call, so it is refused rather than
+    followed.
+    """
+
+    with pytest.raises(ClosedSchemaError) as caught:
+        _validate(OmegaConf.create(dict(body)))
+    assert "undeterminable-identity" in _rules(caught.value), (
+        f"{axis}: {sorted(_rules(caught.value))}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "axis"),
+    [
+        ({"s": 7, "experiment": {"name": "${s}"}}, 7, "int-target"),
+        ({"s": None, "experiment": {"name": "${s}"}}, None, "null-target"),
+        ({"a": "b", "b": "c", "c": {"d": "x"}, "experiment": {"name": "${${${a}}.d}"}}, "x", "three-level-path"),
+    ],
+    ids=["int-target", "null-target", "three-level-path"],
+)
+def test_hi_firewall_review_r1_axis_follows(
+    body: dict[str, Any], expected: object, axis: str
+) -> None:
+    """Axes the follower must resolve, because nothing needs to execute."""
+
+    from tpen.hi_schema import identity_without_execution
+
+    identity = identity_without_execution(OmegaConf.create(dict(body)), "experiment.name")
+    assert identity.determined, f"{axis}: {identity.reason}"
+    assert identity.value == expected, axis
+
+
+def test_hi_firewall_review_r1_escaped_interpolation_is_not_followed() -> None:
+    """An escaped opener is literal text and must never be followed.
+
+    Escape-awareness is by backslash PARITY, not by presence: an odd number
+    of backslashes escapes the opener, an even number is an escaped backslash
+    followed by a REAL interpolation.
+    """
+
+    from tpen.hi_schema import identity_without_execution
+
+    escaped = identity_without_execution(
+        OmegaConf.create({"s": "tpen_he_importance", "experiment": {"name": r"\${s}"}}),
+        "experiment.name",
+    )
+    assert escaped.determined
+    assert escaped.value != "tpen_he_importance", "an escaped opener was followed"
+
+    # Even parity is a REAL interpolation and must be followed.
+    real = identity_without_execution(
+        OmegaConf.create({"s": "tpen_he_importance", "experiment": {"name": "\\\\${s}"}}),
+        "experiment.name",
+    )
+    assert real.determined
+    assert "tpen_he_importance" in str(real.value)
+
+
+def test_hi_firewall_review_r1_omegaconf_does_not_resolve_keys() -> None:
+    """PIN THE ASSUMPTION that closes the key-position axis by construction.
+
+    An interpolation in a KEY cannot hide a section, because OmegaConf leaves
+    it as a literal key even after FULL resolution.  That is a property of
+    OmegaConf, not of this module, so it is pinned here: a future OmegaConf
+    that DID resolve keys would turn this red rather than silently opening a
+    hole in the identity lookup.
+    """
+
+    cfg = OmegaConf.create({"k": "experiment", "${k}": {"name": "tpen_he_importance"}})
+
+    resolved = OmegaConf.to_container(cfg, resolve=True)
+
+    assert "${k}" in resolved, resolved
+    assert "experiment" not in resolved, (
+        "OmegaConf now resolves keys; the identity lookup reads literal keys only "
+        "and an interpolated key could therefore hide an experiment section"
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "OPEN AXIS, named as a decision rather than left to discovery. A MISSING "
+        "sentinel resolves to the literal '???', which is not the family name, so a "
+        "config whose identity is ??? receives no enforcement. PRE-EXISTING, not "
+        "introduced by this layer: the reader this replaced returned None or raised "
+        "for the same inputs and reached the same not-this-family conclusion. strict "
+        "is deliberate -- closing it makes this XPASS and FAIL, so the marker cannot "
+        "outlive the defect it documents"
+    ),
+)
+def test_hi_firewall_review_r1_missing_sentinel_identity_is_refused() -> None:
+    """The MISSING sentinel should not buy a config zero enforcement."""
+
+    cfg = OmegaConf.create(
+        {"experiment": {"name": "???"}, "reference_energy": REFERENCE_ENERGY}
+    )
+
+    with pytest.raises(ClosedSchemaError):
+        _validate(cfg)
