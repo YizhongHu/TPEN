@@ -834,11 +834,8 @@ def test_hi_firewall_review_r1_resolving_reads_stay_pinned() -> None:
     }
     assert omegaconf_imports == {
         ("omegaconf", "DictConfig", None),
+        ("omegaconf", "ListConfig", None),
         ("omegaconf", "OmegaConf", None),
-        # INTERNAL API, pinned deliberately rather than smuggled in. The
-        # identity follower classifies interpolations with the grammar, and a
-        # string test for a colon would both over- and under-report.
-        ("omegaconf", "grammar_parser", "_grammar_parser"),
     }, (
         "the omegaconf import form changed; an alias would make every call "
         f"below invisible to this census. Imports: {sorted(omegaconf_imports)}"
@@ -861,12 +858,13 @@ def test_hi_firewall_review_r1_resolving_reads_stay_pinned() -> None:
         for alias in node.names
     }
     assert deep == {
-        (
-            "omegaconf.grammar.gen.OmegaConfGrammarParser",
-            "OmegaConfGrammarParser",
-            "_OmegaConfGrammarParser",
-        )
-    }, f"the internal OmegaConf grammar dependency changed: {sorted(deep)}"
+        # INTERNAL API, pinned deliberately rather than smuggled in: the
+        # resolver registry is a class attribute on BaseContainer, and
+        # emptying it for the duration of a resolution is what makes the
+        # follower unable to execute anything. The generated grammar parser
+        # this pin used to name is GONE, retired with the hand-rolled walk.
+        ("omegaconf.basecontainer", "BaseContainer", None)
+    }, f"the internal OmegaConf dependency changed: {sorted(deep)}"
 
     # Each entry must stay justified by the ORDERING, not by its location:
     # a raw read may run at any time, and a resolving read may run only after
@@ -882,6 +880,15 @@ def test_hi_firewall_review_r1_resolving_reads_stay_pinned() -> None:
         # Resolving, and permitted: a post-validation identity over a config
         # the caller has already had validated. Not on any preflight path.
         ("canonical_train_identity", "to_container", "True"),
+        # RESOLVING, AND PERMITTED FOR A DIFFERENT REASON THAN THE OTHERS: the
+        # identity follower resolves with the resolver registry swapped to an
+        # EMPTY one, so a node reference resolves while a resolver call finds
+        # nothing registered and raises instead of running. It is safe because
+        # of WHAT CANNOT RUN during it, not because of when it happens.
+        ("identity_without_execution", "select", "no-resolve-keyword"),
+        # Normalises a plain mapping into a config so the same delegation
+        # serves both caller shapes. Builds, resolves nothing.
+        ("identity_without_execution", "create", "no-resolve-keyword"),
     }, observed
 
     # The raw sweep cannot resolve because it never holds an OmegaConf object.
