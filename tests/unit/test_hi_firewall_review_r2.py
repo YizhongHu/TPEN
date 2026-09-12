@@ -284,18 +284,35 @@ def test_hi_firewall_review_r2_follower_agrees_with_the_grammar_or_refuses() -> 
 # ---------------------------------------------------------------------------
 
 
+# A resolver interpolation parked OUTSIDE the identity chain.  It is what makes
+# the witness half of the arms below capable of failing: nothing on the identity
+# path names a resolver, so without this node no implementation -- correct or
+# defective -- could ever invoke one, and counting zero invocations would assert
+# nothing at all.  A follower that established identity by RESOLVING THE WHOLE
+# TREE would run this; the raw follower never looks at it.
+_DECOY = f"${{{RESOLVER}:x}}"
+
+
 _UNFOLLOWABLE_SPELLINGS = {
     # Whitespace inside the body: the grammar trims it, the follower does not.
-    "whitespace": {"experiment": {"name": "${ names.hi }"}, "names": {"hi": FAMILY}},
+    "whitespace": {
+        "experiment": {"name": "${ names.hi }"},
+        "names": {"hi": FAMILY},
+        "decoy": _DECOY,
+    },
     # A leading dot is a RELATIVE reference to the grammar and a leading empty
     # path segment to the follower.
-    "relative-sibling": {"experiment": {"name": "${.base}", "base": FAMILY}},
+    "relative-sibling": {
+        "experiment": {"name": "${.base}", "base": FAMILY},
+        "decoy": _DECOY,
+    },
     # An INTERMEDIATE segment of the path is itself an interpolation: the
     # follower walks raw keys and never expands a node reached mid-path.
     "mid-segment-interpolation": {
         "experiment": {"name": "${a.b.c}"},
         "a": {"b": "${x}"},
         "x": {"c": FAMILY},
+        "decoy": _DECOY,
     },
 }
 
@@ -320,7 +337,12 @@ def test_hi_firewall_review_r2_unfollowable_spelling_refuses_without_execution(
 
     The witness half is the without-execution property: refusal must not be
     reached by evaluating anything, so a resolver registered for the duration
-    of the call must record zero invocations.
+    of the call must record zero invocations.  The resolver is reached only
+    through ``_DECOY``, a node OUTSIDE the identity chain, which is what gives
+    that count something to measure: the resolver-inside-the-identity-chain
+    case is already covered by the ``axis_refuses`` arms in the round-1 file,
+    while this decoy covers the whole-tree-resolve defect -- an implementation
+    that resolved the configuration to find out what it is would run it.
     """
 
     calls: list[Any] = []
