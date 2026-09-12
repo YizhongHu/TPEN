@@ -11,6 +11,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import NamedTuple
 from types import MappingProxyType, SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -111,6 +112,58 @@ class _IntMarker(IntEnum):
 
 class _StringMarker(str):
     pass
+
+
+class _AlwaysEqualHash:
+    """Non-string source value that lies to equality-based comparisons."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+
+class _LyingHash(str):
+    """String subclass whose comparison claims to match every checkpoint."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return False
+
+
+class _SameContentDistinctIdentity(str):
+    """Equal-looking content with deliberately distinct equality/hash behavior."""
+
+    def __new__(cls, value: str, identity_hash: int) -> "_SameContentDistinctIdentity":
+        result = str.__new__(cls, value)
+        result.identity_hash = identity_hash
+        return result
+
+    def __eq__(self, other: object) -> bool:
+        return self is other
+
+    def __hash__(self) -> int:
+        return self.identity_hash
+
+
+class _WhitespaceLooksValid(str):
+    def strip(self, chars: str | None = None) -> str:
+        return "looks-valid"
+
+
+@dataclass
+class _RawMarker:
+    value: str
+
+
+class _MutableProvenanceKey(str):
+    def __new__(cls, value: str, marker: _RawMarker) -> "_MutableProvenanceKey":
+        result = str.__new__(cls, value)
+        result.marker = marker
+        return result
 
 
 class _TwoFacedMapping(Mapping[str, object]):
@@ -983,9 +1036,310 @@ def test_the_real_producer_fixture_is_the_l2_test_modules_own() -> None:
         Path(l2_tests._packet_source_cells.__globals__["__file__"]).resolve()
         == Path(__file__).with_name("test_stage_coordinate.py").resolve()
     )
-    assert stage_coordinate.materialize_job_packets is getattr(
-        l2_tests.stage_coordinate, "materialize_job_packets"
+    assert (
+        Path(stage_coordinate.materialize_job_packets.__globals__["__file__"]).resolve()
+        == Path(__file__).with_name("stage_coordinate.py").resolve()
     )
+
+
+@pytest.mark.parametrize("source_hash", [_AlwaysEqualHash(), _LyingHash("b" * 64)])
+def test_source_hash_comparison_cannot_admit_a_nonmatching_caller_value(
+    tmp_path: Path, source_hash: object
+) -> None:
+    checkpoint = _checkpoint(tmp_path)
+    source = _source(checkpoint)
+    source.source_content_hash = source_hash
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.launch_inference_packet(source, checkpoint, (_chain(0),))
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.SOURCE_HASH_MISMATCH)
+
+
+def test_ordinary_matching_source_hash_remains_a_positive_control(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path)
+    packet = inference_packet.launch_inference_packet(
+        _source(checkpoint), checkpoint, (_chain(0),)
+    )
+    assert packet.checkpoint is checkpoint
+
+
+def test_chain_ids_are_unique_by_underlying_plain_string_content(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+    for index in (0, 1):
+        valid = _chain(index)
+        with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+            inference_packet.IndependentChain(
+                _SameContentDistinctIdentity("same", 101 + index),
+                valid.seeds,
+                valid.interval,
+                valid.status,
+            )
+        _assert_refusal(excinfo, inference_packet.PacketRefusal.CHAIN_ID_EMPTY)
+
+
+def test_chain_id_empty_check_cannot_be_redirected_by_str_subclass_strip() -> None:
+    valid = _chain(0)
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.IndependentChain(
+            _WhitespaceLooksValid("   "), valid.seeds, valid.interval, valid.status
+        )
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.CHAIN_ID_EMPTY)
+
+
+def test_disposed_topology_key_subclass_is_retained_as_residual_measurement(
+    tmp_path: Path,
+) -> None:
+    """Disposed residual only; it is not adoptable closure evidence."""
+
+    marker = _RawMarker("training-walker")
+    key = _MutableProvenanceKey("topology", marker)
+    try:
+        checkpoint = _checkpoint(tmp_path)
+        checkpoint = inference_packet.CheckpointReference(
+            checkpoint.parent_cell_path,
+            checkpoint.checkpoint_path,
+            checkpoint.source_content_hash,
+            {key: "preserved-content"},
+        )
+    except inference_packet.InferencePacketError as exc:
+        assert exc.refusal is inference_packet.PacketRefusal.PROVENANCE_KEY_NOT_A_STRING
+        return
+
+    stored_key = next(iter(checkpoint.topology_provenance))
+    assert type(stored_key) is not str
+    assert stored_key == "topology"
+    marker.value = "mutated-training-walker"
+    assert stored_key.marker.value == "mutated-training-walker"
+
+
+def test_the_same_mutable_key_fixture_is_refused_in_sampler_inputs(
+    tmp_path: Path,
+) -> None:
+    marker = _RawMarker("training-walker")
+    key = _MutableProvenanceKey("walkers", marker)
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.InferencePacket(
+            _checkpoint(tmp_path), {key: 4_096}, (_chain(0),), None
+        )
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.SAMPLER_KEY_NOT_A_STRING)
+
+
+def _completed_status(started_at: datetime, finished_at: datetime) -> object:
+    return inference_packet.ChainStatus(
+        state=inference_packet.ChainState.COMPLETED,
+        created_at=datetime(2026, 11, 1, 0, 0, tzinfo=ZoneInfo("America/New_York")),
+        last_activity_at=finished_at,
+        started_at=started_at,
+        finished_at=finished_at,
+    )
+
+
+@pytest.mark.parametrize(
+    ("started_at", "finished_at", "should_refuse"),
+    [
+        (
+            datetime(2026, 11, 1, 1, 30, fold=1, tzinfo=ZoneInfo("America/New_York")),
+            datetime(2026, 11, 1, 1, 45, fold=0, tzinfo=ZoneInfo("America/New_York")),
+            True,
+        ),
+        (
+            datetime(2026, 11, 1, 1, 45, fold=0, tzinfo=ZoneInfo("America/New_York")),
+            datetime(2026, 11, 1, 1, 30, fold=1, tzinfo=ZoneInfo("America/New_York")),
+            False,
+        ),
+    ],
+    ids=["finish-actually-before-start", "finish-actually-after-start"],
+)
+def test_dst_fold_status_order_is_chronological(
+    started_at: datetime, finished_at: datetime, should_refuse: bool
+) -> None:
+    if should_refuse:
+        assert started_at.astimezone(UTC) > finished_at.astimezone(UTC)
+        with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+            _completed_status(started_at, finished_at)
+        _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_FINISH_PRECEDES_START)
+    else:
+        assert started_at.astimezone(UTC) < finished_at.astimezone(UTC)
+        status = _completed_status(started_at, finished_at)
+        assert status.finished_at is finished_at
+
+
+def test_plain_aware_chronology_controls_remain_directional() -> None:
+    earlier = datetime(2026, 11, 1, 1, 30, tzinfo=UTC)
+    later = datetime(2026, 11, 1, 1, 45, tzinfo=UTC)
+    status = inference_packet.ChainStatus(
+        state=inference_packet.ChainState.COMPLETED,
+        created_at=datetime(2026, 11, 1, 0, 0, tzinfo=UTC),
+        last_activity_at=later,
+        started_at=earlier,
+        finished_at=later,
+    )
+    assert status.finished_at is later
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.ChainStatus(
+            state=inference_packet.ChainState.COMPLETED,
+            created_at=datetime(2026, 11, 1, 0, 0, tzinfo=UTC),
+            last_activity_at=earlier,
+            started_at=later,
+            finished_at=earlier,
+        )
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_FINISH_PRECEDES_START)
+
+
+def test_only_finish_before_creation_reports_creation_precedence() -> None:
+    created = datetime(2026, 9, 12, 10, 0, tzinfo=UTC)
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.ChainStatus(
+            state=inference_packet.ChainState.COMPLETED,
+            created_at=created,
+            started_at=created,
+            finished_at=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+            last_activity_at=datetime(2026, 9, 12, 11, 0, tzinfo=UTC),
+        )
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_NON_ACTIVITY_PRECEDES_CREATION)
+
+
+def test_only_notification_before_creation_reports_creation_precedence() -> None:
+    created = datetime(2026, 9, 12, 10, 0, tzinfo=UTC)
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.ChainStatus(
+            state=inference_packet.ChainState.ERROR,
+            created_at=created,
+            started_at=created,
+            finished_at=datetime(2026, 9, 12, 11, 0, tzinfo=UTC),
+            last_activity_at=datetime(2026, 9, 12, 11, 0, tzinfo=UTC),
+            terminal_reason="reviewed error",
+            finish_notification_at=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+        )
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_NON_ACTIVITY_PRECEDES_CREATION)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        inference_packet.ChainState.COMPLETED,
+        inference_packet.ChainState.ERROR,
+        inference_packet.ChainState.CANCELLED,
+        inference_packet.ChainState.DEAD,
+    ],
+    ids=["COMPLETED", "ERROR", "CANCELLED", "DEAD"],
+)
+@pytest.mark.parametrize("notified", [False, True], ids=["without-notification", "with-notification"])
+def test_each_valid_terminal_status_is_accepted(state: object, notified: bool) -> None:
+    created = datetime(2026, 9, 12, 12, 0, tzinfo=UTC)
+    started = datetime(2026, 9, 12, 12, 1, tzinfo=UTC)
+    finished = datetime(2026, 9, 12, 12, 2, tzinfo=UTC)
+    notification = datetime(2026, 9, 12, 12, 3, tzinfo=UTC) if notified else None
+    reason = None if state is inference_packet.ChainState.COMPLETED else "reviewed terminal outcome"
+    status = inference_packet.ChainStatus(
+        state=state,
+        created_at=created,
+        last_activity_at=finished,
+        started_at=started,
+        finished_at=finished,
+        terminal_reason=reason,
+        finish_notification_at=notification,
+    )
+    assert status.state is state
+    assert status.terminal_reason is reason
+    assert status.finish_notification_at is notification
+
+
+@pytest.mark.parametrize("depth", [6, 7], ids=["depth-6", "depth-7"])
+def test_exact_provenance_depth_boundary(depth: int, tmp_path: Path) -> None:
+    topology: object = 1
+    for index in reversed(range(depth)):
+        topology = {f"level_{index}": topology}
+    if depth == 6:
+        assert _checkpoint(tmp_path, topology=topology).topology_provenance
+    else:
+        with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+            _checkpoint(tmp_path, topology=topology)
+        _assert_refusal(excinfo, inference_packet.PacketRefusal.PROVENANCE_DEPTH_BUDGET_EXCEEDED)
+
+
+@pytest.mark.parametrize(
+    "position", ["training_seed", "calibration_seed", "inference_seed", "chain_seed"]
+)
+def test_each_seed_position_requires_positive_exact_int(position: str) -> None:
+    values = dict(training_seed=101, calibration_seed=201, inference_seed=301, chain_seed=401)
+    values[position] = 0
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.ChainSeedProvenance(**values)
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.SEED_NOT_POSITIVE_INT)
+
+
+@pytest.mark.parametrize(
+    "position", ["training_seed", "calibration_seed", "inference_seed", "chain_seed"]
+)
+def test_each_seed_position_rejects_bad_type(position: str) -> None:
+    values = dict(training_seed=101, calibration_seed=201, inference_seed=301, chain_seed=401)
+    values[position] = "not-an-int"
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.ChainSeedProvenance(**values)
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.SEED_NOT_POSITIVE_INT)
+
+
+def test_ddp_rank_artifacts_are_independently_immutable(tmp_path: Path) -> None:
+    ranks = {0: tmp_path / "checkpoint" / "rank-0"}
+    provenance = inference_packet.DistributedCheckpointProvenance(1, ranks)
+    assert type(provenance.rank_artifacts) is MappingProxyType
+    with pytest.raises(TypeError):
+        provenance.rank_artifacts[0] = tmp_path / "checkpoint" / "other"  # type: ignore[index]
+
+
+def test_valid_packet_accepts_complete_ddp_artifacts_inside_checkpoint(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path)
+    artifacts = {
+        rank: checkpoint.checkpoint_path / f"rank-{rank}.safetensors"
+        for rank in range(2)
+    }
+    distributed = inference_packet.DistributedCheckpointProvenance(2, artifacts)
+    packet = inference_packet.launch_inference_packet(
+        _source(checkpoint), checkpoint, (_chain(0),), distributed_checkpoint=distributed
+    )
+    assert packet.distributed_checkpoint is distributed
+    assert set(packet.distributed_checkpoint.rank_artifacts) == {0, 1}
+
+
+def test_topology_mapping_is_independently_immutable(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path, topology={"launcher": "review"})
+    assert type(checkpoint.topology_provenance) is MappingProxyType
+    with pytest.raises(TypeError):
+        checkpoint.topology_provenance["launcher"] = "mutated"  # type: ignore[index]
+
+
+def test_caller_open_sampler_leaf_refuses_actual_mapping_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = _checkpoint(tmp_path)
+    monkeypatch.setattr(
+        inference_packet,
+        "_SAMPLER_INPUT_SPEC",
+        MappingProxyType({"walkers": None}),
+    )
+    payload = {"marker": 0.1, "positions": [0.2, 0.3]}
+    with pytest.raises(inference_packet.InferencePacketError) as excinfo:
+        inference_packet.launch_inference_packet(
+            _source(checkpoint, inputs={"walkers": payload}),
+            checkpoint,
+            (_chain(0),),
+        )
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.SAMPLER_SPEC_NOT_CLOSED)
+
+
+def test_materialize_job_packets_is_the_actual_stage_coordinate_producer() -> None:
+    path = Path(__file__).resolve()
+    spec = importlib.util.spec_from_file_location("review_r2_contract_suite", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    producer = module.stage_coordinate.materialize_job_packets
+    defining_file = Path(producer.__globals__["__file__"]).resolve()
+    expected = path.with_name("stage_coordinate.py").resolve()
+    assert defining_file == expected
 
 
 class _ReviewTwoFacedRanks(Mapping):
