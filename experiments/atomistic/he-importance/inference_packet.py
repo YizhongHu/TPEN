@@ -597,7 +597,7 @@ def launch_inference_packet(
             ) from error
         return getattr(source_packet, name)
 
-    source_checkpoint = Path(read_source_attribute("checkpoint_path"))
+    source_checkpoint = Path(read_source_attribute("checkpoint_path")).resolve()
     source_hash = read_source_attribute("source_content_hash")
     sampler_inputs = read_source_attribute("independent_sampler_inputs")
     if source_checkpoint != checkpoint.checkpoint_path:

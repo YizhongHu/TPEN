@@ -811,6 +811,19 @@ def test_source_packet_checkpoint_path_is_binding(tmp_path: Path) -> None:
     _assert_refusal(excinfo, inference_packet.PacketRefusal.SOURCE_CHECKPOINT_MISMATCH)
 
 
+def test_source_packet_checkpoint_path_accepts_a_symlinked_spelling(tmp_path: Path) -> None:
+    checkpoint = _checkpoint(tmp_path)
+    alias = tmp_path / "checkpoint-alias"
+    alias.symlink_to(checkpoint.checkpoint_path.parent.parent, target_is_directory=True)
+    source = _source(checkpoint)
+    source.checkpoint_path = alias / "checkpoints" / checkpoint.checkpoint_path.name
+
+    packet = inference_packet.launch_inference_packet(
+        source, checkpoint, (_chain(0),)
+    )
+    assert packet.checkpoint is checkpoint
+
+
 def test_source_packet_content_hash_is_binding(tmp_path: Path) -> None:
     checkpoint = _checkpoint(tmp_path)
     source = _source(checkpoint)
