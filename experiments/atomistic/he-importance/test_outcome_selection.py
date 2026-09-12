@@ -9,8 +9,16 @@ import pytest
 def _load(name: str, filename: str):
     spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
     assert spec is not None and spec.loader is not None
+    if name in sys.modules:
+        return sys.modules[name]
+    target = Path(__file__).with_name(filename).resolve()
+    for candidate in tuple(sys.modules.values()):
+        candidate_path = getattr(candidate, "__file__", None)
+        if candidate_path is not None and Path(candidate_path).resolve() == target:
+            sys.modules.update({name: candidate})
+            return candidate
     module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
+    sys.modules.update({name: module})
     spec.loader.exec_module(module)
     return module
 
