@@ -32,7 +32,11 @@ is an accepted residual and is not priced as part of the sampler declaration.
 The status record is an audit record, not a probe of a live process.  In
 particular, idle, dead, and completed chains have different required fields,
 and every terminal state records a finish time even where no finish
-notification was emitted.
+notification was emitted.  UTC canonicalization makes the stored chronology
+stable and detached from caller tzinfo code.  Same-instant cross-zone records
+are already equal under datetime's current semantics; the improvement here is
+that same-zone records with different DST folds, which compare equal today,
+become distinct represented instants after canonicalization.
 """
 
 from __future__ import annotations
@@ -72,6 +76,7 @@ class PacketRefusal(str, Enum):
     SEEDS_NOT_DISJOINT = "seeds_not_disjoint"
     STATUS_ACTIVITY_PRECEDES_CREATION = "status_activity_precedes_creation"
     STATUS_TIMESTAMP_NOT_AWARE_DATETIME = "status_timestamp_not_aware_datetime"
+    STATUS_TIMESTAMP_OUT_OF_UTC_RANGE = "status_timestamp_out_of_utc_range"
     STATUS_NON_ACTIVITY_PRECEDES_CREATION = "status_non_activity_precedes_creation"
     STATUS_UNKNOWN_STATE = "status_unknown_state"
     STATUS_IDLE_CLAIMS_START_OR_TERMINATION = "status_idle_claims_start_or_termination"
@@ -82,6 +87,8 @@ class PacketRefusal(str, Enum):
     STATUS_TERMINAL_MISSING_REASON = "status_terminal_missing_reason"
     STATUS_NOTIFICATION_WITHOUT_TERMINATION = "status_notification_without_termination"
     STATUS_NOTIFICATION_PRECEDES_TERMINATION = "status_notification_precedes_termination"
+    STATUS_ACTIVITY_PRECEDES_START = "status_activity_precedes_start"
+    STATUS_ACTIVITY_PRECEDES_FINISH = "status_activity_precedes_finish"
     CHECKPOINT_PATH_NOT_ABSOLUTE = "checkpoint_path_not_absolute"
     CHECKPOINT_NOT_BOUND_TO_PARENT_CELL = "checkpoint_not_bound_to_parent_cell"
     CHECKPOINT_HASH_NOT_SHA256 = "checkpoint_hash_not_sha256"
@@ -102,6 +109,12 @@ class PacketRefusal(str, Enum):
     SOURCE_PACKET_NOT_A_PACKET = "source_packet_not_a_packet"
     SOURCE_CHECKPOINT_MISMATCH = "source_checkpoint_mismatch"
     SOURCE_HASH_MISMATCH = "source_hash_mismatch"
+    SOURCE_CHECKPOINT_PATH_NOT_PATHLIKE = "source_checkpoint_path_not_pathlike"
+    DDP_RANK_ARTIFACT_NOT_PATHLIKE = "ddp_rank_artifact_not_pathlike"
+    PACKET_CHAINS_NOT_ITERABLE = "packet_chains_not_iterable"
+    SAMPLER_ITEMS_NOT_PAIRS = "sampler_items_not_pairs"
+    PROVENANCE_ITEMS_NOT_PAIRS = "provenance_items_not_pairs"
+    DDP_RANK_ARTIFACT_ITEMS_NOT_PAIRS = "ddp_rank_artifact_items_not_pairs"
 
 
 class InferencePacketError(ValueError):
@@ -127,11 +140,6 @@ _TERMINAL_STATES = frozenset(
     {ChainState.COMPLETED, ChainState.ERROR, ChainState.CANCELLED, ChainState.DEAD}
 )
 
-
-def _instant_order(value: datetime) -> datetime:
-    """Compare aware timestamps by their represented UTC instant."""
-
-    return value.astimezone(UTC)
 
 _SAMPLER_INPUT_SPEC = MappingProxyType(
     {
@@ -159,7 +167,14 @@ def _require_declared_sampler_inputs(value: Any, spec: Any, label: str) -> Any:
         frozen: dict[str, Any] = {}
         # This is the only read of the caller-owned mapping.  In particular,
         # do not screen and then freeze it through a second items()/dict pass.
-        for key, nested in value.items():
+        for item in value.items():
+            try:
+                key, nested = item
+            except (TypeError, ValueError) as exc:
+                raise InferencePacketError(
+                    f"{label} items must be key/value pairs",
+                    refusal=PacketRefusal.SAMPLER_ITEMS_NOT_PAIRS,
+                ) from exc
             if type(key) is not str:
                 raise InferencePacketError(
                     f"{label} keys must be strings",
@@ -202,7 +217,14 @@ def _freeze_provenance_node(
         )
     if isinstance(value, Mapping):
         frozen: dict[str, Any] = {}
-        for key, nested in value.items():
+        for item in value.items():
+            try:
+                key, nested = item
+            except (TypeError, ValueError) as exc:
+                raise InferencePacketError(
+                    f"{label} items must be key/value pairs",
+                    refusal=PacketRefusal.PROVENANCE_ITEMS_NOT_PAIRS,
+                ) from exc
             if not isinstance(key, str):
                 raise InferencePacketError(
                     f"{label} keys must be strings",
@@ -326,45 +348,94 @@ class ChainStatus:
     terminal_reason: str | None = None
     finish_notification_at: datetime | None = None
 
+    @staticmethod
+    def _canonical_instant(
+        value: datetime | None, *, required: bool
+    ) -> datetime | None:
+        """Detach one aware datetime as an exact UTC instant."""
+
+        if value is None:
+            if required:
+                raise InferencePacketError(
+                    "required chain status timestamp is missing",
+                    refusal=PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME,
+                )
+            return None
+        if type(value) is not datetime or value.tzinfo is None:
+            raise InferencePacketError(
+                "chain status timestamps must be exact aware datetimes",
+                refusal=PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME,
+            )
+        try:
+            # datetime.utcoffset() performs CPython's return-value and range
+            # validation.  This is deliberately the one and only tzinfo read.
+            offset = value.utcoffset()
+        except Exception as exc:
+            raise InferencePacketError(
+                "chain status timestamp offset is not available",
+                refusal=PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME,
+            ) from exc
+        if offset is None:
+            raise InferencePacketError(
+                "chain status timestamp must have an offset",
+                refusal=PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME,
+            )
+        try:
+            return (value.replace(tzinfo=None, fold=0) - offset).replace(
+                tzinfo=UTC, fold=0
+            )
+        except OverflowError as exc:
+            raise InferencePacketError(
+                "chain status timestamp is outside the UTC datetime range",
+                refusal=PacketRefusal.STATUS_TIMESTAMP_OUT_OF_UTC_RANGE,
+            ) from exc
+        except TypeError as exc:
+            raise InferencePacketError(
+                "chain status timestamp offset is not usable",
+                refusal=PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME,
+            ) from exc
+
     def __post_init__(self) -> None:
         if type(self.state) is not ChainState:
             raise InferencePacketError(
                 f"unknown chain state {self.state!r}",
                 refusal=PacketRefusal.STATUS_UNKNOWN_STATE,
             )
-        timestamps = (
-            self.created_at,
-            self.last_activity_at,
-            self.started_at,
-            self.finished_at,
-            self.finish_notification_at,
+        # After state, canonicalize all five fields in this order before any
+        # terminal_reason or lifecycle check.  The exact order thereafter is:
+        # terminal_reason type; activity/creation; non-activity/creation;
+        # state shape; RUNNING activity/start; terminal missing records,
+        # finish/start, activity/finish, terminal reason rules;
+        # notification-without-finish; notification/finish.
+        created_at = ChainStatus._canonical_instant(self.created_at, required=True)
+        last_activity_at = ChainStatus._canonical_instant(
+            self.last_activity_at, required=True
         )
-        if any(
-            timestamp is not None
-            and (
-                type(timestamp) is not datetime
-                or timestamp.tzinfo is None
-                or timestamp.utcoffset() is None
-            )
-            for timestamp in timestamps
-        ):
-            raise InferencePacketError(
-                "chain status timestamps must be exact aware datetimes",
-                refusal=PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME,
-            )
+        started_at = ChainStatus._canonical_instant(self.started_at, required=False)
+        finished_at = ChainStatus._canonical_instant(
+            self.finished_at, required=False
+        )
+        finish_notification_at = ChainStatus._canonical_instant(
+            self.finish_notification_at, required=False
+        )
+        object.__setattr__(self, "created_at", created_at)
+        object.__setattr__(self, "last_activity_at", last_activity_at)
+        object.__setattr__(self, "started_at", started_at)
+        object.__setattr__(self, "finished_at", finished_at)
+        object.__setattr__(self, "finish_notification_at", finish_notification_at)
         if self.terminal_reason is not None and type(self.terminal_reason) is not str:
             raise InferencePacketError(
                 "terminal reason must be a string",
                 refusal=PacketRefusal.STATUS_TERMINAL_MISSING_REASON,
             )
-        if _instant_order(self.last_activity_at) < _instant_order(self.created_at):
+        if self.last_activity_at < self.created_at:
             raise InferencePacketError(
                 "chain activity cannot precede creation",
                 refusal=PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION,
             )
         if any(
             timestamp is not None
-            and _instant_order(timestamp) < _instant_order(self.created_at)
+            and timestamp < self.created_at
             for timestamp in (
                 self.started_at,
                 self.finished_at,
@@ -381,21 +452,26 @@ class ChainStatus:
         elif self.state is ChainState.RUNNING:
             if self.started_at is None or self.finished_at is not None or self.terminal_reason is not None:
                 raise InferencePacketError("running chain status requires only a start record", refusal=PacketRefusal.STATUS_RUNNING_NOT_ONLY_A_START)
+            if self.last_activity_at < self.started_at:
+                raise InferencePacketError(
+                    "chain activity cannot precede start",
+                    refusal=PacketRefusal.STATUS_ACTIVITY_PRECEDES_START,
+                )
         elif self.state in _TERMINAL_STATES:
             if self.started_at is None or self.finished_at is None:
                 raise InferencePacketError(
                     "terminal chain status requires start and finish records",
                     refusal=PacketRefusal.STATUS_TERMINAL_MISSING_RECORDS,
                 )
-            if _instant_order(self.finished_at) < _instant_order(self.started_at):
+            if self.finished_at < self.started_at:
                 raise InferencePacketError(
                     "chain finish cannot precede start",
                     refusal=PacketRefusal.STATUS_FINISH_PRECEDES_START,
                 )
-            if _instant_order(self.last_activity_at) < _instant_order(self.finished_at):
+            if self.last_activity_at < self.finished_at:
                 raise InferencePacketError(
                     "chain activity cannot precede finish",
-                    refusal=PacketRefusal.STATUS_FINISH_PRECEDES_START,
+                    refusal=PacketRefusal.STATUS_ACTIVITY_PRECEDES_FINISH,
                 )
             if self.state is ChainState.COMPLETED:
                 if self.terminal_reason is not None:
@@ -419,9 +495,7 @@ class ChainStatus:
                     "finish notification requires a terminal status",
                     refusal=PacketRefusal.STATUS_NOTIFICATION_WITHOUT_TERMINATION,
                 )
-            if _instant_order(self.finish_notification_at) < _instant_order(
-                self.finished_at
-            ):
+            if self.finish_notification_at < self.finished_at:
                 raise InferencePacketError(
                     "finish notification cannot precede termination",
                     refusal=PacketRefusal.STATUS_NOTIFICATION_PRECEDES_TERMINATION,
@@ -485,7 +559,13 @@ class DistributedCheckpointProvenance:
                 "distributed checkpoint rank_artifacts must be a mapping",
                 refusal=PacketRefusal.DDP_RANK_ARTIFACTS_NOT_A_MAPPING,
             )
-        rank_artifacts = dict(self.rank_artifacts.items())
+        try:
+            rank_artifacts = dict(self.rank_artifacts.items())
+        except (TypeError, ValueError) as exc:
+            raise InferencePacketError(
+                "distributed checkpoint rank artifacts items must be pairs",
+                refusal=PacketRefusal.DDP_RANK_ARTIFACT_ITEMS_NOT_PAIRS,
+            ) from exc
         if any(type(rank) is not int for rank in rank_artifacts):
             raise InferencePacketError(
                 "distributed checkpoint ranks must be exact integers",
@@ -497,9 +577,16 @@ class DistributedCheckpointProvenance:
                 "distributed checkpoint artifacts must contain each rank exactly once",
                 refusal=PacketRefusal.DDP_RANK_MEMBERSHIP_INCOMPLETE,
             )
-        artifacts = {
-            rank: Path(path).resolve() for rank, path in rank_artifacts.items()
-        }
+        artifacts: dict[int, Path] = {}
+        for rank, path in rank_artifacts.items():
+            try:
+                artifact = Path(path)
+            except TypeError as exc:
+                raise InferencePacketError(
+                    "distributed checkpoint rank artifact must be path-like",
+                    refusal=PacketRefusal.DDP_RANK_ARTIFACT_NOT_PATHLIKE,
+                ) from exc
+            artifacts[rank] = artifact.resolve()
         if len(set(artifacts.values())) != self.world_size:
             raise InferencePacketError(
                 "distributed checkpoint rank artifacts must be unambiguous",
@@ -546,7 +633,14 @@ class InferencePacket:
     distributed_checkpoint: DistributedCheckpointProvenance | None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "chains", tuple(self.chains))
+        try:
+            chains = tuple(self.chains)
+        except TypeError as exc:
+            raise InferencePacketError(
+                "inference packet chains must be iterable",
+                refusal=PacketRefusal.PACKET_CHAINS_NOT_ITERABLE,
+            ) from exc
+        object.__setattr__(self, "chains", chains)
         frozen_inputs = _require_declared_sampler_inputs(
             self.independent_sampler_inputs,
             _SAMPLER_INPUT_SPEC,
@@ -612,7 +706,15 @@ def launch_inference_packet(
             ) from error
         return getattr(source_packet, name)
 
-    source_checkpoint = Path(read_source_attribute("checkpoint_path")).resolve()
+    source_checkpoint_value = read_source_attribute("checkpoint_path")
+    try:
+        source_checkpoint = Path(source_checkpoint_value)
+    except TypeError as exc:
+        raise InferencePacketError(
+            "source packet checkpoint path must be path-like",
+            refusal=PacketRefusal.SOURCE_CHECKPOINT_PATH_NOT_PATHLIKE,
+        ) from exc
+    source_checkpoint = source_checkpoint.resolve()
     source_hash = read_source_attribute("source_content_hash")
     sampler_inputs = read_source_attribute("independent_sampler_inputs")
     if source_checkpoint != checkpoint.checkpoint_path:
@@ -631,6 +733,6 @@ def launch_inference_packet(
     return InferencePacket(
         checkpoint=checkpoint,
         independent_sampler_inputs=sampler_inputs,
-        chains=tuple(chains),
+        chains=chains,
         distributed_checkpoint=distributed_checkpoint,
     )
