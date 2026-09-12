@@ -8,7 +8,7 @@ import sys
 spec = importlib.util.spec_from_file_location("he_importance_content_traversal", Path(__file__).with_name("content_traversal.py"))
 assert spec is not None and spec.loader is not None
 content = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = content
+sys.modules.update({spec.name: content})
 spec.loader.exec_module(content)
 
 def test_freeze_uses_immutable_containers_and_projection_uses_fresh_mutables() -> None:
