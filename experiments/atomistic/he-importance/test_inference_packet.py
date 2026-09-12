@@ -1255,19 +1255,27 @@ def test_the_single_pass_read_holds_at_the_nested_sampler_position(tmp_path: Pat
     ("interval", "field"),
     [
         ((0.5, 1.5, 2.5), "burn_in_proposals"),
+        ((10, 1.5, 5), "proposals_between_draws"),
         ((0, 1, float("inf")), "retained_draws"),
+        ((10, 2, 2.5), "retained_draws"),
         ((False, 1, 1), "burn_in_proposals"),
     ],
-    ids=["fractional", "infinite", "bool"],
+    ids=[
+        "fractional",
+        "spacing_fractional",
+        "infinite",
+        "retained_fractional",
+        "bool",
+    ],
 )
 def test_sampling_interval_admits_non_integer_proposal_counts(
     interval: tuple[object, object, object], field: str
 ) -> None:
     """Every sampling interval count requires an exact integer."""
     refusal = {
-        "burn_in_proposals": inference_packet.PacketRefusal.INTERVAL_BURN_IN_NEGATIVE,
-        "proposals_between_draws": inference_packet.PacketRefusal.INTERVAL_SPACING_NOT_POSITIVE,
-        "retained_draws": inference_packet.PacketRefusal.INTERVAL_DRAWS_NOT_POSITIVE,
+        "burn_in_proposals": inference_packet.PacketRefusal.INTERVAL_BURN_IN_NOT_INT,
+        "proposals_between_draws": inference_packet.PacketRefusal.INTERVAL_SPACING_NOT_INT,
+        "retained_draws": inference_packet.PacketRefusal.INTERVAL_DRAWS_NOT_INT,
     }[field]
     with pytest.raises(inference_packet.InferencePacketError) as excinfo:
         inference_packet.SamplingInterval(*interval)
@@ -1323,7 +1331,7 @@ def test_status_ordering_guards_are_vacuous_against_a_caller_supplied_comparison
         inference_packet.ChainStatus(
             inference_packet.ChainState.COMPLETED, value, value, value, value
         )
-    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION)
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME)
 
 
 def test_mixing_naive_and_aware_timestamps_raises_typeerror_instead_of_a_declared_refusal() -> None:
@@ -1334,7 +1342,7 @@ def test_mixing_naive_and_aware_timestamps_raises_typeerror_instead_of_a_declare
             datetime(2026, 1, 1),
             datetime(2026, 1, 1, tzinfo=UTC),
         )
-    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION)
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME)
 
 
 def test_a_fully_naive_status_record_is_admitted() -> None:
@@ -1348,7 +1356,7 @@ def test_a_fully_naive_status_record_is_admitted() -> None:
             created + timedelta(seconds=1),
             created + timedelta(seconds=2),
         )
-    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION)
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_TIMESTAMP_NOT_AWARE_DATETIME)
 
 
 def test_a_non_string_terminal_reason_raises_attributeerror_instead_of_a_declared_refusal() -> None:
@@ -1518,7 +1526,7 @@ def test_status_records_may_precede_the_creation_they_are_attached_to(
     expected = (
         inference_packet.PacketRefusal.STATUS_FINISH_PRECEDES_START
         if finished_at is not None and last_activity_at < finished_at
-        else inference_packet.PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION
+        else inference_packet.PacketRefusal.STATUS_NON_ACTIVITY_PRECEDES_CREATION
     )
     _assert_refusal(excinfo, expected)
 
@@ -1533,7 +1541,7 @@ def test_creation_precedence_is_enforced_only_against_last_activity() -> None:
             created,
             datetime(2026, 1, 1, tzinfo=UTC),
         )
-    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_ACTIVITY_PRECEDES_CREATION)
+    _assert_refusal(excinfo, inference_packet.PacketRefusal.STATUS_NON_ACTIVITY_PRECEDES_CREATION)
     with pytest.raises(inference_packet.InferencePacketError) as excinfo:
         inference_packet.ChainStatus(
             inference_packet.ChainState.IDLE,
