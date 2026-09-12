@@ -1,0 +1,57 @@
+probe run at 2026-09-12T10:32:23.677874+00:00
+target module /Users/yizhonghu/.paseo/worktrees/2t6pp2zq/l4a-review-r3-worker/experiments/atomistic/he-importance/inference_packet.py
+P1-calibrate [ADMITTED]
+P1-calibrate utcoffset-call-count N=4 (admitted=True)
+P1-flip [ADMITTED]
+P1-flip stored finished_at(UTC)=2026-01-01T14:30:00+00:00
+P1-flip stored started_at(UTC)=2026-01-02T00:00:00+00:00
+P1-flip finish_precedes_start_after_construction=True
+P1-flip-none [ADMITTED]
+P1-flip-none finished_at.astimezone(UTC)=2026-01-02T05:30:00+00:00
+P1-flip-none reinterpreted_in_host_local_time=2026-01-02T05:30:00+00:00
+P2-idle-min [OTHER:OverflowError: date value out of range]
+P2-terminal-max [OTHER:OverflowError: date value out of range]
+P3-member [REFUSED:status_finish_precedes_start]
+P4-running-gap [ADMITTED]
+P5-matrix packet pickle.dumps=FAIL[TypeError: cannot pickle 'mappingproxy' object]
+P5-matrix packet copy.deepcopy=FAIL[TypeError: cannot pickle 'mappingproxy' object]
+P5-matrix packet copy.copy=OK
+P5-matrix packet hash=FAIL[TypeError: unhashable type: 'dict']
+P5-matrix packet dataclasses.asdict=FAIL[TypeError: cannot pickle 'mappingproxy' object]
+P5-matrix packet dataclasses.replace=OK
+P5-matrix packet pickle.loads=SKIPPED[dumps failed]
+P5-matrix checkpoint pickle.dumps=FAIL[TypeError: cannot pickle 'mappingproxy' object]
+P5-matrix checkpoint copy.deepcopy=FAIL[TypeError: cannot pickle 'mappingproxy' object]
+P5-matrix checkpoint copy.copy=OK
+P5-matrix checkpoint hash=FAIL[TypeError: unhashable type: 'dict']
+P5-matrix checkpoint dataclasses.asdict=FAIL[TypeError: cannot pickle 'mappingproxy' object]
+P5-matrix checkpoint dataclasses.replace=OK
+P5-matrix checkpoint pickle.loads=SKIPPED[dumps failed]
+P5-matrix distributed_checkpoint pickle.dumps=FAIL[TypeError: cannot pickle 'mappingproxy' object]
+P5-matrix distributed_checkpoint copy.deepcopy=FAIL[TypeError: cannot pickle 'mappingproxy' object]
+P5-matrix distributed_checkpoint copy.copy=OK
+P5-matrix distributed_checkpoint hash=FAIL[TypeError: unhashable type: 'dict']
+P5-matrix distributed_checkpoint dataclasses.asdict=FAIL[TypeError: cannot pickle 'mappingproxy' object]
+P5-matrix distributed_checkpoint dataclasses.replace=OK
+P5-matrix distributed_checkpoint pickle.loads=SKIPPED[dumps failed]
+P5-matrix chain pickle.dumps=OK
+P5-matrix chain copy.deepcopy=OK
+P5-matrix chain copy.copy=OK
+P5-matrix chain hash=OK
+P5-matrix chain dataclasses.asdict=OK
+P5-matrix chain dataclasses.replace=OK
+P5-matrix chain pickle.loads=OK
+P5-matrix chain.status pickle.dumps=OK
+P5-matrix chain.status copy.deepcopy=OK
+P5-matrix chain.status copy.copy=OK
+P5-matrix chain.status hash=OK
+P5-matrix chain.status dataclasses.asdict=OK
+P5-matrix chain.status dataclasses.replace=OK
+P5-matrix chain.status pickle.loads=OK
+P6-precheck getattr(obj, 'checkpoint_path')=/private/var/folders/wz/gr0d0g59325_bxkgsxrg4sxw0000gn/T/l4a-r3-c0mm_2cp/O1/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/checkpoints/update-00050000
+P6-getattr-source [REFUSED:source_packet_not_a_packet]
+P7a-source-path-int [OTHER:TypeError: argument should be a str or an os.PathLike object where __fspath__ returns a str, not 'int']
+P7b-rank-artifact-int [OTHER:TypeError: argument should be a str or an os.PathLike object where __fspath__ returns a str, not 'int']
+P7c-chains-int [OTHER:TypeError: 'int' object is not iterable]
+P7d-three-tuple-items [OTHER:ValueError: too many values to unpack (expected 2)]
+P8-world-size-contradiction [ADMITTED]
