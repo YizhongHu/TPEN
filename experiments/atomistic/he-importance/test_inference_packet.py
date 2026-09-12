@@ -24,16 +24,12 @@ def _reuse_or_load(module_name: str, path: Path) -> object:
     for candidate in tuple(sys.modules.values()):
         candidate_path = getattr(candidate, "__file__", None)
         if candidate_path is not None and Path(candidate_path).resolve() == target:
-            sys.modules[module_name] = candidate
+            sys.modules.update({module_name: candidate})
             return candidate
     spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    if path.name == "test_stage_coordinate.py":
-        # Pytest may later import this file under its stem.  Register the
-        # same object there so collection cannot execute the file twice.
-        sys.modules.setdefault(path.stem, module)
+    sys.modules.update({module_name: module})
     spec.loader.exec_module(module)
     return module
 
@@ -983,7 +979,10 @@ def test_the_real_producer_declaration_shapes_are_accepted(
 
 
 def test_the_real_producer_fixture_is_the_l2_test_modules_own() -> None:
-    assert l2_tests._packet_source_cells.__module__ == "he_importance_test_stage_coordinate"
+    assert (
+        Path(l2_tests._packet_source_cells.__globals__["__file__"]).resolve()
+        == Path(__file__).with_name("test_stage_coordinate.py").resolve()
+    )
     assert stage_coordinate.materialize_job_packets is getattr(
         l2_tests.stage_coordinate, "materialize_job_packets"
     )
