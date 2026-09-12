@@ -557,6 +557,15 @@ def declared_schema(cfg: Any) -> str | None:
     str or None
         The value of the top-level ``schema`` key, or ``None`` when the
         configuration declares none.
+
+    Notes
+    -----
+    Read raw configuration nodes without evaluating interpolations. Every
+    validation decision made before raw resolver refusal must preserve this
+    property, so no config-named callable can execute before refusal. The
+    value returned is therefore the literal node content: a schema key that
+    interpolates does not match any schema and is not treated as declaring
+    one, because deciding otherwise would require running the interpolation.
     """
 
     raw_tree = _raw_config_mapping(cfg)

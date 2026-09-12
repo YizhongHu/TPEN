@@ -331,9 +331,30 @@ print(json.dumps({
     }, observations
 
 
+@pytest.mark.parametrize("position", ["schema-key", "ordinary-node"])
 def test_hi_firewall_review_r1_recording_resolver_is_refused_before_witness(
+    position: str,
 ) -> None:
-    """Refusal must precede every config-named resolver witness."""
+    """Refusal must precede every config-named resolver witness.
+
+    A recording witness observes resolver invocation directly rather than
+    through a side effect, so it discriminates "the payload did not run"
+    from "the payload ran and left nothing behind".
+
+    The carrier is placed on two different nodes because the property is
+    that no config-named callable runs before refusal ANYWHERE, not that
+    one node was repaired.  The two nodes refuse by different routes -- the
+    schema key cannot resolve to a declaration, so the family check refuses
+    it as undeclared; an ordinary node reaches the raw resolver sweep -- and
+    the witness must stay uncalled on both.
+
+    The ordinary-node arm is also the ``unadmitted-resolver`` half of the
+    per-rule pairing pin: every rule in
+    :data:`~tpen.config_schema.RESOLVER_REFUSAL_RULES` must pair its refusal
+    with ``resolved-sweep-skipped``.  The other two halves are
+    ``uncheckable-resolver`` below and ``forbidden-resolver`` in
+    ``test_hi_schema.py``.
+    """
 
     calls: list[Any] = []
 
@@ -343,15 +364,22 @@ def test_hi_firewall_review_r1_recording_resolver_is_refused_before_witness(
 
     assert RESOLVER not in HI_TRAIN_POLICY.allowed_resolvers
     original = config_module.basis_feature_dim
+    carrier = f"${{{RESOLVER}:x}}"
+    if position == "schema-key":
+        cfg = _config(experiment={"name": "tpen_he_importance"}, schema=carrier)
+        expected = {"undeclared-schema"}
+    else:
+        cfg = _config(runtime={"probe": carrier})
+        expected = {"unadmitted-resolver", "resolved-sweep-skipped"}
+
     OmegaConf.register_new_resolver(RESOLVER, witness, replace=True)
     try:
-        cfg = _config(schema=f"${{{RESOLVER}:x}}")
         with pytest.raises(ClosedSchemaError) as caught:
             _validate(cfg)
     finally:
         OmegaConf.register_new_resolver(RESOLVER, original, replace=True)
-    assert calls == []
-    assert "unadmitted-resolver" in _rules(caught.value)
+    assert calls == [], f"the witness ran before refusal at {position}"
+    assert expected <= _rules(caught.value)
     assert RESOLVER not in HI_TRAIN_POLICY.allowed_resolvers
 
 
