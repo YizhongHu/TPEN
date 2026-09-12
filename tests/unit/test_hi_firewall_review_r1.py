@@ -673,12 +673,19 @@ def test_hi_firewall_review_r1_every_config_position_stays_inert_before_refusal(
     remembering to extend a list -- which is how preflight came to be an
     unguarded location in the first place.
 
-    Coverage this does and does not have: it observes the payload itself, so
-    it catches a resolving read reached by ANY route, including plain
-    attribute access on a ``DictConfig``; it is bounded to the node shapes
-    present in the template, so a node shape the template omits is not
-    covered.  The companion source census bounds the OmegaConf API surface
-    instead, and the two gaps do not overlap.
+    Coverage this does and does not have.  It observes the payload itself,
+    so it catches a resolving read reached by ANY route, including plain
+    attribute access on a ``DictConfig``.
+
+    Its bound is the template's EXACT PATH SET, not a class of node shapes.
+    Saying "shape" would overstate it and make the residual harder to find
+    than it is: ``runtime.device`` is the same scalar-string shape as
+    ``runtime.note`` and is NOT covered, because it is not a path in the
+    template.  A read of any config path absent from the pinned set below is
+    outside this test, and widening the template is what widens the bound.
+
+    The companion source census bounds the OmegaConf call surface instead,
+    and the two gaps do not overlap.
     """
 
     positions = _scalar_leaf_paths(_position_sweep_template())
@@ -733,15 +740,26 @@ def test_hi_firewall_review_r1_resolving_reads_stay_pinned() -> None:
 
     Clause 2 of the contract: the guarantee is a property, and a property
     needs a mechanism rather than a docstring asking future readers to
-    preserve it.  This pins the entire OmegaConf API surface of the module
-    -- not a blocklist of the calls known to resolve -- so a new read of any
-    kind, at any location, goes red and has to be justified against the
-    ordering rather than reviewed by whoever happens to notice.
+    preserve it.  This pins the OmegaConf call surface of the module -- not
+    a blocklist of the calls known to resolve -- so a new read of any kind
+    goes red and has to be justified against the ordering rather than
+    reviewed by whoever happens to notice.
 
-    Coverage: this bounds the OmegaConf API surface of the two modules that
-    implement the firewall.  It does not see resolution reached through a
-    ``DictConfig`` value handed to a third module; the behavioural position
-    sweep covers that route by observing the payload.
+    WHAT IT ACTUALLY ENFORCES, stated as the code enforces it rather than as
+    the intent:
+
+    - It walks the WHOLE module, including class bodies and module level,
+      and labels each call by its nearest enclosing definition.  An earlier
+      version walked only top-level functions, which made a call inside
+      either of this module's two classes, or at module level, invisible.
+    - It matches a call whose owner is the bare name ``OmegaConf``.  An
+      ALIASED import would be invisible to that match, so a companion
+      assertion pins the import form itself; the two together, not the call
+      match alone, are what close the aliasing route.
+    - It does NOT see resolution reached through a ``DictConfig`` value
+      handed to a third module, nor any resolution that never names
+      OmegaConf.  The behavioural position sweep covers those by observing
+      the payload instead.
     """
 
     import ast
@@ -757,29 +775,61 @@ def test_hi_firewall_review_r1_resolving_reads_stay_pinned() -> None:
 
     module = ast.parse(source_path.read_text())
     observed: set[tuple[str, str, str]] = set()
-    for definition in module.body:
-        if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for node in ast.walk(definition):
-            if not isinstance(node, ast.Call):
-                continue
+
+    def visit(node: ast.AST, scope: str) -> None:
+        """Walk every node, carrying the nearest enclosing definition name."""
+
+        if isinstance(node, ast.Call):
             func = node.func
-            if not (
+            if (
                 isinstance(func, ast.Attribute)
                 and isinstance(func.value, ast.Name)
                 and func.value.id == "OmegaConf"
             ):
-                continue
-            resolve = "no-resolve-keyword"
-            for keyword in node.keywords:
-                if keyword.arg == "resolve":
-                    value = keyword.value
-                    resolve = (
-                        repr(value.value)
-                        if isinstance(value, ast.Constant)
-                        else "non-literal"
-                    )
-            observed.add((definition.name, func.attr, resolve))
+                resolve = "no-resolve-keyword"
+                for keyword in node.keywords:
+                    if keyword.arg == "resolve":
+                        value = keyword.value
+                        resolve = (
+                            repr(value.value)
+                            if isinstance(value, ast.Constant)
+                            else "non-literal"
+                        )
+                observed.add((scope, func.attr, resolve))
+        for child in ast.iter_child_nodes(node):
+            child_scope = (
+                child.name
+                if isinstance(
+                    child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                )
+                else scope
+            )
+            visit(child, child_scope)
+
+    visit(module, "<module>")
+
+    # The call match keys on the bare name ``OmegaConf``, so an aliased
+    # import would walk straight past it. Pin the import form rather than
+    # leaving that hole described in prose.
+    omegaconf_imports = {
+        (node.module, alias.name, alias.asname)
+        for node in ast.walk(module)
+        if isinstance(node, ast.ImportFrom) and node.module == "omegaconf"
+        for alias in node.names
+    }
+    assert omegaconf_imports == {
+        ("omegaconf", "DictConfig", None),
+        ("omegaconf", "OmegaConf", None),
+    }, (
+        "the omegaconf import form changed; an alias would make every call "
+        f"below invisible to this census. Imports: {sorted(omegaconf_imports)}"
+    )
+    assert not [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.Import)
+        and any(alias.name.split(".")[0] == "omegaconf" for alias in node.names)
+    ], "omegaconf gained a plain import, which can bind any name"
 
     # Each entry must stay justified by the ORDERING, not by its location:
     # a raw read may run at any time, and a resolving read may run only after
