@@ -43,7 +43,7 @@ def test_alias_is_read_once_and_cycle_is_refused() -> None:
     cycle = {}
     cycle["self"] = cycle
     with pytest.raises(content.ContentTraversalError) as caught:
-        content.freeze_content(cycle, content._ARRAY)
+        content.freeze_content(cycle)
     assert caught.value.refusal is content.ContentRefusal.CONTENT_CYCLE
 
 class EmittedMapping(Mapping):
@@ -160,7 +160,9 @@ def test_array_ancestor_cycles_are_refused() -> None:
     cycle: list[object] = []
     cycle.append(cycle)
     with pytest.raises(content.ContentTraversalError) as caught:
-        content.freeze_content(cycle)
+        # No public array declaration exists; use the module's closed private
+        # declaration so the array subject reaches the ancestor-cycle guard.
+        content.freeze_content(cycle, content._ARRAY)
     assert caught.value.refusal is content.ContentRefusal.CONTENT_CYCLE
     assert caught.value.path == (("index", 0),)
 
