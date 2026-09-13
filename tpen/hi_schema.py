@@ -56,7 +56,6 @@ from tpen.config_schema import (
     Rejection,
     RESOLVER_REFUSAL_RULES,
     SchemaPolicy,
-    iter_interpolations,
     iter_nodes,
     sweep_environment,
     sweep_raw,
@@ -539,15 +538,14 @@ ADMITTED_CONSTRUCTION_TARGETS = (
 
 
 def _raw_config_mapping(cfg: Any) -> Mapping[str, Any] | None:
-    """Return configuration content without evaluating interpolations.
+    """Return a plain mapping for a NON-``DictConfig`` configuration.
 
-    Every validation decision made before raw resolver refusal must preserve
-    this property, so no config-named callable can execute before refusal.
+    Narrowed to the only shape that reaches it. The sole caller pre-filters on
+    ``isinstance(cfg, DictConfig)`` and normalises that case itself, so the
+    ``DictConfig`` branch this used to carry was unreachable -- retired with
+    the walk it served rather than left as a branch no test could enter.
     """
 
-    if isinstance(cfg, DictConfig):
-        raw_tree = OmegaConf.to_container(cfg, resolve=False)
-        return raw_tree if isinstance(raw_tree, Mapping) else None
     return cfg if isinstance(cfg, Mapping) else None
 
 
@@ -677,6 +675,20 @@ def identity_without_execution(cfg: Any, path: str) -> Identity:
     follow-up item owns that, and this paragraph exists so the gap is named
     rather than discovered again.
 
+    AN AVAILABILITY NARROWING, RECORDED WITH ITS COST RATHER THAN ONLY ITS
+    BENEFIT. A container-valued schema node, and a name derived from a
+    resolver call, now REFUSE on a FOREIGN configuration where the pre-layer
+    reader passed it. That is a real narrowing and it is KEPT DELIBERATELY:
+    relaxing a fail-closed guard deserves its own analysis, not a tweak
+    alongside the repair that introduced it.
+
+    THE COST IS BOUNDED TO ZERO TODAY, AND THAT BOUND IS A MEASUREMENT, NOT A
+    GUARANTEE. ``validate_hi_train_config`` runs on EVERY config on the live
+    path in ``tpen.run``, not only helium-importance ones, so the blast radius
+    is the whole tracked corpus -- and the corpus sweep arm shows all of it
+    passing. A config added tomorrow with a container-valued schema would pay
+    this cost, and the sweep is what would say so.
+
     The registry swap is PROCESS-GLOBAL, so this is not safe against
     concurrent validation on another thread -- the same residual the
     construction guard already carries.
@@ -714,18 +726,41 @@ def identity_without_execution(cfg: Any, path: str) -> Identity:
                 cfg, path, default=None, throw_on_resolution_failure=True
             )
         except Exception as error:  # noqa: BLE001 - OmegaConf raises several types
+            # THE TEMPLATE MUST NOT GUESS THE CAUSE. This branch is reached by
+            # a resolver call, a dangling key, a cycle and a recursion bound
+            # alike, and a fixed "a resolver call is not followable" sentence
+            # is FALSE for three of those four. The embedded exception carries
+            # the truth, so name the exception and let it speak; only the
+            # resolver case gets the resolver explanation.
+            unsupported = type(error).__name__ == "UnsupportedInterpolationType"
+            because = (
+                "a resolver call cannot be followed, because following it means "
+                "running a configured callable before any refusal"
+                if unsupported
+                else "it could not be resolved without execution being attempted"
+            )
             return Identity(
                 False,
                 reason=(
-                    f"{path} cannot be resolved without executing something "
-                    f"({type(error).__name__}: {error}); a resolver call is not "
-                    "followable, because following it means running a configured "
-                    "callable before any refusal"
+                    f"{path} could not be determined: {type(error).__name__}: "
+                    f"{error}. {because}"
                 ),
             )
 
     if isinstance(value, (Mapping, list, tuple, DictConfig, ListConfig)):
-        return Identity(False, reason=f"{path!r} is a container, not a scalar identity")
+        # NOT an execution question. A raw container is DETERMINABLY not a
+        # scalar family name, so saying it "cannot be decided without
+        # execution" would be false. It is refused because an identity node
+        # holding a container is malformed, not because anything is unreadable.
+        return Identity(
+            False,
+            reason=(
+                f"{path!r} holds a {type(value).__name__}, and an identity node must be "
+                "a scalar. This is determinable without execution -- a container is "
+                "not the family name -- and is refused as malformed rather than as "
+                "unreadable"
+            ),
+        )
     return Identity(determined=True, value=value)
 
 
