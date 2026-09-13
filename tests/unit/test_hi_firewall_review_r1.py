@@ -870,7 +870,8 @@ def test_hi_firewall_review_r1_resolving_reads_stay_pinned() -> None:
     # a raw read may run at any time, and a resolving read may run only after
     # every refusal that could make resolution unsafe has been raised.
     assert observed == {
-        # Raw: the two preflight reads share this one helper.
+        # Raw: normalises a NON-DictConfig caller. One caller, not two --
+        # the delegating follower handles the DictConfig shape itself.
         ("_raw_config_mapping", "to_container", "False"),
         # Raw: the sweep input, collected before the resolver refusal.
         ("validate_hi_train_config", "to_container", "False"),
