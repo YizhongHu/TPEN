@@ -6,6 +6,7 @@ import json
 import os
 import random
 from dataclasses import replace
+from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,7 @@ from omegaconf import OmegaConf
 import tpen.checkpoint.restore as restore_module
 import tpen.checkpoint.save as save_module
 from tpen.accelerator import current_accelerator_type, device_module
+from tpen.artifacts import ArtifactManager, RunClock, RunContext, RunMetadata
 from tpen.callback.checkpoint import Checkpoint
 from tpen.checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
@@ -31,7 +33,7 @@ from tpen.checkpoint import (
     save_checkpoint,
     stable_config_hash,
 )
-from tpen.checkpoint.catalog import reconcile_publication
+from tpen.checkpoint.catalog import publication_catalog_path, reconcile_publication
 from tpen.checkpoint.receipt import publication_receipt_path
 from tpen.checkpoint.events import LoadStarted, LoadSucceeded
 from tpen.checkpoint.hashing import file_sha256
@@ -47,7 +49,9 @@ from tpen.checkpoint.rng import (
     rng_state_dict,
 )
 from tpen.checkpoint.schema import read_manifest
+from tpen.events import Occurrence
 from tpen.nn import ElectronElectronCusp, HookeOrbitalBasis
+from tpen.training.events import TrainingCompleted
 from tests.unit.callback.support import RecordingContext, training_state
 
 
@@ -82,6 +86,40 @@ def _context(cfg=None):
     )
 
 
+def _fully_initialized_context(tmp_path: Path) -> RunContext:
+    """Build the production-shaped context required by typed callback tests."""
+
+    artifact_manager = ArtifactManager(
+        tmp_path / "run-artifacts",
+        experiment="checkpoint-reconcile",
+        sector="unit",
+        run_id="checkpoint-reconcile-unit",
+        layout="flat",
+    )
+    artifact_manager.make_dirs()
+    return RunContext(
+        cfg=_cfg(),
+        source_cfg=OmegaConf.create({}),
+        artifact_manager=artifact_manager,
+        metadata=RunMetadata(
+            run_id="checkpoint-reconcile-unit",
+            run_name="checkpoint-reconcile-unit",
+            timestamp="2026-09-13T12:00:00+00:00",
+            timezone="UTC",
+            git_commit="test-sha",
+            git_branch="test-branch",
+            dirty_worktree=False,
+            command="pytest",
+            config_path="test.yaml",
+            resolved_config_path=str(artifact_manager.path("resolved_config.yaml")),
+            run_dir=str(artifact_manager.run_dir),
+            device="cpu",
+            dtype="float64",
+        ),
+        clock=RunClock(timezone="UTC", tzinfo=UTC),
+    )
+
+
 class _Trainer:
     def __init__(self) -> None:
         self.loaded = None
@@ -91,6 +129,48 @@ class _Trainer:
 
     def load_state_dict(self, state) -> None:
         self.loaded = dict(state)
+
+
+class _ProgressTrainer:
+    def __init__(self, next_iteration: int, completed_updates: int) -> None:
+        self.next_iteration = next_iteration
+        self.completed_updates = completed_updates
+
+    def state_dict(self) -> dict[str, int]:
+        return {
+            "next_iteration": self.next_iteration,
+            "completed_updates": self.completed_updates,
+        }
+
+
+def _save_real_model_checkpoint(
+    root: Path, context: RunContext, model: torch.nn.Module, step: int
+) -> Path:
+    return save_checkpoint(
+        output_dir=root,
+        next_iteration=step,
+        completed_updates=step,
+        model=model,
+        optimizer=torch.optim.Adam(model.parameters(), lr=0.01),
+        trainer=_Trainer(),
+        sampler=_Sampler(),
+        context=context,
+    )
+
+
+def _named_checkpoint_artifacts(checkpoint_dir: Path) -> dict[Path, bytes]:
+    manifest = json.loads((checkpoint_dir / "manifest.json").read_text(encoding="utf-8"))
+    paths = tuple(
+        checkpoint_dir / name
+        for name in (*manifest["files"].values(), "manifest.json", "COMPLETE")
+    )
+    return {path: path.read_bytes() for path in paths}
+
+
+def _assert_model_state_equal(model: torch.nn.Module, expected: dict[str, torch.Tensor]) -> None:
+    assert set(model.state_dict()) == set(expected)
+    for name, value in model.state_dict().items():
+        assert torch.equal(value, expected[name])
 
 
 class _Sampler:
@@ -1218,6 +1298,191 @@ def test_checkpoint_callback_reconcile_preserves_newer_latest_target(tmp_path: P
     assert older.name == "step_000007"
     assert newer.name == "step_000009"
     assert latest_path.read_bytes() == newer_latest_bytes
+
+
+def _prepare_real_reconcile_pair(
+    tmp_path: Path,
+) -> tuple[Path, RunContext, torch.nn.Module, torch.nn.Module, Path, Path]:
+    root = tmp_path / "checkpoints"
+    context = _fully_initialized_context(tmp_path)
+    older_model = torch.nn.Linear(3, 2).double()
+    older = _save_real_model_checkpoint(root, context, older_model, 7)
+    newer_model = torch.nn.Linear(3, 2).double()
+    newer = _save_real_model_checkpoint(root, context, newer_model, 9)
+    return root, context, older_model, newer_model, older, newer
+
+
+@pytest.mark.parametrize(
+    ("malformed_field", "malformed_value", "expected_exception"),
+    (
+        ("missing_created_at", None, KeyError),
+        ("null_next_iteration", None, TypeError),
+        ("infinite_next_iteration", float("inf"), OverflowError),
+        ("null_files", None, TypeError),
+    ),
+)
+def test_invalid_manifest_target_repairs_through_callback(
+    tmp_path: Path,
+    malformed_field: str,
+    malformed_value: object,
+    expected_exception: type[Exception],
+) -> None:
+    root, context, older_model, _, older, newer = _prepare_real_reconcile_pair(
+        tmp_path
+    )
+    valid_artifacts = {
+        older: _named_checkpoint_artifacts(older),
+        newer: _named_checkpoint_artifacts(newer),
+    }
+    catalog_path = publication_catalog_path(root)
+    receipt_path = publication_receipt_path(root)
+    manifest_path = newer / "manifest.json"
+    manifest_before = manifest_path.read_bytes()
+    manifest = json.loads(manifest_before)
+    if malformed_field == "missing_created_at":
+        del manifest["created_at_unix"]
+    elif malformed_field == "null_next_iteration":
+        manifest["next_iteration"] = malformed_value
+    elif malformed_field == "infinite_next_iteration":
+        manifest["next_iteration"] = malformed_value
+    else:
+        manifest["files"] = malformed_value
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert manifest_path.read_bytes() != manifest_before
+    post_fault_artifacts = {
+        path: path.read_bytes()
+        for artifacts in valid_artifacts.values()
+        for path in artifacts
+    }
+    post_fault_catalog = catalog_path.read_bytes()
+    post_fault_receipt = receipt_path.read_bytes()
+
+    callback = Checkpoint(root)
+    state = training_state(trainer=_ProgressTrainer(7, 7))
+    error: Exception | None = None
+    try:
+        callback.handle_occurrence(
+            Occurrence(event=TrainingCompleted(), count=1), context, state
+        )
+    except Exception as exc:  # noqa: BLE001 - assertion records the route failure
+        error = exc
+
+    assert error is None, (malformed_field, error)
+    assert read_latest(root)["checkpoint_dir"] == older.name
+    assert catalog_path.read_bytes() == post_fault_catalog
+    assert receipt_path.read_bytes() == post_fault_receipt
+    assert all(
+        path.read_bytes() == content for path, content in post_fault_artifacts.items()
+    )
+
+    restored = torch.nn.Linear(3, 2).double()
+    report = restore_checkpoint(
+        load={"path": str(root), "mode": "model_only", "strict": True},
+        model=restored,
+        context=context,
+    )
+    assert report.next_iteration == 7
+    _assert_model_state_equal(restored, {
+        name: value.detach().clone() for name, value in older_model.state_dict().items()
+    })
+
+
+def test_digest_invalid_latest_target_is_repairable(tmp_path: Path) -> None:
+    root, context, older_model, _, older, newer = _prepare_real_reconcile_pair(tmp_path)
+    valid_artifacts = {
+        older: _named_checkpoint_artifacts(older),
+        newer: _named_checkpoint_artifacts(newer),
+    }
+    catalog_path = publication_catalog_path(root)
+    receipt_path = publication_receipt_path(root)
+    model_path = newer / "model.pt"
+    model_before = model_path.read_bytes()
+    model_path.write_bytes(b"corrupt-model-bytes\n")
+    assert model_path.read_bytes() != model_before
+    post_fault_artifacts = {
+        path: path.read_bytes()
+        for artifacts in valid_artifacts.values()
+        for path in artifacts
+    }
+    post_fault_catalog = catalog_path.read_bytes()
+    post_fault_receipt = receipt_path.read_bytes()
+
+    corrupted_model = torch.nn.Linear(3, 2).double()
+    with pytest.raises(ValueError, match="model checkpoint file digest mismatch"):
+        restore_checkpoint(
+            load={"path": str(root), "mode": "model_only", "strict": True},
+            model=corrupted_model,
+            context=context,
+        )
+
+    callback = Checkpoint(root)
+    callback.handle_occurrence(
+        Occurrence(event=TrainingCompleted(), count=1),
+        context,
+        training_state(trainer=_ProgressTrainer(7, 7)),
+    )
+
+    assert read_latest(root)["checkpoint_dir"] == older.name
+    assert catalog_path.read_bytes() == post_fault_catalog
+    assert receipt_path.read_bytes() == post_fault_receipt
+    assert all(
+        path.read_bytes() == content for path, content in post_fault_artifacts.items()
+    )
+    restored = torch.nn.Linear(3, 2).double()
+    report = restore_checkpoint(
+        load={"path": str(root), "mode": "model_only", "strict": True},
+        model=restored,
+        context=context,
+    )
+    assert report.next_iteration == 7
+    _assert_model_state_equal(
+        restored,
+        {name: value.detach().clone() for name, value in older_model.state_dict().items()},
+    )
+
+
+@pytest.mark.parametrize("remove_model_digest", [False, True])
+def test_reconcile_preserves_valid_newer_target_compatibility(
+    tmp_path: Path, remove_model_digest: bool
+) -> None:
+    root, context, older_model, newer_model, older, newer = _prepare_real_reconcile_pair(
+        tmp_path
+    )
+    if remove_model_digest:
+        manifest_path = newer / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        del manifest["hashes"]["model_sha256"]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    latest_path = root / "latest.json"
+    newer_latest_bytes = latest_path.read_bytes()
+    catalog_path = publication_catalog_path(root)
+    receipt_path = publication_receipt_path(root)
+    catalog_bytes = catalog_path.read_bytes()
+    receipt_bytes = receipt_path.read_bytes()
+    artifacts = {
+        path: path.read_bytes()
+        for checkpoint in (older, newer)
+        for path in _named_checkpoint_artifacts(checkpoint)
+    }
+
+    reconcile_publication(root, older)
+
+    assert latest_path.read_bytes() == newer_latest_bytes
+    assert catalog_path.read_bytes() == catalog_bytes
+    assert receipt_path.read_bytes() == receipt_bytes
+    assert all(path.read_bytes() == content for path, content in artifacts.items())
+    restored = torch.nn.Linear(3, 2).double()
+    report = restore_checkpoint(
+        load={"path": str(root), "mode": "model_only", "strict": True},
+        model=restored,
+        context=context,
+    )
+    assert report.next_iteration == 9
+    _assert_model_state_equal(
+        restored,
+        {name: value.detach().clone() for name, value in newer_model.state_dict().items()},
+    )
+    assert older_model is not restored
 
 
 def test_stable_config_hash_is_canonical_and_strict() -> None:

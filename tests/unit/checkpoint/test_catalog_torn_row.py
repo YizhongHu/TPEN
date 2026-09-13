@@ -510,6 +510,72 @@ def test_reconcile_invalid_candidate_cases_fail_closed_without_mutation(
     )
 
 
+@pytest.mark.parametrize(
+    ("malformed_field", "malformed_value", "expected_exception"),
+    (
+        ("missing_created_at", None, KeyError),
+        ("null_next_iteration", None, TypeError),
+        ("infinite_next_iteration", float("inf"), OverflowError),
+        ("null_files", None, TypeError),
+    ),
+)
+def test_reconcile_malformed_candidate_variants_fail_closed(
+    tmp_path: Path,
+    malformed_field: str,
+    malformed_value: object,
+    expected_exception: type[Exception],
+) -> None:
+    newer = _write_checkpoint(tmp_path, 9)
+    reconcile_publication(tmp_path, newer)
+    candidate = _write_checkpoint(tmp_path, 7)
+    newer_manifest = json.loads(
+        (newer / "manifest.json").read_text(encoding="utf-8")
+    )
+    target_artifacts = {
+        path: path.read_bytes()
+        for path in (
+            *(newer / name for name in newer_manifest["files"].values()),
+            newer / "manifest.json",
+            newer / "COMPLETE",
+        )
+    }
+    candidate_manifest_path = candidate / "manifest.json"
+    candidate_manifest_before = candidate_manifest_path.read_bytes()
+    candidate_manifest = json.loads(candidate_manifest_before)
+    candidate_paths = tuple(
+        candidate / name
+        for name in (*candidate_manifest["files"].values(), "manifest.json", "COMPLETE")
+    )
+    if malformed_field == "missing_created_at":
+        del candidate_manifest["created_at_unix"]
+    elif malformed_field == "null_next_iteration":
+        candidate_manifest["next_iteration"] = malformed_value
+    elif malformed_field == "infinite_next_iteration":
+        candidate_manifest["next_iteration"] = malformed_value
+    else:
+        candidate_manifest["files"] = malformed_value
+    candidate_manifest_path.write_text(json.dumps(candidate_manifest), encoding="utf-8")
+    assert candidate_manifest_path.read_bytes() != candidate_manifest_before
+    post_fault_candidate = {
+        path: path.read_bytes() for path in candidate_paths if path.exists()
+    }
+    latest_path = tmp_path / "latest.json"
+    catalog_path = publication_catalog_path(tmp_path)
+    receipt_path = publication_receipt_path(tmp_path)
+    before_latest = latest_path.read_bytes()
+    before_catalog = catalog_path.read_bytes()
+    before_receipt = receipt_path.read_bytes()
+
+    with pytest.raises(expected_exception):
+        reconcile_publication(tmp_path, candidate)
+
+    assert latest_path.read_bytes() == before_latest
+    assert catalog_path.read_bytes() == before_catalog
+    assert receipt_path.read_bytes() == before_receipt
+    assert all(path.read_bytes() == content for path, content in target_artifacts.items())
+    assert all(path.read_bytes() == content for path, content in post_fault_candidate.items())
+
+
 def test_reconcile_pointer_repair_preserves_all_candidate_artifacts(tmp_path: Path) -> None:
     candidate = _write_checkpoint(tmp_path, 7)
     (tmp_path / "latest.json").write_text("{not json", encoding="utf-8")

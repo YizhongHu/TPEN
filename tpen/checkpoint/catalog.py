@@ -11,6 +11,7 @@ from tpen.artifacts import append_jsonl
 
 from .artifact import LATEST_JSON, read_latest, resolve_checkpoint_dir, write_latest
 from .receipt import backfill_publication_receipt, publication_receipt_path
+from .hashing import file_sha256
 from .reference import (
     CHECKPOINT_REF_SCHEMA,
     CheckpointRef,
@@ -265,8 +266,18 @@ def _validated_latest_target(
         if not isinstance(target_value, str) or not target_value:
             return None
         target = resolve_checkpoint_dir(checkpoint_root / LATEST_JSON)
-        return CheckpointRef.from_directory(target), pointer
-    except (FileNotFoundError, ValueError):
+        target_ref = CheckpointRef.from_directory(target)
+        target_manifest = read_manifest(target / "manifest.json", mode="model_only")
+        declared_model_digest = target_manifest.hashes.get("model_sha256")
+        if declared_model_digest is not None:
+            actual_model_digest = file_sha256(target / target_manifest.files["model"])
+            if actual_model_digest != declared_model_digest:
+                raise ValueError(
+                    f"{target}: model checkpoint file digest mismatch "
+                    f"(manifest {declared_model_digest}, actual {actual_model_digest})"
+                )
+        return target_ref, pointer
+    except (FileNotFoundError, ValueError, KeyError, TypeError, OverflowError):
         return None
 
 
