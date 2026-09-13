@@ -870,9 +870,10 @@ def test_hi_firewall_review_r1_resolving_reads_stay_pinned() -> None:
     # a raw read may run at any time, and a resolving read may run only after
     # every refusal that could make resolution unsafe has been raised.
     assert observed == {
-        # Raw: normalises a NON-DictConfig caller. One caller, not two --
-        # the delegating follower handles the DictConfig shape itself.
-        ("_raw_config_mapping", "to_container", "False"),
+        # _raw_config_mapping no longer appears here AT ALL. Narrowing it to
+        # the one shape that reaches it removed its to_container call with the
+        # unreachable DictConfig branch, so the entry is gone rather than
+        # merely re-justified -- and this census is what noticed.
         # Raw: the sweep input, collected before the resolver refusal.
         ("validate_hi_train_config", "to_container", "False"),
         # Resolving, and permitted: guarded, and after the refusal that makes
@@ -1346,12 +1347,13 @@ def test_hi_firewall_review_r1_omegaconf_does_not_resolve_keys() -> None:
     strict=True,
     reason=(
         "OPEN AXIS, DISPOSED TO FOLLOW-UP ITEM "
-        "1efc8552-800e-4248-9b8b-984549f0e3dc. A MISSING sentinel resolves to the "
-        "literal '???', which is not the family name, so a config whose identity is "
-        "??? receives no enforcement at all. PRE-EXISTING, not introduced by this "
-        "layer: the reader this replaced returned None for a ??? identity node and "
-        "raised InterpolationToMissingValueError for a ??? target, reaching the same "
-        "not-this-family conclusion by two different routes. strict is deliberate -- "
+        "1efc8552-800e-4248-9b8b-984549f0e3dc. MEASURED MECHANISM, corrected: a "
+        "DIRECT ??? is read as ABSENT -- select returns the default -- so it is "
+        "determined with value None and passes as a foreign config. It does NOT "
+        "resolve to the literal '???', which is what this reason used to claim. A "
+        "??? reached THROUGH a node reference already REFUSES, on "
+        "InterpolationToMissingValueError, so only the direct spelling is open. "
+        "PRE-EXISTING, not introduced by this layer. strict is deliberate -- "
         "closing it makes this XPASS and FAIL, so whoever turns it green is told "
         "which item they just closed and the marker cannot outlive the defect"
     ),
@@ -1361,10 +1363,18 @@ def test_hi_firewall_review_r1_missing_sentinel_identity_is_refused() -> None:
 
     FOLLOW-UP ITEM: 1efc8552-800e-4248-9b8b-984549f0e3dc.
 
-    This needs NO adversarial construction. ``???`` is the STANDARD
+    THE MECHANISM, MEASURED RATHER THAN ASSUMED. A DIRECT ``???`` is read as
+    ABSENT: ``select`` returns the default, so the identity is DETERMINED with
+    value ``None`` and the config passes as foreign. That is not the same as
+    "resolves to the literal ``???``", which this arm previously claimed, and
+    the difference matters because the two suggest different fixes.
+
+    A ``???`` reached THROUGH a node reference ALREADY REFUSES, on
+    ``InterpolationToMissingValueError``. Only the direct spelling is open.
+
+    It needs NO adversarial construction either: ``???`` is the STANDARD
     PLACEHOLDER for a value a template requires its caller to supply, so an
-    omitted override reaches this state by itself -- which is what makes it
-    worth an item rather than a footnote.
+    omitted override reaches this state by itself.
     """
 
     cfg = OmegaConf.create(

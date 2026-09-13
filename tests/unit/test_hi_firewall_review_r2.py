@@ -13,15 +13,22 @@ the body and resolves a leading dot as a RELATIVE reference.  The two readings
 agree on ordinary spellings and diverge on two axes -- whitespace and leading
 dots -- in both directions:
 
-* FAIL-CLOSED where the follower's verbatim path does not exist while
-  OmegaConf resolves it.  The firewall refuses ``undeterminable-identity``:
-  an availability bound, pinned green in Group 2 with the disclosure that
-  these arms encode a bound and not desired behaviour.
-* FAIL-OPEN where a key-space COLLISION makes the verbatim path exist on a
-  DIFFERENT node than the one OmegaConf reaches.  The follower then determines
-  a WRONG identity, the firewall returns clean, and the run itself resolves to
-  the helium-importance family with zero enforcement.  Group 1 pins those
-  carriers with strict xfail so the marker cannot outlive the defect.
+BOTH GROUPS WERE FLIPPED INSIDE THIS RANGE, AND THIS PARAGRAPH IS WRITTEN
+AFTER THE FLIP.  The follower no longer reads paths itself: it delegates to
+OmegaConf with the resolver registry swapped to empty, so the two readings
+CANNOT diverge, because there is only one.
+
+* The key-space COLLISION carriers -- Group 1 -- were FAIL-OPEN: the verbatim
+  path existed on a DIFFERENT node than the one OmegaConf reached, so the
+  follower determined a WRONG identity and the firewall returned clean while
+  the run resolved to the helium-importance family.  They carried strict
+  xfail; the repair XPASSed them, so THE MARKERS ARE GONE and the arms now
+  assert the refusal directly.
+* The spellings OmegaConf resolves but the old walk could not -- Group 2 --
+  were refused as a disclosed AVAILABILITY BOUND, with their own docstring
+  saying they MUST be flipped if the follower were ever made grammar-normal.
+  It was, so they are: they now assert the reference is FOLLOWED and that the
+  follower's answer EQUALS the grammar's.
 
 Group 3 pins the same property on the LIVE path through ``tpen.run``, which no
 earlier probe executed, with a green control that varies exactly one thing --
@@ -575,3 +582,245 @@ def test_hi_firewall_review_r2_the_reimplementation_is_gone() -> None:
     }
     assert "identity_without_execution" in defined
     assert not (defined & set(retired)), sorted(defined & set(retired))
+
+
+# ---------------------------------------------------------------------------
+# Round-3 accepted items.  Each pins a property that was TRUE at head and
+# entirely UNPINNED -- true-but-unpinned is the state a later narrowing turns
+# into a silent regression, which is what these exist to stop.
+# ---------------------------------------------------------------------------
+
+
+def test_hi_firewall_review_r2_resolver_as_the_experiment_node_is_refused() -> None:
+    """THE CONTRACT'S OWN FALSIFIER, reproduced at base and fixed at head.
+
+    ``{experiment: ${resolver:x}}`` puts the resolver call at the EXPERIMENT
+    NODE ITSELF rather than at ``experiment.name``.  At slice B's head this
+    exact construction EXECUTED the witness during ``validate`` -- one
+    measured call -- and then PASSED.  At this head it refuses and the
+    witness records nothing.
+
+    Nothing pinned it, so this is the falsifier the acceptance contract names
+    and the one arm whose absence would let the whole guarantee regress
+    unobserved.
+    """
+
+    calls: list[Any] = []
+    original = config_module.basis_feature_dim
+    OmegaConf.register_new_resolver(RESOLVER, lambda *a: calls.append(a) or FAMILY, replace=True)
+    try:
+        cfg = OmegaConf.create({"experiment": f"${{{RESOLVER}:x}}"})
+        with pytest.raises(ClosedSchemaError) as caught:
+            validate_hi_train_config(cfg, env={})
+    finally:
+        OmegaConf.register_new_resolver(RESOLVER, original, replace=True)
+
+    assert calls == [], "the witness ran while identifying the config"
+    assert "undeterminable-identity" in {r.rule for r in caught.value.rejections}
+
+
+@pytest.mark.parametrize(
+    ("body", "expected", "refuses"),
+    [
+        ({"experiment": "${d}", "d": {"name": FAMILY}}, FAMILY, True),
+        ({"experiment": "${d}", "d": {"name": "some-other-study"}}, "some-other-study", False),
+    ],
+    ids=["intermediate-node-is-family", "intermediate-node-is-foreign"],
+)
+def test_hi_firewall_review_r2_intermediate_node_on_the_identity_path(
+    body: dict[str, object], expected: str, refuses: bool
+) -> None:
+    """The interpolated node may sit ABOVE the identity leaf, not only at it.
+
+    The round-1 axis enumeration varied the interpolation BODY exhaustively
+    and never varied the TREE POSITION of the interpolated node on the
+    identity path.  Its own vary-the-complement warning applies to itself:
+    the complement of "which spelling" is "which node".
+    """
+
+    cfg = OmegaConf.create(dict(body))
+
+    identity = identity_without_execution(cfg, "experiment.name")
+
+    assert identity.determined, identity.reason
+    assert identity.value == expected
+    assert identity.value == OmegaConf.select(cfg, "experiment.name")
+    if refuses:
+        with pytest.raises(ClosedSchemaError) as caught:
+            validate_hi_train_config(cfg, env={})
+        assert "undeclared-schema" in {r.rule for r in caught.value.rejections}
+    else:
+        validate_hi_train_config(cfg, env={})
+
+
+def test_hi_firewall_review_r2_a_cached_resolver_is_not_served_from_its_cache() -> None:
+    """A PRE-WARMED resolver cache must not answer under the empty registry.
+
+    ``use_cache=True`` stores the memo INSIDE the registered wrapper, so
+    emptying the registry removes the cache with it.  If the lookup sat
+    outside the wrapper a warm cache would answer without the resolver, and
+    the follower would return a value it never had permission to compute --
+    a fail-open with a witness count of zero, which is the one shape the
+    witness cannot see.
+
+    The warm arm proves the cache IS populated, so a zero here is
+    containment and not an empty cache.
+    """
+
+    calls: list[Any] = []
+    name = "cached.probe.r3"
+    OmegaConf.register_new_resolver(name, lambda *a: calls.append(a) or FAMILY, use_cache=True, replace=True)
+
+    warm = OmegaConf.select(OmegaConf.create({"experiment": {"name": f"${{{name}:k}}"}}), "experiment.name")
+    assert warm == FAMILY
+    assert len(calls) == 1, "the cache was never populated; the arm would be vacuous"
+
+    identity = identity_without_execution(
+        OmegaConf.create({"experiment": {"name": f"${{{name}:k}}"}}), "experiment.name"
+    )
+
+    assert not identity.determined
+    assert len(calls) == 1, "the pre-warmed cache answered under the empty registry"
+
+
+def test_hi_firewall_review_r2_the_registry_is_restored_on_both_paths() -> None:
+    """Restoration is pinned DIRECTLY, on success AND on refusal.
+
+    Without this, a deleted ``finally`` is caught only ORDER-DEPENDENTLY --
+    by whichever later test in the same worker happens to need a resolver.
+    An order-dependent failure is one that moves when the suite is resharded,
+    which is indistinguishable from flakiness.
+    """
+
+    from omegaconf.basecontainer import BaseContainer
+
+    before = set(BaseContainer._resolvers)
+    assert before, "no resolvers registered; this arm would pass vacuously"
+
+    identity_without_execution(
+        OmegaConf.create({"s": FAMILY, "experiment": {"name": "${s}"}}), "experiment.name"
+    )
+    assert set(BaseContainer._resolvers) == before, "success path did not restore the registry"
+
+    identity_without_execution(
+        OmegaConf.create({"experiment": {"name": f"${{{RESOLVER}:x}}"}}), "experiment.name"
+    )
+    assert set(BaseContainer._resolvers) == before, "refusal path did not restore the registry"
+
+
+def test_hi_firewall_review_r2_concatenation_is_not_re_resolved() -> None:
+    """Text ASSEMBLED into an interpolation must stay text.
+
+    ``${a}${b}`` where the parts concatenate to ``${resolver:1}`` must yield
+    that LITERAL TEXT, not a second resolution pass over the result.  A
+    follower that re-resolved its own output would run a resolver the config
+    never wrote down, and the equality with a FULL-registry select is what
+    shows the answer is OmegaConf's rather than merely safe.
+    """
+
+    calls: list[Any] = []
+    original = config_module.basis_feature_dim
+    OmegaConf.register_new_resolver(RESOLVER, lambda *a: calls.append(a) or FAMILY, replace=True)
+    try:
+        cfg = OmegaConf.create(
+            {"a": "$", "b": "{%s:1}" % RESOLVER, "experiment": {"name": "${a}${b}"}}
+        )
+        identity = identity_without_execution(cfg, "experiment.name")
+        reference = OmegaConf.select(cfg, "experiment.name")
+    finally:
+        OmegaConf.register_new_resolver(RESOLVER, original, replace=True)
+
+    assert identity.determined, identity.reason
+    assert identity.value == "${%s:1}" % RESOLVER
+    assert identity.value == reference
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("body", "shape"),
+    [
+        ({"a": "${b}", "b": "${a}", "experiment": {"name": "${a}"}}, "direct-cycle"),
+        ({"a": "${a}", "experiment": {"name": "${a}"}}, "self-cycle"),
+        ({"experiment": {"name": "${experiment.name}"}}, "name-refers-to-itself"),
+    ],
+    ids=["direct-cycle", "self-cycle", "name-refers-to-itself"],
+)
+def test_hi_firewall_review_r2_a_cycle_refuses_rather_than_escaping(
+    body: dict[str, object], shape: str
+) -> None:
+    """A cycle must REFUSE, not propagate.
+
+    TRUE AT HEAD AND UNPINNED UNTIL NOW. OmegaConf raises its own
+    recursive-interpolation error and the follower converts it to a refusal.
+    Narrow that except clause to a tighter type later and the firewall
+    CRASHES instead of refusing -- which is not hypothetical, it is exactly
+    the defect this layer already shipped once when GrammarParseError escaped
+    from config construction.
+    """
+
+    cfg = OmegaConf.create(dict(body))
+
+    identity = identity_without_execution(cfg, "experiment.name")
+    assert not identity.determined, shape
+
+    with pytest.raises(ClosedSchemaError) as caught:
+        validate_hi_train_config(cfg, env={})
+    assert "undeterminable-identity" in {r.rule for r in caught.value.rejections}
+
+
+def test_hi_firewall_review_r2_a_recursion_bound_refuses_rather_than_escaping() -> None:
+    """A chain deep enough to hit OmegaConf's recursion bound also refuses.
+
+    Same property as the cycle arms by a different internal exception --
+    ``RecursionError`` rather than a recursive-interpolation error -- which
+    is why it is a separate arm: one except clause catching only the first
+    would leave this one crashing.
+    """
+
+    body: dict[str, object] = {"experiment": {"name": "${n0}"}}
+    for index in range(200):
+        body[f"n{index}"] = "${n%d}" % (index + 1)
+    body["n200"] = FAMILY
+
+    identity = identity_without_execution(OmegaConf.create(body), "experiment.name")
+
+    assert not identity.determined
+
+    with pytest.raises(ClosedSchemaError) as caught:
+        validate_hi_train_config(OmegaConf.create(body), env={})
+    assert "undeterminable-identity" in {r.rule for r in caught.value.rejections}
+
+
+@pytest.mark.parametrize(
+    ("body", "path", "shape"),
+    [
+        ({"schema": "${c}", "c": {"k": 1}, "experiment": {"name": "other"}}, "schema", "container-schema"),
+        ({"experiment": {"name": "${c}"}, "c": {"k": 1}}, "experiment.name", "container-name"),
+    ],
+    ids=["container-schema", "container-name"],
+)
+def test_hi_firewall_review_r2_container_identity_refuses_as_malformed(
+    body: dict[str, object], path: str, shape: str
+) -> None:
+    """PIN THE ACCEPTED NARROWING so the residual stays detectable.
+
+    These refuse on a FOREIGN config where the pre-layer reader passed them.
+    That cost is accepted deliberately rather than relaxed, so it is pinned
+    rather than left implied -- an accepted residual nothing detects becomes
+    an undetectable one.
+
+    The reason must say MALFORMED, not undecidable: a raw container is
+    determinably not a scalar family name, and claiming otherwise would be
+    the false-refusal-text defect this batch also fixes.
+    """
+
+    cfg = OmegaConf.create(dict(body))
+
+    identity = identity_without_execution(cfg, path)
+
+    assert not identity.determined
+    assert "must be a scalar" in (identity.reason or ""), identity.reason
+    assert "determinable without execution" in (identity.reason or ""), identity.reason
+
+    with pytest.raises(ClosedSchemaError):
+        validate_hi_train_config(cfg, env={})
