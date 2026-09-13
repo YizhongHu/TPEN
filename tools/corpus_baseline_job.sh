@@ -16,7 +16,24 @@ OUTER_LOG="$RUN_ROOT/evidence/outer-uv.log"
 mkdir -p "$RUN_ROOT/evidence"
 printf 'BEGIN outer-uv COMMAND=%q run --no-project python %q --revision %q --run-root %q --uv %q --source %q\n' "$UV" "$HARNESS" "$REVISION" "$RUN_ROOT" "$UV" "$SOURCE" | tee -a "$OUTER_LOG"
 printf 'UV_CACHE_DIR=%q\n' "$UV_CACHE_DIR" >>"$OUTER_LOG"
-df -P "$RUN_ROOT" "$UV_CACHE_DIR" "$UV" >>"$OUTER_LOG" 2>&1 || true
+set +e
+python3 - "$OUTER_LOG" "$QUOTA_COMMANDS_JSON" "$RUN_ROOT" "$UV_CACHE_DIR" "$UV" <<'PY'
+import json, subprocess, sys, time
+log, spec, *paths = sys.argv[1:]
+with open(log, "a", encoding="utf-8") as stream:
+    stream.write("BEGIN outer-preflight\n")
+    stream.write("OBSERVED_UNIX=" + str(time.time()) + "\n")
+    for command in json.loads(spec):
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        stream.write("QUOTA_COMMAND=" + json.dumps(command) + " RC=" + str(result.returncode) + "\n")
+        stream.write(result.stdout); stream.write(result.stderr)
+    result = subprocess.run(["df", "-P", *paths], text=True, capture_output=True, check=False)
+    stream.write("DF_RC=" + str(result.returncode) + "\n" + result.stdout + result.stderr)
+    stream.write("END outer-preflight RC=" + str(result.returncode) + "\n")
+PY
+preflight_rc=$?
+set -e
+printf 'OUTER_PREFLIGHT_RC=%s\n' "$preflight_rc" | tee -a "$OUTER_LOG"
 set +e
 "$UV" run --no-project python "$HARNESS" \
   --revision "$REVISION" \
@@ -27,4 +44,22 @@ set +e
 rc=$?
 set -e
 printf 'END outer-uv RC=%s\n' "$rc" | tee -a "$OUTER_LOG"
+set +e
+python3 - "$OUTER_LOG" "$QUOTA_COMMANDS_JSON" "$RUN_ROOT" "$UV_CACHE_DIR" "$UV" <<'PY'
+import json, subprocess, sys, time
+log, spec, *paths = sys.argv[1:]
+with open(log, "a", encoding="utf-8") as stream:
+    stream.write("BEGIN outer-postflight\n")
+    stream.write("OBSERVED_UNIX=" + str(time.time()) + "\n")
+    for command in json.loads(spec):
+        result = subprocess.run(command, text=True, capture_output=True, check=False)
+        stream.write("QUOTA_COMMAND=" + json.dumps(command) + " RC=" + str(result.returncode) + "\n")
+        stream.write(result.stdout); stream.write(result.stderr)
+    result = subprocess.run(["df", "-P", *paths], text=True, capture_output=True, check=False)
+    stream.write("DF_RC=" + str(result.returncode) + "\n" + result.stdout + result.stderr)
+    stream.write("END outer-postflight RC=" + str(result.returncode) + "\n")
+PY
+postflight_rc=$?
+set -e
+printf 'OUTER_POSTFLIGHT_RC=%s\n' "$postflight_rc" | tee -a "$OUTER_LOG"
 exit "$rc"

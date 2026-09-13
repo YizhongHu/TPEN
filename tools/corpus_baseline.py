@@ -16,6 +16,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 
 
@@ -47,7 +48,7 @@ def pytest_collection_modifyitems(config, items):
 def pytest_collectreport(report):
     if report.failed:
         with _OBS.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"nodeid": report.nodeid, "outcome": "error"}) + "\n")
+        stream.write(json.dumps({"nodeid": report.nodeid, "when": "collection", "outcome": "error"}) + "\n")
         return
     if report.skipped:
         phase = os.environ.get("CORPUS_PHASE", "run")
@@ -63,50 +64,76 @@ def pytest_runtest_logreport(report):
     elif report.skipped:
         label = "skipped"
     with p.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps({"nodeid": report.nodeid, "outcome": label}) + "\n")
+        stream.write(json.dumps({"nodeid": report.nodeid, "when": report.when, "outcome": label}) + "\n")
 '''
 
 
-def run(cmd, *, cwd, stdout, env, label, quota_root=None, quota_evidence=None, quota_commands=()):
+def run(cmd, *, cwd, stdout, env, label, quota_root=None, quota_evidence=None, quota_commands=(), cache_dir=None):
     """Run one step with a durable merged stream and an unambiguous result."""
     stdout.parent.mkdir(parents=True, exist_ok=True)
     if quota_root is not None and quota_evidence is not None:
-        safe_quota_snapshot(quota_root, quota_evidence, label + "-before", quota_commands)
-    with stdout.open("w", encoding="utf-8", buffering=1) as stream:
-        stream.write(f"BEGIN {label} COMMAND={json.dumps(cmd)}\n")
-        stream.flush()
-        try:
-            rc = subprocess.run(cmd, cwd=cwd, env=env, stdout=stream,
-                                stderr=subprocess.STDOUT, text=True).returncode
-        except BaseException:
-            import traceback
-            traceback.print_exc(file=stream)
-            stream.flush()
-            rc = 125
-        stream.write(f"END {label} RC={rc} PEAK_RSS={resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss}\n")
-        stream.flush()
+        safe_quota_snapshot(quota_root, quota_evidence, label + "-before", quota_commands, cache_dir or env.get("UV_CACHE_DIR", quota_root))
+    capture_error = None
+    rc = None
+    try:
+        with stdout.open("wb") as stream:
+            begin = f"BEGIN {label} COMMAND={json.dumps(cmd)}\n".encode()
+            stream.write(begin); stream.flush()
+            try:
+                child = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT)
+            except OSError as exc:
+                capture_error = f"LAUNCH_ERROR {exc!r}"
+            else:
+                assert child.stdout is not None
+                for chunk in iter(child.stdout.readline, b""):
+                    try:
+                        stream.write(chunk); stream.flush()
+                    except OSError as exc:
+                        capture_error = f"LOG_WRITE_ERROR {exc!r}"
+                        try: sys.stderr.buffer.write(chunk); sys.stderr.flush()
+                        except OSError: capture_error += " EMERGENCY_STREAM_FAILED"
+                rc = child.wait()
+            if capture_error:
+                try: stream.write((capture_error + "\n").encode()); stream.flush()
+                except OSError:
+                    try: sys.stderr.write(capture_error + "\n"); sys.stderr.flush()
+                    except OSError: pass
+            end = f"END {label} RC={rc if rc is not None else 'LAUNCH_ERROR'} PEAK_RSS_CUMULATIVE_CHILDREN_LINUX_KIB={resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss}\n".encode()
+            try: stream.write(end); stream.flush()
+            except OSError:
+                try: sys.stderr.buffer.write(end); sys.stderr.flush()
+                except OSError: pass
+    except OSError as exc:
+        capture_error = capture_error or f"LOG_OPEN_ERROR {exc!r}"
+        try: sys.stderr.write(capture_error + "\n"); sys.stderr.flush()
+        except OSError: pass
+    if rc is None:
+        rc = 125
     if quota_root is not None and quota_evidence is not None:
-        safe_quota_snapshot(quota_root, quota_evidence, label + "-after", quota_commands)
+        safe_quota_snapshot(quota_root, quota_evidence, label + "-after", quota_commands, cache_dir or env.get("UV_CACHE_DIR", quota_root))
     return rc
 
 
-def quota_snapshot(root, evidence, label, quota_commands):
+def quota_snapshot(root, evidence, label, quota_commands, cache_dir):
     """Persist supported quota calls and disk headroom without inventing fields."""
-    payload = {"label": label, "uv_cache_dir": str(root / "uv-cache-trunk"), "disk": {}, "quota": []}
-    for path in (root, Path.home() / ".local" / "bin" / "uv"):
+    payload = {"label": label, "observed_at_utc": datetime.now(timezone.utc).isoformat(), "uv_cache_dir": str(cache_dir), "disk": {}, "quota": []}
+    for path in (root, Path(cache_dir), Path.home() / ".local" / "bin" / "uv"):
         target = path if path.exists() else path.parent
         usage = shutil.disk_usage(target)
         payload["disk"][str(path)] = {"free": usage.free, "total": usage.total, "used": usage.used}
     for command in quota_commands:
         result = subprocess.run(command, text=True, capture_output=True, check=False)
         payload["quota"].append({"command": command, "rc": result.returncode,
-                                 "stdout": result.stdout, "stderr": result.stderr})
+                                 "stdout": result.stdout, "stderr": result.stderr,
+                                 "space_headroom": "UNKNOWN", "file_headroom": "UNKNOWN",
+                                 "headroom_units": "UNKNOWN", "table_freshness": "UNKNOWN"})
     (evidence / f"quota-{label}.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def safe_quota_snapshot(root, evidence, label, quota_commands):
+def safe_quota_snapshot(root, evidence, label, quota_commands, cache_dir):
     try:
-        quota_snapshot(root, evidence, label, quota_commands)
+        quota_snapshot(root, evidence, label, quota_commands, cache_dir)
     except BaseException as exc:
         with (evidence / "capture-errors.log").open("a", encoding="utf-8") as stream:
             stream.write(f"QUOTA_SNAPSHOT_ERROR label={label} error={exc!r}\n")
@@ -169,7 +196,7 @@ def arm(name, revision, root, uv, deliberate_red, quota_commands):
     env["PYTHONPATH"] = str(checkout) + os.pathsep + env.get("PYTHONPATH", "")
     if os.environ.get("SLURM_JOB_ID", "") == "":
         raise RuntimeError("SLURM_JOB_ID is required before any test command")
-    safe_quota_snapshot(root, evidence, "arm-before", quota_commands)
+    safe_quota_snapshot(root, evidence, "arm-before", quota_commands, cachedir)
     if not checkout.exists():
         if run(["git", "clone", "--no-single-branch", os.environ["CORPUS_SOURCE"], str(checkout)], cwd=root,
                stdout=evidence / "git-clone.log", env=env, label="git-clone",
@@ -211,6 +238,7 @@ def arm(name, revision, root, uv, deliberate_red, quota_commands):
     if deliberate_red:
         control = checkout / "test_corpus_deliberate_red.py"
         control.write_text("def test_corpus_deliberate_red():\n    assert False, 'intentional corpus extraction control'\n", encoding="utf-8")
+        env["CORPUS_PHASE"] = "control"
         control_rc = run([str(uv), "run", "--extra", "cpu", "--locked", "python", "-m", "pytest", "-q", "-k", "test_corpus_deliberate_red", "--junitxml=deliberate-red.xml", "-p", "corpus_plugin", "--corpus-observations=deliberate-red-observations.jsonl"], cwd=checkout, stdout=evidence / "deliberate-red.log", env=env, label="deliberate-red", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands)
         shutil.copy2(control, evidence / control.name)
         shutil.copy2(checkout / "deliberate-red.xml", evidence / "deliberate-red.xml")
@@ -219,8 +247,10 @@ def arm(name, revision, root, uv, deliberate_red, quota_commands):
         if control_rc != 1:
             raise RuntimeError(f"{name}: deliberate red rc={control_rc}, expected 1")
         control_pairs = xml_pairs(evidence / "deliberate-red.xml")
-        if not any(name == "test_corpus_deliberate_red" for _, name in control_pairs):
-            raise RuntimeError(f"{name}: deliberate red node absent from JUnit")
+        control_xml = xml_outcomes(evidence / "deliberate-red.xml")
+        control_pair = next((pair for pair in control_pairs if pair[1] == "test_corpus_deliberate_red"), None)
+        if control_pair is None or control_xml.get(control_pair) != "failed":
+            raise RuntimeError(f"{name}: deliberate red node is not a JUnit failure")
         control_observations = evidence / "deliberate-red-observations.jsonl"
         if not control_observations.exists() or not any(
             json.loads(line).get("nodeid", "").endswith("test_corpus_deliberate_red") and
@@ -233,8 +263,11 @@ def arm(name, revision, root, uv, deliberate_red, quota_commands):
         "collect_rc": collect_rc, "pytest_rc": pytest_rc,
         "collected": (evidence / "collect-collected.txt").read_text(encoding="utf-8").splitlines(),
         "collection_skipped": (evidence / "collect-collection-skipped.txt").read_text(encoding="utf-8").splitlines() if (evidence / "collect-collection-skipped.txt").exists() else [],
+        "run_collected": (evidence / "run-collected.txt").read_text(encoding="utf-8").splitlines() if (evidence / "run-collected.txt").exists() else [],
+        "run_collection_skipped": (evidence / "run-collection-skipped.txt").read_text(encoding="utf-8").splitlines() if (evidence / "run-collection-skipped.txt").exists() else [],
         "xml_pairs": xml_pairs(evidence / "corpus.xml"),
-        "xml_outcomes": xml_outcomes(evidence / "corpus.xml"),
+        "xml_outcomes": [{"classname": pair[0], "name": pair[1], "outcome": outcome}
+                         for pair, outcome in xml_outcomes(evidence / "corpus.xml").items()],
     }
 
 
@@ -259,20 +292,26 @@ def main():
         parser.error(f"--quota-spec must be JSON list of three argv lists: {exc}")
     results["trunk"] = arm("trunk", args.revision, args.run_root, args.uv, True, quota_commands)
     for result in results.values():
+        result["xml_outcomes"] = {(row["classname"], row["name"]): row["outcome"] for row in result["xml_outcomes"]}
         result["failed"] = []
         result["errors"] = []
-        result["skipped"] = result["collection_skipped"]
+        result["skipped"] = []
         for filename in ("collect-observations.jsonl", "observations.jsonl"):
             observation_file = args.run_root / "evidence" / "trunk" / filename
             if not observation_file.exists():
-                continue
+                raise RuntimeError(f"missing required observation artifact: {observation_file}")
             for line in observation_file.read_text(encoding="utf-8").splitlines():
                 row = json.loads(line)
                 target = {"failed": "failed", "error": "errors", "skipped": "skipped"}.get(row["outcome"])
                 if target:
                     result[target].append(row["nodeid"])
+        if set(result["collected"]) != set(result["run_collected"]):
+            raise RuntimeError("collect-only and run collected sets differ")
+        if set(result["collection_skipped"]) != set(result["run_collection_skipped"]):
+            raise RuntimeError("collect-only and run collection-skip sets differ")
         for key in ("failed", "errors", "skipped"):
             result[key] = sorted(set(result[key]))
+        result["skipped"] = sorted(set(result["skipped"]) | set(result["collection_skipped"]))
         floor = len(set(result["collected"]) | set(result["collection_skipped"]))
         result["floor"] = floor
         expected_pairs = {pair_for_nodeid(node) for node in result["collected"] + result["collection_skipped"]}
@@ -298,11 +337,15 @@ def main():
         for outcome in ("failed", "error", "skipped"):
             result_key = "errors" if outcome == "error" else outcome
             observed_set = {node for node in result["collected"] if observed.get(pair_for_nodeid(node)) == outcome}
-            if observed_set != set(result[result_key]):
+            expected_set = set(result[result_key]) - (set(result["collection_skipped"]) if outcome == "skipped" else set())
+            if observed_set != expected_set:
                 raise RuntimeError(f"observed {outcome} set is not stable")
             xml_set = {node for node in result["collected"] if result["xml_outcomes"].get(pair_for_nodeid(node)) == outcome}
             if xml_set != observed_set:
                 raise RuntimeError(f"JUnit {outcome} set does not reconcile")
+    for result in results.values():
+        result["xml_outcomes"] = [{"classname": pair[0], "name": pair[1], "outcome": outcome}
+                                  for pair, outcome in result["xml_outcomes"].items()]
     (args.run_root / "corpus-result.json").write_text(json.dumps(results, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({"revision": args.revision, "collected": len(results["trunk"]["collected"]), "failed": results["trunk"]["failed"], "errors": results["trunk"]["errors"], "skipped": results["trunk"]["skipped"]}, sort_keys=True), flush=True)
     return 0 if all(result["pytest_rc"] == 0 for result in results.values()) else 1
