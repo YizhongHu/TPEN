@@ -7,11 +7,17 @@ from types import MappingProxyType
 import pytest
 import sys
 
-spec = importlib.util.spec_from_file_location("he_importance_content_traversal", Path(__file__).with_name("content_traversal.py"))
-assert spec is not None and spec.loader is not None
-content = importlib.util.module_from_spec(spec)
-sys.modules.update({spec.name: content})
-spec.loader.exec_module(content)
+_target = Path(__file__).with_name("content_traversal.py").resolve()
+_canonical = sys.modules.get("content_traversal")
+if _canonical is not None and Path(getattr(_canonical, "__file__", "")).resolve() == _target:
+    content = _canonical
+else:
+    spec = importlib.util.spec_from_file_location("content_traversal", _target)
+    assert spec is not None and spec.loader is not None
+    content = importlib.util.module_from_spec(spec)
+    sys.modules.update({spec.name: content})
+    spec.loader.exec_module(content)
+sys.modules.update({"he_importance_content_traversal": content})
 
 def test_freeze_uses_immutable_containers_and_projection_uses_fresh_mutables() -> None:
     source = {"nested": {"values": [1, 2]}}
@@ -112,8 +118,93 @@ def test_surrogate_mapping_keys_are_refused() -> None:
         content.freeze_content({chr(0xD800): "value"})
     assert caught.value.refusal is content.ContentRefusal.STRING_HAS_SURROGATE_CODEPOINT
 
+
+def test_surrogate_pair_key_spelling_is_refused() -> None:
+    astral, pair = chr(0x1F600), chr(0xD83D) + chr(0xDE00)
+    with pytest.raises(content.ContentTraversalError) as caught:
+        content.freeze_content({pair: "value"})
+    assert caught.value.refusal is content.ContentRefusal.STRING_HAS_SURROGATE_CODEPOINT
+    assert caught.value.path == (("key", pair),)
+    admitted = content.freeze_content({astral: "value"})
+    assert content.project_content(admitted) == {astral: "value"}
+
+
+def test_distinct_admitted_unicode_scalars_have_distinct_utf8_and_canonical_bytes() -> None:
+    first, second = chr(0x1F600), chr(0x1F601)
+    assert first.encode("utf-8") == b"\xf0\x9f\x98\x80"
+    assert second.encode("utf-8") == b"\xf0\x9f\x98\x81"
+    assert first.encode("utf-8") != second.encode("utf-8")
+
 def test_nonfinite_scalars_are_refused() -> None:
     for value in (float("nan"), float("inf"), float("-inf")):
         with pytest.raises(content.ContentTraversalError) as caught:
             content.freeze_content({"x": value})
         assert caught.value.refusal is content.ContentRefusal.CONTENT_NONFINITE
+
+
+@pytest.mark.parametrize("payload", [{}, [], {"nested": []}])
+def test_open_declaration_payloads_are_refused(payload: object) -> None:
+    with pytest.raises(content.ContentTraversalError) as caught:
+        content.freeze_content(payload, object())
+    assert caught.value.refusal is content.ContentRefusal.DECLARATION_NOT_CLOSED
+
+
+@pytest.mark.parametrize("payload", [{"k": object()}, [object()]])
+def test_unknown_carriers_are_refused_on_each_route(payload: object) -> None:
+    with pytest.raises(content.ContentTraversalError) as caught:
+        content.freeze_content(payload)
+    assert caught.value.refusal is content.ContentRefusal.CONTENT_KIND_UNDECLARED
+
+
+def test_array_ancestor_cycles_are_refused() -> None:
+    cycle: list[object] = []
+    cycle.append(cycle)
+    with pytest.raises(content.ContentTraversalError) as caught:
+        content.freeze_content(cycle)
+    assert caught.value.refusal is content.ContentRefusal.CONTENT_CYCLE
+    assert caught.value.path == (("index", 0),)
+
+
+def test_refusals_carry_literal_tagged_paths() -> None:
+    with pytest.raises(content.ContentTraversalError) as caught:
+        content.freeze_content({"outer": [{"inner": object()}]})
+    assert caught.value.refusal is content.ContentRefusal.CONTENT_KIND_UNDECLARED
+    assert caught.value.path == (("key", "outer"), ("index", 0), ("key", "inner"))
+
+
+def test_admitted_empty_and_boundary_values_round_trip() -> None:
+    value = {"empty-map": {}, "empty-array": [], "boundary": chr(0x10FFFF)}
+    frozen = content.freeze_content(value)
+    assert content.project_content(frozen) == value
+
+
+def test_changing_mapping_views_are_read_once_and_refused() -> None:
+    class Changing(Mapping):
+        reads = 0
+
+        def __getitem__(self, key: str) -> object:
+            return 1
+
+        def __iter__(self):
+            return iter(("a",))
+
+        def __len__(self) -> int:
+            return 1
+
+        def items(self):
+            self.reads += 1
+            return [("a", self.reads)]
+
+    source = Changing()
+    frozen = content.freeze_content(source)
+    assert source.reads == 1
+    assert content.project_content(frozen) == {"a": 1}
+
+
+def test_keys_are_refused_for_subclass() -> None:
+    class SubclassKey(str):
+        pass
+
+    with pytest.raises(content.ContentTraversalError) as caught:
+        content.freeze_content({SubclassKey("key"): "value"})
+    assert caught.value.refusal is content.ContentRefusal.MAPPING_KEY_NOT_EXACT_STRING

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sys
 from datetime import UTC, datetime, timedelta
@@ -439,3 +440,185 @@ def test_recurrence_guard_mentions_every_declared_refusal_member_not_coverage_pr
     # Deliberately a mention ratchet: a member named only in a comment passes.
     for refusal in (*traversal.ContentRefusal, *selection.OutcomeRefusal):
         assert refusal.name in contract_text
+
+
+def test_literal_envelope_oracle_completes_attach_and_select(tmp_path: Path) -> None:
+    interval = selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    commitment = selection.SelectionCommitment.create(("cell-a",), {"eligibility": "x"}, interval)
+    assert commitment.criteria_digest == hashlib.sha256(b'{"eligibility":"x"}').hexdigest()
+    envelope = b'{"candidate_ids":["cell-a"],"criteria":{"eligibility":"x"},"interval":{"coverage":0.95,"estimator":"mean","interval_form":"two-sided-t","multiplicity_method":"holm"},"schema":"he-importance/preregistration/v1"}'
+    assert commitment.preregistration_digest == hashlib.sha256(envelope).hexdigest()
+    commitment.verify()
+    ledger = selection.OutcomeLedger.attach(
+        commitment, (selection.CellOutcome("cell-a", _completed_packet(tmp_path, 70), 1.0),)
+    )
+    assert [record.candidate_id for record in ledger.select_complete()] == ["cell-a"]
+    object.__setattr__(commitment, "candidate_ids", ())
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        ledger.select_complete()
+    assert caught.value.refusal is selection.OutcomeRefusal.PREREGISTRATION_DIGEST_MISMATCH
+
+
+def test_candidate_shorter_tuple_after_attach_is_preregistration_mismatch(tmp_path: Path) -> None:
+    commitment = selection.SelectionCommitment.create(
+        ("cell-a", "cell-b"), {"eligibility": "x"}, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    )
+    ledger = selection.OutcomeLedger.attach(
+        commitment,
+        (selection.CellOutcome("cell-a", _completed_packet(tmp_path, 71), 1.0), selection.CellOutcome("cell-b", _completed_packet(tmp_path, 72), 2.0)),
+    )
+    object.__setattr__(commitment, "candidate_ids", ("cell-a",))
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        ledger.select_complete()
+    assert caught.value.refusal is selection.OutcomeRefusal.PREREGISTRATION_DIGEST_MISMATCH
+
+
+def test_criteria_tamper_after_attach_is_detected_by_select(tmp_path: Path) -> None:
+    commitment = selection.SelectionCommitment.create(
+        ("cell-a",), {"eligibility": "x"}, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    )
+    ledger = selection.OutcomeLedger.attach(
+        commitment, (selection.CellOutcome("cell-a", _completed_packet(tmp_path, 73), 1.0),)
+    )
+    object.__setattr__(commitment, "criteria", {"eligibility": "tampered"})
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        ledger.select_complete()
+    assert caught.value.refusal is selection.OutcomeRefusal.CRITERIA_DIGEST_MISMATCH
+
+
+def test_canonical_encoder_uses_ascii_escaped_strings() -> None:
+    assert selection._canonical_bytes({"k": "é"}) == b'{"k":"\\u00e9"}'
+
+
+def test_canonical_encoder_orders_raw_keys_before_ascii_escaping() -> None:
+    assert selection._canonical_bytes({"é": 2, "a": 1}) == b'{"a":1,"\\u00e9":2}'
+
+
+def test_canonical_digest_is_sha256_of_production_canonical_bytes() -> None:
+    expected = hashlib.sha256(b'{"k":"v"}').hexdigest()
+    assert selection._canonical_bytes({"k": "v"}) == b'{"k":"v"}'
+    assert selection._canonical_digest({"k": "v"}) == expected
+
+
+@pytest.mark.parametrize("coverage", [math.nextafter(0.0, 1.0), math.nextafter(1.0, 0.0)])
+def test_interval_contract_accepts_open_unit_coverage_boundaries(coverage: float) -> None:
+    contract = selection.IntervalContract("mean", "two-sided-t", coverage, "holm")
+    assert contract.coverage == coverage
+
+
+@pytest.mark.parametrize("coverage", [0.0, 1.0])
+def test_interval_contract_rejects_closed_unit_coverage_boundaries(coverage: float) -> None:
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        selection.IntervalContract("mean", "two-sided-t", coverage, "holm")
+    assert caught.value.refusal is selection.OutcomeRefusal.INTERVAL_NOT_DECLARED
+
+
+def test_content_traversal_error_identity_is_same_object_content_first() -> None:
+    assert traversal.ContentTraversalError is selection.ContentTraversalError
+
+
+def test_content_traversal_error_identity_is_same_object_selection_first() -> None:
+    assert selection.ContentTraversalError is traversal.ContentTraversalError
+
+
+@pytest.mark.parametrize(
+    "criteria",
+    [{"nested": {"value": 1}}, {"nested": [{"value": 1}]}, {"nested": [{"value": {"deep": True}}]}],
+)
+def test_nested_commitment_content_is_validated_through_select(criteria: dict[str, object], tmp_path: Path) -> None:
+    commitment = selection.SelectionCommitment.create(
+        ("cell-a",), criteria, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    )
+    commitment.verify()
+    ledger = selection.OutcomeLedger.attach(
+        commitment, (selection.CellOutcome("cell-a", _completed_packet(tmp_path, 80), 1.0),)
+    )
+    assert [record.candidate_id for record in ledger.select_complete()] == ["cell-a"]
+
+
+def test_mutating_original_after_commitment_create_does_not_change_commitment(tmp_path: Path) -> None:
+    criteria = {"nested": {"values": [1, 2]}}
+    commitment = selection.SelectionCommitment.create(
+        ("cell-a",), criteria, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    )
+    original_digest = commitment.criteria_digest
+    criteria["nested"]["values"].append(3)
+    assert commitment.criteria_digest == original_digest
+    assert selection.project_content(commitment.criteria)["nested"]["values"] == [1, 2]
+    ledger = selection.OutcomeLedger.attach(
+        commitment, (selection.CellOutcome("cell-a", _completed_packet(tmp_path, 81), 1.0),)
+    )
+    assert [record.candidate_id for record in ledger.select_complete()] == ["cell-a"]
+
+
+def test_complete_selection_is_invariant_to_none_outcome_values(tmp_path: Path) -> None:
+    commitment = selection.SelectionCommitment.create(
+        ("cell-a", "cell-b"), {"eligibility": "x"}, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    )
+    ledger = selection.OutcomeLedger.attach(
+        commitment,
+        (selection.CellOutcome("cell-a", _completed_packet(tmp_path, 82), None), selection.CellOutcome("cell-b", _completed_packet(tmp_path, 83), 4.0)),
+    )
+    assert tuple(record.candidate_id for record in ledger.select_complete()) == ("cell-a", "cell-b")
+
+
+def test_outcome_lookalike_with_packet_fields_is_refused(tmp_path: Path) -> None:
+    packet = _completed_packet(tmp_path, 84)
+
+    class Lookalike:
+        chains = packet.chains
+        independent_sampler_inputs = packet.independent_sampler_inputs
+
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        selection.CellOutcome("cell-a", Lookalike(), 1.0)
+    assert caught.value.refusal is selection.OutcomeRefusal.OUTCOME_PACKET_NOT_PACKET
+
+
+def test_packet_with_distributed_inputs_is_rejected_by_the_exact_packet_gate() -> None:
+    class DistributedLookalike:
+        distributed_checkpoint = object()
+
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        selection.CellOutcome("cell-a", DistributedLookalike(), 1.0)
+    assert caught.value.refusal is selection.OutcomeRefusal.OUTCOME_PACKET_NOT_PACKET
+
+
+def test_duplicate_outcomes_are_not_silently_dropped(tmp_path: Path) -> None:
+    commitment = selection.SelectionCommitment.create(
+        ("cell-a",), {"eligibility": "x"}, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    )
+    outcome = selection.CellOutcome("cell-a", _completed_packet(tmp_path, 86), 1.0)
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        selection.OutcomeLedger.attach(commitment, (outcome, outcome))
+    assert caught.value.refusal is selection.OutcomeRefusal.OUTCOMES_NOT_COMPLETE_SET
+
+
+def test_canonical_bytes_distinguish_scalar_and_sequence_spellings() -> None:
+    cases = [
+        (-0.0, b"-0.0"),
+        (1, b"1"),
+        (1.0, b"1.0"),
+        (True, b"true"),
+        ([1, 2], b"[1,2]"),
+        ([2, 1], b"[2,1]"),
+    ]
+    for value, expected in cases:
+        assert selection._canonical_bytes(value) == expected
+    assert selection._canonical_bytes([1, 2]) != selection._canonical_bytes([1, 2, 1])
+
+
+@pytest.mark.parametrize("criteria", [{"topology": object()}, {"topology": [object()]}, {"topology": {"nested": object()}}, [object()]])
+def test_topology_root_variants_are_refused(criteria: object) -> None:
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        selection.SelectionCommitment.create(
+            ("cell-a",), criteria, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+        )
+    assert caught.value.refusal is selection.ContentRefusal.CONTENT_KIND_UNDECLARED
+
+
+def test_unknown_carriers_are_refused_on_the_selection_route() -> None:
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        selection.SelectionCommitment.create(
+            ("cell-a",), {"unknown": object()}, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+        )
+    assert caught.value.refusal is selection.ContentRefusal.CONTENT_KIND_UNDECLARED
