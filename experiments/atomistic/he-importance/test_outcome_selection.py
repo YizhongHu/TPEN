@@ -500,7 +500,8 @@ def test_canonical_digest_is_sha256_of_production_canonical_bytes() -> None:
     assert selection._canonical_digest({"k": "v"}) == expected
 
 
-def test_b_class_residue_survives_projection_route_mutant() -> None:
+def _b_class_residue_targets_route_mutant() -> None:
+    # Harness-only: this verdict is meaningful only under an externally applied mutant.
     # These five observations intentionally exercise the production encoder
     # directly.  The paired mutation measurement changes only the route to it.
     test_separator_oracle_is_compact_and_sorted()
@@ -510,7 +511,8 @@ def test_b_class_residue_survives_projection_route_mutant() -> None:
     test_canonical_bytes_distinguish_scalar_and_sequence_spellings()
 
 
-def test_b_class_residue_kills_encoder_mutant() -> None:
+def _b_class_residue_targets_encoder_mutant() -> None:
+    # Harness-only: this verdict is meaningful only under an externally applied mutant.
     # The same five observations must die when the production encoder changes;
     # the mutation harness separately asserts that its edit actually applied.
     test_separator_oracle_is_compact_and_sorted()
