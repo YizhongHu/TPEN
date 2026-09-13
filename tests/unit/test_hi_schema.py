@@ -1855,7 +1855,7 @@ class TestResolverRefusalPrecedesResolution:
     ) -> None:
         """Admitting the resolver must not admit targets in its arguments."""
 
-        import hydra.utils
+        from hydra._internal.instantiate import _instantiate2
         import tpen.config as config_module
         import tpen.hi_schema as hi_schema_module
 
@@ -1869,7 +1869,7 @@ class TestResolverRefusalPrecedesResolution:
         assert hi_schema_module.HI_TRAIN_POLICY.allowed_resolvers == frozenset({resolver})
         assert OmegaConf.has_resolver(resolver)
 
-        original_instantiate = hydra.utils.instantiate
+        original_resolve_target = _instantiate2._resolve_target
         marker = tmp_path / "resolver-construction-ran"
         cfg = _config(
             runtime={
@@ -1886,7 +1886,7 @@ class TestResolverRefusalPrecedesResolution:
         assert not marker.exists(), "the refused construction callable ran during resolution"
         assert "unadmitted-resolver" not in _rules(caught.value)
         assert "unadmitted-free-form-target" in _rules(caught.value)
-        assert hydra.utils.instantiate is original_instantiate
+        assert _instantiate2._resolve_target is original_resolve_target
 
     def test_reports_when_resolved_tree_sweeps_do_not_run(self) -> None:
         """D4 stays unresolved, but the unavailable finding is made visible."""
