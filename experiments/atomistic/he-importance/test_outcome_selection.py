@@ -453,7 +453,7 @@ def test_literal_envelope_oracle_completes_attach_and_select(tmp_path: Path) -> 
         commitment, (selection.CellOutcome("cell-a", _completed_packet(tmp_path, 70), 1.0),)
     )
     assert [record.candidate_id for record in ledger.select_complete()] == ["cell-a"]
-    object.__setattr__(commitment, "candidate_ids", ())
+    object.__setattr__(commitment, "candidate_ids", ("cell-b",))
     with pytest.raises(selection.OutcomeSelectionError) as caught:
         ledger.select_complete()
     assert caught.value.refusal is selection.OutcomeRefusal.PREREGISTRATION_DIGEST_MISMATCH

@@ -43,7 +43,7 @@ def test_alias_is_read_once_and_cycle_is_refused() -> None:
     cycle = {}
     cycle["self"] = cycle
     with pytest.raises(content.ContentTraversalError) as caught:
-        content.freeze_content(cycle)
+        content.freeze_content(cycle, content._ARRAY)
     assert caught.value.refusal is content.ContentRefusal.CONTENT_CYCLE
 
 class EmittedMapping(Mapping):
