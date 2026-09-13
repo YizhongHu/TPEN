@@ -117,15 +117,23 @@ def run(cmd, *, cwd, stdout, env, label, quota_root=None, quota_evidence=None, q
 
 def quota_snapshot(root, evidence, label, quota_commands, cache_dir):
     """Persist supported quota calls and disk headroom without inventing fields."""
-    payload = {"label": label, "observed_at_utc": datetime.now(timezone.utc).isoformat(), "uv_cache_dir": str(cache_dir), "disk": {}, "quota": []}
+    read_at = datetime.now(timezone.utc).isoformat()
+    payload = {"label": label, "read_at_utc": read_at, "observed_at_utc": read_at,
+               "uv_cache_dir": str(cache_dir), "disk": {}, "quota": [],
+               "low_cardinality_agreement": {"status": "UNKNOWN",
+                 "qualification": "Displayed/quantized fields are not treated as byte-exact agreement."}}
     for path in (root, Path(cache_dir), Path.home() / ".local" / "bin" / "uv"):
         target = path if path.exists() else path.parent
         usage = shutil.disk_usage(target)
         payload["disk"][str(path)] = {"free": usage.free, "total": usage.total, "used": usage.used}
     for command in quota_commands:
         result = subprocess.run(command, text=True, capture_output=True, check=False)
+        def cat_a(value):
+            return value.replace("\\", "\\\\").replace("\t", "^I").replace("\r", "^M").replace("\n", "$\\n")
         payload["quota"].append({"command": command, "rc": result.returncode,
                                  "stdout": result.stdout, "stderr": result.stderr,
+                                 "stdout_cat_a": cat_a(result.stdout), "stderr_cat_a": cat_a(result.stderr),
+                                 "read_at_utc": read_at,
                                  "space_headroom": "UNKNOWN", "file_headroom": "UNKNOWN",
                                  "headroom_units": "UNKNOWN", "table_freshness": "UNKNOWN"})
     (evidence / f"quota-{label}.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
