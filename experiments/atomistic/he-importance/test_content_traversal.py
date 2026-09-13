@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 import pytest
 import sys
 
@@ -15,7 +16,9 @@ spec.loader.exec_module(content)
 def test_freeze_uses_immutable_containers_and_projection_uses_fresh_mutables() -> None:
     source = {"nested": {"values": [1, 2]}}
     frozen = content.freeze_content(source)
-    assert isinstance(frozen, type(content.freeze_content({})))
+    # Anchor the oracle outside the production call: a mutable-dict mutant
+    # must fail this assertion instead of moving both sides together.
+    assert isinstance(frozen, MappingProxyType)
     assert isinstance(frozen["nested"]["values"], tuple)
     projected = content.project_content(frozen)
     assert isinstance(projected, dict) and isinstance(projected["nested"]["values"], list)
@@ -73,6 +76,16 @@ def test_stable_unique_mapping_is_admitted() -> None:
     )
     commitment.verify()
 
+
+def test_malformed_mapping_items_are_refused() -> None:
+    class Malformed(EmittedMapping):
+        def items(self):
+            return [("a", 1, "extra")]
+
+    with pytest.raises(content.ContentTraversalError) as caught:
+        content.freeze_content(Malformed(duplicate=False))
+    assert caught.value.refusal is content.ContentRefusal.MAPPING_ITEM_MALFORMED
+
 def test_declaration_is_closed_before_source_read() -> None:
     class Exploding(dict):
         def items(self):
@@ -81,13 +94,23 @@ def test_declaration_is_closed_before_source_read() -> None:
         content.freeze_content(Exploding(value=1), object())
     assert caught.value.refusal is content.ContentRefusal.DECLARATION_NOT_CLOSED
 
-def test_duplicate_and_non_string_keys_are_not_silently_overwritten() -> None:
+def test_duplicate_and_non_string_keys_are_refused_without_silent_overwrite() -> None:
     class Duplicate(EmittedMapping):
         def __init__(self):
             super().__init__(duplicate=True)
     with pytest.raises(content.ContentTraversalError) as caught:
         content.freeze_content(Duplicate())
     assert caught.value.refusal is content.ContentRefusal.MAPPING_KEY_REPEATED
+
+    with pytest.raises(content.ContentTraversalError) as caught:
+        content.freeze_content({1: "not an admitted key"})
+    assert caught.value.refusal is content.ContentRefusal.MAPPING_KEY_NOT_EXACT_STRING
+
+
+def test_surrogate_mapping_keys_are_refused() -> None:
+    with pytest.raises(content.ContentTraversalError) as caught:
+        content.freeze_content({chr(0xD800): "value"})
+    assert caught.value.refusal is content.ContentRefusal.STRING_HAS_SURROGATE_CODEPOINT
 
 def test_nonfinite_scalars_are_refused() -> None:
     for value in (float("nan"), float("inf"), float("-inf")):
