@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 from tpen.checkpoint.artifact import COMPLETE_MARKER, read_latest
-from tpen.checkpoint.catalog import publication_catalog_path, read_publications
+from tpen.checkpoint.catalog import (
+    publication_catalog_path,
+    read_publications,
+    reconcile_publication,
+)
 from tpen.checkpoint.reference import CheckpointRef
 from tpen.checkpoint.receipt import (
     PUBLICATION_RECEIPT_SCHEMA,
@@ -658,3 +662,74 @@ def test_reconcile_publication_backfill_is_idempotent_across_repeated_calls(
     reconcile_publication(root, final_dir)
     rows_after_second = receipt_path.read_text(encoding="utf-8").splitlines()
     assert rows_after_second == rows_after_first
+
+
+def test_reconcile_older_target_backfills_catalog_and_receipt_without_regressing_newer_latest(
+    tmp_path: Path,
+) -> None:
+    older_dir, older_files = _write_checkpoint(tmp_path, 7)
+    newer_dir, _ = _write_checkpoint(tmp_path, 9)
+    root = tmp_path
+
+    reconcile_publication(root, newer_dir)
+    latest_path = root / "latest.json"
+    newer_latest_bytes = latest_path.read_bytes()
+    catalog_path = publication_catalog_path(root)
+    receipt_path = publication_receipt_path(root)
+    older_ref = _ref_for(older_dir)
+    newer_ref = _ref_for(newer_dir)
+    older_files_before = {
+        path: path.read_bytes()
+        for relative in (*older_files.values(), "manifest.json", COMPLETE_MARKER)
+        for path in (older_dir / relative,)
+    }
+
+    reconcile_publication(root, older_dir)
+
+    assert read_publications(catalog_path) == (newer_ref, older_ref)
+    assert has_publication_receipt(receipt_path, older_ref.content_id) is True
+    assert latest_path.read_bytes() == newer_latest_bytes
+    catalog_after_first = catalog_path.read_bytes()
+    receipt_after_first = receipt_path.read_bytes()
+
+    reconcile_publication(root, older_dir)
+
+    assert catalog_path.read_bytes() == catalog_after_first
+    assert receipt_path.read_bytes() == receipt_after_first
+    assert latest_path.read_bytes() == newer_latest_bytes
+    assert all(path.read_bytes() == content for path, content in older_files_before.items())
+
+
+def test_reconcile_receipt_failure_preserves_catalog_latest_and_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    older_dir, older_files = _write_checkpoint(tmp_path, 7)
+    newer_dir, _ = _write_checkpoint(tmp_path, 9)
+    reconcile_publication(tmp_path, newer_dir)
+    latest_path = tmp_path / "latest.json"
+    newer_latest_bytes = latest_path.read_bytes()
+    catalog_path = publication_catalog_path(tmp_path)
+    receipt_path = publication_receipt_path(tmp_path)
+    older_ref = _ref_for(older_dir)
+    older_artifacts = {
+        older_dir / relative: (older_dir / relative).read_bytes()
+        for relative in (*older_files.values(), "manifest.json", COMPLETE_MARKER)
+    }
+
+    import tpen.checkpoint.receipt as receipt_module
+
+    append_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fail_append(*args: object, **kwargs: object) -> None:
+        append_calls.append((args, kwargs))
+        raise OSError("receipt append failed")
+
+    monkeypatch.setattr(receipt_module, "append_publication_receipt", fail_append)
+
+    reconcile_publication(tmp_path, older_dir)
+
+    assert len(append_calls) == 1
+    assert older_ref in read_publications(catalog_path)
+    assert latest_path.read_bytes() == newer_latest_bytes
+    assert not has_publication_receipt(receipt_path, older_ref.content_id)
+    assert all(path.read_bytes() == content for path, content in older_artifacts.items())

@@ -17,6 +17,7 @@ from omegaconf import OmegaConf
 import tpen.checkpoint.restore as restore_module
 import tpen.checkpoint.save as save_module
 from tpen.accelerator import current_accelerator_type, device_module
+from tpen.callback.checkpoint import Checkpoint
 from tpen.checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
     CheckpointReplaySemantics,
@@ -47,6 +48,7 @@ from tpen.checkpoint.rng import (
 )
 from tpen.checkpoint.schema import read_manifest
 from tpen.nn import ElectronElectronCusp, HookeOrbitalBasis
+from tests.unit.callback.support import RecordingContext, training_state
 
 
 def _cfg(*, model_out: int = 2):
@@ -1181,6 +1183,41 @@ def test_reconcile_publication_does_not_append_another_receipt(tmp_path: Path) -
 
     rows_after = receipt_path.read_text(encoding="utf-8").splitlines()
     assert rows_after == rows_before
+
+
+def test_checkpoint_callback_reconcile_preserves_newer_latest_target(tmp_path: Path) -> None:
+    root = tmp_path / "checkpoints"
+    older_model = torch.nn.Linear(3, 2).double()
+    older = save_checkpoint(
+        output_dir=root,
+        next_iteration=7,
+        completed_updates=7,
+        model=older_model,
+        optimizer=torch.optim.Adam(older_model.parameters(), lr=0.01),
+        trainer=_Trainer(),
+        sampler=_Sampler(),
+        context=_context(),
+    )
+    newer_model = torch.nn.Linear(3, 2).double()
+    newer = save_checkpoint(
+        output_dir=root,
+        next_iteration=9,
+        completed_updates=9,
+        model=newer_model,
+        optimizer=torch.optim.Adam(newer_model.parameters(), lr=0.01),
+        trainer=_Trainer(),
+        sampler=_Sampler(),
+        context=_context(),
+    )
+    latest_path = root / "latest.json"
+    newer_latest_bytes = latest_path.read_bytes()
+
+    callback = Checkpoint(root)
+    callback._save(RecordingContext(), training_state(), 7, 7)
+
+    assert older.name == "step_000007"
+    assert newer.name == "step_000009"
+    assert latest_path.read_bytes() == newer_latest_bytes
 
 
 def test_stable_config_hash_is_canonical_and_strict() -> None:

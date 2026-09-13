@@ -9,7 +9,7 @@ from typing import Any
 
 from tpen.artifacts import append_jsonl
 
-from .artifact import read_latest, write_latest
+from .artifact import LATEST_JSON, read_latest, resolve_checkpoint_dir, write_latest
 from .receipt import backfill_publication_receipt, publication_receipt_path
 from .reference import (
     CHECKPOINT_REF_SCHEMA,
@@ -140,10 +140,11 @@ class CheckpointCatalog:
                             "record, then re-run tpen.checkpoint.catalog.reconcile_publication "
                             "on the NEWEST complete step_* directory under the checkpoint root "
                             "that now has no catalog row -- a tear is always on the last "
-                            "append, so it is never an older one. Do NOT reconcile older "
-                            "directories to be safe: reconcile_publication rewrites "
-                            "latest.json unconditionally and would point it at an older "
-                            "checkpoint. Dropping the line is an operator action by design -- "
+                            "append. Start with the NEWEST complete directory missing from "
+                            "the catalog; reconciliation orders latest.json by the validated "
+                            "manifest step, so retrying an older complete directory is safe "
+                            "for the latest pointer. Dropping the line is an operator action "
+                            "by design -- "
                             "reconcile_publication reads the catalog before it writes, so it "
                             "cannot clear this itself, and TPEN does not truncate a "
                             "load-bearing file on its own."
@@ -213,26 +214,60 @@ def reconcile_publication(
     CheckpointCatalog(publication_catalog_path(root)).publish(ref)
 
     manifest = read_manifest(directory / "manifest.json", mode="model_only")
-    expected_latest = {
-        "checkpoint_dir": directory.name,
-        "step": ref.next_iteration,
-        "created_at_unix": manifest.created_at_unix,
-    }
-    try:
-        latest = read_latest(root)
-    except (FileNotFoundError, ValueError):
-        latest = None
-    if latest != expected_latest:
+    latest_state = _validated_latest_target(root)
+    if latest_state is None:
         write_latest(
             root,
             directory,
             step=ref.next_iteration,
             created_at_unix=manifest.created_at_unix,
         )
+    else:
+        latest_target, latest_pointer = latest_state
+        if latest_target.next_iteration < ref.next_iteration or (
+            latest_target.next_iteration == ref.next_iteration
+            and latest_pointer
+            != {
+                "checkpoint_dir": directory.name,
+                "step": ref.next_iteration,
+                "created_at_unix": manifest.created_at_unix,
+            }
+        ):
+            write_latest(
+                root,
+                directory,
+                step=ref.next_iteration,
+                created_at_unix=manifest.created_at_unix,
+            )
     backfill_publication_receipt(
         ref, directory, manifest.files, publication_receipt_path(root)
     )
     return ref
+
+
+def _validated_latest_target(
+    checkpoint_root: Path,
+) -> tuple[CheckpointRef, dict[str, Any]] | None:
+    """Return the validated checkpoint and raw pointer, if usable.
+
+    ``latest.json`` is a convenience pointer: its ``step`` and timestamp are
+    not ordering authorities.  The existing resolver deliberately accepts the
+    same absolute and relative target representations as restore, while the
+    checkpoint reference validates the complete directory and derives the
+    authoritative step from its manifest.  A malformed pointer or target is
+    treated as missing so reconciliation can repair it to the committed
+    checkpoint it was given.
+    """
+
+    try:
+        pointer = read_latest(checkpoint_root)
+        target_value = pointer.get("checkpoint_dir")
+        if not isinstance(target_value, str) or not target_value:
+            return None
+        target = resolve_checkpoint_dir(checkpoint_root / LATEST_JSON)
+        return CheckpointRef.from_directory(target), pointer
+    except (FileNotFoundError, ValueError):
+        return None
 
 
 def _deserialize_record(record: Any, *, path: Path, line_number: int) -> CheckpointRef:
