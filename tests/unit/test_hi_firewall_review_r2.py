@@ -525,7 +525,23 @@ def test_hi_firewall_review_r2_follower_equals_the_grammar_or_refuses() -> None:
     ]
     corpus += [(k, v[0], "experiment.name") for k, v in sorted(_NOW_FOLLOWABLE.items())]
 
+    # INDEPENDENT LITERALS. Equality with OmegaConf is PARTIALLY SELF-ANCHORED:
+    # where delegation is total it asserts the delegate equals itself, so it
+    # catches divergence only where we wrap or filter the answer. These expected
+    # values are written out HERE and are not read from production, so if the
+    # follower and OmegaConf ever moved together this arm would still notice.
+    EXPECTED = {
+        "rel-empty-key": FAMILY,
+        "ws-verbatim-key": FAMILY,
+        "ws-padded-key": FAMILY,
+        "schema-side": HI_TRAIN_SCHEMA,
+        "whitespace-padded": FAMILY,
+        "relative-sibling": FAMILY,
+        "mid-segment-interpolation": FAMILY,
+    }
+
     disagreements: list[str] = []
+    unanchored: list[str] = []
     determined = 0
     for name, body, path in corpus:
         cfg = OmegaConf.create(body)
@@ -536,8 +552,16 @@ def test_hi_firewall_review_r2_follower_equals_the_grammar_or_refuses() -> None:
         reference = OmegaConf.select(cfg, path)
         if identity.value != reference:
             disagreements.append(f"{name}: follower={identity.value!r} grammar={reference!r}")
+        if name not in EXPECTED:
+            unanchored.append(name)
+        elif identity.value != EXPECTED[name]:
+            disagreements.append(f"{name}: follower={identity.value!r} expected={EXPECTED[name]!r}")
 
     assert not disagreements, disagreements
+    assert not unanchored, (
+        f"{unanchored} have no independent expected value, so for them this arm "
+        "asserts only that the delegate equals itself"
+    )
     assert determined >= len(corpus) - 1, (
         f"only {determined} of {len(corpus)} carriers were determined; an "
         "equivalence sweep that refuses almost everything proves little"
@@ -669,10 +693,14 @@ def test_hi_firewall_review_r2_a_cached_resolver_is_not_served_from_its_cache() 
 
     calls: list[Any] = []
     name = "cached.probe.r3"
-    OmegaConf.register_new_resolver(name, lambda *a: calls.append(a) or FAMILY, use_cache=True, replace=True)
+    # An ORDINARY LITERAL, not FAMILY: this arm's subject is cache
+    # behaviour, so its oracle must not ride on a production constant
+    # that would move with the config it is compared against.
+    token = "cache-probe-token"
+    OmegaConf.register_new_resolver(name, lambda *a: calls.append(a) or token, use_cache=True, replace=True)
 
     warm = OmegaConf.select(OmegaConf.create({"experiment": {"name": f"${{{name}:k}}"}}), "experiment.name")
-    assert warm == FAMILY
+    assert warm == token
     assert len(calls) == 1, "the cache was never populated; the arm would be vacuous"
 
     identity = identity_without_execution(
@@ -759,13 +787,21 @@ def test_hi_firewall_review_r2_a_cycle_refuses_rather_than_escaping(
     """
 
     cfg = OmegaConf.create(dict(body))
+    calls: list[Any] = []
+    original = config_module.basis_feature_dim
+    OmegaConf.register_new_resolver(RESOLVER, lambda *a: calls.append(a) or 1, replace=True)
+    try:
+        identity = identity_without_execution(cfg, "experiment.name")
+        with pytest.raises(ClosedSchemaError) as caught:
+            validate_hi_train_config(cfg, env={})
+    finally:
+        OmegaConf.register_new_resolver(RESOLVER, original, replace=True)
 
-    identity = identity_without_execution(cfg, "experiment.name")
     assert not identity.determined, shape
-
-    with pytest.raises(ClosedSchemaError) as caught:
-        validate_hi_train_config(cfg, env={})
     assert "undeterminable-identity" in {r.rule for r in caught.value.rejections}
+    # REFUSING IS HALF THE PROPERTY. A cycle that refused by grinding through
+    # the graph and executing on the way would satisfy the assertion above.
+    assert calls == [], f"{shape} executed a resolver while refusing"
 
 
 def test_hi_firewall_review_r2_a_recursion_bound_refuses_rather_than_escaping() -> None:
@@ -782,13 +818,19 @@ def test_hi_firewall_review_r2_a_recursion_bound_refuses_rather_than_escaping() 
         body[f"n{index}"] = "${n%d}" % (index + 1)
     body["n200"] = FAMILY
 
-    identity = identity_without_execution(OmegaConf.create(body), "experiment.name")
+    calls: list[Any] = []
+    original = config_module.basis_feature_dim
+    OmegaConf.register_new_resolver(RESOLVER, lambda *a: calls.append(a) or 1, replace=True)
+    try:
+        identity = identity_without_execution(OmegaConf.create(body), "experiment.name")
+        with pytest.raises(ClosedSchemaError) as caught:
+            validate_hi_train_config(OmegaConf.create(body), env={})
+    finally:
+        OmegaConf.register_new_resolver(RESOLVER, original, replace=True)
 
     assert not identity.determined
-
-    with pytest.raises(ClosedSchemaError) as caught:
-        validate_hi_train_config(OmegaConf.create(body), env={})
     assert "undeterminable-identity" in {r.rule for r in caught.value.rejections}
+    assert calls == [], "the recursion bound was reached by executing something"
 
 
 @pytest.mark.parametrize(
