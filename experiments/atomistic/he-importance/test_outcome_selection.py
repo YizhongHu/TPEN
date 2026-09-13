@@ -500,6 +500,26 @@ def test_canonical_digest_is_sha256_of_production_canonical_bytes() -> None:
     assert selection._canonical_digest({"k": "v"}) == expected
 
 
+def test_b_class_residue_survives_projection_route_mutant() -> None:
+    # These five observations intentionally exercise the production encoder
+    # directly.  The paired mutation measurement changes only the route to it.
+    test_separator_oracle_is_compact_and_sorted()
+    test_canonical_encoder_uses_ascii_escaped_strings()
+    test_canonical_encoder_orders_raw_keys_before_ascii_escaping()
+    test_canonical_digest_is_sha256_of_production_canonical_bytes()
+    test_canonical_bytes_distinguish_scalar_and_sequence_spellings()
+
+
+def test_b_class_residue_kills_encoder_mutant() -> None:
+    # The same five observations must die when the production encoder changes;
+    # the mutation harness separately asserts that its edit actually applied.
+    test_separator_oracle_is_compact_and_sorted()
+    test_canonical_encoder_uses_ascii_escaped_strings()
+    test_canonical_encoder_orders_raw_keys_before_ascii_escaping()
+    test_canonical_digest_is_sha256_of_production_canonical_bytes()
+    test_canonical_bytes_distinguish_scalar_and_sequence_spellings()
+
+
 @pytest.mark.parametrize("coverage", [math.nextafter(0.0, 1.0), math.nextafter(1.0, 0.0)])
 def test_interval_contract_accepts_open_unit_coverage_boundaries(coverage: float) -> None:
     contract = selection.IntervalContract("mean", "two-sided-t", coverage, "holm")
@@ -603,17 +623,124 @@ def test_canonical_bytes_distinguish_scalar_and_sequence_spellings() -> None:
         ([2, 1], b"[2,1]"),
     ]
     for value, expected in cases:
-        assert selection._canonical_bytes(value) == expected
-    assert selection._canonical_bytes([1, 2]) != selection._canonical_bytes([1, 2, 1])
+        projected = selection.project_content(selection.freeze_content({"value": value}))["value"]
+        assert selection._canonical_bytes(projected) == expected
+    left = selection.project_content(selection.freeze_content({"value": [1, 2]}))["value"]
+    right = selection.project_content(selection.freeze_content({"value": [1, 2, 1]}))["value"]
+    assert selection._canonical_bytes(left) != selection._canonical_bytes(right)
 
 
-@pytest.mark.parametrize("criteria", [{"topology": object()}, {"topology": [object()]}, {"topology": {"nested": object()}}, [object()]])
-def test_topology_root_variants_are_refused(criteria: object) -> None:
+def test_projection_preserves_sequence_multiplicity() -> None:
+    projected = selection.project_content(selection.freeze_content({"value": [1, 1]}))["value"]
+    assert projected == [1, 1]
+    assert selection._canonical_bytes(projected) == b"[1,1]"
+
+
+def test_projection_preserves_bool_int_distinction() -> None:
+    bool_value = selection.project_content(selection.freeze_content({"value": True}))
+    int_value = selection.project_content(selection.freeze_content({"value": 1}))
+    assert type(bool_value["value"]) is bool
+    assert type(int_value["value"]) is int
+    assert selection._canonical_bytes(bool_value) != selection._canonical_bytes(int_value)
+
+
+def test_selection_commitment_freezes_first_source_view() -> None:
+    class Changing(dict):
+        reads = 0
+
+        def items(self):
+            self.reads += 1
+            return [("value", self.reads)]
+
+    source = Changing()
+    commitment = selection.SelectionCommitment.create(
+        ("cell-a",), source, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    )
+    assert source.reads == 1
+    assert selection.project_content(commitment.criteria) == {"value": 1}
+    commitment.verify()
+
+
+def test_direct_constructor_rejects_criteria_after_init() -> None:
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        selection.SelectionCommitment(
+            ("cell-a",), {"eligibility": "x"}, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm"), "0" * 64, "0" * 64
+        )
+    assert caught.value.refusal is selection.OutcomeRefusal.CRITERIA_DIGEST_MISMATCH
+
+
+def test_direct_constructor_rejects_prereg_after_init() -> None:
+    criteria_digest = selection._canonical_digest({"eligibility": "x"})
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        selection.SelectionCommitment(
+            ("cell-a",), {"eligibility": "x"}, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm"), criteria_digest, "0" * 64
+        )
+    assert caught.value.refusal is selection.OutcomeRefusal.PREREGISTRATION_DIGEST_MISMATCH
+
+
+def test_first_measurement_rejects_cidns_sequence() -> None:
     with pytest.raises(selection.OutcomeSelectionError) as caught:
         selection.SelectionCommitment.create(
-            ("cell-a",), criteria, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+            1, {"eligibility": "x"}, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
         )
-    assert caught.value.refusal is selection.ContentRefusal.CONTENT_KIND_UNDECLARED
+    assert caught.value.refusal is selection.OutcomeRefusal.CANDIDATE_ID_NOT_STRING
+
+
+def test_first_measurement_rejects_ind_postinit() -> None:
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        selection.SelectionCommitment(
+            ("cell-a",), {"eligibility": "x"}, object(), "0" * 64, "0" * 64
+        )
+    assert caught.value.refusal is selection.OutcomeRefusal.INTERVAL_NOT_DECLARED
+
+
+def test_first_measurement_rejects_ind_create() -> None:
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        selection.SelectionCommitment.create(("cell-a",), {"eligibility": "x"}, object())
+    assert caught.value.refusal is selection.OutcomeRefusal.INTERVAL_NOT_DECLARED
+
+
+def test_first_measurement_rejects_ind_verify() -> None:
+    commitment = selection.SelectionCommitment.create(
+        ("cell-a",), {"eligibility": "x"}, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    )
+    object.__setattr__(commitment, "interval", object())
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        commitment.verify()
+    assert caught.value.refusal is selection.OutcomeRefusal.INTERVAL_NOT_DECLARED
+
+
+def test_projection_accepts_genuine_ddp(tmp_path: Path) -> None:
+    packet_module = importlib.import_module("experiments.atomistic.he-importance.inference_packet")
+    base = _completed_packet(tmp_path, 87)
+    distributed = packet_module.DistributedCheckpointProvenance(
+        world_size=1, rank_artifacts={0: base.checkpoint.checkpoint_path / "rank-0.pt"}
+    )
+    packet = packet_module.InferencePacket(
+        checkpoint=base.checkpoint,
+        independent_sampler_inputs=base.independent_sampler_inputs,
+        chains=base.chains,
+        distributed_checkpoint=distributed,
+    )
+    outcome = selection.CellOutcome("cell-a", packet, 1.0)
+    assert outcome.packet.distributed_checkpoint is distributed
+
+
+@pytest.mark.parametrize(
+    "criteria",
+    [
+        {"topology": {"ranks": 8}},
+        {"schema": "unrelated/v1", "topology": {"ranks": 8}},
+        {"nested": [{"schema": "he-importance/train/v1", "topology": {"ranks": 8}}]},
+        {"outer": {"schema": "he-importance/train/v1", "topology": {"ranks": 8}}},
+    ],
+)
+def test_topology_root_variants_are_preserved(criteria: object) -> None:
+    commitment = selection.SelectionCommitment.create(
+        ("cell-a",), criteria, selection.IntervalContract("mean", "two-sided-t", 0.95, "holm")
+    )
+    commitment.verify()
+    assert selection.project_content(commitment.criteria) == criteria
 
 
 def test_unknown_carriers_are_refused_on_the_selection_route() -> None:
