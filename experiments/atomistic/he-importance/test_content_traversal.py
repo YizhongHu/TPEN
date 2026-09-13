@@ -130,10 +130,41 @@ def test_surrogate_pair_key_spelling_is_refused() -> None:
 
 
 def test_distinct_admitted_unicode_scalars_have_distinct_utf8_and_canonical_bytes() -> None:
+    selection_spec = importlib.util.spec_from_file_location(
+        "he_importance_selection_for_unicode_oracle", Path(__file__).with_name("outcome_selection.py")
+    )
+    assert selection_spec is not None and selection_spec.loader is not None
+    selection = importlib.util.module_from_spec(selection_spec)
+    sys.modules.update({selection_spec.name: selection})
+    selection_spec.loader.exec_module(selection)
     first, second = chr(0x1F600), chr(0x1F601)
     assert first.encode("utf-8") == b"\xf0\x9f\x98\x80"
     assert second.encode("utf-8") == b"\xf0\x9f\x98\x81"
     assert first.encode("utf-8") != second.encode("utf-8")
+    literal_escape = r"\u00e9"
+    actual = "é"
+    actual_bytes = selection._canonical_bytes(content.project_content(content.freeze_content({"value": actual})))
+    literal_bytes = selection._canonical_bytes(content.project_content(content.freeze_content({"value": literal_escape})))
+    assert actual_bytes != literal_bytes
+
+
+def test_projection_admits_structure_beyond_depth_six() -> None:
+    value: object = "leaf"
+    for _ in range(7):
+        value = [value]
+    assert content.project_content(content.freeze_content(value, content._ARRAY), content._ARRAY) == [[[[[[["leaf"]]]]]]]
+
+
+def test_projection_admits_more_than_8192_leaves() -> None:
+    value = [0] * 8193
+    projected = content.project_content(content.freeze_content(value, content._ARRAY), content._ARRAY)
+    assert len(projected) == 8193
+    assert projected[-1] == 0
+
+
+def test_projection_preserves_negative_finite_numeric_value() -> None:
+    value = {"negative": -1.25}
+    assert content.project_content(content.freeze_content(value)) == value
 
 def test_nonfinite_scalars_are_refused() -> None:
     for value in (float("nan"), float("inf"), float("-inf")):
