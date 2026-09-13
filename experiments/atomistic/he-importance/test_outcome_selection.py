@@ -200,6 +200,16 @@ def test_interval_contract_rejects_each_empty_name(field: str) -> None:
     assert caught.value.refusal is selection.OutcomeRefusal.INTERVAL_NOT_DECLARED
 
 
+@pytest.mark.parametrize("field", ["estimator", "interval_form", "multiplicity_method"])
+def test_interval_contract_rejects_each_missing_declaration(field: str) -> None:
+    """Missing name values are distinct from present-but-empty names."""
+    fields = {"estimator": "mean", "interval_form": "two-sided-t", "coverage": 0.95, "multiplicity_method": "holm"}
+    fields[field] = None
+    with pytest.raises(selection.OutcomeSelectionError) as caught:
+        selection.IntervalContract(**fields)
+    assert caught.value.refusal is selection.OutcomeRefusal.INTERVAL_NOT_DECLARED
+
+
 @pytest.mark.parametrize(
     ("candidate_ids", "refusal"),
     [
