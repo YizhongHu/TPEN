@@ -80,7 +80,7 @@ copy_receipts() {
         local root=$1
         find "$root" -type d \( \
             -path "$root/natural" -o -path "$root/reverse" -o \
-            -path "$root/venv-*" -o -path "$root/uv-cache-*" -o \
+            -name 'venv-*' -o -name 'uv-cache-*' -o \
             -name .git -o -name wheels -o -name wheel \
         \) -prune -o -type f -print0
     }
@@ -99,32 +99,27 @@ copy_receipts() {
         echo 'COPYBACK_EXCLUSION_SELF_TEST=exact find -name prune expression'
         if printf '%s\n' "$probe_files" | grep -Fq "$probe/venv-natural/lib/torch.so"; then
             echo 'SELF_TEST_FAIL top-level venv-natural was reachable'
-            rm -rf -- "$probe"
-            return 97
+            self_test_failed=1
         fi
         echo 'SELF_TEST_PASS top-level venv-natural excluded'
         if printf '%s\n' "$probe_files" | grep -Fq "$probe/uv-cache-natural/archive-v0/libtorch_cpu.so"; then
             echo 'SELF_TEST_FAIL top-level uv-cache-natural was reachable'
-            rm -rf -- "$probe"
-            return 97
+            self_test_failed=1
         fi
         echo 'SELF_TEST_PASS top-level uv-cache-natural excluded'
         if printf '%s\n' "$probe_files" | grep -Fq "$probe/sub/venv-natural/lib/foo.so"; then
             echo 'SELF_TEST_FAIL nested venv-natural was reachable'
-            rm -rf -- "$probe"
-            return 97
+            self_test_failed=1
         fi
         echo 'SELF_TEST_PASS nested venv-natural excluded'
         if printf '%s\n' "$probe_files" | grep -Fq "$probe/natural/tpen/nn/readout.py"; then
             echo 'SELF_TEST_FAIL checkout file was reachable'
-            rm -rf -- "$probe"
-            return 97
+            self_test_failed=1
         fi
         echo 'SELF_TEST_PASS checkout file excluded'
         if ! printf '%s\n' "$probe_files" | grep -Fq "$probe/evidence/natural/RUN_COMPLETE.marker"; then
             echo 'SELF_TEST_FAIL evidence marker was excluded'
-            rm -rf -- "$probe"
-            return 97
+            self_test_failed=1
         fi
         echo 'SELF_TEST_PASS evidence marker copied by default'
         self_report="$manifest.self-test"
@@ -136,14 +131,17 @@ copy_receipts() {
         done
         if ! grep -Fq 'SKIPPED venv-natural/lib/torch.so' "$self_report"; then
             echo 'SELF_TEST_FAIL excluded file reporting was silent'
-            rm -rf -- "$probe" "$self_report"
-            return 97
+            self_test_failed=1
         fi
         echo 'SELF_TEST_PASS excluded checkout/venv files produce SKIPPED manifest lines'
         cat "$self_report" >>"$manifest"
         rm -f -- "$self_report"
     } >>"$manifest"
     rm -rf -- "$probe"
+    if test "${self_test_failed:-0}" -ne 0; then
+        printf 'SELF_TEST_FAIL=copyback exclusion/reporting control\n' >>"$manifest"
+        preservation_failed=1
+    fi
     while IFS= read -r -d '' receipt; do
         relative=${receipt#"$RUN_ROOT/"}
         size=$(stat -c '%s' "$receipt") || {
@@ -152,7 +150,7 @@ copy_receipts() {
             continue
         }
         record_excluded "$relative" "$size" 'excluded-known-huge-class' >>"$manifest"
-    done < <(find "$RUN_ROOT" -type f \( -path "$RUN_ROOT/natural/*" -o -path "$RUN_ROOT/reverse/*" -o -path "$RUN_ROOT/venv-*/*" -o -path "$RUN_ROOT/uv-cache-*/*" \) -print0)
+    done < <(find "$RUN_ROOT" -type f \( -path "$RUN_ROOT/natural/*" -o -path "$RUN_ROOT/reverse/*" -o -path '*/venv-*/*' -o -path '*/uv-cache-*/*' \) -print0)
     while IFS= read -r -d '' receipt; do
         relative=${receipt#"$RUN_ROOT/"}
         size=$(stat -c '%s' "$receipt") || {

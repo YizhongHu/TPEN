@@ -241,7 +241,8 @@ def run(cmd, *, cwd, stdout, env, label, quota_root=None, quota_evidence=None, q
                     except OSError: pass
             end = f"END {label} RC={rc if rc is not None else 'LAUNCH_ERROR'} PEAK_RSS_CUMULATIVE_CHILDREN_LINUX_KIB={resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss}\n".encode()
             try: stream.write(end); stream.flush()
-            except OSError:
+            except OSError as exc:
+                capture_error = capture_error or f"LOG_WRITE_ERROR {exc!r}"
                 try: sys.stderr.buffer.write(end); sys.stderr.flush()
                 except OSError: pass
     except OSError as exc:
