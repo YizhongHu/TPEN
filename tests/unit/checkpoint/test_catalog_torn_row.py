@@ -40,7 +40,10 @@ def _manifest(step: int) -> dict[str, object]:
         "completed_updates": step - 1,
         "created_at_unix": 123.0,
         "files": {"model": "model.pt"},
-        "hashes": {},
+        "hashes": {
+            "model_config": "a" * 64,
+            "hamiltonian_config": "b" * 64,
+        },
         "runtime": {"device": "cpu", "dtype": "float64"},
         "provenance": {"run_id": "run", "git_sha": "deadbeef"},
     }
