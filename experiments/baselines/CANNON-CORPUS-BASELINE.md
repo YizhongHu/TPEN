@@ -49,3 +49,12 @@ retaining at least one node in every one of the 242 files is not excluded by a
 file-level census.
 
 NO CLAIM IS MADE ABOUT THE LIKELIHOOD OF THAT RESIDUAL.
+
+## Quota instrumentation limitation
+
+THE PATH-BEARING QUOTA-WRAPPER CORRECTION IS PAPER-ONLY AND UNTESTED: no
+allocation re-exercised it. CONSEQUENCE FOR CONSUMERS: THE QUOTA SNAPSHOTS IN
+JOB 46382195 CAPTURED A USAGE ERROR RATHER THAN QUOTA DATA - both `quota`
+calls omitted the required path argument and returned rc 2 - SO NO QUOTA
+HEADROOM FIGURE FROM THAT RUN IS MEANINGFUL. Only its `df` readings carry
+information.
