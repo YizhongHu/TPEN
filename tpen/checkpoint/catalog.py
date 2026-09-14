@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from tpen.artifacts import append_jsonl
 
-from .artifact import LATEST_JSON, read_latest, resolve_checkpoint_dir, write_latest
+from .artifact import (
+    LATEST_JSON,
+    checkpoint_step_dir_name,
+    read_latest,
+    resolve_checkpoint_dir,
+    write_latest,
+)
 from .receipt import backfill_publication_receipt, publication_receipt_path
 from .hashing import file_sha256
+from .manifest import CHECKPOINT_SCHEMA_VERSION
 from .reference import (
     CHECKPOINT_REF_SCHEMA,
     CheckpointRef,
@@ -22,6 +30,14 @@ from .schema import read_manifest
 
 PUBLICATION_CATALOG_FILENAME = "publications.jsonl"
 PUBLICATION_RECORD_SCHEMA = "tpen.checkpoint-publication/v1"
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedLatestTarget:
+    """The ordering fields needed from an already-published latest target."""
+
+    checkpoint_dir: Path
+    next_iteration: int
 
 
 class IncompletePublicationRecordError(ValueError):
@@ -248,7 +264,7 @@ def reconcile_publication(
 
 def _validated_latest_target(
     checkpoint_root: Path,
-) -> tuple[CheckpointRef, dict[str, Any]] | None:
+) -> tuple[_ValidatedLatestTarget, dict[str, Any]] | None:
     """Return the validated checkpoint and raw pointer, if usable.
 
     ``latest.json`` is a convenience pointer: its ``step`` and timestamp are
@@ -266,8 +282,37 @@ def _validated_latest_target(
         if not isinstance(target_value, str) or not target_value:
             return None
         target = resolve_checkpoint_dir(checkpoint_root / LATEST_JSON)
-        target_ref = CheckpointRef.from_directory(target)
         target_manifest = read_manifest(target / "manifest.json", mode="model_only")
+        # These declarations are mandatory at the existing-target validity
+        # boundary because restore_checkpoint rejects missing or null values.
+        # They are presence checks only: the target may legitimately have
+        # configuration hashes different from the older candidate's hashes.
+        for hash_name in ("model_config", "hamiltonian_config"):
+            if target_manifest.hashes.get(hash_name) is None:
+                raise ValueError(f"{target}: manifest missing {hash_name}")
+
+        if target_manifest.schema_version == CHECKPOINT_SCHEMA_VERSION:
+            target_ref = CheckpointRef.from_directory(target)
+            target_identity = _ValidatedLatestTarget(
+                checkpoint_dir=target_ref.checkpoint_dir,
+                next_iteration=target_ref.next_iteration,
+            )
+        else:
+            # CheckpointRef is intentionally v2-only for catalog publication.
+            # An already-selected v1 target is still a valid model_only restore;
+            # preserve it for latest ordering without publishing a v1 ref.
+            if target.name != checkpoint_step_dir_name(target_manifest.next_iteration):
+                raise ValueError(
+                    f"checkpoint path {target.name!r} disagrees with manifest "
+                    f"next_iteration {target_manifest.next_iteration}"
+                )
+            model_name = target_manifest.files["model"]
+            if not (target / model_name).is_file():
+                raise FileNotFoundError(f"checkpoint model payload not found: {target / model_name}")
+            target_identity = _ValidatedLatestTarget(
+                checkpoint_dir=target,
+                next_iteration=target_manifest.next_iteration,
+            )
         declared_model_digest = target_manifest.hashes.get("model_sha256")
         if declared_model_digest is not None:
             actual_model_digest = file_sha256(target / target_manifest.files["model"])
@@ -276,7 +321,7 @@ def _validated_latest_target(
                     f"{target}: model checkpoint file digest mismatch "
                     f"(manifest {declared_model_digest}, actual {actual_model_digest})"
                 )
-        return target_ref, pointer
+        return target_identity, pointer
     except (FileNotFoundError, ValueError, KeyError, TypeError, OverflowError):
         return None
 

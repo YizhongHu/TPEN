@@ -17,6 +17,7 @@ from omegaconf import OmegaConf
 
 import tpen.checkpoint.restore as restore_module
 import tpen.checkpoint.save as save_module
+import tpen.checkpoint.catalog as catalog_module
 from tpen.accelerator import current_accelerator_type, device_module
 from tpen.artifacts import ArtifactManager, RunClock, RunContext, RunMetadata
 from tpen.callback.checkpoint import Checkpoint
@@ -1439,6 +1440,257 @@ def test_digest_invalid_latest_target_is_repairable(tmp_path: Path) -> None:
         restored,
         {name: value.detach().clone() for name, value in older_model.state_dict().items()},
     )
+
+
+def test_restorable_schema_v1_newer_target_is_admitted(tmp_path: Path) -> None:
+    root, context, _, newer_model, older, newer = _prepare_real_reconcile_pair(tmp_path)
+    _rewrite_manifest_as_v1(newer)
+    latest_path = root / "latest.json"
+    latest_before = latest_path.read_bytes()
+
+    for restore_path in (root, latest_path):
+        restored = torch.nn.Linear(3, 2).double()
+        report = restore_checkpoint(
+            load={"path": str(restore_path), "mode": "model_only", "strict": True},
+            model=restored,
+            context=context,
+        )
+        assert report.schema_version == LEGACY_CHECKPOINT_SCHEMA_VERSION
+        assert restored_as(report, 9)
+        _assert_model_state_equal(
+            restored,
+            {name: value.detach().clone() for name, value in newer_model.state_dict().items()},
+        )
+
+    Checkpoint(root).handle_occurrence(
+        Occurrence(event=TrainingCompleted(), count=1),
+        context,
+        training_state(trainer=_ProgressTrainer(7, 7)),
+    )
+
+    row = {"older": older.name, "newer": newer.name}
+    assert latest_path.read_bytes() == latest_before, row
+    after = restore_checkpoint(
+        load={"path": str(latest_path), "mode": "model_only", "strict": True},
+        model=torch.nn.Linear(3, 2).double(),
+        context=context,
+    )
+    assert restored_as(after, 9), row
+
+
+@pytest.mark.parametrize("damage", ["absent", "null"])
+@pytest.mark.parametrize("hash_name", ["model_config", "hamiltonian_config"])
+def test_missing_restore_config_declaration_repairs_latest(
+    tmp_path: Path, hash_name: str, damage: str
+) -> None:
+    root, context, older_model, _, older, newer = _prepare_real_reconcile_pair(tmp_path)
+    manifest_path = newer / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if damage == "absent":
+        del manifest["hashes"][hash_name]
+    else:
+        manifest["hashes"][hash_name] = None
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    for restore_path in (root, root / "latest.json"):
+        with pytest.raises(ValueError, match=f"manifest missing {hash_name}"):
+            restore_checkpoint(
+                load={"path": str(restore_path), "mode": "model_only", "strict": True},
+                model=torch.nn.Linear(3, 2).double(),
+                context=context,
+            )
+
+    callback = Checkpoint(root)
+    callback.handle_occurrence(
+        Occurrence(event=TrainingCompleted(), count=1),
+        context,
+        training_state(trainer=_ProgressTrainer(7, 7)),
+    )
+
+    after = None
+    for restore_path in (root, root / "latest.json"):
+        restored = torch.nn.Linear(3, 2).double()
+        report = restore_checkpoint(
+            load={"path": str(restore_path), "mode": "model_only", "strict": True},
+            model=restored,
+            context=context,
+        )
+        _assert_model_state_equal(
+            restored,
+            {name: value.detach().clone() for name, value in older_model.state_dict().items()},
+        )
+        after = report
+    row = {"hash_name": hash_name, "damage": damage, "after": after}
+    assert restored_as(after, 7), row
+
+
+@pytest.mark.parametrize("damage", ["absent", "null"])
+@pytest.mark.parametrize("hash_name", ["model_config", "hamiltonian_config"])
+def test_schema_v1_missing_restore_config_declaration_repairs_latest(
+    tmp_path: Path, hash_name: str, damage: str
+) -> None:
+    root, context, older_model, _, older, newer = _prepare_real_reconcile_pair(tmp_path)
+    _rewrite_manifest_as_v1(newer)
+    manifest_path = newer / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if damage == "absent":
+        del manifest["hashes"][hash_name]
+    else:
+        manifest["hashes"][hash_name] = None
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    for restore_path in (root, root / "latest.json"):
+        with pytest.raises(ValueError, match=f"manifest missing {hash_name}"):
+            restore_checkpoint(
+                load={"path": str(restore_path), "mode": "model_only", "strict": True},
+                model=torch.nn.Linear(3, 2).double(),
+                context=context,
+            )
+
+    Checkpoint(root).handle_occurrence(
+        Occurrence(event=TrainingCompleted(), count=1),
+        context,
+        training_state(trainer=_ProgressTrainer(7, 7)),
+    )
+
+    after = None
+    for restore_path in (root, root / "latest.json"):
+        restored = torch.nn.Linear(3, 2).double()
+        report = restore_checkpoint(
+            load={"path": str(restore_path), "mode": "model_only", "strict": True},
+            model=restored,
+            context=context,
+        )
+        _assert_model_state_equal(
+            restored,
+            {name: value.detach().clone() for name, value in older_model.state_dict().items()},
+        )
+        after = report
+    row = {"damage": damage, "after": after}
+    assert restored_as(after, 7), row
+
+
+@pytest.mark.parametrize("config_section", ["model", "hamiltonian_terms"])
+def test_valid_newer_with_different_configuration_is_admitted(
+    tmp_path: Path, config_section: str
+) -> None:
+    root = tmp_path / "checkpoints"
+    older_context = _fully_initialized_context(tmp_path / "older-context")
+    newer_context = _fully_initialized_context(tmp_path / "newer-context")
+    if config_section == "model":
+        OmegaConf.update(newer_context.cfg, "model.out_features", 3, force_add=True)
+        older_model = torch.nn.Linear(3, 2).double()
+        newer_model = torch.nn.Linear(3, 3).double()
+    else:
+        OmegaConf.update(
+            newer_context.cfg,
+            "hamiltonian_terms.constant.value",
+            2.0,
+            force_add=True,
+        )
+        older_model = torch.nn.Linear(3, 2).double()
+        newer_model = torch.nn.Linear(3, 2).double()
+    older = _save_real_model_checkpoint(root, older_context, older_model, 7)
+    newer = _save_real_model_checkpoint(root, newer_context, newer_model, 9)
+    latest_path = root / "latest.json"
+    latest_before = latest_path.read_bytes()
+
+    Checkpoint(root).handle_occurrence(
+        Occurrence(event=TrainingCompleted(), count=1),
+        older_context,
+        training_state(trainer=_ProgressTrainer(7, 7)),
+    )
+
+    row = {"config_section": config_section, "older": older.name, "newer": newer.name}
+    assert latest_path.read_bytes() == latest_before, row
+    restored = torch.nn.Linear(3, 3 if config_section == "model" else 2).double()
+    after = restore_checkpoint(
+        load={"path": str(root), "mode": "model_only", "strict": True},
+        model=restored,
+        context=newer_context,
+    )
+    assert restored_as(after, 9), row
+    _assert_model_state_equal(
+        restored,
+        {name: value.detach().clone() for name, value in newer_model.state_dict().items()},
+    )
+
+
+def restored_as(report, expected_step: int) -> bool:
+    """Return whether a model-only restore reached the expected checkpoint."""
+
+    return report.next_iteration == expected_step
+
+
+@pytest.mark.parametrize("declaration", ["matching", "absent", "null", "empty", "mismatch"])
+def test_model_digest_declaration_boundary(tmp_path: Path, declaration: str) -> None:
+    root, context, _, newer_model, older, newer = _prepare_real_reconcile_pair(tmp_path)
+    manifest_path = newer / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if declaration == "matching":
+        pass
+    elif declaration == "absent":
+        del manifest["hashes"]["model_sha256"]
+    elif declaration == "null":
+        manifest["hashes"]["model_sha256"] = None
+    elif declaration == "empty":
+        manifest["hashes"]["model_sha256"] = ""
+    else:
+        manifest["hashes"]["model_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    Checkpoint(root).handle_occurrence(
+        Occurrence(event=TrainingCompleted(), count=1),
+        context,
+        training_state(trainer=_ProgressTrainer(7, 7)),
+    )
+
+    expected_step = 9 if declaration in {"matching", "absent", "null"} else 7
+    restored = torch.nn.Linear(3, 2).double()
+    after = restore_checkpoint(
+        load={"path": str(root), "mode": "model_only", "strict": True},
+        model=restored,
+        context=context,
+    )
+    if expected_step == 9:
+        _assert_model_state_equal(
+            restored,
+            {name: value.detach().clone() for name, value in newer_model.state_dict().items()},
+        )
+    row = {"declaration": declaration, "older": older.name, "after": after}
+    assert restored_as(after, expected_step), row
+
+
+def test_new_target_digest_io_failure_stays_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, context, _, newer_model, older, newer = _prepare_real_reconcile_pair(tmp_path)
+    healthy = torch.nn.Linear(3, 2).double()
+    healthy_report = restore_checkpoint(
+        load={"path": str(root), "mode": "model_only", "strict": True},
+        model=healthy,
+        context=context,
+    )
+    assert healthy_report.next_iteration == 9
+    _assert_model_state_equal(
+        healthy,
+        {name: value.detach().clone() for name, value in newer_model.state_dict().items()},
+    )
+
+    model_path = newer / "model.pt"
+    calls: list[Path] = []
+    injected = OSError("digest I/O failure")
+
+    def fail_new_target_digest(path: Path) -> str:
+        calls.append(Path(path))
+        raise injected
+
+    monkeypatch.setattr(catalog_module, "file_sha256", fail_new_target_digest)
+    with pytest.raises(OSError) as raised:
+        reconcile_publication(root, older)
+
+    assert calls == [model_path]
+    assert raised.value is injected
 
 
 @pytest.mark.parametrize("remove_model_digest", [False, True])
