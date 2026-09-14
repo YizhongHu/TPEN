@@ -445,6 +445,43 @@ def assert_selected_order_differs(results):
         raise RuntimeError("ORDER_MISMATCH: named natural and reverse arms did not differ")
 
 
+def scan_error_signatures(evidence, predicates, excluded_dir=None, excluded_files=()):
+    """Return signature matches, excluding only the supplied control paths."""
+    matches = []
+    excluded_files = set(excluded_files)
+    for path in sorted(evidence.rglob("*")):
+        if not path.is_file() or path in excluded_files or (excluded_dir is not None and excluded_dir in path.parents):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        found = [predicate for predicate in predicates if predicate in text]
+        if found:
+            matches.append({"path": str(path.relative_to(evidence)), "signatures": found})
+    return matches
+
+
+def check_error_sweep_control(predicates):
+    """Exercise matcher output with independent positive and empty cases."""
+    expected_predicates = ("LOG_WRITE_ERROR", "LAUNCH_ERROR", "LOG_OPEN_ERROR",
+                           "EDQUOT", "[Errno 122]", "Disk quota exceeded")
+    if tuple(predicates) != expected_predicates:
+        raise RuntimeError("write-error predicate list changed without updating its control")
+    with tempfile.TemporaryDirectory(prefix="corpus-sweep-control-") as directory:
+        root = Path(directory)
+        expected = []
+        for index, predicate in enumerate(predicates):
+            path = root / f"signature-{index}.log"
+            path.write_text(predicate + "\n", encoding="utf-8")
+            expected.append({"path": path.name, "signatures": [predicate]})
+        actual = scan_error_signatures(root, predicates)
+        if actual != expected:
+            raise RuntimeError(f"write-error matcher positive control failed: {actual!r}")
+        clean = root / "clean"
+        clean.mkdir()
+        if scan_error_signatures(clean, predicates):
+            raise RuntimeError("write-error matcher empty-tree control failed")
+    return {"positive": expected, "empty": []}
+
+
 def write_error_sweep(evidence):
     """Find real capture signatures while isolating the planted control."""
     predicates = ("LOG_WRITE_ERROR", "LAUNCH_ERROR", "LOG_OPEN_ERROR", "EDQUOT", "[Errno 122]", "Disk quota exceeded")
@@ -452,22 +489,15 @@ def write_error_sweep(evidence):
     control_dir.mkdir(parents=True, exist_ok=True)
     control = control_dir / "positive-control.log"
     report = evidence / "write-error-sweep-report.txt"
-    control.write_text("\n".join(predicates) + "\n", encoding="utf-8")
-    control_text = control.read_text(encoding="utf-8")
-    if not all(predicate in control_text for predicate in predicates):
-        raise RuntimeError("write-error sweep positive control did not discriminate")
-    matches = []
-    for path in sorted(evidence.rglob("*")):
-        if not path.is_file() or path == report or control_dir in path.parents:
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        found = [predicate for predicate in predicates if predicate in text]
-        if found:
-            matches.append({"path": str(path.relative_to(evidence)), "signatures": found})
+    control.write_text("LOG_WRITE_ERROR\n", encoding="utf-8")
+    control_result = check_error_sweep_control(predicates)
+    matches = scan_error_signatures(evidence, predicates, excluded_dir=control_dir,
+                                    excluded_files=(report,))
     report.write_text(
         f"PREDICATES={json.dumps(predicates)}\n"
         f"CONTROL_ISOLATED={control.relative_to(evidence)}\n"
-        f"CONTROL_HIT=PASS\nREAL_MATCHES={json.dumps(matches, sort_keys=True)}\n"
+        f"CONTROL_HIT=PASS\nCONTROL_MATCHES={json.dumps(control_result, sort_keys=True)}\n"
+        f"REAL_MATCHES={json.dumps(matches, sort_keys=True)}\n"
         f"REPORT_EXCLUDED={report.name}\n", encoding="utf-8")
     return {"predicates": predicates, "control_hit": True, "real_matches": matches,
             "report_excluded": str(report)}
