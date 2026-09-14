@@ -215,6 +215,8 @@ def check_status_receipt_control():
 
 def check_selected_order_control():
     """Prove the selected-order comparison rejects an equal pair."""
+    assert_selected_order_differs({"natural": {"collect_sequence": ["a"]},
+                                   "reverse": {"collect_sequence": ["b"]}})
     try:
         assert_selected_order_differs({"natural": {"collect_sequence": ["a"]},
                                        "reverse": {"collect_sequence": ["a"]}})
@@ -222,26 +224,35 @@ def check_selected_order_control():
         pass
     else:
         raise AssertionError("import-order equality control did not fail")
-    print("SELECTED_ORDER_EQUALITY_CONTROL=PASS")
+    print("SELECTED_ORDER_POLARITY_CONTROL=PASS")
     return 0
 
 
 def check_marker_control():
-    """Prove a refused completion-marker write fails closed."""
+    """Prove final-artifact failure leaves no marker and success leaves one."""
     with tempfile.TemporaryDirectory(prefix="corpus-marker-control-") as directory:
         marker = Path(directory) / "RUN_COMPLETE.marker"
+        evidence = Path(directory) / "evidence"
+        evidence.mkdir()
+        finalize_arm(evidence, marker, "clean\n", {})
+        if not marker.is_file():
+            raise AssertionError("clean final-artifact control did not write marker")
+        failed_marker = Path(directory) / "failed.marker"
+        def fail_final_artifact(*args, **kwargs):
+            raise OSError("forced final-artifact write failure")
         try:
-            write_completion_marker(marker, "control\n", writer=lambda *args, **kwargs: None)
-        except RuntimeError:
-            pass
+            finalize_arm(evidence, failed_marker, "failed\n", {}, artifact_writer=fail_final_artifact)
+        except OSError:
+            if failed_marker.exists():
+                raise AssertionError("marker was written after final-artifact failure")
         else:
-            raise AssertionError("marker-absence control was accepted")
-    print("MARKER_ABSENCE_CONTROL=PASS")
+            raise AssertionError("final-artifact failure control was accepted")
+    print("MARKER_PREDECESSOR_FAILURE_AND_SUCCESS_CONTROL=PASS")
     return 0
 
 
 def check_hostile_cache_control():
-    """Exercise arm's bound-versus-resolved cache check with inherited hostility."""
+    """Exercise arm's cache override and mismatch rejection through production."""
     with tempfile.TemporaryDirectory(prefix="corpus-cache-control-") as directory:
         root = Path(directory)
         source = root / "source"
@@ -256,32 +267,50 @@ def check_hostile_cache_control():
                                   text=True, capture_output=True).stdout.strip()
         old_source = os.environ.get("CORPUS_SOURCE")
         old_job = os.environ.get("SLURM_JOB_ID")
+        old_cache = os.environ.get("UV_CACHE_DIR")
         os.environ["CORPUS_SOURCE"] = str(source)
         os.environ["SLURM_JOB_ID"] = "cache-control"
+        inherited = "/tmp/hostile-inherited-cache"
+        os.environ["UV_CACHE_DIR"] = inherited
+        mode = {"value": "override"}
         def fake_step(cmd, *, cwd, stdout, env, label, **kwargs):
             if len(cmd) >= 3 and cmd[1:3] == ["cache", "dir"]:
                 stdout.parent.mkdir(parents=True, exist_ok=True)
-                stdout.write_text("BEGIN uv-cache-dir\n/tmp/hostile-inherited-cache\nEND uv-cache-dir RC=0\n", encoding="utf-8")
+                resolved = env["UV_CACHE_DIR"] if mode["value"] == "override" else "/tmp/wrong-cache"
+                stdout.write_text("BEGIN uv-cache-dir\n" + resolved + "\nEND uv-cache-dir RC=0\n", encoding="utf-8")
                 return {"rc": 0, "capture_error": None}
+            if len(cmd) >= 2 and cmd[1] == "sync" and mode["value"] == "override":
+                return {"rc": 1, "capture_error": None}
             return run(cmd, cwd=cwd, stdout=stdout, env=env, label=label, **kwargs)
         try:
             try:
                 arm("control", "natural", revision, root / "run", Path("/bin/true"), False, [], step_runner=fake_step)
             except RuntimeError as exc:
+                if "uv sync rc=1" not in str(exc):
+                    raise
+            else:
+                raise AssertionError("hostile inherited cache was not exercised")
+            payload = json.loads((root / "run" / "evidence" / "control" / "statuses.json").read_text(encoding="utf-8"))
+            if payload.get("uv_cache_dir_bound") != payload.get("uv_cache_dir_resolved"):
+                raise AssertionError("inherited cache override did not resolve to bound path")
+            if payload.get("uv_cache_dir_resolved") == inherited:
+                raise AssertionError("hostile inherited cache was not overridden")
+            mode["value"] = "mismatch"
+            try:
+                arm("control", "natural", revision, root / "run-mismatch", Path("/bin/true"), False, [], step_runner=fake_step)
+            except RuntimeError as exc:
                 if "uv cache resolved" not in str(exc):
                     raise
             else:
-                raise AssertionError("hostile-cache control did not reject a mismatched resolution")
+                raise AssertionError("cache mismatch polarity was accepted")
         finally:
-            if old_source is None:
-                os.environ.pop("CORPUS_SOURCE", None)
-            else:
-                os.environ["CORPUS_SOURCE"] = old_source
-            if old_job is None:
-                os.environ.pop("SLURM_JOB_ID", None)
-            else:
-                os.environ["SLURM_JOB_ID"] = old_job
-    print("HOSTILE_CACHE_CONTROL=PASS")
+            if old_source is None: os.environ.pop("CORPUS_SOURCE", None)
+            else: os.environ["CORPUS_SOURCE"] = old_source
+            if old_job is None: os.environ.pop("SLURM_JOB_ID", None)
+            else: os.environ["SLURM_JOB_ID"] = old_job
+            if old_cache is None: os.environ.pop("UV_CACHE_DIR", None)
+            else: os.environ["UV_CACHE_DIR"] = old_cache
+    print("HOSTILE_CACHE_OVERRIDE_AND_MISMATCH_CONTROL=PASS")
     return 0
 
 
@@ -401,6 +430,13 @@ def write_completion_marker(path, content, writer=Path.write_text):
     writer(path, content, encoding="utf-8")
     if not path.is_file() or path.stat().st_size == 0:
         raise RuntimeError(f"run completion marker write was not durable: {path}")
+
+
+def finalize_arm(evidence, marker, content, values, artifact_writer=write_status,
+                 marker_writer=write_completion_marker):
+    """Write the final arm artifact before its completion marker."""
+    artifact_writer(evidence, **values)
+    marker_writer(marker, content)
 
 
 def assert_selected_order_differs(results):
@@ -615,10 +651,11 @@ def arm(name, order, revision, root, uv, deliberate_red, quota_commands, step_ru
             for line in control_observations.read_text(encoding="utf-8").splitlines()
         ):
             raise RuntimeError(f"{name}: deliberate red failure was not extracted")
-    write_status(evidence, run_sweep=sweep, run_complete=False,
-                 emitted_plugin_check=emitted_plugin_check)
     marker = evidence / "RUN_COMPLETE.marker"
-    write_completion_marker(marker, f"RUN_COMPLETE arm={name} order={order} revision={measured}\n")
+    finalize_arm(evidence, marker,
+                 f"RUN_COMPLETE arm={name} order={order} revision={measured}\n",
+                 {"run_sweep": sweep, "run_complete": False,
+                  "emitted_plugin_check": emitted_plugin_check})
     return {
         "revision": measured, "tag_count": len(tag_count), "shallow": shallow,
         "collection_order": order, "collect_rc": collect_rc, "pytest_rc": pytest_rc,
