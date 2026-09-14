@@ -22,6 +22,12 @@ if test "$POSITIVE_CONTROL_VALUE" -ge "$MIN_SCRATCH_FREE_KIB"; then
     exit 73
 fi
 printf 'POSITIVE_CONTROL=threshold_can_fail_as_expected VALUE=%s\n' "$POSITIVE_CONTROL_VALUE"
+set +e
+false | cat >/dev/null
+PIPEFAIL_CONTROL_RC=$?
+set -e
+test "$PIPEFAIL_CONTROL_RC" -ne 0 || { echo 'pipefail control unexpectedly passed' >&2; exit 73; }
+printf 'POSITIVE_CONTROL=pipefail_detects_left_failure RC=%s\n' "$PIPEFAIL_CONTROL_RC"
 test "$SCRATCH_FREE_KIB" -ge "$MIN_SCRATCH_FREE_KIB" || {
     echo "insufficient node-local scratch: ${SCRATCH_FREE_KIB}KiB < ${MIN_SCRATCH_FREE_KIB}KiB" >&2
     exit 74
@@ -57,29 +63,38 @@ HOME_RECEIPT_DIR="$HOME/tpen-corpus-${SLURM_JOB_ID}"
 copy_receipts() {
     local outer_rc=$?
     local free_kib
+    local preservation_failed=0
     free_kib=$(df -Pk "$HOME" | awk 'NR == 2 {print $4}') || free_kib=UNKNOWN
     if ! mkdir -p "$HOME_RECEIPT_DIR"; then
         echo "cannot preserve receipt directory: $HOME_RECEIPT_DIR" >&2
-        return "$outer_rc"
+        exit 98
     fi
     printf 'HOME_FREE_KIB=%s\nRECEIPTS_HOME_DEVIATION=declared\nOUTER_RC=%s\n' "$free_kib" "$outer_rc" >"$HOME_RECEIPT_DIR/receipt-meta.txt"
     COPY_MAX_BYTES=$((10 * 1024 * 1024))
     manifest="$HOME_RECEIPT_DIR/copyback-manifest.txt"
     {
         printf 'COPY_POLICY=keep every regular file at or below %s bytes\n' "$COPY_MAX_BYTES"
-        echo 'EXCLUSIONS=checkout, .git, venv-*, uv-cache-* (including downloaded wheels), and files above threshold'
+        echo 'EXCLUSIONS=top-level natural/reverse checkouts, .git, venv-*, uv-cache-* (including downloaded wheels), and files above threshold'
     } >"$manifest"
+    copyback_files() {
+        local root=$1
+        find "$root" -type d \( \
+            -path "$root/natural" -o -path "$root/reverse" -o \
+            -path "$root/venv-*" -o -path "$root/uv-cache-*" -o \
+            -name .git -o -name wheels -o -name wheel \
+        \) -prune -o -type f -print0
+    }
     record_excluded() {
         printf 'SKIPPED %s size=%s reason=%s\n' "$1" "$2" "$3"
     }
     probe=$(mktemp -d "${TMPDIR:-/tmp}/corpus-copyback.XXXXXX")
     mkdir -p "$probe/venv-natural/lib" "$probe/uv-cache-natural/archive-v0" \
-             "$probe/natural/tpen/nn" "$probe/sub/venv-natural/lib" \
-             "$probe/natural/checkout/.git/objects"
+             "$probe/natural" "$probe/natural/tpen/nn" "$probe/evidence/natural" \
+             "$probe/sub/venv-natural/lib" "$probe/natural/.git/objects"
     touch "$probe/venv-natural/lib/torch.so" "$probe/uv-cache-natural/archive-v0/libtorch_cpu.so" \
           "$probe/natural/tpen/nn/readout.py" "$probe/sub/venv-natural/lib/foo.so" \
-          "$probe/natural/checkout/.git/objects/abcdef"
-    probe_files=$(find "$probe" -type d \( -name checkout -o -name .git -o -name 'venv-*' -o -name 'uv-cache-*' \) -prune -o -type f -print)
+          "$probe/natural/.git/objects/abcdef" "$probe/evidence/natural/RUN_COMPLETE.marker"
+    probe_files=$(copyback_files "$probe" | tr '\0' '\n')
     {
         echo 'COPYBACK_EXCLUSION_SELF_TEST=exact find -name prune expression'
         if printf '%s\n' "$probe_files" | grep -Fq "$probe/venv-natural/lib/torch.so"; then
@@ -100,34 +115,49 @@ copy_receipts() {
             return 97
         fi
         echo 'SELF_TEST_PASS nested venv-natural excluded'
-        if ! printf '%s\n' "$probe_files" | grep -Fq "$probe/natural/tpen/nn/readout.py"; then
-            echo 'SELF_TEST_FAIL ordinary source file was excluded'
+        if printf '%s\n' "$probe_files" | grep -Fq "$probe/natural/tpen/nn/readout.py"; then
+            echo 'SELF_TEST_FAIL checkout file was reachable'
             rm -rf -- "$probe"
             return 97
         fi
-        echo 'SELF_TEST_PASS ordinary source file copied by default'
-        report_line=$(record_excluded 'venv-natural/lib/torch.so' 1 'self-test-known-huge-class')
-        if ! printf '%s\n' "$report_line" | grep -Fq 'SKIPPED venv-natural/lib/torch.so'; then
+        echo 'SELF_TEST_PASS checkout file excluded'
+        if ! printf '%s\n' "$probe_files" | grep -Fq "$probe/evidence/natural/RUN_COMPLETE.marker"; then
+            echo 'SELF_TEST_FAIL evidence marker was excluded'
+            rm -rf -- "$probe"
+            return 97
+        fi
+        echo 'SELF_TEST_PASS evidence marker copied by default'
+        self_report="$manifest.self-test"
+        find "$probe" -type f \( -path "$probe/natural/*" -o -path "$probe/venv-*/*" -o -path "$probe/uv-cache-*/*" \) -print0 |
+        while IFS= read -r -d '' excluded; do
+            relative=$(printf '%s' "$excluded" | sed "s#^$probe/##")
+            printf 'SKIPPED %s size=%s reason=excluded-known-huge-class\n' \
+                "$relative" "$(stat -c '%s' "$excluded")" >>"$self_report"
+        done
+        if ! grep -Fq 'SKIPPED venv-natural/lib/torch.so' "$self_report"; then
             echo 'SELF_TEST_FAIL excluded file reporting was silent'
-            rm -rf -- "$probe"
+            rm -rf -- "$probe" "$self_report"
             return 97
         fi
-        printf '%s\n' "$report_line"
-        echo 'SELF_TEST_PASS top-level venv file produces a SKIPPED manifest line'
+        echo 'SELF_TEST_PASS excluded checkout/venv files produce SKIPPED manifest lines'
+        cat "$self_report" >>"$manifest"
+        rm -f -- "$self_report"
     } >>"$manifest"
     rm -rf -- "$probe"
     while IFS= read -r -d '' receipt; do
         relative=${receipt#"$RUN_ROOT/"}
         size=$(stat -c '%s' "$receipt") || {
             printf 'SKIPPED %s reason=stat-failed\n' "$relative" >>"$manifest"
+            preservation_failed=1
             continue
         }
         record_excluded "$relative" "$size" 'excluded-known-huge-class' >>"$manifest"
-    done < <(find "$RUN_ROOT" -type f \( -path '*/checkout/*' -o -path '*/.git/*' -o -path '*/venv-*/*' -o -path '*/uv-cache-*/*' \) -print0)
+    done < <(find "$RUN_ROOT" -type f \( -path "$RUN_ROOT/natural/*" -o -path "$RUN_ROOT/reverse/*" -o -path "$RUN_ROOT/venv-*/*" -o -path "$RUN_ROOT/uv-cache-*/*" \) -print0)
     while IFS= read -r -d '' receipt; do
         relative=${receipt#"$RUN_ROOT/"}
         size=$(stat -c '%s' "$receipt") || {
             printf 'SKIPPED %s reason=stat-failed\n' "$relative" >>"$manifest"
+            preservation_failed=1
             continue
         }
         if test "$size" -gt "$COPY_MAX_BYTES"; then
@@ -135,8 +165,11 @@ copy_receipts() {
             continue
         fi
         destination="$HOME_RECEIPT_DIR/$relative"
-        mkdir -p "${destination%/*}" || {
-            echo "cannot preserve receipt parent: ${destination%/*}" >&2
+        destination_parent=$(dirname "$destination")
+        mkdir -p "$destination_parent" || {
+            echo "cannot preserve receipt parent: $destination_parent" >&2
+            printf 'SKIPPED %s size=%s reason=parent-create-failed\n' "$relative" "$size" >>"$manifest"
+            preservation_failed=1
             continue
         }
         if cp "$receipt" "$destination"; then
@@ -144,8 +177,27 @@ copy_receipts() {
         else
             printf 'SKIPPED %s size=%s reason=copy-failed\n' "$relative" "$size" >>"$manifest"
             echo "cannot preserve receipt: $relative" >&2
+            preservation_failed=1
         fi
-    done < <(find "$RUN_ROOT" -type d \( -name checkout -o -name .git -o -name 'venv-*' -o -name 'uv-cache-*' \) -prune -o -type f -print0)
+    done < <(copyback_files "$RUN_ROOT")
+    if test "$preservation_failed" -eq 0; then
+        printf 'COPYBACK_COMPLETE=1\n' >>"$manifest"
+        if ! test -s "$manifest" || ! grep -Fq 'COPYBACK_COMPLETE=1' "$manifest"; then
+            preservation_failed=1
+        fi
+    else
+        printf 'COPYBACK_COMPLETE=0\n' >>"$manifest"
+    fi
+    if test "$preservation_failed" -ne 0; then
+        printf 'PRESERVATION_STATUS=FAILED\n' >>"$manifest"
+        echo 'required evidence copy-back failed' >&2
+        if test "$outer_rc" -eq 0; then
+            exit 98
+        fi
+    else
+        printf 'PRESERVATION_STATUS=COMPLETE\n' >>"$manifest"
+    fi
+    exit "$outer_rc"
 }
 trap copy_receipts EXIT
 printf 'BEGIN outer-uv COMMAND=%q run --no-project python %q --revision %q --run-root %q --uv %q --source %q\n' "$UV" "$HARNESS" "$REVISION" "$RUN_ROOT" "$UV" "$SOURCE" >>"$OUTER_LOG"

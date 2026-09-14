@@ -17,6 +17,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 
@@ -61,6 +62,9 @@ def pytest_collection_finish(session):
         "order": os.environ.get("CORPUS_COLLECTION_ORDER", "UNSET"),
         "selected_sequence": list(_SELECTED),
         "argv": list(session.config.invocation_params.args),
+        "effective_pytest_addopts": os.environ.get("PYTEST_ADDOPTS", ""),
+        "effective_selection_policy": os.environ.get("CORPUS_SELECTION_POLICY", "UNSET"),
+        "configured_addopts": list(session.config.getini("addopts")),
         "cwd": os.getcwd(),
         "rootdir": str(session.config.rootpath),
         "pytest_version": __import__("pytest").__version__,
@@ -115,6 +119,17 @@ def check_plugin_literal():
     raise AssertionError("deliberately broken plugin control was accepted")
 
 
+def check_emitted_plugin(path):
+    """Parse the payload file immediately after the arm emits it."""
+    source = path.read_text(encoding="utf-8")
+    ast.parse(source, filename=str(path))
+    try:
+        ast.parse(source + "\ndef deliberately_broken(:\n", filename="broken-emitted-plugin.py")
+    except SyntaxError:
+        return {"payload": "PASS", "broken_control": "PASS"}
+    raise AssertionError("emitted-plugin broken control was accepted")
+
+
 _OUTCOME_PRIORITY = {"passed": 0, "skipped": 1, "failed": 2, "error": 3}
 
 
@@ -126,13 +141,21 @@ def reduce_node_outcome(outcomes):
 
 
 def check_outcome_reducer_controls():
-    """Prove skip, teardown failure, and repeated subtest reports reduce safely."""
+    """Prove the canonical phase/subtest precedence on representative reports."""
     controls = {
+        "call-failed-teardown-error": ["passed", "failed", "error"],
+        "call-failed-teardown-passed": ["passed", "failed", "passed"],
+        "setup-error": ["error", "skipped", "passed"],
         "skip": ["passed", "skipped", "passed"],
-        "teardown-failure": ["passed", "passed", "error"],
-        "subtests": ["passed", "passed", "passed"],
+        "subtests": ["passed", "passed", "passed", "passed"],
     }
-    expected = {"skip": "skipped", "teardown-failure": "error", "subtests": "passed"}
+    expected = {
+        "call-failed-teardown-error": "error",
+        "call-failed-teardown-passed": "failed",
+        "setup-error": "error",
+        "skip": "skipped",
+        "subtests": "passed",
+    }
     reduced = {name: reduce_node_outcome(outcomes) for name, outcomes in controls.items()}
     if reduced != expected:
         raise AssertionError(f"outcome reducer controls failed: {reduced!r}")
@@ -140,14 +163,59 @@ def check_outcome_reducer_controls():
     return 0
 
 
+def check_status_receipt_control():
+    """Prove a nonzero sync status is durable before its caller raises."""
+    with tempfile.TemporaryDirectory(prefix="corpus-status-control-") as directory:
+        evidence = Path(directory)
+        write_status(evidence, sync_rc=1)
+        payload = json.loads((evidence / "statuses.json").read_text(encoding="utf-8"))
+        if payload.get("sync_rc") != 1:
+            raise AssertionError("sync failure receipt control did not retain rc=1")
+    print("STATUS_RECEIPT_CONTROL=PASS")
+    return 0
+
+
+def check_selected_order_control():
+    """Prove the selected-order comparison rejects an equal pair."""
+    def require_different(left, right):
+        if left == right:
+            raise AssertionError("equal import sequences must be rejected")
+
+    natural = ["module_a", "module_b"]
+    reverse = list(natural)
+    try:
+        require_different(natural, reverse)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("import-order equality control did not fail")
+    print("SELECTED_ORDER_EQUALITY_CONTROL=PASS")
+    return 0
+
+
+def check_nodeid_controls():
+    """Prove parameter punctuation remains part of one callable identity."""
+    actual = pair_for_nodeid("tests/test_x.py::test_y[a::b]")
+    expected = ("tests.test_x", "test_y[a::b]")
+    if actual != expected:
+        raise AssertionError(f"parameter punctuation mapping failed: {actual!r}")
+    print("NODEID_PARAMETER_PUNCTUATION_CONTROL=PASS")
+    return 0
+
+
 def run(cmd, *, cwd, stdout, env, label, quota_root=None, quota_evidence=None, quota_commands=(), cache_dir=None):
     """Run one step with a durable merged stream and an unambiguous result."""
-    stdout.parent.mkdir(parents=True, exist_ok=True)
+    capture_error = None
+    try:
+        stdout.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        capture_error = f"LOG_OPEN_ERROR {exc!r}"
     if quota_root is not None and quota_evidence is not None:
         safe_quota_snapshot(quota_root, quota_evidence, label + "-before", quota_commands, cache_dir or env.get("UV_CACHE_DIR", quota_root))
-    capture_error = None
     rc = None
     try:
+        if capture_error:
+            raise OSError(capture_error)
         with stdout.open("wb") as stream:
             begin = f"BEGIN {label} COMMAND={json.dumps(cmd)}\n".encode()
             stream.write(begin); stream.flush()
@@ -184,7 +252,7 @@ def run(cmd, *, cwd, stdout, env, label, quota_root=None, quota_evidence=None, q
         rc = 125
     if quota_root is not None and quota_evidence is not None:
         safe_quota_snapshot(quota_root, quota_evidence, label + "-after", quota_commands, cache_dir or env.get("UV_CACHE_DIR", quota_root))
-    return rc
+    return {"rc": rc, "capture_error": capture_error}
 
 
 def quota_snapshot(root, evidence, label, quota_commands, cache_dir):
@@ -236,21 +304,31 @@ def assert_complete_xml(path):
 
 
 def write_error_sweep(evidence):
-    """Exercise the sweep and exclude the report from its own searched set."""
-    predicate = "WRITE_ERROR_SWEEP_TRIGGER"
-    control = evidence / "write-error-positive-control.log"
+    """Find real capture signatures while isolating the planted control."""
+    predicates = ("LOG_WRITE_ERROR", "LAUNCH_ERROR", "LOG_OPEN_ERROR", "EDQUOT", "Disk quota exceeded")
+    control_dir = evidence / "write-error-control"
+    control_dir.mkdir(parents=True, exist_ok=True)
+    control = control_dir / "positive-control.log"
     report = evidence / "write-error-sweep-report.txt"
-    control.write_text(predicate + "\n", encoding="utf-8")
+    control.write_text("LOG_WRITE_ERROR\n", encoding="utf-8")
+    control_text = control.read_text(encoding="utf-8")
+    if not any(predicate in control_text for predicate in predicates):
+        raise RuntimeError("write-error sweep positive control did not discriminate")
     matches = []
     for path in sorted(evidence.rglob("*")):
-        if not path.is_file() or path == report:
+        if not path.is_file() or path == report or control_dir in path.parents:
             continue
-        if predicate in path.read_text(encoding="utf-8", errors="replace"):
-            matches.append(str(path.relative_to(evidence)))
-    report.write_text(f"PREDICATE={predicate}\nMATCHES={json.dumps(matches)}\n", encoding="utf-8")
-    if not matches:
-        raise RuntimeError("write-error sweep did not find positive control")
-    return {"predicate": predicate, "matches": matches, "report_excluded": str(report)}
+        text = path.read_text(encoding="utf-8", errors="replace")
+        found = [predicate for predicate in predicates if predicate in text]
+        if found:
+            matches.append({"path": str(path.relative_to(evidence)), "signatures": found})
+    report.write_text(
+        f"PREDICATES={json.dumps(predicates)}\n"
+        f"CONTROL_ISOLATED={control.relative_to(evidence)}\n"
+        f"CONTROL_HIT=PASS\nREAL_MATCHES={json.dumps(matches, sort_keys=True)}\n"
+        f"REPORT_EXCLUDED={report.name}\n", encoding="utf-8")
+    return {"predicates": predicates, "control_hit": True, "real_matches": matches,
+            "report_excluded": str(report)}
 
 
 def xml_pairs(path):
@@ -261,20 +339,26 @@ def xml_pairs(path):
 
 
 def xml_outcomes(path):
-    outcomes = {}
+    reports = {}
     for case in ET.parse(path).getroot().iter("testcase"):
         pair = (case.attrib.get("classname", ""), case.attrib.get("name", ""))
         children = {child.tag for child in case}
-        outcomes[pair] = "error" if "error" in children else "failed" if "failure" in children else "skipped" if "skipped" in children else "passed"
-    return outcomes
+        outcome = "error" if "error" in children else "failed" if "failure" in children else "skipped" if "skipped" in children else "passed"
+        reports.setdefault(pair, []).append(outcome)
+    return {pair: reduce_node_outcome(outcomes) for pair, outcomes in reports.items()}
 
 
 def pair_for_nodeid(nodeid):
     if "::" not in nodeid:
         return ("", nodeid.replace("/", ".").removesuffix(".py"))
-    module, *parts = nodeid.split("::")
+    callable_node = nodeid.split("[", 1)[0]
+    parameter = nodeid[len(callable_node):]
+    module, *parts = callable_node.split("::")
     dotted = module.replace("/", ".").removesuffix(".py")
-    return (".".join([dotted, *parts[:-1]]) if len(parts) > 1 else dotted, parts[-1])
+    if not parts:
+        return (dotted, parameter)
+    return (".".join([dotted, *parts[:-1]]) if len(parts) > 1 else dotted,
+            parts[-1] + parameter)
 
 
 def identity(checkout, uv, env, evidence, quota_commands):
@@ -288,11 +372,11 @@ def identity(checkout, uv, env, evidence, quota_commands):
         "print('PYTHONPATH='+os.environ.get('PYTHONPATH',''), flush=True)"
     )
     output = evidence / "identity-command.log"
-    rc = run([str(uv), "run", "--extra", "cpu", "--locked", "python", "-c", code],
+    step = run([str(uv), "run", "--extra", "cpu", "--locked", "python", "-c", code],
              cwd=checkout, stdout=output, env=env, label="identity",
              quota_root=evidence.parents[1], quota_evidence=evidence, quota_commands=quota_commands)
-    if rc != 0:
-        raise RuntimeError(f"identity command rc={rc}; see {output}")
+    if step["rc"] != 0 or step["capture_error"]:
+        raise RuntimeError(f"identity command rc={step['rc']} capture={step['capture_error']}; see {output}")
     return "\n".join(line for line in output.read_text(encoding="utf-8").splitlines()
                          if not line.startswith(("BEGIN ", "END "))) + "\n"
 
@@ -304,23 +388,33 @@ def arm(name, order, revision, root, uv, deliberate_red, quota_commands):
     envdir = root / ("venv-" + name)
     cachedir = root / ("uv-cache-" + name)
     env = os.environ.copy()
+    inherited_addopts = env.pop("PYTEST_ADDOPTS", "")
+    env["PYTEST_ADDOPTS"] = ""
     env.update({"UV_PROJECT_ENVIRONMENT": str(envdir), "UV_CACHE_DIR": str(cachedir), "PYTHONDONTWRITEBYTECODE": "1"})
+    env["CORPUS_SELECTION_POLICY"] = "PYTEST_ADDOPTS_SANITIZED"
     env["CORPUS_COLLECTION_ORDER"] = order
     env["PATH"] = str(envdir / "bin") + os.pathsep + env.get("PATH", "")
     env["PYTHONPATH"] = str(checkout) + os.pathsep + env.get("PYTHONPATH", "")
     if os.environ.get("SLURM_JOB_ID", "") == "":
         raise RuntimeError("SLURM_JOB_ID is required before any test command")
-    write_status(evidence, arm=name, collection_order=order, sync_rc=None,
+    write_status(evidence, arm=name, collection_order=order,
+                 inherited_pytest_addopts=inherited_addopts,
+                 effective_pytest_addopts="",
+                 selection_policy="PYTEST_ADDOPTS_SANITIZED",
+                 sync_rc=None,
                  collect_rc=None, pytest_rc=None, control_rc=None)
     safe_quota_snapshot(root, evidence, "arm-before", quota_commands, cachedir)
     if not checkout.exists():
-        if run(["git", "clone", "--no-single-branch", os.environ["CORPUS_SOURCE"], str(checkout)], cwd=root,
+        step = run(["git", "clone", "--no-single-branch", os.environ["CORPUS_SOURCE"], str(checkout)], cwd=root,
                stdout=evidence / "git-clone.log", env=env, label="git-clone",
-               quota_root=root, quota_evidence=evidence, quota_commands=quota_commands) != 0:
+               quota_root=root, quota_evidence=evidence, quota_commands=quota_commands)
+        if step["rc"] != 0 or step["capture_error"]:
             raise RuntimeError("git clone failed")
-    if run(["git", "fetch", "--tags", "--all"], cwd=checkout, stdout=evidence / "git-fetch.log", env=env, label="git-fetch", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands) != 0:
+    step = run(["git", "fetch", "--tags", "--all"], cwd=checkout, stdout=evidence / "git-fetch.log", env=env, label="git-fetch", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands)
+    if step["rc"] != 0 or step["capture_error"]:
         raise RuntimeError("git fetch failed")
-    if run(["git", "checkout", "--detach", revision], cwd=checkout, stdout=evidence / "git-checkout.log", env=env, label="git-checkout", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands) != 0:
+    step = run(["git", "checkout", "--detach", revision], cwd=checkout, stdout=evidence / "git-checkout.log", env=env, label="git-checkout", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands)
+    if step["rc"] != 0 or step["capture_error"]:
         raise RuntimeError("git checkout failed")
     measured = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout, text=True, capture_output=True, check=True).stdout.strip()
     if measured != revision:
@@ -328,34 +422,42 @@ def arm(name, order, revision, root, uv, deliberate_red, quota_commands):
     tag_count = subprocess.run(["git", "tag", "--list"], cwd=checkout, text=True, capture_output=True, check=True).stdout.splitlines()
     shallow = subprocess.run(["git", "rev-parse", "--is-shallow-repository"], cwd=checkout, text=True, capture_output=True, check=True).stdout.strip()
     cache_log = evidence / "uv-cache-dir.log"
-    cache_rc = run([str(uv), "cache", "dir"], cwd=checkout, stdout=cache_log, env=env,
+    cache_step = run([str(uv), "cache", "dir"], cwd=checkout, stdout=cache_log, env=env,
                    label="uv-cache-dir", quota_root=root, quota_evidence=evidence,
                    quota_commands=quota_commands, cache_dir=cachedir)
+    cache_rc = cache_step["rc"]
     cache_lines = [line for line in cache_log.read_text(encoding="utf-8").splitlines()
                    if line and not line.startswith(("BEGIN ", "END "))]
     resolved_cache = cache_lines[-1] if cache_lines else "UNSET"
     write_status(evidence, uv_cache_dir_bound=str(cachedir), uv_cache_dir_resolved=resolved_cache,
-                 uv_cache_dir_rc=cache_rc)
-    if cache_rc != 0:
+                 uv_cache_dir_rc=cache_rc,
+                 uv_cache_capture_error=cache_step["capture_error"])
+    if cache_rc != 0 or cache_step["capture_error"]:
         raise RuntimeError(f"{name}: uv cache dir rc={cache_rc}")
-    sync_rc = run([str(uv), "sync", "--extra", "cpu", "--locked"], cwd=checkout, stdout=evidence / "uv-sync.log", env=env, label="uv-sync", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands)
-    write_status(evidence, sync_rc=sync_rc)
-    if sync_rc != 0:
+    if resolved_cache != str(cachedir):
+        raise RuntimeError(f"{name}: uv cache resolved to {resolved_cache!r}, expected bound {cachedir!s}")
+    sync_step = run([str(uv), "sync", "--extra", "cpu", "--locked"], cwd=checkout, stdout=evidence / "uv-sync.log", env=env, label="uv-sync", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands)
+    sync_rc = sync_step["rc"]
+    write_status(evidence, sync_rc=sync_rc, sync_capture_error=sync_step["capture_error"])
+    if sync_rc != 0 or sync_step["capture_error"]:
         raise RuntimeError(f"{name}: uv sync rc={sync_rc}")
     (evidence / "identity.txt").write_text(identity(checkout, uv, env, evidence, quota_commands) + f"REVISION={measured}\nTAG_COUNT={len(tag_count)}\nSHALLOW={shallow}\n", encoding="utf-8")
     plugin = checkout / "corpus_plugin.py"
     plugin.write_text(PLUGIN, encoding="utf-8")
+    emitted_plugin_check = check_emitted_plugin(plugin)
     (evidence / "command-provenance.txt").write_text("uv run --extra cpu --locked python -m pytest -q --junitxml=corpus.xml -p corpus_plugin --corpus-observations=observations.jsonl\n", encoding="utf-8")
     env["CORPUS_PHASE"] = "collect"
-    collect_rc = run([str(uv), "run", "--extra", "cpu", "--locked", "python", "-m", "pytest", "-q", "--collect-only", "-p", "corpus_plugin", "--corpus-observations=collect-observations.jsonl"], cwd=checkout, stdout=evidence / "collect.log", env=env, label="pytest-collect", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands)
-    write_status(evidence, collect_rc=collect_rc)
+    collect_step = run([str(uv), "run", "--extra", "cpu", "--locked", "python", "-m", "pytest", "-q", "--collect-only", "-p", "corpus_plugin", "--corpus-observations=collect-observations.jsonl"], cwd=checkout, stdout=evidence / "collect.log", env=env, label="pytest-collect", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands)
+    collect_rc = collect_step["rc"]
+    write_status(evidence, collect_rc=collect_rc, collect_capture_error=collect_step["capture_error"])
     for filename in ("collect-collected.txt", "collect-collection-skipped.txt", "collect-collection-metadata.json", "collect-observations.jsonl"):
         source = checkout / filename
         if source.exists():
             shutil.copy2(source, evidence / filename)
     env["CORPUS_PHASE"] = "run"
-    pytest_rc = run([str(uv), "run", "--extra", "cpu", "--locked", "python", "-m", "pytest", "-q", "--junitxml=corpus.xml", "-p", "corpus_plugin", "--corpus-observations=observations.jsonl"], cwd=checkout, stdout=evidence / "pytest.log", env=env, label="pytest-run", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands)
-    write_status(evidence, pytest_rc=pytest_rc)
+    pytest_step = run([str(uv), "run", "--extra", "cpu", "--locked", "python", "-m", "pytest", "-q", "--junitxml=corpus.xml", "-p", "corpus_plugin", "--corpus-observations=observations.jsonl"], cwd=checkout, stdout=evidence / "pytest.log", env=env, label="pytest-run", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands)
+    pytest_rc = pytest_step["rc"]
+    write_status(evidence, pytest_rc=pytest_rc, pytest_capture_error=pytest_step["capture_error"])
     if (checkout / "corpus.xml").exists():
         shutil.copy2(checkout / "corpus.xml", evidence / "corpus.xml")
     for filename in ("run-collected.txt", "run-collection-skipped.txt", "run-collection-metadata.json", "observations.jsonl"):
@@ -364,8 +466,10 @@ def arm(name, order, revision, root, uv, deliberate_red, quota_commands):
             shutil.copy2(source, evidence / filename)
     if collect_rc != 0:
         raise RuntimeError(f"{name}: collection instrument rc={collect_rc}")
-    if pytest_rc != 0:
-        raise RuntimeError(f"{name}: pytest rc={pytest_rc}")
+    if collect_step["capture_error"]:
+        raise RuntimeError(f"{name}: collection capture fault: {collect_step['capture_error']}")
+    if pytest_step["capture_error"]:
+        raise RuntimeError(f"{name}: pytest capture fault: {pytest_step['capture_error']}")
     assert_complete_xml(evidence / "corpus.xml")
     truncated_xml = evidence / "corpus-truncated.xml"
     xml_bytes = (evidence / "corpus.xml").read_bytes()
@@ -377,17 +481,21 @@ def arm(name, order, revision, root, uv, deliberate_red, quota_commands):
     else:
         raise RuntimeError(f"truncated JUnit was accepted: {truncated_xml}")
     sweep = write_error_sweep(evidence)
+    if sweep["real_matches"]:
+        write_status(evidence, run_sweep=sweep, corpus_complete=False)
+        raise RuntimeError(f"{name}: real capture-error signatures found; completeness invalid")
     if deliberate_red:
         control = checkout / "test_corpus_deliberate_red.py"
         control.write_text("def test_corpus_deliberate_red():\n    assert False, 'intentional corpus extraction control'\n", encoding="utf-8")
         env["CORPUS_PHASE"] = "control"
-        control_rc = run([str(uv), "run", "--extra", "cpu", "--locked", "python", "-m", "pytest", "-q", "-k", "test_corpus_deliberate_red", "--junitxml=deliberate-red.xml", "-p", "corpus_plugin", "--corpus-observations=deliberate-red-observations.jsonl"], cwd=checkout, stdout=evidence / "deliberate-red.log", env=env, label="deliberate-red", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands)
+        control_step = run([str(uv), "run", "--extra", "cpu", "--locked", "python", "-m", "pytest", "-q", "-k", "test_corpus_deliberate_red", "--junitxml=deliberate-red.xml", "-p", "corpus_plugin", "--corpus-observations=deliberate-red-observations.jsonl"], cwd=checkout, stdout=evidence / "deliberate-red.log", env=env, label="deliberate-red", quota_root=root, quota_evidence=evidence, quota_commands=quota_commands)
+        control_rc = control_step["rc"]
         shutil.copy2(control, evidence / control.name)
         shutil.copy2(checkout / "deliberate-red.xml", evidence / "deliberate-red.xml")
         shutil.copy2(checkout / "deliberate-red-observations.jsonl", evidence / "deliberate-red-observations.jsonl")
-        (evidence / "deliberate-red-status.txt").write_text(f"INNER_RC={control_rc}\n", encoding="utf-8")
-        write_status(evidence, control_rc=control_rc)
-        if control_rc != 1:
+        (evidence / "deliberate-red-status.txt").write_text(f"INNER_RC={control_rc}\nCAPTURE_ERROR={control_step['capture_error']}\n", encoding="utf-8")
+        write_status(evidence, control_rc=control_rc, control_capture_error=control_step["capture_error"])
+        if control_rc != 1 or control_step["capture_error"]:
             raise RuntimeError(f"{name}: deliberate red rc={control_rc}, expected 1")
         control_pairs = xml_pairs(evidence / "deliberate-red.xml")
         control_xml = xml_outcomes(evidence / "deliberate-red.xml")
@@ -401,9 +509,14 @@ def arm(name, order, revision, root, uv, deliberate_red, quota_commands):
             for line in control_observations.read_text(encoding="utf-8").splitlines()
         ):
             raise RuntimeError(f"{name}: deliberate red failure was not extracted")
-    write_status(evidence, run_sweep=sweep, run_complete=False)
-    (evidence / "RUN_COMPLETE.marker").write_text(
+    write_status(evidence, run_sweep=sweep, run_complete=False,
+                 emitted_plugin_check=emitted_plugin_check)
+    marker = evidence / "RUN_COMPLETE.marker"
+    marker.write_text(
         f"RUN_COMPLETE arm={name} order={order} revision={measured}\n", encoding="utf-8")
+    if not marker.is_file() or marker.stat().st_size == 0:
+        write_status(evidence, run_complete=False)
+        raise RuntimeError(f"{name}: run completion marker write was not durable")
     return {
         "revision": measured, "tag_count": len(tag_count), "shallow": shallow,
         "collection_order": order, "collect_rc": collect_rc, "pytest_rc": pytest_rc,
@@ -438,6 +551,11 @@ def main():
     args = parser.parse_args()
     if not os.environ.get("SLURM_JOB_ID"):
         parser.error("must run inside a Slurm allocation")
+    check_outcome_reducer_controls()
+    check_status_receipt_control()
+    check_selected_order_control()
+    check_nodeid_controls()
+    check_plugin_literal()
     args.run_root.mkdir(parents=True, exist_ok=True)
     os.environ["CORPUS_SOURCE"] = args.source
     results = {}
@@ -447,13 +565,17 @@ def main():
             raise ValueError
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         parser.error(f"--quota-spec must be JSON list of three argv lists: {exc}")
-    results["natural"] = arm("natural", "natural", args.revision, args.run_root, args.uv, True, quota_commands)
-    results["reverse"] = arm("reverse", "reverse", args.revision, args.run_root, args.uv, False, quota_commands)
+    arm_errors = {}
+    for arm_name, arm_order, red in (("natural", "natural", True), ("reverse", "reverse", False)):
+        try:
+            results[arm_name] = arm(arm_name, arm_order, args.revision, args.run_root, args.uv, red, quota_commands)
+        except Exception as exc:
+            arm_errors[arm_name] = repr(exc)
+            evidence = args.run_root / "evidence" / arm_name
+            if (evidence / "statuses.json").exists():
+                write_status(evidence, arm_error=repr(exc))
     for result in results.values():
         result["xml_outcomes"] = {(row["classname"], row["name"]): row["outcome"] for row in result["xml_outcomes"]}
-        result["failed"] = []
-        result["errors"] = []
-        result["skipped"] = []
         evidence = args.run_root / "evidence" / result["collection_order"]
         if not (evidence / "RUN_COMPLETE.marker").exists():
             raise RuntimeError(f"missing run-level completion marker for {result['collection_order']}")
@@ -463,52 +585,42 @@ def main():
             metadata = json.loads((evidence / filename).read_text(encoding="utf-8"))
             if metadata["order"] != result["collection_order"]:
                 raise RuntimeError(f"collection metadata order mismatch for {result['collection_order']}")
-        for filename in ("collect-observations.jsonl", "observations.jsonl"):
-            observation_file = evidence / filename
-            if not observation_file.exists():
-                raise RuntimeError(f"missing required observation artifact: {observation_file}")
-            for line in observation_file.read_text(encoding="utf-8").splitlines():
-                row = json.loads(line)
-                target = {"failed": "failed", "error": "errors", "skipped": "skipped"}.get(row["outcome"])
-                if target:
-                    result[target].append(row["nodeid"])
+        observation_file = evidence / "observations.jsonl"
+        if not observation_file.exists():
+            raise RuntimeError(f"missing required observation artifact: {observation_file}")
+        observed_reports = {}
+        for line in observation_file.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            observed_reports.setdefault(row["nodeid"], []).append(row["outcome"])
         if set(result["collected"]) != set(result["run_collected"]):
             raise RuntimeError("collect-only and run collected sets differ")
         if set(result["collection_skipped"]) != set(result["run_collection_skipped"]):
             raise RuntimeError("collect-only and run collection-skip sets differ")
-        for key in ("failed", "errors", "skipped"):
-            result[key] = sorted(set(result[key]))
-        result["skipped"] = sorted(set(result["skipped"]) | set(result["collection_skipped"]))
+        observed = {nodeid: reduce_node_outcome(outcomes)
+                    for nodeid, outcomes in observed_reports.items()}
+        for nodeid in result["collection_skipped"]:
+            observed[nodeid] = "skipped"
+        result["failed"] = sorted(nodeid for nodeid, outcome in observed.items() if outcome == "failed")
+        result["errors"] = sorted(nodeid for nodeid, outcome in observed.items() if outcome == "error")
+        result["skipped"] = sorted(nodeid for nodeid, outcome in observed.items() if outcome == "skipped")
         floor = len(set(result["collected"]) | set(result["collection_skipped"]))
         result["floor"] = floor
         expected_pairs = {pair_for_nodeid(node) for node in result["collected"] + result["collection_skipped"]}
         if set(result["xml_pairs"]) - expected_pairs:
             raise RuntimeError("JUnit outcome contains an identity absent from collect-only set")
-        if len(result["xml_pairs"]) != len(set(result["xml_pairs"])):
-            raise RuntimeError("JUnit contains duplicate (classname,name) identities")
-        if len(result["xml_pairs"]) != floor:
-            raise RuntimeError(f"JUnit rows {len(result['xml_pairs'])} do not equal in-job floor {floor}")
-        observed_reports = {}
-        for filename in ("collect-observations.jsonl", "observations.jsonl"):
-            path = evidence / filename
-            if path.exists():
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    row = json.loads(line)
-                    if row["nodeid"] in result["collected"]:
-                        observed_reports.setdefault(row["nodeid"], []).append(row["outcome"])
-        observed = {pair_for_nodeid(nodeid): reduce_node_outcome(outcomes)
-                    for nodeid, outcomes in observed_reports.items()}
-        for nodeid in result["collection_skipped"]:
-            observed[pair_for_nodeid(nodeid)] = "skipped"
-        if set(observed) != set(result["xml_outcomes"]):
+        xml_identity_set = set(result["xml_pairs"])
+        if len(xml_identity_set) != floor:
+            raise RuntimeError(f"JUnit identities {len(xml_identity_set)} do not equal in-job floor {floor}")
+        observed_by_pair = {pair_for_nodeid(nodeid): outcome for nodeid, outcome in observed.items()}
+        if set(observed_by_pair) != set(result["xml_outcomes"]):
             raise RuntimeError("JUnit identities do not exactly reconcile with observed collected nodes")
         for outcome in ("failed", "error", "skipped"):
             result_key = "errors" if outcome == "error" else outcome
-            observed_set = {node for node in result["collected"] if observed.get(pair_for_nodeid(node)) == outcome}
-            expected_set = set(result[result_key]) - (set(result["collection_skipped"]) if outcome == "skipped" else set())
-            if observed_set != expected_set:
+            observed_set = {node for node, actual in observed.items() if actual == outcome}
+            if observed_set != set(result[result_key]):
                 raise RuntimeError(f"observed {outcome} set is not stable")
-            xml_set = {node for node in result["collected"] if result["xml_outcomes"].get(pair_for_nodeid(node)) == outcome}
+            xml_set = {node for node in result["collected"] + result["collection_skipped"]
+                       if result["xml_outcomes"].get(pair_for_nodeid(node)) == outcome}
             if xml_set != observed_set:
                 raise RuntimeError(f"JUnit {outcome} set does not reconcile")
     if set(results["natural"]["collected"]) != set(results["reverse"]["collected"]):
