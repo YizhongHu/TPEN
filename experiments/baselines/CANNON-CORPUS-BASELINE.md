@@ -19,6 +19,10 @@ control in the same allocation. It asserts the allocation and exact revision,
 and explicitly flushes every machine-readable result before returning. It
 records, rather than asserts, tag visibility and interpreter/Torch identity.
 
+THE MEMBERSHIPS WERE COMPUTED OFFLINE FROM THE PRESERVED ARTEFACTS AND
+INDEPENDENTLY REPLAYED BY A SECOND PARTY. THE HARNESS'S OWN INTERNAL CONTROLS
+AND ITS CROSS-ARM COMPARISON WERE NOT THE BASIS OF THE RESULT.
+
 ## Ordering limitation
 
 ONE COLLECTION ORDER WAS MEASURED, UNDER TWO SELECTION AND EXECUTION ORDERS.
