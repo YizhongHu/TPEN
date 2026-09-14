@@ -1570,6 +1570,74 @@ def test_schema_v1_missing_restore_config_declaration_repairs_latest(
     assert restored_as(after, 7), row
 
 
+@pytest.mark.parametrize("damage", ["empty", "nonhex"])
+@pytest.mark.parametrize("schema", [1, 2])
+def test_impossible_model_config_declaration_repairs_latest(
+    tmp_path: Path, schema: int, damage: str
+) -> None:
+    root, context, older_model, newer_model, older, newer = _prepare_real_reconcile_pair(tmp_path)
+    if schema == LEGACY_CHECKPOINT_SCHEMA_VERSION:
+        _rewrite_manifest_as_v1(newer)
+
+    healthy = {}
+    for restore_path in (root, root / "latest.json"):
+        restored = torch.nn.Linear(3, 2).double()
+        healthy[str(restore_path)] = restore_checkpoint(
+            load={"path": str(restore_path), "mode": "model_only", "strict": True},
+            model=restored,
+            context=context,
+        )
+        assert healthy[str(restore_path)].schema_version == schema
+        assert restored_as(healthy[str(restore_path)], 9)
+        _assert_model_state_equal(
+            restored,
+            {name: value.detach().clone() for name, value in newer_model.state_dict().items()},
+        )
+
+    actual_config_hash = checkpoint_hashes(context.cfg)["model_config"]
+    assert (
+        isinstance(actual_config_hash, str)
+        and len(actual_config_hash) == 64
+        and all(character in "0123456789abcdef" for character in actual_config_hash)
+    )
+    manifest_path = newer / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    damaged_hash = "" if damage == "empty" else "g" * 64
+    manifest["hashes"]["model_config"] = damaged_hash
+    assert damaged_hash != actual_config_hash
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    for restore_path in (root, root / "latest.json"):
+        with pytest.raises(ValueError, match="model_config mismatch"):
+            restore_checkpoint(
+                load={"path": str(restore_path), "mode": "model_only", "strict": True},
+                model=torch.nn.Linear(3, 2).double(),
+                context=context,
+            )
+
+    Checkpoint(root).handle_occurrence(
+        Occurrence(event=TrainingCompleted(), count=1),
+        context,
+        training_state(trainer=_ProgressTrainer(7, 7)),
+    )
+
+    after = None
+    for restore_path in (root, root / "latest.json"):
+        restored = torch.nn.Linear(3, 2).double()
+        report = restore_checkpoint(
+            load={"path": str(restore_path), "mode": "model_only", "strict": True},
+            model=restored,
+            context=context,
+        )
+        _assert_model_state_equal(
+            restored,
+            {name: value.detach().clone() for name, value in older_model.state_dict().items()},
+        )
+        after = report
+    row = {"schema": schema, "damage": damage, "healthy": healthy, "after": after}
+    assert restored_as(after, 7), row
+
+
 @pytest.mark.parametrize("config_section", ["model", "hamiltonian_terms"])
 def test_valid_newer_with_different_configuration_is_admitted(
     tmp_path: Path, config_section: str

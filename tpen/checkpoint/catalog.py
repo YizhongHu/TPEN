@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,7 @@ from .schema import read_manifest
 
 PUBLICATION_CATALOG_FILENAME = "publications.jsonl"
 PUBLICATION_RECORD_SCHEMA = "tpen.checkpoint-publication/v1"
+_MODEL_CONFIG_HASH = re.compile(r"[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,8 +290,14 @@ def _validated_latest_target(
         # They are presence checks only: the target may legitimately have
         # configuration hashes different from the older candidate's hashes.
         for hash_name in ("model_config", "hamiltonian_config"):
-            if target_manifest.hashes.get(hash_name) is None:
+            declared_hash = target_manifest.hashes.get(hash_name)
+            if declared_hash is None:
                 raise ValueError(f"{target}: manifest missing {hash_name}")
+            if hash_name == "model_config" and (
+                not isinstance(declared_hash, str)
+                or _MODEL_CONFIG_HASH.fullmatch(declared_hash) is None
+            ):
+                raise ValueError(f"{target}: manifest has invalid {hash_name}")
 
         if target_manifest.schema_version == CHECKPOINT_SCHEMA_VERSION:
             target_ref = CheckpointRef.from_directory(target)
