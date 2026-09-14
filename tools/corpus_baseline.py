@@ -411,14 +411,14 @@ def assert_selected_order_differs(results):
 
 def write_error_sweep(evidence):
     """Find real capture signatures while isolating the planted control."""
-    predicates = ("LOG_WRITE_ERROR", "LAUNCH_ERROR", "LOG_OPEN_ERROR", "EDQUOT", "Disk quota exceeded")
+    predicates = ("LOG_WRITE_ERROR", "LAUNCH_ERROR", "LOG_OPEN_ERROR", "EDQUOT", "[Errno 122]", "Disk quota exceeded")
     control_dir = evidence / "write-error-control"
     control_dir.mkdir(parents=True, exist_ok=True)
     control = control_dir / "positive-control.log"
     report = evidence / "write-error-sweep-report.txt"
-    control.write_text("LOG_WRITE_ERROR\n", encoding="utf-8")
+    control.write_text("\n".join(predicates) + "\n", encoding="utf-8")
     control_text = control.read_text(encoding="utf-8")
-    if not any(predicate in control_text for predicate in predicates):
+    if not all(predicate in control_text for predicate in predicates):
         raise RuntimeError("write-error sweep positive control did not discriminate")
     matches = []
     for path in sorted(evidence.rglob("*")):

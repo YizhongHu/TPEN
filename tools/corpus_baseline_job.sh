@@ -84,6 +84,9 @@ copy_receipts() {
             -name .git -o -name wheels -o -name wheel \
         \) -prune -o -type f -print0
     }
+    copyback_discovery_control() {
+        return 73
+    }
     record_excluded() {
         printf 'SKIPPED %s size=%s reason=%s\n' "$1" "$2" "$3"
     }
@@ -134,6 +137,15 @@ copy_receipts() {
             self_test_failed=1
         fi
         echo 'SELF_TEST_PASS excluded checkout/venv files produce SKIPPED manifest lines'
+        discovery_control_file="$probe/discovery-control"
+        copyback_discovery_control >"$discovery_control_file"
+        discovery_control_rc=$?
+        if test "$discovery_control_rc" -eq 0; then
+            echo 'SELF_TEST_FAIL discovery failure status was lost'
+            self_test_failed=1
+        else
+            echo "SELF_TEST_PASS discovery failure status preserved rc=$discovery_control_rc"
+        fi
         cat "$self_report" >>"$manifest"
         rm -f -- "$self_report"
     } >>"$manifest"
@@ -141,6 +153,16 @@ copy_receipts() {
     if test "${self_test_failed:-0}" -ne 0; then
         printf 'SELF_TEST_FAIL=copyback exclusion/reporting control\n' >>"$manifest"
         preservation_failed=1
+    fi
+    discovery_file=$(mktemp "${TMPDIR:-/tmp}/corpus-copyback-discovery.XXXXXX")
+    copyback_files "$RUN_ROOT" >"$discovery_file"
+    discovery_rc=$?
+    if test "$discovery_rc" -ne 0; then
+        printf 'COPYBACK_DISCOVERY_RC=%s\nSKIPPED <copyback-discovery> reason=discovery-failed\n' "$discovery_rc" >>"$manifest"
+        echo "cannot discover receipts for copy-back: rc=$discovery_rc" >&2
+        preservation_failed=1
+    else
+        printf 'COPYBACK_DISCOVERY_RC=0\n' >>"$manifest"
     fi
     while IFS= read -r -d '' receipt; do
         relative=${receipt#"$RUN_ROOT/"}
@@ -177,7 +199,8 @@ copy_receipts() {
             echo "cannot preserve receipt: $relative" >&2
             preservation_failed=1
         fi
-    done < <(copyback_files "$RUN_ROOT")
+    done <"$discovery_file"
+    rm -f -- "$discovery_file"
     if test "$preservation_failed" -eq 0; then
         printf 'COPYBACK_COMPLETE=1\n' >>"$manifest"
         if ! test -s "$manifest" || ! grep -Fq 'COPYBACK_COMPLETE=1' "$manifest"; then
