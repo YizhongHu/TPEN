@@ -107,28 +107,33 @@ copy_receipts() {
         if printf '%s\n' "$probe_files" | grep -Fq "$probe/venv-natural/lib/torch.so"; then
             echo 'SELF_TEST_FAIL top-level venv-natural was reachable'
             self_test_failed=1
+        else
+            echo 'SELF_TEST_PASS top-level venv-natural excluded'
         fi
-        echo 'SELF_TEST_PASS top-level venv-natural excluded'
         if printf '%s\n' "$probe_files" | grep -Fq "$probe/uv-cache-natural/archive-v0/libtorch_cpu.so"; then
             echo 'SELF_TEST_FAIL top-level uv-cache-natural was reachable'
             self_test_failed=1
+        else
+            echo 'SELF_TEST_PASS top-level uv-cache-natural excluded'
         fi
-        echo 'SELF_TEST_PASS top-level uv-cache-natural excluded'
         if printf '%s\n' "$probe_files" | grep -Fq "$probe/sub/venv-natural/lib/foo.so"; then
             echo 'SELF_TEST_FAIL nested venv-natural was reachable'
             self_test_failed=1
+        else
+            echo 'SELF_TEST_PASS nested venv-natural excluded'
         fi
-        echo 'SELF_TEST_PASS nested venv-natural excluded'
         if printf '%s\n' "$probe_files" | grep -Fq "$probe/natural/tpen/nn/readout.py"; then
             echo 'SELF_TEST_FAIL checkout file was reachable'
             self_test_failed=1
+        else
+            echo 'SELF_TEST_PASS checkout file excluded'
         fi
-        echo 'SELF_TEST_PASS checkout file excluded'
         if ! printf '%s\n' "$probe_files" | grep -Fq "$probe/evidence/natural/RUN_COMPLETE.marker"; then
             echo 'SELF_TEST_FAIL evidence marker was excluded'
             self_test_failed=1
+        else
+            echo 'SELF_TEST_PASS evidence marker copied by default'
         fi
-        echo 'SELF_TEST_PASS evidence marker copied by default'
         self_report="$manifest.self-test"
         find "$probe" -type f \( -path "$probe/natural/*" -o -path "$probe/venv-*/*" -o -path "$probe/uv-cache-*/*" \) -print0 |
         while IFS= read -r -d '' excluded; do
@@ -139,8 +144,9 @@ copy_receipts() {
         if ! grep -Fq 'SKIPPED venv-natural/lib/torch.so' "$self_report"; then
             echo 'SELF_TEST_FAIL excluded file reporting was silent'
             self_test_failed=1
+        else
+            echo 'SELF_TEST_PASS excluded checkout/venv files produce SKIPPED manifest lines'
         fi
-        echo 'SELF_TEST_PASS excluded checkout/venv files produce SKIPPED manifest lines'
         discovery_control_file="$probe/discovery-control"
         discovery_control_rc=0
         copyback_discovery_control >"$discovery_control_file" || discovery_control_rc=$?
@@ -158,6 +164,22 @@ copy_receipts() {
         printf 'SELF_TEST_FAIL=copyback exclusion/reporting control\n' >>"$manifest"
         preservation_failed=1
     fi
+    forced_label_manifest="$manifest.forced-label-control"
+    forced_check_rc=1
+    if test "$forced_check_rc" -eq 0; then
+        printf 'SELF_TEST_PASS forced-label-check\n' >"$forced_label_manifest"
+    else
+        printf 'SELF_TEST_FAIL forced-label-check\n' >"$forced_label_manifest"
+    fi
+    if grep -Fq 'SELF_TEST_FAIL forced-label-check' "$forced_label_manifest" &&
+       ! grep -Fq 'SELF_TEST_PASS forced-label-check' "$forced_label_manifest"; then
+        printf 'SELF_TEST_PASS label polarity control\n' >>"$manifest"
+    else
+        printf 'SELF_TEST_FAIL label polarity control\n' >>"$manifest"
+        preservation_failed=1
+    fi
+    cat "$forced_label_manifest" >>"$manifest"
+    rm -f -- "$forced_label_manifest"
     discovery_file=$(mktemp "${TMPDIR:-/tmp}/corpus-copyback-discovery.XXXXXX")
     discovery_rc=0
     copyback_files "$RUN_ROOT" >"$discovery_file" || discovery_rc=$?
@@ -222,11 +244,14 @@ copy_receipts() {
         preservation_failed=1
     fi
     if test "$preservation_failed" -eq 0; then
-        printf 'COPYBACK_COMPLETE=1\n' >>"$manifest"
-        if ! test -s "$manifest" || ! grep -Fq 'COPYBACK_COMPLETE=1' "$manifest"; then
+        completion_write_rc=0
+        printf 'COPYBACK_COMPLETE=1\n' >>"$manifest" || completion_write_rc=$?
+        if test "$completion_write_rc" -ne 0 || ! test -s "$manifest" ||
+           ! grep -Fq 'COPYBACK_COMPLETE=1' "$manifest"; then
             preservation_failed=1
         fi
-    else
+    fi
+    if test "$preservation_failed" -ne 0; then
         printf 'COPYBACK_COMPLETE=0\n' >>"$manifest"
     fi
     if test "$preservation_failed" -ne 0; then
