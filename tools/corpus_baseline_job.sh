@@ -62,6 +62,8 @@ mkdir -p "$RUN_ROOT/evidence"
 HOME_RECEIPT_DIR="$HOME/tpen-corpus-${SLURM_JOB_ID}"
 copy_receipts() {
     local outer_rc=$?
+    # An EXIT trap is a preservation path: errexit must never abandon it.
+    set +e
     local free_kib
     local preservation_failed=0
     free_kib=$(df -Pk "$HOME" | awk 'NR == 2 {print $4}') || free_kib=UNKNOWN
@@ -76,6 +78,8 @@ copy_receipts() {
         printf 'COPY_POLICY=keep every regular file at or below %s bytes\n' "$COPY_MAX_BYTES"
         echo 'EXCLUSIONS=top-level natural/reverse checkouts, .git, venv-*, uv-cache-* (including downloaded wheels), and files above threshold'
     } >"$manifest"
+    preservation_control_source="$RUN_ROOT/evidence/preservation-control-source"
+    printf 'preservation-control\n' >"$preservation_control_source"
     copyback_files() {
         local root=$1
         find "$root" -type d \( \
@@ -138,8 +142,8 @@ copy_receipts() {
         fi
         echo 'SELF_TEST_PASS excluded checkout/venv files produce SKIPPED manifest lines'
         discovery_control_file="$probe/discovery-control"
-        copyback_discovery_control >"$discovery_control_file"
-        discovery_control_rc=$?
+        discovery_control_rc=0
+        copyback_discovery_control >"$discovery_control_file" || discovery_control_rc=$?
         if test "$discovery_control_rc" -eq 0; then
             echo 'SELF_TEST_FAIL discovery failure status was lost'
             self_test_failed=1
@@ -155,8 +159,8 @@ copy_receipts() {
         preservation_failed=1
     fi
     discovery_file=$(mktemp "${TMPDIR:-/tmp}/corpus-copyback-discovery.XXXXXX")
-    copyback_files "$RUN_ROOT" >"$discovery_file"
-    discovery_rc=$?
+    discovery_rc=0
+    copyback_files "$RUN_ROOT" >"$discovery_file" || discovery_rc=$?
     if test "$discovery_rc" -ne 0; then
         printf 'COPYBACK_DISCOVERY_RC=%s\nSKIPPED <copyback-discovery> reason=discovery-failed\n' "$discovery_rc" >>"$manifest"
         echo "cannot discover receipts for copy-back: rc=$discovery_rc" >&2
@@ -201,6 +205,22 @@ copy_receipts() {
         fi
     done <"$discovery_file"
     rm -f -- "$discovery_file"
+    control_copy="$HOME_RECEIPT_DIR/preservation-control-copy"
+    control_status="$HOME_RECEIPT_DIR/preservation-control-status.txt"
+    control_forced_failure=1
+    control_copied=0
+    if cp "$preservation_control_source" "$control_copy"; then
+        control_copied=1
+    fi
+    if test "$control_forced_failure" -eq 1; then
+        printf 'PRESERVATION_STATUS=FAILED\n' >"$control_status"
+    fi
+    if test "$control_copied" -eq 1 && grep -Fq 'PRESERVATION_STATUS=FAILED' "$control_status"; then
+        printf 'SELF_TEST_PASS forced self-test failure preserved evidence before failed status\n' >>"$manifest"
+    else
+        printf 'SELF_TEST_FAIL forced self-test failure lost evidence\n' >>"$manifest"
+        preservation_failed=1
+    fi
     if test "$preservation_failed" -eq 0; then
         printf 'COPYBACK_COMPLETE=1\n' >>"$manifest"
         if ! test -s "$manifest" || ! grep -Fq 'COPYBACK_COMPLETE=1' "$manifest"; then
