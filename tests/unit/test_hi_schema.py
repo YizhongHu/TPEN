@@ -1822,6 +1822,20 @@ class TestAdmittedMethods:
             _validate(cfg)
         assert "unadmitted-method" in _rules(caught.value)
 
+    def test_sr_remains_unadmitted_in_production(self) -> None:
+        """The roster rationale cannot silently admit SR to the scan."""
+
+        _validate(_config(optimizer={"_target_": "torch.optim.Adam", "lr": 0.005}))
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(
+                _config(
+                    optimizer={
+                        "_target_": "tpen.training.sr.StochasticReconfiguration",
+                    }
+                )
+            )
+        assert "unadmitted-method" in _rules(caught.value)
+
     def test_the_refusal_states_what_admission_requires(self) -> None:
         """A refusal that does not say what would change it is a dead end."""
 
@@ -1841,6 +1855,45 @@ class TestAdmittedMethods:
         for name in ("sr", "kfac", "spring", "linear_method"):
             assert not by_name[name].admitted
             assert by_name[name].requires
+
+    def test_sr_remains_exposed_and_unadmitted_via_admitted_field(self) -> None:
+        """The roster entry, not its prose, controls machine-readable admission."""
+
+        by_name = {entry.method: entry for entry in HI_METHOD_ROSTER}
+        assert "sr" in by_name
+        assert by_name["sr"].admitted is False
+        assert by_name["sr"].target is None
+
+        _validate(_config(optimizer={"_target_": "torch.optim.Adam", "lr": 0.005}))
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(
+                _config(
+                    optimizer={
+                        "_target_": "tpen.training.sr.StochasticReconfiguration",
+                    }
+                )
+            )
+        assert "unadmitted-method" in _rules(caught.value)
+
+    def test_sr_refusal_reports_current_two_electron_rationale(self) -> None:
+        """The production refusal carries an independent, current rationale."""
+
+        _validate(_config(optimizer={"_target_": "torch.optim.Adam", "lr": 0.005}))
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(
+                _config(
+                    optimizer={
+                        "_target_": "tpen.training.sr.StochasticReconfiguration",
+                    }
+                )
+            )
+        detail = " ".join(r.detail for r in caught.value.rejections)
+        assert "#488 made SR/minSR available at two electrons" in detail
+        assert "02859027" in detail
+        assert "OPEN non-finite-score row-policy question" in detail
+        assert "undischarged SR limb of 3957a23c's ADAM-ONLY determination" in detail
+        assert "SR was not measured here" in detail
+        assert "does not run on two-electron models" not in detail
 
     def test_a_landed_implementation_is_not_described_as_pending(self) -> None:
         """SR's stated reason must track the repository, which moves under it.
