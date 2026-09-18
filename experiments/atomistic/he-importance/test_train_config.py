@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+from dataclasses import replace
 import importlib.util
 import json
 from pathlib import Path
@@ -103,6 +104,53 @@ def test_resolve_accepts_training_packet_wrapping_a_cell(tmp_path: Path) -> None
     resolved = train_config.resolve_train_config(packet)
 
     assert resolved.run.run_id == cell.content_hash
+
+
+def test_resolve_refuses_a_source_without_a_materialized_cell() -> None:
+    with pytest.raises(train_config.TrainConfigResolutionError, match="source"):
+        train_config.resolve_train_config(object())
+
+
+def test_resolve_refuses_a_hash_that_does_not_bind_the_manifest(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    broken = replace(cell, content_hash="0" * 64)
+
+    with pytest.raises(train_config.TrainConfigResolutionError, match="content hash"):
+        train_config.resolve_train_config(broken)
+
+
+def test_resolve_refuses_a_non_absolute_output_path(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    broken = replace(cell, output_path=Path("relative-output"))
+
+    with pytest.raises(train_config.TrainConfigResolutionError, match="absolute"):
+        train_config.resolve_train_config(broken)
+
+
+def test_resolve_refuses_missing_model_initialization_seed(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    streams = dict(cell.seed_streams)
+    del streams["model_initialization"]
+    broken = replace(cell, seed_streams=streams)
+
+    with pytest.raises(train_config.TrainConfigResolutionError, match="model_initialization"):
+        train_config.resolve_train_config(broken)
+
+
+def test_resolve_refuses_an_unnamed_initializer_from_the_production_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path)
+    original_compose = train_config._compose_base_config
+
+    def malformed_config() -> object:
+        config = original_compose()
+        config.model.embedding.initializer.stream = None
+        return config
+
+    monkeypatch.setattr(train_config, "_compose_base_config", malformed_config)
+    with pytest.raises(train_config.TrainConfigResolutionError, match="named stream"):
+        train_config.resolve_train_config(cell)
 
 
 def test_resolve_binds_admitted_optimizer_cell_through_live_roster(tmp_path: Path) -> None:
