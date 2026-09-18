@@ -11,7 +11,7 @@ caller declaration and therefore identity-significant.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from hashlib import sha256
@@ -297,6 +297,60 @@ def _freeze(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return tuple(_freeze(nested) for nested in value)
     return value
+
+
+def _thaw(value: Any) -> Any:
+    """Copy a frozen manifest into mutable JSON-shaped containers."""
+
+    if isinstance(value, Mapping):
+        return {key: _thaw(nested) for key, nested in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw(nested) for nested in value]
+    return value
+
+
+def with_execution_topology(
+    cell: MaterializedCell,
+    topology: Mapping[str, Any],
+) -> MaterializedCell:
+    """Return ``cell`` with launch facts populated under its topology subtree.
+
+    The source materializer deliberately leaves this mapping empty because it
+    has no launch facts.  Rebinding it here is therefore a launch operation,
+    not a scientific-row edit.  The existing root-topology exclusion is used
+    by :func:`content_hash`, so the row identity and output path remain stable.
+
+    Parameters
+    ----------
+    cell
+        An immutable materialized training row.
+    topology
+        Non-empty, JSON-shaped execution facts supplied by the launcher.
+
+    Raises
+    ------
+    MaterializationError
+        If the source row is malformed, the topology is empty, or rebinding
+        would change the content identity.
+    """
+
+    if not isinstance(topology, Mapping) or not topology:
+        raise MaterializationError("execution topology must be populated with a non-empty mapping")
+    try:
+        source_manifest = cell.manifest
+        source_hash = cell.content_hash
+    except AttributeError as error:
+        raise MaterializationError("cell must be a materialized training row") from error
+    validate_materialized_manifest(source_manifest)
+    if content_hash(source_manifest) != source_hash:
+        raise MaterializationError("cell content hash does not bind its manifest")
+
+    manifest = _thaw(source_manifest)
+    manifest[TOPOLOGY_KEY] = _thaw(topology)
+    validate_materialized_manifest(manifest)
+    if content_hash(manifest) != source_hash:
+        raise MaterializationError("execution topology changed the content identity")
+    return replace(cell, manifest=_freeze(manifest))
 
 
 def _project_identity(value: Any, *, exclude_root_topology: bool, is_root: bool = True) -> Any:
