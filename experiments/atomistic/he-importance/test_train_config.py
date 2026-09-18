@@ -8,6 +8,7 @@ import io
 import importlib.util
 import json
 import math
+import os
 import random
 from collections.abc import Mapping, Sequence
 from numbers import Real
@@ -288,18 +289,21 @@ def test_resolver_routes_schema_validation_through_production(
 def test_resolver_does_not_read_evaluation_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Guard direct builtins, pathlib, and io reads after cell construction.
+    """Guard four Python-level file-opening entry points after construction.
 
-    This is a direct-call detector, not a transitive filesystem monitor.  It
-    does not intercept already-open handles, aliases captured before patching,
-    alternate paths, os.open, native I/O, or loader reads through unpatched
-    APIs.  The explicit ``io.open`` arm proves the detector is live on a route
-    that previously bypassed it.
+    This is a direct-call detector, not a transitive filesystem monitor. It
+    covers builtins.open, pathlib.Path.open, io.open, and os.open. It does not
+    intercept already-open handles, aliases captured before patching, alternate
+    paths, native or C I/O, importlib internals, cached or earlier reads,
+    symlinked paths, or loader reads through unpatched APIs. The explicit
+    io.open and os.open arms prove the detector is live on routes that could
+    otherwise bypass it.
     """
     cell = _cell(tmp_path)
     original_open = builtins.open
     original_path_open = Path.open
     original_io_open = io.open
+    original_os_open = os.open
 
     def is_evaluation_manifest(file: object) -> bool:
         return str(file).endswith("manifests/evaluation.yaml")
@@ -319,14 +323,26 @@ def test_resolver_does_not_read_evaluation_manifest(
             raise AssertionError("resolver read the evaluation manifest")
         return original_io_open(file, *args, **kwargs)
 
+    def guarded_os_open(file: object, *args: object, **kwargs: object) -> int:
+        if is_evaluation_manifest(file):
+            raise AssertionError("resolver read the evaluation manifest")
+        return original_os_open(file, *args, **kwargs)
+
     monkeypatch.setattr(builtins, "open", guarded_open)
     monkeypatch.setattr(Path, "open", guarded_path_open)
     monkeypatch.setattr(io, "open", guarded_io_open)
+    monkeypatch.setattr(os, "open", guarded_os_open)
 
     evaluation_manifest = Path(train_config.__file__).parent / "manifests" / "evaluation.yaml"
     with pytest.raises(AssertionError, match="evaluation manifest"):
         with io.open(evaluation_manifest, "r", encoding="utf-8") as handle:
             handle.read()
+    with pytest.raises(AssertionError, match="evaluation manifest"):
+        descriptor = os.open(evaluation_manifest, os.O_RDONLY)
+        try:
+            os.read(descriptor, 1800)
+        finally:
+            os.close(descriptor)
 
     resolved = train_config.resolve_train_config(cell)
     assert isinstance(resolved, DictConfig)
