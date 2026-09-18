@@ -7,11 +7,9 @@ from dataclasses import replace
 import io
 import importlib.util
 import json
-import math
 import os
 import random
 from collections.abc import Mapping, Sequence
-from numbers import Real
 from pathlib import Path
 import sys
 
@@ -248,12 +246,7 @@ def _contains_reference_energy_number(value: object) -> bool:
         )
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return any(_contains_reference_energy_number(nested) for nested in value)
-    return isinstance(value, Real) and not isinstance(value, bool) and math.isclose(
-        float(value),
-        float(stage_coordinate._REFERENCE_ENERGY),
-        rel_tol=0.0,
-        abs_tol=1e-15,
-    )
+    return stage_coordinate._is_reference_energy_representation(value)
 
 
 def test_resolved_config_passes_hi_schema_and_contains_no_reference_energy(tmp_path: Path) -> None:
@@ -266,6 +259,19 @@ def test_resolved_config_passes_hi_schema_and_contains_no_reference_energy(tmp_p
     assert "reference_energy" not in serialized
     assert "evaluation.yaml" not in serialized
     assert not _contains_reference_energy_number(resolved_tree)
+
+
+@pytest.mark.parametrize(
+    "contamination",
+    (
+        stage_coordinate._REFERENCE_ENERGY,
+        {"nested": stage_coordinate._REFERENCE_ENERGY},
+        stage_coordinate._REFERENCE_ENERGY_TEXT,
+        "-2.9037243770341195",
+    ),
+)
+def test_reference_energy_detector_is_live(contamination: object) -> None:
+    assert _contains_reference_energy_number({"nested": [contamination]})
 
 
 def test_resolver_routes_schema_validation_through_production(
@@ -292,38 +298,56 @@ def test_resolver_does_not_read_evaluation_manifest(
     """Guard four Python-level file-opening entry points after construction.
 
     This is a direct-call detector, not a transitive filesystem monitor. It
-    covers builtins.open, pathlib.Path.open, io.open, and os.open. It does not
-    intercept already-open handles, aliases captured before patching, alternate
-    paths, native or C I/O, importlib internals, cached or earlier reads,
-    symlinked paths, or loader reads through unpatched APIs. The explicit
-    io.open and os.open arms prove the detector is live on routes that could
-    otherwise bypass it.
+    covers builtins.open, pathlib.Path.open, io.open, and os.open, including
+    bytes paths for builtins.open, io.open, and os.open normalized with
+    os.fsdecode (Path.open does not accept bytes). It does not intercept
+    already-open handles, aliases captured before patching, alternate paths,
+    native or C I/O, importlib internals, cached or earlier reads, symlinked
+    paths, or loader reads through unpatched APIs. The explicit opener arms
+    prove the detector is live on routes that could otherwise bypass it.
     """
     cell = _cell(tmp_path)
     original_open = builtins.open
     original_path_open = Path.open
     original_io_open = io.open
     original_os_open = os.open
+    train_config_path = Path(train_config._CONFIG_PATH).resolve()
+    train_config_reads = 0
+
+    def decoded_path(file: object) -> str:
+        try:
+            return os.fsdecode(os.fspath(file))
+        except TypeError:
+            return str(file)
 
     def is_evaluation_manifest(file: object) -> bool:
-        return str(file).endswith("manifests/evaluation.yaml")
+        return decoded_path(file).endswith("manifests/evaluation.yaml")
+
+    def record_train_config_read(file: object) -> None:
+        nonlocal train_config_reads
+        if Path(decoded_path(file)).resolve() == train_config_path:
+            train_config_reads += 1
 
     def guarded_open(file: object, *args: object, **kwargs: object) -> object:
+        record_train_config_read(file)
         if is_evaluation_manifest(file):
             raise AssertionError("resolver read the evaluation manifest")
         return original_open(file, *args, **kwargs)
 
     def guarded_path_open(path: Path, *args: object, **kwargs: object) -> object:
+        record_train_config_read(path)
         if is_evaluation_manifest(path):
             raise AssertionError("resolver read the evaluation manifest")
         return original_path_open(path, *args, **kwargs)
 
     def guarded_io_open(file: object, *args: object, **kwargs: object) -> object:
+        record_train_config_read(file)
         if is_evaluation_manifest(file):
             raise AssertionError("resolver read the evaluation manifest")
         return original_io_open(file, *args, **kwargs)
 
     def guarded_os_open(file: object, *args: object, **kwargs: object) -> int:
+        record_train_config_read(file)
         if is_evaluation_manifest(file):
             raise AssertionError("resolver read the evaluation manifest")
         return original_os_open(file, *args, **kwargs)
@@ -334,27 +358,49 @@ def test_resolver_does_not_read_evaluation_manifest(
     monkeypatch.setattr(os, "open", guarded_os_open)
 
     evaluation_manifest = Path(train_config.__file__).parent / "manifests" / "evaluation.yaml"
+    encoded_manifest = os.fsencode(evaluation_manifest)
+    for opener in (builtins.open, io.open):
+        with pytest.raises(AssertionError, match="evaluation manifest"):
+            with opener(evaluation_manifest, "r", encoding="utf-8") as handle:
+                handle.read(1800)
     with pytest.raises(AssertionError, match="evaluation manifest"):
-        with io.open(evaluation_manifest, "r", encoding="utf-8") as handle:
-            handle.read()
-    with pytest.raises(AssertionError, match="evaluation manifest"):
-        descriptor = os.open(evaluation_manifest, os.O_RDONLY)
-        try:
-            os.read(descriptor, 1800)
-        finally:
-            os.close(descriptor)
+        with evaluation_manifest.open("r", encoding="utf-8") as handle:
+            handle.read(1800)
+    for manifest_path in (evaluation_manifest, encoded_manifest):
+        with pytest.raises(AssertionError, match="evaluation manifest"):
+            descriptor = os.open(manifest_path, os.O_RDONLY)
+            try:
+                os.read(descriptor, 1800)
+            finally:
+                os.close(descriptor)
+    for manifest_path in (encoded_manifest,):
+        for opener in (builtins.open, io.open):
+            with pytest.raises(AssertionError, match="evaluation manifest"):
+                with opener(manifest_path, "r", encoding="utf-8") as handle:
+                    handle.read(1800)
 
     resolved = train_config.resolve_train_config(cell)
     assert isinstance(resolved, DictConfig)
+    assert resolved.trainer.max_steps == stage_coordinate.stage_definition("O1").updates
+    assert train_config_reads > 0
 
 
 def test_resolve_does_not_draw_from_global_rng(tmp_path: Path) -> None:
+    numpy = pytest.importorskip("numpy")
+    torch = pytest.importorskip("torch")
     cell = _cell(tmp_path)
-    before = random.getstate()
+    before_python = random.getstate()
+    before_numpy = numpy.random.get_state()
+    before_torch = torch.get_rng_state().clone()
 
     resolved = train_config.resolve_train_config(cell)
 
-    assert random.getstate() == before
+    assert random.getstate() == before_python
+    after_numpy = numpy.random.get_state()
+    assert after_numpy[0] == before_numpy[0]
+    assert numpy.array_equal(after_numpy[1], before_numpy[1])
+    assert after_numpy[2:] == before_numpy[2:]
+    assert torch.equal(torch.get_rng_state(), before_torch)
     assert resolved.runtime.seed == cell.seed_streams["model_initialization"]
 
 
