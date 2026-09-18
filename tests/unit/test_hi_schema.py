@@ -1842,6 +1842,47 @@ class TestAdmittedMethods:
             assert not by_name[name].admitted
             assert by_name[name].requires
 
+    def test_sr_remains_exposed_and_unadmitted_via_admitted_field(self) -> None:
+        """The roster entry, not its prose, controls machine-readable admission."""
+
+        by_name = {entry.method: entry for entry in HI_METHOD_ROSTER}
+        assert "sr" in by_name
+        assert by_name["sr"].admitted is False
+        assert by_name["sr"].target is None
+
+        _validate(_config(optimizer={"_target_": "torch.optim.Adam", "lr": 0.005}))
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(
+                _config(
+                    optimizer={
+                        "_target_": "tpen.training.sr.StochasticReconfigurationUpdate",
+                    }
+                )
+            )
+        assert "unadmitted-method" in _rules(caught.value)
+
+    def test_sr_refusal_reports_two_electron_rationale(self) -> None:
+        """The entry prose is independent from its production refusal route."""
+
+        entry = next(item for item in HI_METHOD_ROSTER if item.method == "sr")
+        assert "#488 made SR/minSR available at two electrons" in entry.requires
+        assert "non-finite-score row-policy question tracked by 02859027" in entry.requires
+        assert "undischarged SR limb of 3957a23c's ADAM-ONLY determination" in entry.requires
+        assert "SR was not measured here" in entry.requires
+        assert "does not run on two-electron models" not in entry.requires
+        assert "admitted=False" not in entry.requires
+
+        _validate(_config(optimizer={"_target_": "torch.optim.Adam", "lr": 0.005}))
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(
+                _config(
+                    optimizer={
+                        "_target_": "tpen.training.sr.StochasticReconfigurationUpdate",
+                    }
+                )
+            )
+        assert "unadmitted-method" in _rules(caught.value)
+
     def test_a_landed_implementation_is_not_described_as_pending(self) -> None:
         """SR's stated reason must track the repository, which moves under it.
 
