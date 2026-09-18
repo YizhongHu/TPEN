@@ -133,7 +133,10 @@ def _initializer_paths(value: Any, path: str = "") -> tuple[str, ...]:
 def _set_named_initializer_seeds(cfg: DictConfig, seed: int) -> None:
     """Bind every declared initializer to the shared model-init seed."""
 
-    paths = _initializer_paths(cfg)
+    # ``runner.model`` interpolates the same model block.  Traverse the
+    # canonical model declaration once; walking the alias produces a second
+    # path whose relative interpolation does not expose the named stream.
+    paths = _initializer_paths(cfg.model, "model")
     if not paths:
         raise TrainConfigResolutionError("HI train config declares no named initializer")
     for path in paths:
