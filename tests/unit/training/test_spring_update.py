@@ -544,7 +544,7 @@ def test_state_and_policy_validation_reject_mismatch_and_bounds() -> None:
     changed_conventions = _method(
         torch.nn.Parameter(parameter.detach().clone()),
         history_decay=0.3,
-        conventions=ScoreConventions(solve_dtype=torch.float32),
+        conventions=ScoreConventions(energy_gradient_scale=3.0),
     )
     with pytest.raises(ValueError, match="fingerprint does not match"):
         changed_conventions.load_method_state_dict(state)
