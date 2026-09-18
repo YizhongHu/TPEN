@@ -95,6 +95,7 @@ def _method(
     *,
     history_decay: float = 0.35,
     max_update_norm: float | None = None,
+    conventions: ScoreConventions | None = None,
 ) -> SPRINGUpdate:
     """Build one SPRING method with the same base policy used by SR parity arms."""
 
@@ -107,7 +108,7 @@ def _method(
         optimizer,
         model_parameters=ModelParameterBinding(parameters=(parameter,)),
         policy=policy,
-        conventions=ScoreConventions(),
+        conventions=ScoreConventions() if conventions is None else conventions,
     )
 
 
@@ -157,6 +158,69 @@ def _sequence(seed: int = 42) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Ten
         for _ in range(3)
     )
     return features, energies
+
+
+def _mixed_layout() -> ParameterLayout:
+    """Build a same-size two-slot layout with float32 then float64 storage."""
+
+    return ParameterLayout(
+        slots=(
+            ParameterSlot(ordinal=0, shape=(4,), numel=4, dtype=torch.float32),
+            ParameterSlot(ordinal=1, shape=(4,), numel=4, dtype=torch.float64),
+        )
+    )
+
+
+def _mixed_step_input(
+    parameters: tuple[torch.nn.Parameter, torch.nn.Parameter],
+    features32: torch.Tensor,
+    features64: torch.Tensor,
+    energies: torch.Tensor,
+    *,
+    step: int,
+) -> ScoreUpdateInput:
+    """Build a score packet whose concatenation promotes to float64."""
+
+    p32, p64 = parameters
+    n_samples = int(features32.shape[0])
+    positions = torch.zeros((n_samples, 2, 1), dtype=torch.float64)
+    spins = torch.ones((n_samples, 2), dtype=torch.float64)
+    batch = ElectronBatch(positions=positions, spins=spins)
+    logabs = (
+        features32.to(dtype=torch.float64) @ p32.detach().to(dtype=torch.float64)
+        + features64 @ p64.detach()
+    )
+    layout = _mixed_layout()
+    return ScoreUpdateInput(
+        batch=batch,
+        wavefunction=WavefunctionOutput(
+            logabs=logabs,
+            sign=torch.ones(n_samples, dtype=torch.float64),
+        ),
+        local_energy=energies,
+        step=step,
+        parameter_scores=MaterializedParameterLogScores(
+            layout=layout,
+            blocks=(features32, features64),
+        ),
+        parameter_binding=ParameterBinding(layout=layout, parameters=parameters),
+    )
+
+
+def _mixed_method(
+    parameters: tuple[torch.nn.Parameter, torch.nn.Parameter],
+    *,
+    history_decay: float = 0.4,
+) -> SPRINGUpdate:
+    """Build SPRING for a mixed-dtype parameter binding."""
+
+    policy = SPRINGPolicy(base=_base_policy(), history_decay=history_decay)
+    return SPRINGUpdate(
+        torch.optim.SGD(parameters, lr=policy.base.learning_rate),
+        model_parameters=ModelParameterBinding(parameters=parameters),
+        policy=policy,
+        conventions=ScoreConventions(),
+    )
 
 
 def test_spring_first_step_is_bitwise_equal_to_minsr_policy_base() -> None:
@@ -279,6 +343,89 @@ def test_history_state_resume_matches_uninterrupted_third_step() -> None:
     assert resumed.method_state_dict() == straight.method_state_dict()
 
 
+def test_mixed_parameter_dtypes_resume_preserves_promoted_history_dtype() -> None:
+    """A float32-first/float64-second layout resumes its promoted float64 history."""
+
+    generator = torch.Generator().manual_seed(561)
+    features_steps = tuple(
+        (
+            torch.randn((5, 4), generator=generator, dtype=torch.float32),
+            torch.randn((5, 4), generator=generator, dtype=torch.float64),
+        )
+        for _ in range(3)
+    )
+    energy_steps = tuple(
+        torch.randn(5, generator=generator, dtype=torch.float64) for _ in range(3)
+    )
+    initial32 = torch.randn(4, generator=generator, dtype=torch.float32)
+    initial64 = torch.randn(4, generator=generator, dtype=torch.float64)
+
+    straight_parameters = (
+        torch.nn.Parameter(initial32.detach().clone()),
+        torch.nn.Parameter(initial64.detach().clone()),
+    )
+    straight = _mixed_method(straight_parameters)
+    for step, ((features32, features64), energies) in enumerate(
+        zip(features_steps, energy_steps, strict=True)
+    ):
+        straight.update(
+            _mixed_step_input(
+                straight_parameters,
+                features32,
+                features64,
+                energies,
+                step=step,
+            )
+        )
+
+    split_parameters = (
+        torch.nn.Parameter(initial32.detach().clone()),
+        torch.nn.Parameter(initial64.detach().clone()),
+    )
+    split = _mixed_method(split_parameters)
+    for step in range(2):
+        features32, features64 = features_steps[step]
+        split.update(
+            _mixed_step_input(
+                split_parameters,
+                features32,
+                features64,
+                energy_steps[step],
+                step=step,
+            )
+        )
+    assert split.history.dtype == torch.float64
+    saved = json.loads(json.dumps(dict(split.method_state_dict())))
+    loaded_history = torch.tensor(saved["history"], dtype=torch.float64)
+    # JSON decimal rendering must preserve numeric history values, not merely strings.
+    torch.testing.assert_close(loaded_history, split.history, rtol=0.0, atol=0.0)
+
+    resumed_parameters = (
+        torch.nn.Parameter(split_parameters[0].detach().clone()),
+        torch.nn.Parameter(split_parameters[1].detach().clone()),
+    )
+    resumed = _mixed_method(resumed_parameters)
+    resumed.load_method_state_dict(saved)
+    assert resumed.history.dtype == torch.float64
+    torch.testing.assert_close(resumed.history, split.history, rtol=0.0, atol=0.0)
+    features32, features64 = features_steps[2]
+    resumed.update(
+        _mixed_step_input(
+            resumed_parameters,
+            features32,
+            features64,
+            energy_steps[2],
+            step=2,
+        )
+    )
+
+    for resumed_parameter, straight_parameter in zip(
+        resumed_parameters, straight_parameters, strict=True
+    ):
+        torch.testing.assert_close(resumed_parameter, straight_parameter, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(resumed.history, straight.history, rtol=0.0, atol=0.0)
+
+
 def test_cap_applies_uncapped_history_is_persisted() -> None:
     """A firing trust cap changes application, never the persisted projected history."""
 
@@ -389,6 +536,39 @@ def test_state_and_policy_validation_reject_mismatch_and_bounds() -> None:
     with pytest.raises(ValueError, match="fingerprint does not match"):
         restored.load_method_state_dict(wrong_fingerprint)
 
+    wrong_history_dtype = copy.deepcopy(state)
+    wrong_history_dtype["history_dtype"] = "torch.float32"
+    with pytest.raises(ValueError, match="history dtype"):
+        restored.load_method_state_dict(wrong_history_dtype)
+
+    changed_conventions = _method(
+        torch.nn.Parameter(parameter.detach().clone()),
+        history_decay=0.3,
+        conventions=ScoreConventions(solve_dtype=torch.float32),
+    )
+    with pytest.raises(ValueError, match="fingerprint does not match"):
+        changed_conventions.load_method_state_dict(state)
+
+    changed_layout = ParameterLayout(
+        slots=(
+            ParameterSlot(ordinal=0, shape=(4,), numel=4, dtype=torch.float64),
+            ParameterSlot(ordinal=1, shape=(4,), numel=4, dtype=torch.float64),
+        )
+    )
+    changed_layout_parameters = (
+        torch.nn.Parameter(torch.zeros(4, dtype=torch.float64)),
+        torch.nn.Parameter(torch.zeros(4, dtype=torch.float64)),
+    )
+    changed_layout_method = SPRINGUpdate(
+        torch.optim.SGD(changed_layout_parameters, lr=LEARNING_RATE),
+        model_parameters=ModelParameterBinding(parameters=changed_layout_parameters),
+        policy=method.policy,
+        conventions=ScoreConventions(),
+    )
+    assert changed_layout.total_numel == method.model_parameters.layout.total_numel
+    with pytest.raises(ValueError, match="fingerprint does not match"):
+        changed_layout_method.load_method_state_dict(state)
+
     wrong_policy = copy.deepcopy(state)
     wrong_policy["policy"]["history_decay"] = 0.2
     with pytest.raises(ValueError, match="policy does not match"):
@@ -437,9 +617,7 @@ def test_spring_consumes_one_score_packet_and_one_solve_per_update(
         return original_solver(*args, **kwargs)
 
     monkeypatch.setattr(spring_module, "solve_sample_space", counted_solver)
-    packet = model.evaluate_materialized_parameter_score_request(
-        request=method.forward_request(), batch=batch
-    )
+    packet = method.forward_request().evaluate(model, batch)
     energies = torch.randn(5, generator=torch.Generator().manual_seed(62), dtype=torch.float64)
     update_input = ScoreUpdateInput(
         batch=batch,

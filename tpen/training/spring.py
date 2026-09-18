@@ -248,6 +248,7 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             ),
             "policy": self.policy.fingerprint(),
             "completed_updates": self.completed_updates,
+            "history_dtype": str(self._history_dtype()),
             "history": [float(value) for value in self.history.detach().cpu().tolist()],
         }
 
@@ -269,6 +270,13 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             )
         if state.get("policy") != self.policy.fingerprint():
             raise ValueError("SPRING checkpoint policy does not match the live method")
+        recorded_dtype = _parse_history_dtype(state.get("history_dtype"))
+        expected_dtype = self._history_dtype()
+        if recorded_dtype != expected_dtype:
+            raise ValueError(
+                "SPRING checkpoint history dtype does not match the live geometry "
+                f"({expected_dtype}); got {recorded_dtype}"
+            )
         completed = state.get("completed_updates")
         if type(completed) is not int or completed < 0:
             raise ValueError("SPRING state completed_updates must be a non-negative integer")
@@ -290,7 +298,7 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             raise ValueError("SPRING state history must contain only finite numeric values")
         self.history = torch.tensor(
             [float(value) for value in recorded_history],
-            dtype=self._history_dtype(),
+            dtype=recorded_dtype,
             device=self._history_device(),
         )
         self.completed_updates = completed
@@ -355,6 +363,12 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             conventions=self.conventions,
             reducer=self.reducer,
         )
+        history_dtype = self._history_dtype()
+        if geometry.dtype != history_dtype:
+            raise ValueError(
+                "SPRING geometry dtype does not match the canonical history dtype: "
+                f"geometry={geometry.dtype}, history={history_dtype}"
+            )
         residual = build_energy_residual(
             local_energy,
             geometry=geometry,
@@ -491,13 +505,14 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         )
 
     def _history_dtype(self) -> Any:
-        """Return the dtype used by SR's geometry for persistent history."""
+        """Return the dtype resolved by the score geometry for history."""
 
         if self.conventions.solve_dtype is not None:
             return self.conventions.solve_dtype
-        if self.model_parameters.parameters:
-            return self.model_parameters.parameters[0].dtype
-        return torch.float64
+        resolved = None
+        for slot in self.model_parameters.layout.slots:
+            resolved = slot.dtype if resolved is None else torch.promote_types(resolved, slot.dtype)
+        return torch.float64 if resolved is None else resolved
 
     def _history_device(self) -> Any:
         """Return the live model device for the canonical history vector."""
@@ -552,6 +567,17 @@ def _validate_plain_sgd(optimizer: Any, *, learning_rate: float) -> None:
                 raise ValueError(f"SPRING SGD param group {index} must have {key}=False")
         if float(group.get("lr")) != float(learning_rate):
             raise ValueError("SPRING SGD learning rate must match SPRINGPolicy.base.learning_rate")
+
+
+def _parse_history_dtype(value: Any) -> Any:
+    """Parse and validate the state envelope's explicit floating dtype."""
+
+    if not isinstance(value, str) or not value.startswith("torch."):
+        raise ValueError("SPRING checkpoint history_dtype must be a torch dtype name")
+    dtype = getattr(torch, value.removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point or dtype.is_complex:
+        raise ValueError("SPRING checkpoint history_dtype must be a real floating torch dtype")
+    return dtype
 
 
 def _is_finite(value: float) -> bool:
