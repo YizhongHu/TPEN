@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import builtins
 from dataclasses import replace
+import io
 import importlib.util
 import json
+import math
+import random
+from collections.abc import Mapping, Sequence
+from numbers import Real
 from pathlib import Path
 import sys
 
 import pytest
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 
 _STAGE_SPEC = importlib.util.spec_from_file_location(
@@ -32,10 +37,16 @@ sys.modules[_RESOLVER_SPEC.name] = train_config
 _RESOLVER_SPEC.loader.exec_module(train_config)
 
 
-def _cell(tmp_path: Path, *, method: str = "adam", status: str = "available") -> object:
+def _cell(
+    tmp_path: Path,
+    *,
+    stage: str = "O1",
+    method: str = "adam",
+    status: str = "available",
+) -> object:
     reason = None if status == "available" else "qualification pending"
     return stage_coordinate.materialize_stage(
-        "O1",
+        stage,
         [
             {
                 "scientific_identity": {"architecture": "control", "optimizer": method},
@@ -56,11 +67,18 @@ def _callback_checkers(cfg: object) -> list[object]:
     ]
 
 
-def test_resolve_maps_stage_horizon_to_trainer_max_steps(tmp_path: Path) -> None:
-    cell = _cell(tmp_path)
+@pytest.mark.parametrize("stage_code", ("O1", "Q"))
+def test_resolve_maps_stage_horizon_to_trainer_max_steps(
+    tmp_path: Path, stage_code: str
+) -> None:
+    cell = _cell(tmp_path, stage=stage_code)
     resolved = train_config.resolve_train_config(cell)
+    authority = stage_coordinate.stage_definition(stage_code)
 
-    assert resolved.trainer.max_steps == stage_coordinate.stage_definition("O1").updates
+    assert authority.updates is not None
+    assert resolved.trainer.max_steps == authority.updates
+    if stage_code == "Q":
+        assert authority.updates == 2_000
 
 
 def test_resolve_binds_content_hash_to_run_identity(tmp_path: Path) -> None:
@@ -164,6 +182,35 @@ def test_resolve_binds_admitted_optimizer_cell_through_live_roster(tmp_path: Pat
     assert resolved.optimizer._target_ == entry.target
 
 
+def test_resolve_refuses_available_optimizer_when_roster_entry_is_not_admitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path, method="adam", status="available")
+    import tpen.hi_schema as schema
+
+    original_roster = schema.HI_METHOD_ROSTER
+    original_entry = next(entry for entry in original_roster if entry.method == "adam")
+    assert original_entry.admitted
+    assert original_entry.target is not None
+    monkeypatch.setattr(
+        schema,
+        "HI_METHOD_ROSTER",
+        tuple(
+            replace(entry, admitted=False) if entry.method == "adam" else entry
+            for entry in original_roster
+        ),
+    )
+
+    optimizer_cell = cell.manifest["scientific_identity"]["optimizer_cell"]
+    assert optimizer_cell["status"] == "available"
+    patched_entry = next(entry for entry in schema.HI_METHOD_ROSTER if entry.method == "adam")
+    assert not patched_entry.admitted
+    assert patched_entry.target == original_entry.target
+
+    with pytest.raises(train_config.UnavailableOptimizerError, match="unavailable"):
+        train_config.resolve_train_config(cell)
+
+
 def test_resolve_refuses_unavailable_optimizer_cell_without_adam_substitution(tmp_path: Path) -> None:
     cell = _cell(tmp_path, method="linear_method", status="unavailable")
 
@@ -191,14 +238,33 @@ def test_resolve_refuses_stage_without_fixed_training_horizon(tmp_path: Path) ->
         train_config.resolve_train_config(cell)
 
 
+def _contains_reference_energy_number(value: object) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            _contains_reference_energy_number(key)
+            or _contains_reference_energy_number(nested)
+            for key, nested in value.items()
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_contains_reference_energy_number(nested) for nested in value)
+    return isinstance(value, Real) and not isinstance(value, bool) and math.isclose(
+        float(value),
+        float(stage_coordinate._REFERENCE_ENERGY),
+        rel_tol=0.0,
+        abs_tol=1e-15,
+    )
+
+
 def test_resolved_config_passes_hi_schema_and_contains_no_reference_energy(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
     resolved = train_config.resolve_train_config(cell)
-    serialized = json.dumps(OmegaConf.to_container(resolved, resolve=True), sort_keys=True)
+    resolved_tree = OmegaConf.to_container(resolved, resolve=True)
+    serialized = json.dumps(resolved_tree, sort_keys=True)
 
     assert "-2.903724377034119598" not in serialized
     assert "reference_energy" not in serialized
     assert "evaluation.yaml" not in serialized
+    assert not _contains_reference_energy_number(resolved_tree)
 
 
 def test_resolver_routes_schema_validation_through_production(
@@ -222,23 +288,58 @@ def test_resolver_routes_schema_validation_through_production(
 def test_resolver_does_not_read_evaluation_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Guard direct builtins, pathlib, and io reads after cell construction.
+
+    This is a direct-call detector, not a transitive filesystem monitor.  It
+    does not intercept already-open handles, aliases captured before patching,
+    alternate paths, os.open, native I/O, or loader reads through unpatched
+    APIs.  The explicit ``io.open`` arm proves the detector is live on a route
+    that previously bypassed it.
+    """
     cell = _cell(tmp_path)
     original_open = builtins.open
     original_path_open = Path.open
+    original_io_open = io.open
+
+    def is_evaluation_manifest(file: object) -> bool:
+        return str(file).endswith("manifests/evaluation.yaml")
 
     def guarded_open(file: object, *args: object, **kwargs: object) -> object:
-        if str(file).endswith("manifests/evaluation.yaml"):
+        if is_evaluation_manifest(file):
             raise AssertionError("resolver read the evaluation manifest")
         return original_open(file, *args, **kwargs)
 
     def guarded_path_open(path: Path, *args: object, **kwargs: object) -> object:
-        if path.as_posix().endswith("manifests/evaluation.yaml"):
+        if is_evaluation_manifest(path):
             raise AssertionError("resolver read the evaluation manifest")
         return original_path_open(path, *args, **kwargs)
 
+    def guarded_io_open(file: object, *args: object, **kwargs: object) -> object:
+        if is_evaluation_manifest(file):
+            raise AssertionError("resolver read the evaluation manifest")
+        return original_io_open(file, *args, **kwargs)
+
     monkeypatch.setattr(builtins, "open", guarded_open)
     monkeypatch.setattr(Path, "open", guarded_path_open)
-    train_config.resolve_train_config(cell)
+    monkeypatch.setattr(io, "open", guarded_io_open)
+
+    evaluation_manifest = Path(train_config.__file__).parent / "manifests" / "evaluation.yaml"
+    with pytest.raises(AssertionError, match="evaluation manifest"):
+        with io.open(evaluation_manifest, "r", encoding="utf-8") as handle:
+            handle.read()
+
+    resolved = train_config.resolve_train_config(cell)
+    assert isinstance(resolved, DictConfig)
+
+
+def test_resolve_does_not_draw_from_global_rng(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    before = random.getstate()
+
+    resolved = train_config.resolve_train_config(cell)
+
+    assert random.getstate() == before
+    assert resolved.runtime.seed == cell.seed_streams["model_initialization"]
 
 
 def test_resolver_requires_repo_root_on_sys_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
