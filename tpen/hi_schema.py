@@ -61,6 +61,7 @@ from tpen.config_schema import (
 
 __all__ = [
     "ADMITTED_CALLBACK_TARGETS",
+    "ADMITTED_CONSTRUCTION_TARGETS",
     "ADMITTED_METHOD_TARGETS",
     "ADMITTED_UPDATE_METHOD_TARGETS",
     "REFERENCE_MANIFEST_MODULE",
@@ -469,6 +470,65 @@ HI_TRAIN_POLICY = SchemaPolicy(
 )
 
 
+# Exact construction identities for the complete HI configuration tree. The
+# shipped control supplies the component vocabulary; the schema's existing
+# admission contracts and valid-target tests supply the additional variants.
+# Adding an executable capability requires explicit review here. These are
+# strings, never imports: validation must not execute a target to qualify it.
+ADMITTED_CONSTRUCTION_TARGETS = (
+    ADMITTED_CALLBACK_TARGETS
+    | ADMITTED_METHOD_TARGETS
+    | ADMITTED_UPDATE_METHOD_TARGETS
+    | frozenset(
+        {
+            # Control geometry, training, and Hamiltonian components.
+            "torch.tensor",
+            "tpen.data.atomic_configuration.AtomicConfiguration",
+            "tpen.runner.Train",
+            "tpen.training.trainer.VMCTrainer",
+            "tpen.sampling.metropolis.MetropolisSampler",
+            "tpen.physics.kinetic.KineticEnergy",
+            "tpen.physics.potential.ElectronNucleusPotential",
+            "tpen.physics.potential.ElectronElectronInteraction",
+            "tpen.physics.potential.NucleusNucleusPotential",
+            # Control architecture and the variants exercised by HI tests.
+            "tpen.nn.TPENWaveFunction",
+            "tpen.nn.Embedding",
+            "tpen.nn.TPENLayer",
+            "tpen.nn.EquivariantMixing",
+            "tpen.nn.PathAggregation",
+            "tpen.nn.ResidualUpdater",
+            "tpen.nn.ReplaceUpdater",
+            "tpen.nn.ElectronElectronCusp",
+            "tpen.nn.ElectronNucleusCusp",
+            "tpen.nn.TailSafeElectronNucleusCuspLaw",
+            "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
+            # Preserve the existing schema-test identity too. The constructor
+            # exists in jastrow.py but has no package-root re-export at baseline.
+            "tpen.nn.BoundedTwoCoefficientJastrow",
+            "tpen.nn.readout.PfaffianReadout",
+            "tpen.nn.initialization.TorchInitializer",
+            "torch.nn.SiLU",
+            "torch.nn.Tanh",
+            # Existing valid wrapper tests require these identities. Their
+            # arguments remain subject to the same recursive target sweep,
+            # including when construction is partial or recursion is deferred.
+            "torch.nn.ModuleList",
+            "hydra.utils.instantiate",
+            "tpen.runner.Evaluate",
+            # Control bookkeeping and nested callback arguments.
+            "tpen.logging.CSV",
+            "tpen.logging.JSONL",
+            "tpen.checkpoint.EveryNUpdates",
+            "tpen.checkpoint.TrainResume",
+            "tpen.equivariance.checks.FullModelEquivarianceChecker",
+            "tpen.equivariance.checks.TraceEquivarianceChecker",
+            "tpen.accelerator.TorchAllocatorPeakProbe",
+        }
+    )
+)
+
+
 def declared_schema(cfg: Any) -> str | None:
     """Return the schema a configuration opts in to, if any.
 
@@ -549,11 +609,8 @@ def _sweep_callbacks(resolved_tree: Any) -> list[Rejection]:
         # Only the callback's own ``_target_`` is a callback identity; a nested
         # ``_target_`` is a constructor argument (a schedule, a payload, a
         # probe) and is governed by its owning callback, not by this allowlist.
-        # THE BOUNDARY IS UNCHANGED AND THE REASON STILL HOLDS. What changed is
-        # that a nested target is no longer ungoverned: `_sweep_target_values`
-        # refuses an executable target that names the evaluation reference,
-        # anywhere in the tree and at any depth. See its docstring for why that
-        # is a separate rule rather than a wider allowlist here.
+        # Every construction identity, including constructor arguments, also
+        # passes the global admission sweep. This rule adds callback semantics.
         owner = path.rsplit("._target_", 1)[0]
         if owner.count(".") != 0 or not owner.startswith("callbacks["):
             continue
@@ -570,6 +627,44 @@ def _sweep_callbacks(resolved_tree: Any) -> list[Rejection]:
                     ),
                 )
             )
+    return rejections
+
+
+def _sweep_free_form_targets(config_tree: Any, *, tree: str = "resolved") -> list[Rejection]:
+    """Require explicit admission for every construction identity in the tree.
+
+    Traverse every mapping and sequence before Hydra construction, including
+    arguments beneath admitted targets and deferred or partial constructions.
+    Admission is exact membership, independent of the key or depth at which a
+    target occurs. Existing component rules still qualify its scientific use.
+
+    On the raw tree, collect literal findings without resolving interpolations.
+    Interpolated identities must pass the same allowlist on the resolved tree;
+    the raw pass alone never establishes admission for them. Keeping raw
+    findings separate preserves them when resolution fails or is refused.
+    """
+
+    rejections: list[Rejection] = []
+    for path, key, target in iter_nodes(config_tree):
+        if key != "_target_":
+            continue
+        if isinstance(target, str):
+            if tree == "raw" and "${" in target:
+                continue
+            if target in ADMITTED_CONSTRUCTION_TARGETS:
+                continue
+        rejections.append(
+            Rejection(
+                rule="unadmitted-free-form-target",
+                tree=tree,
+                path=path,
+                detail=(
+                    f"construction target {target!r} is not explicitly admitted for HI. "
+                    "Every target must belong to ADMITTED_CONSTRUCTION_TARGETS before "
+                    "construction, including targets in arguments of admitted objects."
+                ),
+            )
+        )
     return rejections
 
 
@@ -603,16 +698,10 @@ def _sweep_target_values(resolved_tree: Any) -> list[Rejection]:
     ``TestNoTargetCanNameTheReferenceModule``, which asserts the rule name and
     not merely that something was refused.
 
-    WHY A DENYLIST HERE AND AN ALLOWLIST FOR CALLBACKS. The callback allowlist
-    is enumerable: the study installs a fixed set of bookkeeping and health
-    callbacks and a new one is a review event. The targets in ``model``,
-    ``sampler`` and ``trainer`` are NOT enumerable at schema time -- the scan
-    varies producers, activations, update rules and five initializations, so an
-    allowlist would have to list every arm the materializer may emit and would
-    refuse a legitimate arm the day one is added. That is the over-restriction
-    Amendment A warns about, and it surfaces as a run that cannot start rather
-    than as a red test. The hazard being closed is narrow and nameable -- an
-    executable that loads the evaluation reference -- so it is named.
+    These name checks retain their specific diagnostics. They supplement the
+    global recursive construction allowlist; they are not the admission rule.
+    Changes to the study's executable vocabulary require explicit admission,
+    while scientific coordinates remain governed by the component rules.
 
     TWO RULES, AND NEITHER SUBSUMES THE OTHER. The module rule catches
     ``tpen.hi_manifest.load_evaluation_manifest``, whose tokens are
@@ -694,8 +783,8 @@ def _sweep_target_values(resolved_tree: Any) -> list[Rejection]:
         #
         # So the honest bound is only this: this RULE refuses the dotted module
         # spelling wherever it appears as a string. It does not bound what a
-        # configuration can read. Tracked as its own item; see the residual list
-        # on :func:`_sweep_positional_construction`.
+        # configuration can read. Executable capabilities are separately
+        # qualified by the global recursive construction allowlist.
         if target == REFERENCE_MANIFEST_MODULE or target.startswith(
             f"{REFERENCE_MANIFEST_MODULE}."
         ):
@@ -1158,69 +1247,12 @@ def _sweep_positional_construction(resolved_tree: Any) -> list[Rejection]:
     resolution-time ``_args_``, materialised through a resolver, is refused as
     well, because the resolved sweep walks materialised containers.
 
-    RESIDUAL, CORRECTED. An earlier version of this paragraph named a model hung
-    from ``runner.net``. **That was the comfortable member and it is not
-    reachable at all**: ``Train`` has no such parameter, so it is a TypeError at
-    construction. Naming it read as candour while leaving the reachable
-    residuals unstated -- the second time in this slice that happened, and the
-    reviewer caught both.
-
-    The reachable residuals of this same class, as of this commit, are:
-
-    - **Generic importers carrying a module path as DATA. NARROWED, NOT
-      CLOSED, and the earlier text here said "Closed" -- which was wrong.**
-      Widening the module-identity check to every string value (see
-      :func:`_sweep_target_values`) catches the DOTTED spelling wherever it
-      appears. It does not catch a path that is never spelled dotted. MEASURED
-      at head ``745de1e``, all three validating end-to-end:
-      ``import_module(name=".hi_manifest", package="tpen")`` splits the path
-      across two strings; ``runpy.run_path(path_name="tpen/hi_manifest.py")``
-      uses the FILESYSTEM spelling and executes the module source outright;
-      ``builtins.__import__(name="hi_manifest", globals={"__package__": "tpen"},
-      level=1)`` does the same through the import hook.
-
-      The false step was the doctrine sentence, not the code: "the module path
-      has to appear SOMEWHERE as a string" is true only if it appears WHOLE.
-      Split across two arguments, or written as a file path, it does not.
-
-      Filed as its own item rather than patched here: the filesystem class is
-      not closable by string identity at all -- absolute paths, ``./`` prefixes,
-      symlinks and case-insensitive filesystems all spell the same file -- so
-      the remedy has to govern the SLOT or the CONSUMER rather than enumerate
-      spellings, and that is a new production surface.
-
-      Impact: the module is imported or executed on the training path, which is
-      the hazard the rule names.
-
-      **THE OLD BOUND HERE WAS FALSE AND IS RETRACTED.** It said the reference
-      NUMBERS were safe because ``_args_`` is refused so "no config-only shape
-      can CALL the loader". That bounded a hazard by ONE LOADER'S NAME -- the
-      same failure this whole slice is about, committed in an impact bound
-      instead of in a rule, and it shipped. MEASURED by an independent verifier
-      at ``96f64f6``::
-
-          runner:
-            load:
-              _target_: omegaconf.OmegaConf.load
-              file_: experiments/atomistic/he-importance/manifests/evaluation.yaml
-
-      That VALIDATES, and instantiating it returns ``reference.energy ==
-      -2.9037243770341195``. It needs no module path and trips no token: the
-      manifest's own file path tokenizes to nothing this schema denies. The
-      numbers are reachable without touching ``tpen.hi_manifest`` at all.
-
-      Filed as its own item under Amendment C rather than fixed here. It does
-      not falsify the acceptance contract, which explicitly excludes runtime
-      isolation of the reference -- but nothing in this module may claim the
-      numbers are out of reach, and until that item lands, they are not.
-    - **Resolvers supplying a denied capability under an undenied name.** Closed
-      by moving to an allowlist; see ``allowed_resolvers`` on
-      :data:`HI_TRAIN_POLICY`.
-    - **Still open: a component reached through a keyword no rule names, in a
-      slot whose consumer does NOT have a strict signature.** No such slot is
-      known on the constructed path today, and the strict-signature audit above
-      is what makes that a bounded claim rather than an assumption. It is an
-      assumption about every consumer ADDED LATER, and nothing enforces it.
+    Construction admission is independent of this positional-argument policy.
+    Earlier name and location checks left executable capabilities unqualified;
+    the global recursive allowlist now qualifies every declared target before
+    Hydra construction. This positional rule still constrains how admitted
+    components receive their scientific coordinates. Resolution safety is a
+    separate phase; see :func:`validate_hi_train_config`.
     """
 
     rejections: list[Rejection] = []
@@ -2130,6 +2162,9 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
     # config that both fails to resolve and carries a reference must report the
     # reference, because that is the finding that stops a run from happening.
     rejections = list(sweep_raw(raw_tree, HI_TRAIN_POLICY))
+    # Literal construction findings must survive any resolution failure or
+    # early refusal. Collect them alongside the other raw findings.
+    rejections.extend(_sweep_free_form_targets(raw_tree, tree="raw"))
     rejections.extend(sweep_environment(environment, HI_TRAIN_POLICY))
 
     # Resolution failure is itself a rejection, which keeps every
@@ -2149,6 +2184,16 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
 
     rejections.extend(sweep_resolved(resolved_tree, HI_TRAIN_POLICY))
     rejections.extend(_sweep_callbacks(resolved_tree))
+    # A resolved interpolation can introduce a new target anywhere. Avoid
+    # duplicating literal findings already reported from the raw tree.
+    raw_target_paths = {
+        finding.path for finding in rejections
+        if finding.rule == "unadmitted-free-form-target"
+    }
+    rejections.extend(
+        finding for finding in _sweep_free_form_targets(resolved_tree)
+        if finding.path not in raw_target_paths
+    )
     rejections.extend(_sweep_target_values(resolved_tree))
     rejections.extend(_sweep_constructed_components(resolved_tree))
     rejections.extend(_sweep_frozen_scalars(resolved_tree))
