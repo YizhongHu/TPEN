@@ -326,7 +326,7 @@ HI_METHOD_ROSTER: tuple[MethodAvailability, ...] = (
         # works at two electrons after #488 supplied exact-zero scores for
         # structurally inactive even-electron parameters. Scan-factor inclusion
         # still awaits the operator's scan-design decision, which must account
-        # for the OPEN non-finite-score row-policy question at 02859027 and the
+        # for the non-finite-score row-policy question tracked by 02859027 and the
         # undischarged SR limb of 3957a23c's ADAM-ONLY determination (its stage-30
         # note says SR was not measured here).
         #
@@ -339,10 +339,10 @@ HI_METHOD_ROSTER: tuple[MethodAvailability, ...] = (
             "EXCLUDED from the helium-importance scan pending the operator's scan-design "
             "decision: #488 made SR/minSR available at two electrons by supplying exact-zero "
             "scores for structurally inactive even-electron parameters. The decision must "
-            "account for 02859027, the OPEN non-finite-score row-policy question, and the "
+            "account for the non-finite-score row-policy question tracked by 02859027 and the "
             "undischarged SR limb of 3957a23c's ADAM-ONLY determination (SR was not measured "
-            "here). This is not an admission to the scan; the machine-readable field remains "
-            "admitted=False"
+            "here). This is not an admission to the scan; MethodAvailability.admitted is the "
+            "machine-readable admission field, while this rationale is explanatory prose"
         ),
     ),
     MethodAvailability(
