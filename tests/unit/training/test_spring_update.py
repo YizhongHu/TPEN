@@ -316,7 +316,8 @@ def test_skips_leave_history_unchanged_and_nonfinite_direction_not_recorded(
 
     parameter, features, energies = _problem(seed=59)
     method = _method(parameter, history_decay=0.4)
-    method.update(_step_input(parameter, features, energies, step=0))
+    initial = method.update(_step_input(parameter, features, energies, step=0))
+    assert initial.applied is True
     prior = method.history.clone()
 
     zero = method.update(
