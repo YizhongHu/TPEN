@@ -4,6 +4,11 @@ Blinding is a property of this boundary: reference values are refused from
 every input route and are never emitted.  This module only qualifies mechanics
 and reports whether a checkpoint is usable for later ranking; it never ranks
 or makes an accuracy decision.
+
+The non-finite policy is declared independently at each evaluator seam. L3a
+retains rows with provenance and rejects the resulting artifact, while the
+adjacent L3b ranking evaluator declares ``defer``. This declaration is
+deliberate; L3a does not inherit trainer ruling 377f6b0f's raise-always policy.
 """
 
 from __future__ import annotations
@@ -77,6 +82,7 @@ def qualify_factor(
     a qualification result.
     """
 
+    _refuse_blinding_content(factor_id, "factor id")
     _refuse_blinding_content(value, "factor input")
     supplied = {
         name: oracle
@@ -122,6 +128,8 @@ def evaluate_local_energy_rows(
         raise IncompleteRankArtifactError("local-energy rows must contain each expected chain exactly once")
     if any(row.checkpoint_id != checkpoint_id for row in rows):
         raise EvaluatorQualificationError("local-energy row checkpoint provenance does not match evaluation")
+    for index, row in enumerate(rows):
+        _refuse_blinding_content(row.topology, f"local-energy row[{index}] topology")
     if any(not row.topology for row in rows):
         raise EvaluatorQualificationError("local-energy rows require nonempty topology provenance")
     status = (
@@ -147,7 +155,11 @@ def require_complete_rank_artifact(states: Sequence[InferenceState], *, expected
 def _refuse_blinding_content(value: Any, label: str) -> None:
     """Reject reference-bearing fields recursively before they reach the evaluator."""
 
-    if isinstance(value, Mapping):
+    if isinstance(value, str):
+        normalized = value.lower().replace("-", "_")
+        if normalized in _FORBIDDEN_BLINDING_TOKENS or "reference" in normalized:
+            raise EvaluatorQualificationError(f"{label} contains forbidden blinding value {value!r}")
+    elif isinstance(value, Mapping):
         for key, nested in value.items():
             if not isinstance(key, str):
                 raise EvaluatorQualificationError(f"{label} keys must be strings")
