@@ -230,6 +230,7 @@ def run_from_config(
     config_path: str | None = None,
     command: str | None = None,
     raise_exceptions: bool = False,
+    topology: ExecutionTopology | None = None,
 ) -> int:
     """Instantiate and execute the configured runner.
 
@@ -244,6 +245,10 @@ def run_from_config(
         exception event, and logger teardown. The default ``False`` preserves
         CLI-style ``return 1`` behavior; tests and debugging can set ``True`` to
         surface the original traceback.
+    topology : ExecutionTopology or None, optional
+        Launcher-supplied execution topology forwarded to the context consumer
+        for this call. When omitted, ``prepare_run_context`` applies its normal
+        single-process fallback.
 
     Returns
     -------
@@ -278,7 +283,21 @@ def run_from_config(
         # exception event, logger teardown, `return 1`) rather than escaping as
         # a bare exception from a helper.
         validate_hi_train_config(cfg)
-        context = prepare_run_context(cfg, config_path=config_path, command=command, bootstrap=bootstrap)
+        if topology is None:
+            context = prepare_run_context(
+                cfg,
+                config_path=config_path,
+                command=command,
+                bootstrap=bootstrap,
+            )
+        else:
+            context = prepare_run_context(
+                cfg,
+                config_path=config_path,
+                command=command,
+                bootstrap=bootstrap,
+                topology=topology,
+            )
         _seed_runtime_rngs(context.cfg)
         context.emit(RunStarted())
         runner = _instantiate_runner(context)
