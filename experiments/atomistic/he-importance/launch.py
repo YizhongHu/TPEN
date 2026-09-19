@@ -11,11 +11,9 @@ distributed workers.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import import_module
 import re
-from threading import RLock
 from typing import Any
 
 from omegaconf import DictConfig
@@ -28,7 +26,10 @@ from tpen.run import run_from_config
 
 _STAGE_API = import_module("experiments.atomistic.he-importance.stage_coordinate")
 _TRAIN_CONFIG = import_module("experiments.atomistic.he-importance.train_config")
-_TOPOLOGY_FACT_KEYS = frozenset(
+# This vocabulary is deliberately closed. Names outside this declaration belong
+# to the scientific manifest unless a future owner adds them and gives the
+# production consumer a representation for them.
+_DECLARED_EXECUTION_FACT_KEYS = frozenset(
     {
         "global_rank",
         "global_size",
@@ -76,19 +77,24 @@ _TOPOLOGY_FACT_KEYS = frozenset(
         "mpi_localrankid",
     }
 )
-_NORMALIZED_TOPOLOGY_FACT_KEYS = frozenset(
-    re.sub(r"[^a-z0-9]", "", key.lower()) for key in _TOPOLOGY_FACT_KEYS
+_NORMALIZED_DECLARED_EXECUTION_FACT_KEYS = frozenset(
+    re.sub(r"[^a-z0-9]", "", key.lower()) for key in _DECLARED_EXECUTION_FACT_KEYS
 )
-_LAUNCHER_FACT_PREFIXES = ("slurm", "pmi", "pmix", "ompi", "mpi")
-_LAUNCHER_FACT_SUFFIXES = (
-    "rank",
-    "worldsize",
-    "jobid",
-    "processid",
-    "hostname",
-    "visibledevices",
+_RUNNER_TOPOLOGY_FACT_KEYS = frozenset(
+    {
+        "global_rank",
+        "global_size",
+        "local_rank",
+        "local_size",
+        "node_rank",
+        "node_size",
+        "host",
+        "pid",
+        "device",
+        "job_id",
+        "device_identity",
+    }
 )
-_TOPOLOGY_HANDOFF_LOCK = RLock()
 
 
 class LaunchValidationError(ValueError):
@@ -147,20 +153,22 @@ def execution_topology_facts(topology: ExecutionTopology | Mapping[str, Any]) ->
 def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> None:
     """Refuse launcher-shaped facts in scientific or payload namespaces.
 
-    The detector traverses mappings and non-text sequences to arbitrary depth.
-    Root ``topology`` is the sole excluded subtree; every other namespace is
-    inspected.  Keys are compared after lower-casing and removing separators,
-    so common launcher/environment aliases such as ``WORLD_SIZE``,
-    ``hostname``, and ``process_id`` cannot bypass the boundary.
+    The declared vocabulary is the normalized form of
+    ``_DECLARED_EXECUTION_FACT_KEYS``. The detector traverses mappings and
+    non-text sequences recursively; the root ``topology`` is the sole excluded
+    subtree. Names outside that declaration are scientific data, even when they
+    resemble process metadata (for example ``matrix_rank``, ``low_rank``,
+    ``RANK_ID``, or ``process_count``). The declaration contains the canonical
+    rank/size, host/pid/device, job, identity, and explicitly listed launcher
+    and environment aliases; it does not claim to classify every key whose
+    spelling resembles execution metadata.
     """
 
     def is_execution_fact_key(key: object) -> bool:
         if not isinstance(key, str):
             return False
         normalized = re.sub(r"[^a-z0-9]", "", key.lower())
-        return normalized in _NORMALIZED_TOPOLOGY_FACT_KEYS or normalized.startswith(
-            _LAUNCHER_FACT_PREFIXES
-        ) or normalized.endswith(_LAUNCHER_FACT_SUFFIXES)
+        return normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS
 
     def visit(value: Any, path: str) -> None:
         if isinstance(value, Mapping):
@@ -185,6 +193,12 @@ def _typed_runner_topology(topology: ExecutionTopology | Mapping[str, Any]) -> E
     if isinstance(topology, ExecutionTopology):
         return topology
     facts = execution_topology_facts(topology)
+    unsupported = tuple(key for key in facts if key not in _RUNNER_TOPOLOGY_FACT_KEYS)
+    if unsupported:
+        names = ", ".join(repr(key) for key in unsupported)
+        raise LaunchValidationError(
+            "unsupported production runner topology facts: " + names
+        )
     required = (
         "global_rank",
         "global_size",
@@ -233,33 +247,6 @@ def _typed_runner_topology(topology: ExecutionTopology | Mapping[str, Any]) -> E
         raise LaunchValidationError(f"invalid production runner topology: {error}") from error
 
 
-@contextmanager
-def _topology_at_production_consumer(topology: ExecutionTopology):
-    """Bind ``topology`` to TPEN's existing context construction path.
-
-    ``run_from_config`` is the production callable and currently exposes no
-    topology keyword, while its consumer ``prepare_run_context`` does.  The
-    narrow adapter below binds that existing consumer seam for the duration of
-    one launch; it does not reimplement runner setup or execution.
-    """
-
-    production_globals = run_from_config.__globals__
-    original_prepare = production_globals["prepare_run_context"]
-
-    def prepare_with_topology(*args: Any, **kwargs: Any) -> Any:
-        if kwargs.get("topology") is not None:
-            raise LaunchValidationError("production runner supplied a conflicting execution topology")
-        kwargs["topology"] = topology
-        return original_prepare(*args, **kwargs)
-
-    with _TOPOLOGY_HANDOFF_LOCK:
-        production_globals["prepare_run_context"] = prepare_with_topology
-        try:
-            yield
-        finally:
-            production_globals["prepare_run_context"] = original_prepare
-
-
 def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any:
     """Bind non-empty launch facts to a source row's designated subtree."""
 
@@ -301,7 +288,7 @@ def launch_train(
     source: Any,
     topology: ExecutionTopology | Mapping[str, Any] | None = None,
     *,
-    runner: Callable[[DictConfig], int | RunResult] = run_from_config,
+    runner: Callable[..., int | RunResult] = run_from_config,
 ) -> int:
     """Resolve one topology-bound row and execute TPEN's production runner."""
 
@@ -310,8 +297,7 @@ def launch_train(
         if topology is None:
             raise LaunchValidationError("launch topology is required")
         runtime_topology = _typed_runner_topology(topology)
-        with _topology_at_production_consumer(runtime_topology):
-            return _exit_code(runner(plan.config))
+        return _exit_code(runner(plan.config, topology=runtime_topology))
     return _exit_code(runner(plan.config))
 
 
