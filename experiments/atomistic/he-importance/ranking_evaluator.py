@@ -55,6 +55,7 @@ _FORBIDDEN_TOKENS = frozenset(
     }
 )
 _SIGNAL_KEYS = frozenset({"checkpoint_id", "disposition", "ordinal"})
+MAX_MECHANICAL_OBSERVATIONS = 1024
 
 
 def evaluate_checkpoint(request: CheckpointRankingRequest) -> RankingSignal:
@@ -91,30 +92,42 @@ def validate_ranking_output(output: Any) -> None:
 def _validate_request(request: CheckpointRankingRequest) -> None:
     if request.max_observations <= 0:
         raise RankingEvaluationError("max_observations must be positive")
+    if request.max_observations > MAX_MECHANICAL_OBSERVATIONS:
+        raise RankingEvaluationError("max_observations exceeds the evaluator bound")
     if not request.mechanical_observations or len(request.mechanical_observations) > request.max_observations:
         raise RankingEvaluationError("mechanical observations exceed the declared bounded cost")
     if not request.rng_provenance:
         raise RankingEvaluationError("ranking jobs require distinct RNG provenance")
-    if request.checkpoint_path.parent.name != "checkpoints" or request.checkpoint_path.parent.parent != request.cell_directory:
+    checkpoint_directory = request.checkpoint_path.parent.resolve()
+    cell_directory = request.cell_directory.resolve()
+    if checkpoint_directory.name != "checkpoints" or checkpoint_directory.parent != cell_directory:
         raise RankingEvaluationError("checkpoint path must bind to its parent cell directory")
 
 
 def _refuse_blinded_content(value: Any, path: str) -> None:
     """Traverse mappings, frozen containers, and dataclasses by structure."""
 
-    if is_dataclass(value):
+    if isinstance(value, str):
+        normalized = value.lower().replace("-", "_")
+        if _is_forbidden_token(normalized):
+            raise RankingEvaluationError(f"{path} contains forbidden value {value!r}")
+    elif is_dataclass(value):
         _refuse_blinded_content(_dataclass_members(value), path)
     elif isinstance(value, Mapping):
         for key, nested in value.items():
             if not isinstance(key, str):
                 raise RankingEvaluationError(f"{path} keys must be strings")
             normalized = key.lower().replace("-", "_")
-            if normalized in _FORBIDDEN_TOKENS or "reference" in normalized or "energy" in normalized:
+            if _is_forbidden_token(normalized):
                 raise RankingEvaluationError(f"{path} contains forbidden field {key!r}")
             _refuse_blinded_content(nested, f"{path}.{key}")
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for index, nested in enumerate(value):
             _refuse_blinded_content(nested, f"{path}[{index}]")
+
+
+def _is_forbidden_token(normalized: str) -> bool:
+    return normalized in _FORBIDDEN_TOKENS or "reference" in normalized or "energy" in normalized
 
 
 def _dataclass_members(value: Any) -> Mapping[str, Any]:
