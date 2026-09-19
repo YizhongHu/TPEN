@@ -47,8 +47,8 @@ def test_blinding_refuses_reference_field_on_every_evaluator_route(
     route: str, forbidden_key: str
 ) -> None:
     value = {"coordinate": 2}
-    calculator = lambda item: item
-    oracle = lambda item: item
+    calculator = lambda item: {"coordinate": 2}
+    oracle = lambda item: {"coordinate": 2}
     if route == "input":
         value = {forbidden_key: 0.01}
     elif route == "calculator output":
@@ -57,6 +57,40 @@ def test_blinding_refuses_reference_field_on_every_evaluator_route(
         oracle = lambda item: {forbidden_key: 0.01}
     with pytest.raises(evaluator.EvaluatorQualificationError, match=f"forbidden blinding field '{forbidden_key}'"):
         evaluator.qualify_factor("cusp", value, calculator, analytic_oracle=oracle)
+
+
+def test_blinding_refuses_reference_label_channel() -> None:
+    with pytest.raises(evaluator.EvaluatorQualificationError, match="forbidden blinding value 'reference_energy'"):
+        evaluator.qualify_factor(
+            "reference_energy",
+            {"coordinate": 2},
+            lambda item: {"coordinate": 2},
+            analytic_oracle=lambda item: {"coordinate": 2},
+        )
+
+
+@pytest.mark.parametrize("route", ["input", "calculator output", "analytic oracle output"])
+def test_blinding_refuses_reference_string_values_on_every_qualified_route(route: str) -> None:
+    value = {"coordinate": 2}
+    calculator = lambda item: {"coordinate": 2}
+    oracle = lambda item: {"coordinate": 2}
+    if route == "input":
+        value = {"label": "reference_energy"}
+    elif route == "calculator output":
+        calculator = lambda item: {"label": "reference_energy"}
+    else:
+        oracle = lambda item: {"label": "reference_energy"}
+    with pytest.raises(evaluator.EvaluatorQualificationError, match="forbidden blinding value"):
+        evaluator.qualify_factor("cusp", value, calculator, analytic_oracle=oracle)
+
+
+def test_blinding_refuses_reference_name_in_local_energy_topology() -> None:
+    rows = (evaluator.LocalEnergyRow("checkpoint-a", "chain-0", {"reference_energy": 0.0}, 1.0),)
+    with pytest.raises(
+        evaluator.EvaluatorQualificationError,
+        match="local-energy row\\[0\\] topology contains forbidden blinding field 'reference_energy'",
+    ):
+        evaluator.evaluate_local_energy_rows("checkpoint-a", rows, expected_chain_ids=("chain-0",))
 
 
 def test_nonfinite_row_is_visible_with_its_chain_and_topology_witness() -> None:
@@ -70,11 +104,36 @@ def test_nonfinite_row_is_visible_with_its_chain_and_topology_witness() -> None:
     assert state.rows[1].topology == {"rank": 1}
 
 
+def test_local_energy_requires_nonempty_topology_provenance() -> None:
+    rows = (evaluator.LocalEnergyRow("checkpoint-a", "chain-0", {}, 1.0),)
+    with pytest.raises(evaluator.EvaluatorQualificationError, match="require nonempty topology provenance"):
+        evaluator.evaluate_local_energy_rows("checkpoint-a", rows, expected_chain_ids=("chain-0",))
+
+
+def test_local_energy_rejects_mismatched_row_checkpoint_provenance() -> None:
+    rows = (evaluator.LocalEnergyRow("checkpoint-b", "chain-0", {"rank": 0}, 1.0),)
+    with pytest.raises(evaluator.EvaluatorQualificationError, match="checkpoint provenance"):
+        evaluator.evaluate_local_energy_rows("checkpoint-a", rows, expected_chain_ids=("chain-0",))
+
+
+def test_local_energy_rejects_void_corpus() -> None:
+    with pytest.raises(evaluator.EvaluatorQualificationError, match="requires at least one row"):
+        evaluator.evaluate_local_energy_rows("checkpoint-a", (), expected_chain_ids=())
+
+
 @pytest.mark.parametrize(
     ("rows", "expected", "message"),
     [
         (_rows(1.0), ("chain-0", "chain-1"), "each expected chain exactly once"),
         (_rows(1.0, 2.0), ("chain-0",), "each expected chain exactly once"),
+        (
+            (
+                evaluator.LocalEnergyRow("checkpoint-a", "chain-0", {"rank": 0}, 1.0),
+                evaluator.LocalEnergyRow("checkpoint-a", "chain-0", {"rank": 1}, 2.0),
+            ),
+            ("chain-0",),
+            "each expected chain exactly once",
+        ),
     ],
 )
 def test_local_energy_chain_completeness_has_a_discriminating_witness(
@@ -102,9 +161,26 @@ def test_rank_artifact_rejects_nonfinite_state_instead_of_silently_dropping_it()
         )
 
 
+def test_rank_artifact_rejects_duplicate_checkpoint_ids() -> None:
+    ready = evaluator.InferenceState("checkpoint-a", evaluator.InferenceStatus.READY, ())
+    with pytest.raises(evaluator.IncompleteRankArtifactError, match="each expected checkpoint exactly once"):
+        evaluator.require_complete_rank_artifact(
+            (ready, ready), expected_checkpoint_ids=("checkpoint-a",)
+        )
+
+
 @pytest.mark.parametrize(
     ("states", "expected"),
-    [([], ("checkpoint-a",)),],
+    [
+        ([], ("checkpoint-a",)),
+        (
+            [
+                evaluator.InferenceState("checkpoint-a", evaluator.InferenceStatus.READY, ()),
+                evaluator.InferenceState("checkpoint-a", evaluator.InferenceStatus.READY, ()),
+            ],
+            ("checkpoint-a",),
+        ),
+    ],
 )
 def test_rank_artifact_rejects_partial_or_duplicate_checkpoint_sets(
     states: list[object], expected: tuple[str, ...]
