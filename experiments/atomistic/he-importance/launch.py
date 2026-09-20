@@ -315,7 +315,7 @@ def launch_train(
     ``topology`` keyword or arbitrary keyword arguments; plain config-only
     doubles retain the existing config-only call. This closes the named
     capability-blind identity-dispatch mechanism, not every way a callable
-    could ignore or mishandle a topology it declares.
+    could ignore or mishandle a topology it accepts.
     """
 
     plan = prepare_train_launch(source, topology)
