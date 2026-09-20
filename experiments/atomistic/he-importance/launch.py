@@ -178,6 +178,7 @@ def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> Non
 
     def is_execution_fact_key(key: object) -> bool:
         if not isinstance(key, str):
+            # Backstop: L1's materializer refuses non-string identity keys first.
             return False
         normalized = re.sub(r"[^a-z0-9]", "", key.lower())
         return normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS

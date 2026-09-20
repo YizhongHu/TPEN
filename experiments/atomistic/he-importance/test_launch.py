@@ -272,11 +272,31 @@ def test_typed_serializer_covers_current_topology_schema() -> None:
     }
 
 
-def test_manifest_non_string_key_is_not_treated_as_execution_fact(tmp_path: Path) -> None:
-    cell = _cell(tmp_path)
-    cell.manifest["scientific_identity"][1] = "scientific-value"
+def test_non_string_identity_key_is_refused_at_materialization(tmp_path: Path) -> None:
+    """L1 refuses a non-string identity key before launch ever sees a cell.
 
-    assert launch.launch_train(cell, runner=lambda _: 0) == 0
+    Manifests are deep-frozen, so a post-hoc mutation of ``cell.manifest``
+    cannot exercise launch's ``isinstance(key, str)`` backstop; that branch
+    is only reachable if this upstream refusal ever stopped enforcing it.
+    This test is a trigger: if it goes red, L1 stopped rejecting non-string
+    keys and the launch-side backstop needs re-examination for whether it
+    became load-bearing.
+    """
+    with pytest.raises(
+        stage_coordinate.MaterializationError, match="identity mapping keys must be strings"
+    ):
+        stage_coordinate.materialize_stage(
+            "O1",
+            [
+                {
+                    "scientific_identity": {"architecture": "control", 1: "scientific-value"},
+                    "payload": {"updates": 50_000},
+                    "topology": {},
+                }
+            ],
+            stage_coordinate.OptimizerCell("adam", "available"),
+            tmp_path,
+        )
 
 
 def test_identity_non_mapping_error_is_specific(tmp_path: Path) -> None:
