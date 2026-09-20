@@ -101,6 +101,52 @@ def _paths(error: ClosedSchemaError) -> set[str]:
     return {rejection.path for rejection in error.rejections}
 
 
+def _free_form_reachability_corpus() -> dict[str, dict[str, object]]:
+    """Generate independently shaped executable specifications.
+
+    These candidates vary reader and importer families with spellings that do
+    not require a dotted module reference.  They intentionally do not consult
+    the production allowlists: the corpus tests the boundary property, not the
+    particular implementation entries that happen to be admitted today.
+    """
+
+    manifest_leaf = "evaluation.yaml"
+    manifest_directory = "experiments/atomistic/he-importance/manifests"
+    file_spellings = (
+        f"{manifest_directory}/{manifest_leaf}",
+        f"./{manifest_directory}/{manifest_leaf}",
+        f"{manifest_directory}/../manifests/{manifest_leaf}",
+        f"/tmp/{manifest_leaf}",
+        f"/tmp/manifest-link/{manifest_leaf}",
+        f"{manifest_directory.upper()}/{manifest_leaf.upper()}",
+    )
+    readers = {
+        "omegaconf.OmegaConf.load": "file_",
+        "json.load": "fp",
+        "yaml.safe_load": "stream",
+        "pathlib.Path.read_text": "self",
+        "builtins.open": "file",
+    }
+    importers = {
+        "importlib.import_module": {"name": ".hi_manifest", "package": "tpen"},
+        "runpy.run_path": {"path_name": "tpen/hi_manifest.py"},
+        "builtins.__import__": {"name": "hi_manifest", "level": 1},
+        "hydra.utils.get_class": {"path": ".hi_manifest"},
+        "hydra.utils.get_object": {"path": ".hi_manifest"},
+        "pydoc.locate": {"path": ".hi_manifest"},
+        "pkgutil.resolve_name": {"name": ".hi_manifest"},
+        "runpy.run_module": {"mod_name": "hi_manifest"},
+    }
+
+    corpus: dict[str, dict[str, object]] = {}
+    for target, argument in readers.items():
+        for index, spelling in enumerate(file_spellings):
+            corpus[f"reader:{target}:{index}"] = {"_target_": target, argument: spelling}
+    for target, arguments in importers.items():
+        corpus[f"importer:{target}"] = {"_target_": target, **arguments}
+    return corpus
+
+
 class TestScope:
     """Who the firewall applies to.
 
@@ -1497,61 +1543,17 @@ class TestTheReferenceModuleCannotArriveAsDATA:
             ),
         ],
     )
-    def test_KNOWN_OPEN_a_path_never_written_whole_is_not_caught(
+    def test_non_dotted_reachability_candidates_are_refused_at_the_loader_boundary(
         self, label: str, spec: dict
     ) -> None:
-        """A RED-BY-DESIGN record of a known-open escape, filed as `fb70cf90`.
-
-        This test asserts the CURRENT, WRONG behaviour on purpose. Every spec
-        below VALIDATES, which is the defect under record.
-
-        **THEY DO NOT ALL REACH THE MODULE, and the earlier wording here said
-        they did.** Measured through Hydra, which is the path that matters:
-        the relative-import and ``runpy.run_path`` specs REACH it; the
-        ``builtins.__import__`` spec does NOT -- it dies
-        ``TypeError('globals must be a dict')``, because OmegaConf hands Hydra a
-        ``DictConfig`` for that argument rather than a real dict. It reaches the
-        module when called directly from Python with a real dict, which is how
-        the wrong claim was made: **the mechanism was verified in a shell and
-        the CONSTRUCTION PATH was not.**
-
-        The third spec is kept, as a validation-gap arm rather than a
-        reachability arm, and labelled so.
-
-        Why assert the defect rather than delete the case: a known-open hole
-        with no executable trace is indistinguishable from one nobody found. If
-        a later slice closes `fb70cf90`, this test goes RED and whoever fixed it
-        is pointed at the item and at this docstring, rather than discovering a
-        mysterious passing assertion about a config that should be refused.
-
-        THE CLASS IS NOT THESE THREE SPELLINGS. It is "a path that is never
-        written whole": split across arguments, or in filesystem form. String
-        identity cannot close the filesystem half at all -- absolute paths,
-        ``./`` prefixes, symlinks and case-insensitive filesystems all spell the
-        same file -- so the remedy must govern the SLOT or the CONSUMER. Do not
-        close this by adding three more strings to a list.
-
-        Impact bound, and it should stay bounded: the holder becomes reachable,
-        which is the hazard the rule names. The reference NUMBERS live in
-        manifest files, and with ``_args_`` refused no config-only shape can
-        CALL the loader.
-        """
+        """Pin representative non-dotted inputs at the closed slot boundary."""
 
         cfg = OmegaConf.load(_CONTROL_CONFIG)
         OmegaConf.update(cfg, "runner.load", spec, force_add=True)
-        _validate(cfg)  # known-open: this SHOULD refuse and does not
-
-        # The control that keeps this honest: the dotted spelling in the very
-        # same slot IS refused, so the gap is the spelling and not the slot.
-        dotted = OmegaConf.load(_CONTROL_CONFIG)
-        OmegaConf.update(
-            dotted,
-            "runner.load",
-            {"_target_": "importlib.import_module", "name": REFERENCE_MANIFEST_MODULE},
-            force_add=True,
-        )
-        with pytest.raises(ClosedSchemaError):
-            _validate(dotted)
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "unadmitted-free-form-target" in _rules(caught.value)
+        assert "runner.load._target_" in _paths(caught.value)
 
     def test_a_similarly_named_module_is_not_caught(self) -> None:
         """The identity check must not fire on a prefix that merely looks alike."""
@@ -2161,11 +2163,14 @@ class TestDeclaredTrainability:
 
         ``BoundedTwoCoefficientJastrow`` now HAS a rule, registered when the
         factor landed rather than when a config first used it. This test keeps
-        using a genuinely unregistered name, so it still measures the absence
-        of guessing rather than the absence of that one entry.
+        using an unregistered name: the trainability rule must not guess at
+        its semantics, while the global construction allowlist must refuse it.
         """
 
-        _validate(_config(model={"factors": [{"_target_": "tpen.nn.SomeFutureJastrow"}]}))
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(_config(model={"factors": [{"_target_": "tpen.nn.SomeFutureJastrow"}]}))
+        assert "undeclared-trainability" not in _rules(caught.value)
+        assert "unadmitted-free-form-target" in _rules(caught.value)
 
     def test_rejects_a_jastrow_that_omits_trainable(self) -> None:
         """Both coefficients start at zero, so an inherited false is invisible.
@@ -2281,20 +2286,16 @@ class TestTheElectronNucleusLawIsAdmitted:
         assert "undeclared-nonfinite-policy" in _rules(caught.value)
 
     def test_a_factor_that_is_not_the_en_cusp_is_left_alone(self) -> None:
-        """The rule is scoped to the electron-nucleus cusp, not to any 'law' key."""
+        """Unknown constructions fail admission without acquiring a cusp-law rule."""
 
-        _validate(
-            _config(
-                model={
-                    "factors": [
-                        {
-                            "_target_": "tpen.nn.SomeFutureFactor",
-                            "law": {"_target_": "tpen.nn.CurvatureElectronNucleusCuspLaw"},
-                        }
-                    ]
-                }
-            )
-        )
+        cfg = _config(model={"factors": [{
+            "_target_": "tpen.nn.SomeFutureFactor",
+            "law": {"_target_": "tpen.nn.CurvatureElectronNucleusCuspLaw"},
+        }]})
+        with pytest.raises(ClosedSchemaError) as caught:
+            _validate(cfg)
+        assert "unadmitted-cusp-law" not in _rules(caught.value)
+        assert "unadmitted-free-form-target" in _rules(caught.value)
 
 
 class TestRankInvariance:
@@ -2516,3 +2517,41 @@ class TestEveryFindingIsReported:
             "forbidden-surface:reference",
             "forbidden-surface:band",
         } <= _rules(caught.value)
+
+
+class TestFreeFormConstructionSlots:
+    """The loader boundary refuses generated reachability candidates."""
+
+    @pytest.mark.parametrize("slot", ["runner.load", "loggers[]"])
+    def test_every_generated_reachability_node_is_refused(self, slot: str) -> None:
+        corpus = _free_form_reachability_corpus()
+        refused_node_ids: set[str] = set()
+
+        for node_id, specification in corpus.items():
+            if slot == "runner.load":
+                cfg = _config(
+                    runner={"_target_": "tpen.runner.Train", "load": specification}
+                )
+                expected_path = "runner.load._target_"
+            else:
+                cfg = _config(loggers=[specification])
+                expected_path = "loggers[0]._target_"
+
+            with pytest.raises(ClosedSchemaError) as caught:
+                _validate(cfg)
+
+            if (
+                "unadmitted-free-form-target" in _rules(caught.value)
+                and expected_path in _paths(caught.value)
+            ):
+                refused_node_ids.add(node_id)
+
+        assert refused_node_ids == set(corpus), (
+            "The corpus is tracked by generated node identifier, not a case count. "
+            f"Missing: {sorted(set(corpus) - refused_node_ids)}"
+        )
+
+    def test_control_logger_targets_remain_admitted(self) -> None:
+        """The concrete control config is the over-restriction witness."""
+
+        _validate(OmegaConf.load(_CONTROL_CONFIG))
