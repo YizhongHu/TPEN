@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib import import_module
+import inspect
 import re
 from typing import Any
 
@@ -56,6 +57,11 @@ _DECLARED_EXECUTION_FACT_KEYS = frozenset(
         "processid",
         "device_id",
         "deviceid",
+        "cuda_device_id",
+        "rank_id",
+        "process_count",
+        "pbs_jobid",
+        "nvidia_visible_devices",
         "cuda_visible_devices",
         "visible_devices",
         "num_nodes",
@@ -157,11 +163,17 @@ def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> Non
     ``_DECLARED_EXECUTION_FACT_KEYS``. The detector traverses mappings and
     non-text sequences recursively; the root ``topology`` is the sole excluded
     subtree. Names outside that declaration are scientific data, even when they
-    resemble process metadata (for example ``matrix_rank``, ``low_rank``,
-    ``RANK_ID``, or ``process_count``). The declaration contains the canonical
+    resemble process metadata (for example ``matrix_rank`` or ``low_rank``).
+    This closed lexical vocabulary cannot
+    classify every spelling: the guard closes named mechanisms, not the class.
+    Whoever adds an execution fact to the production consumer owns adding its
+    spellings here. The declaration contains the canonical
     rank/size, host/pid/device, job, identity, and explicitly listed launcher
-    and environment aliases; it does not claim to classify every key whose
-    spelling resembles execution metadata.
+    and environment aliases. It carries five ``slurm_*``, three
+    ``pmi*``/``pmix``, and two ``ompi_*`` spellings, but, before ``pbs_jobid``
+    was added from measurement, zero PBS spellings. TPEN's production facility,
+    ALCF Polaris, is PBS; other PBS spellings are an open probe target for the
+    next review round rather than names added speculatively.
     """
 
     def is_execution_fact_key(key: object) -> bool:
@@ -219,6 +231,12 @@ def _typed_runner_topology(topology: ExecutionTopology | Mapping[str, Any]) -> E
     if identity_value is None or isinstance(identity_value, AcceleratorIdentity):
         identity = identity_value
     elif isinstance(identity_value, Mapping):
+        unsupported_identity = set(identity_value) - {"kind", "index", "uuid"}
+        if unsupported_identity:
+            names = ", ".join(repr(key) for key in sorted(unsupported_identity, key=str))
+            raise LaunchValidationError(
+                "unsupported topology.device_identity keys: " + names
+            )
         try:
             identity = AcceleratorIdentity(
                 kind=AcceleratorKind(str(identity_value["kind"])),
@@ -290,14 +308,31 @@ def launch_train(
     *,
     runner: Callable[..., int | RunResult] = run_from_config,
 ) -> int:
-    """Resolve one topology-bound row and execute TPEN's production runner."""
+    """Resolve one topology-bound row and execute TPEN's production runner.
+
+    Custom runners receive topology when their signature can accept a
+    ``topology`` keyword or arbitrary keyword arguments; plain config-only
+    doubles retain the existing config-only call. This closes the named
+    capability-blind identity-dispatch mechanism, not every way a callable
+    could ignore or mishandle a topology it declares.
+    """
 
     plan = prepare_train_launch(source, topology)
     if runner is run_from_config:
         if topology is None:
+            # Backstop: L1's empty-mapping refusal is reached first.
             raise LaunchValidationError("launch topology is required")
         runtime_topology = _typed_runner_topology(topology)
         return _exit_code(runner(plan.config, topology=runtime_topology))
+    if topology is not None:
+        parameters = inspect.signature(runner).parameters.values()
+        accepts_topology = any(
+            parameter.name == "topology" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if accepts_topology:
+            runtime_topology = _typed_runner_topology(topology)
+            return _exit_code(runner(plan.config, topology=runtime_topology))
     return _exit_code(runner(plan.config))
 
 
