@@ -50,6 +50,7 @@ __all__ = [
     "canonical_digest",
     "ForbiddenSurface",
     "Rejection",
+    "RESOLVER_REFUSAL_RULES",
     "SchemaPolicy",
     "iter_nodes",
     "sweep",
@@ -81,6 +82,12 @@ _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 # expression and never examined. Brace nesting is not a regular language, so
 # :func:`iter_interpolations` walks the braces instead.
 _INTERPOLATION_OPEN = "${"
+
+# Any one of these raw findings makes every resolving read unsafe: evaluating
+# the tree could execute a config-named callable before the refusal is raised.
+RESOLVER_REFUSAL_RULES = frozenset(
+    {"forbidden-resolver", "unadmitted-resolver", "uncheckable-resolver"}
+)
 
 
 def tokens_of(name: object) -> tuple[str, ...]:

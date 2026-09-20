@@ -46,13 +46,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Iterator
 
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf.basecontainer import BaseContainer
 
 from tpen.config_schema import (
     ClosedSchemaError,
     canonical_digest,
     ForbiddenSurface,
     Rejection,
+    RESOLVER_REFUSAL_RULES,
     SchemaPolicy,
     iter_nodes,
     sweep_environment,
@@ -74,6 +76,7 @@ __all__ = [
     "SCHEMA_KEY",
     "canonical_train_identity",
     "declared_schema",
+    "identity_without_execution",
     "is_hi_family",
     "validate_hi_train_config",
 ]
@@ -203,6 +206,10 @@ STOP_RULE_SURFACE = ForbiddenSurface(
 # agree, because a silent divergence would leave the rule below pointing at a
 # module nobody loads.
 REFERENCE_MANIFEST_MODULE = "tpen.hi_manifest"
+
+# The rule reporting a target that reaches the reference manifest. Named once
+# so the refusal below selects it by identity rather than by retyping it.
+REFERENCE_MODULE_TARGET_RULE = "forbidden-target:reference-module"
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +537,233 @@ ADMITTED_CONSTRUCTION_TARGETS = (
 )
 
 
+def _raw_config_mapping(cfg: Any) -> Mapping[str, Any] | None:
+    """Return a plain mapping for a NON-``DictConfig`` configuration.
+
+    Narrowed to the only shape that reaches it. The sole caller pre-filters on
+    ``isinstance(cfg, DictConfig)`` and normalises that case itself, so the
+    ``DictConfig`` branch this used to carry was unreachable -- retired with
+    the walk it served rather than left as a branch no test could enter.
+    """
+
+    return cfg if isinstance(cfg, Mapping) else None
+
+
+# Following a node reference is a dictionary lookup in the RAW tree, so a
+# chain of them terminates without evaluating anything. A chain is still a
+# chain, though, so it is bounded and REFUSES at the bound rather than
+# truncating: a silent truncation is a caller-open leaf, and a guard that
+# stops early without saying so is indistinguishable from one that succeeded.
+@dataclass(frozen=True)
+class Identity:
+    """The outcome of determining one identity node WITHOUT EXECUTION.
+
+    Parameters
+    ----------
+    determined : bool
+        Whether the node's value was established without evaluating anything.
+    value : object
+        The established value, or ``None`` when the node is absent. Meaningful
+        only when ``determined`` is ``True``.
+    reason : str or None
+        Why the value could not be established, when it could not.
+    """
+
+    determined: bool
+    value: object = None
+    reason: str | None = None
+
+
+@contextmanager
+def _no_resolvers() -> Iterator[None]:
+    """Swap OmegaConf's resolver registry for an empty one, then restore it.
+
+    Node references need no resolver, so they still resolve. A resolver CALL
+    finds nothing registered and raises instead of running, which is exactly
+    the boundary this module needs: identity determined without execution.
+
+    The registry is a CLASS attribute and therefore PROCESS-GLOBAL, so this is
+    not safe against concurrent validation in another thread -- the same
+    residual the construction guard already carries, and reachable only if
+    this module is ever called off the main thread. Restoration is in a
+    ``finally`` so an exception cannot leave the registry emptied.
+    """
+
+    saved = BaseContainer._resolvers
+    BaseContainer._resolvers = {}
+    try:
+        yield
+    finally:
+        BaseContainer._resolvers = saved
+
+
+def identity_without_execution(cfg: Any, path: str) -> Identity:
+    """Determine one identity node by following RAW node references only.
+
+    Parameters
+    ----------
+    cfg : Any
+        A ``DictConfig`` or plain mapping.
+    path : str
+        Dotted path of the identity node, e.g. ``"experiment.name"``.
+
+    Returns
+    -------
+    Identity
+        ``determined`` with the literal value, ``determined`` with ``None``
+        when the node is absent, or undetermined with a reason.
+
+    Notes
+    -----
+    The property is IDENTITY DETERMINED WITHOUT EXECUTION -- not that the
+    identity is literal. A node reference names another node in the same
+    tree, so following it is a dictionary lookup and nothing runs. A
+    resolver-call interpolation cannot be followed without invoking a
+    configured callable, which is exactly what must not happen before a
+    refusal, so reaching one at ANY depth on EITHER side of a reference ends
+    in refusal.
+
+    HOW IT WORKS, AND WHY IT DELEGATES
+    ----------------------------------
+    OmegaConf decides what a path MEANS; this module decides only what may
+    RUN while it is decided. Resolution happens with the resolver registry
+    swapped to an EMPTY one, so a node reference still resolves and a
+    resolver CALL finds nothing registered and raises instead of running.
+
+    THIS REPLACED A HAND-ROLLED WALK AND THE WALK WAS DELETED, not kept
+    alongside. The walk read an interpolation body as a VERBATIM ABSOLUTE
+    dotted path; OmegaConf trims whitespace and resolves a leading dot
+    RELATIVE. Wherever a key-space COLLISION put the verbatim path on a
+    different node, the follower determined a WRONG identity and a
+    configuration carrying a reference energy validated clean. The class was
+    not those carriers -- it was that TWO IMPLEMENTATIONS OF PATH SEMANTICS
+    EXISTED, so every divergence between them was a carrier waiting to be
+    constructed. Patching the measured carriers would have left the class
+    open; only retiring one implementation closes it.
+
+    WHAT DELEGATION BOUGHT, beyond the collisions: whitespace-padded bodies,
+    relative references, interpolated mid-path segments, list indices in both
+    spellings, and arbitrarily long chains are now all FOLLOWED rather than
+    refused, because they are followable without executing anything. A
+    deviation this module used to carry -- an escaped opener kept its
+    backslash where OmegaConf drops it -- is closed too: the follower's answer
+    is now the grammar's answer.
+
+    WHAT STILL REFUSES: a resolver call at any depth, on either side of a
+    reference; a cycle; a dangling target; a container where a scalar
+    identity is required. Each is refused because it cannot be established
+    without execution, or is not an identity at all.
+
+    LIMITS, recorded so the residual stays detectable rather than implied.
+
+    The enumeration of interpolation shapes this module used to carry was
+    complete on its own terms and structurally blind to its own complement:
+    its domain was "things that are interpolations", so a plain literal was
+    never varied, and a defect reachable only by a literal was invisible to
+    it. That is not hypothetical -- a refactor once reordered a grammar call
+    ahead of the interpolation scan and an ordinary blank name raised out of
+    validation. Delegation removes that particular blindness by removing the
+    enumeration's subject, but the lesson stands for any successor: VARY THE
+    COMPLEMENT OF YOUR DOMAIN, and re-run the whole suite after a refactor
+    that only moves code.
+
+    THE ENUMERATION WAS ALSO BLIND TO ITS SECOND INPUT. It varied the
+    interpolation, never the RAW TREE'S KEY SPACE -- and the collisions above
+    are constructed entirely in the key space, with the interpolation held
+    ordinary. A carrier is a pair, a spelling AND a set of keys, and varying
+    one member cannot expose a defect that needs both. NOT WIDENED HERE; a
+    follow-up item owns that, and this paragraph exists so the gap is named
+    rather than discovered again.
+
+    AN AVAILABILITY NARROWING, RECORDED WITH ITS COST RATHER THAN ONLY ITS
+    BENEFIT. A container-valued schema node, and a name derived from a
+    resolver call, now REFUSE on a FOREIGN configuration where the pre-layer
+    reader passed it. That is a real narrowing and it is KEPT DELIBERATELY:
+    relaxing a fail-closed guard deserves its own analysis, not a tweak
+    alongside the repair that introduced it.
+
+    THE COST IS BOUNDED TO ZERO TODAY, AND THAT BOUND IS A MEASUREMENT, NOT A
+    GUARANTEE. ``validate_hi_train_config`` runs on EVERY config on the live
+    path in ``tpen.run``, not only helium-importance ones, so the blast radius
+    is the whole tracked corpus -- and the corpus sweep arm shows all of it
+    passing. A config added tomorrow with a container-valued schema would pay
+    this cost, and the sweep is what would say so.
+
+    The registry swap is PROCESS-GLOBAL, so this is not safe against
+    concurrent validation on another thread -- the same residual the
+    construction guard already carries.
+    """
+
+    if not isinstance(cfg, DictConfig):
+        raw_tree = _raw_config_mapping(cfg)
+        if raw_tree is None:
+            return Identity(determined=True, value=None)
+        try:
+            cfg = OmegaConf.create(raw_tree)
+        except Exception as error:  # noqa: BLE001 - OmegaConf raises several types
+            # A plain mapping can hold text OmegaConf will not even BUILD --
+            # an unclosed interpolation is rejected at construction, which a
+            # DictConfig caller could never have reached. Refuse rather than
+            # let the construction error escape as an unhandled exception:
+            # a value this cannot classify is one whose safety it cannot
+            # vouch for, and crashing is not refusing.
+            return Identity(
+                False,
+                reason=(
+                    f"{path} sits in a mapping OmegaConf cannot parse into a config "
+                    f"({type(error).__name__}: {error}); whether it would run a "
+                    "configured callable cannot be established"
+                ),
+            )
+
+    # DELEGATE. OmegaConf decides what a path means; this module decides only
+    # what may RUN while it is decided. Anything else reimplements path
+    # semantics, and every divergence between the two readings is an identity
+    # mismatch waiting to be constructed.
+    with _no_resolvers():
+        try:
+            value = OmegaConf.select(
+                cfg, path, default=None, throw_on_resolution_failure=True
+            )
+        except Exception as error:  # noqa: BLE001 - OmegaConf raises several types
+            # THE TEMPLATE MUST NOT GUESS THE CAUSE. This branch is reached by
+            # a resolver call, a dangling key, a cycle and a recursion bound
+            # alike, and a fixed "a resolver call is not followable" sentence
+            # is FALSE for three of those four. The embedded exception carries
+            # the truth, so name the exception and let it speak; only the
+            # resolver case gets the resolver explanation.
+            unsupported = type(error).__name__ == "UnsupportedInterpolationType"
+            because = (
+                "a resolver call cannot be followed, because following it means "
+                "running a configured callable before any refusal"
+                if unsupported
+                else "it could not be resolved without execution being attempted"
+            )
+            return Identity(
+                False,
+                reason=(
+                    f"{path} could not be determined: {type(error).__name__}: "
+                    f"{error}. {because}"
+                ),
+            )
+
+    if isinstance(value, (Mapping, list, tuple, DictConfig, ListConfig)):
+        # NOT an execution question. A raw container is DETERMINABLY not a
+        # scalar family name, so saying it "cannot be decided without
+        # execution" would be false. It is refused because an identity node
+        # holding a container is malformed, not because anything is unreadable.
+        return Identity(
+            False,
+            reason=(
+                f"{path!r} holds a {type(value).__name__}, and an identity node must be "
+                "a scalar. This is determinable without execution -- a container is "
+                "not the family name -- and is refused as malformed rather than as "
+                "unreadable"
+            ),
+        )
+    return Identity(determined=True, value=value)
+
+
 def declared_schema(cfg: Any) -> str | None:
     """Return the schema a configuration opts in to, if any.
 
@@ -541,17 +775,26 @@ def declared_schema(cfg: Any) -> str | None:
     Returns
     -------
     str or None
-        The value of the top-level ``schema`` key, or ``None`` when the
-        configuration declares none.
+        The schema this configuration declares, or ``None`` when it declares
+        none OR when the declaration cannot be established without execution.
+
+    Notes
+    -----
+    IDENTITY DETERMINED WITHOUT EXECUTION. A node reference names another
+    node in the same tree, so it is followed by raw lookup and nothing runs;
+    a resolver-call interpolation is not followed, because following it means
+    running a configured callable before any refusal.
+
+    This collapses "declares none" and "cannot be established" into ``None``.
+    A caller that must tell those apart -- and validation must, because the
+    second is refusable and the first is not -- uses
+    :func:`identity_without_execution` instead.
     """
 
-    if isinstance(cfg, DictConfig):
-        value = OmegaConf.select(cfg, SCHEMA_KEY, default=None)
-    elif isinstance(cfg, Mapping):
-        value = cfg.get(SCHEMA_KEY)
-    else:
+    identity = identity_without_execution(cfg, SCHEMA_KEY)
+    if not identity.determined or identity.value is None:
         return None
-    return None if value is None else str(value)
+    return str(identity.value)
 
 
 def is_hi_family(cfg: Any) -> bool:
@@ -565,28 +808,21 @@ def is_hi_family(cfg: Any) -> bool:
     Returns
     -------
     bool
-        ``True`` when ``experiment.name`` is :data:`HI_EXPERIMENT_NAME`.
+        ``True`` when ``experiment.name`` is established, without execution,
+        as :data:`HI_EXPERIMENT_NAME`.
 
     Notes
     -----
-    Read WITHOUT resolving, so a config whose interpolations are broken is
-    still recognised as belonging to the family and still refused for omitting
-    the schema key. Resolving here would make an unrelated typo silently
-    downgrade a helium-importance config to an unenforced one -- the finding
-    and the thing that hides it would share a failure domain.
+    IDENTITY DETERMINED WITHOUT EXECUTION, the same property
+    :func:`declared_schema` holds. A name that cannot be established is NOT
+    this family as far as this predicate is concerned, which is why a caller
+    deciding whether to enforce anything must consult
+    :func:`identity_without_execution` for the undetermined case rather than
+    reading a ``False`` here as "some other family".
     """
 
-    if isinstance(cfg, DictConfig):
-        try:
-            name = OmegaConf.select(cfg, "experiment.name", default=None)
-        except Exception:  # noqa: BLE001 - a broken tree must not grant an exemption
-            return False
-    elif isinstance(cfg, Mapping):
-        experiment = cfg.get("experiment")
-        name = experiment.get("name") if isinstance(experiment, Mapping) else None
-    else:
-        return False
-    return name == HI_EXPERIMENT_NAME
+    identity = identity_without_execution(cfg, "experiment.name")
+    return identity.determined and identity.value == HI_EXPERIMENT_NAME
 
 
 def _sweep_callbacks(resolved_tree: Any) -> list[Rejection]:
@@ -859,7 +1095,7 @@ def _sweep_target_values(resolved_tree: Any) -> list[Rejection]:
         ):
             rejections.append(
                 Rejection(
-                    rule="forbidden-target:reference-module",
+                    rule=REFERENCE_MODULE_TARGET_RULE,
                     tree="resolved",
                     path=path,
                     detail=(
@@ -2184,9 +2420,15 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
     decision logic. A config-only check would leave one of the five open.
     """
 
-    declared = declared_schema(cfg)
+    schema_identity = identity_without_execution(cfg, SCHEMA_KEY)
+    name_identity = identity_without_execution(cfg, "experiment.name")
+    declared = (
+        None
+        if not schema_identity.determined or schema_identity.value is None
+        else str(schema_identity.value)
+    )
     if declared != HI_TRAIN_SCHEMA:
-        if is_hi_family(cfg):
+        if name_identity.determined and name_identity.value == HI_EXPERIMENT_NAME:
             # The config says it is helium-importance but did not declare the
             # schema. Refusing loudly here is the whole point: silently
             # returning would give a real HI run zero enforcement.
@@ -2205,6 +2447,41 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
                             "closed, and the omission would otherwise be silent"
                         ),
                     )
+                ]
+            )
+
+        # Whether this policy applies at all is now known for every config
+        # whose identity can be established WITHOUT EXECUTION -- which
+        # includes every node reference, at any depth. What remains is a
+        # config whose identity could only be established by RUNNING
+        # something, and running it is the defect this module exists to
+        # prevent. Neither read it as a foreign family nor evaluate it.
+        undetermined = [
+            (path, identity)
+            for path, identity in (
+                (SCHEMA_KEY, schema_identity),
+                ("experiment.name", name_identity),
+            )
+            if not identity.determined
+        ]
+        if undetermined:
+            raise ClosedSchemaError(
+                [
+                    Rejection(
+                        rule="undeterminable-identity",
+                        tree="raw",
+                        path=path,
+                        detail=(
+                            f"whether this is a helium-importance configuration cannot be "
+                            f"decided from {path} without execution: {identity.reason}. "
+                            "Reading it as a foreign family would hand a configuration "
+                            "that might be helium-importance ZERO enforcement, and "
+                            "evaluating it to find out is what lets a config-named "
+                            "callable run before any refusal. Name the identity with a "
+                            "literal, or with a reference this can follow"
+                        ),
+                    )
+                    for path, identity in undetermined
                 ]
             )
         return
@@ -2228,11 +2505,7 @@ def validate_hi_train_config(cfg: DictConfig, *, env: Mapping[str, str] | None =
     # tree would invoke the very callable this policy has already refused. Raw
     # findings are collected before this decision so they remain visible with
     # the ordering refusal.
-    if any(
-        rejection.rule
-        in {"forbidden-resolver", "unadmitted-resolver", "uncheckable-resolver"}
-        for rejection in rejections
-    ):
+    if any(rejection.rule in RESOLVER_REFUSAL_RULES for rejection in rejections):
         rejections.append(
             Rejection(
                 rule="resolved-sweep-skipped",
