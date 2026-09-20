@@ -323,8 +323,12 @@ HI_METHOD_ROSTER: tuple[MethodAvailability, ...] = (
         target=None,
         # EXCLUDED FROM THIS STUDY, not awaiting implementation. SR/minSR LANDED
         # on dev (Lane N, PRs #472 and #476), so `tpen/training/sr.py` exists and
-        # works -- and it still cannot be a scan arm here, because it does not
-        # run on two-electron models and helium is two electrons.
+        # works at two electrons after #488 supplied exact-zero scores for
+        # structurally inactive even-electron parameters. Scan-factor inclusion
+        # still awaits the operator's scan-design decision, which must account
+        # for the non-finite-score row-policy question tracked by 02859027 and the
+        # undischarged SR limb of 3957a23c's ADAM-ONLY determination (its stage-30
+        # note says SR was not measured here).
         #
         # The distinction matters and is why this text is not "waiting for Lane
         # N": that phrasing was true until Lane N merged, and would now send a
@@ -332,10 +336,13 @@ HI_METHOD_ROSTER: tuple[MethodAvailability, ...] = (
         # they would conclude the refusal is a bug. A refusal that survives its
         # stated reason misdirects harder than one with no reason at all.
         requires=(
-            "EXCLUDED from the helium-importance scan on scientific grounds: SR/minSR is "
-            "implemented and merged (Lane N), but does not run on two-electron models and "
-            "helium is two electrons. This is not pending work and no amount of optimizer "
-            "work will admit it; admitting it would need a different system"
+            "EXCLUDED from the helium-importance scan pending the operator's scan-design "
+            "decision: #488 made SR/minSR available at two electrons by supplying exact-zero "
+            "scores for structurally inactive even-electron parameters. The decision must "
+            "account for the non-finite-score row-policy question tracked by 02859027 and the "
+            "undischarged SR limb of 3957a23c's ADAM-ONLY determination (SR was not measured "
+            "here). This is not an admission to the scan; MethodAvailability.admitted is the "
+            "machine-readable admission field, while this rationale is explanatory prose"
         ),
     ),
     MethodAvailability(
