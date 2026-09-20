@@ -5,6 +5,7 @@ from __future__ import annotations
 from importlib import import_module
 import inspect
 import os
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 import threading
@@ -114,6 +115,8 @@ def test_launch_refuses_missing_or_empty_topology(tmp_path: Path) -> None:
         launch.launch_train(cell, None, runner=lambda _: pytest.fail("runner was called"))
     with pytest.raises(launch.LaunchValidationError, match="populated"):
         launch.launch_train(cell, {}, runner=lambda _: pytest.fail("runner was called"))
+    with pytest.raises(launch.LaunchValidationError, match="populated"):
+        launch.launch_train(cell, None)
 
 
 def test_launch_refuses_execution_facts_outside_topology(tmp_path: Path) -> None:
@@ -180,10 +183,6 @@ def test_public_launch_rejects_execution_fact_matrix(
     [
         ("matrix_rank", 4),
         ("low_rank", 8),
-        ("mpir_feature", "science"),
-        ("CUDA_DEVICE_ID", 0),
-        ("RANK_ID", 0),
-        ("process_count", 2),
     ],
 )
 @pytest.mark.parametrize(
@@ -202,6 +201,141 @@ def test_public_launch_accepts_undeclared_scientific_names(
 
     assert launch.launch_train(cell, _topology(), runner=lambda config: calls.append(config) or 0) == 0
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "CUDA_DEVICE_ID",
+        "RANK_ID",
+        "process_count",
+        "PBS_JOBID",
+        "NVIDIA_VISIBLE_DEVICES",
+    ],
+)
+@pytest.mark.parametrize(
+    "shape",
+    [
+        lambda key: {key: "sentinel"},
+        lambda key: {"nested": {key: "sentinel"}},
+        lambda key: {"nested": [{key: "sentinel"}]},
+    ],
+)
+def test_public_launch_rejects_new_execution_fact_names(
+    tmp_path: Path, key: str, shape: object
+) -> None:
+    cell = _cell(tmp_path, identity=shape(key))
+
+    with pytest.raises(launch.LaunchValidationError, match="under manifest.topology"):
+        launch.launch_train(cell, _topology(), runner=lambda _: pytest.fail("runner was called"))
+
+
+def test_typed_execution_topology_serializes_every_distinct_field() -> None:
+    identity = launch.AcceleratorIdentity(
+        kind=launch.AcceleratorKind("cuda"), index=19, uuid="distinct-uuid"
+    )
+    topology = ExecutionTopology(
+        global_rank=11,
+        global_size=12,
+        local_rank=13,
+        local_size=14,
+        node_rank=15,
+        node_size=16,
+        host="distinct-host",
+        pid=17,
+        device="distinct-device",
+        job_id="distinct-job",
+        device_identity=identity,
+    )
+
+    assert launch.execution_topology_facts(topology) == {
+        "global_rank": 11,
+        "global_size": 12,
+        "local_rank": 13,
+        "local_size": 14,
+        "node_rank": 15,
+        "node_size": 16,
+        "host": "distinct-host",
+        "pid": 17,
+        "device": "distinct-device",
+        "job_id": "distinct-job",
+        "device_identity": {"kind": "cuda", "index": 19, "uuid": "distinct-uuid"},
+    }
+
+
+def test_typed_serializer_covers_current_topology_schema() -> None:
+    assert set(launch.execution_topology_facts(_topology())) == {
+        field.name for field in fields(ExecutionTopology)
+    }
+    assert {"kind", "index", "uuid"} == {
+        field.name for field in fields(launch.AcceleratorIdentity)
+    }
+
+
+def test_manifest_non_string_key_is_not_treated_as_execution_fact(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    cell.manifest["scientific_identity"][1] = "scientific-value"
+
+    assert launch.launch_train(cell, runner=lambda _: 0) == 0
+
+
+def test_identity_non_mapping_error_is_specific(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    facts = launch.execution_topology_facts(_topology())
+    facts["device_identity"] = "not-a-mapping"
+
+    with pytest.raises(launch.LaunchValidationError, match="must be a mapping or null"):
+        launch.launch_train(cell, facts)
+
+
+def test_identity_rejects_unsupported_nested_keys(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    facts = launch.execution_topology_facts(_topology())
+    facts["device_identity"] = {
+        "kind": "cuda", "index": 0, "uuid": None, "pci_bus_id": "sentinel"
+    }
+
+    with pytest.raises(launch.LaunchValidationError, match="pci_bus_id"):
+        launch.launch_train(cell, facts)
+
+
+def test_explicit_topology_runner_receives_topology(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+
+    received: list[object] = []
+
+    def wrapper(config: object, *, topology: object) -> int:
+        del config
+        received.append(topology)
+        return 0
+
+    assert launch.launch_train(cell, _topology(), runner=wrapper) == 0
+    assert received[0].host == "test-host"
+
+
+def test_kwargs_runner_receives_topology(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    received: list[object] = []
+
+    def wrapper(config: object, **kwargs: object) -> int:
+        del config
+        received.append(kwargs["topology"])
+        return 0
+
+    assert launch.launch_train(cell, _topology(), runner=wrapper) == 0
+    assert received[0].job_id == "test-job"
+
+
+def test_plain_injected_runner_keeps_config_only_contract(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    received: list[object] = []
+
+    def recording_runner(config: object) -> int:
+        received.append(config)
+        return 0
+
+    assert launch.launch_train(cell, _topology(), runner=recording_runner) == 0
+    assert len(received) == 1
 
 
 @pytest.mark.parametrize("key", ["WORLD_SIZE", "hostname", "process_id", "cuda_visible_devices"])
