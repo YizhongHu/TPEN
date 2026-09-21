@@ -51,6 +51,35 @@ def test_factor_qualification_witnesses_disagreeing_oracle() -> None:
         evaluator.qualify_factor("cusp", 3, lambda value: value * 2, slow_oracle=lambda value: 7)
 
 
+def test_r3_all_supplied_oracles_are_called_and_retained():
+    calls = []
+
+    def operation(name):
+        def calculate(value):
+            calls.append((name, value))
+            return value * 2
+        return calculate
+
+    result = evaluator.qualify_factor(
+        "cusp", 3, operation("calculator"),
+        analytic_oracle=operation("analytic"),
+        naive_oracle=operation("naive"),
+        slow_oracle=operation("slow"),
+    )
+    # Pin one call per supplied participant without prescribing oracle order.
+    assert sorted(calls) == sorted((name, 3) for name in ("calculator", "analytic", "naive", "slow"))
+    assert result.value == 6
+    assert result.oracle_values == {"analytic": 6, "naive": 6, "slow": 6}
+
+
+@pytest.mark.parametrize("disagreeing", ["naive", "slow"])
+def test_r3_later_oracle_disagreement_cannot_be_skipped(disagreeing):
+    oracles = {f"{name}_oracle": (lambda value: value * 2) for name in ("analytic", "naive", "slow")}
+    oracles[f"{disagreeing}_oracle"] = lambda value: 7
+    with pytest.raises(evaluator.EvaluatorQualificationError):
+        evaluator.qualify_factor("cusp", 3, lambda value: value * 2, **oracles)
+
+
 @pytest.mark.parametrize(
     "route",
     [
