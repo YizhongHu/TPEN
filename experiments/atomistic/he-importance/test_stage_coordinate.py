@@ -177,6 +177,39 @@ def test_topology_is_required_and_mesh_outside_it_remains_caller_declared_scienc
     stage_coordinate.validate_train_manifest(fine)
 
 
+def test_topology_rebinding_guards_have_positive_and_negative_arms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _packet_source_cells(tmp_path)[0]
+    populated = stage_coordinate.with_execution_topology(cell, {"global_rank": 0})
+    assert populated.manifest["topology"]["global_rank"] == 0
+
+    tampered = stage_coordinate.MaterializedCell(
+        manifest={**cell.manifest, "scientific_identity": {"changed": True}},
+        content_hash=cell.content_hash,
+        output_path=cell.output_path,
+        seed_streams=cell.seed_streams,
+    )
+    with pytest.raises(stage_coordinate.MaterializationError, match="does not bind"):
+        stage_coordinate.with_execution_topology(tampered, {"global_rank": 0})
+
+    real_hash = stage_coordinate.content_hash
+    calls = 0
+
+    def changing_hash(value: object) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return cell.content_hash
+        if calls == 2:
+            return cell.content_hash + "changed"
+        return real_hash(value)
+
+    monkeypatch.setattr(stage_coordinate, "content_hash", changing_hash)
+    with pytest.raises(stage_coordinate.MaterializationError, match="changed the content identity"):
+        stage_coordinate.with_execution_topology(cell, {"global_rank": 0})
+
+
 @pytest.mark.parametrize(
     "topology",
     [
