@@ -230,3 +230,29 @@ def test_l3b_refuses_energy_tokens_in_both_channels(token: str, channel: str) ->
     payload = {token: 1} if channel == "key" else {"label": token}
     with pytest.raises(ranking_evaluator.RankingEvaluationError):
         ranking_evaluator._refuse_blinded_content(payload, "L3b forbidden payload")
+
+
+def test_r2_b_non_string_mapping_key_is_refused_with_declared_error() -> None:
+    """The non-string-key limb must raise the declared error, not an AttributeError."""
+
+    with pytest.raises(ranking_evaluator.RankingEvaluationError):
+        ranking_evaluator._refuse_blinded_content({1: "x"}, "probe")
+
+
+def test_r2_b_non_string_key_is_refused_at_nested_node() -> None:
+    with pytest.raises(ranking_evaluator.RankingEvaluationError):
+        ranking_evaluator._refuse_blinded_content({"outer": ({3: "z"},)}, "probe")
+
+
+def test_r2_b_output_missing_required_key_is_refused() -> None:
+    """A subset key set must be refused with the declared error, not a KeyError."""
+
+    with pytest.raises(ranking_evaluator.RankingEvaluationError):
+        ranking_evaluator.validate_ranking_output({"checkpoint_id": "cp", "disposition": "keep"})
+
+
+def test_r2_b_output_non_mapping_with_matching_key_names_is_refused() -> None:
+    """A non-Mapping whose iteration yields exactly the key names must still be refused."""
+
+    with pytest.raises(ranking_evaluator.RankingEvaluationError):
+        ranking_evaluator.validate_ranking_output(["checkpoint_id", "disposition", "ordinal"])
