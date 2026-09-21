@@ -256,3 +256,17 @@ def test_r2_b_output_non_mapping_with_matching_key_names_is_refused() -> None:
 
     with pytest.raises(ranking_evaluator.RankingEvaluationError):
         ranking_evaluator.validate_ranking_output(["checkpoint_id", "disposition", "ordinal"])
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), -float("inf")], ids=["nan", "posinf", "neginf"])
+@pytest.mark.parametrize("nonfinite_first", [False, True], ids=["finite-first", "nonfinite-first"])
+def test_r3_mixed_observations_defer(tmp_path, nonfinite, nonfinite_first):
+    observations = (nonfinite, 0.25) if nonfinite_first else (0.25, nonfinite)
+    cell = tmp_path / "cell"
+    request = ranking_evaluator.CheckpointRankingRequest(
+        "cp", cell / "checkpoints" / "1.pt", cell,
+        MappingProxyType({"stream": "ranking-a"}), observations, 2,
+    )
+    result = ranking_evaluator.evaluate_checkpoint(request)
+    assert result == ranking_evaluator.RankingSignal("cp", "defer", 1)
+    assert set(vars(result)) == {"checkpoint_id", "disposition", "ordinal"}
