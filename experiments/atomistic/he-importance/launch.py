@@ -61,6 +61,8 @@ _DECLARED_EXECUTION_FACT_KEYS = frozenset(
         "rank_id",
         "process_count",
         "pbs_jobid",
+        "pbs_nodenum",
+        "pbs_tasknum",
         "nvidia_visible_devices",
         "cuda_visible_devices",
         "visible_devices",
@@ -170,10 +172,13 @@ def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> Non
     spellings here. The declaration contains the canonical
     rank/size, host/pid/device, job, identity, and explicitly listed launcher
     and environment aliases. It carries five ``slurm_*``, three
-    ``pmi*``/``pmix``, and two ``ompi_*`` spellings, but, before ``pbs_jobid``
-    was added from measurement, zero PBS spellings. TPEN's production facility,
-    ALCF Polaris, is PBS; other PBS spellings are an open probe target for the
-    next review round rather than names added speculatively.
+    ``pmi*``/``pmix``, and two ``ompi_*`` spellings. TPEN's production
+    facility, ALCF Polaris, is PBS; that probe has now run: the facility sets
+    27 ``PBS_*`` names, 26 of which are accepted outside ``manifest.topology``.
+    ``pbs_jobid``, ``pbs_nodenum``, and ``pbs_tasknum`` are declared as the
+    per-process execution facts among them. The remaining 24 are deliberately
+    excluded as submission context and provenance (queue, account, paths,
+    ``PBS_O_*`` origin names) rather than per-process execution facts.
     """
 
     def is_execution_fact_key(key: object) -> bool:

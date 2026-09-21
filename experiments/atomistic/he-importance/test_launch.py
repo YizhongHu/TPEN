@@ -59,6 +59,10 @@ _EXECUTION_FACT_KEY_PROBES = (
     "PMIX_RANK",
     "OMPI_COMM_WORLD_SIZE",
     "MPI_LOCALRANKID",
+    "pbs_nodenum",
+    "pbs_tasknum",
+    "PBS_NODENUM",
+    "PBS_TASKNUM",
 )
 
 
@@ -278,9 +282,15 @@ def test_non_string_identity_key_is_refused_at_materialization(tmp_path: Path) -
     Manifests are deep-frozen, so a post-hoc mutation of ``cell.manifest``
     cannot exercise launch's ``isinstance(key, str)`` backstop; that branch
     is only reachable if this upstream refusal ever stopped enforcing it.
-    This test is a trigger: if it goes red, L1 stopped rejecting non-string
-    keys and the launch-side backstop needs re-examination for whether it
-    became load-bearing.
+    This test is a MESSAGE-PIN, not mechanism coverage: under the mutant that
+    removes L1's string-key check, L1 still refuses via a second, deeper
+    guard (``MaterializationError: identity values must be finite JSON
+    data``), so this test only reddens through its ``match=``. The invariant
+    is double-guarded, and route coverage for the deeper guard comes from
+    L1's own ``test_canonical_hash_preserves_the_typed_non_string_key_failure``.
+    If this test goes red, L1 stopped rejecting non-string keys with this
+    specific message and the launch-side backstop needs re-examination for
+    whether it became load-bearing.
     """
     with pytest.raises(
         stage_coordinate.MaterializationError, match="identity mapping keys must be strings"
