@@ -364,3 +364,15 @@ def test_rank_artifact_rejects_empty_or_duplicate_checkpoint_sets(
 ) -> None:
     with pytest.raises(evaluator.IncompleteRankArtifactError, match="each expected checkpoint exactly once"):
         evaluator.require_complete_rank_artifact(states, expected_checkpoint_ids=expected)
+
+
+def test_r2_a_non_string_mapping_key_is_refused_with_declared_error() -> None:
+    """The non-string-key limb must raise the declared error, not an AttributeError."""
+
+    with pytest.raises(evaluator.EvaluatorQualificationError):
+        evaluator._refuse_blinding_content({1: "x"}, "probe")
+
+
+def test_r2_a_non_string_key_is_refused_at_nested_node() -> None:
+    with pytest.raises(evaluator.EvaluatorQualificationError):
+        evaluator._refuse_blinding_content({"outer": [{2: "y"}]}, "probe")
