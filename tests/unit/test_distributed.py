@@ -120,7 +120,7 @@ def test_execution_topology_from_facts_rejects_boundary_shape_errors() -> None:
     with pytest.raises(ValueError, match="device_identity is malformed"):
         execution_topology_from_facts(malformed)
 
-    with pytest.raises((TypeError, TypeCheckError), match="ExecutionTopology or mapping"):
+    with pytest.raises((TypeError, TypeCheckError), match=r"(facts|ExecutionTopology or mapping)"):
         execution_topology_from_facts(object())
     with suppress_type_checks():
         with pytest.raises(TypeError, match="ExecutionTopology or mapping"):

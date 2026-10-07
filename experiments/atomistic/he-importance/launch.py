@@ -346,12 +346,14 @@ def launch_train(
     """
 
     plan = prepare_train_launch(source, topology)
+    facts = None
+    if topology is not None:
+        facts = execution_topology_facts(topology)
+        _validate_runner_topology_facts(facts)
     if runner is run_from_config:
         if topology is None:
             # Backstop: L1's empty-mapping refusal is reached first.
             raise LaunchValidationError("launch topology is required")
-        facts = execution_topology_facts(topology)
-        _validate_runner_topology_facts(facts)
         return _exit_code(runner(plan.config, topology=facts))
     if topology is not None:
         parameters = inspect.signature(runner).parameters.values()
@@ -360,8 +362,6 @@ def launch_train(
             for parameter in parameters
         )
         if accepts_topology:
-            facts = execution_topology_facts(topology)
-            _validate_runner_topology_facts(facts)
             return _exit_code(runner(plan.config, topology=facts))
     return _exit_code(runner(plan.config))
 
