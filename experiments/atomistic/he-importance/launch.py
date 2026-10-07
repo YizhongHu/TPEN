@@ -1,11 +1,10 @@
-"""Launch one resolved HI training row through TPEN's production runner.
+"""Launch one resolved HI training row through the production runner.
 
-The source materializer has no process facts, so this adapter accepts an
-operator-supplied :class:`~tpen.distributed.ExecutionTopology`, records its
-facts under the manifest's designated ``topology`` subtree, resolves the row
-through L1, and delegates execution to ``tpen.run.run_from_config``.  It does
-not choose inventory rows, submit scheduler jobs, iterate cells, or launch
-distributed workers.
+The source materializer has no process facts, so this adapter accepts
+operator-supplied execution facts, records them under the manifest's
+designated ``topology`` subtree, resolves the row through L1, and delegates
+execution to the sanctioned runner entry point. It does not choose inventory
+rows, submit scheduler jobs, iterate cells, or launch distributed workers.
 """
 
 from __future__ import annotations
@@ -19,9 +18,6 @@ from typing import Any
 
 from omegaconf import DictConfig
 
-from tpen.accelerator import AcceleratorIdentity, AcceleratorKind
-from tpen.artifacts import RunResult
-from tpen.distributed import ExecutionTopology
 from tpen.run import run_from_config
 
 
@@ -127,35 +123,37 @@ def _source_cell(source: Any) -> Any:
     return cell
 
 
-def execution_topology_facts(topology: ExecutionTopology | Mapping[str, Any]) -> dict[str, Any]:
-    """Serialize typed launcher facts into the manifest topology boundary."""
+def execution_topology_facts(topology: object) -> dict[str, Any]:
+    """Serialize launcher facts into the manifest topology boundary."""
 
-    if isinstance(topology, ExecutionTopology):
-        identity = topology.device_identity
-        return {
-            "global_rank": topology.global_rank,
-            "global_size": topology.global_size,
-            "local_rank": topology.local_rank,
-            "local_size": topology.local_size,
-            "node_rank": topology.node_rank,
-            "node_size": topology.node_size,
-            "host": topology.host,
-            "pid": topology.pid,
-            "device": topology.device,
-            "job_id": topology.job_id,
+    if isinstance(topology, Mapping):
+        return dict(topology)
+    try:
+        identity = topology.device_identity  # type: ignore[attr-defined]
+        fields = {
+            "global_rank": topology.global_rank,  # type: ignore[attr-defined]
+            "global_size": topology.global_size,  # type: ignore[attr-defined]
+            "local_rank": topology.local_rank,  # type: ignore[attr-defined]
+            "local_size": topology.local_size,  # type: ignore[attr-defined]
+            "node_rank": topology.node_rank,  # type: ignore[attr-defined]
+            "node_size": topology.node_size,  # type: ignore[attr-defined]
+            "host": topology.host,  # type: ignore[attr-defined]
+            "pid": topology.pid,  # type: ignore[attr-defined]
+            "device": topology.device,  # type: ignore[attr-defined]
+            "job_id": topology.job_id,  # type: ignore[attr-defined]
             "device_identity": (
                 None
                 if identity is None
                 else {
-                    "kind": identity.kind.value,
+                    "kind": getattr(identity.kind, "value", identity.kind),
                     "index": identity.index,
                     "uuid": identity.uuid,
                 }
             ),
         }
-    if isinstance(topology, Mapping):
-        return dict(topology)
-    raise LaunchValidationError("topology must be an ExecutionTopology or mapping")
+    except AttributeError as error:
+        raise LaunchValidationError("topology must be an execution topology or mapping") from error
+    return fields
 
 
 def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> None:
@@ -205,12 +203,9 @@ def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> Non
             visit(value, key)
 
 
-def _typed_runner_topology(topology: ExecutionTopology | Mapping[str, Any]) -> ExecutionTopology:
-    """Return the typed topology that the TPEN consumer stores in its context."""
+def _validate_runner_topology_facts(facts: Mapping[str, Any]) -> None:
+    """Validate the facts accepted by the production runner boundary."""
 
-    if isinstance(topology, ExecutionTopology):
-        return topology
-    facts = execution_topology_facts(topology)
     unsupported = tuple(key for key in facts if key not in _RUNNER_TOPOLOGY_FACT_KEYS)
     if unsupported:
         names = ", ".join(repr(key) for key in unsupported)
@@ -234,9 +229,9 @@ def _typed_runner_topology(topology: ExecutionTopology | Mapping[str, Any]) -> E
             "production runner topology is missing required facts: " + ", ".join(missing)
         )
     identity_value = facts.get("device_identity")
-    if identity_value is None or isinstance(identity_value, AcceleratorIdentity):
-        identity = identity_value
-    elif isinstance(identity_value, Mapping):
+    if identity_value is None:
+        return
+    if isinstance(identity_value, Mapping):
         unsupported_identity = set(identity_value) - {"kind", "index", "uuid"}
         if unsupported_identity:
             names = ", ".join(repr(key) for key in sorted(unsupported_identity, key=str))
@@ -244,31 +239,13 @@ def _typed_runner_topology(topology: ExecutionTopology | Mapping[str, Any]) -> E
                 "unsupported topology.device_identity keys: " + names
             )
         try:
-            identity = AcceleratorIdentity(
-                kind=AcceleratorKind(str(identity_value["kind"])),
-                index=identity_value.get("index"),
-                uuid=identity_value.get("uuid"),
-            )
+            kind = identity_value["kind"]
+            if kind not in {"cpu", "cuda", "rocm", "other"}:
+                raise ValueError(kind)
+            return
         except (KeyError, TypeError, ValueError) as error:
             raise LaunchValidationError("topology.device_identity is malformed") from error
-    else:
-        raise LaunchValidationError("topology.device_identity must be a mapping or null")
-    try:
-        return ExecutionTopology(
-            global_rank=facts["global_rank"],
-            global_size=facts["global_size"],
-            local_rank=facts["local_rank"],
-            local_size=facts["local_size"],
-            node_rank=facts["node_rank"],
-            node_size=facts["node_size"],
-            host=facts["host"],
-            pid=facts["pid"],
-            device=facts["device"],
-            job_id=facts.get("job_id"),
-            device_identity=identity,
-        )
-    except (TypeError, ValueError) as error:
-        raise LaunchValidationError(f"invalid production runner topology: {error}") from error
+    raise LaunchValidationError("topology.device_identity must be a mapping or null")
 
 
 def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any:
@@ -288,7 +265,7 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
 
 def prepare_train_launch(
     source: Any,
-    topology: ExecutionTopology | Mapping[str, Any] | None = None,
+    topology: object | None = None,
 ) -> LaunchPlan:
     """Populate topology and resolve one source row through L1."""
 
@@ -298,21 +275,24 @@ def prepare_train_launch(
     return LaunchPlan(cell=cell, config=config, topology=cell.manifest[_STAGE_API.TOPOLOGY_KEY])
 
 
-def _exit_code(result: int | RunResult) -> int:
+def _exit_code(result: object) -> int:
     """Normalize production and injected runner results to a process code."""
 
-    if isinstance(result, RunResult):
-        return 1 if result.status == "failed" else 0
     if type(result) is not int:
+        status = getattr(result, "status", None)
+        if status == "completed":
+            return 0
+        if status == "failed":
+            return 1
         raise LaunchValidationError("runner must return an int or RunResult")
     return result
 
 
 def launch_train(
     source: Any,
-    topology: ExecutionTopology | Mapping[str, Any] | None = None,
+    topology: object | None = None,
     *,
-    runner: Callable[..., int | RunResult] = run_from_config,
+    runner: Callable[..., object] = run_from_config,
 ) -> int:
     """Resolve one topology-bound row and execute TPEN's production runner.
 
@@ -328,8 +308,9 @@ def launch_train(
         if topology is None:
             # Backstop: L1's empty-mapping refusal is reached first.
             raise LaunchValidationError("launch topology is required")
-        runtime_topology = _typed_runner_topology(topology)
-        return _exit_code(runner(plan.config, topology=runtime_topology))
+        facts = execution_topology_facts(topology)
+        _validate_runner_topology_facts(facts)
+        return _exit_code(runner(plan.config, topology=facts))
     if topology is not None:
         parameters = inspect.signature(runner).parameters.values()
         accepts_topology = any(
@@ -337,8 +318,8 @@ def launch_train(
             for parameter in parameters
         )
         if accepts_topology:
-            runtime_topology = _typed_runner_topology(topology)
-            return _exit_code(runner(plan.config, topology=runtime_topology))
+            _validate_runner_topology_facts(execution_topology_facts(topology))
+            return _exit_code(runner(plan.config, topology=topology))
     return _exit_code(runner(plan.config))
 
 
