@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 
 
 STUDY_DIR = Path(__file__).resolve().parent
@@ -279,16 +280,250 @@ def _assert_pending_516_partition(
     return len(pending_keys), len(measured_keys)
 
 
+# CONTROL CAPABILITY MATRIX
+# Each detector capability has a property-named negative control.  Keep this
+# list synchronized with the implementation above: a capability mutation must
+# kill the control named on its row, with pytest cache disabled during audits.
+#
+# static ast.Import / module scope       -> test_capability_static_import_statement
+# static import alias iteration          -> test_capability_multiple_static_import_aliases
+# static ast.ImportFrom                  -> test_capability_static_from_import
+# bare tpen name                         -> test_capability_bare_tpen_name
+# dotted tpen name                       -> test_capability_dotted_tpen_name
+# function-local nesting                 -> test_capability_function_local_static_import
+# class-body nesting                     -> test_capability_class_body_static_import
+# recursive AST traversal                -> test_capability_recursive_ast_walk
+# bare import_module dynamic form        -> test_capability_dynamic_bare_import_module
+# qualified importlib dynamic form       -> test_capability_dynamic_qualified_importlib
+# __import__ dynamic form                -> test_capability_dynamic_dunder_import
+# positional dynamic argument            -> test_capability_dynamic_positional_argument
+# keyword dynamic argument               -> test_capability_dynamic_keyword_argument
+# dynamic argument iteration             -> test_capability_dynamic_argument_iteration
+# recursive *.py discovery               -> test_capability_recursive_python_file_discovery
+# *.py file filtering                    -> test_capability_python_file_filter
+# sanctioned runner carve-out            -> test_capability_sanctioned_runner_carveout
+# production/test partition              -> test_capability_production_test_partition
+# non-empty file scan                    -> test_capability_nonempty_scan / test_capability_empty_scan_rejected
+# non-empty crossing scan                -> test_capability_no_crossings_rejected
+# non-empty unsanctioned scan            -> test_capability_no_unsanctioned_crossings_rejected
+# literal dynamic target                 -> test_capability_dynamic_literal_string
+# measured/declared admission            -> test_capability_undeclared_measured_crossing
+# existing-file stale admission          -> test_capability_existing_stale_entry
+# absent-file pending admission           -> test_capability_absent_pending_entry
+# absent-file pending_pr requirement      -> test_capability_absent_without_pending_pr
+# pending/measured partition             -> test_capability_pending_entry_partition
+
+
 def test_inventory_metadata_is_pinned_and_dated() -> None:
     assert INVENTORY_DATE == "2026-10-07"
     assert INVENTORY_HEAD == "3143e43ac170df33f61f2002b1011cd85c9cfc37"
     assert PENDING_516_SHA == "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
 
 
-def test_scanner_has_nonempty_inputs_and_crossings() -> None:
+def test_capability_static_import_statement() -> None:
+    crossings = _detect_crossings("import tpen\n")
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [(1, "tpen")]
+
+
+def test_capability_multiple_static_import_aliases() -> None:
+    crossings = _detect_crossings("import tpen.one, tpen.two\n")
+    assert [crossing.target for crossing in crossings] == ["tpen.one", "tpen.two"]
+
+
+def test_capability_static_from_import() -> None:
+    crossings = _detect_crossings("from tpen.accelerator import AcceleratorKind\n")
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [
+        (1, "tpen.accelerator")
+    ]
+
+
+def test_capability_bare_tpen_name() -> None:
+    crossings = _detect_crossings("import tpen\n")
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [(1, "tpen")]
+
+
+def test_capability_dotted_tpen_name() -> None:
+    crossings = _detect_crossings("import tpen.accelerator\n")
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [
+        (1, "tpen.accelerator")
+    ]
+
+
+def test_capability_class_body_static_import() -> None:
+    source = '''
+class Resolver:
+    from tpen.anything import value
+'''
+    crossings = _detect_crossings(source)
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [(3, "tpen.anything")]
+
+
+def test_capability_recursive_ast_walk() -> None:
+    source = '''
+def resolve():
+    class Nested:
+        import tpen.deep
+'''
+    crossings = _detect_crossings(source)
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [(4, "tpen.deep")]
+
+
+def test_capability_dynamic_qualified_importlib() -> None:
+    source = '''
+import importlib
+module = importlib.import_module("tpen.anything")
+'''
+    crossings = _detect_crossings(source)
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [
+        (3, "tpen.anything")
+    ]
+
+
+def test_capability_dynamic_dunder_import() -> None:
+    source = 'module = __import__("tpen.anything", fromlist=["value"])\n'
+    crossings = _detect_crossings(source)
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [
+        (1, "tpen.anything")
+    ]
+
+
+def test_capability_dynamic_positional_argument() -> None:
+    source = 'module = import_module("tpen.anything")\n'
+    crossings = _detect_crossings(source)
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [
+        (1, "tpen.anything")
+    ]
+
+
+def test_capability_dynamic_literal_string() -> None:
+    source = 'module = import_module("tpen.literal")\n'
+    crossings = _detect_crossings(source)
+    assert crossings[0].target == "tpen.literal"
+
+
+def test_capability_dynamic_argument_iteration() -> None:
+    source = 'module = import_module("stdlib", "tpen.second")\n'
+    crossings = _detect_crossings(source)
+    assert crossings[0].target == "tpen.second"
+
+
+def test_capability_recursive_python_file_discovery() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        nested = root / "one" / "two"
+        nested.mkdir(parents=True)
+        (nested / "deep.py").write_text("import tpen.deep\n", encoding="utf-8")
+        STUDY_DIR = root
+        try:
+            _, crossings = _scan_study()
+        finally:
+            STUDY_DIR = original_study_dir
+    assert [(path, crossing.line, crossing.target) for path, crossing in crossings] == [
+        ("one/two/deep.py", 1, "tpen.deep")
+    ]
+
+
+def test_capability_python_file_filter() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "kept.py").write_text("import tpen.kept\n", encoding="utf-8")
+        (root / "ignored.txt").write_text("import tpen.ignored\n", encoding="utf-8")
+        STUDY_DIR = root
+        try:
+            _, crossings = _scan_study()
+        finally:
+            STUDY_DIR = original_study_dir
+    assert [(path, crossing.target) for path, crossing in crossings] == [
+        ("kept.py", "tpen.kept")
+    ]
+
+
+def test_capability_sanctioned_runner_carveout() -> None:
+    crossings = _detect_crossings("from tpen.run import run_from_config\n")
+    assert len(crossings) == 1
+    assert crossings[0].sanctioned
+    assert crossings[0].target == "tpen.run.run_from_config"
+    _, scanned = _scan_study()
+    assert not any(
+        path == "launch.py" and crossing.line == 25 for path, crossing in scanned
+    )
+
+
+def test_capability_production_test_partition() -> None:
+    scanned = (
+        ("production.py", Crossing(1, "tpen.production")),
+        ("nested/test_case.py", Crossing(2, "tpen.test")),
+    )
+    assert _inventory_keys(scanned, tests=False) == {
+        ("production.py", 1, "tpen.production")
+    }
+    assert _inventory_keys(scanned, tests=True) == {
+        ("nested/test_case.py", 2, "tpen.test")
+    }
+
+
+def test_capability_nonempty_scan() -> None:
     visited, crossings = _scan_study()
     assert len(visited) > 0
     assert len(crossings) > 0
+
+
+def test_capability_empty_scan_rejected() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        STUDY_DIR = Path(temporary_root)
+        try:
+            try:
+                _scan_study()
+            except AssertionError as exc:
+                assert "visited no Python files" in str(exc)
+            else:
+                raise AssertionError("an empty study must be rejected")
+        finally:
+            STUDY_DIR = original_study_dir
+
+
+def test_capability_no_crossings_rejected() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "plain.py").write_text("value = 1\n", encoding="utf-8")
+        STUDY_DIR = root
+        try:
+            try:
+                _scan_study()
+            except AssertionError as exc:
+                assert "found no tpen crossings" in str(exc)
+            else:
+                raise AssertionError("a study with no crossings must be rejected")
+        finally:
+            STUDY_DIR = original_study_dir
+
+
+def test_capability_no_unsanctioned_crossings_rejected() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "launcher.py").write_text(
+            "from tpen.run import run_from_config\n", encoding="utf-8"
+        )
+        STUDY_DIR = root
+        try:
+            try:
+                _scan_study()
+            except AssertionError as exc:
+                assert "found no unsanctioned tpen crossings" in str(exc)
+            else:
+                raise AssertionError("a study with only sanctioned crossings must be rejected")
+        finally:
+            STUDY_DIR = original_study_dir
 
 
 def test_production_inventory_obeys_admission_rule() -> None:
@@ -311,7 +546,7 @@ def test_test_file_inventory_obeys_admission_rule() -> None:
     assert pending_count + measured_count == 1
 
 
-def test_dynamic_import_module_crossing_is_detected() -> None:
+def test_capability_dynamic_bare_import_module() -> None:
     source = '''
 from importlib import import_module
 module = import_module("tpen.anything")
@@ -320,7 +555,7 @@ module = import_module("tpen.anything")
     assert any(crossing.target == "tpen.anything" for crossing in crossings)
 
 
-def test_dynamic_import_module_keyword_crossing_is_detected() -> None:
+def test_capability_dynamic_keyword_argument() -> None:
     source = '''
 from importlib import import_module
 module = import_module(name="tpen.anything")
@@ -329,7 +564,7 @@ module = import_module(name="tpen.anything")
     assert any(crossing.target == "tpen.anything" for crossing in crossings)
 
 
-def test_function_local_static_import_crossing_is_detected() -> None:
+def test_capability_function_local_static_import() -> None:
     source = '''
 def resolve():
     from tpen.anything import value
@@ -339,7 +574,7 @@ def resolve():
     assert any(crossing.target == "tpen.anything" for crossing in crossings)
 
 
-def test_absent_file_pending_pr_entry_is_admitted_and_reported() -> None:
+def test_capability_absent_pending_entry() -> None:
     key = ("pending_future.py", 1, "tpen.anything")
     declared = {
         key: InventoryEntry(
@@ -351,7 +586,48 @@ def test_absent_file_pending_pr_entry_is_admitted_and_reported() -> None:
     )
 
 
-def test_absent_file_without_pending_pr_is_rejected() -> None:
+def test_capability_pending_entry_partition() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        existing_key = ("existing.py", 1, "tpen.existing")
+        pending_key = ("pending.py", 1, "tpen.pending")
+        (root / existing_key[0]).write_text("import tpen.existing\n", encoding="utf-8")
+        declared = {
+            existing_key: InventoryEntry("measured", pending_pr=516, pending_sha=PENDING_516_SHA),
+            pending_key: InventoryEntry("pending", pending_pr=516, pending_sha=PENDING_516_SHA),
+        }
+        STUDY_DIR = root
+        try:
+            pending = _validate_inventory_admission({existing_key}, declared)
+            assert _assert_pending_516_partition(
+                {existing_key}, declared, pending
+            ) == (1, 1)
+        finally:
+            STUDY_DIR = original_study_dir
+
+
+def test_capability_pending_entry_partition_rejects_gaps_and_overlap() -> None:
+    gap_key = ("test_tpen_boundary.py", 1, "tpen.future")
+    overlap_key = ("future.py", 1, "tpen.future")
+    cases = (
+        (gap_key, set(), ()),
+        (overlap_key, {overlap_key}, ((overlap_key, 516, PENDING_516_SHA),)),
+    )
+    for key, measured, pending in cases:
+        declared = {
+            key: InventoryEntry("pending", pending_pr=516, pending_sha=PENDING_516_SHA)
+        }
+        try:
+            _assert_pending_516_partition(measured, declared, pending)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("pending/measured entries must form a strict partition")
+
+
+def test_capability_absent_without_pending_pr() -> None:
     key = ("absent_no_pending.py", 1, "tpen.real")
     declared = {key: InventoryEntry("missing traceability metadata.")}
     try:
@@ -362,7 +638,7 @@ def test_absent_file_without_pending_pr_is_rejected() -> None:
         raise AssertionError("an absent-file entry without pending_pr must be rejected")
 
 
-def test_existing_file_with_absent_crossing_rejects_pending_pr_allowance() -> None:
+def test_capability_existing_stale_entry() -> None:
     key = ("test_tpen_boundary.py", 1, "tpen.never_imported")
     declared = {
         key: InventoryEntry(
@@ -377,7 +653,7 @@ def test_existing_file_with_absent_crossing_rejects_pending_pr_allowance() -> No
         raise AssertionError("pending_pr must not excuse a stale entry for an existing file")
 
 
-def test_undeclared_measured_crossing_always_fails() -> None:
+def test_capability_undeclared_measured_crossing() -> None:
     measured = {("existing.py", 1, "tpen.unlisted")}
     try:
         _validate_inventory_admission(measured, {})
