@@ -64,6 +64,30 @@ def _duplicate_basename_groups() -> dict[str, list[Path]]:
     return {name: paths for name, paths in groups.items() if len(paths) > 1}
 
 
+def _is_package_rooted(path: Path) -> bool:
+    """Return whether a test file is below a regular package directory."""
+
+    for parent in path.parents:
+        if parent == REPO_ROOT:
+            break
+        if (parent / "__init__.py").is_file():
+            return True
+    return False
+
+
+def _non_package_rooted_duplicate_groups(
+    duplicate_groups: dict[str, list[Path]],
+) -> dict[str, list[Path]]:
+    """Keep duplicate groups whose selected files are all outside packages."""
+
+    result: dict[str, list[Path]] = {}
+    for name, paths in duplicate_groups.items():
+        selected = [path for path in paths if not _is_package_rooted(path)]
+        if len(selected) > 1:
+            result[name] = selected
+    return result
+
+
 def test_duplicate_test_module_names_collect_without_collision() -> None:
     duplicate_groups = _duplicate_basename_groups()
     if not duplicate_groups:
@@ -118,4 +142,36 @@ def test_duplicate_test_module_names_collect_without_collision() -> None:
         "duplicate-basename files\n"
         f"console invocation ({console_result.returncode}) stdout:\n{console_result.stdout}\n"
         f"console invocation stderr:\n{console_result.stderr}"
+    )
+
+    non_package_groups = _non_package_rooted_duplicate_groups(duplicate_groups)
+    if not non_package_groups:
+        pytest.skip(
+            "No duplicate-basename group remains entirely outside regular packages; "
+            "the pythonpath-sensitive console arm has no collision targets."
+        )
+    non_package_files = [
+        path
+        for paths in sorted(non_package_groups.values(), key=lambda paths: paths[0].name)
+        for path in paths
+    ]
+    non_package_selection = [
+        "--collect-only",
+        "-q",
+        *(str(path.relative_to(REPO_ROOT)) for path in non_package_files),
+    ]
+    non_package_console_result = subprocess.run(
+        [str(console_pytest), *non_package_selection],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert non_package_console_result.returncode == 0, (
+        "pytest console invocation could not collect duplicate files outside "
+        "regular packages; this arm protects repository-root discovery when "
+        "pythonpath = [\".\"] is absent\n"
+        f"console invocation ({non_package_console_result.returncode}) stdout:\n"
+        f"{non_package_console_result.stdout}\n"
+        f"console invocation stderr:\n{non_package_console_result.stderr}"
     )

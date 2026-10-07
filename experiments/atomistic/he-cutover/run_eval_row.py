@@ -49,7 +49,7 @@ def run(row: Mapping[str, Any], *, plan_attempt_id: str, environ: Mapping[str, s
 
     environ = os.environ if environ is None else environ
     require_allocation(environ)
-    import hev1
+    hev1 = sibling(__file__, "hev1")
 
     device_reader = device_reader or hev1.driver.torch_device_name
     cutover_strata.check_delivered_device(facility=str(row["facility"]), stratum=str(row["resources"]["stratum"]), delivered=device_reader())
