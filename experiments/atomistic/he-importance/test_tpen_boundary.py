@@ -323,7 +323,9 @@ def _assert_pending_516_partition(
 # existing-file stale admission          -> test_capability_existing_stale_entry
 # absent-file pending admission           -> test_capability_absent_pending_entry
 # absent-file pending_pr requirement      -> test_capability_absent_without_pending_pr
+# pending metadata pinning                -> test_capability_pending_entry_rejects_mispinned_metadata
 # pending/measured partition             -> test_capability_pending_entry_partition
+# tpen prefix semantics                   -> test_capability_tpen_name_rejects_substring_matches
 
 
 def test_inventory_metadata_is_pinned_and_dated() -> None:
@@ -364,6 +366,13 @@ def test_capability_dotted_tpen_name() -> None:
 def test_capability_tpen_name_rejects_non_tpen() -> None:
     assert _detect_crossings("import numpy\n") == ()
     assert _detect_crossings("from numpy import array\n") == ()
+
+
+def test_capability_tpen_name_rejects_substring_matches() -> None:
+    assert _is_tpen_name("tpen")
+    assert _is_tpen_name("tpen.anything")
+    assert not _is_tpen_name("mytpen")
+    assert not _is_tpen_name("other.tpen")
 
 
 def test_capability_class_body_static_import() -> None:
@@ -710,6 +719,38 @@ def test_capability_pending_entry_partition_rejects_gaps_and_overlap() -> None:
             pass
         else:
             raise AssertionError("pending/measured entries must form a strict partition")
+
+
+def test_capability_pending_entry_rejects_mispinned_metadata() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        STUDY_DIR = Path(temporary_root)
+        cases = (
+            (515, PENDING_516_SHA),
+            (516, "wrong-source-sha"),
+        )
+        try:
+            for pending_pr, pending_sha in cases:
+                key = ("future.py", 1, "tpen.future")
+                declared = {
+                    key: InventoryEntry(
+                        "mispinned pending declaration",
+                        pending_pr=pending_pr,
+                        pending_sha=pending_sha,
+                    )
+                }
+                pending = _validate_inventory_admission(set(), declared)
+                try:
+                    _assert_pending_516_partition(set(), declared, pending)
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError(
+                        "pending admission must reject wrong PR or source SHA"
+                    )
+        finally:
+            STUDY_DIR = original_study_dir
 
 
 def test_capability_absent_without_pending_pr() -> None:
