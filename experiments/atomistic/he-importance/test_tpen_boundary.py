@@ -175,12 +175,15 @@ def _detect_crossings(source: str) -> tuple[Crossing, ...]:
 
         if not isinstance(node, ast.Call) or _dynamic_import_name(node) is None:
             continue
-        if not node.args:
-            continue
-        argument = node.args[0]
-        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
-            if _is_tpen_name(argument.value):
-                crossings.append(Crossing(node.lineno, argument.value))
+        arguments = [*node.args]
+        arguments.extend(
+            keyword.value for keyword in node.keywords if keyword.arg == "name"
+        )
+        for argument in arguments:
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                if _is_tpen_name(argument.value):
+                    crossings.append(Crossing(node.lineno, argument.value))
+                    break
 
     return tuple(sorted(crossings, key=lambda crossing: (crossing.line, crossing.target)))
 
@@ -249,6 +252,33 @@ def _inventory_keys(
     }
 
 
+def _assert_pending_516_partition(
+    measured: set[tuple[str, int, str]],
+    declared: dict[tuple[str, int, str], InventoryEntry],
+    pending: tuple[tuple[tuple[str, int, str], int, str | None], ...],
+) -> tuple[int, int]:
+    """Require each declared PR-516 crossing to be pending or measured once."""
+
+    pending_by_key = {key: (pending_pr, pending_sha) for key, pending_pr, pending_sha in pending}
+    pending_keys = set(pending_by_key)
+    measured_keys = {
+        key for key, entry in declared.items() if entry.pending_pr == 516 and key in measured
+    }
+    declared_516 = {
+        key for key, entry in declared.items() if entry.pending_pr == 516
+    }
+    assert pending_keys | measured_keys == declared_516
+    assert not pending_keys & measured_keys
+
+    for key in declared_516:
+        file_exists = (STUDY_DIR / key[0]).is_file()
+        assert (key in pending_keys) is (not file_exists)
+        if key in pending_keys:
+            assert pending_by_key[key] == (516, PENDING_516_SHA)
+
+    return len(pending_keys), len(measured_keys)
+
+
 def test_inventory_metadata_is_pinned_and_dated() -> None:
     assert INVENTORY_DATE == "2026-10-07"
     assert INVENTORY_HEAD == "3143e43ac170df33f61f2002b1011cd85c9cfc37"
@@ -265,26 +295,35 @@ def test_production_inventory_obeys_admission_rule() -> None:
     _, crossings = _scan_study()
     measured = _inventory_keys(crossings, tests=False)
     pending = _validate_inventory_admission(measured, EXPECTED_PRODUCTION_INVENTORY)
-    assert pending == (
-        (("run_stage_q.py", 30, "tpen.accelerator"), 516, PENDING_516_SHA),
-        (("run_stage_q.py", 31, "tpen.distributed"), 516, PENDING_516_SHA),
-        (("run_stage_q.py", 100, "tpen.hi_schema"), 516, PENDING_516_SHA),
+    pending_count, measured_count = _assert_pending_516_partition(
+        measured, EXPECTED_PRODUCTION_INVENTORY, pending
     )
+    assert pending_count + measured_count == 3
 
 
 def test_test_file_inventory_obeys_admission_rule() -> None:
     _, crossings = _scan_study()
     measured = _inventory_keys(crossings, tests=True)
     pending = _validate_inventory_admission(measured, EXPECTED_TEST_INVENTORY)
-    assert pending == (
-        (("test_run_stage_q.py", 99, "tpen.hi_schema"), 516, PENDING_516_SHA),
+    pending_count, measured_count = _assert_pending_516_partition(
+        measured, EXPECTED_TEST_INVENTORY, pending
     )
+    assert pending_count + measured_count == 1
 
 
 def test_dynamic_import_module_crossing_is_detected() -> None:
     source = '''
 from importlib import import_module
 module = import_module("tpen.anything")
+'''
+    crossings = _detect_crossings(source)
+    assert any(crossing.target == "tpen.anything" for crossing in crossings)
+
+
+def test_dynamic_import_module_keyword_crossing_is_detected() -> None:
+    source = '''
+from importlib import import_module
+module = import_module(name="tpen.anything")
 '''
     crossings = _detect_crossings(source)
     assert any(crossing.target == "tpen.anything" for crossing in crossings)
