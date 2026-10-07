@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.parse
 import threading
@@ -25,6 +28,56 @@ ROOT_ID = GUARD.DEFAULT_PROJECT_ROOT_ID
 def _run(cwd: Path, *args: str) -> str:
     result = subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True)
     return result.stdout.strip()
+
+
+def _pre39_interpreters() -> tuple[list[tuple[Path, str]], list[str]]:
+    candidates = []
+    configured = os.environ.get("TPEN_GUARD_PRE39_PYTHON")
+    if configured:
+        candidates.append(("TPEN_GUARD_PRE39_PYTHON", configured))
+    candidates.extend((name, name) for name in ("python3.8", "python3.7", "python3", "python"))
+
+    found: list[tuple[Path, str]] = []
+    attempts: list[str] = []
+    seen: set[Path] = set()
+    version_code = "import sys; print('%d.%d.%d' % sys.version_info[:3])"
+    for label, candidate in candidates:
+        executable = shutil.which(candidate)
+        if executable is None:
+            attempts.append(f"{label}: not found")
+            continue
+        realpath = Path(executable).resolve()
+        result = subprocess.run(
+            [str(realpath), "-c", version_code],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        version = result.stdout.strip()
+        attempts.append(f"{label}: {realpath} -> {version or result.stderr.strip() or 'no version'}")
+        if result.returncode != 0 or not version:
+            continue
+        try:
+            parsed = tuple(int(part) for part in version.split("."))
+        except ValueError:
+            continue
+        if (3, 7) <= parsed[:2] < (3, 9) and realpath not in seen:
+            seen.add(realpath)
+            found.append((realpath, version))
+    return found, attempts
+
+
+def _guard_args(repo: Path, api_url: str) -> list[str]:
+    return [
+        "--cwd",
+        str(repo),
+        "--api-url",
+        api_url,
+        "--item",
+        ITEM_ID,
+        "--project-root-id",
+        ROOT_ID,
+    ]
 
 
 def _item(
@@ -196,6 +249,50 @@ class AuthoritativeEditGuardTest(unittest.TestCase):
             with self.subTest(api_url=api_url):
                 with self.assertRaisesRegex(GUARD.GuardFailure, "Task Orchestrator API"):
                     self.check(api_url)
+
+    def test_pre39_subprocess_refuses_and_current_interpreter_passes(self) -> None:
+        with _api() as api_url:
+            args = _guard_args(self.repo, api_url)
+            control = subprocess.run(
+                [sys.executable, str(MODULE_PATH), *args],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(control.returncode, 0, control.stderr)
+            self.assertEqual(json.loads(control.stdout)["status"], "ok")
+
+            interpreters, attempts = _pre39_interpreters()
+            if not interpreters:
+                self.skipTest("Arm A skipped; candidates tried: " + "; ".join(attempts))
+            for interpreter, version in interpreters:
+                with self.subTest(interpreter=str(interpreter), version=version):
+                    result = subprocess.run(
+                        [str(interpreter), str(MODULE_PATH), *args],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "")
+                    verdict = json.loads(result.stderr)
+                    self.assertEqual(verdict["status"], "blocked")
+                    self.assertIn("3.9", verdict["reason"])
+                    self.assertIn(version, verdict["reason"])
+                    self.assertIn(
+                        "uv run --no-project python tools/check_authoritative_edit.py",
+                        verdict["reason"],
+                    )
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertNotIn("AttributeError", result.stderr)
+                    self.assertNotIn("removesuffix", result.stderr)
+
+    def test_interpreter_gate_has_both_directions_at_boundary(self) -> None:
+        with self.assertRaises(GUARD.UnsupportedInterpreter):
+            GUARD._require_supported_interpreter((3, 8, 20))
+        for version_info in ((3, 9, 0), (3, 12, 13), sys.version_info):
+            with self.subTest(version_info=version_info):
+                GUARD._require_supported_interpreter(version_info)
 
 
 if __name__ == "__main__":

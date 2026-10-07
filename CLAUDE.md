@@ -132,6 +132,19 @@ tree on an agent-namespaced branch plus a claimed TPEN `implementation-slice`
 already in `work` with a non-empty `acceptance-contract`. Existing untracked
 research and run data are deliberately ignored and must remain untouched.
 
+The guard requires Python 3.9+ because it uses `str.removesuffix`. The
+`uv run --no-project python` form resolves the project interpreter and is
+therefore safe. The sanctioned interpreter-direct deviation is precisely where
+a stale ambient `python3` may be selected, so name an explicitly installed
+3.9+ interpreter when invoking the script directly. A `blocked` verdict whose
+reason says the interpreter is unsupported means no guard precondition was
+evaluated: rerun with the `uv run --no-project python` command above or a
+named 3.9+ interpreter. Any other `blocked` reason is a genuine guard
+precondition failure; repair that precondition before editing. Because
+`from __future__ import annotations` requires Python 3.7+, structured
+interpreter refusals cover Python 3.7 and 3.8; Python <=3.6 raises `SyntaxError`
+before the gate can run, which is a documented residual limitation.
+
 **Run the guard outside the agent sandbox.** This is allowed and encouraged, not
 a workaround. The guard reads the Task Orchestrator HTTP API, and sandboxed
 coding agents deny outbound network, so it returns
