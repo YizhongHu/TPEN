@@ -93,6 +93,12 @@ def test_duplicate_test_module_names_collect_without_collision() -> None:
         text=True,
         check=False,
     )
+    assert module_result.returncode == 0, (
+        "pytest module invocation could not collect the dynamically discovered "
+        "duplicate-basename files\n"
+        f"stdout:\n{module_result.stdout}\n"
+        f"stderr:\n{module_result.stderr}"
+    )
     console_pytest = Path(sys.executable).parent / "pytest"
     if not console_pytest.is_file():
         pytest.skip(
@@ -107,11 +113,9 @@ def test_duplicate_test_module_names_collect_without_collision() -> None:
         check=False,
     )
 
-    assert module_result.returncode == console_result.returncode == 0, (
-        "pytest collection did not succeed consistently for the dynamically discovered "
+    assert console_result.returncode == 0, (
+        "pytest console invocation could not collect the dynamically discovered "
         "duplicate-basename files\n"
-        f"module invocation ({module_result.returncode}) stdout:\n{module_result.stdout}\n"
-        f"module invocation stderr:\n{module_result.stderr}\n"
         f"console invocation ({console_result.returncode}) stdout:\n{console_result.stdout}\n"
         f"console invocation stderr:\n{console_result.stderr}"
     )
