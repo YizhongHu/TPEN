@@ -621,3 +621,11 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
 
     assert launch.launch_train(cell, _topology(), runner=production_run.run_from_config) == 1
     assert context.metadata.status == "failed"
+
+
+def test_exit_code_rejects_unrelated_status_object() -> None:
+    class UnrelatedResult:
+        status = "not-a-run-result"
+
+    with pytest.raises(launch.LaunchValidationError, match="int or RunResult"):
+        launch._exit_code(UnrelatedResult())

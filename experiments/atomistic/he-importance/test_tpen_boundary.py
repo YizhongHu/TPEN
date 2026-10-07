@@ -45,15 +45,6 @@ class InventoryEntry:
 # Each key is (relative file, line, dotted target).  Each value is the
 # one-line disposition recorded for that exact crossing.
 EXPECTED_PRODUCTION_INVENTORY = {
-    ("launch.py", 22, "tpen.accelerator"): InventoryEntry(
-        "item ffb269d1: removed by the next stack layer."
-    ),
-    ("launch.py", 23, "tpen.artifacts"): InventoryEntry(
-        "item ffb269d1: removed by the next stack layer."
-    ),
-    ("launch.py", 24, "tpen.distributed"): InventoryEntry(
-        "item ffb269d1: removed by the next stack layer."
-    ),
     ("train_config.py", 187, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),

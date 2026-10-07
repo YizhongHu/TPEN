@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import logging
 import random
 import sys
@@ -26,7 +27,11 @@ from tpen.artifacts import (
     write_error_artifact,
     write_run_start_artifact,
 )
-from tpen.distributed import ExecutionTopology, RankLocalJSONLWriter
+from tpen.distributed import (
+    ExecutionTopology,
+    RankLocalJSONLWriter,
+    execution_topology_from_facts,
+)
 from tpen.callback import configure_terminal_logging
 from tpen.config import register_resolvers
 from tpen.dependencies import OptionalDependencyError, require_torch
@@ -230,7 +235,7 @@ def run_from_config(
     config_path: str | None = None,
     command: str | None = None,
     raise_exceptions: bool = False,
-    topology: ExecutionTopology | None = None,
+    topology: ExecutionTopology | Mapping[str, object] | None = None,
 ) -> int:
     """Instantiate and execute the configured runner.
 
@@ -245,10 +250,11 @@ def run_from_config(
         exception event, and logger teardown. The default ``False`` preserves
         CLI-style ``return 1`` behavior; tests and debugging can set ``True`` to
         surface the original traceback.
-    topology : ExecutionTopology or None, optional
+    topology : ExecutionTopology or mapping or None, optional
         Launcher-supplied execution topology forwarded to the context consumer
-        for this call. When omitted, ``prepare_run_context`` applies its normal
-        single-process fallback.
+        for this call. Mapping facts are normalized to ``ExecutionTopology``
+        before context construction. When omitted, ``prepare_run_context``
+        applies its normal single-process fallback.
 
     Returns
     -------
@@ -283,6 +289,8 @@ def run_from_config(
         # exception event, logger teardown, `return 1`) rather than escaping as
         # a bare exception from a helper.
         validate_hi_train_config(cfg)
+        if topology is not None:
+            topology = execution_topology_from_facts(topology)
         if topology is None:
             context = prepare_run_context(
                 cfg,
