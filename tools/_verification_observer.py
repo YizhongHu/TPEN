@@ -9,7 +9,7 @@ the hook functions by name after the receipt wrapper injects this module with
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 OBSERVATION_ENV = "TPEN_VERIFICATION_OBSERVATION_PATH"
@@ -18,13 +18,38 @@ VERSION = 1
 _COUNT_FIELDS = ("passed", "failed", "errors", "skipped", "xfailed", "xpassed")
 
 
-def _option_value(option: Any, *names: str) -> Any:
-    """Read the first available pytest option alias."""
+_SELECTION_OPTION_ALIASES = {
+    "keyword": ("keyword",),
+    "markexpr": ("markexpr",),
+    "stepwise": ("stepwise",),
+    "stepwise_skip": ("stepwise_skip",),
+    "last_failed": ("last_failed", "lf"),
+    # Pytest 6.2 uses ``failedfirst``; do not infer the spelling from the
+    # option's long flag. Runtime introspection and the real-config test keep
+    # this compatibility map honest across supported pytest versions.
+    "failed_first": ("failedfirst", "failed_first", "ff"),
+    "maxfail": ("maxfail",),
+    # ``-x`` stores its limit in maxfail on supported pytest versions, so an
+    # absent exitfirst attribute is an explicit, documented exception.
+    "exitfirst": ("exitfirst",),
+    "collectonly": ("collectonly",),
+    "ignore": ("ignore",),
+    "ignore_glob": ("ignore_glob",),
+    "deselect": ("deselect",),
+    "file_or_dir": ("file_or_dir",),
+}
+OPTIONAL_ABSENT_OPTIONS = {
+    "exitfirst": "-x is represented by maxfail on supported pytest versions"
+}
+
+
+def _option_value(option: Any, names: Tuple[str, ...]) -> Tuple[bool, Optional[str], Any]:
+    """Read an option alias and preserve whether introspection found it."""
 
     for name in names:
         if hasattr(option, name):
-            return getattr(option, name)
-    return None
+            return True, name, getattr(option, name)
+    return False, None, None
 
 
 def _json_value(value: Any) -> Any:
@@ -41,21 +66,15 @@ def _selection_options(config: Any) -> Dict[str, Any]:
     """Capture resolved selection-bearing ``config.option`` fields."""
 
     option = config.option
-    return {
-        "keyword": _json_value(_option_value(option, "keyword")),
-        "markexpr": _json_value(_option_value(option, "markexpr")),
-        "stepwise": _json_value(_option_value(option, "stepwise")),
-        "stepwise_skip": _json_value(_option_value(option, "stepwise_skip")),
-        "last_failed": _json_value(_option_value(option, "last_failed", "lf")),
-        "failed_first": _json_value(_option_value(option, "failed_first", "ff")),
-        "maxfail": _json_value(_option_value(option, "maxfail")),
-        "exitfirst": _json_value(_option_value(option, "exitfirst")),
-        "collectonly": _json_value(_option_value(option, "collectonly")),
-        "ignore": _json_value(_option_value(option, "ignore")),
-        "ignore_glob": _json_value(_option_value(option, "ignore_glob")),
-        "deselect": _json_value(_option_value(option, "deselect")),
-        "file_or_dir": _json_value(_option_value(option, "file_or_dir")),
-    }
+    resolved: Dict[str, Any] = {}
+    for logical_name, aliases in _SELECTION_OPTION_ALIASES.items():
+        found, attribute, value = _option_value(option, aliases)
+        resolved[logical_name] = {
+            "state": "FOUND" if found else "ABSENT",
+            "attribute": attribute,
+            "value": _json_value(value),
+        }
+    return resolved
 
 
 def _ini_value(config: Any, name: str, default: Any) -> Any:

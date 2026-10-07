@@ -26,6 +26,25 @@ OBSERVATION_ENV = "TPEN_VERIFICATION_OBSERVATION_PATH"
 NONCE_ENV = "TPEN_VERIFICATION_NONCE"
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _COUNT_FIELDS = ("passed", "failed", "errors", "skipped", "xfailed", "xpassed")
+_SELECTION_OPTION_NAMES = (
+    "keyword",
+    "markexpr",
+    "stepwise",
+    "stepwise_skip",
+    "last_failed",
+    "failed_first",
+    "maxfail",
+    "exitfirst",
+    "collectonly",
+    "ignore",
+    "ignore_glob",
+    "deselect",
+    "file_or_dir",
+)
+# This is intentionally the only optional absence. Pytest represents -x by
+# setting maxfail, so an exitfirst attribute is not required when that alias
+# is absent. Every other selection-bearing observation must be found.
+_OPTIONAL_ABSENT_OPTIONS = {"exitfirst"}
 _SELECTION_LONG = {
     "--ignore",
     "--ignore-glob",
@@ -330,22 +349,15 @@ def _selection_from_observation(observation: Dict[str, Any]) -> Tuple[str, List[
         sources.append("ini:testpaths")
 
     options = observation["options"]
-    for name in (
-        "keyword",
-        "markexpr",
-        "stepwise",
-        "stepwise_skip",
-        "last_failed",
-        "failed_first",
-        "maxfail",
-        "exitfirst",
-        "collectonly",
-        "ignore",
-        "ignore_glob",
-        "deselect",
-        "file_or_dir",
-    ):
-        if _option_has_value(options.get(name)):
+    absent_options = [
+        name
+        for name in _SELECTION_OPTION_NAMES
+        if options[name]["state"] == "ABSENT" and name not in _OPTIONAL_ABSENT_OPTIONS
+    ]
+    if absent_options:
+        return "UNKNOWN", ["option_absent:" + name for name in absent_options]
+    for name in _SELECTION_OPTION_NAMES:
+        if _option_has_value(options[name]["value"]):
             sources.append("option:" + name)
 
     deselected = observation["deselected"]
@@ -385,23 +397,19 @@ def _read_observation(path: Optional[str], nonce: str) -> Tuple[Optional[Dict[st
         return None, "observation_ini"
     if not isinstance(observation.get("options"), dict):
         return None, "observation_options"
-    required_options = {
-        "keyword",
-        "markexpr",
-        "stepwise",
-        "stepwise_skip",
-        "last_failed",
-        "failed_first",
-        "maxfail",
-        "exitfirst",
-        "collectonly",
-        "ignore",
-        "ignore_glob",
-        "deselect",
-        "file_or_dir",
-    }
-    if not required_options.issubset(set(observation["options"])):
+    if not set(_SELECTION_OPTION_NAMES).issubset(set(observation["options"])):
         return None, "observation_options"
+    for name in _SELECTION_OPTION_NAMES:
+        option = observation["options"][name]
+        if not isinstance(option, dict) or option.get("state") not in {"FOUND", "ABSENT"}:
+            return None, "observation_options"
+        if "value" not in option:
+            return None, "observation_options"
+        if option["state"] == "FOUND":
+            if not isinstance(option.get("attribute"), str):
+                return None, "observation_options"
+        elif option.get("attribute") is not None:
+            return None, "observation_options"
     if observation.get("env_pytest_addopts") is not None and not isinstance(
         observation["env_pytest_addopts"], str
     ):
@@ -448,7 +456,14 @@ def _receipt_facts(
         counts = {"collected": observation["collected"]}
         counts.update({field: observation["stats"][field] for field in _COUNT_FIELDS})
 
-    provenance = "OK" if observation is not None and stable == "YES" and bool(before["git_ok"]) else "BROKEN"
+    provenance = (
+        "OK"
+        if observation is not None
+        and selection != "UNKNOWN"
+        and stable == "YES"
+        and bool(before["git_ok"])
+        else "BROKEN"
+    )
     reasons: List[str] = []
     if provenance != "OK":
         reasons.append("provenance")
@@ -492,6 +507,7 @@ def _receipt_facts(
         "argv": list(command),
         "advisory_selection": classification["selection"],
         "observation_error": observation_error,
+        "selection_options": observation["options"] if observation is not None else None,
     }
 
 

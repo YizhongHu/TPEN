@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 
@@ -20,6 +21,11 @@ SPEC = importlib.util.spec_from_file_location("verification_receipt", MODULE_PAT
 assert SPEC and SPEC.loader
 RECEIPT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RECEIPT)
+OBSERVER_PATH = Path(__file__).parents[2] / "tools" / "_verification_observer.py"
+OBSERVER_SPEC = importlib.util.spec_from_file_location("_verification_observer", OBSERVER_PATH)
+assert OBSERVER_SPEC and OBSERVER_SPEC.loader
+OBSERVER = importlib.util.module_from_spec(OBSERVER_SPEC)
+OBSERVER_SPEC.loader.exec_module(OBSERVER)
 
 
 def _run(cwd: Path, *args: str) -> str:
@@ -74,6 +80,7 @@ class VerificationReceiptTest(unittest.TestCase):
         *,
         claim: bool = False,
         environment: Optional[Dict[str, str]] = None,
+        receipt_json: Optional[Path] = None,
     ) -> Tuple[int, str, str]:
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -89,6 +96,8 @@ class VerificationReceiptTest(unittest.TestCase):
             wrapper_args: List[str] = ["run"]
             if claim:
                 wrapper_args.append("--claim-baseline")
+            if receipt_json is not None:
+                wrapper_args.extend(["--receipt-json", str(receipt_json)])
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 code = RECEIPT.main(wrapper_args + ["--"] + command)
         finally:
@@ -183,6 +192,79 @@ class VerificationReceiptTest(unittest.TestCase):
         receipt = self._receipt_line(stdout)
         self.assertIn("selection=SELECTED[", receipt)
         self.assertIn("option:keyword", receipt)
+        self.assertIn("baseline_eligible=NO", receipt)
+
+    def test_observer_option_presence_is_fail_closed_and_polarized(self) -> None:
+        def make_observation(options: Dict[str, object]) -> Dict[str, object]:
+            return {
+                "invocation_args": [],
+                "ini_addopts": [],
+                "ini_testpaths": [],
+                "env_pytest_addopts": None,
+                "options": options,
+                "collected": 2,
+                "deselected": 0,
+                "stats": {field: 0 for field in RECEIPT._COUNT_FIELDS},
+            }
+
+        git = {
+            "head": "a" * 40,
+            "branch": "main",
+            "tracked_clean": "YES",
+            "git_ok": True,
+        }
+        attributes = {
+            aliases[0]: None
+            for aliases in OBSERVER._SELECTION_OPTION_ALIASES.values()
+            if aliases[0] != "exitfirst"
+        }
+        missing = OBSERVER._selection_options(SimpleNamespace(option=SimpleNamespace(**attributes)))
+        missing_facts = RECEIPT._receipt_facts(
+            ["pytest"],
+            RECEIPT.classify_command(["pytest"]),
+            git,
+            git,
+            0,
+            make_observation(missing),
+            None,
+        )
+        self.assertEqual(missing["failed_first"]["state"], "ABSENT")
+        self.assertEqual(missing_facts["provenance"], "BROKEN")
+        self.assertEqual(missing_facts["selection"], "UNKNOWN")
+        self.assertEqual(missing_facts["baseline_eligible"], "NO")
+
+        attributes["failedfirst"] = None
+        present = OBSERVER._selection_options(SimpleNamespace(option=SimpleNamespace(**attributes)))
+        present_facts = RECEIPT._receipt_facts(
+            ["pytest"],
+            RECEIPT.classify_command(["pytest"]),
+            git,
+            git,
+            0,
+            make_observation(present),
+            None,
+        )
+        self.assertEqual(present["failed_first"]["state"], "FOUND")
+        self.assertEqual(present_facts["selection"], "UNSELECTED")
+        self.assertEqual(present_facts["provenance"], "OK")
+        self.assertEqual(present_facts["baseline_eligible"], "YES")
+
+    def test_real_pytest_option_map_and_failed_first_flag(self) -> None:
+        receipt_json = self.repo / "receipt.json"
+        code, stdout, _ = self._run_receipt(receipt_json=receipt_json)
+        self.assertEqual(code, 0)
+        facts = json.loads(receipt_json.read_text())
+        options = facts["selection_options"]
+        required = set(RECEIPT._SELECTION_OPTION_NAMES) - {"exitfirst"}
+        self.assertTrue(all(options[name]["state"] == "FOUND" for name in required))
+        self.assertEqual(options["failed_first"]["attribute"], "failedfirst")
+        self.assertIn(options["exitfirst"]["state"], {"FOUND", "ABSENT"})
+
+        code, stdout, _ = self._run_receipt(("-q", "--ff"), claim=True)
+        self.assertEqual(code, 0)
+        receipt = self._receipt_line(stdout)
+        self.assertIn("selection=SELECTED[", receipt)
+        self.assertIn("option:failed_first", receipt)
         self.assertIn("baseline_eligible=NO", receipt)
 
     def test_env_addopts_is_observed_and_refused(self) -> None:
