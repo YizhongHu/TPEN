@@ -255,7 +255,25 @@ class VerificationReceiptTest(unittest.TestCase):
         self.assertEqual(code, 0)
         facts = json.loads(receipt_json.read_text())
         options = facts["selection_options"]
-        required = set(RECEIPT._SELECTION_OPTION_NAMES) - {"exitfirst"}
+        # This list is intentionally independent of the implementation map:
+        # the real pytest config must empirically resolve every expected name.
+        expected = {
+            "keyword",
+            "markexpr",
+            "stepwise",
+            "stepwise_skip",
+            "last_failed",
+            "failed_first",
+            "maxfail",
+            "exitfirst",
+            "collectonly",
+            "ignore",
+            "ignore_glob",
+            "deselect",
+            "file_or_dir",
+        }
+        self.assertEqual(set(options), expected)
+        required = expected - {"exitfirst"}
         self.assertTrue(all(options[name]["state"] == "FOUND" for name in required))
         self.assertEqual(options["failed_first"]["attribute"], "failedfirst")
         self.assertIn(options["exitfirst"]["state"], {"FOUND", "ABSENT"})
