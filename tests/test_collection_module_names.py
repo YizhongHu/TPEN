@@ -50,9 +50,6 @@ def _test_files() -> list[Path]:
     test_files: list[Path] = []
     for current, directories, filenames in os.walk(REPO_ROOT):
         current_path = Path(current)
-        if _is_environment_root(current_path):
-            directories[:] = []
-            continue
         relative_current = Path(current).relative_to(REPO_ROOT)
         directories[:] = [
             directory
@@ -72,6 +69,11 @@ def _duplicate_basename_groups() -> dict[str, list[Path]]:
     groups: dict[str, list[Path]] = defaultdict(list)
     for path in _test_files():
         groups[path.name].append(path)
+    if not groups:
+        raise AssertionError(
+            "Duplicate-basename walk found no test_*.py files; "
+            "the repository scan is disabled."
+        )
     return {name: paths for name, paths in groups.items() if len(paths) > 1}
 
 
@@ -275,3 +277,27 @@ def test_namespace_gap_remains_a_root_sensitive_target(
     assert sensitive_groups == {
         "test_anchor.py": expected,
     }
+
+
+@pytest.mark.parametrize("marker", ["pyvenv.cfg", "conda-meta/history"])
+def test_environment_marker_at_repo_root_does_not_silence_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: str,
+) -> None:
+    _configure_collection_tree(tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    expected = [
+        _put(tmp_path, f"{name}/test_review.py", "def test_ok(): pass\n")
+        for name in ("suite_a", "suite_b")
+    ]
+    _put(tmp_path, marker)
+
+    try:
+        test_duplicate_test_module_names_collect_without_collision()
+    except pytest.skip.Exception as exc:
+        pytest.fail(f"root marker hid real duplicate targets: {exc}")
+
+    assert _duplicate_basename_groups() == {"test_review.py": expected}
