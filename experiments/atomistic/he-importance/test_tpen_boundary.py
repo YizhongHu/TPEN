@@ -342,6 +342,17 @@ def test_absent_file_pending_pr_entry_is_admitted_and_reported() -> None:
     )
 
 
+def test_absent_file_without_pending_pr_is_rejected() -> None:
+    key = ("absent_no_pending.py", 1, "tpen.real")
+    declared = {key: InventoryEntry("missing traceability metadata.")}
+    try:
+        _validate_inventory_admission(set(), declared)
+    except AssertionError as exc:
+        assert "pending_pr" in str(exc)
+    else:
+        raise AssertionError("an absent-file entry without pending_pr must be rejected")
+
+
 def test_existing_file_with_absent_crossing_rejects_pending_pr_allowance() -> None:
     key = ("test_tpen_boundary.py", 1, "tpen.never_imported")
     declared = {
