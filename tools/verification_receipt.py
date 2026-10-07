@@ -39,6 +39,21 @@ _SELECTION_LONG = {
     "--collect-only",
     "--co",
 }
+# Closed set of pytest options whose separate next token is a value, not a
+# positional test target. Unknown options intentionally retain the loud,
+# fail-closed behaviour of the final bare-token rule.
+_VALUE_OPTIONS = {
+    "-p",
+    "-n",
+    "-c",
+    "-o",
+    "-W",
+    "--rootdir",
+    "--junitxml",
+    "--durations",
+    "--basetemp",
+    "--log-file",
+}
 
 
 def _shell_token(token: str) -> str:
@@ -127,6 +142,16 @@ def classify_pytest_args(pytest_args: Sequence[str]) -> Tuple[str, List[str]]:
             continue
         if token.startswith("-k=") or token.startswith("-m="):
             disqualifying.append(token)
+            index += 1
+            continue
+
+        if token in _VALUE_OPTIONS:
+            if index + 1 < len(values):
+                index += 2
+            else:
+                index += 1
+            continue
+        if token.startswith("--") and any(token.startswith(option + "=") for option in _VALUE_OPTIONS):
             index += 1
             continue
 

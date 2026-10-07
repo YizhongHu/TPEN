@@ -65,6 +65,8 @@ class VerificationReceiptTest(unittest.TestCase):
         return code, stdout.getvalue(), stderr.getvalue()
 
     def test_classifier_table_includes_negative_controls_and_prefix_skip(self) -> None:
+        # Each SELECTED control stays beside an UNSELECTED control: this table
+        # is an instrument for both directions, not a hope that flags vanish.
         cases = [
             (["pytest", "-k", "expr"], "SELECTED", ["-k", "expr"]),
             (["pytest", "-k=expr"], "SELECTED", ["-k=expr"]),
@@ -75,6 +77,16 @@ class VerificationReceiptTest(unittest.TestCase):
             (["pytest", "-x"], "SELECTED", ["-x"]),
             (["pytest", "--maxfail=1"], "SELECTED", ["--maxfail=1"]),
             (["pytest", "--co"], "SELECTED", ["--co"]),
+            (["pytest", "-q", "-p", "no:cacheprovider"], "UNSELECTED", []),
+            (["pytest", "-q", "-n", "4"], "UNSELECTED", []),
+            (["pytest", "-q", "-c", "pytest.ini"], "UNSELECTED", []),
+            (["pytest", "-q", "-o", "cache_dir=/tmp/cache"], "UNSELECTED", []),
+            (["pytest", "-q", "--junitxml", "/tmp/r.xml"], "UNSELECTED", []),
+            (["pytest", "-q", "--rootdir", "."], "UNSELECTED", []),
+            (["pytest", "-q", "-W", "ignore::DeprecationWarning"], "UNSELECTED", []),
+            (["pytest", "-q", "--durations", "10"], "UNSELECTED", []),
+            (["pytest", "-q", "--basetemp", "/tmp/pytest-tmp"], "UNSELECTED", []),
+            (["pytest", "-q", "--log-file", "/tmp/pytest.log"], "UNSELECTED", []),
             (["python", "-m", "pytest", "-q"], "UNSELECTED", []),
             (["python", "-m", "pytest", "-m", "slow"], "SELECTED", ["-m", "slow"]),
         ]
