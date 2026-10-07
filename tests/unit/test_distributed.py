@@ -15,6 +15,7 @@ from tpen.distributed import (
     ProfileScope,
     RankLocalJSONLWriter,
     ScalarMetric,
+    execution_topology_from_facts,
     project_scalars,
 )
 from tpen.process_resources import ProcessResourceResult, ResourceUnavailable
@@ -63,6 +64,63 @@ def test_missing_global_rank_stays_explicit_and_cannot_make_path() -> None:
     assert topology.global_rank is None
     with pytest.raises(ValueError, match="global rank is unavailable"):
         _ = topology.rank_path_component
+
+
+def test_execution_topology_from_facts_normalizes_mapping_and_preserves_type() -> None:
+    facts = {
+        "global_rank": 1,
+        "global_size": 2,
+        "local_rank": 1,
+        "local_size": 2,
+        "node_rank": 0,
+        "node_size": 1,
+        "host": "node-b",
+        "pid": 1001,
+        "device": "cuda:3",
+        "job_id": "job-1",
+        "device_identity": {"kind": "cuda", "index": 3, "uuid": "GPU-3"},
+    }
+
+    topology = execution_topology_from_facts(facts)
+
+    assert topology.global_rank == 1
+    assert topology.local_rank == 1
+    assert topology.host == "node-b"
+    assert topology.job_id == "job-1"
+    assert topology.device_identity == AcceleratorIdentity(
+        AcceleratorKind.CUDA, 3, "GPU-3"
+    )
+    assert execution_topology_from_facts(topology) is topology
+
+
+def test_execution_topology_from_facts_rejects_boundary_shape_errors() -> None:
+    facts = {
+        "global_rank": 0,
+        "global_size": 1,
+        "local_rank": 0,
+        "local_size": 1,
+        "node_rank": 0,
+        "node_size": 1,
+        "host": "node-a",
+        "pid": 1000,
+        "device": "cpu",
+    }
+
+    unsupported = dict(facts, launcher_job_id="not-a-topology-fact")
+    with pytest.raises(ValueError, match="unsupported production runner topology"):
+        execution_topology_from_facts(unsupported)
+
+    missing = dict(facts)
+    missing.pop("host")
+    with pytest.raises(ValueError, match="missing required facts"):
+        execution_topology_from_facts(missing)
+
+    malformed = dict(facts, device_identity={"kind": "not-an-accelerator"})
+    with pytest.raises(ValueError, match="device_identity is malformed"):
+        execution_topology_from_facts(malformed)
+
+    with pytest.raises(TypeError, match="ExecutionTopology or mapping"):
+        execution_topology_from_facts(object())
 
 
 @pytest.mark.parametrize(
@@ -249,4 +307,3 @@ def test_projector_marks_missing_device_count_explicitly() -> None:
         ("reserved_mb", 4.0),
         ("device_count_unavailable", True),
     ]
-
