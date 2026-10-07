@@ -127,6 +127,24 @@ def test_execution_topology_from_facts_rejects_boundary_shape_errors() -> None:
             execution_topology_from_facts(object())
 
 
+def test_execution_topology_from_facts_rejects_unsupported_identity_keys() -> None:
+    facts = {
+        "global_rank": 0,
+        "global_size": 1,
+        "local_rank": 0,
+        "local_size": 1,
+        "node_rank": 0,
+        "node_size": 1,
+        "host": "node-a",
+        "pid": 1000,
+        "device": "cpu",
+        "device_identity": {"kind": "cpu", "unexpected": "value"},
+    }
+
+    with pytest.raises(ValueError, match="unsupported topology.device_identity keys"):
+        execution_topology_from_facts(facts)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

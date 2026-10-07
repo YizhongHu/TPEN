@@ -203,7 +203,9 @@ def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> Non
             visit(value, key)
 
 
-def _validate_runner_topology_facts(facts: Mapping[str, Any]) -> None:
+def _validate_runner_topology_facts(
+    facts: Mapping[str, Any], *, reject_unsupported: bool = True
+) -> None:
     """Validate the facts accepted by the production runner boundary.
 
     This mirrors the value invariants of TPEN's topology type without naming
@@ -212,12 +214,13 @@ def _validate_runner_topology_facts(facts: Mapping[str, Any]) -> None:
     values before any injected runner is called.
     """
 
-    unsupported = tuple(key for key in facts if key not in _RUNNER_TOPOLOGY_FACT_KEYS)
-    if unsupported:
-        names = ", ".join(repr(key) for key in unsupported)
-        raise LaunchValidationError(
-            "unsupported production runner topology facts: " + names
-        )
+    if reject_unsupported:
+        unsupported = tuple(key for key in facts if key not in _RUNNER_TOPOLOGY_FACT_KEYS)
+        if unsupported:
+            names = ", ".join(repr(key) for key in unsupported)
+            raise LaunchValidationError(
+                "unsupported production runner topology facts: " + names
+            )
     required = (
         "global_rank",
         "global_size",
@@ -349,11 +352,14 @@ def launch_train(
     facts = None
     if topology is not None:
         facts = execution_topology_facts(topology)
-        _validate_runner_topology_facts(facts)
+        # Topology is caller-open, so config-only runners retain extra facts.
+        # Strict key rejection remains below when the mapping crosses into TPEN.
+        _validate_runner_topology_facts(facts, reject_unsupported=False)
     if runner is run_from_config:
         if topology is None:
             # Backstop: L1's empty-mapping refusal is reached first.
             raise LaunchValidationError("launch topology is required")
+        _validate_runner_topology_facts(facts)
         return _exit_code(runner(plan.config, topology=facts))
     if topology is not None:
         parameters = inspect.signature(runner).parameters.values()
@@ -362,6 +368,7 @@ def launch_train(
             for parameter in parameters
         )
         if accepts_topology:
+            _validate_runner_topology_facts(facts)
             return _exit_code(runner(plan.config, topology=facts))
     return _exit_code(runner(plan.config))
 
