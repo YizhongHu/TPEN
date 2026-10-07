@@ -39,15 +39,26 @@ def _is_excluded(relative: Path, norecursedirs: tuple[tuple[str, ...], ...]) -> 
     return False
 
 
+def _is_environment_root(path: Path) -> bool:
+    """Return whether a directory contains a Python environment marker."""
+
+    return (path / "pyvenv.cfg").is_file() or (path / "conda-meta" / "history").is_file()
+
+
 def _test_files() -> list[Path]:
     norecursedirs = _norecursedirs()
     test_files: list[Path] = []
     for current, directories, filenames in os.walk(REPO_ROOT):
+        current_path = Path(current)
+        if _is_environment_root(current_path):
+            directories[:] = []
+            continue
         relative_current = Path(current).relative_to(REPO_ROOT)
         directories[:] = [
             directory
             for directory in directories
             if not _is_excluded(relative_current / directory, norecursedirs)
+            and not _is_environment_root(current_path / directory)
         ]
         test_files.extend(
             Path(current) / filename
@@ -67,11 +78,15 @@ def _duplicate_basename_groups() -> dict[str, list[Path]]:
 def _is_package_rooted(path: Path) -> bool:
     """Return whether a test file is below a regular package directory."""
 
-    for parent in path.parents:
-        if parent == REPO_ROOT:
-            break
-        if (parent / "__init__.py").is_file():
+    directory = path.parent
+    while directory != REPO_ROOT:
+        if REPO_ROOT not in directory.parents:
+            return False
+        if not (directory / "__init__.py").is_file():
+            return False
+        if directory.parent == REPO_ROOT:
             return True
+        directory = directory.parent
     return False
 
 
@@ -146,9 +161,15 @@ def test_duplicate_test_module_names_collect_without_collision() -> None:
 
     non_package_groups = _non_package_rooted_duplicate_groups(duplicate_groups)
     if not non_package_groups:
+        classification = ", ".join(
+            f"{name}: {sum(not _is_package_rooted(path) for path in paths)}"
+            f"/{len(paths)} outside regular packages"
+            for name, paths in sorted(duplicate_groups.items())
+        )
         pytest.skip(
-            "No duplicate-basename group remains entirely outside regular packages; "
-            "the pythonpath-sensitive console arm has no collision targets."
+            "No duplicate-basename group has at least two files outside regular "
+            "packages; the pythonpath-sensitive console arm has no collision "
+            f"targets (evidence: {classification})."
         )
     non_package_files = [
         path
@@ -175,3 +196,82 @@ def test_duplicate_test_module_names_collect_without_collision() -> None:
         f"{non_package_console_result.stdout}\n"
         f"console invocation stderr:\n{non_package_console_result.stderr}"
     )
+
+
+def _put(root: Path, relative: str, text: str = "") -> Path:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _configure_collection_tree(root: Path) -> None:
+    _put(
+        root,
+        "pyproject.toml",
+        '[tool.pytest.ini_options]\n'
+        'pythonpath = ["."]\n'
+        "consider_namespace_packages = true\n"
+        "norecursedirs = []\n",
+    )
+
+
+@pytest.mark.parametrize(
+    "env_name, marker",
+    [
+        (".venv-gpu", "pyvenv.cfg"),
+        (".venv-rocm", "pyvenv.cfg"),
+        ("custom-env", "pyvenv.cfg"),
+        ("conda-env", "conda-meta/history"),
+    ],
+)
+def test_duplicate_walk_excludes_environments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    env_name: str,
+    marker: str,
+) -> None:
+    _configure_collection_tree(tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+    expected = [
+        _put(tmp_path, f"{directory}/test_review.py", "def test_ok(): pass\n")
+        for directory in ("suite_a", "suite_b")
+    ]
+    _put(tmp_path, f"{env_name}/{marker}")
+    for vendor in ("vendor_a", "vendor_b"):
+        _put(
+            tmp_path,
+            f"{env_name}/lib/python3.12/site-packages/{vendor}/test_review.py",
+            'raise RuntimeError("virtualenv test must not be imported")\n',
+        )
+
+    try:
+        groups = _duplicate_basename_groups()
+    except pytest.skip.Exception as exc:
+        pytest.fail(f"environment exclusion regression test skipped: {exc}")
+    assert groups == {"test_review.py": expected}
+
+
+def test_namespace_gap_remains_a_root_sensitive_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_collection_tree(tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+    _put(tmp_path, "tests/__init__.py")
+    _put(tmp_path, "tests/conftest.py")
+    _put(tmp_path, "tests/test_anchor.py", "def test_ok(): pass\n")
+    _put(tmp_path, "experiments/pkg/__init__.py")
+    expected = [
+        _put(tmp_path, f"experiments/pkg/{leaf}/test_anchor.py", "def test_ok(): pass\n")
+        for leaf in ("left", "right")
+    ]
+
+    try:
+        groups = _duplicate_basename_groups()
+        sensitive_groups = _non_package_rooted_duplicate_groups(groups)
+    except pytest.skip.Exception as exc:
+        pytest.fail(f"namespace-gap regression test skipped: {exc}")
+    assert sensitive_groups == {
+        "test_anchor.py": expected,
+    }
