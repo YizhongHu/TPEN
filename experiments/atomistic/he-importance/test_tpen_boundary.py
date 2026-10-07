@@ -281,34 +281,44 @@ def _assert_pending_516_partition(
 
 
 # CONTROL CAPABILITY MATRIX
-# Each detector capability has a property-named negative control.  Keep this
-# list synchronized with the implementation above: a capability mutation must
-# kill the control named on its row, with pytest cache disabled during audits.
+# Each detector capability owes BOTH directions: an accept-direction control
+# must fail when matching is broken, and a reject-direction control must fail
+# when the restriction is loosened. Keep this list synchronized with the
+# implementation above; audit mutations with pytest cache disabled.
 #
 # static ast.Import / module scope       -> test_capability_static_import_statement
 # static import alias iteration          -> test_capability_multiple_static_import_aliases
 # static ast.ImportFrom                  -> test_capability_static_from_import
 # bare tpen name                         -> test_capability_bare_tpen_name
 # dotted tpen name                       -> test_capability_dotted_tpen_name
+# tpen-name rejection                    -> test_capability_tpen_name_rejects_non_tpen
 # function-local nesting                 -> test_capability_function_local_static_import
 # class-body nesting                     -> test_capability_class_body_static_import
 # recursive AST traversal                -> test_capability_recursive_ast_walk
 # bare import_module dynamic form        -> test_capability_dynamic_bare_import_module
 # qualified importlib dynamic form       -> test_capability_dynamic_qualified_importlib
 # __import__ dynamic form                -> test_capability_dynamic_dunder_import
+# unknown dynamic callable rejection     -> test_capability_dynamic_rejects_unknown_callable
 # positional dynamic argument            -> test_capability_dynamic_positional_argument
 # keyword dynamic argument               -> test_capability_dynamic_keyword_argument
+# non-name keyword rejection              -> test_capability_dynamic_rejects_non_name_keyword
 # dynamic argument iteration             -> test_capability_dynamic_argument_iteration
 # disk source reading                    -> test_capability_reads_source_from_disk
 # AST source parsing                     -> test_capability_ast_source_parsing
 # recursive *.py discovery               -> test_capability_recursive_python_file_discovery
 # *.py file filtering                    -> test_capability_python_file_filter
 # sanctioned runner carve-out            -> test_capability_sanctioned_runner_carveout
+# sanctioned module restriction           -> test_capability_sanctioned_import_rejects_wrong_module
+# sanctioned name-count restriction      -> test_capability_sanctioned_import_rejects_extra_names
+# sanctioned symbol restriction          -> test_capability_sanctioned_import_rejects_wrong_symbol
+# qualified receiver restriction         -> test_capability_dynamic_rejects_non_importlib_receiver
+# qualified attribute restriction        -> test_capability_dynamic_rejects_non_import_module_attribute
 # production/test partition              -> test_capability_production_test_partition
 # non-empty file scan                    -> test_capability_nonempty_scan / test_capability_empty_scan_rejected
 # non-empty crossing scan                -> test_capability_no_crossings_rejected
 # non-empty unsanctioned scan            -> test_capability_no_unsanctioned_crossings_rejected
 # literal dynamic target                 -> test_capability_dynamic_literal_string
+# nonliteral dynamic target rejection     -> test_capability_dynamic_rejects_nonliteral
 # measured/declared admission            -> test_capability_undeclared_measured_crossing
 # existing-file stale admission          -> test_capability_existing_stale_entry
 # absent-file pending admission           -> test_capability_absent_pending_entry
@@ -351,6 +361,11 @@ def test_capability_dotted_tpen_name() -> None:
     ]
 
 
+def test_capability_tpen_name_rejects_non_tpen() -> None:
+    assert _detect_crossings("import numpy\n") == ()
+    assert _detect_crossings("from numpy import array\n") == ()
+
+
 def test_capability_class_body_static_import() -> None:
     source = '''
 class Resolver:
@@ -389,6 +404,10 @@ def test_capability_dynamic_dunder_import() -> None:
     ]
 
 
+def test_capability_dynamic_rejects_unknown_callable() -> None:
+    assert _detect_crossings('load_anything("tpen.anything")\n') == ()
+
+
 def test_capability_dynamic_positional_argument() -> None:
     source = 'module = import_module("tpen.anything")\n'
     crossings = _detect_crossings(source)
@@ -401,6 +420,11 @@ def test_capability_dynamic_literal_string() -> None:
     source = 'module = import_module("tpen.literal")\n'
     crossings = _detect_crossings(source)
     assert crossings[0].target == "tpen.literal"
+
+
+def test_capability_dynamic_rejects_nonliteral() -> None:
+    source = 'module_name = "tpen.variable"\nimport_module(module_name)\n'
+    assert _detect_crossings(source) == ()
 
 
 def test_capability_dynamic_argument_iteration() -> None:
@@ -474,6 +498,39 @@ def test_capability_sanctioned_runner_carveout() -> None:
     assert not any(
         path == "launch.py" and crossing.line == 25 for path, crossing in scanned
     )
+
+
+def test_capability_sanctioned_import_rejects_wrong_module() -> None:
+    crossings = _detect_crossings("from tpen.other import run_from_config\n")
+    assert len(crossings) == 1
+    assert not crossings[0].sanctioned
+    assert crossings[0].target == "tpen.other"
+
+
+def test_capability_sanctioned_import_rejects_extra_names() -> None:
+    crossings = _detect_crossings(
+        "from tpen.run import run_from_config, prepare_run_context\n"
+    )
+    assert len(crossings) == 1
+    assert not crossings[0].sanctioned
+    assert crossings[0].target == "tpen.run"
+
+
+def test_capability_sanctioned_import_rejects_wrong_symbol() -> None:
+    crossings = _detect_crossings("from tpen.run import prepare_run_context\n")
+    assert len(crossings) == 1
+    assert not crossings[0].sanctioned
+    assert crossings[0].target == "tpen.run"
+
+
+def test_capability_dynamic_rejects_non_importlib_receiver() -> None:
+    crossings = _detect_crossings('other.import_module("tpen.anything")\n')
+    assert crossings == ()
+
+
+def test_capability_dynamic_rejects_non_import_module_attribute() -> None:
+    crossings = _detect_crossings('importlib.load_module("tpen.anything")\n')
+    assert crossings == ()
 
 
 def test_capability_production_test_partition() -> None:
@@ -585,6 +642,11 @@ module = import_module(name="tpen.anything")
 '''
     crossings = _detect_crossings(source)
     assert any(crossing.target == "tpen.anything" for crossing in crossings)
+
+
+def test_capability_dynamic_rejects_non_name_keyword() -> None:
+    source = 'import_module(package="tpen.anything")\n'
+    assert _detect_crossings(source) == ()
 
 
 def test_capability_function_local_static_import() -> None:
