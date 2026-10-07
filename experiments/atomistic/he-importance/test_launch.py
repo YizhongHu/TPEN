@@ -13,9 +13,8 @@ import threading
 import pytest
 from omegaconf import OmegaConf
 
-from tpen.accelerator import AcceleratorIdentity, AcceleratorKind
 from tpen.artifacts import RunContext, RunResult
-from tpen.distributed import ExecutionTopology
+from tpen.distributed import AcceleratorIdentity, AcceleratorKind, ExecutionTopology
 from tpen.run import run_from_config
 from tpen.runner import Runner
 
@@ -236,7 +235,9 @@ def test_public_launch_rejects_new_execution_fact_names(
 
 
 def test_typed_execution_topology_serializes_every_distinct_field() -> None:
-    identity = AcceleratorIdentity(kind=AcceleratorKind("cuda"), index=19, uuid="distinct-uuid")
+    identity = AcceleratorIdentity(
+        kind=AcceleratorKind("cuda"), index=19, uuid="distinct-uuid"
+    )
     topology = ExecutionTopology(
         global_rank=11,
         global_size=12,
