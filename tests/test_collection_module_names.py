@@ -70,30 +70,48 @@ def test_duplicate_test_module_names_collect_without_collision() -> None:
         pytest.skip(
             "No duplicate test-file basenames remain; there are no collision targets to collect."
         )
-    assert duplicate_groups, "The duplicate-basename walk must find at least one group."
 
     duplicate_files = [
         path
         for paths in sorted(duplicate_groups.values(), key=lambda paths: paths[0].name)
         for path in paths
     ]
-    result = subprocess.run(
+    selection = [
+        "--collect-only",
+        "-q",
+        *(str(path.relative_to(REPO_ROOT)) for path in duplicate_files),
+    ]
+    module_result = subprocess.run(
         [
             sys.executable,
             "-m",
             "pytest",
-            "--collect-only",
-            "-q",
-            *(str(path.relative_to(REPO_ROOT)) for path in duplicate_files),
+            *selection,
         ],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=False,
     )
+    console_pytest = Path(sys.executable).parent / "pytest"
+    if not console_pytest.is_file():
+        pytest.skip(
+            f"pytest console script is not available beside {sys.executable}; "
+            "cannot verify console/module collection agreement."
+        )
+    console_result = subprocess.run(
+        [str(console_pytest), *selection],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
-    assert result.returncode == 0, (
-        "pytest could not collect the dynamically discovered duplicate-basename files\n"
-        f"stdout:\n{result.stdout}\n"
-        f"stderr:\n{result.stderr}"
+    assert module_result.returncode == console_result.returncode == 0, (
+        "pytest collection did not succeed consistently for the dynamically discovered "
+        "duplicate-basename files\n"
+        f"module invocation ({module_result.returncode}) stdout:\n{module_result.stdout}\n"
+        f"module invocation stderr:\n{module_result.stderr}\n"
+        f"console invocation ({console_result.returncode}) stdout:\n{console_result.stdout}\n"
+        f"console invocation stderr:\n{console_result.stderr}"
     )
