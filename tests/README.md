@@ -38,5 +38,13 @@ tests/integration/artifacts/training/vmc_smoke.yaml
 Shared pytest-only helpers live under `tests/helpers/`. Generated run outputs go
 under `outputs/`.
 
+## Verification receipts
+
+Run cluster verification through `tools/verification_receipt.py run -- <command>`.
+The receipt's `baseline_eligible=YES` means in-job provenance, an unselected
+pytest invocation, stable HEAD, a clean tracked tree, known counts, and a zero
+pytest exit status all passed; otherwise it records why the counts are not a
+whole-suite baseline.
+
 No test modules live directly under `tests/` -- only `README.md`, `conftest.py`,
 and `__init__.py` may.
