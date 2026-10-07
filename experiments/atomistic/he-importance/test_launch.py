@@ -340,7 +340,7 @@ def test_explicit_topology_runner_receives_topology(tmp_path: Path) -> None:
         return 0
 
     assert launch.launch_train(cell, _topology(), runner=wrapper) == 0
-    assert received[0].host == "test-host"
+    assert isinstance(received[0], dict) and received[0]["host"] == "test-host"
 
 
 def test_kwargs_runner_receives_topology(tmp_path: Path) -> None:
@@ -353,7 +353,7 @@ def test_kwargs_runner_receives_topology(tmp_path: Path) -> None:
         return 0
 
     assert launch.launch_train(cell, _topology(), runner=wrapper) == 0
-    assert received[0].job_id == "test-job"
+    assert isinstance(received[0], dict) and received[0]["job_id"] == "test-job"
 
 
 def test_plain_injected_runner_keeps_config_only_contract(tmp_path: Path) -> None:
@@ -629,3 +629,28 @@ def test_exit_code_rejects_unrelated_status_object() -> None:
 
     with pytest.raises(launch.LaunchValidationError, match="int or RunResult"):
         launch._exit_code(UnrelatedResult())
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("global_size", 0, "global_size must be positive"),
+        ("global_rank", "0", "global_rank must be an int"),
+        ("global_rank", True, "global_rank must be an int"),
+    ],
+)
+def test_launch_rejects_invalid_topology_values_before_injected_runner(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    cell = _cell(tmp_path)
+    facts = launch.execution_topology_facts(_topology())
+    facts[field] = value
+
+    with pytest.raises(launch.LaunchValidationError, match=message):
+        launch.launch_train(cell, facts, runner=lambda _: pytest.fail("runner was called"))
+
+
+@pytest.mark.parametrize("result", [True])
+def test_exit_code_rejects_boolean(result: object) -> None:
+    with pytest.raises(launch.LaunchValidationError, match="int or RunResult"):
+        launch._exit_code(result)

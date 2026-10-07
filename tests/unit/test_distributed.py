@@ -128,6 +128,34 @@ def test_execution_topology_from_facts_rejects_boundary_shape_errors() -> None:
 
 
 @pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("global_size", 0, "global_size must be positive"),
+        ("global_rank", "0", "global_rank must be an int"),
+        ("global_rank", True, "global_rank must be an int"),
+    ],
+)
+def test_execution_topology_from_facts_rejects_invalid_values(
+    field: str, value: object, message: str
+) -> None:
+    facts = {
+        "global_rank": 0,
+        "global_size": 1,
+        "local_rank": 0,
+        "local_size": 1,
+        "node_rank": 0,
+        "node_size": 1,
+        "host": "node-a",
+        "pid": 1000,
+        "device": "cpu",
+    }
+    facts[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        execution_topology_from_facts(facts)
+
+
+@pytest.mark.parametrize(
     ("rank_field", "rank_value"),
     [("global_rank", False), ("global_rank", 0.5), ("global_size", True)],
 )

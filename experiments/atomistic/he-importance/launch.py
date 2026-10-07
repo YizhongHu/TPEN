@@ -204,7 +204,13 @@ def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> Non
 
 
 def _validate_runner_topology_facts(facts: Mapping[str, Any]) -> None:
-    """Validate the facts accepted by the production runner boundary."""
+    """Validate the facts accepted by the production runner boundary.
+
+    This mirrors the value invariants of TPEN's topology type without naming
+    that type across the experiment boundary. The production runner performs
+    the authoritative typed normalization; this seam must still reject bad
+    values before any injected runner is called.
+    """
 
     unsupported = tuple(key for key in facts if key not in _RUNNER_TOPOLOGY_FACT_KEYS)
     if unsupported:
@@ -228,6 +234,40 @@ def _validate_runner_topology_facts(facts: Mapping[str, Any]) -> None:
         raise LaunchValidationError(
             "production runner topology is missing required facts: " + ", ".join(missing)
         )
+
+    for name in ("global_size", "local_size", "node_size"):
+        size = facts[name]
+        if type(size) is not int:
+            raise LaunchValidationError(
+                f"{name} must be an int, got {type(size).__name__}"
+            )
+        if size < 1:
+            raise LaunchValidationError(f"{name} must be positive, got {size}")
+    for rank_name, size_name in (
+        ("global_rank", "global_size"),
+        ("local_rank", "local_size"),
+        ("node_rank", "node_size"),
+    ):
+        rank = facts[rank_name]
+        size = facts[size_name]
+        if rank is not None and type(rank) is not int:
+            raise LaunchValidationError(
+                f"{rank_name} must be an int or None, got {type(rank).__name__}"
+            )
+        if rank is not None and not 0 <= rank < size:
+            raise LaunchValidationError(f"{rank_name} must be in [0, {size})")
+    if not facts["host"]:
+        raise LaunchValidationError("host must be nonempty")
+    try:
+        if facts["pid"] < 1:
+            raise LaunchValidationError("pid must be positive")
+    except TypeError as error:
+        raise LaunchValidationError(
+            f"pid must be an int, got {type(facts['pid']).__name__}"
+        ) from error
+    if not facts["device"]:
+        raise LaunchValidationError("device must be nonempty")
+
     identity_value = facts.get("device_identity")
     if identity_value is None:
         return
@@ -296,9 +336,11 @@ def launch_train(
 ) -> int:
     """Resolve one topology-bound row and execute TPEN's production runner.
 
-    Custom runners receive topology when their signature can accept a
-    ``topology`` keyword or arbitrary keyword arguments; plain config-only
-    doubles retain the existing config-only call. This closes the named
+    Custom runners receive the canonical execution-facts mapping when their
+    signature can accept a ``topology`` keyword or arbitrary keyword
+    arguments; plain config-only doubles retain the existing config-only call.
+    The mapping is the declared experiment-side contract because the typed
+    TPEN topology is owned behind this boundary. This closes the named
     capability-blind identity-dispatch mechanism, not every way a callable
     could ignore or mishandle a topology it accepts.
     """
@@ -318,8 +360,9 @@ def launch_train(
             for parameter in parameters
         )
         if accepts_topology:
-            _validate_runner_topology_facts(execution_topology_facts(topology))
-            return _exit_code(runner(plan.config, topology=topology))
+            facts = execution_topology_facts(topology)
+            _validate_runner_topology_facts(facts)
+            return _exit_code(runner(plan.config, topology=facts))
     return _exit_code(runner(plan.config))
 
 
