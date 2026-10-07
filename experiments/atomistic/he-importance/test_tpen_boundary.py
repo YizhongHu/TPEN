@@ -5,9 +5,10 @@ not import the study: ``he-importance`` is not an importable package name, and
 the study's imports would pull in its training dependencies.
 
 The inventory is pinned to ``dev`` at 3143e43ac170df33f61f2002b1011cd85c9cfc37
-on 2026-10-07.  The two inventories are intentionally explicit so that a new
-crossing, or the removal of a declared crossing, fails review until the
-inventory is updated with its disposition.
+on 2026-10-07.  The two inventories are intentionally explicit: every measured
+crossing must be declared, and every declared entry for a file already present
+must be measured.  Entries for files introduced by pending PR 516 are admitted
+only with an explicit pending PR and source SHA.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from pathlib import Path
 STUDY_DIR = Path(__file__).resolve().parent
 INVENTORY_DATE = "2026-10-07"
 INVENTORY_HEAD = "3143e43ac170df33f61f2002b1011cd85c9cfc37"
+PENDING_516_SHA = "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
 
 
 @dataclass(frozen=True)
@@ -31,59 +33,88 @@ class Crossing:
     sanctioned: bool = False
 
 
+@dataclass(frozen=True)
+class InventoryEntry:
+    """Disposition and optional admission metadata for one declared crossing."""
+
+    disposition: str
+    pending_pr: int | None = None
+    pending_sha: str | None = None
+
+
 # Each key is (relative file, line, dotted target).  Each value is the
 # one-line disposition recorded for that exact crossing.
 EXPECTED_PRODUCTION_INVENTORY = {
-    ("launch.py", 22, "tpen.accelerator"): (
+    ("launch.py", 22, "tpen.accelerator"): InventoryEntry(
         "item ffb269d1: removed by the next stack layer."
     ),
-    ("launch.py", 23, "tpen.artifacts"): (
+    ("launch.py", 23, "tpen.artifacts"): InventoryEntry(
         "item ffb269d1: removed by the next stack layer."
     ),
-    ("launch.py", 24, "tpen.distributed"): (
+    ("launch.py", 24, "tpen.distributed"): InventoryEntry(
         "item ffb269d1: removed by the next stack layer."
     ),
-    ("train_config.py", 187, "tpen.hi_schema"): (
+    ("train_config.py", 187, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 258, "tpen.hi_schema"): (
+    ("train_config.py", 258, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
+    ),
+    ("run_stage_q.py", 30, "tpen.accelerator"): InventoryEntry(
+        "pending PR 516: reconcile only if this crossing differs from its measured SHA.",
+        pending_pr=516,
+        pending_sha=PENDING_516_SHA,
+    ),
+    ("run_stage_q.py", 31, "tpen.distributed"): InventoryEntry(
+        "pending PR 516: reconcile only if this crossing differs from its measured SHA.",
+        pending_pr=516,
+        pending_sha=PENDING_516_SHA,
+    ),
+    ("run_stage_q.py", 100, "tpen.hi_schema"): InventoryEntry(
+        "pending PR 516 and item df8f8b31: reconcile only if this crossing differs from its measured SHA.",
+        pending_pr=516,
+        pending_sha=PENDING_516_SHA,
     ),
 }
 
 EXPECTED_TEST_INVENTORY = {
-    ("test_launch.py", 16, "tpen.artifacts"): (
+    ("test_launch.py", 16, "tpen.artifacts"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 17, "tpen.distributed"): (
+    ("test_launch.py", 17, "tpen.distributed"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 19, "tpen.runner"): (
+    ("test_launch.py", 19, "tpen.runner"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 388, "tpen.run"): (
+    ("test_launch.py", 388, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 430, "tpen.run"): (
+    ("test_launch.py", 430, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 486, "tpen.run"): (
+    ("test_launch.py", 486, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 591, "tpen.run"): (
+    ("test_launch.py", 591, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_stage_coordinate.py", 594, "tpen.hi.train"): (
+    ("test_stage_coordinate.py", 594, "tpen.hi.train"): InventoryEntry(
         "item e923ec4e: retained until the facade slice removes this crossing."
     ),
-    ("test_train_config.py", 176, "tpen.hi_schema"): (
+    ("test_train_config.py", 176, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 188, "tpen.hi_schema"): (
+    ("test_train_config.py", 188, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 281, "tpen.hi_schema"): (
+    ("test_train_config.py", 281, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
+    ),
+    ("test_run_stage_q.py", 99, "tpen.hi_schema"): InventoryEntry(
+        "pending PR 516 and item df8f8b31: reconcile only if this crossing differs from its measured SHA.",
+        pending_pr=516,
+        pending_sha=PENDING_516_SHA,
     ),
 }
 
@@ -180,6 +211,32 @@ def _scan_study() -> tuple[tuple[Path, ...], tuple[tuple[str, Crossing], ...]]:
     return paths, violations
 
 
+def _validate_inventory_admission(
+    measured: set[tuple[str, int, str]],
+    declared: dict[tuple[str, int, str], InventoryEntry],
+) -> tuple[tuple[tuple[str, int, str], int, str | None], ...]:
+    """Apply the three-part admission rule and report absent-file allowances."""
+
+    undeclared = measured - set(declared)
+    assert not undeclared, f"undeclared tpen crossings: {sorted(undeclared)}"
+
+    admitted_pending: list[tuple[tuple[str, int, str], int, str | None]] = []
+    for key, entry in declared.items():
+        file_path = STUDY_DIR / key[0]
+        if file_path.is_file():
+            # pending_pr never excuses a stale entry for a file already in the
+            # tree: an existing file must contain its declared crossing.
+            assert key in measured, f"declared crossing not measured: {key}"
+            continue
+
+        assert entry.pending_pr is not None, (
+            f"absent-file entry lacks pending_pr admission: {key}"
+        )
+        admitted_pending.append((key, entry.pending_pr, entry.pending_sha))
+
+    return tuple(sorted(admitted_pending))
+
+
 def _inventory_keys(
     scanned: tuple[tuple[str, Crossing], ...], *, tests: bool
 ) -> set[tuple[str, int, str]]:
@@ -188,13 +245,14 @@ def _inventory_keys(
     return {
         (relative_path, crossing.line, crossing.target)
         for relative_path, crossing in scanned
-        if relative_path.startswith("test_") is tests
+        if Path(relative_path).name.startswith("test_") is tests
     }
 
 
 def test_inventory_metadata_is_pinned_and_dated() -> None:
     assert INVENTORY_DATE == "2026-10-07"
     assert INVENTORY_HEAD == "3143e43ac170df33f61f2002b1011cd85c9cfc37"
+    assert PENDING_516_SHA == "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
 
 
 def test_scanner_has_nonempty_inputs_and_crossings() -> None:
@@ -203,14 +261,24 @@ def test_scanner_has_nonempty_inputs_and_crossings() -> None:
     assert len(crossings) > 0
 
 
-def test_production_inventory_is_exact() -> None:
+def test_production_inventory_obeys_admission_rule() -> None:
     _, crossings = _scan_study()
-    assert _inventory_keys(crossings, tests=False) == set(EXPECTED_PRODUCTION_INVENTORY)
+    measured = _inventory_keys(crossings, tests=False)
+    pending = _validate_inventory_admission(measured, EXPECTED_PRODUCTION_INVENTORY)
+    assert pending == (
+        (("run_stage_q.py", 30, "tpen.accelerator"), 516, PENDING_516_SHA),
+        (("run_stage_q.py", 31, "tpen.distributed"), 516, PENDING_516_SHA),
+        (("run_stage_q.py", 100, "tpen.hi_schema"), 516, PENDING_516_SHA),
+    )
 
 
-def test_test_file_inventory_is_exact() -> None:
+def test_test_file_inventory_obeys_admission_rule() -> None:
     _, crossings = _scan_study()
-    assert _inventory_keys(crossings, tests=True) == set(EXPECTED_TEST_INVENTORY)
+    measured = _inventory_keys(crossings, tests=True)
+    pending = _validate_inventory_admission(measured, EXPECTED_TEST_INVENTORY)
+    assert pending == (
+        (("test_run_stage_q.py", 99, "tpen.hi_schema"), 516, PENDING_516_SHA),
+    )
 
 
 def test_dynamic_import_module_crossing_is_detected() -> None:
@@ -220,3 +288,50 @@ module = import_module("tpen.anything")
 '''
     crossings = _detect_crossings(source)
     assert any(crossing.target == "tpen.anything" for crossing in crossings)
+
+
+def test_function_local_static_import_crossing_is_detected() -> None:
+    source = '''
+def resolve():
+    from tpen.anything import value
+    return value
+'''
+    crossings = _detect_crossings(source)
+    assert any(crossing.target == "tpen.anything" for crossing in crossings)
+
+
+def test_absent_file_pending_pr_entry_is_admitted_and_reported() -> None:
+    key = ("pending_future.py", 1, "tpen.anything")
+    declared = {
+        key: InventoryEntry(
+            "pending PR 516 admission.", pending_pr=516, pending_sha=PENDING_516_SHA
+        )
+    }
+    assert _validate_inventory_admission(set(), declared) == (
+        (key, 516, PENDING_516_SHA),
+    )
+
+
+def test_existing_file_with_absent_crossing_rejects_pending_pr_allowance() -> None:
+    key = ("test_tpen_boundary.py", 1, "tpen.never_imported")
+    declared = {
+        key: InventoryEntry(
+            "stale entry must fail.", pending_pr=516, pending_sha=PENDING_516_SHA
+        )
+    }
+    try:
+        _validate_inventory_admission(set(), declared)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("pending_pr must not excuse a stale entry for an existing file")
+
+
+def test_undeclared_measured_crossing_always_fails() -> None:
+    measured = {("existing.py", 1, "tpen.unlisted")}
+    try:
+        _validate_inventory_admission(measured, {})
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("every measured crossing must have a declared entry")
