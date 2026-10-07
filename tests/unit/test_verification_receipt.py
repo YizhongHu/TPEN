@@ -108,8 +108,14 @@ class VerificationReceiptTest(unittest.TestCase):
         (self.repo / "conftest.py").write_text(body)
 
     def test_classifier_table_is_bidirectional(self) -> None:
-        # Each SELECTED control stays beside UNSELECTED controls: this table
-        # is an instrument for both directions, not a hope that flags vanish.
+        # This table is an instrument for both directions, not a hope that
+        # flags vanish. It covers only unambiguous pre-flight selections that
+        # can be refused before allocation cost; --maxfail and --co are
+        # deliberately observer-only because pytest is the authority for
+        # those truncation settings. Keeping -x as pre-flight refusal is a
+        # deliberate asymmetry: it has no useful value to consume, whereas
+        # --maxfail/--co must pass through so the observer can report the
+        # resolved option source.
         cases = [
             (["pytest", "-k", "expr"], "SELECTED"),
             (["pytest", "-k=expr"], "SELECTED"),
@@ -118,8 +124,6 @@ class VerificationReceiptTest(unittest.TestCase):
             (["pytest", "-m", "slow"], "SELECTED"),
             (["pytest", "--ignore", "tests/slow"], "SELECTED"),
             (["pytest", "-x"], "SELECTED"),
-            (["pytest", "--maxfail=1"], "SELECTED"),
-            (["pytest", "--co"], "SELECTED"),
             (["python", "-m", "pytest", "-q"], "UNSELECTED"),
             (["python", "-m", "pytest", "-m", "slow"], "SELECTED"),
             (["pytest", "-q", "-p", "no:cacheprovider"], "UNSELECTED"),
@@ -143,6 +147,19 @@ class VerificationReceiptTest(unittest.TestCase):
         for command, expected in cases:
             with self.subTest(command=command):
                 self.assertEqual(RECEIPT.classify_command(command)["selection"], expected)
+
+    def test_observer_refuses_observer_only_truncation_options(self) -> None:
+        for args, source in (
+            (("-q", "--maxfail=1"), "option:maxfail"),
+            (("-q", "--co"), "option:collectonly"),
+        ):
+            with self.subTest(args=args):
+                code, stdout, _ = self._run_receipt(args, claim=True)
+                self.assertEqual(code, 0)
+                receipt = self._receipt_line(stdout)
+                self.assertIn("selection=SELECTED[", receipt)
+                self.assertIn(source, receipt)
+                self.assertIn("baseline_eligible=NO", receipt)
 
     def test_classifier_has_both_polarities(self) -> None:
         self.assertEqual(RECEIPT.classify_command(["pytest", "-q"])["selection"], "UNSELECTED")
