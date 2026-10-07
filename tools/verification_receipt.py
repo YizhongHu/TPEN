@@ -12,20 +12,20 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shlex
 import subprocess
 import sys
-from typing import Dict, List, Optional, Sequence, Tuple
+import tempfile
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 SENTINEL = "TPEN-VERIFICATION-RECEIPT"
 VERSION = "v1"
+OBSERVATION_ENV = "TPEN_VERIFICATION_OBSERVATION_PATH"
+NONCE_ENV = "TPEN_VERIFICATION_NONCE"
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _COUNT_FIELDS = ("passed", "failed", "errors", "skipped", "xfailed", "xpassed")
-_SUMMARY_RE = re.compile(
-    r"(?P<count>\d+)\s+(?P<word>passed|failed|errors?|skipped|xfailed|xpassed)\b"
-)
-_COLLECTED_RE = re.compile(r"\bcollected\s+(?P<count>\d+)\s+items?\b", re.IGNORECASE)
 _SELECTION_LONG = {
     "--ignore",
     "--ignore-glob",
@@ -50,10 +50,16 @@ _VALUE_OPTIONS = {
     "-W",
     "--rootdir",
     "--junitxml",
+    "--junit-xml",
     "--durations",
     "--basetemp",
     "--log-file",
+    "--color",
+    "--capture",
+    "--tb",
 }
+_ATTACHED_VALUE_SHORT = ("-p", "-n", "-c", "-o", "-W")
+_CLUSTER_FLAGS = set("qvrsfxlakm")
 
 
 def _shell_token(token: str) -> str:
@@ -102,19 +108,11 @@ def split_pytest_command(command: Sequence[str]) -> Tuple[Optional[List[str]], O
 
 
 def classify_pytest_args(pytest_args: Sequence[str]) -> Tuple[str, List[str]]:
-    """Classify pytest arguments and enumerate every disqualifying token.
+    """Classify pytest arguments and enumerate pre-flight disqualifiers.
 
-    Parameters
-    ----------
-    pytest_args
-        Arguments after the pytest executable or ``python -m pytest`` prefix.
-
-    Returns
-    -------
-    tuple[str, list[str]]
-        ``("UNSELECTED", [])`` for a whole-suite invocation, otherwise
-        ``("SELECTED", tokens)`` where ``tokens`` are exact argv tokens that
-        caused the classification.
+    This classifier is advisory only. The pytest-side observer is authoritative
+    for the receipt because selection can arrive through config, environment,
+    plugins, or collection hooks without appearing in argv.
     """
 
     values = list(pytest_args)
@@ -140,43 +138,33 @@ def classify_pytest_args(pytest_args: Sequence[str]) -> Tuple[str, List[str]]:
             else:
                 index += 1
             continue
-        if token.startswith("-k=") or token.startswith("-m="):
+        if (
+            token.startswith("-k=")
+            or token.startswith("-m=")
+            or (token.startswith("-k") and len(token) > 2)
+            or (token.startswith("-m") and len(token) > 2)
+        ):
             disqualifying.append(token)
             index += 1
             continue
 
         if token in _VALUE_OPTIONS:
-            if index + 1 < len(values):
-                index += 2
-            else:
-                index += 1
+            index += 2 if index + 1 < len(values) else 1
             continue
         if token.startswith("--") and any(token.startswith(option + "=") for option in _VALUE_OPTIONS):
             index += 1
             continue
-
-        matched_long = None
-        for option in _SELECTION_LONG:
-            if token == option or token.startswith(option + "="):
-                matched_long = option
-                break
-        if matched_long is not None:
-            disqualifying.append(token)
-            takes_value = matched_long in {"--ignore", "--ignore-glob", "--deselect", "--maxfail"}
-            if token == matched_long and takes_value and index + 1 < len(values):
-                disqualifying.append(values[index + 1])
-                index += 2
-            else:
-                index += 1
-            continue
-
-        # Handle clustered short flags such as -xq. Pytest's -k and -m
-        # spellings are also caught here when supplied in a cluster.
-        if token.startswith("-") and not token.startswith("--") and len(token) > 1:
-            if any(flag in token[1:] for flag in ("k", "m", "x")):
-                disqualifying.append(token)
+        if token.startswith("-") and not token.startswith("--"):
+            if any(token.startswith(option) and len(token) > len(option) for option in _ATTACHED_VALUE_SHORT):
                 index += 1
                 continue
+            # Only a genuine short-flag cluster can carry -x/-k/-m here.
+            # Values such as -Wignore::RuntimeWarning and -ocache_dir=...
+            # are not clusters and must not cause a pre-flight false refusal.
+            if set(token[1:]).issubset(_CLUSTER_FLAGS) and any(
+                flag in token[1:] for flag in ("x", "k", "m")
+            ):
+                disqualifying.append(token)
             index += 1
             continue
 
@@ -211,48 +199,6 @@ def classify_command(command: Sequence[str]) -> Dict[str, object]:
         "pytest_args": list(pytest_args or []),
         "command_error": None,
     }
-
-
-def parse_pytest_summary(output: str) -> Dict[str, Optional[int]]:
-    """Parse counts from the terminal summary line in pytest output.
-
-    Parameters
-    ----------
-    output
-        Combined pytest stdout and stderr.
-
-    Returns
-    -------
-    dict[str, int | None]
-        Count fields. All fields are ``None`` when no summary line is found;
-        a known summary line gives absent categories the value zero.
-    """
-
-    summary_matches = []
-    for line in output.splitlines():
-        matches = list(_SUMMARY_RE.finditer(line))
-        if matches:
-            summary_matches = matches
-    counts: Dict[str, Optional[int]] = {field: None for field in _COUNT_FIELDS}
-    collected: Optional[int] = None
-    collected_matches = list(_COLLECTED_RE.finditer(output))
-    if collected_matches:
-        collected = int(collected_matches[-1].group("count"))
-    if not summary_matches:
-        counts["collected"] = collected
-        return counts
-
-    for field in _COUNT_FIELDS:
-        counts[field] = 0
-    for match in summary_matches:
-        field = match.group("word")
-        if field == "error":
-            field = "errors"
-        counts[field] = int(match.group("count"))
-    if collected is None:
-        collected = sum(int(counts[field] or 0) for field in _COUNT_FIELDS)
-    counts["collected"] = collected
-    return counts
 
 
 def _git_probe() -> Dict[str, object]:
@@ -292,8 +238,188 @@ def _git_probe() -> Dict[str, object]:
     return result
 
 
+def _raw_tokens(value: Any) -> List[str]:
+    """Convert pytest's list-or-string config values to argv tokens."""
+
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            return shlex.split(value)
+        except ValueError:
+            return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _unique(values: Sequence[str]) -> List[str]:
+    """Keep source diagnostics stable and non-repeating."""
+
+    result: List[str] = []
+    for value in values:
+        if value not in result:
+            result.append(value)
+    return result
+
+
+def _sources_from_tokens(tokens: Sequence[str], prefix: str) -> List[str]:
+    """Name the source and option that made a raw token stream selected."""
+
+    selection, disqualifying = classify_pytest_args(tokens)
+    if selection != "SELECTED":
+        return []
+    option_tokens = [token for token in disqualifying if token.startswith("-")]
+    if option_tokens:
+        return _unique([prefix + token for token in option_tokens])
+    return [prefix + disqualifying[0]] if disqualifying else [prefix + "present"]
+
+
+def _override_sources(invocation_args: Sequence[str]) -> List[str]:
+    """Expose selection hidden in ``-o addopts=...`` or ``testpaths=...``."""
+
+    sources: List[str] = []
+    index = 0
+    values = list(invocation_args)
+    while index < len(values):
+        token = values[index]
+        override: Optional[str] = None
+        if token in ("-o", "--override-ini") and index + 1 < len(values):
+            override = values[index + 1]
+            index += 2
+        else:
+            index += 1
+        if not override or "=" not in override:
+            continue
+        name, value = override.split("=", 1)
+        if name == "addopts":
+            sources.extend(_sources_from_tokens(_raw_tokens(value), "ini:addopts:"))
+        elif name == "testpaths" and value.strip():
+            sources.append("ini:testpaths")
+    return _unique(sources)
+
+
+def _option_has_value(value: Any) -> bool:
+    """Whether a resolved pytest option represents an active selection."""
+
+    if value is None or value is False or value == 0 or value == "":
+        return False
+    if isinstance(value, (list, tuple, dict, set)):
+        return bool(value)
+    return True
+
+
+def _selection_from_observation(observation: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Derive selection only from pytest-side observations."""
+
+    sources: List[str] = []
+    invocation = [str(item) for item in observation["invocation_args"]]
+    sources.extend(_sources_from_tokens(invocation, "argv:"))
+    sources.extend(_override_sources(invocation))
+
+    env_addopts = observation["env_pytest_addopts"]
+    if env_addopts is not None and str(env_addopts).strip():
+        env_sources = _sources_from_tokens(_raw_tokens(env_addopts), "PYTEST_ADDOPTS:")
+        sources.extend(env_sources or ["PYTEST_ADDOPTS:present"])
+
+    ini_addopts = observation["ini_addopts"]
+    sources.extend(_sources_from_tokens(_raw_tokens(ini_addopts), "ini:addopts:"))
+
+    ini_testpaths = _raw_tokens(observation["ini_testpaths"])
+    if ini_testpaths:
+        sources.append("ini:testpaths")
+
+    options = observation["options"]
+    for name in (
+        "keyword",
+        "markexpr",
+        "stepwise",
+        "stepwise_skip",
+        "last_failed",
+        "failed_first",
+        "maxfail",
+        "exitfirst",
+        "collectonly",
+        "ignore",
+        "ignore_glob",
+        "deselect",
+        "file_or_dir",
+    ):
+        if _option_has_value(options.get(name)):
+            sources.append("option:" + name)
+
+    deselected = observation["deselected"]
+    if deselected:
+        sources.append("deselected:" + str(deselected))
+    sources = _unique(sources)
+    return ("SELECTED", sources) if sources else ("UNSELECTED", [])
+
+
+def _valid_nonnegative_int(value: Any) -> bool:
+    """Whether a structured count is an integer and not negative."""
+
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _read_observation(path: Optional[str], nonce: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Read and validate the nonce-bound pytest observation file."""
+
+    if not path:
+        return None, "observation_missing"
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            observation = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None, "observation_unreadable"
+    if not isinstance(observation, dict):
+        return None, "observation_malformed"
+    if observation.get("version") != 1:
+        return None, "observation_version"
+    if observation.get("nonce") != nonce:
+        return None, "nonce_mismatch"
+    if not isinstance(observation.get("invocation_args"), list):
+        return None, "observation_invocation_args"
+    if not all(isinstance(item, str) for item in observation["invocation_args"]):
+        return None, "observation_invocation_args"
+    if "ini_addopts" not in observation or "ini_testpaths" not in observation:
+        return None, "observation_ini"
+    if not isinstance(observation.get("options"), dict):
+        return None, "observation_options"
+    required_options = {
+        "keyword",
+        "markexpr",
+        "stepwise",
+        "stepwise_skip",
+        "last_failed",
+        "failed_first",
+        "maxfail",
+        "exitfirst",
+        "collectonly",
+        "ignore",
+        "ignore_glob",
+        "deselect",
+        "file_or_dir",
+    }
+    if not required_options.issubset(set(observation["options"])):
+        return None, "observation_options"
+    if observation.get("env_pytest_addopts") is not None and not isinstance(
+        observation["env_pytest_addopts"], str
+    ):
+        return None, "observation_environment"
+    if not _valid_nonnegative_int(observation.get("collected")):
+        return None, "observation_collected"
+    if not _valid_nonnegative_int(observation.get("deselected")):
+        return None, "observation_deselected"
+    stats = observation.get("stats")
+    if not isinstance(stats, dict):
+        return None, "observation_stats"
+    if not all(_valid_nonnegative_int(stats.get(field)) for field in _COUNT_FIELDS):
+        return None, "observation_stats"
+    return observation, None
+
+
 def _unknown_counts(counts: Dict[str, Optional[int]]) -> bool:
-    """Whether any receipt count is unavailable."""
+    """Whether any authoritative receipt count is unavailable."""
 
     return any(counts.get(field) is None for field in ("collected",) + _COUNT_FIELDS)
 
@@ -304,24 +430,36 @@ def _receipt_facts(
     before: Dict[str, object],
     after: Dict[str, object],
     pytest_exit: int,
-    counts: Dict[str, Optional[int]],
+    observation: Optional[Dict[str, Any]],
+    observation_error: Optional[str],
     command_error: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Build the canonical facts shared by text and JSON receipts."""
+    """Build canonical facts from the observer and both Git probes."""
 
     head = str(before["head"])
     head_after = str(after["head"])
     stable = "YES" if bool(before["git_ok"]) and bool(after["git_ok"]) and head == head_after else "NO"
-    provenance = "OK" if stable == "YES" and bool(before["git_ok"]) else "BROKEN"
+    if observation is None:
+        selection = "UNKNOWN"
+        selection_sources = [observation_error or "observation_missing"]
+        counts: Dict[str, Optional[int]] = {field: None for field in ("collected",) + _COUNT_FIELDS}
+    else:
+        selection, selection_sources = _selection_from_observation(observation)
+        counts = {"collected": observation["collected"]}
+        counts.update({field: observation["stats"][field] for field in _COUNT_FIELDS})
+
+    provenance = "OK" if observation is not None and stable == "YES" and bool(before["git_ok"]) else "BROKEN"
     reasons: List[str] = []
     if provenance != "OK":
         reasons.append("provenance")
-    if classification["selection"] != "UNSELECTED":
-        reasons.append("selection")
+    if selection != "UNSELECTED":
+        reasons.append("selection_unknown" if selection == "UNKNOWN" else "selection")
     if stable != "YES":
         reasons.append("head_unstable")
     if before["tracked_clean"] != "YES":
-        reasons.append("tracked_dirty")
+        reasons.append("tracked_dirty_before")
+    if after["tracked_clean"] != "YES":
+        reasons.append("tracked_dirty_after")
     if _unknown_counts(counts):
         reasons.append("counts_unknown")
     if pytest_exit != 0:
@@ -329,15 +467,18 @@ def _receipt_facts(
     if command_error is not None:
         reasons.append(command_error)
 
+    tracked_clean = "YES" if before["tracked_clean"] == "YES" and after["tracked_clean"] == "YES" else "NO"
     return {
         "provenance": provenance,
         "head": head,
         "head_after": head_after,
         "head_stable": stable,
-        "tracked_clean": str(before["tracked_clean"]),
+        "tracked_clean": tracked_clean,
+        "tracked_clean_before": str(before["tracked_clean"]),
+        "tracked_clean_after": str(after["tracked_clean"]),
         "branch": str(before["branch"]),
-        "selection": str(classification["selection"]),
-        "selection_tokens": list(classification["selection_tokens"]),
+        "selection": selection,
+        "selection_tokens": selection_sources,
         "baseline_eligible": "YES" if not reasons else "NO",
         "baseline_reasons": reasons,
         "pytest_exit": pytest_exit,
@@ -349,6 +490,8 @@ def _receipt_facts(
         "xfailed": counts.get("xfailed"),
         "xpassed": counts.get("xpassed"),
         "argv": list(command),
+        "advisory_selection": classification["selection"],
+        "observation_error": observation_error,
     }
 
 
@@ -362,7 +505,7 @@ def format_receipt(facts: Dict[str, object]) -> str:
     """Serialize canonical facts into the one-line greppable receipt."""
 
     selection_tokens = ",".join(_shell_token(str(token)) for token in facts["selection_tokens"])
-    reasons = ",".join(str(reason) for reason in facts["baseline_reasons"])
+    reasons = ",".join(_shell_token(str(reason)) for reason in facts["baseline_reasons"])
     selection = str(facts["selection"])
     if selection_tokens:
         selection += "[" + selection_tokens + "]"
@@ -375,6 +518,8 @@ def format_receipt(facts: Dict[str, object]) -> str:
         "head_after=" + str(facts["head_after"]),
         "head_stable=" + str(facts["head_stable"]),
         "tracked_clean=" + str(facts["tracked_clean"]),
+        "tracked_clean_before=" + str(facts["tracked_clean_before"]),
+        "tracked_clean_after=" + str(facts["tracked_clean_after"]),
         "branch=" + _shell_token(str(facts["branch"])),
         "selection=" + selection,
         "baseline_eligible=" + baseline,
@@ -399,8 +544,19 @@ def _write_json(path: str, facts: Dict[str, object]) -> None:
         handle.write("\n")
 
 
+def _observer_command(command: Sequence[str]) -> List[str]:
+    """Inject the observer plugin after the pytest command prefix."""
+
+    pytest_args, error = split_pytest_command(command)
+    if error is not None or pytest_args is None:
+        return list(command)
+    if _is_pytest_program(command[0]):
+        return [command[0], "-p", "_verification_observer"] + list(command[1:])
+    return list(command[:3]) + ["-p", "_verification_observer"] + list(command[3:])
+
+
 def _run_command(options: argparse.Namespace, command: Sequence[str]) -> int:
-    """Run pytest, forward its output, and emit exactly one receipt line."""
+    """Run pytest, forward raw output, and emit one authoritative receipt."""
 
     classification = classify_command(command)
     command_error = classification["command_error"]
@@ -414,14 +570,33 @@ def _run_command(options: argparse.Namespace, command: Sequence[str]) -> int:
     before = _git_probe()
     after = before
     pytest_exit = 127
-    output = ""
+    observation_path: Optional[str] = None
+    nonce = secrets.token_hex(16)
     try:
         if command_error is not None:
             print("verification receipt refused: " + str(command_error), file=sys.stderr)
         else:
             try:
-                process = subprocess.run(list(command), capture_output=True, text=True, check=False)
-                output = process.stdout + process.stderr
+                descriptor, observation_path = tempfile.mkstemp(
+                    prefix=".tpen-verification-observation-", suffix=".json"
+                )
+                os.close(descriptor)
+                os.unlink(observation_path)
+                environment = os.environ.copy()
+                environment[OBSERVATION_ENV] = observation_path
+                environment[NONCE_ENV] = nonce
+                tool_directory = os.path.dirname(os.path.abspath(__file__))
+                existing_pythonpath = environment.get("PYTHONPATH")
+                environment["PYTHONPATH"] = tool_directory + (
+                    os.pathsep + existing_pythonpath if existing_pythonpath else ""
+                )
+                process = subprocess.run(
+                    _observer_command(command),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=environment,
+                )
                 if process.stdout:
                     sys.stdout.write(process.stdout)
                 if process.stderr:
@@ -431,8 +606,17 @@ def _run_command(options: argparse.Namespace, command: Sequence[str]) -> int:
                 print("pytest invocation failed: " + str(error), file=sys.stderr)
     finally:
         after = _git_probe()
-        counts = parse_pytest_summary(output)
-        facts = _receipt_facts(command, classification, before, after, pytest_exit, counts, command_error)
+        observation, observation_error = _read_observation(observation_path, nonce)
+        facts = _receipt_facts(
+            command,
+            classification,
+            before,
+            after,
+            pytest_exit,
+            observation,
+            observation_error,
+            command_error,
+        )
         print(format_receipt(facts))
         if options.receipt_json:
             try:
@@ -444,19 +628,23 @@ def _run_command(options: argparse.Namespace, command: Sequence[str]) -> int:
                 return_code = 0
         else:
             return_code = 0
+        if observation_path:
+            try:
+                os.unlink(observation_path)
+            except OSError:
+                pass
     if pytest_exit != 0:
         return pytest_exit
     return return_code
 
 
 def _parse_receipt_line(line: str) -> Optional[Dict[str, str]]:
-    """Parse a receipt line, preserving the variable-length argv field."""
+    """Parse a receipt line, preserving quoted variable-length fields."""
 
     if not line.startswith(SENTINEL + " "):
         return None
-    xpassed_marker = line.find(" xpassed=")
-    argv_marker = line.find(" argv=", xpassed_marker)
-    if xpassed_marker < 0 or argv_marker < 0:
+    argv_marker = line.find(" argv=", line.find(" xpassed="))
+    if argv_marker < 0:
         return None
     prefix = line[:argv_marker]
     argv = line[argv_marker + len(" argv=") :]
@@ -469,6 +657,8 @@ def _parse_receipt_line(line: str) -> Optional[Dict[str, str]]:
         "head_after",
         "head_stable",
         "tracked_clean",
+        "tracked_clean_before",
+        "tracked_clean_after",
         "branch",
         "selection",
         "baseline_eligible",
@@ -497,22 +687,21 @@ def _parse_receipt_line(line: str) -> Optional[Dict[str, str]]:
             value_end = len(prefix)
         values[field_name] = prefix[value_start:value_end]
         cursor = value_end + (1 if index + 1 < len(field_names) else 0)
-    required = set(field_names) | {"argv"}
-    if set(values) != required:
+    if set(values) != set(field_names) | {"argv"}:
         return None
     if values["provenance"] not in {"OK", "BROKEN"}:
         return None
-    if values["head"] != "UNKNOWN" and not _HEX40.fullmatch(values["head"]):
-        return None
-    if values["head_after"] != "UNKNOWN" and not _HEX40.fullmatch(values["head_after"]):
-        return None
-    if values["head_stable"] not in {"YES", "NO"}:
-        return None
-    if values["tracked_clean"] not in {"YES", "NO"}:
-        return None
+    for field in ("head", "head_after"):
+        if values[field] != "UNKNOWN" and not _HEX40.fullmatch(values[field]):
+            return None
+    for field in ("head_stable", "tracked_clean", "tracked_clean_before", "tracked_clean_after"):
+        if values[field] not in {"YES", "NO"}:
+            return None
     if not (
         values["selection"] == "UNSELECTED"
         or values["selection"].startswith("SELECTED[")
+        and values["selection"].endswith("]")
+        or values["selection"].startswith("UNKNOWN[")
         and values["selection"].endswith("]")
     ):
         return None
@@ -526,13 +715,69 @@ def _parse_receipt_line(line: str) -> Optional[Dict[str, str]]:
         int(values["pytest_exit"])
     except ValueError:
         return None
-    for field_name in ("collected",) + _COUNT_FIELDS:
-        if values[field_name] != "UNKNOWN":
+    for field in ("collected",) + _COUNT_FIELDS:
+        if values[field] != "UNKNOWN":
             try:
-                int(values[field_name])
+                if int(values[field]) < 0:
+                    return None
             except ValueError:
                 return None
     return values
+
+
+def _receipt_state(value: str) -> str:
+    """Return YES or NO from the structured baseline field."""
+
+    return "YES" if value.startswith("YES[") else "NO"
+
+
+def _check_consistency(receipt: Dict[str, str]) -> List[str]:
+    """Re-derive receipt implications instead of trusting its labels."""
+
+    failures: List[str] = []
+    counts_unknown = any(receipt[field] == "UNKNOWN" for field in ("collected",) + _COUNT_FIELDS)
+    unknown_provenance = (
+        receipt["head"] == "UNKNOWN"
+        or receipt["head_after"] == "UNKNOWN"
+        or receipt["branch"] == "UNKNOWN"
+        or receipt["selection"].startswith("UNKNOWN[")
+        or counts_unknown
+    )
+    if receipt["provenance"] == "OK" and unknown_provenance:
+        failures.append("provenance=OK beside UNKNOWN evidence")
+    if receipt["head_stable"] == "YES" and receipt["head"] != receipt["head_after"]:
+        failures.append("head differs while head_stable=YES")
+    if receipt["provenance"] == "OK" and receipt["head_stable"] != "YES":
+        failures.append("provenance=OK requires head_stable=YES")
+    derived_tracked_clean = (
+        "YES"
+        if receipt["tracked_clean_before"] == "YES" and receipt["tracked_clean_after"] == "YES"
+        else "NO"
+    )
+    if receipt["tracked_clean"] != derived_tracked_clean:
+        failures.append("tracked_clean disagrees with before/after fields")
+
+    reasons: List[str] = []
+    if receipt["provenance"] != "OK":
+        reasons.append("provenance")
+    if receipt["selection"] != "UNSELECTED":
+        reasons.append("selection")
+    if receipt["head_stable"] != "YES":
+        reasons.append("head_unstable")
+    if receipt["head"] != receipt["head_after"]:
+        reasons.append("head_mismatch")
+    if receipt["tracked_clean_before"] != "YES":
+        reasons.append("tracked_dirty_before")
+    if receipt["tracked_clean_after"] != "YES":
+        reasons.append("tracked_dirty_after")
+    if counts_unknown:
+        reasons.append("counts_unknown")
+    if int(receipt["pytest_exit"]) != 0:
+        reasons.append("pytest_exit")
+    expected = "YES" if not reasons else "NO"
+    if _receipt_state(receipt["baseline_eligible"]) != expected:
+        failures.append("baseline_eligible disagrees with receipt evidence")
+    return failures
 
 
 def _check_command(options: argparse.Namespace) -> int:
@@ -561,15 +806,15 @@ def _check_command(options: argparse.Namespace) -> int:
     if any(receipt != first for receipt in parsed[1:]):
         print("verification receipt check failed: receipt lines disagree", file=sys.stderr)
         return 1
-    failures: List[str] = []
-    if first.get("provenance") != "OK":
-        failures.append("provenance=" + first.get("provenance", "<missing>"))
-    if options.require_baseline and first.get("baseline_eligible") != "YES[]":
-        failures.append("baseline_eligible=" + first.get("baseline_eligible", "<missing>"))
-    if options.expect_head is not None and first.get("head") != options.expect_head:
-        failures.append("head expected " + options.expect_head + ", got " + first.get("head", "<missing>"))
+    failures = _check_consistency(first)
+    if first["provenance"] != "OK":
+        failures.append("provenance=" + first["provenance"])
+    if options.require_baseline and first["baseline_eligible"] != "YES[]":
+        failures.append("baseline_eligible=" + first["baseline_eligible"])
+    if options.expect_head is not None and first["head"] != options.expect_head:
+        failures.append("head expected " + options.expect_head + ", got " + first["head"])
     if failures:
-        print("verification receipt check failed: " + "; ".join(failures), file=sys.stderr)
+        print("verification receipt check failed: " + "; ".join(_unique(failures)), file=sys.stderr)
         return 1
     return 0
 
