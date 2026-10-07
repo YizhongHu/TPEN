@@ -213,12 +213,22 @@ class VerificationReceiptTest(unittest.TestCase):
             "tracked_clean": "YES",
             "git_ok": True,
         }
+        # Build the PRESENT arm with every alias, then derive ABSENT by
+        # subtracting every failed_first alias. Iterating the mapping's first
+        # alias would let a future alias addition silently repopulate the arm.
         attributes = {
-            aliases[0]: None
-            for aliases in OBSERVER._SELECTION_OPTION_ALIASES.values()
-            if aliases[0] != "exitfirst"
+            alias: None
+            for logical_name, aliases in OBSERVER._SELECTION_OPTION_ALIASES.items()
+            if logical_name != "exitfirst"
+            for alias in aliases
         }
-        missing = OBSERVER._selection_options(SimpleNamespace(option=SimpleNamespace(**attributes)))
+        failed_first_aliases = set(OBSERVER._SELECTION_OPTION_ALIASES["failed_first"])
+        missing_attributes = {
+            name: value for name, value in attributes.items() if name not in failed_first_aliases
+        }
+        missing = OBSERVER._selection_options(
+            SimpleNamespace(option=SimpleNamespace(**missing_attributes))
+        )
         missing_facts = RECEIPT._receipt_facts(
             ["pytest"],
             RECEIPT.classify_command(["pytest"]),
@@ -233,7 +243,6 @@ class VerificationReceiptTest(unittest.TestCase):
         self.assertEqual(missing_facts["selection"], "UNKNOWN")
         self.assertEqual(missing_facts["baseline_eligible"], "NO")
 
-        attributes["failedfirst"] = None
         present = OBSERVER._selection_options(SimpleNamespace(option=SimpleNamespace(**attributes)))
         present_facts = RECEIPT._receipt_facts(
             ["pytest"],
