@@ -299,6 +299,8 @@ def _assert_pending_516_partition(
 # positional dynamic argument            -> test_capability_dynamic_positional_argument
 # keyword dynamic argument               -> test_capability_dynamic_keyword_argument
 # dynamic argument iteration             -> test_capability_dynamic_argument_iteration
+# disk source reading                    -> test_capability_reads_source_from_disk
+# AST source parsing                     -> test_capability_ast_source_parsing
 # recursive *.py discovery               -> test_capability_recursive_python_file_discovery
 # *.py file filtering                    -> test_capability_python_file_filter
 # sanctioned runner carve-out            -> test_capability_sanctioned_runner_carveout
@@ -405,6 +407,27 @@ def test_capability_dynamic_argument_iteration() -> None:
     source = 'module = import_module("stdlib", "tpen.second")\n'
     crossings = _detect_crossings(source)
     assert crossings[0].target == "tpen.second"
+
+
+def test_capability_reads_source_from_disk() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "source.py").write_text("import tpen.disk\n", encoding="utf-8")
+        STUDY_DIR = root
+        try:
+            _, crossings = _scan_study()
+        finally:
+            STUDY_DIR = original_study_dir
+    assert [(path, crossing.target) for path, crossing in crossings] == [
+        ("source.py", "tpen.disk")
+    ]
+
+
+def test_capability_ast_source_parsing() -> None:
+    crossings = _detect_crossings("import tpen.parsed\n")
+    assert crossings[0].target == "tpen.parsed"
 
 
 def test_capability_recursive_python_file_discovery() -> None:
