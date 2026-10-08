@@ -14,6 +14,7 @@ only with an explicit pending PR and source SHA.
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 import tempfile
@@ -124,6 +125,13 @@ EXPECTED_TEST_INVENTORY = {
         pending_sha=PENDING_516_SHA,
     ),
 }
+
+EXPECTED_PUBLIC_INVENTORY_CALLERS = frozenset(
+    {
+        "test_production_inventory_obeys_admission_rule",
+        "test_test_file_inventory_obeys_admission_rule",
+    }
+)
 
 
 def _is_tpen_name(name: str) -> bool:
@@ -290,6 +298,18 @@ def _inventory_keys(
     }
 
 
+def _public_inventory_caller_names() -> frozenset[str]:
+    """Return the module's public inventory callers by their shared shape."""
+
+    return frozenset(
+        name
+        for name, value in globals().items()
+        if name.startswith("test_")
+        and name.endswith("_inventory_obeys_admission_rule")
+        and callable(value)
+    )
+
+
 def _assert_pending_516_partition(
     measured: set[tuple[str, int, str]],
     declared: dict[tuple[str, int, str], InventoryEntry],
@@ -368,7 +388,8 @@ def _assert_pending_516_partition(
 # unsanctioned filter partition (including keyword form) -> test_capability_unsanctioned_filter_partition
 # added crossing count diagnostic        -> test_capability_inventory_count_diagnostic_added
 # removed crossing count diagnostic      -> test_capability_inventory_count_diagnostic_removed
-# unchanged count reaches public admission -> test_capability_inventory_count_diagnostic_line_shift
+# unchanged count reaches both public admission callers -> test_capability_inventory_count_diagnostic_line_shift
+# public inventory caller roster exactness -> test_capability_public_inventory_caller_roster
 # zero unsanctioned crossings allowed    -> test_capability_no_unsanctioned_crossings_allowed
 # literal dynamic target                 -> test_capability_dynamic_literal_string
 # nonliteral dynamic target rejection     -> test_capability_dynamic_rejects_nonliteral
@@ -815,34 +836,59 @@ def test_capability_inventory_count_diagnostic_removed() -> None:
     assert "reconcile" in message
 
 
-def test_capability_inventory_count_diagnostic_line_shift() -> None:
+def _assert_inventory_caller_rejects_line_shift(
+    caller: Callable[[], None],
+    filename: str,
+    source: str,
+    expected_key: tuple[str, int, str],
+) -> None:
     global STUDY_DIR
     global EXPECTED_UNSANCTIONED_COUNTS
     original_study_dir = STUDY_DIR
     original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
     with tempfile.TemporaryDirectory() as temporary_root:
         root = Path(temporary_root)
-        (root / "launch.py").write_text(
-            "\nfrom tpen.accelerator import AcceleratorIdentity\n"
-            "from tpen.artifacts import RunResult\n"
-            "from tpen.distributed import ExecutionTopology\n",
-            encoding="utf-8",
-        )
+        (root / filename).write_text(source, encoding="utf-8")
         STUDY_DIR = root
         EXPECTED_UNSANCTIONED_COUNTS = {3}
         try:
             try:
-                test_production_inventory_obeys_admission_rule()
+                caller()
             except AssertionError as error:
                 message = str(error)
             else:
-                assert False, "line-shifted sibling entry was admitted"
+                assert False, f"line-shifted sibling entry was admitted by {caller.__name__}"
         finally:
             STUDY_DIR = original_study_dir
             EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
-    assert "('launch.py', 2, 'tpen.accelerator')" in message
-    assert "rule (a)" in message
-    assert "rule (b)" in message
+    assert repr(expected_key) in message, f"{caller.__name__}: {message}"
+    assert "rule (a)" in message, f"{caller.__name__}: {message}"
+    assert "rule (b)" in message, f"{caller.__name__}: {message}"
+
+
+def test_capability_inventory_count_diagnostic_line_shift() -> None:
+    _assert_inventory_caller_rejects_line_shift(
+        test_production_inventory_obeys_admission_rule,
+        "launch.py",
+        "\nfrom tpen.accelerator import AcceleratorIdentity\n"
+        "from tpen.artifacts import RunResult\n"
+        "from tpen.distributed import ExecutionTopology\n",
+        ("launch.py", 2, "tpen.accelerator"),
+    )
+    _assert_inventory_caller_rejects_line_shift(
+        test_test_file_inventory_obeys_admission_rule,
+        "test_launch.py",
+        "\n" * 16
+        + "from tpen.artifacts import RunResult\n"
+        + "from tpen.distributed import ExecutionTopology\n"
+        + "\n"
+        + "from tpen.runner import Runner\n",
+        ("test_launch.py", 17, "tpen.artifacts"),
+    )
+
+
+def test_capability_public_inventory_caller_roster() -> None:
+    assert _public_inventory_caller_names() == EXPECTED_PUBLIC_INVENTORY_CALLERS
 
 
 def test_capability_dynamic_bare_import_module() -> None:
