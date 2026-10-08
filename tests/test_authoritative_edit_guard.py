@@ -433,18 +433,31 @@ class AuthoritativeEditGuardTest(unittest.TestCase):
             with self.subTest(version=version), mock.patch.object(GUARD.sys, "version_info", version):
                 parser_seen = []
                 original_parser = GUARD._parser
+                expected_args = original_parser().parse_args(["--item", ITEM_ID])
 
                 def parser() -> argparse.ArgumentParser:
                     parser_seen.append(True)
                     return original_parser()
 
+                check_launch = mock.Mock(side_effect=GUARD.GuardFailure("main downstream sentinel"))
+                stderr = io.StringIO()
                 with mock.patch.object(GUARD, "_parser", side_effect=parser), mock.patch.object(
-                    GUARD, "check_launch", side_effect=GUARD.GuardFailure("main downstream sentinel")
-                ):
-                    with contextlib.redirect_stderr(io.StringIO()):
-                        with self.assertRaises(SystemExit):
-                            GUARD.main(["--item", ITEM_ID])
+                    GUARD, "check_launch", check_launch
+                ), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as raised:
+                        GUARD.main(["--item", ITEM_ID])
                 self.assertEqual(parser_seen, [True])
+                check_launch.assert_called_once_with(
+                    expected_args.cwd,
+                    expected_args.item,
+                    expected_args.api_url,
+                    expected_args.project_root_id,
+                )
+                self.assertEqual(raised.exception.code, 1)
+                self.assertEqual(
+                    json.loads(stderr.getvalue()),
+                    {"status": "blocked", "reason": "main downstream sentinel"},
+                )
                 with mock.patch.object(
                     GUARD, "_validated_api_url", side_effect=GUARD.GuardFailure("check downstream sentinel")
                 ):

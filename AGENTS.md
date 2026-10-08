@@ -150,10 +150,9 @@ options, and a missing `--item` return exit 1 with the structured interpreter
 refusal instead of argparse's usage or help output. On Python 3.9+ argparse
 behaviour is unchanged by this guard. The version predicate refuses every
 version tuple below 3.9, but that predicate is not a claim of delivered runtime
-coverage: the structured refusal is implemented for Python 3.7 and 3.8, this
-lane executed Python 3.8.3 only, and Python 3.7 was not executed. Python <=3.6
-raises `SyntaxError` before the gate can run because `from __future__ import
-annotations` requires Python 3.7+; that residual limitation remains documented.
+coverage: the structured refusal is implemented for Python 3.7 and 3.8.
+Python <=3.6 raises `SyntaxError` before the gate can run because `from
+__future__ import annotations` requires Python 3.7+.
 
 **Run the guard outside the agent sandbox.** This is allowed and encouraged, not
 a workaround. The guard reads the Task Orchestrator HTTP API, and sandboxed
