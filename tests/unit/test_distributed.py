@@ -252,7 +252,7 @@ def _late_buffer_topology() -> ExecutionTopology:
 
 def test_distributed_entry_guard_rejects_cache_stale_buffer() -> None:
     with pytest.raises(ValueError, match="binary buffer refused"):
-        execution_topology_from_facts(_late_buffer_topology())
+        distributed.execution_topology_from_facts(_late_buffer_topology())
 
 
 def test_distributed_detacher_rejects_cache_stale_buffer() -> None:
