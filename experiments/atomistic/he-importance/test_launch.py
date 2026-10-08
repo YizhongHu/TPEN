@@ -158,7 +158,7 @@ def test_launch_snapshots_duck_topology_for_manifest_and_runner(
 
 
 def test_launch_detaches_nested_topology_facts_before_validation_and_runner(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cell = _cell(tmp_path)
     facts = launch.execution_topology_facts(_topology())
@@ -174,6 +174,15 @@ def test_launch_detaches_nested_topology_facts_before_validation_and_runner(
     identity = ChangingIdentity()
     facts["device_identity"] = identity
     received: list[object] = []
+    rebound_cells: list[object] = []
+    original_populate = launch.populate_execution_topology
+
+    def recording_populate(source: object, topology: object) -> object:
+        rebound = original_populate(source, topology)
+        rebound_cells.append(rebound)
+        return rebound
+
+    monkeypatch.setattr(launch, "populate_execution_topology", recording_populate)
 
     def recording_runner(config: object, *, topology: object) -> int:
         del config
@@ -182,7 +191,7 @@ def test_launch_detaches_nested_topology_facts_before_validation_and_runner(
 
     assert launch.launch_train(cell, facts, runner=recording_runner) == 0
     assert identity.reads == 1
-    assert cell.manifest["topology"]["device_identity"]["kind"] == "cpu"
+    assert rebound_cells[0].manifest["topology"]["device_identity"]["kind"] == "cpu"
     assert received[0]["device_identity"]["kind"] == "cpu"
 
 
