@@ -215,6 +215,35 @@ def test_an_applied_legacy_step_reports_the_applied_reason() -> None:
     assert metrics["update_record_applied"] is True
 
 
+def test_the_legacy_adapter_remembers_its_attempt_like_any_other_method() -> None:
+    """`last_result` must work on the method every default config uses.
+
+    The legacy adapter is the DEFAULT update method, so a `last_result` that
+    were permanently `None` here would be None for most runs in the project
+    while appearing to work everywhere else.
+    """
+
+    parameter = torch.nn.Parameter(torch.ones(1, dtype=torch.float64))
+    adapter = LegacyAutogradUpdate(
+        torch.optim.SGD([parameter], lr=0.1),
+        model_parameters=ModelParameterBinding(parameters=(parameter,)),
+    )
+    assert adapter.last_result is None
+
+    vacuum = _batch(n_electrons=0)
+    result = adapter.update(
+        AutogradUpdateInput(
+            batch=vacuum,
+            wavefunction=_output(vacuum),
+            local_energy=torch.zeros(1, dtype=torch.float64),
+            step=0,
+            objective=torch.tensor(1.0, dtype=torch.float64),
+            reevaluate=_reevaluation(vacuum),
+        )
+    )
+    assert adapter.last_result is result
+
+
 def test_the_legacy_norm_is_described_as_post_clip() -> None:
     """With clipping configured the reported norm is bounded, and says so."""
 
