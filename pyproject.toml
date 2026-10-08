@@ -151,6 +151,7 @@ markers = [
 ]
 addopts = "--typeguard-packages=tpen"
 norecursedirs = [
+  ".*",  # Restore pytest's hidden-directory pruning family dropped by this custom list.
   ".agent-scratch",
   ".agent-worktrees",
   "experiments/hooke/pair_validation",

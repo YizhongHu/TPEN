@@ -12,6 +12,7 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+PYTEST_DEFAULT_TEST_FILE_PATTERNS = ("test_*.py", "*_test.py")
 ALWAYS_EXCLUDED_DIRS = frozenset(
     {".git", ".venv", ".paseo", ".agent-worktrees", ".agent-scratch"}
 )
@@ -60,7 +61,8 @@ def _test_files() -> list[Path]:
         test_files.extend(
             Path(current) / filename
             for filename in filenames
-            if filename.startswith("test_") and filename.endswith(".py")
+            # Keep this census aligned with pytest's default python_files.
+            if any(fnmatch.fnmatch(filename, pattern) for pattern in PYTEST_DEFAULT_TEST_FILE_PATTERNS)
         )
     return sorted(test_files)
 
@@ -279,6 +281,48 @@ def test_namespace_gap_remains_a_root_sensitive_target(
     }
 
 
+def test_duplicate_pytest_default_suffix_is_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_collection_tree(tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], "REPO_ROOT", tmp_path)
+    expected = [
+        _put(tmp_path, f"{directory}/foo_test.py", "def test_ok(): pass\n")
+        for directory in ("suite_a", "suite_b")
+    ]
+
+    assert _duplicate_basename_groups() == {"foo_test.py": expected}
+
+
+def test_real_norecursedirs_excludes_hidden_checkout(
+    tmp_path: Path,
+) -> None:
+    real_config = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    norecursedirs = real_config["tool"]["pytest"]["ini_options"]["norecursedirs"]
+    _put(
+        tmp_path,
+        "pyproject.toml",
+        "[tool.pytest.ini_options]\n"
+        'pythonpath = ["."]\n'
+        "consider_namespace_packages = true\n"
+        f"norecursedirs = {norecursedirs!r}\n",
+    )
+    _put(tmp_path, "tests/__init__.py")
+    _put(tmp_path, ".claude/worktrees/agent-x/tests/__init__.py")
+    _put(tmp_path, "tests/test_anchor.py", "def test_ok(): pass\n")
+    _put(tmp_path, ".claude/worktrees/agent-x/tests/test_anchor.py", "def test_hidden(): pass\n")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
 @pytest.mark.parametrize("marker", ["pyvenv.cfg", "conda-meta/history"])
 def test_environment_marker_at_repo_root_does_not_silence_guard(
     tmp_path: Path,
@@ -294,6 +338,10 @@ def test_environment_marker_at_repo_root_does_not_silence_guard(
         for name in ("suite_a", "suite_b")
     ]
     _put(tmp_path, marker)
+
+    if not (Path(sys.executable).parent / "pytest").is_file():
+        # This environment condition is unrelated to a root marker hiding duplicates.
+        pytest.skip("console script unavailable; cannot drive the full guard")
 
     try:
         test_duplicate_test_module_names_collect_without_collision()
