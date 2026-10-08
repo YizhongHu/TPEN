@@ -309,21 +309,37 @@ def _inventory_keys(
     }
 
 
-def _inventory_admission_caller_names() -> frozenset[str]:
-    """Return module-level functions that directly call admission validation."""
+def _inventory_admission_caller_names(source: str | None = None) -> frozenset[str]:
+    """Return direct admission callers at module and one-level class scope.
 
-    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"), filename=__file__)
-    return frozenset(
-        node.name
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and any(
+    This intentionally does not see aliases, ``functools.partial``, dynamic
+    ``globals()`` lookup, bare module-level calls, or callers in another module.
+    """
+
+    if source is None:
+        source = Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=__file__)
+
+    def calls_admission(node: ast.AST) -> bool:
+        return any(
             isinstance(call, ast.Call)
             and isinstance(call.func, ast.Name)
             and call.func.id == "_validate_inventory_admission"
             for call in ast.walk(node)
         )
-    )
+
+    callers: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if calls_admission(node):
+                callers.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            for member in node.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and calls_admission(
+                    member
+                ):
+                    callers.add(f"{node.name}.{member.name}")
+    return frozenset(callers)
 
 
 def _assert_pending_516_partition(
@@ -405,7 +421,11 @@ def _assert_pending_516_partition(
 # added crossing count diagnostic        -> test_capability_inventory_count_diagnostic_added
 # removed crossing count diagnostic      -> test_capability_inventory_count_diagnostic_removed
 # unchanged count reaches both public admission callers -> test_capability_inventory_count_diagnostic_line_shift
-# public inventory caller roster (structural accept/reject) -> test_capability_public_inventory_caller_roster
+# structural caller detector (accept) -> test_capability_inventory_caller_detector_accepts_structural_callers
+# structural caller detector (reject) -> test_capability_inventory_caller_detector_rejects_non_callers
+# public inventory caller roster exactness -> test_capability_public_inventory_caller_roster
+# roster limitation: direct Name calls in module functions and one-level class methods only;
+# aliases, partials, globals lookups, bare module calls, and cross-module callers are out of scope.
 # zero unsanctioned crossings allowed    -> test_capability_no_unsanctioned_crossings_allowed
 # literal dynamic target                 -> test_capability_dynamic_literal_string
 # nonliteral dynamic target rejection     -> test_capability_dynamic_rejects_nonliteral
@@ -907,6 +927,28 @@ def test_capability_public_inventory_caller_roster() -> None:
     declared = EXPECTED_PUBLIC_INVENTORY_CALLERS | EXPECTED_DIRECT_ADMISSION_CONTROLS
     actual = _inventory_admission_caller_names()
     assert actual == declared, f"actual={sorted(actual)}, declared={sorted(declared)}"
+
+
+def test_capability_inventory_caller_detector_accepts_structural_callers() -> None:
+    source = """
+async def future_async_admission():
+    _validate_inventory_admission(set(), {})
+
+class FutureAdmission:
+    def method(self):
+        _validate_inventory_admission(set(), {})
+"""
+    assert _inventory_admission_caller_names(source) == frozenset(
+        {"future_async_admission", "FutureAdmission.method"}
+    )
+
+
+def test_capability_inventory_caller_detector_rejects_non_callers() -> None:
+    source = """
+def unrelated_function():
+    return None
+"""
+    assert _inventory_admission_caller_names(source) == frozenset()
 
 
 def test_capability_dynamic_bare_import_module() -> None:
