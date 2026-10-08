@@ -723,7 +723,13 @@ class MinimalUpdateDiagnostics(UpdateDiagnostics):
     reason: str
     step: int
     grad_norm: float | None = None
-    prefix: str = "update"
+    # NOT "update": the trainer emits a generic `update_reason` for every
+    # attempt, so a record prefixed "update" would collide with it and one key
+    # would silently overwrite the other in the metrics dict. The collision was
+    # real and invisible -- both happened to carry the same value -- which is
+    # exactly why the prefix is pinned here and asserted by a test rather than
+    # left to chance.
+    prefix: str = "update_record"
 
     def as_metrics(self) -> dict[str, Any]:
         """Return the minimal record under this method's own key prefix."""

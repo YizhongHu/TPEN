@@ -27,7 +27,7 @@ from tpen.logging.base import LogRecord
 from tpen.logging.csv import CSV
 from tpen.logging.jsonl import JSONL
 from tpen.training.block_ng import BlockNGPolicy, BlockDiagonalNaturalGradientUpdate
-from tpen.training.qgt import DampingPolicy, SolveDiagnostics
+from tpen.training.qgt import DampingPolicy
 from tpen.training.score_geometry import ScoreConventions
 from tpen.training.spring import SPRINGPolicy, SPRINGUpdate
 from tpen.training.sr import SRPolicy, StochasticReconfigurationUpdate
@@ -143,9 +143,9 @@ def test_a_vacuum_skip_reports_its_own_reason_and_a_minimal_record() -> None:
     assert metrics["optimizer_step"] is False
     assert metrics["update_reason"] == UPDATE_REASON_ZERO_ELECTRON_BATCH
     # The minimal record reached the sink under the method's own prefix.
-    assert metrics["update_applied"] is False
-    assert metrics["update_reason"] == UPDATE_REASON_ZERO_ELECTRON_BATCH
-    assert metrics["update_method"] == "LegacyAutogradUpdate"
+    assert metrics["update_record_applied"] is False
+    assert metrics["update_record_reason"] == UPDATE_REASON_ZERO_ELECTRON_BATCH
+    assert metrics["update_record_method"] == "LegacyAutogradUpdate"
 
 
 def test_the_vacuum_skip_stays_distinct_from_a_disconnected_objective() -> None:
@@ -191,8 +191,8 @@ def test_the_vacuum_skip_stays_distinct_from_a_disconnected_objective() -> None:
 
     record = skipped.diagnostics
     assert isinstance(record, MinimalUpdateDiagnostics)
-    assert record.as_metrics()["update_reason"] == UPDATE_REASON_ZERO_ELECTRON_BATCH
-    assert record.as_metrics()["update_applied"] is False
+    assert record.as_metrics()["update_record_reason"] == UPDATE_REASON_ZERO_ELECTRON_BATCH
+    assert record.as_metrics()["update_record_applied"] is False
 
 
 def test_an_applied_legacy_step_reports_the_applied_reason() -> None:
@@ -212,7 +212,7 @@ def test_an_applied_legacy_step_reports_the_applied_reason() -> None:
     )
     metrics = [m for ns, m in context.records if ns == "train"][-1]
     assert metrics["update_reason"] == UPDATE_REASON_APPLIED
-    assert metrics["update_applied"] is True
+    assert metrics["update_record_applied"] is True
 
 
 def test_the_legacy_norm_is_described_as_post_clip() -> None:
@@ -246,35 +246,35 @@ def _sr_method(model, **policy_kwargs) -> StochasticReconfigurationUpdate:
 
 
 def test_a_skip_after_an_applied_step_reports_the_skip_not_the_solve() -> None:
-    """An applied attempt then a skipped one must leave NO stale solver record.
+    """A REAL applied attempt then a skipped one must leave NO stale record.
 
     This is the leak the returned-result contract closes. While the record
     lived on the method object, a skip that produced no solver diagnostics
     left the PREVIOUS step's `SolveDiagnostics` in place, so a reader of the
-    skipped step saw a solve that did not happen on it.
+    skipped step saw a solve that had not happened on it.
+
+    The applied step is driven through the REAL trainer rather than
+    stubbed, so the first record is a genuine solve and the test cannot pass
+    against a fabricated one.
     """
 
     model = build_connected_model()
     method = _sr_method(model)
-
-    applied = method._skip(
-        reason="applied_stand_in",
-        step=0,
-        n_samples=4,
-        n_finite=4,
-        n_parameters=8,
-        energy_gradient_norm=1.0,
-        diagnostics=SolveDiagnostics(
-            space="parameter",
-            shift=1.0e-3,
-            trace=1.0,
-            n_modes=8,
-            retained_modes=8,
-            max_eigenvalue=1.0,
-            min_retained_eigenvalue=1.0e-6,
-            dtype="torch.float64",
-        ),
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
+    trainer.fit(
+        model=model,
+        sampler=_FixedSampler(),
+        hamiltonian_terms=build_tiny_hamiltonian_terms(),
+        optimizer=method.optimizer,
+        context=_StubContext(),
+        emit=lambda **_: None,
     )
+
+    applied = method.last_result
+    assert applied is not None
+    assert applied.applied is True
+    assert applied.reason == UPDATE_REASON_APPLIED
+    # A real solve happened, so the record carries real solve diagnostics.
     assert applied.diagnostics is not None
     assert applied.diagnostics.diagnostics is not None
 
@@ -285,9 +285,11 @@ def test_a_skip_after_an_applied_step_reports_the_skip_not_the_solve() -> None:
         n_finite=0,
         n_parameters=8,
     )
-    # The new record, not the old one.
+    # The NEW record, not the old one.
+    assert skipped.applied is False
     assert skipped.diagnostics.reason == "insufficient_finite_samples"
     assert skipped.diagnostics.step == 1
+    # The decisive assertion: the earlier solve did NOT survive into this one.
     assert skipped.diagnostics.diagnostics is None
     # And the compatibility property follows the result rather than lagging it.
     assert method.last_telemetry is skipped.diagnostics
@@ -478,12 +480,12 @@ def _describe_every_builtin_method(model) -> list[UpdateMethodDescription]:
         SPRINGUpdate(
             torch.optim.SGD(parameters, lr=LEARNING_RATE),
             model_parameters=binding,
-            policy=SPRINGPolicy(base=sr_policy),
+            policy=SPRINGPolicy(base=sr_policy, history_decay=0.9),
         ).describe(),
         BlockDiagonalNaturalGradientUpdate(
             torch.optim.SGD(parameters, lr=LEARNING_RATE),
             model_parameters=binding,
-            policy=BlockNGPolicy(learning_rate=LEARNING_RATE),
+            policy=BlockNGPolicy(damping=1.0e-3, learning_rate=LEARNING_RATE),
         ).describe(),
     ]
 
@@ -551,6 +553,44 @@ def test_the_sr_diagnostics_record_survives_both_real_sinks(tmp_path) -> None:
         assert len(row.split(",")) == 4, f"row split into extra columns: {row!r}"
 
 
+def test_no_method_owned_diagnostic_key_collides_with_a_trainer_owned_key() -> None:
+    """A collision would silently overwrite one metric with the other.
+
+    This is not hypothetical. `MinimalUpdateDiagnostics` first shipped with the
+    prefix `update`, which collided with the trainer's generic `update_reason`.
+    Both happened to carry the same value, so nothing looked wrong and nothing
+    failed -- the worst shape a defect can have. The guard is mechanical so the
+    next record added cannot reintroduce it by choosing a plausible prefix.
+    """
+
+    # Keys the trainer composes itself, at the metrics boundary.
+    trainer_owned = {
+        "grad_norm",
+        "param_norm",
+        "loss_has_grad",
+        "optimizer_step",
+        "update_reason",
+    }
+
+    model = build_connected_model()
+    parameters = tuple(model.parameters())
+    binding = ModelParameterBinding(parameters=parameters)
+    sr_policy = SRPolicy(learning_rate=LEARNING_RATE)
+    records: list[UpdateDiagnostics] = [
+        MinimalUpdateDiagnostics(
+            method="Any", applied=True, reason="applied", step=0, grad_norm=1.0
+        ),
+        StochasticReconfigurationUpdate(
+            torch.optim.SGD(parameters, lr=LEARNING_RATE),
+            model_parameters=binding,
+            policy=sr_policy,
+        )._skip(reason="declined", step=0, n_samples=1, n_finite=0, n_parameters=1).diagnostics,
+    ]
+    for record in records:
+        overlap = trainer_owned & set(record.as_metrics())
+        assert not overlap, f"{type(record).__name__} collides on {sorted(overlap)}"
+
+
 # --------------------------------------------------------------------------
 # Custom and stateless methods keep working
 # --------------------------------------------------------------------------
@@ -605,9 +645,9 @@ def test_a_minimal_record_is_an_explicit_choice_with_honest_absence() -> None:
     )
     assert isinstance(record, UpdateDiagnostics)
     metrics = record.as_metrics()
-    assert metrics["update_grad_norm"] is None
-    assert metrics["update_reason"] == "declined"
-    assert metrics["update_step"] == 7
+    assert metrics["update_record_grad_norm"] is None
+    assert metrics["update_record_reason"] == "declined"
+    assert metrics["update_record_step"] == 7
 
 
 # --------------------------------------------------------------------------
