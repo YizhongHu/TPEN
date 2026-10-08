@@ -470,13 +470,6 @@ class AuthoritativeEditGuardTest(unittest.TestCase):
         expected_item = "44444444-4444-4444-8444-444444444444"
         expected_api = "http://127.0.0.1:4545"
         expected_root = "55555555-5555-4555-8555-555555555555"
-        receipt = {
-            "status": "ok",
-            "cwd": str(expected_cwd),
-            "itemId": expected_item,
-            "api": expected_api,
-            "projectRootId": expected_root,
-        }
         argv = [
             "--cwd",
             str(expected_cwd),
@@ -490,6 +483,14 @@ class AuthoritativeEditGuardTest(unittest.TestCase):
         current_version = tuple(sys.version_info[:3])
         for version in ((3, 9, 0), current_version):
             with self.subTest(version=version):
+                receipt = {
+                    "status": "ok",
+                    "cwd": str(expected_cwd),
+                    "itemId": expected_item,
+                    "api": expected_api,
+                    "projectRootId": expected_root,
+                }
+                expected_stdout = json.dumps(receipt, sort_keys=True) + "\n"
                 check_launch = mock.Mock(return_value=receipt)
                 stdout = io.StringIO()
                 stderr = io.StringIO()
@@ -498,7 +499,7 @@ class AuthoritativeEditGuardTest(unittest.TestCase):
                 ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                     result = GUARD.main(argv)
                 self.assertEqual(result, 0)
-                self.assertEqual(stdout.getvalue(), json.dumps(receipt, sort_keys=True) + "\n")
+                self.assertEqual(stdout.getvalue(), expected_stdout)
                 self.assertEqual(stderr.getvalue(), "")
                 check_launch.assert_called_once_with(
                     expected_cwd, expected_item, expected_api, expected_root
