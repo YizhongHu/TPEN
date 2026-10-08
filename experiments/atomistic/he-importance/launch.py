@@ -127,33 +127,36 @@ def execution_topology_facts(topology: object) -> dict[str, Any]:
     """Serialize launcher facts into the manifest topology boundary."""
 
     if isinstance(topology, Mapping):
-        return _detach_topology_facts(topology)
-    try:
-        identity = topology.device_identity  # type: ignore[attr-defined]
-        fields = {
-            "global_rank": topology.global_rank,  # type: ignore[attr-defined]
-            "global_size": topology.global_size,  # type: ignore[attr-defined]
-            "local_rank": topology.local_rank,  # type: ignore[attr-defined]
-            "local_size": topology.local_size,  # type: ignore[attr-defined]
-            "node_rank": topology.node_rank,  # type: ignore[attr-defined]
-            "node_size": topology.node_size,  # type: ignore[attr-defined]
-            "host": topology.host,  # type: ignore[attr-defined]
-            "pid": topology.pid,  # type: ignore[attr-defined]
-            "device": topology.device,  # type: ignore[attr-defined]
-            "job_id": topology.job_id,  # type: ignore[attr-defined]
-            "device_identity": (
-                None
-                if identity is None
-                else {
-                    "kind": getattr(identity.kind, "value", identity.kind),
-                    "index": identity.index,
-                    "uuid": identity.uuid,
-                }
-            ),
-        }
-    except AttributeError as error:
-        raise LaunchValidationError("topology must be an execution topology or mapping") from error
-    return fields
+        fields = dict(topology)
+    else:
+        try:
+            identity = topology.device_identity  # type: ignore[attr-defined]
+            fields = {
+                "global_rank": topology.global_rank,  # type: ignore[attr-defined]
+                "global_size": topology.global_size,  # type: ignore[attr-defined]
+                "local_rank": topology.local_rank,  # type: ignore[attr-defined]
+                "local_size": topology.local_size,  # type: ignore[attr-defined]
+                "node_rank": topology.node_rank,  # type: ignore[attr-defined]
+                "node_size": topology.node_size,  # type: ignore[attr-defined]
+                "host": topology.host,  # type: ignore[attr-defined]
+                "pid": topology.pid,  # type: ignore[attr-defined]
+                "device": topology.device,  # type: ignore[attr-defined]
+                "job_id": topology.job_id,  # type: ignore[attr-defined]
+                "device_identity": (
+                    None
+                    if identity is None
+                    else {
+                        "kind": getattr(identity.kind, "value", identity.kind),
+                        "index": identity.index,
+                        "uuid": identity.uuid,
+                    }
+                ),
+            }
+        except AttributeError as error:
+            raise LaunchValidationError(
+                "topology must be an execution topology or mapping"
+            ) from error
+    return _detach_topology_facts(fields)
 
 
 def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> None:

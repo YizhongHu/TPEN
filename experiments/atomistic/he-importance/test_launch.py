@@ -157,6 +157,45 @@ def test_launch_snapshots_duck_topology_for_manifest_and_runner(
                          "device_identity": None}]
 
 
+def test_launch_detaches_duck_nested_topology_before_validation_and_runner(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+
+    class DuckTopology:
+        def __init__(self) -> None:
+            self.source = _topology()
+            self.live_host = {"name": "manifest-host"}
+            self.host_reads = 0
+
+        @property
+        def host(self) -> dict[str, str]:
+            self.host_reads += 1
+            return self.live_host
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.source, name)
+
+    topology = DuckTopology()
+    received: list[object] = []
+
+    def recording_runner(config: object, *, topology: object) -> int:
+        del config
+        topology["host"]["name"] = "runner-snapshot"
+        received.append(topology)
+        return 0
+
+    assert launch.launch_train(cell, topology, runner=recording_runner) == 0
+    assert topology.host_reads == 1
+    assert topology.live_host == {"name": "manifest-host"}
+    assert cell.manifest["topology"]["host"] == {"name": "manifest-host"}
+    assert received == [{"global_rank": 0, "global_size": 1, "local_rank": 0,
+                         "local_size": 1, "node_rank": 0, "node_size": 1,
+                         "host": {"name": "runner-snapshot"}, "pid": os.getpid(),
+                         "device": "cuda:0", "job_id": "test-job",
+                         "device_identity": None}]
+
+
 def test_launch_detaches_nested_topology_facts_before_validation_and_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -193,6 +232,16 @@ def test_launch_detaches_nested_topology_facts_before_validation_and_runner(
     assert identity.reads == 1
     assert rebound_cells[0].manifest["topology"]["device_identity"]["kind"] == "cpu"
     assert received[0]["device_identity"]["kind"] == "cpu"
+
+
+def test_execution_topology_facts_rejects_non_topology_object(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+
+    with pytest.raises(
+        launch.LaunchValidationError,
+        match="topology must be an execution topology or mapping",
+    ):
+        launch.prepare_train_launch(cell, object())
 
 
 def test_launch_refuses_missing_or_empty_topology(tmp_path: Path) -> None:
