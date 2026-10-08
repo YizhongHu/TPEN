@@ -1384,9 +1384,16 @@ class LegacyAutogradUpdate(VMCUpdateMethod[AutogradUpdateInput]):
         reason: str,
         step: int,
     ) -> VMCUpdateResult:
-        """Build this attempt's result with its explicit minimal record."""
+        """Build this attempt's result with its explicit minimal record.
 
-        return VMCUpdateResult(
+        Routed through :meth:`VMCUpdateMethod._record_result` rather than
+        constructing the record directly, so ``last_result`` reports this
+        adapter's attempts like any other method's. Building it here instead
+        would leave ``last_result`` permanently ``None`` on the one method
+        every default configuration uses.
+        """
+
+        return self._record_result(
             applied=applied,
             grad_norm=grad_norm,
             reason=reason,
