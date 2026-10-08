@@ -157,6 +157,35 @@ def test_launch_snapshots_duck_topology_for_manifest_and_runner(
                          "device_identity": None}]
 
 
+def test_launch_detaches_nested_topology_facts_before_validation_and_runner(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    facts = launch.execution_topology_facts(_topology())
+
+    class ChangingIdentity(dict[str, object]):
+        reads = 0
+
+        def items(self):
+            type(self).reads += 1
+            kind = "cpu" if type(self).reads == 1 else "invalid-runner-kind"
+            return [("kind", kind), ("index", None), ("uuid", None)]
+
+    identity = ChangingIdentity()
+    facts["device_identity"] = identity
+    received: list[object] = []
+
+    def recording_runner(config: object, *, topology: object) -> int:
+        del config
+        received.append(topology)
+        return 0
+
+    assert launch.launch_train(cell, facts, runner=recording_runner) == 0
+    assert identity.reads == 1
+    assert cell.manifest["topology"]["device_identity"]["kind"] == "cpu"
+    assert received[0]["device_identity"]["kind"] == "cpu"
+
+
 def test_launch_refuses_missing_or_empty_topology(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
 
@@ -628,16 +657,37 @@ def test_default_mapping_required_and_identity_guards_have_both_polarities(
         launch.launch_train(cell, malformed, runner=runner)
 
 
-@pytest.mark.parametrize(
-    ("result", "expected"),
-    [(RunResult(status="completed"), 0), (RunResult(status="failed"), 1), (0, 0), (7, 7)],
-)
-def test_exit_code_direct_runresult_and_int_polarity(result: object, expected: int) -> None:
+@pytest.mark.parametrize(("result", "expected"), [(0, 0), (7, 7), (-1, -1)])
+def test_exit_code_accepts_integer_polarity(result: int, expected: int) -> None:
     assert launch._exit_code(result) == expected
 
 
+def test_exit_code_rejects_all_non_integer_result_shapes() -> None:
+    class DetailedResult(RunResult):
+        pass
+
+    ForgedResult = type(
+        "RunResult",
+        (),
+        {"__module__": "tpen.artifacts", "status": "completed"},
+    )
+    rejected = (
+        RunResult(status="completed"),
+        RunResult(status="failed"),
+        DetailedResult(status="completed"),
+        DetailedResult(status="failed"),
+        SimpleNamespace(status="completed"),
+        ForgedResult(),
+        "0",
+        True,
+    )
+    for result in rejected:
+        with pytest.raises(launch.LaunchValidationError, match="runner must return an int"):
+            launch._exit_code(result)
+
+
 def test_exit_code_rejects_non_result_non_int() -> None:
-    with pytest.raises(launch.LaunchValidationError, match="int or RunResult"):
+    with pytest.raises(launch.LaunchValidationError, match="runner must return an int"):
         launch._exit_code("0")
 
 
@@ -698,12 +748,12 @@ def test_exit_code_rejects_unrelated_status_object(status: str) -> None:
     result = UnrelatedResult()
     result.status = status
 
-    with pytest.raises(launch.LaunchValidationError, match="int or RunResult"):
+    with pytest.raises(launch.LaunchValidationError, match="runner must return an int"):
         launch._exit_code(result)
 
 
 def test_exit_code_rejects_unknown_runresult_status() -> None:
-    with pytest.raises(launch.LaunchValidationError, match="int or RunResult"):
+    with pytest.raises(launch.LaunchValidationError, match="runner must return an int"):
         launch._exit_code(RunResult(status="unknown"))
 
 
@@ -729,5 +779,5 @@ def test_launch_rejects_invalid_topology_values_before_injected_runner(
 
 @pytest.mark.parametrize("result", [True])
 def test_exit_code_rejects_boolean(result: object) -> None:
-    with pytest.raises(launch.LaunchValidationError, match="int or RunResult"):
+    with pytest.raises(launch.LaunchValidationError, match="runner must return an int"):
         launch._exit_code(result)

@@ -127,7 +127,7 @@ def execution_topology_facts(topology: object) -> dict[str, Any]:
     """Serialize launcher facts into the manifest topology boundary."""
 
     if isinstance(topology, Mapping):
-        return dict(topology)
+        return _detach_topology_facts(topology)
     try:
         identity = topology.device_identity  # type: ignore[attr-defined]
         fields = {
@@ -291,6 +291,18 @@ def _validate_runner_topology_facts(
     raise LaunchValidationError("topology.device_identity must be a mapping or null")
 
 
+def _detach_topology_facts(value: Any) -> Any:
+    """Recursively detach caller-owned mappings before boundary validation."""
+
+    if isinstance(value, Mapping):
+        return {key: _detach_topology_facts(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detach_topology_facts(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_topology_facts(item) for item in value)
+    return value
+
+
 def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any:
     """Bind non-empty launch facts to a source row's designated subtree."""
 
@@ -319,20 +331,10 @@ def prepare_train_launch(
 
 
 def _exit_code(result: object) -> int:
-    """Normalize production and injected runner results to a process code."""
+    """Require runners to return an integer process code."""
 
     if type(result) is not int:
-        result_type = type(result)
-        if (
-            result_type.__name__ == "RunResult"
-            and result_type.__module__ == "tpen.artifacts"
-        ):
-            status = getattr(result, "status", None)
-            if status == "completed":
-                return 0
-            if status == "failed":
-                return 1
-        raise LaunchValidationError("runner must return an int or RunResult")
+        raise LaunchValidationError("runner must return an int")
     return result
 
 
