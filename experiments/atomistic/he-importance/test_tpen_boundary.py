@@ -23,6 +23,9 @@ STUDY_DIR = Path(__file__).resolve().parent
 INVENTORY_DATE = "2026-10-07"
 INVENTORY_HEAD = "3143e43ac170df33f61f2002b1011cd85c9cfc37"
 PENDING_516_SHA = "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
+# The second value is the four additional unsanctioned crossings introduced by
+# PR 516; keep both merge orders green until that PR lands.
+EXPECTED_UNSANCTIONED_COUNTS = {16, 20}
 
 
 @dataclass(frozen=True)
@@ -213,7 +216,9 @@ def _scan_study() -> tuple[tuple[Path, ...], tuple[tuple[str, Crossing], ...]]:
         for relative_path, crossing in all_crossings
         if not crossing.sanctioned
     )
-    assert len(violations) > 0, "boundary scanner found no unsanctioned tpen crossings"
+    assert len(violations) in EXPECTED_UNSANCTIONED_COUNTS, (
+        "boundary scanner found an unexpected number of unsanctioned tpen crossings"
+    )
     return paths, violations
 
 
@@ -318,7 +323,8 @@ def _assert_pending_516_partition(
 # production/test partition              -> test_capability_production_test_partition
 # non-empty file scan                    -> test_capability_nonempty_scan / test_capability_empty_scan_rejected
 # non-empty crossing scan                -> test_capability_no_crossings_rejected
-# non-empty unsanctioned scan            -> test_capability_no_unsanctioned_crossings_rejected
+# unsanctioned filter partition          -> test_capability_unsanctioned_filter_partition
+# zero unsanctioned crossings allowed    -> test_capability_no_unsanctioned_crossings_allowed
 # literal dynamic target                 -> test_capability_dynamic_literal_string
 # nonliteral dynamic target rejection     -> test_capability_dynamic_rejects_nonliteral
 # measured/declared admission            -> test_capability_undeclared_measured_crossing
@@ -560,7 +566,7 @@ def test_capability_production_test_partition() -> None:
 def test_capability_nonempty_scan() -> None:
     visited, crossings = _scan_study()
     assert len(visited) > 0
-    assert len(crossings) > 0
+    assert len(crossings) in EXPECTED_UNSANCTIONED_COUNTS
 
 
 def test_capability_empty_scan_rejected() -> None:
@@ -597,24 +603,49 @@ def test_capability_no_crossings_rejected() -> None:
             STUDY_DIR = original_study_dir
 
 
-def test_capability_no_unsanctioned_crossings_rejected() -> None:
+def test_capability_unsanctioned_filter_partition() -> None:
     global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
     original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "sanctioned.py").write_text(
+            "from tpen.run import run_from_config\n", encoding="utf-8"
+        )
+        (root / "unsanctioned.py").write_text(
+            "from tpen.accelerator import AcceleratorKind\n", encoding="utf-8"
+        )
+        STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {1}
+        try:
+            _, crossings = _scan_study()
+        finally:
+            STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+    assert [(path, crossing.target) for path, crossing in crossings] == [
+        ("unsanctioned.py", "tpen.accelerator")
+    ]
+
+
+def test_capability_no_unsanctioned_crossings_allowed() -> None:
+    global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
+    original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
     with tempfile.TemporaryDirectory() as temporary_root:
         root = Path(temporary_root)
         (root / "launcher.py").write_text(
             "from tpen.run import run_from_config\n", encoding="utf-8"
         )
         STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {0}
         try:
-            try:
-                _scan_study()
-            except AssertionError as exc:
-                assert "found no unsanctioned tpen crossings" in str(exc)
-            else:
-                raise AssertionError("a study with only sanctioned crossings must be rejected")
+            _, crossings = _scan_study()
         finally:
             STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+    assert crossings == ()
 
 
 def test_production_inventory_obeys_admission_rule() -> None:
