@@ -552,14 +552,16 @@ def test_capability_python_file_filter() -> None:
 
 
 def test_capability_sanctioned_runner_carveout() -> None:
-    crossings = _detect_crossings("from tpen.run import run_from_config\n")
-    assert len(crossings) == 1
-    assert crossings[0].sanctioned
-    assert crossings[0].target == "tpen.run.run_from_config"
+    launch_source = (STUDY_DIR / "launch.py").read_text(encoding="utf-8")
+    sanctioned = [
+        crossing
+        for crossing in _detect_crossings(launch_source, filename="launch.py")
+        if crossing.sanctioned
+    ]
+    assert len(sanctioned) == 1
+    assert sanctioned[0].target == "tpen.run.run_from_config"
     _, scanned = _scan_study()
-    assert not any(
-        path == "launch.py" and crossing.line == 25 for path, crossing in scanned
-    )
+    assert not any(path == "launch.py" for path, crossing in scanned)
 
 
 def test_capability_sanctioned_import_rejects_wrong_module() -> None:
