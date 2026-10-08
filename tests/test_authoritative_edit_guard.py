@@ -464,6 +464,46 @@ class AuthoritativeEditGuardTest(unittest.TestCase):
                     with self.assertRaisesRegex(GUARD.GuardFailure, "check downstream sentinel"):
                         GUARD.check_launch(Path("/never"), ITEM_ID, "http://127.0.0.1:3001", ROOT_ID)
 
+    def test_supported_success_return_is_json_and_dispatches_once(self) -> None:
+        """Exercise the successful path under both simulated and current Python."""
+        expected_cwd = Path("/pr518-r4-success-cwd")
+        expected_item = "44444444-4444-4444-8444-444444444444"
+        expected_api = "http://127.0.0.1:4545"
+        expected_root = "55555555-5555-4555-8555-555555555555"
+        receipt = {
+            "status": "ok",
+            "cwd": str(expected_cwd),
+            "itemId": expected_item,
+            "api": expected_api,
+            "projectRootId": expected_root,
+        }
+        argv = [
+            "--cwd",
+            str(expected_cwd),
+            "--item",
+            expected_item,
+            "--api-url",
+            expected_api,
+            "--project-root-id",
+            expected_root,
+        ]
+        current_version = tuple(sys.version_info[:3])
+        for version in ((3, 9, 0), current_version):
+            with self.subTest(version=version):
+                check_launch = mock.Mock(return_value=receipt)
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with mock.patch.object(GUARD.sys, "version_info", version), mock.patch.object(
+                    GUARD, "check_launch", check_launch
+                ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    result = GUARD.main(argv)
+                self.assertEqual(result, 0)
+                self.assertEqual(stdout.getvalue(), json.dumps(receipt, sort_keys=True) + "\n")
+                self.assertEqual(stderr.getvalue(), "")
+                check_launch.assert_called_once_with(
+                    expected_cwd, expected_item, expected_api, expected_root
+                )
+
     def test_empty_pre39_discovery_keeps_supported_control_green(self) -> None:
         """Ensure an empty old-runtime census cannot skip the modern control.
 
