@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections import UserString
 from dataclasses import replace
 
 import pytest
@@ -180,6 +181,63 @@ def test_execution_topology_from_facts_rejects_unadmitted_object() -> None:
     }
 
     with pytest.raises(ValueError, match="unsupported topology fact value type: object"):
+        execution_topology_from_facts(facts)
+
+
+@pytest.mark.parametrize("value", [b"node1", bytearray(b"node1"), memoryview(b"node1")])
+def test_execution_topology_from_facts_rejects_binary_buffers(value: object) -> None:
+    facts = {
+        "global_rank": 0,
+        "global_size": 1,
+        "local_rank": 0,
+        "local_size": 1,
+        "node_rank": 0,
+        "node_size": 1,
+        "host": value,
+        "pid": 1000,
+        "device": "cpu",
+    }
+
+    with pytest.raises(ValueError, match="unsupported topology fact value"):
+        execution_topology_from_facts(facts)
+
+
+@pytest.mark.parametrize("key", [UserString("host"), 1])
+def test_execution_topology_from_facts_rejects_non_exact_string_keys(key: object) -> None:
+    facts = {key: "node"}
+    with pytest.raises(ValueError, match="mapping keys must be exact str"):
+        execution_topology_from_facts(facts)
+
+    assert execution_topology_from_facts(
+        {
+            "global_rank": 0,
+            "global_size": 1,
+            "local_rank": 0,
+            "local_size": 1,
+            "node_rank": 0,
+            "node_size": 1,
+            "host": "node",
+            "pid": 1000,
+            "device": "cpu",
+        }
+    ).host == "node"
+
+
+def test_execution_topology_from_facts_rejects_typed_identity_mapping_value() -> None:
+    facts = {
+        "global_rank": 0,
+        "global_size": 1,
+        "local_rank": 0,
+        "local_size": 1,
+        "node_rank": 0,
+        "node_size": 1,
+        "host": "node",
+        "pid": 1000,
+        "device": "cpu",
+        "device_identity": AcceleratorIdentity(AcceleratorKind.CPU, None, None),
+    }
+
+    with pytest.raises(ValueError, match="unsupported topology fact value type"):
         execution_topology_from_facts(facts)
 
 

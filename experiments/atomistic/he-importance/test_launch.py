@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import UserList, deque
+from collections import UserList, UserString, deque
 from importlib import import_module
 import inspect
 import os
@@ -900,3 +900,29 @@ def test_topology_detacher_rejects_unadmitted_object() -> None:
         match="unsupported topology fact value type: object",
     ):
         launch.execution_topology_facts({"host": object()})
+
+
+@pytest.mark.parametrize("value", [b"node1", bytearray(b"node1"), memoryview(b"node1")])
+def test_topology_detacher_rejects_binary_buffers(value: object) -> None:
+    with pytest.raises(launch.LaunchValidationError, match="unsupported topology fact value"):
+        launch.execution_topology_facts({"host": value})
+
+
+@pytest.mark.parametrize("key", [UserString("host"), 1])
+def test_topology_detacher_rejects_non_exact_string_keys(key: object) -> None:
+    with pytest.raises(launch.LaunchValidationError, match="mapping keys must be exact str"):
+        launch.execution_topology_facts({key: "node"})
+
+    assert launch.execution_topology_facts({"host": "node"}) == {"host": "node"}
+
+
+def test_populate_execution_topology_detaches_direct_public_input(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    live = UserList(["before"])
+
+    rebound = launch.populate_execution_topology(
+        cell, {"host": {"nested": [live]}}
+    )
+    live[0] = "after"
+
+    assert rebound.manifest["topology"]["host"] == {"nested": [["before"]]}

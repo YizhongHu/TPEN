@@ -297,14 +297,23 @@ def _validate_runner_topology_facts(
 def _detach_topology_facts(value: Any) -> Any:
     """Recursively materialize the closed topology-facts value schema."""
 
+    def is_binary_buffer(candidate: object) -> bool:
+        try:
+            memoryview(candidate)
+        except TypeError:
+            return False
+        return True
+
     if value is None or type(value) in (str, int, float, bool):
         return value
     if isinstance(value, Mapping):
-        return {
-            key: _detach_topology_facts(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        copied: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise LaunchValidationError("topology fact mapping keys must be exact str")
+            copied[key] = _detach_topology_facts(item)
+        return copied
+    if isinstance(value, Sequence) and not isinstance(value, str) and not is_binary_buffer(value):
         return [_detach_topology_facts(item) for item in value]
     raise LaunchValidationError(
         f"unsupported topology fact value type: {type(value).__name__}"
@@ -314,6 +323,7 @@ def _detach_topology_facts(value: Any) -> Any:
 def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any:
     """Bind non-empty launch facts to a source row's designated subtree."""
 
+    topology = _detach_topology_facts(topology)
     cell = _source_cell(source)
     try:
         _STAGE_API.validate_materialized_manifest(cell.manifest)

@@ -139,11 +139,23 @@ _RUNNER_TOPOLOGY_FACT_KEYS = frozenset(
 def _detach_topology_facts(value: Any) -> Any:
     """Materialize the closed mapping-facts value schema for TPEN ownership."""
 
+    def is_binary_buffer(candidate: object) -> bool:
+        try:
+            memoryview(candidate)
+        except TypeError:
+            return False
+        return True
+
     if value is None or type(value) in (str, int, float, bool):
         return value
     if isinstance(value, Mapping):
-        return {key: _detach_topology_facts(item) for key, item in value.items()}
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        copied: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ValueError("topology fact mapping keys must be exact str")
+            copied[key] = _detach_topology_facts(item)
+        return copied
+    if isinstance(value, Sequence) and not isinstance(value, str) and not is_binary_buffer(value):
         return [_detach_topology_facts(item) for item in value]
     raise ValueError(f"unsupported topology fact value type: {type(value).__name__}")
 
@@ -188,7 +200,7 @@ def execution_topology_from_facts(
         )
 
     identity_value = facts.get("device_identity")
-    if identity_value is None or isinstance(identity_value, AcceleratorIdentity):
+    if identity_value is None:
         identity = identity_value
     elif isinstance(identity_value, Mapping):
         unsupported_identity = set(identity_value) - {"kind", "index", "uuid"}
