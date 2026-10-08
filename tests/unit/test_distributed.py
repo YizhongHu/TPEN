@@ -243,7 +243,7 @@ def test_execution_topology_from_facts_rejects_binary_buffers(value: object) -> 
         "device": "cpu",
     }
 
-    with pytest.raises(ValueError, match="unsupported topology fact value"):
+    with pytest.raises(ValueError, match="binary buffer refused"):
         execution_topology_from_facts(facts)
 
 
