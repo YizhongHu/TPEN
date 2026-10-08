@@ -340,9 +340,7 @@ def test_explicit_topology_runner_receives_topology(tmp_path: Path) -> None:
         return 0
 
     assert launch.launch_train(cell, _topology(), runner=wrapper) == 0
-    # Amendment `contract-amendment-injected-runner-mapping-2026-10-08`
-    # replaces the predecessor's typed `.host` assertion with the mapping contract.
-    assert isinstance(received[0], dict) and received[0]["host"] == "test-host"
+    assert isinstance(received[0], dict) and received[0]["host"] == "test-host"  # Amendment `contract-amendment-injected-runner-mapping-2026-10-08` replaces predecessor typed `.host` assertion.
 
 
 def test_kwargs_runner_receives_topology(tmp_path: Path) -> None:
@@ -355,9 +353,7 @@ def test_kwargs_runner_receives_topology(tmp_path: Path) -> None:
         return 0
 
     assert launch.launch_train(cell, _topology(), runner=wrapper) == 0
-    # Amendment `contract-amendment-injected-runner-mapping-2026-10-08`
-    # replaces the predecessor's typed `.job_id` assertion with the mapping contract.
-    assert isinstance(received[0], dict) and received[0]["job_id"] == "test-job"
+    assert isinstance(received[0], dict) and received[0]["job_id"] == "test-job"  # Amendment `contract-amendment-injected-runner-mapping-2026-10-08` replaces predecessor typed `.job_id` assertion.
 
 
 def test_plain_injected_runner_keeps_config_only_contract(tmp_path: Path) -> None:
