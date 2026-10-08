@@ -178,7 +178,9 @@ def _detect_crossings(source: str) -> tuple[Crossing, ...]:
             continue
         arguments = [*node.args]
         arguments.extend(
-            keyword.value for keyword in node.keywords if keyword.arg == "name"
+            keyword.value
+            for keyword in node.keywords
+            if keyword.arg in {"name", "package"}
         )
         for argument in arguments:
             if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
@@ -300,8 +302,8 @@ def _assert_pending_516_partition(
 # __import__ dynamic form                -> test_capability_dynamic_dunder_import
 # unknown dynamic callable rejection     -> test_capability_dynamic_rejects_unknown_callable
 # positional dynamic argument            -> test_capability_dynamic_positional_argument
-# keyword dynamic argument               -> test_capability_dynamic_keyword_argument
-# non-name keyword rejection              -> test_capability_dynamic_rejects_non_name_keyword
+# name/package keyword dynamic arguments  -> test_capability_dynamic_keyword_argument
+# irrelevant keyword rejection            -> test_capability_dynamic_rejects_non_name_keyword
 # dynamic argument iteration             -> test_capability_dynamic_argument_iteration
 # disk source reading                    -> test_capability_reads_source_from_disk
 # AST source parsing                     -> test_capability_ast_source_parsing
@@ -645,16 +647,17 @@ module = import_module("tpen.anything")
 
 
 def test_capability_dynamic_keyword_argument() -> None:
-    source = '''
-from importlib import import_module
-module = import_module(name="tpen.anything")
-'''
-    crossings = _detect_crossings(source)
-    assert any(crossing.target == "tpen.anything" for crossing in crossings)
+    for source in (
+        'import_module(name="tpen.anything")\n',
+        'import_module(".anything", package="tpen")\n',
+        'importlib.import_module(".anything", package="tpen")\n',
+    ):
+        crossings = _detect_crossings(source)
+        assert any(crossing.target.startswith("tpen") for crossing in crossings)
 
 
 def test_capability_dynamic_rejects_non_name_keyword() -> None:
-    source = 'import_module(package="tpen.anything")\n'
+    source = 'import_module(label="tpen.anything")\n'
     assert _detect_crossings(source) == ()
 
 
