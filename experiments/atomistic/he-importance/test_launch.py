@@ -112,7 +112,9 @@ def test_launch_populates_topology_under_designated_key(tmp_path: Path) -> None:
     assert launch.launch_train(cell, _topology(), runner=lambda _: 0) == 0
 
 
-def test_launch_snapshots_duck_topology_for_manifest_and_runner(tmp_path: Path) -> None:
+def test_launch_snapshots_duck_topology_for_manifest_and_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cell = _cell(tmp_path)
 
     class ChangingTopology:
@@ -130,6 +132,15 @@ def test_launch_snapshots_duck_topology_for_manifest_and_runner(tmp_path: Path) 
 
     topology = ChangingTopology()
     received: list[object] = []
+    rebound_cells: list[object] = []
+    original_populate = launch.populate_execution_topology
+
+    def recording_populate(source: object, facts: object) -> object:
+        rebound = original_populate(source, facts)
+        rebound_cells.append(rebound)
+        return rebound
+
+    monkeypatch.setattr(launch, "populate_execution_topology", recording_populate)
 
     def recording_runner(config: object, *, topology: object) -> int:
         del config
@@ -138,7 +149,7 @@ def test_launch_snapshots_duck_topology_for_manifest_and_runner(tmp_path: Path) 
 
     assert launch.launch_train(cell, topology, runner=recording_runner) == 0
     assert topology.host_reads == 1
-    assert cell.manifest["topology"]["host"] == "manifest-host"
+    assert rebound_cells[0].manifest["topology"]["host"] == "manifest-host"
     assert received == [{"global_rank": 0, "global_size": 1, "local_rank": 0,
                          "local_size": 1, "node_rank": 0, "node_size": 1,
                          "host": "manifest-host", "pid": os.getpid(),
