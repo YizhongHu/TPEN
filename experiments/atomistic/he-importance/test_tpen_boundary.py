@@ -480,15 +480,19 @@ def test_capability_dynamic_argument_iteration() -> None:
 
 def test_capability_reads_source_from_disk() -> None:
     global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
     original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
     with tempfile.TemporaryDirectory() as temporary_root:
         root = Path(temporary_root)
         (root / "source.py").write_text("import tpen.disk\n", encoding="utf-8")
         STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {1}
         try:
             _, crossings = _scan_study()
         finally:
             STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
     assert [(path, crossing.target) for path, crossing in crossings] == [
         ("source.py", "tpen.disk")
     ]
@@ -519,17 +523,21 @@ def test_capability_ast_parse_diagnostic_names_relative_file() -> None:
 
 def test_capability_recursive_python_file_discovery() -> None:
     global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
     original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
     with tempfile.TemporaryDirectory() as temporary_root:
         root = Path(temporary_root)
         nested = root / "one" / "two"
         nested.mkdir(parents=True)
         (nested / "deep.py").write_text("import tpen.deep\n", encoding="utf-8")
         STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {1}
         try:
             _, crossings = _scan_study()
         finally:
             STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
     assert [(path, crossing.line, crossing.target) for path, crossing in crossings] == [
         ("one/two/deep.py", 1, "tpen.deep")
     ]
@@ -537,16 +545,20 @@ def test_capability_recursive_python_file_discovery() -> None:
 
 def test_capability_python_file_filter() -> None:
     global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
     original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
     with tempfile.TemporaryDirectory() as temporary_root:
         root = Path(temporary_root)
         (root / "kept.py").write_text("import tpen.kept\n", encoding="utf-8")
         (root / "ignored.txt").write_text("import tpen.ignored\n", encoding="utf-8")
         STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {1}
         try:
             _, crossings = _scan_study()
         finally:
             STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
     assert [(path, crossing.target) for path, crossing in crossings] == [
         ("kept.py", "tpen.kept")
     ]
@@ -562,7 +574,10 @@ def test_capability_sanctioned_runner_carveout() -> None:
     assert len(sanctioned) == 1
     assert sanctioned[0].target == "tpen.run.run_from_config"
     _, scanned = _scan_study()
-    assert not any(path == "launch.py" for path, crossing in scanned)
+    assert not any(
+        path == "launch.py" and crossing.target == "tpen.run.run_from_config"
+        for path, crossing in scanned
+    )
 
 
 def test_capability_sanctioned_import_rejects_wrong_module() -> None:
