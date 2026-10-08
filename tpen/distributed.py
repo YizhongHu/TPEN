@@ -10,7 +10,7 @@ and are deliberately refused until that type exists.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Buffer, Mapping, Sequence
 import json
 import math
 import os
@@ -139,15 +139,10 @@ _RUNNER_TOPOLOGY_FACT_KEYS = frozenset(
 def _detach_topology_facts(value: Any) -> Any:
     """Materialize the closed mapping-facts value schema for TPEN ownership."""
 
-    def is_binary_buffer(candidate: object) -> bool:
-        try:
-            memoryview(candidate)
-        except TypeError:
-            return False
-        return True
-
     if value is None or type(value) in (str, int, float, bool):
         return value
+    if isinstance(value, Buffer):
+        raise ValueError(f"binary buffer refused: {type(value).__name__}")
     if isinstance(value, Mapping):
         copied: dict[str, Any] = {}
         for key, item in value.items():
@@ -155,7 +150,7 @@ def _detach_topology_facts(value: Any) -> Any:
                 raise ValueError("topology fact mapping keys must be exact str")
             copied[key] = _detach_topology_facts(item)
         return copied
-    if isinstance(value, Sequence) and not isinstance(value, str) and not is_binary_buffer(value):
+    if isinstance(value, Sequence) and not isinstance(value, str):
         return [_detach_topology_facts(item) for item in value]
     raise ValueError(f"unsupported topology fact value type: {type(value).__name__}")
 
@@ -171,6 +166,8 @@ def execution_topology_from_facts(
     object as callers that already have one.
     """
 
+    if isinstance(facts, Buffer):
+        raise ValueError(f"binary buffer refused: {type(facts).__name__}")
     if isinstance(facts, ExecutionTopology):
         return facts
     if not isinstance(facts, Mapping):

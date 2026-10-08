@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections import UserString
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 
 import pytest
@@ -20,6 +21,7 @@ from tpen.distributed import (
     execution_topology_from_facts,
     project_scalars,
 )
+import tpen.distributed as distributed
 from tpen.process_resources import ProcessResourceResult, ResourceUnavailable
 
 
@@ -184,6 +186,49 @@ def test_execution_topology_from_facts_rejects_unadmitted_object() -> None:
         execution_topology_from_facts(facts)
 
 
+class _BinaryMapping(bytes, Mapping):
+    def __iter__(self):
+        return iter(("name",))
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, key):
+        if key != "name":
+            raise KeyError(key)
+        return "node"
+
+
+class _TypeErrorBufferSequence(Sequence):
+    def __init__(self):
+        self._values = [1, 2]
+
+    def __len__(self):
+        return len(self._values)
+
+    def __getitem__(self, index):
+        return self._values[index]
+
+    def __buffer__(self, flags):
+        del flags
+        raise TypeError("export unavailable")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [b"node1", bytearray(b"node1"), memoryview(b"node1"), _BinaryMapping(b"node1"), _TypeErrorBufferSequence()],
+)
+def test_distributed_detacher_rejects_all_buffer_providers(value: object) -> None:
+    with pytest.raises(ValueError, match="binary buffer refused"):
+        distributed._detach_topology_facts(value)
+
+
+def test_execution_topology_from_facts_rejects_top_level_hybrid_buffer() -> None:
+    with suppress_type_checks():
+        with pytest.raises(ValueError, match="binary buffer refused"):
+            execution_topology_from_facts(_BinaryMapping(b"node1"))
+
+
 @pytest.mark.parametrize("value", [b"node1", bytearray(b"node1"), memoryview(b"node1")])
 def test_execution_topology_from_facts_rejects_binary_buffers(value: object) -> None:
     facts = {
@@ -202,7 +247,11 @@ def test_execution_topology_from_facts_rejects_binary_buffers(value: object) -> 
         execution_topology_from_facts(facts)
 
 
-@pytest.mark.parametrize("key", [UserString("host"), 1])
+class _StringKey(str):
+    pass
+
+
+@pytest.mark.parametrize("key", [UserString("host"), _StringKey("host"), 1])
 def test_execution_topology_from_facts_rejects_non_exact_string_keys(key: object) -> None:
     facts = {key: "node"}
     with suppress_type_checks():

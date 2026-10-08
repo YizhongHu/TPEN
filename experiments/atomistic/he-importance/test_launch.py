@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import UserList, UserString, deque
+from collections.abc import Mapping, Sequence
 from importlib import import_module
 import inspect
 import os
@@ -902,13 +903,52 @@ def test_topology_detacher_rejects_unadmitted_object() -> None:
         launch.execution_topology_facts({"host": object()})
 
 
-@pytest.mark.parametrize("value", [b"node1", bytearray(b"node1"), memoryview(b"node1")])
-def test_topology_detacher_rejects_binary_buffers(value: object) -> None:
-    with pytest.raises(launch.LaunchValidationError, match="unsupported topology fact value"):
-        launch.execution_topology_facts({"host": value})
+class _BinaryMapping(bytes, Mapping):
+    def __iter__(self):
+        return iter(("name",))
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, key):
+        if key != "name":
+            raise KeyError(key)
+        return "node"
 
 
-@pytest.mark.parametrize("key", [UserString("host"), 1])
+class _TypeErrorBufferSequence(Sequence):
+    def __init__(self):
+        self._values = [1, 2]
+
+    def __len__(self):
+        return len(self._values)
+
+    def __getitem__(self, index):
+        return self._values[index]
+
+    def __buffer__(self, flags):
+        del flags
+        raise TypeError("export unavailable")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [b"node1", bytearray(b"node1"), memoryview(b"node1"), _BinaryMapping(b"node1"), _TypeErrorBufferSequence()],
+)
+@pytest.mark.parametrize("nested", [False, True])
+def test_topology_detacher_rejects_all_buffer_providers(
+    value: object, nested: bool
+) -> None:
+    candidate = {"host": value} if nested else value
+    with pytest.raises(launch.LaunchValidationError, match="binary buffer refused"):
+        launch.execution_topology_facts(candidate)
+
+
+class _StringKey(str):
+    pass
+
+
+@pytest.mark.parametrize("key", [UserString("host"), _StringKey("host"), 1])
 def test_topology_detacher_rejects_non_exact_string_keys(key: object) -> None:
     with pytest.raises(launch.LaunchValidationError, match="mapping keys must be exact str"):
         launch.execution_topology_facts({key: "node"})
