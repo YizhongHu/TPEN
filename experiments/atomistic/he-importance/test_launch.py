@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import UserList, UserString, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Buffer, Mapping, Sequence
 from importlib import import_module
 import inspect
 import os
@@ -449,6 +449,27 @@ def test_non_string_identity_key_is_refused_at_materialization(tmp_path: Path) -
             ],
             stage_coordinate.OptimizerCell("adam", "available"),
             tmp_path,
+        )
+
+
+def test_execution_fact_detector_rejects_lie_about_lower() -> None:
+    class Sneaky(str):
+        def lower(self) -> str:
+            return "benign_name"
+
+    with pytest.raises(launch.LaunchValidationError, match="global_rank"):
+        launch._reject_execution_facts_outside_topology(
+            {"scientific_identity": {Sneaky("global_rank"): 1}, "payload": {}, "topology": {}}
+        )
+
+
+def test_execution_fact_detector_rejects_plain_string_subclass() -> None:
+    class Plain(str):
+        pass
+
+    with pytest.raises(launch.LaunchValidationError, match="global_rank"):
+        launch._reject_execution_facts_outside_topology(
+            {"scientific_identity": {Plain("global_rank"): 1}, "payload": {}, "topology": {}}
         )
 
 
@@ -929,6 +950,29 @@ class _TypeErrorBufferSequence(Sequence):
     def __buffer__(self, flags):
         del flags
         raise TypeError("export unavailable")
+
+
+def _late_buffer_mapping() -> Mapping[str, object]:
+    class LateMapping(dict):
+        pass
+
+    value = LateMapping(name="node")
+    assert not isinstance(value, Buffer)
+    LateMapping.__buffer__ = lambda self, flags: memoryview(b"node")
+    LateMapping.__release_buffer__ = lambda self, view: None
+    assert memoryview(value).tobytes() == b"node"
+    assert not isinstance(value, Buffer)
+    return value
+
+
+def test_launch_entry_guard_rejects_cache_stale_buffer() -> None:
+    with pytest.raises(launch.LaunchValidationError, match="binary buffer refused"):
+        launch.execution_topology_facts(_late_buffer_mapping())
+
+
+def test_launch_detacher_rejects_cache_stale_buffer() -> None:
+    with pytest.raises(launch.LaunchValidationError, match="binary buffer refused"):
+        launch._detach_topology_facts(_late_buffer_mapping())
 
 
 @pytest.mark.parametrize(

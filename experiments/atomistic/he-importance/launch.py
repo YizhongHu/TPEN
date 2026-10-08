@@ -190,7 +190,7 @@ def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> Non
         if not isinstance(key, str):
             # Backstop: L1's materializer refuses non-string identity keys first.
             return False
-        normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+        normalized = re.sub(r"[^a-z0-9]", "", str.lower(key))
         return normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS
 
     def visit(value: Any, path: str) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections import UserString
-from collections.abc import Mapping, Sequence
+from collections.abc import Buffer, Mapping, Sequence
 from dataclasses import replace
 
 import pytest
@@ -212,6 +212,52 @@ class _TypeErrorBufferSequence(Sequence):
     def __buffer__(self, flags):
         del flags
         raise TypeError("export unavailable")
+
+
+def _late_buffer_mapping() -> Mapping[str, object]:
+    class LateMapping(dict):
+        pass
+
+    value = LateMapping(name="node")
+    assert not isinstance(value, Buffer)
+    LateMapping.__buffer__ = lambda self, flags: memoryview(b"node")
+    LateMapping.__release_buffer__ = lambda self, view: None
+    assert memoryview(value).tobytes() == b"node"
+    assert not isinstance(value, Buffer)
+    return value
+
+
+def _late_buffer_topology() -> ExecutionTopology:
+    class LateTopology(ExecutionTopology):
+        pass
+
+    value = LateTopology(
+        global_rank=0,
+        global_size=1,
+        local_rank=0,
+        local_size=1,
+        node_rank=0,
+        node_size=1,
+        host="node",
+        pid=1,
+        device="cpu",
+    )
+    assert not isinstance(value, Buffer)
+    LateTopology.__buffer__ = lambda self, flags: memoryview(b"node")
+    LateTopology.__release_buffer__ = lambda self, view: None
+    assert memoryview(value).tobytes() == b"node"
+    assert not isinstance(value, Buffer)
+    return value
+
+
+def test_distributed_entry_guard_rejects_cache_stale_buffer() -> None:
+    with pytest.raises(ValueError, match="binary buffer refused"):
+        execution_topology_from_facts(_late_buffer_topology())
+
+
+def test_distributed_detacher_rejects_cache_stale_buffer() -> None:
+    with pytest.raises(ValueError, match="binary buffer refused"):
+        distributed._detach_topology_facts(_late_buffer_mapping())
 
 
 @pytest.mark.parametrize(
