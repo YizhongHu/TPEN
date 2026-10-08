@@ -332,7 +332,7 @@ def _assert_pending_516_partition(
 # __import__ dynamic form                -> test_capability_dynamic_dunder_import
 # unknown dynamic callable rejection     -> test_capability_dynamic_rejects_unknown_callable
 # positional dynamic argument            -> test_capability_dynamic_positional_argument
-# name/package keyword dynamic arguments  -> test_capability_dynamic_keyword_argument
+# name/package keyword dynamic arguments (exact target + unsanctioned) -> test_capability_dynamic_keyword_argument
 # irrelevant keyword rejection            -> test_capability_dynamic_rejects_non_name_keyword
 # dynamic argument iteration             -> test_capability_dynamic_argument_iteration
 # disk source reading                    -> test_capability_reads_source_from_disk
@@ -348,7 +348,7 @@ def _assert_pending_516_partition(
 # production/test partition              -> test_capability_production_test_partition
 # non-empty file scan                    -> test_capability_nonempty_scan / test_capability_empty_scan_rejected
 # non-empty crossing scan                -> test_capability_no_crossings_rejected
-# unsanctioned filter partition          -> test_capability_unsanctioned_filter_partition
+# unsanctioned filter partition (including keyword form) -> test_capability_unsanctioned_filter_partition
 # zero unsanctioned crossings allowed    -> test_capability_no_unsanctioned_crossings_allowed
 # literal dynamic target                 -> test_capability_dynamic_literal_string
 # nonliteral dynamic target rejection     -> test_capability_dynamic_rejects_nonliteral
@@ -487,7 +487,7 @@ def test_capability_reads_source_from_disk() -> None:
         root = Path(temporary_root)
         (root / "source.py").write_text("import tpen.disk\n", encoding="utf-8")
         STUDY_DIR = root
-        EXPECTED_UNSANCTIONED_COUNTS = {1}
+        EXPECTED_UNSANCTIONED_COUNTS = {2}
         try:
             _, crossings = _scan_study()
         finally:
@@ -679,6 +679,10 @@ def test_capability_unsanctioned_filter_partition() -> None:
         (root / "unsanctioned.py").write_text(
             "from tpen.accelerator import AcceleratorKind\n", encoding="utf-8"
         )
+        (root / "keyword.py").write_text(
+            'importlib.import_module(".r3_hidden", package="tpen")\n',
+            encoding="utf-8",
+        )
         STUDY_DIR = root
         EXPECTED_UNSANCTIONED_COUNTS = {1}
         try:
@@ -687,7 +691,8 @@ def test_capability_unsanctioned_filter_partition() -> None:
             STUDY_DIR = original_study_dir
             EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
     assert [(path, crossing.target) for path, crossing in crossings] == [
-        ("unsanctioned.py", "tpen.accelerator")
+        ("keyword.py", "tpen"),
+        ("unsanctioned.py", "tpen.accelerator"),
     ]
 
 
@@ -741,13 +746,14 @@ module = import_module("tpen.anything")
 
 
 def test_capability_dynamic_keyword_argument() -> None:
-    for source in (
-        'import_module(name="tpen.anything")\n',
-        'import_module(".anything", package="tpen")\n',
-        'importlib.import_module(".anything", package="tpen")\n',
+    for source, expected_target in (
+        ('import_module(name="tpen.anything")\n', "tpen.anything"),
+        ('import_module(".anything", package="tpen")\n', "tpen"),
+        ('importlib.import_module(".anything", package="tpen")\n', "tpen"),
     ):
-        crossings = _detect_crossings(source)
-        assert any(crossing.target.startswith("tpen") for crossing in crossings)
+        assert _detect_crossings(source) == (
+            Crossing(1, expected_target, sanctioned=False),
+        )
 
 
 def test_capability_dynamic_rejects_non_name_keyword() -> None:
