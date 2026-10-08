@@ -295,15 +295,20 @@ def _validate_runner_topology_facts(
 
 
 def _detach_topology_facts(value: Any) -> Any:
-    """Recursively detach caller-owned mappings before boundary validation."""
+    """Recursively materialize the closed topology-facts value schema."""
 
+    if value is None or type(value) in (str, int, float, bool):
+        return value
     if isinstance(value, Mapping):
-        return {key: _detach_topology_facts(item) for key, item in value.items()}
-    if isinstance(value, list):
+        return {
+            key: _detach_topology_facts(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_detach_topology_facts(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_detach_topology_facts(item) for item in value)
-    return value
+    raise LaunchValidationError(
+        f"unsupported topology fact value type: {type(value).__name__}"
+    )
 
 
 def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any:

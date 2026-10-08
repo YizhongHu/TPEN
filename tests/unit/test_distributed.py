@@ -145,6 +145,44 @@ def test_execution_topology_from_facts_rejects_unsupported_identity_keys() -> No
         execution_topology_from_facts(facts)
 
 
+def test_execution_topology_from_facts_detaches_nested_mapping_values() -> None:
+    supplied_host = {"nested": [["before"]]}
+    facts = {
+        "global_rank": 0,
+        "global_size": 1,
+        "local_rank": 0,
+        "local_size": 1,
+        "node_rank": 0,
+        "node_size": 1,
+        "host": supplied_host,
+        "pid": 1000,
+        "device": "cpu",
+    }
+
+    topology = execution_topology_from_facts(facts)
+    supplied_host["nested"][0][0] = "after"
+
+    assert topology.host == {"nested": [["before"]]}
+    assert topology.host is not supplied_host
+
+
+def test_execution_topology_from_facts_rejects_unadmitted_object() -> None:
+    facts = {
+        "global_rank": 0,
+        "global_size": 1,
+        "local_rank": 0,
+        "local_size": 1,
+        "node_rank": 0,
+        "node_size": 1,
+        "host": object(),
+        "pid": 1000,
+        "device": "cpu",
+    }
+
+    with pytest.raises(ValueError, match="unsupported topology fact value type: object"):
+        execution_topology_from_facts(facts)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

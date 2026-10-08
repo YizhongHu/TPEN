@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import UserList, deque
 from importlib import import_module
 import inspect
 import os
@@ -848,3 +849,54 @@ def test_launch_rejects_invalid_topology_values_before_injected_runner(
 def test_exit_code_rejects_boolean(result: object) -> None:
     with pytest.raises(launch.LaunchValidationError, match="runner must return an int"):
         launch._exit_code(result)
+
+
+def test_topology_detacher_closes_nested_sequence_schema() -> None:
+    user_list = UserList(["before"])
+    queue = deque(["before"])
+    facts = launch.execution_topology_facts(
+        {"host": {"nested": [user_list, (queue,)]}}
+    )
+
+    user_list[0] = "after"
+    queue.append("after")
+
+    assert facts == {"host": {"nested": [["before"], [["before"]]]}}
+    assert type(facts["host"]["nested"]) is list
+    assert type(facts["host"]["nested"][0]) is list
+    assert type(facts["host"]["nested"][1]) is list
+
+
+def test_duck_topology_detacher_closes_nested_sequence_schema() -> None:
+    live = UserList([deque(["before"])])
+
+    class DuckTopology:
+        global_rank = 0
+        global_size = 1
+        local_rank = 0
+        local_size = 1
+        node_rank = 0
+        node_size = 1
+        pid = 1
+        device = "cpu"
+        job_id = "job"
+        device_identity = None
+
+        @property
+        def host(self) -> UserList[object]:
+            return live
+
+    facts = launch.execution_topology_facts(DuckTopology())
+    live[0].append("after")
+
+    assert facts["host"] == [["before"]]
+    assert type(facts["host"]) is list
+    assert type(facts["host"][0]) is list
+
+
+def test_topology_detacher_rejects_unadmitted_object() -> None:
+    with pytest.raises(
+        launch.LaunchValidationError,
+        match="unsupported topology fact value type: object",
+    ):
+        launch.execution_topology_facts({"host": object()})
