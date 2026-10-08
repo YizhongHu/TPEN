@@ -220,9 +220,26 @@ def _scan_study() -> tuple[tuple[Path, ...], tuple[tuple[str, Crossing], ...]]:
         for relative_path, crossing in all_crossings
         if not crossing.sanctioned
     )
-    assert len(violations) in EXPECTED_UNSANCTIONED_COUNTS, (
-        "boundary scanner found an unexpected number of unsanctioned tpen crossings"
-    )
+    if len(violations) not in EXPECTED_UNSANCTIONED_COUNTS:
+        declared = set(EXPECTED_PRODUCTION_INVENTORY) | set(EXPECTED_TEST_INVENTORY)
+        measured = {
+            (relative_path, crossing.line, crossing.target)
+            for relative_path, crossing in violations
+        }
+        existing_declared = {
+            key for key in declared if (STUDY_DIR / key[0]).is_file()
+        }
+        added = sorted(measured - declared)
+        removed = sorted(existing_declared - measured)
+        raise AssertionError(
+            "boundary scanner found an unexpected number of unsanctioned tpen "
+            f"crossings: actual={len(violations)}, "
+            f"expected={sorted(EXPECTED_UNSANCTIONED_COUNTS)}, "
+            f"added={added}, removed={removed}; reconcile by removing the import "
+            "per experiments/README.md or declaring it with a disposition under "
+            "rule (a); if an import merely shifted lines, update the stale sibling "
+            "entry under rule (b), then rerun the boundary control"
+        )
     return paths, violations
 
 
@@ -349,6 +366,9 @@ def _assert_pending_516_partition(
 # non-empty file scan                    -> test_capability_nonempty_scan / test_capability_empty_scan_rejected
 # non-empty crossing scan                -> test_capability_no_crossings_rejected
 # unsanctioned filter partition (including keyword form) -> test_capability_unsanctioned_filter_partition
+# added crossing count diagnostic        -> test_capability_inventory_count_diagnostic_added
+# removed crossing count diagnostic      -> test_capability_inventory_count_diagnostic_removed
+# unchanged count reaches admission      -> test_capability_inventory_count_diagnostic_line_shift
 # zero unsanctioned crossings allowed    -> test_capability_no_unsanctioned_crossings_allowed
 # literal dynamic target                 -> test_capability_dynamic_literal_string
 # nonliteral dynamic target rejection     -> test_capability_dynamic_rejects_nonliteral
@@ -487,7 +507,7 @@ def test_capability_reads_source_from_disk() -> None:
         root = Path(temporary_root)
         (root / "source.py").write_text("import tpen.disk\n", encoding="utf-8")
         STUDY_DIR = root
-        EXPECTED_UNSANCTIONED_COUNTS = {2}
+        EXPECTED_UNSANCTIONED_COUNTS = {1}
         try:
             _, crossings = _scan_study()
         finally:
@@ -684,7 +704,7 @@ def test_capability_unsanctioned_filter_partition() -> None:
             encoding="utf-8",
         )
         STUDY_DIR = root
-        EXPECTED_UNSANCTIONED_COUNTS = {1}
+        EXPECTED_UNSANCTIONED_COUNTS = {2}
         try:
             _, crossings = _scan_study()
         finally:
@@ -734,6 +754,95 @@ def test_test_file_inventory_obeys_admission_rule() -> None:
         measured, EXPECTED_TEST_INVENTORY, pending
     )
     assert pending_count + measured_count == 1
+
+
+def test_capability_inventory_count_diagnostic_added() -> None:
+    global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
+    original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "added.py").write_text(
+            "from tpen.added import Added\n", encoding="utf-8"
+        )
+        STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {0}
+        try:
+            try:
+                _scan_study()
+            except AssertionError as error:
+                message = str(error)
+            else:
+                assert False, "added crossing did not trip the public count gate"
+        finally:
+            STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+    assert "actual=1" in message
+    assert "expected=[0]" in message
+    assert "('added.py', 1, 'tpen.added')" in message
+    assert "reconcile" in message
+
+
+def test_capability_inventory_count_diagnostic_removed() -> None:
+    global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
+    original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "launch.py").write_text(
+            "\nfrom tpen.artifacts import RunResult\n", encoding="utf-8"
+        )
+        STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {2}
+        try:
+            try:
+                _scan_study()
+            except AssertionError as error:
+                message = str(error)
+            else:
+                assert False, "removed crossing did not trip the public count gate"
+        finally:
+            STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+    assert "actual=1" in message
+    assert "expected=[2]" in message
+    assert "('launch.py', 22, 'tpen.accelerator')" in message
+    assert "('launch.py', 24, 'tpen.distributed')" in message
+    assert "reconcile" in message
+
+
+def test_capability_inventory_count_diagnostic_line_shift() -> None:
+    global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
+    original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "launch.py").write_text(
+            "\nfrom tpen.accelerator import AcceleratorIdentity\n"
+            "from tpen.artifacts import RunResult\n"
+            "from tpen.distributed import ExecutionTopology\n",
+            encoding="utf-8",
+        )
+        STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {3}
+        try:
+            _, crossings = _scan_study()
+            measured = _inventory_keys(crossings, tests=False)
+            try:
+                _validate_inventory_admission(measured, EXPECTED_PRODUCTION_INVENTORY)
+            except AssertionError as error:
+                message = str(error)
+            else:
+                assert False, "line-shifted sibling entry was admitted"
+        finally:
+            STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+    assert "('launch.py', 2, 'tpen.accelerator')" in message
+    assert "rule (a)" in message
+    assert "rule (b)" in message
 
 
 def test_capability_dynamic_bare_import_module() -> None:
