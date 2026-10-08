@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Generic, TypeVar
 
 from tpen.data.batch import (
@@ -606,17 +606,203 @@ class ScoreUpdateInput(VMCStepData):
         raise RuntimeError("live ScoreUpdateInput cannot be serialized")
 
 
+# Reason vocabulary shared by the built-in methods. These are DISPLAY and
+# RECORD values, never behavior selectors: nothing in the trainer or in any
+# method branches on a reason string. SR and SPRING already spell the vacuum
+# skip ``zero_electron_batch``; the legacy adapter reuses that exact spelling
+# rather than inventing a second name for one condition.
+UPDATE_REASON_APPLIED = "applied"
+UPDATE_REASON_ZERO_ELECTRON_BATCH = "zero_electron_batch"
+# What a result reports when a method returned no reason at all. A custom
+# method predating the reason contract is the case this exists for. It is
+# deliberately a distinct token, NOT "applied" and NOT an empty string, so a
+# record never claims a reason its method did not give.
+UPDATE_REASON_UNREPORTED = "unreported"
+
+
+def json_safe_scalar(value: Any) -> Any:
+    """Return a value a JSON and CSV metrics sink can both carry.
+
+    WHY THIS EXISTS, as a mechanism rather than a convention. The two sinks
+    this project writes impose two different hard limits, and a naive float
+    violates both:
+
+    - ``tpen.logging.jsonl`` calls ``json.dumps(..., allow_nan=False)``. A NaN
+      or infinity therefore RAISES in the sink, turning a diagnostic nobody
+      asked to be fatal into a failed run.
+    - ``tpen.logging.csv`` writes ``f"{step},{namespace},{key},{value}"`` with
+      no quoting. A value whose text contains a comma silently becomes two
+      columns, which is worse than an exception because the file still parses.
+
+    The representation here is explicit in both directions: a finite real
+    number passes through as a ``float``; anything else becomes a SHORT
+    COMMA-FREE STRING naming what was actually observed. A reader can tell the
+    two apart by type alone.
+
+    NEVER FABRICATE ZERO. Returning ``0.0`` for an unavailable or non-finite
+    observation is the specific failure this helper exists to prevent: zero is
+    a legitimate value for every norm reported here, so a fabricated zero is
+    indistinguishable from a real measurement and silently corrupts any
+    downstream average.
+
+    Parameters
+    ----------
+    value : Any
+        Observation to represent. ``None`` means the method had nothing to
+        report for this key.
+
+    Returns
+    -------
+    float or int or bool or str or None
+        ``None`` passes through (JSON ``null``, empty CSV cell). ``bool`` and
+        ``int`` pass through. A finite ``float`` passes through. A non-finite
+        float becomes ``"nan"``, ``"inf"``, or ``"-inf"``. Any other object
+        becomes ``repr``-free ``str`` text with commas replaced by ``;``.
+    """
+
+    if value is None or type(value) is bool or type(value) is int:
+        return value
+    if isinstance(value, float) or isinstance(value, int):
+        numeric = float(value)
+        if numeric != numeric:
+            return "nan"
+        if numeric == float("inf"):
+            return "inf"
+        if numeric == float("-inf"):
+            return "-inf"
+        return numeric
+    text = str(value)
+    # Unquoted CSV rows: a comma in a value would create a phantom column.
+    return text.replace(",", ";")
+
+
+class UpdateDiagnostics(ABC):
+    """Nominal DETACHED record of what one update attempt actually did.
+
+    Nominal rather than structural on purpose. An update method cannot satisfy
+    this by happening to own an attribute of the right name; it has to declare
+    the record as this contract, which is what lets
+    :class:`VMCUpdateResult` state the type it carries instead of accepting
+    any object with an ``as_metrics``.
+
+    DETACHED is the load-bearing word. Implementations hold plain Python
+    scalars and already-detached sub-records only. No tensor that participates
+    in a graph, and no model or optimizer reference, belongs in a diagnostic:
+    the record outlives the step that produced it and is written to artifacts,
+    so a graph-bearing field would both retain the step's memory and fail at
+    the serialization boundary.
+    """
+
+    @abstractmethod
+    def as_metrics(self) -> dict[str, Any]:
+        """Return this record as flat, JSON-safe, comma-free metric entries.
+
+        Flat because the CSV sink writes one row per key and cannot express
+        nesting; JSON-safe because the JSONL sink rejects non-finite floats.
+        Implementations compose their OWN key names, so the trainer never
+        re-spells a method-owned key.
+        """
+
+
+@dataclass(frozen=True, kw_only=True)
+class MinimalUpdateDiagnostics(UpdateDiagnostics):
+    """The smallest honest diagnostic: what every method can always report.
+
+    This is the compatibility path the update contract promises to methods
+    that own no solver telemetry -- the legacy autograd adapter, and any
+    custom or stateless method outside this package. It reports only what is
+    knowable without a solver, and reports absence as absence.
+
+    Using this record is an explicit choice by a method, not a fallback the
+    trainer applies. That distinction matters: a trainer-side fallback would
+    be attribute probing again, which is exactly what this slice removes.
+    """
+
+    method: str
+    applied: bool
+    reason: str
+    step: int
+    grad_norm: float | None = None
+    prefix: str = "update"
+
+    def as_metrics(self) -> dict[str, Any]:
+        """Return the minimal record under this method's own key prefix."""
+
+        return {
+            f"{self.prefix}_method": json_safe_scalar(self.method),
+            f"{self.prefix}_applied": bool(self.applied),
+            f"{self.prefix}_reason": json_safe_scalar(self.reason),
+            f"{self.prefix}_step": int(self.step),
+            f"{self.prefix}_grad_norm": json_safe_scalar(self.grad_norm),
+        }
+
+
 @dataclass(frozen=True, kw_only=True)
 class VMCUpdateResult:
-    """Result of one update-method invocation."""
+    """Result of one update-method invocation.
+
+    Parameters
+    ----------
+    applied : bool
+        Whether the attempt actually stepped the parameters.
+    grad_norm : float
+        The norm this method reports for the step. ITS MEANING IS METHOD-OWNED
+        and is not uniform across methods: for the legacy adapter it is the
+        post-clip Euclidean norm of ``.grad`` over the gradient domain, while
+        for SR, SPRING, and block NG it is the ENERGY-GRADIENT norm, which is
+        not the norm of the preconditioned direction those methods write into
+        ``.grad``. Read the method's
+        :meth:`VMCUpdateMethod.describe` record for the actual meaning rather
+        than assuming one; this is precisely the ambiguity the description
+        contract exists to resolve.
+    reason : str or None, optional
+        Explicit, method-owned reason for the outcome. ``None`` means the
+        method reported none -- the shape a custom method written before this
+        field existed has. Use :attr:`reported_reason` to read it without
+        having to re-handle ``None`` at every call site.
+    diagnostics : UpdateDiagnostics or None, optional
+        The detached record for THIS attempt. ``None`` means the method
+        reported none.
+
+    Notes
+    -----
+    BOTH NEW FIELDS DEFAULT. That is a compatibility requirement, not an
+    oversight: existing custom ``VMCUpdateMethod`` implementations construct
+    this record positionally by keyword with two fields, and making either new
+    field required would break every one of them at once. A method that
+    reports nothing is a supported shape; a method that reports a FABRICATED
+    reason would not be.
+
+    THE RESULT IS THE SINGLE AUTHORITY for one attempt. The built-in methods
+    retain a ``last_telemetry`` property for compatibility, but it is derived
+    from the result they returned and is not a second place where an attempt
+    is recorded.
+    """
 
     applied: bool
     grad_norm: float
+    reason: str | None = None
+    diagnostics: UpdateDiagnostics | None = None
 
     def __post_init__(self) -> None:
         if type(self.applied) is not bool:
             raise TypeError("VMCUpdateResult.applied must be a bool")
         object.__setattr__(self, "grad_norm", float(self.grad_norm))
+        if self.reason is not None:
+            if not isinstance(self.reason, str) or not self.reason:
+                raise TypeError("VMCUpdateResult.reason must be a non-empty str or None")
+            if "," in self.reason:
+                # The CSV sink writes unquoted rows, so a comma here would
+                # split one metric into two columns and still parse.
+                raise ValueError("VMCUpdateResult.reason must not contain a comma")
+        if self.diagnostics is not None and not isinstance(self.diagnostics, UpdateDiagnostics):
+            raise TypeError("VMCUpdateResult.diagnostics must be an UpdateDiagnostics or None")
+
+    @property
+    def reported_reason(self) -> str:
+        """Return the reason, or the explicit unreported token when absent."""
+
+        return UPDATE_REASON_UNREPORTED if self.reason is None else self.reason
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -730,6 +916,151 @@ class VMCUpdateState:
             raise TypeError("VMCUpdateState.model_parameters must be a ModelParameterBinding")
 
 
+def carrier_settings(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+    """Return the carrier optimizer's EFFECTIVE settings as flat scalars.
+
+    "Effective" means read off the live ``param_groups`` at call time, not
+    recalled from the config that built the optimizer. After a checkpoint
+    restore those two can differ, and the restored values are the ones the
+    next step will actually use.
+
+    COMPOUND SETTINGS ARE SPLIT, NOT REPR'D. Adam's ``betas`` is the motivating
+    case: writing ``(0.9, 0.999)`` into the unquoted CSV sink produces a row
+    with two extra columns that still parses. Each element becomes its own
+    named scalar key instead -- ``betas1``, ``betas2``.
+
+    Parameters
+    ----------
+    optimizer : torch.optim.Optimizer
+        The live carrier to describe.
+
+    Returns
+    -------
+    dict
+        Flat JSON-safe entries. ``n_param_groups`` is always present. Group 0's
+        settings are reported unprefixed; a heterogeneous multi-group optimizer
+        additionally reports ``group<i>_<key>`` for every later group, so a
+        per-layer learning rate is visible rather than hidden behind group 0.
+    """
+
+    if not isinstance(optimizer, torch.optim.Optimizer):
+        raise TypeError("carrier_settings requires a torch.optim.Optimizer")
+    groups = list(optimizer.param_groups)
+    settings: dict[str, Any] = {"n_param_groups": len(groups)}
+    for index, group in enumerate(groups):
+        prefix = "" if index == 0 else f"group{index}_"
+        for key, value in sorted(group.items()):
+            # `params` is the live parameter list. It is the one thing that
+            # must never enter a description: it is unbounded in size and
+            # holds the model's tensors.
+            if key == "params":
+                continue
+            if isinstance(value, (tuple, list)):
+                for ordinal, element in enumerate(value, start=1):
+                    settings[f"{prefix}{key}{ordinal}"] = json_safe_scalar(element)
+                continue
+            settings[f"{prefix}{key}"] = json_safe_scalar(value)
+    return settings
+
+
+def flatten_settings(settings: Mapping[str, Any], *, prefix: str = "") -> dict[str, Any]:
+    """Flatten a nested policy fingerprint into flat JSON-safe scalar entries.
+
+    A policy fingerprint is allowed to nest -- ``SRPolicy.fingerprint`` carries
+    a whole ``damping`` sub-mapping -- but neither metrics sink can express
+    nesting: the CSV sink writes one row per key, and a dict written into it
+    would be a brace-and-comma string that silently becomes several columns.
+    Nested keys are therefore joined with ``_`` into one flat namespace.
+
+    Parameters
+    ----------
+    settings : Mapping
+        Possibly nested settings mapping.
+    prefix : str, optional
+        Key prefix for recursion; callers normally leave it empty.
+
+    Returns
+    -------
+    dict
+        Flat mapping whose values are all :func:`json_safe_scalar` outputs.
+    """
+
+    flat: dict[str, Any] = {}
+    for key, value in settings.items():
+        composed = f"{prefix}{key}"
+        if isinstance(value, Mapping):
+            flat.update(flatten_settings(value, prefix=f"{composed}_"))
+        elif isinstance(value, (tuple, list)):
+            for ordinal, element in enumerate(value, start=1):
+                flat[f"{composed}{ordinal}"] = json_safe_scalar(element)
+        else:
+            flat[composed] = json_safe_scalar(value)
+    return flat
+
+
+@dataclass(frozen=True, kw_only=True)
+class UpdateMethodDescription:
+    """What was ACTUALLY constructed or restored, for one fit invocation.
+
+    THE PROBLEM THIS SOLVES. SR, SPRING, and block NG all drive a plain
+    ``torch.optim.SGD`` as a carrier: they compute a preconditioned direction,
+    write it into ``.grad``, and let SGD apply it. Anything that identifies the
+    update by looking at the optimizer therefore reports every one of those
+    runs as plain SGD, which is wrong in the most expensive possible way --
+    the run looks like a baseline nobody ran. :attr:`method_class` and
+    :attr:`carrier_class` are separate fields for exactly this reason.
+
+    CLASS NAMES ARE FOR DISPLAY ONLY. Nothing selects behavior from these
+    strings. A config's label for a run is likewise never consulted here: every
+    field is read off the live constructed or restored objects, so a run
+    mislabelled in YAML still describes itself truthfully.
+
+    Parameters
+    ----------
+    method_class : str
+        Qualified name of the actual :class:`VMCUpdateMethod` instance.
+    carrier_class : str
+        Qualified name of the actual optimizer applying the step, or
+        ``"none"`` for a method that owns no carrier.
+    n_parameters : int
+        Total scalar parameter count in the bound domain.
+    n_parameter_tensors : int
+        Number of tensors in the bound domain.
+    forward_request : str
+        The requested derivative convention -- the qualified type of the typed
+        forward request this method returns, or ``"value"`` for an ordinary
+        ``model(batch)`` forward.
+    norm_semantics : str
+        What this method's reported ``grad_norm`` actually measures.
+    settings : Mapping
+        Flat scalar effective settings: carrier settings, plus any
+        method-owned policy fields.
+    """
+
+    method_class: str
+    carrier_class: str
+    n_parameters: int
+    n_parameter_tensors: int
+    forward_request: str
+    norm_semantics: str
+    settings: Mapping[str, Any] = field(default_factory=dict)
+
+    def as_metrics(self, *, prefix: str = "update_method") -> dict[str, Any]:
+        """Return the description as flat, JSON-safe, comma-free entries."""
+
+        metrics: dict[str, Any] = {
+            f"{prefix}_class": json_safe_scalar(self.method_class),
+            f"{prefix}_carrier_class": json_safe_scalar(self.carrier_class),
+            f"{prefix}_n_parameters": int(self.n_parameters),
+            f"{prefix}_n_parameter_tensors": int(self.n_parameter_tensors),
+            f"{prefix}_forward_request": json_safe_scalar(self.forward_request),
+            f"{prefix}_norm_semantics": json_safe_scalar(self.norm_semantics),
+        }
+        for key, value in self.settings.items():
+            metrics[f"{prefix}_{key}"] = json_safe_scalar(value)
+        return metrics
+
+
 class VMCUpdateMethod(Generic[InputT], ABC):
     """Nominal typed contract for VMC update strategies.
 
@@ -836,6 +1167,103 @@ class VMCUpdateMethod(Generic[InputT], ABC):
 
         return None
 
+    @property
+    def last_result(self) -> VMCUpdateResult | None:
+        """Return the result of this method's most recent attempt.
+
+        ``None`` before the first attempt. This is the ONE place an attempt is
+        remembered; the built-in methods' ``last_telemetry`` property reads
+        the diagnostics out of this record rather than keeping a parallel one.
+        """
+
+        return getattr(self, "_last_result", None)
+
+    def _record_result(
+        self,
+        *,
+        applied: bool,
+        grad_norm: float,
+        reason: str,
+        diagnostics: UpdateDiagnostics | None = None,
+    ) -> VMCUpdateResult:
+        """Build, remember, and return the result for one attempt.
+
+        Remembering is assignment to a single slot, so a fresh attempt always
+        REPLACES the previous record rather than merging with it. That is what
+        makes "applied, then skipped" report the skip's own diagnostics
+        instead of leaking the earlier solve's.
+        """
+
+        result = VMCUpdateResult(
+            applied=applied,
+            grad_norm=grad_norm,
+            reason=reason,
+            diagnostics=diagnostics,
+        )
+        self._last_result = result
+        return result
+
+    def describe(self) -> UpdateMethodDescription:
+        """Describe the object that will actually perform the next update.
+
+        The default reads everything off ``self`` and off the owned
+        :class:`VMCUpdateState`, so a method inherits a truthful description
+        without writing one. A method with policy worth recording overrides
+        this, calls ``super().describe()``, and returns a copy with its policy
+        merged into ``settings`` and its own ``norm_semantics``.
+
+        CALL THIS AFTER RESTORE. Settings are read from the live carrier, so
+        calling it before ``load_state_dict`` would describe the pre-restore
+        object and the description would disagree with the run.
+
+        Returns
+        -------
+        UpdateMethodDescription
+            Flat, JSON-safe description of the live method and carrier.
+        """
+
+        update_state = self.update_state()
+        if update_state is None:
+            # A stateless method delegates the carrier to the trainer, so
+            # there is no owned optimizer to read. Report that honestly
+            # rather than naming an optimizer this method does not own.
+            carrier_class = "none"
+            settings: dict[str, Any] = {}
+            n_parameters = 0
+            n_parameter_tensors = 0
+        else:
+            optimizer = update_state.optimizer
+            carrier_class = f"{type(optimizer).__module__}.{type(optimizer).__qualname__}"
+            settings = carrier_settings(optimizer)
+            layout = update_state.model_parameters.layout
+            assert layout is not None
+            n_parameters = int(layout.total_numel)
+            n_parameter_tensors = len(layout.slots)
+        request = self.forward_request()
+        forward_request = (
+            "value"
+            if request is None
+            else f"{type(request).__module__}.{type(request).__qualname__}"
+        )
+        return UpdateMethodDescription(
+            method_class=f"{type(self).__module__}.{type(self).__qualname__}",
+            carrier_class=carrier_class,
+            n_parameters=n_parameters,
+            n_parameter_tensors=n_parameter_tensors,
+            forward_request=forward_request,
+            norm_semantics=self.norm_semantics(),
+            settings=settings,
+        )
+
+    def norm_semantics(self) -> str:
+        """Return what this method's reported ``grad_norm`` actually measures.
+
+        The default is deliberately non-committal: a method that has not said
+        what its norm means must not have a specific meaning invented for it.
+        """
+
+        return "method_defined"
+
     def set_step_scopes(
         self,
         *,
@@ -907,7 +1335,21 @@ class LegacyAutogradUpdate(VMCUpdateMethod[AutogradUpdateInput]):
         objective = update_input.objective
         if not objective.requires_grad:
             if update_input.batch.n_electrons == 0:
-                return VMCUpdateResult(applied=False, grad_norm=0.0)
+                # THE VACUUM SKIP. A zero-electron batch has no sampled
+                # coordinate degree of freedom, so there is nothing to
+                # differentiate and declining is correct. The grad_norm of 0.0
+                # here is a REAL measurement -- no backward ran, so the
+                # gradient domain genuinely holds no gradient -- and it is an
+                # established compatibility field, so it keeps its value and
+                # its meaning. The reason field is what newly distinguishes
+                # this from the raise below; the two conditions were always
+                # distinct in behavior and are now distinct in the record.
+                return self._result(
+                    applied=False,
+                    grad_norm=0.0,
+                    reason=UPDATE_REASON_ZERO_ELECTRON_BATCH,
+                    step=update_input.step,
+                )
             raise RuntimeError(
                 "VMC loss is disconnected from model parameters for a "
                 "nonzero-electron batch"
@@ -921,7 +1363,54 @@ class LegacyAutogradUpdate(VMCUpdateMethod[AutogradUpdateInput]):
             )
         grad_norm = _gradient_norm(gradient_parameters)
         self._run_optimizer_step(update_input)
-        return VMCUpdateResult(applied=True, grad_norm=grad_norm)
+        return self._result(
+            applied=True,
+            grad_norm=grad_norm,
+            reason=UPDATE_REASON_APPLIED,
+            step=update_input.step,
+        )
+
+    def _result(
+        self,
+        *,
+        applied: bool,
+        grad_norm: float,
+        reason: str,
+        step: int,
+    ) -> VMCUpdateResult:
+        """Build this attempt's result with its explicit minimal record."""
+
+        return VMCUpdateResult(
+            applied=applied,
+            grad_norm=grad_norm,
+            reason=reason,
+            diagnostics=MinimalUpdateDiagnostics(
+                method=type(self).__qualname__,
+                applied=applied,
+                reason=reason,
+                step=step,
+                grad_norm=grad_norm,
+            ),
+        )
+
+    def norm_semantics(self) -> str:
+        """Report the legacy adapter's norm as the POST-CLIP gradient norm.
+
+        Stated precisely because the ordering is observable: the norm is taken
+        after ``clip_grad_norm_`` and before ``optimizer.step()``, so with
+        clipping configured it is bounded by ``gradient_clip_norm`` and is NOT
+        the norm of the raw backward gradient.
+        """
+
+        return "post_clip_grad_l2_over_gradient_domain"
+
+    def describe(self) -> UpdateMethodDescription:
+        """Add the adapter's clipping setting to the generic description."""
+
+        base = super().describe()
+        settings = dict(base.settings)
+        settings["gradient_clip_norm"] = json_safe_scalar(self.gradient_clip_norm)
+        return replace(base, settings=settings)
 
     def optimizer_params(self) -> tuple[torch.nn.Parameter, ...]:
         """Return the optimizer's direct parameter references in group order."""
@@ -1060,14 +1549,23 @@ def _gradient_norm(parameters: tuple[torch.nn.Parameter, ...]) -> float:
 __all__ = [
     "AutogradUpdateInput",
     "LegacyAutogradUpdate",
+    "MinimalUpdateDiagnostics",
     "ModelParameterBinding",
     "ObjectiveReevaluation",
     "ScoreUpdateInput",
+    "UPDATE_REASON_APPLIED",
+    "UPDATE_REASON_UNREPORTED",
+    "UPDATE_REASON_ZERO_ELECTRON_BATCH",
+    "UpdateDiagnostics",
+    "UpdateMethodDescription",
     "VMCStepData",
     "VMCUpdateMethod",
     "VMCUpdateResult",
     "VMCUpdateState",
+    "carrier_settings",
     "deserialize_parameter_layout",
+    "flatten_settings",
+    "json_safe_scalar",
     "select_reevaluation_rows",
     "serialize_parameter_layout",
     "vmc_objective_reevaluation",
