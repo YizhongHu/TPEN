@@ -276,7 +276,7 @@ def _validate_runner_topology_facts(
         return
     if isinstance(identity_value, Mapping):
         unsupported_identity = set(identity_value) - {"kind", "index", "uuid"}
-        if unsupported_identity:
+        if reject_unsupported and unsupported_identity:
             names = ", ".join(repr(key) for key in sorted(unsupported_identity, key=str))
             raise LaunchValidationError(
                 "unsupported topology.device_identity keys: " + names

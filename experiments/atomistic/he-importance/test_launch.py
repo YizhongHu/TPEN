@@ -329,6 +329,24 @@ def test_identity_rejects_unsupported_nested_keys(tmp_path: Path) -> None:
         launch.launch_train(cell, facts)
 
 
+def test_identity_unknown_keys_follow_runner_strictness_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path)
+    facts = launch.execution_topology_facts(_topology())
+    facts["device_identity"] = {
+        "kind": "cuda", "index": 0, "uuid": None, "caller_note": "keep"
+    }
+
+    # The config-only route is caller-open: nested unknown keys are admitted.
+    assert launch.launch_train(cell, facts, runner=lambda _: 0) == 0
+
+    # The TPEN crossing remains strict: the same nested unknown key is rejected.
+    runner = _install_default_runner_witness(monkeypatch, [])
+    with pytest.raises(launch.LaunchValidationError, match="caller_note"):
+        launch.launch_train(cell, facts, runner=runner)
+
+
 def test_explicit_topology_runner_receives_topology(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
 
@@ -340,6 +358,8 @@ def test_explicit_topology_runner_receives_topology(tmp_path: Path) -> None:
         return 0
 
     assert launch.launch_train(cell, _topology(), runner=wrapper) == 0
+    # Amendment `contract-amendment-injected-runner-mapping-2026-10-08`
+    # replaces the predecessor's typed `.host` assertion with the mapping contract.
     assert isinstance(received[0], dict) and received[0]["host"] == "test-host"
 
 
@@ -353,6 +373,8 @@ def test_kwargs_runner_receives_topology(tmp_path: Path) -> None:
         return 0
 
     assert launch.launch_train(cell, _topology(), runner=wrapper) == 0
+    # Amendment `contract-amendment-injected-runner-mapping-2026-10-08`
+    # replaces the predecessor's typed `.job_id` assertion with the mapping contract.
     assert isinstance(received[0], dict) and received[0]["job_id"] == "test-job"
 
 
@@ -631,12 +653,18 @@ def test_exit_code_rejects_unrelated_status_object() -> None:
         launch._exit_code(UnrelatedResult())
 
 
+def test_exit_code_rejects_unknown_runresult_status() -> None:
+    with pytest.raises(launch.LaunchValidationError, match="int or RunResult"):
+        launch._exit_code(RunResult(status="unknown"))
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
         ("global_size", 0, "global_size must be positive"),
         ("global_rank", "0", "global_rank must be an int"),
         ("global_rank", True, "global_rank must be an int"),
+        ("local_rank", 1, "local_rank must be in [0, 1)"),
     ],
 )
 def test_launch_rejects_invalid_topology_values_before_injected_runner(
