@@ -158,7 +158,7 @@ def test_launch_snapshots_duck_topology_for_manifest_and_runner(
 
 
 def test_launch_detaches_duck_nested_topology_before_validation_and_runner(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cell = _cell(tmp_path)
 
@@ -178,6 +178,15 @@ def test_launch_detaches_duck_nested_topology_before_validation_and_runner(
 
     topology = DuckTopology()
     received: list[object] = []
+    rebound_cells: list[object] = []
+    original_populate = launch.populate_execution_topology
+
+    def recording_populate(source: object, facts: object) -> object:
+        rebound = original_populate(source, facts)
+        rebound_cells.append(rebound)
+        return rebound
+
+    monkeypatch.setattr(launch, "populate_execution_topology", recording_populate)
 
     def recording_runner(config: object, *, topology: object) -> int:
         del config
@@ -188,7 +197,7 @@ def test_launch_detaches_duck_nested_topology_before_validation_and_runner(
     assert launch.launch_train(cell, topology, runner=recording_runner) == 0
     assert topology.host_reads == 1
     assert topology.live_host == {"name": "manifest-host"}
-    assert cell.manifest["topology"]["host"] == {"name": "manifest-host"}
+    assert rebound_cells[0].manifest["topology"]["host"] == {"name": "manifest-host"}
     assert received == [{"global_rank": 0, "global_size": 1, "local_rank": 0,
                          "local_size": 1, "node_rank": 0, "node_size": 1,
                          "host": {"name": "runner-snapshot"}, "pid": os.getpid(),
