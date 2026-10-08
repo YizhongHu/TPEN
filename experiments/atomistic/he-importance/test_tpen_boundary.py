@@ -841,7 +841,7 @@ def test_capability_inventory_count_diagnostic_removed() -> None:
     original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
     with tempfile.TemporaryDirectory() as temporary_root:
         root = Path(temporary_root)
-        (root / "launch.py").write_text(
+        (root / "run_stage_q.py").write_text(
             "\nfrom tpen.artifacts import RunResult\n", encoding="utf-8"
         )
         STUDY_DIR = root
@@ -858,8 +858,8 @@ def test_capability_inventory_count_diagnostic_removed() -> None:
             EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
     assert "actual=1" in message
     assert "expected=[2]" in message
-    assert "('launch.py', 22, 'tpen.accelerator')" in message
-    assert "('launch.py', 24, 'tpen.distributed')" in message
+    assert "('run_stage_q.py', 30, 'tpen.accelerator')" in message
+    assert "('run_stage_q.py', 31, 'tpen.distributed')" in message
     assert "reconcile" in message
 
 
