@@ -26,6 +26,9 @@ PENDING_516_SHA = "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
 # The second value is the four additional unsanctioned crossings introduced by
 # PR 516; keep both merge orders green until that PR lands.
 EXPECTED_UNSANCTIONED_COUNTS = {16, 20}
+PENDING_516_POLICY = (
+    "the control is deliberately 516-scoped; a new pending PR needs its own pin"
+)
 
 
 @dataclass(frozen=True)
@@ -154,11 +157,11 @@ def _dynamic_import_name(node: ast.Call) -> str | None:
     return None
 
 
-def _detect_crossings(source: str) -> tuple[Crossing, ...]:
+def _detect_crossings(source: str, *, filename: str = "<unknown>") -> tuple[Crossing, ...]:
     """Detect static imports and literal dynamic imports in *source*."""
 
     crossings: list[Crossing] = []
-    tree = ast.parse(source)
+    tree = ast.parse(source, filename=filename)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -203,7 +206,8 @@ def _scan_study() -> tuple[tuple[Path, ...], tuple[tuple[str, Crossing], ...]]:
         relative_path = path.relative_to(STUDY_DIR).as_posix()
         source = path.read_text(encoding="utf-8")
         all_crossings.extend(
-            (relative_path, crossing) for crossing in _detect_crossings(source)
+            (relative_path, crossing)
+            for crossing in _detect_crossings(source, filename=relative_path)
         )
 
     # These are controls, not optional diagnostics: an empty walk must fail
@@ -229,7 +233,11 @@ def _validate_inventory_admission(
     """Apply the three-part admission rule and report absent-file allowances."""
 
     undeclared = measured - set(declared)
-    assert not undeclared, f"undeclared tpen crossings: {sorted(undeclared)}"
+    assert not undeclared, (
+        f"undeclared tpen crossings: {sorted(undeclared)}; remove the import per "
+        "experiments/README.md or declare it with a disposition (rule (a)); if the "
+        "import merely shifted lines, update the stale sibling entry under rule (b)"
+    )
 
     admitted_pending: list[tuple[tuple[str, int, str], int, str | None]] = []
     for key, entry in declared.items():
@@ -237,7 +245,12 @@ def _validate_inventory_admission(
         if file_path.is_file():
             # pending_pr never excuses a stale entry for a file already in the
             # tree: an existing file must contain its declared crossing.
-            assert key in measured, f"declared crossing not measured: {key}"
+            assert key in measured, (
+                f"declared crossing not measured: {key}; if the import merely shifted "
+                "lines, update the stale sibling entry under rule (b); otherwise "
+                "remove the import per experiments/README.md or declare it with a "
+                "disposition (rule (a))"
+            )
             continue
 
         assert entry.pending_pr is not None, (
@@ -275,14 +288,26 @@ def _assert_pending_516_partition(
     declared_516 = {
         key for key, entry in declared.items() if entry.pending_pr == 516
     }
-    assert pending_keys | measured_keys == declared_516
-    assert not pending_keys & measured_keys
+    assert pending_keys | measured_keys == declared_516, (
+        f"pending_keys={sorted(pending_keys)}, measured_keys={sorted(measured_keys)}, "
+        f"declared_516={sorted(declared_516)}; {PENDING_516_POLICY}"
+    )
+    assert not pending_keys & measured_keys, (
+        f"pending_keys={sorted(pending_keys)} overlaps measured_keys="
+        f"{sorted(measured_keys)}; {PENDING_516_POLICY}"
+    )
 
     for key in declared_516:
         file_exists = (STUDY_DIR / key[0]).is_file()
-        assert (key in pending_keys) is (not file_exists)
+        assert (key in pending_keys) is (not file_exists), (
+            f"key={key}, pending_keys={sorted(pending_keys)}, file_exists={file_exists}; "
+            f"{PENDING_516_POLICY}"
+        )
         if key in pending_keys:
-            assert pending_by_key[key] == (516, PENDING_516_SHA)
+            assert pending_by_key[key] == (516, PENDING_516_SHA), (
+                f"key={key}, pending_by_key={pending_by_key[key]}, "
+                f"expected=(516, {PENDING_516_SHA!r}); {PENDING_516_POLICY}"
+            )
 
     return len(pending_keys), len(measured_keys)
 
@@ -311,7 +336,7 @@ def _assert_pending_516_partition(
 # irrelevant keyword rejection            -> test_capability_dynamic_rejects_non_name_keyword
 # dynamic argument iteration             -> test_capability_dynamic_argument_iteration
 # disk source reading                    -> test_capability_reads_source_from_disk
-# AST source parsing                     -> test_capability_ast_source_parsing
+# AST source parsing                     -> test_capability_ast_source_parsing / test_capability_ast_parse_diagnostic_names_relative_file
 # recursive *.py discovery               -> test_capability_recursive_python_file_discovery
 # *.py file filtering                    -> test_capability_python_file_filter
 # sanctioned runner carve-out            -> test_capability_sanctioned_runner_carveout
@@ -333,7 +358,9 @@ def _assert_pending_516_partition(
 # absent-file pending_pr requirement      -> test_capability_absent_without_pending_pr
 # pending metadata pinning                -> test_capability_pending_entry_rejects_mispinned_metadata
 # pending/measured partition             -> test_capability_pending_entry_partition
+# pending-516 diagnostic scope           -> test_capability_pending_516_partition_diagnostic_is_516_scoped
 # tpen prefix semantics                   -> test_capability_tpen_name_rejects_substring_matches
+# admission diagnostics                  -> test_capability_undeclared_measured_crossing / test_capability_existing_stale_entry
 
 
 def test_inventory_metadata_is_pinned_and_dated() -> None:
@@ -469,6 +496,24 @@ def test_capability_reads_source_from_disk() -> None:
 def test_capability_ast_source_parsing() -> None:
     crossings = _detect_crossings("import tpen.parsed\n")
     assert crossings[0].target == "tpen.parsed"
+
+
+def test_capability_ast_parse_diagnostic_names_relative_file() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "broken.py").write_text("if :\n", encoding="utf-8")
+        STUDY_DIR = root
+        try:
+            try:
+                _scan_study()
+            except SyntaxError as exc:
+                assert exc.filename == "broken.py"
+            else:
+                raise AssertionError("a syntax error must be reported by its relative file")
+        finally:
+            STUDY_DIR = original_study_dir
 
 
 def test_capability_recursive_python_file_discovery() -> None:
@@ -787,6 +832,24 @@ def test_capability_pending_entry_rejects_mispinned_metadata() -> None:
             STUDY_DIR = original_study_dir
 
 
+def test_capability_pending_516_partition_diagnostic_is_516_scoped() -> None:
+    key = ("future.py", 1, "tpen.future")
+    declared = {
+        key: InventoryEntry("future pending crossing", pending_pr=530, pending_sha="sha")
+    }
+    pending = _validate_inventory_admission(set(), declared)
+    try:
+        _assert_pending_516_partition(set(), declared, pending)
+    except AssertionError as exc:
+        message = str(exc)
+        assert "pending_keys" in message
+        assert "declared_516" in message
+        assert "516-scoped" in message
+        assert "new pending PR needs its own pin" in message
+    else:
+        raise AssertionError("a non-516 pending PR must not enter the 516 partition")
+
+
 def test_capability_absent_without_pending_pr() -> None:
     key = ("absent_no_pending.py", 1, "tpen.real")
     declared = {key: InventoryEntry("missing traceability metadata.")}
@@ -807,8 +870,11 @@ def test_capability_existing_stale_entry() -> None:
     }
     try:
         _validate_inventory_admission(set(), declared)
-    except AssertionError:
-        pass
+    except AssertionError as exc:
+        message = str(exc)
+        assert "declared crossing not measured" in message
+        assert "stale sibling entry under rule (b)" in message
+        assert "experiments/README.md" in message
     else:
         raise AssertionError("pending_pr must not excuse a stale entry for an existing file")
 
@@ -817,7 +883,11 @@ def test_capability_undeclared_measured_crossing() -> None:
     measured = {("existing.py", 1, "tpen.unlisted")}
     try:
         _validate_inventory_admission(measured, {})
-    except AssertionError:
-        pass
+    except AssertionError as exc:
+        message = str(exc)
+        assert "undeclared tpen crossings" in message
+        assert "remove the import per experiments/README.md" in message
+        assert "declare it with a disposition" in message
+        assert "stale sibling entry under rule (b)" in message
     else:
         raise AssertionError("every measured crossing must have a declared entry")
