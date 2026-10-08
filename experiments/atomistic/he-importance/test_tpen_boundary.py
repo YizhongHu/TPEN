@@ -132,6 +132,17 @@ EXPECTED_PUBLIC_INVENTORY_CALLERS = frozenset(
         "test_test_file_inventory_obeys_admission_rule",
     }
 )
+EXPECTED_DIRECT_ADMISSION_CONTROLS = frozenset(
+    {
+        "test_capability_absent_pending_entry",
+        "test_capability_absent_without_pending_pr",
+        "test_capability_existing_stale_entry",
+        "test_capability_pending_516_partition_diagnostic_is_516_scoped",
+        "test_capability_pending_entry_partition",
+        "test_capability_pending_entry_rejects_mispinned_metadata",
+        "test_capability_undeclared_measured_crossing",
+    }
+)
 
 
 def _is_tpen_name(name: str) -> bool:
@@ -298,15 +309,20 @@ def _inventory_keys(
     }
 
 
-def _public_inventory_caller_names() -> frozenset[str]:
-    """Return the module's public inventory callers by their shared shape."""
+def _inventory_admission_caller_names() -> frozenset[str]:
+    """Return module-level functions that directly call admission validation."""
 
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"), filename=__file__)
     return frozenset(
-        name
-        for name, value in globals().items()
-        if name.startswith("test_")
-        and name.endswith("_inventory_obeys_admission_rule")
-        and callable(value)
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_validate_inventory_admission"
+            for call in ast.walk(node)
+        )
     )
 
 
@@ -389,7 +405,7 @@ def _assert_pending_516_partition(
 # added crossing count diagnostic        -> test_capability_inventory_count_diagnostic_added
 # removed crossing count diagnostic      -> test_capability_inventory_count_diagnostic_removed
 # unchanged count reaches both public admission callers -> test_capability_inventory_count_diagnostic_line_shift
-# public inventory caller roster exactness -> test_capability_public_inventory_caller_roster
+# public inventory caller roster (structural accept/reject) -> test_capability_public_inventory_caller_roster
 # zero unsanctioned crossings allowed    -> test_capability_no_unsanctioned_crossings_allowed
 # literal dynamic target                 -> test_capability_dynamic_literal_string
 # nonliteral dynamic target rejection     -> test_capability_dynamic_rejects_nonliteral
@@ -888,7 +904,9 @@ def test_capability_inventory_count_diagnostic_line_shift() -> None:
 
 
 def test_capability_public_inventory_caller_roster() -> None:
-    assert _public_inventory_caller_names() == EXPECTED_PUBLIC_INVENTORY_CALLERS
+    declared = EXPECTED_PUBLIC_INVENTORY_CALLERS | EXPECTED_DIRECT_ADMISSION_CONTROLS
+    actual = _inventory_admission_caller_names()
+    assert actual == declared, f"actual={sorted(actual)}, declared={sorted(declared)}"
 
 
 def test_capability_dynamic_bare_import_module() -> None:
