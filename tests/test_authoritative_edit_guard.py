@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import importlib.util
 import json
 import os
@@ -14,6 +17,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator
+from unittest import mock
 
 MODULE_PATH = Path(__file__).parents[1] / "tools" / "check_authoritative_edit.py"
 SPEC = importlib.util.spec_from_file_location("check_authoritative_edit", MODULE_PATH)
@@ -102,6 +106,7 @@ def _api(
     item: dict | None = None,
     root_id: str = ROOT_ID,
     active_claim_ids: set[str] | None = None,
+    count_file: Path | None = None,
 ) -> Iterator[str]:
     payload = item or _item()
     if active_claim_ids is None:
@@ -109,6 +114,9 @@ def _api(
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
+            if count_file is not None:
+                previous = count_file.read_text() if count_file.exists() else ""
+                count_file.write_text(previous + "hit\n")
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == f"/api/v1/items/{ITEM_ID}" and parsed.query == "include=notes":
                 body = payload
@@ -157,6 +165,26 @@ def _api(
         server.shutdown()
         thread.join()
         server.server_close()
+
+
+@contextmanager
+def _fake_git_path() -> Iterator[tuple[Path, Path]]:
+    """Put an instrumented git wrapper first on PATH.
+
+    Yields
+    ------
+    tuple[pathlib.Path, pathlib.Path]
+        The temporary directory containing the wrapper and its log path.
+    """
+    with tempfile.TemporaryDirectory(prefix="guard-git-instrument-") as raw:
+        directory = Path(raw)
+        log = directory / "git.log"
+        real_git = shutil.which("git")
+        assert real_git
+        wrapper = directory / "git"
+        wrapper.write_text(f"#!/bin/sh\nprintf '%s\\n' git >> {log}\nexec {real_git} \"$@\"\n")
+        wrapper.chmod(0o755)
+        yield directory, log
 
 
 class AuthoritativeEditGuardTest(unittest.TestCase):
@@ -250,42 +278,202 @@ class AuthoritativeEditGuardTest(unittest.TestCase):
                 with self.assertRaisesRegex(GUARD.GuardFailure, "Task Orchestrator API"):
                     self.check(api_url)
 
-    def test_pre39_subprocess_refuses_and_current_interpreter_passes(self) -> None:
-        with _api() as api_url:
-            args = _guard_args(self.repo, api_url)
-            control = subprocess.run(
-                [sys.executable, str(MODULE_PATH), *args],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(control.returncode, 0, control.stderr)
-            self.assertEqual(json.loads(control.stdout)["status"], "ok")
+    def test_current_interpreter_passes_full_guard_and_reaches_instruments(self) -> None:
+        """Prove the supported-runtime control independently and completely.
 
-            interpreters, attempts = _pre39_interpreters()
-            if not interpreters:
-                self.skipTest("Arm A skipped; candidates tried: " + "; ".join(attempts))
-            for interpreter, version in interpreters:
-                with self.subTest(interpreter=str(interpreter), version=version):
-                    result = subprocess.run(
-                        [str(interpreter), str(MODULE_PATH), *args],
-                        check=False,
-                        capture_output=True,
-                        text=True,
-                    )
-                    self.assertEqual(result.returncode, 1)
-                    self.assertEqual(result.stdout, "")
-                    verdict = json.loads(result.stderr)
-                    self.assertEqual(verdict["status"], "blocked")
-                    self.assertIn("3.9", verdict["reason"])
-                    self.assertIn(version, verdict["reason"])
-                    self.assertIn(
-                        "uv run --no-project python tools/check_authoritative_edit.py",
-                        verdict["reason"],
-                    )
-                    self.assertNotIn("Traceback", result.stderr)
-                    self.assertNotIn("AttributeError", result.stderr)
-                    self.assertNotIn("removesuffix", result.stderr)
+        The control asserts the full success envelope and instruments both git
+        and the Task Orchestrator API. Keeping it separate from discovery means
+        an absent old interpreter cannot report this control as skipped.
+        """
+        with _fake_git_path() as (git_directory, git_log), tempfile.TemporaryDirectory() as raw:
+            api_log = Path(raw) / "api.log"
+            with _api(count_file=api_log) as api_url:
+                result = subprocess.run(
+                    [sys.executable, str(MODULE_PATH), *_guard_args(self.repo, api_url)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env={**os.environ, "PATH": f"{git_directory}:{os.environ['PATH']}"},
+                )
+                expected = {
+                    "status": "ok",
+                    "itemId": ITEM_ID,
+                    "projectRootId": ROOT_ID,
+                    "cwd": str(self.repo.resolve()),
+                    "branch": "codex/guard-test",
+                    "head": _run(self.repo, "git", "rev-parse", "HEAD"),
+                }
+                self.assertTrue(git_log.exists() and git_log.read_text())
+                self.assertTrue(api_log.exists() and api_log.read_text())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(json.loads(result.stdout), expected)
+
+    def test_pre39_subprocess_refuses_before_git_or_api(self) -> None:
+        """Exercise every CLI shape under a real pre-3.9 interpreter.
+
+        The skip is decided before any refusal assertions. Every subcase must
+        produce the same structured interpreter refusal and must avoid both
+        repository and API instruments.
+        """
+        interpreters, attempts = _pre39_interpreters()
+        if not interpreters:
+            self.skipTest(
+                "NOT EXERCISED: no real pre-3.9 interpreter; candidates tried: "
+                + "; ".join(attempts)
+            )
+
+        with tempfile.TemporaryDirectory() as raw:
+            api_log = Path(raw) / "api.log"
+            with _api(count_file=api_log) as api_url:
+                for interpreter, version in interpreters:
+                    with _fake_git_path() as (git_directory, git_log):
+                        cases = [
+                            ("valid", _guard_args(self.repo, api_url)),
+                            (
+                                "missing-item",
+                                [
+                                    "--cwd",
+                                    str(self.repo),
+                                    "--api-url",
+                                    api_url,
+                                    "--project-root-id",
+                                    ROOT_ID,
+                                ],
+                            ),
+                            ("unknown-option", ["--unknown"]),
+                            ("help", ["--help"]),
+                            (
+                                "nonexistent-cwd",
+                                ["--cwd", str(self.repo / "missing"), "--item", ITEM_ID],
+                            ),
+                            (
+                                "unsafe-api",
+                                ["--api-url", "http://example.com:3001", "--item", ITEM_ID],
+                            ),
+                        ]
+                        env = {**os.environ, "PATH": f"{git_directory}:{os.environ['PATH']}"}
+                        baseline_git = ""
+                        baseline_api = ""
+                        for name, args in cases:
+                            with self.subTest(interpreter=str(interpreter), version=version, case=name):
+                                result = subprocess.run(
+                                    [str(interpreter), str(MODULE_PATH), *args],
+                                    check=False,
+                                    capture_output=True,
+                                    text=True,
+                                    env=env,
+                                )
+                                self.assertEqual(result.returncode, 1, result.stderr)
+                                self.assertEqual(result.stdout, "")
+                                verdict = json.loads(result.stderr)
+                                self.assertEqual(set(verdict), {"status", "reason"})
+                                self.assertEqual(verdict["status"], "blocked")
+                                for expected in (
+                                    version,
+                                    "3.9+",
+                                    "no guard precondition was evaluated",
+                                    "uv run --no-project python tools/check_authoritative_edit.py",
+                                ):
+                                    self.assertIn(expected, verdict["reason"])
+                                for forbidden in ("Traceback", "AttributeError", "removesuffix"):
+                                    self.assertNotIn(forbidden, result.stderr)
+                                self.assertEqual(
+                                    git_log.read_text() if git_log.exists() else "", baseline_git
+                                )
+                                self.assertEqual(
+                                    api_log.read_text() if api_log.exists() else "", baseline_api
+                                )
+
+    def test_simulated_main_and_check_launch_gate_boundary(self) -> None:
+        """Pin gate placement at both entry points with simulated versions.
+
+        Notes
+        -----
+        These are injected version tuples, not executions under old Python
+        interpreters. Rejected versions must reach neither parser, repository
+        validation, cwd resolution, nor API work; accepted versions must reach
+        a downstream sentinel.
+        """
+        current_version = tuple(sys.version_info[:3])
+        for version in ((3, 7, 0), (3, 8, 20)):
+            with self.subTest(version=version), mock.patch.object(GUARD.sys, "version_info", version):
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    GUARD, "_parser", side_effect=AssertionError("parser reached")
+                ), mock.patch.object(
+                    GUARD, "_validated_api_url", side_effect=AssertionError("URL validation reached")
+                ), mock.patch.object(
+                    GUARD, "_validate_repository", side_effect=AssertionError("repository validation reached")
+                ), mock.patch.object(
+                    GUARD, "_validate_item", side_effect=AssertionError("API reached")
+                ), mock.patch.object(
+                    GUARD.Path, "resolve", side_effect=AssertionError("cwd resolution reached")
+                ):
+                    with contextlib.redirect_stderr(stderr):
+                        with self.assertRaises(SystemExit) as raised:
+                            GUARD.main(["--item", ITEM_ID])
+                self.assertEqual(raised.exception.code, 1)
+                verdict = json.loads(stderr.getvalue())
+                self.assertEqual(set(verdict), {"status", "reason"})
+                self.assertEqual(verdict["status"], "blocked")
+                with mock.patch.object(
+                    GUARD, "_validated_api_url", side_effect=AssertionError("URL validation reached")
+                ), mock.patch.object(
+                    GUARD, "_validate_repository", side_effect=AssertionError("repository validation reached")
+                ), mock.patch.object(
+                    GUARD, "_validate_item", side_effect=AssertionError("API reached")
+                ), mock.patch.object(
+                    GUARD.Path, "resolve", side_effect=AssertionError("cwd resolution reached")
+                ):
+                    with self.assertRaises(GUARD.UnsupportedInterpreter):
+                        GUARD.check_launch(Path("/never"), ITEM_ID, "http://127.0.0.1:3001", ROOT_ID)
+
+        for version in ((3, 9, 0), current_version):
+            with self.subTest(version=version), mock.patch.object(GUARD.sys, "version_info", version):
+                parser_seen = []
+                original_parser = GUARD._parser
+
+                def parser() -> argparse.ArgumentParser:
+                    parser_seen.append(True)
+                    return original_parser()
+
+                with mock.patch.object(GUARD, "_parser", side_effect=parser), mock.patch.object(
+                    GUARD, "check_launch", side_effect=GUARD.GuardFailure("main downstream sentinel")
+                ):
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaises(SystemExit):
+                            GUARD.main(["--item", ITEM_ID])
+                self.assertEqual(parser_seen, [True])
+                with mock.patch.object(
+                    GUARD, "_validated_api_url", side_effect=GUARD.GuardFailure("check downstream sentinel")
+                ):
+                    with self.assertRaisesRegex(GUARD.GuardFailure, "check downstream sentinel"):
+                        GUARD.check_launch(Path("/never"), ITEM_ID, "http://127.0.0.1:3001", ROOT_ID)
+
+    def test_empty_pre39_discovery_keeps_supported_control_green(self) -> None:
+        """Ensure an empty old-runtime census cannot skip the modern control.
+
+        The recording result is the forward regression guard for the split: one
+        supported-runtime test must report one success and no skip even when
+        pre-3.9 discovery is forced empty.
+        """
+        class RecordingResult(unittest.TestResult):
+            def __init__(self) -> None:
+                super().__init__()
+                self.successes = 0
+
+            def addSuccess(self, test: unittest.TestCase) -> None:
+                self.successes += 1
+                super().addSuccess(test)
+
+        control = self.__class__("test_current_interpreter_passes_full_guard_and_reaches_instruments")
+        result = RecordingResult()
+        with mock.patch.object(sys.modules[__name__], "_pre39_interpreters", return_value=([], ["forced empty discovery"])):
+            control.run(result)
+        self.assertEqual(result.testsRun, 1)
+        self.assertEqual(result.successes, 1)
+        self.assertEqual(result.skipped, [])
 
     def test_interpreter_gate_has_both_directions_at_boundary(self) -> None:
         with self.assertRaises(GUARD.UnsupportedInterpreter):
