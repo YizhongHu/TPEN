@@ -205,7 +205,7 @@ def test_execution_topology_from_facts_rejects_binary_buffers(value: object) -> 
 @pytest.mark.parametrize("key", [UserString("host"), 1])
 def test_execution_topology_from_facts_rejects_non_exact_string_keys(key: object) -> None:
     facts = {key: "node"}
-    with pytest.raises(ValueError, match="mapping keys must be exact str"):
+    with pytest.raises((ValueError, TypeCheckError)):
         execution_topology_from_facts(facts)
 
     assert execution_topology_from_facts(

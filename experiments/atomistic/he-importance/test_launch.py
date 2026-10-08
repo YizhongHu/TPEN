@@ -925,4 +925,6 @@ def test_populate_execution_topology_detaches_direct_public_input(tmp_path: Path
     )
     live[0] = "after"
 
-    assert rebound.manifest["topology"]["host"] == {"nested": [["before"]]}
+    assert dict(rebound.manifest["topology"]["host"]) == {
+        "nested": (("before",),)
+    }
