@@ -837,8 +837,12 @@ def test_capability_inventory_count_diagnostic_added() -> None:
 def test_capability_inventory_count_diagnostic_removed() -> None:
     global STUDY_DIR
     global EXPECTED_UNSANCTIONED_COUNTS
+    global EXPECTED_PRODUCTION_INVENTORY
+    global EXPECTED_TEST_INVENTORY
     original_study_dir = STUDY_DIR
     original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    original_production_inventory = EXPECTED_PRODUCTION_INVENTORY
+    original_test_inventory = EXPECTED_TEST_INVENTORY
     with tempfile.TemporaryDirectory() as temporary_root:
         root = Path(temporary_root)
         (root / "run_stage_q.py").write_text(
@@ -846,6 +850,15 @@ def test_capability_inventory_count_diagnostic_removed() -> None:
         )
         STUDY_DIR = root
         EXPECTED_UNSANCTIONED_COUNTS = {2}
+        EXPECTED_PRODUCTION_INVENTORY = {
+            ("run_stage_q.py", 30, "tpen.accelerator"): InventoryEntry(
+                "synthetic removed accelerator entry"
+            ),
+            ("run_stage_q.py", 31, "tpen.distributed"): InventoryEntry(
+                "synthetic removed distributed entry"
+            ),
+        }
+        EXPECTED_TEST_INVENTORY = {}
         try:
             try:
                 _scan_study()
@@ -856,6 +869,8 @@ def test_capability_inventory_count_diagnostic_removed() -> None:
         finally:
             STUDY_DIR = original_study_dir
             EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+            EXPECTED_PRODUCTION_INVENTORY = original_production_inventory
+            EXPECTED_TEST_INVENTORY = original_test_inventory
     assert "actual=1" in message
     assert "expected=[2]" in message
     assert "('run_stage_q.py', 30, 'tpen.accelerator')" in message

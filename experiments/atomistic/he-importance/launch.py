@@ -322,11 +322,16 @@ def _exit_code(result: object) -> int:
     """Normalize production and injected runner results to a process code."""
 
     if type(result) is not int:
-        status = getattr(result, "status", None)
-        if status == "completed":
-            return 0
-        if status == "failed":
-            return 1
+        result_type = type(result)
+        if (
+            result_type.__name__ == "RunResult"
+            and result_type.__module__ == "tpen.artifacts"
+        ):
+            status = getattr(result, "status", None)
+            if status == "completed":
+                return 0
+            if status == "failed":
+                return 1
         raise LaunchValidationError("runner must return an int or RunResult")
     return result
 
@@ -348,10 +353,9 @@ def launch_train(
     could ignore or mishandle a topology it accepts.
     """
 
-    plan = prepare_train_launch(source, topology)
-    facts = None
+    facts = execution_topology_facts(topology) if topology is not None else {}
+    plan = prepare_train_launch(source, facts)
     if topology is not None:
-        facts = execution_topology_facts(topology)
         # Topology is caller-open, so config-only runners retain extra facts.
         # Strict key rejection remains below when the mapping crosses into TPEN.
         _validate_runner_topology_facts(facts, reject_unsupported=False)

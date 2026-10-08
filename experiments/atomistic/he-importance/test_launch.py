@@ -112,6 +112,40 @@ def test_launch_populates_topology_under_designated_key(tmp_path: Path) -> None:
     assert launch.launch_train(cell, _topology(), runner=lambda _: 0) == 0
 
 
+def test_launch_snapshots_duck_topology_for_manifest_and_runner(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+
+    class ChangingTopology:
+        def __init__(self) -> None:
+            self.source = _topology()
+            self.host_reads = 0
+
+        @property
+        def host(self) -> str:
+            self.host_reads += 1
+            return "manifest-host" if self.host_reads == 1 else "runner-host"
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self.source, name)
+
+    topology = ChangingTopology()
+    received: list[object] = []
+
+    def recording_runner(config: object, *, topology: object) -> int:
+        del config
+        received.append(topology)
+        return 0
+
+    assert launch.launch_train(cell, topology, runner=recording_runner) == 0
+    assert topology.host_reads == 1
+    assert cell.manifest["topology"]["host"] == "manifest-host"
+    assert received == [{"global_rank": 0, "global_size": 1, "local_rank": 0,
+                         "local_size": 1, "node_rank": 0, "node_size": 1,
+                         "host": "manifest-host", "pid": os.getpid(),
+                         "device": "cuda:0", "job_id": "test-job",
+                         "device_identity": None}]
+
+
 def test_launch_refuses_missing_or_empty_topology(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
 
@@ -645,12 +679,16 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
     assert context.metadata.status == "failed"
 
 
-def test_exit_code_rejects_unrelated_status_object() -> None:
+@pytest.mark.parametrize("status", ["completed", "not-a-run-result"])
+def test_exit_code_rejects_unrelated_status_object(status: str) -> None:
     class UnrelatedResult:
-        status = "not-a-run-result"
+        pass
+
+    result = UnrelatedResult()
+    result.status = status
 
     with pytest.raises(launch.LaunchValidationError, match="int or RunResult"):
-        launch._exit_code(UnrelatedResult())
+        launch._exit_code(result)
 
 
 def test_exit_code_rejects_unknown_runresult_status() -> None:
