@@ -368,7 +368,7 @@ def _assert_pending_516_partition(
 # unsanctioned filter partition (including keyword form) -> test_capability_unsanctioned_filter_partition
 # added crossing count diagnostic        -> test_capability_inventory_count_diagnostic_added
 # removed crossing count diagnostic      -> test_capability_inventory_count_diagnostic_removed
-# unchanged count reaches admission      -> test_capability_inventory_count_diagnostic_line_shift
+# unchanged count reaches public admission -> test_capability_inventory_count_diagnostic_line_shift
 # zero unsanctioned crossings allowed    -> test_capability_no_unsanctioned_crossings_allowed
 # literal dynamic target                 -> test_capability_dynamic_literal_string
 # nonliteral dynamic target rejection     -> test_capability_dynamic_rejects_nonliteral
@@ -377,7 +377,8 @@ def _assert_pending_516_partition(
 # absent-file pending admission           -> test_capability_absent_pending_entry
 # absent-file pending_pr requirement      -> test_capability_absent_without_pending_pr
 # pending metadata pinning                -> test_capability_pending_entry_rejects_mispinned_metadata
-# pending/measured partition             -> test_capability_pending_entry_partition
+# pending/measured partition (accept)    -> test_capability_pending_entry_partition
+# pending/measured partition (reject)    -> test_capability_pending_entry_partition_rejects_gaps_and_overlap
 # pending-516 diagnostic scope           -> test_capability_pending_516_partition_diagnostic_is_516_scoped
 # tpen prefix semantics                   -> test_capability_tpen_name_rejects_substring_matches
 # admission diagnostics                  -> test_capability_undeclared_measured_crossing / test_capability_existing_stale_entry
@@ -429,6 +430,7 @@ def test_capability_tpen_name_rejects_substring_matches() -> None:
     assert _is_tpen_name("tpen.anything")
     assert not _is_tpen_name("mytpen")
     assert not _is_tpen_name("other.tpen")
+    assert not _is_tpen_name("tpenlike")
 
 
 def test_capability_class_body_static_import() -> None:
@@ -829,10 +831,8 @@ def test_capability_inventory_count_diagnostic_line_shift() -> None:
         STUDY_DIR = root
         EXPECTED_UNSANCTIONED_COUNTS = {3}
         try:
-            _, crossings = _scan_study()
-            measured = _inventory_keys(crossings, tests=False)
             try:
-                _validate_inventory_admission(measured, EXPECTED_PRODUCTION_INVENTORY)
+                test_production_inventory_obeys_admission_rule()
             except AssertionError as error:
                 message = str(error)
             else:
