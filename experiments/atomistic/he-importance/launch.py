@@ -126,7 +126,7 @@ def _source_cell(source: Any) -> Any:
 def execution_topology_facts(topology: object) -> dict[str, Any]:
     """Serialize launcher facts into the manifest topology boundary."""
 
-    if isinstance(topology, Buffer):
+    if isinstance(topology, Buffer) or hasattr(type(topology), "__buffer__"):
         raise LaunchValidationError(
             f"binary buffer refused: {type(topology).__name__}"
         )
@@ -303,7 +303,7 @@ def _detach_topology_facts(value: Any) -> Any:
 
     if value is None or type(value) in (str, int, float, bool):
         return value
-    if isinstance(value, Buffer):
+    if isinstance(value, Buffer) or hasattr(type(value), "__buffer__"):
         raise LaunchValidationError(f"binary buffer refused: {type(value).__name__}")
     if isinstance(value, Mapping):
         copied: dict[str, Any] = {}
