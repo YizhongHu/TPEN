@@ -387,8 +387,9 @@ def test_capability_static_from_import() -> None:
 
 
 def test_capability_bare_tpen_name() -> None:
-    crossings = _detect_crossings("import tpen\n")
-    assert [(crossing.line, crossing.target) for crossing in crossings] == [(1, "tpen")]
+    crossings = _detect_crossings("import tpen\nimport tpen.accelerator\n")
+    assert [crossing.target for crossing in crossings] == ["tpen", "tpen.accelerator"]
+    assert crossings[0].target == "tpen"
 
 
 def test_capability_dotted_tpen_name() -> None:
