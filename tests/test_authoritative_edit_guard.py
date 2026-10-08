@@ -216,12 +216,14 @@ class AuthoritativeEditGuardTest(unittest.TestCase):
 
     def test_allows_clean_agent_branch_with_live_work_claim(self) -> None:
         (self.repo / "untracked-research-data").write_text("preserve me\n")
+        expected_head = _run(self.repo, "git", "rev-parse", "HEAD")
         with _api() as api_url:
             receipt = self.check(api_url)
         self.assertEqual(receipt["status"], "ok")
         self.assertEqual(receipt["itemId"], ITEM_ID)
         self.assertEqual(receipt["branch"], "codex/guard-test")
-        self.assertEqual(receipt["head"], _run(self.repo, "git", "rev-parse", "HEAD"))
+        self.assertEqual(receipt["head"], expected_head)
+        self.assertEqual(_run(self.repo, "git", "rev-parse", "HEAD"), expected_head)
 
     def test_rejects_non_agent_branch(self) -> None:
         _run(self.repo, "git", "branch", "-m", "dev")
@@ -287,6 +289,7 @@ class AuthoritativeEditGuardTest(unittest.TestCase):
         """
         with _fake_git_path() as (git_directory, git_log), tempfile.TemporaryDirectory() as raw:
             api_log = Path(raw) / "api.log"
+            expected_head = _run(self.repo, "git", "rev-parse", "HEAD")
             with _api(count_file=api_log) as api_url:
                 result = subprocess.run(
                     [sys.executable, str(MODULE_PATH), *_guard_args(self.repo, api_url)],
@@ -301,13 +304,14 @@ class AuthoritativeEditGuardTest(unittest.TestCase):
                     "projectRootId": ROOT_ID,
                     "cwd": str(self.repo.resolve()),
                     "branch": "codex/guard-test",
-                    "head": _run(self.repo, "git", "rev-parse", "HEAD"),
+                    "head": expected_head,
                 }
                 self.assertTrue(git_log.exists() and git_log.read_text())
                 self.assertTrue(api_log.exists() and api_log.read_text())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(json.loads(result.stdout), expected)
+        self.assertEqual(_run(self.repo, "git", "rev-parse", "HEAD"), expected_head)
 
     def test_pre39_subprocess_refuses_before_git_or_api(self) -> None:
         """Exercise every CLI shape under a real pre-3.9 interpreter.
