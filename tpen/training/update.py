@@ -1138,9 +1138,14 @@ def carrier_settings(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
     arbitrary strings, so a group-0 key named ``betas1`` still lands on the
     name produced by splitting a ``betas`` pair. Rather than letting the later
     write win -- which is how a description comes to report a value nobody set
-    -- the FIRST value is kept and every collided name is listed under
-    ``setting_name_collisions``. A reader then sees that the map is incomplete
-    instead of trusting a silently overwritten entry.
+    -- the FIRST value is kept and every collided name is listed under the key
+    :data:`SETTING_NAME_COLLISIONS_KEY`. A reader then sees that the map is
+    incomplete instead of trusting a silently overwritten entry.
+
+    THE KEY IS NAMED BY ITS CONSTANT rather than spelled out, because the
+    literal changed once already: it is now ``"%collisions"``, chosen so no
+    encoded user key can spell it. A docstring repeating a stale literal sends
+    a consumer to look up a key that is never emitted.
 
     Parameters
     ----------
@@ -1220,7 +1225,7 @@ def flatten_settings(settings: Mapping[Any, Any], *, prefix: str = "") -> dict[s
     -------
     dict
         Flat mapping whose values are all :func:`json_safe_scalar` outputs. Any
-        collided name is reported under ``setting_name_collisions``.
+        collided name is reported under :data:`SETTING_NAME_COLLISIONS_KEY`.
     """
 
     flat: dict[str, Any] = {}
@@ -1354,12 +1359,15 @@ class UpdateMethodDescription:
     # KEYS ARE `Any`, NOT `str`, AND THAT IS LOAD-BEARING. typeguard enforces
     # these annotations at runtime in this repository, so `Mapping[str, Any]`
     # did not merely document an expectation -- it REJECTED non-string keys at
-    # the boundary. That contradicted the collision machinery below it:
-    # `json_safe_metric_name` is injective over STRINGS, so a collision can
-    # only arise from a non-string key being coerced by `str()`. A narrow
-    # annotation therefore made the very path the collision detection exists
-    # to handle unreachable, leaving that detection as dead code guarding a
-    # case the type system had already excluded.
+    # the boundary, making one whole class of collision input unreachable and
+    # leaving the detection below it guarding a case the type system had
+    # already excluded.
+    #
+    # NON-STRING KEYS ARE NOT THE ONLY COLLISION SOURCE. An earlier version of
+    # this comment said they were, which was wrong: joining nested names with
+    # `_` also lets `{"a_b": 1}` and `{"a": {"b": 2}}` collide using ordinary
+    # strings. Encoder injectivity constrains a single encoded part, not a name
+    # ASSEMBLED from several of them.
     settings: Mapping[Any, Any] = field(default_factory=dict)
 
     def as_metrics(self, *, prefix: str = "update_method") -> dict[str, Any]:
