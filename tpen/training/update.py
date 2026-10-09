@@ -684,14 +684,22 @@ def json_safe_scalar(value: Any) -> Any:
             return "-inf"
         return numeric
     text = str(value)
-    # UNQUOTED CSV ROWS IMPOSE TWO SEPARATE CONSTRAINTS, and the second is the
-    # more damaging one. The sink writes `f"{step},{ns},{key},{value}\n"`:
+    # UNQUOTED CSV ROWS IMPOSE THREE SEPARATE CONSTRAINTS. The sink writes
+    # `f"{step},{ns},{key},{value}\n"` with no quoting and no escaping:
     #   - a COMMA creates a phantom column, and the file still parses;
     #   - a NEWLINE or CARRIAGE RETURN TERMINATES THE ROW, turning the
-    #     remainder of the value into a bogus record.
-    # An earlier version of this helper guarded only the comma, which left the
-    # worse half of the same failure open.
-    for hostile, replacement in ((",", ";"), ("\r", " "), ("\n", " ")):
+    #     remainder of the value into a bogus record;
+    #   - a DOUBLE QUOTE is the csv module's quotechar, so a value containing
+    #     one makes a STRICT READER fail with "unexpected end of data" when it
+    #     looks for a closing quote that never comes. The file is then not
+    #     merely wrong, it is unreadable from that row on.
+    # This guard was built up one reported symptom at a time -- first the
+    # comma, then the newline, then the quote -- which is exactly how a guard
+    # ends up covering less than its name promises. The test for it reads a
+    # row back with a STRICT csv reader rather than splitting on commas, so a
+    # future hostile character fails the reader instead of passing a
+    # hand-rolled check.
+    for hostile, replacement in ((",", ";"), ("\r", " "), ("\n", " "), ('"', "'")):
         text = text.replace(hostile, replacement)
     return text
 

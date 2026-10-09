@@ -133,21 +133,34 @@ class SPRINGTelemetry(UpdateDiagnostics):
     diagnostics: SolveDiagnostics | None = None
 
     def as_metrics(self, *, prefix: str = "spring") -> dict[str, Any]:
-        """Return JSON-safe telemetry keys for a training metrics record."""
+        """Return JSON-safe telemetry keys for a training metrics record.
+
+        EVERY FLOAT HERE ROUTES THROUGH `json_safe_scalar`, and that is
+        load-bearing rather than defensive. This method predates the explicit
+        result contract and used a bare ``float()``, which meant a NON-FINITE
+        norm reached ``tpen.logging.jsonl`` -- which calls
+        ``json.dumps(..., allow_nan=False)`` and RAISES.
+
+        This path is the one most likely to produce such a value, not the
+        least: a non-finite direction is an EXPECTED outcome here, with its own
+        skip reason, so the record written to explain the bad step was the
+        record that crashed the run writing it. A finite value passes through
+        unchanged, so no existing record changes meaning.
+        """
 
         metrics: dict[str, Any] = {
             f"{prefix}_applied": bool(self.applied),
-            f"{prefix}_reason": self.reason,
+            f"{prefix}_reason": json_safe_scalar(self.reason),
             f"{prefix}_step": int(self.step),
             f"{prefix}_samples": int(self.n_samples),
             f"{prefix}_finite_samples": int(self.n_finite_samples),
             f"{prefix}_parameters": int(self.n_parameters),
-            f"{prefix}_energy_gradient_norm": float(self.energy_gradient_norm),
-            f"{prefix}_update_direction_norm": float(self.update_direction_norm),
-            f"{prefix}_applied_update_norm": float(self.applied_update_norm),
-            f"{prefix}_trust_scale": float(self.trust_scale),
-            f"{prefix}_history_norm": float(self.history_norm),
-            f"{prefix}_history_decay": float(self.history_decay),
+            f"{prefix}_energy_gradient_norm": json_safe_scalar(self.energy_gradient_norm),
+            f"{prefix}_update_direction_norm": json_safe_scalar(self.update_direction_norm),
+            f"{prefix}_applied_update_norm": json_safe_scalar(self.applied_update_norm),
+            f"{prefix}_trust_scale": json_safe_scalar(self.trust_scale),
+            f"{prefix}_history_norm": json_safe_scalar(self.history_norm),
+            f"{prefix}_history_decay": json_safe_scalar(self.history_decay),
             f"{prefix}_history_advanced": bool(self.history_advanced),
         }
         if self.diagnostics is not None:

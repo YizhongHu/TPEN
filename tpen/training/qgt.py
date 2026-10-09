@@ -61,6 +61,7 @@ from typing import Any, Self
 
 from tpen.dependencies import require_torch
 from tpen.training.score_geometry import ScoreGeometry
+from tpen.training.update import json_safe_scalar
 from tpen.training.statistics import IdentityStatisticsReducer, StatisticsReducer
 
 torch = require_torch(feature="VMC quantum geometric tensor")
@@ -192,19 +193,35 @@ class SolveDiagnostics:
 
         return self.n_modes - self.retained_modes
 
-    def as_metrics(self, *, prefix: str = "qgt") -> dict[str, float | int | str]:
-        """Return JSON-safe telemetry keys for a training metrics record."""
+    def as_metrics(self, *, prefix: str = "qgt") -> dict[str, Any]:
+        """Return JSON-safe telemetry keys for a training metrics record.
+
+        The docstring's "JSON-safe" claim used to be FALSE for exactly the
+        solves worth recording. These values come out of an eigendecomposition
+        of a regularized QGT: an ill-conditioned or overflowing solve can make
+        ``trace``, ``max_eigenvalue`` or ``shift`` non-finite, and a bare
+        ``float()`` passed that straight to the JSONL sink, which calls
+        ``json.dumps(..., allow_nan=False)`` and RAISES. A diagnostic recorded
+        to explain a bad solve therefore killed the run that produced it.
+
+        Routing through :func:`~tpen.training.update.json_safe_scalar` makes a
+        finite value pass through unchanged -- so no existing record changes --
+        while a non-finite one is NAMED rather than crashing the sink or being
+        fabricated into a zero.
+        """
 
         return {
-            f"{prefix}_space": self.space,
-            f"{prefix}_shift": float(self.shift),
-            f"{prefix}_trace": float(self.trace),
+            f"{prefix}_space": json_safe_scalar(self.space),
+            f"{prefix}_shift": json_safe_scalar(self.shift),
+            f"{prefix}_trace": json_safe_scalar(self.trace),
             f"{prefix}_modes": int(self.n_modes),
             f"{prefix}_retained_modes": int(self.retained_modes),
             f"{prefix}_truncated_modes": int(self.truncated_modes),
-            f"{prefix}_max_eigenvalue": float(self.max_eigenvalue),
-            f"{prefix}_min_retained_eigenvalue": float(self.min_retained_eigenvalue),
-            f"{prefix}_dtype": str(self.dtype),
+            f"{prefix}_max_eigenvalue": json_safe_scalar(self.max_eigenvalue),
+            f"{prefix}_min_retained_eigenvalue": json_safe_scalar(
+                self.min_retained_eigenvalue
+            ),
+            f"{prefix}_dtype": json_safe_scalar(str(self.dtype)),
         }
 
 
