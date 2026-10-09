@@ -390,6 +390,7 @@ def test_r1_5_a_trainer_with_a_foreign_resolve_contract_keeps_the_runner_path(
     """
 
     seen = {}
+    built = {}
 
     class _ForeignTrainer:
         """Implements the duck-typed runner contract and nothing else."""
@@ -406,6 +407,15 @@ def test_r1_5_a_trainer_with_a_foreign_resolve_contract_keeps_the_runner_path(
             seen["optimizer"] = optimizer
             return None
 
+    def build_adam(params):
+        # Capture the instance, so the assertion below can pin IDENTITY rather
+        # than type. Strengthened after reviewer round 2 (R2-4): an `isinstance`
+        # check passes for ANY Adam, including one the runner did not build,
+        # so it could not distinguish "the runner kept its own carrier" from
+        # "something else supplied a different Adam".
+        built["optimizer"] = torch.optim.Adam(params, lr=LEARNING_RATE)
+        return built["optimizer"]
+
     context = make_run_context(tmp_path / "foreign-run")
     torch.manual_seed(0)
 
@@ -413,12 +423,12 @@ def test_r1_5_a_trainer_with_a_foreign_resolve_contract_keeps_the_runner_path(
         model=build_tiny_spenn(),
         sampler=_FixedSampler(),
         hamiltonian_terms=build_tiny_hamiltonian_terms(),
-        optimizer=lambda params: torch.optim.Adam(params, lr=LEARNING_RATE),
+        optimizer=build_adam,
         trainer=_ForeignTrainer(),
     ).run(context)
 
     assert result.status == "completed"
-    assert isinstance(seen["optimizer"], torch.optim.Adam), (
-        "the runner must fall back to the optimizer it built when the trainer's "
+    assert seen["optimizer"] is built["optimizer"], (
+        "the runner must hand `fit` the optimizer it built when the trainer's "
         "resolve contract returns something without a carrier"
     )
