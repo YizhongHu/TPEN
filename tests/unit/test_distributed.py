@@ -367,6 +367,24 @@ def test_converter_copies_metaclass_spoofed_mapping_values() -> None:
     assert topology.host["name"] == "before"
 
 
+def test_distributed_buffer_detection_reads_the_real_mro_descriptor() -> None:
+    class MroHidingMeta(type):
+        @property
+        def __mro__(cls) -> tuple[type, ...]:
+            del cls
+            return (object,)
+
+    class HiddenBuffer(dict[str, object], metaclass=MroHidingMeta):
+        def __buffer__(self, flags: int) -> memoryview:
+            del flags
+            return memoryview(b"payload")
+
+    value = HiddenBuffer(name="node")
+    assert memoryview(value).tobytes() == b"payload"
+    with pytest.raises(ValueError, match="binary buffer refused"):
+        distributed._detach_topology_facts(value)
+
+
 class _StringKey(str):
     pass
 

@@ -803,9 +803,28 @@ class _FlipMapping(dict[str, object]):
 
 
 def test_populate_validates_the_frozen_manifest_across_flip_schedules(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clean = _cell(tmp_path)
+    events: list[str] = []
+    original_with = launch._STAGE_API.with_execution_topology
+    original_reject = launch._reject_execution_facts_outside_topology
+
+    def recording_with(cell: object, topology: Mapping[str, object]) -> object:
+        events.append("freeze")
+        bound = original_with(cell, topology)
+        if isinstance(cell.manifest, dict):
+            identity = cell.manifest["scientific_identity"]
+            if isinstance(identity, dict):
+                identity["post_freeze_marker"] = True
+        return bound
+
+    def recording_reject(manifest: Mapping[str, object]) -> None:
+        events.append("reject")
+        original_reject(manifest)
+
+    monkeypatch.setattr(launch._STAGE_API, "with_execution_topology", recording_with)
+    monkeypatch.setattr(launch, "_reject_execution_facts_outside_topology", recording_reject)
     for flip_after in range(0, 8):
         scientific_identity = _FlipMapping(
             dict(clean.manifest["scientific_identity"]), flip_after
@@ -817,7 +836,9 @@ def test_populate_validates_the_frozen_manifest_across_flip_schedules(
             bound = launch.populate_execution_topology(candidate, {"host": "node"})
         except launch.LaunchValidationError:
             continue
+        assert events[-2:] == ["freeze", "reject"]
         assert "global_rank" not in bound.manifest["scientific_identity"]
+        assert "post_freeze_marker" not in bound.manifest["scientific_identity"]
 
     ordinary = launch.populate_execution_topology(clean, {"host": "node"})
     assert ordinary.manifest["topology"]["host"] == "node"
