@@ -1063,8 +1063,11 @@ def test_carrier_metadata_cannot_overwrite_the_authoritative_identity() -> None:
     assert metrics["update_method_layout_fingerprint"] != "not-the-real-layout"
     # The hostile values are still REPORTED, just under a namespace that
     # cannot impersonate identity -- suppressing them would hide real state.
-    assert metrics["update_method_setting_class"] == "misleading-run-label"
-    assert metrics["update_method_setting_n_parameters"] == 999
+    # Note the DOUBLE namespacing: `{prefix}_setting_` separates settings from
+    # identity, and `g0_` separates group 0 from every other group. Both are
+    # load-bearing and both appear in the final name.
+    assert metrics["update_method_setting_g0_class"] == "misleading-run-label"
+    assert metrics["update_method_setting_g0_n_parameters"] == 999
 
 
 def test_no_setting_key_can_ever_reach_an_authoritative_name() -> None:
