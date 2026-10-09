@@ -1201,10 +1201,15 @@ def flatten_settings(settings: Mapping[Any, Any], *, prefix: str = "") -> dict[s
     was already here; what was missing was detection, so two keys that encoded
     to one name silently lost an entry. (An earlier note of mine said this
     function had neither -- that was wrong, and is corrected here: the
-    ``json_safe_metric_name`` call predates this change.) The gap was invisible
-    because every built-in policy fingerprint happens to use ordinary string
-    keys, so the guarantee held by accident of its callers rather than by
-    construction.
+    ``json_safe_metric_name`` call predates this change.)
+
+    THE GAP WAS INVISIBLE FOR A NARROWER REASON THAN I FIRST WROTE. I said it
+    was because built-in policy fingerprints use ordinary STRING keys. String
+    keys are not sufficient -- ``{"a_b": 1}`` and ``{"a": {"b": 2}}`` collide
+    while being perfectly ordinary strings. The actual reason is that the
+    built-in fingerprints happen to produce NON-COLLIDING FLATTENED NAMES. The
+    guarantee held by accident of those particular names, not by anything the
+    key type guarantees.
 
     KEYS MAY BE NON-STRING. The annotation is deliberately ``Mapping[Any,
     Any]``: typeguard enforces annotations at runtime here, so a ``str`` key

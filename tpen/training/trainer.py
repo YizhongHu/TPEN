@@ -698,8 +698,15 @@ class VMCTrainer:
                         # name-safety property held for the implementations
                         # this package happens to ship rather than for the
                         # contract. Encoding here makes it hold for any
-                        # implementation; for the built-ins the encoding is
-                        # idempotent and changes nothing.
+                        # implementation.
+                        #
+                        # FOR THE BUILT-INS THIS CHANGES NOTHING, because their
+                        # names are ordinary and encode to themselves. That is
+                        # NOT the same as the encoder being idempotent, which
+                        # an earlier version of this comment claimed: a second
+                        # pass escapes `%` again, turning `%25` into `%2525`.
+                        # The guarantee is about these particular names, not
+                        # about repeated application.
                         diagnostic_collisions = merge_named_metrics(
                             metrics, update_diagnostics.as_metrics()
                         )
