@@ -84,7 +84,7 @@ def _compose_base_config() -> DictConfig:
         return compose(config_name=_CONFIG_PATH.stem)
 
 
-def _cell_from_source(source: Any) -> Any:
+def _cell_from_source(source: Any) -> tuple[Any, str]:
     """Extract a materialized cell from a cell or a training packet."""
 
     cell = getattr(source, "cell", source)
@@ -93,7 +93,10 @@ def _cell_from_source(source: Any) -> Any:
         raise TrainConfigResolutionError(
             "source must be a MaterializedCell or TrainingPacket with a complete cell"
         )
-    return cell
+    content_hash = cell.content_hash
+    if type(content_hash) is not str:
+        raise TrainConfigResolutionError("source content_hash must be an exact str")
+    return cell, content_hash
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -223,11 +226,14 @@ def resolve_train_config(source: Any) -> DictConfig:
         If the composed configuration fails the HI schema firewall.
     """
 
-    cell = _cell_from_source(source)
+    cell, source_hash = _cell_from_source(source)
     stage_api = _stage_api()
-    manifest = _mapping(cell.manifest, "cell.manifest")
+    # Own one frozen manifest before any resolver consumer can read it again.
+    # Validation, hashing, and config composition then use identical bytes.
+    source_manifest = _mapping(cell.manifest, "cell.manifest")
+    manifest = stage_api._freeze(stage_api._thaw(source_manifest))
     stage_api.validate_materialized_manifest(manifest)
-    if stage_api.content_hash(manifest) != cell.content_hash:
+    if stage_api.content_hash(manifest) != source_hash:
         raise TrainConfigResolutionError("cell content hash does not bind its manifest")
 
     stage = stage_api.stage_definition(manifest["stage"])
@@ -246,7 +252,7 @@ def resolve_train_config(source: Any) -> DictConfig:
     cfg = _compose_base_config()
     OmegaConf.update(cfg, "trainer.max_steps", stage.updates, merge=False)
     OmegaConf.update(cfg, "run.root", str(output_path.parent.parent), merge=False)
-    OmegaConf.update(cfg, "run.run_id", str(cell.content_hash), merge=False)
+    OmegaConf.update(cfg, "run.run_id", source_hash, merge=False)
     OmegaConf.update(cfg, "run.layout", "flat", merge=False, force_add=True)
     OmegaConf.update(cfg, "run.dir", str(output_path), merge=False)
     OmegaConf.update(cfg, "runtime.seed", model_seed, merge=False)

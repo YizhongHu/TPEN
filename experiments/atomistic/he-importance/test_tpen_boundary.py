@@ -1174,15 +1174,15 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
         ("distributed.py", "__post_init__", "self.scope in (ProfileScope.NODE, ProfileScope.JOB)"):
             "scope is an owned enum field and the tuple contains module-owned enum members",
         ("distributed.py", "write", "record.topology != self.topology"):
-            "both operands are owned typed topology records after conversion",
+            "this telemetry comparison is reached with typed ExecutionTopology records from the converter; write itself performs no conversion or type admission",
         ("stage_coordinate.py", "_is_manifest_root", 'value.get("schema") in {TRAIN_MANIFEST_SCHEMA, EVALUATION_MANIFEST_SCHEMA}'):
             "the mapping is the validated manifest shape and the membership set contains module-owned schema literals",
         ("stage_coordinate.py", "_is_manifest_root", "TOPOLOGY_KEY in value"):
             "the mapping is the validated manifest shape and TOPOLOGY_KEY is a module-owned literal",
         ("stage_coordinate.py", "with_execution_topology", "content_hash(source_manifest) != source_hash"):
-            "this is the stage-owned hash binding check; launcher admission owns the caller-facing hash precondition",
+            "the resolver's exact-str admission and owned-carrier re-bind are the terminal guards for launcher routes; direct stage callers remain outside this launch contract",
         ("stage_coordinate.py", "with_execution_topology", "content_hash(manifest) != source_hash"):
-            "manifest is freshly thawed from the validated stage row and source_hash is the stage-cell precondition",
+            "the resolver's exact-str admission and owned-carrier re-bind are the terminal guards for launcher routes; direct stage callers remain outside this launch contract",
         ("stage_coordinate.py", "_project_identity", "key == TOPOLOGY_KEY"):
             "key is a validated manifest key and TOPOLOGY_KEY is a module-owned literal",
         ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["stage"] != manifest["stage"]'):
@@ -1213,8 +1213,8 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             "status is read from the validated scientific-identity mapping and compared with module literals",
         ("train_config.py", "_optimizer_entry", 'status != "available"'):
             "status is read from the validated scientific-identity mapping and compared with a module literal",
-        ("train_config.py", "resolve_train_config", "stage_api.content_hash(manifest) != cell.content_hash"):
-            "this is the resolver's predecessor hash binding check; launcher entry admission owns exact hash identity",
+        ("train_config.py", "resolve_train_config", "stage_api.content_hash(manifest) != source_hash"):
+            "resolve_train_config's own _cell_from_source admission requires an exact-str hash on every direct and wrapped resolver route",
         ("train_config.py", "resolve_train_config", "output_path.parent.parent == output_path"):
             "output_path is freshly converted to an owned Path before this structural sanity check",
     }
