@@ -1315,7 +1315,17 @@ def test_exact_string_admissions_return_the_values_they_admit() -> None:
         "launch.py": repository / "experiments/atomistic/he-importance/launch.py",
         "train_config.py": repository / "experiments/atomistic/he-importance/train_config.py",
     }
+    # Detached mapping keys are classification inputs, not caller attributes;
+    # this is the one explicit exemption from the admission-return property.
+    allowlist = {
+        (
+            "launch.py",
+            "_detach_topology_facts",
+            "type(key) is not str",
+        ): "classifies a key already read from a detached mapping",
+    }
     admissions: list[tuple[str, str, str]] = []
+    observed_allowlist: set[tuple[str, str, str]] = set()
     failures: list[str] = []
     for filename, path in sources.items():
         source = path.read_text(encoding="utf-8")
@@ -1333,18 +1343,23 @@ def test_exact_string_admissions_return_the_values_they_admit() -> None:
                     and isinstance(node.test.left.func, ast.Name)
                     and node.test.left.func.id == "type"
                     and len(node.test.left.args) == 1
-                    and isinstance(node.test.left.args[0], ast.Name)
                     and len(node.test.comparators) == 1
                     and isinstance(node.test.comparators[0], ast.Name)
                     and node.test.comparators[0].id == "str"
                 ):
                     continue
-                admitted = node.test.left.args[0].id
-                if admitted not in {"content_hash", "bound_hash"}:
-                    # Other exact-string guards classify detached mapping keys;
-                    # this property concerns admitted caller attributes.
-                    continue
                 segment = ast.get_source_segment(source, node.test) or ""
+                key = (filename, function.name, segment)
+                if key in allowlist:
+                    observed_allowlist.add(key)
+                    continue
+                expression = node.test.left.args[0]
+                if not isinstance(expression, ast.Name):
+                    failures.append(
+                        f"{filename}:{function.name}:{segment} admits an unbound expression"
+                    )
+                    continue
+                admitted = expression.id
                 admissions.append((filename, function.name, segment))
                 if not any(isinstance(child, ast.Raise) for child in node.body):
                     failures.append(f"{filename}:{function.name}:guard has no raise")
@@ -1385,6 +1400,12 @@ def test_exact_string_admissions_return_the_values_they_admit() -> None:
                     failures.append(
                         f"{filename}:{function.name}:{segment} discards {admitted}"
                     )
+    for key, reason in allowlist.items():
+        filename, _function, segment = key
+        assert reason, f"allowlist reason is empty for {key}"
+        source = sources[filename].read_text(encoding="utf-8")
+        assert segment in source, f"stale admission allowlist entry: {key}"
+        assert key in observed_allowlist, f"unobserved admission allowlist entry: {key}"
     assert admissions == [
         ("launch.py", "_source_cell", "type(content_hash) is not str"),
         ("launch.py", "populate_execution_topology", "type(bound_hash) is not str"),
