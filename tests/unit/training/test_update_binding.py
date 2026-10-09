@@ -271,8 +271,19 @@ def test_direct_fit_binds_once_and_enters_the_same_loop(monkeypatch) -> None:
     assert final_state.update_state.optimizer is optimizer
 
 
-def test_an_explicit_none_late_selector_reuses_the_bound_method() -> None:
-    """``update_method=None`` means "use what is bound", never "rebuild"."""
+def test_an_explicit_none_late_selector_rereads_the_constructor_spec() -> None:
+    """``update_method=None`` re-reads the CONSTRUCTOR spec; it does not rebuild.
+
+    SCOPED, after reviewer round 2 (R2-2). An earlier name and docstring here
+    said ``None`` means "use what is bound" -- the exact wording round 1
+    refuted in the trainer's own docstring, recurring verbatim in the test
+    that is supposed to pin the behaviour. It is only true in THIS case, where
+    the trainer was never given a constructor spec, so re-reading it yields
+    ``None`` and nothing conflicts. A trainer configured with one method and
+    bound from an explicit override RAISES on the same call; that is pinned by
+    `test_r1_2_explicit_none_after_an_explicit_override_raises_despite_the_doc`
+    in the adopted round-1 probes.
+    """
 
     model, optimizer, trainer = _fresh_run()
 

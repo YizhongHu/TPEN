@@ -429,8 +429,12 @@ class VMCTrainer:
         Raises
         ------
         ValueError
-            If a second model, a second carrier, or a conflicting non-``None``
-            late selector reaches an already-bound trainer.
+            If a second model or a second carrier reaches an already-bound
+            trainer, or if the effective selector disagrees with the bound
+            one. That includes an explicit ``None``: it is not "no selector",
+            it re-reads the CONSTRUCTOR's spec, so a trainer configured with
+            one method and bound from an explicit override raises here on a
+            plain call.
 
         Notes
         -----
