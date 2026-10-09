@@ -108,6 +108,116 @@ def test_finite_scalars_and_bools_pass_through_unchanged() -> None:
     assert json_safe_scalar(False) is False
 
 
+def test_a_newline_cannot_reach_an_unquoted_csv_row() -> None:
+    """A newline TERMINATES a CSV row, which is worse than a comma.
+
+    `tpen/logging/csv.py` writes ``f"{step},{ns},{key},{value}\n"`` with no
+    quoting. A comma in a value adds a phantom column; a NEWLINE ends the row
+    outright and turns the remainder into a bogus record. The first version of
+    this guard escaped commas and not newlines, which left the more damaging
+    half of the same failure open.
+
+    Exception text is the realistic source: a method description can carry a
+    class name or a setting whose repr spans lines.
+    """
+
+    assert "\n" not in json_safe_scalar("line one\nline two")
+    assert "\r" not in json_safe_scalar("line one\rline two")
+    assert json_safe_scalar("line one\nline two") == "line one line two"
+    # The comma guard must survive the newline guard being added.
+    assert json_safe_scalar("a,b\nc") == "a;b c"
+
+
+def test_a_csv_row_built_from_a_hostile_value_still_has_four_fields(tmp_path) -> None:
+    """End-to-end control at the real sink, not just on the helper."""
+
+    path = tmp_path / "hostile.csv"
+    CSV(path).log(
+        LogRecord(
+            step=0,
+            namespace="train",
+            metrics={"hostile": json_safe_scalar("a,b\nc\rd")},
+        )
+    )
+    rows = path.read_text().strip().splitlines()
+    # Header plus exactly ONE data row. A newline would have produced two.
+    assert len(rows) == 2, f"value broke the row structure: {rows!r}"
+    assert len(rows[1].split(",")) == 4, f"row split into extra columns: {rows[1]!r}"
+
+
+def test_a_tensor_valued_setting_keeps_its_exact_value() -> None:
+    """A tensor `lr` must not be reported as rounded display text.
+
+    PyTorch permits a tensor learning rate (the capturable and fused optimizer
+    paths use it). `str(torch.tensor(0.001))` is ``"tensor(0.0010)"`` -- display
+    text, already rounded -- so a description built from `str()` silently loses
+    precision on exactly the setting a reader most wants to trust.
+    """
+
+    exact = 0.0001234567890123
+    reported = json_safe_scalar(torch.tensor(exact, dtype=torch.float64))
+    assert isinstance(reported, float), f"got display text: {reported!r}"
+    assert reported == exact
+    # And it must still be representable by the sinks.
+    assert "," not in str(reported)
+
+
+def test_a_tensor_lr_survives_carrier_settings_with_full_precision() -> None:
+    """The same property through the real carrier-settings path."""
+
+    model = build_connected_model()
+    exact = 0.0001234567890123
+    optimizer = torch.optim.SGD(model.parameters(), lr=exact)
+    # Mirror what a capturable/fused optimizer does: a tensor in the group.
+    optimizer.param_groups[0]["lr"] = torch.tensor(exact, dtype=torch.float64)
+    settings = carrier_settings(optimizer)
+    assert isinstance(settings["lr"], float), f"got display text: {settings['lr']!r}"
+    assert settings["lr"] == exact
+
+
+def test_a_multi_element_tensor_setting_is_named_not_dumped() -> None:
+    """A pathological setting must be labelled, never serialized into a row."""
+
+    reported = json_safe_scalar(torch.ones(3, dtype=torch.float64))
+    assert isinstance(reported, str)
+    assert "," not in reported
+    assert "\n" not in reported
+    assert "3" in reported
+
+
+def test_a_method_with_no_carrier_reports_unknown_not_zero_parameters() -> None:
+    """An unknown parameter count must NOT be reported as 0.
+
+    This slice already forbids fabricating zero for an unavailable observation,
+    and gives the reason: zero is a legitimate value, so a fabricated zero is
+    indistinguishable from a real measurement. `describe()` violated that in
+    the same module, reporting `n_parameters=0` for a method that owns no
+    carrier and therefore has no parameter domain to count.
+
+    Zero and unknown are genuinely different here: a real zero-parameter
+    binding is possible, and must stay distinguishable from "not reported".
+    """
+
+    description = _CustomMethodPredatingTheReasonContract().describe()
+    assert description.n_parameters is None
+    assert description.n_parameter_tensors is None
+    # Not merely non-zero: the metrics must carry absence, not a number.
+    metrics = description.as_metrics()
+    assert metrics["update_method_n_parameters"] is None
+    assert metrics["update_method_n_parameter_tensors"] is None
+
+
+def test_a_real_parameter_count_is_still_reported_as_a_number() -> None:
+    """Control for the test above: the available case must not regress to None."""
+
+    model = build_connected_model()
+    method = _sr_method(model)
+    description = method.describe()
+    assert isinstance(description.n_parameters, int)
+    assert description.n_parameters > 0
+    assert description.as_metrics()["update_method_n_parameters"] == description.n_parameters
+
+
 # --------------------------------------------------------------------------
 # The legacy adapter: explicit reason, and the vacuum/disconnected distinction
 # --------------------------------------------------------------------------
@@ -655,6 +765,7 @@ def test_a_stateless_method_describes_itself_without_naming_a_carrier() -> None:
 
     description = _CustomMethodPredatingTheReasonContract().describe()
     assert description.carrier_class == "none"
+    assert description.n_parameters is None
     assert description.method_class.endswith(
         "_CustomMethodPredatingTheReasonContract"
     )

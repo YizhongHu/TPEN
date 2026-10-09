@@ -662,6 +662,18 @@ def json_safe_scalar(value: Any) -> Any:
 
     if value is None or type(value) is bool or type(value) is int:
         return value
+    if isinstance(value, torch.Tensor):
+        # A TENSOR-VALUED SETTING IS REAL, not hypothetical: PyTorch's
+        # capturable and fused optimizer paths put a tensor in `lr`. Falling
+        # through to `str()` would yield "tensor(0.0010)" -- DISPLAY TEXT,
+        # already rounded -- so the one setting a reader most wants to trust
+        # would be silently truncated. Take the exact Python scalar instead,
+        # and recurse so the finiteness handling below still applies.
+        if value.numel() == 1:
+            return json_safe_scalar(value.item())
+        # A multi-element tensor is not a scalar setting. Name it rather than
+        # serializing it: its text would carry commas and could be unbounded.
+        return f"tensor_numel{value.numel()}"
     if isinstance(value, float) or isinstance(value, int):
         numeric = float(value)
         if numeric != numeric:
@@ -672,8 +684,16 @@ def json_safe_scalar(value: Any) -> Any:
             return "-inf"
         return numeric
     text = str(value)
-    # Unquoted CSV rows: a comma in a value would create a phantom column.
-    return text.replace(",", ";")
+    # UNQUOTED CSV ROWS IMPOSE TWO SEPARATE CONSTRAINTS, and the second is the
+    # more damaging one. The sink writes `f"{step},{ns},{key},{value}\n"`:
+    #   - a COMMA creates a phantom column, and the file still parses;
+    #   - a NEWLINE or CARRIAGE RETURN TERMINATES THE ROW, turning the
+    #     remainder of the value into a bogus record.
+    # An earlier version of this helper guarded only the comma, which left the
+    # worse half of the same failure open.
+    for hostile, replacement in ((",", ";"), ("\r", " "), ("\n", " ")):
+        text = text.replace(hostile, replacement)
+    return text
 
 
 class UpdateDiagnostics(ABC):
@@ -1028,10 +1048,13 @@ class UpdateMethodDescription:
     carrier_class : str
         Qualified name of the actual optimizer applying the step, or
         ``"none"`` for a method that owns no carrier.
-    n_parameters : int
-        Total scalar parameter count in the bound domain.
-    n_parameter_tensors : int
-        Number of tensors in the bound domain.
+    n_parameters : int or None
+        Total scalar parameter count in the bound domain. ``None`` when this
+        method owns no carrier and therefore no parameter domain -- never 0,
+        which is a legitimate count and would be indistinguishable from a
+        measurement.
+    n_parameter_tensors : int or None
+        Number of tensors in the bound domain, or ``None`` on the same terms.
     forward_request : str
         The requested derivative convention -- the qualified type of the typed
         forward request this method returns, or ``"value"`` for an ordinary
@@ -1045,8 +1068,13 @@ class UpdateMethodDescription:
 
     method_class: str
     carrier_class: str
-    n_parameters: int
-    n_parameter_tensors: int
+    # OPTIONAL, and NOT defaulted to 0. A method owning no carrier has no
+    # parameter domain to count, and zero is a legitimate count -- so reporting
+    # 0 there would be a fabricated value indistinguishable from a real
+    # measurement, which is precisely what `json_safe_scalar` exists to
+    # prevent. `None` means "not reported" and stays distinguishable.
+    n_parameters: int | None
+    n_parameter_tensors: int | None
     forward_request: str
     norm_semantics: str
     settings: Mapping[str, Any] = field(default_factory=dict)
@@ -1057,8 +1085,8 @@ class UpdateMethodDescription:
         metrics: dict[str, Any] = {
             f"{prefix}_class": json_safe_scalar(self.method_class),
             f"{prefix}_carrier_class": json_safe_scalar(self.carrier_class),
-            f"{prefix}_n_parameters": int(self.n_parameters),
-            f"{prefix}_n_parameter_tensors": int(self.n_parameter_tensors),
+            f"{prefix}_n_parameters": json_safe_scalar(self.n_parameters),
+            f"{prefix}_n_parameter_tensors": json_safe_scalar(self.n_parameter_tensors),
             f"{prefix}_forward_request": json_safe_scalar(self.forward_request),
             f"{prefix}_norm_semantics": json_safe_scalar(self.norm_semantics),
         }
@@ -1235,8 +1263,10 @@ class VMCUpdateMethod(Generic[InputT], ABC):
             # rather than naming an optimizer this method does not own.
             carrier_class = "none"
             settings: dict[str, Any] = {}
-            n_parameters = 0
-            n_parameter_tensors = 0
+            # NOT 0: this method owns no parameter domain, so the count is
+            # UNKNOWN rather than empty. See the field comment above.
+            n_parameters = None
+            n_parameter_tensors = None
         else:
             optimizer = update_state.optimizer
             carrier_class = f"{type(optimizer).__module__}.{type(optimizer).__qualname__}"
