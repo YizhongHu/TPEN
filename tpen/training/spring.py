@@ -51,6 +51,7 @@ from tpen.training.update import (
     VMCUpdateResult,
     VMCUpdateState,
     flatten_settings,
+    json_safe_metric_name,
     json_safe_scalar,
 )
 from tpen.training.vmc import (
