@@ -1012,6 +1012,11 @@ def test_a_finite_diagnostics_record_is_numerically_unchanged() -> None:
     Without this, the fix above could have silently stringified every norm and
     the tests would still pass. Finite values must remain floats, with their
     exact magnitudes.
+
+    NOTE a limit of the SR assertions below: `2.5` is dyadic, so it survives a
+    narrowing cast unchanged and cannot witness a precision-degrading defect.
+    Only the block-NG values are chosen to carry that second property. Giving
+    SR and SPRING the same treatment is a recorded follow-up.
     """
 
     telemetry = _nonfinite_sr_telemetry(2.5)
@@ -1026,19 +1031,27 @@ def test_a_finite_diagnostics_record_is_numerically_unchanged() -> None:
     # guard's own label, so a flatten-to-string defect in block NG's
     # `as_metrics` passed the entire unit suite. Only a FINITE value
     # separates the two. Distinct magnitudes per field, so a swap cannot hide.
+    #
+    # The magnitudes are deliberately NOT dyadic. `0.1` and `0.3` have no
+    # exact binary representation at any width, so they change under a
+    # narrowing cast; `2.5`, `0.75` and `1.0` -- which is what this control
+    # used at first, and what the SR case above still uses -- survive a
+    # round trip through float16 UNCHANGED, which made the whole file blind
+    # to a precision-degrading defect. "Exact magnitudes" cannot be tested
+    # with values that are exact everywhere.
     block_ng = BlockNGTelemetry(
         applied=True,
         step=1,
         n_samples=4,
         n_blocks=2,
-        energy_gradient_norm=2.5,
-        update_direction_norm=0.75,
+        energy_gradient_norm=0.1,
+        update_direction_norm=0.3,
         solve_dtype="torch.float64",
     )
     block_ng_metrics = block_ng.as_metrics()
-    assert block_ng_metrics["block_ng_energy_gradient_norm"] == 2.5
+    assert block_ng_metrics["block_ng_energy_gradient_norm"] == 0.1
     assert isinstance(block_ng_metrics["block_ng_energy_gradient_norm"], float)
-    assert block_ng_metrics["block_ng_update_direction_norm"] == 0.75
+    assert block_ng_metrics["block_ng_update_direction_norm"] == 0.3
     assert isinstance(block_ng_metrics["block_ng_update_direction_norm"], float)
 
 
