@@ -50,8 +50,11 @@ from tpen.training.update import (
     UpdateMethodDescription,
     VMCUpdateMethod,
     VMCUpdateResult,
+    SETTING_NAME_COLLISIONS_KEY,
     carrier_settings,
     deserialize_parameter_layout,
+    flatten_settings,
+    merge_named_metrics,
     parameter_layout_fingerprint,
     serialize_parameter_layout,
     flatten_settings,
@@ -1475,6 +1478,184 @@ def test_a_hostile_setting_key_survives_the_real_csv_sink_from_a_direct_descript
     for row in rows[1:]:
         assert len(row) == 4, f"row did not have four fields: {row!r}"
     assert rows[-1] == ["1", "sentinel", "after", "still-readable"]
+
+
+@pytest.mark.parametrize("hostile", ["pfx,a", "pfx\nb", 'pfx"c'])
+def test_a_hostile_flatten_settings_prefix_cannot_break_the_csv_row(
+    tmp_path, hostile
+) -> None:
+    """`flatten_settings` takes a PUBLIC prefix argument that arrived raw.
+
+    Encoding the prefixes at the five emitters left this one: a public helper
+    whose caller-supplied prefix went straight into every name it composed.
+    Found by verification, not by a test -- the fifth consecutive finding in
+    the same shape, a guard applied at the sites named rather than at every
+    site of the kind.
+    """
+
+    flat = flatten_settings({"lr": 0.1, "damping": {"relative": 1e-2}}, prefix=hostile)
+    path = tmp_path / "flat.csv"
+    sink = CSV(path)
+    sink.log(LogRecord(step=0, namespace="train", metrics=flat))
+    sink.log(LogRecord(step=1, namespace="sentinel", metrics={"after": "still-readable"}))
+
+    rows = _strict_csv_rows(path)
+    assert len(rows) == 1 + len(flat) + 1
+    for row in rows[1:]:
+        assert len(row) == 4, f"row did not have four fields: {row!r}"
+    assert rows[-1] == ["1", "sentinel", "after", "still-readable"]
+
+
+def test_the_collision_marker_cannot_overwrite_a_user_setting() -> None:
+    """The marker reports lost entries; it must not itself lose one.
+
+    The marker was written with a plain assignment under an ordinary name, so
+    a user setting encoding to that same name was silently clobbered -- the
+    exact failure the marker exists to report, reintroduced by the reporting.
+
+    The marker name now begins with `%`, which `json_safe_metric_name` escapes
+    to `%25` FIRST, so no encoded user key can ever spell it. This is a
+    structural guarantee rather than a reserved-word convention, which is why
+    the test asserts the ENCODING property and not merely this one name.
+    """
+
+    # No encoded key can produce the marker name.
+    assert SETTING_NAME_COLLISIONS_KEY.startswith("%")
+    assert json_safe_metric_name(SETTING_NAME_COLLISIONS_KEY) != SETTING_NAME_COLLISIONS_KEY
+
+    # A user setting NAMED like the marker survives under its own encoded name,
+    # alongside a genuine collision report.
+    parameter = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+    optimizer = torch.optim.Adam([parameter], lr=0.1, betas=(0.9, 0.999))
+    optimizer.param_groups[0][SETTING_NAME_COLLISIONS_KEY] = "user-value"
+    optimizer.param_groups[0]["betas1"] = -1.0
+    settings = carrier_settings(optimizer)
+
+    assert settings[SETTING_NAME_COLLISIONS_KEY]  # the real marker
+    assert "betas1" in settings[SETTING_NAME_COLLISIONS_KEY]
+    # The user's similarly-named setting is still present and distinct.
+    encoded = json_safe_metric_name(SETTING_NAME_COLLISIONS_KEY)
+    assert settings[f"g0_{encoded}"] == "user-value"
+
+
+def test_an_already_encoded_prefix_is_not_double_escaped() -> None:
+    """Encode ONCE per boundary; re-encoding corrupts a correct caller.
+
+    `merge_named_metrics` takes an already-encoded prefix by contract. Had it
+    re-encoded, a caller that had done the right thing would see `%` become
+    `%25` become `%2525`.
+    """
+
+    once = json_safe_metric_name("a%b")
+    twice = json_safe_metric_name(once)
+    assert once == "a%25b"
+    assert twice != once, "control: encoding is NOT idempotent, hence encode-once"
+
+    target: dict[str, object] = {}
+    merge_named_metrics(target, {"k": 1}, prefix=once + "_")
+    assert f"{once}_k" in target
+
+
+class _HostileNameDiagnostics(UpdateDiagnostics):
+    """A custom record returning names no built-in would produce.
+
+    `UpdateDiagnostics` is a NOMINAL contract: it obliges an implementation to
+    return flat JSON-safe entries and cannot enforce it. This is what an
+    implementation that does not comply looks like.
+    """
+
+    def as_metrics(self) -> dict:
+        return {
+            "custom,comma": 1.0,
+            "custom\nnewline": 2.0,
+            1: "int-key",
+            "1": "str-key",
+        }
+
+
+class _HostileDiagnosticsMethod(LegacyAutogradUpdate):
+    """A supported custom method whose diagnostics record is non-compliant."""
+
+    def update(self, update_input):
+        result = super().update(update_input)
+        return VMCUpdateResult(
+            applied=result.applied,
+            grad_norm=result.grad_norm,
+            reason=result.reason,
+            diagnostics=_HostileNameDiagnostics(),
+        )
+
+
+def test_custom_diagnostics_names_are_guarded_at_the_trainer_merge(tmp_path) -> None:
+    """The guard must hold at the CONTRACT, not only for the records we ship.
+
+    Reviewer-demonstrated witness: replacing the trainer's guarded merge with a
+    bare `metrics.update` left ALL 93 existing observation tests passing. The
+    protection was real and nothing observed it, which is the same shape as the
+    two vacuous guards found earlier in this lane.
+
+    Mixed `1` and `"1"` keys are included because they also break the JSONL
+    sink outright -- `json.dumps(sort_keys=True)` raises TypeError comparing
+    int to str -- so the unguarded path fails in two different ways.
+    """
+
+    model = build_connected_model()
+    parameters = tuple(model.parameters())
+    method = _HostileDiagnosticsMethod(
+        optimizer=torch.optim.SGD(parameters, lr=LEARNING_RATE),
+        model_parameters=ModelParameterBinding(parameters=parameters),
+    )
+    csv_path = tmp_path / "custom.csv"
+    jsonl_path = tmp_path / "custom.jsonl"
+    context = _SinkWritingContext(csv_path, jsonl_path)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
+    trainer.fit(
+        model=model,
+        sampler=_FixedSampler(),
+        hamiltonian_terms=build_tiny_hamiltonian_terms(),
+        optimizer=method.optimizer,
+        context=context,
+        emit=lambda **_: None,
+    )
+
+    rows = _strict_csv_rows(csv_path)
+    for row in rows[1:]:
+        assert len(row) == 4, f"row did not have four fields: {row!r}"
+    # Every line must parse: the mixed-key case raises in the sink unguarded.
+    for line in jsonl_path.read_text().strip().splitlines():
+        payload = json.loads(line)
+        for key in payload["metrics"]:
+            assert isinstance(key, str)
+            assert "," not in key and "\n" not in key
+
+
+def test_flatten_settings_reports_a_scalar_level_collision() -> None:
+    """Collisions must PROPAGATE out of the recursion, not just be survived.
+
+    Reviewer-demonstrated witness: dropping `collisions=collisions` from the
+    scalar merge left retention working -- the first value still won -- so
+    every value-level assertion passed while the report silently vanished.
+    Retention and reporting are separate promises and need separate witnesses.
+    """
+
+    flat = flatten_settings({1: "int-first", "1": "str-second"})
+    # Retention: the first writer survives.
+    assert flat["1"] == "int-first"
+    # Reporting: and the clash is named.
+    assert SETTING_NAME_COLLISIONS_KEY in flat
+    assert "1" in flat[SETTING_NAME_COLLISIONS_KEY]
+
+
+def test_flatten_settings_encodes_a_hostile_parent_mapping_key() -> None:
+    """The PARENT key of a nested mapping is a name component too.
+
+    Reviewer-demonstrated witness: encoding only leaf keys produced
+    `outer,section_child`, which splits a CSV row, while the whole existing
+    corpus passed. Built-in policy fingerprints nest exactly this way.
+    """
+
+    flat = flatten_settings({"outer,section": {"child": "nested-marker"}})
+    assert flat == {"outer%2Csection_child": "nested-marker"}
 
 
 # --------------------------------------------------------------------------
