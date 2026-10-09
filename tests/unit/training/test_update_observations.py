@@ -927,9 +927,16 @@ def test_nested_solve_diagnostics_with_a_nonfinite_eigenvalue_survive_jsonl(tmp_
     assert payload["metrics"]["qgt_min_retained_eigenvalue"] == 0.0
 
 
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    ("energy_norm", "direction_norm", "energy_expected", "direction_expected"),
+    [
+        (float("nan"), float("inf"), "nan", "inf"),
+        (float("inf"), float("-inf"), "inf", "-inf"),
+        (float("-inf"), float("nan"), "-inf", "nan"),
+    ],
+)
 def test_block_ng_diagnostics_with_a_nonfinite_norm_survive_the_real_jsonl_sink(
-    tmp_path, value
+    tmp_path, energy_norm, direction_norm, energy_expected, direction_expected
 ) -> None:
     """Block NG carries the same hazard, and was the only method left untested.
 
@@ -945,14 +952,29 @@ def test_block_ng_diagnostics_with_a_nonfinite_norm_survive_the_real_jsonl_sink(
 
     REACHABILITY, stated precisely rather than implied. ``update()`` raises on
     non-finite local energies and again on a non-finite update DIRECTION, so
-    the component tensors reaching the telemetry are finite. It does NOT check
-    the energy GRADIENT, and -- more to the point -- a vector norm of entirely
-    finite components can still overflow to ``inf``, in float32 especially. So
-    ``inf`` is reachable here through ``update()`` today; ``nan`` and
-    ``-inf`` are not reachable through that path, and are covered because the
-    dataclass is public, constructible by callers and by a restore path, and
-    the guarantee being asserted is a property of ``as_metrics``, not of one
-    caller's arithmetic.
+    the component tensors reaching the telemetry are finite -- a non-finite
+    GRADIENT component is not checked directly, but it cannot stay contained:
+    it propagates through the solve into the direction, since a dot product
+    with a non-finite term is never finite, and the direction check raises
+    before any telemetry is built. What survives that is overflow: a vector
+    norm of entirely finite components can still reach ``inf``, in float32
+    especially. So ``inf`` is reachable here through ``update()`` today, while
+    ``nan`` and ``-inf`` are not -- a norm is non-negative, and finite inputs
+    cannot produce ``nan``.
+
+    They are covered anyway because the guarantee belongs to ``as_metrics``,
+    not to one caller's arithmetic, and the dataclass is public and
+    constructible by any caller. An earlier version of this docstring also
+    claimed a "restore path" constructs it. That was false: at this revision
+    the only production construction site is inside ``update()``, and nothing
+    in the checkpoint or receipt machinery reconstructs telemetry.
+
+    EXACT VALUES PER FIELD, not a membership check. The sibling SR and SPRING
+    cases assert ``in ("nan", "inf", "-inf")`` against one value shared by
+    both fields, which cannot distinguish a mapping that always reports the
+    same label from a correct one, nor catch the two keys being cross-wired.
+    This follows the stricter nested-QGT convention instead: distinct inputs
+    per field, exact equality per field.
     """
 
     telemetry = BlockNGTelemetry(
@@ -960,16 +982,17 @@ def test_block_ng_diagnostics_with_a_nonfinite_norm_survive_the_real_jsonl_sink(
         step=1,
         n_samples=4,
         n_blocks=2,
-        energy_gradient_norm=value,
-        update_direction_norm=value,
+        energy_gradient_norm=energy_norm,
+        update_direction_norm=direction_norm,
         solve_dtype="torch.float64",
     )
     path = tmp_path / "block_ng.jsonl"
     JSONL(path).log(LogRecord(step=1, namespace="train", metrics=telemetry.as_metrics()))
     payload = json.loads(path.read_text().strip())
-    # Named, not crashed, and NOT silently turned into a number.
-    assert payload["metrics"]["block_ng_energy_gradient_norm"] in ("nan", "inf", "-inf")
-    assert payload["metrics"]["block_ng_update_direction_norm"] in ("nan", "inf", "-inf")
+    # Named, not crashed, NOT silently turned into a number -- and each field
+    # carrying ITS OWN value, so a swap or a constant label cannot pass.
+    assert payload["metrics"]["block_ng_energy_gradient_norm"] == energy_expected
+    assert payload["metrics"]["block_ng_update_direction_norm"] == direction_expected
     # The finite fields stay themselves: the guard must not flatten everything.
     assert payload["metrics"]["block_ng_n_blocks"] == 2
     assert payload["metrics"]["block_ng_reason"] == "applied"
