@@ -50,6 +50,9 @@ from tpen.training.update import (
     VMCUpdateMethod,
     VMCUpdateResult,
     carrier_settings,
+    deserialize_parameter_layout,
+    parameter_layout_fingerprint,
+    serialize_parameter_layout,
     flatten_settings,
     json_safe_scalar,
 )
@@ -752,13 +755,16 @@ def test_no_method_owned_diagnostic_key_collides_with_a_trainer_owned_key() -> N
         overlap = trainer_owned & set(record.as_metrics())
         assert not overlap, f"{type(record).__name__} collides on {sorted(overlap)}"
 
-    # The DESCRIPTION shares the metrics dict with these records too, and was
-    # not checked at all before.
+    # The description is checked against the TRAINER-OWNED names only. An
+    # earlier version also asserted it could not collide with the per-attempt
+    # telemetry records, which OVERSTATED the relationship: descriptions are
+    # logged under the `train/update_method` namespace and per-attempt metrics
+    # under `train`, so they never share one dict at runtime. Asserting a
+    # constraint that the code does not actually need is its own kind of
+    # wrong -- it invites a future change to be judged against a rule nobody
+    # relies on.
     description_keys = set(_sr_method(model).describe().as_metrics())
     assert not (trainer_owned & description_keys)
-    for record in records:
-        clash = description_keys & set(record.as_metrics())
-        assert not clash, f"{type(record).__name__} collides with description on {sorted(clash)}"
 
 
 def _strict_csv_rows(path) -> list[list[str]]:
@@ -1062,31 +1068,54 @@ def test_carrier_metadata_cannot_overwrite_the_authoritative_identity() -> None:
 
 
 def test_no_setting_key_can_ever_reach_an_authoritative_name() -> None:
-    """Structural guard, not a sample of hostile keys.
+    """GENERATIVE structural guard: inject the exact names that would collide.
 
-    Enumerating bad key names would only ever cover the ones imagined. Every
-    authoritative name is checked to not begin with the settings sub-namespace,
-    which is what makes the separation hold for ANY key a param_group carries.
+    REWRITTEN AFTER BEING FOUND VACUOUS, and the failure is worth stating
+    because it is subtle. The previous version asserted that no authoritative
+    name began with ``update_method_setting_`` -- trivially true of hand-written
+    literals, independent of the code -- and then inspected only keys ALREADY
+    FILTERED by that prefix, which is circular. It passed an isolated rollback
+    that removed both namespacing protections, so it certified a guarantee that
+    was not there.
+
+    A structural guard has to be GENERATIVE: derive the colliding names from
+    the description's own authoritative fields and inject exactly those as
+    param_group keys. If namespacing is removed, each injected key lands on its
+    authoritative name and this fails -- which is the property the old test
+    only appeared to check.
     """
 
-    model = build_connected_model()
-    description = _sr_method(model).describe()
-    metrics = description.as_metrics()
-    authoritative = {
-        "update_method_class",
-        "update_method_carrier_class",
-        "update_method_n_parameters",
-        "update_method_n_parameter_tensors",
-        "update_method_layout_fingerprint",
-        "update_method_forward_request",
-        "update_method_norm_semantics",
-    }
-    assert authoritative <= set(metrics)
-    for name in authoritative:
-        assert not name.startswith("update_method_setting_")
-    for key in metrics:
-        if key.startswith("update_method_setting_"):
-            assert key not in authoritative
+    parameter = torch.nn.Parameter(torch.ones(4, dtype=torch.float64))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+
+    # Every suffix the description emits, derived rather than retyped, so a
+    # NEW authoritative field is automatically covered by this guard.
+    clean = LegacyAutogradUpdate(
+        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.ones(4, dtype=torch.float64))], lr=0.1),
+        model_parameters=ModelParameterBinding(
+            parameters=(torch.nn.Parameter(torch.ones(4, dtype=torch.float64)),)
+        ),
+    )
+    prefix = "update_method_"
+    suffixes = [k[len(prefix):] for k in clean.describe().as_metrics() if k.startswith(prefix)]
+    assert suffixes, "description emitted no authoritative fields to guard"
+
+    # Inject each suffix as a hostile group key.
+    for suffix in suffixes:
+        optimizer.param_groups[0][suffix] = f"spoofed-{suffix}"
+    method = LegacyAutogradUpdate(
+        optimizer=optimizer,
+        model_parameters=ModelParameterBinding(parameters=(parameter,)),
+    )
+    metrics = method.describe().as_metrics()
+
+    # Not one authoritative field may carry a spoofed value.
+    for suffix in suffixes:
+        value = metrics[f"{prefix}{suffix}"]
+        assert value != f"spoofed-{suffix}", f"{suffix} was overwritten by a group key"
+    # And the identity fields specifically still report the truth.
+    assert metrics["update_method_class"].endswith("LegacyAutogradUpdate")
+    assert metrics["update_method_n_parameters"] == 4
 
 
 # --------------------------------------------------------------------------
@@ -1191,6 +1220,276 @@ def test_no_collision_marker_when_there_is_no_collision() -> None:
     parameter = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
     settings = carrier_settings(torch.optim.Adam([parameter], lr=0.1))
     assert "setting_name_collisions" not in settings
+
+
+@pytest.mark.parametrize("hostile_key", ["tag,source", "tag\nsource", "tag\rsource"])
+def test_a_hostile_setting_key_keeps_the_csv_record_intact(tmp_path, hostile_key) -> None:
+    """Reviewer R3-1's design, with its exact literal keys and row oracle.
+
+    The comma case produced an extra COLUMN; the CR and LF cases produced extra
+    RECORDS (22 rows where 21 were expected). Asserting the exact row count,
+    not merely four fields per row, is what catches the record-splitting half.
+    """
+
+    parameter = torch.nn.Parameter(torch.ones(4, dtype=torch.float64))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    optimizer.param_groups[0][hostile_key] = "marker"
+    optimizer.param_groups[0]["tag"] = "control"
+    method = LegacyAutogradUpdate(
+        optimizer=optimizer,
+        model_parameters=ModelParameterBinding(parameters=(parameter,)),
+    )
+    metrics = method.describe().as_metrics()
+
+    path = tmp_path / "keys.csv"
+    sink = CSV(path)
+    sink.log(LogRecord(step=0, namespace="train/update_method", metrics=metrics))
+    sink.log(LogRecord(step=1, namespace="sentinel", metrics={"after": "still-readable"}))
+
+    rows = _strict_csv_rows(path)
+    # Exact count: header + one row per metric + sentinel. An extra RECORD
+    # from a newline shows up here and nowhere else.
+    assert len(rows) == 1 + len(metrics) + 1, f"row count wrong: {len(rows)}"
+    for row in rows[1:]:
+        assert len(row) == 4, f"row did not have four fields: {row!r}"
+    assert rows[-1] == ["1", "sentinel", "after", "still-readable"]
+    # The hostile key's value survives exactly once, under a safe name.
+    markers = [row for row in rows[1:] if row[3] == "marker"]
+    assert len(markers) == 1
+    assert "," not in markers[0][2] and "\n" not in markers[0][2]
+    assert [row for row in rows[1:] if row[3] == "control"]
+
+
+@pytest.mark.parametrize("spoofed_group", [0, 1])
+def test_a_compound_setting_cannot_be_spoofed_in_a_multi_group_optimizer(
+    spoofed_group,
+) -> None:
+    """Reviewer R3-2's design. Literal oracles, not values read back from the map.
+
+    Two-group Adam with genuinely different betas. Injecting `betas1` into
+    EITHER group used to report 999 as that group's beta1, because the split
+    tuple element and the raw key produced the same name. The expected values
+    here are written literally so the test cannot agree with a wrong map.
+    """
+
+    a = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+    b = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+    optimizer = torch.optim.Adam(
+        [
+            {"params": [a], "betas": (0.8, 0.9)},
+            {"params": [b], "betas": (0.7, 0.95)},
+        ],
+        lr=0.1,
+    )
+    optimizer.param_groups[spoofed_group]["betas1"] = 999.0
+    settings = carrier_settings(optimizer)
+
+    assert settings["g0_betas1"] == pytest.approx(0.8)
+    assert settings["g0_betas2"] == pytest.approx(0.9)
+    assert settings["g1_betas1"] == pytest.approx(0.7)
+    assert settings["g1_betas2"] == pytest.approx(0.95)
+    # The clash is surfaced rather than silently resolved.
+    assert "setting_name_collisions" in settings
+
+
+def test_the_group_count_cannot_be_spoofed_in_a_multi_group_optimizer() -> None:
+    """Reviewer R3-2's second design: the count must be measured, not merged."""
+
+    a = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+    b = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+    optimizer = torch.optim.SGD([{"params": [a], "lr": 0.1}, {"params": [b], "lr": 0.2}])
+    # Assert the live truth FIRST, so the oracle is independent of the map.
+    assert len(optimizer.param_groups) == 2
+    optimizer.param_groups[0]["n_param_groups"] = 999
+    assert carrier_settings(optimizer)["n_param_groups"] == 2
+
+
+# --------------------------------------------------------------------------
+# Gaps the 5c4631a0 verifier declared uncovered. Closing them here rather
+# than carrying them, because a declared gap that nobody closes becomes a
+# permanent exception.
+# --------------------------------------------------------------------------
+
+
+class _SinkWritingContext(_StubContext):
+    """A context that writes through the REAL CSV and JSONL sinks.
+
+    The existing tests exercise `reported_reason` directly and assert on the
+    metrics dict. That leaves the actual trainer-to-sink path untested, which
+    is where the corruption would occur: the trainer composes the record, and
+    the sink is what a newline or quote actually breaks.
+    """
+
+    def __init__(self, csv_path, jsonl_path) -> None:
+        super().__init__()
+        self._csv = CSV(csv_path)
+        self._jsonl = JSONL(jsonl_path)
+
+    def log(self, metrics, *, step=None, namespace="run") -> None:
+        super().log(metrics, step=step, namespace=namespace)
+        record = LogRecord(step=step, namespace=namespace, metrics=dict(metrics))
+        self._csv.log(record)
+        self._jsonl.log(record)
+
+
+class _HostileReasonMethod(LegacyAutogradUpdate):
+    """A supported custom method whose reason carries CSV-hostile text.
+
+    Realistic rather than contrived: a reason assembled from an exception
+    message routinely contains a newline.
+    """
+
+    HOSTILE = 'line one\nline two, with "quotes"'
+
+    def update(self, update_input):
+        result = super().update(update_input)
+        return VMCUpdateResult(
+            applied=result.applied,
+            grad_norm=result.grad_norm,
+            reason=self.HOSTILE,
+            diagnostics=result.diagnostics,
+        )
+
+
+def test_a_hostile_reason_survives_the_real_trainer_to_sink_path(tmp_path) -> None:
+    """END TO END, through the real trainer and both real sinks.
+
+    This is the path the 5c4631a0 verifier named as uncovered: everything
+    before this exercised `reported_reason` in isolation, so a defect in how
+    the TRAINER composes or emits the record would not have been caught.
+    """
+
+    model = build_connected_model()
+    parameters = tuple(model.parameters())
+    method = _HostileReasonMethod(
+        optimizer=torch.optim.SGD(parameters, lr=LEARNING_RATE),
+        model_parameters=ModelParameterBinding(parameters=parameters),
+    )
+    csv_path = tmp_path / "train.csv"
+    jsonl_path = tmp_path / "train.jsonl"
+    context = _SinkWritingContext(csv_path, jsonl_path)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
+    trainer.fit(
+        model=model,
+        sampler=_FixedSampler(),
+        hamiltonian_terms=build_tiny_hamiltonian_terms(),
+        optimizer=method.optimizer,
+        context=context,
+        emit=lambda **_: None,
+    )
+
+    # CSV: every row still four fields under a STRICT reader.
+    rows = _strict_csv_rows(csv_path)
+    assert len(rows) > 1
+    for row in rows[1:]:
+        assert len(row) == 4, f"row did not have four fields: {row!r}"
+    reason_rows = [row for row in rows[1:] if row[2] == "update_reason"]
+    assert len(reason_rows) == 1
+    assert "\n" not in reason_rows[0][3] and "," not in reason_rows[0][3]
+
+    # JSONL: every line parses, and the reason is present and sanitized.
+    for line in jsonl_path.read_text().strip().splitlines():
+        payload = json.loads(line)
+        assert isinstance(payload["metrics"], dict)
+
+
+# --- Layout fingerprint: dtypes and shapes the writer had not tried ---
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16]
+)
+def test_the_fingerprint_separates_dtypes_at_identical_shape(dtype) -> None:
+    """Same shape, different dtype, must not fingerprint identically.
+
+    The writer's tests used float64 only, so a fingerprint that dropped dtype
+    entirely would have passed them.
+    """
+
+    reference = torch.nn.Parameter(torch.ones((2, 2), dtype=torch.float64))
+    candidate = torch.nn.Parameter(torch.ones((2, 2), dtype=dtype))
+    reference_fp = parameter_layout_fingerprint(
+        ModelParameterBinding(parameters=(reference,)).layout
+    )
+    candidate_fp = parameter_layout_fingerprint(
+        ModelParameterBinding(parameters=(candidate,)).layout
+    )
+    if dtype is torch.float64:
+        assert reference_fp == candidate_fp
+    else:
+        assert reference_fp != candidate_fp
+
+
+def test_the_fingerprint_separates_slot_ORDER() -> None:
+    """Two layouts with the same multiset of slots in different order differ."""
+
+    a = torch.nn.Parameter(torch.ones((2,), dtype=torch.float64))
+    b = torch.nn.Parameter(torch.ones((3,), dtype=torch.float64))
+    forward = parameter_layout_fingerprint(
+        ModelParameterBinding(parameters=(a, b)).layout
+    )
+    reverse = parameter_layout_fingerprint(
+        ModelParameterBinding(parameters=(b, a)).layout
+    )
+    assert forward != reverse
+
+
+def test_the_fingerprint_survives_a_layout_serialization_round_trip() -> None:
+    """Stable across restore, which is the property that makes it usable.
+
+    Comparing a resumed run against its original is the actual use; a
+    fingerprint that changed across serialize/deserialize would be useless for
+    exactly that.
+    """
+
+    parameters = (
+        torch.nn.Parameter(torch.ones((2, 3), dtype=torch.float64)),
+        torch.nn.Parameter(torch.ones((4,), dtype=torch.float32)),
+    )
+    layout = ModelParameterBinding(parameters=parameters).layout
+    restored = deserialize_parameter_layout(serialize_parameter_layout(layout))
+    assert parameter_layout_fingerprint(restored) == parameter_layout_fingerprint(layout)
+
+
+def test_the_fingerprint_handles_a_scalar_shaped_parameter() -> None:
+    """A 0-dim parameter has an empty shape tuple and must still be named."""
+
+    scalar = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float64))
+    fingerprint = parameter_layout_fingerprint(
+        ModelParameterBinding(parameters=(scalar,)).layout
+    )
+    assert fingerprint
+    assert "scalar" in fingerprint
+    vector = parameter_layout_fingerprint(
+        ModelParameterBinding(
+            parameters=(torch.nn.Parameter(torch.ones((1,), dtype=torch.float64)),)
+        ).layout
+    )
+    # A scalar and a one-element vector are DIFFERENT layouts.
+    assert fingerprint != vector
+
+
+# --- Arbitrary param_group keys ---
+
+
+def test_a_non_string_param_group_key_does_not_raise() -> None:
+    """Mixed key types must not break sorting before anything is emitted.
+
+    `sorted(group.items())` on mixed types raises TypeError, which would fail
+    the description before a single metric was produced -- a crash, not a
+    corrupted value, and so a different failure mode from the rest of this
+    family.
+    """
+
+    parameter = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    optimizer.param_groups[0][7] = "int-keyed"
+    optimizer.param_groups[0][("tuple", "key")] = "tuple-keyed"
+
+    settings = carrier_settings(optimizer)
+    assert settings["g0_7"] == "int-keyed"
+    for key in settings:
+        assert "," not in key and "\n" not in key
 
 
 # --------------------------------------------------------------------------
