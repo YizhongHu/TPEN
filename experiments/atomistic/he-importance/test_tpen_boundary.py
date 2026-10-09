@@ -53,10 +53,10 @@ class InventoryEntry:
 # Each key is (relative file, line, dotted target).  Each value is the
 # one-line disposition recorded for that exact crossing.
 EXPECTED_PRODUCTION_INVENTORY = {
-    ("train_config.py", 187, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 190, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 258, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 264, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("run_stage_q.py", 30, "tpen.accelerator"): InventoryEntry(
@@ -101,13 +101,13 @@ EXPECTED_TEST_INVENTORY = {
     ("test_stage_coordinate.py", 594, "tpen.hi.train"): InventoryEntry(
         "item e923ec4e: retained until the facade slice removes this crossing."
     ),
-    ("test_train_config.py", 176, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 220, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 188, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 232, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 281, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 325, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("test_run_stage_q.py", 99, "tpen.hi_schema"): InventoryEntry(
