@@ -1639,9 +1639,12 @@ def test_a_non_string_key_is_actually_accepted_not_rejected_by_typeguard() -> No
     typeguard enforces annotations at runtime in this repository, so
     `Mapping[str, Any]` on these surfaces did not merely document an
     expectation -- it rejected non-string keys at the boundary with a
-    TypeCheckError. That made the collision detection dead code: encoding is
-    injective over STRINGS, so a collision can only arise from a non-string key
-    coerced by `str()`, and the type had already excluded those.
+    TypeCheckError, excluding one whole class of collision input.
+
+    NON-STRING KEYS ARE NOT THE ONLY SOURCE, and an earlier version of this
+    docstring said they were. Ordinary strings collide structurally through
+    the flattening join; see
+    `test_two_ordinary_string_keys_can_collide_structurally`.
 
     A guard and a type that disagree about what can reach a function is the
     same failure as a docstring that overstates its body, which this slice has
