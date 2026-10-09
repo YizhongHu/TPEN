@@ -1150,76 +1150,76 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
     }
     allowlist = {
         ("launch.py", "_has_buffer_capability", '"__buffer__" in namespace'):
-            "namespace is obtained through type.__dict__'s descriptor, and the key is a module literal",
+            ("namespace is obtained through type.__dict__'s descriptor, and the key is a module literal", 1),
         ("launch.py", "_source_cell", "hasattr(cell, name)"):
-            "this is source-shape admission, not topology classification; false positives fail at manifest access",
+            ("this is source-shape admission, not topology classification; false positives fail at manifest access", 1),
         ("launch.py", "_reject_execution_facts_outside_topology", "normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS"):
-            "normalized is a fresh exact str and the set contains only this module's literals",
+            ("normalized is a fresh exact str and the set contains only this module's literals", 1),
         ("launch.py", "is_execution_fact_key", "normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS"):
-            "normalized is a fresh exact str and the set contains only this module's literals",
+            ("normalized is a fresh exact str and the set contains only this module's literals", 1),
         ("launch.py", "_validate_runner_topology_facts", "key not in _RUNNER_TOPOLOGY_FACT_KEYS"):
-            "all current callers pass facts detached to exact string keys before validation",
+            ("all current callers pass facts detached to exact string keys before validation", 1),
         ("launch.py", "_validate_runner_topology_facts", "name not in facts"):
-            "all current callers pass facts detached to exact string keys before validation",
+            ("all current callers pass facts detached to exact string keys before validation", 1),
         ("launch.py", "_validate_runner_topology_facts", 'kind not in {"cpu", "cuda", "rocm", "other"}'):
-            "all current callers pass facts detached before value validation, so kind is an owned scalar",
+            ("all current callers pass facts detached before value validation, so kind is an owned scalar", 1),
         ("distributed.py", "_has_buffer_capability", '"__buffer__" in namespace'):
-            "namespace is obtained through type.__dict__'s descriptor, and the key is a module literal",
+            ("namespace is obtained through type.__dict__'s descriptor, and the key is a module literal", 1),
         ("distributed.py", "execution_topology_from_facts", "key not in _RUNNER_TOPOLOGY_FACT_KEYS"):
-            "detachment has already required exact string mapping keys",
+            ("detachment has already required exact string mapping keys", 1),
         ("distributed.py", "execution_topology_from_facts", "name not in facts"):
-            "detachment has already required exact string mapping keys",
+            ("detachment has already required exact string mapping keys", 1),
         ("distributed.py", "__post_init__", "self.device.identity != self.topology.device_identity"):
-            "both operands are owned typed dataclass fields, not caller mapping objects",
+            ("both operands are owned typed dataclass fields, not caller mapping objects", 1),
         ("distributed.py", "__post_init__", "self.scope in (ProfileScope.NODE, ProfileScope.JOB)"):
-            "scope is an owned enum field and the tuple contains module-owned enum members",
+            ("scope is an owned enum field and the tuple contains module-owned enum members", 1),
         ("distributed.py", "write", "record.topology != self.topology"):
-            "this telemetry comparison is reached with typed ExecutionTopology records from the converter; write itself performs no conversion or type admission",
+            ("this telemetry comparison is reached with typed ExecutionTopology records from the converter; write itself performs no conversion or type admission", 1),
         ("stage_coordinate.py", "_is_manifest_root", 'value.get("schema") in {TRAIN_MANIFEST_SCHEMA, EVALUATION_MANIFEST_SCHEMA}'):
-            "the mapping is the validated manifest shape and the membership set contains module-owned schema literals",
+            ("the mapping is the validated manifest shape and the membership set contains module-owned schema literals", 1),
         ("stage_coordinate.py", "_is_manifest_root", "TOPOLOGY_KEY in value"):
-            "the mapping is the validated manifest shape and TOPOLOGY_KEY is a module-owned literal",
+            ("the mapping is the validated manifest shape and TOPOLOGY_KEY is a module-owned literal", 1),
         ("stage_coordinate.py", "with_execution_topology", "content_hash(source_manifest) != source_hash"):
-            "the resolver's exact-str admission and owned-carrier re-bind are the terminal guards for launcher routes; direct stage callers remain outside this launch contract",
+            ("the resolver's exact-str admission and owned-carrier re-bind are the terminal guards for launcher routes; direct stage callers remain outside this launch contract", 1),
         ("stage_coordinate.py", "with_execution_topology", "content_hash(manifest) != source_hash"):
-            "the resolver's exact-str admission and owned-carrier re-bind are the terminal guards for launcher routes; direct stage callers remain outside this launch contract",
+            ("the resolver's exact-str admission and owned-carrier re-bind are the terminal guards for launcher routes; direct stage callers remain outside this launch contract", 1),
         ("stage_coordinate.py", "_project_identity", "key == TOPOLOGY_KEY"):
-            "key is a validated manifest key and TOPOLOGY_KEY is a module-owned literal",
+            ("key is a validated manifest key and TOPOLOGY_KEY is a module-owned literal", 1),
         ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["stage"] != manifest["stage"]'):
-            "manifest has passed the structural validator and both values are exact schema fields",
+            ("manifest has passed the structural validator and both values are exact schema fields", 1),
         ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["label"] not in seed_labels(manifest["stage"])'):
-            "manifest has passed the structural validator and the namespace is module-owned",
+            ("manifest has passed the structural validator and the namespace is module-owned", 1),
         ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["namespace"] != "fresh-training"'):
-            "manifest has passed the structural validator and the expected namespace is a module literal",
+            ("manifest has passed the structural validator and the expected namespace is a module literal", 1),
         ("stage_coordinate.py", "_require_exact_keys", "frozenset(value) != expected"):
-            "value is a validated mapping at each caller and expected is a module-owned schema set",
+            ("value is a validated mapping at each caller and expected is a module-owned schema set", 1),
         ("stage_coordinate.py", "_validate_delegated_subtree", "key in _FORBIDDEN_TRAIN_CONTENT_KEYS"):
-            "key is required to be a string and the forbidden-key set is module-owned",
+            ("key is required to be a string and the forbidden-key set is module-owned", 1),
         ("stage_coordinate.py", "_validate_delegated_subtree", "type(value) not in {str, int, float, bool, type(None)}"):
-            "type(value) is a built-in identity and the admitted type set is module-owned",
+            ("type(value) is a built-in identity and the admitted type set is module-owned", 1),
         ("stage_coordinate.py", "_validate_delegated_subtree", "value == _REFERENCE_ENERGY"):
-            "the preceding exact-type test makes value an exact float and the reference is module-owned",
+            ("the preceding exact-type test makes value an exact float and the reference is module-owned", 1),
         ("stage_coordinate.py", "_validate_delegated_subtree", "value == _REFERENCE_ENERGY_TEXT"):
-            "the preceding exact-type test makes value an exact str and the reference is module-owned",
+            ("the preceding exact-type test makes value an exact str and the reference is module-owned", 1),
         ("stage_coordinate.py", "_validate_common", 'manifest["schema"] != schema'):
-            "manifest has passed the exact-key and mapping checks and schema is a module-owned validator argument",
+            ("manifest has passed the exact-key and mapping checks and schema is a module-owned validator argument", 1),
         ("train_config.py", "_require_checkout_root", "repo_root not in candidates"):
-            "repo_root and candidates are freshly resolved Path values owned by the checkout probe",
+            ("repo_root and candidates are freshly resolved Path values owned by the checkout probe", 1),
         ("train_config.py", "_cell_from_source", "hasattr(cell, name)"):
-            "this is source-shape admission; false positives fail at the required downstream reads",
+            ("this is source-shape admission; false positives fail at the required downstream reads", 1),
         ("train_config.py", "_set_optional_execution_seeds", '"seed" in checker'):
-            "checker is a validated mapping from the composed config and the key is a module literal",
+            ("checker is a validated mapping from the composed config and the key is a module literal", 1),
         ("train_config.py", "_optimizer_entry", 'status not in {"available", "unavailable"}'):
-            "status is read from the validated scientific-identity mapping and compared with module literals",
+            ("status is read from the validated scientific-identity mapping and compared with module literals", 1),
         ("train_config.py", "_optimizer_entry", 'status != "available"'):
-            "status is read from the validated scientific-identity mapping and compared with a module literal",
+            ("status is read from the validated scientific-identity mapping and compared with a module literal", 1),
         ("train_config.py", "resolve_train_config", "stage_api.content_hash(manifest) != source_hash"):
-            "resolve_train_config's own _cell_from_source admission requires an exact-str hash on every direct and wrapped resolver route",
+            ("resolve_train_config's own _cell_from_source admission requires an exact-str hash on every direct and wrapped resolver route", 1),
         ("train_config.py", "resolve_train_config", "output_path.parent.parent == output_path"):
-            "output_path is freshly converted to an owned Path before this structural sanity check",
+            ("output_path is freshly converted to an owned Path before this structural sanity check", 1),
     }
     findings: list[str] = []
-    observed: set[tuple[str, str, str]] = set()
+    observed: dict[tuple[str, str, str], int] = {}
     closure_roots = {
         "stage_coordinate.py": {"with_execution_topology"},
         "train_config.py": {"resolve_train_config"},
@@ -1271,7 +1271,7 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
                     segment = ast.get_source_segment(source, node) or ""
                     key = (filename, function.name, segment)
                     if key in allowlist:
-                        observed.add(key)
+                        observed[key] = observed.get(key, 0) + 1
                     if key not in allowlist:
                         findings.append(f"{filename}:{function.name}:{segment}")
                 if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
@@ -1285,19 +1285,22 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
                     segment = ast.get_source_segment(source, node) or ""
                     key = (filename, function.name, segment)
                     if key in allowlist:
-                        observed.add(key)
+                        observed[key] = observed.get(key, 0) + 1
                     else:
                         findings.append(
                             f"{filename}:{function.name}:hasattr-like call {segment}"
                         )
                 if isinstance(node, ast.Match):
                     findings.append(f"{filename}:{function.name}:match statement at line {node.lineno}")
-    for key, reason in allowlist.items():
+    for key, (reason, expected_count) in allowlist.items():
         filename, _function, segment = key
         assert reason, f"allowlist reason is empty for {key}"
         source = sources[filename].read_text(encoding="utf-8")
         assert segment in source, f"stale structural allowlist entry: {key}"
-        assert key in observed, f"unobserved structural allowlist entry: {key}"
+        assert observed.get(key, 0) == expected_count, (
+            f"structural allowlist occurrence count changed for {key}: "
+            f"expected {expected_count}, observed {observed.get(key, 0)}"
+        )
     assert not findings, "object-overridable validator decisions: " + "; ".join(findings)
 
 
@@ -1322,10 +1325,10 @@ def test_exact_string_admissions_return_the_values_they_admit() -> None:
             "launch.py",
             "_detach_topology_facts",
             "type(key) is not str",
-        ): "classifies a key already read from a detached mapping",
+            ): ("classifies a key already read from a detached mapping", 1),
     }
     admissions: list[tuple[str, str, str]] = []
-    observed_allowlist: set[tuple[str, str, str]] = set()
+    observed_allowlist: dict[tuple[str, str, str], int] = {}
     failures: list[str] = []
     for filename, path in sources.items():
         source = path.read_text(encoding="utf-8")
@@ -1351,7 +1354,7 @@ def test_exact_string_admissions_return_the_values_they_admit() -> None:
                 segment = ast.get_source_segment(source, node.test) or ""
                 key = (filename, function.name, segment)
                 if key in allowlist:
-                    observed_allowlist.add(key)
+                    observed_allowlist[key] = observed_allowlist.get(key, 0) + 1
                     continue
                 expression = node.test.left.args[0]
                 if not isinstance(expression, ast.Name):
@@ -1400,15 +1403,18 @@ def test_exact_string_admissions_return_the_values_they_admit() -> None:
                     failures.append(
                         f"{filename}:{function.name}:{segment} discards {admitted}"
                     )
-    for key, reason in allowlist.items():
+    for key, (reason, expected_count) in allowlist.items():
         filename, _function, segment = key
         assert reason, f"allowlist reason is empty for {key}"
         source = sources[filename].read_text(encoding="utf-8")
         assert segment in source, f"stale admission allowlist entry: {key}"
-        assert key in observed_allowlist, f"unobserved admission allowlist entry: {key}"
+        assert observed_allowlist.get(key, 0) == expected_count, (
+            f"admission allowlist occurrence count changed for {key}: "
+            f"expected {expected_count}, observed {observed_allowlist.get(key, 0)}"
+        )
     assert admissions == [
         ("launch.py", "_source_cell", "type(content_hash) is not str"),
         ("launch.py", "populate_execution_topology", "type(bound_hash) is not str"),
         ("train_config.py", "_cell_from_source", "type(content_hash) is not str"),
-    ]
+    ], "exact-string admission inventory changed: expected captured caller values"
     assert not failures, "admission values are not returned: " + "; ".join(failures)
