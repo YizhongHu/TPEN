@@ -763,11 +763,20 @@ def merge_named_metrics(
     shape of every defect in this slice: a guard placed where a symptom was
     reported rather than where the concept lives.
 
-    WHY A COLLISION IS STILL POSSIBLE AT ALL. :func:`json_safe_metric_name` is
-    injective over STRINGS but opens with ``str()``, so ``1`` and ``"1"``
-    encode identically. Encoding therefore cannot guarantee distinctness on
-    its own, and detection is not belt-and-braces -- it is the half of the
-    guarantee encoding cannot provide.
+    WHY A COLLISION IS STILL POSSIBLE AT ALL, stated correctly after an earlier
+    version of this comment got it wrong. TWO independent sources, not one:
+
+    1. COERCION. :func:`json_safe_metric_name` is injective over strings but
+       opens with ``str()``, so ``1`` and ``"1"`` encode identically.
+    2. STRUCTURAL JOINING, which an earlier wording denied by claiming only
+       non-string keys could collide. Flattening joins nested keys with ``_``,
+       so ``{"a_b": 1}`` and ``{"a": {"b": 2}}`` both produce ``a_b`` from
+       ORDINARY STRING KEYS. Injectivity of the encoder says nothing about a
+       name assembled from several encoded parts.
+
+    Encoding therefore cannot guarantee distinctness on its own, and detection
+    is not belt-and-braces -- it is the half of the guarantee encoding cannot
+    provide.
 
     FIRST WRITER WINS, deliberately. A later write silently replacing an
     earlier one is how a description comes to report a value nobody set; the
@@ -815,6 +824,17 @@ def merge_named_metrics(
 # overwrite a user entry -- the exact silent-loss failure the marker exists to
 # report, reintroduced by the reporting.
 SETTING_NAME_COLLISIONS_KEY = "%collisions"
+
+# The SAME reservation, for the trainer's diagnostics merge. It is a separate
+# constant rather than a reuse because the two markers report collisions in
+# different namespaces and a reader must be able to tell which one fired.
+#
+# THIS EXISTED AS AN ORDINARY KEY UNTIL VERIFICATION FOUND IT. The `%` rule was
+# applied at three name-composition sites and missed at the fourth, so a custom
+# diagnostics record returning the literal marker name lost its value to the
+# marker write -- the precise silent-loss failure the marker reports,
+# reintroduced by the reporting, for the second time in this slice.
+DIAGNOSTIC_NAME_COLLISIONS_KEY = "%diagnostic_collisions"
 
 
 class UpdateDiagnostics(ABC):
@@ -1183,9 +1203,11 @@ def flatten_settings(settings: Mapping[Any, Any], *, prefix: str = "") -> dict[s
 
     KEYS MAY BE NON-STRING. The annotation is deliberately ``Mapping[Any,
     Any]``: typeguard enforces annotations at runtime here, so a ``str`` key
-    type would REJECT exactly the inputs the collision detection above exists
-    to handle. Encoding is injective over strings, so a collision can ONLY come
-    from a non-string key coerced by ``str()``.
+    type would REJECT one whole class of input the collision detection exists
+    to handle. Note that non-string keys are NOT the only source -- joining
+    nested names with ``_`` also lets ``{"a_b": 1}`` and ``{"a": {"b": 2}}``
+    collide using ordinary strings. An earlier version of this docstring
+    claimed otherwise and was wrong.
 
     Parameters
     ----------
@@ -1923,6 +1945,7 @@ __all__ = [
     "carrier_settings",
     "deserialize_parameter_layout",
     "flatten_settings",
+    "DIAGNOSTIC_NAME_COLLISIONS_KEY",
     "SETTING_NAME_COLLISIONS_KEY",
     "json_safe_metric_name",
     "merge_named_metrics",
