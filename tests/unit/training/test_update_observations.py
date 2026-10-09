@@ -16,6 +16,7 @@ A test that asserted on the metrics dict alone would see neither.
 
 from __future__ import annotations
 
+import csv
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -27,10 +28,10 @@ from tpen.logging.base import LogRecord
 from tpen.logging.csv import CSV
 from tpen.logging.jsonl import JSONL
 from tpen.training.block_ng import BlockNGPolicy, BlockDiagonalNaturalGradientUpdate
-from tpen.training.qgt import DampingPolicy
+from tpen.training.qgt import DampingPolicy, SolveDiagnostics
 from tpen.training.score_geometry import ScoreConventions
-from tpen.training.spring import SPRINGPolicy, SPRINGUpdate
-from tpen.training.sr import SRPolicy, StochasticReconfigurationUpdate
+from tpen.training.spring import SPRINGPolicy, SPRINGTelemetry, SPRINGUpdate
+from tpen.training.sr import SRPolicy, SRTelemetry, StochasticReconfigurationUpdate
 from tpen.training.trainer import VMCTrainer
 from tpen.training.update import (
     UPDATE_REASON_APPLIED,
@@ -139,10 +140,10 @@ def test_a_csv_row_built_from_a_hostile_value_still_has_four_fields(tmp_path) ->
             metrics={"hostile": json_safe_scalar("a,b\nc\rd")},
         )
     )
-    rows = path.read_text().strip().splitlines()
+    rows = _strict_csv_rows(path)
     # Header plus exactly ONE data row. A newline would have produced two.
     assert len(rows) == 2, f"value broke the row structure: {rows!r}"
-    assert len(rows[1].split(",")) == 4, f"row split into extra columns: {rows[1]!r}"
+    assert len(rows[1]) == 4, f"row did not have four fields: {rows[1]!r}"
 
 
 def test_a_tensor_valued_setting_keeps_its_exact_value() -> None:
@@ -659,11 +660,13 @@ def test_every_builtin_description_survives_the_real_csv_sink(tmp_path) -> None:
             LogRecord(step=0, namespace="train/update_method", metrics=description.as_metrics())
         )
 
-    rows = path.read_text().strip().splitlines()
-    assert rows[0] == "step,namespace,key,value"
+    # Parsed with the STRICT reader rather than split on commas: a naive split
+    # is blind to an unbalanced double quote, which is a real hazard here and
+    # was missed by the first version of this assertion.
+    rows = _strict_csv_rows(path)
+    assert rows[0] == ["step", "namespace", "key", "value"]
     for row in rows[1:]:
-        # Exactly four fields: any comma inside a value would make it five.
-        assert len(row.split(",")) == 4, f"row split into extra columns: {row!r}"
+        assert len(row) == 4, f"row did not have four fields: {row!r}"
 
 
 def test_the_sr_diagnostics_record_survives_both_real_sinks(tmp_path) -> None:
@@ -688,8 +691,8 @@ def test_the_sr_diagnostics_record_survives_both_real_sinks(tmp_path) -> None:
 
     csv_path = tmp_path / "m.csv"
     CSV(csv_path).log(LogRecord(step=2, namespace="train", metrics=metrics))
-    for row in csv_path.read_text().strip().splitlines()[1:]:
-        assert len(row.split(",")) == 4, f"row split into extra columns: {row!r}"
+    for row in _strict_csv_rows(csv_path)[1:]:
+        assert len(row) == 4, f"row did not have four fields: {row!r}"
 
 
 def test_no_method_owned_diagnostic_key_collides_with_a_trainer_owned_key() -> None:
@@ -728,6 +731,176 @@ def test_no_method_owned_diagnostic_key_collides_with_a_trainer_owned_key() -> N
     for record in records:
         overlap = trainer_owned & set(record.as_metrics())
         assert not overlap, f"{type(record).__name__} collides on {sorted(overlap)}"
+
+
+def _strict_csv_rows(path) -> list[list[str]]:
+    """Parse a CSV with the STRICT reader, not by splitting on commas.
+
+    WHY THIS HELPER EXISTS. Earlier tests here asserted
+    ``len(row.split(",")) == 4``. That is a hand-rolled check which agrees with
+    a real reader only for the hazards its author already thought of: it is
+    blind to an unbalanced DOUBLE QUOTE, which makes `csv.reader` fail with
+    "unexpected end of data" while a naive split happily returns four fields.
+    Parsing with the real reader means a future hostile character fails the
+    READER rather than passing a check that was only ever as good as its
+    author's imagination.
+    """
+
+    with open(path, newline="", encoding="utf-8") as handle:
+        return list(csv.reader(handle, strict=True))
+
+
+@pytest.mark.parametrize("hostile", ['a"b', '"unclosed', 'a,b', "a\nb", "a\r\nb", 'mix",\n"x'])
+def test_any_hostile_value_still_yields_one_four_field_csv_row(tmp_path, hostile) -> None:
+    """The guard is asserted against a STRICT reader, over several hazards.
+
+    Parameterised rather than written once, because this guard was built up one
+    reported symptom at a time -- comma, then newline, then quote -- which is
+    precisely how a guard ends up covering less than its name promises.
+    """
+
+    path = tmp_path / f"hostile.csv"
+    CSV(path).log(
+        LogRecord(step=0, namespace="train", metrics={"hostile": json_safe_scalar(hostile)})
+    )
+    rows = _strict_csv_rows(path)
+    assert len(rows) == 2, f"expected header + one row, got {rows!r}"
+    assert len(rows[1]) == 4, f"row did not have four fields: {rows[1]!r}"
+
+
+def test_every_builtin_description_is_strict_csv_readable(tmp_path) -> None:
+    """Whole-description control, through the real sink and a real reader."""
+
+    model = build_connected_model()
+    path = tmp_path / "descriptions.csv"
+    sink = CSV(path)
+    for description in _describe_every_builtin_method(model):
+        sink.log(
+            LogRecord(step=0, namespace="train/update_method", metrics=description.as_metrics())
+        )
+    rows = _strict_csv_rows(path)
+    assert len(rows) > 1
+    for row in rows[1:]:
+        assert len(row) == 4, f"row did not have four fields: {row!r}"
+
+
+# --------------------------------------------------------------------------
+# Non-finite diagnostics must not crash the sink that records them
+# --------------------------------------------------------------------------
+
+
+def _nonfinite_sr_telemetry(value: float) -> SRTelemetry:
+    return SRTelemetry(
+        applied=False,
+        reason="nonfinite_update_direction",
+        step=1,
+        n_samples=4,
+        n_finite_samples=4,
+        n_parameters=8,
+        energy_gradient_norm=value,
+        update_direction_norm=value,
+        applied_update_norm=0.0,
+        trust_scale=1.0,
+        diagnostics=None,
+    )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_sr_diagnostics_with_a_nonfinite_norm_survive_the_real_jsonl_sink(
+    tmp_path, value
+) -> None:
+    """The record written to EXPLAIN a bad solve must not crash the run.
+
+    This is the sharpest form of the hazard. `tpen/logging/jsonl.py` calls
+    ``json.dumps(..., allow_nan=False)``, which RAISES on a non-finite float.
+    SR's `as_metrics` used a bare ``float()``, and SR has
+    ``nonfinite_update_direction`` as an EXPECTED skip reason -- so the single
+    path most likely to produce a non-finite norm was the one that killed the
+    run recording it.
+    """
+
+    path = tmp_path / "sr.jsonl"
+    JSONL(path).log(
+        LogRecord(step=1, namespace="train", metrics=_nonfinite_sr_telemetry(value).as_metrics())
+    )
+    payload = json.loads(path.read_text().strip())
+    # Named, not crashed, and NOT silently turned into a number.
+    assert payload["metrics"]["sr_energy_gradient_norm"] in ("nan", "inf", "-inf")
+    assert payload["metrics"]["sr_reason"] == "nonfinite_update_direction"
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_spring_diagnostics_with_a_nonfinite_norm_survive_the_real_jsonl_sink(
+    tmp_path, value
+) -> None:
+    """SPRING carries the same hazard on the same terms."""
+
+    telemetry = SPRINGTelemetry(
+        applied=False,
+        reason="nonfinite_projected_history",
+        step=1,
+        n_samples=4,
+        n_finite_samples=4,
+        n_parameters=8,
+        energy_gradient_norm=value,
+        update_direction_norm=0.0,
+        applied_update_norm=0.0,
+        trust_scale=1.0,
+        history_norm=value,
+        history_decay=0.9,
+        history_advanced=False,
+        diagnostics=None,
+    )
+    path = tmp_path / "spring.jsonl"
+    JSONL(path).log(LogRecord(step=1, namespace="train", metrics=telemetry.as_metrics()))
+    payload = json.loads(path.read_text().strip())
+    assert payload["metrics"]["spring_energy_gradient_norm"] in ("nan", "inf")
+    assert payload["metrics"]["spring_history_norm"] in ("nan", "inf")
+
+
+def test_nested_solve_diagnostics_with_a_nonfinite_eigenvalue_survive_jsonl(tmp_path) -> None:
+    """The NESTED record is emitted too, and had the same raw-float defect.
+
+    `SolveDiagnostics.as_metrics` documented itself as returning "JSON-safe"
+    keys while using a bare ``float()``. An ill-conditioned or overflowing
+    solve makes these values non-finite, and they reach the sink nested under
+    ``sr_qgt_*`` / ``spring_qgt_*``.
+    """
+
+    diagnostics = SolveDiagnostics(
+        space="parameter",
+        shift=float("inf"),
+        trace=float("nan"),
+        n_modes=8,
+        retained_modes=8,
+        max_eigenvalue=float("inf"),
+        min_retained_eigenvalue=0.0,
+        dtype="torch.float64",
+    )
+    path = tmp_path / "qgt.jsonl"
+    JSONL(path).log(LogRecord(step=1, namespace="train", metrics=diagnostics.as_metrics()))
+    payload = json.loads(path.read_text().strip())
+    assert payload["metrics"]["qgt_shift"] == "inf"
+    assert payload["metrics"]["qgt_trace"] == "nan"
+    assert payload["metrics"]["qgt_max_eigenvalue"] == "inf"
+    # The finite one stays a real number: the guard must not flatten everything.
+    assert payload["metrics"]["qgt_min_retained_eigenvalue"] == 0.0
+
+
+def test_a_finite_diagnostics_record_is_numerically_unchanged() -> None:
+    """CONTROL. Routing through the guard must not alter finite values.
+
+    Without this, the fix above could have silently stringified every norm and
+    the tests would still pass. Finite values must remain floats, with their
+    exact magnitudes.
+    """
+
+    telemetry = _nonfinite_sr_telemetry(2.5)
+    metrics = telemetry.as_metrics()
+    assert metrics["sr_energy_gradient_norm"] == 2.5
+    assert isinstance(metrics["sr_energy_gradient_norm"], float)
+    assert metrics["sr_step"] == 1
+    assert metrics["sr_applied"] is False
 
 
 # --------------------------------------------------------------------------
