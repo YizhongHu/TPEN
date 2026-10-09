@@ -95,7 +95,7 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 672, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 882, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 884, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
     ("test_stage_coordinate.py", 594, "tpen.hi.train"): InventoryEntry(
@@ -1299,3 +1299,95 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
         assert segment in source, f"stale structural allowlist entry: {key}"
         assert key in observed, f"unobserved structural allowlist entry: {key}"
     assert not findings, "object-overridable validator decisions: " + "; ".join(findings)
+
+
+def test_exact_string_admissions_return_the_values_they_admit() -> None:
+    """Ensure exact-string guards bind and return their admitted values.
+
+    This is deliberately structural: a future admission that discards its
+    value must fail before a caller-controlled re-read can reach a downstream
+    boundary.  The check covers every exact-string admission in these two
+    modules; it does not claim ownership for stage-layer admissions.
+    """
+
+    repository = STUDY_DIR.parents[2]
+    sources = {
+        "launch.py": repository / "experiments/atomistic/he-importance/launch.py",
+        "train_config.py": repository / "experiments/atomistic/he-importance/train_config.py",
+    }
+    admissions: list[tuple[str, str, str]] = []
+    failures: list[str] = []
+    for filename, path in sources.items():
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(function):
+                if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+                    continue
+                if len(node.test.ops) != 1 or not isinstance(node.test.ops[0], ast.IsNot):
+                    continue
+                if not (
+                    isinstance(node.test.left, ast.Call)
+                    and isinstance(node.test.left.func, ast.Name)
+                    and node.test.left.func.id == "type"
+                    and len(node.test.left.args) == 1
+                    and isinstance(node.test.left.args[0], ast.Name)
+                    and len(node.test.comparators) == 1
+                    and isinstance(node.test.comparators[0], ast.Name)
+                    and node.test.comparators[0].id == "str"
+                ):
+                    continue
+                admitted = node.test.left.args[0].id
+                if admitted not in {"content_hash", "bound_hash"}:
+                    # Other exact-string guards classify detached mapping keys;
+                    # this property concerns admitted caller attributes.
+                    continue
+                segment = ast.get_source_segment(source, node.test) or ""
+                admissions.append((filename, function.name, segment))
+                if not any(isinstance(child, ast.Raise) for child in node.body):
+                    failures.append(f"{filename}:{function.name}:guard has no raise")
+                    continue
+                returned = False
+                for returned_node in ast.walk(function):
+                    if not isinstance(returned_node, ast.Return) or returned_node.value is None:
+                        continue
+                    if any(
+                        isinstance(name, ast.Name) and name.id == admitted
+                        for name in ast.walk(returned_node.value)
+                    ):
+                        returned = True
+                        break
+                    if isinstance(returned_node.value, ast.Name):
+                        returned_name = returned_node.value.id
+                        for assignment in ast.walk(function):
+                            if not (
+                                isinstance(assignment, ast.Assign)
+                                and isinstance(assignment.value, ast.Call)
+                                and any(
+                                    isinstance(target, ast.Name)
+                                    and target.id == returned_name
+                                    for target in assignment.targets
+                                )
+                            ):
+                                continue
+                            if any(
+                                isinstance(keyword.value, ast.Name)
+                                and keyword.value.id == admitted
+                                for keyword in assignment.value.keywords
+                            ):
+                                returned = True
+                                break
+                        if returned:
+                            break
+                if not returned:
+                    failures.append(
+                        f"{filename}:{function.name}:{segment} discards {admitted}"
+                    )
+    assert admissions == [
+        ("launch.py", "_source_cell", "type(content_hash) is not str"),
+        ("launch.py", "populate_execution_topology", "type(bound_hash) is not str"),
+        ("train_config.py", "_cell_from_source", "type(content_hash) is not str"),
+    ]
+    assert not failures, "admission values are not returned: " + "; ".join(failures)

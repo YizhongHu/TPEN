@@ -13,6 +13,7 @@ from collections.abc import Buffer, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib import import_module
 import inspect
+from pathlib import Path
 import re
 from typing import Any
 
@@ -138,15 +139,19 @@ def _has_buffer_capability(value: object) -> bool:
     return False
 
 
-def _source_cell(source: Any) -> Any:
+def _source_cell(source: Any) -> tuple[Any, str]:
     """Extract the materialized cell from a cell or a training packet."""
 
     cell = getattr(source, "cell", source)
-    if not all(hasattr(cell, name) for name in ("manifest", "content_hash", "output_path")):
+    if not all(hasattr(cell, name) for name in ("manifest", "output_path")):
         raise LaunchValidationError("source must be a MaterializedCell or TrainingPacket")
-    if type(cell.content_hash) is not str:
+    try:
+        content_hash = cell.content_hash
+    except AttributeError as error:
+        raise LaunchValidationError("source must be a MaterializedCell or TrainingPacket") from error
+    if type(content_hash) is not str:
         raise LaunchValidationError("source content_hash must be an exact str")
-    return cell
+    return cell, content_hash
 
 
 def execution_topology_facts(topology: object) -> dict[str, Any]:
@@ -360,13 +365,19 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
     """Bind non-empty launch facts to a source row's designated subtree."""
 
     topology = _detach_topology_facts(topology)
-    cell = _source_cell(source)
+    cell, source_hash = _source_cell(source)
+    owned_source = _OwnedLaunchCell(
+        manifest=_STAGE_API._freeze(_detach_topology_facts(cell.manifest)),
+        content_hash=source_hash,
+        output_path=Path(cell.output_path),
+        seed_streams=_detach_topology_facts(cell.seed_streams),
+    )
     try:
-        _STAGE_API.validate_materialized_manifest(cell.manifest)
+        _STAGE_API.validate_materialized_manifest(owned_source.manifest)
     except Exception as error:
         raise LaunchValidationError("source manifest is not a valid HI train row") from error
     try:
-        bound = _STAGE_API.with_execution_topology(cell, topology)
+        bound = _STAGE_API.with_execution_topology(owned_source, topology)
         # The stage API preserves the caller's concrete cell type.  Capture its
         # frozen result once, then hand only this module-owned carrier onward so
         # later consumers cannot obtain a fresh caller-controlled manifest read.
@@ -376,7 +387,7 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
         owned = _OwnedLaunchCell(
             manifest=_STAGE_API._freeze(_detach_topology_facts(bound.manifest)),
             content_hash=bound_hash,
-            output_path=bound.output_path,
+            output_path=Path(bound.output_path),
             seed_streams=_detach_topology_facts(bound.seed_streams),
         )
         _reject_execution_facts_outside_topology(owned.manifest)

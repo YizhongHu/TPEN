@@ -783,7 +783,9 @@ def test_exit_code_rejects_non_result_non_int() -> None:
 
 def test_source_shape_guard_has_positive_and_negative_arms(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
-    assert launch._source_cell(cell) is cell
+    admitted, admitted_hash = launch._source_cell(cell)
+    assert admitted is cell
+    assert admitted_hash == cell.content_hash
     with pytest.raises(launch.LaunchValidationError, match="MaterializedCell"):
         launch._source_cell(object())
 
@@ -1283,7 +1285,7 @@ def test_prepare_train_launch_owns_manifest_before_downstream_reads(
     assert isinstance(ordinary.cell, launch._OwnedLaunchCell)
 
 
-def test_content_hash_is_exact_and_binds_both_public_launch_entries(
+def test_content_hash_is_exact_and_binds_all_public_launch_entries(
     tmp_path: Path,
 ) -> None:
     row_a = _cell(tmp_path / "a", identity={"architecture": "a"})
@@ -1291,6 +1293,10 @@ def test_content_hash_is_exact_and_binds_both_public_launch_entries(
     seen_run_ids: list[str] = []
 
     assert launch.prepare_train_launch(row_b, _topology()).config.run.run_id == row_b.content_hash
+    populated = launch.populate_execution_topology(
+        row_b, launch.execution_topology_facts(_topology())
+    )
+    assert stage_coordinate.content_hash(populated.manifest) == populated.content_hash
 
     def runner(config: object) -> int:
         seen_run_ids.append(str(config.run.run_id))
@@ -1298,6 +1304,33 @@ def test_content_hash_is_exact_and_binds_both_public_launch_entries(
 
     assert launch.launch_train(row_b, _topology(), runner=runner) == 0
     assert seen_run_ids == [row_b.content_hash]
+
+    class LyingReadCell:
+        def __init__(self, source: object) -> None:
+            self._source = source
+            self._hash_reads = 0
+
+        def __getattribute__(self, name: str) -> object:
+            if name == "content_hash":
+                reads = object.__getattribute__(self, "_hash_reads")
+                object.__setattr__(self, "_hash_reads", reads + 1)
+                if reads >= 2:
+                    class LyingHash:
+                        def __ne__(self, other: object) -> bool:
+                            del other
+                            return False
+
+                    return LyingHash()
+                return object.__getattribute__(self, "_source").content_hash
+            if name in {"manifest", "output_path", "seed_streams"}:
+                return getattr(object.__getattribute__(self, "_source"), name)
+            return object.__getattribute__(self, name)
+
+    lying_read = LyingReadCell(row_b)
+    populated = launch.populate_execution_topology(
+        lying_read, launch.execution_topology_facts(_topology())
+    )
+    assert stage_coordinate.content_hash(populated.manifest) == populated.content_hash
 
     class LyingHash(str):
         def __ne__(self, other: object) -> bool:
