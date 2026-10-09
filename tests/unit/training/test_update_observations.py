@@ -1280,8 +1280,8 @@ def test_an_unavoidable_name_collision_is_reported_not_silently_resolved() -> No
 
     # The structural value survives; the impostor does not overwrite it.
     assert settings["g0_betas1"] == pytest.approx(0.9)
-    assert "setting_name_collisions" in settings
-    assert "g0_betas1" in settings["setting_name_collisions"]
+    assert SETTING_NAME_COLLISIONS_KEY in settings
+    assert "g0_betas1" in settings[SETTING_NAME_COLLISIONS_KEY]
 
 
 def test_no_collision_marker_when_there_is_no_collision() -> None:
@@ -1289,7 +1289,7 @@ def test_no_collision_marker_when_there_is_no_collision() -> None:
 
     parameter = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
     settings = carrier_settings(torch.optim.Adam([parameter], lr=0.1))
-    assert "setting_name_collisions" not in settings
+    assert SETTING_NAME_COLLISIONS_KEY not in settings
 
 
 @pytest.mark.parametrize("hostile_key", ["tag,source", "tag\nsource", "tag\rsource"])
@@ -1359,7 +1359,7 @@ def test_a_compound_setting_cannot_be_spoofed_in_a_multi_group_optimizer(
     assert settings["g1_betas1"] == pytest.approx(0.7)
     assert settings["g1_betas2"] == pytest.approx(0.95)
     # The clash is surfaced rather than silently resolved.
-    assert "setting_name_collisions" in settings
+    assert SETTING_NAME_COLLISIONS_KEY in settings
 
 
 def test_the_group_count_cannot_be_spoofed_in_a_multi_group_optimizer() -> None:
@@ -1627,6 +1627,38 @@ def test_custom_diagnostics_names_are_guarded_at_the_trainer_merge(tmp_path) -> 
         for key in payload["metrics"]:
             assert isinstance(key, str)
             assert "," not in key and "\n" not in key
+
+
+def test_a_non_string_key_is_actually_accepted_not_rejected_by_typeguard() -> None:
+    """The collision path must be REACHABLE, not excluded by the annotation.
+
+    typeguard enforces annotations at runtime in this repository, so
+    `Mapping[str, Any]` on these surfaces did not merely document an
+    expectation -- it rejected non-string keys at the boundary with a
+    TypeCheckError. That made the collision detection dead code: encoding is
+    injective over STRINGS, so a collision can only arise from a non-string key
+    coerced by `str()`, and the type had already excluded those.
+
+    A guard and a type that disagree about what can reach a function is the
+    same failure as a docstring that overstates its body, which this slice has
+    now produced twice. This test pins the agreement rather than the guard.
+    """
+
+    # flatten_settings: the public helper.
+    flat = flatten_settings({1: "int", "other": "str"})
+    assert flat["1"] == "int"
+    assert flat["other"] == "str"
+
+    # UpdateMethodDescription.settings: the direct-construction surface.
+    description = UpdateMethodDescription(
+        method_class="Custom", carrier_class="none", n_parameters=1,
+        n_parameter_tensors=1, layout_fingerprint="float64:1",
+        forward_request="value", norm_semantics="method_defined",
+        settings={1: "int-value", "plain": "str-value"},
+    )
+    metrics = description.as_metrics()
+    assert metrics["update_method_setting_1"] == "int-value"
+    assert metrics["update_method_setting_plain"] == "str-value"
 
 
 def test_flatten_settings_reports_a_scalar_level_collision() -> None:

@@ -1163,7 +1163,7 @@ def carrier_settings(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
     return settings
 
 
-def flatten_settings(settings: Mapping[str, Any], *, prefix: str = "") -> dict[str, Any]:
+def flatten_settings(settings: Mapping[Any, Any], *, prefix: str = "") -> dict[str, Any]:
     """Flatten a nested policy fingerprint into flat JSON-safe scalar entries.
 
     A policy fingerprint is allowed to nest -- ``SRPolicy.fingerprint`` carries
@@ -1181,10 +1181,16 @@ def flatten_settings(settings: Mapping[str, Any], *, prefix: str = "") -> dict[s
     keys, so the guarantee held by accident of its callers rather than by
     construction.
 
+    KEYS MAY BE NON-STRING. The annotation is deliberately ``Mapping[Any,
+    Any]``: typeguard enforces annotations at runtime here, so a ``str`` key
+    type would REJECT exactly the inputs the collision detection above exists
+    to handle. Encoding is injective over strings, so a collision can ONLY come
+    from a non-string key coerced by ``str()``.
+
     Parameters
     ----------
     settings : Mapping
-        Possibly nested settings mapping.
+        Possibly nested settings mapping. Keys need not be strings.
     prefix : str, optional
         Key prefix for recursion; callers normally leave it empty.
 
@@ -1209,7 +1215,7 @@ def flatten_settings(settings: Mapping[str, Any], *, prefix: str = "") -> dict[s
 
 def _flatten_into(
     flat: dict[str, Any],
-    settings: Mapping[str, Any],
+    settings: Mapping[Any, Any],
     *,
     prefix: str,
     collisions: list[str],
@@ -1323,7 +1329,16 @@ class UpdateMethodDescription:
     layout_fingerprint: str | None
     forward_request: str
     norm_semantics: str
-    settings: Mapping[str, Any] = field(default_factory=dict)
+    # KEYS ARE `Any`, NOT `str`, AND THAT IS LOAD-BEARING. typeguard enforces
+    # these annotations at runtime in this repository, so `Mapping[str, Any]`
+    # did not merely document an expectation -- it REJECTED non-string keys at
+    # the boundary. That contradicted the collision machinery below it:
+    # `json_safe_metric_name` is injective over STRINGS, so a collision can
+    # only arise from a non-string key being coerced by `str()`. A narrow
+    # annotation therefore made the very path the collision detection exists
+    # to handle unreachable, leaving that detection as dead code guarding a
+    # case the type system had already excluded.
+    settings: Mapping[Any, Any] = field(default_factory=dict)
 
     def as_metrics(self, *, prefix: str = "update_method") -> dict[str, Any]:
         """Return the description as flat, JSON-safe, comma-free entries.
