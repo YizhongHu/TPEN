@@ -704,6 +704,36 @@ def json_safe_scalar(value: Any) -> Any:
     return text
 
 
+def json_safe_metric_name(name: Any) -> str:
+    """Return a sink-safe METRIC NAME that is INJECTIVE over hostile inputs.
+
+    WHY NAMES NEED A DIFFERENT RULE FROM VALUES. :func:`json_safe_scalar`
+    REPLACES hostile characters -- a comma becomes ``;``, a newline becomes a
+    space -- which is right for a value, where readability matters and a
+    collision is harmless. For a NAME it is actively dangerous: two distinct
+    keys can sanitize to the SAME name, and the second write then silently
+    overwrites the first. Measured: ``"tag\nsource"`` and ``"tag\rsource"``
+    both became ``"tag source"``, so four settings produced three entries and
+    one was lost with nothing reporting it.
+
+    Percent-encoding is used instead because it is REVERSIBLE and therefore
+    injective: distinct inputs cannot collide, so no setting can be dropped by
+    the act of making it safe. ``%`` is escaped FIRST, or a literal ``%2C`` in
+    an input key would become indistinguishable from an encoded comma.
+
+    This is for names only. Values keep :func:`json_safe_scalar`, which stays
+    readable; a reason that reads ``a;b`` is friendlier than ``a%2Cb`` and has
+    nothing to collide with.
+    """
+
+    text = str(name)
+    # `%` FIRST. Reordering this breaks injectivity.
+    text = text.replace("%", "%25")
+    for hostile, code in ((",", "%2C"), ("\r", "%0D"), ("\n", "%0A"), ('"', "%22")):
+        text = text.replace(hostile, code)
+    return text
+
+
 class UpdateDiagnostics(ABC):
     """Nominal DETACHED record of what one update attempt actually did.
 
@@ -1023,7 +1053,7 @@ def carrier_settings(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
     def put(name: Any, value: Any) -> None:
         """Record one entry, keeping the FIRST writer and noting any clash."""
 
-        safe_name = str(json_safe_scalar(name))
+        safe_name = json_safe_metric_name(name)
         if safe_name in settings:
             collisions.append(safe_name)
             return
@@ -1075,7 +1105,7 @@ def flatten_settings(settings: Mapping[str, Any], *, prefix: str = "") -> dict[s
     flat: dict[str, Any] = {}
     for key, value in settings.items():
         # Sanitized here too: these names reach the sinks as metric names.
-        composed = f"{prefix}{json_safe_scalar(key)}"
+        composed = f"{prefix}{json_safe_metric_name(key)}"
         if isinstance(value, Mapping):
             flat.update(flatten_settings(value, prefix=f"{composed}_"))
         elif isinstance(value, (tuple, list)):
@@ -1212,7 +1242,7 @@ class UpdateMethodDescription:
         # as well as the value: a setting name becomes a METRIC NAME, so a
         # comma or newline in it corrupts the row exactly as a value would.
         for key, value in self.settings.items():
-            safe_key = str(json_safe_scalar(key))
+            safe_key = json_safe_metric_name(key)
             metrics[f"{prefix}_setting_{safe_key}"] = json_safe_scalar(value)
         # Authoritative identity LAST, so it always wins.
         metrics.update(
@@ -1745,6 +1775,7 @@ __all__ = [
     "carrier_settings",
     "deserialize_parameter_layout",
     "flatten_settings",
+    "json_safe_metric_name",
     "json_safe_scalar",
     "parameter_layout_fingerprint",
     "select_reevaluation_rows",

@@ -54,6 +54,7 @@ from tpen.training.update import (
     parameter_layout_fingerprint,
     serialize_parameter_layout,
     flatten_settings,
+    json_safe_metric_name,
     json_safe_scalar,
 )
 from tests.helpers.hooke_models import build_tiny_hamiltonian_terms
@@ -1305,6 +1306,40 @@ def test_the_group_count_cannot_be_spoofed_in_a_multi_group_optimizer() -> None:
     assert len(optimizer.param_groups) == 2
     optimizer.param_groups[0]["n_param_groups"] = 999
     assert carrier_settings(optimizer)["n_param_groups"] == 2
+
+
+@pytest.mark.parametrize(
+    "a,b",
+    [
+        ("tag\nsource", "tag\rsource"),
+        ("a,b", "a;b"),
+        ("x%2Cy", "x,y"),
+        ('q"uote', "q'uote"),
+    ],
+)
+def test_metric_name_encoding_never_collapses_two_distinct_names(a, b) -> None:
+    """The name encoder must be INJECTIVE, or sanitizing silently loses data.
+
+    A replacement-based sanitizer is not injective, and the collisions are not
+    exotic. Measured on the previous implementation: "tag\\nsource" and
+    "tag\\rsource" BOTH became "tag source", so one of two real settings was
+    dropped by the act of making it safe, with nothing reporting the loss.
+    The `%` cases pin the escape-ordering bug that makes a literal "%2C"
+    indistinguishable from an encoded comma.
+    """
+
+    assert a != b
+    assert json_safe_metric_name(a) != json_safe_metric_name(b)
+    for encoded in (json_safe_metric_name(a), json_safe_metric_name(b)):
+        for hostile in (",", "\n", "\r", '"'):
+            assert hostile not in encoded
+
+
+def test_metric_name_encoding_leaves_an_ordinary_name_untouched() -> None:
+    """CONTROL: the common case must not be disfigured by the encoder."""
+
+    assert json_safe_metric_name("lr") == "lr"
+    assert json_safe_metric_name("g0_betas1") == "g0_betas1"
 
 
 def test_a_hostile_setting_key_is_sanitized_at_the_description_boundary() -> None:
