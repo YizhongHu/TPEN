@@ -27,7 +27,11 @@ import torch
 from tpen.logging.base import LogRecord
 from tpen.logging.csv import CSV
 from tpen.logging.jsonl import JSONL
-from tpen.training.block_ng import BlockNGPolicy, BlockDiagonalNaturalGradientUpdate
+from tpen.training.block_ng import (
+    BlockDiagonalNaturalGradientUpdate,
+    BlockNGPolicy,
+    BlockNGTelemetry,
+)
 from tpen.training.qgt import DampingPolicy, SolveDiagnostics
 from tpen.training.score_geometry import ScoreConventions
 from tpen.training.spring import SPRINGPolicy, SPRINGTelemetry, SPRINGUpdate
@@ -727,10 +731,34 @@ def test_no_method_owned_diagnostic_key_collides_with_a_trainer_owned_key() -> N
             model_parameters=binding,
             policy=sr_policy,
         )._skip(reason="declined", step=0, n_samples=1, n_finite=0, n_parameters=1).diagnostics,
+        # SPRING and block NG were NOT covered by the first version of this
+        # test, which is how the description-namespace collision (R5) survived
+        # it. Partial coverage of a collision check is close to no coverage:
+        # it certifies the pairs it happened to look at.
+        _nonfinite_sr_telemetry(1.0),
+        SPRINGTelemetry(
+            applied=False, reason="declined", step=0, n_samples=1, n_finite_samples=0,
+            n_parameters=1, energy_gradient_norm=1.0, update_direction_norm=0.0,
+            applied_update_norm=0.0, trust_scale=1.0, history_norm=0.0,
+            history_decay=0.9, history_advanced=False, diagnostics=None,
+        ),
+        BlockNGTelemetry(
+            applied=True, step=0, n_samples=1, n_blocks=1,
+            energy_gradient_norm=1.0, update_direction_norm=1.0,
+            solve_dtype="torch.float64",
+        ),
     ]
     for record in records:
         overlap = trainer_owned & set(record.as_metrics())
         assert not overlap, f"{type(record).__name__} collides on {sorted(overlap)}"
+
+    # The DESCRIPTION shares the metrics dict with these records too, and was
+    # not checked at all before.
+    description_keys = set(_sr_method(model).describe().as_metrics())
+    assert not (trainer_owned & description_keys)
+    for record in records:
+        clash = description_keys & set(record.as_metrics())
+        assert not clash, f"{type(record).__name__} collides with description on {sorted(clash)}"
 
 
 def _strict_csv_rows(path) -> list[list[str]]:
@@ -904,6 +932,164 @@ def test_a_finite_diagnostics_record_is_numerically_unchanged() -> None:
 
 
 # --------------------------------------------------------------------------
+# Reviewer round 2 findings R2, R4, R5
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("hostile", ["line one\nline two", "line one\rline two", 'quote"d'])
+def test_a_hostile_returned_reason_cannot_break_the_csv_record(tmp_path, hostile) -> None:
+    """A method's reason must not be able to corrupt the trainer's own record.
+
+    `reported_reason` is logged by the trainer directly. A custom method may
+    return a reason assembled from an exception message, which can carry a
+    newline -- and the unquoted CSV sink TERMINATES ITS ROW on one, so the
+    trainer-owned record is broken even when the method's own diagnostics are
+    clean.
+    """
+
+    result = VMCUpdateResult(applied=False, grad_norm=0.0, reason=hostile)
+    path = tmp_path / "reason.csv"
+    sink = CSV(path)
+    sink.log(LogRecord(step=0, namespace="train", metrics={"update_reason": result.reported_reason}))
+    sink.log(LogRecord(step=1, namespace="sentinel", metrics={"after": "still-readable"}))
+
+    rows = _strict_csv_rows(path)
+    for row in rows[1:]:
+        assert len(row) == 4, f"row did not have four fields: {row!r}"
+    # The sentinel proves the reason did not swallow following records.
+    assert rows[-1] == ["1", "sentinel", "after", "still-readable"]
+
+
+def test_a_hostile_reason_is_sanitized_at_emission_but_stored_verbatim() -> None:
+    """Sanitize the EMITTED form; leave the method's own datum untouched.
+
+    An earlier version RAISED on a comma in a reason. That let the observation
+    layer abort the run it was only supposed to describe -- the same mistake,
+    in the opposite direction, as letting a non-finite float reach a sink that
+    raises on it. A caller reading the result object should still see exactly
+    what the method said.
+    """
+
+    result = VMCUpdateResult(applied=False, grad_norm=0.0, reason="a,b\nc")
+    assert result.reason == "a,b\nc"
+    assert result.reported_reason == "a;b c"
+
+
+def test_a_valid_reason_is_unchanged_by_sanitization() -> None:
+    """CONTROL: ordinary reasons must pass through untouched."""
+
+    result = VMCUpdateResult(applied=True, grad_norm=1.0, reason=UPDATE_REASON_APPLIED)
+    assert result.reported_reason == UPDATE_REASON_APPLIED
+
+
+def _single_parameter_method(shape: tuple[int, ...], fill: float) -> LegacyAutogradUpdate:
+    parameter = torch.nn.Parameter(torch.full(shape, fill, dtype=torch.float64))
+    return LegacyAutogradUpdate(
+        optimizer=torch.optim.SGD([parameter], lr=0.1),
+        model_parameters=ModelParameterBinding(parameters=(parameter,)),
+    )
+
+
+def test_the_description_distinguishes_equal_size_parameter_layouts() -> None:
+    """Counts alone cannot tell (4,) from (2, 2); the description must.
+
+    The binding design requires "parameter count/layout identity". With only
+    scalar and tensor counts emitted, two genuinely different models produced
+    IDENTICAL description metrics, which defeats the point of describing what
+    was actually constructed.
+    """
+
+    flat = _single_parameter_method((4,), 1.0).describe().as_metrics()
+    square = _single_parameter_method((2, 2), 1.0).describe().as_metrics()
+    other_flat = _single_parameter_method((4,), 7.0).describe().as_metrics()
+
+    # Different LAYOUT must differ...
+    assert flat != square
+    assert flat["update_method_layout_fingerprint"] != square["update_method_layout_fingerprint"]
+    # ...while different VALUES at the same layout must NOT, so the fingerprint
+    # is an identity of the architecture and not of the run.
+    assert flat["update_method_layout_fingerprint"] == other_flat["update_method_layout_fingerprint"]
+
+
+def test_the_layout_fingerprint_is_sink_safe() -> None:
+    """It is emitted to both sinks, so it must carry no separator."""
+
+    fingerprint = _single_parameter_method((2, 2), 1.0).describe().layout_fingerprint
+    assert fingerprint is not None
+    for hostile in (",", "\n", "\r", '"'):
+        assert hostile not in fingerprint
+
+
+def test_carrier_metadata_cannot_overwrite_the_authoritative_identity() -> None:
+    """A param_group key must never be able to rename the method.
+
+    param_groups are ordinary dicts that anything may add keys to, and their
+    contents are read live. While settings shared the description's namespace,
+    a group carrying `class` or `n_parameters` OVERWROTE the authoritative
+    value: the description object stayed truthful while the emitted metrics
+    lied.
+
+    This is the exact promise the description contract exists to make. The
+    earlier test of that promise passed only because it set an ATTRIBUTE on
+    the method; the reachable route was through the carrier's group dict. A
+    guard is only as good as the channel it watches.
+    """
+
+    parameter = torch.nn.Parameter(torch.ones(4, dtype=torch.float64))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    # The hostile keys, placed exactly where they are actually reachable.
+    optimizer.param_groups[0]["class"] = "misleading-run-label"
+    optimizer.param_groups[0]["n_parameters"] = 999
+    optimizer.param_groups[0]["layout_fingerprint"] = "not-the-real-layout"
+    method = LegacyAutogradUpdate(
+        optimizer=optimizer,
+        model_parameters=ModelParameterBinding(parameters=(parameter,)),
+    )
+
+    description = method.describe()
+    metrics = description.as_metrics()
+
+    # The OBJECT was already truthful; the METRICS are what regressed.
+    assert description.method_class.endswith("LegacyAutogradUpdate")
+    assert metrics["update_method_class"].endswith("LegacyAutogradUpdate")
+    assert metrics["update_method_class"] != "misleading-run-label"
+    assert metrics["update_method_n_parameters"] == 4
+    assert metrics["update_method_layout_fingerprint"] != "not-the-real-layout"
+    # The hostile values are still REPORTED, just under a namespace that
+    # cannot impersonate identity -- suppressing them would hide real state.
+    assert metrics["update_method_setting_class"] == "misleading-run-label"
+    assert metrics["update_method_setting_n_parameters"] == 999
+
+
+def test_no_setting_key_can_ever_reach_an_authoritative_name() -> None:
+    """Structural guard, not a sample of hostile keys.
+
+    Enumerating bad key names would only ever cover the ones imagined. Every
+    authoritative name is checked to not begin with the settings sub-namespace,
+    which is what makes the separation hold for ANY key a param_group carries.
+    """
+
+    model = build_connected_model()
+    description = _sr_method(model).describe()
+    metrics = description.as_metrics()
+    authoritative = {
+        "update_method_class",
+        "update_method_carrier_class",
+        "update_method_n_parameters",
+        "update_method_n_parameter_tensors",
+        "update_method_layout_fingerprint",
+        "update_method_forward_request",
+        "update_method_norm_semantics",
+    }
+    assert authoritative <= set(metrics)
+    for name in authoritative:
+        assert not name.startswith("update_method_setting_")
+    for key in metrics:
+        if key.startswith("update_method_setting_"):
+            assert key not in authoritative
+
+
+# --------------------------------------------------------------------------
 # Custom and stateless methods keep working
 # --------------------------------------------------------------------------
 
@@ -968,11 +1154,26 @@ def test_a_minimal_record_is_an_explicit_choice_with_honest_absence() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_a_reason_containing_a_comma_is_rejected_at_construction() -> None:
-    """Rejected where it is cheap, not where it silently corrupts a CSV."""
+def test_a_hostile_reason_is_accepted_at_construction_and_fixed_at_emission() -> None:
+    """DELIBERATE REVERSAL of an earlier assertion, recorded as such.
 
-    with pytest.raises(ValueError, match="comma"):
-        VMCUpdateResult(applied=True, grad_norm=0.0, reason="a,b")
+    This test previously required `VMCUpdateResult(reason="a,b")` to RAISE.
+    That was wrong in a way worth naming: it let the observation layer abort
+    the run it was only supposed to describe. A method returning an awkward
+    string -- a reason built from an exception message, say -- crashed
+    training to protect a log file's column alignment.
+
+    The replacement is not a relaxation. The hazard is closed at the EMISSION
+    boundary instead, which is strictly stronger: construction-time rejection
+    only ever covered reasons that passed through this constructor, while
+    `reported_reason` covers every path to a sink. The construction check that
+    remains is the one that cannot be fixed downstream -- a reason that is
+    empty or not a string carries no information to sanitize.
+    """
+
+    result = VMCUpdateResult(applied=True, grad_norm=0.0, reason="a,b")
+    assert result.reason == "a,b"
+    assert result.reported_reason == "a;b"
 
 
 def test_an_empty_reason_is_rejected_rather_than_treated_as_absent() -> None:

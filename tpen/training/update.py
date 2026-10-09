@@ -825,18 +825,35 @@ class VMCUpdateResult:
         if self.reason is not None:
             if not isinstance(self.reason, str) or not self.reason:
                 raise TypeError("VMCUpdateResult.reason must be a non-empty str or None")
-            if "," in self.reason:
-                # The CSV sink writes unquoted rows, so a comma here would
-                # split one metric into two columns and still parse.
-                raise ValueError("VMCUpdateResult.reason must not contain a comma")
         if self.diagnostics is not None and not isinstance(self.diagnostics, UpdateDiagnostics):
             raise TypeError("VMCUpdateResult.diagnostics must be an UpdateDiagnostics or None")
 
     @property
     def reported_reason(self) -> str:
-        """Return the reason, or the explicit unreported token when absent."""
+        """Return a SINK-SAFE reason, or the explicit unreported token.
 
-        return UPDATE_REASON_UNREPORTED if self.reason is None else self.reason
+        SANITIZED HERE RATHER THAN REJECTED AT CONSTRUCTION, and that reversal
+        is deliberate. An earlier version RAISED on a reason containing a
+        comma. That made the observation layer able to abort the run it was
+        only supposed to describe -- a method returning an awkward string
+        crashed training rather than producing a slightly ugly log line. It is
+        the same mistake, in the opposite direction, as letting a non-finite
+        float reach a sink that raises on it: in both cases the record written
+        to explain something destroyed the thing it was explaining.
+
+        The stored :attr:`reason` is left VERBATIM, because it is the method's
+        own datum and a caller reading the result object should see exactly
+        what the method said. Only the EMITTED form is sanitized, and only at
+        this boundary.
+
+        Custom methods are the realistic source: a reason assembled from an
+        exception message can carry a newline, and the unquoted CSV sink
+        terminates its row on one.
+        """
+
+        if self.reason is None:
+            return UPDATE_REASON_UNREPORTED
+        return json_safe_scalar(self.reason)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1032,6 +1049,34 @@ def flatten_settings(settings: Mapping[str, Any], *, prefix: str = "") -> dict[s
     return flat
 
 
+def parameter_layout_fingerprint(layout: ParameterLayout) -> str:
+    """Return a stable, sink-safe identity for a parameter LAYOUT.
+
+    WHY COUNTS ARE NOT ENOUGH. The binding design requires the description to
+    carry "parameter count/layout identity", and a count alone does not supply
+    it: one parameter shaped ``(4,)`` and one shaped ``(2, 2)`` have identical
+    scalar and tensor counts, so two genuinely different models produced
+    identical descriptions. That defeats the purpose of describing what was
+    actually constructed.
+
+    STABLE ACROSS VALUES AND ADDRESSES: built only from shape and dtype, never
+    from parameter values or object identity, so the same architecture
+    fingerprints identically across runs, processes and restores -- which is
+    what makes it usable for comparing a resumed run against its original.
+
+    Comma-free and newline-free by construction: dimensions are joined with
+    ``x`` and slots with ``|``, so the result passes through the unquoted CSV
+    sink without needing sanitization.
+    """
+
+    slots = []
+    for slot in layout.slots:
+        dtype = str(slot.dtype).replace("torch.", "")
+        shape = "x".join(str(dim) for dim in slot.shape) or "scalar"
+        slots.append(f"{dtype}:{shape}")
+    return "|".join(slots)
+
+
 @dataclass(frozen=True, kw_only=True)
 class UpdateMethodDescription:
     """What was ACTUALLY constructed or restored, for one fit invocation.
@@ -1063,6 +1108,10 @@ class UpdateMethodDescription:
         measurement.
     n_parameter_tensors : int or None
         Number of tensors in the bound domain, or ``None`` on the same terms.
+    layout_fingerprint : str or None
+        Stable shape-and-dtype identity of the bound domain, or ``None`` when
+        there is none. Counts alone cannot distinguish ``(4,)`` from
+        ``(2, 2)``; this can.
     forward_request : str
         The requested derivative convention -- the qualified type of the typed
         forward request this method returns, or ``"value"`` for an ordinary
@@ -1083,23 +1132,60 @@ class UpdateMethodDescription:
     # prevent. `None` means "not reported" and stays distinguishable.
     n_parameters: int | None
     n_parameter_tensors: int | None
+    # Shape-and-dtype identity, NOT just a count. Two layouts with equal
+    # counts but different shapes must be distinguishable; see
+    # `parameter_layout_fingerprint`.
+    layout_fingerprint: str | None
     forward_request: str
     norm_semantics: str
     settings: Mapping[str, Any] = field(default_factory=dict)
 
     def as_metrics(self, *, prefix: str = "update_method") -> dict[str, Any]:
-        """Return the description as flat, JSON-safe, comma-free entries."""
+        """Return the description as flat, JSON-safe, comma-free entries.
 
-        metrics: dict[str, Any] = {
-            f"{prefix}_class": json_safe_scalar(self.method_class),
-            f"{prefix}_carrier_class": json_safe_scalar(self.carrier_class),
-            f"{prefix}_n_parameters": json_safe_scalar(self.n_parameters),
-            f"{prefix}_n_parameter_tensors": json_safe_scalar(self.n_parameter_tensors),
-            f"{prefix}_forward_request": json_safe_scalar(self.forward_request),
-            f"{prefix}_norm_semantics": json_safe_scalar(self.norm_semantics),
-        }
+        SETTINGS ARE NAMESPACED AWAY FROM THE AUTHORITATIVE FIELDS, and that
+        separation is the whole point of this method rather than a tidiness
+        preference.
+
+        THE ATTACK IT CLOSES. Settings are read off the LIVE optimizer
+        ``param_groups``, and a param_group is an ordinary dict that anything
+        may add keys to. When settings were merged into the same ``prefix_``
+        namespace as the identity fields, a group carrying a key named
+        ``class`` or ``n_parameters`` OVERWROTE the authoritative value. The
+        description OBJECT stayed truthful while the emitted METRICS lied --
+        reporting, in the observed case, ``update_method_class =
+        'misleading-run-label'`` for a real ``LegacyAutogradUpdate``.
+
+        That is precisely the failure this whole description contract exists
+        to prevent. The contract's promise is that a misleading external label
+        cannot change what is reported; a test asserting that promise passed,
+        because it set an ATTRIBUTE on the method, and the reachable route was
+        through the carrier's group dict instead. A guard is only as good as
+        the channel it watches.
+
+        Two independent mechanisms now hold, so neither alone is load-bearing:
+        settings go under ``{prefix}_setting_``, which cannot collide with any
+        authoritative name because no authoritative name begins with
+        ``setting_``; and the authoritative fields are written LAST, so even a
+        hypothetical collision resolves in favour of the truth.
+        """
+
+        metrics: dict[str, Any] = {}
+        # Settings FIRST, under their own sub-namespace.
         for key, value in self.settings.items():
-            metrics[f"{prefix}_{key}"] = json_safe_scalar(value)
+            metrics[f"{prefix}_setting_{key}"] = json_safe_scalar(value)
+        # Authoritative identity LAST, so it always wins.
+        metrics.update(
+            {
+                f"{prefix}_class": json_safe_scalar(self.method_class),
+                f"{prefix}_carrier_class": json_safe_scalar(self.carrier_class),
+                f"{prefix}_n_parameters": json_safe_scalar(self.n_parameters),
+                f"{prefix}_n_parameter_tensors": json_safe_scalar(self.n_parameter_tensors),
+                f"{prefix}_layout_fingerprint": json_safe_scalar(self.layout_fingerprint),
+                f"{prefix}_forward_request": json_safe_scalar(self.forward_request),
+                f"{prefix}_norm_semantics": json_safe_scalar(self.norm_semantics),
+            }
+        )
         return metrics
 
 
@@ -1275,6 +1361,7 @@ class VMCUpdateMethod(Generic[InputT], ABC):
             # UNKNOWN rather than empty. See the field comment above.
             n_parameters = None
             n_parameter_tensors = None
+            layout_fingerprint = None
         else:
             optimizer = update_state.optimizer
             carrier_class = f"{type(optimizer).__module__}.{type(optimizer).__qualname__}"
@@ -1283,6 +1370,7 @@ class VMCUpdateMethod(Generic[InputT], ABC):
             assert layout is not None
             n_parameters = int(layout.total_numel)
             n_parameter_tensors = len(layout.slots)
+            layout_fingerprint = parameter_layout_fingerprint(layout)
         request = self.forward_request()
         forward_request = (
             "value"
@@ -1294,6 +1382,7 @@ class VMCUpdateMethod(Generic[InputT], ABC):
             carrier_class=carrier_class,
             n_parameters=n_parameters,
             n_parameter_tensors=n_parameter_tensors,
+            layout_fingerprint=layout_fingerprint,
             forward_request=forward_request,
             norm_semantics=self.norm_semantics(),
             settings=settings,
@@ -1617,6 +1706,7 @@ __all__ = [
     "deserialize_parameter_layout",
     "flatten_settings",
     "json_safe_scalar",
+    "parameter_layout_fingerprint",
     "select_reevaluation_rows",
     "serialize_parameter_layout",
     "vmc_objective_reevaluation",
