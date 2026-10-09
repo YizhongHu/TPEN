@@ -1307,6 +1307,78 @@ def test_the_group_count_cannot_be_spoofed_in_a_multi_group_optimizer() -> None:
     assert carrier_settings(optimizer)["n_param_groups"] == 2
 
 
+def test_a_hostile_setting_key_is_sanitized_at_the_description_boundary() -> None:
+    """ISOLATE the as_metrics layer, which carrier_settings otherwise MASKS.
+
+    WHY THIS EXISTS, and it is a lesson about test design rather than about
+    this code. Key sanitization happens in TWO places: `carrier_settings`
+    cleans names as it builds the map, and `as_metrics` cleans them again as it
+    composes metric names. A mutation removing the SECOND one SURVIVED both
+    end-to-end tests, because every key those tests supply has already been
+    cleaned by the first. The tests were not wrong about their property -- a
+    hostile key genuinely cannot corrupt the CSV -- but they pinned the wrong
+    LAYER, and a layer no test isolates can be deleted without anything going
+    red.
+
+    The second layer is not redundant. Settings reach a description from
+    sources that never pass through `carrier_settings`: a policy fingerprint
+    merged by SR/SPRING's `describe`, or a custom method constructing an
+    `UpdateMethodDescription` directly, as here. For those, this is the ONLY
+    guard.
+    """
+
+    description = UpdateMethodDescription(
+        method_class="Custom",
+        carrier_class="none",
+        n_parameters=1,
+        n_parameter_tensors=1,
+        layout_fingerprint="float64:1",
+        forward_request="value",
+        norm_semantics="method_defined",
+        # Built directly, bypassing carrier_settings entirely.
+        settings={"tag,source": "a", "tag\nsource": "b", "tag\rsource": "c", 'q"uote': "d"},
+    )
+    metrics = description.as_metrics()
+
+    for key in metrics:
+        assert "," not in key, f"metric name carries a comma: {key!r}"
+        assert "\n" not in key, f"metric name carries a newline: {key!r}"
+        assert "\r" not in key, f"metric name carries a CR: {key!r}"
+        assert '"' not in key, f"metric name carries a quote: {key!r}"
+    # All four distinct hostile keys still produce four distinct entries:
+    # sanitizing must not collapse them into one and silently lose three.
+    setting_keys = [k for k in metrics if k.startswith("update_method_setting_")]
+    assert len(setting_keys) == 4, f"sanitizing collapsed keys: {setting_keys!r}"
+
+
+def test_a_hostile_setting_key_survives_the_real_csv_sink_from_a_direct_description(
+    tmp_path,
+) -> None:
+    """The same isolated layer, proven at the real sink rather than by string check."""
+
+    description = UpdateMethodDescription(
+        method_class="Custom",
+        carrier_class="none",
+        n_parameters=1,
+        n_parameter_tensors=1,
+        layout_fingerprint="float64:1",
+        forward_request="value",
+        norm_semantics="method_defined",
+        settings={"tag,source": "a", "tag\nsource": "b"},
+    )
+    metrics = description.as_metrics()
+    path = tmp_path / "direct.csv"
+    sink = CSV(path)
+    sink.log(LogRecord(step=0, namespace="train/update_method", metrics=metrics))
+    sink.log(LogRecord(step=1, namespace="sentinel", metrics={"after": "still-readable"}))
+
+    rows = _strict_csv_rows(path)
+    assert len(rows) == 1 + len(metrics) + 1
+    for row in rows[1:]:
+        assert len(row) == 4, f"row did not have four fields: {row!r}"
+    assert rows[-1] == ["1", "sentinel", "after", "still-readable"]
+
+
 # --------------------------------------------------------------------------
 # Gaps the 5c4631a0 verifier declared uncovered. Closing them here rather
 # than carrying them, because a declared gap that nobody closes becomes a
