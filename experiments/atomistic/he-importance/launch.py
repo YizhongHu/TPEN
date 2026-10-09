@@ -369,7 +369,7 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
         # frozen result once, then hand only this module-owned carrier onward so
         # later consumers cannot obtain a fresh caller-controlled manifest read.
         owned = _OwnedLaunchCell(
-            manifest=_detach_topology_facts(bound.manifest),
+            manifest=_STAGE_API._freeze(_detach_topology_facts(bound.manifest)),
             content_hash=bound.content_hash,
             output_path=bound.output_path,
             seed_streams=_detach_topology_facts(bound.seed_streams),
