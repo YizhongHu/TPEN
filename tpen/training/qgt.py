@@ -61,7 +61,7 @@ from typing import Any, Self
 
 from tpen.dependencies import require_torch
 from tpen.training.score_geometry import ScoreGeometry
-from tpen.training.update import json_safe_scalar
+from tpen.training.update import json_safe_metric_name, json_safe_scalar
 from tpen.training.statistics import IdentityStatisticsReducer, StatisticsReducer
 
 torch = require_torch(feature="VMC quantum geometric tensor")
@@ -209,6 +209,8 @@ class SolveDiagnostics:
         while a non-finite one is NAMED rather than crashing the sink or being
         fabricated into a zero.
         """
+
+        prefix = json_safe_metric_name(prefix)
 
         return {
             f"{prefix}_space": json_safe_scalar(self.space),

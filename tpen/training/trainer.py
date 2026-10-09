@@ -31,6 +31,7 @@ from tpen.training.update import (
     ModelParameterBinding,
     ScoreUpdateInput,
     UpdateMethodDescription,
+    merge_named_metrics,
     deserialize_parameter_layout,
     serialize_parameter_layout,
     VMCUpdateMethod,
@@ -686,7 +687,25 @@ class VMCTrainer:
                     # silently invisible.
                     update_diagnostics = update_result.diagnostics
                     if update_diagnostics is not None:
-                        metrics.update(update_diagnostics.as_metrics())
+                        # MERGED THROUGH THE SHARED NAME GUARD, not with a bare
+                        # dict update. Every BUILT-IN record already encodes its
+                        # own names, but `UpdateDiagnostics` is a NOMINAL
+                        # contract: it obliges an implementation to return flat
+                        # JSON-safe entries and cannot enforce it. A custom
+                        # record was therefore able to deliver raw CSV-hostile
+                        # or colliding names straight to the sink, so the
+                        # name-safety property held for the implementations
+                        # this package happens to ship rather than for the
+                        # contract. Encoding here makes it hold for any
+                        # implementation; for the built-ins the encoding is
+                        # idempotent and changes nothing.
+                        diagnostic_collisions = merge_named_metrics(
+                            metrics, update_diagnostics.as_metrics()
+                        )
+                        if diagnostic_collisions:
+                            metrics["update_diagnostic_name_collisions"] = ";".join(
+                                sorted(set(diagnostic_collisions))
+                            )
 
                 state.step = step
                 state.metrics = metrics

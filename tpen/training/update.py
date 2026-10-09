@@ -717,9 +717,22 @@ def json_safe_metric_name(name: Any) -> str:
     one was lost with nothing reporting it.
 
     Percent-encoding is used instead because it is REVERSIBLE and therefore
-    injective: distinct inputs cannot collide, so no setting can be dropped by
-    the act of making it safe. ``%`` is escaped FIRST, or a literal ``%2C`` in
-    an input key would become indistinguishable from an encoded comma.
+    INJECTIVE OVER STRINGS: two distinct strings cannot collide, so no setting
+    can be dropped by the act of making it safe. ``%`` is escaped FIRST, or a
+    literal ``%2C`` in an input key would become indistinguishable from an
+    encoded comma.
+
+    WHAT THIS IS NOT, stated because an earlier version of this docstring
+    claimed universal injectivity and was WRONG. The function opens with
+    ``str(name)``, so it is NOT injective over arbitrary objects: ``1`` and
+    ``"1"``, ``True`` and ``"True"``, and any two values sharing a ``str()``
+    all collapse to one name. That coercion is deliberate -- a param_group may
+    hold non-string keys and refusing them would turn a reporting concern into
+    a crash -- but it means ENCODING ALONE CANNOT GUARANTEE DISTINCTNESS. The
+    callers therefore detect collisions on the ENCODED name; see
+    :func:`merge_named_metrics`. A docstring promising more than the body
+    delivers is worse than silence, because it is what the next reader trusts
+    instead of checking.
 
     This is for names only. Values keep :func:`json_safe_scalar`, which stays
     readable; a reason that reads ``a;b`` is friendlier than ``a%2Cb`` and has
@@ -732,6 +745,65 @@ def json_safe_metric_name(name: Any) -> str:
     for hostile, code in ((",", "%2C"), ("\r", "%0D"), ("\n", "%0A"), ('"', "%22")):
         text = text.replace(hostile, code)
     return text
+
+
+def merge_named_metrics(
+    target: dict[str, Any],
+    entries: "Mapping[Any, Any] | list[tuple[Any, Any]]",
+    *,
+    prefix: str = "",
+    collisions: list[str] | None = None,
+) -> list[str]:
+    """Merge entries under ENCODED names, keeping the FIRST and reporting clashes.
+
+    ONE PLACE, BECAUSE THE CONCEPT IS ONE. Collision handling previously lived
+    only in :func:`carrier_settings`, so a clash there was reported while the
+    identical clash through ``UpdateMethodDescription.as_metrics`` or
+    :func:`flatten_settings` silently dropped an entry. That is the recurring
+    shape of every defect in this slice: a guard placed where a symptom was
+    reported rather than where the concept lives.
+
+    WHY A COLLISION IS STILL POSSIBLE AT ALL. :func:`json_safe_metric_name` is
+    injective over STRINGS but opens with ``str()``, so ``1`` and ``"1"``
+    encode identically. Encoding therefore cannot guarantee distinctness on
+    its own, and detection is not belt-and-braces -- it is the half of the
+    guarantee encoding cannot provide.
+
+    FIRST WRITER WINS, deliberately. A later write silently replacing an
+    earlier one is how a description comes to report a value nobody set; the
+    clash is surfaced instead so a reader can see the map is incomplete.
+
+    Parameters
+    ----------
+    target : dict
+        Mapping to merge into, mutated in place.
+    entries : mapping or list of pairs
+        Source entries. A list of pairs is accepted so callers that expand one
+        source key into several names keep their ordering.
+    prefix : str, optional
+        Prepended to each encoded name.
+    collisions : list of str, optional
+        Accumulator for collided names. A caller merging several sources
+        passes one list so a single marker covers them all.
+
+    Returns
+    -------
+    list of str
+        The collided names, for the caller to surface.
+    """
+
+    recorded = [] if collisions is None else collisions
+    pairs = entries.items() if isinstance(entries, Mapping) else entries
+    for key, value in pairs:
+        name = f"{prefix}{json_safe_metric_name(key)}"
+        if name in target:
+            recorded.append(name)
+            continue
+        target[name] = json_safe_scalar(value)
+    return recorded
+
+
+SETTING_NAME_COLLISIONS_KEY = "setting_name_collisions"
 
 
 class UpdateDiagnostics(ABC):
@@ -790,14 +862,22 @@ class MinimalUpdateDiagnostics(UpdateDiagnostics):
     prefix: str = "update_record"
 
     def as_metrics(self) -> dict[str, Any]:
-        """Return the minimal record under this method's own key prefix."""
+        """Return the minimal record under this method's own key prefix.
 
+        The PREFIX IS ENCODED, because it is part of the metric name and it is
+        CALLER-SUPPLIED: a custom method may select this built-in record and
+        give it any prefix, so interpolating it verbatim let a hostile prefix
+        break a row through a record this package ships. The default encodes to
+        itself.
+        """
+
+        safe_prefix = json_safe_metric_name(self.prefix)
         return {
-            f"{self.prefix}_method": json_safe_scalar(self.method),
-            f"{self.prefix}_applied": bool(self.applied),
-            f"{self.prefix}_reason": json_safe_scalar(self.reason),
-            f"{self.prefix}_step": int(self.step),
-            f"{self.prefix}_grad_norm": json_safe_scalar(self.grad_norm),
+            f"{safe_prefix}_method": json_safe_scalar(self.method),
+            f"{safe_prefix}_applied": bool(self.applied),
+            f"{safe_prefix}_reason": json_safe_scalar(self.reason),
+            f"{safe_prefix}_step": int(self.step),
+            f"{safe_prefix}_grad_norm": json_safe_scalar(self.grad_norm),
         }
 
 
@@ -1050,19 +1130,10 @@ def carrier_settings(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
     settings: dict[str, Any] = {}
     collisions: list[str] = []
 
-    def put(name: Any, value: Any) -> None:
-        """Record one entry, keeping the FIRST writer and noting any clash."""
-
-        safe_name = json_safe_metric_name(name)
-        if safe_name in settings:
-            collisions.append(safe_name)
-            return
-        settings[safe_name] = json_safe_scalar(value)
-
     # Seeded first so that no group key can displace it.
-    put("n_param_groups", len(groups))
+    merge_named_metrics(settings, [("n_param_groups", len(groups))], collisions=collisions)
     for index, group in enumerate(groups):
-        prefix = f"g{index}_"
+        pairs: list[tuple[Any, Any]] = []
         # Sorted by the key's TEXT: a param_group may hold non-comparable key
         # types, and sorting those directly raises.
         for key, value in sorted(group.items(), key=lambda item: str(item[0])):
@@ -1072,11 +1143,12 @@ def carrier_settings(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
                 continue
             if isinstance(value, (tuple, list)):
                 for ordinal, element in enumerate(value, start=1):
-                    put(f"{prefix}{key}{ordinal}", element)
+                    pairs.append((f"{key}{ordinal}", element))
                 continue
-            put(f"{prefix}{key}", value)
+            pairs.append((key, value))
+        merge_named_metrics(settings, pairs, prefix=f"g{index}_", collisions=collisions)
     if collisions:
-        put("setting_name_collisions", ";".join(sorted(set(collisions))))
+        settings[SETTING_NAME_COLLISIONS_KEY] = ";".join(sorted(set(collisions)))
     return settings
 
 
@@ -1089,6 +1161,15 @@ def flatten_settings(settings: Mapping[str, Any], *, prefix: str = "") -> dict[s
     would be a brace-and-comma string that silently becomes several columns.
     Nested keys are therefore joined with ``_`` into one flat namespace.
 
+    COLLISION DETECTION ADDED, through :func:`merge_named_metrics`. Encoding
+    was already here; what was missing was detection, so two keys that encoded
+    to one name silently lost an entry. (An earlier note of mine said this
+    function had neither -- that was wrong, and is corrected here: the
+    ``json_safe_metric_name`` call predates this change.) The gap was invisible
+    because every built-in policy fingerprint happens to use ordinary string
+    keys, so the guarantee held by accident of its callers rather than by
+    construction.
+
     Parameters
     ----------
     settings : Mapping
@@ -1099,21 +1180,41 @@ def flatten_settings(settings: Mapping[str, Any], *, prefix: str = "") -> dict[s
     Returns
     -------
     dict
-        Flat mapping whose values are all :func:`json_safe_scalar` outputs.
+        Flat mapping whose values are all :func:`json_safe_scalar` outputs. Any
+        collided name is reported under ``setting_name_collisions``.
     """
 
     flat: dict[str, Any] = {}
-    for key, value in settings.items():
-        # Sanitized here too: these names reach the sinks as metric names.
-        composed = f"{prefix}{json_safe_metric_name(key)}"
-        if isinstance(value, Mapping):
-            flat.update(flatten_settings(value, prefix=f"{composed}_"))
-        elif isinstance(value, (tuple, list)):
-            for ordinal, element in enumerate(value, start=1):
-                flat[f"{composed}{ordinal}"] = json_safe_scalar(element)
-        else:
-            flat[composed] = json_safe_scalar(value)
+    collisions: list[str] = []
+    _flatten_into(flat, settings, prefix=prefix, collisions=collisions)
+    if collisions:
+        flat[SETTING_NAME_COLLISIONS_KEY] = ";".join(sorted(set(collisions)))
     return flat
+
+
+def _flatten_into(
+    flat: dict[str, Any],
+    settings: Mapping[str, Any],
+    *,
+    prefix: str,
+    collisions: list[str],
+) -> None:
+    """Recurse one level, accumulating collisions across the whole walk."""
+
+    for key, value in settings.items():
+        encoded = json_safe_metric_name(key)
+        if isinstance(value, Mapping):
+            _flatten_into(flat, value, prefix=f"{prefix}{encoded}_", collisions=collisions)
+        elif isinstance(value, (tuple, list)):
+            merge_named_metrics(
+                flat,
+                [(f"{encoded}{ordinal}", element)
+                 for ordinal, element in enumerate(value, start=1)],
+                prefix=prefix,
+                collisions=collisions,
+            )
+        else:
+            merge_named_metrics(flat, [(key, value)], prefix=prefix, collisions=collisions)
 
 
 def parameter_layout_fingerprint(layout: ParameterLayout) -> str:
@@ -1237,23 +1338,38 @@ class UpdateMethodDescription:
         hypothetical collision resolves in favour of the truth.
         """
 
+        # THE PREFIX IS PART OF THE NAME, so it is encoded like any other
+        # part. It is CALLER-SUPPLIED -- a custom method may select this record
+        # and choose its prefix -- and encoding the keys while interpolating
+        # the prefix verbatim guarded two thirds of a name. The default
+        # prefixes are ordinary and encode to themselves.
+        safe_prefix = json_safe_metric_name(prefix)
         metrics: dict[str, Any] = {}
-        # Settings FIRST, under their own sub-namespace. The KEY is sanitized
-        # as well as the value: a setting name becomes a METRIC NAME, so a
-        # comma or newline in it corrupts the row exactly as a value would.
-        for key, value in self.settings.items():
-            safe_key = json_safe_metric_name(key)
-            metrics[f"{prefix}_setting_{safe_key}"] = json_safe_scalar(value)
+        # Settings FIRST, through the SHARED collision-aware merge. Both halves
+        # matter: the KEY is encoded because a setting name becomes a METRIC
+        # NAME, and a clash is REPORTED because encoding opens with str() and
+        # so cannot guarantee distinctness alone.
+        collisions = merge_named_metrics(
+            metrics, self.settings, prefix=f"{safe_prefix}_setting_"
+        )
+        if collisions:
+            metrics[f"{safe_prefix}_{SETTING_NAME_COLLISIONS_KEY}"] = ";".join(
+                sorted(set(collisions))
+            )
         # Authoritative identity LAST, so it always wins.
         metrics.update(
             {
-                f"{prefix}_class": json_safe_scalar(self.method_class),
-                f"{prefix}_carrier_class": json_safe_scalar(self.carrier_class),
-                f"{prefix}_n_parameters": json_safe_scalar(self.n_parameters),
-                f"{prefix}_n_parameter_tensors": json_safe_scalar(self.n_parameter_tensors),
-                f"{prefix}_layout_fingerprint": json_safe_scalar(self.layout_fingerprint),
-                f"{prefix}_forward_request": json_safe_scalar(self.forward_request),
-                f"{prefix}_norm_semantics": json_safe_scalar(self.norm_semantics),
+                f"{safe_prefix}_class": json_safe_scalar(self.method_class),
+                f"{safe_prefix}_carrier_class": json_safe_scalar(self.carrier_class),
+                f"{safe_prefix}_n_parameters": json_safe_scalar(self.n_parameters),
+                f"{safe_prefix}_n_parameter_tensors": json_safe_scalar(
+                    self.n_parameter_tensors
+                ),
+                f"{safe_prefix}_layout_fingerprint": json_safe_scalar(
+                    self.layout_fingerprint
+                ),
+                f"{safe_prefix}_forward_request": json_safe_scalar(self.forward_request),
+                f"{safe_prefix}_norm_semantics": json_safe_scalar(self.norm_semantics),
             }
         )
         return metrics
@@ -1775,7 +1891,9 @@ __all__ = [
     "carrier_settings",
     "deserialize_parameter_layout",
     "flatten_settings",
+    "SETTING_NAME_COLLISIONS_KEY",
     "json_safe_metric_name",
+    "merge_named_metrics",
     "json_safe_scalar",
     "parameter_layout_fingerprint",
     "select_reevaluation_rows",
