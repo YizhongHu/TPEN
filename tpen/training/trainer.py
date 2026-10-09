@@ -24,11 +24,19 @@ from tpen.training.events import (
 )
 from tpen.training.state import TrainerState
 from tpen.nn.forward import ParameterScoreRequest
-from tpen.training.optim import UpdateMethodSpec, make_update_method
+from tpen.training.optim import (
+    UpdateMethodSpec,
+    # Aliased because this trainer's own binding boundary below is also
+    # called `bind_update_method`: this is the CONSTRUCTION step that
+    # boundary delegates to, and the two must not be confusable at a call
+    # site. Construction policy -- including which adapter an unconfigured
+    # run gets -- lives in `optim`, which owns construction; the trainer
+    # owns only the lifecycle question of whether one already exists.
+    bind_update_method as construct_update_method,
+)
 from tpen.training.update import (
     DIAGNOSTIC_NAME_COLLISIONS_KEY,
     AutogradUpdateInput,
-    LegacyAutogradUpdate,
     ModelParameterBinding,
     ScoreUpdateInput,
     UpdateMethodDescription,
@@ -138,9 +146,13 @@ class VMCTrainer:
         # rebuilding direct parameter references after model weights load.
         self._resolved_model = None
         self._resolved_update_method: VMCUpdateMethod[AutogradUpdateInput] | None = None
-        # The spec that produced `_resolved_update_method`, kept so a repeated
-        # selection from the same spec reuses one instance. See F5 above.
-        self._update_method_spec: UpdateMethodSpec = None
+        # The spec this run was BOUND from, kept only to detect a conflicting
+        # late selector. It is NOT the lifecycle authority: the retained
+        # `_resolved_update_method` above is, and it is what decides whether a
+        # method already exists. An earlier version keyed reuse on this spec's
+        # identity, which silently excluded the `None` default and so rebuilt
+        # the legacy adapter on every selection.
+        self._bound_update_method_spec: UpdateMethodSpec = None
         self._resolved_update_state: VMCUpdateState | None = None
         self._checkpoint_parameter_layout = None
         # The description of the method actually built/restored for the most
@@ -320,9 +332,16 @@ class VMCTrainer:
         when it is that same object; otherwise runner restore or the training
         loop could mutate one optimizer while publishing another.
         Stateless methods use the supplied optimizer as their authority.
+
+        Notes
+        -----
+        This is where a runner-driven run BINDS its method, before checkpoint
+        restore mutates anything. `fit` later reaches the same boundary and
+        receives that same instance back, so the object that loads method
+        state is the object that performs the next update.
         """
 
-        selected_update_method = self._select_update_method(
+        selected_update_method = self.bind_update_method(
             model=model,
             optimizer=optimizer,
             update_method=update_method,
@@ -332,8 +351,8 @@ class VMCTrainer:
             optimizer=optimizer,
             update_method=selected_update_method,
         )
-        self._resolved_model = model
-        self._resolved_update_method = selected_update_method
+        # `bind_update_method` already retained the model and the method; only
+        # the resolved state is this method's to record.
         self._resolved_update_state = resolved_state
         return resolved_state
 
@@ -370,75 +389,114 @@ class VMCTrainer:
         self._resolved_update_state = rebuilt_state
         return rebuilt_state
 
-    def _select_update_method(
+    def bind_update_method(
         self,
         *,
         model,
         optimizer: torch.optim.Optimizer,
-        update_method: UpdateMethodSpec,
+        update_method: UpdateMethodSpec = None,
     ) -> VMCUpdateMethod[AutogradUpdateInput]:
-        """Select or construct the update method for one fit invocation.
+        """Bind one update method for this run, then keep returning that one.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+            The live model whose parameters the method will update.
+        optimizer : torch.optim.Optimizer
+            The carrier for this run.
+        update_method : VMCUpdateMethod or callable or Mapping or None, optional
+            A late selector. ``None`` means "whatever this trainer was
+            configured with", which is the ordinary case and never a conflict.
+
+        Returns
+        -------
+        VMCUpdateMethod
+            The one method bound to this run.
+
+        Raises
+        ------
+        ValueError
+            If a second model, a second carrier, or a conflicting non-``None``
+            late selector reaches an already-bound trainer.
 
         Notes
         -----
-        The memo below is keyed on the SPEC's identity, not on the model or the
-        optimizer. Fitting the SAME trainer again with a DIFFERENT model or
-        optimizer under that same spec therefore returns the instance built for
-        the first one, rather than rebuilding against the second.
+        BINDING IS IDEMPOTENT, AND THAT IS THE WHOLE POINT. A run reaches this
+        boundary at least twice -- once from `resolve_update_state`, which the
+        runner calls BEFORE checkpoint restore, and once from `fit` -- and the
+        object that loads a checkpoint's method state must be the object that
+        performs the next update. The first call constructs; every later call
+        validates and returns the same instance.
 
-        That is not silent today, and the reviewer judged disposal defensible:
-        a stateful method validates its parameter binding at its first update
-        (`_validate_binding` on the SR method) and raises when the scores no
-        longer reference the parameters it holds, so the mismatch surfaces
-        loudly rather than training the wrong tensors. It is recorded here
-        rather than guarded because a guard would add a branch to buy an error
-        message for a case that already fails loudly, and one trainer instance
-        driving two different models is not a shape this project uses.
+        WHAT THIS REPLACES, because the difference is the defect. The previous
+        helper memoized on the SPEC's identity behind a ``spec is not None``
+        guard. A run with no configured method has ``spec is None``, so the
+        guard excluded it and a fresh `LegacyAutogradUpdate` was built on
+        EVERY selection: the runner's pre-restore instance received the
+        restored method state and the parameter rebind, and `fit` then built a
+        second instance and ran the loop with that one instead. The default
+        adapter owns no persistent state today, which is the only reason that
+        was survivable -- it was a lifecycle defect waiting for the first
+        default-path method that did.
 
-        If that ever becomes a real usage, key the memo on the resolved
-        `VMCUpdateState` identity instead of on the spec alone.
+        Keying reuse on "is a method already bound?" rather than on "is this
+        the same spec object?" removes the dependence on spec identity
+        altogether, which is what the ``None`` case could never satisfy.
         """
 
+        # The effective selector: an explicit argument wins over the
+        # constructor's, exactly as before.
         spec = self.update_method if update_method is None else update_method
-        # Reuse the instance already built from THIS spec. Selection runs twice
-        # in a resumed run -- once from `resolve_update_state` before restore,
-        # once from `fit` -- and a factory would otherwise yield two different
-        # instances, so the checkpoint would load into the one then discarded.
-        # Keying on the spec's identity covers a factory passed EXPLICITLY to
-        # both calls, which an earlier version keyed on `self` alone and missed.
-        if (
-            spec is not None
-            and self._resolved_update_method is not None
-            and spec is self._update_method_spec
-        ):
-            return self._resolved_update_method
-        selected_update_method = spec
-        if selected_update_method is None:
-            return LegacyAutogradUpdate(
+        bound = self._resolved_update_method
+        if bound is None:
+            bound = construct_update_method(
+                spec,
                 optimizer=optimizer,
-                gradient_clip_norm=self.gradient_clip_norm,
                 model_parameters=ModelParameterBinding(parameters=tuple(model.parameters())),
+                gradient_clip_norm=self.gradient_clip_norm,
             )
-        # A Hydra `_partial_` block resolves to a factory rather than a method,
-        # because a stateful method needs the optimizer and the live parameter
-        # binding, neither of which exists at config time. Completing it here
-        # keeps the one place that already resolves the method as the only
-        # place that knows how it is built.
-        selected_update_method = make_update_method(
-            selected_update_method,
-            optimizer=optimizer,
-            model_parameters=ModelParameterBinding(parameters=tuple(model.parameters())),
-        )
-        if not isinstance(selected_update_method, VMCUpdateMethod):
-            raise TypeError("VMCTrainer update_method must be a VMCUpdateMethod")
-        # Remember the spec alongside the instance it produced, so the guard at
-        # the top of this method can reuse it on the next selection from the
-        # same spec. The caller's constructor argument is deliberately left
-        # unmutated; an earlier version overwrote `self.update_method` with the
-        # constructed instance, which memoized the self path only.
-        self._update_method_spec = spec
-        self._resolved_update_method = selected_update_method
-        return selected_update_method
+            self._bound_update_method_spec = spec
+            self._resolved_model = model
+            self._resolved_update_method = bound
+            return bound
+
+        # ALREADY BOUND: validate, never reconstruct. Each check below fires
+        # before sampling and before any mutable checkpoint restore, because
+        # the runner reaches this boundary first of all.
+        if model is not self._resolved_model:
+            raise ValueError(
+                "update method is already bound to a different model; a new run "
+                "needs a fresh trainer and method rather than silent reuse"
+            )
+        bound_state = self._resolved_update_state
+        if bound_state is None:
+            # A caller that bound directly, without going through
+            # `resolve_update_state`, has no recorded state yet. Ask the method
+            # for its own authority so the carrier check still applies; a
+            # stateless method returns `None` and has no carrier to disagree
+            # with.
+            bound_state = bound.update_state()
+        if bound_state is not None and optimizer is not bound_state.optimizer:
+            # `_resolve_method_state` enforces carrier identity only for a
+            # method that OWNS its state; for a stateless method it wraps
+            # whatever optimizer it is handed, so without this a second carrier
+            # would be accepted silently and the run would publish one
+            # optimizer while mutating another.
+            raise ValueError("mismatched legacy optimizer ownership")
+        # A late selector only conflicts when it actually selects something. An
+        # explicit `None` -- what `fit` receives on every runner-driven run --
+        # means "use what is already bound", not "switch to the default".
+        late_spec = update_method if update_method is not None else self.update_method
+        if (
+            late_spec is not None
+            and late_spec is not self._bound_update_method_spec
+            and late_spec is not bound
+        ):
+            raise ValueError(
+                "update method was already bound from a different specification; "
+                "refusing to rebuild it mid-run"
+            )
+        return bound
 
     def _resolve_method_state(
         self,
@@ -479,7 +537,11 @@ class VMCTrainer:
     ) -> TrainerState:
         """Run the training loop and return the final `TrainerState`."""
 
-        selected_update_method = self._select_update_method(
+        # Bind, or confirm the binding the runner already made. A direct
+        # caller that never went through the runner binds here, once, and then
+        # enters the same loop -- direct fit is an adapter onto this path, not
+        # a second one.
+        selected_update_method = self.bind_update_method(
             model=model,
             optimizer=optimizer,
             update_method=update_method,
@@ -489,8 +551,6 @@ class VMCTrainer:
             optimizer=optimizer,
             update_method=selected_update_method,
         )
-        self._resolved_model = model
-        self._resolved_update_method = selected_update_method
         self._resolved_update_state = update_state
         state = TrainerState(
             model=model,

@@ -70,13 +70,30 @@ class Train(Runner):
             _assert_eager_initialized(self.model)
             self.model.train()
 
+        # ONE carrier is constructed for this run, here, and nothing below
+        # builds a second.
         optimizer = make_optimizer(self.optimizer, self.model.parameters())
         resolve_update_state = getattr(self.trainer, "resolve_update_state", None)
         if callable(resolve_update_state):
-            # This validation must precede checkpoint restore: restore mutates
-            # the optimizer, so a mismatched legacy owner must be rejected
-            # before the runner can touch either state source.
-            resolve_update_state(model=self.model, optimizer=optimizer)
+            # This binding and validation must precede checkpoint restore:
+            # restore mutates the optimizer, so a mismatched legacy owner must
+            # be rejected before the runner can touch either state source. It
+            # also binds the one update method the whole run will use, so the
+            # instance that `_load_trainer` restores method state into is the
+            # instance `fit` then steps with.
+            update_state = resolve_update_state(model=self.model, optimizer=optimizer)
+            # Take the carrier from the binding rather than keeping the local
+            # one. For every method this package ships the two are already the
+            # same object -- the trainer refuses a method that owns a different
+            # optimizer -- so this changes no behaviour today. What it removes
+            # is the possibility of their ever diverging: restore, the
+            # callbacks' `TrainerState`, and the loop all read one source.
+            if update_state is not None:
+                optimizer = update_state.optimizer
+        # The duck-typed lookup above is deliberate. Other configured trainers
+        # reach this runner through the same path and are not required to
+        # implement the VMC binding contract; a trainer without it simply uses
+        # the optimizer this runner built.
         context.emit(ModelBuilt())
         mode = _load_mode(self.load)
         if mode == "model_only":
