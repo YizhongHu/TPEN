@@ -1012,3 +1012,119 @@ def test_populate_execution_topology_detaches_direct_public_input(tmp_path: Path
     assert dict(rebound.manifest["topology"]["host"]) == {
         "nested": (("before",),)
     }
+
+
+class _ScalarSpoofMeta(type):
+    def __eq__(cls, other: object) -> bool:
+        return other is str
+
+    __hash__ = type.__hash__
+
+
+class _ScalarSpoof(dict[str, object], metaclass=_ScalarSpoofMeta):
+    pass
+
+
+def test_detachers_use_exact_scalar_identity_and_copy_spoofed_mapping() -> None:
+    value = _ScalarSpoof(name="before")
+    facts = launch.execution_topology_facts({"host": value})
+
+    value["name"] = "after"
+    assert facts == {"host": {"name": "before"}}
+    assert facts["host"] is not value
+
+
+class _IdentityBuffer(bytearray):
+    kind = SimpleNamespace(value="cpu")
+    index = None
+    uuid = None
+
+
+class _KindBuffer(bytearray):
+    value = "cpu"
+
+
+def test_duck_projection_classifies_identity_and_kind_before_projection() -> None:
+    class DuckTopology:
+        global_rank = 0
+        global_size = 1
+        local_rank = 0
+        local_size = 1
+        node_rank = 0
+        node_size = 1
+        host = "node"
+        pid = 1
+        device = "cpu"
+        job_id = None
+
+        def __init__(self, identity: object) -> None:
+            self.device_identity = identity
+
+    with pytest.raises(launch.LaunchValidationError, match="binary buffer refused"):
+        launch.execution_topology_facts(DuckTopology(_IdentityBuffer(b"identity")))
+
+    class KindIdentity:
+        kind = _KindBuffer(b"kind")
+        index = None
+        uuid = None
+
+    with pytest.raises(launch.LaunchValidationError, match="binary buffer refused"):
+        launch.execution_topology_facts(DuckTopology(KindIdentity()))
+
+    ordinary = launch.execution_topology_facts(DuckTopology(SimpleNamespace(
+        kind=SimpleNamespace(value="cpu"), index=None, uuid=None
+    )))
+    assert ordinary["device_identity"] == {"kind": "cpu", "index": None, "uuid": None}
+
+
+class _SkipRoot(str):
+    def __ne__(self, other: object) -> bool:
+        return False
+
+
+def test_root_topology_exemption_uses_base_string_comparison() -> None:
+    manifest = {
+        _SkipRoot("scientific_identity"): {"global_rank": 1},
+        "topology": {},
+    }
+    with pytest.raises(launch.LaunchValidationError, match="execution fact"):
+        launch._reject_execution_facts_outside_topology(manifest)
+
+    launch._reject_execution_facts_outside_topology(
+        {"scientific_identity": {"architecture": "control"}, "topology": {}}
+    )
+
+
+def test_signature_parameter_routing_uses_base_string_comparison(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    received: list[object] = []
+
+    class LyingName(str):
+        def __eq__(self, other: object) -> bool:
+            return False
+
+        __hash__ = str.__hash__
+
+    def runner(config: object, *, topology: object) -> int:
+        del config
+        received.append(topology)
+        return 0
+
+    runner.__signature__ = inspect.Signature(
+        [inspect.Parameter(LyingName("topology"), inspect.Parameter.KEYWORD_ONLY)]
+    )
+    facts = {
+        "global_rank": 0,
+        "global_size": 1,
+        "local_rank": 0,
+        "local_size": 1,
+        "node_rank": 0,
+        "node_size": 1,
+        "host": "node",
+        "pid": 1,
+        "device": "cpu",
+    }
+    assert launch.launch_train(cell, facts, runner=runner) == 0
+    assert received == [facts]

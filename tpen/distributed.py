@@ -136,12 +136,27 @@ _RUNNER_TOPOLOGY_FACT_KEYS = frozenset(
 )
 
 
+def _has_buffer_capability(value: object) -> bool:
+    """Detect buffer exporters without invoking caller-defined attribute hooks."""
+
+    if isinstance(value, Buffer):
+        return True
+    value_type = type(value)
+    for base in type.__getattribute__(value_type, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        if "__buffer__" in namespace:
+            return True
+    return False
+
+
 def _detach_topology_facts(value: Any) -> Any:
     """Materialize the closed mapping-facts value schema for TPEN ownership."""
 
-    if value is None or type(value) in (str, int, float, bool):
+    if value is None or any(
+        type(value) is scalar for scalar in (str, int, float, bool)
+    ):
         return value
-    if isinstance(value, Buffer) or hasattr(type(value), "__buffer__"):
+    if _has_buffer_capability(value):
         raise ValueError(f"binary buffer refused: {type(value).__name__}")
     if isinstance(value, Mapping):
         copied: dict[str, Any] = {}
@@ -166,7 +181,7 @@ def execution_topology_from_facts(
     object as callers that already have one.
     """
 
-    if isinstance(facts, Buffer) or hasattr(type(facts), "__buffer__"):
+    if _has_buffer_capability(facts):
         raise ValueError(f"binary buffer refused: {type(facts).__name__}")
     if isinstance(facts, ExecutionTopology):
         return facts

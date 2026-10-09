@@ -1136,3 +1136,66 @@ def test_capability_undeclared_measured_crossing() -> None:
         assert "stale sibling entry under rule (b)" in message
     else:
         raise AssertionError("every measured crossing must have a declared entry")
+
+
+def test_topology_validators_have_no_object_overridable_decision_sites() -> None:
+    """Keep validator decisions structural rather than caller-method driven."""
+
+    repository = STUDY_DIR.parents[2]
+    sources = {
+        "launch.py": repository / "experiments/atomistic/he-importance/launch.py",
+        "distributed.py": repository / "tpen/distributed.py",
+    }
+    validator_names = {
+        "launch.py": frozenset(
+            {
+                "_has_buffer_capability",
+                "execution_topology_facts",
+                "_reject_execution_facts_outside_topology",
+                "_detach_topology_facts",
+                "launch_train",
+            }
+        ),
+        "distributed.py": frozenset(
+            {"_has_buffer_capability", "_detach_topology_facts", "execution_topology_from_facts"}
+        ),
+    }
+    allowlist = {
+        ("launch.py", "_has_buffer_capability", '"__buffer__" in namespace'):
+            "the key is a module-owned literal read from an MRO dict via type.__getattribute__",
+        ("launch.py", "_reject_execution_facts_outside_topology", "normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS"):
+            "normalized is a fresh exact str and the set contains only this module's literals",
+        ("distributed.py", "_has_buffer_capability", '"__buffer__" in namespace'):
+            "the key is a module-owned literal read from an MRO dict via type.__getattribute__",
+        ("distributed.py", "execution_topology_from_facts", "key not in _RUNNER_TOPOLOGY_FACT_KEYS"):
+            "detachment has already required exact str mapping keys",
+        ("distributed.py", "execution_topology_from_facts", "name not in facts"):
+            "name is a module-owned exact str required-field literal and facts keys are exact str",
+    }
+    findings: list[str] = []
+    for filename, path in sources.items():
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if function.name not in validator_names[filename]:
+                continue
+            for node in ast.walk(function):
+                if isinstance(node, ast.Compare) and any(
+                    isinstance(op, (ast.Eq, ast.NotEq, ast.In, ast.NotIn))
+                    for op in node.ops
+                ):
+                    segment = ast.get_source_segment(source, node) or ""
+                    key = (filename, function.name, segment)
+                    if key not in allowlist:
+                        findings.append(f"{filename}:{function.name}:{segment}")
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "hasattr"
+                ):
+                    findings.append(
+                        f"{filename}:{function.name}:hasattr at line {node.lineno}"
+                    )
+    assert not findings, "object-overridable validator decisions: " + "; ".join(findings)

@@ -114,6 +114,19 @@ class LaunchPlan:
     topology: Mapping[str, Any]
 
 
+def _has_buffer_capability(value: object) -> bool:
+    """Detect buffer exporters without invoking caller-defined attribute hooks."""
+
+    if isinstance(value, Buffer):
+        return True
+    value_type = type(value)
+    for base in type.__getattribute__(value_type, "__mro__"):
+        namespace = type.__getattribute__(base, "__dict__")
+        if "__buffer__" in namespace:
+            return True
+    return False
+
+
 def _source_cell(source: Any) -> Any:
     """Extract the materialized cell from a cell or a training packet."""
 
@@ -126,7 +139,7 @@ def _source_cell(source: Any) -> Any:
 def execution_topology_facts(topology: object) -> dict[str, Any]:
     """Serialize launcher facts into the manifest topology boundary."""
 
-    if isinstance(topology, Buffer) or hasattr(type(topology), "__buffer__"):
+    if _has_buffer_capability(topology):
         raise LaunchValidationError(
             f"binary buffer refused: {type(topology).__name__}"
         )
@@ -135,6 +148,15 @@ def execution_topology_facts(topology: object) -> dict[str, Any]:
     else:
         try:
             identity = topology.device_identity  # type: ignore[attr-defined]
+            if _has_buffer_capability(identity):
+                raise LaunchValidationError(
+                    f"binary buffer refused: {type(identity).__name__}"
+                )
+            kind = None if identity is None else identity.kind
+            if _has_buffer_capability(kind):
+                raise LaunchValidationError(
+                    f"binary buffer refused: {type(kind).__name__}"
+                )
             fields = {
                 "global_rank": topology.global_rank,  # type: ignore[attr-defined]
                 "global_size": topology.global_size,  # type: ignore[attr-defined]
@@ -150,7 +172,7 @@ def execution_topology_facts(topology: object) -> dict[str, Any]:
                     None
                     if identity is None
                     else {
-                        "kind": getattr(identity.kind, "value", identity.kind),
+                        "kind": getattr(kind, "value", kind),
                         "index": identity.index,
                         "uuid": identity.uuid,
                     }
@@ -206,7 +228,7 @@ def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> Non
                 visit(nested, f"{path}[{index}]")
 
     for key, value in manifest.items():
-        if key != _STAGE_API.TOPOLOGY_KEY:
+        if str.__eq__(key, _STAGE_API.TOPOLOGY_KEY) is not True:
             visit(value, key)
 
 
@@ -301,9 +323,11 @@ def _validate_runner_topology_facts(
 def _detach_topology_facts(value: Any) -> Any:
     """Recursively materialize the closed topology-facts value schema."""
 
-    if value is None or type(value) in (str, int, float, bool):
+    if value is None or any(
+        type(value) is scalar for scalar in (str, int, float, bool)
+    ):
         return value
-    if isinstance(value, Buffer) or hasattr(type(value), "__buffer__"):
+    if _has_buffer_capability(value):
         raise LaunchValidationError(f"binary buffer refused: {type(value).__name__}")
     if isinstance(value, Mapping):
         copied: dict[str, Any] = {}
@@ -387,7 +411,8 @@ def launch_train(
     if topology is not None:
         parameters = inspect.signature(runner).parameters.values()
         accepts_topology = any(
-            parameter.name == "topology" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            str.__eq__(parameter.name, "topology") is True
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
         if accepts_topology:

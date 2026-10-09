@@ -293,6 +293,80 @@ def test_execution_topology_from_facts_rejects_binary_buffers(value: object) -> 
         execution_topology_from_facts(facts)
 
 
+class _DescriptorBuffer:
+    def __get__(self, instance: object, owner: type[object] | None = None) -> object:
+        if instance is None:
+            raise AttributeError("class lookup is hidden")
+        return lambda flags: memoryview(b"node")
+
+
+def test_structural_buffer_detection_handles_late_descriptor_and_fresh_class() -> None:
+    class LateDescriptor(dict):
+        pass
+
+    value = LateDescriptor(name="node")
+    assert not isinstance(value, Buffer)
+    LateDescriptor.__buffer__ = _DescriptorBuffer()
+    assert memoryview(value).tobytes() == b"node"
+    with pytest.raises(ValueError, match="binary buffer refused"):
+        distributed._detach_topology_facts(value)
+
+    class FreshDescriptor(dict):
+        __buffer__ = _DescriptorBuffer()
+
+    fresh = FreshDescriptor(name="node")
+    with pytest.raises(ValueError, match="binary buffer refused"):
+        distributed._detach_topology_facts(fresh)
+
+
+def test_structural_buffer_detection_rejects_metaclass_hidden_exporter() -> None:
+    class HidingMeta(type):
+        def __getattribute__(cls, name: str) -> object:
+            if name == "__buffer__":
+                raise AttributeError(name)
+            return super().__getattribute__(name)
+
+    class Hidden(dict, metaclass=HidingMeta):
+        pass
+
+    value = Hidden(name="node")
+    assert not isinstance(value, Buffer)
+    Hidden.__buffer__ = lambda self, flags: memoryview(b"node")
+    assert memoryview(value).tobytes() == b"node"
+    with pytest.raises(ValueError, match="binary buffer refused"):
+        distributed._detach_topology_facts(value)
+
+
+class _ScalarSpoofMeta(type):
+    def __eq__(cls, other: object) -> bool:
+        return other is str
+
+    __hash__ = type.__hash__
+
+
+class _ScalarSpoof(dict[str, object], metaclass=_ScalarSpoofMeta):
+    pass
+
+
+def test_converter_copies_metaclass_spoofed_mapping_values() -> None:
+    value = _ScalarSpoof(name="before")
+    facts = {
+        "global_rank": 0,
+        "global_size": 1,
+        "local_rank": 0,
+        "local_size": 1,
+        "node_rank": 0,
+        "node_size": 1,
+        "host": value,
+        "pid": 1,
+        "device": "cpu",
+    }
+    topology = execution_topology_from_facts(facts)
+    value["name"] = "after"
+    assert topology.host is not value
+    assert topology.host["name"] == "before"
+
+
 class _StringKey(str):
     pass
 
