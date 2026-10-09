@@ -120,8 +120,9 @@ def _has_buffer_capability(value: object) -> bool:
     if isinstance(value, Buffer):
         return True
     value_type = type(value)
-    for base in type.__getattribute__(value_type, "__mro__"):
-        namespace = type.__getattribute__(base, "__dict__")
+    real_mro = type.__dict__["__mro__"].__get__(value_type)
+    for base in real_mro:
+        namespace = type.__dict__["__dict__"].__get__(base)
         if "__buffer__" in namespace:
             return True
     return False
@@ -352,9 +353,10 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
         _STAGE_API.validate_materialized_manifest(cell.manifest)
     except Exception as error:
         raise LaunchValidationError("source manifest is not a valid HI train row") from error
-    _reject_execution_facts_outside_topology(cell.manifest)
     try:
-        return _STAGE_API.with_execution_topology(cell, topology)
+        bound = _STAGE_API.with_execution_topology(cell, topology)
+        _reject_execution_facts_outside_topology(bound.manifest)
+        return bound
     except Exception as error:
         raise LaunchValidationError(str(error)) from error
 

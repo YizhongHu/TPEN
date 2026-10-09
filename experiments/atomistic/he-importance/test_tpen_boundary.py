@@ -95,7 +95,7 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 672, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 798, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 861, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
     ("test_stage_coordinate.py", 594, "tpen.hi.train"): InventoryEntry(
@@ -1146,41 +1146,43 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
         "launch.py": repository / "experiments/atomistic/he-importance/launch.py",
         "distributed.py": repository / "tpen/distributed.py",
     }
-    validator_names = {
-        "launch.py": frozenset(
-            {
-                "_has_buffer_capability",
-                "execution_topology_facts",
-                "_reject_execution_facts_outside_topology",
-                "_detach_topology_facts",
-                "launch_train",
-            }
-        ),
-        "distributed.py": frozenset(
-            {"_has_buffer_capability", "_detach_topology_facts", "execution_topology_from_facts"}
-        ),
-    }
     allowlist = {
         ("launch.py", "_has_buffer_capability", '"__buffer__" in namespace'):
-            "the key is a module-owned literal read from an MRO dict via type.__getattribute__",
+            "namespace is obtained through type.__dict__'s descriptor, and the key is a module literal",
+        ("launch.py", "_source_cell", "hasattr(cell, name)"):
+            "this is source-shape admission, not topology classification; false positives fail at manifest access",
         ("launch.py", "_reject_execution_facts_outside_topology", "normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS"):
             "normalized is a fresh exact str and the set contains only this module's literals",
+        ("launch.py", "is_execution_fact_key", "normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS"):
+            "normalized is a fresh exact str and the set contains only this module's literals",
+        ("launch.py", "_validate_runner_topology_facts", "key not in _RUNNER_TOPOLOGY_FACT_KEYS"):
+            "all current callers pass facts detached to exact string keys before validation",
+        ("launch.py", "_validate_runner_topology_facts", "name not in facts"):
+            "all current callers pass facts detached to exact string keys before validation",
+        ("launch.py", "_validate_runner_topology_facts", 'kind not in {"cpu", "cuda", "rocm", "other"}'):
+            "all current callers pass facts detached before value validation, so kind is an owned scalar",
         ("distributed.py", "_has_buffer_capability", '"__buffer__" in namespace'):
-            "the key is a module-owned literal read from an MRO dict via type.__getattribute__",
+            "namespace is obtained through type.__dict__'s descriptor, and the key is a module literal",
         ("distributed.py", "execution_topology_from_facts", "key not in _RUNNER_TOPOLOGY_FACT_KEYS"):
-            "detachment has already required exact str mapping keys",
+            "detachment has already required exact string mapping keys",
         ("distributed.py", "execution_topology_from_facts", "name not in facts"):
-            "name is a module-owned exact str required-field literal and facts keys are exact str",
+            "detachment has already required exact string mapping keys",
+        ("distributed.py", "__post_init__", "self.device.identity != self.topology.device_identity"):
+            "both operands are owned typed dataclass fields, not caller mapping objects",
+        ("distributed.py", "__post_init__", "self.scope in (ProfileScope.NODE, ProfileScope.JOB)"):
+            "scope is an owned enum field and the tuple contains module-owned enum members",
+        ("distributed.py", "write", "record.topology != self.topology"):
+            "both operands are owned typed topology records after conversion",
     }
     findings: list[str] = []
+    observed: set[tuple[str, str, str]] = set()
     for filename, path in sources.items():
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(path))
         for function in ast.walk(tree):
             if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            if function.name not in validator_names[filename]:
-                continue
+            aliases = {"hasattr"}
             for node in ast.walk(function):
                 if isinstance(node, ast.Compare) and any(
                     isinstance(op, (ast.Eq, ast.NotEq, ast.In, ast.NotIn))
@@ -1188,14 +1190,32 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
                 ):
                     segment = ast.get_source_segment(source, node) or ""
                     key = (filename, function.name, segment)
+                    if key in allowlist:
+                        observed.add(key)
                     if key not in allowlist:
                         findings.append(f"{filename}:{function.name}:{segment}")
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                    and node.func.id == "hasattr"
-                ):
-                    findings.append(
-                        f"{filename}:{function.name}:hasattr at line {node.lineno}"
-                    )
+                if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+                    if node.value.id == "hasattr":
+                        aliases.update(
+                            target.id
+                            for target in node.targets
+                            if isinstance(target, ast.Name)
+                        )
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in aliases:
+                    segment = ast.get_source_segment(source, node) or ""
+                    key = (filename, function.name, segment)
+                    if key in allowlist:
+                        observed.add(key)
+                    else:
+                        findings.append(
+                            f"{filename}:{function.name}:hasattr-like call {segment}"
+                        )
+                if isinstance(node, ast.Match):
+                    findings.append(f"{filename}:{function.name}:match statement at line {node.lineno}")
+    for key, reason in allowlist.items():
+        filename, _function, segment = key
+        assert reason, f"allowlist reason is empty for {key}"
+        source = sources[filename].read_text(encoding="utf-8")
+        assert segment in source, f"stale structural allowlist entry: {key}"
+        assert key in observed, f"unobserved structural allowlist entry: {key}"
     assert not findings, "object-overridable validator decisions: " + "; ".join(findings)

@@ -7,7 +7,7 @@ from collections.abc import Buffer, Mapping, Sequence
 from importlib import import_module
 import inspect
 import os
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 import threading
@@ -786,6 +786,69 @@ def test_source_shape_guard_has_positive_and_negative_arms(tmp_path: Path) -> No
     assert launch._source_cell(cell) is cell
     with pytest.raises(launch.LaunchValidationError, match="MaterializedCell"):
         launch._source_cell(object())
+
+
+class _FlipMapping(dict[str, object]):
+    def __init__(self, values: dict[str, object], flip_after: int) -> None:
+        super().__init__(values)
+        self.flip_after = flip_after
+        self.reads = 0
+
+    def items(self):
+        self.reads += 1
+        values = dict(super().items())
+        if self.reads > self.flip_after:
+            values["global_rank"] = 1
+        return values.items()
+
+
+def test_populate_validates_the_frozen_manifest_across_flip_schedules(
+    tmp_path: Path,
+) -> None:
+    clean = _cell(tmp_path)
+    for flip_after in range(0, 8):
+        scientific_identity = _FlipMapping(
+            dict(clean.manifest["scientific_identity"]), flip_after
+        )
+        manifest = dict(clean.manifest)
+        manifest["scientific_identity"] = scientific_identity
+        candidate = replace(clean, manifest=manifest)
+        try:
+            bound = launch.populate_execution_topology(candidate, {"host": "node"})
+        except launch.LaunchValidationError:
+            continue
+        assert "global_rank" not in bound.manifest["scientific_identity"]
+
+    ordinary = launch.populate_execution_topology(clean, {"host": "node"})
+    assert ordinary.manifest["topology"]["host"] == "node"
+
+
+class _MroHidingMeta(type):
+    @property
+    def __mro__(cls) -> tuple[type, ...]:
+        del cls
+        return (object,)
+
+
+class _MroHiddenBuffer(dict[str, object], metaclass=_MroHidingMeta):
+    def __buffer__(self, flags: int) -> memoryview:
+        del flags
+        return memoryview(b"payload")
+
+
+def test_buffer_detection_reads_the_real_mro_descriptor() -> None:
+    value = _MroHiddenBuffer(name="node")
+    assert memoryview(value).tobytes() == b"payload"
+    with pytest.raises(launch.LaunchValidationError, match="binary buffer refused"):
+        launch._detach_topology_facts(value)
+
+    class HonestBuffer(dict[str, object]):
+        def __buffer__(self, flags: int) -> memoryview:
+            del flags
+            return memoryview(b"payload")
+
+    with pytest.raises(launch.LaunchValidationError, match="binary buffer refused"):
+        launch._detach_topology_facts(HonestBuffer(name="node"))
 
 
 def test_launch_propagates_success_and_handled_failure_exit_codes(

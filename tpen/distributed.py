@@ -142,8 +142,9 @@ def _has_buffer_capability(value: object) -> bool:
     if isinstance(value, Buffer):
         return True
     value_type = type(value)
-    for base in type.__getattribute__(value_type, "__mro__"):
-        namespace = type.__getattribute__(base, "__dict__")
+    real_mro = type.__dict__["__mro__"].__get__(value_type)
+    for base in real_mro:
+        namespace = type.__dict__["__dict__"].__get__(base)
         if "__buffer__" in namespace:
             return True
     return False
