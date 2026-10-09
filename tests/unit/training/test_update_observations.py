@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import csv
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -1071,55 +1072,117 @@ def test_carrier_metadata_cannot_overwrite_the_authoritative_identity() -> None:
     assert metrics["update_method_setting_g0_n_parameters"] == 999
 
 
-def test_no_setting_key_can_ever_reach_an_authoritative_name() -> None:
-    """GENERATIVE structural guard: inject the exact names that would collide.
+def test_direct_description_preserves_all_colliding_setting_values() -> None:
+    """SENSITIVE replacement for a guard that review proved was still blind.
 
-    REWRITTEN AFTER BEING FOUND VACUOUS, and the failure is worth stating
-    because it is subtle. The previous version asserted that no authoritative
-    name began with ``update_method_setting_`` -- trivially true of hand-written
-    literals, independent of the code -- and then inspected only keys ALREADY
-    FILTERED by that prefix, which is circular. It passed an isolated rollback
-    that removed both namespacing protections, so it certified a guarantee that
-    was not there.
+    THE HISTORY MATTERS HERE. The first version of this guard was vacuous. I
+    rewrote it to be "generative" and believed that fixed it. Review then
+    MEASURED it under the namespace-removal mutation and found it STILL
+    PASSED -- the node only looked detected because a NEIGHBOUR test failed,
+    and my harness scored the whole node together. Two rewrites, both blind,
+    both believed.
 
-    A structural guard has to be GENERATIVE: derive the colliding names from
-    the description's own authoritative fields and inject exactly those as
-    param_group keys. If namespacing is removed, each injected key lands on its
-    authoritative name and this fails -- which is the property the old test
-    only appeared to check.
+    Why the generative version failed: it derived its suffixes from an emitter
+    that already includes settings, injected through the GROUP prefix so the
+    names were doubly namespaced anyway, and never required the injected
+    VALUES to survive.
+
+    This version follows the design the reviewer supplied. It freezes the
+    authoritative fields from an EMPTY-settings description, so the expected
+    values cannot be contaminated by the injection; injects a unique sentinel
+    for every authoritative suffix DIRECTLY into settings, bypassing the group
+    prefix; then requires both that every authority is unchanged AND that every
+    sentinel is present at its own name. Removing the settings namespace makes
+    a sentinel land on an authoritative name, so one of those two requirements
+    must break.
     """
 
-    parameter = torch.nn.Parameter(torch.ones(4, dtype=torch.float64))
-    optimizer = torch.optim.SGD([parameter], lr=0.1)
-
-    # Every suffix the description emits, derived rather than retyped, so a
-    # NEW authoritative field is automatically covered by this guard.
-    clean = LegacyAutogradUpdate(
-        optimizer=torch.optim.SGD([torch.nn.Parameter(torch.ones(4, dtype=torch.float64))], lr=0.1),
-        model_parameters=ModelParameterBinding(
-            parameters=(torch.nn.Parameter(torch.ones(4, dtype=torch.float64)),)
-        ),
+    base = UpdateMethodDescription(
+        method_class="tpen.training.update.LegacyAutogradUpdate",
+        carrier_class="torch.optim.sgd.SGD",
+        n_parameters=4,
+        n_parameter_tensors=1,
+        layout_fingerprint="float64:4",
+        forward_request="value",
+        norm_semantics="post_clip_grad_l2_over_gradient_domain",
+        settings={},
     )
     prefix = "update_method_"
-    suffixes = [k[len(prefix):] for k in clean.describe().as_metrics() if k.startswith(prefix)]
+    frozen = base.as_metrics()
+    suffixes = [k[len(prefix):] for k in frozen if k.startswith(prefix)]
     assert suffixes, "description emitted no authoritative fields to guard"
 
-    # Inject each suffix as a hostile group key.
-    for suffix in suffixes:
-        optimizer.param_groups[0][suffix] = f"spoofed-{suffix}"
-    method = LegacyAutogradUpdate(
-        optimizer=optimizer,
-        model_parameters=ModelParameterBinding(parameters=(parameter,)),
-    )
-    metrics = method.describe().as_metrics()
+    injected = {suffix: f"sentinel-{suffix}" for suffix in suffixes}
+    described = replace(base, settings=injected).as_metrics()
 
-    # Not one authoritative field may carry a spoofed value.
+    # Every authoritative field keeps the value it had with NO settings at all.
     for suffix in suffixes:
-        value = metrics[f"{prefix}{suffix}"]
-        assert value != f"spoofed-{suffix}", f"{suffix} was overwritten by a group key"
-    # And the identity fields specifically still report the truth.
-    assert metrics["update_method_class"].endswith("LegacyAutogradUpdate")
-    assert metrics["update_method_n_parameters"] == 4
+        name = f"{prefix}{suffix}"
+        assert described[name] == frozen[name], f"{name} was overwritten by a setting"
+    # AND every injected value survives, under its own namespaced name.
+    for suffix, sentinel in injected.items():
+        assert described[f"{prefix}setting_{suffix}"] == sentinel, (
+            f"setting {suffix} was lost"
+        )
+
+
+@pytest.mark.parametrize("hostile", ["custom,record", "custom\nrecord", "custom\rrecord"])
+def test_a_hostile_description_prefix_cannot_break_the_csv_row(tmp_path, hostile) -> None:
+    """R4-1: the PREFIX is the third part of a name, and was unguarded.
+
+    A supported custom method may select a built-in record and choose its
+    prefix. Encoding the keys while interpolating the prefix verbatim guarded
+    two thirds of a name: review measured five columns for the comma case and
+    doubled row counts for CR/LF.
+    """
+
+    description = UpdateMethodDescription(
+        method_class="Custom", carrier_class="none", n_parameters=1,
+        n_parameter_tensors=1, layout_fingerprint="float64:1",
+        forward_request="value", norm_semantics="method_defined",
+        settings={"lr": 0.1},
+    )
+    metrics = description.as_metrics(prefix=hostile)
+    path = tmp_path / "prefix.csv"
+    sink = CSV(path)
+    sink.log(LogRecord(step=0, namespace="train/update_method", metrics=metrics))
+    sink.log(LogRecord(step=1, namespace="sentinel", metrics={"after": "still-readable"}))
+
+    rows = _strict_csv_rows(path)
+    assert len(rows) == 1 + len(metrics) + 1, f"row count wrong: {len(rows)}"
+    for row in rows[1:]:
+        assert len(row) == 4, f"row did not have four fields: {row!r}"
+    assert rows[-1] == ["1", "sentinel", "after", "still-readable"]
+
+
+@pytest.mark.parametrize("hostile", ["m,p", "m\np"])
+def test_a_hostile_minimal_record_prefix_cannot_break_the_csv_row(tmp_path, hostile) -> None:
+    """Same defect in the minimal record, which a custom method may also select."""
+
+    record = MinimalUpdateDiagnostics(
+        method="Custom", applied=True, reason="applied", step=0,
+        grad_norm=1.0, prefix=hostile,
+    )
+    metrics = record.as_metrics()
+    path = tmp_path / "minimal.csv"
+    sink = CSV(path)
+    sink.log(LogRecord(step=0, namespace="train", metrics=metrics))
+    sink.log(LogRecord(step=1, namespace="sentinel", metrics={"after": "still-readable"}))
+
+    rows = _strict_csv_rows(path)
+    assert len(rows) == 1 + len(metrics) + 1
+    for row in rows[1:]:
+        assert len(row) == 4, f"row did not have four fields: {row!r}"
+    assert rows[-1] == ["1", "sentinel", "after", "still-readable"]
+
+
+def test_an_ordinary_prefix_is_unchanged_by_encoding() -> None:
+    """CONTROL: the default prefixes must encode to themselves."""
+
+    record = MinimalUpdateDiagnostics(
+        method="M", applied=True, reason="applied", step=0, grad_norm=1.0
+    )
+    assert "update_record_method" in record.as_metrics()
 
 
 # --------------------------------------------------------------------------

@@ -148,6 +148,8 @@ class SPRINGTelemetry(UpdateDiagnostics):
         unchanged, so no existing record changes meaning.
         """
 
+        prefix = json_safe_metric_name(prefix)
+
         metrics: dict[str, Any] = {
             f"{prefix}_applied": bool(self.applied),
             f"{prefix}_reason": json_safe_scalar(self.reason),
