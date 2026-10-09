@@ -970,11 +970,14 @@ def test_block_ng_diagnostics_with_a_nonfinite_norm_survive_the_real_jsonl_sink(
     in the checkpoint or receipt machinery reconstructs telemetry.
 
     EXACT VALUES PER FIELD, not a membership check. The sibling SR and SPRING
-    cases assert ``in ("nan", "inf", "-inf")`` against one value shared by
-    both fields, which cannot distinguish a mapping that always reports the
+    cases both assert MEMBERSHIP against one value shared by both fields --
+    SR against ``("nan", "inf", "-inf")`` and SPRING against ``("nan",
+    "inf")`` -- which cannot distinguish a mapping that always reports the
     same label from a correct one, nor catch the two keys being cross-wired.
-    This follows the stricter nested-QGT convention instead: distinct inputs
-    per field, exact equality per field.
+    This uses exact equality per field with DISTINCT inputs per field. The
+    nested-QGT case is the closest existing convention, since it asserts
+    exact equality, but it is not quite the same: it shares ``inf`` between
+    ``shift`` and ``max_eigenvalue``, so swapping those two keys passes it.
     """
 
     telemetry = BlockNGTelemetry(
@@ -993,7 +996,12 @@ def test_block_ng_diagnostics_with_a_nonfinite_norm_survive_the_real_jsonl_sink(
     # carrying ITS OWN value, so a swap or a constant label cannot pass.
     assert payload["metrics"]["block_ng_energy_gradient_norm"] == energy_expected
     assert payload["metrics"]["block_ng_update_direction_norm"] == direction_expected
-    # The finite fields stay themselves: the guard must not flatten everything.
+    # The non-norm fields are carried through intact. NOTE what this does
+    # NOT show: `n_blocks` is an int and `reason` a string, and neither takes
+    # the guard's float path, so these two assertions say nothing about
+    # whether a FINITE norm survives as a number. That property is pinned in
+    # `test_a_finite_diagnostics_record_is_numerically_unchanged`; an earlier
+    # version of this comment claimed it here, and was wrong.
     assert payload["metrics"]["block_ng_n_blocks"] == 2
     assert payload["metrics"]["block_ng_reason"] == "applied"
 
@@ -1012,6 +1020,26 @@ def test_a_finite_diagnostics_record_is_numerically_unchanged() -> None:
     assert isinstance(metrics["sr_energy_gradient_norm"], float)
     assert metrics["sr_step"] == 1
     assert metrics["sr_applied"] is False
+
+    # Block NG was covered by the non-finite case but NOT here, and that gap
+    # was invisible: `str()` of a non-finite float is byte-identical to the
+    # guard's own label, so a flatten-to-string defect in block NG's
+    # `as_metrics` passed the entire unit suite. Only a FINITE value
+    # separates the two. Distinct magnitudes per field, so a swap cannot hide.
+    block_ng = BlockNGTelemetry(
+        applied=True,
+        step=1,
+        n_samples=4,
+        n_blocks=2,
+        energy_gradient_norm=2.5,
+        update_direction_norm=0.75,
+        solve_dtype="torch.float64",
+    )
+    block_ng_metrics = block_ng.as_metrics()
+    assert block_ng_metrics["block_ng_energy_gradient_norm"] == 2.5
+    assert isinstance(block_ng_metrics["block_ng_energy_gradient_norm"], float)
+    assert block_ng_metrics["block_ng_update_direction_norm"] == 0.75
+    assert isinstance(block_ng_metrics["block_ng_update_direction_norm"], float)
 
 
 # --------------------------------------------------------------------------
