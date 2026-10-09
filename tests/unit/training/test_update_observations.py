@@ -927,6 +927,54 @@ def test_nested_solve_diagnostics_with_a_nonfinite_eigenvalue_survive_jsonl(tmp_
     assert payload["metrics"]["qgt_min_retained_eigenvalue"] == 0.0
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_block_ng_diagnostics_with_a_nonfinite_norm_survive_the_real_jsonl_sink(
+    tmp_path, value
+) -> None:
+    """Block NG carries the same hazard, and was the only method left untested.
+
+    WHY THIS EXISTS, since the omission is the point. SR, SPRING and the
+    nested QGT record each had a dedicated non-finite case; block NG did not,
+    even though ``BlockNGTelemetry.as_metrics`` routes both norms through the
+    same ``json_safe_scalar``. The suite constructed ``BlockNGTelemetry``
+    exactly once, with finite values, inside a NAME-COLLISION test -- so a
+    change that dropped the guard from this one class alone would have left
+    every test green. That is the same shape as the gap recorded a few
+    functions above: partial coverage certifies only the pairs it happened to
+    look at, and block NG was the member it did not look at, twice.
+
+    REACHABILITY, stated precisely rather than implied. ``update()`` raises on
+    non-finite local energies and again on a non-finite update DIRECTION, so
+    the component tensors reaching the telemetry are finite. It does NOT check
+    the energy GRADIENT, and -- more to the point -- a vector norm of entirely
+    finite components can still overflow to ``inf``, in float32 especially. So
+    ``inf`` is reachable here through ``update()`` today; ``nan`` and
+    ``-inf`` are not reachable through that path, and are covered because the
+    dataclass is public, constructible by callers and by a restore path, and
+    the guarantee being asserted is a property of ``as_metrics``, not of one
+    caller's arithmetic.
+    """
+
+    telemetry = BlockNGTelemetry(
+        applied=True,
+        step=1,
+        n_samples=4,
+        n_blocks=2,
+        energy_gradient_norm=value,
+        update_direction_norm=value,
+        solve_dtype="torch.float64",
+    )
+    path = tmp_path / "block_ng.jsonl"
+    JSONL(path).log(LogRecord(step=1, namespace="train", metrics=telemetry.as_metrics()))
+    payload = json.loads(path.read_text().strip())
+    # Named, not crashed, and NOT silently turned into a number.
+    assert payload["metrics"]["block_ng_energy_gradient_norm"] in ("nan", "inf", "-inf")
+    assert payload["metrics"]["block_ng_update_direction_norm"] in ("nan", "inf", "-inf")
+    # The finite fields stay themselves: the guard must not flatten everything.
+    assert payload["metrics"]["block_ng_n_blocks"] == 2
+    assert payload["metrics"]["block_ng_reason"] == "applied"
+
+
 def test_a_finite_diagnostics_record_is_numerically_unchanged() -> None:
     """CONTROL. Routing through the guard must not alter finite values.
 
