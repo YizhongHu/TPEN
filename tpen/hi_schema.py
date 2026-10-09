@@ -382,7 +382,7 @@ ADMITTED_METHOD_TARGETS = frozenset(
 # Admitted update methods
 # ---------------------------------------------------------------------------
 # THE SECOND HALF OF METHOD ADMISSION. `VMCTrainer` takes an `update_method`
-# spec, and `_select_update_method` resolves a Hydra ``_partial_`` block into
+# spec, and `VMCTrainer.bind_update_method` resolves a Hydra ``_partial_`` block into
 # the object that performs every parameter update. So a configuration selects
 # its update RULE here and its optimizer in `optimizer` -- two surfaces, and
 # only the second was qualified. `tpen.training.sr.StochasticReconfigurationUpdate`
@@ -397,7 +397,7 @@ ADMITTED_METHOD_TARGETS = frozenset(
 # anything is constructed.
 #
 # ABSENCE IS ADMITTED, and it is what the control config does. `update_method:
-# null` (or omission) makes `_select_update_method` build `LegacyAutogradUpdate`
+# null` (or omission) makes `VMCTrainer.bind_update_method` build `LegacyAutogradUpdate`
 # -- the plain optimizer step, which IS the admitted Adam method. Requiring the
 # declaration would refuse every shipped configuration.
 #
