@@ -1100,6 +1100,19 @@ def test_populate_execution_topology_detaches_direct_public_input(tmp_path: Path
     }
 
 
+def test_populate_rejects_non_exact_source_hash_before_stage_binding(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+
+    class LyingHash(str):
+        pass
+
+    forged = replace(cell, content_hash=LyingHash(cell.content_hash))
+    with pytest.raises(launch.LaunchValidationError, match="exact str"):
+        launch.populate_execution_topology(
+            forged, launch.execution_topology_facts(_topology())
+        )
+
+
 class _ScalarSpoofMeta(type):
     def __eq__(cls, other: object) -> bool:
         return other is str
