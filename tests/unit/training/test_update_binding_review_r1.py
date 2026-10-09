@@ -319,6 +319,16 @@ def test_r1_4_a_runner_driven_resume_constructs_the_default_adapter_once(
 
     calls = _count_legacy_constructions(monkeypatch)
     torch.manual_seed(555)
+    # `make_run_context` builds its `RunContext` with an empty `cfg`, but
+    # `_save_resume_checkpoint` saved through `_checkpoint_context`'s populated
+    # one. Restore hashes `context.cfg` against the manifest, so an empty cfg
+    # is refused at the hash gate before the construction count this test
+    # pins is ever exercised. `RunContext` is a plain (non-frozen) dataclass,
+    # so align the two sides post-construction rather than hand-building a
+    # second `RunContext`.
+    resume_context = make_run_context(tmp_path / "resume-run")
+    resume_context.cfg = _checkpoint_context(tmp_path).cfg
+    resume_context.source_cfg = resume_context.cfg
     Train(
         model=build_tiny_spenn(),
         sampler=_FixedSampler(),
@@ -326,7 +336,7 @@ def test_r1_4_a_runner_driven_resume_constructs_the_default_adapter_once(
         optimizer=lambda params: torch.optim.Adam(params, lr=LEARNING_RATE),
         trainer=VMCTrainer(max_steps=2, log_every_n_steps=1),
         load={"mode": "train_resume", "path": str(checkpoint)},
-    ).run(make_run_context(tmp_path / "resume-run"))
+    ).run(resume_context)
 
     assert calls["n"] == 1, (
         "the resumed runner path constructed the default adapter more than "

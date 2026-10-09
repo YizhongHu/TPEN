@@ -120,16 +120,105 @@ it passed throughout the defect's lifetime (the stateless adapter made double
 construction numerically invisible, which is the writer's own point).
 Test: test_r1_4_a_runner_driven_resume_constructs_the_default_adapter_once.
 
+### R1-5 (medium) — duck-typed runner contract narrowed without disclosure
+
+Provenance: reviewer observation under claim 1, UPGRADED to an accepted issue
+by the writer (2026-10-09 message), and the reviewer CONCURS — this is not an
+over-read. The acceptance contract carries "Preserve other configured
+trainers' existing runner path." A third-party trainer whose
+`resolve_update_state` returns a non-None object without `.optimizer` now
+raises AttributeError at tpen/runner/train.py where its return value was
+previously discarded. The only reason nothing breaks in-repo is that the one
+stub returns None — an accident, not a guarantee. Fix (writer's shape, agreed):
+take the alias only when the attribute exists, e.g.
+`if update_state is not None and hasattr(update_state, "optimizer")`,
+otherwise keep the locally built optimizer. Torch-free, no new import.
+
+Adoptable post-fix pin (red on head, green with the fix — land them together):
+
+```python
+def test_r1_5_a_trainer_with_a_foreign_resolve_contract_keeps_the_runner_path(tmp_path):
+    """A non-VMC trainer whose resolve_update_state returns a truthy object
+    without `.optimizer` must keep the pre-524 runner path: return value
+    ignored, runner-built optimizer used."""
+
+    class ForeignTrainer:
+        next_iteration = 0
+
+        def resolve_update_state(self, *, model, optimizer):
+            return object()  # truthy, no .optimizer — the narrowing trips here
+
+        def fit(self, *, model, sampler, hamiltonian_terms, optimizer,
+                context, emit):
+            self.seen_optimizer = optimizer
+            return TrainerState(model=model, optimizer=optimizer,
+                                update_state=None, trainer=self,
+                                sampler=sampler)  # match real signature
+
+    # Drive tpen.runner.Train fresh (no load) with ForeignTrainer and assert
+    # run() completes and seen_optimizer is the runner-built Adam. Adjust the
+    # TrainerState construction to whatever the runner actually requires of
+    # final_state (it reads next_iteration); a SimpleNamespace may suffice.
+```
+
+(Sketch deliberately loose on TrainerState fields — writer should shape it to
+the runner's real final_state consumption when landing the fix.)
+
 ## Out-of-scope notes (not issues)
 
 - Error message "mismatched legacy optimizer ownership" now also fires for
   non-legacy carriers at the binding boundary; cosmetic.
-- Duck-type narrowing of the runner's resolve contract (claim-1 observation).
 
-## Worker results — FILL IN
+## Worker results
 
-- Job id / partition delivered / node / elapsed / exit:
-- JUnit arm 1 (review file, expect 5):
-- JUnit arm 2 (writer file, expect 15):
-- Edits needed to R1-3 / R1-4 fixtures:
-- Final file md5:
+RUN 1 — Cannon job 51674866, partition test (requested+delivered), node
+holy8a24102, COMPLETED 0:0, Elapsed 00:02:49. Venv FRESH (err log: locked
+sync, "Installed 32 packages in 49.31s" incl torch — explains the elapsed).
+Raw JUnit <testsuite> attributes, read independently by the reviewer over ssh:
+
+- arm 1 (review probes): tests=5 failures=1 errors=0 skipped=0 time=16.33s
+- arm 2 (writer's test_update_binding.py): tests=15 failures=0 errors=0
+  skipped=0 time=12.41s
+
+The single failure is test_r1_4: restore hash gate refused —
+"current config is missing model for restore" — because make_run_context
+hardcodes cfg=OmegaConf.create({}) (tests/helpers/run_context.py:119), so
+restore-side component hashes are None. REVIEWER FIXTURE DEFECT, not a product
+defect; the gate behaved as designed. R1-1 (both probes), R1-2, R1-3 (SPRING
+through the full checkpoint lifecycle, NO fixture change needed) measured
+green in run 1.
+
+RUN 2 — Cannon job 51675986, partition test, node holy8a24102, COMPLETED 0:0,
+Elapsed 00:00:33 (env REUSED — pre-announced before the run so the short
+elapsed reads as explained, not as the inert-harness shape). In-job: HEAD
+asserted at 40 chars, CPython 3.12.13 from the job-local uv env, pycache purge
+printed 0 before each arm. Raw JUnit, corroborated independently by the
+writer:
+
+- arm 1 (review probes): tests=5 failures=0 errors=0 skipped=0 time=12.47s
+- arm 2 (writer's file): tests=15 failures=0 errors=0 skipped=0 time=12.79s
+
+Fixture fix (worker, file-local, 11 lines): set `.cfg`/`.source_cfg` on the
+make_run_context-built RunContext (plain non-frozen dataclass) to the
+save-side `_checkpoint_context` cfg. Final file md5
+63a262edac81a61616cfe028737530e2, committed on the reviewer branch.
+
+ALL FIVE PROBES GREEN at head 4175fc17 in run 2. R1-4's property (resumed
+runner path constructs the default adapter exactly once) is now MEASURED and
+holds.
+
+## Process notes adopted for round 2
+
+- EVIDENCE HAZARD (writer-reported, adopted): run 2 overwrote run 1's JUnit
+  in place — junit/<arm>.xml is a fixed key, so a superseded arm's
+  machine-readable artefact was destroyed by its successor; only the raw
+  <testsuite> echo in the per-job .out preserved it. Round 2 jobs write
+  junit/<arm>-<jobid>.xml (or a per-run directory).
+- CONVERGENCE with the verifier's M2: the verifier found the binding-boundary
+  carrier check is SHADOWED — deleting it survives because
+  `_resolve_method_state` raises the IDENTICAL string from its older guard.
+  Converges with R1-1 from the dynamic side (R1-1: stateless path where
+  NEITHER guard fires; M2: stateful path where either guard suffices and no
+  test can tell which fired). Root cause the writer adopted: two distinct
+  guards, one message. Distinguishable messages at the binding boundary also
+  dispose of this review's cosmetic note about "legacy" wording.
