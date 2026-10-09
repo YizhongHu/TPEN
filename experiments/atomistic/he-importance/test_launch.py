@@ -1281,3 +1281,55 @@ def test_prepare_train_launch_owns_manifest_before_downstream_reads(
 
     ordinary = launch.prepare_train_launch(clean_cell, _topology())
     assert isinstance(ordinary.cell, launch._OwnedLaunchCell)
+
+
+def test_content_hash_is_exact_and_binds_both_public_launch_entries(
+    tmp_path: Path,
+) -> None:
+    row_a = _cell(tmp_path / "a", identity={"architecture": "a"})
+    row_b = _cell(tmp_path / "b", identity={"architecture": "b"})
+    seen_run_ids: list[str] = []
+
+    assert launch.prepare_train_launch(row_b, _topology()).config.run.run_id == row_b.content_hash
+
+    def runner(config: object) -> int:
+        seen_run_ids.append(str(config.run.run_id))
+        return 0
+
+    assert launch.launch_train(row_b, _topology(), runner=runner) == 0
+    assert seen_run_ids == [row_b.content_hash]
+
+    class LyingHash(str):
+        def __ne__(self, other: object) -> bool:
+            del other
+            return False
+
+        def __eq__(self, other: object) -> bool:
+            del other
+            return True
+
+        __hash__ = str.__hash__
+
+    class LyingNonStringHash:
+        def __ne__(self, other: object) -> bool:
+            del other
+            return False
+
+        def __eq__(self, other: object) -> bool:
+            del other
+            return True
+
+        def __str__(self) -> str:
+            return row_a.content_hash
+
+    mismatches = (
+        row_a.content_hash,
+        LyingHash(row_a.content_hash),
+        LyingNonStringHash(),
+    )
+    for held in mismatches:
+        forged = replace(row_b, content_hash=held)
+        with pytest.raises(launch.LaunchValidationError, match="exact str"):
+            launch.prepare_train_launch(forged, _topology())
+        with pytest.raises(launch.LaunchValidationError, match="exact str"):
+            launch.launch_train(forged, _topology(), runner=lambda _: 0)

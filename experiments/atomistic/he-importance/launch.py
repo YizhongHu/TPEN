@@ -144,6 +144,8 @@ def _source_cell(source: Any) -> Any:
     cell = getattr(source, "cell", source)
     if not all(hasattr(cell, name) for name in ("manifest", "content_hash", "output_path")):
         raise LaunchValidationError("source must be a MaterializedCell or TrainingPacket")
+    if type(cell.content_hash) is not str:
+        raise LaunchValidationError("source content_hash must be an exact str")
     return cell
 
 
@@ -368,9 +370,12 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
         # The stage API preserves the caller's concrete cell type.  Capture its
         # frozen result once, then hand only this module-owned carrier onward so
         # later consumers cannot obtain a fresh caller-controlled manifest read.
+        bound_hash = bound.content_hash
+        if type(bound_hash) is not str:
+            raise LaunchValidationError("bound content_hash must be an exact str")
         owned = _OwnedLaunchCell(
             manifest=_STAGE_API._freeze(_detach_topology_facts(bound.manifest)),
-            content_hash=bound.content_hash,
+            content_hash=bound_hash,
             output_path=bound.output_path,
             seed_streams=_detach_topology_facts(bound.seed_streams),
         )
