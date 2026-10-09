@@ -23,6 +23,16 @@ from tpen.run import run_from_config
 
 _STAGE_API = import_module("experiments.atomistic.he-importance.stage_coordinate")
 _TRAIN_CONFIG = import_module("experiments.atomistic.he-importance.train_config")
+
+
+@dataclass(frozen=True)
+class _OwnedLaunchCell:
+    """Launch-owned view of a bound row handed to downstream consumers."""
+
+    manifest: Mapping[str, Any]
+    content_hash: str
+    output_path: Any
+    seed_streams: Mapping[str, Any]
 # This vocabulary is deliberately closed. Names outside this declaration belong
 # to the scientific manifest unless a future owner adds them and gives the
 # production consumer a representation for them.
@@ -355,8 +365,17 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
         raise LaunchValidationError("source manifest is not a valid HI train row") from error
     try:
         bound = _STAGE_API.with_execution_topology(cell, topology)
-        _reject_execution_facts_outside_topology(bound.manifest)
-        return bound
+        # The stage API preserves the caller's concrete cell type.  Capture its
+        # frozen result once, then hand only this module-owned carrier onward so
+        # later consumers cannot obtain a fresh caller-controlled manifest read.
+        owned = _OwnedLaunchCell(
+            manifest=_detach_topology_facts(bound.manifest),
+            content_hash=bound.content_hash,
+            output_path=bound.output_path,
+            seed_streams=_detach_topology_facts(bound.seed_streams),
+        )
+        _reject_execution_facts_outside_topology(owned.manifest)
+        return owned
     except Exception as error:
         raise LaunchValidationError(str(error)) from error
 

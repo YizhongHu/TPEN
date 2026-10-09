@@ -844,6 +844,74 @@ def test_populate_validates_the_frozen_manifest_across_flip_schedules(
     assert ordinary.manifest["topology"]["host"] == "node"
 
 
+def test_prepare_train_launch_owns_manifest_before_downstream_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clean_cell = _cell(tmp_path)
+    clean_manifest = dict(clean_cell.manifest)
+    dirty_manifest = dict(clean_manifest)
+    dirty_identity = dict(clean_manifest["scientific_identity"])
+    dirty_identity["global_rank"] = 1
+    dirty_manifest["scientific_identity"] = dirty_identity
+
+    @stage_coordinate.dataclass(frozen=True)
+    class DivergentCell:
+        manifest: Mapping[str, object]
+        content_hash: str
+        output_path: Path
+        seed_streams: Mapping[str, int]
+        clean: Mapping[str, object]
+        dirty: Mapping[str, object]
+        reads: list[int]
+        flip_after: int
+
+        def __getattribute__(self, name: str) -> object:
+            if name == "manifest":
+                reads = object.__getattribute__(self, "reads")
+                reads[0] += 1
+                limit = object.__getattribute__(self, "flip_after")
+                chosen = "clean" if reads[0] <= limit else "dirty"
+                return object.__getattribute__(self, chosen)
+            if name == "content_hash":
+                reads = object.__getattribute__(self, "reads")
+                limit = object.__getattribute__(self, "flip_after")
+                chosen = "clean" if reads[0] <= limit else "dirty"
+                value = object.__getattribute__(self, chosen)
+                return stage_coordinate.content_hash(value)
+            return object.__getattribute__(self, name)
+
+    original_resolve = launch._TRAIN_CONFIG.resolve_train_config
+    downstream_cells: list[object] = []
+
+    def recording_resolve(source: object) -> object:
+        downstream_cells.append(source)
+        return original_resolve(source)
+
+    monkeypatch.setattr(launch._TRAIN_CONFIG, "resolve_train_config", recording_resolve)
+
+    # _source_cell and binding perform the initial reads; flip after the
+    # detector's read so the old caller-typed return diverges downstream.
+    for flip_after in range(6, 10):
+        candidate = DivergentCell(
+            manifest=clean_manifest,
+            content_hash="unused-field",
+            output_path=clean_cell.output_path,
+            seed_streams=clean_cell.seed_streams,
+            clean=clean_manifest,
+            dirty=dirty_manifest,
+            reads=[0],
+            flip_after=flip_after,
+        )
+        plan = launch.prepare_train_launch(candidate, _topology())
+        assert isinstance(plan.cell, launch._OwnedLaunchCell)
+        assert isinstance(downstream_cells[-1], launch._OwnedLaunchCell)
+        assert plan.cell.manifest["scientific_identity"] == clean_manifest["scientific_identity"]
+        assert plan.topology["host"] == "test-host"
+
+    ordinary = launch.prepare_train_launch(clean_cell, _topology())
+    assert isinstance(ordinary.cell, launch._OwnedLaunchCell)
+
+
 class _MroHidingMeta(type):
     @property
     def __mro__(cls) -> tuple[type, ...]:
