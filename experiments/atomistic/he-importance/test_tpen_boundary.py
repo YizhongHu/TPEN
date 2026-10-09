@@ -1145,6 +1145,8 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
     sources = {
         "launch.py": repository / "experiments/atomistic/he-importance/launch.py",
         "distributed.py": repository / "tpen/distributed.py",
+        "stage_coordinate.py": repository / "experiments/atomistic/he-importance/stage_coordinate.py",
+        "train_config.py": repository / "experiments/atomistic/he-importance/train_config.py",
     }
     allowlist = {
         ("launch.py", "_has_buffer_capability", '"__buffer__" in namespace'):
@@ -1173,14 +1175,92 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             "scope is an owned enum field and the tuple contains module-owned enum members",
         ("distributed.py", "write", "record.topology != self.topology"):
             "both operands are owned typed topology records after conversion",
+        ("stage_coordinate.py", "_is_manifest_root", 'value.get("schema") in {TRAIN_MANIFEST_SCHEMA, EVALUATION_MANIFEST_SCHEMA}'):
+            "the mapping is the validated manifest shape and the membership set contains module-owned schema literals",
+        ("stage_coordinate.py", "_is_manifest_root", "TOPOLOGY_KEY in value"):
+            "the mapping is the validated manifest shape and TOPOLOGY_KEY is a module-owned literal",
+        ("stage_coordinate.py", "with_execution_topology", "content_hash(source_manifest) != source_hash"):
+            "this is the stage-owned hash binding check; launcher admission owns the caller-facing hash precondition",
+        ("stage_coordinate.py", "with_execution_topology", "content_hash(manifest) != source_hash"):
+            "manifest is freshly thawed from the validated stage row and source_hash is the stage-cell precondition",
+        ("stage_coordinate.py", "_project_identity", "key == TOPOLOGY_KEY"):
+            "key is a validated manifest key and TOPOLOGY_KEY is a module-owned literal",
+        ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["stage"] != manifest["stage"]'):
+            "manifest has passed the structural validator and both values are exact schema fields",
+        ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["label"] not in seed_labels(manifest["stage"])'):
+            "manifest has passed the structural validator and the namespace is module-owned",
+        ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["namespace"] != "fresh-training"'):
+            "manifest has passed the structural validator and the expected namespace is a module literal",
+        ("stage_coordinate.py", "_require_exact_keys", "frozenset(value) != expected"):
+            "value is a validated mapping at each caller and expected is a module-owned schema set",
+        ("stage_coordinate.py", "_validate_delegated_subtree", "key in _FORBIDDEN_TRAIN_CONTENT_KEYS"):
+            "key is required to be a string and the forbidden-key set is module-owned",
+        ("stage_coordinate.py", "_validate_delegated_subtree", "type(value) not in {str, int, float, bool, type(None)}"):
+            "type(value) is a built-in identity and the admitted type set is module-owned",
+        ("stage_coordinate.py", "_validate_delegated_subtree", "value == _REFERENCE_ENERGY"):
+            "the preceding exact-type test makes value an exact float and the reference is module-owned",
+        ("stage_coordinate.py", "_validate_delegated_subtree", "value == _REFERENCE_ENERGY_TEXT"):
+            "the preceding exact-type test makes value an exact str and the reference is module-owned",
+        ("stage_coordinate.py", "_validate_common", 'manifest["schema"] != schema'):
+            "manifest has passed the exact-key and mapping checks and schema is a module-owned validator argument",
+        ("train_config.py", "_require_checkout_root", "repo_root not in candidates"):
+            "repo_root and candidates are freshly resolved Path values owned by the checkout probe",
+        ("train_config.py", "_cell_from_source", "hasattr(cell, name)"):
+            "this is source-shape admission; false positives fail at the required downstream reads",
+        ("train_config.py", "_set_optional_execution_seeds", '"seed" in checker'):
+            "checker is a validated mapping from the composed config and the key is a module literal",
+        ("train_config.py", "_optimizer_entry", 'status not in {"available", "unavailable"}'):
+            "status is read from the validated scientific-identity mapping and compared with module literals",
+        ("train_config.py", "_optimizer_entry", 'status != "available"'):
+            "status is read from the validated scientific-identity mapping and compared with a module literal",
+        ("train_config.py", "resolve_train_config", "stage_api.content_hash(manifest) != cell.content_hash"):
+            "this is the resolver's predecessor hash binding check; launcher entry admission owns exact hash identity",
+        ("train_config.py", "resolve_train_config", "output_path.parent.parent == output_path"):
+            "output_path is freshly converted to an owned Path before this structural sanity check",
     }
     findings: list[str] = []
     observed: set[tuple[str, str, str]] = set()
+    closure_roots = {
+        "stage_coordinate.py": {"with_execution_topology"},
+        "train_config.py": {"resolve_train_config"},
+    }
+    closures: dict[str, set[str]] = {}
+    for filename, path in sources.items():
+        if filename not in closure_roots:
+            continue
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        definitions = {
+            function.name: function
+            for function in ast.walk(tree)
+            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        calls = {
+            name: {
+                node.id
+                for node in ast.walk(function)
+                if isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in definitions
+            }
+            for name, function in definitions.items()
+        }
+        reachable: set[str] = set()
+        pending = list(closure_roots[filename])
+        while pending:
+            name = pending.pop()
+            if name in reachable:
+                continue
+            reachable.add(name)
+            pending.extend(calls.get(name, ()))
+        closures[filename] = reachable
     for filename, path in sources.items():
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(path))
         for function in ast.walk(tree):
             if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if filename in closures and function.name not in closures[filename]:
                 continue
             aliases = {"hasattr"}
             for node in ast.walk(function):
