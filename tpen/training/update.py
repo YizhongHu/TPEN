@@ -794,6 +794,12 @@ def merge_named_metrics(
 
     recorded = [] if collisions is None else collisions
     pairs = entries.items() if isinstance(entries, Mapping) else entries
+    # PRECONDITION, stated rather than re-encoded: `prefix` arrives ALREADY
+    # ENCODED. Encoding it again here would double-escape a caller that had
+    # done the right thing -- `%` becomes `%25` becomes `%2525` -- so the
+    # encode happens ONCE at each public boundary instead. This is an internal
+    # helper; the boundaries are UpdateMethodDescription.as_metrics,
+    # flatten_settings and carrier_settings, and each encodes before calling.
     for key, value in pairs:
         name = f"{prefix}{json_safe_metric_name(key)}"
         if name in target:
@@ -803,7 +809,12 @@ def merge_named_metrics(
     return recorded
 
 
-SETTING_NAME_COLLISIONS_KEY = "setting_name_collisions"
+# RESERVED, and UNREACHABLE BY CONSTRUCTION. The leading `%` is the point:
+# `json_safe_metric_name` escapes `%` to `%25` FIRST, so no encoded user key
+# can ever spell this name. Without that, the marker write could itself
+# overwrite a user entry -- the exact silent-loss failure the marker exists to
+# report, reintroduced by the reporting.
+SETTING_NAME_COLLISIONS_KEY = "%collisions"
 
 
 class UpdateDiagnostics(ABC):
@@ -1186,7 +1197,11 @@ def flatten_settings(settings: Mapping[str, Any], *, prefix: str = "") -> dict[s
 
     flat: dict[str, Any] = {}
     collisions: list[str] = []
-    _flatten_into(flat, settings, prefix=prefix, collisions=collisions)
+    # PUBLIC BOUNDARY: `prefix` is caller-supplied and arrives raw, so it is
+    # encoded here, once. Everything below this line works in encoded space.
+    _flatten_into(
+        flat, settings, prefix=json_safe_metric_name(prefix), collisions=collisions
+    )
     if collisions:
         flat[SETTING_NAME_COLLISIONS_KEY] = ";".join(sorted(set(collisions)))
     return flat
@@ -1202,6 +1217,8 @@ def _flatten_into(
     """Recurse one level, accumulating collisions across the whole walk."""
 
     for key, value in settings.items():
+        # `prefix` is already encoded; only the KEY needs encoding here, and
+        # the concatenation stays in encoded space.
         encoded = json_safe_metric_name(key)
         if isinstance(value, Mapping):
             _flatten_into(flat, value, prefix=f"{prefix}{encoded}_", collisions=collisions)
