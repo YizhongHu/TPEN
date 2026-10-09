@@ -26,6 +26,7 @@ from tpen.training.state import TrainerState
 from tpen.nn.forward import ParameterScoreRequest
 from tpen.training.optim import UpdateMethodSpec, make_update_method
 from tpen.training.update import (
+    DIAGNOSTIC_NAME_COLLISIONS_KEY,
     AutogradUpdateInput,
     LegacyAutogradUpdate,
     ModelParameterBinding,
@@ -703,7 +704,13 @@ class VMCTrainer:
                             metrics, update_diagnostics.as_metrics()
                         )
                         if diagnostic_collisions:
-                            metrics["update_diagnostic_name_collisions"] = ";".join(
+                            # RESERVED NAME, not an ordinary one. A custom
+                            # record returning this literal key would otherwise
+                            # have its value replaced by the marker -- the
+                            # silent loss the marker exists to report. The
+                            # leading `%` is escaped to `%25` by the encoder,
+                            # so no encoded diagnostic name can spell it.
+                            metrics[DIAGNOSTIC_NAME_COLLISIONS_KEY] = ";".join(
                                 sorted(set(diagnostic_collisions))
                             )
 

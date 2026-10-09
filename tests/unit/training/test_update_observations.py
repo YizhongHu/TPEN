@@ -50,6 +50,7 @@ from tpen.training.update import (
     UpdateMethodDescription,
     VMCUpdateMethod,
     VMCUpdateResult,
+    DIAGNOSTIC_NAME_COLLISIONS_KEY,
     SETTING_NAME_COLLISIONS_KEY,
     carrier_settings,
     deserialize_parameter_layout,
@@ -1570,6 +1571,9 @@ class _HostileNameDiagnostics(UpdateDiagnostics):
             "custom\nnewline": 2.0,
             1: "int-key",
             "1": "str-key",
+            # The literal marker name. A record may return it, and until the
+            # marker was reserved, the marker write replaced this value.
+            "update_diagnostic_name_collisions": "user-value",
         }
 
 
@@ -1659,6 +1663,75 @@ def test_a_non_string_key_is_actually_accepted_not_rejected_by_typeguard() -> No
     metrics = description.as_metrics()
     assert metrics["update_method_setting_1"] == "int-value"
     assert metrics["update_method_setting_plain"] == "str-value"
+
+
+def test_the_trainer_collision_marker_cannot_overwrite_a_custom_diagnostic(
+    tmp_path,
+) -> None:
+    """The trainer's marker needed the same reservation as the settings marker.
+
+    Found by verification, not by a test. The `%`-prefix rule was applied at
+    three name-composition sites and missed at the fourth: the trainer wrote
+    its diagnostics marker under an ORDINARY key, so a custom record returning
+    that literal name lost its value to the marker write.
+
+    That is the silent-loss failure the marker exists to report, reintroduced
+    by the reporting -- for the SECOND time in this slice. The first instance
+    was the settings marker; fixing one and not the other is the recurring
+    shape of every defect found here.
+    """
+
+    model = build_connected_model()
+    parameters = tuple(model.parameters())
+    method = _HostileDiagnosticsMethod(
+        optimizer=torch.optim.SGD(parameters, lr=LEARNING_RATE),
+        model_parameters=ModelParameterBinding(parameters=parameters),
+    )
+    context = _SinkWritingContext(tmp_path / "m.csv", tmp_path / "m.jsonl")
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
+    trainer.fit(
+        model=model,
+        sampler=_FixedSampler(),
+        hamiltonian_terms=build_tiny_hamiltonian_terms(),
+        optimizer=method.optimizer,
+        context=context,
+        emit=lambda **_: None,
+    )
+
+    metrics = [m for ns, m in context.records if ns == "train"][-1]
+    # The custom record's own value survives under its encoded name...
+    assert metrics["update_diagnostic_name_collisions"] == "user-value"
+    # ...and the marker is reported separately, under its reserved name.
+    assert DIAGNOSTIC_NAME_COLLISIONS_KEY in metrics
+    assert metrics[DIAGNOSTIC_NAME_COLLISIONS_KEY] != "user-value"
+    # The reservation is structural: no encoded name can spell the marker.
+    assert DIAGNOSTIC_NAME_COLLISIONS_KEY.startswith("%")
+    assert (
+        json_safe_metric_name(DIAGNOSTIC_NAME_COLLISIONS_KEY)
+        != DIAGNOSTIC_NAME_COLLISIONS_KEY
+    )
+
+
+def test_two_ordinary_string_keys_can_collide_structurally() -> None:
+    """Collisions are NOT confined to non-string keys, as I had claimed.
+
+    Flattening joins nested names with `_`, so `{"a_b": 1}` and
+    `{"a": {"b": 2}}` both produce `a_b` from perfectly ordinary strings.
+    Injectivity of the encoder says nothing about a name ASSEMBLED from
+    several encoded parts -- a distinction my docstring asserted away, and
+    the reviewer corrected.
+
+    This matters beyond wording: had the "only non-string keys" claim been
+    believed, narrowing the annotations back to `Mapping[str, Any]` would have
+    looked like a safe simplification that silently removed a reachable guard.
+    """
+
+    flat = flatten_settings({"a_b": 1, "a": {"b": 2}})
+    # First writer retained, clash reported -- the same discipline as the
+    # coercion case, reached by a completely different route.
+    assert flat["a_b"] == 1
+    assert SETTING_NAME_COLLISIONS_KEY in flat
+    assert "a_b" in flat[SETTING_NAME_COLLISIONS_KEY]
 
 
 def test_flatten_settings_reports_a_scalar_level_collision() -> None:
