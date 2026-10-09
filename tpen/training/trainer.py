@@ -153,6 +153,13 @@ class VMCTrainer:
         # identity, which silently excluded the `None` default and so rebuilt
         # the legacy adapter on every selection.
         self._bound_update_method_spec: UpdateMethodSpec = None
+        # The carrier this run was BOUND to, retained explicitly rather than
+        # re-derived from update state. An earlier version derived it from
+        # `_resolved_update_state` or `update_state()`, both of which are
+        # `None` for a STATELESS method bound directly -- so the carrier check
+        # was skipped for exactly the method class its own comment said it
+        # existed for. Retaining the object removes that dependence entirely.
+        self._bound_optimizer: torch.optim.Optimizer | None = None
         self._resolved_update_state: VMCUpdateState | None = None
         self._checkpoint_parameter_layout = None
         # The description of the method actually built/restored for the most
@@ -405,8 +412,14 @@ class VMCTrainer:
         optimizer : torch.optim.Optimizer
             The carrier for this run.
         update_method : VMCUpdateMethod or callable or Mapping or None, optional
-            A late selector. ``None`` means "whatever this trainer was
-            configured with", which is the ordinary case and never a conflict.
+            A late selector. ``None`` means "re-read the spec this trainer was
+            CONSTRUCTED with" -- it does NOT mean "use whatever is bound". The
+            distinction only matters after a bind that came from an explicit
+            override: a trainer configured with spec F, bound from an explicit
+            override G, then called again with ``None``, re-reads F, finds it
+            disagrees with the bound spec, and RAISES. That is deliberate (see
+            Notes), and it is the ordinary case only because a runner-driven
+            run never passes an override in the first place.
 
         Returns
         -------
@@ -456,6 +469,7 @@ class VMCTrainer:
                 gradient_clip_norm=self.gradient_clip_norm,
             )
             self._bound_update_method_spec = spec
+            self._bound_optimizer = optimizer
             self._resolved_model = model
             self._resolved_update_method = bound
             return bound
@@ -468,24 +482,39 @@ class VMCTrainer:
                 "update method is already bound to a different model; a new run "
                 "needs a fresh trainer and method rather than silent reuse"
             )
-        bound_state = self._resolved_update_state
-        if bound_state is None:
-            # A caller that bound directly, without going through
-            # `resolve_update_state`, has no recorded state yet. Ask the method
-            # for its own authority so the carrier check still applies; a
-            # stateless method returns `None` and has no carrier to disagree
-            # with.
-            bound_state = bound.update_state()
-        if bound_state is not None and optimizer is not bound_state.optimizer:
-            # `_resolve_method_state` enforces carrier identity only for a
-            # method that OWNS its state; for a stateless method it wraps
-            # whatever optimizer it is handed, so without this a second carrier
-            # would be accepted silently and the run would publish one
-            # optimizer while mutating another.
-            raise ValueError("mismatched legacy optimizer ownership")
-        # A late selector only conflicts when it actually selects something. An
-        # explicit `None` -- what `fit` receives on every runner-driven run --
-        # means "use what is already bound", not "switch to the default".
+        if optimizer is not self._bound_optimizer:
+            # Compared against the RETAINED carrier, not against one re-derived
+            # from update state. `_resolve_method_state` has its own carrier
+            # check, but it applies only to a method that OWNS its state: for a
+            # stateless method it wraps whatever optimizer it is handed, so a
+            # second carrier reaching this boundary would otherwise be accepted
+            # silently and the run would publish one optimizer while mutating
+            # another.
+            #
+            # THE MESSAGE IS DELIBERATELY DISTINCT from
+            # `_resolve_method_state`'s "mismatched legacy optimizer
+            # ownership". Two guards raising the SAME string is why this one
+            # went unnoticed: every test that asserted on that message reached
+            # it through `resolve_update_state`, where the older check fires
+            # first, so this check could be deleted outright without a single
+            # test failing. A guard whose refusal is indistinguishable from
+            # another's is a guard nothing can pin. It is also more accurate:
+            # nothing about a carrier at this boundary is "legacy".
+            raise ValueError(
+                "update method is already bound to a different optimizer; "
+                "a run publishes and mutates one carrier"
+            )
+        # A late selector only conflicts when it actually selects something,
+        # and an explicit `None` selects nothing -- so it falls back to the
+        # CONSTRUCTOR's spec and that is what gets conflict-checked.
+        #
+        # Reviewer round 1 (R1-2) caught this: an earlier version of this
+        # comment claimed `None` meant "use what is already bound", and the
+        # Parameters doc claimed `None` could never conflict. Neither was what
+        # the code did. The code is kept and the documentation corrected,
+        # rather than the reverse, because the alternative -- letting a plain
+        # call silently diverge from the spec the trainer was configured with
+        # -- is the exact class of defect this slice exists to remove.
         late_spec = update_method if update_method is not None else self.update_method
         if (
             late_spec is not None

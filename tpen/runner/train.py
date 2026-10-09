@@ -88,8 +88,19 @@ class Train(Runner):
             # optimizer -- so this changes no behaviour today. What it removes
             # is the possibility of their ever diverging: restore, the
             # callbacks' `TrainerState`, and the loop all read one source.
-            if update_state is not None:
-                optimizer = update_state.optimizer
+            #
+            # ATTRIBUTE-GUARDED, not `is not None`-guarded. This return value
+            # was DISCARDED before this change, so any trainer implementing the
+            # duck-typed contract was free to return whatever it liked. An
+            # `is not None` test would turn a truthy foreign return into an
+            # `AttributeError` and break a runner path the acceptance contract
+            # requires preserving -- and the only reason nothing in this repo
+            # breaks is that its one other implementer happens to return
+            # `None`, which is an accident rather than a guarantee. A foreign
+            # return without `.optimizer` is ignored exactly as it was before.
+            carrier = getattr(update_state, "optimizer", None)
+            if carrier is not None:
+                optimizer = carrier
         # The duck-typed lookup above is deliberate. Other configured trainers
         # reach this runner through the same path and are not required to
         # implement the VMC binding contract; a trainer without it simply uses

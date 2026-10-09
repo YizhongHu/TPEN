@@ -549,16 +549,20 @@ def test_a_second_model_is_refused_after_binding() -> None:
 def test_a_second_carrier_is_refused_after_binding() -> None:
     """A run publishes one optimizer and mutates that same one.
 
-    The pre-existing ownership check only covers a method that OWNS its state;
-    the default adapter's authority is the optimizer it was handed, so without
-    the binding boundary a second carrier would have been accepted here.
+    The message asserted here is the BINDING boundary's own, not
+    `_resolve_method_state`'s "mismatched legacy optimizer ownership". The two
+    guards used to share a string, and reviewer round 1 plus the independent
+    verifier's M2 mutant together showed what that cost: the older check fires
+    first on this path, so the binding check could be deleted outright and no
+    test noticed. Asserting the distinct message is what pins WHICH guard
+    refused.
     """
 
     model, optimizer, trainer = _fresh_run()
     trainer.resolve_update_state(model=model, optimizer=optimizer)
     other_optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    with pytest.raises(ValueError, match="mismatched legacy optimizer ownership"):
+    with pytest.raises(ValueError, match="already bound to a different optimizer"):
         trainer.resolve_update_state(model=model, optimizer=other_optimizer)
 
 
@@ -596,7 +600,7 @@ def test_a_refusal_happens_before_any_update_runs() -> None:
     trainer.resolve_update_state(model=model, optimizer=optimizer)
     other_optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    with pytest.raises(ValueError, match="mismatched legacy optimizer ownership"):
+    with pytest.raises(ValueError, match="already bound to a different optimizer"):
         _fit(trainer, model, other_optimizer)
 
     assert trainer.completed_updates == 0
