@@ -978,7 +978,28 @@ def carrier_settings(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
     COMPOUND SETTINGS ARE SPLIT, NOT REPR'D. Adam's ``betas`` is the motivating
     case: writing ``(0.9, 0.999)`` into the unquoted CSV sink produces a row
     with two extra columns that still parses. Each element becomes its own
-    named scalar key instead -- ``betas1``, ``betas2``.
+    named scalar key instead.
+
+    KEYS ARE SANITIZED, NOT ONLY VALUES. A param_group is an ordinary dict and
+    its keys become METRIC NAMES, so a key carrying a comma or a newline
+    corrupts the row exactly as a hostile value would. An earlier version
+    guarded only values, which is half a channel.
+
+    EVERY GROUP IS PREFIXED, INCLUDING THE FIRST. Leaving group 0 unprefixed
+    read as tidier and was wrong: a group-0 key literally named ``group1_lr``
+    then produced the same name as group 1's real learning rate, and a group-0
+    key named ``n_param_groups`` overwrote the count this function itself
+    seeds. Uniform ``g<i>_`` prefixing puts every group-derived name in a space
+    no unprefixed name can reach.
+
+    COLLISIONS ARE REPORTED, NOT RESOLVED SILENTLY. Prefixing removes the
+    collisions structure can remove, but it CANNOT remove all of them: keys are
+    arbitrary strings, so a group-0 key named ``betas1`` still lands on the
+    name produced by splitting a ``betas`` pair. Rather than letting the later
+    write win -- which is how a description comes to report a value nobody set
+    -- the FIRST value is kept and every collided name is listed under
+    ``setting_name_collisions``. A reader then sees that the map is incomplete
+    instead of trusting a silently overwritten entry.
 
     Parameters
     ----------
@@ -988,29 +1009,44 @@ def carrier_settings(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
     Returns
     -------
     dict
-        Flat JSON-safe entries. ``n_param_groups`` is always present. Group 0's
-        settings are reported unprefixed; a heterogeneous multi-group optimizer
-        additionally reports ``group<i>_<key>`` for every later group, so a
-        per-layer learning rate is visible rather than hidden behind group 0.
+        Flat JSON-safe entries. ``n_param_groups`` is always present. Every
+        group's settings appear under ``g<i>_<key>``, so a per-layer learning
+        rate is visible rather than hidden behind group 0.
     """
 
     if not isinstance(optimizer, torch.optim.Optimizer):
         raise TypeError("carrier_settings requires a torch.optim.Optimizer")
     groups = list(optimizer.param_groups)
-    settings: dict[str, Any] = {"n_param_groups": len(groups)}
+    settings: dict[str, Any] = {}
+    collisions: list[str] = []
+
+    def put(name: Any, value: Any) -> None:
+        """Record one entry, keeping the FIRST writer and noting any clash."""
+
+        safe_name = str(json_safe_scalar(name))
+        if safe_name in settings:
+            collisions.append(safe_name)
+            return
+        settings[safe_name] = json_safe_scalar(value)
+
+    # Seeded first so that no group key can displace it.
+    put("n_param_groups", len(groups))
     for index, group in enumerate(groups):
-        prefix = "" if index == 0 else f"group{index}_"
-        for key, value in sorted(group.items()):
-            # `params` is the live parameter list. It is the one thing that
-            # must never enter a description: it is unbounded in size and
-            # holds the model's tensors.
+        prefix = f"g{index}_"
+        # Sorted by the key's TEXT: a param_group may hold non-comparable key
+        # types, and sorting those directly raises.
+        for key, value in sorted(group.items(), key=lambda item: str(item[0])):
+            # `params` is the live parameter list -- unbounded, and it holds
+            # the model's tensors. It must never enter a description.
             if key == "params":
                 continue
             if isinstance(value, (tuple, list)):
                 for ordinal, element in enumerate(value, start=1):
-                    settings[f"{prefix}{key}{ordinal}"] = json_safe_scalar(element)
+                    put(f"{prefix}{key}{ordinal}", element)
                 continue
-            settings[f"{prefix}{key}"] = json_safe_scalar(value)
+            put(f"{prefix}{key}", value)
+    if collisions:
+        put("setting_name_collisions", ";".join(sorted(set(collisions))))
     return settings
 
 
@@ -1038,7 +1074,8 @@ def flatten_settings(settings: Mapping[str, Any], *, prefix: str = "") -> dict[s
 
     flat: dict[str, Any] = {}
     for key, value in settings.items():
-        composed = f"{prefix}{key}"
+        # Sanitized here too: these names reach the sinks as metric names.
+        composed = f"{prefix}{json_safe_scalar(key)}"
         if isinstance(value, Mapping):
             flat.update(flatten_settings(value, prefix=f"{composed}_"))
         elif isinstance(value, (tuple, list)):
@@ -1171,9 +1208,12 @@ class UpdateMethodDescription:
         """
 
         metrics: dict[str, Any] = {}
-        # Settings FIRST, under their own sub-namespace.
+        # Settings FIRST, under their own sub-namespace. The KEY is sanitized
+        # as well as the value: a setting name becomes a METRIC NAME, so a
+        # comma or newline in it corrupts the row exactly as a value would.
         for key, value in self.settings.items():
-            metrics[f"{prefix}_setting_{key}"] = json_safe_scalar(value)
+            safe_key = str(json_safe_scalar(key))
+            metrics[f"{prefix}_setting_{safe_key}"] = json_safe_scalar(value)
         # Authoritative identity LAST, so it always wins.
         metrics.update(
             {

@@ -176,8 +176,8 @@ def test_a_tensor_lr_survives_carrier_settings_with_full_precision() -> None:
     # Mirror what a capturable/fused optimizer does: a tensor in the group.
     optimizer.param_groups[0]["lr"] = torch.tensor(exact, dtype=torch.float64)
     settings = carrier_settings(optimizer)
-    assert isinstance(settings["lr"], float), f"got display text: {settings['lr']!r}"
-    assert settings["lr"] == exact
+    assert isinstance(settings["g0_lr"], float), f"got display text: {settings['g0_lr']!r}"
+    assert settings["g0_lr"] == exact
 
 
 def test_a_multi_element_tensor_setting_is_named_not_dumped() -> None:
@@ -562,9 +562,9 @@ def test_adam_betas_are_split_into_named_scalars() -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, betas=(0.9, 0.999))
     settings = carrier_settings(optimizer)
 
-    assert settings["betas1"] == pytest.approx(0.9)
-    assert settings["betas2"] == pytest.approx(0.999)
-    assert "betas" not in settings
+    assert settings["g0_betas1"] == pytest.approx(0.9)
+    assert settings["g0_betas2"] == pytest.approx(0.999)
+    assert "g0_betas" not in settings
     for key, value in settings.items():
         assert not isinstance(value, (tuple, list, dict)), f"{key} is compound"
         assert "," not in str(value), f"{key} would break an unquoted CSV row"
@@ -1087,6 +1087,110 @@ def test_no_setting_key_can_ever_reach_an_authoritative_name() -> None:
     for key in metrics:
         if key.startswith("update_method_setting_"):
             assert key not in authoritative
+
+
+# --------------------------------------------------------------------------
+# Reviewer round 3: setting NAMES are a channel too
+# --------------------------------------------------------------------------
+
+
+def test_a_hostile_setting_name_cannot_corrupt_the_csv_row(tmp_path) -> None:
+    """A setting NAME becomes a metric name, so it is a channel like any other.
+
+    An earlier version sanitized setting VALUES and not KEYS -- half a channel,
+    which is the same blind spot that produced three earlier findings. A
+    param_group is an ordinary dict and nothing stops a key carrying a comma or
+    a newline.
+    """
+
+    parameter = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    optimizer.param_groups[0]["hostile,name"] = 1.0
+    optimizer.param_groups[0]["hostile\nname"] = 2.0
+    method = LegacyAutogradUpdate(
+        optimizer=optimizer,
+        model_parameters=ModelParameterBinding(parameters=(parameter,)),
+    )
+
+    path = tmp_path / "names.csv"
+    sink = CSV(path)
+    sink.log(
+        LogRecord(step=0, namespace="train/update_method", metrics=method.describe().as_metrics())
+    )
+    sink.log(LogRecord(step=1, namespace="sentinel", metrics={"after": "still-readable"}))
+
+    rows = _strict_csv_rows(path)
+    for row in rows[1:]:
+        assert len(row) == 4, f"row did not have four fields: {row!r}"
+    assert rows[-1] == ["1", "sentinel", "after", "still-readable"]
+    for row in rows[1:]:
+        assert "," not in row[2] and "\n" not in row[2]
+
+
+def test_a_group_zero_key_cannot_impersonate_the_group_count() -> None:
+    """`n_param_groups` is seeded by the function and must stay authoritative.
+
+    With group 0 unprefixed, a group-0 key literally named `n_param_groups`
+    was merged straight over the count this function had just computed.
+    """
+
+    parameter = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    optimizer.param_groups[0]["n_param_groups"] = 999
+    settings = carrier_settings(optimizer)
+
+    assert settings["n_param_groups"] == 1
+    # Still reported, under a name that cannot impersonate the real count.
+    assert settings["g0_n_param_groups"] == 999
+
+
+def test_a_group_zero_key_cannot_impersonate_another_group_setting() -> None:
+    """Group 0 being unprefixed let it collide with later groups' real names.
+
+    A group-0 key named `group1_lr` produced exactly the name group 1's own
+    learning rate produced, so a per-layer rate could be reported as a value
+    from a different group entirely.
+    """
+
+    a = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+    b = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+    optimizer = torch.optim.SGD([{"params": [a], "lr": 0.1}, {"params": [b], "lr": 0.2}])
+    optimizer.param_groups[0]["group1_lr"] = 999.0
+    settings = carrier_settings(optimizer)
+
+    # Each group's real rate is reported under its own unambiguous name.
+    assert settings["g0_lr"] == pytest.approx(0.1)
+    assert settings["g1_lr"] == pytest.approx(0.2)
+    # The impostor is reported, but cannot be mistaken for group 1's rate.
+    assert settings["g0_group1_lr"] == pytest.approx(999.0)
+
+
+def test_an_unavoidable_name_collision_is_reported_not_silently_resolved() -> None:
+    """Structure cannot remove every collision, so the rest must be VISIBLE.
+
+    Keys are arbitrary strings: a group-0 key named `betas1` lands on the name
+    produced by splitting a `betas` pair. Letting the later write win is how a
+    description comes to report a value nobody set. The first value is kept and
+    the clash is named, so a reader can see the map is incomplete.
+    """
+
+    parameter = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+    optimizer = torch.optim.Adam([parameter], lr=0.1, betas=(0.9, 0.999))
+    optimizer.param_groups[0]["betas1"] = -1.0
+    settings = carrier_settings(optimizer)
+
+    # The structural value survives; the impostor does not overwrite it.
+    assert settings["g0_betas1"] == pytest.approx(0.9)
+    assert "setting_name_collisions" in settings
+    assert "g0_betas1" in settings["setting_name_collisions"]
+
+
+def test_no_collision_marker_when_there_is_no_collision() -> None:
+    """CONTROL: the marker must not appear on ordinary optimizers."""
+
+    parameter = torch.nn.Parameter(torch.ones(2, dtype=torch.float64))
+    settings = carrier_settings(torch.optim.Adam([parameter], lr=0.1))
+    assert "setting_name_collisions" not in settings
 
 
 # --------------------------------------------------------------------------
