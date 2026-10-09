@@ -1323,13 +1323,13 @@ def test_content_hash_is_exact_and_binds_both_public_launch_entries(
             return row_a.content_hash
 
     mismatches = (
-        row_a.content_hash,
-        LyingHash(row_a.content_hash),
-        LyingNonStringHash(),
+        (row_a.content_hash, "cell content hash does not bind"),
+        (LyingHash(row_a.content_hash), "exact str"),
+        (LyingNonStringHash(), "exact str"),
     )
-    for held in mismatches:
+    for held, message in mismatches:
         forged = replace(row_b, content_hash=held)
-        with pytest.raises(launch.LaunchValidationError, match="exact str"):
+        with pytest.raises(launch.LaunchValidationError, match=message):
             launch.prepare_train_launch(forged, _topology())
-        with pytest.raises(launch.LaunchValidationError, match="exact str"):
+        with pytest.raises(launch.LaunchValidationError, match=message):
             launch.launch_train(forged, _topology(), runner=lambda _: 0)
