@@ -501,10 +501,13 @@ class VMCTrainer:
             # THE MESSAGE IS DELIBERATELY DISTINCT from
             # `_resolve_method_state`'s "mismatched legacy optimizer
             # ownership". Two guards raising the SAME string is why this one
-            # went unnoticed: every test that asserted on that message reached
-            # it through `resolve_update_state`, where the older check fires
-            # first, so this check could be deleted outright without a single
-            # test failing. A guard whose refusal is indistinguishable from
+            # went unnoticed BEFORE the distinct message existed: every test
+            # that asserted on the shared string reached it through
+            # `resolve_update_state`, where the older check fires first, so at
+            # that time this check could have been deleted outright without a
+            # single test failing. That is no longer so, and the tense matters
+            # -- the review probes now bind directly and pin this refusal by
+            # its own message. A guard whose refusal is indistinguishable from
             # another's is a guard nothing can pin. It is also more accurate:
             # nothing about a carrier at this boundary is "legacy".
             raise ValueError(

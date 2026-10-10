@@ -153,13 +153,15 @@ def test_r2_1_a_foreign_resolve_return_with_a_carrier_keeps_the_runner_optimizer
     """A foreign trainer returning an object WITH ``.optimizer`` keeps the
     runner-built optimizer, as it did before PR 524.
 
-    Measured GREEN at base dbb486ea and RED at head 47989a12 by the reviewer:
-    before the slice `Train.run` discarded `resolve_update_state`'s return, so
-    whatever a duck-typed trainer returned, `fit` received the optimizer the
-    runner built; the carrier alias adopted the foreign ``.optimizer``
-    instead. That red arm proved the alias was NOT unreachable -- mutant M-E's
-    survival was structural rather than a fixture accident -- on exactly the
-    branch the R1-5 fix did not cover.
+    Why this probe exists: before the slice `Train.run` discarded
+    `resolve_update_state`'s return, so whatever a duck-typed trainer
+    returned, `fit` received the optimizer the runner built; the carrier alias
+    adopted the foreign ``.optimizer`` instead. Demonstrating that on both
+    sides of the slice is what proved the alias was NOT unreachable -- mutant
+    M-E's survival was structural rather than a fixture accident -- on exactly
+    the branch the R1-5 fix did not cover. The measurement that settled it
+    lives in the record, not here, and the body below has been strengthened
+    since it was run.
 
     The alias has since been removed, so this is now GREEN and serves as the
     pin that keeps it removed.
