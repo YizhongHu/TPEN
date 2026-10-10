@@ -32,6 +32,8 @@ from tpen.training.update import (
     VMCUpdateResult,
     VMCUpdateState,
 )
+from types import SimpleNamespace
+
 from tests.helpers.hooke_models import build_tiny_spenn
 
 LEARNING_RATE = 0.01
@@ -228,3 +230,97 @@ def test_rebuild_accepts_a_method_that_retains_its_carrier_through_rebind() -> N
 
     assert rebuilt.optimizer is optimizer
     assert method.rebind_calls == 1
+
+
+def test_rebuild_refuses_to_run_before_the_method_has_been_resolved() -> None:
+    """`rebuild_update_state` refuses when nothing has been resolved yet.
+
+    The runner's order is resolve-then-restore-then-rebuild. Reaching rebuild
+    first means the run never bound a method, and rebuilding from no authority
+    would invent one. The accept path -- resolve first, then rebuild -- is
+    exercised by the retain-carrier test in this file, so this is not satisfied
+    by a trainer that refuses every rebuild.
+    """
+
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1)
+
+    with pytest.raises(
+        RuntimeError, match="update state must be resolved before it can be rebuilt"
+    ):
+        trainer.rebuild_update_state(model=model)
+
+
+class _StructuralStateMethod(VMCUpdateMethod[AutogradUpdateInput]):
+    """A method returning something SHAPED like VMCUpdateState but not one.
+
+    ``nominal`` selects between the real dataclass and an ordinary object
+    carrying the same two attribute names, so one class serves as both the
+    witness and its control.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        binding: ModelParameterBinding,
+        *,
+        nominal: bool,
+    ) -> None:
+        self._optimizer = optimizer
+        self._binding = binding
+        self._nominal = nominal
+
+    def update(self, update_input: AutogradUpdateInput) -> VMCUpdateResult:
+        return VMCUpdateResult(applied=False, grad_norm=0.0, reason="declined_for_test")
+
+    def update_state(self):
+        if self._nominal:
+            return VMCUpdateState(optimizer=self._optimizer, model_parameters=self._binding)
+        return SimpleNamespace(optimizer=self._optimizer, model_parameters=self._binding)
+
+    def rebind_model_parameters(self, model_parameters: ModelParameterBinding) -> None:
+        self._binding = model_parameters
+
+
+def test_resolve_refuses_a_structurally_compatible_non_update_state() -> None:
+    """Admission is NOMINAL: the declared type, not a matching shape.
+
+    The substitute carries the same two attributes with the same values, so
+    every check BELOW this one would pass on it. Only the type admission can
+    refuse, which is what makes this a pin on that line rather than on the
+    guards after it.
+    """
+
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
+
+    method = _StructuralStateMethod(optimizer, binding, nominal=False)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
+
+    with pytest.raises(
+        TypeError, match="update_state must return VMCUpdateState or None"
+    ):
+        trainer.resolve_update_state(model=model, optimizer=optimizer)
+
+
+def test_resolve_accepts_the_same_state_when_it_is_nominally_correct() -> None:
+    """Control: the identical contents in a real VMCUpdateState ARE accepted.
+
+    Without this, the refusal above would be satisfied by a trainer that
+    rejects every stateful method, which would pin nothing about nominality.
+    """
+
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
+
+    method = _StructuralStateMethod(optimizer, binding, nominal=True)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
+
+    resolved = trainer.resolve_update_state(model=model, optimizer=optimizer)
+
+    assert resolved.optimizer is optimizer
