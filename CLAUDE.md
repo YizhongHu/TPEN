@@ -132,6 +132,28 @@ tree on an agent-namespaced branch plus a claimed TPEN `implementation-slice`
 already in `work` with a non-empty `acceptance-contract`. Existing untracked
 research and run data are deliberately ignored and must remain untouched.
 
+The guard requires Python 3.9+ because it uses `str.removesuffix`. The
+`uv run --no-project python` form skips project and workspace discovery, but it
+still selects an interpreter from ambient state such as a discovered or
+activated `.venv`, `VIRTUAL_ENV`, `UV_PYTHON`, or `.python-version`; it does not
+guarantee the project interpreter. Before relying on that invocation, settle
+the selection with `uv run --no-project python -c 'import sys; print(sys.version)'`.
+The sanctioned interpreter-direct deviation is precisely where a stale ambient
+`python3` may be selected, so name an explicitly installed 3.9+ interpreter
+when invoking the script directly. A `blocked` verdict whose reason says the
+interpreter is unsupported means no guard precondition was evaluated: rerun
+with the `uv run --no-project python` command above or a named 3.9+ interpreter.
+Any other `blocked` reason is a genuine guard precondition failure; repair that
+precondition before editing. Because the gate runs ahead of `parse_args()`, on
+an interpreter where the gate is reachable but unsupported, `--help`, unknown
+options, and a missing `--item` return exit 1 with the structured interpreter
+refusal instead of argparse's usage or help output. On Python 3.9+ argparse
+behaviour is unchanged by this guard. The version predicate refuses every
+version tuple below 3.9, but that predicate is not a claim of delivered runtime
+coverage: the structured refusal is implemented for Python 3.7 and 3.8.
+Python <=3.6 raises `SyntaxError` before the gate can run because `from
+__future__ import annotations` requires Python 3.7+.
+
 **Run the guard outside the agent sandbox.** This is allowed and encouraged, not
 a workaround. The guard reads the Task Orchestrator HTTP API, and sandboxed
 coding agents deny outbound network, so it returns
@@ -146,11 +168,13 @@ Instead, an unsandboxed party — normally the orchestrator — runs it from the
 lane's own worktree, and records the output as an
 `authoritative-edit-launch-receipt` note on that lane's item. Invoking the
 script through an interpreter directly instead of `uv run --no-project` is
-acceptable here: the script performs no dependency resolution, and
-`uv run --no-project` resolves to the project interpreter anyway. Record both
-deviations in the receipt — interpreter-direct, and executed by someone other
-than the editing agent — together with what that does *not* establish: the
-editing agent did not confirm its own preconditions. The receipt is
+acceptable here: the script performs no dependency resolution. However,
+`uv run --no-project` does not guarantee the project interpreter; it can follow
+the ambient environment-selection inputs described above, so check
+`uv run --no-project python -c 'import sys; print(sys.version)'` before relying
+on it. Record both deviations in the receipt — interpreter-direct, and
+executed by someone other than the editing agent — together with what that does
+*not* establish: the editing agent did not confirm its own preconditions. The receipt is
 point-in-time, so the lane must not reset, rebase, or switch branches between
 the receipt and its first edit. One caution: an agent may run the guard
 successfully early in a session and be denied later, so an early success is not

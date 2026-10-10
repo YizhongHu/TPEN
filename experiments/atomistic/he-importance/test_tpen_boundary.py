@@ -1,0 +1,1420 @@
+"""Enforce the ``experiments/README.md`` boundary for this study.
+
+This test reads study files from disk and parses them with :mod:`ast`.  It does
+not import the study: ``he-importance`` is not an importable package name, and
+the study's imports would pull in its training dependencies.
+
+The inventory is pinned to ``dev`` at 3143e43ac170df33f61f2002b1011cd85c9cfc37
+on 2026-10-07.  The two inventories are intentionally explicit: every measured
+crossing must be declared, and every declared entry for a file already present
+must be measured.  Entries for files introduced by pending PR 516 are admitted
+only with an explicit pending PR and source SHA.
+"""
+
+from __future__ import annotations
+
+import ast
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+import tempfile
+
+
+STUDY_DIR = Path(__file__).resolve().parent
+INVENTORY_DATE = "2026-10-07"
+INVENTORY_HEAD = "3143e43ac170df33f61f2002b1011cd85c9cfc37"
+PENDING_516_SHA = "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
+# This layer removed three launch.py production crossings; PR 516 supplies the
+# second population change. Keep both measured merge-world counts explicit.
+EXPECTED_UNSANCTIONED_COUNTS = {13, 17}
+PENDING_516_POLICY = (
+    "the control is deliberately 516-scoped; a new pending PR needs its own pin"
+)
+
+
+@dataclass(frozen=True)
+class Crossing:
+    """One source-level tpen boundary crossing found by the AST walk."""
+
+    line: int
+    target: str
+    sanctioned: bool = False
+
+
+@dataclass(frozen=True)
+class InventoryEntry:
+    """Disposition and optional admission metadata for one declared crossing."""
+
+    disposition: str
+    pending_pr: int | None = None
+    pending_sha: str | None = None
+
+
+# Each key is (relative file, line, dotted target).  Each value is the
+# one-line disposition recorded for that exact crossing.
+EXPECTED_PRODUCTION_INVENTORY = {
+    ("train_config.py", 190, "tpen.hi_schema"): InventoryEntry(
+        "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
+    ),
+    ("train_config.py", 264, "tpen.hi_schema"): InventoryEntry(
+        "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
+    ),
+    ("run_stage_q.py", 30, "tpen.accelerator"): InventoryEntry(
+        "pending PR 516: reconcile only if this crossing differs from its measured SHA.",
+        pending_pr=516,
+        pending_sha=PENDING_516_SHA,
+    ),
+    ("run_stage_q.py", 31, "tpen.distributed"): InventoryEntry(
+        "pending PR 516: reconcile only if this crossing differs from its measured SHA.",
+        pending_pr=516,
+        pending_sha=PENDING_516_SHA,
+    ),
+    ("run_stage_q.py", 100, "tpen.hi_schema"): InventoryEntry(
+        "pending PR 516 and item df8f8b31: reconcile only if this crossing differs from its measured SHA.",
+        pending_pr=516,
+        pending_sha=PENDING_516_SHA,
+    ),
+}
+
+EXPECTED_TEST_INVENTORY = {
+    ("test_launch.py", 18, "tpen.artifacts"): InventoryEntry(
+        "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
+    ),
+    ("test_launch.py", 19, "tpen.distributed"): InventoryEntry(
+        "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
+    ),
+    ("test_launch.py", 21, "tpen.runner"): InventoryEntry(
+        "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
+    ),
+    ("test_launch.py", 574, "tpen.run"): InventoryEntry(
+        "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
+    ),
+    ("test_launch.py", 616, "tpen.run"): InventoryEntry(
+        "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
+    ),
+    ("test_launch.py", 672, "tpen.run"): InventoryEntry(
+        "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
+    ),
+    ("test_launch.py", 884, "tpen.run"): InventoryEntry(
+        "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
+    ),
+    ("test_stage_coordinate.py", 594, "tpen.hi.train"): InventoryEntry(
+        "item e923ec4e: retained until the facade slice removes this crossing."
+    ),
+    ("test_train_config.py", 220, "tpen.hi_schema"): InventoryEntry(
+        "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
+    ),
+    ("test_train_config.py", 232, "tpen.hi_schema"): InventoryEntry(
+        "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
+    ),
+    ("test_train_config.py", 325, "tpen.hi_schema"): InventoryEntry(
+        "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
+    ),
+    ("test_run_stage_q.py", 99, "tpen.hi_schema"): InventoryEntry(
+        "pending PR 516 and item df8f8b31: reconcile only if this crossing differs from its measured SHA.",
+        pending_pr=516,
+        pending_sha=PENDING_516_SHA,
+    ),
+}
+
+EXPECTED_PUBLIC_INVENTORY_CALLERS = frozenset(
+    {
+        "test_production_inventory_obeys_admission_rule",
+        "test_test_file_inventory_obeys_admission_rule",
+    }
+)
+EXPECTED_DIRECT_ADMISSION_CONTROLS = frozenset(
+    {
+        "test_capability_absent_pending_entry",
+        "test_capability_absent_without_pending_pr",
+        "test_capability_existing_stale_entry",
+        "test_capability_pending_516_partition_diagnostic_is_516_scoped",
+        "test_capability_pending_entry_partition",
+        "test_capability_pending_entry_rejects_mispinned_metadata",
+        "test_capability_undeclared_measured_crossing",
+    }
+)
+
+
+def _is_tpen_name(name: str) -> bool:
+    """Return whether *name* names ``tpen`` or one of its submodules."""
+
+    return name == "tpen" or name.startswith("tpen.")
+
+
+def _is_sanctioned_import(node: ast.ImportFrom) -> bool:
+    """Recognize the one launcher import allowed by ``experiments/README.md``."""
+
+    return (
+        node.module == "tpen.run"
+        and len(node.names) == 1
+        and node.names[0].name == "run_from_config"
+    )
+
+
+def _dynamic_import_name(node: ast.Call) -> str | None:
+    """Return the supported dynamic-import spelling, if *node* uses one."""
+
+    if isinstance(node.func, ast.Name) and node.func.id in {"import_module", "__import__"}:
+        return node.func.id
+    if (
+        isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "importlib"
+        and node.func.attr == "import_module"
+    ):
+        return "importlib.import_module"
+    return None
+
+
+def _detect_crossings(source: str, *, filename: str = "<unknown>") -> tuple[Crossing, ...]:
+    """Detect static imports and literal dynamic imports in *source*."""
+
+    crossings: list[Crossing] = []
+    tree = ast.parse(source, filename=filename)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if _is_tpen_name(alias.name):
+                    crossings.append(Crossing(node.lineno, alias.name))
+            continue
+
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if _is_tpen_name(module):
+                target = module
+                if _is_sanctioned_import(node):
+                    target = f"{module}.{node.names[0].name}"
+                crossings.append(
+                    Crossing(node.lineno, target, sanctioned=_is_sanctioned_import(node))
+                )
+            continue
+
+        if not isinstance(node, ast.Call) or _dynamic_import_name(node) is None:
+            continue
+        arguments = [*node.args]
+        arguments.extend(
+            keyword.value
+            for keyword in node.keywords
+            if keyword.arg in {"name", "package"}
+        )
+        for argument in arguments:
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                if _is_tpen_name(argument.value):
+                    crossings.append(Crossing(node.lineno, argument.value))
+                    break
+
+    return tuple(sorted(crossings, key=lambda crossing: (crossing.line, crossing.target)))
+
+
+def _scan_study() -> tuple[tuple[Path, ...], tuple[tuple[str, Crossing], ...]]:
+    """Read and parse every Python file, returning only unsanctioned crossings."""
+
+    paths = tuple(sorted(STUDY_DIR.rglob("*.py")))
+    all_crossings: list[tuple[str, Crossing]] = []
+    for path in paths:
+        relative_path = path.relative_to(STUDY_DIR).as_posix()
+        source = path.read_text(encoding="utf-8")
+        all_crossings.extend(
+            (relative_path, crossing)
+            for crossing in _detect_crossings(source, filename=relative_path)
+        )
+
+    # These are controls, not optional diagnostics: an empty walk must fail
+    # instead of making the declared inventory pass vacuously.
+    assert len(paths) > 0, "boundary scanner visited no Python files"
+    assert len(all_crossings) > 0, "boundary scanner found no tpen crossings"
+
+    violations = tuple(
+        (relative_path, crossing)
+        for relative_path, crossing in all_crossings
+        if not crossing.sanctioned
+    )
+    if len(violations) not in EXPECTED_UNSANCTIONED_COUNTS:
+        declared = set(EXPECTED_PRODUCTION_INVENTORY) | set(EXPECTED_TEST_INVENTORY)
+        measured = {
+            (relative_path, crossing.line, crossing.target)
+            for relative_path, crossing in violations
+        }
+        existing_declared = {
+            key for key in declared if (STUDY_DIR / key[0]).is_file()
+        }
+        added = sorted(measured - declared)
+        removed = sorted(existing_declared - measured)
+        raise AssertionError(
+            "boundary scanner found an unexpected number of unsanctioned tpen "
+            f"crossings: actual={len(violations)}, "
+            f"expected={sorted(EXPECTED_UNSANCTIONED_COUNTS)}, "
+            f"added={added}, removed={removed}; reconcile by removing the import "
+            "per experiments/README.md or declaring it with a disposition under "
+            "rule (a); if an import merely shifted lines, update the stale sibling "
+            "entry under rule (b), then rerun the boundary control"
+        )
+    return paths, violations
+
+
+def _validate_inventory_admission(
+    measured: set[tuple[str, int, str]],
+    declared: dict[tuple[str, int, str], InventoryEntry],
+) -> tuple[tuple[tuple[str, int, str], int, str | None], ...]:
+    """Apply the three-part admission rule and report absent-file allowances."""
+
+    undeclared = measured - set(declared)
+    assert not undeclared, (
+        f"undeclared tpen crossings: {sorted(undeclared)}; remove the import per "
+        "experiments/README.md or declare it with a disposition (rule (a)); if the "
+        "import merely shifted lines, update the stale sibling entry under rule (b)"
+    )
+
+    admitted_pending: list[tuple[tuple[str, int, str], int, str | None]] = []
+    for key, entry in declared.items():
+        file_path = STUDY_DIR / key[0]
+        if file_path.is_file():
+            # pending_pr never excuses a stale entry for a file already in the
+            # tree: an existing file must contain its declared crossing.
+            assert key in measured, (
+                f"declared crossing not measured: {key}; if the import merely shifted "
+                "lines, update the stale sibling entry under rule (b); otherwise "
+                "remove the import per experiments/README.md or declare it with a "
+                "disposition (rule (a))"
+            )
+            continue
+
+        assert entry.pending_pr is not None, (
+            f"absent-file entry lacks pending_pr admission: {key}"
+        )
+        admitted_pending.append((key, entry.pending_pr, entry.pending_sha))
+
+    return tuple(sorted(admitted_pending))
+
+
+def _inventory_keys(
+    scanned: tuple[tuple[str, Crossing], ...], *, tests: bool
+) -> set[tuple[str, int, str]]:
+    """Project scanner results into one of the two named inventories."""
+
+    return {
+        (relative_path, crossing.line, crossing.target)
+        for relative_path, crossing in scanned
+        if Path(relative_path).name.startswith("test_") is tests
+    }
+
+
+def _inventory_admission_caller_names(source: str | None = None) -> frozenset[str]:
+    """Return direct admission callers at module and one-level class scope.
+
+    This intentionally does not see aliases, ``functools.partial``, dynamic
+    ``globals()`` lookup, bare module-level calls, or callers in another module.
+    """
+
+    if source is None:
+        source = Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=__file__)
+
+    def calls_admission(node: ast.AST) -> bool:
+        return any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_validate_inventory_admission"
+            for call in ast.walk(node)
+        )
+
+    callers: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if calls_admission(node):
+                callers.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            for member in node.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and calls_admission(
+                    member
+                ):
+                    callers.add(f"{node.name}.{member.name}")
+    return frozenset(callers)
+
+
+def _assert_pending_516_partition(
+    measured: set[tuple[str, int, str]],
+    declared: dict[tuple[str, int, str], InventoryEntry],
+    pending: tuple[tuple[tuple[str, int, str], int, str | None], ...],
+) -> tuple[int, int]:
+    """Require each declared PR-516 crossing to be pending or measured once."""
+
+    pending_by_key = {key: (pending_pr, pending_sha) for key, pending_pr, pending_sha in pending}
+    pending_keys = set(pending_by_key)
+    measured_keys = {
+        key for key, entry in declared.items() if entry.pending_pr == 516 and key in measured
+    }
+    declared_516 = {
+        key for key, entry in declared.items() if entry.pending_pr == 516
+    }
+    assert pending_keys | measured_keys == declared_516, (
+        f"pending_keys={sorted(pending_keys)}, measured_keys={sorted(measured_keys)}, "
+        f"declared_516={sorted(declared_516)}; {PENDING_516_POLICY}"
+    )
+    assert not pending_keys & measured_keys, (
+        f"pending_keys={sorted(pending_keys)} overlaps measured_keys="
+        f"{sorted(measured_keys)}; {PENDING_516_POLICY}"
+    )
+
+    for key in declared_516:
+        file_exists = (STUDY_DIR / key[0]).is_file()
+        assert (key in pending_keys) is (not file_exists), (
+            f"key={key}, pending_keys={sorted(pending_keys)}, file_exists={file_exists}; "
+            f"{PENDING_516_POLICY}"
+        )
+        if key in pending_keys:
+            assert pending_by_key[key] == (516, PENDING_516_SHA), (
+                f"key={key}, pending_by_key={pending_by_key[key]}, "
+                f"expected=(516, {PENDING_516_SHA!r}); {PENDING_516_POLICY}"
+            )
+
+    return len(pending_keys), len(measured_keys)
+
+
+# CONTROL CAPABILITY MATRIX
+# Each detector capability owes BOTH directions: an accept-direction control
+# must fail when matching is broken, and a reject-direction control must fail
+# when the restriction is loosened. Keep this list synchronized with the
+# implementation above; audit mutations with pytest cache disabled.
+#
+# static ast.Import / module scope       -> test_capability_static_import_statement
+# static import alias iteration          -> test_capability_multiple_static_import_aliases
+# static ast.ImportFrom                  -> test_capability_static_from_import
+# bare tpen name                         -> test_capability_bare_tpen_name
+# dotted tpen name                       -> test_capability_dotted_tpen_name
+# tpen-name rejection                    -> test_capability_tpen_name_rejects_non_tpen
+# function-local nesting                 -> test_capability_function_local_static_import
+# class-body nesting                     -> test_capability_class_body_static_import
+# recursive AST traversal                -> test_capability_recursive_ast_walk
+# bare import_module dynamic form        -> test_capability_dynamic_bare_import_module
+# qualified importlib dynamic form       -> test_capability_dynamic_qualified_importlib
+# __import__ dynamic form                -> test_capability_dynamic_dunder_import
+# unknown dynamic callable rejection     -> test_capability_dynamic_rejects_unknown_callable
+# positional dynamic argument            -> test_capability_dynamic_positional_argument
+# name/package keyword dynamic arguments (exact target + unsanctioned) -> test_capability_dynamic_keyword_argument
+# irrelevant keyword rejection            -> test_capability_dynamic_rejects_non_name_keyword
+# dynamic argument iteration             -> test_capability_dynamic_argument_iteration
+# disk source reading                    -> test_capability_reads_source_from_disk
+# AST source parsing                     -> test_capability_ast_source_parsing / test_capability_ast_parse_diagnostic_names_relative_file
+# recursive *.py discovery               -> test_capability_recursive_python_file_discovery
+# *.py file filtering                    -> test_capability_python_file_filter
+# sanctioned runner carve-out            -> test_capability_sanctioned_runner_carveout
+# sanctioned module restriction           -> test_capability_sanctioned_import_rejects_wrong_module
+# sanctioned name-count restriction      -> test_capability_sanctioned_import_rejects_extra_names
+# sanctioned symbol restriction          -> test_capability_sanctioned_import_rejects_wrong_symbol
+# qualified receiver restriction         -> test_capability_dynamic_rejects_non_importlib_receiver
+# qualified attribute restriction        -> test_capability_dynamic_rejects_non_import_module_attribute
+# production/test partition              -> test_capability_production_test_partition
+# non-empty file scan                    -> test_capability_nonempty_scan / test_capability_empty_scan_rejected
+# non-empty crossing scan                -> test_capability_no_crossings_rejected
+# unsanctioned filter partition (including keyword form) -> test_capability_unsanctioned_filter_partition
+# added crossing count diagnostic        -> test_capability_inventory_count_diagnostic_added
+# removed crossing count diagnostic      -> test_capability_inventory_count_diagnostic_removed
+# unchanged count reaches both public admission callers -> test_capability_inventory_count_diagnostic_line_shift
+# structural caller detector (accept) -> test_capability_inventory_caller_detector_accepts_structural_callers
+# structural caller detector (reject) -> test_capability_inventory_caller_detector_rejects_non_callers
+# public inventory caller roster exactness -> test_capability_public_inventory_caller_roster
+# roster limitation: direct Name calls in module functions and one-level class methods only;
+# aliases, partials, globals lookups, bare module calls, and cross-module callers are out of scope.
+# zero unsanctioned crossings allowed    -> test_capability_no_unsanctioned_crossings_allowed
+# literal dynamic target                 -> test_capability_dynamic_literal_string
+# nonliteral dynamic target rejection     -> test_capability_dynamic_rejects_nonliteral
+# measured/declared admission            -> test_capability_undeclared_measured_crossing
+# existing-file stale admission          -> test_capability_existing_stale_entry
+# absent-file pending admission           -> test_capability_absent_pending_entry
+# absent-file pending_pr requirement      -> test_capability_absent_without_pending_pr
+# pending metadata pinning                -> test_capability_pending_entry_rejects_mispinned_metadata
+# pending/measured partition (accept)    -> test_capability_pending_entry_partition
+# pending/measured partition (reject)    -> test_capability_pending_entry_partition_rejects_gaps_and_overlap
+# pending-516 diagnostic scope           -> test_capability_pending_516_partition_diagnostic_is_516_scoped
+# tpen prefix semantics                   -> test_capability_tpen_name_rejects_substring_matches
+# admission diagnostics                  -> test_capability_undeclared_measured_crossing / test_capability_existing_stale_entry
+
+
+def test_inventory_metadata_is_pinned_and_dated() -> None:
+    assert INVENTORY_DATE == "2026-10-07"
+    assert INVENTORY_HEAD == "3143e43ac170df33f61f2002b1011cd85c9cfc37"
+    assert PENDING_516_SHA == "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
+
+
+def test_capability_static_import_statement() -> None:
+    crossings = _detect_crossings("import tpen\n")
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [(1, "tpen")]
+
+
+def test_capability_multiple_static_import_aliases() -> None:
+    crossings = _detect_crossings("import tpen.one, tpen.two\n")
+    assert [crossing.target for crossing in crossings] == ["tpen.one", "tpen.two"]
+
+
+def test_capability_static_from_import() -> None:
+    crossings = _detect_crossings("from tpen.accelerator import AcceleratorKind\n")
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [
+        (1, "tpen.accelerator")
+    ]
+
+
+def test_capability_bare_tpen_name() -> None:
+    crossings = _detect_crossings("import tpen\nimport tpen.accelerator\n")
+    assert [crossing.target for crossing in crossings] == ["tpen", "tpen.accelerator"]
+    assert crossings[0].target == "tpen"
+
+
+def test_capability_dotted_tpen_name() -> None:
+    crossings = _detect_crossings("import tpen.accelerator\n")
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [
+        (1, "tpen.accelerator")
+    ]
+
+
+def test_capability_tpen_name_rejects_non_tpen() -> None:
+    assert _detect_crossings("import numpy\n") == ()
+    assert _detect_crossings("from numpy import array\n") == ()
+
+
+def test_capability_tpen_name_rejects_substring_matches() -> None:
+    assert _is_tpen_name("tpen")
+    assert _is_tpen_name("tpen.anything")
+    assert not _is_tpen_name("mytpen")
+    assert not _is_tpen_name("other.tpen")
+    assert not _is_tpen_name("tpenlike")
+
+
+def test_capability_class_body_static_import() -> None:
+    source = '''
+class Resolver:
+    from tpen.anything import value
+'''
+    crossings = _detect_crossings(source)
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [(3, "tpen.anything")]
+
+
+def test_capability_recursive_ast_walk() -> None:
+    source = '''
+def resolve():
+    class Nested:
+        import tpen.deep
+'''
+    crossings = _detect_crossings(source)
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [(4, "tpen.deep")]
+
+
+def test_capability_dynamic_qualified_importlib() -> None:
+    source = '''
+import importlib
+module = importlib.import_module("tpen.anything")
+'''
+    crossings = _detect_crossings(source)
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [
+        (3, "tpen.anything")
+    ]
+
+
+def test_capability_dynamic_dunder_import() -> None:
+    source = 'module = __import__("tpen.anything", fromlist=["value"])\n'
+    crossings = _detect_crossings(source)
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [
+        (1, "tpen.anything")
+    ]
+
+
+def test_capability_dynamic_rejects_unknown_callable() -> None:
+    assert _detect_crossings('load_anything("tpen.anything")\n') == ()
+
+
+def test_capability_dynamic_positional_argument() -> None:
+    source = 'module = import_module("tpen.anything")\n'
+    crossings = _detect_crossings(source)
+    assert [(crossing.line, crossing.target) for crossing in crossings] == [
+        (1, "tpen.anything")
+    ]
+
+
+def test_capability_dynamic_literal_string() -> None:
+    source = 'module = import_module("tpen.literal")\n'
+    crossings = _detect_crossings(source)
+    assert crossings[0].target == "tpen.literal"
+
+
+def test_capability_dynamic_rejects_nonliteral() -> None:
+    source = 'module_name = "tpen.variable"\nimport_module(module_name)\n'
+    assert _detect_crossings(source) == ()
+
+
+def test_capability_dynamic_argument_iteration() -> None:
+    source = 'module = import_module("stdlib", "tpen.second")\n'
+    crossings = _detect_crossings(source)
+    assert crossings[0].target == "tpen.second"
+
+
+def test_capability_reads_source_from_disk() -> None:
+    global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
+    original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "source.py").write_text("import tpen.disk\n", encoding="utf-8")
+        STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {1}
+        try:
+            _, crossings = _scan_study()
+        finally:
+            STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+    assert [(path, crossing.target) for path, crossing in crossings] == [
+        ("source.py", "tpen.disk")
+    ]
+
+
+def test_capability_ast_source_parsing() -> None:
+    crossings = _detect_crossings("import tpen.parsed\n")
+    assert crossings[0].target == "tpen.parsed"
+
+
+def test_capability_ast_parse_diagnostic_names_relative_file() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "broken.py").write_text("if :\n", encoding="utf-8")
+        STUDY_DIR = root
+        try:
+            try:
+                _scan_study()
+            except SyntaxError as exc:
+                assert exc.filename == "broken.py"
+            else:
+                raise AssertionError("a syntax error must be reported by its relative file")
+        finally:
+            STUDY_DIR = original_study_dir
+
+
+def test_capability_recursive_python_file_discovery() -> None:
+    global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
+    original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        nested = root / "one" / "two"
+        nested.mkdir(parents=True)
+        (nested / "deep.py").write_text("import tpen.deep\n", encoding="utf-8")
+        STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {1}
+        try:
+            _, crossings = _scan_study()
+        finally:
+            STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+    assert [(path, crossing.line, crossing.target) for path, crossing in crossings] == [
+        ("one/two/deep.py", 1, "tpen.deep")
+    ]
+
+
+def test_capability_python_file_filter() -> None:
+    global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
+    original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "kept.py").write_text("import tpen.kept\n", encoding="utf-8")
+        (root / "ignored.txt").write_text("import tpen.ignored\n", encoding="utf-8")
+        STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {1}
+        try:
+            _, crossings = _scan_study()
+        finally:
+            STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+    assert [(path, crossing.target) for path, crossing in crossings] == [
+        ("kept.py", "tpen.kept")
+    ]
+
+
+def test_capability_sanctioned_runner_carveout() -> None:
+    launch_source = (STUDY_DIR / "launch.py").read_text(encoding="utf-8")
+    sanctioned = [
+        crossing
+        for crossing in _detect_crossings(launch_source, filename="launch.py")
+        if crossing.sanctioned
+    ]
+    assert len(sanctioned) == 1
+    assert sanctioned[0].target == "tpen.run.run_from_config"
+    _, scanned = _scan_study()
+    assert not any(
+        path == "launch.py" and crossing.target == "tpen.run.run_from_config"
+        for path, crossing in scanned
+    )
+
+
+def test_capability_sanctioned_import_rejects_wrong_module() -> None:
+    crossings = _detect_crossings("from tpen.other import run_from_config\n")
+    assert len(crossings) == 1
+    assert not crossings[0].sanctioned
+    assert crossings[0].target == "tpen.other"
+
+
+def test_capability_sanctioned_import_rejects_extra_names() -> None:
+    crossings = _detect_crossings(
+        "from tpen.run import run_from_config, prepare_run_context\n"
+    )
+    assert len(crossings) == 1
+    assert not crossings[0].sanctioned
+    assert crossings[0].target == "tpen.run"
+
+
+def test_capability_sanctioned_import_rejects_wrong_symbol() -> None:
+    crossings = _detect_crossings("from tpen.run import prepare_run_context\n")
+    assert len(crossings) == 1
+    assert not crossings[0].sanctioned
+    assert crossings[0].target == "tpen.run"
+
+
+def test_capability_dynamic_rejects_non_importlib_receiver() -> None:
+    crossings = _detect_crossings('other.import_module("tpen.anything")\n')
+    assert crossings == ()
+
+
+def test_capability_dynamic_rejects_non_import_module_attribute() -> None:
+    crossings = _detect_crossings('importlib.load_module("tpen.anything")\n')
+    assert crossings == ()
+
+
+def test_capability_production_test_partition() -> None:
+    scanned = (
+        ("production.py", Crossing(1, "tpen.production")),
+        ("nested/test_case.py", Crossing(2, "tpen.test")),
+    )
+    assert _inventory_keys(scanned, tests=False) == {
+        ("production.py", 1, "tpen.production")
+    }
+    assert _inventory_keys(scanned, tests=True) == {
+        ("nested/test_case.py", 2, "tpen.test")
+    }
+
+
+def test_capability_nonempty_scan() -> None:
+    visited, crossings = _scan_study()
+    assert len(visited) > 0
+    assert len(crossings) in EXPECTED_UNSANCTIONED_COUNTS
+
+
+def test_capability_empty_scan_rejected() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        STUDY_DIR = Path(temporary_root)
+        try:
+            try:
+                _scan_study()
+            except AssertionError as exc:
+                assert "visited no Python files" in str(exc)
+            else:
+                raise AssertionError("an empty study must be rejected")
+        finally:
+            STUDY_DIR = original_study_dir
+
+
+def test_capability_no_crossings_rejected() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "plain.py").write_text("value = 1\n", encoding="utf-8")
+        STUDY_DIR = root
+        try:
+            try:
+                _scan_study()
+            except AssertionError as exc:
+                assert "found no tpen crossings" in str(exc)
+            else:
+                raise AssertionError("a study with no crossings must be rejected")
+        finally:
+            STUDY_DIR = original_study_dir
+
+
+def test_capability_unsanctioned_filter_partition() -> None:
+    global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
+    original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "sanctioned.py").write_text(
+            "from tpen.run import run_from_config\n", encoding="utf-8"
+        )
+        (root / "unsanctioned.py").write_text(
+            "from tpen.accelerator import AcceleratorKind\n", encoding="utf-8"
+        )
+        (root / "keyword.py").write_text(
+            'importlib.import_module(".r3_hidden", package="tpen")\n',
+            encoding="utf-8",
+        )
+        STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {2}
+        try:
+            _, crossings = _scan_study()
+        finally:
+            STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+    assert [(path, crossing.target) for path, crossing in crossings] == [
+        ("keyword.py", "tpen"),
+        ("unsanctioned.py", "tpen.accelerator"),
+    ]
+
+
+def test_capability_no_unsanctioned_crossings_allowed() -> None:
+    global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
+    original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "launcher.py").write_text(
+            "from tpen.run import run_from_config\n", encoding="utf-8"
+        )
+        STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {0}
+        try:
+            _, crossings = _scan_study()
+        finally:
+            STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+    assert crossings == ()
+
+
+def test_production_inventory_obeys_admission_rule() -> None:
+    _, crossings = _scan_study()
+    measured = _inventory_keys(crossings, tests=False)
+    pending = _validate_inventory_admission(measured, EXPECTED_PRODUCTION_INVENTORY)
+    pending_count, measured_count = _assert_pending_516_partition(
+        measured, EXPECTED_PRODUCTION_INVENTORY, pending
+    )
+    assert pending_count + measured_count == 3
+
+
+def test_test_file_inventory_obeys_admission_rule() -> None:
+    _, crossings = _scan_study()
+    measured = _inventory_keys(crossings, tests=True)
+    pending = _validate_inventory_admission(measured, EXPECTED_TEST_INVENTORY)
+    pending_count, measured_count = _assert_pending_516_partition(
+        measured, EXPECTED_TEST_INVENTORY, pending
+    )
+    assert pending_count + measured_count == 1
+
+
+def test_capability_inventory_count_diagnostic_added() -> None:
+    global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
+    original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "added.py").write_text(
+            "from tpen.added import Added\n", encoding="utf-8"
+        )
+        STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {0}
+        try:
+            try:
+                _scan_study()
+            except AssertionError as error:
+                message = str(error)
+            else:
+                assert False, "added crossing did not trip the public count gate"
+        finally:
+            STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+    assert "actual=1" in message
+    assert "expected=[0]" in message
+    assert "('added.py', 1, 'tpen.added')" in message
+    assert "reconcile" in message
+
+
+def test_capability_inventory_count_diagnostic_removed() -> None:
+    global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
+    global EXPECTED_PRODUCTION_INVENTORY
+    global EXPECTED_TEST_INVENTORY
+    original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    original_production_inventory = EXPECTED_PRODUCTION_INVENTORY
+    original_test_inventory = EXPECTED_TEST_INVENTORY
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / "run_stage_q.py").write_text(
+            "\nfrom tpen.artifacts import RunResult\n", encoding="utf-8"
+        )
+        STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {2}
+        EXPECTED_PRODUCTION_INVENTORY = {
+            ("run_stage_q.py", 30, "tpen.accelerator"): InventoryEntry(
+                "synthetic removed accelerator entry"
+            ),
+            ("run_stage_q.py", 31, "tpen.distributed"): InventoryEntry(
+                "synthetic removed distributed entry"
+            ),
+        }
+        EXPECTED_TEST_INVENTORY = {}
+        try:
+            try:
+                _scan_study()
+            except AssertionError as error:
+                message = str(error)
+            else:
+                assert False, "removed crossing did not trip the public count gate"
+        finally:
+            STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+            EXPECTED_PRODUCTION_INVENTORY = original_production_inventory
+            EXPECTED_TEST_INVENTORY = original_test_inventory
+    assert "actual=1" in message
+    assert "expected=[2]" in message
+    assert "('run_stage_q.py', 30, 'tpen.accelerator')" in message
+    assert "('run_stage_q.py', 31, 'tpen.distributed')" in message
+    assert "reconcile" in message
+
+
+def _assert_inventory_caller_rejects_line_shift(
+    caller: Callable[[], None],
+    filename: str,
+    source: str,
+    expected_key: tuple[str, int, str],
+) -> None:
+    global STUDY_DIR
+    global EXPECTED_UNSANCTIONED_COUNTS
+    original_study_dir = STUDY_DIR
+    original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        (root / filename).write_text(source, encoding="utf-8")
+        STUDY_DIR = root
+        EXPECTED_UNSANCTIONED_COUNTS = {3}
+        try:
+            try:
+                caller()
+            except AssertionError as error:
+                message = str(error)
+            else:
+                assert False, f"line-shifted sibling entry was admitted by {caller.__name__}"
+        finally:
+            STUDY_DIR = original_study_dir
+            EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+    assert repr(expected_key) in message, f"{caller.__name__}: {message}"
+    assert "rule (a)" in message, f"{caller.__name__}: {message}"
+    assert "rule (b)" in message, f"{caller.__name__}: {message}"
+
+
+def test_capability_inventory_count_diagnostic_line_shift() -> None:
+    _assert_inventory_caller_rejects_line_shift(
+        test_production_inventory_obeys_admission_rule,
+        "launch.py",
+        "\nfrom tpen.accelerator import AcceleratorIdentity\n"
+        "from tpen.artifacts import RunResult\n"
+        "from tpen.distributed import ExecutionTopology\n",
+        ("launch.py", 2, "tpen.accelerator"),
+    )
+    _assert_inventory_caller_rejects_line_shift(
+        test_test_file_inventory_obeys_admission_rule,
+        "test_launch.py",
+        "\n" * 16
+        + "from tpen.artifacts import RunResult\n"
+        + "from tpen.distributed import ExecutionTopology\n"
+        + "\n"
+        + "from tpen.runner import Runner\n",
+        ("test_launch.py", 17, "tpen.artifacts"),
+    )
+
+
+def test_capability_public_inventory_caller_roster() -> None:
+    declared = EXPECTED_PUBLIC_INVENTORY_CALLERS | EXPECTED_DIRECT_ADMISSION_CONTROLS
+    actual = _inventory_admission_caller_names()
+    assert actual == declared, f"actual={sorted(actual)}, declared={sorted(declared)}"
+
+
+def test_capability_inventory_caller_detector_accepts_structural_callers() -> None:
+    source = """
+async def future_async_admission():
+    _validate_inventory_admission(set(), {})
+
+class FutureAdmission:
+    def method(self):
+        _validate_inventory_admission(set(), {})
+"""
+    assert _inventory_admission_caller_names(source) == frozenset(
+        {"future_async_admission", "FutureAdmission.method"}
+    )
+
+
+def test_capability_inventory_caller_detector_rejects_non_callers() -> None:
+    source = """
+def unrelated_function():
+    return None
+"""
+    assert _inventory_admission_caller_names(source) == frozenset()
+
+
+def test_capability_dynamic_bare_import_module() -> None:
+    source = '''
+from importlib import import_module
+module = import_module("tpen.anything")
+'''
+    crossings = _detect_crossings(source)
+    assert any(crossing.target == "tpen.anything" for crossing in crossings)
+
+
+def test_capability_dynamic_keyword_argument() -> None:
+    for source, expected_target in (
+        ('import_module(name="tpen.anything")\n', "tpen.anything"),
+        ('import_module(".anything", package="tpen")\n', "tpen"),
+        ('importlib.import_module(".anything", package="tpen")\n', "tpen"),
+    ):
+        assert _detect_crossings(source) == (
+            Crossing(1, expected_target, sanctioned=False),
+        )
+
+
+def test_capability_dynamic_rejects_non_name_keyword() -> None:
+    source = 'import_module(label="tpen.anything")\n'
+    assert _detect_crossings(source) == ()
+
+
+def test_capability_function_local_static_import() -> None:
+    source = '''
+def resolve():
+    from tpen.anything import value
+    return value
+'''
+    crossings = _detect_crossings(source)
+    assert any(crossing.target == "tpen.anything" for crossing in crossings)
+
+
+def test_capability_absent_pending_entry() -> None:
+    key = ("pending_future.py", 1, "tpen.anything")
+    declared = {
+        key: InventoryEntry(
+            "pending PR 516 admission.", pending_pr=516, pending_sha=PENDING_516_SHA
+        )
+    }
+    assert _validate_inventory_admission(set(), declared) == (
+        (key, 516, PENDING_516_SHA),
+    )
+
+
+def test_capability_pending_entry_partition() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        root = Path(temporary_root)
+        existing_key = ("existing.py", 1, "tpen.existing")
+        pending_key = ("pending.py", 1, "tpen.pending")
+        (root / existing_key[0]).write_text("import tpen.existing\n", encoding="utf-8")
+        declared = {
+            existing_key: InventoryEntry("measured", pending_pr=516, pending_sha=PENDING_516_SHA),
+            pending_key: InventoryEntry("pending", pending_pr=516, pending_sha=PENDING_516_SHA),
+        }
+        STUDY_DIR = root
+        try:
+            pending = _validate_inventory_admission({existing_key}, declared)
+            assert _assert_pending_516_partition(
+                {existing_key}, declared, pending
+            ) == (1, 1)
+        finally:
+            STUDY_DIR = original_study_dir
+
+
+def test_capability_pending_entry_partition_rejects_gaps_and_overlap() -> None:
+    gap_key = ("test_tpen_boundary.py", 1, "tpen.future")
+    overlap_key = ("future.py", 1, "tpen.future")
+    cases = (
+        (gap_key, set(), ()),
+        (overlap_key, {overlap_key}, ((overlap_key, 516, PENDING_516_SHA),)),
+    )
+    for key, measured, pending in cases:
+        declared = {
+            key: InventoryEntry("pending", pending_pr=516, pending_sha=PENDING_516_SHA)
+        }
+        try:
+            _assert_pending_516_partition(measured, declared, pending)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("pending/measured entries must form a strict partition")
+
+
+def test_capability_pending_entry_rejects_mispinned_metadata() -> None:
+    global STUDY_DIR
+    original_study_dir = STUDY_DIR
+    with tempfile.TemporaryDirectory() as temporary_root:
+        STUDY_DIR = Path(temporary_root)
+        cases = (
+            (515, PENDING_516_SHA),
+            (516, "wrong-source-sha"),
+        )
+        try:
+            for pending_pr, pending_sha in cases:
+                key = ("future.py", 1, "tpen.future")
+                declared = {
+                    key: InventoryEntry(
+                        "mispinned pending declaration",
+                        pending_pr=pending_pr,
+                        pending_sha=pending_sha,
+                    )
+                }
+                pending = _validate_inventory_admission(set(), declared)
+                try:
+                    _assert_pending_516_partition(set(), declared, pending)
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError(
+                        "pending admission must reject wrong PR or source SHA"
+                    )
+        finally:
+            STUDY_DIR = original_study_dir
+
+
+def test_capability_pending_516_partition_diagnostic_is_516_scoped() -> None:
+    key = ("future.py", 1, "tpen.future")
+    declared = {
+        key: InventoryEntry("future pending crossing", pending_pr=530, pending_sha="sha")
+    }
+    pending = _validate_inventory_admission(set(), declared)
+    try:
+        _assert_pending_516_partition(set(), declared, pending)
+    except AssertionError as exc:
+        message = str(exc)
+        assert "pending_keys" in message
+        assert "declared_516" in message
+        assert "516-scoped" in message
+        assert "new pending PR needs its own pin" in message
+    else:
+        raise AssertionError("a non-516 pending PR must not enter the 516 partition")
+
+
+def test_capability_absent_without_pending_pr() -> None:
+    key = ("absent_no_pending.py", 1, "tpen.real")
+    declared = {key: InventoryEntry("missing traceability metadata.")}
+    try:
+        _validate_inventory_admission(set(), declared)
+    except AssertionError as exc:
+        assert "pending_pr" in str(exc)
+    else:
+        raise AssertionError("an absent-file entry without pending_pr must be rejected")
+
+
+def test_capability_existing_stale_entry() -> None:
+    key = ("test_tpen_boundary.py", 1, "tpen.never_imported")
+    declared = {
+        key: InventoryEntry(
+            "stale entry must fail.", pending_pr=516, pending_sha=PENDING_516_SHA
+        )
+    }
+    try:
+        _validate_inventory_admission(set(), declared)
+    except AssertionError as exc:
+        message = str(exc)
+        assert "declared crossing not measured" in message
+        assert "stale sibling entry under rule (b)" in message
+        assert "experiments/README.md" in message
+    else:
+        raise AssertionError("pending_pr must not excuse a stale entry for an existing file")
+
+
+def test_capability_undeclared_measured_crossing() -> None:
+    measured = {("existing.py", 1, "tpen.unlisted")}
+    try:
+        _validate_inventory_admission(measured, {})
+    except AssertionError as exc:
+        message = str(exc)
+        assert "undeclared tpen crossings" in message
+        assert "remove the import per experiments/README.md" in message
+        assert "declare it with a disposition" in message
+        assert "stale sibling entry under rule (b)" in message
+    else:
+        raise AssertionError("every measured crossing must have a declared entry")
+
+
+def test_topology_validators_have_no_object_overridable_decision_sites() -> None:
+    """Keep validator decisions structural rather than caller-method driven."""
+
+    repository = STUDY_DIR.parents[2]
+    sources = {
+        "launch.py": repository / "experiments/atomistic/he-importance/launch.py",
+        "distributed.py": repository / "tpen/distributed.py",
+        "stage_coordinate.py": repository / "experiments/atomistic/he-importance/stage_coordinate.py",
+        "train_config.py": repository / "experiments/atomistic/he-importance/train_config.py",
+    }
+    allowlist = {
+        ("launch.py", "_has_buffer_capability", '"__buffer__" in namespace'):
+            ("namespace is obtained through type.__dict__'s descriptor, and the key is a module literal", 1),
+        ("launch.py", "_source_cell", "hasattr(cell, name)"):
+            ("this is source-shape admission, not topology classification; false positives fail at manifest access", 1),
+        ("launch.py", "_reject_execution_facts_outside_topology", "normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS"):
+            ("normalized is a fresh exact str and the set contains only this module's literals", 1),
+        ("launch.py", "is_execution_fact_key", "normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS"):
+            ("normalized is a fresh exact str and the set contains only this module's literals", 1),
+        ("launch.py", "_validate_runner_topology_facts", "key not in _RUNNER_TOPOLOGY_FACT_KEYS"):
+            ("all current callers pass facts detached to exact string keys before validation", 1),
+        ("launch.py", "_validate_runner_topology_facts", "name not in facts"):
+            ("all current callers pass facts detached to exact string keys before validation", 1),
+        ("launch.py", "_validate_runner_topology_facts", 'kind not in {"cpu", "cuda", "rocm", "other"}'):
+            ("all current callers pass facts detached before value validation, so kind is an owned scalar", 1),
+        ("distributed.py", "_has_buffer_capability", '"__buffer__" in namespace'):
+            ("namespace is obtained through type.__dict__'s descriptor, and the key is a module literal", 1),
+        ("distributed.py", "execution_topology_from_facts", "key not in _RUNNER_TOPOLOGY_FACT_KEYS"):
+            ("detachment has already required exact string mapping keys", 1),
+        ("distributed.py", "execution_topology_from_facts", "name not in facts"):
+            ("detachment has already required exact string mapping keys", 1),
+        ("distributed.py", "__post_init__", "self.device.identity != self.topology.device_identity"):
+            ("both operands are owned typed dataclass fields, not caller mapping objects", 1),
+        ("distributed.py", "__post_init__", "self.scope in (ProfileScope.NODE, ProfileScope.JOB)"):
+            ("scope is an owned enum field and the tuple contains module-owned enum members", 1),
+        ("distributed.py", "write", "record.topology != self.topology"):
+            ("this telemetry comparison is reached with typed ExecutionTopology records from the converter; write itself performs no conversion or type admission", 1),
+        ("stage_coordinate.py", "_is_manifest_root", 'value.get("schema") in {TRAIN_MANIFEST_SCHEMA, EVALUATION_MANIFEST_SCHEMA}'):
+            ("the mapping is the validated manifest shape and the membership set contains module-owned schema literals", 1),
+        ("stage_coordinate.py", "_is_manifest_root", "TOPOLOGY_KEY in value"):
+            ("the mapping is the validated manifest shape and TOPOLOGY_KEY is a module-owned literal", 1),
+        ("stage_coordinate.py", "with_execution_topology", "content_hash(source_manifest) != source_hash"):
+            ("the resolver's exact-str admission and owned-carrier re-bind are the terminal guards for launcher routes; direct stage callers remain outside this launch contract", 1),
+        ("stage_coordinate.py", "with_execution_topology", "content_hash(manifest) != source_hash"):
+            ("the resolver's exact-str admission and owned-carrier re-bind are the terminal guards for launcher routes; direct stage callers remain outside this launch contract", 1),
+        ("stage_coordinate.py", "_project_identity", "key == TOPOLOGY_KEY"):
+            ("key is a validated manifest key and TOPOLOGY_KEY is a module-owned literal", 1),
+        ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["stage"] != manifest["stage"]'):
+            ("manifest has passed the structural validator and both values are exact schema fields", 1),
+        ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["label"] not in seed_labels(manifest["stage"])'):
+            ("manifest has passed the structural validator and the namespace is module-owned", 1),
+        ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["namespace"] != "fresh-training"'):
+            ("manifest has passed the structural validator and the expected namespace is a module literal", 1),
+        ("stage_coordinate.py", "_require_exact_keys", "frozenset(value) != expected"):
+            ("value is a validated mapping at each caller and expected is a module-owned schema set", 1),
+        ("stage_coordinate.py", "_validate_delegated_subtree", "key in _FORBIDDEN_TRAIN_CONTENT_KEYS"):
+            ("key is required to be a string and the forbidden-key set is module-owned", 1),
+        ("stage_coordinate.py", "_validate_delegated_subtree", "type(value) not in {str, int, float, bool, type(None)}"):
+            ("type(value) is a built-in identity and the admitted type set is module-owned", 1),
+        ("stage_coordinate.py", "_validate_delegated_subtree", "value == _REFERENCE_ENERGY"):
+            ("the preceding exact-type test makes value an exact float and the reference is module-owned", 1),
+        ("stage_coordinate.py", "_validate_delegated_subtree", "value == _REFERENCE_ENERGY_TEXT"):
+            ("the preceding exact-type test makes value an exact str and the reference is module-owned", 1),
+        ("stage_coordinate.py", "_validate_common", 'manifest["schema"] != schema'):
+            ("manifest has passed the exact-key and mapping checks and schema is a module-owned validator argument", 1),
+        ("train_config.py", "_require_checkout_root", "repo_root not in candidates"):
+            ("repo_root and candidates are freshly resolved Path values owned by the checkout probe", 1),
+        ("train_config.py", "_cell_from_source", "hasattr(cell, name)"):
+            ("this is source-shape admission; false positives fail at the required downstream reads", 1),
+        ("train_config.py", "_set_optional_execution_seeds", '"seed" in checker'):
+            ("checker is a validated mapping from the composed config and the key is a module literal", 1),
+        ("train_config.py", "_optimizer_entry", 'status not in {"available", "unavailable"}'):
+            ("status is read from the validated scientific-identity mapping and compared with module literals", 1),
+        ("train_config.py", "_optimizer_entry", 'status != "available"'):
+            ("status is read from the validated scientific-identity mapping and compared with a module literal", 1),
+        ("train_config.py", "resolve_train_config", "stage_api.content_hash(manifest) != source_hash"):
+            ("resolve_train_config's own _cell_from_source admission requires an exact-str hash on every direct and wrapped resolver route", 1),
+        ("train_config.py", "resolve_train_config", "output_path.parent.parent == output_path"):
+            ("output_path is freshly converted to an owned Path before this structural sanity check", 1),
+    }
+    findings: list[str] = []
+    observed: dict[tuple[str, str, str], int] = {}
+    closure_roots = {
+        "stage_coordinate.py": {"with_execution_topology"},
+        "train_config.py": {"resolve_train_config"},
+    }
+    closures: dict[str, set[str]] = {}
+    for filename, path in sources.items():
+        if filename not in closure_roots:
+            continue
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        definitions = {
+            function.name: function
+            for function in ast.walk(tree)
+            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        calls = {
+            name: {
+                node.id
+                for node in ast.walk(function)
+                if isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in definitions
+            }
+            for name, function in definitions.items()
+        }
+        reachable: set[str] = set()
+        pending = list(closure_roots[filename])
+        while pending:
+            name = pending.pop()
+            if name in reachable:
+                continue
+            reachable.add(name)
+            pending.extend(calls.get(name, ()))
+        closures[filename] = reachable
+    for filename, path in sources.items():
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if filename in closures and function.name not in closures[filename]:
+                continue
+            aliases = {"hasattr"}
+            for node in ast.walk(function):
+                if isinstance(node, ast.Compare) and any(
+                    isinstance(op, (ast.Eq, ast.NotEq, ast.In, ast.NotIn))
+                    for op in node.ops
+                ):
+                    segment = ast.get_source_segment(source, node) or ""
+                    key = (filename, function.name, segment)
+                    if key in allowlist:
+                        observed[key] = observed.get(key, 0) + 1
+                    if key not in allowlist:
+                        findings.append(f"{filename}:{function.name}:{segment}")
+                if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+                    if node.value.id == "hasattr":
+                        aliases.update(
+                            target.id
+                            for target in node.targets
+                            if isinstance(target, ast.Name)
+                        )
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in aliases:
+                    segment = ast.get_source_segment(source, node) or ""
+                    key = (filename, function.name, segment)
+                    if key in allowlist:
+                        observed[key] = observed.get(key, 0) + 1
+                    else:
+                        findings.append(
+                            f"{filename}:{function.name}:hasattr-like call {segment}"
+                        )
+                if isinstance(node, ast.Match):
+                    findings.append(f"{filename}:{function.name}:match statement at line {node.lineno}")
+    for key, (reason, expected_count) in allowlist.items():
+        filename, _function, segment = key
+        assert reason, f"allowlist reason is empty for {key}"
+        source = sources[filename].read_text(encoding="utf-8")
+        assert segment in source, f"stale structural allowlist entry: {key}"
+        assert observed.get(key, 0) == expected_count, (
+            f"structural allowlist occurrence count changed for {key}: "
+            f"expected {expected_count}, observed {observed.get(key, 0)}"
+        )
+    assert not findings, "object-overridable validator decisions: " + "; ".join(findings)
+
+
+def test_exact_string_admissions_return_the_values_they_admit() -> None:
+    """Ensure exact-string guards bind and return their admitted values.
+
+    This is deliberately structural: a future admission that discards its
+    value must fail before a caller-controlled re-read can reach a downstream
+    boundary.  The check covers every exact-string admission in these two
+    modules; it does not claim ownership for stage-layer admissions.
+    """
+
+    repository = STUDY_DIR.parents[2]
+    sources = {
+        "launch.py": repository / "experiments/atomistic/he-importance/launch.py",
+        "train_config.py": repository / "experiments/atomistic/he-importance/train_config.py",
+    }
+    # Detached mapping keys are classification inputs, not caller attributes;
+    # this is the one explicit exemption from the admission-return property.
+    allowlist = {
+        (
+            "launch.py",
+            "_detach_topology_facts",
+            "type(key) is not str",
+            ): ("classifies a key already read from a detached mapping", 1),
+    }
+    admissions: list[tuple[str, str, str]] = []
+    observed_allowlist: dict[tuple[str, str, str], int] = {}
+    failures: list[str] = []
+    for filename, path in sources.items():
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(function):
+                if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+                    continue
+                if len(node.test.ops) != 1 or not isinstance(node.test.ops[0], ast.IsNot):
+                    continue
+                if not (
+                    isinstance(node.test.left, ast.Call)
+                    and isinstance(node.test.left.func, ast.Name)
+                    and node.test.left.func.id == "type"
+                    and len(node.test.left.args) == 1
+                    and len(node.test.comparators) == 1
+                    and isinstance(node.test.comparators[0], ast.Name)
+                    and node.test.comparators[0].id == "str"
+                ):
+                    continue
+                segment = ast.get_source_segment(source, node.test) or ""
+                key = (filename, function.name, segment)
+                if key in allowlist:
+                    observed_allowlist[key] = observed_allowlist.get(key, 0) + 1
+                    continue
+                expression = node.test.left.args[0]
+                if not isinstance(expression, ast.Name):
+                    failures.append(
+                        f"{filename}:{function.name}:{segment} admits an unbound expression"
+                    )
+                    continue
+                admitted = expression.id
+                admissions.append((filename, function.name, segment))
+                if not any(isinstance(child, ast.Raise) for child in node.body):
+                    failures.append(f"{filename}:{function.name}:guard has no raise")
+                    continue
+                returned = False
+                for returned_node in ast.walk(function):
+                    if not isinstance(returned_node, ast.Return) or returned_node.value is None:
+                        continue
+                    if any(
+                        isinstance(name, ast.Name) and name.id == admitted
+                        for name in ast.walk(returned_node.value)
+                    ):
+                        returned = True
+                        break
+                    if isinstance(returned_node.value, ast.Name):
+                        returned_name = returned_node.value.id
+                        for assignment in ast.walk(function):
+                            if not (
+                                isinstance(assignment, ast.Assign)
+                                and isinstance(assignment.value, ast.Call)
+                                and any(
+                                    isinstance(target, ast.Name)
+                                    and target.id == returned_name
+                                    for target in assignment.targets
+                                )
+                            ):
+                                continue
+                            if any(
+                                isinstance(keyword.value, ast.Name)
+                                and keyword.value.id == admitted
+                                for keyword in assignment.value.keywords
+                            ):
+                                returned = True
+                                break
+                        if returned:
+                            break
+                if not returned:
+                    failures.append(
+                        f"{filename}:{function.name}:{segment} discards {admitted}"
+                    )
+    for key, (reason, expected_count) in allowlist.items():
+        filename, _function, segment = key
+        assert reason, f"allowlist reason is empty for {key}"
+        source = sources[filename].read_text(encoding="utf-8")
+        assert segment in source, f"stale admission allowlist entry: {key}"
+        assert observed_allowlist.get(key, 0) == expected_count, (
+            f"admission allowlist occurrence count changed for {key}: "
+            f"expected {expected_count}, observed {observed_allowlist.get(key, 0)}"
+        )
+    assert admissions == [
+        ("launch.py", "_source_cell", "type(content_hash) is not str"),
+        ("launch.py", "populate_execution_topology", "type(bound_hash) is not str"),
+        ("train_config.py", "_cell_from_source", "type(content_hash) is not str"),
+    ], "exact-string admission inventory changed: expected captured caller values"
+    assert not failures, "admission values are not returned: " + "; ".join(failures)
