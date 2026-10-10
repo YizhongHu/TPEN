@@ -5,16 +5,13 @@ they are kept under the reviewer's names so the provenance stays legible:
 every one of them found something the writer's own suite did not.
 
 This header deliberately records NO measurement, and NO claim about which
-probes have or have not been edited since they were written. Six consecutive
-review rounds found exactly one such sentence false, each time at this cluster
-of files, and the cause is structural rather than careless: a claim about a
-past run, or about how the surrounding file has changed, cannot be checked
-against the tree and goes stale the next time anyone edits the file. The
-durable record owns that history -- PR 524's review thread and the Task
-Orchestrator notes on item b6b5b4f5, whose per-round verdict and red/green
-note keys carry the heads, the Cannon job IDs and the per-arm counts. What
-follows describes only what each probe asserts and why, which a reader can
-falsify by reading the code beneath it.
+probes have or have not been edited since they were written. Such a claim
+cannot be checked against the tree and goes stale the next time anyone edits
+the file. The durable record owns that history -- PR 524's review thread and
+the Task Orchestrator notes on item b6b5b4f5, whose per-round verdict and
+red/green note keys carry the heads, the Cannon job IDs and the per-arm
+counts. What follows describes only what each probe asserts and why, which a
+reader can falsify by reading the code beneath it.
 
 R1-1 as adopted is INVERTED relative to the form that found the issue: it
 pinned the hole -- a second carrier accepted silently -- and now requires the

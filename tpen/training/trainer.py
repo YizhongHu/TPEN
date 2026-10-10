@@ -500,16 +500,15 @@ class VMCTrainer:
             #
             # THE MESSAGE IS DELIBERATELY DISTINCT from
             # `_resolve_method_state`'s "mismatched legacy optimizer
-            # ownership". Two guards raising the SAME string is why this one
-            # went unnoticed BEFORE the distinct message existed: every test
-            # that asserted on the shared string reached it through
-            # `resolve_update_state`, where the older check fires first, so at
-            # that time this check could have been deleted outright without a
-            # single test failing. That is no longer so, and the tense matters
-            # -- the review probes now bind directly and pin this refusal by
-            # its own message. A guard whose refusal is indistinguishable from
-            # another's is a guard nothing can pin. It is also more accurate:
-            # nothing about a carrier at this boundary is "legacy".
+            # ownership". A guard whose refusal is indistinguishable from
+            # another's is a guard nothing can pin: any test matching on the
+            # shared string is satisfied by whichever guard answers first, so
+            # the one it was written for can stop firing unnoticed. The
+            # distinct message is what lets the review probes pin THIS check
+            # by its own text, and disabling it is what makes them fail. The
+            # history of how that was discovered is in the record, not here.
+            # It is also more accurate: nothing about a carrier at this
+            # boundary is "legacy".
             raise ValueError(
                 "update method is already bound to a different optimizer; "
                 "a run publishes and mutates one carrier"
