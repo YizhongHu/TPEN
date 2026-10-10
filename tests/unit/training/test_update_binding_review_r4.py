@@ -10,12 +10,11 @@ witness instrument, an `open(..., "a")` probe, tripped the durable-append
 census. Round 4 carried that qualifier and an earlier version of this
 docstring dropped it, saying "every test passed" -- corrected in round 5,
 R5-2.) The property was not unprotected in the repository; it was
-unprotected in the suite that every verification receipt in this PR ran at the
-time. `tests/integration/training/test_train_runner.py` does catch this
-payload -- measured rather than inferred, after this docstring first asserted
-it unmeasured: round 6 ran that file green at both the head and the stack
-base, and red under this exact mutant, failing on the diverged-parameters
-assert in `test_resume_reproduces_the_uninterrupted_run_bitwise`.
+unprotected in the suite the verification receipts of the time ran. Whether
+`tests/integration/training/test_train_runner.py` catches this payload, and
+at which heads that was measured, belongs to the record rather than to this
+docstring -- see the per-round verdict and red/green notes on Task
+Orchestrator item b6b5b4f5.
 
 Why the existing coverage missed it, from the reviewer's analysis:
 

@@ -1,10 +1,9 @@
 """Round-3 review probes for the one-bound-update-method lifecycle (PR 524).
 
-Reviewer round 3, head dd1fa1464b38a71782e4dea29408a92ea89538f8. These two
-tests exist to settle M-R2-4, the question the round-3 verifier deliberately
-left open: does the R2-4 strengthening of the R1-5 pin -- replacing
-``isinstance(seen, Adam)`` with identity against the captured runner-built
-instance -- actually buy anything, or is it decorative?
+Reviewer round 3. This file exists to settle M-R2-4, the question the round-3
+verifier deliberately left open: does the R2-4 strengthening of the R1-5 pin
+-- replacing ``isinstance(seen, Adam)`` with identity against the captured
+runner-built instance -- actually buy anything, or is it decorative?
 
 ADOPTED BY THE WRITER. The reviewer's file carried TWO tests; only the pin
 below is adopted, and the omission is deliberate.
@@ -26,13 +25,14 @@ R2-4 strengthening is load-bearing, not decorative. That was the open
 question (M-R2-4) the round-3 verifier flagged unsettled rather than skipping.
 
 - The test below is the ADOPTABLE strengthening the measurement points at.
-  The R1-5/R2-1 capture fixtures record only the LAST optimizer the factory
-  built, so their identity assertions are blind to a runner that builds the
-  carrier TWICE through the configured factory and hands `fit` the second
-  build -- `built` is overwritten and ``seen is built`` passes. Counting the
-  builds pins the runner's own claim (train.py: "ONE carrier is constructed
-  for this run, here, and nothing below builds a second") directly on the
-  foreign path, where no binding boundary exists to refuse the second build.
+  A capture fixture that keeps only the last optimizer the factory built is
+  blind to a runner that builds the carrier TWICE and hands `fit` the second
+  build: the single slot holds the second, and an identity assertion against
+  it passes. That is the shape this test closes. Counting the builds pins the
+  runner's own claim (train.py: "ONE carrier is constructed for this run,
+  here, and nothing below builds a second") directly on the foreign path,
+  where no binding boundary exists to refuse the second build. Read the
+  sibling fixtures for what THEY assert; this header does not describe them.
 """
 
 from __future__ import annotations
