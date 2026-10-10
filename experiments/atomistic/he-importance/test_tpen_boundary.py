@@ -53,6 +53,9 @@ class InventoryEntry:
 # Each key is (relative file, line, dotted target).  Each value is the
 # one-line disposition recorded for that exact crossing.
 EXPECTED_PRODUCTION_INVENTORY = {
+    ("optimizer_grid.py", 340, "tpen.hi_schema"): InventoryEntry(
+        "remedy blocked on pending HI authority ruling 99591859."
+    ),
     ("train_config.py", 190, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
@@ -97,9 +100,6 @@ EXPECTED_TEST_INVENTORY = {
     ),
     ("test_launch.py", 884, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
-    ),
-    ("test_stage_coordinate.py", 594, "tpen.hi.train"): InventoryEntry(
-        "item e923ec4e: retained until the facade slice removes this crossing."
     ),
     ("test_train_config.py", 220, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
