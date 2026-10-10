@@ -156,7 +156,17 @@ def test_materialized_q_inventory_has_no_unintended_duplicate_identities(tmp_pat
     cells = stage_coordinate.materialize_intended_configurations(tmp_path, availability=availability)
     assert len(cells) == 480
     assert len({cell.content_hash for cell in cells}) == 480
-    assert len({_declared_signature(cell) for cell in cells}) == 480
+
+    # The declared signature (scientific_identity minus the roster-derived
+    # optimizer_cell status) is seed-free by design: 120 cells x 2 contexts =
+    # 240 distinct signatures, each shared by exactly the 2 seeds (810001,
+    # 810002) that make the full manifest content_hash unique above.
+    signatures = [_declared_signature(cell) for cell in cells]
+    assert len(set(signatures)) == 240
+    counts: dict[str, int] = {}
+    for signature in signatures:
+        counts[signature] = counts.get(signature, 0) + 1
+    assert set(counts.values()) == {2}
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +198,10 @@ def test_contract_clause_4_roster_change_leaves_declared_universe_fixed(tmp_path
     signatures_a = {_declared_signature(cell) for cell in cells_a}
     signatures_b = {_declared_signature(cell) for cell in cells_b}
     assert signatures_a == signatures_b
-    assert len(signatures_a) == len(cells_a) == len(cells_b) == 480
+    # Seed-free declared signatures: 120 cells x 2 contexts = 240, each seed
+    # (810001, 810002) sharing one; len(cells_*) stays 480.
+    assert len(signatures_a) == 240
+    assert len(cells_a) == len(cells_b) == 480
 
     def _sr_statuses(cells: tuple) -> set[str]:
         return {
@@ -269,3 +282,34 @@ def test_committed_intended_configurations_has_no_status_or_reason_key() -> None
         assert len(entry["configurations"]) == 2
         for configuration in entry["configurations"]:
             assert frozenset(configuration["scientific_identity"]["optimizer"]) == frozenset({"method", "levels"})
+
+
+# ---------------------------------------------------------------------------
+# Contexts carry literal coordinates in the identity, not just a label
+# ---------------------------------------------------------------------------
+
+
+def test_context_identity_carries_the_authoritys_literal_override_coordinates() -> None:
+    contexts = optimizer_grid.load_authority()["contexts"]
+    by_name = {context["name"]: dict(context["overrides"]) for context in contexts}
+
+    for entry in optimizer_grid.render_intended_configurations():
+        for configuration in entry["configurations"]:
+            context_identity = configuration["scientific_identity"]["context"]
+            assert frozenset(context_identity) == frozenset({"name", "overrides"})
+            name = context_identity["name"]
+            assert context_identity["overrides"] == by_name[name]
+
+
+def test_o_raw_and_o_composite_identities_differ_by_more_than_the_name() -> None:
+    entry = optimizer_grid.render_intended_configurations()[0]
+    contexts_by_name = {
+        configuration["scientific_identity"]["context"]["name"]: configuration["scientific_identity"]["context"]
+        for configuration in entry["configurations"]
+    }
+    assert frozenset(contexts_by_name) == frozenset({"O-raw", "O-composite"})
+
+    o_raw_without_name = {k: v for k, v in contexts_by_name["O-raw"].items() if k != "name"}
+    o_composite_without_name = {k: v for k, v in contexts_by_name["O-composite"].items() if k != "name"}
+    assert o_raw_without_name != o_composite_without_name
+    assert o_raw_without_name["overrides"] != o_composite_without_name["overrides"]

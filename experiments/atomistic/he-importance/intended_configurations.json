@@ -14,7 +14,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -33,7 +39,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -67,7 +81,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -86,7 +106,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -120,7 +148,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -139,7 +173,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -173,7 +215,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -192,7 +240,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -226,7 +282,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -245,7 +307,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -279,7 +349,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -298,7 +374,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -332,7 +416,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -351,7 +441,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -385,7 +483,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -404,7 +508,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "adam",
             "levels": {
@@ -436,7 +548,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -453,7 +571,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -483,7 +609,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -500,7 +632,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -530,7 +670,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -547,7 +693,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -577,7 +731,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -594,7 +754,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -624,7 +792,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -641,7 +815,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -671,7 +853,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -688,7 +876,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -718,7 +914,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -735,7 +937,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -765,7 +975,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -782,7 +998,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -812,7 +1036,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -829,7 +1059,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -859,7 +1097,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -876,7 +1120,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -906,7 +1158,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -923,7 +1181,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -953,7 +1219,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -970,7 +1242,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1000,7 +1280,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1017,7 +1303,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1047,7 +1341,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1064,7 +1364,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1094,7 +1402,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1111,7 +1425,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1141,7 +1463,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1158,7 +1486,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1188,7 +1524,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1205,7 +1547,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1235,7 +1585,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1252,7 +1608,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1282,7 +1646,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1299,7 +1669,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1329,7 +1707,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1346,7 +1730,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1376,7 +1768,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1393,7 +1791,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1423,7 +1829,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1440,7 +1852,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1470,7 +1890,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1487,7 +1913,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1517,7 +1951,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1534,7 +1974,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1564,7 +2012,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1581,7 +2035,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1611,7 +2073,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1628,7 +2096,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1658,7 +2134,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1675,7 +2157,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1705,7 +2195,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1722,7 +2218,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1752,7 +2256,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1769,7 +2279,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1799,7 +2317,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1816,7 +2340,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1846,7 +2378,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1863,7 +2401,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1893,7 +2439,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1910,7 +2462,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "sr",
             "levels": {
@@ -1944,7 +2504,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -1965,7 +2531,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2003,7 +2577,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2024,7 +2604,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2062,7 +2650,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2083,7 +2677,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2121,7 +2723,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2142,7 +2750,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2180,7 +2796,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2201,7 +2823,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2239,7 +2869,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2260,7 +2896,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2298,7 +2942,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2319,7 +2969,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2357,7 +3015,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2378,7 +3042,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2416,7 +3088,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2437,7 +3115,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2475,7 +3161,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2496,7 +3188,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2534,7 +3234,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2555,7 +3261,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2593,7 +3307,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2614,7 +3334,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2652,7 +3380,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2673,7 +3407,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2711,7 +3453,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2732,7 +3480,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2770,7 +3526,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2791,7 +3553,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2829,7 +3599,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2850,7 +3626,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2888,7 +3672,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2909,7 +3699,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2947,7 +3745,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -2968,7 +3772,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3006,7 +3818,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3027,7 +3845,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3065,7 +3891,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3086,7 +3918,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3124,7 +3964,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3145,7 +3991,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3183,7 +4037,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3204,7 +4064,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3242,7 +4110,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3263,7 +4137,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3301,7 +4183,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3322,7 +4210,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3360,7 +4256,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3381,7 +4283,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3419,7 +4329,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3440,7 +4356,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3478,7 +4402,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3499,7 +4429,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3537,7 +4475,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3558,7 +4502,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3596,7 +4548,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3617,7 +4575,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3655,7 +4621,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3676,7 +4648,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3714,7 +4694,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3735,7 +4721,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3773,7 +4767,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3794,7 +4794,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "kfac",
             "levels": {
@@ -3830,7 +4838,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -3849,7 +4863,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -3883,7 +4905,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -3902,7 +4930,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -3936,7 +4972,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -3955,7 +4997,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -3989,7 +5039,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4008,7 +5064,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4042,7 +5106,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4061,7 +5131,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4095,7 +5173,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4114,7 +5198,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4148,7 +5240,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4167,7 +5265,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4201,7 +5307,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4220,7 +5332,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4254,7 +5374,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4273,7 +5399,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4307,7 +5441,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4326,7 +5466,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4360,7 +5508,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4379,7 +5533,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4413,7 +5575,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4432,7 +5600,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4466,7 +5642,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4485,7 +5667,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4519,7 +5709,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4538,7 +5734,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4572,7 +5776,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4591,7 +5801,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4625,7 +5843,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4644,7 +5868,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4678,7 +5910,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4697,7 +5935,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4731,7 +5977,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4750,7 +6002,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4784,7 +6044,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4803,7 +6069,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4837,7 +6111,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4856,7 +6136,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4890,7 +6178,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4909,7 +6203,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4943,7 +6245,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4962,7 +6270,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -4996,7 +6312,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5015,7 +6337,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5049,7 +6379,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5068,7 +6404,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5102,7 +6446,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5121,7 +6471,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5155,7 +6513,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5174,7 +6538,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5208,7 +6580,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5227,7 +6605,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5261,7 +6647,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5280,7 +6672,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5314,7 +6714,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5333,7 +6739,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5367,7 +6781,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5386,7 +6806,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5420,7 +6848,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5439,7 +6873,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5473,7 +6915,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5492,7 +6940,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "spring",
             "levels": {
@@ -5523,7 +6979,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5539,7 +7001,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5567,7 +7037,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5583,7 +7059,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5611,7 +7095,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5627,7 +7117,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5655,7 +7153,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5671,7 +7175,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5699,7 +7211,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5715,7 +7233,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5743,7 +7269,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5759,7 +7291,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5787,7 +7327,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5803,7 +7349,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5831,7 +7385,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5847,7 +7407,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5875,7 +7443,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5891,7 +7465,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5919,7 +7501,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5935,7 +7523,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5963,7 +7559,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -5979,7 +7581,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -6007,7 +7617,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -6023,7 +7639,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -6051,7 +7675,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -6067,7 +7697,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -6095,7 +7733,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -6111,7 +7755,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -6139,7 +7791,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -6155,7 +7813,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -6183,7 +7849,13 @@
     "configurations": [
       {
         "scientific_identity": {
-          "context": "O-raw",
+          "context": {
+            "name": "O-raw",
+            "overrides": {
+              "input_features": "B00",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {
@@ -6199,7 +7871,15 @@
       },
       {
         "scientific_identity": {
-          "context": "O-composite",
+          "context": {
+            "name": "O-composite",
+            "overrides": {
+              "producer_policy": "hybrid/coordinate-neighbor",
+              "aggregation_activation": "channel-MLP at both activation sites",
+              "input_features": "B11",
+              "feature_update": "residual"
+            }
+          },
           "optimizer": {
             "method": "linear_method",
             "levels": {

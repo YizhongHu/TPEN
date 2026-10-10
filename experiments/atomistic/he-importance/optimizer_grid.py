@@ -375,7 +375,10 @@ def render_intended_configurations() -> list[dict[str, Any]]:
         configurations = [
             {
                 "scientific_identity": {
-                    "context": context["name"],
+                    "context": {
+                        "name": context["name"],
+                        "overrides": dict(context["overrides"]),
+                    },
                     "optimizer": {"method": cell.family, "levels": dict(levels)},
                 },
                 "payload": {"updates": stage.updates},
