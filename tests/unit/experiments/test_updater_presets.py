@@ -106,12 +106,18 @@ def test_legacy_remains_the_trainer_default_when_no_method_is_configured() -> No
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
     trainer = VMCTrainer(max_steps=1)
 
-    selected = trainer._select_update_method(
+    selected = trainer.bind_update_method(
         model=model, optimizer=optimizer, update_method=None
     )
 
     assert isinstance(selected, LegacyAutogradUpdate)
     assert selected.forward_request() is None, "legacy must not request a score payload"
+
+    # And it is bound, not re-decided: the DEFAULT path is the one the old
+    # spec-identity memo could not cover, because its spec is `None`.
+    assert trainer.bind_update_method(
+        model=model, optimizer=optimizer, update_method=None
+    ) is selected
 
 
 @pytest.mark.parametrize(
