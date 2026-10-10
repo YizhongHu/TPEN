@@ -75,7 +75,7 @@ def _load_stage_coordinate() -> Any:
     # Registered before exec: stage_coordinate's frozen dataclasses resolve
     # their own module via ``sys.modules``, which requires the entry to
     # already exist by the time the class body executes.
-    sys.modules[name] = module
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
