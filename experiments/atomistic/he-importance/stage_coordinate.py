@@ -711,7 +711,14 @@ def validate_materialized_manifest(manifest: Mapping[str, Any]) -> None:
 
 
 def intended_configurations() -> tuple[Mapping[str, Any], ...]:
-    """Load the committed, literal L2b configuration enumeration."""
+    """Load the committed, literal L2b configuration enumeration.
+
+    Each entry's ``optimizer`` declares only ``method`` and ``levels``. It
+    carries no availability ``status`` and no ``reason``: enumeration is a
+    declared-universe fact, and runnability is a separate, build-time
+    judgement supplied by the caller of
+    :func:`materialize_intended_configurations`.
+    """
 
     raw = json.loads(_INTENDED_CONFIGURATIONS_PATH.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
@@ -721,22 +728,41 @@ def intended_configurations() -> tuple[Mapping[str, Any], ...]:
             {"stage", "optimizer", "configurations"}
         ):
             raise MaterializationError("intended configuration entry has an invalid schema")
+        optimizer_data = entry["optimizer"]
+        if not isinstance(optimizer_data, Mapping) or frozenset(optimizer_data) != frozenset({"method", "levels"}):
+            raise MaterializationError("intended optimizer must declare exactly method and levels")
+        if not isinstance(optimizer_data["method"], str) or not optimizer_data["method"]:
+            raise MaterializationError("intended optimizer method must be a non-empty string")
+        if not isinstance(optimizer_data["levels"], Mapping):
+            raise MaterializationError("intended optimizer levels must be a mapping")
     return tuple(raw)
 
 
-def materialize_intended_configurations(output_root: Path) -> tuple[MaterializedCell, ...]:
-    """Materialize every configuration in the committed L2b inventory."""
+def materialize_intended_configurations(
+    output_root: Path, *, availability: Mapping[str, OptimizerCell]
+) -> tuple[MaterializedCell, ...]:
+    """Materialize every configuration in the committed L2b inventory.
+
+    Parameters
+    ----------
+    output_root
+        Root directory for content-addressed output paths.
+    availability
+        Required mapping from declared optimizer method to its build-time
+        :class:`OptimizerCell`. A method present in the committed inventory
+        but absent from this mapping fails closed: it is never treated as
+        available by default. Callers typically supply
+        ``optimizer_grid.roster_availability()``.
+    """
 
     cells: list[MaterializedCell] = []
     for entry in intended_configurations():
-        optimizer_data = entry["optimizer"]
-        if not isinstance(optimizer_data, Mapping):
-            raise MaterializationError("intended optimizer must be a mapping")
-        optimizer = OptimizerCell(
-            method=optimizer_data["method"],
-            status=optimizer_data["status"],
-            reason=optimizer_data.get("reason"),
-        )
+        method = entry["optimizer"]["method"]
+        optimizer = availability.get(method)
+        if optimizer is None:
+            raise MaterializationError(
+                f"optimizer method {method!r} is absent from the supplied availability mapping"
+            )
         cells.extend(materialize_stage(entry["stage"], entry["configurations"], optimizer, output_root))
     return tuple(cells)
 

@@ -579,9 +579,22 @@ def test_canonical_hash_preserves_the_typed_non_string_key_failure() -> None:
         stage_coordinate.content_hash({1: "not-json"})
 
 
+def _complete_available_roster() -> dict[str, "stage_coordinate.OptimizerCell"]:
+    # Every family declared in the committed inventory, all marked
+    # available: enough to materialize the whole inventory without pulling
+    # in the live tpen roster. Fail-closed coverage of a roster that omits a
+    # family lives in test_optimizer_grid.py.
+    return {
+        method: stage_coordinate.OptimizerCell(method, "available")
+        for method in ("adam", "sr", "kfac", "spring", "linear_method")
+    }
+
+
 def test_committed_intended_configuration_inventory_materializes_completely(tmp_path: Path) -> None:
     inventory = json.loads(Path(__file__).with_name("intended_configurations.json").read_text())
-    cells = stage_coordinate.materialize_intended_configurations(tmp_path)
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=_complete_available_roster()
+    )
     expected = sum(
         len(entry["configurations"]) * stage_coordinate.stage_definition(entry["stage"]).seeds_per_point
         for entry in inventory
