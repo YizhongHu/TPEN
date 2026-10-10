@@ -24,9 +24,9 @@ STUDY_DIR = Path(__file__).resolve().parent
 INVENTORY_DATE = "2026-10-07"
 INVENTORY_HEAD = "3143e43ac170df33f61f2002b1011cd85c9cfc37"
 PENDING_516_SHA = "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
-# The second value is the four additional unsanctioned crossings introduced by
-# PR 516; keep both merge orders green until that PR lands.
-EXPECTED_UNSANCTIONED_COUNTS = {16, 20}
+# This layer removed three launch.py production crossings; PR 516 supplies the
+# second population change. Keep both measured merge-world counts explicit.
+EXPECTED_UNSANCTIONED_COUNTS = {13, 17}
 PENDING_516_POLICY = (
     "the control is deliberately 516-scoped; a new pending PR needs its own pin"
 )
@@ -53,19 +53,10 @@ class InventoryEntry:
 # Each key is (relative file, line, dotted target).  Each value is the
 # one-line disposition recorded for that exact crossing.
 EXPECTED_PRODUCTION_INVENTORY = {
-    ("launch.py", 22, "tpen.accelerator"): InventoryEntry(
-        "item ffb269d1: removed by the next stack layer."
-    ),
-    ("launch.py", 23, "tpen.artifacts"): InventoryEntry(
-        "item ffb269d1: removed by the next stack layer."
-    ),
-    ("launch.py", 24, "tpen.distributed"): InventoryEntry(
-        "item ffb269d1: removed by the next stack layer."
-    ),
-    ("train_config.py", 187, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 190, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 258, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 264, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("run_stage_q.py", 30, "tpen.accelerator"): InventoryEntry(
@@ -86,37 +77,37 @@ EXPECTED_PRODUCTION_INVENTORY = {
 }
 
 EXPECTED_TEST_INVENTORY = {
-    ("test_launch.py", 16, "tpen.artifacts"): InventoryEntry(
+    ("test_launch.py", 18, "tpen.artifacts"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 17, "tpen.distributed"): InventoryEntry(
+    ("test_launch.py", 19, "tpen.distributed"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 19, "tpen.runner"): InventoryEntry(
+    ("test_launch.py", 21, "tpen.runner"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 388, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 574, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 430, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 616, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 486, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 672, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 591, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 884, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
     ("test_stage_coordinate.py", 594, "tpen.hi.train"): InventoryEntry(
         "item e923ec4e: retained until the facade slice removes this crossing."
     ),
-    ("test_train_config.py", 176, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 220, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 188, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 232, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 281, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 325, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("test_run_stage_q.py", 99, "tpen.hi_schema"): InventoryEntry(
@@ -846,15 +837,28 @@ def test_capability_inventory_count_diagnostic_added() -> None:
 def test_capability_inventory_count_diagnostic_removed() -> None:
     global STUDY_DIR
     global EXPECTED_UNSANCTIONED_COUNTS
+    global EXPECTED_PRODUCTION_INVENTORY
+    global EXPECTED_TEST_INVENTORY
     original_study_dir = STUDY_DIR
     original_expected_counts = EXPECTED_UNSANCTIONED_COUNTS
+    original_production_inventory = EXPECTED_PRODUCTION_INVENTORY
+    original_test_inventory = EXPECTED_TEST_INVENTORY
     with tempfile.TemporaryDirectory() as temporary_root:
         root = Path(temporary_root)
-        (root / "launch.py").write_text(
+        (root / "run_stage_q.py").write_text(
             "\nfrom tpen.artifacts import RunResult\n", encoding="utf-8"
         )
         STUDY_DIR = root
         EXPECTED_UNSANCTIONED_COUNTS = {2}
+        EXPECTED_PRODUCTION_INVENTORY = {
+            ("run_stage_q.py", 30, "tpen.accelerator"): InventoryEntry(
+                "synthetic removed accelerator entry"
+            ),
+            ("run_stage_q.py", 31, "tpen.distributed"): InventoryEntry(
+                "synthetic removed distributed entry"
+            ),
+        }
+        EXPECTED_TEST_INVENTORY = {}
         try:
             try:
                 _scan_study()
@@ -865,10 +869,12 @@ def test_capability_inventory_count_diagnostic_removed() -> None:
         finally:
             STUDY_DIR = original_study_dir
             EXPECTED_UNSANCTIONED_COUNTS = original_expected_counts
+            EXPECTED_PRODUCTION_INVENTORY = original_production_inventory
+            EXPECTED_TEST_INVENTORY = original_test_inventory
     assert "actual=1" in message
     assert "expected=[2]" in message
-    assert "('launch.py', 22, 'tpen.accelerator')" in message
-    assert "('launch.py', 24, 'tpen.distributed')" in message
+    assert "('run_stage_q.py', 30, 'tpen.accelerator')" in message
+    assert "('run_stage_q.py', 31, 'tpen.distributed')" in message
     assert "reconcile" in message
 
 
@@ -1130,3 +1136,285 @@ def test_capability_undeclared_measured_crossing() -> None:
         assert "stale sibling entry under rule (b)" in message
     else:
         raise AssertionError("every measured crossing must have a declared entry")
+
+
+def test_topology_validators_have_no_object_overridable_decision_sites() -> None:
+    """Keep validator decisions structural rather than caller-method driven."""
+
+    repository = STUDY_DIR.parents[2]
+    sources = {
+        "launch.py": repository / "experiments/atomistic/he-importance/launch.py",
+        "distributed.py": repository / "tpen/distributed.py",
+        "stage_coordinate.py": repository / "experiments/atomistic/he-importance/stage_coordinate.py",
+        "train_config.py": repository / "experiments/atomistic/he-importance/train_config.py",
+    }
+    allowlist = {
+        ("launch.py", "_has_buffer_capability", '"__buffer__" in namespace'):
+            ("namespace is obtained through type.__dict__'s descriptor, and the key is a module literal", 1),
+        ("launch.py", "_source_cell", "hasattr(cell, name)"):
+            ("this is source-shape admission, not topology classification; false positives fail at manifest access", 1),
+        ("launch.py", "_reject_execution_facts_outside_topology", "normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS"):
+            ("normalized is a fresh exact str and the set contains only this module's literals", 1),
+        ("launch.py", "is_execution_fact_key", "normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS"):
+            ("normalized is a fresh exact str and the set contains only this module's literals", 1),
+        ("launch.py", "_validate_runner_topology_facts", "key not in _RUNNER_TOPOLOGY_FACT_KEYS"):
+            ("all current callers pass facts detached to exact string keys before validation", 1),
+        ("launch.py", "_validate_runner_topology_facts", "name not in facts"):
+            ("all current callers pass facts detached to exact string keys before validation", 1),
+        ("launch.py", "_validate_runner_topology_facts", 'kind not in {"cpu", "cuda", "rocm", "other"}'):
+            ("all current callers pass facts detached before value validation, so kind is an owned scalar", 1),
+        ("distributed.py", "_has_buffer_capability", '"__buffer__" in namespace'):
+            ("namespace is obtained through type.__dict__'s descriptor, and the key is a module literal", 1),
+        ("distributed.py", "execution_topology_from_facts", "key not in _RUNNER_TOPOLOGY_FACT_KEYS"):
+            ("detachment has already required exact string mapping keys", 1),
+        ("distributed.py", "execution_topology_from_facts", "name not in facts"):
+            ("detachment has already required exact string mapping keys", 1),
+        ("distributed.py", "__post_init__", "self.device.identity != self.topology.device_identity"):
+            ("both operands are owned typed dataclass fields, not caller mapping objects", 1),
+        ("distributed.py", "__post_init__", "self.scope in (ProfileScope.NODE, ProfileScope.JOB)"):
+            ("scope is an owned enum field and the tuple contains module-owned enum members", 1),
+        ("distributed.py", "write", "record.topology != self.topology"):
+            ("this telemetry comparison is reached with typed ExecutionTopology records from the converter; write itself performs no conversion or type admission", 1),
+        ("stage_coordinate.py", "_is_manifest_root", 'value.get("schema") in {TRAIN_MANIFEST_SCHEMA, EVALUATION_MANIFEST_SCHEMA}'):
+            ("the mapping is the validated manifest shape and the membership set contains module-owned schema literals", 1),
+        ("stage_coordinate.py", "_is_manifest_root", "TOPOLOGY_KEY in value"):
+            ("the mapping is the validated manifest shape and TOPOLOGY_KEY is a module-owned literal", 1),
+        ("stage_coordinate.py", "with_execution_topology", "content_hash(source_manifest) != source_hash"):
+            ("the resolver's exact-str admission and owned-carrier re-bind are the terminal guards for launcher routes; direct stage callers remain outside this launch contract", 1),
+        ("stage_coordinate.py", "with_execution_topology", "content_hash(manifest) != source_hash"):
+            ("the resolver's exact-str admission and owned-carrier re-bind are the terminal guards for launcher routes; direct stage callers remain outside this launch contract", 1),
+        ("stage_coordinate.py", "_project_identity", "key == TOPOLOGY_KEY"):
+            ("key is a validated manifest key and TOPOLOGY_KEY is a module-owned literal", 1),
+        ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["stage"] != manifest["stage"]'):
+            ("manifest has passed the structural validator and both values are exact schema fields", 1),
+        ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["label"] not in seed_labels(manifest["stage"])'):
+            ("manifest has passed the structural validator and the namespace is module-owned", 1),
+        ("stage_coordinate.py", "validate_materialized_manifest", 'manifest["seed_identity"]["namespace"] != "fresh-training"'):
+            ("manifest has passed the structural validator and the expected namespace is a module literal", 1),
+        ("stage_coordinate.py", "_require_exact_keys", "frozenset(value) != expected"):
+            ("value is a validated mapping at each caller and expected is a module-owned schema set", 1),
+        ("stage_coordinate.py", "_validate_delegated_subtree", "key in _FORBIDDEN_TRAIN_CONTENT_KEYS"):
+            ("key is required to be a string and the forbidden-key set is module-owned", 1),
+        ("stage_coordinate.py", "_validate_delegated_subtree", "type(value) not in {str, int, float, bool, type(None)}"):
+            ("type(value) is a built-in identity and the admitted type set is module-owned", 1),
+        ("stage_coordinate.py", "_validate_delegated_subtree", "value == _REFERENCE_ENERGY"):
+            ("the preceding exact-type test makes value an exact float and the reference is module-owned", 1),
+        ("stage_coordinate.py", "_validate_delegated_subtree", "value == _REFERENCE_ENERGY_TEXT"):
+            ("the preceding exact-type test makes value an exact str and the reference is module-owned", 1),
+        ("stage_coordinate.py", "_validate_common", 'manifest["schema"] != schema'):
+            ("manifest has passed the exact-key and mapping checks and schema is a module-owned validator argument", 1),
+        ("train_config.py", "_require_checkout_root", "repo_root not in candidates"):
+            ("repo_root and candidates are freshly resolved Path values owned by the checkout probe", 1),
+        ("train_config.py", "_cell_from_source", "hasattr(cell, name)"):
+            ("this is source-shape admission; false positives fail at the required downstream reads", 1),
+        ("train_config.py", "_set_optional_execution_seeds", '"seed" in checker'):
+            ("checker is a validated mapping from the composed config and the key is a module literal", 1),
+        ("train_config.py", "_optimizer_entry", 'status not in {"available", "unavailable"}'):
+            ("status is read from the validated scientific-identity mapping and compared with module literals", 1),
+        ("train_config.py", "_optimizer_entry", 'status != "available"'):
+            ("status is read from the validated scientific-identity mapping and compared with a module literal", 1),
+        ("train_config.py", "resolve_train_config", "stage_api.content_hash(manifest) != source_hash"):
+            ("resolve_train_config's own _cell_from_source admission requires an exact-str hash on every direct and wrapped resolver route", 1),
+        ("train_config.py", "resolve_train_config", "output_path.parent.parent == output_path"):
+            ("output_path is freshly converted to an owned Path before this structural sanity check", 1),
+    }
+    findings: list[str] = []
+    observed: dict[tuple[str, str, str], int] = {}
+    closure_roots = {
+        "stage_coordinate.py": {"with_execution_topology"},
+        "train_config.py": {"resolve_train_config"},
+    }
+    closures: dict[str, set[str]] = {}
+    for filename, path in sources.items():
+        if filename not in closure_roots:
+            continue
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        definitions = {
+            function.name: function
+            for function in ast.walk(tree)
+            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        calls = {
+            name: {
+                node.id
+                for node in ast.walk(function)
+                if isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in definitions
+            }
+            for name, function in definitions.items()
+        }
+        reachable: set[str] = set()
+        pending = list(closure_roots[filename])
+        while pending:
+            name = pending.pop()
+            if name in reachable:
+                continue
+            reachable.add(name)
+            pending.extend(calls.get(name, ()))
+        closures[filename] = reachable
+    for filename, path in sources.items():
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if filename in closures and function.name not in closures[filename]:
+                continue
+            aliases = {"hasattr"}
+            for node in ast.walk(function):
+                if isinstance(node, ast.Compare) and any(
+                    isinstance(op, (ast.Eq, ast.NotEq, ast.In, ast.NotIn))
+                    for op in node.ops
+                ):
+                    segment = ast.get_source_segment(source, node) or ""
+                    key = (filename, function.name, segment)
+                    if key in allowlist:
+                        observed[key] = observed.get(key, 0) + 1
+                    if key not in allowlist:
+                        findings.append(f"{filename}:{function.name}:{segment}")
+                if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+                    if node.value.id == "hasattr":
+                        aliases.update(
+                            target.id
+                            for target in node.targets
+                            if isinstance(target, ast.Name)
+                        )
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in aliases:
+                    segment = ast.get_source_segment(source, node) or ""
+                    key = (filename, function.name, segment)
+                    if key in allowlist:
+                        observed[key] = observed.get(key, 0) + 1
+                    else:
+                        findings.append(
+                            f"{filename}:{function.name}:hasattr-like call {segment}"
+                        )
+                if isinstance(node, ast.Match):
+                    findings.append(f"{filename}:{function.name}:match statement at line {node.lineno}")
+    for key, (reason, expected_count) in allowlist.items():
+        filename, _function, segment = key
+        assert reason, f"allowlist reason is empty for {key}"
+        source = sources[filename].read_text(encoding="utf-8")
+        assert segment in source, f"stale structural allowlist entry: {key}"
+        assert observed.get(key, 0) == expected_count, (
+            f"structural allowlist occurrence count changed for {key}: "
+            f"expected {expected_count}, observed {observed.get(key, 0)}"
+        )
+    assert not findings, "object-overridable validator decisions: " + "; ".join(findings)
+
+
+def test_exact_string_admissions_return_the_values_they_admit() -> None:
+    """Ensure exact-string guards bind and return their admitted values.
+
+    This is deliberately structural: a future admission that discards its
+    value must fail before a caller-controlled re-read can reach a downstream
+    boundary.  The check covers every exact-string admission in these two
+    modules; it does not claim ownership for stage-layer admissions.
+    """
+
+    repository = STUDY_DIR.parents[2]
+    sources = {
+        "launch.py": repository / "experiments/atomistic/he-importance/launch.py",
+        "train_config.py": repository / "experiments/atomistic/he-importance/train_config.py",
+    }
+    # Detached mapping keys are classification inputs, not caller attributes;
+    # this is the one explicit exemption from the admission-return property.
+    allowlist = {
+        (
+            "launch.py",
+            "_detach_topology_facts",
+            "type(key) is not str",
+            ): ("classifies a key already read from a detached mapping", 1),
+    }
+    admissions: list[tuple[str, str, str]] = []
+    observed_allowlist: dict[tuple[str, str, str], int] = {}
+    failures: list[str] = []
+    for filename, path in sources.items():
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(function):
+                if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+                    continue
+                if len(node.test.ops) != 1 or not isinstance(node.test.ops[0], ast.IsNot):
+                    continue
+                if not (
+                    isinstance(node.test.left, ast.Call)
+                    and isinstance(node.test.left.func, ast.Name)
+                    and node.test.left.func.id == "type"
+                    and len(node.test.left.args) == 1
+                    and len(node.test.comparators) == 1
+                    and isinstance(node.test.comparators[0], ast.Name)
+                    and node.test.comparators[0].id == "str"
+                ):
+                    continue
+                segment = ast.get_source_segment(source, node.test) or ""
+                key = (filename, function.name, segment)
+                if key in allowlist:
+                    observed_allowlist[key] = observed_allowlist.get(key, 0) + 1
+                    continue
+                expression = node.test.left.args[0]
+                if not isinstance(expression, ast.Name):
+                    failures.append(
+                        f"{filename}:{function.name}:{segment} admits an unbound expression"
+                    )
+                    continue
+                admitted = expression.id
+                admissions.append((filename, function.name, segment))
+                if not any(isinstance(child, ast.Raise) for child in node.body):
+                    failures.append(f"{filename}:{function.name}:guard has no raise")
+                    continue
+                returned = False
+                for returned_node in ast.walk(function):
+                    if not isinstance(returned_node, ast.Return) or returned_node.value is None:
+                        continue
+                    if any(
+                        isinstance(name, ast.Name) and name.id == admitted
+                        for name in ast.walk(returned_node.value)
+                    ):
+                        returned = True
+                        break
+                    if isinstance(returned_node.value, ast.Name):
+                        returned_name = returned_node.value.id
+                        for assignment in ast.walk(function):
+                            if not (
+                                isinstance(assignment, ast.Assign)
+                                and isinstance(assignment.value, ast.Call)
+                                and any(
+                                    isinstance(target, ast.Name)
+                                    and target.id == returned_name
+                                    for target in assignment.targets
+                                )
+                            ):
+                                continue
+                            if any(
+                                isinstance(keyword.value, ast.Name)
+                                and keyword.value.id == admitted
+                                for keyword in assignment.value.keywords
+                            ):
+                                returned = True
+                                break
+                        if returned:
+                            break
+                if not returned:
+                    failures.append(
+                        f"{filename}:{function.name}:{segment} discards {admitted}"
+                    )
+    for key, (reason, expected_count) in allowlist.items():
+        filename, _function, segment = key
+        assert reason, f"allowlist reason is empty for {key}"
+        source = sources[filename].read_text(encoding="utf-8")
+        assert segment in source, f"stale admission allowlist entry: {key}"
+        assert observed_allowlist.get(key, 0) == expected_count, (
+            f"admission allowlist occurrence count changed for {key}: "
+            f"expected {expected_count}, observed {observed_allowlist.get(key, 0)}"
+        )
+    assert admissions == [
+        ("launch.py", "_source_cell", "type(content_hash) is not str"),
+        ("launch.py", "populate_execution_topology", "type(bound_hash) is not str"),
+        ("train_config.py", "_cell_from_source", "type(content_hash) is not str"),
+    ], "exact-string admission inventory changed: expected captured caller values"
+    assert not failures, "admission values are not returned: " + "; ".join(failures)

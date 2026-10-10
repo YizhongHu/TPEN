@@ -87,6 +87,50 @@ def test_resolve_binds_content_hash_to_run_identity(tmp_path: Path) -> None:
     assert resolved.run.run_id == cell.content_hash
 
 
+def test_resolve_direct_rejects_non_exact_hashes_and_preserves_provenance(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    honest = train_config.resolve_train_config(cell)
+    assert honest.run.run_id == cell.content_hash
+
+    class LyingHash(str):
+        def __str__(self) -> str:
+            return "forged-run-id"
+
+    class LyingNonStringHash:
+        def __ne__(self, other: object) -> bool:
+            return False
+
+        def __str__(self) -> str:
+            return "forged-run-id"
+
+    for value in (LyingHash(cell.content_hash), LyingNonStringHash()):
+        with pytest.raises(train_config.TrainConfigResolutionError, match="exact str"):
+            train_config.resolve_train_config(replace(cell, content_hash=value))
+
+
+def test_resolve_direct_owns_manifest_before_hash_and_composition(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    original = cell.manifest
+
+    class DivergentManifest(dict[str, object]):
+        reads = 0
+
+        def items(self):
+            self.reads += 1
+            if self.reads > 1:
+                changed = dict(original)
+                changed["scientific_identity"] = {"architecture": "forged"}
+                return changed.items()
+            return super().items()
+
+    manifest = DivergentManifest(original)
+    resolved = train_config.resolve_train_config(replace(cell, manifest=manifest))
+    assert manifest.reads == 1
+    assert resolved.run.run_id == cell.content_hash
+
+
 def test_resolve_binds_output_path_to_run_root_and_dir(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
     resolved = train_config.resolve_train_config(cell)

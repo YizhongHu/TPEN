@@ -1,32 +1,39 @@
-"""Launch one resolved HI training row through TPEN's production runner.
+"""Launch one resolved HI training row through the production runner.
 
-The source materializer has no process facts, so this adapter accepts an
-operator-supplied :class:`~tpen.distributed.ExecutionTopology`, records its
-facts under the manifest's designated ``topology`` subtree, resolves the row
-through L1, and delegates execution to ``tpen.run.run_from_config``.  It does
-not choose inventory rows, submit scheduler jobs, iterate cells, or launch
-distributed workers.
+The source materializer has no process facts, so this adapter accepts
+operator-supplied execution facts, records them under the manifest's
+designated ``topology`` subtree, resolves the row through L1, and delegates
+execution to the sanctioned runner entry point. It does not choose inventory
+rows, submit scheduler jobs, iterate cells, or launch distributed workers.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Buffer, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib import import_module
 import inspect
+from pathlib import Path
 import re
 from typing import Any
 
 from omegaconf import DictConfig
 
-from tpen.accelerator import AcceleratorIdentity, AcceleratorKind
-from tpen.artifacts import RunResult
-from tpen.distributed import ExecutionTopology
 from tpen.run import run_from_config
 
 
 _STAGE_API = import_module("experiments.atomistic.he-importance.stage_coordinate")
 _TRAIN_CONFIG = import_module("experiments.atomistic.he-importance.train_config")
+
+
+@dataclass(frozen=True)
+class _OwnedLaunchCell:
+    """Launch-owned view of a bound row handed to downstream consumers."""
+
+    manifest: Mapping[str, Any]
+    content_hash: str
+    output_path: Any
+    seed_streams: Mapping[str, Any]
 # This vocabulary is deliberately closed. Names outside this declaration belong
 # to the scientific manifest unless a future owner adds them and gives the
 # production consumer a representation for them.
@@ -118,44 +125,82 @@ class LaunchPlan:
     topology: Mapping[str, Any]
 
 
-def _source_cell(source: Any) -> Any:
+def _has_buffer_capability(value: object) -> bool:
+    """Detect buffer exporters without invoking caller-defined attribute hooks."""
+
+    if isinstance(value, Buffer):
+        return True
+    value_type = type(value)
+    real_mro = type.__dict__["__mro__"].__get__(value_type)
+    for base in real_mro:
+        namespace = type.__dict__["__dict__"].__get__(base)
+        if "__buffer__" in namespace:
+            return True
+    return False
+
+
+def _source_cell(source: Any) -> tuple[Any, str]:
     """Extract the materialized cell from a cell or a training packet."""
 
     cell = getattr(source, "cell", source)
-    if not all(hasattr(cell, name) for name in ("manifest", "content_hash", "output_path")):
+    if not all(hasattr(cell, name) for name in ("manifest", "output_path")):
         raise LaunchValidationError("source must be a MaterializedCell or TrainingPacket")
-    return cell
+    try:
+        content_hash = cell.content_hash
+    except AttributeError as error:
+        raise LaunchValidationError("source must be a MaterializedCell or TrainingPacket") from error
+    if type(content_hash) is not str:
+        raise LaunchValidationError("source content_hash must be an exact str")
+    return cell, content_hash
 
 
-def execution_topology_facts(topology: ExecutionTopology | Mapping[str, Any]) -> dict[str, Any]:
-    """Serialize typed launcher facts into the manifest topology boundary."""
+def execution_topology_facts(topology: object) -> dict[str, Any]:
+    """Serialize launcher facts into the manifest topology boundary."""
 
-    if isinstance(topology, ExecutionTopology):
-        identity = topology.device_identity
-        return {
-            "global_rank": topology.global_rank,
-            "global_size": topology.global_size,
-            "local_rank": topology.local_rank,
-            "local_size": topology.local_size,
-            "node_rank": topology.node_rank,
-            "node_size": topology.node_size,
-            "host": topology.host,
-            "pid": topology.pid,
-            "device": topology.device,
-            "job_id": topology.job_id,
-            "device_identity": (
-                None
-                if identity is None
-                else {
-                    "kind": identity.kind.value,
-                    "index": identity.index,
-                    "uuid": identity.uuid,
-                }
-            ),
-        }
+    if _has_buffer_capability(topology):
+        raise LaunchValidationError(
+            f"binary buffer refused: {type(topology).__name__}"
+        )
     if isinstance(topology, Mapping):
-        return dict(topology)
-    raise LaunchValidationError("topology must be an ExecutionTopology or mapping")
+        fields = dict(topology)
+    else:
+        try:
+            identity = topology.device_identity  # type: ignore[attr-defined]
+            if _has_buffer_capability(identity):
+                raise LaunchValidationError(
+                    f"binary buffer refused: {type(identity).__name__}"
+                )
+            kind = None if identity is None else identity.kind
+            if _has_buffer_capability(kind):
+                raise LaunchValidationError(
+                    f"binary buffer refused: {type(kind).__name__}"
+                )
+            fields = {
+                "global_rank": topology.global_rank,  # type: ignore[attr-defined]
+                "global_size": topology.global_size,  # type: ignore[attr-defined]
+                "local_rank": topology.local_rank,  # type: ignore[attr-defined]
+                "local_size": topology.local_size,  # type: ignore[attr-defined]
+                "node_rank": topology.node_rank,  # type: ignore[attr-defined]
+                "node_size": topology.node_size,  # type: ignore[attr-defined]
+                "host": topology.host,  # type: ignore[attr-defined]
+                "pid": topology.pid,  # type: ignore[attr-defined]
+                "device": topology.device,  # type: ignore[attr-defined]
+                "job_id": topology.job_id,  # type: ignore[attr-defined]
+                "device_identity": (
+                    None
+                    if identity is None
+                    else {
+                        "kind": getattr(kind, "value", kind),
+                        "index": identity.index,
+                        "uuid": identity.uuid,
+                    }
+                ),
+            }
+        except AttributeError as error:
+            raise LaunchValidationError(
+                "topology must be an execution topology or mapping"
+            ) from error
+    return _detach_topology_facts(fields)
 
 
 def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> None:
@@ -185,7 +230,7 @@ def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> Non
         if not isinstance(key, str):
             # Backstop: L1's materializer refuses non-string identity keys first.
             return False
-        normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+        normalized = re.sub(r"[^a-z0-9]", "", str.lower(key))
         return normalized in _NORMALIZED_DECLARED_EXECUTION_FACT_KEYS
 
     def visit(value: Any, path: str) -> None:
@@ -201,22 +246,28 @@ def _reject_execution_facts_outside_topology(manifest: Mapping[str, Any]) -> Non
                 visit(nested, f"{path}[{index}]")
 
     for key, value in manifest.items():
-        if key != _STAGE_API.TOPOLOGY_KEY:
+        if str.__eq__(key, _STAGE_API.TOPOLOGY_KEY) is not True:
             visit(value, key)
 
 
-def _typed_runner_topology(topology: ExecutionTopology | Mapping[str, Any]) -> ExecutionTopology:
-    """Return the typed topology that the TPEN consumer stores in its context."""
+def _validate_runner_topology_facts(
+    facts: Mapping[str, Any], *, reject_unsupported: bool = True
+) -> None:
+    """Validate the facts accepted by the production runner boundary.
 
-    if isinstance(topology, ExecutionTopology):
-        return topology
-    facts = execution_topology_facts(topology)
-    unsupported = tuple(key for key in facts if key not in _RUNNER_TOPOLOGY_FACT_KEYS)
-    if unsupported:
-        names = ", ".join(repr(key) for key in unsupported)
-        raise LaunchValidationError(
-            "unsupported production runner topology facts: " + names
-        )
+    This mirrors the value invariants of TPEN's topology type without naming
+    that type across the experiment boundary. The production runner performs
+    the authoritative typed normalization; this seam must still reject bad
+    values before any injected runner is called.
+    """
+
+    if reject_unsupported:
+        unsupported = tuple(key for key in facts if key not in _RUNNER_TOPOLOGY_FACT_KEYS)
+        if unsupported:
+            names = ", ".join(repr(key) for key in unsupported)
+            raise LaunchValidationError(
+                "unsupported production runner topology facts: " + names
+            )
     required = (
         "global_rank",
         "global_size",
@@ -233,62 +284,121 @@ def _typed_runner_topology(topology: ExecutionTopology | Mapping[str, Any]) -> E
         raise LaunchValidationError(
             "production runner topology is missing required facts: " + ", ".join(missing)
         )
+
+    for name in ("global_size", "local_size", "node_size"):
+        size = facts[name]
+        if type(size) is not int:
+            raise LaunchValidationError(
+                f"{name} must be an int, got {type(size).__name__}"
+            )
+        if size < 1:
+            raise LaunchValidationError(f"{name} must be positive, got {size}")
+    for rank_name, size_name in (
+        ("global_rank", "global_size"),
+        ("local_rank", "local_size"),
+        ("node_rank", "node_size"),
+    ):
+        rank = facts[rank_name]
+        size = facts[size_name]
+        if rank is not None and type(rank) is not int:
+            raise LaunchValidationError(
+                f"{rank_name} must be an int or None, got {type(rank).__name__}"
+            )
+        if rank is not None and not 0 <= rank < size:
+            raise LaunchValidationError(f"{rank_name} must be in [0, {size})")
+    if not facts["host"]:
+        raise LaunchValidationError("host must be nonempty")
+    try:
+        if facts["pid"] < 1:
+            raise LaunchValidationError("pid must be positive")
+    except TypeError as error:
+        raise LaunchValidationError(
+            f"pid must be an int, got {type(facts['pid']).__name__}"
+        ) from error
+    if not facts["device"]:
+        raise LaunchValidationError("device must be nonempty")
+
     identity_value = facts.get("device_identity")
-    if identity_value is None or isinstance(identity_value, AcceleratorIdentity):
-        identity = identity_value
-    elif isinstance(identity_value, Mapping):
+    if identity_value is None:
+        return
+    if isinstance(identity_value, Mapping):
         unsupported_identity = set(identity_value) - {"kind", "index", "uuid"}
-        if unsupported_identity:
+        if reject_unsupported and unsupported_identity:
             names = ", ".join(repr(key) for key in sorted(unsupported_identity, key=str))
             raise LaunchValidationError(
                 "unsupported topology.device_identity keys: " + names
             )
         try:
-            identity = AcceleratorIdentity(
-                kind=AcceleratorKind(str(identity_value["kind"])),
-                index=identity_value.get("index"),
-                uuid=identity_value.get("uuid"),
-            )
+            kind = identity_value["kind"]
+            if kind not in {"cpu", "cuda", "rocm", "other"}:
+                raise ValueError(kind)
+            return
         except (KeyError, TypeError, ValueError) as error:
             raise LaunchValidationError("topology.device_identity is malformed") from error
-    else:
-        raise LaunchValidationError("topology.device_identity must be a mapping or null")
-    try:
-        return ExecutionTopology(
-            global_rank=facts["global_rank"],
-            global_size=facts["global_size"],
-            local_rank=facts["local_rank"],
-            local_size=facts["local_size"],
-            node_rank=facts["node_rank"],
-            node_size=facts["node_size"],
-            host=facts["host"],
-            pid=facts["pid"],
-            device=facts["device"],
-            job_id=facts.get("job_id"),
-            device_identity=identity,
-        )
-    except (TypeError, ValueError) as error:
-        raise LaunchValidationError(f"invalid production runner topology: {error}") from error
+    raise LaunchValidationError("topology.device_identity must be a mapping or null")
+
+
+def _detach_topology_facts(value: Any) -> Any:
+    """Recursively materialize the closed topology-facts value schema."""
+
+    if value is None or any(
+        type(value) is scalar for scalar in (str, int, float, bool)
+    ):
+        return value
+    if _has_buffer_capability(value):
+        raise LaunchValidationError(f"binary buffer refused: {type(value).__name__}")
+    if isinstance(value, Mapping):
+        copied: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise LaunchValidationError("topology fact mapping keys must be exact str")
+            copied[key] = _detach_topology_facts(item)
+        return copied
+    if isinstance(value, Sequence) and not isinstance(value, str):
+        return [_detach_topology_facts(item) for item in value]
+    raise LaunchValidationError(
+        f"unsupported topology fact value type: {type(value).__name__}"
+    )
 
 
 def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any:
     """Bind non-empty launch facts to a source row's designated subtree."""
 
-    cell = _source_cell(source)
+    topology = _detach_topology_facts(topology)
+    cell, source_hash = _source_cell(source)
+    owned_source = _OwnedLaunchCell(
+        manifest=_STAGE_API._freeze(_detach_topology_facts(cell.manifest)),
+        content_hash=source_hash,
+        output_path=Path(cell.output_path),
+        seed_streams=_detach_topology_facts(cell.seed_streams),
+    )
     try:
-        _STAGE_API.validate_materialized_manifest(cell.manifest)
+        _STAGE_API.validate_materialized_manifest(owned_source.manifest)
     except Exception as error:
         raise LaunchValidationError("source manifest is not a valid HI train row") from error
-    _reject_execution_facts_outside_topology(cell.manifest)
     try:
-        return _STAGE_API.with_execution_topology(cell, topology)
+        bound = _STAGE_API.with_execution_topology(owned_source, topology)
+        # The stage API preserves the caller's concrete cell type.  Capture its
+        # frozen result once, then hand only this module-owned carrier onward so
+        # later consumers cannot obtain a fresh caller-controlled manifest read.
+        bound_hash = bound.content_hash
+        if type(bound_hash) is not str:
+            raise LaunchValidationError("bound content_hash must be an exact str")
+        owned = _OwnedLaunchCell(
+            manifest=_STAGE_API._freeze(_detach_topology_facts(bound.manifest)),
+            content_hash=bound_hash,
+            output_path=Path(bound.output_path),
+            seed_streams=_detach_topology_facts(bound.seed_streams),
+        )
+        _reject_execution_facts_outside_topology(owned.manifest)
+        return owned
     except Exception as error:
         raise LaunchValidationError(str(error)) from error
 
 
 def prepare_train_launch(
     source: Any,
-    topology: ExecutionTopology | Mapping[str, Any] | None = None,
+    topology: object | None = None,
 ) -> LaunchPlan:
     """Populate topology and resolve one source row through L1."""
 
@@ -298,47 +408,53 @@ def prepare_train_launch(
     return LaunchPlan(cell=cell, config=config, topology=cell.manifest[_STAGE_API.TOPOLOGY_KEY])
 
 
-def _exit_code(result: int | RunResult) -> int:
-    """Normalize production and injected runner results to a process code."""
+def _exit_code(result: object) -> int:
+    """Require runners to return an integer process code."""
 
-    if isinstance(result, RunResult):
-        return 1 if result.status == "failed" else 0
     if type(result) is not int:
-        raise LaunchValidationError("runner must return an int or RunResult")
+        raise LaunchValidationError("runner must return an int")
     return result
 
 
 def launch_train(
     source: Any,
-    topology: ExecutionTopology | Mapping[str, Any] | None = None,
+    topology: object | None = None,
     *,
-    runner: Callable[..., int | RunResult] = run_from_config,
+    runner: Callable[..., object] = run_from_config,
 ) -> int:
     """Resolve one topology-bound row and execute TPEN's production runner.
 
-    Custom runners receive topology when their signature can accept a
-    ``topology`` keyword or arbitrary keyword arguments; plain config-only
-    doubles retain the existing config-only call. This closes the named
+    Custom runners receive the canonical execution-facts mapping when their
+    signature can accept a ``topology`` keyword or arbitrary keyword
+    arguments; plain config-only doubles retain the existing config-only call.
+    The mapping is the declared experiment-side contract because the typed
+    TPEN topology is owned behind this boundary. This closes the named
     capability-blind identity-dispatch mechanism, not every way a callable
     could ignore or mishandle a topology it accepts.
     """
 
-    plan = prepare_train_launch(source, topology)
+    facts = execution_topology_facts(topology) if topology is not None else {}
+    plan = prepare_train_launch(source, facts)
+    if topology is not None:
+        # Topology is caller-open, so config-only runners retain extra facts.
+        # Strict key rejection remains below when the mapping crosses into TPEN.
+        _validate_runner_topology_facts(facts, reject_unsupported=False)
     if runner is run_from_config:
         if topology is None:
             # Backstop: L1's empty-mapping refusal is reached first.
             raise LaunchValidationError("launch topology is required")
-        runtime_topology = _typed_runner_topology(topology)
-        return _exit_code(runner(plan.config, topology=runtime_topology))
+        _validate_runner_topology_facts(facts)
+        return _exit_code(runner(plan.config, topology=facts))
     if topology is not None:
         parameters = inspect.signature(runner).parameters.values()
         accepts_topology = any(
-            parameter.name == "topology" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            str.__eq__(parameter.name, "topology") is True
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in parameters
         )
         if accepts_topology:
-            runtime_topology = _typed_runner_topology(topology)
-            return _exit_code(runner(plan.config, topology=runtime_topology))
+            _validate_runner_topology_facts(facts)
+            return _exit_code(runner(plan.config, topology=facts))
     return _exit_code(runner(plan.config))
 
 
