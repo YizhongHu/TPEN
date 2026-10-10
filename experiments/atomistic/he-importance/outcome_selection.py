@@ -10,21 +10,54 @@ import importlib.util
 import json
 from math import isfinite
 from pathlib import Path
+import sys
 from typing import Any, Mapping, Sequence
 
 try:
     from content_traversal import CRITERIA_DECLARATION, ContentRefusal, ContentTraversalError, freeze_content, project_content
 except ModuleNotFoundError:  # Direct experiment-file execution has no package initializer.
-    spec = importlib.util.spec_from_file_location("he_importance_content_traversal", Path(__file__).with_name("content_traversal.py"))
-    if spec is None or spec.loader is None:
-        raise
-    content_traversal = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(content_traversal)
-    CRITERIA_DECLARATION = content_traversal.CRITERIA_DECLARATION
-    ContentRefusal = content_traversal.ContentRefusal
-    ContentTraversalError = content_traversal.ContentTraversalError
-    freeze_content = content_traversal.freeze_content
-    project_content = content_traversal.project_content
+    content_path = Path(__file__).with_name("content_traversal.py").resolve()
+    # Registered under this explicitly unique key, never the bare "content_traversal":
+    # a bare key is a slot shared with every other study, which is what makes
+    # resolution order-dependent.  tests/unit/experiments/test_study_module_identity.py
+    # pins that rule, and reads this registration statically -- so the key stays a
+    # literal here rather than a variable that also holds the bare name below.
+    content_traversal = None
+    for candidate_name in ("he_importance_content_traversal", "content_traversal"):
+        candidate = sys.modules.get(candidate_name)
+        candidate_path = getattr(candidate, "__file__", None)
+        if candidate is not None and candidate_path is not None:
+            try:
+                same_file = Path(candidate_path).resolve() == content_path
+            except (OSError, RuntimeError, TypeError):
+                same_file = False
+            if same_file:
+                content_traversal = candidate
+                break
+    if content_traversal is not None:
+        CRITERIA_DECLARATION = content_traversal.CRITERIA_DECLARATION
+        ContentRefusal = content_traversal.ContentRefusal
+        ContentTraversalError = content_traversal.ContentTraversalError
+        freeze_content = content_traversal.freeze_content
+        project_content = content_traversal.project_content
+    else:
+        spec = importlib.util.spec_from_file_location(
+            "he_importance_content_traversal", content_path
+        )
+        if spec is None or spec.loader is None:
+            raise
+        content_traversal = importlib.util.module_from_spec(spec)
+        sys.modules["he_importance_content_traversal"] = content_traversal
+        try:
+            spec.loader.exec_module(content_traversal)
+        except BaseException:
+            sys.modules.pop("he_importance_content_traversal", None)
+            raise
+        CRITERIA_DECLARATION = content_traversal.CRITERIA_DECLARATION
+        ContentRefusal = content_traversal.ContentRefusal
+        ContentTraversalError = content_traversal.ContentTraversalError
+        freeze_content = content_traversal.freeze_content
+        project_content = content_traversal.project_content
 
 
 class OutcomeRefusal(str, Enum):

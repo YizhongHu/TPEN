@@ -141,11 +141,17 @@ include = ["tpen*"]
 # giving two answers depending on invocation is how a green run comes to mean
 # nothing.
 pythonpath = ["."]
+# This EXTENDS (does not replace) the ``pythonpath = ["."]`` setting above:
+# ``experiments`` is a namespace package by design, so test module names must
+# be resolved THROUGH that namespace from the repository root.  Without this,
+# test files in directories without ``__init__.py`` can collide as bare names.
+consider_namespace_packages = true
 markers = [
   "integration: end-to-end tests that exercise entrypoints, configs, or generated artifacts",
 ]
 addopts = "--typeguard-packages=tpen"
 norecursedirs = [
+  ".*",  # Restore pytest's hidden-directory pruning family dropped by this custom list.
   ".agent-scratch",
   ".agent-worktrees",
   "experiments/hooke/pair_validation",
