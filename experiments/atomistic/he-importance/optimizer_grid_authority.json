@@ -6,7 +6,8 @@
   "notes": [
     "Section 2.7 states a bound C as ||Delta theta||_2^2 <= C (squared Euclidean update-norm bound), not ||Delta theta||_2 <= C. The earlier 'step cap' phrasing is called underspecified and is not used here. This applies to every 'squared_update_norm_bound' level below, for SR and SPRING.",
     "Section 2.7's 120-cell total (112 VMC-specialized cells, eight Adam cells) replaces the old 128-cell menu by removing RAdam.",
-    "Family names below spell HI_METHOD_ROSTER's method vocabulary exactly: adam, sr, kfac, spring, linear_method."
+    "Family names below spell HI_METHOD_ROSTER's method vocabulary exactly: adam, sr, kfac, spring, linear_method.",
+    "Adam's fixed 'parameter_groups': 1 and 'schedule': 'constant' are stated literally in section 2.3 ('one group, constant schedule') and are reinforced by section 2.7's 'no schedules or parameter-group policies are crossed'. They are transcribed, not invented."
   ],
   "families": [
     {
@@ -18,7 +19,9 @@
       "fixed": {
         "beta1": 0.9,
         "epsilon": 1e-8,
-        "weight_decay": 0.0
+        "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant"
       },
       "declared_cells": 8
     },

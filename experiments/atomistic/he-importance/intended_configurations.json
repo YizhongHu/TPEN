@@ -7,6 +7,8 @@
         "beta1": 0.9,
         "epsilon": 1e-08,
         "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
         "lr": 0.0005,
         "beta2": 0.99
       }
@@ -27,6 +29,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.0005,
               "beta2": 0.99
             }
@@ -54,6 +58,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.0005,
               "beta2": 0.99
             }
@@ -74,6 +80,8 @@
         "beta1": 0.9,
         "epsilon": 1e-08,
         "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
         "lr": 0.0005,
         "beta2": 0.999
       }
@@ -94,6 +102,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.0005,
               "beta2": 0.999
             }
@@ -121,6 +131,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.0005,
               "beta2": 0.999
             }
@@ -141,6 +153,8 @@
         "beta1": 0.9,
         "epsilon": 1e-08,
         "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
         "lr": 0.0015,
         "beta2": 0.99
       }
@@ -161,6 +175,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.0015,
               "beta2": 0.99
             }
@@ -188,6 +204,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.0015,
               "beta2": 0.99
             }
@@ -208,6 +226,8 @@
         "beta1": 0.9,
         "epsilon": 1e-08,
         "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
         "lr": 0.0015,
         "beta2": 0.999
       }
@@ -228,6 +248,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.0015,
               "beta2": 0.999
             }
@@ -255,6 +277,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.0015,
               "beta2": 0.999
             }
@@ -275,6 +299,8 @@
         "beta1": 0.9,
         "epsilon": 1e-08,
         "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
         "lr": 0.005,
         "beta2": 0.99
       }
@@ -295,6 +321,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.005,
               "beta2": 0.99
             }
@@ -322,6 +350,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.005,
               "beta2": 0.99
             }
@@ -342,6 +372,8 @@
         "beta1": 0.9,
         "epsilon": 1e-08,
         "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
         "lr": 0.005,
         "beta2": 0.999
       }
@@ -362,6 +394,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.005,
               "beta2": 0.999
             }
@@ -389,6 +423,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.005,
               "beta2": 0.999
             }
@@ -409,6 +445,8 @@
         "beta1": 0.9,
         "epsilon": 1e-08,
         "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
         "lr": 0.015,
         "beta2": 0.99
       }
@@ -429,6 +467,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.015,
               "beta2": 0.99
             }
@@ -456,6 +496,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.015,
               "beta2": 0.99
             }
@@ -476,6 +518,8 @@
         "beta1": 0.9,
         "epsilon": 1e-08,
         "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
         "lr": 0.015,
         "beta2": 0.999
       }
@@ -496,6 +540,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.015,
               "beta2": 0.999
             }
@@ -523,6 +569,8 @@
               "beta1": 0.9,
               "epsilon": 1e-08,
               "weight_decay": 0.0,
+              "parameter_groups": 1,
+              "schedule": "constant",
               "lr": 0.015,
               "beta2": 0.999
             }

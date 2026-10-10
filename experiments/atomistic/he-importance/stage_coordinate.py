@@ -717,7 +717,11 @@ def intended_configurations() -> tuple[Mapping[str, Any], ...]:
     carries no availability ``status`` and no ``reason``: enumeration is a
     declared-universe fact, and runnability is a separate, build-time
     judgement supplied by the caller of
-    :func:`materialize_intended_configurations`.
+    :func:`materialize_intended_configurations`. Each configuration's
+    ``scientific_identity.optimizer`` must repeat the entry-level
+    ``optimizer`` exactly, so a hand-edited file cannot drift the two apart;
+    the generator always writes both from the same source, but this loader
+    also accepts a file that was never regenerated.
     """
 
     raw = json.loads(_INTENDED_CONFIGURATIONS_PATH.read_text(encoding="utf-8"))
@@ -735,6 +739,14 @@ def intended_configurations() -> tuple[Mapping[str, Any], ...]:
             raise MaterializationError("intended optimizer method must be a non-empty string")
         if not isinstance(optimizer_data["levels"], Mapping):
             raise MaterializationError("intended optimizer levels must be a mapping")
+        for configuration in entry["configurations"]:
+            if not isinstance(configuration, Mapping) or "scientific_identity" not in configuration:
+                raise MaterializationError("intended configuration is missing scientific_identity")
+            identity = configuration["scientific_identity"]
+            if not isinstance(identity, Mapping) or "optimizer" not in identity:
+                raise MaterializationError("scientific_identity is missing optimizer")
+            if identity["optimizer"] != optimizer_data:
+                raise MaterializationError("entry optimizer and scientific_identity optimizer must be identical")
     return tuple(raw)
 
 

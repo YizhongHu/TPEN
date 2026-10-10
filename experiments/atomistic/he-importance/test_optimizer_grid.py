@@ -9,6 +9,7 @@ without ever changing which cells are declared.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import itertools
 import json
@@ -147,6 +148,49 @@ def test_all_cell_ids_and_lexical_ids_are_distinct() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Contract clause 5: the inventory report is roster-derived, not hard-coded
+# ---------------------------------------------------------------------------
+
+
+def test_stage_q_report_is_derived_from_the_injected_roster() -> None:
+    reason = "a passing fail-closed kfac-pytorch compatibility gate; a failing gate leaves KFAC unavailable"
+    roster_adam_only = _fake_roster(
+        admitted={"adam": True, "sr": False, "kfac": False, "spring": False, "linear_method": False},
+        requires={"kfac": reason},
+    )
+    report = optimizer_grid.stage_q_report(roster=roster_adam_only)
+
+    assert report["stage"] == "Q"
+    assert report["declared"] == 120
+    assert report["runnable"] == 8
+    assert report["unavailable"] == 112
+    assert report["families"]["adam"] == {"declared": 8, "runnable": 8, "unavailable": 0, "reason": None}
+    assert report["families"]["kfac"] == {"declared": 32, "runnable": 0, "unavailable": 32, "reason": reason}
+    assert report["families"]["sr"]["declared"] == 32
+    assert report["families"]["sr"]["unavailable"] == 32
+    assert report["families"]["sr"]["runnable"] == 0
+    assert report["families"]["spring"]["declared"] == 32
+    assert report["families"]["spring"]["unavailable"] == 32
+    assert report["families"]["spring"]["runnable"] == 0
+    assert report["families"]["linear_method"]["declared"] == 16
+    assert report["families"]["linear_method"]["unavailable"] == 16
+    assert report["families"]["linear_method"]["runnable"] == 0
+    assert set(report["excluded_stages"]) == {"O1", "R", "F"}
+
+    # A second roster, admitting one more family: clause 5 forbids a
+    # hard-coded runnable count, so the totals must move with the roster.
+    roster_adam_and_sr = _fake_roster(
+        admitted={"adam": True, "sr": True, "kfac": False, "spring": False, "linear_method": False}
+    )
+    report_two = optimizer_grid.stage_q_report(roster=roster_adam_and_sr)
+    assert report_two["declared"] == 120
+    assert report_two["runnable"] == 40
+    assert report_two["unavailable"] == 80
+    assert report_two["families"]["sr"]["runnable"] == 32
+    assert report_two["families"]["sr"]["unavailable"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Zero unintended duplicate resolved scientific identities
 # ---------------------------------------------------------------------------
 
@@ -167,6 +211,38 @@ def test_materialized_q_inventory_has_no_unintended_duplicate_identities(tmp_pat
     for signature in signatures:
         counts[signature] = counts.get(signature, 0) + 1
     assert set(counts.values()) == {2}
+
+
+def test_duplicate_identity_detector_fires_on_a_cross_entry_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Negative control for the exactly-twice invariant above.
+
+    ``materialize_stage`` only dedups within one call, so it cannot catch two
+    distinct inventory entries that happen to resolve to the same cell. This
+    proves the signature-count check above actually fires on that failure
+    mode rather than passing only because nothing in the committed inventory
+    ever hits it.
+    """
+
+    entries = json.loads(Path(__file__).with_name("intended_configurations.json").read_text(encoding="utf-8"))
+    assert len(entries) == 120
+    entries[1] = copy.deepcopy(entries[0])
+    broken_path = tmp_path / "intended_configurations.json"
+    broken_path.write_text(json.dumps(entries), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", broken_path)
+
+    availability = optimizer_grid.roster_availability(_all_available_roster())
+    cells = stage_coordinate.materialize_intended_configurations(tmp_path, availability=availability)
+    assert len(cells) == 480
+
+    signatures = [_declared_signature(cell) for cell in cells]
+    assert len(set(signatures)) == 238
+
+    counts: dict[str, int] = {}
+    for signature in signatures:
+        counts[signature] = counts.get(signature, 0) + 1
+    assert sorted(set(counts.values())) == [2, 4]
 
 
 # ---------------------------------------------------------------------------

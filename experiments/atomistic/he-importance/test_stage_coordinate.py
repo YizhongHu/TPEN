@@ -603,6 +603,48 @@ def test_committed_intended_configuration_inventory_materializes_completely(tmp_
     assert {cell.manifest["stage"] for cell in cells} == {entry["stage"] for entry in inventory}
 
 
+def test_intended_configurations_loader_rejects_a_smuggled_status_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed entry's ``optimizer`` must declare exactly method and levels.
+
+    Availability status is a separate, build-time judgement
+    (``optimizer_grid.roster_availability``); it must never be smuggled into
+    the committed inventory itself, which would let a declared cell's
+    identity silently carry a roster-dependent fact.
+    """
+
+    entries = json.loads(Path(__file__).with_name("intended_configurations.json").read_text())
+    entries[0]["optimizer"]["status"] = "available"
+    broken_path = tmp_path / "intended_configurations.json"
+    broken_path.write_text(json.dumps(entries), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", broken_path)
+    with pytest.raises(stage_coordinate.MaterializationError, match="exactly method and levels"):
+        stage_coordinate.intended_configurations()
+
+
+def test_intended_configurations_loader_rejects_a_configuration_optimizer_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each configuration's ``scientific_identity.optimizer`` must mirror the entry-level ``optimizer`` exactly.
+
+    The generator always writes both from the same source, so generated
+    output cannot drift; this loader also accepts a hand-edited file that was
+    never regenerated, so the two copies can otherwise fall out of step
+    silently.
+    """
+
+    entries = json.loads(Path(__file__).with_name("intended_configurations.json").read_text())
+    entries[0]["configurations"][0]["scientific_identity"]["optimizer"]["levels"]["lr"] = -1.0
+    broken_path = tmp_path / "intended_configurations.json"
+    broken_path.write_text(json.dumps(entries), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", broken_path)
+    with pytest.raises(
+        stage_coordinate.MaterializationError, match="entry optimizer and scientific_identity optimizer must be identical"
+    ):
+        stage_coordinate.intended_configurations()
+
+
 def test_real_hi_namespace_family_exposes_the_materialization_api() -> None:
     from tpen.hi.train import v1
 
