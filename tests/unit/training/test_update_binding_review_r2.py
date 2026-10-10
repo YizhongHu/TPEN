@@ -22,14 +22,16 @@ R2-1  The writer's open question at this head is mutant M-E: reverting the
       object.
 
       This probe asserts the PRE-524 contract -- the runner-built optimizer is
-      the one that reaches `fit`. The reviewer measured it GREEN at the base
-      and RED at the head, which is what demonstrated that the duck-typed
-      contract had changed.
+      the one that reaches `fit`. That is what made it discriminating while
+      R2-1 was open; the measurement that settled R2-1 lives in the record,
+      not in this header.
 
-      ADOPTED AND NOW GREEN AT BOTH. The writer accepted R2-1 and removed the
-      carrier alias outright rather than guarding it further, so this probe
-      stops being a red demonstration and becomes the permanent pin against
-      the alias being reintroduced -- unmodified except for this paragraph.
+      ADOPTED. The writer accepted R2-1 and removed the carrier alias outright
+      rather than guarding it further, so this probe is no longer a red
+      demonstration but the permanent pin against the alias being
+      reintroduced. The probe BODY has been strengthened since it was written
+      -- the capture records every build rather than only the last -- so do
+      not read the code below as the form any earlier round measured.
 
 R2-2  Control for "checkpoint/resume contracts are preserved": a STATELESS
       custom method (``update_state()`` is the base-class ``None``) still
