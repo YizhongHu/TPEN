@@ -37,6 +37,44 @@ from tests.helpers.hooke_models import build_tiny_spenn
 LEARNING_RATE = 0.01
 
 
+class _CarrierSwappingMethod(VMCUpdateMethod[AutogradUpdateInput]):
+    """A method that accepts the rebind correctly, then swaps its carrier.
+
+    This is the shape the post-rebind ownership check exists for: everything
+    about the parameter binding is honoured, so the parameter guard below it
+    cannot fire, and only the optimizer-identity check can refuse. ``swap``
+    is what makes one class serve as both the witness and its own control.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        binding: ModelParameterBinding,
+        *,
+        swap: bool,
+    ) -> None:
+        self._optimizer = optimizer
+        self._binding = binding
+        self._swap = swap
+        self.rebind_calls = 0
+
+    def update(self, update_input: AutogradUpdateInput) -> VMCUpdateResult:
+        return VMCUpdateResult(applied=False, grad_norm=0.0, reason="declined_for_test")
+
+    def update_state(self) -> VMCUpdateState:
+        return VMCUpdateState(optimizer=self._optimizer, model_parameters=self._binding)
+
+    def rebind_model_parameters(self, model_parameters: ModelParameterBinding) -> None:
+        self.rebind_calls += 1
+        self._binding = model_parameters
+        if self._swap:
+            # A DIFFERENT Adam over the SAME live parameters: the run would
+            # publish one carrier and mutate another.
+            self._optimizer = torch.optim.Adam(
+                [p for p in model_parameters.parameters], lr=LEARNING_RATE
+            )
+
+
 class _ForeignBindingMethod(VMCUpdateMethod[AutogradUpdateInput]):
     """A stateful method whose reported binding is not the live model's.
 
@@ -133,3 +171,60 @@ def test_rebuild_refuses_a_method_that_ignores_the_rebuilt_binding() -> None:
     assert method.rebind_calls == 1, (
         "the guard must fire because the rebind was DROPPED, not because it was never attempted"
     )
+
+
+def test_rebuild_refuses_a_method_that_swaps_its_carrier_during_rebind() -> None:
+    """`rebuild_update_state`'s ownership check refuses a post-rebind swap.
+
+    The method honours the parameter rebind exactly, so the parameter guard
+    beneath this one cannot be what refuses: the only disagreement left is the
+    optimizer identity. A run that accepted this would publish one carrier and
+    mutate another across a resume.
+    """
+
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
+
+    method = _CarrierSwappingMethod(optimizer, binding, swap=True)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
+    trainer.resolve_update_state(model=model, optimizer=optimizer)
+
+    torch.manual_seed(123)
+    reloaded_model = build_tiny_spenn()
+
+    with pytest.raises(ValueError, match="mismatched legacy optimizer ownership"):
+        trainer.rebuild_update_state(model=reloaded_model)
+
+    assert method.rebind_calls == 1, (
+        "the guard must fire on a SWAP, not because the rebind was never attempted"
+    )
+    assert method._optimizer is not optimizer, (
+        "the fixture did not actually swap the carrier, so the refusal proves nothing"
+    )
+
+
+def test_rebuild_accepts_a_method_that_retains_its_carrier_through_rebind() -> None:
+    """Control for the test above: retaining the carrier is NOT refused.
+
+    Without this, the swap test would be satisfied by a trainer that refuses
+    every rebuild, which would pin nothing about carrier identity.
+    """
+
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
+
+    method = _CarrierSwappingMethod(optimizer, binding, swap=False)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
+    trainer.resolve_update_state(model=model, optimizer=optimizer)
+
+    torch.manual_seed(123)
+    reloaded_model = build_tiny_spenn()
+
+    rebuilt = trainer.rebuild_update_state(model=reloaded_model)
+
+    assert rebuilt.optimizer is optimizer
+    assert method.rebind_calls == 1
