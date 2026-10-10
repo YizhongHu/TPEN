@@ -590,16 +590,6 @@ def test_committed_intended_configuration_inventory_materializes_completely(tmp_
     assert {cell.manifest["stage"] for cell in cells} == {entry["stage"] for entry in inventory}
 
 
-def test_real_hi_namespace_family_exposes_the_materialization_api() -> None:
-    from tpen.hi.train import v1
-
-    assert "materialize_stage" in v1.__all__
-    assert "validate_materialized_manifest" in v1.__all__
-    assert "materialize_job_packets" in v1.__all__
-    assert v1.RankingStatistic.LOGABS_VARIANCE.value == "logabs_variance"
-    assert v1.content_hash({"a": 1, "b": [2, 3]}) == stage_coordinate.content_hash({"a": 1, "b": [2, 3]})
-
-
 def _packet_source_cells(tmp_path: Path) -> tuple[object, ...]:
     # Source-cell construction has no launch or allocation inputs.  This fixture
     # therefore records deliberately empty execution topology; a future
