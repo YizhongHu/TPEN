@@ -3,9 +3,13 @@
 The reviewer MEASURED this gap rather than inferring it. Its M4 mutant hands
 `restore_checkpoint_with_events` a FRESH factory build while `fit` keeps the
 run's real carrier -- precisely the lifecycle class this slice exists to
-remove, state restored into an object the loop never uses -- and **every test
-in `tests/unit` passed under it**, while a runtime witness proved the mutated
-path had executed. The property was not unprotected in the repository; it was
+remove, state restored into an object the loop never uses -- and **no test in
+`tests/unit` detected the PAYLOAD**, while a runtime witness proved the mutated
+path had executed. (Round 4's M4-full arm did measure `failures=1`: its own
+witness instrument, an `open(..., "a")` probe, tripped the durable-append
+census. Round 4 carried that qualifier and an earlier version of this
+docstring dropped it, saying "every test passed" -- corrected in round 5,
+R5-2.) The property was not unprotected in the repository; it was
 unprotected in the suite that every verification receipt in this PR actually
 runs. `tests/integration/` would have caught it and no receipt here runs that
 tree, the writer's own included.

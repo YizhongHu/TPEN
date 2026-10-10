@@ -282,8 +282,7 @@ def test_an_explicit_none_late_selector_rereads_the_constructor_spec() -> None:
     ``None`` and nothing conflicts. A trainer configured with one method and
     bound from an explicit override RAISES on the same call; that is pinned by
     the adopted round-1 R1-2 probe in
-    `tests/unit/training/test_update_binding_review_r1.py`
-    in the adopted round-1 probes.
+    `tests/unit/training/test_update_binding_review_r1.py`.
     """
 
     model, optimizer, trainer = _fresh_run()

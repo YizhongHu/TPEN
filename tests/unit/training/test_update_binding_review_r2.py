@@ -187,9 +187,14 @@ def test_r2_1_a_foreign_resolve_return_with_a_carrier_keeps_the_runner_optimizer
             return None
 
     def build_adam(params):
-        # Every build, not the last: see R3-2 in the round-3 probe file. A
-        # single-slot capture is satisfied by a SECOND build comparing against
-        # itself, so it cannot see a runner that builds twice.
+        # Every build, not the last. The single-slot-capture blindness is
+        # recorded in the round-3 probe file's module docstring; pointing at
+        # it BY CONTENT rather than by label is deliberate (round 5, R5-3) --
+        # the label "R3-2" never appears in that file, and a tree grep for it
+        # lands on an unrelated review lane's identically-numbered finding in
+        # `test_update_observations.py`. A single-slot capture is satisfied by
+        # a SECOND build comparing against itself, so it cannot see a runner
+        # that builds twice.
         builds.append(torch.optim.Adam(params, lr=LEARNING_RATE))
         return builds[-1]
 
