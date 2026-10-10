@@ -389,6 +389,16 @@ class VMCTrainer:
         rebuilt_state = update_method.update_state()
         if rebuilt_state is None:
             raise TypeError("stateful update method returned no update state after rebind")
+        # Admission is NOMINAL on this path too. `_resolve_method_state`
+        # refuses a merely structurally-compatible object at the fit boundary;
+        # without the same check here, a method could return a real
+        # VMCUpdateState at resolve and an ordinary object carrying the same
+        # two attributes after rebind. The identity and binding checks below
+        # would both pass on it, and the run would retain it as its authority
+        # -- state restored into an object the loop does not step, which is
+        # the lifecycle class this boundary exists to refuse.
+        if not isinstance(rebuilt_state, VMCUpdateState):
+            raise TypeError("VMCUpdateMethod.update_state must return VMCUpdateState or None")
         if rebuilt_state.optimizer is not update_state.optimizer:
             raise ValueError("mismatched legacy optimizer ownership")
         if not rebuilt_state.model_parameters.compare(rebuilt_binding)[0]:

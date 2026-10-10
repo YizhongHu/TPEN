@@ -338,3 +338,83 @@ def test_resolve_accepts_the_same_state_when_it_is_nominally_correct() -> None:
         resolved = trainer.resolve_update_state(model=model, optimizer=optimizer)
 
     assert resolved.optimizer is optimizer
+
+
+def test_rebuild_refuses_when_the_method_is_bound_but_no_state_was_resolved() -> None:
+    """The precondition is a DISJUNCTION, and this is its other arm.
+
+    `bind_update_method` alone leaves the method bound and the state unresolved.
+    A test that only ever reaches this guard with BOTH halves absent pins one
+    disjunct: weakening the `or` to an `and` still refuses the both-absent case
+    and silently admits this one. That weakening was measured surviving every
+    committed test before this one existed.
+    """
+
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1)
+
+    trainer.bind_update_method(model=model, optimizer=optimizer)
+
+    with pytest.raises(
+        RuntimeError, match="update state must be resolved before it can be rebuilt"
+    ):
+        trainer.rebuild_update_state(model=model)
+
+
+class _NominalThenStructuralMethod(VMCUpdateMethod[AutogradUpdateInput]):
+    """Nominal at resolve, structurally-compatible after rebind.
+
+    The substitute carries the SAME optimizer object and the rebuilt binding,
+    so the identity and comparison checks below the admission check both pass
+    on it. Only a nominal check can refuse it, which is what makes this a pin
+    on that line.
+    """
+
+    def __init__(self, optimizer: torch.optim.Optimizer, binding: ModelParameterBinding) -> None:
+        self._optimizer = optimizer
+        self._binding = binding
+        self._rebound = False
+
+    def update(self, update_input: AutogradUpdateInput) -> VMCUpdateResult:
+        return VMCUpdateResult(applied=False, grad_norm=0.0, reason="declined_for_test")
+
+    def update_state(self):
+        if self._rebound:
+            return SimpleNamespace(optimizer=self._optimizer, model_parameters=self._binding)
+        return VMCUpdateState(optimizer=self._optimizer, model_parameters=self._binding)
+
+    def rebind_model_parameters(self, model_parameters: ModelParameterBinding) -> None:
+        self._binding = model_parameters
+        self._rebound = True
+
+
+def test_rebuild_refuses_a_structurally_compatible_state_after_rebind() -> None:
+    """Nominal admission is enforced on the RESTORE path, not only on fit.
+
+    Resolve refuses a non-VMCUpdateState; without the same refusal here the
+    two boundaries disagree, and a method that is nominal at resolve and
+    structural after rebind has its substitute retained as the run's authority.
+    Typeguard is suppressed for the same reason as the resolve-path pair: the
+    suite instruments `tpen`, so without this the harness would answer instead
+    of the production check and the test would pass with the guard deleted.
+    """
+
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
+
+    method = _NominalThenStructuralMethod(optimizer, binding)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
+
+    with typeguard.suppress_type_checks():
+        trainer.resolve_update_state(model=model, optimizer=optimizer)
+
+        torch.manual_seed(123)
+        reloaded_model = build_tiny_spenn()
+        with pytest.raises(
+            TypeError, match="update_state must return VMCUpdateState or None"
+        ):
+            trainer.rebuild_update_state(model=reloaded_model)
