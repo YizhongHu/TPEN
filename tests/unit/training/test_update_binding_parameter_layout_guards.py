@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import typeguard
 
 from tpen.training.trainer import VMCTrainer
 from tpen.training.update import (
@@ -300,10 +301,19 @@ def test_resolve_refuses_a_structurally_compatible_non_update_state() -> None:
     method = _StructuralStateMethod(optimizer, binding, nominal=False)
     trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
 
-    with pytest.raises(
-        TypeError, match="update_state must return VMCUpdateState or None"
-    ):
-        trainer.resolve_update_state(model=model, optimizer=optimizer)
+    # The suite runs with `--typeguard-packages=tpen`, so without this
+    # suppression typeguard intercepts the substitute at the call boundary and
+    # raises before the production check is reached. That would make this test
+    # pass while measuring the TEST HARNESS rather than the guard, and it would
+    # pass identically with the guard deleted -- which is what a first run of
+    # this test actually showed. Suppressing runtime type checking here is what
+    # makes the production refusal the only thing that can answer, which is the
+    # configuration shipped code runs in.
+    with typeguard.suppress_type_checks():
+        with pytest.raises(
+            TypeError, match="update_state must return VMCUpdateState or None"
+        ):
+            trainer.resolve_update_state(model=model, optimizer=optimizer)
 
 
 def test_resolve_accepts_the_same_state_when_it_is_nominally_correct() -> None:
@@ -321,6 +331,10 @@ def test_resolve_accepts_the_same_state_when_it_is_nominally_correct() -> None:
     method = _StructuralStateMethod(optimizer, binding, nominal=True)
     trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
 
-    resolved = trainer.resolve_update_state(model=model, optimizer=optimizer)
+    # Suppressed on the same terms as the refusal test, so the pair differs in
+    # exactly one thing: whether the returned state is nominally a
+    # VMCUpdateState.
+    with typeguard.suppress_type_checks():
+        resolved = trainer.resolve_update_state(model=model, optimizer=optimizer)
 
     assert resolved.optimizer is optimizer
