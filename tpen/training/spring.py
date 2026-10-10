@@ -26,7 +26,7 @@ does not participate in the objective-reevaluation capability seam.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Self
 
 from tpen.dependencies import require_torch
@@ -45,9 +45,14 @@ from tpen.training.sr import SRPolicy
 from tpen.training.update import (
     ModelParameterBinding,
     ScoreUpdateInput,
+    UpdateDiagnostics,
+    UpdateMethodDescription,
     VMCUpdateMethod,
     VMCUpdateResult,
     VMCUpdateState,
+    flatten_settings,
+    json_safe_metric_name,
+    json_safe_scalar,
 )
 from tpen.training.vmc import (
     DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
@@ -106,7 +111,7 @@ class SPRINGPolicy:
 
 
 @dataclass(frozen=True, kw_only=True)
-class SPRINGTelemetry:
+class SPRINGTelemetry(UpdateDiagnostics):
     """Observable record of one SPRING update attempt.
 
     The fields mirror SR's telemetry and add the history norm, decay in force,
@@ -129,21 +134,36 @@ class SPRINGTelemetry:
     diagnostics: SolveDiagnostics | None = None
 
     def as_metrics(self, *, prefix: str = "spring") -> dict[str, Any]:
-        """Return JSON-safe telemetry keys for a training metrics record."""
+        """Return JSON-safe telemetry keys for a training metrics record.
+
+        EVERY FLOAT HERE ROUTES THROUGH `json_safe_scalar`, and that is
+        load-bearing rather than defensive. This method predates the explicit
+        result contract and used a bare ``float()``, which meant a NON-FINITE
+        norm reached ``tpen.logging.jsonl`` -- which calls
+        ``json.dumps(..., allow_nan=False)`` and RAISES.
+
+        This path is the one most likely to produce such a value, not the
+        least: a non-finite direction is an EXPECTED outcome here, with its own
+        skip reason, so the record written to explain the bad step was the
+        record that crashed the run writing it. A finite value passes through
+        unchanged, so no existing record changes meaning.
+        """
+
+        prefix = json_safe_metric_name(prefix)
 
         metrics: dict[str, Any] = {
             f"{prefix}_applied": bool(self.applied),
-            f"{prefix}_reason": self.reason,
+            f"{prefix}_reason": json_safe_scalar(self.reason),
             f"{prefix}_step": int(self.step),
             f"{prefix}_samples": int(self.n_samples),
             f"{prefix}_finite_samples": int(self.n_finite_samples),
             f"{prefix}_parameters": int(self.n_parameters),
-            f"{prefix}_energy_gradient_norm": float(self.energy_gradient_norm),
-            f"{prefix}_update_direction_norm": float(self.update_direction_norm),
-            f"{prefix}_applied_update_norm": float(self.applied_update_norm),
-            f"{prefix}_trust_scale": float(self.trust_scale),
-            f"{prefix}_history_norm": float(self.history_norm),
-            f"{prefix}_history_decay": float(self.history_decay),
+            f"{prefix}_energy_gradient_norm": json_safe_scalar(self.energy_gradient_norm),
+            f"{prefix}_update_direction_norm": json_safe_scalar(self.update_direction_norm),
+            f"{prefix}_applied_update_norm": json_safe_scalar(self.applied_update_norm),
+            f"{prefix}_trust_scale": json_safe_scalar(self.trust_scale),
+            f"{prefix}_history_norm": json_safe_scalar(self.history_norm),
+            f"{prefix}_history_decay": json_safe_scalar(self.history_decay),
             f"{prefix}_history_advanced": bool(self.history_advanced),
         }
         if self.diagnostics is not None:
@@ -211,12 +231,54 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         self.reducer = resolved_reducer
         self.completed_updates = 0
         self.history = self._zero_history()
-        self.last_telemetry: SPRINGTelemetry | None = None
+        # The RESULT is the record; `last_telemetry` below reads out of it.
+        self._last_result: VMCUpdateResult | None = None
+
+    @property
+    def last_telemetry(self) -> SPRINGTelemetry | None:
+        """Return this attempt's diagnostics, for callers predating the result.
+
+        COMPATIBILITY ONLY, AND NOT A SECOND AUTHORITY. Derived from
+        :attr:`last_result`, so it cannot disagree with what ``update``
+        returned. This matters more for SPRING than for the others: SPRING's
+        record carries ``history_advanced``, and a stale record would claim
+        the canonical history moved on a step where it did not.
+        """
+
+        result = self._last_result
+        if result is None:
+            return None
+        diagnostics = result.diagnostics
+        assert diagnostics is None or isinstance(diagnostics, SPRINGTelemetry)
+        return diagnostics
 
     def forward_request(self) -> MaterializedParameterScoreRequest:
         """Request the one raw score packet consumed by a SPRING step."""
 
         return MaterializedParameterScoreRequest(chunk_size=self.policy.base.score_chunk_size)
+
+    def norm_semantics(self) -> str:
+        """Report the norm as the ENERGY-GRADIENT norm, not the step's size.
+
+        Stated explicitly because this method writes a PRECONDITIONED
+        direction into ``.grad`` before stepping the carrier, so ``.grad`` is
+        not a gradient at all by the time an observer reads it. The reported
+        norm is the norm of the energy gradient; the size of what was actually
+        applied is a separate field of this method's diagnostics
+        (``applied_update_norm``).
+        """
+
+        return "energy_gradient_l2_preconditioned_direction_in_grad"
+
+    def describe(self) -> UpdateMethodDescription:
+        """Add SPRING's resolved policy, including history decay, to the description."""
+
+        base = super().describe()
+        settings = dict(base.settings)
+        settings.update(flatten_settings(self.policy.fingerprint(), prefix="policy_"))
+        settings.update(flatten_settings(self.conventions.fingerprint(), prefix="conventions_"))
+        settings["reducer_class"] = type(self.reducer).__qualname__
+        return replace(base, settings=settings)
 
     def update_state(self) -> VMCUpdateState:
         """Return the one optimizer and live parameter binding this method owns."""
@@ -429,7 +491,7 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         self._apply(projected_history * trust_scale)
         self.history = projected_history.detach().clone()
         self.completed_updates += 1
-        self.last_telemetry = SPRINGTelemetry(
+        telemetry = SPRINGTelemetry(
             applied=True,
             reason="applied",
             step=update_input.step,
@@ -445,7 +507,12 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             history_advanced=True,
             diagnostics=diagnostics,
         )
-        return VMCUpdateResult(applied=True, grad_norm=energy_gradient_norm)
+        return self._record_result(
+            applied=True,
+            grad_norm=energy_gradient_norm,
+            reason=telemetry.reason,
+            diagnostics=telemetry,
+        )
 
     def _trust_scale(self, direction_norm: float) -> float:
         """Return the base policy's factor capping applied displacement."""
@@ -477,7 +544,7 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
     ) -> VMCUpdateResult:
         """Record a non-applied step without changing canonical history."""
 
-        self.last_telemetry = SPRINGTelemetry(
+        telemetry = SPRINGTelemetry(
             applied=False,
             reason=reason,
             step=step,
@@ -493,7 +560,12 @@ class SPRINGUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             history_advanced=False,
             diagnostics=diagnostics,
         )
-        return VMCUpdateResult(applied=False, grad_norm=energy_gradient_norm)
+        return self._record_result(
+            applied=False,
+            grad_norm=energy_gradient_norm,
+            reason=reason,
+            diagnostics=telemetry,
+        )
 
     def _zero_history(self) -> Any:
         """Build the canonical zero parameter-space history vector."""

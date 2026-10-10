@@ -16,7 +16,7 @@ keeps the scores and energy gradient at one fixed parameter value.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from tpen.dependencies import require_torch
@@ -24,9 +24,13 @@ from tpen.nn import MaterializedParameterScoreRequest
 from tpen.training.update import (
     ModelParameterBinding,
     ScoreUpdateInput,
+    UpdateDiagnostics,
+    UpdateMethodDescription,
     VMCUpdateMethod,
     VMCUpdateResult,
     VMCUpdateState,
+    flatten_settings,
+    json_safe_scalar,
     serialize_parameter_layout,
 )
 
@@ -106,7 +110,7 @@ class BlockNGPolicy:
 
 
 @dataclass(frozen=True, kw_only=True)
-class BlockNGTelemetry:
+class BlockNGTelemetry(UpdateDiagnostics):
     """Observable result of one block-NG update.
 
     ``solve_dtype`` is observed from the configured linear-algebra path and is
@@ -120,17 +124,23 @@ class BlockNGTelemetry:
     energy_gradient_norm: float
     update_direction_norm: float
     solve_dtype: str
+    # Defaulted deliberately: this method has exactly one outcome -- it
+    # applies, or it raises on a non-finite direction -- so there is no second
+    # reason for a caller to pass, and defaulting keeps every existing
+    # construction valid.
+    reason: str = "applied"
 
     def as_metrics(self) -> dict[str, float | int | str | bool]:
         """Return bounded telemetry under method-owned metric names."""
 
         return {
             "block_ng_applied": self.applied,
+            "block_ng_reason": json_safe_scalar(self.reason),
             "block_ng_step": self.step,
             "block_ng_n_samples": self.n_samples,
             "block_ng_n_blocks": self.n_blocks,
-            "block_ng_energy_gradient_norm": self.energy_gradient_norm,
-            "block_ng_update_direction_norm": self.update_direction_norm,
+            "block_ng_energy_gradient_norm": json_safe_scalar(self.energy_gradient_norm),
+            "block_ng_update_direction_norm": json_safe_scalar(self.update_direction_norm),
             "block_ng_solve_dtype": self.solve_dtype,
         }
 
@@ -176,12 +186,49 @@ class BlockDiagonalNaturalGradientUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         self.model_parameters = model_parameters
         self.policy = policy
         self.completed_updates = 0
-        self.last_telemetry: BlockNGTelemetry | None = None
+        # The RESULT is the record; `last_telemetry` below reads out of it.
+        self._last_result: VMCUpdateResult | None = None
+
+    @property
+    def last_telemetry(self) -> BlockNGTelemetry | None:
+        """Return this attempt's diagnostics, for callers predating the result.
+
+        COMPATIBILITY ONLY, AND NOT A SECOND AUTHORITY. Derived from
+        :attr:`last_result`.
+        """
+
+        result = self._last_result
+        if result is None:
+            return None
+        diagnostics = result.diagnostics
+        assert diagnostics is None or isinstance(diagnostics, BlockNGTelemetry)
+        return diagnostics
 
     def forward_request(self) -> MaterializedParameterScoreRequest:
         """Request the raw per-sample score blocks consumed by this method."""
 
         return MaterializedParameterScoreRequest(chunk_size=self.policy.score_chunk_size)
+
+    def norm_semantics(self) -> str:
+        """Report the norm as the ENERGY-GRADIENT norm, not the step's size.
+
+        Stated explicitly because this method writes a PRECONDITIONED
+        direction into ``.grad`` before stepping the carrier, so ``.grad`` is
+        not a gradient at all by the time an observer reads it. The reported
+        norm is the norm of the energy gradient; the size of what was actually
+        applied is a separate field of this method's diagnostics
+        (``applied_update_norm``).
+        """
+
+        return "energy_gradient_l2_preconditioned_direction_in_grad"
+
+    def describe(self) -> UpdateMethodDescription:
+        """Add the block-NG policy, including the solve dtype, to the description."""
+
+        base = super().describe()
+        settings = dict(base.settings)
+        settings.update(flatten_settings(self.policy.fingerprint(), prefix="policy_"))
+        return replace(base, settings=settings)
 
     def update_state(self) -> VMCUpdateState:
         """Return the optimizer and live binding owned by this update method."""
@@ -268,7 +315,7 @@ class BlockDiagonalNaturalGradientUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         flat_gradient = torch.cat([gradient.reshape(-1) for gradient in gradients])
         flat_direction = torch.cat([direction.reshape(-1) for direction in directions])
         grad_norm = float(torch.linalg.vector_norm(flat_gradient).item())
-        self.last_telemetry = BlockNGTelemetry(
+        telemetry = BlockNGTelemetry(
             applied=True,
             step=update_input.step,
             n_samples=n_samples,
@@ -277,7 +324,12 @@ class BlockDiagonalNaturalGradientUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             update_direction_norm=float(torch.linalg.vector_norm(flat_direction).item()),
             solve_dtype=str(self.policy.solve_dtype),
         )
-        return VMCUpdateResult(applied=True, grad_norm=grad_norm)
+        return self._record_result(
+            applied=True,
+            grad_norm=grad_norm,
+            reason=telemetry.reason,
+            diagnostics=telemetry,
+        )
 
     def _validate_binding(self, update_input: ScoreUpdateInput) -> None:
         """Require scores and live references to match the bound tensor layout."""

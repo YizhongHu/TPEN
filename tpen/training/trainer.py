@@ -26,10 +26,13 @@ from tpen.training.state import TrainerState
 from tpen.nn.forward import ParameterScoreRequest
 from tpen.training.optim import UpdateMethodSpec, make_update_method
 from tpen.training.update import (
+    DIAGNOSTIC_NAME_COLLISIONS_KEY,
     AutogradUpdateInput,
     LegacyAutogradUpdate,
     ModelParameterBinding,
     ScoreUpdateInput,
+    UpdateMethodDescription,
+    merge_named_metrics,
     deserialize_parameter_layout,
     serialize_parameter_layout,
     VMCUpdateMethod,
@@ -140,6 +143,12 @@ class VMCTrainer:
         self._update_method_spec: UpdateMethodSpec = None
         self._resolved_update_state: VMCUpdateState | None = None
         self._checkpoint_parameter_layout = None
+        # The description of the method actually built/restored for the most
+        # recent `fit`. Kept on the trainer so a DIRECT `fit` caller, which has
+        # no logging sink to read, receives the same record the sink does.
+        # Deliberately NOT added to `TrainerState`: no callback needs it today,
+        # and a field added for symmetry would have to be maintained forever.
+        self.update_method_description: UpdateMethodDescription | None = None
         # Durable resume cursor: the next iteration this trainer will attempt.
         self.next_iteration = 0
         # Optimizer updates that actually returned; skipped updates never count.
@@ -497,6 +506,27 @@ class VMCTrainer:
             backward_scope=lambda step: context.scope(Backward(step=step), state=state),
             optimizer_scope=lambda step: context.scope(OptimizerUpdate(step=step), state=state),
         )
+        # DESCRIBE WHAT WAS ACTUALLY BUILT OR RESTORED, exactly here.
+        #
+        # The position is the contract, not a convenience. It is AFTER the
+        # runner's restore and parameter rebind -- those happen through
+        # `resolve_update_state` / `rebuild_update_state` before `fit` is
+        # called -- so the settings reported are the ones the next step will
+        # really use, not the ones the config asked for. And it is BEFORE the
+        # loop, so a run with `max_steps == next_iteration` still emits its
+        # identity: a zero-step fit that described nothing would make exactly
+        # the runs one most wants to audit the silent ones.
+        #
+        # Emitted unconditionally rather than under `log_every_n_steps`: this
+        # is a once-per-run identity record, not a per-step metric, and a
+        # cadence of 0 must not erase a run's identity.
+        description = selected_update_method.describe()
+        self.update_method_description = description
+        context.log(
+            description.as_metrics(),
+            step=self.next_iteration,
+            namespace="train/update_method",
+        )
         # One `TrainerState` instance is passed beside every typed occurrence
         # this loop emits, so a typed handler reads it at the moment it is
         # delivered. Its reference fields (`model`, `optimizer`, `trainer`,
@@ -638,13 +668,58 @@ class VMCTrainer:
                     metrics["param_norm"] = param_norm
                     metrics["loss_has_grad"] = bool(loss.requires_grad)
                     metrics["optimizer_step"] = optimizer_step
-                    # Bounded, method-owned telemetry. The update method
-                    # composes its own metric names, so the trainer never
-                    # re-spells a solver key and a method that reports nothing
-                    # adds nothing.
-                    update_metrics = getattr(selected_update_method, "last_telemetry", None)
-                    if update_metrics is not None:
-                        metrics.update(update_metrics.as_metrics())
+                    # The attempt's own explicit reason, taken from the record
+                    # the method RETURNED. `reported_reason` resolves the
+                    # "method reported none" case to an explicit token rather
+                    # than to a blank or to a fabricated "applied".
+                    metrics["update_reason"] = update_result.reported_reason
+                    # Bounded, method-owned diagnostics, read off the returned
+                    # result rather than discovered on the method object. The
+                    # update method composes its own metric names, so the
+                    # trainer never re-spells a solver key and a method that
+                    # reports nothing adds nothing.
+                    #
+                    # This deliberately replaces a `getattr(method,
+                    # "last_telemetry", None)` probe. Two things were wrong
+                    # with that probe and both are fixed by reading the
+                    # result: a method could report an attempt it had not just
+                    # performed (the attribute outlives the call), and a
+                    # method whose diagnostics lived under any other name was
+                    # silently invisible.
+                    update_diagnostics = update_result.diagnostics
+                    if update_diagnostics is not None:
+                        # MERGED THROUGH THE SHARED NAME GUARD, not with a bare
+                        # dict update. Every BUILT-IN record already encodes its
+                        # own names, but `UpdateDiagnostics` is a NOMINAL
+                        # contract: it obliges an implementation to return flat
+                        # JSON-safe entries and cannot enforce it. A custom
+                        # record was therefore able to deliver raw CSV-hostile
+                        # or colliding names straight to the sink, so the
+                        # name-safety property held for the implementations
+                        # this package happens to ship rather than for the
+                        # contract. Encoding here makes it hold for any
+                        # implementation.
+                        #
+                        # FOR THE BUILT-INS THIS CHANGES NOTHING, because their
+                        # names are ordinary and encode to themselves. That is
+                        # NOT the same as the encoder being idempotent, which
+                        # an earlier version of this comment claimed: a second
+                        # pass escapes `%` again, turning `%25` into `%2525`.
+                        # The guarantee is about these particular names, not
+                        # about repeated application.
+                        diagnostic_collisions = merge_named_metrics(
+                            metrics, update_diagnostics.as_metrics()
+                        )
+                        if diagnostic_collisions:
+                            # RESERVED NAME, not an ordinary one. A custom
+                            # record returning this literal key would otherwise
+                            # have its value replaced by the marker -- the
+                            # silent loss the marker exists to report. The
+                            # leading `%` is escaped to `%25` by the encoder,
+                            # so no encoded diagnostic name can spell it.
+                            metrics[DIAGNOSTIC_NAME_COLLISIONS_KEY] = ";".join(
+                                sorted(set(diagnostic_collisions))
+                            )
 
                 state.step = step
                 state.metrics = metrics

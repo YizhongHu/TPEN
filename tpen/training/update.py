@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Generic, TypeVar
 
 from tpen.data.batch import (
@@ -606,17 +606,395 @@ class ScoreUpdateInput(VMCStepData):
         raise RuntimeError("live ScoreUpdateInput cannot be serialized")
 
 
+# Reason vocabulary shared by the built-in methods. These are DISPLAY and
+# RECORD values, never behavior selectors: nothing in the trainer or in any
+# method branches on a reason string. SR and SPRING already spell the vacuum
+# skip ``zero_electron_batch``; the legacy adapter reuses that exact spelling
+# rather than inventing a second name for one condition.
+UPDATE_REASON_APPLIED = "applied"
+UPDATE_REASON_ZERO_ELECTRON_BATCH = "zero_electron_batch"
+# What a result reports when a method returned no reason at all. A custom
+# method predating the reason contract is the case this exists for. It is
+# deliberately a distinct token, NOT "applied" and NOT an empty string, so a
+# record never claims a reason its method did not give.
+UPDATE_REASON_UNREPORTED = "unreported"
+
+
+def json_safe_scalar(value: Any) -> Any:
+    """Return a value a JSON and CSV metrics sink can both carry.
+
+    WHY THIS EXISTS, as a mechanism rather than a convention. The two sinks
+    this project writes impose two different hard limits, and a naive float
+    violates both:
+
+    - ``tpen.logging.jsonl`` calls ``json.dumps(..., allow_nan=False)``. A NaN
+      or infinity therefore RAISES in the sink, turning a diagnostic nobody
+      asked to be fatal into a failed run.
+    - ``tpen.logging.csv`` writes ``f"{step},{namespace},{key},{value}"`` with
+      no quoting. A value whose text contains a comma silently becomes two
+      columns, which is worse than an exception because the file still parses.
+
+    The representation here is explicit in both directions: a finite real
+    number passes through as a ``float``; anything else becomes a SHORT
+    COMMA-FREE STRING naming what was actually observed. A reader can tell the
+    two apart by type alone.
+
+    NEVER FABRICATE ZERO. Returning ``0.0`` for an unavailable or non-finite
+    observation is the specific failure this helper exists to prevent: zero is
+    a legitimate value for every norm reported here, so a fabricated zero is
+    indistinguishable from a real measurement and silently corrupts any
+    downstream average.
+
+    Parameters
+    ----------
+    value : Any
+        Observation to represent. ``None`` means the method had nothing to
+        report for this key.
+
+    Returns
+    -------
+    float or int or bool or str or None
+        ``None`` passes through (JSON ``null``, empty CSV cell). ``bool`` and
+        ``int`` pass through. A finite ``float`` passes through. A non-finite
+        float becomes ``"nan"``, ``"inf"``, or ``"-inf"``. Any other object
+        becomes ``repr``-free ``str`` text with commas replaced by ``;``.
+    """
+
+    if value is None or type(value) is bool or type(value) is int:
+        return value
+    if isinstance(value, torch.Tensor):
+        # A TENSOR-VALUED SETTING IS REAL, not hypothetical: PyTorch's
+        # capturable and fused optimizer paths put a tensor in `lr`. Falling
+        # through to `str()` would yield "tensor(0.0010)" -- DISPLAY TEXT,
+        # already rounded -- so the one setting a reader most wants to trust
+        # would be silently truncated. Take the exact Python scalar instead,
+        # and recurse so the finiteness handling below still applies.
+        if value.numel() == 1:
+            return json_safe_scalar(value.item())
+        # A multi-element tensor is not a scalar setting. Name it rather than
+        # serializing it: its text would carry commas and could be unbounded.
+        return f"tensor_numel{value.numel()}"
+    if isinstance(value, float) or isinstance(value, int):
+        numeric = float(value)
+        if numeric != numeric:
+            return "nan"
+        if numeric == float("inf"):
+            return "inf"
+        if numeric == float("-inf"):
+            return "-inf"
+        return numeric
+    text = str(value)
+    # UNQUOTED CSV ROWS IMPOSE THREE SEPARATE CONSTRAINTS. The sink writes
+    # `f"{step},{ns},{key},{value}\n"` with no quoting and no escaping:
+    #   - a COMMA creates a phantom column, and the file still parses;
+    #   - a NEWLINE or CARRIAGE RETURN TERMINATES THE ROW, turning the
+    #     remainder of the value into a bogus record;
+    #   - a DOUBLE QUOTE is the csv module's quotechar, so a value containing
+    #     one makes a STRICT READER fail with "unexpected end of data" when it
+    #     looks for a closing quote that never comes. The file is then not
+    #     merely wrong, it is unreadable from that row on.
+    # This guard was built up one reported symptom at a time -- first the
+    # comma, then the newline, then the quote -- which is exactly how a guard
+    # ends up covering less than its name promises. The test for it reads a
+    # row back with a STRICT csv reader rather than splitting on commas, so a
+    # future hostile character fails the reader instead of passing a
+    # hand-rolled check.
+    for hostile, replacement in ((",", ";"), ("\r", " "), ("\n", " "), ('"', "'")):
+        text = text.replace(hostile, replacement)
+    return text
+
+
+def json_safe_metric_name(name: Any) -> str:
+    """Return a sink-safe METRIC NAME that is INJECTIVE over hostile inputs.
+
+    WHY NAMES NEED A DIFFERENT RULE FROM VALUES. :func:`json_safe_scalar`
+    REPLACES hostile characters -- a comma becomes ``;``, a newline becomes a
+    space -- which is right for a value, where readability matters and a
+    collision is harmless. For a NAME it is actively dangerous: two distinct
+    keys can sanitize to the SAME name, and the second write then silently
+    overwrites the first. Measured: ``"tag\nsource"`` and ``"tag\rsource"``
+    both became ``"tag source"``, so four settings produced three entries and
+    one was lost with nothing reporting it.
+
+    Percent-encoding is used instead because it is REVERSIBLE and therefore
+    INJECTIVE OVER STRINGS: two distinct strings cannot collide, so no setting
+    can be dropped by the act of making it safe. ``%`` is escaped FIRST, or a
+    literal ``%2C`` in an input key would become indistinguishable from an
+    encoded comma.
+
+    WHAT THIS IS NOT, stated because an earlier version of this docstring
+    claimed universal injectivity and was WRONG. The function opens with
+    ``str(name)``, so it is NOT injective over arbitrary objects: ``1`` and
+    ``"1"``, ``True`` and ``"True"``, and any two values sharing a ``str()``
+    all collapse to one name. That coercion is deliberate -- a param_group may
+    hold non-string keys and refusing them would turn a reporting concern into
+    a crash -- but it means ENCODING ALONE CANNOT GUARANTEE DISTINCTNESS. The
+    callers therefore detect collisions on the ENCODED name; see
+    :func:`merge_named_metrics`. A docstring promising more than the body
+    delivers is worse than silence, because it is what the next reader trusts
+    instead of checking.
+
+    This is for names only. Values keep :func:`json_safe_scalar`, which stays
+    readable; a reason that reads ``a;b`` is friendlier than ``a%2Cb`` and has
+    nothing to collide with.
+    """
+
+    text = str(name)
+    # `%` FIRST. Reordering this breaks injectivity.
+    text = text.replace("%", "%25")
+    for hostile, code in ((",", "%2C"), ("\r", "%0D"), ("\n", "%0A"), ('"', "%22")):
+        text = text.replace(hostile, code)
+    return text
+
+
+def merge_named_metrics(
+    target: dict[str, Any],
+    entries: "Mapping[Any, Any] | list[tuple[Any, Any]]",
+    *,
+    prefix: str = "",
+    collisions: list[str] | None = None,
+) -> list[str]:
+    """Merge entries under ENCODED names, keeping the FIRST and reporting clashes.
+
+    ONE PLACE, BECAUSE THE CONCEPT IS ONE. Collision handling previously lived
+    only in :func:`carrier_settings`, so a clash there was reported while the
+    identical clash through ``UpdateMethodDescription.as_metrics`` or
+    :func:`flatten_settings` silently dropped an entry. That is the recurring
+    shape of every defect in this slice: a guard placed where a symptom was
+    reported rather than where the concept lives.
+
+    WHY A COLLISION IS STILL POSSIBLE AT ALL, stated correctly after an earlier
+    version of this comment got it wrong. TWO independent sources, not one:
+
+    1. COERCION. :func:`json_safe_metric_name` is injective over strings but
+       opens with ``str()``, so ``1`` and ``"1"`` encode identically.
+    2. STRUCTURAL JOINING, which an earlier wording denied by claiming only
+       non-string keys could collide. Flattening joins nested keys with ``_``,
+       so ``{"a_b": 1}`` and ``{"a": {"b": 2}}`` both produce ``a_b`` from
+       ORDINARY STRING KEYS. Injectivity of the encoder says nothing about a
+       name assembled from several encoded parts.
+
+    Encoding therefore cannot guarantee distinctness on its own, and detection
+    is not belt-and-braces -- it is the half of the guarantee encoding cannot
+    provide.
+
+    FIRST WRITER WINS, deliberately. A later write silently replacing an
+    earlier one is how a description comes to report a value nobody set; the
+    clash is surfaced instead so a reader can see the map is incomplete.
+
+    Parameters
+    ----------
+    target : dict
+        Mapping to merge into, mutated in place.
+    entries : mapping or list of pairs
+        Source entries. A list of pairs is accepted so callers that expand one
+        source key into several names keep their ordering.
+    prefix : str, optional
+        Prepended to each encoded name.
+    collisions : list of str, optional
+        Accumulator for collided names. A caller merging several sources
+        passes one list so a single marker covers them all.
+
+    Returns
+    -------
+    list of str
+        The collided names, for the caller to surface.
+    """
+
+    recorded = [] if collisions is None else collisions
+    pairs = entries.items() if isinstance(entries, Mapping) else entries
+    # PRECONDITION, stated rather than re-encoded: `prefix` arrives ALREADY
+    # ENCODED. Encoding it again here would double-escape a caller that had
+    # done the right thing -- `%` becomes `%25` becomes `%2525` -- so the
+    # encode happens ONCE at each public boundary instead. This is an internal
+    # helper; the boundaries are UpdateMethodDescription.as_metrics,
+    # flatten_settings and carrier_settings, and each encodes before calling.
+    for key, value in pairs:
+        name = f"{prefix}{json_safe_metric_name(key)}"
+        if name in target:
+            recorded.append(name)
+            continue
+        target[name] = json_safe_scalar(value)
+    return recorded
+
+
+# RESERVED, and UNREACHABLE BY CONSTRUCTION. The leading `%` is the point:
+# `json_safe_metric_name` escapes `%` to `%25` FIRST, so no encoded user key
+# can ever spell this name. Without that, the marker write could itself
+# overwrite a user entry -- the exact silent-loss failure the marker exists to
+# report, reintroduced by the reporting.
+SETTING_NAME_COLLISIONS_KEY = "%collisions"
+
+# The SAME reservation, for the trainer's diagnostics merge. It is a separate
+# constant rather than a reuse because the two markers report collisions in
+# different namespaces and a reader must be able to tell which one fired.
+#
+# THIS EXISTED AS AN ORDINARY KEY UNTIL VERIFICATION FOUND IT. The `%` rule was
+# applied at three name-composition sites and missed at the fourth, so a custom
+# diagnostics record returning the literal marker name lost its value to the
+# marker write -- the precise silent-loss failure the marker reports,
+# reintroduced by the reporting, for the second time in this slice.
+DIAGNOSTIC_NAME_COLLISIONS_KEY = "%diagnostic_collisions"
+
+
+class UpdateDiagnostics(ABC):
+    """Nominal DETACHED record of what one update attempt actually did.
+
+    Nominal rather than structural on purpose. An update method cannot satisfy
+    this by happening to own an attribute of the right name; it has to declare
+    the record as this contract, which is what lets
+    :class:`VMCUpdateResult` state the type it carries instead of accepting
+    any object with an ``as_metrics``.
+
+    DETACHED is the load-bearing word. Implementations hold plain Python
+    scalars and already-detached sub-records only. No tensor that participates
+    in a graph, and no model or optimizer reference, belongs in a diagnostic:
+    the record outlives the step that produced it and is written to artifacts,
+    so a graph-bearing field would both retain the step's memory and fail at
+    the serialization boundary.
+    """
+
+    @abstractmethod
+    def as_metrics(self) -> dict[str, Any]:
+        """Return this record as flat, JSON-safe, comma-free metric entries.
+
+        Flat because the CSV sink writes one row per key and cannot express
+        nesting; JSON-safe because the JSONL sink rejects non-finite floats.
+        Implementations compose their OWN key names, so the trainer never
+        re-spells a method-owned key.
+        """
+
+
+@dataclass(frozen=True, kw_only=True)
+class MinimalUpdateDiagnostics(UpdateDiagnostics):
+    """The smallest honest diagnostic: what every method can always report.
+
+    This is the compatibility path the update contract promises to methods
+    that own no solver telemetry -- the legacy autograd adapter, and any
+    custom or stateless method outside this package. It reports only what is
+    knowable without a solver, and reports absence as absence.
+
+    Using this record is an explicit choice by a method, not a fallback the
+    trainer applies. That distinction matters: a trainer-side fallback would
+    be attribute probing again, which is exactly what this slice removes.
+    """
+
+    method: str
+    applied: bool
+    reason: str
+    step: int
+    grad_norm: float | None = None
+    # NOT "update": the trainer emits a generic `update_reason` for every
+    # attempt, so a record prefixed "update" would collide with it and one key
+    # would silently overwrite the other in the metrics dict. The collision was
+    # real and invisible -- both happened to carry the same value -- which is
+    # exactly why the prefix is pinned here and asserted by a test rather than
+    # left to chance.
+    prefix: str = "update_record"
+
+    def as_metrics(self) -> dict[str, Any]:
+        """Return the minimal record under this method's own key prefix.
+
+        The PREFIX IS ENCODED, because it is part of the metric name and it is
+        CALLER-SUPPLIED: a custom method may select this built-in record and
+        give it any prefix, so interpolating it verbatim let a hostile prefix
+        break a row through a record this package ships. The default encodes to
+        itself.
+        """
+
+        safe_prefix = json_safe_metric_name(self.prefix)
+        return {
+            f"{safe_prefix}_method": json_safe_scalar(self.method),
+            f"{safe_prefix}_applied": bool(self.applied),
+            f"{safe_prefix}_reason": json_safe_scalar(self.reason),
+            f"{safe_prefix}_step": int(self.step),
+            f"{safe_prefix}_grad_norm": json_safe_scalar(self.grad_norm),
+        }
+
+
 @dataclass(frozen=True, kw_only=True)
 class VMCUpdateResult:
-    """Result of one update-method invocation."""
+    """Result of one update-method invocation.
+
+    Parameters
+    ----------
+    applied : bool
+        Whether the attempt actually stepped the parameters.
+    grad_norm : float
+        The norm this method reports for the step. ITS MEANING IS METHOD-OWNED
+        and is not uniform across methods: for the legacy adapter it is the
+        post-clip Euclidean norm of ``.grad`` over the gradient domain, while
+        for SR, SPRING, and block NG it is the ENERGY-GRADIENT norm, which is
+        not the norm of the preconditioned direction those methods write into
+        ``.grad``. Read the method's
+        :meth:`VMCUpdateMethod.describe` record for the actual meaning rather
+        than assuming one; this is precisely the ambiguity the description
+        contract exists to resolve.
+    reason : str or None, optional
+        Explicit, method-owned reason for the outcome. ``None`` means the
+        method reported none -- the shape a custom method written before this
+        field existed has. Use :attr:`reported_reason` to read it without
+        having to re-handle ``None`` at every call site.
+    diagnostics : UpdateDiagnostics or None, optional
+        The detached record for THIS attempt. ``None`` means the method
+        reported none.
+
+    Notes
+    -----
+    BOTH NEW FIELDS DEFAULT. That is a compatibility requirement, not an
+    oversight: existing custom ``VMCUpdateMethod`` implementations construct
+    this record positionally by keyword with two fields, and making either new
+    field required would break every one of them at once. A method that
+    reports nothing is a supported shape; a method that reports a FABRICATED
+    reason would not be.
+
+    THE RESULT IS THE SINGLE AUTHORITY for one attempt. The built-in methods
+    retain a ``last_telemetry`` property for compatibility, but it is derived
+    from the result they returned and is not a second place where an attempt
+    is recorded.
+    """
 
     applied: bool
     grad_norm: float
+    reason: str | None = None
+    diagnostics: UpdateDiagnostics | None = None
 
     def __post_init__(self) -> None:
         if type(self.applied) is not bool:
             raise TypeError("VMCUpdateResult.applied must be a bool")
         object.__setattr__(self, "grad_norm", float(self.grad_norm))
+        if self.reason is not None:
+            if not isinstance(self.reason, str) or not self.reason:
+                raise TypeError("VMCUpdateResult.reason must be a non-empty str or None")
+        if self.diagnostics is not None and not isinstance(self.diagnostics, UpdateDiagnostics):
+            raise TypeError("VMCUpdateResult.diagnostics must be an UpdateDiagnostics or None")
+
+    @property
+    def reported_reason(self) -> str:
+        """Return a SINK-SAFE reason, or the explicit unreported token.
+
+        SANITIZED HERE RATHER THAN REJECTED AT CONSTRUCTION, and that reversal
+        is deliberate. An earlier version RAISED on a reason containing a
+        comma. That made the observation layer able to abort the run it was
+        only supposed to describe -- a method returning an awkward string
+        crashed training rather than producing a slightly ugly log line. It is
+        the same mistake, in the opposite direction, as letting a non-finite
+        float reach a sink that raises on it: in both cases the record written
+        to explain something destroyed the thing it was explaining.
+
+        The stored :attr:`reason` is left VERBATIM, because it is the method's
+        own datum and a caller reading the result object should see exactly
+        what the method said. Only the EMITTED form is sanitized, and only at
+        this boundary.
+
+        Custom methods are the realistic source: a reason assembled from an
+        exception message can carry a newline, and the unquoted CSV sink
+        terminates its row on one.
+        """
+
+        if self.reason is None:
+            return UPDATE_REASON_UNREPORTED
+        return json_safe_scalar(self.reason)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -730,6 +1108,340 @@ class VMCUpdateState:
             raise TypeError("VMCUpdateState.model_parameters must be a ModelParameterBinding")
 
 
+def carrier_settings(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+    """Return the carrier optimizer's EFFECTIVE settings as flat scalars.
+
+    "Effective" means read off the live ``param_groups`` at call time, not
+    recalled from the config that built the optimizer. After a checkpoint
+    restore those two can differ, and the restored values are the ones the
+    next step will actually use.
+
+    COMPOUND SETTINGS ARE SPLIT, NOT REPR'D. Adam's ``betas`` is the motivating
+    case: writing ``(0.9, 0.999)`` into the unquoted CSV sink produces a row
+    with two extra columns that still parses. Each element becomes its own
+    named scalar key instead.
+
+    KEYS ARE SANITIZED, NOT ONLY VALUES. A param_group is an ordinary dict and
+    its keys become METRIC NAMES, so a key carrying a comma or a newline
+    corrupts the row exactly as a hostile value would. An earlier version
+    guarded only values, which is half a channel.
+
+    EVERY GROUP IS PREFIXED, INCLUDING THE FIRST. Leaving group 0 unprefixed
+    read as tidier and was wrong: a group-0 key literally named ``group1_lr``
+    then produced the same name as group 1's real learning rate, and a group-0
+    key named ``n_param_groups`` overwrote the count this function itself
+    seeds. Uniform ``g<i>_`` prefixing puts every group-derived name in a space
+    no unprefixed name can reach.
+
+    COLLISIONS ARE REPORTED, NOT RESOLVED SILENTLY. Prefixing removes the
+    collisions structure can remove, but it CANNOT remove all of them: keys are
+    arbitrary strings, so a group-0 key named ``betas1`` still lands on the
+    name produced by splitting a ``betas`` pair. Rather than letting the later
+    write win -- which is how a description comes to report a value nobody set
+    -- the FIRST value is kept and every collided name is listed under the key
+    :data:`SETTING_NAME_COLLISIONS_KEY`. A reader then sees that the map is
+    incomplete instead of trusting a silently overwritten entry.
+
+    THE KEY IS NAMED BY ITS CONSTANT rather than spelled out, because the
+    literal changed once already: it is now ``"%collisions"``, chosen so no
+    encoded user key can spell it. A docstring repeating a stale literal sends
+    a consumer to look up a key that is never emitted.
+
+    Parameters
+    ----------
+    optimizer : torch.optim.Optimizer
+        The live carrier to describe.
+
+    Returns
+    -------
+    dict
+        Flat JSON-safe entries. ``n_param_groups`` is always present. Every
+        group's settings appear under ``g<i>_<key>``, so a per-layer learning
+        rate is visible rather than hidden behind group 0.
+    """
+
+    if not isinstance(optimizer, torch.optim.Optimizer):
+        raise TypeError("carrier_settings requires a torch.optim.Optimizer")
+    groups = list(optimizer.param_groups)
+    settings: dict[str, Any] = {}
+    collisions: list[str] = []
+
+    # Seeded first so that no group key can displace it.
+    merge_named_metrics(settings, [("n_param_groups", len(groups))], collisions=collisions)
+    for index, group in enumerate(groups):
+        pairs: list[tuple[Any, Any]] = []
+        # Sorted by the key's TEXT: a param_group may hold non-comparable key
+        # types, and sorting those directly raises.
+        for key, value in sorted(group.items(), key=lambda item: str(item[0])):
+            # `params` is the live parameter list -- unbounded, and it holds
+            # the model's tensors. It must never enter a description.
+            if key == "params":
+                continue
+            if isinstance(value, (tuple, list)):
+                for ordinal, element in enumerate(value, start=1):
+                    pairs.append((f"{key}{ordinal}", element))
+                continue
+            pairs.append((key, value))
+        merge_named_metrics(settings, pairs, prefix=f"g{index}_", collisions=collisions)
+    if collisions:
+        settings[SETTING_NAME_COLLISIONS_KEY] = ";".join(sorted(set(collisions)))
+    return settings
+
+
+def flatten_settings(settings: Mapping[Any, Any], *, prefix: str = "") -> dict[str, Any]:
+    """Flatten a nested policy fingerprint into flat JSON-safe scalar entries.
+
+    A policy fingerprint is allowed to nest -- ``SRPolicy.fingerprint`` carries
+    a whole ``damping`` sub-mapping -- but neither metrics sink can express
+    nesting: the CSV sink writes one row per key, and a dict written into it
+    would be a brace-and-comma string that silently becomes several columns.
+    Nested keys are therefore joined with ``_`` into one flat namespace.
+
+    COLLISION DETECTION ADDED, through :func:`merge_named_metrics`. Encoding
+    was already here; what was missing was detection, so two keys that encoded
+    to one name silently lost an entry. (An earlier note of mine said this
+    function had neither -- that was wrong, and is corrected here: the
+    ``json_safe_metric_name`` call predates this change.)
+
+    THE GAP WAS INVISIBLE FOR A NARROWER REASON THAN I FIRST WROTE. I said it
+    was because built-in policy fingerprints use ordinary STRING keys. String
+    keys are not sufficient -- ``{"a_b": 1}`` and ``{"a": {"b": 2}}`` collide
+    while being perfectly ordinary strings. The actual reason is that the
+    built-in fingerprints happen to produce NON-COLLIDING FLATTENED NAMES. The
+    guarantee held by accident of those particular names, not by anything the
+    key type guarantees.
+
+    KEYS MAY BE NON-STRING. The annotation is deliberately ``Mapping[Any,
+    Any]``: typeguard enforces annotations at runtime here, so a ``str`` key
+    type would REJECT one whole class of input the collision detection exists
+    to handle. Note that non-string keys are NOT the only source -- joining
+    nested names with ``_`` also lets ``{"a_b": 1}`` and ``{"a": {"b": 2}}``
+    collide using ordinary strings. An earlier version of this docstring
+    claimed otherwise and was wrong.
+
+    Parameters
+    ----------
+    settings : Mapping
+        Possibly nested settings mapping. Keys need not be strings.
+    prefix : str, optional
+        Key prefix for recursion; callers normally leave it empty.
+
+    Returns
+    -------
+    dict
+        Flat mapping whose values are all :func:`json_safe_scalar` outputs. Any
+        collided name is reported under :data:`SETTING_NAME_COLLISIONS_KEY`.
+    """
+
+    flat: dict[str, Any] = {}
+    collisions: list[str] = []
+    # PUBLIC BOUNDARY: `prefix` is caller-supplied and arrives raw, so it is
+    # encoded here, once. Everything below this line works in encoded space.
+    _flatten_into(
+        flat, settings, prefix=json_safe_metric_name(prefix), collisions=collisions
+    )
+    if collisions:
+        flat[SETTING_NAME_COLLISIONS_KEY] = ";".join(sorted(set(collisions)))
+    return flat
+
+
+def _flatten_into(
+    flat: dict[str, Any],
+    settings: Mapping[Any, Any],
+    *,
+    prefix: str,
+    collisions: list[str],
+) -> None:
+    """Recurse one level, accumulating collisions across the whole walk."""
+
+    for key, value in settings.items():
+        # `prefix` is already encoded; only the KEY needs encoding here, and
+        # the concatenation stays in encoded space.
+        encoded = json_safe_metric_name(key)
+        if isinstance(value, Mapping):
+            _flatten_into(flat, value, prefix=f"{prefix}{encoded}_", collisions=collisions)
+        elif isinstance(value, (tuple, list)):
+            merge_named_metrics(
+                flat,
+                [(f"{encoded}{ordinal}", element)
+                 for ordinal, element in enumerate(value, start=1)],
+                prefix=prefix,
+                collisions=collisions,
+            )
+        else:
+            merge_named_metrics(flat, [(key, value)], prefix=prefix, collisions=collisions)
+
+
+def parameter_layout_fingerprint(layout: ParameterLayout) -> str:
+    """Return a stable, sink-safe identity for a parameter LAYOUT.
+
+    WHY COUNTS ARE NOT ENOUGH. The binding design requires the description to
+    carry "parameter count/layout identity", and a count alone does not supply
+    it: one parameter shaped ``(4,)`` and one shaped ``(2, 2)`` have identical
+    scalar and tensor counts, so two genuinely different models produced
+    identical descriptions. That defeats the purpose of describing what was
+    actually constructed.
+
+    STABLE ACROSS VALUES AND ADDRESSES: built only from shape and dtype, never
+    from parameter values or object identity, so the same architecture
+    fingerprints identically across runs, processes and restores -- which is
+    what makes it usable for comparing a resumed run against its original.
+
+    Comma-free and newline-free by construction: dimensions are joined with
+    ``x`` and slots with ``|``, so the result passes through the unquoted CSV
+    sink without needing sanitization.
+    """
+
+    slots = []
+    for slot in layout.slots:
+        dtype = str(slot.dtype).replace("torch.", "")
+        shape = "x".join(str(dim) for dim in slot.shape) or "scalar"
+        slots.append(f"{dtype}:{shape}")
+    return "|".join(slots)
+
+
+@dataclass(frozen=True, kw_only=True)
+class UpdateMethodDescription:
+    """What was ACTUALLY constructed or restored, for one fit invocation.
+
+    THE PROBLEM THIS SOLVES. SR, SPRING, and block NG all drive a plain
+    ``torch.optim.SGD`` as a carrier: they compute a preconditioned direction,
+    write it into ``.grad``, and let SGD apply it. Anything that identifies the
+    update by looking at the optimizer therefore reports every one of those
+    runs as plain SGD, which is wrong in the most expensive possible way --
+    the run looks like a baseline nobody ran. :attr:`method_class` and
+    :attr:`carrier_class` are separate fields for exactly this reason.
+
+    CLASS NAMES ARE FOR DISPLAY ONLY. Nothing selects behavior from these
+    strings. A config's label for a run is likewise never consulted here: every
+    field is read off the live constructed or restored objects, so a run
+    mislabelled in YAML still describes itself truthfully.
+
+    Parameters
+    ----------
+    method_class : str
+        Qualified name of the actual :class:`VMCUpdateMethod` instance.
+    carrier_class : str
+        Qualified name of the actual optimizer applying the step, or
+        ``"none"`` for a method that owns no carrier.
+    n_parameters : int or None
+        Total scalar parameter count in the bound domain. ``None`` when this
+        method owns no carrier and therefore no parameter domain -- never 0,
+        which is a legitimate count and would be indistinguishable from a
+        measurement.
+    n_parameter_tensors : int or None
+        Number of tensors in the bound domain, or ``None`` on the same terms.
+    layout_fingerprint : str or None
+        Stable shape-and-dtype identity of the bound domain, or ``None`` when
+        there is none. Counts alone cannot distinguish ``(4,)`` from
+        ``(2, 2)``; this can.
+    forward_request : str
+        The requested derivative convention -- the qualified type of the typed
+        forward request this method returns, or ``"value"`` for an ordinary
+        ``model(batch)`` forward.
+    norm_semantics : str
+        What this method's reported ``grad_norm`` actually measures.
+    settings : Mapping
+        Flat scalar effective settings: carrier settings, plus any
+        method-owned policy fields.
+    """
+
+    method_class: str
+    carrier_class: str
+    # OPTIONAL, and NOT defaulted to 0. A method owning no carrier has no
+    # parameter domain to count, and zero is a legitimate count -- so reporting
+    # 0 there would be a fabricated value indistinguishable from a real
+    # measurement, which is precisely what `json_safe_scalar` exists to
+    # prevent. `None` means "not reported" and stays distinguishable.
+    n_parameters: int | None
+    n_parameter_tensors: int | None
+    # Shape-and-dtype identity, NOT just a count. Two layouts with equal
+    # counts but different shapes must be distinguishable; see
+    # `parameter_layout_fingerprint`.
+    layout_fingerprint: str | None
+    forward_request: str
+    norm_semantics: str
+    # KEYS ARE `Any`, NOT `str`, AND THAT IS LOAD-BEARING. typeguard enforces
+    # these annotations at runtime in this repository, so `Mapping[str, Any]`
+    # did not merely document an expectation -- it REJECTED non-string keys at
+    # the boundary, making one whole class of collision input unreachable and
+    # leaving the detection below it guarding a case the type system had
+    # already excluded.
+    #
+    # NON-STRING KEYS ARE NOT THE ONLY COLLISION SOURCE. An earlier version of
+    # this comment said they were, which was wrong: joining nested names with
+    # `_` also lets `{"a_b": 1}` and `{"a": {"b": 2}}` collide using ordinary
+    # strings. Encoder injectivity constrains a single encoded part, not a name
+    # ASSEMBLED from several of them.
+    settings: Mapping[Any, Any] = field(default_factory=dict)
+
+    def as_metrics(self, *, prefix: str = "update_method") -> dict[str, Any]:
+        """Return the description as flat, JSON-safe, comma-free entries.
+
+        SETTINGS ARE NAMESPACED AWAY FROM THE AUTHORITATIVE FIELDS, and that
+        separation is the whole point of this method rather than a tidiness
+        preference.
+
+        THE ATTACK IT CLOSES. Settings are read off the LIVE optimizer
+        ``param_groups``, and a param_group is an ordinary dict that anything
+        may add keys to. When settings were merged into the same ``prefix_``
+        namespace as the identity fields, a group carrying a key named
+        ``class`` or ``n_parameters`` OVERWROTE the authoritative value. The
+        description OBJECT stayed truthful while the emitted METRICS lied --
+        reporting, in the observed case, ``update_method_class =
+        'misleading-run-label'`` for a real ``LegacyAutogradUpdate``.
+
+        That is precisely the failure this whole description contract exists
+        to prevent. The contract's promise is that a misleading external label
+        cannot change what is reported; a test asserting that promise passed,
+        because it set an ATTRIBUTE on the method, and the reachable route was
+        through the carrier's group dict instead. A guard is only as good as
+        the channel it watches.
+
+        Two independent mechanisms now hold, so neither alone is load-bearing:
+        settings go under ``{prefix}_setting_``, which cannot collide with any
+        authoritative name because no authoritative name begins with
+        ``setting_``; and the authoritative fields are written LAST, so even a
+        hypothetical collision resolves in favour of the truth.
+        """
+
+        # THE PREFIX IS PART OF THE NAME, so it is encoded like any other
+        # part. It is CALLER-SUPPLIED -- a custom method may select this record
+        # and choose its prefix -- and encoding the keys while interpolating
+        # the prefix verbatim guarded two thirds of a name. The default
+        # prefixes are ordinary and encode to themselves.
+        safe_prefix = json_safe_metric_name(prefix)
+        metrics: dict[str, Any] = {}
+        # Settings FIRST, through the SHARED collision-aware merge. Both halves
+        # matter: the KEY is encoded because a setting name becomes a METRIC
+        # NAME, and a clash is REPORTED because encoding opens with str() and
+        # so cannot guarantee distinctness alone.
+        collisions = merge_named_metrics(
+            metrics, self.settings, prefix=f"{safe_prefix}_setting_"
+        )
+        if collisions:
+            metrics[f"{safe_prefix}_{SETTING_NAME_COLLISIONS_KEY}"] = ";".join(
+                sorted(set(collisions))
+            )
+        # Authoritative identity LAST, so it always wins.
+        metrics.update(
+            {
+                f"{safe_prefix}_class": json_safe_scalar(self.method_class),
+                f"{safe_prefix}_carrier_class": json_safe_scalar(self.carrier_class),
+                f"{safe_prefix}_n_parameters": json_safe_scalar(self.n_parameters),
+                f"{safe_prefix}_n_parameter_tensors": json_safe_scalar(
+                    self.n_parameter_tensors
+                ),
+                f"{safe_prefix}_layout_fingerprint": json_safe_scalar(
+                    self.layout_fingerprint
+                ),
+                f"{safe_prefix}_forward_request": json_safe_scalar(self.forward_request),
+                f"{safe_prefix}_norm_semantics": json_safe_scalar(self.norm_semantics),
+            }
+        )
+        return metrics
+
+
 class VMCUpdateMethod(Generic[InputT], ABC):
     """Nominal typed contract for VMC update strategies.
 
@@ -836,6 +1548,108 @@ class VMCUpdateMethod(Generic[InputT], ABC):
 
         return None
 
+    @property
+    def last_result(self) -> VMCUpdateResult | None:
+        """Return the result of this method's most recent attempt.
+
+        ``None`` before the first attempt. This is the ONE place an attempt is
+        remembered; the built-in methods' ``last_telemetry`` property reads
+        the diagnostics out of this record rather than keeping a parallel one.
+        """
+
+        return getattr(self, "_last_result", None)
+
+    def _record_result(
+        self,
+        *,
+        applied: bool,
+        grad_norm: float,
+        reason: str,
+        diagnostics: UpdateDiagnostics | None = None,
+    ) -> VMCUpdateResult:
+        """Build, remember, and return the result for one attempt.
+
+        Remembering is assignment to a single slot, so a fresh attempt always
+        REPLACES the previous record rather than merging with it. That is what
+        makes "applied, then skipped" report the skip's own diagnostics
+        instead of leaking the earlier solve's.
+        """
+
+        result = VMCUpdateResult(
+            applied=applied,
+            grad_norm=grad_norm,
+            reason=reason,
+            diagnostics=diagnostics,
+        )
+        self._last_result = result
+        return result
+
+    def describe(self) -> UpdateMethodDescription:
+        """Describe the object that will actually perform the next update.
+
+        The default reads everything off ``self`` and off the owned
+        :class:`VMCUpdateState`, so a method inherits a truthful description
+        without writing one. A method with policy worth recording overrides
+        this, calls ``super().describe()``, and returns a copy with its policy
+        merged into ``settings`` and its own ``norm_semantics``.
+
+        CALL THIS AFTER RESTORE. Settings are read from the live carrier, so
+        calling it before ``load_state_dict`` would describe the pre-restore
+        object and the description would disagree with the run.
+
+        Returns
+        -------
+        UpdateMethodDescription
+            Flat, JSON-safe description of the live method and carrier.
+        """
+
+        update_state = self.update_state()
+        if update_state is None:
+            # A stateless method delegates the carrier to the trainer, so
+            # there is no owned optimizer to read. Report that honestly
+            # rather than naming an optimizer this method does not own.
+            carrier_class = "none"
+            settings: dict[str, Any] = {}
+            # NOT 0: this method owns no parameter domain, so the count is
+            # UNKNOWN rather than empty. See the field comment above.
+            n_parameters = None
+            n_parameter_tensors = None
+            layout_fingerprint = None
+        else:
+            optimizer = update_state.optimizer
+            carrier_class = f"{type(optimizer).__module__}.{type(optimizer).__qualname__}"
+            settings = carrier_settings(optimizer)
+            layout = update_state.model_parameters.layout
+            assert layout is not None
+            n_parameters = int(layout.total_numel)
+            n_parameter_tensors = len(layout.slots)
+            layout_fingerprint = parameter_layout_fingerprint(layout)
+        request = self.forward_request()
+        forward_request = (
+            "value"
+            if request is None
+            else f"{type(request).__module__}.{type(request).__qualname__}"
+        )
+        return UpdateMethodDescription(
+            method_class=f"{type(self).__module__}.{type(self).__qualname__}",
+            carrier_class=carrier_class,
+            n_parameters=n_parameters,
+            n_parameter_tensors=n_parameter_tensors,
+            layout_fingerprint=layout_fingerprint,
+            forward_request=forward_request,
+            norm_semantics=self.norm_semantics(),
+            settings=settings,
+        )
+
+    def norm_semantics(self) -> str:
+        """Return what this method's reported ``grad_norm`` actually measures.
+
+        The default is deliberately non-committal: a method that has not said
+        what its norm means must not have a specific meaning invented for it.
+        """
+
+        return "method_defined"
+
     def set_step_scopes(
         self,
         *,
@@ -907,7 +1721,21 @@ class LegacyAutogradUpdate(VMCUpdateMethod[AutogradUpdateInput]):
         objective = update_input.objective
         if not objective.requires_grad:
             if update_input.batch.n_electrons == 0:
-                return VMCUpdateResult(applied=False, grad_norm=0.0)
+                # THE VACUUM SKIP. A zero-electron batch has no sampled
+                # coordinate degree of freedom, so there is nothing to
+                # differentiate and declining is correct. The grad_norm of 0.0
+                # here is a REAL measurement -- no backward ran, so the
+                # gradient domain genuinely holds no gradient -- and it is an
+                # established compatibility field, so it keeps its value and
+                # its meaning. The reason field is what newly distinguishes
+                # this from the raise below; the two conditions were always
+                # distinct in behavior and are now distinct in the record.
+                return self._result(
+                    applied=False,
+                    grad_norm=0.0,
+                    reason=UPDATE_REASON_ZERO_ELECTRON_BATCH,
+                    step=update_input.step,
+                )
             raise RuntimeError(
                 "VMC loss is disconnected from model parameters for a "
                 "nonzero-electron batch"
@@ -921,7 +1749,61 @@ class LegacyAutogradUpdate(VMCUpdateMethod[AutogradUpdateInput]):
             )
         grad_norm = _gradient_norm(gradient_parameters)
         self._run_optimizer_step(update_input)
-        return VMCUpdateResult(applied=True, grad_norm=grad_norm)
+        return self._result(
+            applied=True,
+            grad_norm=grad_norm,
+            reason=UPDATE_REASON_APPLIED,
+            step=update_input.step,
+        )
+
+    def _result(
+        self,
+        *,
+        applied: bool,
+        grad_norm: float,
+        reason: str,
+        step: int,
+    ) -> VMCUpdateResult:
+        """Build this attempt's result with its explicit minimal record.
+
+        Routed through :meth:`VMCUpdateMethod._record_result` rather than
+        constructing the record directly, so ``last_result`` reports this
+        adapter's attempts like any other method's. Building it here instead
+        would leave ``last_result`` permanently ``None`` on the one method
+        every default configuration uses.
+        """
+
+        return self._record_result(
+            applied=applied,
+            grad_norm=grad_norm,
+            reason=reason,
+            diagnostics=MinimalUpdateDiagnostics(
+                method=type(self).__qualname__,
+                applied=applied,
+                reason=reason,
+                step=step,
+                grad_norm=grad_norm,
+            ),
+        )
+
+    def norm_semantics(self) -> str:
+        """Report the legacy adapter's norm as the POST-CLIP gradient norm.
+
+        Stated precisely because the ordering is observable: the norm is taken
+        after ``clip_grad_norm_`` and before ``optimizer.step()``, so with
+        clipping configured it is bounded by ``gradient_clip_norm`` and is NOT
+        the norm of the raw backward gradient.
+        """
+
+        return "post_clip_grad_l2_over_gradient_domain"
+
+    def describe(self) -> UpdateMethodDescription:
+        """Add the adapter's clipping setting to the generic description."""
+
+        base = super().describe()
+        settings = dict(base.settings)
+        settings["gradient_clip_norm"] = json_safe_scalar(self.gradient_clip_norm)
+        return replace(base, settings=settings)
 
     def optimizer_params(self) -> tuple[torch.nn.Parameter, ...]:
         """Return the optimizer's direct parameter references in group order."""
@@ -1060,14 +1942,28 @@ def _gradient_norm(parameters: tuple[torch.nn.Parameter, ...]) -> float:
 __all__ = [
     "AutogradUpdateInput",
     "LegacyAutogradUpdate",
+    "MinimalUpdateDiagnostics",
     "ModelParameterBinding",
     "ObjectiveReevaluation",
     "ScoreUpdateInput",
+    "UPDATE_REASON_APPLIED",
+    "UPDATE_REASON_UNREPORTED",
+    "UPDATE_REASON_ZERO_ELECTRON_BATCH",
+    "UpdateDiagnostics",
+    "UpdateMethodDescription",
     "VMCStepData",
     "VMCUpdateMethod",
     "VMCUpdateResult",
     "VMCUpdateState",
+    "carrier_settings",
     "deserialize_parameter_layout",
+    "flatten_settings",
+    "DIAGNOSTIC_NAME_COLLISIONS_KEY",
+    "SETTING_NAME_COLLISIONS_KEY",
+    "json_safe_metric_name",
+    "merge_named_metrics",
+    "json_safe_scalar",
+    "parameter_layout_fingerprint",
     "select_reevaluation_rows",
     "serialize_parameter_layout",
     "vmc_objective_reevaluation",
