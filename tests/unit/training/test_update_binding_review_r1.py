@@ -1,23 +1,26 @@
 """Round-1 review probes for the one-bound-update-method lifecycle (PR 524).
 
-ADOPTED BY THE WRITER, unchanged except where a disposition required it.
-These are the reviewer's probes, not the writer's, and they are kept under the
-reviewer's names so the provenance stays legible: every one of them found
-something the writer's own suite did not.
+ADOPTED BY THE WRITER. These are the reviewer's probes, not the writer's, and
+they are kept under the reviewer's names so the provenance stays legible:
+every one of them found something the writer's own suite did not.
 
-Original state: all five GREEN at head 4175fc17c79a51e62d9d886ee3f18f1980aed280,
-measured on FASRC-Cannon jobs 51674866 and 51675986.
+This header deliberately records NO measurement, and NO claim about which
+probes have or have not been edited since they were written. Six consecutive
+review rounds found exactly one such sentence false, each time at this cluster
+of files, and the cause is structural rather than careless: a claim about a
+past run, or about how the surrounding file has changed, cannot be checked
+against the tree and goes stale the next time anyone edits the file. The
+durable record owns that history -- PR 524's review thread and the Task
+Orchestrator notes on item b6b5b4f5, whose per-round verdict and red/green
+note keys carry the heads, the Cannon job IDs and the per-arm counts. What
+follows describes only what each probe asserts and why, which a reader can
+falsify by reading the code beneath it.
 
-Changed on adoption, and only these:
-  - R1-1's probe pinned the HOLE (a second carrier accepted silently). The
-    writer accepted the issue and closed it, so the probe is INVERTED to
-    require the refusal. Its control changed message, because the binding
-    boundary now raises its own distinguishable string.
-  - R1-5's pin test is ADDED here rather than in the writer's file, because it
-    is the reviewer's design.
-R1-2, R1-3 and R1-4 are untouched: the writer kept the behavior R1-2 pins and
-corrected the documentation instead, and R1-3/R1-4 were always acceptance arms
-rather than disputes.
+R1-1 as adopted is INVERTED relative to the form that found the issue: it
+pinned the hole -- a second carrier accepted silently -- and now requires the
+refusal, because the writer accepted R1-1 and closed it. Its control asserts
+the binding boundary's own distinguishable message. R1-5's pin lives in this
+file rather than in the writer's because it is the reviewer's design.
 
 R1-1  A stateless method bound through the public
       `VMCTrainer.bind_update_method` accepts a SECOND carrier silently. The

@@ -10,18 +10,24 @@ witness instrument, an `open(..., "a")` probe, tripped the durable-append
 census. Round 4 carried that qualifier and an earlier version of this
 docstring dropped it, saying "every test passed" -- corrected in round 5,
 R5-2.) The property was not unprotected in the repository; it was
-unprotected in the suite that every verification receipt in this PR actually
-runs. `tests/integration/` would have caught it and no receipt here runs that
-tree, the writer's own included.
+unprotected in the suite that every verification receipt in this PR ran at the
+time. `tests/integration/training/test_train_runner.py` does catch this
+payload -- measured rather than inferred, after this docstring first asserted
+it unmeasured: round 6 ran that file green at both the head and the stack
+base, and red under this exact mutant, failing on the diverged-parameters
+assert in `test_resume_reproduces_the_uninterrupted_run_bitwise`.
 
 Why the existing coverage missed it, from the reviewer's analysis:
 
 - `test_r1_4_*` pins the construction COUNT on the resumed runner path, not
   the identity of the carrier that restore is handed.
-- Every exactness resume test in the focused files -- `test_adam_moments_*`,
+- The exactness resume tests enumerated here -- `test_adam_moments_*`,
   `test_r1_3_*`, `test_the_default_adapter_survives_restore_as_one_instance`
-  -- calls `restore_checkpoint` DIRECTLY, bypassing `Train.run`, so the
-  runner's own wiring of restore to the carrier is never exercised.
+  -- call `restore_checkpoint` DIRECTLY, bypassing `Train.run`, so the
+  runner's own wiring of restore to the carrier is never exercised. The
+  enumeration is closed and describes the coverage this finding was made
+  against: `test_r4_2_*` below goes through `Train.run`, and is the exception
+  that closing the gap created.
 - Block-NG's runner-driven bitwise resume rides a stateless SGD carrier, so a
   lost optimizer state dict is numerically invisible there.
 
