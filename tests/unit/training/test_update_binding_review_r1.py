@@ -31,13 +31,17 @@ R1-1  A stateless method bound through the public
       shows the default adapter refuses the same call sequence, so the hole is
       specific to stateless methods.
 
-R1-2  `bind_update_method`'s Parameters doc says an explicit
-      ``update_method=None`` "never" conflicts, and the inline comment says it
-      means "use what is already bound". The code implements neither: with an
-      explicit ``None`` it re-reads the CONSTRUCTOR spec and conflict-checks
-      that, so a trainer configured with one method and bound from an explicit
-      override raises on a plain ``fit``. Raising may be the right call, but
-      then both docstrings are wrong; one of code or doc must move.
+R1-2  AS FOUND (at 4175fc17): `bind_update_method`'s Parameters doc SAID an
+      explicit ``update_method=None`` "never" conflicted, and its inline
+      comment SAID the value meant "use what is already bound". The code
+      implemented neither -- with an explicit ``None`` it re-read the
+      CONSTRUCTOR spec and conflict-checked that, so a trainer configured with
+      one method and bound from an explicit override raised on a plain ``fit``.
+      RESOLVED: the writer kept the raise and corrected both docstrings, so at
+      this head the raise is documented. The test below therefore pins
+      behaviour that now AGREES with its documentation; its name was corrected
+      in round 3 (R3-1) because the original asserted a contradiction that no
+      longer exists and travelled alone into pytest output.
 
 R1-3  The acceptance contract names "SPRING history/trajectory match
       uninterrupted execution" and the writer's design note promised it as new
@@ -162,13 +166,21 @@ def test_r1_1_control_the_default_adapter_refuses_the_same_sequence() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_r1_2_explicit_none_after_an_explicit_override_raises_despite_the_doc() -> None:
+def test_r1_2_explicit_none_after_an_explicit_override_raises_as_the_doc_states() -> None:
     """Configured spec F, bound from explicit override G, then a plain call.
 
-    `bind_update_method`'s Parameters doc: ``None`` "never [conflicts]". Its
-    inline comment: explicit ``None`` "means 'use what is already bound'".
-    The code instead resurrects the constructor spec F and refuses. The raise
-    may be the safer semantic -- but then the documentation is wrong twice.
+    RENAMED IN ROUND 3 (R3-1). As originally written this test was called
+    ``..._raises_despite_the_doc``, and its docstring quoted, in the present
+    tense, a Parameters doc saying ``None`` "never [conflicts]" and an inline
+    comment saying ``None`` means "use what is already bound". Both strings
+    were real when round 1 found them and NEITHER EXISTS AT THIS HEAD: the
+    writer kept the raise and corrected the documentation to describe it.
+
+    A test name travels alone into pytest and JUnit output, without the module
+    header that explains its provenance. Left unchanged, this one asserted a
+    live contradiction in the current tree to anyone who read only the name --
+    the same class of stale-wording defect as R2-2, which the writer accepted
+    one round earlier. The behaviour assertion below is unchanged.
     """
 
     torch.manual_seed(0)
@@ -390,7 +402,7 @@ def test_r1_5_a_trainer_with_a_foreign_resolve_contract_keeps_the_runner_path(
     """
 
     seen = {}
-    built = {}
+    builds = []
 
     class _ForeignTrainer:
         """Implements the duck-typed runner contract and nothing else."""
@@ -408,13 +420,17 @@ def test_r1_5_a_trainer_with_a_foreign_resolve_contract_keeps_the_runner_path(
             return None
 
     def build_adam(params):
-        # Capture the instance, so the assertion below can pin IDENTITY rather
-        # than type. Strengthened after reviewer round 2 (R2-4): an `isinstance`
-        # check passes for ANY Adam, including one the runner did not build,
-        # so it could not distinguish "the runner kept its own carrier" from
-        # "something else supplied a different Adam".
-        built["optimizer"] = torch.optim.Adam(params, lr=LEARNING_RATE)
-        return built["optimizer"]
+        # Capture EVERY build, not the last one. Strengthened twice: round 2
+        # (R2-4) replaced an `isinstance` check with identity, because
+        # `isinstance` passes for ANY Adam including one the runner did not
+        # build. Round 3 (R3-2) then measured that a single-slot capture was
+        # still blind -- under a mutant that built the carrier TWICE and fed
+        # `fit` the second, the slot held the SECOND build and `seen is built`
+        # compared it against itself, so the pin stayed green. Recording the
+        # list and asserting against `builds[0]` closes that: the carrier that
+        # reaches `fit` must be the FIRST one the runner built.
+        builds.append(torch.optim.Adam(params, lr=LEARNING_RATE))
+        return builds[-1]
 
     context = make_run_context(tmp_path / "foreign-run")
     torch.manual_seed(0)
@@ -428,7 +444,11 @@ def test_r1_5_a_trainer_with_a_foreign_resolve_contract_keeps_the_runner_path(
     ).run(context)
 
     assert result.status == "completed"
-    assert seen["optimizer"] is built["optimizer"], (
-        "the runner must hand `fit` the optimizer it built when the trainer's "
-        "resolve contract returns something without a carrier"
+    assert builds, (
+        "the runner never invoked the configured optimizer factory; it built "
+        "its carrier somewhere else"
+    )
+    assert seen["optimizer"] is builds[0], (
+        "the runner must hand `fit` the FIRST optimizer it built when the "
+        "trainer's resolve contract returns something without a carrier"
     )

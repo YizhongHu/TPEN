@@ -417,9 +417,12 @@ class VMCTrainer:
             distinction only matters after a bind that came from an explicit
             override: a trainer configured with spec F, bound from an explicit
             override G, then called again with ``None``, re-reads F, finds it
-            disagrees with the bound spec, and RAISES. That is deliberate (see
-            Notes), and it is the ordinary case only because a runner-driven
-            run never passes an override in the first place.
+            disagrees with the bound spec, and RAISES. That is deliberate;
+            the rationale sits at the check itself in the body below, NOT in
+            Notes -- an earlier revision pointed at Notes, which never
+            addressed it (reviewer round 3, R3-3). It is the ordinary case
+            only because a runner-driven run never passes an override in the
+            first place.
 
         Returns
         -------
@@ -519,11 +522,14 @@ class VMCTrainer:
         # rather than the reverse, because the alternative -- letting a plain
         # call silently diverge from the spec the trainer was configured with
         # -- is the exact class of defect this slice exists to remove.
-        late_spec = update_method if update_method is not None else self.update_method
+        # `spec`, computed at the top of this method, is already exactly this
+        # expression. An earlier revision recomputed it here under a second
+        # name, which invited a reader to hunt for a difference that was never
+        # there (reviewer round 3, R3-3).
         if (
-            late_spec is not None
-            and late_spec is not self._bound_update_method_spec
-            and late_spec is not bound
+            spec is not None
+            and spec is not self._bound_update_method_spec
+            and spec is not bound
         ):
             raise ValueError(
                 "update method was already bound from a different specification; "

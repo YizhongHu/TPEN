@@ -164,7 +164,7 @@ def test_r2_1_a_foreign_resolve_return_with_a_carrier_keeps_the_runner_optimizer
     """
 
     seen: dict[str, Any] = {}
-    built: dict[str, Any] = {}
+    builds: list[Any] = []
 
     class _ForeignCarrierTrainer:
         """Implements the duck-typed runner contract and nothing else.
@@ -187,8 +187,11 @@ def test_r2_1_a_foreign_resolve_return_with_a_carrier_keeps_the_runner_optimizer
             return None
 
     def build_adam(params):
-        built["optimizer"] = torch.optim.Adam(params, lr=LEARNING_RATE)
-        return built["optimizer"]
+        # Every build, not the last: see R3-2 in the round-3 probe file. A
+        # single-slot capture is satisfied by a SECOND build comparing against
+        # itself, so it cannot see a runner that builds twice.
+        builds.append(torch.optim.Adam(params, lr=LEARNING_RATE))
+        return builds[-1]
 
     context = make_run_context(tmp_path / "foreign-carrier-run")
     torch.manual_seed(0)
@@ -203,7 +206,11 @@ def test_r2_1_a_foreign_resolve_return_with_a_carrier_keeps_the_runner_optimizer
     ).run(context)
 
     assert result.status == "completed"
-    assert seen["optimizer"] is built["optimizer"], (
+    assert builds, (
+        "the runner never invoked the configured optimizer factory; it built "
+        "its carrier somewhere else"
+    )
+    assert seen["optimizer"] is builds[0], (
         "the runner handed `fit` a carrier it did not build: the foreign "
         "trainer's `resolve_update_state` return was adopted instead of being "
         "discarded as it was before PR 524"
