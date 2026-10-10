@@ -173,8 +173,11 @@ def test_r1_2_explicit_none_after_an_explicit_override_raises_as_the_doc_states(
     ``..._raises_despite_the_doc``, and its docstring quoted, in the present
     tense, a Parameters doc saying ``None`` "never [conflicts]" and an inline
     comment saying ``None`` means "use what is already bound". Both strings
-    were real when round 1 found them and NEITHER EXISTS AT THIS HEAD: the
-    writer kept the raise and corrected the documentation to describe it.
+    were real when round 1 found them, and NEITHER SURVIVES AS A LIVE CLAIM at
+    this head: the writer kept the raise and corrected the documentation to
+    describe it. One of the two strings is still present, quoted as HISTORY, at
+    the check itself in `trainer.py` -- so this paragraph is about the claims,
+    not about what a grep will find (reviewer round 4).
 
     A test name travels alone into pytest and JUnit output, without the module
     header that explains its provenance. Left unchanged, this one asserted a
