@@ -148,6 +148,7 @@ pythonpath = ["."]
 consider_namespace_packages = true
 markers = [
   "integration: end-to-end tests that exercise entrypoints, configs, or generated artifacts",
+  "retained_binding_timing: a witness for a bind_update_method retained-guard timing cell; the suite enforces that every such witness is parametrised over stateful AND stateless",
 ]
 addopts = "--typeguard-packages=tpen"
 norecursedirs = [

@@ -822,6 +822,7 @@ def _bound_trainer(stateless: bool = False):
     return model, optimizer, trainer
 
 
+@pytest.mark.retained_binding_timing
 @pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
 def test_a_second_MODEL_is_refused_BEFORE_any_sample_is_drawn(stateless: bool) -> None:
     """The rebind guards are in the clause too, and their timing was unpinned.
@@ -861,6 +862,7 @@ def test_a_second_MODEL_is_refused_BEFORE_any_sample_is_drawn(stateless: bool) -
     )
 
 
+@pytest.mark.retained_binding_timing
 @pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
 def test_a_second_CARRIER_is_refused_BEFORE_any_sample_is_drawn(stateless: bool) -> None:
     """The carrier half of the same rebind pair, at the same boundary."""
