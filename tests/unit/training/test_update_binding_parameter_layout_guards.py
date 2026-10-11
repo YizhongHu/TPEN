@@ -37,7 +37,11 @@ from tpen.training.update import (
 from types import SimpleNamespace
 
 from tests.helpers.hooke_models import build_tiny_hamiltonian_terms, build_tiny_spenn
-from tests.unit.training.test_update_binding import _FixedSampler, _StubContext
+from tests.unit.training.test_update_binding import (
+    _FixedSampler,
+    _StatelessCustomMethod,
+    _StubContext,
+)
 
 LEARNING_RATE = 0.01
 
@@ -793,18 +797,33 @@ def test_a_conflicting_late_SELECTOR_is_refused_BEFORE_any_sample_is_drawn() -> 
     )
 
 
-def _bound_trainer():
-    """One trainer already bound to its own model and carrier."""
+def _bound_trainer(stateless: bool = False):
+    """One trainer already bound to its own model and carrier.
+
+    `stateless` selects a method whose `update_state()` returns `None`. That is
+    not a cosmetic variation: `_resolve_method_state` RETURNS EARLY on `None`,
+    so neither the ownership guard nor the parameter guard ever runs, and the
+    retained model/carrier checks in `bind_update_method` are the only defence
+    left. An independent verifier measured all four retained-binding single
+    deferrals crossing their boundary on this path (Cannon 52093726), which
+    refuted a claim of mine that a single deferral is always caught by the
+    method-state guard. It is caught only when a method HAS state.
+    """
 
     torch.manual_seed(0)
     model = build_tiny_spenn()
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1)
+    trainer = VMCTrainer(
+        max_steps=1,
+        log_every_n_steps=1,
+        update_method=_StatelessCustomMethod() if stateless else None,
+    )
     trainer.resolve_update_state(model=model, optimizer=optimizer)
     return model, optimizer, trainer
 
 
-def test_a_second_MODEL_is_refused_BEFORE_any_sample_is_drawn() -> None:
+@pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
+def test_a_second_MODEL_is_refused_BEFORE_any_sample_is_drawn(stateless: bool) -> None:
     """The rebind guards are in the clause too, and their timing was unpinned.
 
     `test_a_second_model_is_refused_after_binding` calls `resolve_update_state`
@@ -821,7 +840,7 @@ def test_a_second_MODEL_is_refused_BEFORE_any_sample_is_drawn() -> None:
     contract names, so the assertion has to be on the sample count.
     """
 
-    _model, optimizer, trainer = _bound_trainer()
+    _model, optimizer, trainer = _bound_trainer(stateless)
     torch.manual_seed(1)
     other_model = build_tiny_spenn()
     sampler = _CountingSampler()
@@ -842,10 +861,11 @@ def test_a_second_MODEL_is_refused_BEFORE_any_sample_is_drawn() -> None:
     )
 
 
-def test_a_second_CARRIER_is_refused_BEFORE_any_sample_is_drawn() -> None:
+@pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
+def test_a_second_CARRIER_is_refused_BEFORE_any_sample_is_drawn(stateless: bool) -> None:
     """The carrier half of the same rebind pair, at the same boundary."""
 
-    model, _optimizer, trainer = _bound_trainer()
+    model, _optimizer, trainer = _bound_trainer(stateless)
     other_optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     sampler = _CountingSampler()
 
