@@ -418,3 +418,81 @@ def test_rebuild_refuses_a_structurally_compatible_state_after_rebind() -> None:
             TypeError, match="update_state must return VMCUpdateState or None"
         ):
             trainer.rebuild_update_state(model=reloaded_model)
+
+
+class _SubclassedUpdateState(VMCUpdateState):
+    """A lawful subclass of the declared authority type.
+
+    Nothing in the contract requires an implementation to return the base
+    class exactly; `isinstance` admits subclasses and that is the documented
+    behaviour both admission checks rely on.
+    """
+
+
+class _SubclassStateMethod(VMCUpdateMethod[AutogradUpdateInput]):
+    """A method whose owned state is a SUBCLASS of VMCUpdateState."""
+
+    def __init__(self, optimizer: torch.optim.Optimizer, binding: ModelParameterBinding) -> None:
+        self._optimizer = optimizer
+        self._binding = binding
+
+    def update(self, update_input: AutogradUpdateInput) -> VMCUpdateResult:
+        return VMCUpdateResult(applied=False, grad_norm=0.0, reason="declined_for_test")
+
+    def update_state(self) -> VMCUpdateState:
+        return _SubclassedUpdateState(optimizer=self._optimizer, model_parameters=self._binding)
+
+    def rebind_model_parameters(self, model_parameters: ModelParameterBinding) -> None:
+        self._binding = model_parameters
+
+
+def test_resolve_accepts_a_lawful_subclass_of_the_update_state() -> None:
+    """Admission is NOMINAL, not EXACT: a subclass is a VMCUpdateState.
+
+    The refusal tests in this file pin that a non-VMCUpdateState is rejected.
+    They do not pin the other direction, and the independent verifier measured
+    that gap: tightening either `isinstance` check to an exact-type comparison
+    survived every committed suite. Nothing noticed that lawful subclass
+    implementations had been locked out. This is the discriminator for that.
+    """
+
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
+
+    method = _SubclassStateMethod(optimizer, binding)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
+
+    resolved = trainer.resolve_update_state(model=model, optimizer=optimizer)
+
+    assert isinstance(resolved, _SubclassedUpdateState), (
+        "the subclass must survive admission as itself, not be coerced to the base"
+    )
+    assert resolved.optimizer is optimizer
+
+
+def test_rebuild_accepts_a_lawful_subclass_of_the_update_state() -> None:
+    """The RESTORE boundary admits subclasses on the same terms as resolve.
+
+    Both boundaries now carry an `isinstance` admission check, so both can be
+    tightened to an exact-type comparison independently. One discriminator per
+    boundary is what keeps that from happening unnoticed at either.
+    """
+
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
+
+    method = _SubclassStateMethod(optimizer, binding)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
+    trainer.resolve_update_state(model=model, optimizer=optimizer)
+
+    torch.manual_seed(123)
+    reloaded_model = build_tiny_spenn()
+
+    rebuilt = trainer.rebuild_update_state(model=reloaded_model)
+
+    assert isinstance(rebuilt, _SubclassedUpdateState)
+    assert rebuilt.optimizer is optimizer
