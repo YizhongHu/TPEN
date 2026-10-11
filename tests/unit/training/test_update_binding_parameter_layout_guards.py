@@ -612,3 +612,88 @@ def test_a_later_resolve_accepts_a_method_that_did_not_drift() -> None:
     resolved = trainer.resolve_update_state(model=model, optimizer=optimizer)
 
     assert resolved.optimizer is optimizer
+
+
+class _CountingSampler:
+    """Wraps the deterministic sampler and COUNTS how often it is asked.
+
+    The contract clause under test is temporal, not behavioural: a refusal
+    that arrives after one sample is still the right refusal and still breaks
+    the promise. Only a witness that observes WHETHER sampling happened can
+    tell those apart, which is why this counts rather than asserting on the
+    error alone.
+    """
+
+    def __init__(self) -> None:
+        self._inner = _FixedSampler()
+        self.collect_calls = 0
+
+    def collect_samples(self, model, *, device=None):
+        self.collect_calls += 1
+        return self._inner.collect_samples(model, device=device)
+
+    def mcmc_state_dict(self):
+        return self._inner.mcmc_state_dict()
+
+    def load_mcmc_state_dict(self, state) -> None:
+        self._inner.load_mcmc_state_dict(state)
+
+
+def test_a_wrong_binding_is_refused_BEFORE_any_sample_is_drawn() -> None:
+    """ACCEPTANCE clause: the refusal must land BEFORE SAMPLING.
+
+    The contract does not merely require that a wrong model/optimizer binding
+    fails; it requires that it fails *before sampling or mutable restore*. A
+    trainer that validates late raises the identical ValueError after having
+    already drawn a batch, satisfies every error-matching test in this suite,
+    and violates the clause. The independent verifier measured exactly that:
+    delayed validation survived the focused, unit and integration selections
+    while its external witnesses sampled once before the correct refusal.
+
+    `collect_calls == 0` is the whole assertion. The ValueError is necessary
+    but not sufficient, so it is checked and then set aside.
+    """
+
+    model, optimizer, _method, trainer = _drift_fixture("optimizer")
+    sampler = _CountingSampler()
+
+    with pytest.raises(ValueError, match="mismatched legacy optimizer ownership"):
+        trainer.fit(
+            model=model,
+            sampler=sampler,
+            hamiltonian_terms=build_tiny_hamiltonian_terms(),
+            optimizer=optimizer,
+            context=_StubContext(),
+            emit=lambda **_: None,
+        )
+
+    assert sampler.collect_calls == 0, (
+        "the binding was refused only AFTER sampling; the contract requires "
+        "the refusal to land before any sample is drawn"
+    )
+
+
+def test_the_counting_sampler_does_count_when_a_run_is_allowed_to_proceed() -> None:
+    """Control for the witness itself, not for the trainer.
+
+    `collect_calls == 0` proves nothing unless this sampler is known to reach
+    a non-zero count on a run that is permitted to sample. Without this, a
+    sampler that was never wired in at all would satisfy the clause test.
+    """
+
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1)
+    sampler = _CountingSampler()
+
+    trainer.fit(
+        model=model,
+        sampler=sampler,
+        hamiltonian_terms=build_tiny_hamiltonian_terms(),
+        optimizer=optimizer,
+        context=_StubContext(),
+        emit=lambda **_: None,
+    )
+
+    assert sampler.collect_calls > 0
