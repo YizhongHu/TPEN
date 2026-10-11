@@ -62,6 +62,120 @@ def test_selection_refuses_zero_matches_and_never_first_matches(tmp_path: Path) 
         runner.select_cell(cells, seed_label=999_999)
 
 
+@pytest.mark.parametrize(
+    ("axis", "value"),
+    [("architecture", "hybrid"), ("optimizer", "kfac"), ("optimizer", "sr")],
+)
+def test_r3_selection_axes_reject_unadmitted_values_before_all_execution_stages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    axis: str,
+    value: str,
+) -> None:
+    """Architecture and optimizer are both required admission coordinates."""
+
+    cells = _cells(tmp_path)
+    selection_kwargs = {axis: value, "seed_label": 810001}
+    with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
+        runner.select_cell(cells, **selection_kwargs)
+
+    for name, target in (
+        ("_q_training_packet", runner),
+        ("_execution_facts", runner),
+    ):
+        monkeypatch.setattr(
+            target,
+            name,
+            lambda *args, _name=name, **kwargs: pytest.fail(f"{_name} was reached"),
+        )
+    monkeypatch.setattr(
+        runner.train_config,
+        "resolve_train_config",
+        lambda *args, **kwargs: pytest.fail("config resolution was reached"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_refuse_occupied_output_path",
+        lambda *args, **kwargs: pytest.fail("output claim was reached"),
+    )
+    monkeypatch.setattr(
+        runner.launch,
+        "launch_train",
+        lambda *args, **kwargs: pytest.fail("launch was reached"),
+    )
+
+    for dry_run in (True, False):
+        args = _args(
+            tmp_path / f"{axis}-{value}-{dry_run}",
+            dry_run=dry_run,
+            **selection_kwargs,
+        )
+        with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
+            runner.execute(args)
+        assert not list(args.output_root.rglob("selection_receipt.json"))
+        assert not list(args.output_root.rglob("resolved_config.yaml"))
+        assert not list(args.output_root.rglob("COMPLETE"))
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_r3_default_axes_reach_frozen_exact_cell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dry_run: bool,
+) -> None:
+    """The valid Q/control/Adam axis remains a real executable selection."""
+
+    cells = _cells(tmp_path)
+    expected_cell = next(
+        cell
+        for cell in cells
+        if cell.manifest["stage"] == "Q"
+        and cell.manifest["scientific_identity"]["architecture"] == "control"
+        and cell.manifest["scientific_identity"]["optimizer"] == "adam"
+        and cell.manifest["seed_identity"]["label"] == 810001
+    )
+    expected_descriptor = {
+        "stage": "Q",
+        "architecture": "control",
+        "optimizer": "adam",
+        "seed_label": 810001,
+        "status": "available",
+    }
+    expected_type = type(expected_cell)
+    expected_hash = expected_cell.content_hash
+    expected_manifest = expected_cell.manifest
+    selected = runner.select_cell(cells, seed_label=810001)
+    assert selected.selected.as_dict() == expected_descriptor
+    assert type(selected.cell) is expected_type
+    assert selected.cell.content_hash == expected_hash
+    assert selected.cell.manifest == expected_manifest
+
+    observed: dict[str, object] = {}
+    if not dry_run:
+        monkeypatch.setattr(runner, "_execution_facts", lambda: {"device": "cuda:0"})
+
+        def injected_launch(packet: object, facts: object) -> int:
+            observed["packet"] = packet
+            observed["facts"] = facts
+            return 7
+
+        monkeypatch.setattr(runner.launch, "launch_train", injected_launch)
+
+    assert runner.execute(
+        _args(tmp_path / f"valid-{dry_run}", dry_run=dry_run)
+    ) == (0 if dry_run else 7)
+    if dry_run:
+        report = json.loads(capsys.readouterr().out)
+        assert report["selection"]["selected"] == expected_descriptor
+        assert report["train_packet"]["content_hash"] == expected_hash
+    else:
+        packet = observed["packet"]
+        assert type(packet.cell) is expected_type
+        assert packet.cell.content_hash == expected_hash
+        assert packet.cell.manifest == expected_manifest
+
+
 def test_q_cadence_is_accepted_at_the_horizon_and_only_train_is_emitted(tmp_path: Path) -> None:
     selected = runner.select_cell(_cells(tmp_path), seed_label=810_001)
     packet = runner._q_training_packet(selected.cell)
