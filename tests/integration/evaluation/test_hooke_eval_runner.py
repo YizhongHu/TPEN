@@ -399,6 +399,69 @@ def test_train_rejects_parameter_binding_mismatch_before_resume_restore(
     )
 
 
+def test_train_rejects_a_conflicting_late_selector_before_resume_restore(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """The selector arm of the clause, at the restore boundary.
+
+    An independent verifier (Cannon 52065488) built `delay_selector_restore`,
+    which defers only the selector predicate past restore. It passed F 43 and
+    I 8 while its external witness recorded one restore that CHANGED REAL
+    MODEL TENSORS and moved the carrier learning rate from 0.01 to 0.03125
+    before the correct ValueError. Pristine restores zero times and leaves
+    weights and lr untouched. Restore mutates state, so a refusal landing
+    afterwards has already done the damage.
+
+    The conflict is built WITHOUT a late argument, because the runner never
+    passes one: the trainer is constructed carrying one spec and then
+    explicitly pre-bound to a different method, so the runner's own resolve
+    falls back to the constructor spec and conflicts with what is bound. The
+    model and optimizer are deliberately the same objects the runner uses --
+    the factory returns the pre-built carrier -- so the two binding guards that
+    precede the selector check cannot fire first and steal the kill.
+    """
+
+    model = nn.Linear(1, 1).double()
+    owned_optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    binding = ModelParameterBinding(parameters=tuple(model.parameters()))
+    configured = LegacyAutogradUpdate(owned_optimizer, model_parameters=binding)
+    already_bound = LegacyAutogradUpdate(owned_optimizer, model_parameters=binding)
+    trainer = VMCTrainer(max_steps=0, update_method=configured)
+    trainer.bind_update_method(
+        model=model,
+        optimizer=owned_optimizer,
+        update_method=already_bound,
+    )
+    restore_calls = []
+
+    def fake_restore_checkpoint_with_events(**kwargs):
+        restore_calls.append(kwargs)
+        raise AssertionError("restore must not run before late-selector validation")
+
+    monkeypatch.setattr(
+        train_runner_module,
+        "restore_checkpoint_with_events",
+        fake_restore_checkpoint_with_events,
+    )
+    runner = Train(
+        model=model,
+        sampler=object(),
+        hamiltonian_terms=[],
+        optimizer=lambda params: owned_optimizer,
+        trainer=trainer,
+        load={"mode": "train_resume", "path": "unused"},
+    )
+
+    with pytest.raises(ValueError, match="already bound from a different specification"):
+        runner.run(_recording_context(tmp_path, [])[0])
+
+    assert restore_calls == [], (
+        "the conflicting late selector was refused only AFTER restore; the "
+        "contract requires the refusal to land before any mutable restore"
+    )
+
+
 def test_evaluate_model_only_calls_runner_owned_restore(monkeypatch, tmp_path: Path) -> None:
     calls = []
 

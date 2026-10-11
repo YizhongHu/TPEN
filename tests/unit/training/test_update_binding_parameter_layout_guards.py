@@ -28,6 +28,7 @@ import typeguard
 from tpen.training.trainer import VMCTrainer
 from tpen.training.update import (
     AutogradUpdateInput,
+    LegacyAutogradUpdate,
     ModelParameterBinding,
     VMCUpdateMethod,
     VMCUpdateResult,
@@ -737,4 +738,56 @@ def test_a_drifted_PARAMETER_BINDING_is_refused_BEFORE_any_sample_is_drawn() -> 
     assert sampler.collect_calls == 0, (
         "the parameter binding was refused only AFTER sampling; the contract "
         "requires the refusal to land before any sample is drawn"
+    )
+
+
+def test_a_conflicting_late_SELECTOR_is_refused_BEFORE_any_sample_is_drawn() -> None:
+    """The selector arm of the clause, at the sampling boundary.
+
+    ACCEPTANCE names TWO failure classes: "a conflicting late SELECTOR or
+    wrong model/optimizer binding fails before sampling or mutable restore."
+    Three rounds of this lane pinned refinements of the SECOND class while the
+    first had no timing witness at all.
+
+    `test_a_conflicting_late_selector_is_refused_after_binding` pins that the
+    refusal happens; it calls `bind_update_method` directly and observes
+    nothing about when the refusal lands relative to sampling. An independent
+    verifier (Cannon 52065488) built `delay_selector_sample`, which defers only
+    the selector predicate past the first ordinary sample and SURVIVED F 43,
+    I 8, B 3067 pass + 5 skip and J 12, all rc 0, while its external witness
+    recorded one sample before the correct ValueError.
+
+    Deleting the selector guard outright is killed by two direct binding tests,
+    so the guard is not untested -- only its TIMING is. This witness therefore
+    has to fail on the sample count, not on the absence of a refusal.
+    """
+
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1)
+    trainer.resolve_update_state(model=model, optimizer=optimizer)
+
+    # A DIFFERENT method instance arriving late. Not the bound one -- handing
+    # back the very instance that is bound is explicitly not a conflict.
+    late = LegacyAutogradUpdate(
+        optimizer,
+        model_parameters=ModelParameterBinding.from_parameters(tuple(model.parameters())),
+    )
+    sampler = _CountingSampler()
+
+    with pytest.raises(ValueError, match="already bound from a different specification"):
+        trainer.fit(
+            model=model,
+            sampler=sampler,
+            hamiltonian_terms=build_tiny_hamiltonian_terms(),
+            optimizer=optimizer,
+            context=_StubContext(),
+            emit=lambda **_: None,
+            update_method=late,
+        )
+
+    assert sampler.collect_calls == 0, (
+        "the conflicting late selector was refused only AFTER sampling; the "
+        "contract requires the refusal to land before any sample is drawn"
     )
