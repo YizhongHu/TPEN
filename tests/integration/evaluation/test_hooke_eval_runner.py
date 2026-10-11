@@ -47,7 +47,13 @@ from tpen.runner import Evaluate, Train
 from tpen.sampling import SamplerStats
 from tpen.training.state import TrainerState
 from tpen.training.trainer import VMCTrainer
-from tpen.training.update import LegacyAutogradUpdate, ModelParameterBinding
+from tpen.training.update import (
+    AutogradUpdateInput,
+    LegacyAutogradUpdate,
+    ModelParameterBinding,
+    VMCUpdateMethod,
+    VMCUpdateResult,
+)
 from tests.helpers.hooke_models import build_tiny_sampler, build_tiny_spenn
 from tests.helpers.run_context import RecordingLogger, make_run_context
 
@@ -462,6 +468,27 @@ def test_train_rejects_a_conflicting_late_selector_before_resume_restore(
     )
 
 
+class _StatelessRunnerMethod(VMCUpdateMethod[AutogradUpdateInput]):
+    """A method with no owned state, for the stateless half of each pair.
+
+    `_resolve_method_state` returns early when `update_state()` is `None`, so
+    on this path neither the ownership guard nor the parameter guard runs and
+    the retained model/carrier checks are the only defence. The stateful half
+    of each pair below is shadowed by those method-state guards; the stateless
+    half is not. Independent measurement (Cannon 52093726) showed all four
+    retained-binding SINGLE deferrals crossing their boundary here.
+    """
+
+    def update(self, update_input: AutogradUpdateInput) -> VMCUpdateResult:
+        return VMCUpdateResult(applied=False, grad_norm=0.0, reason="declined_for_test")
+
+
+def _retained_method(stateless: bool, optimizer, binding):
+    if stateless:
+        return _StatelessRunnerMethod()
+    return LegacyAutogradUpdate(optimizer, model_parameters=binding)
+
+
 def _recording_restore(monkeypatch):
     """Monkeypatch restore to record and refuse to proceed."""
 
@@ -479,9 +506,11 @@ def _recording_restore(monkeypatch):
     return restore_calls
 
 
+@pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
 def test_train_rejects_a_second_model_before_resume_restore(
     monkeypatch,
     tmp_path: Path,
+    stateless: bool,
 ) -> None:
     """The model-rebind guard at the restore boundary.
 
@@ -496,11 +525,10 @@ def test_train_rejects_a_second_model_before_resume_restore(
     owned_optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
     trainer = VMCTrainer(
         max_steps=0,
-        update_method=LegacyAutogradUpdate(
+        update_method=_retained_method(
+            stateless,
             owned_optimizer,
-            model_parameters=ModelParameterBinding(
-                parameters=tuple(foreign_model.parameters())
-            ),
+            ModelParameterBinding(parameters=tuple(foreign_model.parameters())),
         ),
     )
     # Bind to the FOREIGN model first, so the runner's own model is the second.
@@ -524,9 +552,11 @@ def test_train_rejects_a_second_model_before_resume_restore(
     )
 
 
+@pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
 def test_train_rejects_a_second_carrier_before_resume_restore(
     monkeypatch,
     tmp_path: Path,
+    stateless: bool,
 ) -> None:
     """The carrier half of the same pair, at the restore boundary."""
 
@@ -535,9 +565,10 @@ def test_train_rejects_a_second_carrier_before_resume_restore(
     foreign_optimizer = torch.optim.Adam(model.parameters(), lr=0.2)
     trainer = VMCTrainer(
         max_steps=0,
-        update_method=LegacyAutogradUpdate(
+        update_method=_retained_method(
+            stateless,
             foreign_optimizer,
-            model_parameters=ModelParameterBinding(parameters=tuple(model.parameters())),
+            ModelParameterBinding(parameters=tuple(model.parameters())),
         ),
     )
     # Bind to the FOREIGN carrier first; the runner then supplies its own.
