@@ -506,6 +506,7 @@ def _recording_restore(monkeypatch):
     return restore_calls
 
 
+@pytest.mark.retained_binding_timing
 @pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
 def test_train_rejects_a_second_model_before_resume_restore(
     monkeypatch,
@@ -552,6 +553,7 @@ def test_train_rejects_a_second_model_before_resume_restore(
     )
 
 
+@pytest.mark.retained_binding_timing
 @pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
 def test_train_rejects_a_second_carrier_before_resume_restore(
     monkeypatch,
