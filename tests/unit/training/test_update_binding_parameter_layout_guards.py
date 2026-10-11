@@ -697,3 +697,44 @@ def test_the_counting_sampler_does_count_when_a_run_is_allowed_to_proceed() -> N
     )
 
     assert sampler.collect_calls > 0
+
+
+def test_a_drifted_PARAMETER_BINDING_is_refused_BEFORE_any_sample_is_drawn() -> None:
+    """The clause names TWO paths and the optimizer one does not cover both.
+
+    ACCEPTANCE: "a conflicting late selector or wrong model/OPTIMIZER BINDING
+    fails before sampling or mutable restore." The sibling test above drives
+    optimizer drift, so a trainer that keeps the type and optimizer guards
+    eager and defers ONLY the parameter-identity check past the first sample
+    satisfies it -- the optimizer refusal still lands early and nothing counts
+    the sample drawn before the binding was checked.
+
+    That is not hypothetical. The independent verifier built exactly that
+    mutant: committed focused 42, unit 3066 + 5 skip and integration 6 all
+    passed with the same phase outcomes as pristine, while its external
+    binding-drift probe recorded one sample and zero updates before the
+    correct ValueError.
+
+    One witness pins one arm of a disjunction. This is the second disjunctive
+    clause on this slice to need that said out loud; `:381` was the first.
+    """
+
+    model, optimizer, _method, trainer = _drift_fixture("binding")
+    sampler = _CountingSampler()
+
+    with pytest.raises(
+        ValueError, match="update method parameter binding does not match live model"
+    ):
+        trainer.fit(
+            model=model,
+            sampler=sampler,
+            hamiltonian_terms=build_tiny_hamiltonian_terms(),
+            optimizer=optimizer,
+            context=_StubContext(),
+            emit=lambda **_: None,
+        )
+
+    assert sampler.collect_calls == 0, (
+        "the parameter binding was refused only AFTER sampling; the contract "
+        "requires the refusal to land before any sample is drawn"
+    )
