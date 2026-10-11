@@ -822,66 +822,76 @@ def _bound_trainer(stateless: bool = False):
     return model, optimizer, trainer
 
 
-@pytest.mark.retained_binding_timing
+# ---------------------------------------------------------------------------
+# ONE HARNESS OWNS CONSTRUCTION, EXECUTION AND ASSERTION FOR ALL FOUR CASES.
+#
+# Three earlier attempts tried to keep four hand-written witnesses honest with a
+# meta-test that inspected their shape. Each was bypassed: a `not_stateless`
+# substring decoy; then an annotation/decorator/default reference satisfying a
+# "body reads the name" check that was really "the tree contains a load"; then
+# indirect parametrisation delivering False under both ids. The meta-test was
+# deleted rather than patched a third time -- it inferred a RUNTIME property
+# from STATIC SHAPE, and every bypass lived in that gap.
+#
+# A proposed replacement, injecting a path-bound factory the witness "could not
+# work without", was refuted before it was written: a factory result can be
+# discarded and a separate object exercised instead. Injection constrains what
+# is AVAILABLE, never what is USED.
+#
+# What is left is the thing that actually holds: the harness selects the path,
+# builds the scenario, drives the boundary and makes the assertion. No per-case
+# body exists, so there is nowhere to put a case that ignores its parameter.
+# This is not enforcement of a convention; it is the absence of the surface the
+# convention was protecting.
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
-def test_a_second_MODEL_is_refused_BEFORE_any_sample_is_drawn(stateless: bool) -> None:
-    """The rebind guards are in the clause too, and their timing was unpinned.
+@pytest.mark.parametrize("guard", ["model", "carrier"])
+def test_a_second_BINDING_is_refused_BEFORE_any_sample_is_drawn(
+    guard: str, stateless: bool
+) -> None:
+    """Retained model/carrier rebind guards must refuse before sampling.
 
-    `test_a_second_model_is_refused_after_binding` calls `resolve_update_state`
-    directly and asserts nothing about timing.
+    `test_a_second_model_is_refused_after_binding` and its carrier twin call
+    `resolve_update_state` directly and assert nothing about timing.
     `test_a_refusal_happens_before_any_update_runs` drives `fit` but asserts
-    `completed_updates == 0` and `next_iteration == 0` -- COUNTERS, not
-    samples. A guard deferred past `collect_samples` and raised before the
-    update leaves both counters at zero and survives, while its docstring
-    claims "the guards fire at the binding boundary, not part-way through a
-    loop".
+    `completed_updates == 0` and `next_iteration == 0` -- COUNTERS, not samples.
+    A guard deferred past `collect_samples` and raised before the update leaves
+    both counters at zero and survives, while that test's docstring claims the
+    guards "fire at the binding boundary, not part-way through a loop". Right
+    property, wrong witness.
 
-    That is the right property with the wrong witness, which is how this lane
-    has lost four cells of this clause already. Sampling is the observable the
-    contract names, so the assertion has to be on the sample count.
+    Independent measurement (Cannon 52113889) refined what each case does: a
+    SINGLE deferral of a retained guard is caught here only on the STATELESS
+    path. On the stateful path the owned-state guard refuses earlier, so that
+    case contributes an early-refusal shadow rather than a timing kill, and
+    only the COMBINED deferral reaches this assertion on both paths.
     """
 
-    _model, optimizer, trainer = _bound_trainer(stateless)
-    torch.manual_seed(1)
-    other_model = build_tiny_spenn()
+    model, optimizer, trainer = _bound_trainer(stateless)
     sampler = _CountingSampler()
 
-    with pytest.raises(ValueError, match="already bound to a different model"):
+    if guard == "model":
+        torch.manual_seed(1)
+        fit_model, fit_optimizer = build_tiny_spenn(), optimizer
+        expected = "already bound to a different model"
+    else:
+        fit_model = model
+        fit_optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        expected = "already bound to a different optimizer"
+
+    with pytest.raises(ValueError, match=expected):
         trainer.fit(
-            model=other_model,
+            model=fit_model,
             sampler=sampler,
             hamiltonian_terms=build_tiny_hamiltonian_terms(),
-            optimizer=optimizer,
+            optimizer=fit_optimizer,
             context=_StubContext(),
             emit=lambda **_: None,
         )
 
     assert sampler.collect_calls == 0, (
-        "the second model was refused only AFTER sampling; the contract "
-        "requires the refusal to land before any sample is drawn"
-    )
-
-
-@pytest.mark.retained_binding_timing
-@pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
-def test_a_second_CARRIER_is_refused_BEFORE_any_sample_is_drawn(stateless: bool) -> None:
-    """The carrier half of the same rebind pair, at the same boundary."""
-
-    model, _optimizer, trainer = _bound_trainer(stateless)
-    other_optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    sampler = _CountingSampler()
-
-    with pytest.raises(ValueError, match="already bound to a different optimizer"):
-        trainer.fit(
-            model=model,
-            sampler=sampler,
-            hamiltonian_terms=build_tiny_hamiltonian_terms(),
-            optimizer=other_optimizer,
-            context=_StubContext(),
-            emit=lambda **_: None,
-        )
-
-    assert sampler.collect_calls == 0, (
-        "the second carrier was refused only AFTER sampling; the contract "
+        f"the second {guard} was refused only AFTER sampling; the contract "
         "requires the refusal to land before any sample is drawn"
     )
