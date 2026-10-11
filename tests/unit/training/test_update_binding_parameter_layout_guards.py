@@ -35,7 +35,8 @@ from tpen.training.update import (
 )
 from types import SimpleNamespace
 
-from tests.helpers.hooke_models import build_tiny_spenn
+from tests.helpers.hooke_models import build_tiny_hamiltonian_terms, build_tiny_spenn
+from tests.unit.training.test_update_binding import _FixedSampler, _StubContext
 
 LEARNING_RATE = 0.01
 
@@ -496,3 +497,118 @@ def test_rebuild_accepts_a_lawful_subclass_of_the_update_state() -> None:
 
     assert isinstance(rebuilt, _SubclassedUpdateState)
     assert rebuilt.optimizer is optimizer
+
+
+class _DriftingMethod(VMCUpdateMethod[AutogradUpdateInput]):
+    """Passes validation once, then DRIFTS what it owns.
+
+    Validation is not a one-time rite. The trainer re-resolves at every later
+    boundary, so a method that satisfies the checks at resolve and then swaps
+    its owned optimizer -- or its parameter binding -- must be refused when it
+    next presents itself. `drift` selects which half moves; `armed` is flipped
+    by the test AFTER the first successful validation, so the first pass is
+    genuinely clean and the refusal can only come from re-validation.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        binding: ModelParameterBinding,
+        *,
+        drift: str,
+    ) -> None:
+        self._optimizer = optimizer
+        self._binding = binding
+        self._drift = drift
+        self.armed = False
+
+    def update(self, update_input: AutogradUpdateInput) -> VMCUpdateResult:
+        return VMCUpdateResult(applied=False, grad_norm=0.0, reason="declined_for_test")
+
+    def update_state(self) -> VMCUpdateState:
+        optimizer, binding = self._optimizer, self._binding
+        if self.armed and self._drift == "optimizer":
+            optimizer = torch.optim.Adam(
+                [p for p in self._binding.parameters], lr=LEARNING_RATE
+            )
+        if self.armed and self._drift == "binding":
+            binding = ModelParameterBinding.from_parameters(
+                tuple(build_tiny_spenn().parameters())
+            )
+        return VMCUpdateState(optimizer=optimizer, model_parameters=binding)
+
+    def rebind_model_parameters(self, model_parameters: ModelParameterBinding) -> None:
+        self._binding = model_parameters
+
+
+def _drift_fixture(drift: str):
+    torch.manual_seed(0)
+    model = build_tiny_spenn()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
+    method = _DriftingMethod(optimizer, binding, drift=drift)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, update_method=method)
+    trainer.resolve_update_state(model=model, optimizer=optimizer)
+    method.armed = True
+    return model, optimizer, method, trainer
+
+
+def test_a_later_resolve_refuses_an_optimizer_that_drifted_after_validation() -> None:
+    """Re-validation catches a carrier swapped AFTER the first clean resolve.
+
+    The independent verifier measured that caching the first validated state
+    and trusting it at later boundaries survives every committed suite. Nothing
+    was pinning that the trainer re-validates rather than reuses.
+    """
+
+    model, optimizer, _method, trainer = _drift_fixture("optimizer")
+
+    with pytest.raises(ValueError, match="mismatched legacy optimizer ownership"):
+        trainer.resolve_update_state(model=model, optimizer=optimizer)
+
+
+def test_a_later_resolve_refuses_a_binding_that_drifted_after_validation() -> None:
+    """The same for the parameter half of the authority."""
+
+    model, optimizer, _method, trainer = _drift_fixture("binding")
+
+    with pytest.raises(
+        ValueError, match="update method parameter binding does not match live model"
+    ):
+        trainer.resolve_update_state(model=model, optimizer=optimizer)
+
+
+def test_fit_refuses_an_optimizer_that_drifted_after_validation() -> None:
+    """`fit` is the boundary that matters, and it re-validates too.
+
+    The later-resolve tests above pin `_resolve_method_state`. This one drives
+    the public `fit` entry point, so a cache introduced at the fit call site
+    rather than inside the resolver is caught as well.
+    """
+
+    model, optimizer, _method, trainer = _drift_fixture("optimizer")
+
+    with pytest.raises(ValueError, match="mismatched legacy optimizer ownership"):
+        trainer.fit(
+            model=model,
+            sampler=_FixedSampler(),
+            hamiltonian_terms=build_tiny_hamiltonian_terms(),
+            optimizer=optimizer,
+            context=_StubContext(),
+            emit=lambda **_: None,
+        )
+
+
+def test_a_later_resolve_accepts_a_method_that_did_not_drift() -> None:
+    """Control: re-validation must not refuse an authority that stayed put.
+
+    Without this, the three refusals above would be satisfied by a trainer
+    that rejects every second resolve, which would pin nothing about drift.
+    """
+
+    model, optimizer, method, trainer = _drift_fixture("optimizer")
+    method.armed = False
+
+    resolved = trainer.resolve_update_state(model=model, optimizer=optimizer)
+
+    assert resolved.optimizer is optimizer
