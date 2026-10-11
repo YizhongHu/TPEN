@@ -323,6 +323,82 @@ def test_train_rejects_legacy_optimizer_mismatch_before_resume_restore(
     assert restore_calls == []
 
 
+def test_train_rejects_parameter_binding_mismatch_before_resume_restore(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """The PARAMETER arm of the same clause, at the same boundary.
+
+    ACCEPTANCE: "a conflicting late selector or wrong model/optimizer binding
+    fails before sampling or mutable restore." That sentence carries TWO
+    disjunctions, so it names four obligations, not two. Three were pinned:
+    optimizer and parameter identity before sampling, and optimizer ownership
+    before restore -- the sibling test directly above. Parameter identity
+    before restore was not.
+
+    An independent verifier measured the hole (Cannon 52043410). A mutant that
+    masks only parameter identity during the runner's pre-restore resolve,
+    keeping the type and optimizer checks eager and performing the real
+    parameter check after restore returns, survived 43 focused tests, the full
+    unit suite and 8 selected integration tests. Its external witness recorded
+    ONE RESTORE AND A REAL MODEL-PARAMETER CHANGE before the correct
+    `ValueError`. Restore mutates optimizer and model state, so a refusal that
+    lands afterwards has already let the damage happen.
+
+    The optimizer is deliberately the same object the runner builds, so the
+    ownership guard above cannot fire and steal the kill: the factory returns
+    the pre-built carrier. The foreign binding has the SAME layout as the live
+    model, so the layout comparison passes and the refusal must come from
+    parameter-reference identity -- `ModelParameterBinding.compare` tests
+    `left is right` -- which is what "wrong model binding" means here.
+    """
+
+    model = nn.Linear(1, 1).double()
+    foreign_model = nn.Linear(1, 1).double()
+    owned_optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    trainer = VMCTrainer(
+        max_steps=0,
+        update_method=LegacyAutogradUpdate(
+            owned_optimizer,
+            model_parameters=ModelParameterBinding(
+                parameters=tuple(foreign_model.parameters())
+            ),
+        ),
+    )
+    restore_calls = []
+
+    def fake_restore_checkpoint_with_events(**kwargs):
+        restore_calls.append(kwargs)
+        raise AssertionError("restore must not run before parameter-binding validation")
+
+    monkeypatch.setattr(
+        train_runner_module,
+        "restore_checkpoint_with_events",
+        fake_restore_checkpoint_with_events,
+    )
+    runner = Train(
+        model=model,
+        sampler=object(),
+        hamiltonian_terms=[],
+        # The runner builds exactly one carrier from this factory. Returning
+        # the already-owned optimizer makes the ownership check pass by
+        # identity, which isolates the parameter arm.
+        optimizer=lambda params: owned_optimizer,
+        trainer=trainer,
+        load={"mode": "train_resume", "path": "unused"},
+    )
+
+    with pytest.raises(
+        ValueError, match="update method parameter binding does not match live model"
+    ):
+        runner.run(_recording_context(tmp_path, [])[0])
+
+    assert restore_calls == [], (
+        "the parameter binding was refused only AFTER restore; the contract "
+        "requires the refusal to land before any mutable restore"
+    )
+
+
 def test_evaluate_model_only_calls_runner_owned_restore(monkeypatch, tmp_path: Path) -> None:
     calls = []
 
