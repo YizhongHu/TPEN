@@ -24,9 +24,10 @@ STUDY_DIR = Path(__file__).resolve().parent
 INVENTORY_DATE = "2026-10-07"
 INVENTORY_HEAD = "3143e43ac170df33f61f2002b1011cd85c9cfc37"
 PENDING_516_SHA = "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
-# This layer removed three launch.py production crossings; PR 516 supplies the
-# second population change. Keep both measured merge-world counts explicit.
-EXPECTED_UNSANCTIONED_COUNTS = {13, 17}
+# The re-landed Stage-Q files contribute their quarantined roster imports; the
+# former topology crossings are gone. Keep the measured merge-world count
+# explicit.
+EXPECTED_UNSANCTIONED_COUNTS = {14}
 PENDING_516_POLICY = (
     "the control is deliberately 516-scoped; a new pending PR needs its own pin"
 )
@@ -59,17 +60,7 @@ EXPECTED_PRODUCTION_INVENTORY = {
     ("train_config.py", 264, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("run_stage_q.py", 30, "tpen.accelerator"): InventoryEntry(
-        "pending PR 516: reconcile only if this crossing differs from its measured SHA.",
-        pending_pr=516,
-        pending_sha=PENDING_516_SHA,
-    ),
-    ("run_stage_q.py", 31, "tpen.distributed"): InventoryEntry(
-        "pending PR 516: reconcile only if this crossing differs from its measured SHA.",
-        pending_pr=516,
-        pending_sha=PENDING_516_SHA,
-    ),
-    ("run_stage_q.py", 100, "tpen.hi_schema"): InventoryEntry(
+    ("run_stage_q.py", 99, "tpen.hi_schema"): InventoryEntry(
         "pending PR 516 and item df8f8b31: reconcile only if this crossing differs from its measured SHA.",
         pending_pr=516,
         pending_sha=PENDING_516_SHA,
@@ -98,9 +89,6 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 884, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_stage_coordinate.py", 594, "tpen.hi.train"): InventoryEntry(
-        "item e923ec4e: retained until the facade slice removes this crossing."
-    ),
     ("test_train_config.py", 220, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
@@ -110,7 +98,7 @@ EXPECTED_TEST_INVENTORY = {
     ("test_train_config.py", 325, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_run_stage_q.py", 99, "tpen.hi_schema"): InventoryEntry(
+    ("test_run_stage_q.py", 102, "tpen.hi_schema"): InventoryEntry(
         "pending PR 516 and item df8f8b31: reconcile only if this crossing differs from its measured SHA.",
         pending_pr=516,
         pending_sha=PENDING_516_SHA,
@@ -793,7 +781,7 @@ def test_production_inventory_obeys_admission_rule() -> None:
     pending_count, measured_count = _assert_pending_516_partition(
         measured, EXPECTED_PRODUCTION_INVENTORY, pending
     )
-    assert pending_count + measured_count == 3
+    assert pending_count + measured_count == 1
 
 
 def test_test_file_inventory_obeys_admission_rule() -> None:
