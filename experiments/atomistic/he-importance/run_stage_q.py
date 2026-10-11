@@ -257,26 +257,32 @@ def _write_json(path: Path, payload: Mapping[str, object]) -> None:
 
 
 def _refuse_occupied_output_path(path: Path) -> None:
-    """Refuse an attempt path that already has any filesystem occupant.
+    """Atomically claim an unoccupied cell leaf before writing evidence.
 
     Parameters
     ----------
     path : pathlib.Path
-        Deterministic cell artifact path for the current execution attempt.
-        A path is occupied when it names an existing file, directory, or
-        symlink, including a dangling symlink.  An occupied path is retained
-        as prior evidence: this function never removes or overwrites it.
+        Deterministic cell artifact leaf for the current execution attempt.
+        Parents may be created non-exclusively, but the leaf is claimed with
+        ``mkdir(exist_ok=False)``.  A path is occupied when it names an
+        existing file, directory, or symlink, including a dangling symlink.
+        A claimed path is the writer's exclusive ownership marker; an
+        occupied path is retained as prior evidence.
 
     Raises
     ------
     StageQSelectionError
-        If *path* is occupied.
+        If *path* cannot be claimed because it is occupied.  The function
+        never removes or overwrites an occupant.
     """
 
-    if path.exists() or path.is_symlink():
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(exist_ok=False)
+    except FileExistsError as error:
         raise StageQSelectionError(
             f"selected cell artifact path is already occupied: {path}"
-        )
+        ) from error
 
 
 def _jsonable(value: Any) -> Any:

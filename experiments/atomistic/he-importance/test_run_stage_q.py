@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import builtins
 import importlib
+import io
 import json
 from dataclasses import replace
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -469,3 +472,286 @@ def test_reused_complete_snapshot_refuses_before_launch_and_preserves_evidence(
             f"unexpected reuse refusal: {refusal!r}"
         )
     assert {path: path.read_bytes() for path in sentinels} == before
+
+
+def _r2_facts() -> dict[str, object]:
+    """Return deterministic execution facts for R2 boundary probes."""
+
+    return {
+        "global_rank": 0,
+        "global_size": 1,
+        "local_rank": 0,
+        "local_size": 1,
+        "node_rank": 0,
+        "node_size": 1,
+        "host": "r2-sentinel-host",
+        "pid": 123,
+        "device": "cuda:0",
+        "job_id": "r2-sentinel-job",
+        "device_identity": {"kind": "cuda", "index": 0, "uuid": "GPU-r2"},
+    }
+
+
+def test_r2_g1_execute_non_q_refuses_before_materialization_and_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The execute-only Q guard must precede materialization and all output."""
+
+    materialize_calls: list[object] = []
+
+    def exploding_materializer(*args: object, **kwargs: object) -> object:
+        materialize_calls.append((args, kwargs))
+        raise AssertionError("non-Q execute reached materialization")
+
+    monkeypatch.setattr(stage, "materialize_intended_configurations", exploding_materializer)
+    monkeypatch.setattr(runner, "_execution_facts", lambda: _r2_facts())
+    monkeypatch.setattr(runner.launch, "launch_train", lambda *a, **k: pytest.fail("launched"))
+
+    with pytest.raises(runner.StageQSelectionError, match="only stage 'Q'"):
+        runner.execute(_args(tmp_path, stage="O1", dry_run=False, seed_label=820001))
+
+    assert not materialize_calls
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+def test_r2_g1_execute_guard_rejects_both_directions(tmp_path: Path) -> None:
+    """The positive Q path remains callable while non-Q remains refused."""
+
+    assert runner.execute(_args(tmp_path, dry_run=True)) == 0
+    with pytest.raises(runner.StageQSelectionError, match="only stage 'Q'"):
+        runner.execute(_args(tmp_path / "non-q", stage="O1"))
+
+
+@pytest.mark.parametrize("opener_name", ["path", "builtins", "io"])
+def test_r2_g2_train_execute_never_reads_evaluation_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opener_name: str
+) -> None:
+    """Dry and real injected-launch arms reject every supported open route."""
+
+    evaluation_path = Path(runner.train_config.__file__).with_name("manifests").joinpath(
+        "evaluation.yaml"
+    )
+    assert evaluation_path.is_file()
+    evaluation_text = evaluation_path.read_text(encoding="utf-8")
+    assert "evaluated_checkpoints:" in evaluation_text
+    assert "100000" in evaluation_text
+
+    def reject_evaluation(path: object) -> None:
+        if str(path).endswith("evaluation.yaml"):
+            raise AssertionError(f"evaluation manifest read through {opener_name}")
+
+    if opener_name == "path":
+        original = Path.open
+
+        def guarded_path_open(self: Path, *args: object, **kwargs: object):
+            reject_evaluation(self)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", guarded_path_open)
+    elif opener_name == "builtins":
+        original = builtins.open
+
+        def guarded_builtin_open(file: object, *args: object, **kwargs: object):
+            reject_evaluation(file)
+            return original(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", guarded_builtin_open)
+    else:
+        original = io.open
+
+        def guarded_io_open(file: object, *args: object, **kwargs: object):
+            reject_evaluation(file)
+            return original(file, *args, **kwargs)
+
+        monkeypatch.setattr(io, "open", guarded_io_open)
+
+    assert runner.execute(_args(tmp_path / "dry")) == 0
+
+    facts = _r2_facts()
+    monkeypatch.setattr(runner, "_execution_facts", lambda: dict(facts))
+    original_launch = runner.launch.launch_train
+
+    def injected_launch(source: object, topology: object) -> int:
+        def fake_runner(config: object, *, topology: object) -> int:
+            output = Path(source.cell.output_path) / "resolved_config.yaml"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("r2: injected\n", encoding="utf-8")
+            return 0
+
+        return original_launch(source, topology, runner=fake_runner)
+
+    monkeypatch.setattr(runner.launch, "launch_train", injected_launch)
+    assert runner.execute(_args(tmp_path / "real", dry_run=False)) == 0
+    assert list((tmp_path / "real").rglob("COMPLETE"))
+
+
+@pytest.mark.parametrize("kind", ["file", "empty-directory", "symlink", "dangling-symlink"])
+def test_r2_g3_occupied_output_path_rejects_every_path_kind_and_preserves_evidence(
+    tmp_path: Path, kind: str
+) -> None:
+    """Every filesystem occupant blocks a claim without mutation."""
+
+    path = tmp_path / "occupied"
+    sentinel = b"prior-evidence\n"
+    if kind == "file":
+        path.write_bytes(sentinel)
+    elif kind == "empty-directory":
+        path.mkdir()
+    elif kind == "symlink":
+        target = tmp_path / "target"
+        target.write_bytes(sentinel)
+        path.symlink_to(target)
+    else:
+        path.symlink_to(tmp_path / "missing-target")
+
+    original_target = os.readlink(path) if path.is_symlink() else None
+    original_target_bytes = path.resolve().read_bytes() if kind == "symlink" else None
+
+    with pytest.raises(runner.StageQSelectionError, match="already occupied"):
+        runner._refuse_occupied_output_path(path)
+    if kind == "file":
+        assert path.read_bytes() == sentinel
+    elif kind == "empty-directory":
+        assert path.is_dir() and not any(path.iterdir())
+    else:
+        assert path.is_symlink()
+        assert os.readlink(path) == original_target
+        if kind == "symlink":
+            assert path.resolve().read_bytes() == original_target_bytes == sentinel
+        else:
+            assert not path.resolve().exists()
+
+
+def test_r2_g3_unoccupied_output_path_is_accepted(tmp_path: Path) -> None:
+    """A fresh leaf is claimed without rejecting or overwriting it."""
+
+    path = tmp_path / "new-output"
+    runner._refuse_occupied_output_path(path)
+    assert not path.is_file() and not path.is_symlink()
+    assert path.is_dir()
+
+
+def _cooperative_execute_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    reserve_directory: bool,
+    final_launch_outcome: int,
+) -> tuple[dict[str, object], Path]:
+    """Interleave a second real execute immediately before the first write."""
+
+    args = _args(tmp_path, dry_run=False)
+    planned_cells = stage.materialize_intended_configurations(tmp_path)
+    selected_output = next(
+        cell.output_path
+        for cell in planned_cells
+        if cell.manifest["seed_identity"]["label"] == 810001
+    )
+    state: dict[str, object] = {
+        "reentered": False,
+        "reserved": False,
+        "launches": [],
+        "first_status": None,
+        "second_status": None,
+        "after_second": None,
+        "after_first": None,
+    }
+    facts = _r2_facts()
+    monkeypatch.setattr(runner, "_execution_facts", lambda: dict(facts))
+
+    def fake_launch(source: object, topology: object) -> int:
+        launches = state["launches"]
+        assert isinstance(launches, list)
+        label = f"launch-{len(launches) + 1}"
+        launches.append(label)
+        output = Path(source.cell.output_path)
+        (output / "resolved_config.yaml").write_text(label + "\n", encoding="utf-8")
+        return final_launch_outcome if label == "launch-1" else 0
+
+    monkeypatch.setattr(runner.launch, "launch_train", fake_launch)
+    original_check = runner._refuse_occupied_output_path
+
+    def check_and_optionally_reserve(path: Path) -> None:
+        original_check(path)
+        if (
+            reserve_directory
+            and os.environ.get("TPEN_R2_ATOMIC_REPAIR") != "1"
+            and not state["reserved"]
+            and not path.exists()
+        ):
+            path.mkdir(parents=True, exist_ok=False)
+            state["reserved"] = True
+
+    monkeypatch.setattr(runner, "_refuse_occupied_output_path", check_and_optionally_reserve)
+    original_write = runner._write_json
+
+    def output_bytes(path: Path) -> dict[str, bytes | None]:
+        return {
+            name: (path / name).read_bytes() if (path / name).exists() else None
+            for name in ("selection_receipt.json", "resolved_config.yaml", "COMPLETE")
+        }
+
+    def interleave_before_first_write(path: Path, payload: object) -> None:
+        if not state["reentered"]:
+            state["reentered"] = True
+            try:
+                try:
+                    state["second_status"] = "success" if runner.execute(args) == 0 else "nonzero"
+                except runner.StageQSelectionError:
+                    state["second_status"] = "StageQSelectionError"
+                state["after_second"] = output_bytes(selected_output)
+            finally:
+                state["reentered"] = False
+        original_write(path, payload)
+
+    monkeypatch.setattr(runner, "_write_json", interleave_before_first_write)
+    try:
+        state["first_status"] = "success" if runner.execute(args) == 0 else "nonzero"
+    except runner.StageQSelectionError:
+        state["first_status"] = "StageQSelectionError"
+
+    state["after_first"] = output_bytes(selected_output)
+    return state, selected_output
+
+
+@pytest.mark.parametrize(
+    ("reserve_directory", "final_launch_outcome"),
+    [(False, 0), (False, 7), (True, 0), (True, 7)],
+    ids=(
+        "ordinary-launch-success",
+        "ordinary-launch-failure",
+        "atomic-launch-success",
+        "atomic-launch-failure",
+    ),
+)
+def test_r2_r4_cooperative_execute_race_has_one_winner_and_preserves_winner_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reserve_directory: bool,
+    final_launch_outcome: int,
+) -> None:
+    """The real race oracle accepts either invocation as the atomic winner."""
+
+    state, output_path = _cooperative_execute_race(
+        tmp_path,
+        monkeypatch,
+        reserve_directory=reserve_directory,
+        final_launch_outcome=final_launch_outcome,
+    )
+    statuses = [state["first_status"], state["second_status"]]
+    assert statuses.count("StageQSelectionError") == 1
+    assert sum(status in {"success", "nonzero"} for status in statuses) == 1
+    launches = state["launches"]
+    assert isinstance(launches, list) and len(launches) == 1
+    after_second = state["after_second"]
+    after_first = state["after_first"]
+    assert isinstance(after_second, dict) and isinstance(after_first, dict)
+    if state["second_status"] != "StageQSelectionError":
+        assert state["first_status"] == "StageQSelectionError"
+        assert after_first == after_second
+    else:
+        assert after_first["resolved_config.yaml"] == b"launch-1\n"
+        if final_launch_outcome == 0:
+            assert after_first["COMPLETE"] == b"completed\n"
+        else:
+            assert after_first["COMPLETE"] is None
