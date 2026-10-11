@@ -462,6 +462,105 @@ def test_train_rejects_a_conflicting_late_selector_before_resume_restore(
     )
 
 
+def _recording_restore(monkeypatch):
+    """Monkeypatch restore to record and refuse to proceed."""
+
+    restore_calls = []
+
+    def fake_restore_checkpoint_with_events(**kwargs):
+        restore_calls.append(kwargs)
+        raise AssertionError("restore must not run before binding validation")
+
+    monkeypatch.setattr(
+        train_runner_module,
+        "restore_checkpoint_with_events",
+        fake_restore_checkpoint_with_events,
+    )
+    return restore_calls
+
+
+def test_train_rejects_a_second_model_before_resume_restore(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """The model-rebind guard at the restore boundary.
+
+    Deletion of this guard is killed by `test_a_second_model_is_refused_after_binding`,
+    so the guard is tested; that test calls `resolve_update_state` directly and
+    observes nothing about restore. Restore mutates model and optimizer state,
+    so a refusal landing after it has already done the damage.
+    """
+
+    model = nn.Linear(1, 1).double()
+    foreign_model = nn.Linear(1, 1).double()
+    owned_optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    trainer = VMCTrainer(
+        max_steps=0,
+        update_method=LegacyAutogradUpdate(
+            owned_optimizer,
+            model_parameters=ModelParameterBinding(
+                parameters=tuple(foreign_model.parameters())
+            ),
+        ),
+    )
+    # Bind to the FOREIGN model first, so the runner's own model is the second.
+    trainer.bind_update_method(model=foreign_model, optimizer=owned_optimizer)
+    restore_calls = _recording_restore(monkeypatch)
+    runner = Train(
+        model=model,
+        sampler=object(),
+        hamiltonian_terms=[],
+        optimizer=lambda params: owned_optimizer,
+        trainer=trainer,
+        load={"mode": "train_resume", "path": "unused"},
+    )
+
+    with pytest.raises(ValueError, match="already bound to a different model"):
+        runner.run(_recording_context(tmp_path, [])[0])
+
+    assert restore_calls == [], (
+        "the second model was refused only AFTER restore; the contract "
+        "requires the refusal to land before any mutable restore"
+    )
+
+
+def test_train_rejects_a_second_carrier_before_resume_restore(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """The carrier half of the same pair, at the restore boundary."""
+
+    model = nn.Linear(1, 1).double()
+    owned_optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    foreign_optimizer = torch.optim.Adam(model.parameters(), lr=0.2)
+    trainer = VMCTrainer(
+        max_steps=0,
+        update_method=LegacyAutogradUpdate(
+            foreign_optimizer,
+            model_parameters=ModelParameterBinding(parameters=tuple(model.parameters())),
+        ),
+    )
+    # Bind to the FOREIGN carrier first; the runner then supplies its own.
+    trainer.bind_update_method(model=model, optimizer=foreign_optimizer)
+    restore_calls = _recording_restore(monkeypatch)
+    runner = Train(
+        model=model,
+        sampler=object(),
+        hamiltonian_terms=[],
+        optimizer=lambda params: owned_optimizer,
+        trainer=trainer,
+        load={"mode": "train_resume", "path": "unused"},
+    )
+
+    with pytest.raises(ValueError, match="already bound to a different optimizer"):
+        runner.run(_recording_context(tmp_path, [])[0])
+
+    assert restore_calls == [], (
+        "the second carrier was refused only AFTER restore; the contract "
+        "requires the refusal to land before any mutable restore"
+    )
+
+
 def test_evaluate_model_only_calls_runner_owned_restore(monkeypatch, tmp_path: Path) -> None:
     calls = []
 
