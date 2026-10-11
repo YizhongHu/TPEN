@@ -14,10 +14,24 @@ import pytest
 
 stage_coordinate = importlib.import_module("experiments.atomistic.he-importance.stage_coordinate")
 runner = importlib.import_module("experiments.atomistic.he-importance.run_stage_q")
+stage = stage_coordinate
 
 
 def _cells(tmp_path: Path) -> tuple[object, ...]:
     return stage_coordinate.materialize_intended_configurations(tmp_path)
+
+
+def _args(tmp_path: Path, **overrides: object) -> SimpleNamespace:
+    values = {
+        "output_root": tmp_path,
+        "stage": "Q",
+        "architecture": "control",
+        "optimizer": "adam",
+        "seed_label": 810001,
+        "dry_run": True,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def test_q_materialization_has_two_seed_labeled_cells_and_selection_is_explicit(tmp_path: Path) -> None:
@@ -163,3 +177,295 @@ def test_execution_facts_cross_launch_boundary(tmp_path: Path, monkeypatch: pyte
         "job_id": facts["job_id"],
         "device_identity": {"kind": "cuda", "index": 0, "uuid": "GPU-0"},
     }
+
+
+def test_g1_reversed_inventory_is_hash_stable_and_zero_multiple_unavailable_refuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = {
+        "stage": "Q",
+        "architecture": "control",
+        "optimizer": "adam",
+        "seed_label": 810001,
+        "status": "available",
+    }
+    cells = stage.materialize_intended_configurations(tmp_path)
+    forward = runner.select_cell(cells, seed_label=810001)
+    reverse = runner.select_cell(tuple(reversed(cells)), seed_label=810001)
+    assert forward.selected.as_dict() == expected
+    assert reverse.selected.as_dict() == expected
+    assert forward.cell.content_hash == reverse.cell.content_hash
+
+    with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
+        runner.select_cell(cells, seed_label=999999)
+    with pytest.raises(runner.StageQSelectionError, match="ambiguous"):
+        runner.select_cell(cells, seed_label=None)
+    with pytest.raises(runner.StageQSelectionError, match="ambiguous"):
+        runner.select_cell(cells + (cells[0],), seed_label=810001)
+
+    original_roster = runner._roster
+    monkeypatch.setattr(
+        runner,
+        "_roster",
+        lambda: tuple(entry for entry in original_roster() if entry.method != "adam"),
+    )
+    with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
+        runner.select_cell(cells, seed_label=810001)
+
+    unavailable = stage.materialize_stage(
+        "Q",
+        [{"scientific_identity": {"architecture": "control", "optimizer": "adam"},
+          "payload": {"updates": 2000}, "topology": {}}],
+        stage.OptimizerCell("adam", "unavailable", reason="sentinel"),
+        tmp_path / "unavailable",
+    )
+    monkeypatch.setattr(runner, "_roster", original_roster)
+    with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
+        runner.select_cell(unavailable, seed_label=810001)
+
+
+def test_runtime_roster_admission_negative_controls_are_not_receipt_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    baseline = runner.roster_design_receipt("Q")
+    assert "adam" in baseline["admitted_methods"]
+    assert baseline["unavailable_methods"]
+    cells = stage.materialize_intended_configurations(tmp_path)
+    original = runner._roster()
+    controls = (
+        (False, "module.Adam", "not-admitted"),
+        (True, None, "missing-target"),
+    )
+    for admitted, target, reason in controls:
+        sentinels = tuple(
+            entry if entry.method != "adam" else SimpleNamespace(
+                method="adam", admitted=admitted, target=target, requires=reason
+            )
+            for entry in original
+        )
+        monkeypatch.setattr(runner, "_roster", lambda sentinels=sentinels: sentinels)
+        receipt = runner.roster_design_receipt("Q")
+        assert receipt["admitted_methods"] == ()
+        assert receipt["unavailable_methods"]["adam"] == reason
+        with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
+            runner.select_cell(cells, seed_label=810001)
+
+
+def test_g2_roster_receipt_is_live_and_authority_difference_is_literal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = (
+        SimpleNamespace(method="sentinel", admitted=True, target="module.Target", requires="ready"),
+        SimpleNamespace(method="not-admitted", admitted=False, target="module.No", requires="blocked"),
+        SimpleNamespace(method="missing-target", admitted=True, target=None, requires="missing"),
+    )
+    authority = SimpleNamespace(maximum_lineages=17)
+    expected_admitted = ("sentinel",)
+    expected_unavailable = {"not-admitted": "blocked", "missing-target": "missing"}
+    monkeypatch.setattr(runner, "_roster", lambda: entries)
+    monkeypatch.setattr(stage, "stage_definition", lambda code: authority)
+    receipt = runner.roster_design_receipt("Q")
+    assert receipt["admitted_methods"] == expected_admitted
+    assert receipt["unavailable_methods"] == expected_unavailable
+    assert receipt["intended_count_from_authority"] == 17
+    assert receipt["difference"]["intended_count_minus_admitted_method_count"] == 16
+
+
+def test_g3_q_cadence_refuses_evaluation_horizon_and_execute_dry_run_does_not_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected = runner.select_cell(
+        stage.materialize_intended_configurations(tmp_path), seed_label=810001
+    )
+    with pytest.raises(stage.MaterializationError, match="exceed the stage horizon"):
+        stage.materialize_job_packets(
+            (selected.cell,), stage.CheckpointCadence(1000, (100000,)),
+            {"statistic": "logabs_variance"},
+            (stage.RankingStatistic.LOGABS_VARIANCE,),
+            {"walkers": 1, "burn_in_sweeps": 0}, ddp_provenance={"launcher": "test"},
+        )
+    monkeypatch.setattr(runner.launch, "launch_train", lambda *a, **k: pytest.fail("dry run launched"))
+    opened: list[Path] = []
+    original_read_text = Path.read_text
+
+    def guarded_read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if path.name == "evaluation.yaml":
+            opened.append(path)
+            raise AssertionError("execute read evaluation manifest")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+    assert runner.execute(_args(tmp_path)) == 0
+    assert not opened
+
+
+def test_cadence_acceptance_and_refusal_are_both_explicit() -> None:
+    assert stage.CheckpointCadence(1000, (1000, 2000)).selected_updates == (1000, 2000)
+    with pytest.raises(stage.MaterializationError, match="lie on the dense cadence"):
+        stage.CheckpointCadence(1000, (1500,))
+    with pytest.raises(stage.MaterializationError, match="at least one"):
+        stage.CheckpointCadence(1000, ())
+
+
+def test_r1_o1_select_cell_refuses_before_consuming_cells() -> None:
+    class ExplodingCells:
+        def __iter__(self):
+            raise AssertionError("non-Q selection consumed cell input")
+
+    with pytest.raises(runner.StageQSelectionError, match="only stage 'Q'"):
+        runner.select_cell(ExplodingCells(), stage="O1", seed_label=820001)
+
+
+def test_r1_o1_execute_refuses_before_artifact_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = _args(tmp_path, stage="O1", seed_label=820001, dry_run=False)
+    facts = {
+        "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
+        "node_rank": 0, "node_size": 1, "host": "host", "pid": 1,
+        "device": "cuda:0", "job_id": "job", "device_identity": None,
+    }
+    calls: list[object] = []
+    monkeypatch.setattr(runner, "_execution_facts", lambda: facts)
+    monkeypatch.setattr(runner.launch, "launch_train", lambda *a, **k: calls.append(a) or 0)
+    error: BaseException | None = None
+    try:
+        runner.execute(args)
+    except BaseException as caught:
+        error = caught
+    assert isinstance(error, runner.StageQSelectionError), (
+        f"O1 execute must refuse before packet resolution/launch, got {error!r}"
+    )
+    assert not calls
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+def test_g4_execute_forwards_exact_facts_and_emits_completion_only_after_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected_packet_type = stage.TrainingPacket
+    facts = {
+        "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
+        "node_rank": 0, "node_size": 1, "host": "sentinel-host", "pid": 123,
+        "device": "cuda:sentinel", "job_id": "job-sentinel",
+        "device_identity": {"kind": "cuda", "index": 0, "uuid": "GPU-sentinel"},
+    }
+    monkeypatch.setattr(runner, "_execution_facts", lambda: dict(facts))
+    original = runner.launch.launch_train
+    observed: dict[str, object] = {}
+
+    def launch_wrapper(source: object, topology: object) -> int:
+        observed["topology"] = topology
+        observed["packet_type"] = type(source)
+
+        def recording_runner(config: object, *, topology: object) -> int:
+            observed["runner_topology"] = topology
+            output = Path(source.cell.output_path) / "resolved_config.yaml"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("horizon: 2000\n", encoding="utf-8")
+            observed["config"] = config
+            return 0
+
+        return original(source, topology, runner=recording_runner)
+
+    monkeypatch.setattr(runner.launch, "launch_train", launch_wrapper)
+    assert runner.execute(_args(tmp_path, dry_run=False)) == 0
+    assert observed["packet_type"] is expected_packet_type
+    assert observed["topology"] == facts
+    assert observed["runner_topology"] == facts
+    materialized = stage.materialize_intended_configurations(tmp_path)
+    selected = next(cell for cell in materialized if cell.manifest["seed_identity"]["label"] == 810001)
+    expected_filenames = {"selection_receipt.json", "resolved_config.yaml", "COMPLETE"}
+    assert {path.name for path in selected.output_path.iterdir()} == expected_filenames
+    resolved = selected.output_path / "resolved_config.yaml"
+    assert resolved.read_text(encoding="utf-8") == "horizon: 2000\n"
+    assert not list(tmp_path.rglob("ranking_packet.json"))
+    assert not list(tmp_path.rglob("independent_sampler_packet.json"))
+
+
+def test_g4_nonzero_runner_never_emits_complete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    facts = {
+        "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
+        "node_rank": 0, "node_size": 1, "host": "host", "pid": 1,
+        "device": "cuda:0", "job_id": "job", "device_identity": None,
+    }
+    monkeypatch.setattr(runner, "_execution_facts", lambda: facts)
+    original = runner.launch.launch_train
+
+    def failing_launch(source: object, topology: object) -> int:
+        return original(source, topology, runner=lambda config, **kwargs: 7)
+
+    monkeypatch.setattr(runner.launch, "launch_train", failing_launch)
+    assert runner.execute(_args(tmp_path, dry_run=False)) == 7
+    assert not list(tmp_path.rglob("COMPLETE"))
+
+
+def test_g4_success_without_snapshot_raises_and_never_emits_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    facts = {
+        "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
+        "node_rank": 0, "node_size": 1, "host": "host", "pid": 1,
+        "device": "cuda:0", "job_id": "job", "device_identity": None,
+    }
+    monkeypatch.setattr(runner, "_execution_facts", lambda: facts)
+    original = runner.launch.launch_train
+
+    def snapshotless_launch(source: object, topology: object) -> int:
+        return original(source, topology, runner=lambda config, **kwargs: 0)
+
+    monkeypatch.setattr(runner.launch, "launch_train", snapshotless_launch)
+    with pytest.raises(RuntimeError, match="success without"):
+        runner.execute(_args(tmp_path, dry_run=False))
+    assert not list(tmp_path.rglob("COMPLETE"))
+
+
+@pytest.mark.parametrize("launch_result", [0, 7])
+def test_reused_complete_snapshot_refuses_before_launch_and_preserves_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_result: int
+) -> None:
+    """A prior attempt is evidence, not permission to reuse its artifact path."""
+    expected_facts = {
+        "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
+        "node_rank": 0, "node_size": 1, "host": "host", "pid": 1,
+        "device": "cuda:0", "job_id": "job", "device_identity": None,
+    }
+    monkeypatch.setattr(runner, "_execution_facts", lambda: dict(expected_facts))
+    cells = stage.materialize_intended_configurations(tmp_path)
+    selected = next(cell for cell in cells if cell.manifest["seed_identity"]["label"] == 810001)
+    selected.output_path.mkdir(parents=True, exist_ok=True)
+    sentinels = {
+        selected.output_path / "selection_receipt.json": b'{"sentinel":"old-selection"}\n',
+        selected.output_path / "resolved_config.yaml": b"old-resolved-config\n",
+        selected.output_path / "COMPLETE": b"old-complete\n",
+    }
+    for path, contents in sentinels.items():
+        path.write_bytes(contents)
+    before = {path: path.read_bytes() for path in sentinels}
+
+    calls = []
+
+    def launch_double(*args: object, **kwargs: object) -> int:
+        calls.append((args, kwargs))
+        return launch_result
+
+    monkeypatch.setattr(runner.launch, "launch_train", launch_double)
+
+    refusal = None
+    result = None
+    try:
+        result = runner.execute(_args(tmp_path, dry_run=False))
+    except BaseException as caught:
+        refusal = caught
+
+    assert not calls, "reusing a COMPLETE artifact path must refuse before launch"
+    if refusal is None:
+        assert isinstance(result, int) and result != 0, (
+            "reusing a COMPLETE artifact path must return a nonzero refusal"
+        )
+    else:
+        message = str(refusal).lower()
+        assert any(token in message for token in ("reuse", "already", "complete", "artifact", "exists")), (
+            f"unexpected reuse refusal: {refusal!r}"
+        )
+    assert {path: path.read_bytes() for path in sentinels} == before

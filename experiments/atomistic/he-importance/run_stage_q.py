@@ -101,6 +101,28 @@ def _roster() -> tuple[Any, ...]:
     return tuple(HI_METHOD_ROSTER)
 
 
+def _require_q_stage(stage: str) -> None:
+    """Refuse non-Q stages before this mechanics-only route does any work.
+
+    Parameters
+    ----------
+    stage : str
+        Requested stage code.  This runner admits only the committed Stage-Q
+        mechanics cell and must reject every other stage before materializing
+        selection input or resolving a training packet.
+
+    Raises
+    ------
+    StageQSelectionError
+        If *stage* is not ``"Q"``.
+    """
+
+    if stage != DEFAULT_STAGE:
+        raise StageQSelectionError(
+            f"Stage-Q runner accepts only stage {DEFAULT_STAGE!r}; got {stage!r}"
+        )
+
+
 def roster_design_receipt(stage: str) -> dict[str, object]:
     """Report live roster admission against the authority's intended count."""
 
@@ -136,6 +158,7 @@ def select_cell(
 ) -> CellSelection:
     """Select one admitted cell and refuse ambiguity instead of first-match fallback."""
 
+    _require_q_stage(stage)
     admitted_methods = {
         entry.method for entry in _roster() if entry.admitted and entry.target
     }
@@ -233,6 +256,29 @@ def _write_json(path: Path, payload: Mapping[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _refuse_occupied_output_path(path: Path) -> None:
+    """Refuse an attempt path that already has any filesystem occupant.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Deterministic cell artifact path for the current execution attempt.
+        A path is occupied when it names an existing file, directory, or
+        symlink, including a dangling symlink.  An occupied path is retained
+        as prior evidence: this function never removes or overwrites it.
+
+    Raises
+    ------
+    StageQSelectionError
+        If *path* is occupied.
+    """
+
+    if path.exists() or path.is_symlink():
+        raise StageQSelectionError(
+            f"selected cell artifact path is already occupied: {path}"
+        )
+
+
 def _jsonable(value: Any) -> Any:
     """Convert frozen packet mappings into ordinary strict-JSON containers."""
 
@@ -246,6 +292,7 @@ def _jsonable(value: Any) -> Any:
 
 
 def execute(args: argparse.Namespace) -> int:
+    _require_q_stage(args.stage)
     output_root = Path(args.output_root).expanduser().resolve()
     cells = stage_coordinate.materialize_intended_configurations(output_root)
     selection = select_cell(
@@ -273,6 +320,7 @@ def execute(args: argparse.Namespace) -> int:
         return 0
 
     output_path = Path(packet.cell.output_path)
+    _refuse_occupied_output_path(output_path)
     _write_json(output_path / "selection_receipt.json", report)
     exit_code = launch.launch_train(packet, _execution_facts())
     if exit_code == 0:

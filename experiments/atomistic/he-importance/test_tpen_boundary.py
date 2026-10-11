@@ -7,8 +7,9 @@ the study's imports would pull in its training dependencies.
 The inventory is pinned to ``dev`` at 3143e43ac170df33f61f2002b1011cd85c9cfc37
 on 2026-10-07.  The two inventories are intentionally explicit: every measured
 crossing must be declared, and every declared entry for a file already present
-must be measured.  Entries for files introduced by pending PR 516 are admitted
-only with an explicit pending PR and source SHA.
+must be measured.  The pending-PR checks below retain historical PR-516
+capability fixtures; live crossings are measured and named by their current
+quarantine or disposition.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable
 from dataclasses import dataclass
+import importlib
 from pathlib import Path
 import tempfile
 
@@ -29,7 +31,7 @@ PENDING_516_SHA = "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
 # explicit.
 EXPECTED_UNSANCTIONED_COUNTS = {14}
 PENDING_516_POLICY = (
-    "the control is deliberately 516-scoped; a new pending PR needs its own pin"
+    "this is a historical, 516-scoped PR-516 capability fixture; a new pending PR needs its own pin"
 )
 
 
@@ -61,9 +63,7 @@ EXPECTED_PRODUCTION_INVENTORY = {
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("run_stage_q.py", 99, "tpen.hi_schema"): InventoryEntry(
-        "pending PR 516 and item df8f8b31: reconcile only if this crossing differs from its measured SHA.",
-        pending_pr=516,
-        pending_sha=PENDING_516_SHA,
+        "measured at reland subject ff7cde49; roster import remains quarantined under item df8f8b31.",
     ),
 }
 
@@ -98,10 +98,8 @@ EXPECTED_TEST_INVENTORY = {
     ("test_train_config.py", 325, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_run_stage_q.py", 102, "tpen.hi_schema"): InventoryEntry(
-        "pending PR 516 and item df8f8b31: reconcile only if this crossing differs from its measured SHA.",
-        pending_pr=516,
-        pending_sha=PENDING_516_SHA,
+    ("test_run_stage_q.py", 116, "tpen.hi_schema"): InventoryEntry(
+        "measured at reland subject ff7cde49; roster assertion remains quarantined under item df8f8b31.",
     ),
 }
 
@@ -781,7 +779,7 @@ def test_production_inventory_obeys_admission_rule() -> None:
     pending_count, measured_count = _assert_pending_516_partition(
         measured, EXPECTED_PRODUCTION_INVENTORY, pending
     )
-    assert pending_count + measured_count == 1
+    assert pending_count + measured_count == 0
 
 
 def test_test_file_inventory_obeys_admission_rule() -> None:
@@ -791,7 +789,7 @@ def test_test_file_inventory_obeys_admission_rule() -> None:
     pending_count, measured_count = _assert_pending_516_partition(
         measured, EXPECTED_TEST_INVENTORY, pending
     )
-    assert pending_count + measured_count == 1
+    assert pending_count + measured_count == 0
 
 
 def test_capability_inventory_count_diagnostic_added() -> None:
@@ -1406,3 +1404,58 @@ def test_exact_string_admissions_return_the_values_they_admit() -> None:
         ("train_config.py", "_cell_from_source", "type(content_hash) is not str"),
     ], "exact-string admission inventory changed: expected captured caller values"
     assert not failures, "admission values are not returned: " + "; ".join(failures)
+
+
+def test_r2_live_boundary_inventory_must_not_call_closed_pr516_current(
+    tmp_path: Path,
+) -> None:
+    source = Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    live_names = {"EXPECTED_PRODUCTION_INVENTORY", "EXPECTED_TEST_INVENTORY"}
+    stale = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id in live_names
+            for target in node.targets
+        ):
+            continue
+        stale.extend(
+            child
+            for child in ast.walk(node.value)
+            if isinstance(child, ast.keyword)
+            and child.arg == "pending_pr"
+            and isinstance(child.value, ast.Constant)
+            and child.value.value == 516
+        )
+    assert not stale, "live inventory still advertises closed UNMERGED PR 516"
+
+
+def test_r2_boundary_count_is_exact_and_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Freeze the measured crossing count before consulting the boundary module."""
+    boundary_path = Path(__file__)
+    source = boundary_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(boundary_path))
+    expected_nodes = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "EXPECTED_UNSANCTIONED_COUNTS"
+            for target in node.targets
+        )
+    ]
+    assert len(expected_nodes) == 1
+    expected = ast.literal_eval(expected_nodes[0])
+    assert expected == {14}
+    boundary = importlib.import_module("experiments.atomistic.he-importance.test_tpen_boundary")
+    synthetic = tmp_path / "synthetic.py"
+    synthetic.write_text("\n".join("import tpen.synthetic" for _ in range(14)) + "\n")
+    monkeypatch.setattr(boundary, "STUDY_DIR", tmp_path)
+    _, crossings = boundary._scan_study()
+    assert len(crossings) == 14
+    assert len(crossings) in expected
