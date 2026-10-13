@@ -52,7 +52,12 @@ def _batch(source: dict[str, object]) -> tuple[ReadyBatch, object]:
 
 
 def _full_checkpoint(root: Path) -> Path:
-    """Create a real complete train-resume checkpoint for the load fixture."""
+    """Create a committed manifest/ref fixture for load-binding validation.
+
+    This is not a claim that the byte payloads are a native scientific
+    train-resume checkpoint; the policy under test only needs a structurally
+    complete committed reference accepted by the checkpoint reader.
+    """
 
     path = root / "step_000001"
     path.mkdir(parents=True)
@@ -64,7 +69,7 @@ def _full_checkpoint(root: Path) -> Path:
         "rng": "rng.pt",
     }
     for name in files.values():
-        (path / name).write_bytes(b"r2-checkpoint")
+        (path / name).write_bytes(b"committed-manifest-ref-fixture")
     (path / "trainer.json").write_text(
         json.dumps({"next_iteration": 1, "completed_updates": 1}), encoding="utf-8"
     )
@@ -106,11 +111,18 @@ def test_changed_optimizer_config_is_refused_before_science(monkeypatch, tmp_pat
     cfg = OmegaConf.create({"runner": source["runner"], "optimizer": {"lr": 0.02}})
     calls = _run_spy(monkeypatch)
 
-    with pytest.raises((ReceiptBindingError, ClosedSchemaError)):
+    try:
         from tpen.execution import WorkerStartGateway
 
         WorkerStartGateway(tmp_path / "outputs").start_configured(
             cfg=cfg, batch=batch, intent=intent, phase=RecoveryPhase.INITIAL
+        )
+    except (ReceiptBindingError, ClosedSchemaError):
+        pass
+    else:
+        raise AssertionError(
+            "source-config refusal was absent; "
+            f"captured runner calls={calls!r}; cfg={OmegaConf.to_container(cfg, resolve=False)!r}"
         )
     assert calls == [], "source-config refusal must precede tpen.run.run_from_config"
 

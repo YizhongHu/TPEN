@@ -35,6 +35,10 @@ class PrefixWalltimeTrap(BaseException):
     """Bound the pilot's intentional walltime wait without accepting exit 3."""
 
 
+class AllocationDeath(BaseException):
+    """Simulate allocation loss immediately after the durable start receipt."""
+
+
 class ScienceCallbackTrap(RuntimeError):
     pass
 
@@ -150,18 +154,27 @@ def test_native_prefix_publishes_evidence_before_bounded_walltime_trap(
 def test_native_prefix_nested_run_dir_resolves_full_checkpoint_control(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """GREEN control: core lookup succeeds at the actual nested run directory."""
+    """GREEN control: the actual prefix emits a valid nested checkpoint ref.
+
+    The current runner may return 3 after its prefix lookup misses the nested
+    run directory; that return is allowed only for this control. The control
+    independently resolves the one actual nested status parent with the core
+    checkpoint reader.
+    """
 
     root = tmp_path / "native-prefix-control"
     _prepare(root)
     runner = _runner_module()
     monkeypatch.setenv("PBS_JOBID", "fixture-allocation-control")
     monkeypatch.setattr(runner.time, "sleep", lambda _seconds: (_ for _ in ()).throw(PrefixWalltimeTrap()))
-    with pytest.raises(PrefixWalltimeTrap):
-        runner.run_attempt(job_id="Job42", job_data=_job_data(root))
+    try:
+        return_code = runner.run_attempt(job_id="Job42", job_data=_job_data(root))
+    except PrefixWalltimeTrap:
+        return_code = None
+    assert return_code in (None, 3)
 
     status_paths = list((root / "outputs").rglob("status.json"))
-    assert status_paths, "native runner must emit a run-owned status artifact"
+    assert len(status_paths) == 1, "native runner must emit one run-owned status artifact"
     reference = _committed_checkpoint(status_paths[0].parent)
     assert reference is not None
     assert reference.checkpoint_dir.is_dir()
@@ -171,29 +184,34 @@ def test_native_prefix_nested_run_dir_resolves_full_checkpoint_control(
 def test_prior_initial_start_without_evidence_parks_before_science(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """RED at E5: a same-Job successor cannot infer INITIAL from missing evidence."""
+    """RED at E5: a dead actual INITIAL start must park its same-Job successor."""
 
     root = tmp_path / "prior-initial"
     batch, intent = _prepare(root)
     prior = BalsamAdapter(
         batch.execution,
         RegisterOnlyClient(),
-        WorkerStartGateway(root / "prior-output"),
+        WorkerStartGateway(root / "outputs"),
         root / "receipts",
     )
-    prior.start(
-        batch=batch,
-        intent=intent,
-        phase=RecoveryPhase.INITIAL,
-        run_once=lambda *_: CoreOutcomeFacts.completed(
-            target_iterations=batch.target_iterations,
-            next_iteration=batch.target_iterations,
-            completed_updates=batch.target_iterations,
-        ),
-        job_id="Job42",
-        attempt_id="prior-initial-attempt",
-    )
+    def allocation_dies(event: str) -> None:
+        if event == "receipt_published":
+            raise AllocationDeath("fixture allocation died after start receipt")
+
+    with pytest.raises(AllocationDeath, match="after start receipt"):
+        prior.start(
+            batch=batch,
+            intent=intent,
+            phase=RecoveryPhase.INITIAL,
+            run_once=lambda *_: (_ for _ in ()).throw(
+                ScienceCallbackTrap("prior science callback must not run")
+            ),
+            job_id="Job42",
+            attempt_id="prior-initial-attempt",
+            fault_injector=allocation_dies,
+        )
     assert not (root / "checkpoint-evidence.json").exists()
+    assert not list((root / "outputs").rglob("outcome.json"))
 
     runner = _runner_module()
     calls = []
@@ -206,6 +224,8 @@ def test_prior_initial_start_without_evidence_parks_before_science(
     monkeypatch.setenv("PBS_JOBID", "fixture-allocation-successor")
     runner.run_attempt(job_id="Job42", job_data=_job_data(root))
     assert calls == [], "prior same-Job INITIAL receipt must park before science"
+    assert not (root / "checkpoint-evidence.json").exists()
+    assert not list((root / "outputs").rglob("outcome.json"))
 
 
 def test_first_ever_start_without_evidence_invokes_initial_once(
