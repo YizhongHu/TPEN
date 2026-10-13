@@ -859,6 +859,9 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
     corrupt_result = _result_from_log(tmp_path, "fault-corrupt-committed")
     assert corrupt_result["status"] == "started"
     assert corrupt_result["invocation"]["outcome"] == "parked"
-    assert corrupt_result["invocation"]["status"] == "parked"
+    # The worker has no core status artifact after restore refuses the bound
+    # mutation, so its status remains UNKNOWN; the typed parked outcome is the
+    # boundary result we are asserting here.
+    assert corrupt_result["invocation"]["status"] == "unknown"
     assert corrupt_result["invocation"]["reason"]
     manifest.write_text(original_manifest, encoding="utf-8")
