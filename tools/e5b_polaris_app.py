@@ -67,17 +67,28 @@ class PolarisE5bApp(ApplicationDefinition):
     def shell_preamble(self) -> str:
         """Verify the inherited Polaris MPI libraries before Python starts."""
 
-        return r'''set -eu
+        return r'''set -u -o pipefail
 echo "TPEN_E5B_PRECHECK host=$(hostname)"
 echo "TPEN_E5B_PRECHECK LD_LIBRARY_PATH=${LD_LIBRARY_PATH-}"
 echo "TPEN_E5B_PRECHECK PATH=${PATH-}"
 echo "TPEN_E5B_PRECHECK PYTHONPATH=${PYTHONPATH-}"
 PYTHON="${TPEN_E5B_PYTHON:-python}"
-ldconfig -p | grep -m1 'libfabric.so.1'
+ldconfig -p | grep -m1 'libfabric.so.1' || { echo "TPEN_E5B_PRECHECK missing libfabric" >&2; exit 2; }
 "$PYTHON" -c 'import ctypes.util, torch; print("TPEN_E5B_TORCH", torch.__version__, torch.__file__); print("TPEN_E5B_LIBFABRIC", ctypes.util.find_library("fabric")); assert ctypes.util.find_library("fabric")'
+if test "$?" -ne 0; then
+    echo "TPEN_E5B_PRECHECK torch/libfabric import failed" >&2
+    exit 2
+fi
 TORCH_GLOBAL="$($PYTHON -c 'from pathlib import Path; import torch; print(Path(torch.__file__).parent / "lib" / "libtorch_global_deps.so")')"
+if test "$?" -ne 0; then
+    echo "TPEN_E5B_PRECHECK could not locate torch global dependencies" >&2
+    exit 2
+fi
 echo "TPEN_E5B_LDD $TORCH_GLOBAL"
-ldd "$TORCH_GLOBAL" | tee /dev/stderr | grep -m1 'libfabric.so.1'
+ldd "$TORCH_GLOBAL" | tee /dev/stderr | grep -m1 'libfabric.so.1' || {
+    echo "TPEN_E5B_PRECHECK torch ldd missing libfabric" >&2
+    exit 2
+}
 '''
 
     def run(self) -> int:
