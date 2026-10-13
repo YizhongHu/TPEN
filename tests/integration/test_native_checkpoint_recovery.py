@@ -287,9 +287,9 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
     resumed_lines = _train_lines(resumed_output)
     reference_lines = _train_lines(reference_output)
     resume_step = int(json.loads(prefix_checkpoint.joinpath("trainer.json").read_text())["next_iteration"])
-    assert [step for step, _ in resumed_lines] == list(range(resume_step, batch.target_iterations))
+    parity_steps = [step for step, _ in resumed_lines] == list(range(resume_step, batch.target_iterations))
     expected_tail = [line for step, line in reference_lines if step >= resume_step]
-    assert [line for _, line in resumed_lines] == expected_tail
+    parity_metrics = [line for _, line in resumed_lines] == expected_tail
 
     resumed_state = torch.load(_final_checkpoint(resumed_output) / "model.pt", map_location="cpu", weights_only=False)
     reference_state = torch.load(_final_checkpoint(reference_output) / "model.pt", map_location="cpu", weights_only=False)
@@ -323,6 +323,9 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         weights_only=False,
     )
     assert any(not torch.equal(reference_state[name], divergent_state[name]) for name in reference_state)
+    print(f"RESTORE_DISABLED_DIVERGENCE={any(not torch.equal(reference_state[name], divergent_state[name]) for name in reference_state)}")
+    assert parity_steps, "restored successor did not start at the checkpoint cursor"
+    assert parity_metrics, "restored successor tail metrics differ from uninterrupted reference"
 
     receipt = {
         "schema": "tpen.execution/qualification-native-recovery-v1",
