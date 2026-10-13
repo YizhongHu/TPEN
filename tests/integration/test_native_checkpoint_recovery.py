@@ -33,10 +33,16 @@ from tpen.execution import (
     source_config_digest,
 )
 from tpen.execution.recovery import CheckpointEvidence, RecoveryPhase
+from tpen.execution.invocation import _committed_checkpoint
+from tests.helpers.trainable_wavefunctions import TrainableHookeSingletAnsatz
 
 
 FIXTURE = Path(__file__).parent / "artifacts" / "execution" / "native_recovery.yaml"
 WORKER = Path(__file__).parents[1] / "helpers" / "native_recovery_worker.py"
+# This threshold is fixed before the qualification measurement.  It is large
+# enough to exclude serialization noise and small enough to catch a real Adam
+# update in the float64 fixture.
+PARAMETER_CHANGE_THRESHOLD = 1.0e-10
 
 
 class QualificationClient:
@@ -126,6 +132,7 @@ def _launch(
     phase: str,
     label: str | None = None,
     evidence: Path | None = None,
+    partial_restore: bool = False,
 ) -> subprocess.Popen[str]:
     command = [
         sys.executable,
@@ -149,6 +156,8 @@ def _launch(
     ]
     if evidence is not None:
         command.extend(("--evidence", str(evidence)))
+    if partial_restore:
+        command.append("--partial-restore")
     log = (root / f"worker-{label or phase}-{time.monotonic_ns()}.log").open("w+")
     environment = os.environ.copy()
     # Executing a helper by absolute path makes Python place tests/helpers,
@@ -164,14 +173,14 @@ def _launch(
 def _wait_for_checkpoint(
     outputs: Path, *, target: int, process: subprocess.Popen[str] | None = None
 ) -> Path:
-    """Wait for one committed prefix checkpoint, never accepting the target."""
+    """Wait for one committed prefix checkpoint, returning its run directory."""
 
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         candidates = sorted(outputs.rglob("checkpoints/step_*/COMPLETE"))
         prefixes = [path.parent for path in candidates if int(path.parent.name.split("_")[-1]) < target]
         if prefixes:
-            return prefixes[-1]
+            return prefixes[-1].parent.parent
         if process is not None and process.poll() is not None:
             logs = sorted(outputs.parent.glob("worker-*.log"))
             detail = "\n".join(path.read_text() for path in logs)
@@ -211,9 +220,15 @@ def _train_lines(output_path: Path) -> list[tuple[int, str]]:
     return lines
 
 
-def _kill_prefix(process: subprocess.Popen[str], outputs: Path, target: int) -> Path:
-    checkpoint = _wait_for_checkpoint(outputs, target=target, process=process)
+def _kill_prefix(process: subprocess.Popen[str], outputs: Path, target: int) -> CheckpointRef:
+    """Kill after an observed prefix, then select the latest committed ref."""
+
+    run_dir = _wait_for_checkpoint(outputs, target=target, process=process)
     os.kill(process.pid, signal.SIGKILL)
+    process.wait(timeout=30)
+    checkpoint = _committed_checkpoint(run_dir)
+    assert checkpoint is not None
+    assert checkpoint.next_iteration < target
     return checkpoint
 
 
@@ -235,9 +250,13 @@ def test_kill_before_checkpoint_parks_without_restart(tmp_path: Path) -> None:
 
 @pytest.mark.integration
 def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) -> None:
-    """Qualify killed-prefix recovery, a fresh namespace, and a real tail."""
+    """Qualify recovery and a single-variable partial-restore control."""
 
-    batch, intent, source = _batch()
+    batch, intent, _source = _batch()
+    initial_state = {
+        name: value.detach().clone()
+        for name, value in TrainableHookeSingletAnsatz().state_dict().items()
+    }
     batch_path, intent_path = _write_inputs(tmp_path, batch, intent)
     receipts = tmp_path / "receipts"
     outputs = tmp_path / "outputs"
@@ -261,9 +280,8 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         label="prefix",
     )
     prefix_checkpoint = _kill_prefix(prefix, outputs, batch.target_iterations)
-    prefix.wait(timeout=30)
     assert prefix.returncode == -signal.SIGKILL
-    assert prefix_checkpoint.exists()
+    assert prefix_checkpoint.checkpoint_dir.exists()
 
     client.state = BalsamJobState.ALLOCATION_LOST
     observation = adapter.observe_lineage(batch)
@@ -271,7 +289,7 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
     assert client.observe_calls == 1
 
     evidence = CheckpointEvidence.from_ref(
-        CheckpointRef.from_directory(prefix_checkpoint),
+        prefix_checkpoint,
         science_input_digest=intent.science_input_digest,
         target_iterations=batch.target_iterations,
     )
@@ -314,9 +332,14 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
 
     resumed_output = Path(successor_result["invocation"]["output_path"])
     reference_output = Path(reference_result["invocation"]["output_path"])
+    assert resumed_output != reference_output
     resumed_lines = _train_lines(resumed_output)
     reference_lines = _train_lines(reference_output)
-    resume_step = int(json.loads(prefix_checkpoint.joinpath("trainer.json").read_text())["next_iteration"])
+    resume_step = prefix_checkpoint.next_iteration
+    selected_trainer = json.loads(
+        prefix_checkpoint.checkpoint_dir.joinpath("trainer.json").read_text()
+    )
+    assert selected_trainer["next_iteration"] == resume_step
     parity_steps = [step for step, _ in resumed_lines] == list(range(resume_step, batch.target_iterations))
     expected_tail = [line for step, line in reference_lines if step >= resume_step]
     parity_metrics = [line for _, line in resumed_lines] == expected_tail
@@ -324,38 +347,67 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
     resumed_state = torch.load(_final_checkpoint(resumed_output) / "model.pt", map_location="cpu", weights_only=False)
     reference_state = torch.load(_final_checkpoint(reference_output) / "model.pt", map_location="cpu", weights_only=False)
     assert resumed_state.keys() == reference_state.keys()
-    assert all(torch.equal(resumed_state[name], reference_state[name]) for name in resumed_state)
-    assert any(torch.max(torch.abs(value)).item() > 1.0e-12 for value in reference_state.values())
+    restored_parameters_bitwise = all(
+        torch.equal(resumed_state[name], reference_state[name]) for name in resumed_state
+    )
+    max_restore_parameter_abs_diff = max(
+        float(torch.max(torch.abs(resumed_state[name] - reference_state[name])).item())
+        for name in resumed_state
+    )
+    max_parameter_delta = max(
+        float(torch.max(torch.abs(reference_state[name] - initial_state[name])).item())
+        for name in reference_state
+    )
+    parameters_changed = max_parameter_delta > PARAMETER_CHANGE_THRESHOLD
 
-    # A restart with restore deliberately disabled uses a different fixed seed:
-    # this is the negative control for state restoration, while remaining
-    # deterministic and retaining the same killed prefix/backend Job.
-    no_restore_config = tmp_path / "native_recovery_no_restore.yaml"
-    no_restore = OmegaConf.load(FIXTURE)
-    no_restore.runtime.seed = 20261014
-    OmegaConf.save(no_restore, no_restore_config)
-    divergent = _launch(
+    # The negative control keeps the same fixture seed, prefix, recovery phase,
+    # selected cursor, and Job.  Only the restored state differs: this
+    # test-only overlay uses model_only to restore parameters, retains the
+    # cursor, and leaves optimizer/sampler/process-RNG state fresh.  It
+    # intentionally bypasses Train's production model_only refusal.
+    partial = _launch(
         root=tmp_path,
         batch_path=batch_path,
         intent_path=intent_path,
-        config_path=no_restore_config,
+        config_path=FIXTURE,
         receipts=receipts,
         outputs=outputs,
-        phase="initial",
-        label="divergent",
+        phase="recovery",
+        label="partial",
+        evidence=evidence_path,
+        partial_restore=True,
     )
-    divergent.wait(timeout=180)
-    assert divergent.returncode == 0
-    divergent_result = _result_from_log(tmp_path, "divergent")
-    divergent_state = torch.load(
-        _final_checkpoint(Path(divergent_result["invocation"]["output_path"])) / "model.pt",
-        map_location="cpu",
-        weights_only=False,
+    partial.wait(timeout=180)
+    assert partial.returncode == 0
+    partial_result = _result_from_log(tmp_path, "partial")
+    assert partial_result["invocation"]["outcome"] == "completed"
+    partial_output = Path(partial_result["invocation"]["output_path"])
+    assert partial_output not in {resumed_output, reference_output}
+    partial_lines = _train_lines(partial_output)
+    partial_steps = [step for step, _ in partial_lines] == list(range(resume_step, batch.target_iterations))
+    partial_tail = [line for _, line in partial_lines]
+    restore_disabled_diverged = bool(partial_steps and partial_tail != expected_tail)
+    partial_state = torch.load(_final_checkpoint(partial_output) / "model.pt", map_location="cpu", weights_only=False)
+    max_partial_parameter_abs_diff = max(
+        float(torch.max(torch.abs(partial_state[name] - reference_state[name])).item())
+        for name in reference_state
     )
-    assert any(not torch.equal(reference_state[name], divergent_state[name]) for name in reference_state)
-    print(f"RESTORE_DISABLED_DIVERGENCE={any(not torch.equal(reference_state[name], divergent_state[name]) for name in reference_state)}")
-    assert parity_steps, "restored successor did not start at the checkpoint cursor"
+    tail_bitwise = bool(parity_steps and parity_metrics and restored_parameters_bitwise)
+    print(f"TAIL_BITWISE={tail_bitwise}")
+    print(f"RESTORE_DISABLED_DIVERGENCE={restore_disabled_diverged}")
+    print(f"MAX_PARAMETER_DELTA={max_parameter_delta:.17g}")
+    print(f"MAX_RESTORE_PARAMETER_ABS_DIFF={max_restore_parameter_abs_diff:.17g}")
+    print(f"MAX_PARTIAL_PARAMETER_ABS_DIFF={max_partial_parameter_abs_diff:.17g}")
+    print(f"PARAMETERS_CHANGED={parameters_changed}")
+    assert parity_steps, "restored successor did not start at the selected latest checkpoint cursor"
     assert parity_metrics, "restored successor tail metrics differ from uninterrupted reference"
+    assert restored_parameters_bitwise, "restored successor final parameters differ from reference"
+    assert partial_steps, "partial restore control did not start at the selected recovery cursor"
+    assert restore_disabled_diverged, "partial restore control did not diverge from reference tail"
+    assert parameters_changed, (
+        "reference final trainable parameters did not change from initial state "
+        f"by threshold {PARAMETER_CHANGE_THRESHOLD}"
+    )
 
     receipt = {
         "schema": "tpen.execution/qualification-native-recovery-v1",
@@ -363,9 +415,27 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         "scheduler": {"kind": "slurm", "partition": os.environ.get("SLURM_JOB_PARTITION", "unknown")},
         "backend": {"kind": "fake-balsam-client", "job_id": registration.job_id, "allocation_state": observation.state.value},
         "wrapper": {"registration_calls": client.register_calls, "observation_calls": client.observe_calls, "prefix_signal": -signal.SIGKILL},
-        "application": {"prefix_exit": prefix.returncode, "successor": successor.returncode, "reference": reference.returncode},
-        "scientific": {"successor_outcome": successor_result["invocation"]["outcome"], "target_iterations": batch.target_iterations, "next_iteration": successor_result["invocation"]["next_iteration"], "completed_updates": successor_result["invocation"]["completed_updates"], "tail_bitwise": True, "restore_disabled_diverged": True, "parameters_changed": True},
+        "application": {"prefix_exit": prefix.returncode, "successor": successor.returncode, "reference": reference.returncode, "partial": partial.returncode},
+        "scientific": {
+            "successor_outcome": successor_result["invocation"]["outcome"],
+            "target_iterations": batch.target_iterations,
+            "resume_checkpoint_next_iteration": resume_step,
+            "next_iteration": successor_result["invocation"]["next_iteration"],
+            "completed_updates": successor_result["invocation"]["completed_updates"],
+            "tail_bitwise": tail_bitwise,
+            "restore_disabled_mode": "test-only model_only overlay; E1 model_only refusal bypassed",
+            "restore_disabled_diverged": restore_disabled_diverged,
+            "parameters_changed": parameters_changed,
+            "parameter_change_threshold": PARAMETER_CHANGE_THRESHOLD,
+            "max_parameter_delta": max_parameter_delta,
+            "max_restore_parameter_abs_diff": max_restore_parameter_abs_diff,
+            "max_partial_parameter_abs_diff": max_partial_parameter_abs_diff,
+        },
     }
     receipt_path = tmp_path / "qualification-receipt.json"
     receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    assert json.loads(receipt_path.read_text())["scientific"]["tail_bitwise"] is True
+    measured = json.loads(receipt_path.read_text())["scientific"]
+    assert measured["tail_bitwise"] is tail_bitwise
+    assert measured["restore_disabled_diverged"] is restore_disabled_diverged
+    assert measured["parameters_changed"] is parameters_changed
+    assert measured["max_parameter_delta"] == max_parameter_delta

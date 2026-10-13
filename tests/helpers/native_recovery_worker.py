@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from omegaconf import OmegaConf
@@ -23,7 +24,11 @@ from tpen.execution import (
     decode_ready_batch,
     validate_native_recovery_profile,
 )
+from tpen.checkpoint.restore import restore_checkpoint
 from tpen.execution.invocation import _core_outcome_from_artifacts, run_configured_once
+from tpen.runner import Train
+from tpen.runner.base import _assert_eager_initialized, _is_torch_module, _place_module_for_runtime
+from tpen.training.optim import make_optimizer
 
 
 class NoLiveBackendClient:
@@ -34,6 +39,62 @@ class NoLiveBackendClient:
 
     def observe_job(self, _job_id):  # pragma: no cover - a worker must not call this
         raise AssertionError("worker attempted backend observation")
+
+
+class PartialRestoreTrain(Train):
+    """Test-only runner for the single-variable partial-restore control.
+
+    The native E1 selector still supplies a full ``train_resume`` decision.
+    This runner deliberately replaces only that load operation with the
+    ``model_only`` checkpoint primitive, then restores the checkpoint cursor
+    without restoring optimizer, sampler, or process-RNG state.  It bypasses
+    the production ``Train`` model-only refusal only inside this qualification
+    worker; no production configured path accepts this runner.
+    """
+
+    def run(self, context):
+        """Load model weights and cursor, then train with fresh mutable state."""
+
+        if _is_torch_module(self.model):
+            _place_module_for_runtime(self.model, context)
+            _assert_eager_initialized(self.model)
+            self.model.train()
+
+        mode = str(self.load.get("mode", "none")) if self.load is not None else "none"
+        optimizer = make_optimizer(self.optimizer, self.model.parameters())
+        if mode == "model_only":
+            report = restore_checkpoint(
+                load=self.load,
+                model=self.model,
+                context=context,
+            )
+            # Keep the recovery cursor identical while intentionally leaving
+            # optimizer, sampler-MCMC, and process-RNG state fresh.
+            self.trainer.next_iteration = int(report.next_iteration or 0)
+            self.trainer.completed_updates = int(report.completed_updates or 0)
+            self.load = None
+        elif mode == "train_resume":
+            # This branch exists only so the Cannon mutation pair can replace
+            # the partial overlay with the real E1 overlay and prove that the
+            # divergence assertion then goes red.
+            resolve_update_state = getattr(self.trainer, "resolve_update_state", None)
+            if callable(resolve_update_state):
+                resolve_update_state(model=self.model, optimizer=optimizer)
+            report = restore_checkpoint(
+                load=self.load,
+                model=self.model,
+                optimizer=optimizer,
+                trainer=self.trainer,
+                sampler=self.sampler,
+                context=context,
+            )
+            rebuild_update_state = getattr(self.trainer, "rebuild_update_state", None)
+            if callable(rebuild_update_state):
+                rebuild_update_state(model=self.model)
+            del report
+            self.load = None
+
+        return super().run(context)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -47,6 +108,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--phase", choices=("initial", "recovery"), required=True)
     parser.add_argument("--label", default="worker")
     parser.add_argument("--evidence", type=Path)
+    parser.add_argument("--partial-restore", action="store_true")
     return parser
 
 
@@ -74,10 +136,30 @@ def main() -> int:
         args.receipts,
     )
 
+    run_cfg = cfg
+    selected_decision = None
+
     def run_once(decision, output_path):
+        nonlocal run_cfg, selected_decision
+        selected_decision = decision
+        if args.partial_restore:
+            if decision.checkpoint is None:
+                raise AssertionError("partial restore requires a selected checkpoint")
+            run_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+            OmegaConf.update(
+                run_cfg,
+                "runner._target_",
+                "tests.helpers.native_recovery_worker.PartialRestoreTrain",
+                merge=False,
+            )
+            partial_load = {
+                "mode": "model_only",
+                "path": str(decision.checkpoint.checkpoint_dir),
+            }
+            selected_decision = replace(decision, load=partial_load)
         run_configured_once(
-            cfg,
-            decision=decision,
+            run_cfg,
+            decision=selected_decision or decision,
             output_path=output_path,
             config_path=str(args.config),
             command="e5-native-worker",
