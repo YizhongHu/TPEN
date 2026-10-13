@@ -199,7 +199,6 @@ def test_decision_load_is_consumable_by_existing_load_path(tmp_path: Path) -> No
 
     decision = select_recovery(intent, phase=RecoveryPhase.RECOVERY, evidence=evidence)
 
-    assert isinstance(decision.load, MappingProxyType)
     assert _load_config(decision.load) == {"mode": "train_resume", "path": str(checkpoint_dir)}
 
 

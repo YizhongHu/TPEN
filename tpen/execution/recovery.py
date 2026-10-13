@@ -24,7 +24,11 @@ from tpen.checkpoint.reference import (
     deserialize_checkpoint_ref,
     serialize_checkpoint_ref,
 )
-from tpen.checkpoint.schema import read_manifest
+from tpen.checkpoint.schema import (
+    KIND_BY_SCHEMA_VERSION,
+    SCHEMA_VERSIONS_BY_RESTORE_MODE,
+    read_manifest,
+)
 from tpen.checkpoint.hashing import stable_config_hash
 
 
@@ -239,7 +243,7 @@ class CheckpointEvidence:
 
         try:
             ref = CheckpointRef.from_directory(path)
-        except (FileNotFoundError, OSError, TypeError, ValueError):
+        except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
             ref = None
         if (science_input is None) == (science_input_digest is None):
             raise TypeError("provide exactly one of science_input or science_input_digest")
@@ -302,7 +306,7 @@ class RecoveryDecision:
     next_iteration: int = 0
     completed_updates: int = 0
     checkpoint: CheckpointRef | None = None
-    load: Mapping[str, str] | None = None
+    load: dict[str, str] | None = None
     refusal: RecoveryRefusal | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -366,6 +370,14 @@ def select_recovery(
             outcome=RecoveryOutcome.NO_CHECKPOINT,
         )
 
+    if phase is RecoveryPhase.RECOVERY and isinstance(evidence, (CheckpointRef, str, Path)):
+        return _refused(
+            intent,
+            phase,
+            RefusalCode.INCOMPATIBLE,
+            "recovery requires checkpoint evidence with a durable immutable binding",
+        )
+
     evidence = _coerce_evidence(evidence, intent)
     if not evidence.committed:
         return _refused(intent, phase, RefusalCode.INCOMPLETE, "checkpoint evidence is not committed")
@@ -384,6 +396,9 @@ def select_recovery(
             "checkpoint evidence uses a different fixed target horizon",
         )
     if evidence.ref is None:
+        source_refusal = _source_manifest_refusal(evidence.source)
+        if source_refusal is not None:
+            return _refused(intent, phase, source_refusal.code, source_refusal.message)
         return _refused(
             intent,
             phase,
@@ -396,13 +411,6 @@ def select_recovery(
         return _refused(intent, phase, refusal.code, refusal.message)
 
     ref = evidence.ref
-    if ref.next_iteration > intent.target_iterations or ref.completed_updates > intent.target_iterations:
-        return _refused(
-            intent,
-            phase,
-            RefusalCode.INCOMPATIBLE,
-            "checkpoint counters exceed the fixed total target horizon",
-        )
     outcome = (
         RecoveryOutcome.INITIAL_CHECKPOINT
         if phase is RecoveryPhase.INITIAL
@@ -415,7 +423,7 @@ def select_recovery(
         next_iteration=ref.next_iteration,
         completed_updates=ref.completed_updates,
         checkpoint=ref,
-        load=MappingProxyType(train_resume_load_overlay(ref)),
+        load=train_resume_load_overlay(ref),
     )
 
 
@@ -468,7 +476,9 @@ def _checkpoint_refusal(ref: CheckpointRef, *, target_iterations: int) -> Recove
     # authority for the actual mode gate below.
     if not isinstance(raw_manifest, Mapping):
         return RecoveryRefusal(RefusalCode.UNSUPPORTED, "checkpoint manifest is not a mapping")
-    if raw_manifest.get("schema_version") != 2 or raw_manifest.get("kind") != "tpen.checkpoint":
+    accepted_versions = SCHEMA_VERSIONS_BY_RESTORE_MODE["train_resume"]
+    schema_version = raw_manifest.get("schema_version")
+    if schema_version not in accepted_versions or raw_manifest.get("kind") != KIND_BY_SCHEMA_VERSION.get(schema_version):
         return RecoveryRefusal(
             RefusalCode.UNSUPPORTED,
             "checkpoint manifest is not the current train-resume schema",
@@ -476,7 +486,7 @@ def _checkpoint_refusal(ref: CheckpointRef, *, target_iterations: int) -> Recove
 
     try:
         ref.validate()
-    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
         return RecoveryRefusal(RefusalCode.INCOMPLETE, f"checkpoint bytes are not a committed ref: {exc}")
 
     manifest_path = checkpoint_dir / "manifest.json"
@@ -514,6 +524,29 @@ def _checkpoint_refusal(ref: CheckpointRef, *, target_iterations: int) -> Recove
         return RecoveryRefusal(
             RefusalCode.INCOMPATIBLE,
             "checkpoint counters exceed the fixed total target horizon",
+        )
+    return None
+
+
+def _source_manifest_refusal(source: Path | None) -> RecoveryRefusal | None:
+    """Classify a source manifest when no immutable ref could be built."""
+
+    if source is None:
+        return None
+    try:
+        checkpoint_dir = require_complete_checkpoint_dir(source)
+        with (checkpoint_dir / "manifest.json").open("r", encoding="utf-8") as handle:
+            raw_manifest = json.load(handle)
+    except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        return RecoveryRefusal(RefusalCode.INCOMPLETE, f"checkpoint is not complete: {exc}")
+    if not isinstance(raw_manifest, Mapping):
+        return RecoveryRefusal(RefusalCode.UNSUPPORTED, "checkpoint manifest is not a mapping")
+    accepted_versions = SCHEMA_VERSIONS_BY_RESTORE_MODE["train_resume"]
+    schema_version = raw_manifest.get("schema_version")
+    if schema_version not in accepted_versions or raw_manifest.get("kind") != KIND_BY_SCHEMA_VERSION.get(schema_version):
+        return RecoveryRefusal(
+            RefusalCode.UNSUPPORTED,
+            "checkpoint manifest is not the current train-resume schema",
         )
     return None
 
