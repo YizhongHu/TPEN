@@ -11,6 +11,21 @@ The adapter does not claim scheduler, allocation-loss, Balsam, IRI, Globus,
 or callback-state coverage.  Its process helper is intentionally small and
 backend-neutral so the E5 fixture can be driven by a launcher without making
 the core package depend on a launcher.
+
+E5 channel declaration
+----------------------
+``E5_CHANNEL_MAP`` is the versioned, importable declaration consumed by this
+adapter and by qualification tests.  Each entry names the first
+random-dependent observable after the resume cursor for one E5 mutable limb:
+
+* ``model`` -> ``model_logabs`` at ``first_model_evaluation``.
+* ``optimizer`` -> ``optimizer_update`` at ``first_optimizer_update``.
+* ``trainer_cursor`` -> ``trainer_cursor`` at ``first_resumed_step``.
+* ``sampler_mcmc`` -> ``sampler_proposal`` at ``first_sampler_proposal``.
+* ``process_rng`` -> ``process_random`` at ``first_process_random``.
+
+The declaration is intentionally limited to the state owners exported by
+``tpen.execution.native_profile``; it does not expand the E5 supported profile.
 """
 
 from __future__ import annotations
@@ -27,7 +42,9 @@ from typing import Any
 from .native_profile import SUPPORTED_STATE_OWNERS
 
 
-CHANNEL_MAP_VERSION = "e5-native-channel-map-v1"
+E5_CHANNEL_MAP_VERSION = "e5-native-channel-map-v1"
+# Backward-compatible name for callers that consumed the initial adapter API.
+CHANNEL_MAP_VERSION = E5_CHANNEL_MAP_VERSION
 NATIVE_PROFILE_VERSION = "tpen.execution.native_profile:SUPPORTED_STATE_OWNERS@e5"
 
 
@@ -74,12 +91,12 @@ class ChannelSpec:
 # These channels are fixture-level observables, not new checkpoint owners.
 # ``trainer_cursor`` is observed at the first resumed step; all other channels
 # observe the random-dependent work performed at that step.
-_E5_CHANNELS: tuple[ChannelSpec, ...] = (
+E5_CHANNEL_MAP: tuple[ChannelSpec, ...] = (
     ChannelSpec("model", "model_logabs", "first_model_evaluation"),
     ChannelSpec("optimizer", "optimizer_update", "first_optimizer_update"),
-    ChannelSpec("trainer_cursor", "trainer_cursor", "first_resumed_step"),
-    ChannelSpec("sampler_mcmc", "sampler_proposal", "first_sampler_proposal"),
     ChannelSpec("process_rng", "process_random", "first_process_random"),
+    ChannelSpec("sampler_mcmc", "sampler_proposal", "first_sampler_proposal"),
+    ChannelSpec("trainer_cursor", "trainer_cursor", "first_resumed_step"),
 )
 
 
@@ -106,7 +123,7 @@ def e5_channel_map(
     """
 
     owners = frozenset(supported_owners)
-    by_limb = {spec.limb: spec for spec in _E5_CHANNELS}
+    by_limb = {spec.limb: spec for spec in E5_CHANNEL_MAP}
     missing = owners - by_limb.keys()
     if missing:
         raise ChannelMapError(
@@ -453,6 +470,8 @@ class ChainResumeReceipt:
 
 __all__ = [
     "CHANNEL_MAP_VERSION",
+    "E5_CHANNEL_MAP",
+    "E5_CHANNEL_MAP_VERSION",
     "NATIVE_PROFILE_VERSION",
     "ChannelEvent",
     "ChannelMapError",

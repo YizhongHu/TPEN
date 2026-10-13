@@ -86,6 +86,8 @@ from .native_profile import (
 )
 from .chain_resume import (
     CHANNEL_MAP_VERSION,
+    E5_CHANNEL_MAP,
+    E5_CHANNEL_MAP_VERSION,
     NATIVE_PROFILE_VERSION,
     ChannelEvent,
     ChannelMapError,
@@ -140,6 +142,8 @@ __all__ = [
     "UnsupportedMutableStateError",
     "validate_native_recovery_profile",
     "CHANNEL_MAP_VERSION",
+    "E5_CHANNEL_MAP",
+    "E5_CHANNEL_MAP_VERSION",
     "NATIVE_PROFILE_VERSION",
     "ChannelEvent",
     "ChannelMapError",

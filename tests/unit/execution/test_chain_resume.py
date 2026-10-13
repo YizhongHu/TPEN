@@ -13,6 +13,8 @@ from tpen.execution import (
     ChannelParityError,
     ChainResumeReceipt,
     CheckpointFaultKind,
+    E5_CHANNEL_MAP,
+    E5_CHANNEL_MAP_VERSION,
     UnmeasuredArmError,
     assert_fresh_processes,
     assert_positive_control,
@@ -54,15 +56,17 @@ def _run(
 
 
 def test_e5_channel_map_is_total_and_directional() -> None:
-    mapping = e5_channel_map()
+    mapping = E5_CHANNEL_MAP
+    assert E5_CHANNEL_MAP_VERSION == "e5-native-channel-map-v1"
     assert {spec.limb for spec in mapping} == set(SUPPORTED_STATE_OWNERS)
     assert len({spec.channel for spec in mapping}) == len(mapping)
     assert {spec.event_kind for spec in mapping}
     assert validate_channel_map(SUPPORTED_STATE_OWNERS, mapping) == mapping
+    assert e5_channel_map() == E5_CHANNEL_MAP
 
 
 def test_totality_guard_rejects_supported_limb_without_channel() -> None:
-    mapping = tuple(spec for spec in e5_channel_map() if spec.limb != "process_rng")
+    mapping = tuple(spec for spec in E5_CHANNEL_MAP if spec.limb != "process_rng")
     with pytest.raises(ChannelMapError, match="no observable channel.*process_rng"):
         validate_channel_map(SUPPORTED_STATE_OWNERS, mapping)
 
@@ -76,7 +80,7 @@ def test_reference_and_resume_are_fresh_processes_with_seed_provenance() -> None
     assert reference.seed_source != resumed.seed_source
     assert_fresh_processes(reference, resumed)
     assert compare_channel_parity(reference, resumed, resume_step=RESUME_STEP) == {
-        spec.channel: True for spec in e5_channel_map()
+        spec.channel: True for spec in E5_CHANNEL_MAP
     }
 
 
@@ -90,17 +94,17 @@ def test_disabled_restore_limb_has_named_channel_mismatch(limb: str) -> None:
         resume_step=RESUME_STEP,
         disabled_limbs=(limb,),
     )
-    assert result[next(spec.channel for spec in e5_channel_map() if spec.limb == limb)] is False
+    assert result[next(spec.channel for spec in E5_CHANNEL_MAP if spec.limb == limb)] is False
     assert all(
         value
         for channel, value in result.items()
-        if channel != next(spec.channel for spec in e5_channel_map() if spec.limb == limb)
+        if channel != next(spec.channel for spec in E5_CHANNEL_MAP if spec.limb == limb)
     )
 
 
 @pytest.mark.parametrize("limb", sorted(SUPPORTED_STATE_OWNERS))
 def test_each_channel_positive_control_moves_its_own_observable(limb: str) -> None:
-    spec = next(spec for spec in e5_channel_map() if spec.limb == limb)
+    spec = next(spec for spec in E5_CHANNEL_MAP if spec.limb == limb)
     baseline = _run(phase="reference")
     perturbed = _run(phase="recovery", disable=(limb,))
     assert_positive_control(baseline, perturbed, spec, resume_step=RESUME_STEP)
