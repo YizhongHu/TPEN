@@ -207,6 +207,17 @@ def decode_ready_batch(data: bytes | str | Mapping[str, Any]) -> ReadyBatch:
     return ReadyBatch.decode(data)
 
 
+def decode_ready_batch_wire(data: bytes | str | Mapping[str, Any]) -> ReadyBatch:
+    """Read the versioned launcher wire format into a validated batch.
+
+    The experiment adapter emits the same ``READY_BATCH_SCHEMA`` bytes
+    without importing this package.  The named core reader makes that
+    launcher boundary explicit while retaining one validation path.
+    """
+
+    return decode_ready_batch(data)
+
+
 def require_lineage_payload(
     lineage_payloads: Mapping[str, str], *, lineage_id: str, payload: Any
 ) -> str:
@@ -229,6 +240,7 @@ __all__ = [
     "ReadyBatch",
     "ReadyItem",
     "decode_ready_batch",
+    "decode_ready_batch_wire",
     "encode_ready_batch",
     "require_lineage_payload",
 ]

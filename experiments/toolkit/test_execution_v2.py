@@ -14,9 +14,19 @@ def _batch() -> dict[str, object]:
         lineage_id="lineage-opaque",
         batch_id="batch-opaque",
         source_config_digest="a" * 64,
+        science_input_digest="b" * 64,
+        target_iterations=10,
+        backend="direct",
+        recovery="none",
         payload={"science": {"system": "hooke"}},
         rows=(
-            {"invocation_id": "invocation-opaque", "logical_task_id": "logical-opaque"},
+            {
+                "invocation_id": "invocation-opaque",
+                "logical_task_id": "logical-opaque",
+                "fresh_output_id": "fresh-output-opaque",
+                "argv": ("launcher",),
+                "result_dir": "results/run-a",
+            },
         ),
     )
 
@@ -39,8 +49,15 @@ def test_v2_adapter_refuses_duplicate_invocation_identity() -> None:
             lineage_id="lineage-opaque",
             batch_id="batch-opaque",
             source_config_digest="a" * 64,
+            science_input_digest="b" * 64,
+            target_iterations=10,
+            backend="direct",
+            recovery="none",
             payload={},
-            rows=({"invocation_id": "same"}, {"invocation_id": "same"}),
+            rows=(
+                {"invocation_id": "same", "logical_task_id": "l1", "fresh_output_id": "o1", "argv": ("x",), "result_dir": "r1"},
+                {"invocation_id": "same", "logical_task_id": "l2", "fresh_output_id": "o2", "argv": ("x",), "result_dir": "r2"},
+            ),
         )
 
 

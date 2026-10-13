@@ -12,7 +12,10 @@ from collections.abc import Mapping, Sequence
 from hashlib import sha256
 from typing import Any
 
-READY_BATCH_ADAPTER_SCHEMA = "experiment-toolkit/v2-ready-batch-adapter"
+# This literal is intentionally duplicated rather than imported from the core:
+# experiments are the producer side of the launcher boundary and must remain
+# importable without core execution dependencies.
+READY_BATCH_ADAPTER_SCHEMA = "tpen.execution/ready-batch-v1"
 
 
 def _canonical(payload: Any) -> bytes:
@@ -32,8 +35,15 @@ def ready_batch_v2(
     lineage_id: str,
     batch_id: str,
     source_config_digest: str,
+    science_input_digest: str,
+    target_iterations: int,
+    backend: str,
+    recovery: str,
     payload: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
+    backend_options: Mapping[str, Any] | None = None,
+    recovery_options: Mapping[str, Any] | None = None,
+    recovery_selection_digest: str | None = None,
 ) -> dict[str, Any]:
     """Build a plain v2 ready-batch mapping from experiment data.
 
@@ -43,6 +53,12 @@ def ready_batch_v2(
         Opaque experiment identities; the adapter does not parse them.
     source_config_digest : str
         Digest of the source syntax captured by the experiment.
+    science_input_digest : str
+        Digest of the immutable science input captured by the experiment.
+    target_iterations : int
+        Fixed total target horizon for the execution lineage.
+    backend, recovery : str
+        Explicit operational lego selections, separate from ``payload``.
     payload : mapping
         Exact serialized science intent.  It remains data and is not resolved.
     rows : sequence of mappings
@@ -55,6 +71,14 @@ def ready_batch_v2(
         raise ValueError("batch_id must be non-empty")
     if not isinstance(source_config_digest, str) or not source_config_digest:
         raise ValueError("source_config_digest must be non-empty")
+    if not isinstance(science_input_digest, str) or not science_input_digest:
+        raise ValueError("science_input_digest must be non-empty")
+    if type(target_iterations) is not int or target_iterations < 0:
+        raise ValueError("target_iterations must be a nonnegative integer")
+    if not isinstance(backend, str) or not backend:
+        raise ValueError("backend must be non-empty")
+    if not isinstance(recovery, str) or not recovery:
+        raise ValueError("recovery must be non-empty")
     copied_rows = [dict(row) for row in rows]
     identities = [row.get("invocation_id") for row in copied_rows]
     if any(not isinstance(identity, str) or not identity for identity in identities):
@@ -62,14 +86,44 @@ def ready_batch_v2(
     if len(identities) != len(set(identities)):
         raise ValueError("duplicate invocation_id in v2 ready batch")
     payload_copy = json.loads(json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False))
+    items = []
+    for row in copied_rows:
+        required = ("logical_task_id", "fresh_output_id", "argv", "result_dir")
+        if any(not isinstance(row.get(name), (str, list, tuple)) or not row.get(name) for name in required):
+            raise ValueError("every v2 row needs materialized item fields")
+        argv = row["argv"]
+        if isinstance(argv, str) or any(not isinstance(part, str) or not part for part in argv):
+            raise ValueError("v2 row argv must be a non-empty sequence of strings")
+        items.append({
+            "invocation_id": row["invocation_id"],
+            "logical_task_id": row["logical_task_id"],
+            "fresh_output_id": row["fresh_output_id"],
+            "argv": list(argv),
+            "result_dir": row["result_dir"],
+            "payload": row.get("payload", {}),
+        })
+    digest = _digest(payload_copy)
     return {
         "schema": READY_BATCH_ADAPTER_SCHEMA,
         "lineage_id": lineage_id,
         "batch_id": batch_id,
         "source_config_digest": source_config_digest,
-        "payload_digest": _digest(payload_copy),
+        "payload_digest": digest,
+        "science_input_digest": science_input_digest,
+        "target_iterations": target_iterations,
+        "execution": {
+            "schema": "tpen.execution/config-v1",
+            "lineage_id": lineage_id,
+            "backend": backend,
+            "recovery": recovery,
+            "source_config_digest": source_config_digest,
+            "payload_digest": digest,
+            "recovery_selection_digest": recovery_selection_digest,
+            "backend_options": dict(backend_options or {}),
+            "recovery_options": dict(recovery_options or {}),
+        },
         "payload": payload_copy,
-        "rows": copied_rows,
+        "items": items,
     }
 
 

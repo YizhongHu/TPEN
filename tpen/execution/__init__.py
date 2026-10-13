@@ -5,6 +5,7 @@ from .batch import (
     ReadyBatch,
     ReadyItem,
     decode_ready_batch,
+    decode_ready_batch_wire,
     encode_ready_batch,
     require_lineage_payload,
 )
@@ -58,6 +59,7 @@ __all__ = [
     "ResultReceipt",
     "capture_science_intent",
     "decode_ready_batch",
+    "decode_ready_batch_wire",
     "encode_ready_batch",
     "encode_receipt",
     "payload_digest",
