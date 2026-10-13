@@ -96,25 +96,54 @@ class PolarisBalsamClient:
         )
         app_class._set_client(config.client)
         app_class.site = config.site_id
+        app_class.python_exe = str(
+            self.backend_options.get(
+                "python_exe", "/soft/applications/conda/2025-09-25/mconda3/bin/python"
+            )
+        )
         app_class.environment_variables = self._worker_environment()
         return api, config, app_class
 
     def _worker_environment(self) -> dict[str, str]:
-        """Build serialized app environment from measured deployment paths."""
+        """Build app environment by prepending to inherited facility paths."""
 
         checkout = str(self.backend_options.get("checkout_root", ""))
+        app_root = str(self.backend_options.get("app_root", ""))
         site_packages = str(self.backend_options.get("site_packages", ""))
-        path_entries = [entry for entry in (checkout, site_packages) if entry]
-        inherited = os.environ.get("PYTHONPATH", "")
-        if inherited:
-            path_entries.append(inherited)
+
+        def prepend(entries: list[str], inherited: str) -> str:
+            """Prepend non-empty additions without discarding the base env."""
+
+            values = [entry for entry in entries if entry]
+            if inherited:
+                values.append(inherited)
+            return ":".join(values)
+
+        path_entries = [str(Path(checkout) / "bin") if checkout else "", app_root]
+        python_entries = [checkout, site_packages]
         environment = {
             "BALSAM_SITE_PATH": str(self.site_root),
             "TPEN_E5B_ROOT": str(self.backend_options.get("pilot_root", "")),
+            "TPEN_E5B_PYTHON": str(
+                self.backend_options.get(
+                    "python_exe", "/soft/applications/conda/2025-09-25/mconda3/bin/python"
+                )
+            ),
         }
-        if path_entries:
-            environment["PYTHONPATH"] = ":".join(path_entries)
-        for key in ("LD_LIBRARY_PATH", "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+        environment["PATH"] = prepend(path_entries, os.environ.get("PATH", ""))
+        environment["PYTHONPATH"] = prepend(python_entries, os.environ.get("PYTHONPATH", ""))
+        ld_prefix = self.backend_options.get(
+            "ld_library_prefix",
+            (
+                "/home/rhu/tpen-libshim-20260823",
+                "/soft/compilers/cudatoolkit/cuda-13.0.1/lib64",
+                "/soft/compilers/cudatoolkit/cuda-12.9.1/lib64",
+            ),
+        )
+        environment["LD_LIBRARY_PATH"] = prepend(
+            [str(entry) for entry in ld_prefix], os.environ.get("LD_LIBRARY_PATH", "")
+        )
+        for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
             if key in os.environ:
                 environment[key] = os.environ[key]
         return environment

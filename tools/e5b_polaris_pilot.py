@@ -26,7 +26,15 @@ from tools.e5b_polaris_client import PolarisBalsamClient
 FIXTURE_RELATIVE = "tests/integration/artifacts/execution/native_recovery.yaml"
 
 
-def _batch(root: Path, config_path: Path, site_root: Path, checkout_root: Path, app_root: Path) -> ReadyBatch:
+def _batch(
+    root: Path,
+    config_path: Path,
+    site_root: Path,
+    checkout_root: Path,
+    app_root: Path,
+    lineage_id: str,
+    batch_id: str,
+) -> ReadyBatch:
     """Materialize the E5a immutable fixture as one E2-ready batch."""
 
     config = OmegaConf.load(str(config_path))
@@ -41,7 +49,7 @@ def _batch(root: Path, config_path: Path, site_root: Path, checkout_root: Path, 
     payload = {"fixture": "native-recovery-v1", "science_input": science_input, "target_iterations": target}
     digest = payload_digest(payload)
     execution = ExecutionConfig(
-        lineage_id="e5b-polaris-lineage",
+        lineage_id=lineage_id,
         backend="balsam",
         recovery="checkpoint",
         source_config_digest=source_config_digest(source),
@@ -54,8 +62,14 @@ def _batch(root: Path, config_path: Path, site_root: Path, checkout_root: Path, 
             "site_packages": "/home/rhu/.local/lib/python3.13/site-packages",
             "app_module": "tools.e5b_polaris_app",
             "app_class": "PolarisE5bApp",
+            "python_exe": "/soft/applications/conda/2025-09-25/mconda3/bin/python",
+            "ld_library_prefix": [
+                "/home/rhu/tpen-libshim-20260823",
+                "/soft/compilers/cudatoolkit/cuda-13.0.1/lib64",
+                "/soft/compilers/cudatoolkit/cuda-12.9.1/lib64",
+            ],
             "wall_time_min": 5,
-            "workdir": "e5b-polaris-job",
+            "workdir": batch_id,
             "job_data": {
                 "pilot_root": str(root),
                 "config_path": str(config_path),
@@ -66,7 +80,7 @@ def _batch(root: Path, config_path: Path, site_root: Path, checkout_root: Path, 
     )
     batch = ReadyBatch(
         lineage_id=execution.lineage_id,
-        batch_id="e5b-polaris-batch",
+        batch_id=batch_id,
         source_config_digest=execution.source_config_digest,
         payload_digest=digest,
         science_input_digest=intent.science_input_digest,
@@ -103,7 +117,15 @@ def prepare(args: argparse.Namespace) -> None:
     """Write serialized inputs and register exactly one persistent Job."""
 
     args.root.mkdir(parents=True, exist_ok=True)
-    batch = _batch(args.root, args.config, args.site, args.checkout, args.app_root)
+    batch = _batch(
+        args.root,
+        args.config,
+        args.site,
+        args.checkout,
+        args.app_root,
+        args.lineage_id,
+        args.batch_id,
+    )
     adapter = _adapter(args, batch)
     registration = adapter.register_lineage(batch)
     if registration is None:
@@ -147,6 +169,8 @@ def main() -> int:
     parser.add_argument("--checkout", type=Path, required=True)
     parser.add_argument("--app-root", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--lineage-id", default="e5b-polaris-lineage-a2")
+    parser.add_argument("--batch-id", default="e5b-polaris-batch-a2")
     args = parser.parse_args()
     if args.command == "prepare":
         prepare(args)
