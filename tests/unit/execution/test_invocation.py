@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
+from tpen.checkpoint import CheckpointRef, resolve_checkpoint_dir
+from tpen.checkpoint.payload import TrainResume
+from tpen.config_schema import ClosedSchemaError
 from tpen.execution import (
+    CheckpointEvidence,
     CoreOutcomeFacts,
     CoreStatus,
     ExecutionConfig,
@@ -271,3 +275,234 @@ def test_run_configured_once_keeps_legacy_return_and_applies_only_worker_overlay
     assert calls[0][0].run.root == str(tmp_path / "fresh")
     assert calls[0][0].runner.load is None
     assert calls[0][1] == {"command": "worker"}
+
+
+def _write_core_completion_artifacts(output_path: Path, *, next_iteration: int = 3, completed_updates: int = 3) -> None:
+    """Write the core-owned status and checkpoint shape used by gateway tests."""
+
+    run_dir = output_path / "experiment" / "sector" / "run-id"
+    checkpoint_dir = run_dir / "checkpoints" / f"step_{next_iteration:06d}"
+    checkpoint_dir.mkdir(parents=True)
+    files = {
+        "model": "model.pt",
+        "optimizer": "optimizer.pt",
+        "trainer": "trainer.json",
+        "sampler": "sampler.pt",
+        "rng": "rng.pt",
+    }
+    for name in files.values():
+        (checkpoint_dir / name).write_bytes(b"core-artifact")
+    (checkpoint_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "kind": "tpen.checkpoint",
+                "next_iteration": next_iteration,
+                "completed_updates": completed_updates,
+                "created_at_unix": 1.0,
+                "files": files,
+                "hashes": {},
+                "runtime": {"device": "cpu", "dtype": "float64"},
+                "provenance": {"run_id": "run-id"},
+                "payload": TrainResume().to_manifest(),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "COMPLETE").write_text("complete\n", encoding="utf-8")
+    (checkpoint_dir.parent / "latest.json").write_text(
+        json.dumps({"checkpoint_dir": checkpoint_dir.name, "step": next_iteration}),
+        encoding="utf-8",
+    )
+    (run_dir / "status.json").write_text(
+        json.dumps({"status": "completed", "current_event": "run_end"}),
+        encoding="utf-8",
+    )
+
+
+def test_configured_gateway_materializes_completion_from_core_artifacts(monkeypatch, tmp_path: Path) -> None:
+    """A successful configured call completes only from status plus checkpoint facts."""
+
+    from tpen import run as run_module
+
+    batch, intent = _batch()
+
+    def fake_run(cfg, **kwargs):
+        assert kwargs["raise_exceptions"] is True
+        _write_core_completion_artifacts(Path(cfg.run.root))
+        return 0
+
+    monkeypatch.setattr(run_module, "run_from_config", fake_run)
+    result = WorkerStartGateway(tmp_path).start_configured(
+        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+    )
+
+    assert result.run_result.status is CoreStatus.COMPLETED
+    assert result.outcome.outcome is InvocationOutcome.COMPLETED
+    assert result.outcome.next_iteration == 3
+    assert result.outcome.completed_updates == 3
+
+
+def test_configured_zero_return_without_final_checkpoint_is_parked(monkeypatch, tmp_path: Path) -> None:
+    """An integer zero cannot replace a committed final-counter artifact."""
+
+    from tpen import run as run_module
+
+    batch, intent = _batch()
+
+    def fake_run(cfg, **kwargs):
+        assert kwargs["raise_exceptions"] is True
+        run_dir = Path(cfg.run.root) / "experiment" / "sector" / "run-id"
+        run_dir.mkdir(parents=True)
+        (run_dir / "status.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(run_module, "run_from_config", fake_run)
+    result = WorkerStartGateway(tmp_path).start_configured(
+        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+    )
+
+    assert result.outcome.outcome is InvocationOutcome.PARKED
+    assert "no committed final checkpoint" in result.outcome.reason
+
+
+def test_configured_gateway_forces_raise_exceptions_for_named_config_refusal(monkeypatch, tmp_path: Path) -> None:
+    """The gateway preserves a deterministic core refusal instead of parking return 1."""
+
+    from tpen import run as run_module
+
+    batch, intent = _batch()
+
+    def fake_run(cfg, **kwargs):
+        assert kwargs["raise_exceptions"] is True
+        raise ClosedSchemaError([])
+
+    monkeypatch.setattr(run_module, "run_from_config", fake_run)
+    result = WorkerStartGateway(tmp_path).start_configured(
+        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+    )
+
+    assert result.outcome.outcome is InvocationOutcome.TERMINAL
+    assert result.outcome.exception_type == "ClosedSchemaError"
+
+
+def test_configured_gateway_does_not_classify_training_value_error_as_terminal(monkeypatch, tmp_path: Path) -> None:
+    """A numeric/application ValueError outside a named core gate parks."""
+
+    from tpen import run as run_module
+
+    batch, intent = _batch()
+
+    def fake_run(cfg, **kwargs):
+        assert kwargs["raise_exceptions"] is True
+        raise ValueError("numeric failure in training")
+
+    monkeypatch.setattr(run_module, "run_from_config", fake_run)
+    result = WorkerStartGateway(tmp_path).start_configured(
+        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+    )
+
+    assert result.outcome.outcome is InvocationOutcome.PARKED
+    assert result.outcome.status is CoreStatus.UNKNOWN
+
+
+def test_configured_gateway_runs_real_tiny_train_and_restarts_in_distinct_namespace(tmp_path: Path) -> None:
+    """The actual configured entry point supplies completion facts to the gateway."""
+
+    pytest.importorskip("torch")
+    config_path = Path(__file__).parents[2] / "integration" / "artifacts" / "training" / "vmc_smoke.yaml"
+    cfg = OmegaConf.load(config_path)
+    batch, intent = _batch()
+    gateway = WorkerStartGateway(tmp_path)
+
+    first = gateway.start_configured(
+        cfg=cfg,
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+    )
+    second = gateway.start_configured(
+        cfg=cfg,
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+    )
+
+    assert first.outcome.outcome is InvocationOutcome.COMPLETED
+    assert first.outcome.next_iteration == 3
+    assert first.outcome.completed_updates == 3
+    assert second.outcome.outcome is InvocationOutcome.COMPLETED
+    assert first.output_path != second.output_path
+    assert len(tuple(first.output_path.rglob("status.json"))) == 1
+    assert len(tuple(second.output_path.rglob("status.json"))) == 1
+
+
+def test_real_bad_config_is_terminal(tmp_path: Path) -> None:
+    """The configured preconstruction schema refusal is terminal, not a retry."""
+
+    from tpen.hi_schema import HI_EXPERIMENT_NAME
+
+    config_path = Path(__file__).parents[2] / "integration" / "artifacts" / "training" / "vmc_smoke.yaml"
+    cfg = OmegaConf.load(config_path)
+    cfg.experiment.name = HI_EXPERIMENT_NAME
+    batch, intent = _batch()
+
+    result = WorkerStartGateway(tmp_path).start_configured(
+        cfg=cfg,
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+    )
+
+    assert result.outcome.outcome is InvocationOutcome.TERMINAL
+    assert result.outcome.exception_type == "ClosedSchemaError"
+
+
+def test_real_incompatible_train_resume_restore_is_terminal(tmp_path: Path) -> None:
+    """A core restore/schema refusal is terminal and never becomes a retry."""
+
+    pytest.importorskip("torch")
+    config_path = Path(__file__).parents[2] / "integration" / "artifacts" / "training" / "vmc_smoke.yaml"
+    cfg = OmegaConf.load(config_path)
+    batch, intent = _batch()
+    gateway = WorkerStartGateway(tmp_path)
+    first = gateway.start_configured(
+        cfg=cfg,
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+    )
+    assert first.outcome.outcome is InvocationOutcome.COMPLETED
+    checkpoint_dir = resolve_checkpoint_dir(next(first.output_path.rglob("checkpoints")))
+    ref = CheckpointRef.from_directory(checkpoint_dir)
+    evidence = CheckpointEvidence.from_ref(
+        ref,
+        science_input=intent.science_input,
+        target_iterations=intent.target_iterations,
+    )
+
+    incompatible = OmegaConf.load(config_path)
+    incompatible.system.omega = 0.75
+    result = gateway.start_configured(
+        cfg=incompatible,
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.RECOVERY,
+        evidence=evidence,
+    )
+
+    assert result.outcome.outcome is InvocationOutcome.TERMINAL
+    assert result.outcome.exception_type == "ValueError"

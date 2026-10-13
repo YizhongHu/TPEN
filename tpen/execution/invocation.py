@@ -18,6 +18,12 @@ from pathlib import Path
 from typing import Any, ClassVar
 from uuid import uuid4
 
+from tpen.checkpoint.artifact import resolve_checkpoint_dir
+from tpen.checkpoint.catalog import PUBLICATION_CATALOG_FILENAME, read_publications
+from tpen.checkpoint.reference import CheckpointRef
+from tpen.checkpoint.schema import read_manifest
+from tpen.config_schema import ClosedSchemaError
+
 from .batch import ReadyBatch, ReadyItem
 from .config import canonical_payload_bytes, payload_digest, recovery_selection_digest
 from .recovery import (
@@ -33,6 +39,25 @@ START_RECEIPT_SCHEMA = "tpen.execution/receipt-worker-start-v1"
 OUTCOME_RECEIPT_SCHEMA = "tpen.execution/receipt-worker-outcome-v1"
 START_RECEIPT_NAME = "start.json"
 OUTCOME_RECEIPT_NAME = "outcome.json"
+
+# These are the only configuration/refusal classes this gateway treats as a
+# deterministic terminal result.  A training-time ValueError (or another
+# ordinary application exception) remains unknown and is parked.  Checkpoint
+# gates predate a shared exception base, so their named owner modules are
+# checked below in addition to this explicit configuration type.
+_CONFIG_REFUSAL_TYPES = (ClosedSchemaError,)
+_CHECKPOINT_GATE_MODULES = frozenset(
+    {
+        "tpen.checkpoint.artifact",
+        "tpen.checkpoint.catalog",
+        "tpen.checkpoint.manifest",
+        "tpen.checkpoint.payload",
+        "tpen.checkpoint.reference",
+        "tpen.checkpoint.restore",
+        "tpen.checkpoint.schema",
+    }
+)
+_CHECKPOINT_GATE_EXCEPTION_TYPES = (FileNotFoundError, KeyError, OSError, TypeError, ValueError)
 
 
 class InvocationOutcome(str, Enum):
@@ -95,6 +120,29 @@ def _check_schema(data: Mapping[str, Any], expected: str) -> None:
 
     if not isinstance(data, Mapping) or data.get("schema") != expected:
         raise ValueError(f"receipt schema is not {expected!r}")
+
+
+def _traceback_has_checkpoint_gate(exc: BaseException) -> bool:
+    """Return whether a named checkpoint gate raised ``exc``."""
+
+    traceback = exc.__traceback__
+    while traceback is not None:
+        module_name = traceback.tb_frame.f_globals.get("__name__")
+        if module_name in _CHECKPOINT_GATE_MODULES:
+            return True
+        traceback = traceback.tb_next
+    return False
+
+
+def _is_terminal_core_refusal(exc: BaseException) -> bool:
+    """Classify only named core config/checkpoint refusal paths as terminal."""
+
+    if isinstance(exc, _CONFIG_REFUSAL_TYPES):
+        return True
+    return (
+        isinstance(exc, _CHECKPOINT_GATE_EXCEPTION_TYPES)
+        and _traceback_has_checkpoint_gate(exc)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +456,111 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _run_status_artifact(output_path: Path) -> tuple[Path, dict[str, Any]] | None:
+    """Read the single durable run-status artifact emitted by configured TPEN."""
+
+    status_paths = tuple(output_path.rglob("status.json"))
+    if not status_paths:
+        return None
+    if len(status_paths) != 1:
+        raise ValueError(
+            f"configured run wrote {len(status_paths)} status artifacts under {output_path}"
+        )
+    return status_paths[0].parent, _read_json(status_paths[0])
+
+
+def _committed_checkpoint(run_dir: Path) -> CheckpointRef | None:
+    """Read the latest committed full-state checkpoint through checkpoint APIs."""
+
+    checkpoint_root = run_dir / "checkpoints"
+    if not checkpoint_root.is_dir():
+        return None
+
+    catalog_path = checkpoint_root / PUBLICATION_CATALOG_FILENAME
+    if catalog_path.is_file():
+        publications = read_publications(catalog_path)
+        if not publications:
+            return None
+        ref = max(publications, key=lambda candidate: candidate.next_iteration)
+    else:
+        # ``latest.json`` is the checkpoint package's durable convenience
+        # pointer.  The resolver also requires the COMPLETE marker, so a
+        # temporary or half-written directory cannot become completion facts.
+        ref = CheckpointRef.from_directory(resolve_checkpoint_dir(checkpoint_root))
+
+    # CheckpointRef owns identity and byte validation; the schema reader owns
+    # the mode-specific full-state gate.  Do not infer counters from filenames
+    # or trainer JSON in this execution layer.
+    read_manifest(ref.checkpoint_dir / "manifest.json", mode="train_resume")
+    ref.validate()
+    return ref
+
+
+def _core_outcome_from_artifacts(
+    output_path: Path, *, decision: RecoveryDecision
+) -> CoreOutcomeFacts:
+    """Materialize core outcome facts from the run and checkpoint artifacts.
+
+    A configured run's integer return value is a process result, not a core
+    completion claim.  Completion therefore requires the run-owned completed
+    status and a committed train-resume checkpoint carrying both counters.
+    """
+
+    status_result = _run_status_artifact(output_path)
+    if status_result is None:
+        return CoreOutcomeFacts(
+            status=CoreStatus.UNKNOWN,
+            target_iterations=decision.target_iterations,
+            next_iteration=decision.next_iteration,
+            completed_updates=decision.completed_updates,
+            reason="core wrote no durable run status; park for reconciliation",
+        )
+    run_dir, status = status_result
+    run_status = status.get("status")
+    if run_status == "failed":
+        return CoreOutcomeFacts(
+            status=CoreStatus.TERMINAL,
+            target_iterations=decision.target_iterations,
+            next_iteration=decision.next_iteration,
+            completed_updates=decision.completed_updates,
+            reason="core run status is failed",
+        )
+    if run_status != "completed":
+        return CoreOutcomeFacts(
+            status=CoreStatus.UNKNOWN,
+            target_iterations=decision.target_iterations,
+            next_iteration=decision.next_iteration,
+            completed_updates=decision.completed_updates,
+            reason=f"core run status is {run_status!r}; park for reconciliation",
+        )
+
+    try:
+        ref = _committed_checkpoint(run_dir)
+    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+        return CoreOutcomeFacts(
+            status=CoreStatus.TERMINAL,
+            target_iterations=decision.target_iterations,
+            next_iteration=decision.next_iteration,
+            completed_updates=decision.completed_updates,
+            reason=f"invalid committed final checkpoint: {exc}",
+            exception_type=type(exc).__name__,
+        )
+    if ref is None:
+        return CoreOutcomeFacts(
+            status=CoreStatus.PARKED,
+            target_iterations=decision.target_iterations,
+            next_iteration=decision.next_iteration,
+            completed_updates=decision.completed_updates,
+            reason="no committed final checkpoint; park for reconciliation",
+        )
+    return CoreOutcomeFacts(
+        status=CoreStatus.COMPLETED,
+        target_iterations=decision.target_iterations,
+        next_iteration=ref.next_iteration,
+        completed_updates=ref.completed_updates,
+    )
+
+
 class WorkerStartGateway:
     """Materialize one actual worker start before calling configured TPEN.
 
@@ -508,11 +661,17 @@ class WorkerStartGateway:
         except Exception as exc:
             exception_type = type(exc).__name__
             facts = CoreOutcomeFacts(
-                status=CoreStatus.TERMINAL if isinstance(exc, (ValueError, TypeError, KeyError)) else CoreStatus.UNKNOWN,
+                status=CoreStatus.TERMINAL
+                if _is_terminal_core_refusal(exc)
+                else CoreStatus.UNKNOWN,
                 target_iterations=decision.target_iterations,
                 next_iteration=decision.next_iteration,
                 completed_updates=decision.completed_updates,
-                reason=str(exc) or "configured run raised before reporting core facts",
+                reason=(
+                    str(exc)
+                    if _is_terminal_core_refusal(exc)
+                    else "configured run raised outside a named deterministic refusal; park for reconciliation"
+                ),
                 exception_type=exception_type,
             )
         outcome, reason = classify_core_outcome(facts, decision=decision)
@@ -545,9 +704,14 @@ class WorkerStartGateway:
         """Run configured TPEN once after publishing the worker-start receipt."""
 
         kwargs = dict(run_kwargs or {})
+        # The direct API keeps its historical ``raise_exceptions=False``
+        # default.  A worker gateway must see the named core refusal itself so
+        # it can classify it; an integer ``1`` would erase that distinction.
+        kwargs["raise_exceptions"] = True
 
         def run_once(decision: RecoveryDecision, output_path: Path) -> Any:
-            return run_configured_once(cfg, decision=decision, output_path=output_path, **kwargs)
+            run_configured_once(cfg, decision=decision, output_path=output_path, **kwargs)
+            return _core_outcome_from_artifacts(output_path, decision=decision)
 
         return self.start(
             batch=batch,
