@@ -54,7 +54,15 @@ def _load_inputs(job_data: Mapping[str, Any]) -> tuple[ReadyBatch, ScienceIntent
 
     root = Path(str(job_data["pilot_root"]))
     batch = decode_ready_batch((root / "batch.json").read_bytes())
-    intent = ScienceIntent(**json.loads((root / "intent.json").read_text(encoding="utf-8")))
+    intent_data = json.loads((root / "intent.json").read_text(encoding="utf-8"))
+    # The serialized digest is derived evidence, not a ScienceIntent
+    # constructor field; reconstruct the immutable intent from its owners.
+    intent = ScienceIntent(
+        science_input=intent_data["science_input"],
+        target_iterations=intent_data["target_iterations"],
+        source_config=intent_data.get("source_config", {}),
+        overrides=intent_data.get("overrides", ()),
+    )
     config = OmegaConf.load(str(job_data["config_path"]))
     validate_native_recovery_profile(config)
     return batch, intent, config, root
