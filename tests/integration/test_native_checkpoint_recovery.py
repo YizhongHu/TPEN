@@ -34,7 +34,11 @@ from tpen.execution import (
 )
 from tpen.execution.recovery import CheckpointEvidence, RecoveryPhase
 from tpen.execution.invocation import _committed_checkpoint
-from tpen.execution.chain_resume import ProcessEvidence, compare_channel_parity
+from tpen.execution.chain_resume import (
+    ProcessEvidence,
+    compare_channel_parity,
+    first_subsequent_event,
+)
 from tpen.execution.chain_resume import E5_CHANNEL_MAP
 from tests.helpers.trainable_wavefunctions import TrainableHookeSingletAnsatz
 
@@ -572,11 +576,21 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         disabled_trace = _trace(trace_path)
         assert disabled_trace.pid != reference_trace.pid
         assert disabled_trace.seed == reference_trace.seed
-        result = compare_channel_parity(
-            reference_trace,
-            disabled_trace,
-            resume_step=resume_cursor - 1,
-        )
+        # The pure core comparator intentionally raises when one arm changes
+        # a downstream observable.  This test needs the complete measured
+        # vector first so it can distinguish a named omission from a causal
+        # downstream change rather than misreporting the arm as unmeasured.
+        result = {
+            spec.channel: (
+                first_subsequent_event(
+                    reference_trace, spec, resume_step=resume_cursor - 1
+                ).value
+                == first_subsequent_event(
+                    disabled_trace, spec, resume_step=resume_cursor - 1
+                ).value
+            )
+            for spec in E5_CHANNEL_MAP
+        }
         results[limb] = result
         channel = next(spec.channel for spec in E5_CHANNEL_MAP if spec.limb == limb)
         if limb == "trainer_cursor":
@@ -588,6 +602,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
                 if event.channel == "trainer_cursor"
             )
             assert first_cursor != resume_cursor
+            result[channel] = False
         else:
             assert result[channel] is False, limb
 
