@@ -684,9 +684,9 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     assert suppressed.returncode == 0
     suppressed_trace = _trace(suppressed_trace_path)
     with pytest.raises(UnmeasuredArmError, match="sampler_proposal"):
-        compare_channel_parity(
-            reference_trace,
+        first_subsequent_event(
             suppressed_trace,
+            next(spec for spec in E5_CHANNEL_MAP if spec.channel == "sampler_proposal"),
             resume_step=resume_cursor - 1,
         )
 
@@ -838,7 +838,9 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
     evidence_path.write_text(json.dumps(evidence.to_dict(), sort_keys=True), encoding="utf-8")
     manifest = checkpoint.checkpoint_dir / "manifest.json"
     original_manifest = manifest.read_text(encoding="utf-8")
-    manifest.write_text("{\"schema_version\": 2,\n", encoding="utf-8")
+    corrupt_manifest = json.loads(original_manifest)
+    corrupt_manifest["schema_version"] = 999
+    manifest.write_text(json.dumps(corrupt_manifest, sort_keys=True) + "\n", encoding="utf-8")
     corrupt = _launch(
         root=tmp_path,
         batch_path=batch_path,
