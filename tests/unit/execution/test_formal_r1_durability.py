@@ -58,6 +58,10 @@ def _spy_filesystem_order(monkeypatch):
 
 
 def _assert_durable_order(events: list[str]) -> None:
+    required = {"fsync-file", "replace", "fsync-dir"}
+    assert required <= set(events), (
+        f"durability writer omitted required event(s); trace={events!r}"
+    )
     file_sync = events.index("fsync-file")
     replace = events.index("replace")
     directory_sync = events.index("fsync-dir")
