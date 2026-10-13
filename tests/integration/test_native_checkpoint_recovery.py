@@ -150,7 +150,15 @@ def _launch(
     if evidence is not None:
         command.extend(("--evidence", str(evidence)))
     log = (root / f"worker-{label or phase}-{time.monotonic_ns()}.log").open("w+")
-    return subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, text=True)
+    environment = os.environ.copy()
+    # Executing a helper by absolute path makes Python place tests/helpers,
+    # rather than the checkout root, first on sys.path.  Keep the fixture's
+    # trainable test model importable without changing the installed package.
+    checkout_root = str(Path(__file__).parents[2])
+    environment["PYTHONPATH"] = checkout_root + os.pathsep + environment.get("PYTHONPATH", "")
+    return subprocess.Popen(
+        command, stdout=log, stderr=subprocess.STDOUT, text=True, env=environment
+    )
 
 
 def _wait_for_checkpoint(
