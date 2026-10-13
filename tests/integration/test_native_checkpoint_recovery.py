@@ -613,7 +613,11 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             for unaffected in ("model_logabs", "optimizer_update", "sampler_proposal", "trainer_cursor"):
                 assert result[unaffected] is True, (limb, unaffected)
         elif limb == "model":
-            for unaffected in ("sampler_proposal", "process_random", "trainer_cursor"):
+            # A model omission changes the model evaluations used by the
+            # sampler and optimizer, and the measured process-RNG channel is
+            # likewise not isolatable through this topology.  Only the cursor
+            # remains independently distinguishable here.
+            for unaffected in ("trainer_cursor",):
                 assert result[unaffected] is True, (limb, unaffected)
         elif limb == "sampler_mcmc":
             for unaffected in ("process_random", "trainer_cursor"):
