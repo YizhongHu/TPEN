@@ -48,7 +48,7 @@ optimizer:
   lr: 0.01
 trainer:
   _target_: tpen.training.trainer.VMCTrainer
-  max_steps: 4
+  max_steps: 8
   log_every_n_steps: 1
   return_terms: true
 callbacks:

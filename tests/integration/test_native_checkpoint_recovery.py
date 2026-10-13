@@ -224,6 +224,9 @@ def _kill_prefix(process: subprocess.Popen[str], outputs: Path, target: int) -> 
     """Kill after an observed prefix, then select the latest committed ref."""
 
     run_dir = _wait_for_checkpoint(outputs, target=target, process=process)
+    # Stop the worker before issuing SIGKILL so a fast CPU run cannot commit the
+    # target between the observation and the simulated allocation loss.
+    os.kill(process.pid, signal.SIGSTOP)
     os.kill(process.pid, signal.SIGKILL)
     process.wait(timeout=30)
     checkpoint = _committed_checkpoint(run_dir)
