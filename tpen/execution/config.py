@@ -35,6 +35,15 @@ def _digest(value: Any, name: str) -> str:
     return value
 
 
+def _reject_unknown_keys(data: Mapping[str, Any], allowed: frozenset[str], name: str) -> None:
+    """Reject fields not defined by this versioned mapping schema."""
+
+    unknown = set(data) - allowed
+    if unknown:
+        names = ", ".join(sorted(str(key) for key in unknown))
+        raise ValueError(f"{name} contains unknown keys: {names}")
+
+
 def canonical_payload_bytes(payload: Any) -> bytes:
     """Encode JSON-shaped data canonically for identity and binding."""
 
@@ -148,6 +157,23 @@ class ExecutionConfig:
 
         if not isinstance(data, Mapping):
             raise TypeError("execution config must be a mapping")
+        _reject_unknown_keys(
+            data,
+            frozenset(
+                {
+                    "schema",
+                    "lineage_id",
+                    "backend",
+                    "recovery",
+                    "source_config_digest",
+                    "payload_digest",
+                    "recovery_selection_digest",
+                    "backend_options",
+                    "recovery_options",
+                }
+            ),
+            "execution config",
+        )
         return cls(
             schema=data.get("schema", ""),
             lineage_id=data.get("lineage_id", ""),

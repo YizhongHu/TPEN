@@ -31,6 +31,7 @@ from .recovery import (
     RecoveryDecision,
     RecoveryOutcome,
     RecoveryPhase,
+    RefusalCode,
     ScienceIntent,
     select_recovery,
 )
@@ -317,6 +318,7 @@ class WorkerOutcomeReceipt:
     next_iteration: int
     completed_updates: int
     reason: str
+    refusal_code: str | None = None
     exception_type: str | None = None
 
     def __post_init__(self) -> None:
@@ -326,6 +328,8 @@ class WorkerOutcomeReceipt:
         for name in ("target_iterations", "next_iteration", "completed_updates"):
             object.__setattr__(self, name, _nonnegative_int(getattr(self, name), name))
         object.__setattr__(self, "reason", str(self.reason))
+        if self.refusal_code is not None:
+            object.__setattr__(self, "refusal_code", RefusalCode(self.refusal_code).value)
         if self.exception_type is not None:
             object.__setattr__(self, "exception_type", _text(self.exception_type, "exception_type"))
 
@@ -341,6 +345,7 @@ class WorkerOutcomeReceipt:
             "next_iteration": self.next_iteration,
             "completed_updates": self.completed_updates,
             "reason": self.reason,
+            "refusal_code": self.refusal_code,
             "exception_type": self.exception_type,
         }
 
@@ -354,7 +359,7 @@ class WorkerOutcomeReceipt:
         return cls(**{name: data.get(name) for name in (
             "start_receipt_digest", "outcome", "status",
             "target_iterations", "next_iteration", "completed_updates",
-            "reason", "exception_type",
+            "reason", "refusal_code", "exception_type",
         )})
 
 
@@ -409,6 +414,14 @@ def classify_core_outcome(
     """
 
     if decision.refusal is not None:
+        if decision.refusal.code in {
+            RefusalCode.INCOMPATIBLE,
+            RefusalCode.UNSUPPORTED,
+            RefusalCode.MODEL_ONLY,
+        }:
+            return InvocationOutcome.TERMINAL, decision.refusal.message
+        # Missing or incomplete checkpoint evidence remains a reconciliation
+        # condition.  Later layers must park it without silently restarting.
         return InvocationOutcome.PARKED, decision.refusal.message
     if facts is None:
         return InvocationOutcome.PARKED, "core did not provide completion facts; park for reconciliation"
@@ -717,6 +730,7 @@ class WorkerStartGateway:
             next_iteration=(facts.next_iteration if facts is not None else decision.next_iteration),
             completed_updates=(facts.completed_updates if facts is not None else decision.completed_updates),
             reason=reason,
+            refusal_code=(decision.refusal.code.value if decision.refusal is not None else None),
             exception_type=exception_type if exception_type is not None else (facts.exception_type if facts else None),
         )
         _atomic_write_json(namespace / OUTCOME_RECEIPT_NAME, outcome_receipt.to_dict())
@@ -812,10 +826,17 @@ def run_configured_once(cfg: Any, *, decision: RecoveryDecision, output_path: Pa
 
     worker_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
     if decision.load is not None:
-        if OmegaConf.select(worker_cfg, "load", default=None) is not None:
+        # The configured runner consumes ``runner.load``.  Keep the
+        # top-level mirror for callers whose config exposes it, but never let
+        # a concrete runner value shadow the selected E1 overlay.
+        OmegaConf.update(worker_cfg, "runner.load", decision.load, merge=False, force_add=True)
+        if "load" in worker_cfg:
             OmegaConf.update(worker_cfg, "load", decision.load, merge=False)
-        else:
-            OmegaConf.update(worker_cfg, "runner.load", decision.load, merge=False, force_add=True)
+        effective_runner_load = OmegaConf.select(worker_cfg, "runner.load", default=None)
+        if OmegaConf.is_config(effective_runner_load):
+            effective_runner_load = OmegaConf.to_container(effective_runner_load, resolve=True)
+        if effective_runner_load != decision.load:
+            raise ValueError("worker overlay did not reach the configured runner.load")
     OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
     return run_from_config(worker_cfg, **kwargs)
 
