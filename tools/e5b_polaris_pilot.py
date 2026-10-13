@@ -2,8 +2,9 @@
 
 All facility deployment paths are required command-line inputs.  The
 2026-10-13 pilot supplied its site-package, interpreter, and library-prefix
-values at runtime; the preserved receipt records those values at
-``/Users/yizhonghu/tpen-manager-receipts/execution-lane/e5b/e5b-attempt4r1-final-e09fe36b.json``.
+values at runtime; the preserved receipt is recorded in E5 item
+``2692a8b0`` note ``e5b-final-not-established``.  It records those values
+without making them repository defaults.
 They are intentionally not repository defaults.
 """
 

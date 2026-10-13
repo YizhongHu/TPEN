@@ -9,24 +9,19 @@ dependency installed.
 
 Balsam API facts relied on
 ---------------------------
-The preserved historical registration source constructs an
-``ApplicationDefinition`` client and submits a Job, then records ``job.id``
-(`/Users/yizhonghu/tpen-manager-receipts/preserved/execution-lane-2026-10-13/
-canaries-f9f5d578-20261012-copy/balsam-allocation-loss-04/evidence/
-register-fresh-job-20261013T023146Z.py:51-72`).  The preserved application
-source also reads ``self.job.id`` inside the launched application
-(`/Users/yizhonghu/tpen-manager-receipts/preserved/execution-lane-2026-10-13/
-canaries-f9f5d578-20261012-copy/balsam-allocation-loss-launch-package-04/source/
-walltime_recovery_app.py:30-44,65-69,83-89,98-103`).  This is capability
-evidence rather than a claim about an installed deployment; the seam therefore
-accepts an integer or string id and records its canonical string form.
+The historical registration and launched-application observations are
+recorded as capability evidence in TO lane item ``34b3e37f`` note
+``formal-review-r1-findings`` and E5 item ``2692a8b0`` note
+``e5b-attempt1-disposition``.  They show a persistent Job acknowledgement
+with an exposed ``id`` and a launched application receiving that identity; the
+seam therefore accepts an integer or string id and records its canonical
+string form.  These notes are evidence, not an installed-deployment claim.
 
-The historical diagnosis records that compute-side Balsam startup depended on
-proxy/site environment prerequisites
-(`/Users/yizhonghu/tpen-manager-receipts/preserved/execution-lane-2026-10-13/
-canaries-f9f5d578-20261012-copy/balsam-allocation-loss-diagnosis-01/diagnosis.md:46-63`).  Worker start
-does not observe the live API for that reason; observation remains a
-submitter/reconciler operation.
+The compute-side proxy/site prerequisites and the decision to keep live API
+observation on the submitter/reconciler side are recorded in E5 item
+``2692a8b0`` notes ``e5-facility-and-prerequisites`` and
+``e5b-final-not-established``.  Worker start consequently does not observe
+the live API.
 """
 
 from __future__ import annotations
@@ -637,7 +632,7 @@ class BalsamAdapter:
             if refusal.get("schema") != BALSAM_REFUSAL_SCHEMA:
                 raise BalsamPermanentRefusal("registration refusal record has an unsupported schema")
             raise BalsamPermanentRefusal(str(refusal.get("reason", "Balsam registration was refused")))
-        if park_path.is_file() or not receipt_path.is_file():
+        if not receipt_path.is_file():
             return None
         receipt = BalsamRegistrationReceipt.from_mapping(_read_json(receipt_path))
         self._validate_receipt(receipt, expected)
@@ -668,15 +663,12 @@ class BalsamAdapter:
                 self._write_park(batch, "another registration owner is unresolved; park for reconciliation")
                 return None
 
-        if receipt_path.is_file():
-            receipt = BalsamRegistrationReceipt.from_mapping(_read_json(receipt_path))
-            self._validate_receipt(receipt, expected)
-            return receipt
-        if refusal_path.is_file():
-            refusal = _read_json(refusal_path)
-            if refusal.get("schema") != BALSAM_REFUSAL_SCHEMA:
-                raise BalsamPermanentRefusal("registration refusal record has an unsupported schema")
-            raise BalsamPermanentRefusal(str(refusal.get("reason", "Balsam registration was refused")))
+        # Both submitter and worker use the same loader, so a validated
+        # acknowledgement outranks a stale pre-ack race park while refusal
+        # precedence remains identical on both paths.
+        registration = self._load_registration(batch)
+        if registration is not None:
+            return registration
         if park_path.is_file():
             # A prior ambiguous client call is durable evidence against a
             # second registration.  Do not let a fresh process silently retry.
