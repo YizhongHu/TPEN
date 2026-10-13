@@ -22,14 +22,95 @@ from __future__ import annotations
 
 import json
 import os
+import ctypes
+import ctypes.util
+import sys
 from pathlib import Path
+from typing import Any, Mapping
+
 from balsam.api import ApplicationDefinition
 
 
 PRE_E3_FAILURE_EXIT_CODE = 2
 
 
-def _write_pre_e3_failure(job: object, exc: BaseException) -> None:
+class PreE3EnvironmentError(RuntimeError):
+    """Raised when worker bootstrap cannot prove its native environment."""
+
+    def __init__(self, message: str, evidence: Mapping[str, Any]) -> None:
+        super().__init__(message)
+        self.evidence = dict(evidence)
+
+
+def _torch_probe() -> dict[str, str]:
+    """Import torch and return the identity needed in a bootstrap receipt."""
+
+    import torch
+
+    return {
+        "version": str(getattr(torch, "__version__", "unknown")),
+        "file": str(getattr(torch, "__file__", "unknown")),
+    }
+
+
+def _library_search(library: str) -> dict[str, Any]:
+    """Resolve one shared library using Python and inherited search paths.
+
+    ``ldconfig`` and ``ldd`` are intentionally not used: neither is guaranteed
+    to be available in a compute-node job shell.  The evidence retains every
+    candidate derived from ``LD_LIBRARY_PATH`` and the Python resolver result.
+    """
+
+    inherited = os.environ.get("LD_LIBRARY_PATH", "")
+    directories = [entry for entry in inherited.split(os.pathsep) if entry]
+    searched_paths = [
+        str(Path(directory) / candidate)
+        for directory in directories
+        for candidate in (f"lib{library}.so.1", f"lib{library}.so")
+    ]
+    existing_paths = [path for path in searched_paths if Path(path).is_file()]
+    ctypes_result = ctypes.util.find_library(library)
+    evidence = {
+        "library": library,
+        "ld_library_path": inherited,
+        "searched_paths": searched_paths,
+        "existing_paths": existing_paths,
+        "ctypes_find_library": ctypes_result,
+    }
+    candidate = existing_paths[0] if existing_paths else ctypes_result
+    if not candidate:
+        raise PreE3EnvironmentError(f"could not resolve lib{library}", {"library": evidence})
+    try:
+        ctypes.CDLL(candidate)
+    except OSError as exc:
+        evidence["load_error"] = str(exc)
+        raise PreE3EnvironmentError(f"could not load {candidate}", {"library": evidence}) from exc
+    evidence["loaded"] = candidate
+    return evidence
+
+
+def _environment_precheck() -> dict[str, Any]:
+    """Validate native bootstrap dependencies before importing the worker."""
+
+    evidence: dict[str, Any] = {"python": {"executable": sys.executable}}
+    try:
+        evidence["torch"] = _torch_probe()
+        evidence["library"] = _library_search("fabric")
+    except PreE3EnvironmentError:
+        raise
+    except Exception as exc:
+        raise PreE3EnvironmentError(
+            f"native environment precheck failed: {type(exc).__name__}: {exc}", evidence
+        ) from exc
+    return evidence
+
+
+def _write_pre_e3_failure(
+    job: object,
+    exc: BaseException,
+    *,
+    precheck: Mapping[str, Any] | None = None,
+) -> None:
     """Publish a durable reason when worker bootstrap fails before E3.
 
     The path is supplied in Balsam ``Job.data`` by the submitter.  The
@@ -54,6 +135,8 @@ def _write_pre_e3_failure(job: object, exc: BaseException) -> None:
         "exit_code": PRE_E3_FAILURE_EXIT_CODE,
         "reason": "Balsam application failed before a confirmed E3 outcome; park without retry",
     }
+    if precheck is not None:
+        record["precheck"] = dict(precheck)
     temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(temporary, path)
 
@@ -65,41 +148,29 @@ class PolarisE5bApp(ApplicationDefinition):
     site = 0
 
     def shell_preamble(self) -> str:
-        """Verify the inherited Polaris MPI libraries before Python starts."""
+        """Log inherited paths; Python performs the durable precheck."""
 
         return r'''set -u -o pipefail
 echo "TPEN_E5B_PRECHECK host=$(hostname)"
 echo "TPEN_E5B_PRECHECK LD_LIBRARY_PATH=${LD_LIBRARY_PATH-}"
 echo "TPEN_E5B_PRECHECK PATH=${PATH-}"
 echo "TPEN_E5B_PRECHECK PYTHONPATH=${PYTHONPATH-}"
-PYTHON="${TPEN_E5B_PYTHON:-python}"
-ldconfig -p | grep -m1 'libfabric.so.1' || { echo "TPEN_E5B_PRECHECK missing libfabric" >&2; exit 2; }
-"$PYTHON" -c 'import ctypes.util, torch; print("TPEN_E5B_TORCH", torch.__version__, torch.__file__); print("TPEN_E5B_LIBFABRIC", ctypes.util.find_library("fabric")); assert ctypes.util.find_library("fabric")'
-if test "$?" -ne 0; then
-    echo "TPEN_E5B_PRECHECK torch/libfabric import failed" >&2
-    exit 2
-fi
-TORCH_GLOBAL="$($PYTHON -c 'from pathlib import Path; import torch; print(Path(torch.__file__).parent / "lib" / "libtorch_global_deps.so")')"
-if test "$?" -ne 0; then
-    echo "TPEN_E5B_PRECHECK could not locate torch global dependencies" >&2
-    exit 2
-fi
-echo "TPEN_E5B_LDD $TORCH_GLOBAL"
-ldd "$TORCH_GLOBAL" | tee /dev/stderr | grep -m1 'libfabric.so.1' || {
-    echo "TPEN_E5B_PRECHECK torch ldd missing libfabric" >&2
-    exit 2
-}
 '''
 
     def run(self) -> int:
         """Pass the launched Job identity explicitly into the worker gateway."""
 
         try:
+            precheck = _environment_precheck()
             from tools.e5b_polaris_runner import run_attempt
 
             result = int(run_attempt(job_id=self.job.id, job_data=self.job.data or {}))
         except Exception as exc:
-            _write_pre_e3_failure(self.job, exc)
+            _write_pre_e3_failure(
+                self.job,
+                exc,
+                precheck=getattr(exc, "evidence", None),
+            )
             raise SystemExit(PRE_E3_FAILURE_EXIT_CODE) from exc
         if result:
             # Returning an integer only prints BALSAM-RETURN-VALUE and exits

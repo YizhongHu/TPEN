@@ -152,6 +152,7 @@ def test_app_records_pre_e3_failure_and_uses_non_retry_exit(monkeypatch, tmp_pat
     """Bootstrap failure is durable, non-success, and outside Balsam retry codes."""
 
     app_module = _load_fake_app(monkeypatch)
+    monkeypatch.setattr(app_module, "_environment_precheck", lambda: {"status": "pass"})
     failing_runner = types.ModuleType("tools.e5b_polaris_runner")
 
     def fail(**_kwargs):
@@ -177,6 +178,7 @@ def test_app_converts_park_result_to_non_retry_exit(monkeypatch, tmp_path):
     """A worker park must not become Balsam's successful zero exit."""
 
     app_module = _load_fake_app(monkeypatch)
+    monkeypatch.setattr(app_module, "_environment_precheck", lambda: {"status": "pass"})
     parked_runner = types.ModuleType("tools.e5b_polaris_runner")
     parked_runner.run_attempt = lambda **_kwargs: 3
     monkeypatch.setitem(sys.modules, "tools.e5b_polaris_runner", parked_runner)
@@ -190,3 +192,39 @@ def test_app_converts_park_result_to_non_retry_exit(monkeypatch, tmp_path):
     else:  # pragma: no cover
         raise AssertionError("park result returned successfully")
     assert not (tmp_path / "pre-e3-failure.json").exists()
+
+
+def test_missing_library_precheck_records_search_and_exits_two(monkeypatch, tmp_path):
+    """A native bootstrap refusal is durable before the worker import."""
+
+    app_module = _load_fake_app(monkeypatch)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/missing/one:/missing/two")
+    monkeypatch.setattr(app_module, "_torch_probe", lambda: {"version": "fake", "file": "fake"})
+    monkeypatch.setattr(app_module.ctypes.util, "find_library", lambda _name: None)
+    app = app_module.PolarisE5bApp(
+        types.SimpleNamespace(id=42610001, data={"pilot_root": str(tmp_path)})
+    )
+
+    try:
+        app.run()
+    except SystemExit as exc:
+        assert exc.code == app_module.PRE_E3_FAILURE_EXIT_CODE == 2
+    else:  # pragma: no cover - assertion documents the required process status
+        raise AssertionError("missing-library precheck returned successfully")
+
+    record = json.loads((tmp_path / "pre-e3-failure.json").read_text())
+    searched = record["precheck"]["library"]["searched_paths"]
+    assert searched == [
+        "/missing/one/libfabric.so.1",
+        "/missing/one/libfabric.so",
+        "/missing/two/libfabric.so.1",
+        "/missing/two/libfabric.so",
+    ]
+    assert record["exit_code"] == 2
+
+
+def test_shell_preamble_does_not_require_ldconfig(monkeypatch):
+    """The compute-node shell only logs; Python owns the durable precheck."""
+
+    app_module = _load_fake_app(monkeypatch)
+    assert "ldconfig" not in app_module.PolarisE5bApp(types.SimpleNamespace()).shell_preamble()
