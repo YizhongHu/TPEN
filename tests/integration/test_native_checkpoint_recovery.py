@@ -817,9 +817,9 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
     # A committed prefix is the after-commit arm.  Select through the same
     # catalog/latest resolver used by E3, then corrupt only its manifest before
     # the successor enters restore.  The immutable checkpoint binding must
-    # park this as application evidence, not as a scheduler loss or a silent
-    # restart.  A changed committed artifact is not a deterministic config
-    # refusal that the worker may retry.
+    # classify this as a typed terminal application refusal, not as a
+    # scheduler loss or a silent restart.  A corrupt committed artifact is a
+    # deterministic unsupported checkpoint, so it must not be retried.
     prefix = _launch(
         root=tmp_path,
         batch_path=batch_path,
@@ -858,10 +858,11 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
     assert corrupt.returncode == 0
     corrupt_result = _result_from_log(tmp_path, "fault-corrupt-committed")
     assert corrupt_result["status"] == "started"
-    assert corrupt_result["invocation"]["outcome"] == "parked"
-    # The worker has no core status artifact after restore refuses the bound
-    # mutation, so its status remains UNKNOWN; the typed parked outcome is the
-    # boundary result we are asserting here.
+    assert corrupt_result["invocation"]["outcome"] == "terminal"
+    assert corrupt_result["invocation"]["refusal_code"] == "unsupported"
+    # The worker has no core status artifact after selection refuses the bound
+    # mutation, so its status remains UNKNOWN; refusal_code carries the typed
+    # E1 reason without requiring a science run.
     assert corrupt_result["invocation"]["status"] == "unknown"
     assert corrupt_result["invocation"]["reason"]
     manifest.write_text(original_manifest, encoding="utf-8")

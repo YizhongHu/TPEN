@@ -264,6 +264,8 @@ def assert_fresh_processes(reference: ProcessEvidence, resumed: ProcessEvidence)
         raise ChannelParityError("reference and resumed evidence have the same phase")
     if not reference.seed_source or not resumed.seed_source:
         raise ChannelParityError("seed provenance is missing")
+    if reference.seed_source == resumed.seed_source:
+        raise ChannelParityError("reference and resumed seed provenance is not distinct")
 
 
 def first_subsequent_event(
