@@ -7,13 +7,20 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
-from tpen.execution import UnsupportedMutableStateError, validate_native_recovery_profile
+from tpen.execution import (
+    SUPPORTED_STATE_OWNERS,
+    UnsupportedMutableStateError,
+    validate_native_recovery_profile,
+)
 
 
 FIXTURE = Path(__file__).resolve().parents[2] / "integration" / "artifacts" / "execution" / "native_recovery.yaml"
 
 
 def test_native_fixture_uses_only_supported_state_owners() -> None:
+    assert SUPPORTED_STATE_OWNERS == {
+        "model", "optimizer", "trainer_cursor", "sampler_mcmc", "process_rng"
+    }
     validate_native_recovery_profile(OmegaConf.load(FIXTURE))
 
 

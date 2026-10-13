@@ -32,7 +32,7 @@ from tpen.execution import (
     payload_digest,
     source_config_digest,
 )
-from tpen.execution.recovery import CheckpointEvidence
+from tpen.execution.recovery import CheckpointEvidence, RecoveryPhase
 
 
 FIXTURE = Path(__file__).parent / "artifacts" / "execution" / "native_recovery.yaml"
@@ -215,6 +215,22 @@ def _kill_prefix(process: subprocess.Popen[str], outputs: Path, target: int) -> 
     checkpoint = _wait_for_checkpoint(outputs, target=target, process=process)
     os.kill(process.pid, signal.SIGKILL)
     return checkpoint
+
+
+def test_kill_before_checkpoint_parks_without_restart(tmp_path: Path) -> None:
+    """A lost prefix with no committed evidence never silently restarts."""
+
+    batch, intent, _ = _batch()
+    called: list[bool] = []
+    result = WorkerStartGateway(tmp_path).start(
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.RECOVERY,
+        run_once=lambda *_: called.append(True),
+    )
+    assert called == []
+    assert result.outcome.outcome.value == "parked"
+    assert "no committed checkpoint" in result.outcome.reason
 
 
 @pytest.mark.integration

@@ -32,6 +32,9 @@ SUPPORTED_CALLBACK_TARGETS = frozenset(
     }
 )
 SUPPORTED_LOGGER_TARGETS = frozenset({"tpen.logging.CSV", "tpen.logging.JSONL"})
+SUPPORTED_STATE_OWNERS = frozenset(
+    {"model", "optimizer", "trainer_cursor", "sampler_mcmc", "process_rng"}
+)
 
 
 def _target(entry: Any, owner: str, index: int) -> str:
@@ -87,6 +90,7 @@ def validate_native_recovery_profile(config: Any) -> None:
 __all__ = [
     "SUPPORTED_CALLBACK_TARGETS",
     "SUPPORTED_LOGGER_TARGETS",
+    "SUPPORTED_STATE_OWNERS",
     "UnsupportedMutableStateError",
     "validate_native_recovery_profile",
 ]
