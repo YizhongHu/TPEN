@@ -72,7 +72,10 @@ class PolarisBalsamClient:
         Private Site directory owned by this qualification.
     backend_options : mapping
         Deployment paths and app settings.  These remain backend data and are
-        not placed in the scientific source configuration.
+        not placed in the scientific source configuration.  The deployment
+        paths ``checkout_root``, ``app_root``, ``site_packages``,
+        ``python_exe``, ``pilot_root``, and ``ld_library_prefix`` are required
+        runtime inputs; this adapter provides no facility-specific defaults.
     """
 
     def __init__(self, site_root: str | Path, backend_options: Mapping[str, Any]):
@@ -82,6 +85,8 @@ class PolarisBalsamClient:
     def _bindings(self) -> tuple[Any, Any, type[Any]]:
         """Load Balsam and bind the configured application to this Site."""
 
+        # Validate operator-supplied paths before touching the optional backend.
+        environment = self._worker_environment()
         # This is the only import of the optional dependency in the wrapper.
         from balsam import api
         from balsam.config import SiteConfig
@@ -96,20 +101,54 @@ class PolarisBalsamClient:
         )
         app_class._set_client(config.client)
         app_class.site = config.site_id
-        app_class.python_exe = str(
-            self.backend_options.get(
-                "python_exe", "/soft/applications/conda/2025-09-25/mconda3/bin/python"
-            )
-        )
-        app_class.environment_variables = self._worker_environment()
+        app_class.python_exe = self._required_backend_path("python_exe")
+        app_class.environment_variables = environment
         return api, config, app_class
+
+    def _required_backend_path(self, key: str) -> str:
+        """Return a required configured deployment path.
+
+        Parameters
+        ----------
+        key : str
+            Backend option name whose value must be supplied by the caller.
+
+        Returns
+        -------
+        str
+            The configured path.
+
+        Raises
+        ------
+        ValueError
+            If the option is absent or blank.
+        """
+
+        value = self.backend_options.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise ValueError(f"required Balsam deployment path {key!r} is missing")
+        return str(value)
+
+    def _required_backend_paths(self, key: str) -> list[str]:
+        """Return a non-empty configured list of deployment paths."""
+
+        value = self.backend_options.get(key)
+        if isinstance(value, (str, bytes)) or value is None:
+            raise ValueError(f"required Balsam deployment path list {key!r} is missing")
+        paths = [str(entry) for entry in value if str(entry).strip()]
+        if not paths:
+            raise ValueError(f"required Balsam deployment path list {key!r} is missing")
+        return paths
 
     def _worker_environment(self) -> dict[str, str]:
         """Build app environment by prepending to inherited facility paths."""
 
-        checkout = str(self.backend_options.get("checkout_root", ""))
-        app_root = str(self.backend_options.get("app_root", ""))
-        site_packages = str(self.backend_options.get("site_packages", ""))
+        checkout = self._required_backend_path("checkout_root")
+        app_root = self._required_backend_path("app_root")
+        site_packages = self._required_backend_path("site_packages")
+        python_exe = self._required_backend_path("python_exe")
+        pilot_root = self._required_backend_path("pilot_root")
+        ld_prefix = self._required_backend_paths("ld_library_prefix")
 
         def prepend(entries: list[str], inherited: str) -> str:
             """Prepend non-empty additions without discarding the base env."""
@@ -123,25 +162,13 @@ class PolarisBalsamClient:
         python_entries = [checkout, site_packages]
         environment = {
             "BALSAM_SITE_PATH": str(self.site_root),
-            "TPEN_E5B_ROOT": str(self.backend_options.get("pilot_root", "")),
-            "TPEN_E5B_PYTHON": str(
-                self.backend_options.get(
-                    "python_exe", "/soft/applications/conda/2025-09-25/mconda3/bin/python"
-                )
-            ),
+            "TPEN_E5B_ROOT": pilot_root,
+            "TPEN_E5B_PYTHON": python_exe,
         }
         environment["PATH"] = prepend(path_entries, os.environ.get("PATH", ""))
         environment["PYTHONPATH"] = prepend(python_entries, os.environ.get("PYTHONPATH", ""))
-        ld_prefix = self.backend_options.get(
-            "ld_library_prefix",
-            (
-                "/home/rhu/tpen-libshim-20260823",
-                "/soft/compilers/cudatoolkit/cuda-13.0.1/lib64",
-                "/soft/compilers/cudatoolkit/cuda-12.9.1/lib64",
-            ),
-        )
         environment["LD_LIBRARY_PATH"] = prepend(
-            [str(entry) for entry in ld_prefix], os.environ.get("LD_LIBRARY_PATH", "")
+            ld_prefix, os.environ.get("LD_LIBRARY_PATH", "")
         )
         for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
             if key in os.environ:

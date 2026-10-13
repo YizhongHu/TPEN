@@ -1,4 +1,11 @@
-"""Submitter/reconciler commands for the bounded E5b Polaris pilot."""
+"""Submitter/reconciler commands for the bounded E5b Polaris pilot.
+
+All facility deployment paths are required command-line inputs.  The
+2026-10-13 pilot supplied its site-package, interpreter, and library-prefix
+values at runtime; the preserved receipt records those values at
+``/Users/yizhonghu/tpen-manager-receipts/execution-lane/e5b/e5b-attempt4r1-final-e09fe36b.json``.
+They are intentionally not repository defaults.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +39,9 @@ def _batch(
     site_root: Path,
     checkout_root: Path,
     app_root: Path,
+    site_packages: Path,
+    python_exe: Path,
+    ld_library_prefix: tuple[Path, ...],
     lineage_id: str,
     batch_id: str,
 ) -> ReadyBatch:
@@ -59,15 +69,11 @@ def _batch(
             "checkout_root": str(checkout_root),
             "app_root": str(app_root),
             "pilot_root": str(root),
-            "site_packages": "/home/rhu/.local/lib/python3.13/site-packages",
+            "site_packages": str(site_packages),
             "app_module": "tools.e5b_polaris_app",
             "app_class": "PolarisE5bApp",
-            "python_exe": "/soft/applications/conda/2025-09-25/mconda3/bin/python",
-            "ld_library_prefix": [
-                "/home/rhu/tpen-libshim-20260823",
-                "/soft/compilers/cudatoolkit/cuda-13.0.1/lib64",
-                "/soft/compilers/cudatoolkit/cuda-12.9.1/lib64",
-            ],
+            "python_exe": str(python_exe),
+            "ld_library_prefix": [str(path) for path in ld_library_prefix],
             "wall_time_min": 5,
             "workdir": batch_id,
             "job_data": {
@@ -123,6 +129,9 @@ def prepare(args: argparse.Namespace) -> None:
         args.site,
         args.checkout,
         args.app_root,
+        args.site_packages,
+        args.python_exe,
+        tuple(args.ld_library_prefix),
         args.lineage_id,
         args.batch_id,
     )
@@ -168,6 +177,9 @@ def main() -> int:
     parser.add_argument("--site", type=Path, required=True)
     parser.add_argument("--checkout", type=Path, required=True)
     parser.add_argument("--app-root", type=Path, required=True)
+    parser.add_argument("--site-packages", type=Path, required=True)
+    parser.add_argument("--python-exe", type=Path, required=True)
+    parser.add_argument("--ld-library-prefix", type=Path, action="append", required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--lineage-id", default="e5b-polaris-lineage-a2")
     parser.add_argument("--batch-id", default="e5b-polaris-batch-a2")

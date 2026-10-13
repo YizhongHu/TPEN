@@ -9,6 +9,8 @@ import importlib
 import json
 from pathlib import Path
 
+import pytest
+
 from tpen.execution import BalsamJobState
 from tools.e5b_polaris_client import PolarisBalsamClient
 
@@ -84,7 +86,10 @@ def _client(tmp_path: Path) -> PolarisBalsamClient:
             "app_module": "fake_e5b_app",
             "app_class": "PolarisE5bApp",
             "checkout_root": "/checkout",
+            "app_root": "/app",
             "site_packages": "/site-packages",
+            "python_exe": "/python",
+            "ld_library_prefix": ["/configured/lib"],
             "pilot_root": "/pilot",
             "job_data": {"pilot_root": "/pilot"},
             "workdir": "e5b-job",
@@ -129,6 +134,22 @@ def test_worker_environment_prepends_without_discarding_facility_paths(monkeypat
     assert environment["LD_LIBRARY_PATH"].endswith(":/facility/libfabric")
     assert environment["PATH"].endswith(":/facility/bin")
     assert environment["PYTHONPATH"].endswith(":/facility/python")
+    assert environment["LD_LIBRARY_PATH"].startswith("/configured/lib")
+    assert environment["TPEN_E5B_PYTHON"] == "/python"
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    ("checkout_root", "app_root", "site_packages", "python_exe", "pilot_root", "ld_library_prefix"),
+)
+def test_missing_facility_path_refuses_before_backend_use(tmp_path, missing_key):
+    """Every facility deployment path must be supplied by runtime config."""
+
+    options = _client(tmp_path).backend_options
+    options.pop(missing_key)
+    client = PolarisBalsamClient(tmp_path / "site", options)
+    with pytest.raises(ValueError, match=missing_key):
+        client._worker_environment()
 
 
 def _load_fake_app(monkeypatch):
