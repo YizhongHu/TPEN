@@ -1,9 +1,11 @@
 """Independent round-1 review tests for E1 checkpoint-recovery contract.
 
-Reviewed head: codex/execution/e1-recovery @ c8570c211774aea98c015c8199373516babe4fc1.
-Polarity is stated per test relative to that exact head; a change to
-``tpen/execution/recovery.py`` after this review invalidates the polarity
-claims below.
+Reviewed head: codex/execution/e1-recovery @
+f070febf9dec61dfa5d0bd4570cedc8774e4752f.  The former expected-RED
+polarity was measured at superseded head
+c8570c211774aea98c015c8199373516babe4fc1; all tests below are expected GREEN
+at the fixed head.  A later change to ``tpen/execution/recovery.py``
+invalidates this polarity claim.
 """
 
 from __future__ import annotations
@@ -104,12 +106,13 @@ def _intent(*, target_iterations: int = 10, science_input: dict[str, object] | N
 
 
 def test_path_evidence_with_manifest_missing_required_field_refuses_typed(tmp_path: Path) -> None:
-    """Expected RED at head c8570c21.
+    """Expected GREEN at fixed head f070febf.
 
-    Exposes: a complete, v2-shaped checkpoint directory whose manifest is
+    Formerly exposed: a complete, v2-shaped checkpoint directory whose manifest is
     missing ``completed_updates`` must still produce a *typed* refusal
     (INCOMPLETE or UNSUPPORTED), not an uncaught exception.
-    Expected red signature: uncaught ``KeyError('completed_updates')`` raised
+    Historical red signature at the superseded head: uncaught
+    ``KeyError('completed_updates')`` raised
     from ``CheckpointManifest.from_mapping`` inside
     ``CheckpointEvidence.from_path`` -> ``CheckpointRef.from_directory``,
     because ``CheckpointEvidence.from_path`` (recovery.py:242) excludes
@@ -139,12 +142,13 @@ def test_path_evidence_with_manifest_missing_required_field_refuses_typed(tmp_pa
 
 
 def test_ref_evidence_with_manifest_degraded_after_ref_build_refuses_typed(tmp_path: Path) -> None:
-    """Expected RED at head c8570c21.
+    """Expected GREEN at fixed head f070febf.
 
-    Exposes: a valid ``CheckpointRef`` whose on-disk manifest is degraded
+    Formerly exposed: a valid ``CheckpointRef`` whose on-disk manifest is degraded
     (``completed_updates`` removed) *after* the ref was built must still
     produce a typed refusal when re-checked by ``select_recovery``.
-    Expected red signature: uncaught ``KeyError('completed_updates')`` from
+    Historical red signature at the superseded head: uncaught
+    ``KeyError('completed_updates')`` from
     ``ref.validate()`` -> ``CheckpointRef.from_directory`` ->
     ``CheckpointManifest.from_mapping``, because the except tuple at
     recovery.py:479 (around ``ref.validate()``) lacks ``KeyError``. The raw
@@ -176,13 +180,13 @@ def test_ref_evidence_with_manifest_degraded_after_ref_build_refuses_typed(tmp_p
 
 
 def test_decision_load_is_consumable_by_existing_load_path(tmp_path: Path) -> None:
-    """Expected RED at head c8570c21.
+    """Expected GREEN at fixed head f070febf.
 
-    Exposes acceptance clause "overlay exactly equal to what the existing
+    Formerly exposed acceptance clause "overlay exactly equal to what the existing
     load path consumes": equality of the mapping contents is not enough if
     the existing ``_load_config`` consumer cannot accept the type that
     ``decision.load`` actually is.
-    Expected red signature: ``TypeError: load config must be a mapping or
+    Historical red signature at the superseded head: ``TypeError: load config must be a mapping or
     OmegaConf container`` -- ``decision.load`` is a ``MappingProxyType``,
     and ``tpen.checkpoint.restore._load_config`` (restore.py:266-273) only
     accepts ``None``, an OmegaConf container, or a plain ``dict``.
@@ -203,13 +207,13 @@ def test_decision_load_is_consumable_by_existing_load_path(tmp_path: Path) -> No
 
 
 def test_genuine_v1_checkpoint_via_path_refuses_unsupported(tmp_path: Path) -> None:
-    """Expected RED at head c8570c21.
+    """Expected GREEN at fixed head f070febf.
 
-    Exposes: a genuinely from-scratch v1 (``spenn.checkpoint``) legacy
+    Formerly exposed: a genuinely from-scratch v1 (``spenn.checkpoint``) legacy
     checkpoint, reachable only via a path (never a pre-built ``CheckpointRef``,
     since v1 cannot build one), must refuse with UNSUPPORTED -- the raw
     pre-gate at recovery.py:469-475 exists precisely for this population.
-    Expected red signature: ``decision.refusal.code`` is actually
+    Historical red signature at the superseded head: ``decision.refusal.code`` is actually
     ``RefusalCode.INCOMPLETE`` ("does not identify a committed complete
     checkpoint"), not ``UNSUPPORTED``, because ``CheckpointRef.from_directory``
     refuses v1 manifests (reference.py:111-115), so
@@ -306,12 +310,12 @@ def test_ref_evidence_with_unhashable_schema_version_refuses_unsupported(
 
 
 def test_raw_path_recovery_of_foreign_lineage_checkpoint_must_not_emit_overlay(tmp_path: Path) -> None:
-    """Expected RED at head c8570c21.
+    """Expected GREEN at fixed head f070febf.
 
-    Exposes: a recovery selection over raw path/ref evidence must not emit a
+    Formerly exposed: a recovery selection over raw path/ref evidence must not emit a
     load overlay for a checkpoint with no actual binding to the current
     intent's science input.
-    Expected red signature: assertion failure -- ``decision.outcome`` is
+    Historical red signature at the superseded head: assertion failure -- ``decision.outcome`` is
     ``RecoveryOutcome.RECOVERY`` with a non-None ``decision.load``, because
     ``_coerce_evidence`` (recovery.py:448-452) stamps path/ref evidence with
     the *current* intent's own digest and target before any binding check
@@ -335,7 +339,7 @@ def test_raw_path_recovery_of_foreign_lineage_checkpoint_must_not_emit_overlay(t
 
 
 def test_evidence_target_horizon_mismatch_refuses_incompatible(tmp_path: Path) -> None:
-    """Expected GREEN at head c8570c21.
+    """Expected GREEN at fixed head f070febf.
 
     Pins: evidence bound to a different fixed target horizon than the
     current intent refuses INCOMPATIBLE.
