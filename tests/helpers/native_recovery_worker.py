@@ -94,6 +94,9 @@ class PartialRestoreTrain(Train):
             del report
             self.load = None
 
+        # Reuse the just-restored optimizer for the full-restore mutant; the
+        # model-only control keeps this newly constructed optimizer fresh.
+        self.optimizer = optimizer
         return super().run(context)
 
 
