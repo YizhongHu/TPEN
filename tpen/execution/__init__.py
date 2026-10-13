@@ -25,6 +25,23 @@ from .receipts import (
     encode_receipt,
     validate_receipt_binding,
 )
+from .invocation import (
+    CoreOutcomeFacts,
+    CoreStatus,
+    InvocationOutcome,
+    OUTCOME_RECEIPT_NAME,
+    OUTCOME_RECEIPT_SCHEMA,
+    ReceiptBindingError,
+    START_RECEIPT_NAME,
+    START_RECEIPT_SCHEMA,
+    WorkerInvocation,
+    WorkerOutcomeReceipt,
+    WorkerStartGateway,
+    WorkerStartReceipt,
+    classify_core_outcome,
+    run_configured_once,
+    validate_start_receipt,
+)
 
 from .recovery import (
     CheckpointEvidence,
@@ -69,4 +86,19 @@ __all__ = [
     "select_recovery",
     "train_resume_load_overlay",
     "validate_receipt_binding",
+    "CoreOutcomeFacts",
+    "CoreStatus",
+    "InvocationOutcome",
+    "OUTCOME_RECEIPT_NAME",
+    "OUTCOME_RECEIPT_SCHEMA",
+    "ReceiptBindingError",
+    "START_RECEIPT_NAME",
+    "START_RECEIPT_SCHEMA",
+    "WorkerInvocation",
+    "WorkerOutcomeReceipt",
+    "WorkerStartGateway",
+    "WorkerStartReceipt",
+    "classify_core_outcome",
+    "run_configured_once",
+    "validate_start_receipt",
 ]
