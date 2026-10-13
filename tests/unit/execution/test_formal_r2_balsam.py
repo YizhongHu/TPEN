@@ -115,13 +115,16 @@ def test_same_job_mapping_observation_is_accepted(tmp_path: Path, observed_id) -
 
 
 def test_typed_foreign_job_observation_is_refused(tmp_path: Path) -> None:
-    """GREEN control: the typed observation path already rejects Job 99."""
+    """GREEN control: typed foreign observations are parked and return None."""
 
     adapter, batch, _intent, _client = _registered_adapter(
         tmp_path, BalsamJobObservation(99, BalsamJobState.COMPLETED)
     )
-    with pytest.raises(BalsamBindingError):
-        adapter.observe_lineage(batch)
+    observed = adapter.observe_lineage(batch)
+    assert observed is None
+    lineage_dir = tmp_path / "receipts" / batch.lineage_id
+    assert not (lineage_dir / "observation.json").exists()
+    assert (lineage_dir / "observation-park.json").is_file()
 
 
 def test_worker_start_never_registers_or_observes_backend(tmp_path: Path) -> None:

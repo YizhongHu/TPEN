@@ -66,12 +66,14 @@ def _receipt(kind: str, batch: ReadyBatch):
     if kind == "fresh-output":
         return FreshOutputReceipt(
             **common,
+            fresh_output_id="output-a",
             output_path="results/a",
             payload_digest=batch.payload_digest,
         )
     if kind == "result":
         return ResultReceipt(
             **common,
+            fresh_output_id="output-a",
             result_receipt_id="result-a",
             payload_digest=batch.payload_digest,
             result_digest="c" * 64,
