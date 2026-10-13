@@ -3,9 +3,30 @@
 The adapter owns only the small durable boundary between one prepared
 ``ReadyBatch`` and a Balsam client.  It does not implement a scheduler,
 reaper, retry controller, or backend lifecycle.  The real optional Balsam
-package is intentionally imported by a deployment seam, never at module
-import time; source tests can therefore use the protocol below without the
-optional dependency installed.
+package is intentionally imported by a deployment seam, never at module import
+time; source tests can therefore use the protocol below without the optional
+dependency installed.
+
+Balsam API facts relied on
+---------------------------
+The preserved historical registration source constructs an
+``ApplicationDefinition`` client and submits a Job, then records ``job.id``
+(`/Users/yizhonghu/tpen-manager-receipts/preserved/execution-lane-2026-10-13/
+canaries-f9f5d578-20261012-copy/balsam-allocation-loss-04/evidence/
+register-fresh-job-20261013T023146Z.py:51-72`).  The preserved application
+source also reads ``self.job.id`` inside the launched application
+(`/Users/yizhonghu/tpen-manager-receipts/preserved/execution-lane-2026-10-13/
+canaries-f9f5d578-20261012-copy/balsam-allocation-loss-launch-package-04/source/
+walltime_recovery_app.py:30-44,65-69,83-89,98-103`).  This is capability
+evidence rather than a claim about an installed deployment; the seam therefore
+accepts an integer or string id and records its canonical string form.
+
+The historical diagnosis records that compute-side Balsam startup depended on
+proxy/site environment prerequisites
+(`/Users/yizhonghu/tpen-manager-receipts/preserved/execution-lane-2026-10-13/
+canaries-f9f5d578-20261012-copy/balsam-allocation-loss-diagnosis-01/diagnosis.md:46-63`).  Worker start
+does not observe the live API for that reason; observation remains a
+submitter/reconciler operation.
 """
 
 from __future__ import annotations
@@ -28,10 +49,14 @@ BALSAM_INTENT_SCHEMA = "tpen.execution/balsam-registration-intent-v1"
 BALSAM_REGISTRATION_SCHEMA = "tpen.execution/balsam-registration-v1"
 BALSAM_PARK_SCHEMA = "tpen.execution/balsam-registration-park-v1"
 BALSAM_REFUSAL_SCHEMA = "tpen.execution/balsam-registration-refusal-v1"
+BALSAM_OBSERVATION_SCHEMA = "tpen.execution/balsam-observation-v1"
+BALSAM_WORKER_PARK_SCHEMA = "tpen.execution/balsam-worker-park-v1"
 REGISTRATION_INTENT_NAME = "registration-intent.json"
 REGISTRATION_RECEIPT_NAME = "registration.json"
 REGISTRATION_PARK_NAME = "registration-park.json"
 REGISTRATION_REFUSAL_NAME = "registration-refusal.json"
+OBSERVATION_NAME = "observation.json"
+WORKER_PARK_NAME = "worker-park.json"
 REGISTRATION_LOCK_NAME = "registration.lock"
 
 
@@ -85,14 +110,16 @@ class BalsamJobObservation:
         Backend observation data kept separate from science intent.
     """
 
-    job_id: str
+    job_id: str | int
     state: BalsamJobState | str
     reason: str = ""
     metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.job_id, str) or not self.job_id.strip():
-            raise ValueError("job_id must be a non-empty string")
+        job_id = _canonical_job_id(self.job_id)
+        if job_id is None:
+            raise ValueError("job_id must be a non-empty string or integer")
+        object.__setattr__(self, "job_id", job_id)
         object.__setattr__(self, "state", BalsamJobState(self.state))
         if not isinstance(self.reason, str):
             raise TypeError("reason must be a string")
@@ -114,7 +141,8 @@ class BalsamClient(Protocol):
     """Minimal lazy-client seam implemented by a Balsam deployment adapter.
 
     A deployment may wrap ``balsam.api`` here.  The core adapter never imports
-    or resolves that optional package and never calls a submission API itself.
+    or resolves that optional package; only the submitter-side method calls the
+    protocol's registration operation.
     """
 
     def register_job(
@@ -354,35 +382,43 @@ class BalsamStartResult:
             raise TypeError("reason must be a string")
 
 
-def _job_id(ack: Any) -> str | None:
-    """Extract an opaque Job identity from common client acknowledgement forms."""
+def _canonical_job_id(value: Any) -> str | None:
+    """Normalize the opaque Balsam Job id without accepting booleans."""
 
-    if isinstance(ack, str):
-        return ack if ack.strip() else None
-    if isinstance(ack, Mapping):
-        for key in ("job_id", "id"):
-            value = ack.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
+    if isinstance(value, bool):
         return None
-    for key in ("job_id", "id"):
-        value = getattr(ack, key, None)
-        if isinstance(value, str) and value.strip():
-            return value
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str) and value.strip():
+        return value
     return None
+
+
+def _job_id(ack: Any) -> str | None:
+    """Extract and canonicalize a Job identity from a client acknowledgement."""
+
+    value = ack
+    if isinstance(ack, Mapping):
+        value = next((ack.get(key) for key in ("job_id", "id") if key in ack), None)
+    elif not isinstance(ack, (str, int)) or isinstance(ack, bool):
+        value = next((getattr(ack, key, None) for key in ("job_id", "id") if hasattr(ack, key)), None)
+    return _canonical_job_id(value)
 
 
 def _observation(value: BalsamJobObservation | Mapping[str, Any], job_id: str) -> BalsamJobObservation:
     """Normalize one backend observation without importing Balsam types."""
 
+    expected_job_id = _canonical_job_id(job_id)
+    if expected_job_id is None:
+        raise BalsamBindingError("registration receipt has an invalid Job identity")
     if isinstance(value, BalsamJobObservation):
-        if value.job_id != job_id:
+        if value.job_id != expected_job_id:
             raise BalsamBindingError("backend observation names a different Job")
         return value
     if not isinstance(value, Mapping):
         raise TypeError("observe_job must return BalsamJobObservation or a mapping")
     return BalsamJobObservation(
-        job_id=value.get("job_id", job_id),
+        job_id=value.get("job_id", expected_job_id),
         state=value.get("state", BalsamJobState.UNKNOWN),
         reason=value.get("reason", ""),
         metadata=value.get("metadata", {}),
@@ -434,36 +470,47 @@ class BalsamAdapter:
         intent: ScienceIntent,
         phase: RecoveryPhase | str,
         run_once: Callable[..., Any],
+        job_id: str | int,
         item: ReadyItem | None = None,
         evidence: CheckpointEvidence | Mapping[str, Any] | str | Path | None = None,
         attempt_id: str | None = None,
         fault_injector: Callable[[str], None] | None = None,
     ) -> BalsamStartResult:
-        """Ensure one Job, observe it, and route this process start through E3.
+        """Route one Balsam-launched process through E3 without backend calls.
 
-        A missing acknowledgement after a registration intent is durable is
-        explicitly parked.  The adapter never calls the client again for that
-        lineage until an external reconciler establishes the acknowledgement.
+        ``job_id`` is supplied by the Balsam launch wrapper.  This worker-side
+        method deliberately never calls ``register_job`` or ``observe_job``:
+        registration and backend observation belong to the submitter or
+        reconciler.  A missing, parked, or mismatched durable registration is
+        therefore a durable worker park rather than an implicit submission.
         """
 
         self._validate_batch(batch)
-        registration = self._ensure_registration(batch)
-        if registration is None:
+        launched_job_id = _canonical_job_id(job_id)
+        if launched_job_id is None:
+            reason = "launched Balsam Job identity is missing or invalid; park for reconciliation"
+            self._write_worker_park(batch, reason)
             return BalsamStartResult(
                 status=BalsamAdapterStatus.PARKED,
                 registration=None,
                 observation=None,
                 invocation=None,
-                reason="registration acknowledgement is unknown; park without resubmitting",
+                reason=reason,
             )
-
-        try:
-            observed = _observation(self.client.observe_job(registration.job_id), registration.job_id)
-        except BalsamPermanentRefusal:
-            raise
-        except Exception as exc:
-            reason = f"backend Job observation is unknown; park for reconciliation: {exc}"
-            self._write_park(batch, reason)
+        registration = self._load_registration(batch)
+        if registration is None:
+            reason = "registration acknowledgement is unavailable or parked; worker must not submit"
+            self._write_worker_park(batch, reason)
+            return BalsamStartResult(
+                status=BalsamAdapterStatus.PARKED,
+                registration=None,
+                observation=None,
+                invocation=None,
+                reason=reason,
+            )
+        if registration.job_id != launched_job_id:
+            reason = "launched Balsam Job identity differs from the durable registration; park"
+            self._write_worker_park(batch, reason)
             return BalsamStartResult(
                 status=BalsamAdapterStatus.PARKED,
                 registration=registration,
@@ -471,24 +518,9 @@ class BalsamAdapter:
                 invocation=None,
                 reason=reason,
             )
-        if observed.state is BalsamJobState.PERMANENT_FAILURE:
-            raise BalsamPermanentRefusal(observed.reason or "Balsam reported permanent Job failure")
-        if observed.state is BalsamJobState.UNKNOWN:
-            self._write_park(
-                batch,
-                "backend Job observation is unknown; park for reconciliation",
-            )
-            return BalsamStartResult(
-                status=BalsamAdapterStatus.PARKED,
-                registration=registration,
-                observation=observed,
-                invocation=None,
-                reason="backend Job observation is unknown; park for reconciliation",
-            )
 
-        # ALLOCATION_LOST is a normal backend lifecycle observation.  E3 still
-        # owns checkpoint selection, fresh output, start ordering, and science
-        # outcome; Balsam state never becomes a completion claim.
+        # Backend state is intentionally absent here.  E3 owns checkpoint
+        # selection, fresh output, start ordering, and the science outcome.
         invocation = self.gateway.start(
             batch=batch,
             intent=intent,
@@ -502,9 +534,45 @@ class BalsamAdapter:
         return BalsamStartResult(
             status=BalsamAdapterStatus.STARTED,
             registration=registration,
-            observation=observed,
+            observation=None,
             invocation=invocation,
         )
+
+    def register_lineage(self, batch: ReadyBatch) -> BalsamRegistrationReceipt | None:
+        """Register one persistent Job from the submitter side only.
+
+        This is the sole adapter method that can call ``register_job``.  The
+        durable intent is published before that call, and an absent or
+        ambiguous acknowledgement is parked without blind resubmission.
+        """
+
+        self._validate_batch(batch)
+        return self._ensure_registration(batch)
+
+    def observe_lineage(self, batch: ReadyBatch) -> BalsamJobObservation | None:
+        """Observe and durably record backend state from a reconciler.
+
+        Observation is intentionally separate from worker start.  Allocation
+        loss remains a backend lifecycle state; a permanent backend refusal is
+        raised as a typed refusal, while unknown client failures are parked.
+        """
+
+        self._validate_batch(batch)
+        registration = self._load_registration(batch)
+        if registration is None:
+            self._write_park(batch, "registration acknowledgement is unavailable; observe later")
+            return None
+        try:
+            observed = _observation(self.client.observe_job(registration.job_id), registration.job_id)
+        except BalsamPermanentRefusal:
+            raise
+        except Exception as exc:
+            self._write_park(batch, f"backend Job observation is unknown; park for reconciliation: {exc}")
+            return None
+        self._write_observation(batch, observed)
+        if observed.state is BalsamJobState.PERMANENT_FAILURE:
+            raise BalsamPermanentRefusal(observed.reason or "Balsam reported permanent Job failure")
+        return observed
 
     def _validate_batch(self, batch: ReadyBatch) -> None:
         """Refuse a batch not bound to this configured backend lineage."""
@@ -540,6 +608,36 @@ class BalsamAdapter:
             directory / REGISTRATION_REFUSAL_NAME,
             directory / REGISTRATION_LOCK_NAME,
         )
+
+    def _lineage_directory(self, lineage_id: str) -> Path:
+        """Return the validated shared-filesystem directory for a lineage."""
+
+        return self.receipt_root / _path_component(lineage_id, "lineage_id")
+
+    def _load_registration(self, batch: ReadyBatch) -> BalsamRegistrationReceipt | None:
+        """Load only a complete, binding-valid registration for worker use."""
+
+        expected = self._intent(batch)
+        intent_path, receipt_path, park_path, refusal_path, lock_path = self._paths(batch.lineage_id)
+        if receipt_path.is_file() and not intent_path.is_file():
+            raise BalsamPermanentRefusal("registration acknowledgement exists without its intent")
+        if not intent_path.is_file():
+            return None
+        stored_intent = BalsamRegistrationIntent.from_mapping(_read_json(intent_path))
+        if stored_intent != expected:
+            raise BalsamBindingError("lineage is already bound to a different Balsam intent")
+        if not lock_path.is_file():
+            raise BalsamPermanentRefusal("registration intent exists without its ownership marker")
+        if refusal_path.is_file():
+            refusal = _read_json(refusal_path)
+            if refusal.get("schema") != BALSAM_REFUSAL_SCHEMA:
+                raise BalsamPermanentRefusal("registration refusal record has an unsupported schema")
+            raise BalsamPermanentRefusal(str(refusal.get("reason", "Balsam registration was refused")))
+        if park_path.is_file() or not receipt_path.is_file():
+            return None
+        receipt = BalsamRegistrationReceipt.from_mapping(_read_json(receipt_path))
+        self._validate_receipt(receipt, expected)
+        return receipt
 
     def _ensure_registration(self, batch: ReadyBatch) -> BalsamRegistrationReceipt | None:
         """Load or create the one acknowledged persistent Job for a lineage."""
@@ -655,6 +753,39 @@ class BalsamAdapter:
             },
         )
 
+    def _write_worker_park(self, batch: ReadyBatch, reason: str) -> None:
+        """Persist a worker-start park without blocking later registration."""
+
+        path = self._lineage_directory(batch.lineage_id) / WORKER_PARK_NAME
+        _atomic_write_json(
+            path,
+            {
+                "schema": BALSAM_WORKER_PARK_SCHEMA,
+                "lineage_id": batch.lineage_id,
+                "batch_id": batch.batch_id,
+                "ready_batch_digest": batch.identity,
+                "reason": reason,
+            },
+        )
+
+    def _write_observation(self, batch: ReadyBatch, observed: BalsamJobObservation) -> None:
+        """Persist one backend observation for a submitter-side reconciler."""
+
+        path = self._lineage_directory(batch.lineage_id) / OBSERVATION_NAME
+        _atomic_write_json(
+            path,
+            {
+                "schema": BALSAM_OBSERVATION_SCHEMA,
+                "lineage_id": batch.lineage_id,
+                "batch_id": batch.batch_id,
+                "ready_batch_digest": batch.identity,
+                "registration_job_id": observed.job_id,
+                "state": observed.state.value,
+                "reason": observed.reason,
+                "metadata": dict(observed.metadata or {}),
+            },
+        )
+
     def _write_refusal(self, batch: ReadyBatch, reason: str) -> None:
         """Persist a deterministic registration refusal for later starts."""
 
@@ -673,9 +804,11 @@ class BalsamAdapter:
 
 __all__ = [
     "BALSAM_INTENT_SCHEMA",
+    "BALSAM_OBSERVATION_SCHEMA",
     "BALSAM_PARK_SCHEMA",
     "BALSAM_REGISTRATION_SCHEMA",
     "BALSAM_REFUSAL_SCHEMA",
+    "BALSAM_WORKER_PARK_SCHEMA",
     "BalsamAcknowledgementUnknown",
     "BalsamAdapter",
     "BalsamAdapterError",
@@ -690,8 +823,10 @@ __all__ = [
     "BalsamStartResult",
     "load_balsam_api",
     "REGISTRATION_INTENT_NAME",
+    "OBSERVATION_NAME",
     "REGISTRATION_PARK_NAME",
     "REGISTRATION_RECEIPT_NAME",
     "REGISTRATION_LOCK_NAME",
     "REGISTRATION_REFUSAL_NAME",
+    "WORKER_PARK_NAME",
 ]
