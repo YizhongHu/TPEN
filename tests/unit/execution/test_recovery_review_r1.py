@@ -251,6 +251,60 @@ def test_genuine_v1_checkpoint_via_path_refuses_unsupported(tmp_path: Path) -> N
     assert decision.refusal.code is RefusalCode.UNSUPPORTED
 
 
+@pytest.mark.parametrize("schema_version", [[2], {}], ids=["list", "dict"])
+def test_path_evidence_with_unhashable_schema_version_refuses_unsupported(
+    tmp_path: Path, schema_version: object
+) -> None:
+    """Malformed raw schema versions must be typed unsupported refusals."""
+
+    intent = _intent()
+    path = _checkpoint(tmp_path, step=5, payload=TrainResume().to_manifest())
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    manifest["schema_version"] = schema_version
+    (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    decision = select_recovery(
+        intent,
+        phase=RecoveryPhase.RECOVERY,
+        evidence=CheckpointEvidence.from_path(
+            path,
+            science_input=intent.science_input,
+            target_iterations=intent.target_iterations,
+        ),
+    )
+
+    assert decision.outcome is RecoveryOutcome.REFUSED
+    assert decision.refusal is not None
+    assert decision.refusal.code is RefusalCode.UNSUPPORTED
+    assert decision.load is None
+
+
+@pytest.mark.parametrize("schema_version", [[2], {}], ids=["list", "dict"])
+def test_ref_evidence_with_unhashable_schema_version_refuses_unsupported(
+    tmp_path: Path, schema_version: object
+) -> None:
+    """A degraded ref manifest must classify malformed schema versions safely."""
+
+    intent = _intent()
+    path = _checkpoint(tmp_path, step=5, payload=TrainResume().to_manifest())
+    ref = CheckpointRef.from_directory(path)
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    manifest["schema_version"] = schema_version
+    (path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    evidence = CheckpointEvidence(
+        ref=ref,
+        science_input_digest=intent.science_input_digest,
+        target_iterations=intent.target_iterations,
+    )
+
+    decision = select_recovery(intent, phase=RecoveryPhase.RECOVERY, evidence=evidence)
+
+    assert decision.outcome is RecoveryOutcome.REFUSED
+    assert decision.refusal is not None
+    assert decision.refusal.code is RefusalCode.UNSUPPORTED
+    assert decision.load is None
+
+
 def test_raw_path_recovery_of_foreign_lineage_checkpoint_must_not_emit_overlay(tmp_path: Path) -> None:
     """Expected RED at head c8570c21.
 

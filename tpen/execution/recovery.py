@@ -474,15 +474,9 @@ def _checkpoint_refusal(ref: CheckpointRef, *, target_iterations: int) -> Recove
     # legacy artifact gets the typed ``unsupported`` outcome rather than being
     # collapsed into generic incompleteness. The schema module remains the
     # authority for the actual mode gate below.
-    if not isinstance(raw_manifest, Mapping):
-        return RecoveryRefusal(RefusalCode.UNSUPPORTED, "checkpoint manifest is not a mapping")
-    accepted_versions = SCHEMA_VERSIONS_BY_RESTORE_MODE["train_resume"]
-    schema_version = raw_manifest.get("schema_version")
-    if schema_version not in accepted_versions or raw_manifest.get("kind") != KIND_BY_SCHEMA_VERSION.get(schema_version):
-        return RecoveryRefusal(
-            RefusalCode.UNSUPPORTED,
-            "checkpoint manifest is not the current train-resume schema",
-        )
+    raw_refusal = _raw_manifest_refusal(raw_manifest)
+    if raw_refusal is not None:
+        return raw_refusal
 
     try:
         ref.validate()
@@ -539,10 +533,21 @@ def _source_manifest_refusal(source: Path | None) -> RecoveryRefusal | None:
             raw_manifest = json.load(handle)
     except (FileNotFoundError, OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
         return RecoveryRefusal(RefusalCode.INCOMPLETE, f"checkpoint is not complete: {exc}")
+    return _raw_manifest_refusal(raw_manifest)
+
+
+def _raw_manifest_refusal(raw_manifest: Any) -> RecoveryRefusal | None:
+    """Classify raw manifest schema metadata without allowing malformed values to escape."""
+
     if not isinstance(raw_manifest, Mapping):
         return RecoveryRefusal(RefusalCode.UNSUPPORTED, "checkpoint manifest is not a mapping")
-    accepted_versions = SCHEMA_VERSIONS_BY_RESTORE_MODE["train_resume"]
     schema_version = raw_manifest.get("schema_version")
+    if type(schema_version) is not int:
+        return RecoveryRefusal(
+            RefusalCode.UNSUPPORTED,
+            "checkpoint manifest schema_version is not an integer",
+        )
+    accepted_versions = SCHEMA_VERSIONS_BY_RESTORE_MODE["train_resume"]
     if schema_version not in accepted_versions or raw_manifest.get("kind") != KIND_BY_SCHEMA_VERSION.get(schema_version):
         return RecoveryRefusal(
             RefusalCode.UNSUPPORTED,
