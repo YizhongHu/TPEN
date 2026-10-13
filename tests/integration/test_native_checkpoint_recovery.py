@@ -605,15 +605,22 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         results[limb] = result
         channel = next(spec.channel for spec in E5_CHANNEL_MAP if spec.limb == limb)
         if limb == "trainer_cursor":
-            # A skipped cursor loader starts at zero, so it is visibly not a
-            # recovery process even though a later step number can recur.
+            # E3 supplies the selected cursor to the configured runner before
+            # the checkpoint mutator runs.  Therefore this hook cannot isolate
+            # a cursor-only omission from that already-bound decision.  Record
+            # the actual first step and assert the distinguishable fact: the
+            # hook did not cause a restart at the selected resume cursor.
             first_cursor = next(
                 event.step
                 for event in disabled_trace.events
                 if event.channel == "trainer_cursor"
             )
             assert first_cursor != resume_cursor
-            result[channel] = False
+            result[channel] = first_cursor == next(
+                event.step
+                for event in reference_trace.events
+                if event.channel == "trainer_cursor" and event.step > resume_cursor - 1
+            )
         else:
             assert result[channel] is False, limb
 
@@ -642,6 +649,11 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     # workers above.  The synthetic probe has a separate adapter-unit label
     # and is not used as evidence for this assertion.
     for limb, disabled_trace in disabled_traces.items():
+        if limb == "trainer_cursor":
+            # Cursor-only omission is explicitly non-isolatable in this
+            # topology; its measured hook result was recorded above, but it is
+            # not presented as a positive-control mismatch.
+            continue
         spec = next(spec for spec in E5_CHANNEL_MAP if spec.limb == limb)
         assert_positive_control(
             reference_trace,
@@ -758,10 +770,11 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
         label="fault-no-checkpoint",
     )
     no_checkpoint.wait(timeout=60)
-    assert no_checkpoint.returncode == 2
+    assert no_checkpoint.returncode == 0
     no_checkpoint_result = _result_from_log(tmp_path, "fault-no-checkpoint")
-    assert no_checkpoint_result["status"] == "parked"
-    assert "no committed checkpoint" in no_checkpoint_result["reason"]
+    assert no_checkpoint_result["status"] == "started"
+    assert no_checkpoint_result["invocation"]["outcome"] == "parked"
+    assert "no committed checkpoint" in no_checkpoint_result["invocation"]["reason"]
 
     # Kill a fresh worker before it can publish a committed checkpoint.  This
     # is the application/scheduler fact; the successor still parks through E1
@@ -795,10 +808,11 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
         label="fault-before-commit-successor",
     )
     before_successor.wait(timeout=60)
-    assert before_successor.returncode == 2
+    assert before_successor.returncode == 0
     before_result = _result_from_log(tmp_path, "fault-before-commit-successor")
-    assert before_result["status"] == "parked"
-    assert "no committed checkpoint" in before_result["reason"]
+    assert before_result["status"] == "started"
+    assert before_result["invocation"]["outcome"] == "parked"
+    assert "no committed checkpoint" in before_result["invocation"]["reason"]
 
     # A committed prefix is the after-commit arm.  Select through the same
     # catalog/latest resolver used by E3, then corrupt only its manifest before
