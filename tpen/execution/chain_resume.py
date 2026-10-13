@@ -8,9 +8,9 @@ cursor; comparing only final tensors would allow two wrong streams to mask one
 another.
 
 The adapter does not claim scheduler, allocation-loss, Balsam, IRI, Globus,
-or callback-state coverage.  Its process helper is intentionally small and
-backend-neutral so the E5 fixture can be driven by a launcher without making
-the core package depend on a launcher.
+or callback-state coverage.  Process launching and fixture instrumentation
+belong to test helpers; this module contains only the importable declaration,
+evidence values, and pure comparison/validation logic.
 
 E5 channel declaration
 ----------------------
@@ -31,12 +31,9 @@ The declaration is intentionally limited to the state owners exported by
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 from .native_profile import SUPPORTED_STATE_OWNERS
@@ -254,52 +251,6 @@ class ProcessEvidence:
         )
 
 
-def run_fresh_process(
-    command: Sequence[str],
-    *,
-    phase: str,
-    seed: int,
-    seed_source: str,
-    cwd: Path | None = None,
-    env: Mapping[str, str] | None = None,
-) -> ProcessEvidence:
-    """Run one fresh fixture process and retain its real PID and trace.
-
-    The adapter does not reuse a Python callable in the parent process.  The
-    launcher receives the seed through an environment variable so the receipt
-    records provenance without importing or constructing science in the
-    adapter.
-    """
-
-    child_env = os.environ.copy()
-    if env:
-        child_env.update(env)
-    child_env["TPEN_CHAIN_RESUME_SEED"] = str(seed)
-    child_env["TPEN_CHAIN_RESUME_PHASE"] = phase
-    process = subprocess.Popen(
-        tuple(command),
-        cwd=None if cwd is None else str(cwd),
-        env=child_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = process.communicate()
-    if process.returncode != 0:
-        raise RuntimeError(
-            f"chain-resume fixture process failed ({phase}, rc={process.returncode}): {stderr}"
-        )
-    return ProcessEvidence.from_json_output(
-        phase=phase,
-        pid=process.pid,
-        seed=seed,
-        seed_source=seed_source,
-        command=tuple(command),
-        returncode=process.returncode,
-        stdout=stdout,
-    )
-
-
 def assert_fresh_processes(reference: ProcessEvidence, resumed: ProcessEvidence) -> None:
     """Require distinct actual processes and explicit distinct seed provenance."""
 
@@ -487,6 +438,5 @@ __all__ = [
     "compare_channel_parity",
     "e5_channel_map",
     "first_subsequent_event",
-    "run_fresh_process",
     "validate_channel_map",
 ]

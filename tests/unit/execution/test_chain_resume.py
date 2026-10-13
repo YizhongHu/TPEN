@@ -1,4 +1,4 @@
-"""Source-level contract tests for the E5 chain-resume adapter."""
+"""Adapter-logic unit tests; these are not CR native-vertical evidence."""
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ from tpen.execution import (
     classify_checkpoint_fault,
     compare_channel_parity,
     e5_channel_map,
-    run_fresh_process,
     validate_channel_map,
 )
 from tpen.execution.native_profile import SUPPORTED_STATE_OWNERS
+from tests.helpers.chain_resume_process import run_fresh_process
 
 
 PROBE = Path(__file__).parents[2] / "helpers" / "chain_resume_probe.py"

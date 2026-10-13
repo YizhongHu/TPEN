@@ -103,7 +103,6 @@ from .chain_resume import (
     compare_channel_parity,
     e5_channel_map,
     first_subsequent_event,
-    run_fresh_process,
     validate_channel_map,
 )
 
@@ -159,7 +158,6 @@ __all__ = [
     "compare_channel_parity",
     "e5_channel_map",
     "first_subsequent_event",
-    "run_fresh_process",
     "validate_channel_map",
     "validate_receipt_binding",
     "CoreOutcomeFacts",

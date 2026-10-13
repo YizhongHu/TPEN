@@ -34,6 +34,8 @@ from tpen.execution import (
 )
 from tpen.execution.recovery import CheckpointEvidence, RecoveryPhase
 from tpen.execution.invocation import _committed_checkpoint
+from tpen.execution.chain_resume import ProcessEvidence, compare_channel_parity
+from tpen.execution.chain_resume import E5_CHANNEL_MAP
 from tests.helpers.trainable_wavefunctions import TrainableHookeSingletAnsatz
 
 
@@ -133,6 +135,9 @@ def _launch(
     label: str | None = None,
     evidence: Path | None = None,
     partial_restore: bool = False,
+    trace: Path | None = None,
+    resume_step: int = 0,
+    disable_limb: str | None = None,
 ) -> subprocess.Popen[str]:
     command = [
         sys.executable,
@@ -158,6 +163,10 @@ def _launch(
         command.extend(("--evidence", str(evidence)))
     if partial_restore:
         command.append("--partial-restore")
+    if trace is not None:
+        command.extend(("--trace", str(trace), "--resume-step", str(resume_step)))
+    if disable_limb is not None:
+        command.extend(("--disable-limb", disable_limb))
     log = (root / f"worker-{label or phase}-{time.monotonic_ns()}.log").open("w+")
     environment = os.environ.copy()
     # Executing a helper by absolute path makes Python place tests/helpers,
@@ -194,6 +203,25 @@ def _result_from_log(root: Path, label: str) -> dict:
     assert logs
     lines = [line for line in logs[-1].read_text().splitlines() if line.strip()]
     return json.loads(lines[-1])
+
+
+def _trace(path: Path) -> ProcessEvidence:
+    """Read a real worker's test-side trace without importing the worker."""
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    lines = [
+        json.dumps({"record": "channel_event", **event}, sort_keys=True)
+        for event in payload["events"]
+    ]
+    return ProcessEvidence.from_json_output(
+        phase=payload["phase"],
+        pid=int(payload["pid"]),
+        seed=int(payload["seed"]),
+        seed_source=payload["seed_source"],
+        command=("native_recovery_worker", payload["phase"]),
+        returncode=0,
+        stdout="\n".join(lines),
+    )
 
 
 def _run_dir(output_path: Path) -> Path:
@@ -281,6 +309,7 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         outputs=outputs,
         phase="initial",
         label="prefix",
+        trace=tmp_path / "trace-prefix.json",
     )
     prefix_checkpoint = _kill_prefix(prefix, outputs, batch.target_iterations)
     assert prefix.returncode == -signal.SIGKILL
@@ -307,6 +336,8 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         outputs=outputs,
         phase="recovery",
         evidence=evidence_path,
+        trace=tmp_path / "trace-recovery.json",
+        resume_step=prefix_checkpoint.next_iteration,
     )
     successor.wait(timeout=180)
     assert successor.returncode == 0
@@ -327,11 +358,26 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         outputs=outputs,
         phase="initial",
         label="reference",
+        trace=tmp_path / "trace-reference.json",
     )
     reference.wait(timeout=180)
     assert reference.returncode == 0
     reference_result = _result_from_log(tmp_path, "reference")
     assert reference_result["invocation"]["outcome"] == "completed"
+
+    reference_trace = _trace(tmp_path / "trace-reference.json")
+    resumed_trace = _trace(tmp_path / "trace-recovery.json")
+    assert reference_trace.pid != resumed_trace.pid
+    assert reference_trace.seed == resumed_trace.seed == int(batch.items[0].payload["seed"])
+    assert reference_trace.seed_source != resumed_trace.seed_source
+    # ``next_iteration`` is the first step attempted by the successor, so the
+    # comparison cursor is the preceding completed step.
+    real_channel_results = compare_channel_parity(
+        reference_trace,
+        resumed_trace,
+        resume_step=prefix_checkpoint.next_iteration - 1,
+    )
+    assert all(real_channel_results.values())
 
     resumed_output = Path(successor_result["invocation"]["output_path"])
     reference_output = Path(reference_result["invocation"]["output_path"])
@@ -442,3 +488,120 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
     assert measured["restore_disabled_diverged"] is restore_disabled_diverged
     assert measured["parameters_changed"] is parameters_changed
     assert measured["max_parameter_delta"] == max_parameter_delta
+
+
+@pytest.mark.integration
+def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
+    """Exercise each E5 restore owner against real E3/native executions.
+
+    The disabled-owner runs use a test-only hook in the checkpoint restore
+    module.  Production validation still runs; only one component loader is
+    skipped.  Model and sampler omissions can causally alter downstream
+    channels, so this test asserts only the channels that remain distinguishable
+    for those arms instead of claiming false one-limb isolation.
+    """
+
+    batch, intent, _source = _batch()
+    batch_path, intent_path = _write_inputs(tmp_path, batch, intent)
+    receipts = tmp_path / "receipts"
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    client = QualificationClient()
+    adapter = BalsamAdapter(
+        batch.execution, client, WorkerStartGateway(outputs), receipts
+    )
+    registration = adapter.register_lineage(batch)
+    assert registration is not None
+
+    prefix = _launch(
+        root=tmp_path,
+        batch_path=batch_path,
+        intent_path=intent_path,
+        config_path=FIXTURE,
+        receipts=receipts,
+        outputs=outputs,
+        phase="initial",
+        label="channel-prefix",
+    )
+    prefix_checkpoint = _kill_prefix(prefix, outputs, batch.target_iterations)
+    evidence = CheckpointEvidence.from_ref(
+        prefix_checkpoint,
+        science_input_digest=intent.science_input_digest,
+        target_iterations=batch.target_iterations,
+    )
+    evidence_path = tmp_path / "channel-evidence.json"
+    evidence_path.write_text(json.dumps(evidence.to_dict(), sort_keys=True), encoding="utf-8")
+
+    reference = _launch(
+        root=tmp_path,
+        batch_path=batch_path,
+        intent_path=intent_path,
+        config_path=FIXTURE,
+        receipts=receipts,
+        outputs=outputs,
+        phase="initial",
+        label="channel-reference",
+        trace=tmp_path / "channel-reference.trace.json",
+        resume_step=0,
+    )
+    reference.wait(timeout=180)
+    assert reference.returncode == 0
+    reference_trace = _trace(tmp_path / "channel-reference.trace.json")
+
+    resume_cursor = prefix_checkpoint.next_iteration
+    results: dict[str, dict[str, bool]] = {}
+    for limb in sorted({spec.limb for spec in E5_CHANNEL_MAP}):
+        label = f"channel-disabled-{limb}"
+        trace_path = tmp_path / f"{label}.trace.json"
+        worker = _launch(
+            root=tmp_path,
+            batch_path=batch_path,
+            intent_path=intent_path,
+            config_path=FIXTURE,
+            receipts=receipts,
+            outputs=outputs,
+            phase="recovery",
+            label=label,
+            evidence=evidence_path,
+            trace=trace_path,
+            resume_step=resume_cursor,
+            disable_limb=limb,
+        )
+        worker.wait(timeout=180)
+        assert worker.returncode == 0, label
+        disabled_trace = _trace(trace_path)
+        assert disabled_trace.pid != reference_trace.pid
+        assert disabled_trace.seed == reference_trace.seed
+        result = compare_channel_parity(
+            reference_trace,
+            disabled_trace,
+            resume_step=resume_cursor - 1,
+        )
+        results[limb] = result
+        channel = next(spec.channel for spec in E5_CHANNEL_MAP if spec.limb == limb)
+        if limb == "trainer_cursor":
+            # A skipped cursor loader starts at zero, so it is visibly not a
+            # recovery process even though a later step number can recur.
+            first_cursor = next(
+                event.step
+                for event in disabled_trace.events
+                if event.channel == "trainer_cursor"
+            )
+            assert first_cursor != resume_cursor
+        else:
+            assert result[channel] is False, limb
+
+        if limb == "optimizer":
+            for unaffected in ("model_logabs", "sampler_proposal", "process_random", "trainer_cursor"):
+                assert result[unaffected] is True, (limb, unaffected)
+        elif limb == "process_rng":
+            for unaffected in ("model_logabs", "optimizer_update", "sampler_proposal", "trainer_cursor"):
+                assert result[unaffected] is True, (limb, unaffected)
+        elif limb == "model":
+            for unaffected in ("sampler_proposal", "process_random", "trainer_cursor"):
+                assert result[unaffected] is True, (limb, unaffected)
+        elif limb == "sampler_mcmc":
+            for unaffected in ("process_random", "trainer_cursor"):
+                assert result[unaffected] is True, (limb, unaffected)
+
+    assert set(results) == {spec.limb for spec in E5_CHANNEL_MAP}

@@ -29,6 +29,11 @@ from tpen.execution.invocation import _core_outcome_from_artifacts, run_configur
 from tpen.runner import Train
 from tpen.runner.base import _assert_eager_initialized, _is_torch_module, _place_module_for_runtime
 from tpen.training.optim import make_optimizer
+from tests.helpers.native_chain_resume_trace import (
+    NativeTrace,
+    install_native_trace,
+    skip_restore_owner,
+)
 
 
 class NoLiveBackendClient:
@@ -112,6 +117,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--label", default="worker")
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--partial-restore", action="store_true")
+    parser.add_argument("--trace", type=Path)
+    parser.add_argument("--resume-step", type=int, default=0)
+    parser.add_argument(
+        "--disable-limb",
+        choices=("model", "optimizer", "trainer_cursor", "sampler_mcmc", "process_rng"),
+    )
     return parser
 
 
@@ -141,6 +152,15 @@ def main() -> int:
 
     run_cfg = cfg
     selected_decision = None
+    trace = (
+        NativeTrace(
+            phase=args.phase,
+            seed=int(cfg.runtime.seed),
+            resume_step=args.resume_step,
+        )
+        if args.trace is not None
+        else None
+    )
 
     def run_once(decision, output_path):
         nonlocal run_cfg, selected_decision
@@ -160,14 +180,22 @@ def main() -> int:
                 "path": str(decision.checkpoint.checkpoint_dir),
             }
             selected_decision = replace(decision, load=partial_load)
-        run_configured_once(
-            run_cfg,
-            decision=selected_decision or decision,
-            output_path=output_path,
-            config_path=str(args.config),
-            command="e5-native-worker",
-            raise_exceptions=True,
-        )
+        trace_stack = install_native_trace(trace) if trace is not None else None
+        try:
+            with skip_restore_owner(args.disable_limb):
+                run_configured_once(
+                    run_cfg,
+                    decision=selected_decision or decision,
+                    output_path=output_path,
+                    config_path=str(args.config),
+                    command="e5-native-worker",
+                    raise_exceptions=True,
+                )
+        finally:
+            if trace_stack is not None:
+                trace_stack.close()
+            if trace is not None:
+                trace.write(args.trace)
         return _core_outcome_from_artifacts(output_path, decision=decision)
 
     result = adapter.start(

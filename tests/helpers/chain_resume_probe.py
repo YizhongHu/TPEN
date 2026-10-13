@@ -1,4 +1,4 @@
-"""Tiny subprocess probe used by the chain-resume adapter tests.
+"""Synthetic probe for adapter-logic unit tests, not CR evidence.
 
 The probe is deliberately independent of TPEN constructors.  It emits the
 same named channels that the E5 adapter observes, with switches that model a
