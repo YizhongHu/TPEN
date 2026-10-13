@@ -1,14 +1,9 @@
 """Review r1: CR adapter guard strength.
 
-Target layer: CR @ ddd01920 only.
+Target layer: CR @ 63548ca8.
 
-Polarity at the CR head:
-- test_identical_seed_provenance_is_rejected: EXPECTED RED (CR contract
-  requires "distinct seed provenance"; assert_fresh_processes only checks
-  non-empty provenance strings).
-- test_first_subsequent_event_uses_completed_step_cursor: EXPECTED GREEN
-  (pins the resume_step = next_iteration - 1 cursor convention).
-- test_channel_map_totality_fails_on_unknown_owner: EXPECTED GREEN (pin).
+All three controls are EXPECTED GREEN at CR. R1-6's disposable provenance
+equality-check removal makes the identical-provenance control RED.
 """
 
 from __future__ import annotations

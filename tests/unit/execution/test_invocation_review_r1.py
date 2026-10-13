@@ -1,15 +1,9 @@
 """Review r1: E3 run_configured_once load-overlay placement.
 
-Target layer: E3 @ 7d86fe49f4f6b66344c5b6bcce2f2f01f605ccf4 (also run at CR head).
+Target layer: E3 @ 7fe26b40 (also run at CR head 63548ca8).
 
-Polarity at the E3 head:
-- test_overlay_reaches_concrete_runner_load: EXPECTED RED. When the config has
-  a top-level ``load`` key, the overlay is written only there; a concrete
-  (non-interpolated) ``runner.load`` keeps its stale value, so the runner
-  would silently run WITHOUT the selected checkpoint while receipts claim
-  RECOVERY.
-- test_overlay_flows_through_interpolated_runner_load: EXPECTED GREEN (pin).
-- test_overlay_force_added_when_no_load_keys: EXPECTED GREEN (pin).
+All three controls are EXPECTED GREEN at E3 and CR. R1-1's disposable
+load-overlay revert makes only the concrete-runner-load control RED.
 """
 
 from __future__ import annotations
