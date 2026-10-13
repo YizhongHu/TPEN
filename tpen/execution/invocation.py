@@ -691,17 +691,20 @@ class WorkerStartGateway:
                 run_result = None
         except Exception as exc:
             exception_type = type(exc).__name__
+            terminal_refusal = _is_terminal_core_refusal(exc)
             facts = CoreOutcomeFacts(
-                status=CoreStatus.TERMINAL
-                if _is_terminal_core_refusal(exc)
-                else CoreStatus.UNKNOWN,
+                status=CoreStatus.TERMINAL if terminal_refusal else CoreStatus.UNKNOWN,
                 target_iterations=decision.target_iterations,
                 next_iteration=decision.next_iteration,
                 completed_updates=decision.completed_updates,
                 reason=(
                     str(exc)
-                    if _is_terminal_core_refusal(exc)
-                    else "configured run raised outside a named deterministic refusal; park for reconciliation"
+                    if terminal_refusal
+                    else (
+                        f"transient I/O during configured run; park for reconciliation: {exc}"
+                        if isinstance(exc, OSError)
+                        else "configured run raised outside a named deterministic refusal; park for reconciliation"
+                    )
                 ),
                 exception_type=exception_type,
             )

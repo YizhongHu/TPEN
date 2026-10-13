@@ -452,39 +452,36 @@ def test_configured_gateway_does_not_classify_training_value_error_as_terminal(m
 def test_checkpoint_catalog_edquot_is_parked(monkeypatch, tmp_path: Path) -> None:
     """Transient catalog I/O is parked rather than made permanently terminal."""
 
-    from tpen import run as run_module
+    from tpen.checkpoint.catalog import read_publications
 
     batch, intent = _batch()
-    armed = False
+    catalog = tmp_path / "publications.jsonl"
+    catalog.write_text("", encoding="utf-8")
     real_open = Path.open
 
     def fail_catalog_open(path, *args, **kwargs):
-        if armed and path.name == "publications.jsonl":
+        if path.name == "publications.jsonl":
             raise OSError(errno.EDQUOT, "checkpoint catalog quota exceeded")
         return real_open(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", fail_catalog_open)
 
-    def fake_run(cfg, **kwargs):
-        nonlocal armed
-        _write_core_completion_artifacts(Path(cfg.run.root))
-        catalog = next(Path(cfg.run.root).rglob("checkpoints")) / "publications.jsonl"
-        catalog.write_text("", encoding="utf-8")
-        armed = True
-        return 0
+    def run_once(*_):
+        # The traceback must retain the real checkpoint-catalog owner so the
+        # terminal gate cannot be widened by an unrelated application frame.
+        read_publications(catalog)
 
-    monkeypatch.setattr(run_module, "run_from_config", fake_run)
-    result = WorkerStartGateway(tmp_path).start_configured(
-        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+    result = WorkerStartGateway(tmp_path / "outputs").start(
         batch=batch,
         intent=intent,
         phase=RecoveryPhase.INITIAL,
+        run_once=run_once,
     )
 
     assert result.outcome.outcome is InvocationOutcome.PARKED
     assert result.outcome.status is CoreStatus.UNKNOWN
     assert result.outcome.exception_type == "OSError"
-    assert "I/O failed" in result.outcome.reason
+    assert "transient I/O" in result.outcome.reason
 
 
 def test_unreadable_final_checkpoint_is_parked(monkeypatch, tmp_path: Path) -> None:
