@@ -51,11 +51,13 @@ BALSAM_PARK_SCHEMA = "tpen.execution/balsam-registration-park-v1"
 BALSAM_REFUSAL_SCHEMA = "tpen.execution/balsam-registration-refusal-v1"
 BALSAM_OBSERVATION_SCHEMA = "tpen.execution/balsam-observation-v1"
 BALSAM_WORKER_PARK_SCHEMA = "tpen.execution/balsam-worker-park-v1"
+BALSAM_OBSERVATION_PARK_SCHEMA = "tpen.execution/balsam-observation-park-v1"
 REGISTRATION_INTENT_NAME = "registration-intent.json"
 REGISTRATION_RECEIPT_NAME = "registration.json"
 REGISTRATION_PARK_NAME = "registration-park.json"
 REGISTRATION_REFUSAL_NAME = "registration-refusal.json"
 OBSERVATION_NAME = "observation.json"
+OBSERVATION_PARK_NAME = "observation-park.json"
 WORKER_PARK_NAME = "worker-park.json"
 REGISTRATION_LOCK_NAME = "registration.lock"
 
@@ -560,14 +562,16 @@ class BalsamAdapter:
         self._validate_batch(batch)
         registration = self._load_registration(batch)
         if registration is None:
-            self._write_park(batch, "registration acknowledgement is unavailable; observe later")
+            self._write_observation_park(batch, "registration acknowledgement is unavailable; observe later")
             return None
         try:
             observed = _observation(self.client.observe_job(registration.job_id), registration.job_id)
         except BalsamPermanentRefusal:
             raise
         except Exception as exc:
-            self._write_park(batch, f"backend Job observation is unknown; park for reconciliation: {exc}")
+            self._write_observation_park(
+                batch, f"backend Job observation is unknown; park for reconciliation: {exc}"
+            )
             return None
         self._write_observation(batch, observed)
         if observed.state is BalsamJobState.PERMANENT_FAILURE:
@@ -786,6 +790,21 @@ class BalsamAdapter:
             },
         )
 
+    def _write_observation_park(self, batch: ReadyBatch, reason: str) -> None:
+        """Persist an observation uncertainty without blocking worker start."""
+
+        path = self._lineage_directory(batch.lineage_id) / OBSERVATION_PARK_NAME
+        _atomic_write_json(
+            path,
+            {
+                "schema": BALSAM_OBSERVATION_PARK_SCHEMA,
+                "lineage_id": batch.lineage_id,
+                "batch_id": batch.batch_id,
+                "ready_batch_digest": batch.identity,
+                "reason": reason,
+            },
+        )
+
     def _write_refusal(self, batch: ReadyBatch, reason: str) -> None:
         """Persist a deterministic registration refusal for later starts."""
 
@@ -805,6 +824,7 @@ class BalsamAdapter:
 __all__ = [
     "BALSAM_INTENT_SCHEMA",
     "BALSAM_OBSERVATION_SCHEMA",
+    "BALSAM_OBSERVATION_PARK_SCHEMA",
     "BALSAM_PARK_SCHEMA",
     "BALSAM_REGISTRATION_SCHEMA",
     "BALSAM_REFUSAL_SCHEMA",
@@ -824,6 +844,7 @@ __all__ = [
     "load_balsam_api",
     "REGISTRATION_INTENT_NAME",
     "OBSERVATION_NAME",
+    "OBSERVATION_PARK_NAME",
     "REGISTRATION_PARK_NAME",
     "REGISTRATION_RECEIPT_NAME",
     "REGISTRATION_LOCK_NAME",

@@ -344,6 +344,7 @@ def test_observation_failure_is_submitter_park_and_worker_still_starts(tmp_path:
 
     assert adapter.observe_lineage(batch) is None
     assert client.observe_calls == 1
+    assert (tmp_path / "receipts" / "lineage-balsam" / "observation-park.json").is_file()
     result = adapter.start(
         batch=batch,
         intent=intent,
