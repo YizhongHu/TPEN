@@ -87,7 +87,14 @@ def test_duplicate_identity_is_refused() -> None:
     with pytest.raises(ValueError, match="duplicate invocation_id"):
         replace(
             batch,
-            items=(batch.items[0], replace(batch.items[0], logical_task_id="other")),
+            items=(
+                batch.items[0],
+                replace(
+                    batch.items[0],
+                    logical_task_id="other",
+                    fresh_output_id="other-output",
+                ),
+            ),
         )
 
 
