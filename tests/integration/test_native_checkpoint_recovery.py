@@ -816,8 +816,10 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
 
     # A committed prefix is the after-commit arm.  Select through the same
     # catalog/latest resolver used by E3, then corrupt only its manifest before
-    # the successor enters restore.  The checkpoint schema gate must classify
-    # this as terminal application evidence, not as a scheduler loss.
+    # the successor enters restore.  The immutable checkpoint binding must
+    # park this as application evidence, not as a scheduler loss or a silent
+    # restart.  A changed committed artifact is not a deterministic config
+    # refusal that the worker may retry.
     prefix = _launch(
         root=tmp_path,
         batch_path=batch_path,
@@ -856,7 +858,7 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
     assert corrupt.returncode == 0
     corrupt_result = _result_from_log(tmp_path, "fault-corrupt-committed")
     assert corrupt_result["status"] == "started"
-    assert corrupt_result["invocation"]["outcome"] == "terminal"
-    assert corrupt_result["invocation"]["status"] == "terminal"
+    assert corrupt_result["invocation"]["outcome"] == "parked"
+    assert corrupt_result["invocation"]["status"] == "parked"
     assert corrupt_result["invocation"]["reason"]
     manifest.write_text(original_manifest, encoding="utf-8")
