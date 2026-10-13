@@ -6,21 +6,20 @@ submitter has registered the private Site and App.
 
 Balsam API facts relied on
 ---------------------------
-The installed Polaris Balsam 0.7.0.a24 launcher runs ``ApplicationDefinition
-.run`` in ``balsam.site.launcher.python_runner`` and treats a non-zero child
-status in ``balsam.site.launcher._serial_mode_worker.Worker`` as an error.  Its
-retry set is ``[-11, 1, 255, 12345]`` (the measured installation source at
-``/home/rhu/.local/lib/python3.13/site-packages/balsam/site/launcher/
-_serial_mode_worker.py:23-26,78-89``).  The wrapper therefore writes a durable
+The installed Polaris Balsam launcher used by the 2026-10-13 pilot runs
+``ApplicationDefinition.run`` through its Python launcher and treats a
+non-zero child status as an application error.  Its retry-set observation was
+recorded with the source details in TO lane item ``34b3e37f`` note
+``formal-review-r1-findings`` and E5 item ``2692a8b0`` note
+``e5b-final-not-established``.  The wrapper therefore writes a durable
 pre-E3 failure record and raises ``SystemExit(2)``: the process is visibly
-unsuccessful, while exit 2 is outside that installation's blind-retry set.
+unsuccessful, while exit 2 is outside that pilot's blind-retry set.
 This is a qualification deployment fact, not a claim about all Balsam
-versions.
+versions or facility environments.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import ctypes
 import ctypes.util
@@ -29,6 +28,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from balsam.api import ApplicationDefinition
+from tpen.execution.invocation import _atomic_write_json
 
 
 PRE_E3_FAILURE_EXIT_CODE = 2
@@ -125,7 +125,6 @@ def _write_pre_e3_failure(
         return
     path = Path(str(root_value)) / "pre-e3-failure.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
     record = {
         "schema": "tpen.execution/e5b-pre-e3-failure-v1",
         "job_id": str(getattr(job, "id", "unknown")),
@@ -137,8 +136,7 @@ def _write_pre_e3_failure(
     }
     if precheck is not None:
         record["precheck"] = dict(precheck)
-    temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    _atomic_write_json(path, record)
 
 
 class PolarisE5bApp(ApplicationDefinition):

@@ -4,6 +4,9 @@ The profile is intentionally an allowlist.  A callback or logger not named
 here may carry private counters, random generators, or cadence state that is
 not reconstructed by ``train_resume``.  Refusing it before ``run_from_config``
 is safer than implying that a checkpoint restored more state than it owns.
+``SUPPORTED_STATE_OWNERS`` is the definitional allowlist of mutable owners
+restored by ``train_resume``; validation below only covers additional
+configured callback and logger state.
 """
 
 from __future__ import annotations
@@ -35,6 +38,8 @@ SUPPORTED_LOGGER_TARGETS = frozenset({"tpen.logging.CSV", "tpen.logging.JSONL"})
 SUPPORTED_STATE_OWNERS = frozenset(
     {"model", "optimizer", "trainer_cursor", "sampler_mcmc", "process_rng"}
 )
+# This allowlist defines the train_resume owners; callback/logger validation
+# below only covers additional user-configured mutable state.
 
 
 def _target(entry: Any, owner: str, index: int) -> str:

@@ -27,6 +27,7 @@ from tpen.execution import (
     validate_native_recovery_profile,
 )
 from tpen.execution.invocation import _committed_checkpoint, _core_outcome_from_artifacts, run_configured_once
+from tpen.execution.invocation import _atomic_write_json
 from tpen.execution.recovery import CheckpointEvidence
 
 
@@ -44,9 +45,7 @@ def _write_json(path: Path, data: Mapping[str, Any]) -> None:
     """Write one durable JSON marker before the next allocation can start."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(dict(data), indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    _atomic_write_json(path, data)
 
 
 def _load_inputs(job_data: Mapping[str, Any]) -> tuple[ReadyBatch, ScienceIntent, Any, Path]:
