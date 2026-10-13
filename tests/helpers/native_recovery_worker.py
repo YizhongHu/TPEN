@@ -223,6 +223,7 @@ def main() -> int:
             "outcome": invocation.outcome.outcome.value,
             "status": invocation.outcome.status.value,
             "reason": invocation.outcome.reason,
+            "refusal_code": invocation.outcome.refusal_code,
             "next_iteration": invocation.outcome.next_iteration,
             "completed_updates": invocation.outcome.completed_updates,
         },
