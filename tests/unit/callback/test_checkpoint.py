@@ -812,24 +812,58 @@ def test_cpu_rng_state_round_trips_unchanged(tmp_path: Path) -> None:
     assert _numpy_states_equal(np.random.get_state(), saved_numpy)
 
 
+class _GlobalDrawingSampler(_Sampler):
+    """Sampler stand-in whose load consumes every global stream.
+
+    A loader that draws from global RNG is lawful, so `restore_checkpoint` has to
+    apply the RNG payload after loading the sampler, not before.
+    """
+
+    def load_mcmc_state_dict(self, state) -> None:
+        super().load_mcmc_state_dict(state)
+        torch.rand(4)
+        random.random()
+        np.random.random(4)
+
+
+@pytest.fixture
+def _preserve_global_rng():
+    """Hand the caller's global Torch/Python/NumPy streams back unchanged."""
+
+    incoming = (torch.get_rng_state().clone(), random.getstate(), np.random.get_state())
+    try:
+        yield
+    finally:
+        torch.set_rng_state(incoming[0])
+        random.setstate(incoming[1])
+        np.random.set_state(incoming[2])
+
+
+@pytest.mark.usefixtures("_preserve_global_rng")
 def test_train_resume_restores_global_rng_state(tmp_path: Path) -> None:
     """`restore_checkpoint` itself puts every global stream back to its saved state.
 
     `test_cpu_rng_state_round_trips_unchanged` calls `apply_rng_state` directly,
     so it cannot see whether `restore_checkpoint` ever invokes it. This arm goes
     through the production entry point: deleting the `apply_rng_state` call in
-    `restore_checkpoint` leaves every stream at its advanced state and has to
+    `restore_checkpoint`, replacing it with a reseed, or applying it before the
+    sampler load each leave some stream away from its saved state and have to
     fail the closing equalities here.
     """
 
-    # Build every module before seeding: parameter initialisation draws from the
-    # global Torch stream and would otherwise move it past the saved state.
+    # Build every module before capturing: parameter initialisation draws from
+    # the global Torch stream and would otherwise move it past the saved state.
     trained = torch.nn.Linear(3, 2).double()
     optimizer = torch.optim.Adam(trained.parameters(), lr=0.01)
 
+    # Draw past the seed before capturing, so the saved state is not one a
+    # restore could reproduce by reseeding instead of applying the payload.
     torch.manual_seed(1234)
     random.seed(1234)
     np.random.seed(1234)
+    torch.rand(5)
+    random.random()
+    np.random.random(5)
     saved_torch = torch.get_rng_state().clone()
     saved_python = random.getstate()
     saved_numpy = np.random.get_state()
@@ -845,8 +879,8 @@ def test_train_resume_restores_global_rng_state(tmp_path: Path) -> None:
         context=_context(),
     )
 
-    # Anchor the oracle to the artifact: the payload on disk is the state seeded
-    # above, so "saved" below means what the checkpoint actually carries.
+    # Anchor the oracle to the artifact: the payload on disk is the state
+    # captured above, so "saved" below means what the checkpoint actually carries.
     payload = torch.load(checkpoint_dir / "rng.pt", map_location="cpu", weights_only=False)
     assert torch.equal(payload["torch_cpu"], saved_torch)
     assert payload["python"] == saved_python
@@ -869,7 +903,7 @@ def test_train_resume_restores_global_rng_state(tmp_path: Path) -> None:
         model=fresh,
         optimizer=fresh_optimizer,
         trainer=_Trainer(),
-        sampler=_Sampler(),
+        sampler=_GlobalDrawingSampler(),
         context=_context(),
     )
 
