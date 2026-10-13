@@ -1,0 +1,79 @@
+experiment:
+  name: native_recovery
+  sector: cpu
+  run_name: native_recovery_train
+run:
+  root: outputs
+  run_id: null
+  dir: null
+runtime:
+  seed: 20261013
+  device: cpu
+  dtype: float64
+system:
+  name: native_recovery_pair
+  n_particles: 2
+  spatial_dim: 3
+  omega: 0.5
+runner:
+  _target_: tpen.runner.Train
+  model: ${model}
+  sampler: ${sampler}
+  hamiltonian_terms: ${hamiltonian_terms}
+  optimizer: ${optimizer}
+  trainer: ${trainer}
+model:
+  _target_: tests.helpers.trainable_wavefunctions.TrainableHookeSingletAnsatz
+hamiltonian_terms:
+  kinetic:
+    _target_: tpen.physics.kinetic.KineticEnergy
+  harmonic_trap:
+    _target_: tpen.physics.potential.HarmonicTrap
+    omega: ${system.omega}
+  electron_electron:
+    _target_: tpen.physics.potential.ElectronElectronInteraction
+sampler:
+  _target_: tpen.sampling.metropolis.MetropolisSampler
+  n_walkers: 16
+  burn_in: 2
+  n_steps: 3
+  proposal_scale: 0.5
+  seed: ${runtime.seed}
+  n_electrons: ${system.n_particles}
+  spatial_dim: ${system.spatial_dim}
+  dtype: ${runtime.dtype}
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.01
+trainer:
+  _target_: tpen.training.trainer.VMCTrainer
+  max_steps: 6
+  log_every_n_steps: 1
+  return_terms: true
+callbacks:
+- _target_: tpen.callback.ConfigSnapshot
+  output_path: ${run.dir}/config.yaml
+- _target_: tpen.callback.ResolvedConfigSnapshot
+  output_path: ${run.dir}/resolved_config.yaml
+- _target_: tpen.callback.Metadata
+  output_path: ${run.dir}/metadata.json
+- _target_: tpen.callback.RunTiming
+- _target_: tpen.callback.TrainStepTiming
+  every_n_steps: 1
+  rolling_window: 2
+- _target_: tpen.callback.TrainPhaseTiming
+- _target_: tpen.callback.Status
+  output_path: ${run.dir}/status.json
+- _target_: tpen.callback.Checkpoint
+  schedule:
+    _target_: tpen.checkpoint.EveryNUpdates
+    every_n: 1
+  payload:
+    _target_: tpen.checkpoint.TrainResume
+  output_dir: ${run.dir}/checkpoints
+loggers:
+- _target_: tpen.logging.CSV
+  path: ${run.dir}/metrics.csv
+- _target_: tpen.logging.JSONL
+  path: ${run.dir}/metrics.jsonl
