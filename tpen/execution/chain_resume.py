@@ -26,6 +26,10 @@ random-dependent observable after the resume cursor for one E5 mutable limb:
 
 The declaration is intentionally limited to the state owners exported by
 ``tpen.execution.native_profile``; it does not expand the E5 supported profile.
+The native fixture binds these declarations in
+``tests/helpers/native_chain_resume_trace.py`` at the sampler proposal,
+fixture-model evaluation, optimizer step, observation-only process-RNG draw,
+and trainer step-boundary instrumentation points.
 """
 
 from __future__ import annotations

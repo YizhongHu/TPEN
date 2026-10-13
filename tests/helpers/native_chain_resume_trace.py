@@ -13,7 +13,7 @@ import json
 import os
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 import torch
 
@@ -23,7 +23,14 @@ from tpen.execution.chain_resume import ChannelEvent
 class NativeTrace:
     """Collect first random-dependent events from one real worker process."""
 
-    def __init__(self, *, phase: str, seed: int, resume_step: int) -> None:
+    def __init__(
+        self,
+        *,
+        phase: str,
+        seed: int,
+        resume_step: int,
+        suppress_channels: Iterable[str] = (),
+    ) -> None:
         self.phase = phase
         self.pid = os.getpid()
         self.seed = seed
@@ -32,6 +39,7 @@ class NativeTrace:
         self.current_step = resume_step
         self._step_count = 0
         self.trainer: Any | None = None
+        self.suppress_channels = frozenset(suppress_channels)
         self._seen: set[tuple[str, int]] = set()
         self.events: list[ChannelEvent] = []
 
@@ -65,6 +73,8 @@ class NativeTrace:
         *,
         random_dependent: bool = True,
     ) -> None:
+        if channel in self.suppress_channels:
+            return
         key = (channel, self.current_step)
         if key in self._seen:
             return
@@ -175,7 +185,7 @@ def install_native_trace(trace: NativeTrace) -> ExitStack:
 
 
 @contextmanager
-def skip_restore_owner(owner: str | None) -> Iterator[None]:
+def skip_restore_owners(owners: Iterable[str]) -> Iterator[None]:
     """Skip exactly one component loader in a test-only resume process.
 
     The production ``train_resume`` gate and validation still run.  Only the
@@ -183,36 +193,49 @@ def skip_restore_owner(owner: str | None) -> Iterator[None]:
     restore omission without weakening the production restore contract.
     """
 
-    if owner is None:
+    owners = tuple(owners)
+    if not owners:
         yield
         return
     allowed = {"model", "optimizer", "trainer_cursor", "sampler_mcmc", "process_rng"}
-    if owner not in allowed:
-        raise ValueError(f"unknown native restore owner {owner!r}")
+    unknown = set(owners) - allowed
+    if unknown:
+        raise ValueError(f"unknown native restore owner(s) {sorted(unknown)!r}")
     import tpen.checkpoint.restore as restore
 
-    target = {
+    targets = {
         "model": "_load_model",
         "optimizer": "_load_optimizer",
         "trainer_cursor": "_load_trainer",
         "sampler_mcmc": "_load_sampler",
-    }.get(owner)
-    original = getattr(restore, target) if target else restore.apply_rng_state
+    }
+    originals: dict[str, Any] = {}
 
     def skipped(*_args, **_kwargs):
         return None
 
-    if target:
+    for owner in owners:
+        target = targets.get(owner, "apply_rng_state")
+        originals[target] = getattr(restore, target)
         setattr(restore, target, skipped)
-    else:
-        restore.apply_rng_state = skipped
     try:
         yield
     finally:
-        if target:
+        for target, original in originals.items():
             setattr(restore, target, original)
-        else:
-            restore.apply_rng_state = original
 
 
-__all__ = ["NativeTrace", "install_native_trace", "skip_restore_owner"]
+@contextmanager
+def skip_restore_owner(owner: str | None) -> Iterator[None]:
+    """Backward-compatible singular form for one test-only omission."""
+
+    with skip_restore_owners(()) if owner is None else skip_restore_owners((owner,)):
+        yield
+
+
+__all__ = [
+    "NativeTrace",
+    "install_native_trace",
+    "skip_restore_owner",
+    "skip_restore_owners",
+]

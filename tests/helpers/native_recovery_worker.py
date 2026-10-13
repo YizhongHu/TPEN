@@ -32,7 +32,7 @@ from tpen.training.optim import make_optimizer
 from tests.helpers.native_chain_resume_trace import (
     NativeTrace,
     install_native_trace,
-    skip_restore_owner,
+    skip_restore_owners,
 )
 
 
@@ -121,8 +121,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume-step", type=int, default=0)
     parser.add_argument(
         "--disable-limb",
+        action="append",
         choices=("model", "optimizer", "trainer_cursor", "sampler_mcmc", "process_rng"),
     )
+    parser.add_argument("--suppress-channel")
     return parser
 
 
@@ -157,6 +159,9 @@ def main() -> int:
             phase=args.phase,
             seed=int(cfg.runtime.seed),
             resume_step=args.resume_step,
+            suppress_channels=()
+            if args.suppress_channel is None
+            else (args.suppress_channel,),
         )
         if args.trace is not None
         else None
@@ -182,7 +187,7 @@ def main() -> int:
             selected_decision = replace(decision, load=partial_load)
         trace_stack = install_native_trace(trace) if trace is not None else None
         try:
-            with skip_restore_owner(args.disable_limb):
+            with skip_restore_owners(args.disable_limb or ()):
                 run_configured_once(
                     run_cfg,
                     decision=selected_decision or decision,

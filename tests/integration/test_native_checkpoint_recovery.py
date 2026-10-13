@@ -35,7 +35,10 @@ from tpen.execution import (
 from tpen.execution.recovery import CheckpointEvidence, RecoveryPhase
 from tpen.execution.invocation import _committed_checkpoint
 from tpen.execution.chain_resume import (
+    ChannelParityError,
     ProcessEvidence,
+    UnmeasuredArmError,
+    assert_positive_control,
     compare_channel_parity,
     first_subsequent_event,
 )
@@ -142,6 +145,8 @@ def _launch(
     trace: Path | None = None,
     resume_step: int = 0,
     disable_limb: str | None = None,
+    disable_limbs: tuple[str, ...] = (),
+    suppress_channel: str | None = None,
 ) -> subprocess.Popen[str]:
     command = [
         sys.executable,
@@ -171,6 +176,10 @@ def _launch(
         command.extend(("--trace", str(trace), "--resume-step", str(resume_step)))
     if disable_limb is not None:
         command.extend(("--disable-limb", disable_limb))
+    for limb in disable_limbs:
+        command.extend(("--disable-limb", limb))
+    if suppress_channel is not None:
+        command.extend(("--suppress-channel", suppress_channel))
     log = (root / f"worker-{label or phase}-{time.monotonic_ns()}.log").open("w+")
     environment = os.environ.copy()
     # Executing a helper by absolute path makes Python place tests/helpers,
@@ -554,6 +563,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
 
     resume_cursor = prefix_checkpoint.next_iteration
     results: dict[str, dict[str, bool]] = {}
+    disabled_traces: dict[str, ProcessEvidence] = {}
     for limb in sorted({spec.limb for spec in E5_CHANNEL_MAP}):
         label = f"channel-disabled-{limb}"
         trace_path = tmp_path / f"{label}.trace.json"
@@ -574,6 +584,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         worker.wait(timeout=180)
         assert worker.returncode == 0, label
         disabled_trace = _trace(trace_path)
+        disabled_traces[limb] = disabled_trace
         assert disabled_trace.pid != reference_trace.pid
         assert disabled_trace.seed == reference_trace.seed
         # The pure core comparator intentionally raises when one arm changes
@@ -626,3 +637,210 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
 
     assert set(results) == {spec.limb for spec in E5_CHANNEL_MAP}
+
+    # Positive controls now consume the vectors emitted by the real native
+    # workers above.  The synthetic probe has a separate adapter-unit label
+    # and is not used as evidence for this assertion.
+    for limb, disabled_trace in disabled_traces.items():
+        spec = next(spec for spec in E5_CHANNEL_MAP if spec.limb == limb)
+        assert_positive_control(
+            reference_trace,
+            disabled_trace,
+            spec,
+            resume_step=resume_cursor - 1,
+        )
+
+    # Observability mutant: the restored limb remains live in a real E3 run,
+    # but its first event is suppressed in the test-side trace.  Missing data
+    # is unmeasured, never a parity result.
+    suppressed_trace_path = tmp_path / "channel-suppressed.trace.json"
+    suppressed = _launch(
+        root=tmp_path,
+        batch_path=batch_path,
+        intent_path=intent_path,
+        config_path=FIXTURE,
+        receipts=receipts,
+        outputs=outputs,
+        phase="recovery",
+        label="channel-suppressed",
+        evidence=evidence_path,
+        trace=suppressed_trace_path,
+        resume_step=resume_cursor,
+        suppress_channel="sampler_proposal",
+    )
+    suppressed.wait(timeout=180)
+    assert suppressed.returncode == 0
+    suppressed_trace = _trace(suppressed_trace_path)
+    with pytest.raises(UnmeasuredArmError, match="sampler_proposal"):
+        compare_channel_parity(
+            reference_trace,
+            suppressed_trace,
+            resume_step=resume_cursor - 1,
+        )
+
+    # Wrong-channel attribution mutant: the real process-RNG omission is
+    # attributed to model_logabs.  The first channel assertion must reject
+    # that attribution before a later channel can accidentally mask it.
+    with pytest.raises(ChannelParityError, match="model_logabs"):
+        compare_channel_parity(
+            reference_trace,
+            disabled_traces["process_rng"],
+            resume_step=resume_cursor - 1,
+            disabled_limbs=("model",),
+        )
+
+    # Mutual-masking mutant: use one real single-limb omission while claiming
+    # every limb was disabled, then use a real multi-omission run while
+    # claiming only one.  Both assertions must fail on the observed vector.
+    with pytest.raises(ChannelParityError, match="model_logabs"):
+        compare_channel_parity(
+            reference_trace,
+            disabled_traces["process_rng"],
+            resume_step=resume_cursor - 1,
+            disabled_limbs=tuple(spec.limb for spec in E5_CHANNEL_MAP),
+        )
+    all_disabled_path = tmp_path / "channel-all-disabled.trace.json"
+    all_disabled = _launch(
+        root=tmp_path,
+        batch_path=batch_path,
+        intent_path=intent_path,
+        config_path=FIXTURE,
+        receipts=receipts,
+        outputs=outputs,
+        phase="recovery",
+        label="channel-all-disabled",
+        evidence=evidence_path,
+        trace=all_disabled_path,
+        resume_step=resume_cursor,
+        disable_limbs=tuple(spec.limb for spec in E5_CHANNEL_MAP),
+    )
+    all_disabled.wait(timeout=180)
+    assert all_disabled.returncode == 0
+    with pytest.raises(ChannelParityError, match="channel"):
+        compare_channel_parity(
+            reference_trace,
+            _trace(all_disabled_path),
+            resume_step=resume_cursor - 1,
+            disabled_limbs=("model",),
+        )
+
+
+@pytest.mark.integration
+def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
+    """Exercise no-checkpoint, before-commit, after-commit, and corruption.
+
+    Every arm enters through the E4 worker seam and E3 configured-run gateway.
+    The scheduler/process signal is retained separately from the typed
+    checkpoint/application result; a killed prefix is never treated as a
+    successful science outcome.
+    """
+
+    batch, intent, _source = _batch()
+    batch_path, intent_path = _write_inputs(tmp_path, batch, intent)
+    receipts = tmp_path / "receipts"
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    client = QualificationClient()
+    adapter = BalsamAdapter(
+        batch.execution, client, WorkerStartGateway(outputs), receipts
+    )
+    assert adapter.register_lineage(batch) is not None
+
+    # No evidence is an explicit E1 park through the real worker process.
+    no_checkpoint = _launch(
+        root=tmp_path,
+        batch_path=batch_path,
+        intent_path=intent_path,
+        config_path=FIXTURE,
+        receipts=receipts,
+        outputs=outputs,
+        phase="recovery",
+        label="fault-no-checkpoint",
+    )
+    no_checkpoint.wait(timeout=60)
+    assert no_checkpoint.returncode == 2
+    no_checkpoint_result = _result_from_log(tmp_path, "fault-no-checkpoint")
+    assert no_checkpoint_result["status"] == "parked"
+    assert "no committed checkpoint" in no_checkpoint_result["reason"]
+
+    # Kill a fresh worker before it can publish a committed checkpoint.  This
+    # is the application/scheduler fact; the successor still parks through E1
+    # rather than silently restarting.
+    before_root = tmp_path / "before-commit-outputs"
+    before_root.mkdir()
+    before = _launch(
+        root=tmp_path,
+        batch_path=batch_path,
+        intent_path=intent_path,
+        config_path=FIXTURE,
+        receipts=receipts,
+        outputs=before_root,
+        phase="initial",
+        label="fault-before-commit",
+    )
+    os.kill(before.pid, signal.SIGSTOP)
+    os.kill(before.pid, signal.SIGKILL)
+    before.wait(timeout=30)
+    assert before.returncode == -signal.SIGKILL
+    assert not list(before_root.rglob("checkpoints/step_*/COMPLETE"))
+
+    before_successor = _launch(
+        root=tmp_path,
+        batch_path=batch_path,
+        intent_path=intent_path,
+        config_path=FIXTURE,
+        receipts=receipts,
+        outputs=before_root,
+        phase="recovery",
+        label="fault-before-commit-successor",
+    )
+    before_successor.wait(timeout=60)
+    assert before_successor.returncode == 2
+    before_result = _result_from_log(tmp_path, "fault-before-commit-successor")
+    assert before_result["status"] == "parked"
+    assert "no committed checkpoint" in before_result["reason"]
+
+    # A committed prefix is the after-commit arm.  Select through the same
+    # catalog/latest resolver used by E3, then corrupt only its manifest before
+    # the successor enters restore.  The checkpoint schema gate must classify
+    # this as terminal application evidence, not as a scheduler loss.
+    prefix = _launch(
+        root=tmp_path,
+        batch_path=batch_path,
+        intent_path=intent_path,
+        config_path=FIXTURE,
+        receipts=receipts,
+        outputs=outputs,
+        phase="initial",
+        label="fault-after-commit",
+    )
+    checkpoint = _kill_prefix(prefix, outputs, batch.target_iterations)
+    evidence = CheckpointEvidence.from_ref(
+        checkpoint,
+        science_input_digest=intent.science_input_digest,
+        target_iterations=batch.target_iterations,
+    )
+    evidence_path = tmp_path / "fault-corrupt-evidence.json"
+    evidence_path.write_text(json.dumps(evidence.to_dict(), sort_keys=True), encoding="utf-8")
+    manifest = checkpoint.checkpoint_dir / "manifest.json"
+    original_manifest = manifest.read_text(encoding="utf-8")
+    manifest.write_text("{\"schema_version\": 2,\n", encoding="utf-8")
+    corrupt = _launch(
+        root=tmp_path,
+        batch_path=batch_path,
+        intent_path=intent_path,
+        config_path=FIXTURE,
+        receipts=receipts,
+        outputs=outputs,
+        phase="recovery",
+        label="fault-corrupt-committed",
+        evidence=evidence_path,
+    )
+    corrupt.wait(timeout=60)
+    assert corrupt.returncode == 0
+    corrupt_result = _result_from_log(tmp_path, "fault-corrupt-committed")
+    assert corrupt_result["status"] == "started"
+    assert corrupt_result["invocation"]["outcome"] == "terminal"
+    assert corrupt_result["invocation"]["status"] == "terminal"
+    assert corrupt_result["invocation"]["reason"]
+    manifest.write_text(original_manifest, encoding="utf-8")
