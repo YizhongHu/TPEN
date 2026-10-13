@@ -57,7 +57,7 @@ _CHECKPOINT_GATE_MODULES = frozenset(
         "tpen.checkpoint.schema",
     }
 )
-_CHECKPOINT_GATE_EXCEPTION_TYPES = (FileNotFoundError, KeyError, OSError, TypeError, ValueError)
+_CHECKPOINT_GATE_EXCEPTION_TYPES = (KeyError, TypeError, ValueError)
 
 
 class InvocationOutcome(str, Enum):
@@ -122,16 +122,23 @@ def _check_schema(data: Mapping[str, Any], expected: str) -> None:
         raise ValueError(f"receipt schema is not {expected!r}")
 
 
-def _traceback_has_checkpoint_gate(exc: BaseException) -> bool:
-    """Return whether a named checkpoint gate raised ``exc``."""
+def _innermost_tpen_module(exc: BaseException) -> str | None:
+    """Return the innermost TPEN module in the exception traceback.
 
+    The innermost TPEN frame is the closest available owner of a refusal.  It
+    avoids classifying an application error merely because it passed through
+    an outer checkpoint-related frame, while still allowing the checkpoint
+    gate's own ``ValueError``/``KeyError``/``TypeError`` to be terminal.
+    """
+
+    owner: str | None = None
     traceback = exc.__traceback__
     while traceback is not None:
         module_name = traceback.tb_frame.f_globals.get("__name__")
-        if module_name in _CHECKPOINT_GATE_MODULES:
-            return True
+        if isinstance(module_name, str) and module_name.startswith("tpen."):
+            owner = module_name
         traceback = traceback.tb_next
-    return False
+    return owner
 
 
 def _is_terminal_core_refusal(exc: BaseException) -> bool:
@@ -141,7 +148,7 @@ def _is_terminal_core_refusal(exc: BaseException) -> bool:
         return True
     return (
         isinstance(exc, _CHECKPOINT_GATE_EXCEPTION_TYPES)
-        and _traceback_has_checkpoint_gate(exc)
+        and _innermost_tpen_module(exc) in _CHECKPOINT_GATE_MODULES
     )
 
 
@@ -393,10 +400,12 @@ def classify_core_outcome(
     """Classify core facts without treating scheduler success as completion.
 
     A completion is accepted only when core explicitly reports completion and
-    both progress counters reach the fixed target.  This is an execution
-    contract, not proof that scientific work happened: a known optimizer/model
-    binding hazard can still advance counters and write checkpoints while doing
-    no meaningful update.
+    ``next_iteration`` reaches the fixed target.  ``completed_updates`` is a
+    distinct fact: skipped updates may make it smaller, but it may never be
+    negative or exceed ``next_iteration``.  This is an execution contract,
+    not proof that scientific work happened: a known optimizer/model binding
+    hazard can still advance counters and write checkpoints while doing no
+    meaningful update.
     """
 
     if decision.refusal is not None:
@@ -406,11 +415,20 @@ def classify_core_outcome(
     if facts.status is CoreStatus.COMPLETED:
         if facts.target_iterations != decision.target_iterations:
             return InvocationOutcome.TERMINAL, "core reported a different fixed target horizon"
-        if (
-            facts.next_iteration != decision.target_iterations
-            or facts.completed_updates != decision.target_iterations
-        ):
-            return InvocationOutcome.TERMINAL, "core completion facts do not reach the fixed target horizon"
+        if facts.completed_updates > facts.next_iteration:
+            return (
+                InvocationOutcome.TERMINAL,
+                "core completion facts have completed_updates greater than next_iteration",
+            )
+        if facts.next_iteration != decision.target_iterations:
+            # Core claims completion, but its durable iteration counter has
+            # not reached this immutable target.  That is ambiguous for a
+            # recovery controller, so reconcile it instead of retrying or
+            # declaring success.
+            return (
+                InvocationOutcome.PARKED,
+                "core reported completion before the fixed target horizon; park for reconciliation",
+            )
         return InvocationOutcome.COMPLETED, "core reported target completion"
     if facts.status is CoreStatus.TERMINAL:
         return InvocationOutcome.TERMINAL, facts.reason or "core reported a deterministic terminal failure"
@@ -536,13 +554,26 @@ def _core_outcome_from_artifacts(
 
     try:
         ref = _committed_checkpoint(run_dir)
-    except (FileNotFoundError, KeyError, OSError, TypeError, ValueError) as exc:
+    except OSError as exc:
         return CoreOutcomeFacts(
-            status=CoreStatus.TERMINAL,
+            status=CoreStatus.UNKNOWN,
             target_iterations=decision.target_iterations,
             next_iteration=decision.next_iteration,
             completed_updates=decision.completed_updates,
-            reason=f"invalid committed final checkpoint: {exc}",
+            reason=f"checkpoint artifact I/O failed; park for reconciliation: {exc}",
+            exception_type=type(exc).__name__,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return CoreOutcomeFacts(
+            status=CoreStatus.TERMINAL if _is_terminal_core_refusal(exc) else CoreStatus.UNKNOWN,
+            target_iterations=decision.target_iterations,
+            next_iteration=decision.next_iteration,
+            completed_updates=decision.completed_updates,
+            reason=(
+                f"invalid committed final checkpoint: {exc}"
+                if _is_terminal_core_refusal(exc)
+                else f"checkpoint artifact refusal is ambiguous; park for reconciliation: {exc}"
+            ),
             exception_type=type(exc).__name__,
         )
     if ref is None:

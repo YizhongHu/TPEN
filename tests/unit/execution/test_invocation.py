@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -237,7 +238,7 @@ def test_terminal_failure_is_not_a_retry_and_scheduler_zero_is_not_completion(tm
     assert "completion facts" in scheduler_zero.outcome.reason
 
 
-def test_completed_requires_both_distinct_core_counters_to_reach_target(tmp_path: Path) -> None:
+def test_completed_with_skipped_update_is_completed(tmp_path: Path) -> None:
     batch, intent = _batch()
     result = WorkerStartGateway(tmp_path).start(
         batch=batch,
@@ -247,10 +248,39 @@ def test_completed_requires_both_distinct_core_counters_to_reach_target(tmp_path
             target_iterations=3, next_iteration=3, completed_updates=2
         ),
     )
-    assert result.outcome.outcome is InvocationOutcome.TERMINAL
-    assert "fixed target horizon" in result.outcome.reason
+    assert result.outcome.outcome is InvocationOutcome.COMPLETED
     assert result.outcome.next_iteration == 3
     assert result.outcome.completed_updates == 2
+
+
+def test_completed_updates_greater_than_next_iteration_is_terminal(tmp_path: Path) -> None:
+    batch, intent = _batch()
+    result = WorkerStartGateway(tmp_path).start(
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+        run_once=lambda *_: CoreOutcomeFacts.completed(
+            target_iterations=3, next_iteration=2, completed_updates=3
+        ),
+    )
+
+    assert result.outcome.outcome is InvocationOutcome.TERMINAL
+    assert "completed_updates greater than next_iteration" in result.outcome.reason
+
+
+def test_completed_status_before_target_is_parked(tmp_path: Path) -> None:
+    batch, intent = _batch()
+    result = WorkerStartGateway(tmp_path).start(
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+        run_once=lambda *_: CoreOutcomeFacts.completed(
+            target_iterations=3, next_iteration=2, completed_updates=1
+        ),
+    )
+
+    assert result.outcome.outcome is InvocationOutcome.PARKED
+    assert "before the fixed target horizon" in result.outcome.reason
 
 
 def test_run_configured_once_keeps_legacy_return_and_applies_only_worker_overlay(monkeypatch, tmp_path: Path) -> None:
@@ -417,6 +447,109 @@ def test_configured_gateway_does_not_classify_training_value_error_as_terminal(m
 
     assert result.outcome.outcome is InvocationOutcome.PARKED
     assert result.outcome.status is CoreStatus.UNKNOWN
+
+
+def test_checkpoint_catalog_edquot_is_parked(monkeypatch, tmp_path: Path) -> None:
+    """Transient catalog I/O is parked rather than made permanently terminal."""
+
+    from tpen import run as run_module
+
+    batch, intent = _batch()
+    armed = False
+    real_open = Path.open
+
+    def fail_catalog_open(path, *args, **kwargs):
+        if armed and path.name == "publications.jsonl":
+            raise OSError(errno.EDQUOT, "checkpoint catalog quota exceeded")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_catalog_open)
+
+    def fake_run(cfg, **kwargs):
+        nonlocal armed
+        _write_core_completion_artifacts(Path(cfg.run.root))
+        catalog = next(Path(cfg.run.root).rglob("checkpoints")) / "publications.jsonl"
+        catalog.write_text("", encoding="utf-8")
+        armed = True
+        return 0
+
+    monkeypatch.setattr(run_module, "run_from_config", fake_run)
+    result = WorkerStartGateway(tmp_path).start_configured(
+        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+    )
+
+    assert result.outcome.outcome is InvocationOutcome.PARKED
+    assert result.outcome.status is CoreStatus.UNKNOWN
+    assert result.outcome.exception_type == "OSError"
+    assert "I/O failed" in result.outcome.reason
+
+
+def test_unreadable_final_checkpoint_is_parked(monkeypatch, tmp_path: Path) -> None:
+    """An I/O failure while reading the final checkpoint remains recoverable."""
+
+    from tpen import run as run_module
+
+    batch, intent = _batch()
+    armed = False
+    real_open = Path.open
+
+    def fail_latest_open(path, *args, **kwargs):
+        if armed and path.name == "latest.json":
+            raise OSError(errno.EIO, "checkpoint pointer unreadable")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_latest_open)
+
+    def fake_run(cfg, **kwargs):
+        nonlocal armed
+        _write_core_completion_artifacts(Path(cfg.run.root))
+        armed = True
+        return 0
+
+    monkeypatch.setattr(run_module, "run_from_config", fake_run)
+    result = WorkerStartGateway(tmp_path).start_configured(
+        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+    )
+
+    assert result.outcome.outcome is InvocationOutcome.PARKED
+    assert result.outcome.status is CoreStatus.UNKNOWN
+    assert result.outcome.exception_type == "OSError"
+    assert "I/O failed" in result.outcome.reason
+
+
+def test_corrupt_checkpoint_manifest_is_terminal(monkeypatch, tmp_path: Path) -> None:
+    """A schema-gate ValueError is deterministic and terminal."""
+
+    from tpen import run as run_module
+
+    batch, intent = _batch()
+
+    def fake_run(cfg, **kwargs):
+        output_path = Path(cfg.run.root)
+        _write_core_completion_artifacts(output_path)
+        manifest_path = next(output_path.rglob("manifest.json"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["kind"] = "not-a-checkpoint"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(run_module, "run_from_config", fake_run)
+    result = WorkerStartGateway(tmp_path).start_configured(
+        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        batch=batch,
+        intent=intent,
+        phase=RecoveryPhase.INITIAL,
+    )
+
+    assert result.outcome.outcome is InvocationOutcome.TERMINAL
+    assert result.outcome.status is CoreStatus.TERMINAL
+    assert result.outcome.exception_type == "ValueError"
 
 
 def test_configured_gateway_runs_real_tiny_train_and_restarts_in_distinct_namespace(tmp_path: Path) -> None:
