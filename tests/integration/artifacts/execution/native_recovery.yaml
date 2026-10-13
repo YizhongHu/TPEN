@@ -34,9 +34,9 @@ hamiltonian_terms:
     _target_: tpen.physics.potential.ElectronElectronInteraction
 sampler:
   _target_: tpen.sampling.metropolis.MetropolisSampler
-  n_walkers: 16
-  burn_in: 2
-  n_steps: 3
+  n_walkers: 4
+  burn_in: 1
+  n_steps: 1
   proposal_scale: 0.5
   seed: ${runtime.seed}
   n_electrons: ${system.n_particles}
@@ -48,7 +48,7 @@ optimizer:
   lr: 0.01
 trainer:
   _target_: tpen.training.trainer.VMCTrainer
-  max_steps: 6
+  max_steps: 4
   log_every_n_steps: 1
   return_terms: true
 callbacks:

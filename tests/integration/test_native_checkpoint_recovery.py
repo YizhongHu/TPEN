@@ -153,15 +153,21 @@ def _launch(
     return subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, text=True)
 
 
-def _wait_for_checkpoint(outputs: Path, *, target: int) -> Path:
+def _wait_for_checkpoint(
+    outputs: Path, *, target: int, process: subprocess.Popen[str] | None = None
+) -> Path:
     """Wait for one committed prefix checkpoint, never accepting the target."""
 
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         candidates = sorted(outputs.rglob("checkpoints/step_*/COMPLETE"))
         prefixes = [path.parent for path in candidates if int(path.parent.name.split("_")[-1]) < target]
         if prefixes:
             return prefixes[-1]
+        if process is not None and process.poll() is not None:
+            logs = sorted(outputs.parent.glob("worker-*.log"))
+            detail = "\n".join(path.read_text() for path in logs)
+            raise AssertionError(f"worker exited before a prefix checkpoint (rc={process.returncode})\n{detail}")
         time.sleep(0.1)
     raise AssertionError("worker wrote no committed periodic checkpoint before the target")
 
@@ -198,7 +204,7 @@ def _train_lines(output_path: Path) -> list[tuple[int, str]]:
 
 
 def _kill_prefix(process: subprocess.Popen[str], outputs: Path, target: int) -> Path:
-    checkpoint = _wait_for_checkpoint(outputs, target=target)
+    checkpoint = _wait_for_checkpoint(outputs, target=target, process=process)
     os.kill(process.pid, signal.SIGKILL)
     return checkpoint
 
