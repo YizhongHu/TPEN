@@ -114,8 +114,9 @@ def test_receipt_binding_refuses_a_mutated_batch_identity() -> None:
     validate_receipt_binding(receipt, batch)
 
     mutated = replace(batch, batch_id="different-batch")
+    receipt_bound_to_mutated_batch = replace(receipt, ready_batch_digest=mutated.identity)
     with pytest.raises(ValueError, match="different lineage or batch"):
-        validate_receipt_binding(receipt, mutated)
+        validate_receipt_binding(receipt_bound_to_mutated_batch, mutated)
 
 
 def test_execution_config_round_trip_keeps_recovery_selection_separate() -> None:
