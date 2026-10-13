@@ -11,7 +11,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .config import EXECUTION_CONFIG_SCHEMA, ExecutionConfig, canonical_payload_bytes, payload_digest
+from .config import (
+    EXECUTION_CONFIG_SCHEMA,
+    ExecutionConfig,
+    _reject_unknown_keys,
+    canonical_payload_bytes,
+    payload_digest,
+)
 from .recovery import _freeze, _thaw
 
 READY_BATCH_SCHEMA = "tpen.execution/ready-batch-v1"
@@ -72,6 +78,20 @@ class ReadyItem:
 
         if not isinstance(data, Mapping):
             raise TypeError("ready-batch item must be a mapping")
+        _reject_unknown_keys(
+            data,
+            frozenset(
+                {
+                    "invocation_id",
+                    "logical_task_id",
+                    "fresh_output_id",
+                    "argv",
+                    "result_dir",
+                    "payload",
+                }
+            ),
+            "ready-batch item",
+        )
         return cls(
             invocation_id=data.get("invocation_id", ""),
             logical_task_id=data.get("logical_task_id", ""),
@@ -170,6 +190,24 @@ class ReadyBatch:
 
         if not isinstance(data, Mapping):
             raise TypeError("ready batch must be a mapping")
+        _reject_unknown_keys(
+            data,
+            frozenset(
+                {
+                    "schema",
+                    "lineage_id",
+                    "batch_id",
+                    "source_config_digest",
+                    "payload_digest",
+                    "science_input_digest",
+                    "target_iterations",
+                    "execution",
+                    "items",
+                    "payload",
+                }
+            ),
+            "ready batch",
+        )
         execution = ExecutionConfig.from_mapping(data.get("execution", {}))
         return cls(
             schema=data.get("schema", ""),
