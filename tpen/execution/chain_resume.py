@@ -309,7 +309,10 @@ def compare_channel_parity(
         limbs must be true.  A missing event raises ``UnmeasuredArmError``.
     """
 
-    specs = validate_channel_map(SUPPORTED_STATE_OWNERS, channel_map or e5_channel_map())
+    specs = validate_channel_map(
+        SUPPORTED_STATE_OWNERS,
+        e5_channel_map() if channel_map is None else channel_map,
+    )
     disabled = frozenset(disabled_limbs)
     unknown_disabled = disabled - {spec.limb for spec in specs}
     if unknown_disabled:
@@ -318,6 +321,27 @@ def compare_channel_parity(
     for spec in specs:
         left = first_subsequent_event(reference, spec, resume_step=resume_step)
         right = first_subsequent_event(resumed, spec, resume_step=resume_step)
+        expected_step = resume_step + 1
+        if right.step != expected_step:
+            raise ChannelParityError(
+                f"resumed channel {spec.channel!r} first event is step {right.step}, "
+                f"expected selected cursor successor {expected_step}"
+            )
+        if resumed.phase.lower() in {"recovery", "resumed"} and any(
+            event.channel == spec.channel
+            and event.random_dependent
+            and event.step <= resume_step
+            for event in resumed.events
+        ):
+            raise ChannelParityError(
+                f"resumed channel {spec.channel!r} contains an event at or before "
+                f"the selected cursor {resume_step}"
+            )
+        if left.step != expected_step:
+            raise ChannelParityError(
+                f"reference channel {spec.channel!r} first aligned event is step {left.step}, "
+                f"expected selected cursor successor {expected_step}"
+            )
         equal = left.value == right.value
         result[spec.channel] = equal
         expected = spec.limb not in disabled

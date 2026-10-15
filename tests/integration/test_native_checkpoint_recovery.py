@@ -649,11 +649,6 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     # workers above.  The synthetic probe has a separate adapter-unit label
     # and is not used as evidence for this assertion.
     for limb, disabled_trace in disabled_traces.items():
-        if limb == "trainer_cursor":
-            # Cursor-only omission is explicitly non-isolatable in this
-            # topology; its measured hook result was recorded above, but it is
-            # not presented as a positive-control mismatch.
-            continue
         spec = next(spec for spec in E5_CHANNEL_MAP if spec.limb == limb)
         assert_positive_control(
             reference_trace,
@@ -665,41 +660,46 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     # Observability mutant: the restored limb remains live in a real E3 run,
     # but its first event is suppressed in the test-side trace.  Missing data
     # is unmeasured, never a parity result.
-    suppressed_trace_path = tmp_path / "channel-suppressed.trace.json"
-    suppressed = _launch(
-        root=tmp_path,
-        batch_path=batch_path,
-        intent_path=intent_path,
-        config_path=FIXTURE,
-        receipts=receipts,
-        outputs=outputs,
-        phase="recovery",
-        label="channel-suppressed",
-        evidence=evidence_path,
-        trace=suppressed_trace_path,
-        resume_step=resume_cursor,
-        suppress_channel="sampler_proposal",
-    )
-    suppressed.wait(timeout=180)
-    assert suppressed.returncode == 0
-    suppressed_trace = _trace(suppressed_trace_path)
-    with pytest.raises(UnmeasuredArmError, match="sampler_proposal"):
-        first_subsequent_event(
-            suppressed_trace,
-            next(spec for spec in E5_CHANNEL_MAP if spec.channel == "sampler_proposal"),
-            resume_step=resume_cursor - 1,
+    for spec in E5_CHANNEL_MAP:
+        suppressed_trace_path = tmp_path / f"channel-suppressed-{spec.channel}.trace.json"
+        suppressed = _launch(
+            root=tmp_path,
+            batch_path=batch_path,
+            intent_path=intent_path,
+            config_path=FIXTURE,
+            receipts=receipts,
+            outputs=outputs,
+            phase="recovery",
+            label=f"channel-suppressed-{spec.channel}",
+            evidence=evidence_path,
+            trace=suppressed_trace_path,
+            resume_step=resume_cursor,
+            suppress_channel=spec.channel,
         )
+        suppressed.wait(timeout=180)
+        assert suppressed.returncode == 0
+        suppressed_trace = _trace(suppressed_trace_path)
+        with pytest.raises(UnmeasuredArmError, match=spec.channel):
+            first_subsequent_event(
+                suppressed_trace,
+                spec,
+                resume_step=resume_cursor - 1,
+            )
 
     # Wrong-channel attribution mutant: the real process-RNG omission is
     # attributed to model_logabs.  The first channel assertion must reject
     # that attribution before a later channel can accidentally mask it.
-    with pytest.raises(ChannelParityError, match="model_logabs"):
-        compare_channel_parity(
-            reference_trace,
-            disabled_traces["process_rng"],
-            resume_step=resume_cursor - 1,
-            disabled_limbs=("model",),
+    for actual_limb, actual_trace in disabled_traces.items():
+        wrong_limb = next(
+            spec.limb for spec in E5_CHANNEL_MAP if spec.limb != actual_limb
         )
+        with pytest.raises(ChannelParityError):
+            compare_channel_parity(
+                reference_trace,
+                actual_trace,
+                resume_step=resume_cursor - 1,
+                disabled_limbs=(wrong_limb,),
+            )
 
     # Mutual-masking mutant: use one real single-limb omission while claiming
     # every limb was disabled, then use a real multi-omission run while
@@ -735,6 +735,13 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             resume_step=resume_cursor - 1,
             disabled_limbs=("model",),
         )
+
+    # Every declared arm above is collected and measured.  Keeping this
+    # explicit prevents a future unsupported hook from silently becoming a
+    # passing omission result.
+    unmeasured_arms: list[str] = []
+    print(f"UNMEASURED_ARMS={unmeasured_arms}")
+    assert not unmeasured_arms
 
 
 @pytest.mark.integration
