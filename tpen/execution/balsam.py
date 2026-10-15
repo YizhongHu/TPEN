@@ -414,8 +414,11 @@ def _observation(value: BalsamJobObservation | Mapping[str, Any], job_id: str) -
         return value
     if not isinstance(value, Mapping):
         raise TypeError("observe_job must return BalsamJobObservation or a mapping")
+    observed_job_id = _canonical_job_id(value.get("job_id", expected_job_id))
+    if observed_job_id != expected_job_id:
+        raise BalsamBindingError("backend observation names a different Job")
     return BalsamJobObservation(
-        job_id=value.get("job_id", expected_job_id),
+        job_id=observed_job_id,
         state=value.get("state", BalsamJobState.UNKNOWN),
         reason=value.get("reason", ""),
         metadata=value.get("metadata", {}),
