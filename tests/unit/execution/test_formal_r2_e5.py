@@ -55,6 +55,37 @@ class RegisterOnlyClient:
         raise AssertionError("E5 unit arm must not observe the backend")
 
 
+class ProtocolCompatibleWorkerTripwire:
+    """Record and reject any backend call in the four isolated worker tests."""
+
+    def __init__(self, calls: list[tuple[str, object]]) -> None:
+        self.calls = calls
+
+    def register_job(
+        self,
+        *,
+        lineage_id: str,
+        batch: ReadyBatch,
+        backend_options: object,
+    ) -> None:
+        self.calls.append(("register_job", (lineage_id, batch, backend_options)))
+        raise AssertionError("E5 worker attempted backend registration")
+
+    def observe_job(self, job_id: str | int) -> None:
+        self.calls.append(("observe_job", job_id))
+        raise AssertionError("E5 worker attempted backend observation")
+
+
+def _install_protocol_compatible_worker_tripwire(monkeypatch, runner, calls):
+    """Patch only the four scenario tests around the unmodified client contract."""
+
+    monkeypatch.setattr(
+        runner,
+        "NoLiveBackendClient",
+        lambda: ProtocolCompatibleWorkerTripwire(calls),
+    )
+
+
 def _prepare(root: Path) -> tuple[ReadyBatch, object]:
     config = OmegaConf.load(str(FIXTURE))
     source = OmegaConf.to_container(config, resolve=False)
@@ -138,6 +169,8 @@ def test_native_prefix_publishes_evidence_before_bounded_walltime_trap(
     root = tmp_path / "native-prefix"
     _prepare(root)
     runner = _runner_module()
+    client_calls = []
+    _install_protocol_compatible_worker_tripwire(monkeypatch, runner, client_calls)
     monkeypatch.setenv("PBS_JOBID", "fixture-allocation-1")
 
     def trap(_seconds: float) -> None:
@@ -149,6 +182,7 @@ def test_native_prefix_publishes_evidence_before_bounded_walltime_trap(
 
     assert (root / "checkpoint-evidence.json").is_file()
     assert (root / "prefix-ready.json").is_file()
+    assert client_calls == []
 
 
 def test_native_prefix_nested_run_dir_resolves_full_checkpoint_control(
@@ -165,6 +199,8 @@ def test_native_prefix_nested_run_dir_resolves_full_checkpoint_control(
     root = tmp_path / "native-prefix-control"
     _prepare(root)
     runner = _runner_module()
+    client_calls = []
+    _install_protocol_compatible_worker_tripwire(monkeypatch, runner, client_calls)
     monkeypatch.setenv("PBS_JOBID", "fixture-allocation-control")
     monkeypatch.setattr(runner.time, "sleep", lambda _seconds: (_ for _ in ()).throw(PrefixWalltimeTrap()))
     try:
@@ -179,6 +215,7 @@ def test_native_prefix_nested_run_dir_resolves_full_checkpoint_control(
     assert reference is not None
     assert reference.checkpoint_dir.is_dir()
     assert (reference.checkpoint_dir / "COMPLETE").is_file()
+    assert client_calls == []
 
 
 def test_prior_initial_start_without_evidence_parks_before_science(
@@ -188,6 +225,9 @@ def test_prior_initial_start_without_evidence_parks_before_science(
 
     root = tmp_path / "prior-initial"
     batch, intent = _prepare(root)
+    runner = _runner_module()
+    client_calls = []
+    _install_protocol_compatible_worker_tripwire(monkeypatch, runner, client_calls)
     prior = BalsamAdapter(
         batch.execution,
         RegisterOnlyClient(),
@@ -213,7 +253,6 @@ def test_prior_initial_start_without_evidence_parks_before_science(
     assert not (root / "checkpoint-evidence.json").exists()
     assert not list((root / "outputs").rglob("outcome.json"))
 
-    runner = _runner_module()
     calls = []
 
     def spy(*_args, **_kwargs):
@@ -224,6 +263,7 @@ def test_prior_initial_start_without_evidence_parks_before_science(
     monkeypatch.setenv("PBS_JOBID", "fixture-allocation-successor")
     runner.run_attempt(job_id="Job42", job_data=_job_data(root))
     assert calls == [], "prior same-Job INITIAL receipt must park before science"
+    assert client_calls == []
     assert not (root / "checkpoint-evidence.json").exists()
 
     # A correct implementation may now publish a durable E3 parked outcome
@@ -258,6 +298,8 @@ def test_first_ever_start_without_evidence_invokes_initial_once(
     root = tmp_path / "first-ever"
     _prepare(root)
     runner = _runner_module()
+    client_calls = []
+    _install_protocol_compatible_worker_tripwire(monkeypatch, runner, client_calls)
     calls = []
 
     def spy(*_args, **_kwargs):
@@ -268,3 +310,22 @@ def test_first_ever_start_without_evidence_invokes_initial_once(
     monkeypatch.setenv("PBS_JOBID", "fixture-allocation-first")
     runner.run_attempt(job_id="Job42", job_data=_job_data(root))
     assert len(calls) == 1
+    assert client_calls == []
+
+
+def test_unmodified_worker_client_is_accepted_by_adapter(tmp_path: Path) -> None:
+    """RED at E5: the shipped worker client must satisfy the adapter protocol."""
+
+    root = tmp_path / "unmodified-worker-client"
+    batch, _intent = _prepare(root)
+    runner = _runner_module()
+
+    # Deliberately use the owner source's unmodified client.  This regression
+    # must expose the product protocol mismatch directly; it must not install
+    # the compatible tripwire used by the four scenario-isolation leaves.
+    BalsamAdapter(
+        batch.execution,
+        runner.NoLiveBackendClient(),
+        WorkerStartGateway(root / "worker-output"),
+        root / "unmodified-receipts",
+    )
