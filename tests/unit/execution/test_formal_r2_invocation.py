@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
 from omegaconf import OmegaConf
 
 from tpen.checkpoint.payload import TrainResume
 from tpen.execution import (
     ExecutionConfig,
+    InvocationOutcome,
     ReadyBatch,
     ReadyItem,
     RecoveryPhase,
@@ -114,16 +114,18 @@ def test_changed_optimizer_config_is_refused_before_science(monkeypatch, tmp_pat
     try:
         from tpen.execution import WorkerStartGateway
 
-        WorkerStartGateway(tmp_path / "outputs").start_configured(
+        invocation = WorkerStartGateway(tmp_path / "outputs").start_configured(
             cfg=cfg, batch=batch, intent=intent, phase=RecoveryPhase.INITIAL
         )
     except (ReceiptBindingError, ClosedSchemaError):
         pass
     else:
-        raise AssertionError(
-            "source-config refusal was absent; "
-            f"captured runner calls={calls!r}; cfg={OmegaConf.to_container(cfg, resolve=False)!r}"
+        assert invocation.outcome.outcome is InvocationOutcome.TERMINAL, (
+            "source-config refusal must be exception or durable TERMINAL, "
+            f"got {invocation.outcome.outcome!r}; captured runner calls={calls!r}; "
+            f"cfg={OmegaConf.to_container(cfg, resolve=False)!r}"
         )
+        assert invocation.outcome.reason.strip(), "durable terminal refusal needs a nonempty reason"
     assert calls == [], "source-config refusal must precede tpen.run.run_from_config"
 
 
@@ -167,10 +169,18 @@ def test_initial_concrete_train_resume_load_is_refused_without_science(
 
     from tpen.execution import WorkerStartGateway
 
-    with pytest.raises((ReceiptBindingError, ClosedSchemaError)):
-        WorkerStartGateway(tmp_path / "outputs").start_configured(
+    try:
+        invocation = WorkerStartGateway(tmp_path / "outputs").start_configured(
             cfg=cfg, batch=batch, intent=intent, phase=RecoveryPhase.INITIAL
         )
+    except (ReceiptBindingError, ClosedSchemaError):
+        pass
+    else:
+        assert invocation.outcome.outcome is InvocationOutcome.TERMINAL, (
+            "undeclared initial load must be exception or durable TERMINAL, "
+            f"got {invocation.outcome.outcome!r}; captured runner calls={calls!r}"
+        )
+        assert invocation.outcome.reason.strip(), "durable terminal refusal needs a nonempty reason"
     assert calls == [], "undeclared initial load must not invoke science"
 
 
