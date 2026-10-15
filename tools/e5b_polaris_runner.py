@@ -26,7 +26,12 @@ from tpen.execution import (
     decode_ready_batch,
     validate_native_recovery_profile,
 )
-from tpen.execution.invocation import _committed_checkpoint, _core_outcome_from_artifacts, run_configured_once
+from tpen.execution.invocation import (
+    _committed_checkpoint,
+    _core_outcome_from_artifacts,
+    _run_status_artifact,
+    run_configured_once,
+)
 from tpen.execution.invocation import _atomic_write_json
 from tpen.execution.recovery import CheckpointEvidence
 
@@ -37,7 +42,8 @@ class NoLiveBackendClient:
     def register_job(self, **_kwargs: Any) -> None:  # pragma: no cover - safety tripwire
         raise AssertionError("worker attempted Balsam registration")
 
-    def observe_job(self, _job_id: str) -> None:  # pragma: no cover - safety tripwire
+    def observe_job(self, job_id: str | int) -> None:  # pragma: no cover - safety tripwire
+        del job_id
         raise AssertionError("worker attempted Balsam observation")
 
 
@@ -114,6 +120,22 @@ def run_attempt(*, job_id: int | str, job_data: Mapping[str, Any]) -> int:
         receipts,
     )
     if not evidence_path.is_file():
+        if tuple(outputs.rglob("start.json")):
+            reason = "a prior worker start exists but no admissible committed checkpoint was recorded"
+            _write_json(
+                root / "no-checkpoint-park.json",
+                {
+                    "schema": "tpen.execution/e5b-no-checkpoint-park-v1",
+                    "job_id": str(job_id),
+                    "reason": reason,
+                },
+            )
+            _record_application(
+                root,
+                "prefix-application.json",
+                {"status": "parked", "job_id": str(job_id), "reason": reason},
+            )
+            return 2
         prefix_steps = int(job_data.get("prefix_steps", max(1, batch.target_iterations // 2)))
         result = adapter.start(
             batch=batch,
@@ -132,7 +154,8 @@ def run_attempt(*, job_id: int | str, job_data: Mapping[str, Any]) -> int:
             _record_application(root, "prefix-application.json", {"status": result.status.value, "reason": result.reason})
             return 2
         run_dir = Path(result.invocation.start.output_path)
-        checkpoint = _committed_checkpoint(run_dir)
+        status_result = _run_status_artifact(run_dir)
+        checkpoint = None if status_result is None else _committed_checkpoint(status_result[0])
         if checkpoint is None or checkpoint.next_iteration >= batch.target_iterations:
             _record_application(root, "prefix-application.json", {"status": "no-prefix-checkpoint", "job_id": str(job_id)})
             return 3
