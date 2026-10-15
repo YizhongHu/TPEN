@@ -233,7 +233,10 @@ def test_prior_initial_start_without_evidence_parks_before_science(
     # after the injected allocation death).
     retained_park_records: list[tuple[Path, dict]] = []
     for candidate in root.rglob("*.json"):
-        if candidate.name not in {"outcome.json", "successor-application.json", "worker-park.json", "registration-park.json"}:
+        if not (
+            candidate.name in {"outcome.json", "worker-park.json", "registration-park.json"}
+            or candidate.name.endswith("-application.json")
+        ):
             continue
         payload = json.loads(candidate.read_text(encoding="utf-8"))
         typed_status = str(payload.get("status", payload.get("outcome", ""))).lower()
