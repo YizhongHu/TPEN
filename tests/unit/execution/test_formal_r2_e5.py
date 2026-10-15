@@ -225,7 +225,26 @@ def test_prior_initial_start_without_evidence_parks_before_science(
     runner.run_attempt(job_id="Job42", job_data=_job_data(root))
     assert calls == [], "prior same-Job INITIAL receipt must park before science"
     assert not (root / "checkpoint-evidence.json").exists()
-    assert not list((root / "outputs").rglob("outcome.json"))
+
+    # A correct implementation may now publish a durable E3 parked outcome
+    # after reconciling the prior start.  Require typed park evidence with a
+    # reason, while reading only this fixture root and preserving the stronger
+    # pre-successor assertions above (no science and no outcome immediately
+    # after the injected allocation death).
+    retained_park_records: list[tuple[Path, dict]] = []
+    for candidate in root.rglob("*.json"):
+        if candidate.name not in {"outcome.json", "successor-application.json", "worker-park.json", "registration-park.json"}:
+            continue
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+        typed_status = str(payload.get("status", payload.get("outcome", ""))).lower()
+        typed_outcome = str(payload.get("outcome", payload.get("successor_outcome", ""))).lower()
+        reason = payload.get("reason")
+        if typed_status == "parked" or typed_outcome == "parked":
+            assert isinstance(reason, str) and reason.strip(), (
+                f"durable park evidence must carry a nonempty reason: {candidate}"
+            )
+            retained_park_records.append((candidate, payload))
+    assert retained_park_records, "same-Job successor must retain typed parked E3/application evidence"
 
 
 def test_first_ever_start_without_evidence_invokes_initial_once(
