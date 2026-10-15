@@ -145,7 +145,7 @@ def _innermost_tpen_module(exc: BaseException) -> str | None:
 def _is_terminal_core_refusal(exc: BaseException) -> bool:
     """Classify only named core config/checkpoint refusal paths as terminal."""
 
-    if isinstance(exc, _CONFIG_REFUSAL_TYPES):
+    if isinstance(exc, ReceiptBindingError) or isinstance(exc, _CONFIG_REFUSAL_TYPES):
         return True
     return (
         isinstance(exc, _CHECKPOINT_GATE_EXCEPTION_TYPES)
@@ -748,6 +748,7 @@ class WorkerStartGateway:
         attempt_id: str | None = None,
         fault_injector: Callable[[str], None] | None = None,
         run_kwargs: Mapping[str, Any] | None = None,
+        declared_overlays: Mapping[str, Any] | None = None,
     ) -> WorkerInvocation:
         """Run configured TPEN once after publishing the worker-start receipt."""
 
@@ -758,7 +759,14 @@ class WorkerStartGateway:
         kwargs["raise_exceptions"] = True
 
         def run_once(decision: RecoveryDecision, output_path: Path) -> Any:
-            run_configured_once(cfg, decision=decision, output_path=output_path, **kwargs)
+            worker_cfg = _materialize_configured_worker_config(
+                cfg,
+                intent=intent,
+                decision=decision,
+                output_path=output_path,
+                declared_overlays=declared_overlays,
+            )
+            run_configured_once(worker_cfg, decision=decision, output_path=output_path, **kwargs)
             return _core_outcome_from_artifacts(output_path, decision=decision)
 
         return self.start(
@@ -810,6 +818,85 @@ class WorkerStartGateway:
         )
         _atomic_write_json(path, parked.to_dict())
         return parked
+
+
+_RECOVERY_CONFIG_PATHS = frozenset({"load", "runner.load"})
+_OPERATIONAL_OVERLAY_PATHS = frozenset({"run.root", "trainer.max_steps"})
+
+
+def _config_leaves(value: Any, prefix: str = "") -> dict[str, Any]:
+    """Flatten config-shaped mappings without resolving arbitrary targets."""
+
+    if isinstance(value, Mapping):
+        leaves: dict[str, Any] = {}
+        for key, child in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            leaves.update(_config_leaves(child, child_prefix))
+        return leaves
+    return {prefix: value}
+
+
+def _materialize_configured_worker_config(
+    cfg: Any,
+    *,
+    intent: ScienceIntent,
+    decision: RecoveryDecision,
+    output_path: Path,
+    declared_overlays: Mapping[str, Any] | None,
+) -> Any:
+    """Build a runner config from captured intent plus explicit worker overlays.
+
+    The submitter's captured source configuration is the immutable base.  The
+    supplied config is checked only as a syntax witness: source-owned leaves
+    must match, recovery ``load`` is owned by the E1 decision, and the only
+    other accepted differences are named operational overlays.  OmegaConf is
+    used for data copying only; no ``_target_`` value is resolved here.
+    """
+
+    from omegaconf import OmegaConf
+
+    source = OmegaConf.to_container(OmegaConf.create(intent.source_config), resolve=False)
+    supplied = OmegaConf.to_container(OmegaConf.create(cfg), resolve=False)
+    if not isinstance(source, Mapping) or not isinstance(supplied, Mapping):
+        raise ReceiptBindingError("captured and supplied worker configs must be mappings")
+
+    overlays = dict(declared_overlays or {})
+    unknown_overlays = set(overlays).difference(_OPERATIONAL_OVERLAY_PATHS)
+    if unknown_overlays:
+        raise ReceiptBindingError(
+            "worker config contains undeclared operational overlays: "
+            + ", ".join(sorted(unknown_overlays))
+        )
+    overlay_values = _config_leaves(overlays)
+    source_values = _config_leaves(source)
+    supplied_values = _config_leaves(supplied)
+    for path, value in supplied_values.items():
+        if path in _RECOVERY_CONFIG_PATHS or path == "run.root":
+            continue
+        expected = source_values.get(path, _MISSING_CONFIG_VALUE)
+        if expected is _MISSING_CONFIG_VALUE:
+            expected = overlay_values.get(path, _MISSING_CONFIG_VALUE)
+        if expected is _MISSING_CONFIG_VALUE or value != expected:
+            raise ReceiptBindingError(
+                f"worker config leaf {path!r} differs from immutable source intent"
+            )
+
+    for path in _RECOVERY_CONFIG_PATHS:
+        source_load = source_values.get(path)
+        supplied_load = supplied_values.get(path)
+        if decision.load is None and (source_load is not None or supplied_load is not None):
+            raise ReceiptBindingError(
+                "INITIAL configured run contains an undeclared concrete runner.load"
+            )
+
+    worker_cfg = OmegaConf.create(source)
+    for path, value in overlays.items():
+        OmegaConf.update(worker_cfg, path, value, merge=False, force_add=True)
+    OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
+    return worker_cfg
+
+
+_MISSING_CONFIG_VALUE = object()
 
 
 def run_configured_once(cfg: Any, *, decision: RecoveryDecision, output_path: Path, **kwargs: Any) -> Any:
