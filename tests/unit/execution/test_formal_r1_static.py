@@ -30,7 +30,7 @@ def _string_constants(path: Path) -> list[str]:
     ]
 
 
-@pytest.mark.parametrize("relative_path", DOC_FILES)
+@pytest.mark.parametrize("relative_path", DOC_FILES, ids=[str(path) for path in DOC_FILES])
 def test_review_docstrings_contain_no_local_provenance(relative_path: Path) -> None:
     constants = _string_constants(REPO_ROOT / relative_path)
     for value in constants:
