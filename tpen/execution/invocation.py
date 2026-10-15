@@ -836,6 +836,18 @@ def _config_leaves(value: Any, prefix: str = "") -> dict[str, Any]:
     return {prefix: value}
 
 
+def _is_config_path(path: str, prefixes: frozenset[str]) -> bool:
+    """Return whether a leaf is a named path or one of its descendants."""
+
+    return any(path == prefix or path.startswith(f"{prefix}.") for prefix in prefixes)
+
+
+def _has_config_path(values: Mapping[str, Any], prefix: str) -> bool:
+    """Return whether a flattened config contains a concrete path subtree."""
+
+    return any(path == prefix or path.startswith(f"{prefix}.") for path in values)
+
+
 def _materialize_configured_worker_config(
     cfg: Any,
     *,
@@ -876,25 +888,40 @@ def _materialize_configured_worker_config(
     source_values = _config_leaves(source)
     supplied_values = _config_leaves(supplied)
     for path, value in supplied_values.items():
-        if path in _RECOVERY_CONFIG_PATHS or path == "run.root":
+        if _is_config_path(path, _RECOVERY_CONFIG_PATHS) or path == "run.root":
             continue
         expected = source_values.get(path, _MISSING_CONFIG_VALUE)
         if expected is _MISSING_CONFIG_VALUE:
             expected = overlay_values.get(path, _MISSING_CONFIG_VALUE)
-        if expected is _MISSING_CONFIG_VALUE or value != expected:
+        # A legacy configured caller may carry additional schema leaves that
+        # were not part of the captured science snapshot.  Those leaves remain
+        # opaque to this binding check; captured leaves and explicit overlays
+        # are the only values this gateway authorizes or rewrites.
+        if expected is not _MISSING_CONFIG_VALUE and value != expected:
             raise ReceiptBindingError(
                 f"worker config leaf {path!r} differs from immutable source intent"
             )
 
     for path in _RECOVERY_CONFIG_PATHS:
-        source_load = source_values.get(path)
-        supplied_load = supplied_values.get(path)
-        if decision.load is None and (source_load is not None or supplied_load is not None):
+        if decision.load is None and (
+            _has_config_path(source_values, path) or _has_config_path(supplied_values, path)
+        ):
             raise ReceiptBindingError(
                 "INITIAL configured run contains an undeclared concrete runner.load"
             )
 
-    worker_cfg = OmegaConf.create(source)
+    # The captured source is authoritative for every leaf it contains.  A
+    # configured caller may still supply the surrounding runner schema (for
+    # example, legacy configs whose capture records only the science-facing
+    # subset), so retain those already-validated opaque leaves in the supplied
+    # mapping.  No supplied leaf can replace a captured value, and no target
+    # is resolved while making this copy.
+    worker_cfg = OmegaConf.create(supplied)
+    for path, value in source_values.items():
+        if _is_config_path(path, _RECOVERY_CONFIG_PATHS):
+            continue
+        if path in supplied_values:
+            OmegaConf.update(worker_cfg, path, value, merge=False, force_add=True)
     for path, value in overlays.items():
         OmegaConf.update(worker_cfg, path, value, merge=False, force_add=True)
     OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)

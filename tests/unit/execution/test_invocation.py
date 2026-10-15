@@ -40,6 +40,7 @@ def _batch() -> tuple[ReadyBatch, ScienceIntent]:
         target_iterations=3,
         source_config={"model": {"_target_": "tests.helpers.NeverConstructed"}},
     )
+
     payload = {"science": science, "target_iterations": 3}
     source_digest = "a" * 64
     payload_digest_value = payload_digest(payload)
@@ -72,6 +73,17 @@ def _batch() -> tuple[ReadyBatch, ScienceIntent]:
             payload=payload,
         ),
         intent,
+    )
+
+
+def _intent_for_config(intent: ScienceIntent, cfg: object) -> ScienceIntent:
+    """Bind configured-entry tests to the complete captured fixture syntax."""
+
+    return capture_science_intent(
+        intent.science_input,
+        target_iterations=intent.target_iterations,
+        source_config=OmegaConf.to_container(cfg, resolve=False),
+        overrides=intent.overrides,
     )
 
 
@@ -556,6 +568,7 @@ def test_configured_gateway_runs_real_tiny_train_and_restarts_in_distinct_namesp
     config_path = Path(__file__).parents[2] / "integration" / "artifacts" / "training" / "vmc_smoke.yaml"
     cfg = OmegaConf.load(config_path)
     batch, intent = _batch()
+    intent = _intent_for_config(intent, cfg)
     gateway = WorkerStartGateway(tmp_path)
 
     first = gateway.start_configured(
@@ -589,6 +602,7 @@ def test_real_bad_config_is_terminal(tmp_path: Path) -> None:
     cfg = OmegaConf.load(config_path)
     cfg.experiment.name = HI_EXPERIMENT_NAME
     batch, intent = _batch()
+    intent = _intent_for_config(intent, OmegaConf.load(config_path))
 
     result = WorkerStartGateway(tmp_path).start_configured(
         cfg=cfg,
@@ -598,7 +612,9 @@ def test_real_bad_config_is_terminal(tmp_path: Path) -> None:
     )
 
     assert result.outcome.outcome is InvocationOutcome.TERMINAL
-    assert result.outcome.exception_type == "ClosedSchemaError"
+    # The complete captured source snapshot makes this a preconstruction
+    # binding refusal before the core schema validator is reached.
+    assert result.outcome.exception_type == "ReceiptBindingError"
 
 
 def test_real_incompatible_train_resume_restore_is_terminal(tmp_path: Path) -> None:
@@ -608,6 +624,7 @@ def test_real_incompatible_train_resume_restore_is_terminal(tmp_path: Path) -> N
     config_path = Path(__file__).parents[2] / "integration" / "artifacts" / "training" / "vmc_smoke.yaml"
     cfg = OmegaConf.load(config_path)
     batch, intent = _batch()
+    intent = _intent_for_config(intent, cfg)
     gateway = WorkerStartGateway(tmp_path)
     first = gateway.start_configured(
         cfg=cfg,
