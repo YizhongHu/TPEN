@@ -855,7 +855,12 @@ def _materialize_configured_worker_config(
 
     from omegaconf import OmegaConf
 
-    source = OmegaConf.to_container(OmegaConf.create(intent.source_config), resolve=False)
+    # ``ScienceIntent`` stores nested mapping proxies for immutability; use
+    # its JSON-shaped thawed representation rather than asking OmegaConf to
+    # construct a config from those proxy objects.
+    source = OmegaConf.to_container(
+        OmegaConf.create(intent.to_dict()["source_config"]), resolve=False
+    )
     supplied = OmegaConf.to_container(OmegaConf.create(cfg), resolve=False)
     if not isinstance(source, Mapping) or not isinstance(supplied, Mapping):
         raise ReceiptBindingError("captured and supplied worker configs must be mappings")
