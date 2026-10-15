@@ -236,12 +236,17 @@ def validate_receipt_binding(
         raise ValueError("receipt is bound to a different ready batch")
     if isinstance(receipt, BackendJobReceipt) and receipt.source_config_digest != batch.source_config_digest:
         raise ValueError("receipt is bound to a different source configuration")
+    if isinstance(receipt, BackendJobReceipt) and receipt.backend != batch.execution.backend:
+        raise ValueError("receipt names a different backend")
     if isinstance(receipt, (BackendJobReceipt, FreshOutputReceipt, ResultReceipt)) and receipt.payload_digest != batch.payload_digest:
         raise ValueError("receipt is bound to a different payload")
-    if hasattr(receipt, "invocation_id") and receipt.invocation_id not in {item.invocation_id for item in batch.items}:
-        raise ValueError("receipt names an invocation absent from the ready batch")
-    if hasattr(receipt, "fresh_output_id") and receipt.fresh_output_id not in {item.fresh_output_id for item in batch.items}:
-        raise ValueError("receipt names a fresh output absent from the ready batch")
+    if hasattr(receipt, "invocation_id"):
+        try:
+            item = next(item for item in batch.items if item.invocation_id == receipt.invocation_id)
+        except StopIteration as exc:
+            raise ValueError("receipt names an invocation absent from the ready batch") from exc
+        if hasattr(receipt, "fresh_output_id") and receipt.fresh_output_id != item.fresh_output_id:
+            raise ValueError("receipt pairs an invocation with a different fresh output")
 
 
 def encode_receipt(receipt: Any) -> bytes:
