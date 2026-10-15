@@ -53,6 +53,26 @@ WORKER = Path(__file__).parents[1] / "helpers" / "native_recovery_worker.py"
 # update in the float64 fixture.
 PARAMETER_CHANGE_THRESHOLD = 1.0e-10
 
+# The E3 cursor binding prevents this test-only hook from isolating the
+# trainer-cursor owner.  Keep the unmeasured owner declaration in one place;
+# the explicit arm record below is derived from it.
+DECLARED_UNMEASURED = frozenset({"trainer_cursor"})
+_UNMEASURED_REASON_BY_ARM = {
+    "restore-disabled": (
+        "E3 binds the recovery cursor before the test-only trainer loader hook, "
+        "so this topology cannot isolate a cursor omission."
+    ),
+    "positive-control": (
+        "the same pre-bound cursor makes an own-channel value-change control "
+        "unobservable; direct cursor evidence is retained above."
+    ),
+}
+UNMEASURED_ARMS = tuple(
+    (f"{arm}:{limb}", _UNMEASURED_REASON_BY_ARM[arm])
+    for arm in ("restore-disabled", "positive-control")
+    for limb in sorted(DECLARED_UNMEASURED)
+)
+
 
 class QualificationClient:
     """Fake submitter-side client with explicit allocation-loss observation."""
@@ -564,18 +584,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     resume_cursor = prefix_checkpoint.next_iteration
     results: dict[str, dict[str, bool]] = {}
     disabled_traces: dict[str, ProcessEvidence] = {}
-    unmeasured_arms = [
-        (
-            "restore-disabled:trainer_cursor",
-            "E3 binds the recovery cursor before the test-only trainer loader hook, "
-            "so this topology cannot isolate a cursor omission.",
-        ),
-        (
-            "positive-control:trainer_cursor",
-            "the same pre-bound cursor makes an own-channel value-change control "
-            "unobservable; direct cursor evidence is retained above.",
-        ),
-    ]
+    unmeasured_arms = UNMEASURED_ARMS
     for limb in sorted({spec.limb for spec in E5_CHANNEL_MAP}):
         label = f"channel-disabled-{limb}"
         trace_path = tmp_path / f"{label}.trace.json"
@@ -754,18 +763,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     # explicit prevents a future unsupported hook from silently becoming a
     # passing omission result.
     print(f"UNMEASURED_ARMS={unmeasured_arms}")
-    assert unmeasured_arms == [
-        (
-            "restore-disabled:trainer_cursor",
-            "E3 binds the recovery cursor before the test-only trainer loader hook, "
-            "so this topology cannot isolate a cursor omission.",
-        ),
-        (
-            "positive-control:trainer_cursor",
-            "the same pre-bound cursor makes an own-channel value-change control "
-            "unobservable; direct cursor evidence is retained above.",
-        ),
-    ]
+    assert unmeasured_arms == UNMEASURED_ARMS
 
 
 @pytest.mark.integration
