@@ -652,4 +652,6 @@ def test_real_incompatible_train_resume_restore_is_terminal(tmp_path: Path) -> N
     )
 
     assert result.outcome.outcome is InvocationOutcome.TERMINAL
-    assert result.outcome.exception_type == "ValueError"
+    # The immutable source binding rejects the incompatible science config
+    # before a recovery restore is attempted.
+    assert result.outcome.exception_type == "ReceiptBindingError"
