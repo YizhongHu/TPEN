@@ -25,7 +25,12 @@ from tpen.checkpoint.schema import read_manifest
 from tpen.config_schema import ClosedSchemaError
 
 from .batch import ReadyBatch, ReadyItem
-from .config import canonical_payload_bytes, payload_digest, recovery_selection_digest
+from .config import (
+    canonical_payload_bytes,
+    payload_digest,
+    recovery_selection_digest,
+    source_config_digest,
+)
 from .recovery import (
     CheckpointEvidence,
     RecoveryDecision,
