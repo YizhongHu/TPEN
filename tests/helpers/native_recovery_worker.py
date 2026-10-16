@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -159,6 +160,7 @@ def main() -> int:
             phase=args.phase,
             seed=int(cfg.runtime.seed),
             resume_step=args.resume_step,
+            command=json.loads(os.environ.get("TPEN_NATIVE_LAUNCH_ARGV", "[]")),
             suppress_channels=()
             if args.suppress_channel is None
             else (args.suppress_channel,),

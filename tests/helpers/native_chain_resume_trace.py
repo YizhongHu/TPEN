@@ -29,6 +29,7 @@ class NativeTrace:
         phase: str,
         seed: int,
         resume_step: int,
+        command: Iterable[str] = (),
         suppress_channels: Iterable[str] = (),
     ) -> None:
         self.phase = phase
@@ -36,6 +37,7 @@ class NativeTrace:
         self.seed = seed
         self.seed_source = f"{phase}:runtime.seed={seed}"
         self.resume_step = resume_step
+        self.command = tuple(command)
         self.current_step = resume_step
         self._step_count = 0
         self.trainer: Any | None = None
@@ -99,6 +101,7 @@ class NativeTrace:
             "pid": self.pid,
             "seed": self.seed,
             "seed_source": self.seed_source,
+            "command": list(self.command),
             "events": [
                 {
                     "record": "channel_event",

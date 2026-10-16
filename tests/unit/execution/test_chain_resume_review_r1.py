@@ -3,9 +3,8 @@
 Target layer: CR @ ddd01920 only.
 
 Polarity at the CR head:
-- test_identical_seed_provenance_is_rejected: EXPECTED RED (CR contract
-  requires "distinct seed provenance"; assert_fresh_processes only checks
-  non-empty provenance strings).
+- test_identical_seed_provenance_is_rejected: GREEN. The CR contract rejects
+  identical seed provenance for separate reference and recovery processes.
 - test_first_subsequent_event_uses_completed_step_cursor: EXPECTED GREEN
   (pins the resume_step = next_iteration - 1 cursor convention).
 - test_channel_map_totality_fails_on_unknown_owner: EXPECTED GREEN (pin).

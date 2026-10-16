@@ -188,8 +188,46 @@ def _launch(
     # trainable test model importable without changing the installed package.
     checkout_root = str(Path(__file__).parents[2])
     environment["PYTHONPATH"] = checkout_root + os.pathsep + environment.get("PYTHONPATH", "")
+    environment["TPEN_NATIVE_LAUNCH_ARGV"] = json.dumps(command)
     return subprocess.Popen(
         command, stdout=log, stderr=subprocess.STDOUT, text=True, env=environment
+    )
+
+
+def _observed_prefix_checkpoints(outputs: Path, target: int) -> tuple[CheckpointRef, ...]:
+    """Return the currently observed committed prefix checkpoints."""
+
+    refs = {
+        ref.content_id: ref
+        for root in outputs.rglob("checkpoints")
+        for path in list_complete_checkpoints(root)
+        for ref in (CheckpointRef.from_directory(path),)
+        if ref.next_iteration < target
+    }
+    return tuple(sorted(refs.values(), key=lambda ref: ref.next_iteration))
+
+
+def _wait_for_prefix_checkpoints(
+    outputs: Path,
+    *,
+    target: int,
+    minimum: int,
+    process: subprocess.Popen[str] | None = None,
+) -> tuple[Path, tuple[CheckpointRef, ...]]:
+    """Wait for an observed count of distinct committed prefix checkpoints."""
+
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        refs = _observed_prefix_checkpoints(outputs, target)
+        if len(refs) >= minimum:
+            return refs[-1].checkpoint_dir.parent.parent, refs
+        if process is not None and process.poll() is not None:
+            logs = sorted(outputs.parent.glob("worker-*.log"))
+            detail = "\n".join(path.read_text() for path in logs)
+            raise AssertionError(f"worker exited before a prefix checkpoint (rc={process.returncode})\n{detail}")
+        time.sleep(0.1)
+    raise AssertionError(
+        f"worker wrote fewer than {minimum} distinct committed periodic checkpoints before the target"
     )
 
 
@@ -211,7 +249,9 @@ def _wait_for_checkpoint(
         if process is not None and process.poll() is not None:
             logs = sorted(outputs.parent.glob("worker-*.log"))
             detail = "\n".join(path.read_text() for path in logs)
-            raise AssertionError(f"worker exited before a prefix checkpoint (rc={process.returncode})\n{detail}")
+            raise AssertionError(
+                f"worker exited before a prefix checkpoint (rc={process.returncode})\n{detail}"
+            )
         time.sleep(0.1)
     raise AssertionError("worker wrote no committed periodic checkpoint before the target")
 
@@ -236,7 +276,7 @@ def _trace(path: Path) -> ProcessEvidence:
         pid=int(payload["pid"]),
         seed=int(payload["seed"]),
         seed_source=payload["seed_source"],
-        command=("native_recovery_worker", payload["phase"]),
+        command=tuple(payload.get("command", ())),
         returncode=0,
         stdout="\n".join(lines),
     )
@@ -329,7 +369,19 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         label="prefix",
         trace=tmp_path / "trace-prefix.json",
     )
-    prefix_checkpoint = _kill_prefix(prefix, outputs, batch.target_iterations)
+    prefix_run_dir, observed_prefix_refs = _wait_for_prefix_checkpoints(
+        outputs, target=batch.target_iterations, minimum=2, process=prefix
+    )
+    # Freeze the worker after the observed condition and select the latest
+    # committed checkpoint through the core resolver.  The lower control is
+    # selected from the same observed pair, so it cannot depend on a timing
+    # sleep or on a guessed checkpoint filename.
+    os.kill(prefix.pid, signal.SIGSTOP)
+    os.kill(prefix.pid, signal.SIGKILL)
+    prefix.wait(timeout=30)
+    prefix_checkpoint = _committed_checkpoint(prefix_run_dir)
+    assert prefix_checkpoint is not None
+    assert prefix_checkpoint.next_iteration < batch.target_iterations
     assert prefix.returncode == -signal.SIGKILL
     assert prefix_checkpoint.checkpoint_dir.exists()
 
@@ -624,16 +676,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     reference_trace = _trace(tmp_path / "channel-reference.trace.json")
 
     resume_cursor = prefix_checkpoint.next_iteration
-    complete_refs = sorted(
-        (
-            CheckpointRef.from_directory(path)
-            for root in outputs.rglob("checkpoints")
-            for path in list_complete_checkpoints(root)
-            if int(path.name.removeprefix("step_")) < batch.target_iterations
-        ),
-        key=lambda ref: ref.next_iteration,
-    )
-    lower_refs = [ref for ref in complete_refs if ref.next_iteration < resume_cursor]
+    lower_refs = [ref for ref in observed_prefix_refs if ref.next_iteration < resume_cursor]
     assert lower_refs, "native prefix did not leave a lower cursor for the positive control"
     lower_evidence = CheckpointEvidence.from_ref(
         lower_refs[0],
@@ -703,13 +746,19 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         }
         results[limb] = result
         channel = next(spec.channel for spec in E5_CHANNEL_MAP if spec.limb == limb)
+        reference_first_cursor = next(
+            event.step for event in reference_trace.events if event.channel == "trainer_cursor"
+        )
+        disabled_first_cursor = next(
+            event.step for event in disabled_trace.events if event.channel == "trainer_cursor"
+        )
         if limb == "trainer_cursor":
-            disabled_first = next(
-                event.step
-                for event in disabled_trace.events
-                if event.channel == channel
-            )
-            result[channel] = disabled_first == resume_cursor
+            result[channel] = disabled_first_cursor == resume_cursor
+        else:
+            # Recompute the unaffected cursor from the actual first event in
+            # each fresh process; the generic channel comparison is not a
+            # sufficient cursor observation for another limb's omission.
+            result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
         assert result[channel] is False, limb
 
         if limb == "optimizer":
