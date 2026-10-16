@@ -330,3 +330,51 @@ def test_r3_13b_e5_no_backend_call_assertions_are_present() -> None:
             and not assertion.test.comparators[0].elts
             for assertion in ast.walk(node)
         ), f"scenario lacks its own client_calls == [] assertion: {name}"
+
+
+def test_issue5_executed_arms_derivation_is_not_a_fixed_declaration() -> None:
+    """R3 issue 5, expected GREEN: source-only derivation-sensitivity oracle.
+
+    ``executed_arms`` must be derived from ``real_channel_results`` (the
+    actual measured per-channel outcome mapping) and ``unmeasured_arms``
+    must be derived by comparing the expected channel set against
+    ``executed_arms``, rather than both being independently fixed
+    declarations that happen to agree by construction. This is a
+    source-only AST check of the derivation shape in
+    ``test_native_e1_to_e4_recovery_parity_divergence_and_receipt`` -- it
+    establishes source sensitivity only, not a native science verdict.
+    """
+
+    root = Path(__file__).parents[3]
+    path = root / "tests/integration/test_native_checkpoint_recovery.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    target_function = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "test_native_e1_to_e4_recovery_parity_divergence_and_receipt"
+        ),
+        None,
+    )
+    assert target_function is not None, "target function not found"
+    assigns: dict[str, list[ast.Assign]] = {}
+    for node in ast.walk(target_function):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            assigns.setdefault(node.targets[0].id, []).append(node)
+    executed_assigns = assigns.get("executed_arms", [])
+    unmeasured_assigns = assigns.get("unmeasured_arms", [])
+    assert len(executed_assigns) == 1, "expected exactly one executed_arms assignment"
+    assert len(unmeasured_assigns) == 1, "expected exactly one unmeasured_arms assignment"
+    executed_source = ast.dump(executed_assigns[0].value)
+    unmeasured_source = ast.dump(unmeasured_assigns[0].value)
+    assert "real_channel_results" in executed_source, (
+        "executed_arms is not derived from real_channel_results (the real measured outcome)"
+    )
+    assert "executed_arms" in unmeasured_source, (
+        "unmeasured_arms is not derived by comparing against executed_arms"
+    )
