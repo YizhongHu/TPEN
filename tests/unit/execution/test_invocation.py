@@ -29,6 +29,7 @@ from tpen.execution import (
     capture_science_intent,
     payload_digest,
     run_configured_once,
+    source_config_digest,
     validate_start_receipt,
 )
 
@@ -42,7 +43,9 @@ def _batch() -> tuple[ReadyBatch, ScienceIntent]:
     )
 
     payload = {"science": science, "target_iterations": 3}
-    source_digest = "a" * 64
+    source_digest = source_config_digest(
+        {"model": {"_target_": "tests.helpers.NeverConstructed"}}
+    )
     payload_digest_value = payload_digest(payload)
     config = ExecutionConfig(
         lineage_id="lineage-e3",
