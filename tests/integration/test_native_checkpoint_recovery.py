@@ -790,11 +790,10 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         elif limb == "model":
             result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
             # A model omission changes the model evaluations used by the
-            # sampler and optimizer, and the measured process-RNG channel is
-            # likewise not isolatable through this topology.  Only the cursor
-            # remains independently distinguishable here.
-            for unaffected in ("trainer_cursor",):
-                assert result[unaffected] is True, (limb, unaffected)
+            # sampler and optimizer, and this topology also shifts the
+            # trainer cursor.  The cursor is observed, but it is not an
+            # unaffected channel, so this arm makes no isolation claim.
+            assert result["trainer_cursor"] is False, (limb, "trainer_cursor")
         elif limb == "sampler_mcmc":
             result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
             assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
