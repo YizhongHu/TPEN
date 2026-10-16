@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -104,10 +105,9 @@ def test_b4_native_receipt_hashes_and_unmeasured_fields_remain_green(
 ) -> None:
     receipt = native_qualification_artifacts["receipt"]
     assert isinstance(receipt, dict)
-    expected_source_sha = os.environ.get(
-        "TPEN_REVIEW_EXPECTED_SOURCE_SHA",
-        "a84df60515cb988d0f825cb15f87c97c6c0aad02",
-    )
+    expected_source_sha = os.environ.get("TPEN_REVIEW_EXPECTED_SOURCE_SHA") or subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True
+    ).strip()
     assert receipt["source_sha"] == expected_source_sha
     chain_resume = Path(native.__file__).parents[2] / "tpen" / "execution" / "chain_resume.py"
     assert receipt["adapter_sha"] == hashlib.sha256(chain_resume.read_bytes()).hexdigest()

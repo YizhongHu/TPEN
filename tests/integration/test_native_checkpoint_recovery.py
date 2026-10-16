@@ -650,7 +650,22 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         phase="initial",
         label="channel-prefix",
     )
-    prefix_checkpoint = _kill_prefix(prefix, outputs, batch.target_iterations)
+    # Establish two distinct committed prefix cursors before stopping the
+    # worker.  The lower evidence used by the cursor control must come from
+    # this observed pair, not from a timing assumption about the first
+    # checkpoint.
+    prefix_run_dir, observed_prefix_refs = _wait_for_prefix_checkpoints(
+        outputs,
+        target=batch.target_iterations,
+        minimum=2,
+        process=prefix,
+    )
+    os.kill(prefix.pid, signal.SIGSTOP)
+    os.kill(prefix.pid, signal.SIGKILL)
+    prefix.wait(timeout=30)
+    prefix_checkpoint = _committed_checkpoint(prefix_run_dir)
+    assert prefix_checkpoint is not None
+    assert prefix_checkpoint.next_iteration < batch.target_iterations
     evidence = CheckpointEvidence.from_ref(
         prefix_checkpoint,
         science_input_digest=intent.science_input_digest,
@@ -762,15 +777,18 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         assert result[channel] is False, limb
 
         if limb == "optimizer":
+            result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
             # The real configured topology does not isolate the global-RNG
             # trace from an optimizer-loader omission, so downstream values
             # are evidence, not claimed independent channels.  The resumed
             # cursor remains independently observable.
             assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
         elif limb == "process_rng":
+            result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
             for unaffected in ("model_logabs", "optimizer_update", "sampler_proposal", "trainer_cursor"):
                 assert result[unaffected] is True, (limb, unaffected)
         elif limb == "model":
+            result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
             # A model omission changes the model evaluations used by the
             # sampler and optimizer, and the measured process-RNG channel is
             # likewise not isolatable through this topology.  Only the cursor
@@ -778,6 +796,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             for unaffected in ("trainer_cursor",):
                 assert result[unaffected] is True, (limb, unaffected)
         elif limb == "sampler_mcmc":
+            result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
             assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
 
     assert set(results) == {spec.limb for spec in E5_CHANNEL_MAP}
