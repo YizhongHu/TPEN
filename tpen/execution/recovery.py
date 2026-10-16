@@ -370,18 +370,12 @@ def select_recovery(
             outcome=RecoveryOutcome.NO_CHECKPOINT,
         )
 
-    # No in-lane configured caller supplies an unbound path or ref for an
-    # initial checkpoint.  Refuse those forms in both phases so this boundary
-    # cannot self-stamp a checkpoint binding; durable evidence mappings remain
-    # the explicit form for callers that need an initial checkpoint.
-    if phase in {RecoveryPhase.INITIAL, RecoveryPhase.RECOVERY} and isinstance(
-        evidence, (CheckpointRef, str, Path)
-    ):
+    if phase is RecoveryPhase.RECOVERY and isinstance(evidence, (CheckpointRef, str, Path)):
         return _refused(
             intent,
             phase,
             RefusalCode.INCOMPATIBLE,
-            "checkpoint selection requires evidence with a durable immutable binding",
+            "recovery requires checkpoint evidence with a durable immutable binding",
         )
 
     evidence = _coerce_evidence(evidence, intent)
