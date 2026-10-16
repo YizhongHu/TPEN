@@ -123,3 +123,85 @@ def test_b4_native_receipt_hashes_and_unmeasured_fields_remain_green(
     assert receipt["adapter_sha"] == hashlib.sha256(chain_resume.read_bytes()).hexdigest()
     assert receipt["unmeasured_arms"] == receipt["scientific"]["unmeasured_arms"]
     assert set(receipt["scientific"]["executed_arms"]) == set(receipt["channel_results"])
+
+
+@pytest.mark.integration
+def test_r3_fix5_native_receipt_required_provenance_fields_are_present(
+    native_qualification_artifacts: dict[str, object],
+) -> None:
+    """R3 issue 5, expected GREEN: required-field-presence is a separate check
+    from the exact-command comparison above.
+
+    This deliberately does not re-check the *content* of ``commands`` (that is
+    ``test_b4_native_receipt_commands_match_actual_launch_argv``'s RED
+    assertion, above). A receipt missing or renaming a required provenance
+    key would pass a content comparison vacuously (e.g. ``KeyError`` is not
+    the same failure as a wrong value) while still being a real provenance
+    regression, so field presence is asserted independently and kept
+    separate from the command-text comparison per the reviewer's
+    instruction not to conflate the two results.
+    """
+
+    receipt = native_qualification_artifacts["receipt"]
+    assert isinstance(receipt, dict)
+    required_top_level_fields = {
+        "schema",
+        "source_sha",
+        "adapter_sha",
+        "profile_version",
+        "channel_map_version",
+        "commands",
+        "process_evidence",
+        "channel_results",
+        "checkpoint_faults",
+        "collection_output",
+        "testcase_ids",
+        "junit_identities",
+        "raw_fault_evidence",
+        "restore_disabled_control",
+        "unmeasured_arms",
+        "scheduler",
+        "backend",
+        "wrapper",
+        "application",
+        "scientific",
+    }
+    missing = required_top_level_fields - receipt.keys()
+    assert not missing, f"receipt is missing required provenance fields: {sorted(missing)}"
+    for process_record in receipt["process_evidence"]:
+        assert {"phase", "pid", "seed", "seed_source", "command", "returncode"} <= process_record.keys()
+    assert {"registration_calls", "observation_calls"} <= receipt["wrapper"].keys()
+
+
+@pytest.mark.integration
+def test_r3_issue13_zero_backend_calls_across_post_registration_launches(
+    native_qualification_artifacts: dict[str, object],
+) -> None:
+    """R3 issue 13, expected GREEN: per-scenario zero-backend-call assertion.
+
+    The pristine target (``test_native_e1_to_e4_recovery_parity_divergence_and_receipt``)
+    asserts ``client.register_calls == 1`` and ``client.observe_calls == 1``
+    immediately after ``register_lineage``/``observe_lineage``, before any of
+    the three post-registration scenario launches (recovery/successor,
+    reference, partial-restore control) run. Those three launches go through
+    ``_launch`` (a direct subprocess invocation) and never touch the adapter
+    or client again. Because both call counters are monotonically
+    non-decreasing integers, the final counts recorded in the receipt's
+    ``wrapper`` block equal 1 if and only if none of the three later
+    scenarios made an additional backend call -- so asserting the final
+    counts here is a valid zero-backend-call proof for every one of those
+    three scenarios individually, without needing to re-run or re-instrument
+    each one separately against the shared single native execution.
+    """
+
+    receipt = native_qualification_artifacts["receipt"]
+    assert isinstance(receipt, dict)
+    wrapper = receipt["wrapper"]
+    assert wrapper["registration_calls"] == 1, (
+        "a post-registration scenario (recovery, reference, or partial) made "
+        "an unexpected additional backend registration call"
+    )
+    assert wrapper["observation_calls"] == 1, (
+        "a post-registration scenario (recovery, reference, or partial) made "
+        "an unexpected additional backend observation call"
+    )
