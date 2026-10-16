@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar
@@ -236,6 +236,7 @@ class WorkerStartReceipt:
     recovery_outcome: str
     recovery_selection_digest: str
     checkpoint_content_id: str | None = None
+    declared_overlays: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name in (
@@ -260,6 +261,9 @@ class WorkerStartReceipt:
             object.__setattr__(self, name, _nonnegative_int(getattr(self, name), name))
         if self.checkpoint_content_id is not None:
             object.__setattr__(self, "checkpoint_content_id", _digest(self.checkpoint_content_id, "checkpoint_content_id"))
+        if not isinstance(self.declared_overlays, Mapping):
+            raise TypeError("declared_overlays must be a mapping")
+        object.__setattr__(self, "declared_overlays", dict(self.declared_overlays))
 
     @property
     def receipt_id(self) -> str:
@@ -288,6 +292,7 @@ class WorkerStartReceipt:
             "recovery_outcome": self.recovery_outcome,
             "recovery_selection_digest": self.recovery_selection_digest,
             "checkpoint_content_id": self.checkpoint_content_id,
+            "declared_overlays": dict(self.declared_overlays),
         }
 
     @classmethod
@@ -303,6 +308,7 @@ class WorkerStartReceipt:
             "source_config_digest", "payload_digest", "science_input_digest",
             "target_iterations", "next_iteration", "completed_updates",
             "recovery_outcome", "recovery_selection_digest", "checkpoint_content_id",
+            "declared_overlays",
         )})
 
 
@@ -631,6 +637,7 @@ class WorkerStartGateway:
         evidence: CheckpointEvidence | Mapping[str, Any] | str | Path | None = None,
         attempt_id: str | None = None,
         fault_injector: Callable[[str], None] | None = None,
+        declared_overlays: Mapping[str, Any] | None = None,
     ) -> WorkerInvocation:
         """Select recovery, publish a start receipt, then call TPEN once.
 
@@ -686,6 +693,7 @@ class WorkerStartGateway:
             checkpoint_content_id=(
                 None if decision.checkpoint is None else decision.checkpoint.content_id
             ),
+            declared_overlays=dict(declared_overlays or {}),
         )
         if fault_injector is not None:
             fault_injector("before_receipt_publish")
@@ -778,6 +786,7 @@ class WorkerStartGateway:
             evidence=evidence,
             attempt_id=attempt_id,
             fault_injector=fault_injector,
+            declared_overlays=declared_overlays,
         )
 
     @staticmethod
@@ -887,6 +896,17 @@ def _materialize_configured_worker_config(
     overlay_values = _config_leaves(overlays)
     source_values = _config_leaves(source)
     supplied_values = _config_leaves(supplied)
+    missing_captured = [
+        path
+        for path in source_values
+        if not _is_config_path(path, _RECOVERY_CONFIG_PATHS)
+        and path not in supplied_values
+    ]
+    if missing_captured:
+        raise ReceiptBindingError(
+            "worker config omits captured source leaves: "
+            + ", ".join(sorted(missing_captured))
+        )
     for path, value in supplied_values.items():
         if _is_config_path(path, _RECOVERY_CONFIG_PATHS) or path == "run.root":
             continue
