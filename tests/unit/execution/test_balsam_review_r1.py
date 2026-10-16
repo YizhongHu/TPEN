@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tpen.execution import (
     BalsamAdapter,
     BalsamAdapterStatus,
@@ -32,7 +34,13 @@ from tpen.execution import (
     capture_science_intent,
     payload_digest,
 )
-from tpen.execution.balsam import BALSAM_PARK_SCHEMA, REGISTRATION_PARK_NAME
+from tpen.execution.balsam import (
+    BALSAM_PARK_SCHEMA,
+    BALSAM_REFUSAL_SCHEMA,
+    REGISTRATION_PARK_NAME,
+    REGISTRATION_REFUSAL_NAME,
+)
+from tpen.execution.balsam import BalsamPermanentRefusal
 
 
 class FakeClient:
@@ -142,3 +150,44 @@ def test_submitter_still_returns_receipt_with_stale_race_park(tmp_path: Path) ->
 
     assert client.register_calls == 1
     assert again is not None and again.job_id == receipt.job_id
+
+
+def test_refusal_precedence_is_shared_by_submitter_and_worker(tmp_path: Path) -> None:
+    """A durable typed refusal outranks a valid acknowledgement everywhere."""
+
+    batch, intent = _batch()
+    client = FakeClient()
+    adapter = BalsamAdapter(
+        batch.execution,
+        client,
+        WorkerStartGateway(tmp_path / "outputs"),
+        tmp_path / "receipts",
+    )
+    receipt = adapter.register_lineage(batch)
+    assert receipt is not None
+    refusal_path = tmp_path / "receipts" / batch.lineage_id / REGISTRATION_REFUSAL_NAME
+    refusal_path.write_text(
+        json.dumps(
+            {
+                "schema": BALSAM_REFUSAL_SCHEMA,
+                "lineage_id": batch.lineage_id,
+                "batch_id": batch.batch_id,
+                "ready_batch_digest": batch.identity,
+                "reason": "operator denied this registration",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(BalsamPermanentRefusal, match="operator denied") as submitter:
+        adapter.register_lineage(batch)
+    with pytest.raises(BalsamPermanentRefusal, match="operator denied") as worker:
+        adapter.start(
+            batch=batch,
+            intent=intent,
+            phase=RecoveryPhase.INITIAL,
+            run_once=lambda *_: _completed(),
+            job_id=receipt.job_id,
+        )
+    assert type(submitter.value) is type(worker.value)

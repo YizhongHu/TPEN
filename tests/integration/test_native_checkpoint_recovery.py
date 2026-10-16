@@ -19,7 +19,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
-from tpen.checkpoint import CheckpointRef
+from tpen.checkpoint import CheckpointRef, list_complete_checkpoints
 from tpen.execution import (
     BalsamAdapter,
     BalsamJobObservation,
@@ -219,8 +219,12 @@ def _wait_for_checkpoint(
 
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
-        candidates = sorted(outputs.rglob("checkpoints/step_*/COMPLETE"))
-        prefixes = [path.parent for path in candidates if int(path.parent.name.split("_")[-1]) < target]
+        candidates = sorted(
+            checkpoint
+            for root in outputs.rglob("checkpoints")
+            for checkpoint in list_complete_checkpoints(root)
+        )
+        prefixes = [path for path in candidates if int(path.name.split("_")[-1]) < target]
         if prefixes:
             return prefixes[-1].parent.parent
         if process is not None and process.poll() is not None:
@@ -265,9 +269,9 @@ def _run_dir(output_path: Path) -> Path:
 
 def _final_checkpoint(output_path: Path) -> Path:
     run_dir = _run_dir(output_path)
-    checkpoints = sorted(run_dir.glob("checkpoints/step_*/COMPLETE"))
+    checkpoints = sorted(list_complete_checkpoints(run_dir / "checkpoints"))
     assert checkpoints
-    return checkpoints[-1].parent
+    return checkpoints[-1]
 
 
 def _train_lines(output_path: Path) -> list[tuple[int, str]]:

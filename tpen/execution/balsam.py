@@ -414,7 +414,9 @@ def _observation(value: BalsamJobObservation | Mapping[str, Any], job_id: str) -
         return value
     if not isinstance(value, Mapping):
         raise TypeError("observe_job must return BalsamJobObservation or a mapping")
-    observed_job_id = _canonical_job_id(value.get("job_id", expected_job_id))
+    if "job_id" not in value:
+        raise BalsamBindingError("backend observation does not identify a Job")
+    observed_job_id = _canonical_job_id(value.get("job_id"))
     if observed_job_id != expected_job_id:
         raise BalsamBindingError("backend observation names a different Job")
     return BalsamJobObservation(
@@ -755,17 +757,23 @@ class BalsamAdapter:
     def _write_worker_park(self, batch: ReadyBatch, reason: str) -> None:
         """Persist a worker-start park without blocking later registration."""
 
-        path = self._lineage_directory(batch.lineage_id) / WORKER_PARK_NAME
-        _atomic_write_json(
-            path,
-            {
-                "schema": BALSAM_WORKER_PARK_SCHEMA,
-                "lineage_id": batch.lineage_id,
-                "batch_id": batch.batch_id,
-                "ready_batch_digest": batch.identity,
-                "reason": reason,
-            },
-        )
+        directory = self._lineage_directory(batch.lineage_id)
+        body = {
+            "schema": BALSAM_WORKER_PARK_SCHEMA,
+            "lineage_id": batch.lineage_id,
+            "batch_id": batch.batch_id,
+            "ready_batch_digest": batch.identity,
+            "reason": reason,
+        }
+        path = directory / WORKER_PARK_NAME
+        if path.is_file():
+            try:
+                if _read_json(path) == body:
+                    return
+            except (OSError, ValueError):
+                pass
+            path = directory / f"worker-park-{uuid4().hex}.json"
+        _atomic_write_json(path, body)
 
     def _write_observation(self, batch: ReadyBatch, observed: BalsamJobObservation) -> None:
         """Persist one backend observation for a submitter-side reconciler."""

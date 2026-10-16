@@ -130,6 +130,21 @@ def _runner_module():
     return e5b_polaris_runner
 
 
+def _record_worker_backend_calls(monkeypatch, runner, calls: list[tuple[str, object]]) -> None:
+    """Instrument the real worker client without replacing its product type."""
+
+    def register(self, **kwargs):
+        calls.append(("register_job", kwargs))
+        raise AssertionError("worker attempted Balsam registration")
+
+    def observe(self, job_id):
+        calls.append(("observe_job", job_id))
+        raise AssertionError("worker attempted Balsam observation")
+
+    monkeypatch.setattr(runner.NoLiveBackendClient, "register_job", register)
+    monkeypatch.setattr(runner.NoLiveBackendClient, "observe_job", observe)
+
+
 def test_native_prefix_publishes_evidence_before_bounded_walltime_trap(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -138,6 +153,8 @@ def test_native_prefix_publishes_evidence_before_bounded_walltime_trap(
     root = tmp_path / "native-prefix"
     _prepare(root)
     runner = _runner_module()
+    client_calls: list[tuple[str, object]] = []
+    _record_worker_backend_calls(monkeypatch, runner, client_calls)
     monkeypatch.setenv("PBS_JOBID", "fixture-allocation-1")
 
     def trap(_seconds: float) -> None:
@@ -149,6 +166,7 @@ def test_native_prefix_publishes_evidence_before_bounded_walltime_trap(
 
     assert (root / "checkpoint-evidence.json").is_file()
     assert (root / "prefix-ready.json").is_file()
+    assert client_calls == []
 
 
 def test_native_prefix_nested_run_dir_resolves_full_checkpoint_control(
@@ -165,6 +183,8 @@ def test_native_prefix_nested_run_dir_resolves_full_checkpoint_control(
     root = tmp_path / "native-prefix-control"
     _prepare(root)
     runner = _runner_module()
+    client_calls: list[tuple[str, object]] = []
+    _record_worker_backend_calls(monkeypatch, runner, client_calls)
     monkeypatch.setenv("PBS_JOBID", "fixture-allocation-control")
     monkeypatch.setattr(runner.time, "sleep", lambda _seconds: (_ for _ in ()).throw(PrefixWalltimeTrap()))
     try:
@@ -179,6 +199,7 @@ def test_native_prefix_nested_run_dir_resolves_full_checkpoint_control(
     assert reference is not None
     assert reference.checkpoint_dir.is_dir()
     assert (reference.checkpoint_dir / "COMPLETE").is_file()
+    assert client_calls == []
 
 
 def test_prior_initial_start_without_evidence_parks_before_science(
@@ -189,6 +210,8 @@ def test_prior_initial_start_without_evidence_parks_before_science(
     root = tmp_path / "prior-initial"
     batch, intent = _prepare(root)
     runner = _runner_module()
+    client_calls: list[tuple[str, object]] = []
+    _record_worker_backend_calls(monkeypatch, runner, client_calls)
     prior = BalsamAdapter(
         batch.execution,
         RegisterOnlyClient(),
@@ -224,6 +247,7 @@ def test_prior_initial_start_without_evidence_parks_before_science(
     monkeypatch.setenv("PBS_JOBID", "fixture-allocation-successor")
     runner.run_attempt(job_id="Job42", job_data=_job_data(root))
     assert calls == [], "prior same-Job INITIAL receipt must park before science"
+    assert client_calls == []
     assert not (root / "checkpoint-evidence.json").exists()
 
     # A correct implementation may now publish a durable E3 parked outcome
@@ -258,6 +282,8 @@ def test_first_ever_start_without_evidence_invokes_initial_once(
     root = tmp_path / "first-ever"
     _prepare(root)
     runner = _runner_module()
+    client_calls: list[tuple[str, object]] = []
+    _record_worker_backend_calls(monkeypatch, runner, client_calls)
     calls = []
 
     def spy(*_args, **_kwargs):
@@ -268,6 +294,7 @@ def test_first_ever_start_without_evidence_invokes_initial_once(
     monkeypatch.setenv("PBS_JOBID", "fixture-allocation-first")
     runner.run_attempt(job_id="Job42", job_data=_job_data(root))
     assert len(calls) == 1
+    assert client_calls == []
 
 
 def test_unmodified_worker_client_is_accepted_by_adapter(tmp_path: Path) -> None:

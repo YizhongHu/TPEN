@@ -377,7 +377,7 @@ def test_configured_gateway_materializes_completion_from_core_artifacts(monkeypa
 
     monkeypatch.setattr(run_module, "run_from_config", fake_run)
     result = WorkerStartGateway(tmp_path).start_configured(
-        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        cfg=OmegaConf.create({"model": {"_target_": "tests.helpers.NeverConstructed"}, "run": {"root": "ignored"}}),
         batch=batch,
         intent=intent,
         phase=RecoveryPhase.INITIAL,
@@ -405,7 +405,7 @@ def test_configured_zero_return_without_final_checkpoint_is_parked(monkeypatch, 
 
     monkeypatch.setattr(run_module, "run_from_config", fake_run)
     result = WorkerStartGateway(tmp_path).start_configured(
-        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        cfg=OmegaConf.create({"model": {"_target_": "tests.helpers.NeverConstructed"}, "run": {"root": "ignored"}}),
         batch=batch,
         intent=intent,
         phase=RecoveryPhase.INITIAL,
@@ -428,7 +428,7 @@ def test_configured_gateway_forces_raise_exceptions_for_named_config_refusal(mon
 
     monkeypatch.setattr(run_module, "run_from_config", fake_run)
     result = WorkerStartGateway(tmp_path).start_configured(
-        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        cfg=OmegaConf.create({"model": {"_target_": "tests.helpers.NeverConstructed"}, "run": {"root": "ignored"}}),
         batch=batch,
         intent=intent,
         phase=RecoveryPhase.INITIAL,
@@ -451,7 +451,7 @@ def test_configured_gateway_does_not_classify_training_value_error_as_terminal(m
 
     monkeypatch.setattr(run_module, "run_from_config", fake_run)
     result = WorkerStartGateway(tmp_path).start_configured(
-        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        cfg=OmegaConf.create({"model": {"_target_": "tests.helpers.NeverConstructed"}, "run": {"root": "ignored"}}),
         batch=batch,
         intent=intent,
         phase=RecoveryPhase.INITIAL,
@@ -520,7 +520,7 @@ def test_unreadable_final_checkpoint_is_parked(monkeypatch, tmp_path: Path) -> N
 
     monkeypatch.setattr(run_module, "run_from_config", fake_run)
     result = WorkerStartGateway(tmp_path).start_configured(
-        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        cfg=OmegaConf.create({"model": {"_target_": "tests.helpers.NeverConstructed"}, "run": {"root": "ignored"}}),
         batch=batch,
         intent=intent,
         phase=RecoveryPhase.INITIAL,
@@ -550,7 +550,7 @@ def test_corrupt_checkpoint_manifest_is_terminal(monkeypatch, tmp_path: Path) ->
 
     monkeypatch.setattr(run_module, "run_from_config", fake_run)
     result = WorkerStartGateway(tmp_path).start_configured(
-        cfg=OmegaConf.create({"run": {"root": "ignored"}}),
+        cfg=OmegaConf.create({"model": {"_target_": "tests.helpers.NeverConstructed"}, "run": {"root": "ignored"}}),
         batch=batch,
         intent=intent,
         phase=RecoveryPhase.INITIAL,
