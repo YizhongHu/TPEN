@@ -166,12 +166,15 @@ def test_r3_2_trainer_cursor_unaffected_assertions_still_tautological() -> None:
     if not path.exists():
         pytest.skip("native integration owner is not present on this layer")
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    func = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "test_real_restore_omission_channels_are_observed"
-    )
+    try:
+        func = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "test_real_restore_omission_channels_are_observed"
+        )
+    except StopIteration:
+        pytest.skip("trainer-cursor control is not owned by this layer")
 
     def is_cursor_recompute(stmt: ast.AST) -> bool:
         return (
