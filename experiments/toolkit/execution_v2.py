@@ -88,11 +88,14 @@ def ready_batch_v2(
     payload_copy = json.loads(json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False))
     items = []
     for row in copied_rows:
-        required = ("logical_task_id", "fresh_output_id", "argv", "result_dir")
-        if any(not isinstance(row.get(name), (str, list, tuple)) or not row.get(name) for name in required):
-            raise ValueError("every v2 row needs materialized item fields")
+        for name in ("logical_task_id", "fresh_output_id", "result_dir"):
+            value = row.get(name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"v2 row {name} must be a non-empty string")
         argv = row["argv"]
-        if isinstance(argv, str) or any(not isinstance(part, str) or not part for part in argv):
+        if not isinstance(argv, (list, tuple)) or not argv or any(
+            not isinstance(part, str) or not part for part in argv
+        ):
             raise ValueError("v2 row argv must be a non-empty sequence of strings")
         items.append({
             "invocation_id": row["invocation_id"],
