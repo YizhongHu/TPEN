@@ -784,7 +784,10 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             assert result["trainer_cursor"] is False, (limb, "trainer_cursor")
         elif limb == "process_rng":
             result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
-            for unaffected in ("model_logabs", "optimizer_update", "sampler_proposal", "trainer_cursor"):
+            # In this topology the process-RNG omission also changes the
+            # observed cursor, so cursor is causal rather than unaffected.
+            assert result["trainer_cursor"] is False, (limb, "trainer_cursor")
+            for unaffected in ("model_logabs", "optimizer_update", "sampler_proposal"):
                 assert result[unaffected] is True, (limb, unaffected)
         elif limb == "model":
             result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
