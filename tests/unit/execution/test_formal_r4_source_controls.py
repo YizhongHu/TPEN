@@ -378,3 +378,84 @@ def test_issue5_executed_arms_derivation_is_not_a_fixed_declaration() -> None:
     assert "executed_arms" in unmeasured_source, (
         "unmeasured_arms is not derived by comparing against executed_arms"
     )
+
+
+def _target_before_root_assertion() -> ast.Assert:
+    root = Path(__file__).parents[3]
+    path = root / "tests/integration/test_native_checkpoint_recovery.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    target_function = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "test_real_checkpoint_boundary_faults_are_typed"
+        ),
+        None,
+    )
+    assert target_function is not None, "target function not found"
+    before_root_asserts = [
+        node
+        for node in ast.walk(target_function)
+        if isinstance(node, ast.Assert) and "before_root" in ast.dump(node)
+    ]
+    assert len(before_root_asserts) == 1, (
+        f"expected exactly one before_root assertion in the pristine target, found {len(before_root_asserts)}"
+    )
+    return before_root_asserts[0]
+
+
+def _before_root_predicate(before_root: Path) -> bool:
+    """Extract the actual ``before_root`` assertion's test expression
+    *from the live target function's own source* and evaluate it -- not a
+    separate reimplementation. A revert mutant changes the real source text
+    (e.g. to an old raw-glob form); extracting and evaluating fresh each
+    call means this predicate automatically reflects that mutation instead
+    of silently bypassing it via a hardcoded copy of the pre-mutation logic.
+    """
+
+    from tpen.checkpoint import list_complete_checkpoints
+
+    expr_source = ast.unparse(_target_before_root_assertion().test)
+    namespace = {"before_root": before_root, "list_complete_checkpoints": list_complete_checkpoints}
+    return eval(expr_source, namespace)  # noqa: S307 -- trusted repo source, not external input
+
+
+def test_issue6_before_root_predicate_accepts_staged(tmp_path: Path) -> None:
+    """R3 issue 6, CR-only third discovery predicate: predicate-only
+    evaluation, not full native science.
+
+    ``test_real_checkpoint_boundary_faults_are_typed``'s ``before_root``
+    assertion is the third ``list_complete_checkpoints`` call site in this
+    file, excluded from the existing fix6 sensitivity coverage (which only
+    verifies the two ``_wait_for_checkpoint``/``_final_checkpoint`` helper
+    call sites). Separate function from the committed-rejection control
+    below so each can carry its own RED/GREEN polarity under the dedicated
+    revert mutant (a single function sharing both assertions could not --
+    the first failing assert would hide the second's independent result).
+    ``_before_root_predicate`` itself enforces the exactly-one-assertion
+    structural requirement before extracting it.
+    """
+
+    staged_root = tmp_path / "staged"
+    staged_dir = staged_root / "checkpoints" / "step_000001.tmp"
+    staged_dir.mkdir(parents=True)
+    (staged_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    (staged_dir / "COMPLETE").write_text("", encoding="utf-8")
+    assert _before_root_predicate(staged_root) is True, (
+        "the real before_root predicate must accept staged-only (uncommitted, .tmp) checkpoint state"
+    )
+
+
+def test_issue6_before_root_predicate_rejects_committed(tmp_path: Path) -> None:
+    """R3 issue 6, CR-only third discovery predicate, GREEN control: the
+    real predicate must actually discriminate, not vacuously accept
+    everything -- a genuinely committed checkpoint must be rejected."""
+
+    committed_root = tmp_path / "committed"
+    committed_dir = committed_root / "checkpoints" / "step_000001"
+    committed_dir.mkdir(parents=True)
+    (committed_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    (committed_dir / "COMPLETE").write_text("", encoding="utf-8")
+    assert _before_root_predicate(committed_root) is False, (
+        "the real before_root predicate must reject a genuinely committed checkpoint"
+    )
