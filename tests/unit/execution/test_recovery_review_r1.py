@@ -434,6 +434,31 @@ def test_initial_phase_with_valid_evidence_selects_initial_checkpoint(tmp_path: 
     assert decision.completed_updates == ref.completed_updates
 
 
+@pytest.mark.parametrize("raw_form", ["path", "ref"])
+def test_initial_phase_refuses_unbound_raw_checkpoint_forms(
+    tmp_path: Path, raw_form: str
+) -> None:
+    """Initial selection rejects raw paths and refs without durable binding.
+
+    No configured TPEN caller in this lane relies on these raw forms for an
+    initial checkpoint.  Serialized :class:`CheckpointEvidence` remains the
+    supported explicit form, so a raw path or pre-built ref cannot be
+    self-stamped with the current intent at the selection boundary.
+    """
+
+    intent = _intent()
+    checkpoint_dir = _checkpoint(tmp_path, step=5, payload=TrainResume().to_manifest())
+    ref = CheckpointRef.from_directory(checkpoint_dir)
+    evidence: object = checkpoint_dir if raw_form == "path" else ref
+
+    decision = select_recovery(intent, phase=RecoveryPhase.INITIAL, evidence=evidence)  # type: ignore[arg-type]
+
+    assert decision.outcome is RecoveryOutcome.REFUSED
+    assert decision.refusal is not None
+    assert decision.refusal.code is RefusalCode.INCOMPATIBLE
+    assert "durable immutable binding" in decision.refusal.message
+
+
 def test_missing_required_component_file_refuses_incomplete(tmp_path: Path) -> None:
     """Expected GREEN at head c8570c21.
 
