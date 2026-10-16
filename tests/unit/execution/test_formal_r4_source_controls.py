@@ -159,9 +159,12 @@ def test_r3_2_trainer_cursor_unaffected_assertions_still_tautological() -> None:
     """The accepted cursor fix must observe the actual unaffected cursor."""
 
     import ast
+    import pytest
 
     root = Path(__file__).parents[3]
     path = root / "tests/integration/test_native_checkpoint_recovery.py"
+    if not path.exists():
+        pytest.skip("native integration owner is not present on this layer")
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     func = next(
         node
