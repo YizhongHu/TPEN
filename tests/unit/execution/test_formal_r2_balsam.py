@@ -19,7 +19,7 @@ from tpen.execution import (
     WorkerStartGateway,
     capture_science_intent,
 )
-from tpen.execution.config import payload_digest
+from tpen.execution.config import payload_digest, source_config_digest
 
 
 class FakeClient:
@@ -44,7 +44,7 @@ def _batch() -> tuple[ReadyBatch, object]:
         lineage_id="r2-e4-lineage",
         backend="balsam",
         recovery="checkpoint",
-        source_config_digest="a" * 64,
+        source_config_digest=source_config_digest({}),
         payload_digest=payload_digest(payload),
         backend_options={"site": "review"},
     )
