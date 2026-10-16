@@ -3,11 +3,9 @@
 Target layer: E3 @ 7d86fe49f4f6b66344c5b6bcce2f2f01f605ccf4 (also run at CR head).
 
 Polarity at the E3 head:
-- test_overlay_reaches_concrete_runner_load: EXPECTED RED. When the config has
-  a top-level ``load`` key, the overlay is written only there; a concrete
-  (non-interpolated) ``runner.load`` keeps its stale value, so the runner
-  would silently run WITHOUT the selected checkpoint while receipts claim
-  RECOVERY.
+- test_overlay_reaches_concrete_runner_load: GREEN. The configured runner
+  receives the selected checkpoint overlay even when a concrete top-level
+  ``load`` key and a concrete ``runner.load`` value were both supplied.
 - test_overlay_flows_through_interpolated_runner_load: EXPECTED GREEN (pin).
 - test_overlay_force_added_when_no_load_keys: EXPECTED GREEN (pin).
 """
