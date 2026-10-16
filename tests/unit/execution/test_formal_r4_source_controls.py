@@ -65,6 +65,42 @@ def test_docguard_doc_files_parameter_cases_match_layer_ownership() -> None:
     assert actual == ownership[layer]
 
 
+def test_r3_13b_e5_no_backend_call_assertions_are_present() -> None:
+    """Each E5 scenario must assert that no backend call was made."""
+
+    import ast
+
+    root = Path(__file__).parents[3]
+    path = root / "tests/unit/execution/test_formal_r2_e5.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    scenario_names = (
+        "test_native_prefix_publishes_evidence_before_bounded_walltime_trap",
+        "test_native_prefix_nested_run_dir_resolves_full_checkpoint_control",
+        "test_prior_initial_start_without_evidence_parks_before_science",
+        "test_first_ever_start_without_evidence_invokes_initial_once",
+    )
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for name in scenario_names:
+        node = functions.get(name)
+        assert node is not None, f"missing E5 scenario function: {name}"
+        assert any(
+            isinstance(assertion, ast.Assert)
+            and isinstance(assertion.test, ast.Compare)
+            and isinstance(assertion.test.left, ast.Name)
+            and assertion.test.left.id == "client_calls"
+            and len(assertion.test.ops) == 1
+            and isinstance(assertion.test.ops[0], ast.Eq)
+            and len(assertion.test.comparators) == 1
+            and isinstance(assertion.test.comparators[0], ast.List)
+            and not assertion.test.comparators[0].elts
+            for assertion in ast.walk(node)
+        ), f"scenario lacks its own client_calls == [] assertion: {name}"
+
+
 def test_r3_2_trainer_cursor_unaffected_assertions_still_tautological() -> None:
     """The accepted cursor fix must observe the actual unaffected cursor."""
 
