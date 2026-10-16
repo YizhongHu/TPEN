@@ -2,15 +2,67 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
 def test_r3_13a_corrected_docstrings_are_present() -> None:
     root = Path(__file__).parents[3]
-    source = (root / "tests/unit/execution/test_invocation_review_r1.py").read_text(
-        encoding="utf-8"
+    layer = os.environ.get("TPEN_REVIEW_LAYER", "CR")
+    docs = {
+        "E3": ("tests/unit/execution/test_invocation_review_r1.py",),
+        "E5": ("tests/unit/execution/test_invocation_review_r1.py",),
+        "CR": (
+            "tests/unit/execution/test_invocation_review_r1.py",
+            "tests/unit/execution/test_chain_resume_review_r1.py",
+        ),
+    }
+    assert layer in docs
+    for relative in docs[layer]:
+        source = (root / relative).read_text(encoding="utf-8")
+        assert "EXPECTED RED" not in source
+
+
+def test_docguard_doc_files_parameter_cases_match_layer_ownership() -> None:
+    """The parameterized docguard must cover exactly this layer's owned files."""
+
+    import ast
+    import pytest
+
+    layer = os.environ.get("TPEN_REVIEW_LAYER", "CR")
+    ownership = {
+        "E4": {Path("tpen/execution/balsam.py")},
+        "E5": {
+            Path("tpen/execution/balsam.py"),
+            Path("tools/e5b_polaris_app.py"),
+            Path("tools/e5b_polaris_pilot.py"),
+        },
+        "CR": {
+            Path("tpen/execution/balsam.py"),
+            Path("tools/e5b_polaris_app.py"),
+            Path("tools/e5b_polaris_pilot.py"),
+        },
+    }
+    if layer not in ownership:
+        pytest.skip(f"no docguard ownership map for layer {layer}")
+    root = Path(__file__).parents[3]
+    source = root / "tests/unit/execution/test_formal_r1_static.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    assign = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "DOC_FILES"
     )
-    assert "EXPECTED RED" not in source
+    actual: set[Path] = set()
+    for element in assign.value.elts:
+        assert isinstance(element, ast.Call) and element.args
+        literal = element.args[0]
+        assert isinstance(literal, ast.Constant) and isinstance(literal.value, str)
+        actual.add(Path(literal.value))
+    assert actual == ownership[layer]
 
 
 def test_r3_2_trainer_cursor_unaffected_assertions_still_tautological() -> None:
