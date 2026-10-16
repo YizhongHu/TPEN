@@ -25,6 +25,7 @@ from tpen.execution import (
     WorkerStartGateway,
     capture_science_intent,
     payload_digest,
+    source_config_digest,
 )
 
 
@@ -63,7 +64,9 @@ def _batch(*, payload: dict[str, object] | None = None, backend_options=None):
         source_config={"model": {"_target_": "tests.helpers.NeverConstructed"}},
     )
     payload = payload or {"science": science, "target_iterations": 2}
-    source_digest = "a" * 64
+    source_digest = source_config_digest(
+        {"model": {"_target_": "tests.helpers.NeverConstructed"}}
+    )
     payload_digest_value = payload_digest(payload)
     config = ExecutionConfig(
         lineage_id="lineage-balsam",

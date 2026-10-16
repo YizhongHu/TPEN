@@ -33,6 +33,7 @@ from tpen.execution import (
     WorkerStartGateway,
     capture_science_intent,
     payload_digest,
+    source_config_digest,
 )
 from tpen.execution.balsam import (
     BALSAM_PARK_SCHEMA,
@@ -60,7 +61,7 @@ def _batch():
     science = {"system": "hooke", "electrons": 2}
     intent = capture_science_intent(science, target_iterations=2)
     payload = {"science": science, "target_iterations": 2}
-    source_digest = "a" * 64
+    source_digest = source_config_digest({})
     digest = payload_digest(payload)
     config = ExecutionConfig(
         lineage_id="lineage-review-park",
