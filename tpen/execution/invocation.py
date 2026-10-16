@@ -650,6 +650,10 @@ class WorkerStartGateway:
 
         if not isinstance(intent, ScienceIntent):
             raise TypeError("intent must be a ScienceIntent")
+        if source_config_digest(intent.source_config) != batch.source_config_digest:
+            raise ReceiptBindingError(
+                "science intent source configuration is bound to a different ready batch"
+            )
         if intent.science_input_digest != batch.science_input_digest:
             raise ReceiptBindingError("science intent is bound to a different ready batch")
         if intent.target_iterations != batch.target_iterations:
@@ -809,13 +813,18 @@ class WorkerStartGateway:
         """
 
         namespace = Path(namespace)
-        path = namespace / OUTCOME_RECEIPT_NAME
-        if path.is_file():
-            return WorkerOutcomeReceipt.from_mapping(_read_json(path))
         start_path = namespace / START_RECEIPT_NAME
         if not start_path.is_file():
             return None
         start = WorkerStartReceipt.from_mapping(_read_json(start_path))
+        path = namespace / OUTCOME_RECEIPT_NAME
+        if path.is_file():
+            outcome = WorkerOutcomeReceipt.from_mapping(_read_json(path))
+            if outcome.start_receipt_digest != start.receipt_id:
+                raise ReceiptBindingError(
+                    "worker outcome receipt is bound to a different start receipt"
+                )
+            return outcome
         parked = WorkerOutcomeReceipt(
             start_receipt_digest=start.receipt_id,
             outcome=InvocationOutcome.PARKED,
@@ -851,10 +860,15 @@ def _is_config_path(path: str, prefixes: frozenset[str]) -> bool:
     return any(path == prefix or path.startswith(f"{prefix}.") for prefix in prefixes)
 
 
-def _has_config_path(values: Mapping[str, Any], prefix: str) -> bool:
-    """Return whether a flattened config contains a concrete path subtree."""
+def _has_concrete_config_path(values: Mapping[str, Any], prefix: str) -> bool:
+    """Return whether a named config path contains a non-null load value."""
 
-    return any(path == prefix or path.startswith(f"{prefix}.") for path in values)
+    for path, value in values.items():
+        if path == prefix:
+            return value is not None
+        if path.startswith(f"{prefix}."):
+            return True
+    return False
 
 
 def _materialize_configured_worker_config(
@@ -924,7 +938,8 @@ def _materialize_configured_worker_config(
 
     for path in _RECOVERY_CONFIG_PATHS:
         if decision.load is None and (
-            _has_config_path(source_values, path) or _has_config_path(supplied_values, path)
+            _has_concrete_config_path(source_values, path)
+            or _has_concrete_config_path(supplied_values, path)
         ):
             raise ReceiptBindingError(
                 "INITIAL configured run contains an undeclared concrete runner.load"
