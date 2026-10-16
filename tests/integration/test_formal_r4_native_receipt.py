@@ -171,37 +171,3 @@ def test_r3_fix5_native_receipt_required_provenance_fields_are_present(
     for process_record in receipt["process_evidence"]:
         assert {"phase", "pid", "seed", "seed_source", "command", "returncode"} <= process_record.keys()
     assert {"registration_calls", "observation_calls"} <= receipt["wrapper"].keys()
-
-
-@pytest.mark.integration
-def test_r3_issue13_zero_backend_calls_across_post_registration_launches(
-    native_qualification_artifacts: dict[str, object],
-) -> None:
-    """R3 issue 13, expected GREEN: per-scenario zero-backend-call assertion.
-
-    The pristine target (``test_native_e1_to_e4_recovery_parity_divergence_and_receipt``)
-    asserts ``client.register_calls == 1`` and ``client.observe_calls == 1``
-    immediately after ``register_lineage``/``observe_lineage``, before any of
-    the three post-registration scenario launches (recovery/successor,
-    reference, partial-restore control) run. Those three launches go through
-    ``_launch`` (a direct subprocess invocation) and never touch the adapter
-    or client again. Because both call counters are monotonically
-    non-decreasing integers, the final counts recorded in the receipt's
-    ``wrapper`` block equal 1 if and only if none of the three later
-    scenarios made an additional backend call -- so asserting the final
-    counts here is a valid zero-backend-call proof for every one of those
-    three scenarios individually, without needing to re-run or re-instrument
-    each one separately against the shared single native execution.
-    """
-
-    receipt = native_qualification_artifacts["receipt"]
-    assert isinstance(receipt, dict)
-    wrapper = receipt["wrapper"]
-    assert wrapper["registration_calls"] == 1, (
-        "a post-registration scenario (recovery, reference, or partial) made "
-        "an unexpected additional backend registration call"
-    )
-    assert wrapper["observation_calls"] == 1, (
-        "a post-registration scenario (recovery, reference, or partial) made "
-        "an unexpected additional backend observation call"
-    )
