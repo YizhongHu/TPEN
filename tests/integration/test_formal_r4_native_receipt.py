@@ -45,20 +45,37 @@ def native_qualification_artifacts(tmp_path_factory: pytest.TempPathFactory) -> 
 
     patch = pytest.MonkeyPatch()
     patch.setattr(native, "_launch", recording_launch)
+    capture_path = root / "captured-launches.json"
     try:
         # This is the original CR target function, imported without edits.
         _native_target(root)
     finally:
         patch.undo()
+        # Persist the raw capture even if the pristine target above raised,
+        # so the actual argv/PID evidence survives independent of whether
+        # the target's own assertions (or ours) pass.
+        capture_path.write_text(json.dumps(launches, indent=2), encoding="utf-8")
     receipt_path = root / "qualification-receipt.json"
     return {
         "receipt": json.loads(receipt_path.read_text(encoding="utf-8")),
         "launches": launches,
+        "capture_path": capture_path,
+    }
+
+
+def _by_label(launches: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    return {
+        argv[argv.index("--label") + 1]: record
+        for record in launches
+        if isinstance(record, dict)
+        and isinstance(record.get("argv"), list)
+        and "--label" in record["argv"]
+        for argv in (record["argv"],)
     }
 
 
 @pytest.mark.integration
-def test_b4_native_receipt_commands_match_actual_launch_argv_and_pids(
+def test_b4_native_receipt_commands_match_actual_launch_argv(
     native_qualification_artifacts: dict[str, object],
 ) -> None:
     """Expected RED: receipt commands must equal untouched native argv."""
@@ -67,16 +84,23 @@ def test_b4_native_receipt_commands_match_actual_launch_argv_and_pids(
     launches = native_qualification_artifacts["launches"]
     assert isinstance(receipt, dict)
     assert isinstance(launches, list)
-    by_label = {
-        argv[argv.index("--label") + 1]: record
-        for record in launches
-        if isinstance(record, dict)
-        and isinstance(record.get("argv"), list)
-        and "--label" in record["argv"]
-        for argv in (record["argv"],)
-    }
+    by_label = _by_label(launches)
     assert {"reference", "recovery"} <= by_label.keys()
     assert receipt["commands"] == [by_label["reference"]["argv"], by_label["recovery"]["argv"]]
+
+
+@pytest.mark.integration
+def test_b4_native_receipt_process_evidence_pids_match_actual_launch_pids(
+    native_qualification_artifacts: dict[str, object],
+) -> None:
+    """Expected GREEN, independent of the command-text assertion above."""
+
+    receipt = native_qualification_artifacts["receipt"]
+    launches = native_qualification_artifacts["launches"]
+    assert isinstance(receipt, dict)
+    assert isinstance(launches, list)
+    by_label = _by_label(launches)
+    assert {"reference", "recovery"} <= by_label.keys()
     evidence_by_phase = {entry["phase"]: entry for entry in receipt["process_evidence"]}
     assert evidence_by_phase["initial"]["pid"] == by_label["reference"]["pid"]
     assert evidence_by_phase["recovery"]["pid"] == by_label["recovery"]["pid"]

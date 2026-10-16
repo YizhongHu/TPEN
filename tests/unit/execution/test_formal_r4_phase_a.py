@@ -113,16 +113,26 @@ def test_a1_source_digest_binding_refuses_changed_intent_and_cfg_before_science(
 
 
 def test_a1_matching_source_digest_control_invokes_once(monkeypatch, tmp_path: Path) -> None:
+    """The matching-path control also pins the frozen receipt-before-call order."""
+
     source = {"runner": {"_target_": "tests.helpers.NeverConstructed"}}
     batch, intent = _batch(source)
     calls: list[object] = []
+    receipt_already_durable: list[bool] = []
     from tpen import run as run_module
 
-    monkeypatch.setattr(run_module, "run_from_config", lambda config, **kwargs: calls.append(config) or 0)
+    def fake_run(config, **kwargs):
+        calls.append(config)
+        run_root = Path(config.run.root)
+        receipt_already_durable.append((run_root.parent / "start.json").is_file())
+        return 0
+
+    monkeypatch.setattr(run_module, "run_from_config", fake_run)
     WorkerStartGateway(tmp_path / "outputs").start_configured(
         cfg=OmegaConf.create(source), batch=batch, intent=intent, phase=RecoveryPhase.INITIAL
     )
     assert len(calls) == 1
+    assert receipt_already_durable == [True]
 
 
 @pytest.mark.parametrize(
@@ -187,6 +197,36 @@ def test_a3_matching_outcome_control_reconciles(tmp_path: Path) -> None:
     reconciled = WorkerStartGateway.reconcile(invocation.output_path.parent)
     assert reconciled is not None
     assert reconciled.start_receipt_digest == invocation.start.receipt_id
+
+
+def test_a3_missing_outcome_receipt_parks_durably_on_reconcile(tmp_path: Path) -> None:
+    """A crash after the start receipt but before any outcome write still parks durably."""
+
+    source = {"runner": {"_target_": "tests.helpers.NeverConstructed"}}
+    batch, intent = _batch(source)
+    gateway = WorkerStartGateway(tmp_path / "outputs")
+
+    def crash_after_publish(stage: str) -> None:
+        if stage == "receipt_published":
+            raise RuntimeError("simulated crash after start receipt, before outcome")
+
+    with pytest.raises(RuntimeError):
+        gateway.start(
+            batch=batch,
+            intent=intent,
+            phase=RecoveryPhase.INITIAL,
+            run_once=_completed,
+            fault_injector=crash_after_publish,
+        )
+    namespaces = list((tmp_path / "outputs").glob("*/*/*"))
+    assert len(namespaces) == 1
+    namespace = namespaces[0]
+    assert (namespace / "start.json").is_file()
+    assert not (namespace / "outcome.json").exists()
+    reconciled = WorkerStartGateway.reconcile(namespace)
+    assert reconciled is not None
+    assert reconciled.outcome is InvocationOutcome.PARKED
+    assert (namespace / "outcome.json").is_file()
 
 
 def test_a4_backend_options_are_bound_before_registration(tmp_path: Path) -> None:

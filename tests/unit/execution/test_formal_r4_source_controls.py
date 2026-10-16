@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -128,24 +129,155 @@ _PORTS = {
 }
 
 
-def _function_names(root: Path) -> set[str]:
+def _tracked_python_files(root: Path) -> list[Path]:
+    """Enumerate tracked ``*.py`` paths only; an untracked stray must not pad the census."""
+
+    completed = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.py"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    return [root / entry for entry in completed.stdout.decode("utf-8").split("\0") if entry]
+
+
+def _function_names(root: Path) -> tuple[set[str], list[str]]:
     names: set[str] = set()
-    for path in root.rglob("*.py"):
-        if any(part in {".venv", ".git", "__pycache__"} for part in path.parts):
-            continue
+    errors: list[str] = []
+    for path in _tracked_python_files(root):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (OSError, SyntaxError):
+        except (OSError, SyntaxError) as exc:
+            errors.append(f"{path}: {exc}")
             continue
         names.update(node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
-    return names
+    return names, errors
 
 
 def test_whole_tree_r1_r2_r3_port_census_has_required_functions() -> None:
     layer = os.environ.get("TPEN_REVIEW_LAYER", "CR")
     assert layer in _PORTS
-    missing = sorted(_PORTS[layer] - _function_names(Path(__file__).parents[3]))
+    names, errors = _function_names(Path(__file__).parents[3])
+    # Fail closed: a file that cannot be parsed must not be silently excluded
+    # from the census, since that would let a missing function hide behind
+    # an unrelated syntax error.
+    assert not errors, f"tracked-tree AST parse failures (fail-closed): {errors}"
+    missing = sorted(_PORTS[layer] - names)
     assert not missing, f"missing accepted reviewer functions at {layer}: {missing}"
+
+
+_DOC_FILE_OWNERSHIP = {
+    "E4": {Path("tpen/execution/balsam.py")},
+    "E5": {
+        Path("tpen/execution/balsam.py"),
+        Path("tools/e5b_polaris_app.py"),
+        Path("tools/e5b_polaris_pilot.py"),
+    },
+    "CR": {
+        Path("tpen/execution/balsam.py"),
+        Path("tools/e5b_polaris_app.py"),
+        Path("tools/e5b_polaris_pilot.py"),
+    },
+}
+
+
+def test_docguard_doc_files_parameter_cases_match_layer_ownership() -> None:
+    """E4 owns only balsam.py for the no-local-provenance docguard; E5 adds the app/pilot tool files.
+
+    The function name ``test_review_docstrings_contain_no_local_provenance``
+    already exists at E4, so a name-only census cannot see this ownership
+    split; this control inspects the ``DOC_FILES`` parametrize tuple itself.
+    """
+
+    layer = os.environ.get("TPEN_REVIEW_LAYER", "CR")
+    if layer not in _DOC_FILE_OWNERSHIP:
+        pytest.skip(f"no docguard ownership map for layer {layer}")
+    root = Path(__file__).parents[3]
+    path = root / "tests/unit/execution/test_formal_r1_static.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    assign = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "DOC_FILES"
+    )
+    actual: set[Path] = set()
+    for element in assign.value.elts:
+        assert isinstance(element, ast.Call) and element.args
+        literal = element.args[0]
+        assert isinstance(literal, ast.Constant) and isinstance(literal.value, str)
+        actual.add(Path(literal.value))
+    assert actual == _DOC_FILE_OWNERSHIP[layer]
+
+
+def test_r3_2_trainer_cursor_unaffected_assertions_still_tautological() -> None:
+    """Source-only B3 residual control.
+
+    ``result["trainer_cursor"]`` is produced once, generically, by comparing
+    ``first_subsequent_event(...).value`` between the reference and disabled
+    trace at ``resume_step=resume_cursor - 1``.  For the cursor's own channel
+    that value IS the step number, so the comparison is true by construction
+    regardless of whether the cursor was actually observed as unaffected.
+    Only the ``limb == "trainer_cursor"`` branch recomputes a non-tautological
+    cursor result; the other branches (optimizer, model, sampler_mcmc,
+    process_rng) still assert the generic, tautological value. Disposition 2
+    calls this a residual, not a full fix; this control is expected RED until
+    that disposition is applied upstream. The direct-first cursor test suite
+    (fix 2) and the real omission/positive/naming fixes remain valid GREEN
+    controls and are untouched here.
+    """
+
+    root = Path(__file__).parents[3]
+    path = root / "tests/integration/test_native_checkpoint_recovery.py"
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    func = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "test_real_restore_omission_channels_are_observed"
+    )
+
+    def _is_cursor_recompute(stmt: ast.AST) -> bool:
+        return (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Subscript)
+            and isinstance(stmt.targets[0].value, ast.Name)
+            and stmt.targets[0].value.id == "result"
+        )
+
+    non_cursor_limbs = {"optimizer", "model", "sampler_mcmc", "process_rng"}
+    tautological_branches: list[str] = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == "limb"
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and isinstance(test.comparators[0], ast.Constant)
+        ):
+            continue
+        limb_literal = test.comparators[0].value
+        if limb_literal not in non_cursor_limbs:
+            continue
+        references_cursor = any(
+            isinstance(sub, ast.Constant) and sub.value == "trainer_cursor" for sub in ast.walk(node)
+        )
+        recomputes_cursor = any(_is_cursor_recompute(stmt) for stmt in ast.walk(node))
+        if references_cursor and not recomputes_cursor:
+            tautological_branches.append(limb_literal)
+
+    assert not tautological_branches, (
+        "still-tautological trainer_cursor assertions in branches: "
+        f"{tautological_branches}"
+    )
 
 
 def test_r3_13a_corrected_docstrings_are_present() -> None:
