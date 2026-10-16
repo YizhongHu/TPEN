@@ -38,7 +38,7 @@ from pathlib import Path
 
 import pytest
 
-from tpen.checkpoint import CheckpointRef
+from tpen.checkpoint import CheckpointRef, list_complete_checkpoints
 from tpen.execution import BalsamAdapter, WorkerStartGateway
 from tpen.execution.chain_resume import ChannelParityError, compare_channel_parity
 from tpen.execution.recovery import CheckpointEvidence
@@ -57,11 +57,18 @@ def _wait_for_two_prefix_checkpoints(outputs: Path, *, target: int, process) -> 
 
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
-        complete = sorted(outputs.rglob("checkpoints/step_*/COMPLETE"))
+        # The checkpoint writer stages ``step_NNNNNN.tmp/`` (COMPLETE included)
+        # before its commit rename, so discovery must use the core predicate
+        # rather than a ``step_*/COMPLETE`` glob that matches the staging dir.
+        complete = [
+            path
+            for root in sorted(outputs.rglob("checkpoints"))
+            for path in list_complete_checkpoints(root)
+        ]
         prefixes = [
-            path.parent
+            path
             for path in complete
-            if int(path.parent.name.split("_")[-1]) < target
+            if int(path.name.removeprefix("step_")) < target
         ]
         if len(prefixes) >= 2:
             return prefixes
