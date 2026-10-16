@@ -221,6 +221,65 @@ def _atomic_write_json(path: Path, data: Mapping[str, Any]) -> None:
             pass
 
 
+def _publish_distinct_json(path: Path, data: Mapping[str, Any]) -> None:
+    """Publish an event without replacing a distinct earlier event.
+
+    The canonical path is retained for the first event.  A same-body repeat is
+    idempotent; a different body is published under a unique sibling name.
+    A temporary file is linked into place with ``O_EXCL``-equivalent link
+    semantics, so concurrent first writers cannot overwrite one another.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = canonical_payload_bytes(data) + b"\n"
+    stem = path.stem
+    suffix = path.suffix
+    candidates = [path, *sorted(path.parent.glob(f"{stem}-*{suffix}"))]
+    for candidate in candidates:
+        try:
+            if _read_json(candidate) == dict(data):
+                return
+        except (OSError, ValueError):
+            continue
+
+    candidate = path
+    while True:
+        temporary = candidate.with_name(f".{candidate.name}.{uuid4().hex}.tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, candidate)
+            except FileExistsError:
+                if candidate == path:
+                    try:
+                        if _read_json(candidate) == dict(data):
+                            return
+                    except (OSError, ValueError):
+                        pass
+                    candidate = path.with_name(f"{stem}-{uuid4().hex}{suffix}")
+                    continue
+                candidate = path.with_name(f"{stem}-{uuid4().hex}{suffix}")
+                continue
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _create_exclusive_marker(path: Path) -> bool:
     """Create a durable one-line marker, returning false when it exists."""
 
@@ -588,6 +647,8 @@ class BalsamAdapter:
         for name in ("lineage_id", "source_config_digest", "payload_digest"):
             if getattr(batch, name) != getattr(self.execution, name):
                 raise BalsamBindingError(f"batch {name} differs from execution configuration")
+        if batch.execution.backend_options != self.execution.backend_options:
+            raise BalsamBindingError("batch backend options differ from execution configuration")
 
     def _intent(self, batch: ReadyBatch) -> BalsamRegistrationIntent:
         """Build the immutable intent that identifies one registration."""
@@ -743,7 +804,7 @@ class BalsamAdapter:
         """Persist an ambiguous registration outcome without resubmission."""
 
         _, _, park_path, _, _ = self._paths(batch.lineage_id)
-        _atomic_write_json(
+        _publish_distinct_json(
             park_path,
             {
                 "schema": BALSAM_PARK_SCHEMA,
@@ -766,14 +827,7 @@ class BalsamAdapter:
             "reason": reason,
         }
         path = directory / WORKER_PARK_NAME
-        if path.is_file():
-            try:
-                if _read_json(path) == body:
-                    return
-            except (OSError, ValueError):
-                pass
-            path = directory / f"worker-park-{uuid4().hex}.json"
-        _atomic_write_json(path, body)
+        _publish_distinct_json(path, body)
 
     def _write_observation(self, batch: ReadyBatch, observed: BalsamJobObservation) -> None:
         """Persist one backend observation for a submitter-side reconciler."""
@@ -797,7 +851,7 @@ class BalsamAdapter:
         """Persist an observation uncertainty without blocking worker start."""
 
         path = self._lineage_directory(batch.lineage_id) / OBSERVATION_PARK_NAME
-        _atomic_write_json(
+        _publish_distinct_json(
             path,
             {
                 "schema": BALSAM_OBSERVATION_PARK_SCHEMA,
