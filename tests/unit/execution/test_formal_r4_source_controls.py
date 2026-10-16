@@ -2,8 +2,59 @@
 
 from __future__ import annotations
 
+import ast
 import os
 from pathlib import Path
+
+
+def test_r3_2_trainer_cursor_unaffected_assertions_are_observed() -> None:
+    """Every non-cursor omission branch recomputes the actual cursor event."""
+
+    root = Path(__file__).parents[3]
+    path = root / "tests/integration/test_native_checkpoint_recovery.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    func = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "test_real_restore_omission_channels_are_observed"
+    )
+
+    def is_cursor_recompute(stmt: ast.AST) -> bool:
+        return (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Subscript)
+            and isinstance(stmt.targets[0].value, ast.Name)
+            and stmt.targets[0].value.id == "result"
+            and isinstance(stmt.targets[0].slice, ast.Constant)
+            and stmt.targets[0].slice.value == "trainer_cursor"
+        )
+
+    non_cursor_limbs = {"optimizer", "model", "sampler_mcmc", "process_rng"}
+    missing: list[str] = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == "limb"
+            and len(test.ops) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+        ):
+            continue
+        limb = test.comparators[0].value
+        if limb not in non_cursor_limbs:
+            continue
+        references_cursor = any(
+            isinstance(sub, ast.Constant) and sub.value == "trainer_cursor"
+            for sub in ast.walk(node)
+        )
+        if references_cursor and not any(is_cursor_recompute(stmt) for stmt in ast.walk(node)):
+            missing.append(limb)
+    assert not missing, f"unobserved trainer_cursor branches: {missing}"
 
 
 def test_r3_13a_corrected_docstrings_are_present() -> None:
@@ -161,3 +212,136 @@ def test_r3_2_trainer_cursor_unaffected_assertions_still_tautological() -> None:
         if references_cursor and not recomputes_cursor:
             tautological.append(limb)
     assert not tautological, f"tautological trainer_cursor assertions: {tautological}"
+
+
+_PORTS = {
+    "E2": {"test_unknown_fields_are_refused_at_all_nested_wire_levels"},
+    "E3": {
+        "test_all_refusal_codes_have_explicit_outcomes",
+        "test_incompatible_refusal_code_survives_receipt_and_disk",
+    },
+    "E4": {
+        "test_refusal_precedence_is_shared_by_submitter_and_worker",
+        "test_review_docstrings_contain_no_local_provenance",
+    },
+    "E5": {
+        "test_runner_json_writer_syncs_file_before_replace_and_directory_after",
+        "test_app_pre_e3_writer_syncs_file_before_replace_and_directory_after",
+        "test_review_docstrings_contain_no_local_provenance",
+    },
+    "CR": {
+        "test_refusal_precedence_is_shared_by_submitter_and_worker",
+        "test_unknown_fields_are_refused_at_all_nested_wire_levels",
+        "test_all_refusal_codes_have_explicit_outcomes",
+        "test_incompatible_refusal_code_survives_receipt_and_disk",
+        "test_runner_json_writer_syncs_file_before_replace_and_directory_after",
+        "test_app_pre_e3_writer_syncs_file_before_replace_and_directory_after",
+        "test_review_docstrings_contain_no_local_provenance",
+    },
+}
+
+
+def _tracked_python_files(root: Path) -> list[Path]:
+    import subprocess
+
+    completed = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.py"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    return [root / entry for entry in completed.stdout.decode("utf-8").split("\0") if entry]
+
+
+def _function_names(root: Path) -> tuple[set[str], list[str]]:
+    names: set[str] = set()
+    errors: list[str] = []
+    for path in _tracked_python_files(root):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError) as exc:
+            errors.append(f"{path}: {exc}")
+            continue
+        names.update(
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+    return names, errors
+
+
+def test_whole_tree_r1_r2_r3_port_census_has_required_functions() -> None:
+    layer = os.environ.get("TPEN_REVIEW_LAYER", "CR")
+    assert layer in _PORTS
+    names, errors = _function_names(Path(__file__).parents[3])
+    assert not errors, f"tracked-tree AST parse failures (fail-closed): {errors}"
+    missing = sorted(_PORTS[layer] - names)
+    assert not missing, f"missing accepted reviewer functions at {layer}: {missing}"
+
+
+def test_issue5_executed_arms_derivation_is_not_a_fixed_declaration() -> None:
+    """Executed and unmeasured arms must be derived from real measured results."""
+
+    root = Path(__file__).parents[3]
+    path = root / "tests/integration/test_native_checkpoint_recovery.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    target = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "test_native_e1_to_e4_recovery_parity_divergence_and_receipt"
+    )
+    assignments: dict[str, list[ast.Assign]] = {}
+    for node in ast.walk(target):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            assignments.setdefault(node.targets[0].id, []).append(node)
+    executed = assignments.get("executed_arms", [])
+    unmeasured = assignments.get("unmeasured_arms", [])
+    assert len(executed) == 1
+    assert len(unmeasured) == 1
+    assert "real_channel_results" in ast.dump(executed[0].value)
+    assert "executed_arms" in ast.dump(unmeasured[0].value)
+
+
+def _target_before_root_assertion() -> ast.Assert:
+    root = Path(__file__).parents[3]
+    path = root / "tests/integration/test_native_checkpoint_recovery.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    target = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "test_real_checkpoint_boundary_faults_are_typed"
+    )
+    assertions = [
+        node
+        for node in ast.walk(target)
+        if isinstance(node, ast.Assert) and "before_root" in ast.dump(node)
+    ]
+    assert len(assertions) == 1
+    return assertions[0]
+
+
+def _before_root_predicate(before_root: Path) -> bool:
+    from tpen.checkpoint import list_complete_checkpoints
+
+    expr_source = ast.unparse(_target_before_root_assertion().test)
+    namespace = {"before_root": before_root, "list_complete_checkpoints": list_complete_checkpoints}
+    return eval(expr_source, namespace)  # noqa: S307 -- trusted repository source
+
+
+def test_issue6_before_root_predicate_accepts_staged(tmp_path: Path) -> None:
+    staged_root = tmp_path / "staged"
+    staged_dir = staged_root / "checkpoints" / "step_000001.tmp"
+    staged_dir.mkdir(parents=True)
+    (staged_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    (staged_dir / "COMPLETE").write_text("", encoding="utf-8")
+    assert _before_root_predicate(staged_root) is True
+
+
+def test_issue6_before_root_predicate_rejects_committed(tmp_path: Path) -> None:
+    committed_root = tmp_path / "committed"
+    committed_dir = committed_root / "checkpoints" / "step_000001"
+    committed_dir.mkdir(parents=True)
+    (committed_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    (committed_dir / "COMPLETE").write_text("", encoding="utf-8")
+    assert _before_root_predicate(committed_root) is False
