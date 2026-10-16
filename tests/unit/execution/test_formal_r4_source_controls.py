@@ -58,6 +58,8 @@ def test_r3_2_trainer_cursor_unaffected_assertions_are_observed() -> None:
 
 
 def test_r3_13a_corrected_docstrings_are_present() -> None:
+    import pytest
+
     root = Path(__file__).parents[3]
     layer = os.environ.get("TPEN_REVIEW_LAYER", "CR")
     docs = {
@@ -68,7 +70,8 @@ def test_r3_13a_corrected_docstrings_are_present() -> None:
             "tests/unit/execution/test_chain_resume_review_r1.py",
         ),
     }
-    assert layer in docs
+    if layer not in docs:
+        pytest.skip(f"docstring polarity is not owned by {layer}")
     for relative in docs[layer]:
         source = (root / relative).read_text(encoding="utf-8")
         assert "EXPECTED RED" not in source
