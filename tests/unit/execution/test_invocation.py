@@ -90,6 +90,17 @@ def _intent_for_config(intent: ScienceIntent, cfg: object) -> ScienceIntent:
     )
 
 
+def _bind_batch_to_intent(batch: ReadyBatch, intent: ScienceIntent) -> ReadyBatch:
+    """Keep test batches aligned with the immutable configured source digest."""
+
+    digest = source_config_digest(intent.source_config)
+    return replace(
+        batch,
+        source_config_digest=digest,
+        execution=replace(batch.execution, source_config_digest=digest),
+    )
+
+
 def _completed() -> CoreOutcomeFacts:
     return CoreOutcomeFacts.completed(target_iterations=3, next_iteration=3, completed_updates=3)
 
@@ -572,6 +583,7 @@ def test_configured_gateway_runs_real_tiny_train_and_restarts_in_distinct_namesp
     cfg = OmegaConf.load(config_path)
     batch, intent = _batch()
     intent = _intent_for_config(intent, cfg)
+    batch = _bind_batch_to_intent(batch, intent)
     gateway = WorkerStartGateway(tmp_path)
 
     first = gateway.start_configured(
@@ -606,6 +618,7 @@ def test_real_bad_config_is_terminal(tmp_path: Path) -> None:
     cfg.experiment.name = HI_EXPERIMENT_NAME
     batch, intent = _batch()
     intent = _intent_for_config(intent, OmegaConf.load(config_path))
+    batch = _bind_batch_to_intent(batch, intent)
 
     result = WorkerStartGateway(tmp_path).start_configured(
         cfg=cfg,
@@ -628,6 +641,7 @@ def test_real_incompatible_train_resume_restore_is_terminal(tmp_path: Path) -> N
     cfg = OmegaConf.load(config_path)
     batch, intent = _batch()
     intent = _intent_for_config(intent, cfg)
+    batch = _bind_batch_to_intent(batch, intent)
     gateway = WorkerStartGateway(tmp_path)
     first = gateway.start_configured(
         cfg=cfg,
