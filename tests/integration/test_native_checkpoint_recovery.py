@@ -7,6 +7,7 @@ allocation loss, and never supplies a live backend object to a worker.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -35,6 +36,7 @@ from tpen.execution import (
 from tpen.execution.recovery import CheckpointEvidence, RecoveryPhase
 from tpen.execution.invocation import _committed_checkpoint
 from tpen.execution.chain_resume import (
+    ChainResumeReceipt,
     ChannelParityError,
     ProcessEvidence,
     UnmeasuredArmError,
@@ -52,27 +54,6 @@ WORKER = Path(__file__).parents[1] / "helpers" / "native_recovery_worker.py"
 # enough to exclude serialization noise and small enough to catch a real Adam
 # update in the float64 fixture.
 PARAMETER_CHANGE_THRESHOLD = 1.0e-10
-
-# The E3 cursor binding prevents this test-only hook from isolating the
-# trainer-cursor owner.  Keep the unmeasured owner declaration in one place;
-# the explicit arm record below is derived from it.
-DECLARED_UNMEASURED = frozenset({"trainer_cursor"})
-_UNMEASURED_REASON_BY_ARM = {
-    "restore-disabled": (
-        "E3 binds the recovery cursor before the test-only trainer loader hook, "
-        "so this topology cannot isolate a cursor omission."
-    ),
-    "positive-control": (
-        "the same pre-bound cursor makes an own-channel value-change control "
-        "unobservable; direct cursor evidence is retained above."
-    ),
-}
-UNMEASURED_ARMS = tuple(
-    (f"{arm}:{limb}", _UNMEASURED_REASON_BY_ARM[arm])
-    for arm in ("restore-disabled", "positive-control")
-    for limb in sorted(DECLARED_UNMEASURED)
-)
-
 
 class QualificationClient:
     """Fake submitter-side client with explicit allocation-loss observation."""
@@ -495,29 +476,86 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         f"by threshold {PARAMETER_CHANGE_THRESHOLD}"
     )
 
-    receipt = {
-        "schema": "tpen.execution/qualification-native-recovery-v1",
-        "source_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "scheduler": {"kind": "slurm", "partition": os.environ.get("SLURM_JOB_PARTITION", "unknown")},
-        "backend": {"kind": "fake-balsam-client", "job_id": registration.job_id, "allocation_state": observation.state.value},
-        "wrapper": {"registration_calls": client.register_calls, "observation_calls": client.observe_calls, "prefix_signal": -signal.SIGKILL},
-        "application": {"prefix_exit": prefix.returncode, "successor": successor.returncode, "reference": reference.returncode, "partial": partial.returncode},
-        "scientific": {
-            "successor_outcome": successor_result["invocation"]["outcome"],
-            "target_iterations": batch.target_iterations,
-            "resume_checkpoint_next_iteration": resume_step,
-            "next_iteration": successor_result["invocation"]["next_iteration"],
-            "completed_updates": successor_result["invocation"]["completed_updates"],
+    source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    adapter_sha = hashlib.sha256(
+        Path(__file__).parents[2].joinpath("tpen/execution/chain_resume.py").read_bytes()
+    ).hexdigest()
+    executed_arms = tuple(sorted(real_channel_results))
+    expected_arms = tuple(sorted(spec.channel for spec in E5_CHANNEL_MAP))
+    unmeasured_arms = tuple(
+        channel for channel in expected_arms if channel not in executed_arms
+    )
+    assert unmeasured_arms == ()
+    receipt = ChainResumeReceipt(
+        source_sha=source_sha,
+        adapter_sha=adapter_sha,
+        profile_version="tpen.execution.native_profile:SUPPORTED_STATE_OWNERS@e5",
+        channel_map_version="e5-native-channel-map-v1",
+        commands=(reference_trace.command, resumed_trace.command),
+        process_evidence=(reference_trace, resumed_trace),
+        channel_results=real_channel_results,
+        checkpoint_faults=(),
+        collection_output=(
+            "tests/integration/test_native_checkpoint_recovery.py::"
+            "test_native_e1_to_e4_recovery_parity_divergence_and_receipt",
+        ),
+        testcase_ids=("test_native_e1_to_e4_recovery_parity_divergence_and_receipt",),
+        junit_identities=(
+            "tests/integration/test_native_checkpoint_recovery.py::"
+            "test_native_e1_to_e4_recovery_parity_divergence_and_receipt",
+        ),
+        raw_fault_evidence=(
+            {"layer": "scheduler", "prefix_signal": -signal.SIGKILL},
+            {"layer": "backend", "allocation_state": observation.state.value},
+        ),
+        restore_disabled_control={
+            "mode": "test-only model_only overlay; E1 model_only refusal bypassed",
             "tail_bitwise": tail_bitwise,
-            "restore_disabled_mode": "test-only model_only overlay; E1 model_only refusal bypassed",
-            "restore_disabled_diverged": restore_disabled_diverged,
-            "parameters_changed": parameters_changed,
-            "parameter_change_threshold": PARAMETER_CHANGE_THRESHOLD,
-            "max_parameter_delta": max_parameter_delta,
-            "max_restore_parameter_abs_diff": max_restore_parameter_abs_diff,
-            "max_partial_parameter_abs_diff": max_partial_parameter_abs_diff,
+            "diverged": restore_disabled_diverged,
+            "max_parameter_abs_diff": max_partial_parameter_abs_diff,
         },
-    }
+        unmeasured_arms=unmeasured_arms,
+    ).to_dict()
+    receipt.update(
+        {
+            "scheduler": {
+                "kind": "slurm",
+                "partition": os.environ.get("SLURM_JOB_PARTITION", "unknown"),
+            },
+            "backend": {
+                "kind": "fake-balsam-client",
+                "job_id": registration.job_id,
+                "allocation_state": observation.state.value,
+            },
+            "wrapper": {
+                "registration_calls": client.register_calls,
+                "observation_calls": client.observe_calls,
+            },
+            "application": {
+                "prefix_exit": prefix.returncode,
+                "successor": successor.returncode,
+                "reference": reference.returncode,
+                "partial": partial.returncode,
+            },
+            "scientific": {
+                "successor_outcome": successor_result["invocation"]["outcome"],
+                "target_iterations": batch.target_iterations,
+                "resume_checkpoint_next_iteration": resume_step,
+                "next_iteration": successor_result["invocation"]["next_iteration"],
+                "completed_updates": successor_result["invocation"]["completed_updates"],
+                "tail_bitwise": tail_bitwise,
+                "restore_disabled_mode": "test-only model_only overlay; E1 model_only refusal bypassed",
+                "restore_disabled_diverged": restore_disabled_diverged,
+                "parameters_changed": parameters_changed,
+                "parameter_change_threshold": PARAMETER_CHANGE_THRESHOLD,
+                "max_parameter_delta": max_parameter_delta,
+                "max_restore_parameter_abs_diff": max_restore_parameter_abs_diff,
+                "max_partial_parameter_abs_diff": max_partial_parameter_abs_diff,
+                "executed_arms": list(executed_arms),
+                "unmeasured_arms": list(unmeasured_arms),
+            },
+        }
+    )
     receipt_path = tmp_path / "qualification-receipt.json"
     receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     measured = json.loads(receipt_path.read_text())["scientific"]
@@ -586,9 +624,45 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     reference_trace = _trace(tmp_path / "channel-reference.trace.json")
 
     resume_cursor = prefix_checkpoint.next_iteration
+    complete_refs = sorted(
+        (
+            CheckpointRef.from_directory(path)
+            for root in outputs.rglob("checkpoints")
+            for path in list_complete_checkpoints(root)
+            if int(path.name.removeprefix("step_")) < batch.target_iterations
+        ),
+        key=lambda ref: ref.next_iteration,
+    )
+    lower_refs = [ref for ref in complete_refs if ref.next_iteration < resume_cursor]
+    assert lower_refs, "native prefix did not leave a lower cursor for the positive control"
+    lower_evidence = CheckpointEvidence.from_ref(
+        lower_refs[0],
+        science_input_digest=intent.science_input_digest,
+        target_iterations=batch.target_iterations,
+    )
+    lower_evidence_path = tmp_path / "channel-evidence-lower.json"
+    lower_evidence_path.write_text(
+        json.dumps(lower_evidence.to_dict(), sort_keys=True), encoding="utf-8"
+    )
+    cursor_control_path = tmp_path / "channel-cursor-control.trace.json"
+    cursor_control = _launch(
+        root=tmp_path,
+        batch_path=batch_path,
+        intent_path=intent_path,
+        config_path=FIXTURE,
+        receipts=receipts,
+        outputs=outputs,
+        phase="recovery",
+        label="channel-cursor-control",
+        evidence=lower_evidence_path,
+        trace=cursor_control_path,
+        resume_step=lower_refs[0].next_iteration,
+    )
+    cursor_control.wait(timeout=180)
+    assert cursor_control.returncode == 0
+    cursor_control_trace = _trace(cursor_control_path)
     results: dict[str, dict[str, bool]] = {}
     disabled_traces: dict[str, ProcessEvidence] = {}
-    unmeasured_arms = UNMEASURED_ARMS
     for limb in sorted({spec.limb for spec in E5_CHANNEL_MAP}):
         label = f"channel-disabled-{limb}"
         trace_path = tmp_path / f"{label}.trace.json"
@@ -630,24 +704,13 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         results[limb] = result
         channel = next(spec.channel for spec in E5_CHANNEL_MAP if spec.limb == limb)
         if limb == "trainer_cursor":
-            # E3 supplies the selected cursor to the configured runner before
-            # the checkpoint mutator runs.  Therefore this hook cannot isolate
-            # a cursor-only omission from that already-bound decision.  Record
-            # the actual first step and assert the distinguishable fact: the
-            # hook did not cause a restart at the selected resume cursor.
-            first_cursor = next(
+            disabled_first = next(
                 event.step
                 for event in disabled_trace.events
-                if event.channel == "trainer_cursor"
+                if event.channel == channel
             )
-            assert first_cursor != resume_cursor
-            result[channel] = first_cursor == next(
-                event.step
-                for event in reference_trace.events
-                if event.channel == "trainer_cursor" and event.step > resume_cursor - 1
-            )
-        else:
-            assert result[channel] is False, limb
+            result[channel] = disabled_first == resume_cursor
+        assert result[channel] is False, limb
 
         if limb == "optimizer":
             # The real configured topology does not isolate the global-RNG
@@ -674,14 +737,15 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     # workers above.  The synthetic probe has a separate adapter-unit label
     # and is not used as evidence for this assertion.
     for limb, disabled_trace in disabled_traces.items():
-        if limb == "trainer_cursor":
-            continue
         spec = next(spec for spec in E5_CHANNEL_MAP if spec.limb == limb)
+        control_trace = (
+            cursor_control_trace if limb == "trainer_cursor" else disabled_trace
+        )
         assert_positive_control(
             reference_trace,
-            disabled_trace,
+            control_trace,
             spec,
-            resume_step=resume_cursor - 1,
+            resume_step=-1 if limb == "trainer_cursor" else resume_cursor - 1,
         )
 
     # Observability mutant: the restored limb remains live in a real E3 run,
@@ -766,8 +830,11 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     # Every declared arm above is collected and measured.  Keeping this
     # explicit prevents a future unsupported hook from silently becoming a
     # passing omission result.
+    unmeasured_arms = tuple(
+        sorted({spec.limb for spec in E5_CHANNEL_MAP} - set(results))
+    )
     print(f"UNMEASURED_ARMS={unmeasured_arms}")
-    assert unmeasured_arms == UNMEASURED_ARMS
+    assert unmeasured_arms == ()
 
 
 @pytest.mark.integration
@@ -828,7 +895,10 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
     os.kill(before.pid, signal.SIGKILL)
     before.wait(timeout=30)
     assert before.returncode == -signal.SIGKILL
-    assert not list(before_root.rglob("checkpoints/step_*/COMPLETE"))
+    assert not any(
+        list_complete_checkpoints(root)
+        for root in before_root.rglob("checkpoints")
+    )
 
     before_successor = _launch(
         root=tmp_path,

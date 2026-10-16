@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 
 from tpen.execution.native_profile import SUPPORTED_STATE_OWNERS
-from tests.integration.test_native_checkpoint_recovery import DECLARED_UNMEASURED
 
 
 @pytest.fixture(scope="module")
@@ -66,7 +65,7 @@ def test_native_positive_controls_cover_declared_state_owners(
 
     record = native_positive_control_observation
     assert record["original_invocations"] == 1
-    expected = set(record["supported_state_owners"]) - DECLARED_UNMEASURED
+    expected = set(record["supported_state_owners"])
     assert set(record["observed_limbs"]) == expected, (
         "native positive-control coverage mismatch; retained record="
         f"{record['record_path']} observed={record['observed_limb_set']} "

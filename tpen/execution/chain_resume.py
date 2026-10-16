@@ -317,6 +317,21 @@ def compare_channel_parity(
     unknown_disabled = disabled - {spec.limb for spec in specs}
     if unknown_disabled:
         raise ChannelMapError("disabled limb is outside the E5 profile")
+    resumed_phase = resumed.phase.strip().lower()
+    if resumed_phase not in {"recovery", "resumed"}:
+        raise ChannelParityError(
+            "resumed evidence has unsupported phase label; expected recovery/resumed"
+        )
+    replayed = any(
+        event.random_dependent and event.step <= resume_step
+        for event in resumed.events
+    )
+    if replayed and "trainer_cursor" in disabled:
+        # A cursor omission is observable as a restarted first step.  Name the
+        # owner before the channel loop reaches an unrelated model event.
+        raise ChannelParityError(
+            "trainer_cursor resumed evidence contains a replayed prefix"
+        )
     result: dict[str, bool] = {}
     for spec in specs:
         left = first_subsequent_event(reference, spec, resume_step=resume_step)
@@ -327,7 +342,7 @@ def compare_channel_parity(
                 f"resumed channel {spec.channel!r} first event is step {right.step}, "
                 f"expected selected cursor successor {expected_step}"
             )
-        if resumed.phase.lower() in {"recovery", "resumed"} and any(
+        if any(
             event.channel == spec.channel
             and event.random_dependent
             and event.step <= resume_step
@@ -407,6 +422,7 @@ class ChainResumeReceipt:
     junit_identities: tuple[str, ...]
     raw_fault_evidence: tuple[Mapping[str, Any], ...]
     restore_disabled_control: Mapping[str, Any]
+    unmeasured_arms: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize all provenance fields without dropping unmeasured arms."""
@@ -446,6 +462,7 @@ class ChainResumeReceipt:
             "junit_identities": list(self.junit_identities),
             "raw_fault_evidence": [dict(fault) for fault in self.raw_fault_evidence],
             "restore_disabled_control": dict(self.restore_disabled_control),
+            "unmeasured_arms": list(self.unmeasured_arms),
         }
 
 
