@@ -40,6 +40,7 @@ from tpen.execution import (
     capture_science_intent,
     classify_core_outcome,
     payload_digest,
+    source_config_digest,
 )
 
 
@@ -47,7 +48,7 @@ def _batch():
     science = {"system": "hooke", "electrons": 2}
     intent = capture_science_intent(science, target_iterations=3)
     payload = {"science": science, "target_iterations": 3}
-    source_digest = "a" * 64
+    source_digest = source_config_digest({})
     digest = payload_digest(payload)
     config = ExecutionConfig(
         lineage_id="lineage-review-refusal",
