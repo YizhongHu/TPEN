@@ -374,9 +374,7 @@ def select_recovery(
     # initial checkpoint.  Refuse those forms in both phases so this boundary
     # cannot self-stamp a checkpoint binding; durable evidence mappings remain
     # the explicit form for callers that need an initial checkpoint.
-    if phase in {RecoveryPhase.INITIAL, RecoveryPhase.RECOVERY} and isinstance(
-        evidence, (CheckpointRef, str, Path)
-    ):
+    if isinstance(evidence, (CheckpointRef, str, Path)):
         return _refused(
             intent,
             phase,
@@ -434,22 +432,13 @@ def select_recovery(
 
 
 def _coerce_evidence(
-    evidence: CheckpointEvidence | CheckpointRef | Mapping[str, Any] | str | Path,
+    evidence: CheckpointEvidence | Mapping[str, Any],
     intent: ScienceIntent,
 ) -> CheckpointEvidence:
     """Normalize supported evidence forms while keeping binding explicit."""
 
     if isinstance(evidence, CheckpointEvidence):
         return evidence
-    if isinstance(evidence, CheckpointRef):
-        # A direct ref supplied to this function is bound to the current intent
-        # at this boundary. Durable callers should prefer CheckpointEvidence so
-        # the binding is preserved across process starts.
-        return CheckpointEvidence.from_ref(
-            evidence,
-            science_input_digest=intent.science_input_digest,
-            target_iterations=intent.target_iterations,
-        )
     if isinstance(evidence, Mapping):
         try:
             return CheckpointEvidence.from_mapping(evidence)
@@ -459,11 +448,7 @@ def _coerce_evidence(
                 science_input_digest=intent.science_input_digest,
                 target_iterations=intent.target_iterations,
             )
-    return CheckpointEvidence.from_path(
-        evidence,
-        science_input_digest=intent.science_input_digest,
-        target_iterations=intent.target_iterations,
-    )
+    raise TypeError("evidence must be CheckpointEvidence or a durable evidence mapping")
 
 
 def _checkpoint_refusal(ref: CheckpointRef, *, target_iterations: int) -> RecoveryRefusal | None:
