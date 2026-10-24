@@ -144,7 +144,7 @@ class ExecutionConfig:
         return canonical_payload_bytes(self.to_dict())
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "ExecutionConfig":
+    def from_mapping(cls, data: Any) -> "ExecutionConfig":
         """Construct a closed, typed execution configuration record."""
 
         decode_fields(data, {

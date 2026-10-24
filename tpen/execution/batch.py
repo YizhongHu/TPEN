@@ -70,7 +70,7 @@ class ReadyItem:
         }
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "ReadyItem":
+    def from_mapping(cls, data: Any) -> "ReadyItem":
         """Construct an item from its closed, typed serialized mapping."""
 
         decode_fields(data, {
@@ -167,7 +167,7 @@ class ReadyBatch:
         return canonical_payload_bytes(self.to_dict())
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "ReadyBatch":
+    def from_mapping(cls, data: Any) -> "ReadyBatch":
         """Construct a closed batch record and verify all identity bindings."""
 
         decode_fields(data, {

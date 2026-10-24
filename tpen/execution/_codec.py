@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
+# Wire entry points intentionally accept Any so decode_fields owns validation.
 def decode_fields(
     data: Any,
     required: Mapping[str, type],

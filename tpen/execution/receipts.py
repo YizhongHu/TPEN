@@ -62,7 +62,7 @@ class BackendJobReceipt:
         )}}
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "BackendJobReceipt":
+    def from_mapping(cls, data: Any) -> "BackendJobReceipt":
         """Deserialize a closed, typed receipt record."""
 
         fields = (
@@ -104,7 +104,7 @@ class AllocationObservation:
                 "metadata": _thaw(self.metadata)}
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "AllocationObservation":
+    def from_mapping(cls, data: Any) -> "AllocationObservation":
         """Deserialize a closed, typed receipt record."""
 
         fields = (
@@ -146,7 +146,7 @@ class InvocationReceipt:
         )}}
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "InvocationReceipt":
+    def from_mapping(cls, data: Any) -> "InvocationReceipt":
         """Deserialize a closed, typed receipt record."""
 
         fields = (
@@ -191,7 +191,7 @@ class ResultReceipt:
         )}}
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "ResultReceipt":
+    def from_mapping(cls, data: Any) -> "ResultReceipt":
         """Deserialize a closed, typed receipt record."""
 
         fields = (
