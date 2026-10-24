@@ -1692,7 +1692,14 @@ class VMCUpdateMethod(Generic[InputT], ABC):
 
 
 class LegacyAutogradUpdate(VMCUpdateMethod[AutogradUpdateInput]):
-    """Exact adapter for TPEN's historical zero-grad/backward/step sequence."""
+    """Exact adapter for TPEN's historical zero-grad/backward/step sequence.
+
+    Raises
+    ------
+    ValueError
+        If the optimizer carrier is empty or contains parameters outside the
+        adapter's own ``model_parameters`` binding at construction.
+    """
 
     def __init__(
         self,

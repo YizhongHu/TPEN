@@ -12,8 +12,12 @@ from tpen.physics.potential import HarmonicTrap
 from tpen.runner.train import Train
 from tpen.training.trainer import VMCTrainer
 from tpen.training.update import (
+    AutogradUpdateInput,
     LegacyAutogradUpdate,
     ModelParameterBinding,
+    VMCUpdateMethod,
+    VMCUpdateResult,
+    VMCUpdateState,
 )
 from tests.unit.training.test_vmc_trainer_tpen_smoke import _StubContext
 
@@ -46,6 +50,22 @@ class _Sampler:
             spins=torch.ones(3, 1, dtype=torch.float64),
         )
         return SimpleNamespace(make_batch=lambda: batch, n_walkers=3), None
+
+
+class _UncheckedStatefulUpdate(VMCUpdateMethod[AutogradUpdateInput]):
+    """Own a real carrier and binding without constructor containment checks."""
+
+    def __init__(self, optimizer, model_parameters) -> None:
+        self.state = VMCUpdateState(optimizer=optimizer, model_parameters=model_parameters)
+
+    def update_state(self) -> VMCUpdateState:
+        return self.state
+
+    def update(self, update_input: AutogradUpdateInput) -> VMCUpdateResult:
+        self.state.optimizer.zero_grad(set_to_none=True)
+        update_input.objective.backward()
+        self.state.optimizer.step()
+        return VMCUpdateResult(applied=True, grad_norm=None)
 
 
 def _entry(entry, model, optimizer, trainer, sampler, monkeypatch, restore_calls):
@@ -96,13 +116,34 @@ def _assert_refused(entry, model, optimizer, trainer, sampler, monkeypatch, mess
 
 @pytest.mark.parametrize("entry", ["fit", "resume"])
 def test_fresh_default_adapter_refuses_foreign_carrier(entry, monkeypatch) -> None:
-    """Same-layout foreign parameters must fail at both real entry points."""
+    """Behaviour witness defended by both constructor and trainer call sites.
+
+    Either remaining site refuses if the other is deleted; these default-path
+    tests deliberately do not claim to pin either site alone.
+    """
 
     model, foreign = _Wavefunction(), _Wavefunction()
     assert {id(p) for p in model.parameters()}.isdisjoint(id(p) for p in foreign.parameters())
     optimizer = torch.optim.SGD(foreign.parameters(), lr=0.1)
     _assert_refused(entry, model, optimizer, VMCTrainer(max_steps=1), _Sampler(),
                     monkeypatch, "carrier contains foreign model parameters")
+
+
+@pytest.mark.parametrize("entry", ["fit", "resume"])
+def test_fresh_stateful_method_refuses_foreign_carrier(entry, monkeypatch) -> None:
+    """A constructor without containment leaves refusal to the trainer site alone."""
+
+    model, foreign = _Wavefunction(), _Wavefunction()
+    optimizer = torch.optim.SGD(foreign.parameters(), lr=0.1)
+    method = _UncheckedStatefulUpdate(
+        optimizer, ModelParameterBinding(parameters=tuple(model.parameters()))
+    )
+    assert method.update_state().optimizer is optimizer
+    assert {id(p) for p in model.parameters()}.isdisjoint(id(p) for p in foreign.parameters())
+    _assert_refused(
+        entry, model, optimizer, VMCTrainer(max_steps=1, update_method=method),
+        _Sampler(), monkeypatch, "carrier contains foreign model parameters",
+    )
 
 
 @pytest.mark.parametrize("entry", ["fit", "resume"])
