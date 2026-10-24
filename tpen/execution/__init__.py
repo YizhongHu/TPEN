@@ -38,6 +38,7 @@ from .invocation import (
     WorkerStartGateway,
     WorkerStartReceipt,
     classify_core_outcome,
+    run_bound_configured_once,
     run_configured_once,
     validate_start_receipt,
 )
@@ -97,6 +98,7 @@ __all__ = [
     "WorkerStartGateway",
     "WorkerStartReceipt",
     "classify_core_outcome",
+    "run_bound_configured_once",
     "run_configured_once",
     "validate_start_receipt",
 ]

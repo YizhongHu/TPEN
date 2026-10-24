@@ -377,6 +377,37 @@ def _write_core_completion_artifacts(output_path: Path, *, next_iteration: int =
     )
 
 
+@pytest.mark.parametrize("empty_catalog", [False, True])
+def test_committed_checkpoint_without_publication_is_reconciled(monkeypatch, tmp_path: Path, empty_catalog: bool) -> None:
+    from tpen import run as run_module
+    from tpen.checkpoint.catalog import PUBLICATION_CATALOG_FILENAME, read_publications
+
+    batch, intent = _batch()
+    original = {}
+
+    def core(cfg, **kwargs):
+        _write_core_completion_artifacts(Path(cfg.run.root))
+        root = next(Path(cfg.run.root).rglob("checkpoints"))
+        (root / "latest.json").unlink()
+        if empty_catalog:
+            (root / PUBLICATION_CATALOG_FILENAME).write_text("")
+        checkpoint = root / "step_000003"
+        original.update({path.name: path.read_bytes() for path in checkpoint.iterdir()})
+        return 0
+
+    monkeypatch.setattr(run_module, "run_from_config", core)
+    result = WorkerStartGateway(tmp_path).start_configured(
+        cfg=OmegaConf.create({"model": {"_target_": "tests.helpers.NeverConstructed"}}),
+        batch=batch, intent=intent, phase=RecoveryPhase.INITIAL,
+    )
+    assert result.outcome.outcome is InvocationOutcome.COMPLETED
+    assert result.outcome.next_iteration == 3
+    root = next(result.output_path.rglob("checkpoints"))
+    checkpoint = resolve_checkpoint_dir(root)
+    assert read_publications(root / PUBLICATION_CATALOG_FILENAME)[0].checkpoint_dir == checkpoint
+    assert {path.name: path.read_bytes() for path in checkpoint.iterdir()} == original
+
+
 def test_configured_gateway_materializes_completion_from_core_artifacts(monkeypatch, tmp_path: Path) -> None:
     """A successful configured call completes only from status plus checkpoint facts."""
 
