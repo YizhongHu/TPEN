@@ -45,7 +45,7 @@ def _map_state(value: Any) -> BalsamJobState:
     name = _state_name(value)
     if name in {"finished", "completed", "job_finished", "succeeded"}:
         return BalsamJobState.COMPLETED
-    if name in {"restart_ready", "allocation_lost", "timeout", "timed_out"}:
+    if name in {"restart_ready", "allocation_lost", "timeout", "timed_out", "run_timeout"}:
         return BalsamJobState.ALLOCATION_LOST
     if name in {"failed", "permanent_failure", "job_failed"}:
         return BalsamJobState.PERMANENT_FAILURE
@@ -54,6 +54,9 @@ def _map_state(value: Any) -> BalsamJobState:
         "awaiting_parents",
         "ready",
         "staged",
+        "staged_in",
+        "run_done",
+        "staged_out",
         "preprocessed",
         "running",
         "postprocessed",

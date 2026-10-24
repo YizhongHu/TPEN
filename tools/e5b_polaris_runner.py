@@ -29,6 +29,7 @@ from tpen.execution import (
 from tpen.execution.invocation import (
     _committed_checkpoint,
     _core_outcome_from_artifacts,
+    _materialize_configured_worker_config,
     _run_status_artifact,
     run_configured_once,
 )
@@ -45,6 +46,27 @@ class NoLiveBackendClient:
     def observe_job(self, job_id: str | int) -> None:  # pragma: no cover - safety tripwire
         del job_id
         raise AssertionError("worker attempted Balsam observation")
+
+
+class PrefixCheckpointReached(RuntimeError):
+    """Stop bounded prefix science after its full checkpoint is published."""
+
+
+class StopAfterCheckpoint:
+    """Operational stop observer, supplied outside all hashed config sections."""
+
+    def __init__(self, next_iteration: int) -> None:
+        self.next_iteration = next_iteration
+
+    def handle_occurrence(self, occurrence: Any, context: Any) -> None:
+        from tpen.training.events import TrainingIterationCompleted
+
+        if isinstance(occurrence.event, TrainingIterationCompleted):
+            # Runtime observers run after the configured checkpoint callback,
+            # so admission waits for the same published ref E3 resolves.
+            checkpoint = _committed_checkpoint(context.artifact_manager.run_dir)
+            if checkpoint is not None and checkpoint.next_iteration >= self.next_iteration:
+                raise PrefixCheckpointReached("bounded prefix checkpoint is published")
 
 
 def _write_json(path: Path, data: Mapping[str, Any]) -> None:
@@ -82,11 +104,16 @@ def _run_once_factory(
 ):
     """Return a configured-run callback for one E3 invocation."""
 
-    def run_once(decision: Any, output_path: Path) -> Any:
-        worker_config = config
+    def run_once(decision: Any, output_path: Path, *, intent: ScienceIntent) -> Any:
+        # Use the same E3 materialization as start_configured before the
+        # observable core-call seam; source binding must precede construction.
+        worker_config = _materialize_configured_worker_config(
+            config, intent=intent, decision=decision, output_path=output_path,
+            declared_overlays=None,
+        )
+        observers = ()
         if phase is RecoveryPhase.INITIAL and prefix_steps is not None:
-            worker_config = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
-            OmegaConf.update(worker_config, "trainer.max_steps", int(prefix_steps), merge=False)
+            observers = (StopAfterCheckpoint(prefix_steps),)
         run_configured_once(
             worker_config,
             decision=decision,
@@ -94,6 +121,7 @@ def _run_once_factory(
             config_path=config_path,
             command="e5b-polaris-worker",
             raise_exceptions=True,
+            runtime_callbacks=observers,
         )
         return _core_outcome_from_artifacts(output_path, decision=decision)
 
@@ -137,16 +165,15 @@ def run_attempt(*, job_id: int | str, job_data: Mapping[str, Any]) -> int:
             )
             return 2
         prefix_steps = int(job_data.get("prefix_steps", max(1, batch.target_iterations // 2)))
+        callback = _run_once_factory(
+            config, config_path=str(job_data["config_path"]),
+            phase=RecoveryPhase.INITIAL, prefix_steps=prefix_steps,
+        )
         result = adapter.start(
             batch=batch,
             intent=intent,
             phase=RecoveryPhase.INITIAL,
-            run_once=_run_once_factory(
-                config,
-                config_path=str(job_data["config_path"]),
-                phase=RecoveryPhase.INITIAL,
-                prefix_steps=prefix_steps,
-            ),
+            run_once=lambda decision, output_path: callback(decision, output_path, intent=intent),
             job_id=job_id,
             attempt_id=f"polaris-prefix-{os.environ.get('PBS_JOBID', 'unknown')}",
         )
@@ -183,15 +210,14 @@ def run_attempt(*, job_id: int | str, job_data: Mapping[str, Any]) -> int:
             time.sleep(60)
 
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    recovery_callback = _run_once_factory(
+        config, config_path=str(job_data["config_path"]), phase=RecoveryPhase.RECOVERY,
+    )
     successor = adapter.start(
         batch=batch,
         intent=intent,
         phase=RecoveryPhase.RECOVERY,
-        run_once=_run_once_factory(
-            config,
-            config_path=str(job_data["config_path"]),
-            phase=RecoveryPhase.RECOVERY,
-        ),
+        run_once=lambda decision, output_path: recovery_callback(decision, output_path, intent=intent),
         job_id=job_id,
         evidence=evidence,
         attempt_id=f"polaris-successor-{os.environ.get('PBS_JOBID', 'unknown')}",
@@ -202,15 +228,14 @@ def run_attempt(*, job_id: int | str, job_data: Mapping[str, Any]) -> int:
 
     # The uninterrupted reference is another fresh E3 invocation in the same
     # successor process, kept separate from the recovered science output.
+    reference_callback = _run_once_factory(
+        config, config_path=str(job_data["config_path"]), phase=RecoveryPhase.INITIAL,
+    )
     reference = adapter.start(
         batch=batch,
         intent=intent,
         phase=RecoveryPhase.INITIAL,
-        run_once=_run_once_factory(
-            config,
-            config_path=str(job_data["config_path"]),
-            phase=RecoveryPhase.INITIAL,
-        ),
+        run_once=lambda decision, output_path: reference_callback(decision, output_path, intent=intent),
         job_id=job_id,
         attempt_id=f"polaris-reference-{os.environ.get('PBS_JOBID', 'unknown')}",
     )

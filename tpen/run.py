@@ -236,6 +236,7 @@ def run_from_config(
     command: str | None = None,
     raise_exceptions: bool = False,
     topology: ExecutionTopology | Mapping[str, object] | None = None,
+    runtime_callbacks: Sequence[object] = (),
 ) -> int:
     """Instantiate and execute the configured runner.
 
@@ -255,6 +256,11 @@ def run_from_config(
         for this call. Mapping facts are normalized to ``ExecutionTopology``
         before context construction. When omitted, ``prepare_run_context``
         applies its normal single-process fallback.
+    runtime_callbacks : sequence of objects, optional
+        Operational observers appended after configured callbacks. They are
+        supplied by the launcher, outside the immutable science configuration;
+        for example, a bounded prefix can stop after a published checkpoint
+        without changing the trainer configuration that restore validates.
 
     Returns
     -------
@@ -306,6 +312,8 @@ def run_from_config(
                 bootstrap=bootstrap,
                 topology=topology,
             )
+        _validate_callbacks(list(runtime_callbacks))
+        context.callbacks.extend(runtime_callbacks)
         _seed_runtime_rngs(context.cfg)
         context.emit(RunStarted())
         runner = _instantiate_runner(context)
