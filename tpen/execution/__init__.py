@@ -19,7 +19,6 @@ from .config import (
 from .receipts import (
     AllocationObservation,
     BackendJobReceipt,
-    FreshOutputReceipt,
     InvocationReceipt,
     ResultReceipt,
     encode_receipt,
@@ -45,7 +44,6 @@ __all__ = [
     "CheckpointEvidence",
     "EXECUTION_CONFIG_SCHEMA",
     "ExecutionConfig",
-    "FreshOutputReceipt",
     "InvocationReceipt",
     "READY_BATCH_SCHEMA",
     "RecoveryDecision",

@@ -11,10 +11,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._codec import decode_fields, string_argv
 from .config import (
-    EXECUTION_CONFIG_SCHEMA,
     ExecutionConfig,
-    _reject_unknown_keys,
     canonical_payload_bytes,
     payload_digest,
 )
@@ -54,9 +53,7 @@ class ReadyItem:
     def __post_init__(self) -> None:
         for name in ("invocation_id", "logical_task_id", "fresh_output_id", "result_dir"):
             object.__setattr__(self, name, _text(getattr(self, name), name))
-        argv = tuple(self.argv)
-        if not argv or any(not isinstance(part, str) or not part for part in argv):
-            raise ValueError("argv must be a non-empty sequence of non-empty strings")
+        argv = string_argv(self.argv)
         object.__setattr__(self, "argv", argv)
         object.__setattr__(self, "payload", _freeze(self.payload, path="item.payload"))
 
@@ -74,31 +71,16 @@ class ReadyItem:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ReadyItem":
-        """Construct an item from its serialized mapping."""
+        """Construct an item from its closed, typed serialized mapping."""
 
-        if not isinstance(data, Mapping):
-            raise TypeError("ready-batch item must be a mapping")
-        _reject_unknown_keys(
-            data,
-            frozenset(
-                {
-                    "invocation_id",
-                    "logical_task_id",
-                    "fresh_output_id",
-                    "argv",
-                    "result_dir",
-                    "payload",
-                }
-            ),
-            "ready-batch item",
-        )
+        decode_fields(data, {
+            "invocation_id": str, "logical_task_id": str, "fresh_output_id": str,
+            "argv": Sequence, "result_dir": str,
+        }, optional={"payload": Mapping}, name="ready-batch item")
         return cls(
-            invocation_id=data.get("invocation_id", ""),
-            logical_task_id=data.get("logical_task_id", ""),
-            fresh_output_id=data.get("fresh_output_id", ""),
-            argv=tuple(data.get("argv", ())),
-            result_dir=data.get("result_dir", ""),
-            payload=data.get("payload", {}),
+            invocation_id=data["invocation_id"], logical_task_id=data["logical_task_id"],
+            fresh_output_id=data["fresh_output_id"], argv=string_argv(data["argv"]),
+            result_dir=data["result_dir"], payload=data.get("payload", {}),
         )
 
 
@@ -186,39 +168,19 @@ class ReadyBatch:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ReadyBatch":
-        """Construct a batch and verify all identity bindings."""
+        """Construct a closed batch record and verify all identity bindings."""
 
-        if not isinstance(data, Mapping):
-            raise TypeError("ready batch must be a mapping")
-        _reject_unknown_keys(
-            data,
-            frozenset(
-                {
-                    "schema",
-                    "lineage_id",
-                    "batch_id",
-                    "source_config_digest",
-                    "payload_digest",
-                    "science_input_digest",
-                    "target_iterations",
-                    "execution",
-                    "items",
-                    "payload",
-                }
-            ),
-            "ready batch",
-        )
-        execution = ExecutionConfig.from_mapping(data.get("execution", {}))
+        decode_fields(data, {
+            "lineage_id": str, "batch_id": str, "source_config_digest": str,
+            "payload_digest": str, "science_input_digest": str,
+            "target_iterations": int, "execution": Mapping, "items": Sequence,
+        }, optional={"payload": Mapping}, schema=READY_BATCH_SCHEMA, name="ready batch")
         return cls(
-            schema=data.get("schema", ""),
-            lineage_id=data.get("lineage_id", ""),
-            batch_id=data.get("batch_id", ""),
-            source_config_digest=data.get("source_config_digest", ""),
-            payload_digest=data.get("payload_digest", ""),
-            science_input_digest=data.get("science_input_digest", ""),
-            target_iterations=data.get("target_iterations", -1),
-            execution=execution,
-            items=tuple(ReadyItem.from_mapping(row) for row in data.get("items", ())),
+            lineage_id=data["lineage_id"], batch_id=data["batch_id"],
+            source_config_digest=data["source_config_digest"], payload_digest=data["payload_digest"],
+            science_input_digest=data["science_input_digest"], target_iterations=data["target_iterations"],
+            execution=ExecutionConfig.from_mapping(data["execution"]),
+            items=tuple(ReadyItem.from_mapping(row) for row in data["items"]),
             payload=data.get("payload", {}),
         )
 

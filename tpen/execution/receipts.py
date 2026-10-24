@@ -10,8 +10,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from ._codec import decode_fields
 from .batch import ReadyBatch
-from .config import canonical_payload_bytes, payload_digest
+from .config import canonical_payload_bytes
 from .recovery import _freeze, _thaw
 
 
@@ -62,13 +63,20 @@ class BackendJobReceipt:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "BackendJobReceipt":
-        """Deserialize and validate a backend-job receipt."""
+        """Deserialize a closed, typed receipt record."""
 
-        _check_schema(data, cls.schema)
-        return cls(**{name: data.get(name, "") for name in (
-            "lineage_id", "batch_id", "invocation_id", "backend", "job_id",
-            "ready_batch_digest", "source_config_digest", "payload_digest",
-        )})
+        fields = (
+            "lineage_id",
+            "batch_id",
+            "invocation_id",
+            "backend",
+            "job_id",
+            "ready_batch_digest",
+            "source_config_digest",
+            "payload_digest",
+        )
+        decode_fields(data, dict.fromkeys(fields, str), schema=cls.schema, name="BackendJobReceipt")
+        return cls(**{name: data[name] for name in fields})
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,14 +105,18 @@ class AllocationObservation:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "AllocationObservation":
-        """Deserialize and validate an allocation observation."""
+        """Deserialize a closed, typed receipt record."""
 
-        _check_schema(data, cls.schema)
-        return cls(
-            lineage_id=data.get("lineage_id", ""), allocation_id=data.get("allocation_id", ""),
-            observed_at_utc=data.get("observed_at_utc", ""), host=data.get("host", ""),
-            partition=data.get("partition", ""), metadata=data.get("metadata", {}),
+        fields = (
+            "lineage_id",
+            "allocation_id",
+            "observed_at_utc",
+            "host",
+            "partition",
         )
+        decode_fields(data, dict.fromkeys(fields, str), optional={"metadata": Mapping},
+                      schema=cls.schema, name="AllocationObservation")
+        return cls(**{name: data[name] for name in fields}, metadata=data.get("metadata", {}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,47 +147,19 @@ class InvocationReceipt:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "InvocationReceipt":
-        """Deserialize and validate an invocation receipt."""
+        """Deserialize a closed, typed receipt record."""
 
-        _check_schema(data, cls.schema)
-        return cls(**{name: data.get(name, "") for name in (
-            "lineage_id", "batch_id", "invocation_id", "job_id", "fresh_output_id",
-            "ready_batch_digest", "status",
-        )})
-
-
-@dataclass(frozen=True, slots=True)
-class FreshOutputReceipt:
-    """Receipt naming the fresh output namespace for an invocation."""
-
-    schema: ClassVar[str] = "tpen.execution/receipt-fresh-output-v1"
-    lineage_id: str
-    batch_id: str
-    invocation_id: str
-    fresh_output_id: str
-    output_path: str
-    payload_digest: str
-
-    def __post_init__(self) -> None:
-        for name in ("lineage_id", "batch_id", "invocation_id", "fresh_output_id", "output_path"):
-            object.__setattr__(self, name, _text(getattr(self, name), name))
-        object.__setattr__(self, "payload_digest", _digest(self.payload_digest, "payload_digest"))
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return a serialized fresh-output receipt."""
-
-        return {"schema": self.schema, **{name: getattr(self, name) for name in (
-            "lineage_id", "batch_id", "invocation_id", "fresh_output_id", "output_path", "payload_digest",
-        )}}
-
-    @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "FreshOutputReceipt":
-        """Deserialize and validate a fresh-output receipt."""
-
-        _check_schema(data, cls.schema)
-        return cls(**{name: data.get(name, "") for name in (
-            "lineage_id", "batch_id", "invocation_id", "fresh_output_id", "output_path", "payload_digest",
-        )})
+        fields = (
+            "lineage_id",
+            "batch_id",
+            "invocation_id",
+            "job_id",
+            "fresh_output_id",
+            "ready_batch_digest",
+            "status",
+        )
+        decode_fields(data, dict.fromkeys(fields, str), schema=cls.schema, name="InvocationReceipt")
+        return cls(**{name: data[name] for name in fields})
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,24 +192,24 @@ class ResultReceipt:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ResultReceipt":
-        """Deserialize and validate a result receipt."""
+        """Deserialize a closed, typed receipt record."""
 
-        _check_schema(data, cls.schema)
-        return cls(**{name: data.get(name, "") for name in (
-            "lineage_id", "batch_id", "invocation_id", "fresh_output_id", "result_receipt_id",
-            "payload_digest", "result_digest", "status",
-        )})
-
-
-def _check_schema(data: Mapping[str, Any], expected: str) -> None:
-    """Reject a receipt serialized under another schema."""
-
-    if not isinstance(data, Mapping) or data.get("schema") != expected:
-        raise ValueError(f"receipt schema is not {expected!r}")
+        fields = (
+            "lineage_id",
+            "batch_id",
+            "invocation_id",
+            "fresh_output_id",
+            "result_receipt_id",
+            "payload_digest",
+            "result_digest",
+            "status",
+        )
+        decode_fields(data, dict.fromkeys(fields, str), schema=cls.schema, name="ResultReceipt")
+        return cls(**{name: data[name] for name in fields})
 
 
 def validate_receipt_binding(
-    receipt: BackendJobReceipt | InvocationReceipt | FreshOutputReceipt | ResultReceipt,
+    receipt: BackendJobReceipt | InvocationReceipt | ResultReceipt,
     batch: ReadyBatch,
 ) -> None:
     """Verify receipt identities and payload bindings against a ready batch."""
@@ -238,7 +222,7 @@ def validate_receipt_binding(
         raise ValueError("receipt is bound to a different source configuration")
     if isinstance(receipt, BackendJobReceipt) and receipt.backend != batch.execution.backend:
         raise ValueError("receipt names a different backend")
-    if isinstance(receipt, (BackendJobReceipt, FreshOutputReceipt, ResultReceipt)) and receipt.payload_digest != batch.payload_digest:
+    if isinstance(receipt, (BackendJobReceipt, ResultReceipt)) and receipt.payload_digest != batch.payload_digest:
         raise ValueError("receipt is bound to a different payload")
     if hasattr(receipt, "invocation_id"):
         try:
@@ -260,7 +244,6 @@ def encode_receipt(receipt: Any) -> bytes:
 __all__ = [
     "AllocationObservation",
     "BackendJobReceipt",
-    "FreshOutputReceipt",
     "InvocationReceipt",
     "ResultReceipt",
     "encode_receipt",

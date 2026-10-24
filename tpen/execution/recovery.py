@@ -17,6 +17,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from ._codec import decode_fields
+
 from tpen.checkpoint.payload import TRAIN_RESUME_PAYLOAD
 from tpen.checkpoint.artifact import require_complete_checkpoint_dir
 from tpen.checkpoint.reference import (
@@ -273,14 +275,19 @@ class CheckpointEvidence:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "CheckpointEvidence":
-        """Deserialize evidence and verify the embedded CheckpointRef identity."""
+        """Deserialize typed evidence and verify its CheckpointRef identity."""
 
-        return cls(
-            ref=deserialize_checkpoint_ref(data["ref"]),
-            science_input_digest=str(data["science_input_digest"]),
-            target_iterations=data["target_iterations"],
-            committed=bool(data.get("committed", True)),
-        )
+        decode_fields(data, {
+            "ref": Mapping, "science_input_digest": str, "target_iterations": int,
+        }, optional={"committed": bool}, name="checkpoint evidence")
+        try:
+            return cls(
+                ref=deserialize_checkpoint_ref(data["ref"]),
+                science_input_digest=data["science_input_digest"],
+                target_iterations=data["target_iterations"], committed=data.get("committed", True),
+            )
+        except (KeyError, TypeError) as exc:
+            raise ValueError("malformed checkpoint evidence") from exc
 
 
 @dataclass(frozen=True, slots=True)
