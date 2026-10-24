@@ -120,6 +120,65 @@ def _register(adapter: BalsamAdapter, batch: ReadyBatch):
     return receipt
 
 
+@pytest.mark.parametrize("changed", [False, True])
+def test_configured_balsam_start_binds_science_before_construction(monkeypatch, tmp_path, changed):
+    from omegaconf import OmegaConf
+    from tpen import run as run_module
+    from tpen.execution import InvocationOutcome
+
+    batch, intent = _batch()
+    client = FakeBalsamClient()
+    adapter = _adapter(tmp_path, client, batch)
+    registration = _register(adapter, batch)
+    cfg = OmegaConf.create({"model": {"_target_": "tests.helpers.Changed" if changed else "tests.helpers.NeverConstructed"}})
+    paths = []
+
+    def core(worker_cfg, **kwargs):
+        path = Path(worker_cfg.run.root)
+        assert (path.parent / "start.json").is_file()
+        assert kwargs["raise_exceptions"] is True
+        paths.append(path)
+        return 0
+
+    monkeypatch.setattr(run_module, "run_from_config", core)
+    starts = [adapter.start_configured(
+        cfg=cfg, batch=batch, intent=intent, phase=RecoveryPhase.INITIAL,
+        job_id=registration.job_id,
+    ) for _ in range(2)]
+    assert client.register_calls == 1
+    assert client.observe_calls == 0
+    assert all(start.status is BalsamAdapterStatus.STARTED for start in starts)
+    assert starts[0].invocation.start.invocation_id != starts[1].invocation.start.invocation_id
+    if changed:
+        assert paths == []
+        assert all(start.invocation.outcome.outcome is InvocationOutcome.TERMINAL for start in starts)
+        assert all(start.invocation.outcome.exception_type == "ReceiptBindingError" for start in starts)
+    else:
+        assert len(paths) == 2 and paths[0] != paths[1]
+        assert all(start.invocation.outcome.outcome is InvocationOutcome.PARKED for start in starts)
+
+
+def test_configured_balsam_start_without_registration_never_enters_core(monkeypatch, tmp_path):
+    from omegaconf import OmegaConf
+    from tpen import run as run_module
+
+    batch, intent = _batch()
+    client = FakeBalsamClient()
+    adapter = _adapter(tmp_path, client, batch)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unregistered configured worker entered science")
+
+    monkeypatch.setattr(run_module, "run_from_config", forbidden)
+    result = adapter.start_configured(
+        cfg=OmegaConf.create({"model": {"_target_": "tests.helpers.NeverConstructed"}}),
+        batch=batch, intent=intent, phase=RecoveryPhase.INITIAL, job_id="unregistered",
+    )
+    assert result.status is BalsamAdapterStatus.PARKED
+    assert result.invocation is None
+    assert client.register_calls == client.observe_calls == 0
+
+
 def test_registration_is_one_persistent_job_and_each_start_is_a_fresh_e3_invocation(tmp_path: Path) -> None:
     batch, intent = _batch()
     client = FakeBalsamClient()

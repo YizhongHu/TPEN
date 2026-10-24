@@ -35,9 +35,10 @@ from pathlib import Path
 from typing import Any, ClassVar, Callable, Protocol
 from uuid import uuid4
 
+from ._codec import decode_fields
 from .batch import ReadyBatch, ReadyItem
 from .config import ExecutionConfig, canonical_payload_bytes, payload_digest
-from .invocation import WorkerInvocation, WorkerStartGateway
+from .invocation import WorkerInvocation, WorkerStartGateway, run_bound_configured_once
 from .recovery import CheckpointEvidence, RecoveryPhase, ScienceIntent
 
 BALSAM_INTENT_SCHEMA = "tpen.execution/balsam-registration-intent-v1"
@@ -352,19 +353,19 @@ class BalsamRegistrationIntent:
         }
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "BalsamRegistrationIntent":
+    def from_mapping(cls, data: Any) -> "BalsamRegistrationIntent":
         """Deserialize and validate a registration intent."""
 
-        if data.get("schema") != cls.schema:
-            raise ValueError(f"registration intent schema is not {cls.schema!r}")
-        return cls(
-            lineage_id=data.get("lineage_id", ""),
-            batch_id=data.get("batch_id", ""),
-            ready_batch_digest=data.get("ready_batch_digest", ""),
-            source_config_digest=data.get("source_config_digest", ""),
-            payload_digest=data.get("payload_digest", ""),
-            backend_options_digest=data.get("backend_options_digest", ""),
+        fields = decode_fields(
+            data,
+            {name: str for name in (
+                "lineage_id", "batch_id", "ready_batch_digest", "source_config_digest",
+                "payload_digest", "backend_options_digest",
+            )},
+            schema=cls.schema,
+            name="BalsamRegistrationIntent",
         )
+        return cls(**{key: value for key, value in fields.items() if key != "schema"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,20 +407,19 @@ class BalsamRegistrationReceipt:
         }
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "BalsamRegistrationReceipt":
+    def from_mapping(cls, data: Any) -> "BalsamRegistrationReceipt":
         """Deserialize and validate a registration acknowledgement."""
 
-        if data.get("schema") != cls.schema:
-            raise ValueError(f"registration receipt schema is not {cls.schema!r}")
-        return cls(
-            lineage_id=data.get("lineage_id", ""),
-            batch_id=data.get("batch_id", ""),
-            job_id=data.get("job_id", ""),
-            ready_batch_digest=data.get("ready_batch_digest", ""),
-            source_config_digest=data.get("source_config_digest", ""),
-            payload_digest=data.get("payload_digest", ""),
-            backend_options_digest=data.get("backend_options_digest", ""),
+        fields = decode_fields(
+            data,
+            {name: str for name in (
+                "lineage_id", "batch_id", "job_id", "ready_batch_digest",
+                "source_config_digest", "payload_digest", "backend_options_digest",
+            )},
+            schema=cls.schema,
+            name="BalsamRegistrationReceipt",
         )
+        return cls(**{key: value for key, value in fields.items() if key != "schema"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -597,6 +597,47 @@ class BalsamAdapter:
             registration=registration,
             observation=None,
             invocation=invocation,
+        )
+
+    def start_configured(
+        self,
+        *,
+        cfg: Any,
+        batch: ReadyBatch,
+        intent: ScienceIntent,
+        phase: RecoveryPhase | str,
+        job_id: str | int,
+        item: ReadyItem | None = None,
+        evidence: CheckpointEvidence | Mapping[str, Any] | str | Path | None = None,
+        attempt_id: str | None = None,
+        fault_injector: Callable[[str], None] | None = None,
+        declared_overlays: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> BalsamStartResult:
+        """Start bound configured science after durable Balsam and E3 admission.
+
+        Worker registration checks stay in :meth:`start`. The callback uses
+        E3's configured materialization so a changed science configuration is
+        refused before construction, with the same recovery/output overlays.
+        """
+
+        return self.start(
+            batch=batch,
+            intent=intent,
+            phase=phase,
+            job_id=job_id,
+            item=item,
+            evidence=evidence,
+            attempt_id=attempt_id,
+            fault_injector=fault_injector,
+            run_once=lambda decision, output_path: run_bound_configured_once(
+                cfg,
+                intent=intent,
+                decision=decision,
+                output_path=output_path,
+                declared_overlays=declared_overlays,
+                **kwargs,
+            ),
         )
 
     def register_lineage(self, batch: ReadyBatch) -> BalsamRegistrationReceipt | None:
