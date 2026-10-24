@@ -46,6 +46,7 @@ from tpen.training.update import (
     VMCUpdateMethod,
     VMCUpdateState,
     vmc_objective_reevaluation,
+    validate_optimizer_parameter_containment,
 )
 from tpen.training.vmc import (
     DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
@@ -564,6 +565,8 @@ class VMCTrainer:
                 optimizer=optimizer,
                 model_parameters=ModelParameterBinding.from_parameters(tuple(model.parameters())),
             )
+            # Recheck mutable param_groups at every sampling/restore boundary.
+            validate_optimizer_parameter_containment(optimizer, resolved_state.model_parameters)
             return resolved_state
         if not isinstance(owned_state, VMCUpdateState):
             raise TypeError("VMCUpdateMethod.update_state must return VMCUpdateState or None")
@@ -573,6 +576,8 @@ class VMCTrainer:
         expected_binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
         if not owned_state.model_parameters.compare(expected_binding)[0]:
             raise ValueError("update method parameter binding does not match live model")
+        # A correct method binding does not establish its carrier's contents.
+        validate_optimizer_parameter_containment(optimizer, expected_binding)
         return owned_state
 
     def fit(
