@@ -21,6 +21,10 @@ import torch
 from omegaconf import OmegaConf
 
 from tpen.checkpoint import CheckpointRef, list_complete_checkpoints
+from tpen.checkpoint.artifact import resolve_checkpoint_dir
+from tpen.checkpoint.catalog import (
+    PUBLICATION_CATALOG_FILENAME, IncompletePublicationRecordError, read_publications,
+)
 from tpen.execution import (
     BalsamAdapter,
     BalsamJobObservation,
@@ -37,6 +41,8 @@ from tpen.execution.recovery import CheckpointEvidence, RecoveryPhase
 from tpen.execution.invocation import _committed_checkpoint
 from tpen.execution.chain_resume import (
     ChainResumeReceipt,
+    classify_checkpoint_fault,
+    E5_NATIVE_EXPECTED_MISMATCHES,
     ChannelParityError,
     ProcessEvidence,
     UnmeasuredArmError,
@@ -148,6 +154,7 @@ def _launch(
     disable_limb: str | None = None,
     disable_limbs: tuple[str, ...] = (),
     suppress_channel: str | None = None,
+    pause_before_science: bool = False,
 ) -> subprocess.Popen[str]:
     command = [
         sys.executable,
@@ -179,6 +186,8 @@ def _launch(
         command.extend(("--disable-limb", disable_limb))
     for limb in disable_limbs:
         command.extend(("--disable-limb", limb))
+    if pause_before_science:
+        command.append("--pause-before-science")
     if suppress_channel is not None:
         command.extend(("--suppress-channel", suppress_channel))
     log = (root / f"worker-{label or phase}-{time.monotonic_ns()}.log").open("w+")
@@ -197,13 +206,22 @@ def _launch(
 def _observed_prefix_checkpoints(outputs: Path, target: int) -> tuple[CheckpointRef, ...]:
     """Return the currently observed committed prefix checkpoints."""
 
-    refs = {
-        ref.content_id: ref
-        for root in outputs.rglob("checkpoints")
-        for path in list_complete_checkpoints(root)
-        for ref in (CheckpointRef.from_directory(path),)
-        if ref.next_iteration < target
-    }
+    refs = {}
+    for root in outputs.rglob("checkpoints"):
+        catalog = root / PUBLICATION_CATALOG_FILENAME
+        if catalog.is_file():
+            try:
+                published = read_publications(catalog)
+            except IncompletePublicationRecordError:
+                continue
+        elif (root / "latest.json").is_file():
+            published = (CheckpointRef.from_directory(resolve_checkpoint_dir(root)),)
+        else:
+            continue
+        for ref in published:
+            if ref.next_iteration < target:
+                ref.validate()
+                refs[ref.content_id] = ref
     return tuple(sorted(refs.values(), key=lambda ref: ref.next_iteration))
 
 
@@ -238,14 +256,21 @@ def _wait_for_checkpoint(
 
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
-        candidates = sorted(
-            checkpoint
-            for root in outputs.rglob("checkpoints")
-            for checkpoint in list_complete_checkpoints(root)
-        )
-        prefixes = [path for path in candidates if int(path.name.split("_")[-1]) < target]
-        if prefixes:
-            return prefixes[-1].parent.parent
+        for root in outputs.rglob("checkpoints"):
+            catalog = root / PUBLICATION_CATALOG_FILENAME
+            if catalog.is_file():
+                try:
+                    refs = read_publications(catalog)
+                except IncompletePublicationRecordError:
+                    continue
+                if any(ref.next_iteration < target for ref in refs):
+                    return root.parent
+            elif (root / "latest.json").is_file():
+                # Use the same latest-pointer resolver as E3; do not fall
+                # back to a merely renamed, unpublished COMPLETE directory.
+                checkpoint = resolve_checkpoint_dir(root)
+                if int(checkpoint.name.split("_")[-1]) < target:
+                    return root.parent
         if process is not None and process.poll() is not None:
             logs = sorted(outputs.parent.glob("worker-*.log"))
             detail = "\n".join(path.read_text() for path in logs)
@@ -319,6 +344,27 @@ def _kill_prefix(process: subprocess.Popen[str], outputs: Path, target: int) -> 
     assert checkpoint is not None
     assert checkpoint.next_iteration < target
     return checkpoint
+
+
+def _kill_before_first_commit(process: subprocess.Popen[str], outputs: Path) -> Path:
+    """Kill a worker paused at the core call, after E3 start publication."""
+
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        starts = list(outputs.rglob("start.json"))
+        if starts:
+            os.kill(process.pid, signal.SIGSTOP)
+            os.kill(process.pid, signal.SIGKILL)
+            process.wait(timeout=30)
+            assert not any(list_complete_checkpoints(root) for root in outputs.rglob("checkpoints"))
+            parked = WorkerStartGateway.reconcile(starts[0].parent)
+            assert parked is not None and parked.outcome.value == "parked"
+            assert "no durable core outcome" in parked.reason
+            return starts[0]
+        if process.poll() is not None:
+            raise AssertionError(f"worker exited before E3 start: {process.returncode}")
+        time.sleep(0.05)
+    raise AssertionError("worker did not publish E3 start before the deadline")
 
 
 def test_kill_before_checkpoint_parks_without_restart(tmp_path: Path) -> None:
@@ -546,7 +592,7 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
         commands=(reference_trace.command, resumed_trace.command),
         process_evidence=(reference_trace, resumed_trace),
         channel_results=real_channel_results,
-        checkpoint_faults=(),
+        checkpoint_faults=_measure_checkpoint_boundary_faults(tmp_path / "checkpoint-faults"),
         collection_output=(
             "tests/integration/test_native_checkpoint_recovery.py::"
             "test_native_e1_to_e4_recovery_parity_divergence_and_receipt",
@@ -754,16 +800,14 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
                     reference_trace, spec, resume_step=resume_cursor - 1
                 ).value
                 == first_subsequent_event(
-                    disabled_trace, spec, resume_step=resume_cursor - 1
+                    disabled_trace, spec,
+                    resume_step=-1 if limb == "trainer_cursor" else resume_cursor - 1,
                 ).value
             )
             for spec in E5_CHANNEL_MAP
         }
         results[limb] = result
         channel = next(spec.channel for spec in E5_CHANNEL_MAP if spec.limb == limb)
-        reference_first_cursor = next(
-            event.step for event in reference_trace.events if event.channel == "trainer_cursor"
-        )
         disabled_first_cursor = next(
             event.step for event in disabled_trace.events if event.channel == "trainer_cursor"
         )
@@ -773,34 +817,23 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             # Recompute the unaffected cursor from the actual first event in
             # each fresh process; the generic channel comparison is not a
             # sufficient cursor observation for another limb's omission.
-            result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
+            result["trainer_cursor"] = disabled_first_cursor == resume_cursor
         assert result[channel] is False, limb
 
         if limb == "optimizer":
-            result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
-            # The optimizer omission also shifts the cursor in this
-            # configured topology.  The cursor is observed, but is not an
-            # unaffected channel, so this arm makes no isolation claim.
-            assert result["trainer_cursor"] is False, (limb, "trainer_cursor")
+            result["trainer_cursor"] = disabled_first_cursor == resume_cursor
+            assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
         elif limb == "process_rng":
-            result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
-            # In this topology the process-RNG omission also changes the
-            # observed cursor, so cursor is causal rather than unaffected.
-            assert result["trainer_cursor"] is False, (limb, "trainer_cursor")
+            result["trainer_cursor"] = disabled_first_cursor == resume_cursor
+            assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
             for unaffected in ("model_logabs", "optimizer_update", "sampler_proposal"):
                 assert result[unaffected] is True, (limb, unaffected)
         elif limb == "model":
-            result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
-            # A model omission changes the model evaluations used by the
-            # sampler and optimizer, and this topology also shifts the
-            # trainer cursor.  The cursor is observed, but it is not an
-            # unaffected channel, so this arm makes no isolation claim.
-            assert result["trainer_cursor"] is False, (limb, "trainer_cursor")
+            result["trainer_cursor"] = disabled_first_cursor == resume_cursor
+            assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
         elif limb == "sampler_mcmc":
-            result["trainer_cursor"] = disabled_first_cursor == reference_first_cursor
-            # The sampler-MCMC omission likewise shifts the observed cursor in
-            # this topology; it is causal rather than an unaffected channel.
-            assert result["trainer_cursor"] is False, (limb, "trainer_cursor")
+            result["trainer_cursor"] = disabled_first_cursor == resume_cursor
+            assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
 
     assert set(results) == {spec.limb for spec in E5_CHANNEL_MAP}
 
@@ -855,23 +888,34 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         wrong_limb = next(
             spec.limb for spec in E5_CHANNEL_MAP if spec.limb != actual_limb
         )
+        correct = compare_channel_parity(
+            reference_trace, actual_trace, resume_step=resume_cursor - 1,
+            disabled_limbs=(actual_limb,), expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
+        )
+        assert correct == results[actual_limb]
         with pytest.raises(ChannelParityError):
             compare_channel_parity(
                 reference_trace,
                 actual_trace,
                 resume_step=resume_cursor - 1,
                 disabled_limbs=(wrong_limb,),
+                expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
             )
 
     # Mutual-masking mutant: use one real single-limb omission while claiming
     # every limb was disabled, then use a real multi-omission run while
     # claiming only one.  Both assertions must fail on the observed vector.
+    compare_channel_parity(
+        reference_trace, disabled_traces["process_rng"], resume_step=resume_cursor - 1,
+        disabled_limbs=("process_rng",), expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
+    )
     with pytest.raises(ChannelParityError, match="model_logabs"):
         compare_channel_parity(
             reference_trace,
             disabled_traces["process_rng"],
             resume_step=resume_cursor - 1,
             disabled_limbs=tuple(spec.limb for spec in E5_CHANNEL_MAP),
+            expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
         )
     all_disabled_path = tmp_path / "channel-all-disabled.trace.json"
     all_disabled = _launch(
@@ -890,12 +934,18 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     )
     all_disabled.wait(timeout=180)
     assert all_disabled.returncode == 0
+    compare_channel_parity(
+        reference_trace, _trace(all_disabled_path), resume_step=resume_cursor - 1,
+        disabled_limbs=tuple(spec.limb for spec in E5_CHANNEL_MAP),
+        expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
+    )
     with pytest.raises(ChannelParityError, match="channel"):
         compare_channel_parity(
             reference_trace,
             _trace(all_disabled_path),
             resume_step=resume_cursor - 1,
             disabled_limbs=("model",),
+            expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
         )
 
     # Every declared arm above is collected and measured.  Keeping this
@@ -906,6 +956,14 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     )
     print(f"UNMEASURED_ARMS={unmeasured_arms}")
     assert unmeasured_arms == ()
+    attribution = {
+        "expected_mismatches": {limb: sorted(channels) for limb, channels in E5_NATIVE_EXPECTED_MISMATCHES.items()},
+        "correct_attribution_passed": sorted(disabled_traces),
+        "observed_parity": results,
+        "unmeasured_attribution": {},
+    }
+    (tmp_path / "attribution-receipt.json").write_text(json.dumps(attribution, sort_keys=True), encoding="utf-8")
+    print("ATTRIBUTION_RECEIPT=" + json.dumps(attribution, sort_keys=True))
 
 
 @pytest.mark.integration
@@ -918,6 +976,7 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
     successful science outcome.
     """
 
+    tmp_path.mkdir(parents=True, exist_ok=True)
     batch, intent, _source = _batch()
     batch_path, intent_path = _write_inputs(tmp_path, batch, intent)
     receipts = tmp_path / "receipts"
@@ -961,10 +1020,10 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
         outputs=before_root,
         phase="initial",
         label="fault-before-commit",
+        pause_before_science=True,
     )
-    os.kill(before.pid, signal.SIGSTOP)
-    os.kill(before.pid, signal.SIGKILL)
-    before.wait(timeout=30)
+    before_start = _kill_before_first_commit(before, before_root)
+    assert before_start.is_file()
     assert before.returncode == -signal.SIGKILL
     assert not any(
         list_complete_checkpoints(root)
@@ -1040,3 +1099,19 @@ def test_real_checkpoint_boundary_faults_are_typed(tmp_path: Path) -> None:
     assert corrupt_result["invocation"]["status"] == "unknown"
     assert corrupt_result["invocation"]["reason"]
     manifest.write_text(original_manifest, encoding="utf-8")
+
+    faults = (
+        classify_checkpoint_fault("no_checkpoint", detail=no_checkpoint_result["invocation"]["outcome"]),
+        classify_checkpoint_fault("before_commit", detail=f"E3 start {before_start}; reconciled parked; successor {before_result['invocation']['outcome']}"),
+        classify_checkpoint_fault("after_commit", detail=f"published checkpoint {checkpoint.content_id}; signal {prefix.returncode}"),
+        classify_checkpoint_fault("corrupt_committed", detail=f"{corrupt_result['invocation']['outcome']}: {corrupt_result['invocation']['refusal_code']}"),
+    )
+
+    (tmp_path / "checkpoint-faults.json").write_text(json.dumps(faults, sort_keys=True), encoding="utf-8")
+
+
+def _measure_checkpoint_boundary_faults(tmp_path: Path) -> tuple[dict[str, str], ...]:
+    """Return the same measured fault outcomes for the qualification receipt."""
+
+    test_real_checkpoint_boundary_faults_are_typed(tmp_path)
+    return tuple(json.loads((tmp_path / "checkpoint-faults.json").read_text(encoding="utf-8")))

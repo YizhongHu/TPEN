@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import os
 from pathlib import Path
 
 
@@ -29,6 +28,14 @@ def test_r3_2_trainer_cursor_unaffected_assertions_are_observed() -> None:
             and stmt.targets[0].value.id == "result"
             and isinstance(stmt.targets[0].slice, ast.Constant)
             and stmt.targets[0].slice.value == "trainer_cursor"
+            and isinstance(stmt.value, ast.Compare)
+            and isinstance(stmt.value.left, ast.Name)
+            and stmt.value.left.id == "disabled_first_cursor"
+            and len(stmt.value.ops) == 1
+            and isinstance(stmt.value.ops[0], ast.Eq)
+            and len(stmt.value.comparators) == 1
+            and isinstance(stmt.value.comparators[0], ast.Name)
+            and stmt.value.comparators[0].id == "resume_cursor"
         )
 
     non_cursor_limbs = {"optimizer", "model", "sampler_mcmc", "process_rng"}
@@ -167,6 +174,14 @@ def test_r3_2_trainer_cursor_unaffected_assertions_still_tautological() -> None:
             and stmt.targets[0].value.id == "result"
             and isinstance(stmt.targets[0].slice, ast.Constant)
             and stmt.targets[0].slice.value == "trainer_cursor"
+            and isinstance(stmt.value, ast.Compare)
+            and isinstance(stmt.value.left, ast.Name)
+            and stmt.value.left.id == "disabled_first_cursor"
+            and len(stmt.value.ops) == 1
+            and isinstance(stmt.value.ops[0], ast.Eq)
+            and len(stmt.value.comparators) == 1
+            and isinstance(stmt.value.comparators[0], ast.Name)
+            and stmt.value.comparators[0].id == "resume_cursor"
         )
 
     limbs = {"optimizer", "model", "sampler_mcmc", "process_rng"}
@@ -253,7 +268,8 @@ def _function_names(root: Path) -> tuple[set[str], list[str]]:
 
 
 def test_whole_tree_r1_r2_r3_port_census_has_required_functions() -> None:
-    layer = os.environ.get("TPEN_REVIEW_LAYER", "CR")
+    root = Path(__file__).parents[3]
+    layer = "CR" if (root / "tpen/execution/chain_resume.py").is_file() else "E5"
     assert layer in _PORTS
     names, errors = _function_names(Path(__file__).parents[3])
     assert not errors, f"tracked-tree AST parse failures (fail-closed): {errors}"

@@ -18,6 +18,10 @@ def test_r4_checkpoint_helpers_ignore_staged_tmp_checkpoint(tmp_path: Path) -> N
     committed.mkdir()
     (committed / "manifest.json").write_text("{}\n", encoding="utf-8")
     (committed / "COMPLETE").write_text("complete\n", encoding="utf-8")
+    # R5 issue 15a: the valid control is published, not only renamed.
+    (checkpoints / "latest.json").write_text(
+        '{"checkpoint_dir": "step_000001"}\n', encoding="utf-8"
+    )
     staged = checkpoints / "step_000001.tmp"
     staged.mkdir()
     (staged / "manifest.json").write_text("{}\n", encoding="utf-8")

@@ -30,12 +30,14 @@ class NativeTrace:
         seed: int,
         resume_step: int,
         command: Iterable[str] = (),
+        checkpoint_rng_source: str | None = None,
         suppress_channels: Iterable[str] = (),
     ) -> None:
         self.phase = phase
         self.pid = os.getpid()
         self.seed = seed
-        self.seed_source = f"{phase}:runtime.seed={seed}"
+        self.seed_source = f"runtime.seed={seed}"
+        self.checkpoint_rng_source = checkpoint_rng_source
         self.resume_step = resume_step
         self.command = tuple(command)
         self.current_step = resume_step
@@ -138,6 +140,13 @@ def install_native_trace(trace: NativeTrace) -> ExitStack:
     original_forward = TrainableHookeSingletAnsatz.forward
     original_step = torch.optim.Adam.step
     original_fit = VMCTrainer.fit
+    import tpen.checkpoint.restore as restore
+    original_apply_rng = restore.apply_rng_state
+
+    def apply_rng(state, device):
+        original_apply_rng(state, device)
+        if trace.checkpoint_rng_source is not None:
+            trace.seed_source = f"checkpoint:{trace.checkpoint_rng_source}:rng_state"
 
     def collect_samples(self, model, *args, **kwargs):
         trace.begin_step()
@@ -176,12 +185,14 @@ def install_native_trace(trace: NativeTrace) -> ExitStack:
     TrainableHookeSingletAnsatz.forward = forward
     torch.optim.Adam.step = optimizer_step
     VMCTrainer.fit = fit
+    restore.apply_rng_state = apply_rng
 
     def undo() -> None:
         MetropolisSampler.collect_samples = original_collect
         TrainableHookeSingletAnsatz.forward = original_forward
         torch.optim.Adam.step = original_step
         VMCTrainer.fit = original_fit
+        restore.apply_rng_state = original_apply_rng
 
     stack.callback(undo)
     return stack

@@ -101,6 +101,18 @@ E5_CHANNEL_MAP: tuple[ChannelSpec, ...] = (
 )
 
 
+# First-event coupling observed in the declared native fixture. These are
+# mismatch sets, not independent-owner claims. Callers must opt in; synthetic
+# adapter-unit fixtures retain the independent single-channel contract.
+E5_NATIVE_EXPECTED_MISMATCHES: Mapping[str, frozenset[str]] = {
+    "model": frozenset({"model_logabs", "optimizer_update", "process_random"}),
+    "optimizer": frozenset({"optimizer_update", "process_random"}),
+    "process_rng": frozenset({"process_random"}),
+    "sampler_mcmc": frozenset({"model_logabs", "optimizer_update", "sampler_proposal", "process_random"}),
+    "trainer_cursor": frozenset({"trainer_cursor", "process_random"}),
+}
+
+
 def e5_channel_map(
     supported_owners: Iterable[str] = SUPPORTED_STATE_OWNERS,
 ) -> tuple[ChannelSpec, ...]:
@@ -299,14 +311,19 @@ def compare_channel_parity(
     resume_step: int,
     channel_map: Iterable[ChannelSpec] | None = None,
     disabled_limbs: Iterable[str] = (),
+    expected_mismatches: Mapping[str, frozenset[str]] | None = None,
 ) -> dict[str, bool]:
     """Compare first post-cursor events, naming expected disabled mismatches.
 
     Returns
     -------
     dict of str to bool
-        Per-channel parity booleans.  Disabled limbs must be false; enabled
-        limbs must be true.  A missing event raises ``UnmeasuredArmError``.
+        Per-channel parity booleans. Without a coupling map, only disabled
+        owners' channels must mismatch. An explicit expected_mismatches map
+        declares each owner's full first-event mismatch signature; combined
+        omissions use their union. A cursor omission compares actual first
+        events, including the restarted cursor, rather than filtering replay.
+        Missing events still raise ``UnmeasuredArmError``.
     """
 
     specs = validate_channel_map(
@@ -317,6 +334,16 @@ def compare_channel_parity(
     unknown_disabled = disabled - {spec.limb for spec in specs}
     if unknown_disabled:
         raise ChannelMapError("disabled limb is outside the E5 profile")
+    channels = {spec.channel for spec in specs}
+    if expected_mismatches is None:
+        mismatch_channels = {spec.channel for spec in specs if spec.limb in disabled}
+    else:
+        if set(expected_mismatches) != {spec.limb for spec in specs}:
+            raise ChannelMapError("coupling map must name every supported limb")
+        if any(not set(values) <= channels for values in expected_mismatches.values()):
+            raise ChannelMapError("coupling map names an unknown channel")
+        mismatch_channels = set().union(*(expected_mismatches[limb] for limb in disabled))
+    cursor_omission = expected_mismatches is not None and "trainer_cursor" in disabled
     resumed_phase = resumed.phase.strip().lower()
     if resumed_phase not in {"recovery", "resumed"}:
         raise ChannelParityError(
@@ -326,7 +353,7 @@ def compare_channel_parity(
         event.random_dependent and event.step <= resume_step
         for event in resumed.events
     )
-    if replayed and "trainer_cursor" in disabled:
+    if replayed and "trainer_cursor" in disabled and not cursor_omission:
         # A cursor omission is observable as a restarted first step.  Name the
         # owner before the channel loop reaches an unrelated model event.
         raise ChannelParityError(
@@ -335,14 +362,19 @@ def compare_channel_parity(
     result: dict[str, bool] = {}
     for spec in specs:
         left = first_subsequent_event(reference, spec, resume_step=resume_step)
-        right = first_subsequent_event(resumed, spec, resume_step=resume_step)
+        # A deliberate cursor omission is measured at its actual FIRST event,
+        # including a restarted prefix. Filtering it past the selected cursor
+        # would erase the very omission that the adapter is meant to expose.
+        right = first_subsequent_event(
+            resumed, spec, resume_step=-1 if cursor_omission else resume_step
+        )
         expected_step = resume_step + 1
-        if right.step != expected_step:
+        if not cursor_omission and right.step != expected_step:
             raise ChannelParityError(
                 f"resumed channel {spec.channel!r} first event is step {right.step}, "
                 f"expected selected cursor successor {expected_step}"
             )
-        if any(
+        if not cursor_omission and any(
             event.channel == spec.channel
             and event.random_dependent
             and event.step <= resume_step
@@ -357,9 +389,9 @@ def compare_channel_parity(
                 f"reference channel {spec.channel!r} first aligned event is step {left.step}, "
                 f"expected selected cursor successor {expected_step}"
             )
-        equal = left.value == right.value
+        equal = (left.step == right.step) if spec.channel == "trainer_cursor" and expected_mismatches is not None else left.value == right.value
         result[spec.channel] = equal
-        expected = spec.limb not in disabled
+        expected = spec.channel not in mismatch_channels
         if equal != expected:
             expected_text = "parity" if expected else "a mismatch"
             raise ChannelParityError(

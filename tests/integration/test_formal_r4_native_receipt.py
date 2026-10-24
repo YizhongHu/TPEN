@@ -14,10 +14,8 @@ from tests.integration import test_native_checkpoint_recovery as native
 
 
 _native_target = native.test_native_e1_to_e4_recovery_parity_divergence_and_receipt
-pytestmark = pytest.mark.skipif(
-    os.environ.get("TPEN_REVIEW_LAYER", "CR") != "CR",
-    reason="B4 receipt command/PID audit is CR-only",
-)
+# This module is owned by the CR tree; review environment variables must not
+# suppress its command/PID evidence.
 
 
 @pytest.fixture(scope="module")
