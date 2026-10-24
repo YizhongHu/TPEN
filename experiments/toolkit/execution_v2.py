@@ -30,6 +30,38 @@ def _digest(payload: Any) -> str:
     return sha256(_canonical(payload)).hexdigest()
 
 
+def _closed_mapping(
+    data: Any, required: Mapping[str, type], *,
+    optional: Mapping[str, type | tuple[type, ...]] | None = None, name: str,
+) -> Mapping[str, Any]:
+    """Validate adapter wire fields without crossing the core import boundary."""
+
+    if not isinstance(data, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    fields = {**required, **(optional or {})}
+    if set(data) - fields.keys() or set(required) - data.keys():
+        raise ValueError(f"{name} has unknown or missing fields")
+    for key, value in data.items():
+        expected = fields[key]
+        valid = isinstance(value, expected)
+        if expected is int:
+            valid = type(value) is int
+        elif expected is Sequence:
+            valid = valid and not isinstance(value, (str, bytes, bytearray))
+        if not valid:
+            raise ValueError(f"{name}.{key} has an invalid type")
+    return data
+
+
+def _row(data: Any) -> Mapping[str, Any]:
+    """Read one closed adapter row before any field lookup."""
+
+    return _closed_mapping(data, {
+        "invocation_id": str, "logical_task_id": str, "fresh_output_id": str,
+        "argv": Sequence, "result_dir": str,
+    }, optional={"payload": Mapping}, name="v2 row")
+
+
 def ready_batch_v2(
     *,
     lineage_id: str,
@@ -79,7 +111,9 @@ def ready_batch_v2(
         raise ValueError("backend must be non-empty")
     if not isinstance(recovery, str) or not recovery:
         raise ValueError("recovery must be non-empty")
-    copied_rows = [dict(row) for row in rows]
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
+        raise ValueError("v2 rows must be a sequence")
+    copied_rows = [dict(_row(row)) for row in rows]
     identities = [row.get("invocation_id") for row in copied_rows]
     if any(not isinstance(identity, str) or not identity for identity in identities):
         raise ValueError("every v2 row needs an opaque invocation_id")
@@ -133,11 +167,37 @@ def ready_batch_v2(
 def encode_ready_batch_v2(batch: Mapping[str, Any]) -> bytes:
     """Serialize an adapter mapping deterministically after validation."""
 
-    if batch.get("schema") != READY_BATCH_ADAPTER_SCHEMA:
+    _closed_mapping(batch, {
+        "schema": str, "lineage_id": str, "batch_id": str,
+        "source_config_digest": str, "science_input_digest": str,
+        "payload_digest": str, "target_iterations": int,
+        "execution": Mapping, "payload": Mapping, "items": Sequence,
+    }, name="v2 ready batch")
+    if batch["schema"] != READY_BATCH_ADAPTER_SCHEMA:
         raise ValueError("unsupported v2 ready-batch adapter schema")
-    expected = _digest(batch.get("payload"))
-    if batch.get("payload_digest") != expected:
+    expected = _digest(batch["payload"])
+    if batch["payload_digest"] != expected:
         raise ValueError("v2 payload digest does not match payload")
+    execution = _closed_mapping(batch["execution"], {
+        "schema": str, "lineage_id": str, "backend": str, "recovery": str,
+        "source_config_digest": str, "payload_digest": str,
+    }, optional={
+        "recovery_selection_digest": (str, type(None)),
+        "backend_options": Mapping, "recovery_options": Mapping,
+    }, name="v2 execution")
+    if execution["schema"] != "tpen.execution/config-v1":
+        raise ValueError("unsupported v2 execution schema")
+    rebuilt = ready_batch_v2(
+        lineage_id=batch["lineage_id"], batch_id=batch["batch_id"],
+        source_config_digest=batch["source_config_digest"],
+        science_input_digest=batch["science_input_digest"],
+        target_iterations=batch["target_iterations"], backend=execution["backend"],
+        recovery=execution["recovery"], payload=batch["payload"], rows=batch["items"],
+        recovery_selection_digest=execution.get("recovery_selection_digest"),
+        backend_options=execution.get("backend_options"), recovery_options=execution.get("recovery_options"),
+    )
+    if _canonical(rebuilt) != _canonical(batch):
+        raise ValueError("v2 execution binding does not match ready batch")
     return _canonical(batch)
 
 

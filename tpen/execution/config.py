@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any
 
+from ._codec import decode_fields
 from .recovery import RecoveryDecision, _freeze, _thaw
 
 EXECUTION_CONFIG_SCHEMA = "tpen.execution/config-v1"
@@ -33,15 +34,6 @@ def _digest(value: Any, name: str) -> str:
     if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
         raise ValueError(f"{name} must be a lowercase SHA-256 digest")
     return value
-
-
-def _reject_unknown_keys(data: Mapping[str, Any], allowed: frozenset[str], name: str) -> None:
-    """Reject fields not defined by this versioned mapping schema."""
-
-    unknown = set(data) - allowed
-    if unknown:
-        names = ", ".join(sorted(str(key) for key in unknown))
-        raise ValueError(f"{name} contains unknown keys: {names}")
 
 
 def canonical_payload_bytes(payload: Any) -> bytes:
@@ -152,38 +144,21 @@ class ExecutionConfig:
         return canonical_payload_bytes(self.to_dict())
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "ExecutionConfig":
-        """Construct and validate a configuration from serialized data."""
+    def from_mapping(cls, data: Any) -> "ExecutionConfig":
+        """Construct a closed, typed execution configuration record."""
 
-        if not isinstance(data, Mapping):
-            raise TypeError("execution config must be a mapping")
-        _reject_unknown_keys(
-            data,
-            frozenset(
-                {
-                    "schema",
-                    "lineage_id",
-                    "backend",
-                    "recovery",
-                    "source_config_digest",
-                    "payload_digest",
-                    "recovery_selection_digest",
-                    "backend_options",
-                    "recovery_options",
-                }
-            ),
-            "execution config",
-        )
+        decode_fields(data, {
+            "lineage_id": str, "backend": str, "recovery": str,
+            "source_config_digest": str, "payload_digest": str,
+        }, optional={
+            "recovery_selection_digest": (str, type(None)),
+            "backend_options": Mapping, "recovery_options": Mapping,
+        }, schema=EXECUTION_CONFIG_SCHEMA, name="execution config")
         return cls(
-            schema=data.get("schema", ""),
-            lineage_id=data.get("lineage_id", ""),
-            backend=data.get("backend", ""),
-            recovery=data.get("recovery", ""),
-            source_config_digest=data.get("source_config_digest", ""),
-            payload_digest=data.get("payload_digest", ""),
+            lineage_id=data["lineage_id"], backend=data["backend"], recovery=data["recovery"],
+            source_config_digest=data["source_config_digest"], payload_digest=data["payload_digest"],
             recovery_selection_digest=data.get("recovery_selection_digest"),
-            backend_options=data.get("backend_options", {}),
-            recovery_options=data.get("recovery_options", {}),
+            backend_options=data.get("backend_options", {}), recovery_options=data.get("recovery_options", {}),
         )
 
     @classmethod
