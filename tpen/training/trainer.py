@@ -463,7 +463,7 @@ class VMCTrainer:
 
         Notes
         -----
-        This is not a validation boundary. Containment is checked by
+        This is not a containment boundary. Containment is checked by
         ``_resolve_method_state`` on the ``fit`` and ``resolve_update_state``
         paths. After a containment refusal on those paths, discard this
         trainer: it may remain bound to the refused carrier.

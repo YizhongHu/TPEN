@@ -65,7 +65,7 @@ class _UncheckedStatefulUpdate(VMCUpdateMethod[AutogradUpdateInput]):
         self.state.optimizer.zero_grad(set_to_none=True)
         update_input.objective.backward()
         self.state.optimizer.step()
-        return VMCUpdateResult(applied=True, grad_norm=None)
+        return VMCUpdateResult(applied=True, grad_norm=0.0)
 
 
 def _entry(entry, model, optimizer, trainer, sampler, monkeypatch, restore_calls):
