@@ -113,9 +113,8 @@ def test_resolved_adapter_refuses_carrier_drift(entry, monkeypatch) -> None:
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     trainer = VMCTrainer(max_steps=1)
     trainer.resolve_update_state(model=model, optimizer=optimizer)
-    # Retain the DEFAULT adapter just resolved: this isolates trainer
-    # revalidation from the independent direct-constructor defence.
-    trainer.update_method = trainer._resolved_update_method
+    # The binding entry retains the default adapter after a valid resolve.
+    # Re-entry must inspect current carrier contents, not cached admission.
     optimizer.param_groups[0]["params"] = list(foreign.parameters())
     _assert_refused(entry, model, optimizer, trainer, _Sampler(), monkeypatch,
                     "carrier contains foreign model parameters")
@@ -130,7 +129,6 @@ def test_trainer_refuses_empty_carrier(entry, empty_shape, monkeypatch) -> None:
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     trainer = VMCTrainer(max_steps=1)
     trainer.resolve_update_state(model=model, optimizer=optimizer)
-    trainer.update_method = trainer._resolved_update_method
     if empty_shape == "no_groups":
         optimizer.param_groups.clear()
     else:
