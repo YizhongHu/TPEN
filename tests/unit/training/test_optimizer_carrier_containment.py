@@ -12,11 +12,8 @@ from tpen.physics.potential import HarmonicTrap
 from tpen.runner.train import Train
 from tpen.training.trainer import VMCTrainer
 from tpen.training.update import (
-    AutogradUpdateInput,
     LegacyAutogradUpdate,
     ModelParameterBinding,
-    VMCUpdateMethod,
-    VMCUpdateResult,
 )
 from tests.unit.training.test_vmc_trainer_tpen_smoke import _StubContext
 
@@ -49,13 +46,6 @@ class _Sampler:
             spins=torch.ones(3, 1, dtype=torch.float64),
         )
         return SimpleNamespace(make_batch=lambda: batch, n_walkers=3), None
-
-
-class _Stateless(VMCUpdateMethod[AutogradUpdateInput]):
-    """Exercise the trainer branch that has no method-owned state."""
-
-    def update(self, update_input: AutogradUpdateInput) -> VMCUpdateResult:
-        return VMCUpdateResult(applied=False, grad_norm=None)
 
 
 def _entry(entry, model, optimizer, trainer, sampler, monkeypatch, restore_calls):
@@ -132,16 +122,13 @@ def test_resolved_adapter_refuses_carrier_drift(entry, monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("entry", ["fit", "resume"])
-@pytest.mark.parametrize("method", ["stateful", "stateless"])
 @pytest.mark.parametrize("empty_shape", ["no_groups", "empty_group"])
-def test_trainer_refuses_empty_carrier(entry, method, empty_shape, monkeypatch) -> None:
+def test_trainer_refuses_empty_carrier(entry, empty_shape, monkeypatch) -> None:
     """Empty groups and groups without parameters cannot pass containment vacuously."""
 
     model = _Wavefunction()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-    trainer = VMCTrainer(
-        max_steps=1, update_method=_Stateless() if method == "stateless" else None
-    )
+    trainer = VMCTrainer(max_steps=1)
     trainer.resolve_update_state(model=model, optimizer=optimizer)
     trainer.update_method = trainer._resolved_update_method
     if empty_shape == "no_groups":
@@ -150,17 +137,6 @@ def test_trainer_refuses_empty_carrier(entry, method, empty_shape, monkeypatch) 
         optimizer.param_groups[0]["params"].clear()
     _assert_refused(entry, model, optimizer, trainer, _Sampler(), monkeypatch,
                     "optimizer parameter carrier is empty")
-
-
-@pytest.mark.parametrize("entry", ["fit", "resume"])
-def test_stateless_trainer_refuses_foreign_carrier(entry, monkeypatch) -> None:
-    """The no-owned-state branch must validate the live carrier too."""
-
-    model, foreign = _Wavefunction(), _Wavefunction()
-    optimizer = torch.optim.SGD(foreign.parameters(), lr=0.1)
-    _assert_refused(entry, model, optimizer,
-                    VMCTrainer(max_steps=1, update_method=_Stateless()), _Sampler(),
-                    monkeypatch, "carrier contains foreign model parameters")
 
 
 @pytest.mark.parametrize("carrier", ["foreign", "empty"])

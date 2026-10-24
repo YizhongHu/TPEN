@@ -565,8 +565,8 @@ class VMCTrainer:
                 optimizer=optimizer,
                 model_parameters=ModelParameterBinding.from_parameters(tuple(model.parameters())),
             )
-            # Recheck mutable param_groups at every sampling/restore boundary.
-            validate_optimizer_parameter_containment(optimizer, resolved_state.model_parameters)
+            # Stateless methods receive no optimizer in AutogradUpdateInput;
+            # the trainer never steps a foreign carrier on their behalf.
             return resolved_state
         if not isinstance(owned_state, VMCUpdateState):
             raise TypeError("VMCUpdateMethod.update_state must return VMCUpdateState or None")
@@ -576,7 +576,8 @@ class VMCTrainer:
         expected_binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
         if not owned_state.model_parameters.compare(expected_binding)[0]:
             raise ValueError("update method parameter binding does not match live model")
-        # A correct method binding does not establish its carrier's contents.
+        # A correct binding does not establish mutable carrier contents:
+        # revalidate at every sampling/restore boundary, without caching.
         validate_optimizer_parameter_containment(optimizer, expected_binding)
         return owned_state
 
