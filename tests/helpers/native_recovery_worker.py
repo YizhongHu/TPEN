@@ -26,7 +26,11 @@ from tpen.execution import (
     validate_native_recovery_profile,
 )
 from tpen.checkpoint.restore import restore_checkpoint
-from tpen.execution.invocation import _core_outcome_from_artifacts, run_configured_once
+from tpen.execution.invocation import (
+    _core_outcome_from_artifacts,
+    _materialize_configured_worker_config,
+    run_configured_once,
+)
 from tpen.runner import Train
 from tpen.runner.base import _assert_eager_initialized, _is_torch_module, _place_module_for_runtime
 from tpen.training.optim import make_optimizer
@@ -172,10 +176,15 @@ def main() -> int:
     def run_once(decision, output_path):
         nonlocal run_cfg, selected_decision
         selected_decision = decision
+        # Validate the original source even for the deliberate partial-restore
+        # negative control, before that control changes the restore operation.
+        run_cfg = _materialize_configured_worker_config(
+            cfg, intent=intent, decision=decision, output_path=output_path,
+            declared_overlays=None,
+        )
         if args.partial_restore:
             if decision.checkpoint is None:
                 raise AssertionError("partial restore requires a selected checkpoint")
-            run_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
             OmegaConf.update(
                 run_cfg,
                 "runner._target_",
@@ -205,14 +214,19 @@ def main() -> int:
                 trace.write(args.trace)
         return _core_outcome_from_artifacts(output_path, decision=decision)
 
-    result = adapter.start(
-        batch=batch,
-        intent=intent,
-        phase=RecoveryPhase(args.phase),
-        run_once=run_once,
-        job_id=args.job_id,
-        evidence=evidence,
-    )
+    if args.partial_restore:
+        # Only this explicit negative control bypasses full-state restore;
+        # it still uses E3's materialization before the injected omission.
+        result = adapter.start(
+            batch=batch, intent=intent, phase=RecoveryPhase(args.phase),
+            run_once=run_once, job_id=args.job_id, evidence=evidence,
+        )
+    else:
+        result = adapter.start_configured(
+            cfg=cfg, batch=batch, intent=intent, phase=RecoveryPhase(args.phase),
+            job_id=args.job_id, evidence=evidence,
+            config_path=str(args.config), command="e5-native-worker",
+        )
     invocation = result.invocation
     output = {
         "status": result.status.value,

@@ -17,6 +17,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from ._codec import decode_fields
+
 from tpen.checkpoint.payload import TRAIN_RESUME_PAYLOAD
 from tpen.checkpoint.artifact import require_complete_checkpoint_dir
 from tpen.checkpoint.reference import (
@@ -273,14 +275,19 @@ class CheckpointEvidence:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "CheckpointEvidence":
-        """Deserialize evidence and verify the embedded CheckpointRef identity."""
+        """Deserialize typed evidence and verify its CheckpointRef identity."""
 
-        return cls(
-            ref=deserialize_checkpoint_ref(data["ref"]),
-            science_input_digest=str(data["science_input_digest"]),
-            target_iterations=data["target_iterations"],
-            committed=bool(data.get("committed", True)),
-        )
+        decode_fields(data, {
+            "ref": Mapping, "science_input_digest": str, "target_iterations": int,
+        }, optional={"committed": bool}, name="checkpoint evidence")
+        try:
+            return cls(
+                ref=deserialize_checkpoint_ref(data["ref"]),
+                science_input_digest=data["science_input_digest"],
+                target_iterations=data["target_iterations"], committed=data.get("committed", True),
+            )
+        except (KeyError, TypeError) as exc:
+            raise ValueError("malformed checkpoint evidence") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,9 +381,7 @@ def select_recovery(
     # initial checkpoint.  Refuse those forms in both phases so this boundary
     # cannot self-stamp a checkpoint binding; durable evidence mappings remain
     # the explicit form for callers that need an initial checkpoint.
-    if phase in {RecoveryPhase.INITIAL, RecoveryPhase.RECOVERY} and isinstance(
-        evidence, (CheckpointRef, str, Path)
-    ):
+    if isinstance(evidence, (CheckpointRef, str, Path)):
         return _refused(
             intent,
             phase,
@@ -434,22 +439,13 @@ def select_recovery(
 
 
 def _coerce_evidence(
-    evidence: CheckpointEvidence | CheckpointRef | Mapping[str, Any] | str | Path,
+    evidence: CheckpointEvidence | Mapping[str, Any],
     intent: ScienceIntent,
 ) -> CheckpointEvidence:
     """Normalize supported evidence forms while keeping binding explicit."""
 
     if isinstance(evidence, CheckpointEvidence):
         return evidence
-    if isinstance(evidence, CheckpointRef):
-        # A direct ref supplied to this function is bound to the current intent
-        # at this boundary. Durable callers should prefer CheckpointEvidence so
-        # the binding is preserved across process starts.
-        return CheckpointEvidence.from_ref(
-            evidence,
-            science_input_digest=intent.science_input_digest,
-            target_iterations=intent.target_iterations,
-        )
     if isinstance(evidence, Mapping):
         try:
             return CheckpointEvidence.from_mapping(evidence)
@@ -459,11 +455,7 @@ def _coerce_evidence(
                 science_input_digest=intent.science_input_digest,
                 target_iterations=intent.target_iterations,
             )
-    return CheckpointEvidence.from_path(
-        evidence,
-        science_input_digest=intent.science_input_digest,
-        target_iterations=intent.target_iterations,
-    )
+    raise TypeError("evidence must be CheckpointEvidence or a durable evidence mapping")
 
 
 def _checkpoint_refusal(ref: CheckpointRef, *, target_iterations: int) -> RecoveryRefusal | None:

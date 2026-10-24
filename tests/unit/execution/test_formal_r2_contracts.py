@@ -14,7 +14,6 @@ import pytest
 from tpen.execution import (
     BackendJobReceipt,
     ExecutionConfig,
-    FreshOutputReceipt,
     InvocationReceipt,
     ReadyBatch,
     ReadyItem,
@@ -63,13 +62,6 @@ def _receipt(kind: str, batch: ReadyBatch):
             ready_batch_digest=batch.identity,
             status="started",
         )
-    if kind == "fresh-output":
-        return FreshOutputReceipt(
-            **common,
-            fresh_output_id="output-a",
-            output_path="results/a",
-            payload_digest=batch.payload_digest,
-        )
     if kind == "result":
         return ResultReceipt(
             **common,
@@ -82,19 +74,17 @@ def _receipt(kind: str, batch: ReadyBatch):
     raise AssertionError(kind)
 
 
-@pytest.mark.parametrize("kind", ("invocation", "fresh-output", "result"))
+@pytest.mark.parametrize("kind", ("invocation", "result"))
 def test_crossed_invocation_and_output_pair_is_refused(kind: str) -> None:
     """RED at E2: A's invocation cannot be paired with B's output identity."""
 
     batch = _batch()
     receipt = replace(_receipt(kind, batch), fresh_output_id="output-b")
-    if kind == "fresh-output":
-        receipt = replace(receipt, output_path="results/b")
     with pytest.raises(ValueError):
         validate_receipt_binding(receipt, batch)
 
 
-@pytest.mark.parametrize("kind", ("invocation", "fresh-output", "result"))
+@pytest.mark.parametrize("kind", ("invocation", "result"))
 def test_matching_invocation_and_output_pair_is_accepted(kind: str) -> None:
     """GREEN control: each exact A/A receipt binding is accepted."""
 

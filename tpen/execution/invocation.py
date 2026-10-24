@@ -18,12 +18,13 @@ from pathlib import Path
 from typing import Any, ClassVar
 from uuid import uuid4
 
-from tpen.checkpoint.artifact import resolve_checkpoint_dir
-from tpen.checkpoint.catalog import PUBLICATION_CATALOG_FILENAME, read_publications
+from tpen.checkpoint.artifact import LATEST_JSON, list_complete_checkpoints, resolve_checkpoint_dir
+from tpen.checkpoint.catalog import PUBLICATION_CATALOG_FILENAME, read_publications, reconcile_publication
 from tpen.checkpoint.reference import CheckpointRef
 from tpen.checkpoint.schema import read_manifest
 from tpen.config_schema import ClosedSchemaError
 
+from ._codec import decode_fields
 from .batch import ReadyBatch, ReadyItem
 from .config import (
     canonical_payload_bytes,
@@ -119,13 +120,6 @@ def _nonnegative_int(value: Any, name: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
     return value
-
-
-def _check_schema(data: Mapping[str, Any], expected: str) -> None:
-    """Reject a receipt serialized under another schema."""
-
-    if not isinstance(data, Mapping) or data.get("schema") != expected:
-        raise ValueError(f"receipt schema is not {expected!r}")
 
 
 def _innermost_tpen_module(exc: BaseException) -> str | None:
@@ -301,20 +295,27 @@ class WorkerStartReceipt:
         }
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "WorkerStartReceipt":
-        """Deserialize one worker-start receipt."""
+    def from_mapping(cls, data: Any) -> "WorkerStartReceipt":
+        """Deserialize a closed, typed worker receipt record."""
 
-        if not isinstance(data, Mapping):
-            raise TypeError("worker-start receipt must be a mapping")
-        _check_schema(data, cls.schema)
-        return cls(**{name: data.get(name) for name in (
-            "lineage_id", "batch_id", "logical_invocation_id",
-            "invocation_id", "fresh_output_id", "output_path", "ready_batch_digest",
-            "source_config_digest", "payload_digest", "science_input_digest",
-            "target_iterations", "next_iteration", "completed_updates",
-            "recovery_outcome", "recovery_selection_digest", "checkpoint_content_id",
-            "declared_overlays",
-        )})
+        fields = {
+            "lineage_id": str, "batch_id": str, "logical_invocation_id": str,
+            "invocation_id": str, "fresh_output_id": str, "output_path": str,
+            "ready_batch_digest": str, "source_config_digest": str,
+            "payload_digest": str, "science_input_digest": str,
+            "target_iterations": int, "next_iteration": int, "completed_updates": int,
+            "recovery_outcome": str, "recovery_selection_digest": str,
+        }
+        decode_fields(
+            data, fields,
+            optional={"checkpoint_content_id": (str, type(None)), "declared_overlays": Mapping},
+            schema=cls.schema, name="WorkerStartReceipt",
+        )
+        return cls(
+            **{name: data[name] for name in fields},
+            checkpoint_content_id=data.get("checkpoint_content_id"),
+            declared_overlays=data.get("declared_overlays", {}),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,17 +362,23 @@ class WorkerOutcomeReceipt:
         }
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "WorkerOutcomeReceipt":
-        """Deserialize one worker-outcome receipt."""
+    def from_mapping(cls, data: Any) -> "WorkerOutcomeReceipt":
+        """Deserialize a closed, typed worker receipt record."""
 
-        if not isinstance(data, Mapping):
-            raise TypeError("worker-outcome receipt must be a mapping")
-        _check_schema(data, cls.schema)
-        return cls(**{name: data.get(name) for name in (
-            "start_receipt_digest", "outcome", "status",
-            "target_iterations", "next_iteration", "completed_updates",
-            "reason", "refusal_code", "exception_type",
-        )})
+        fields = {
+            "start_receipt_digest": str, "outcome": str, "status": str,
+            "target_iterations": int, "next_iteration": int, "completed_updates": int,
+            "reason": str,
+        }
+        decode_fields(
+            data, fields,
+            optional={"refusal_code": (str, type(None)), "exception_type": (str, type(None))},
+            schema=cls.schema, name="WorkerOutcomeReceipt",
+        )
+        return cls(
+            **{name: data[name] for name in fields},
+            refusal_code=data.get("refusal_code"), exception_type=data.get("exception_type"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,7 +467,7 @@ def classify_core_outcome(
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Write and fsync JSON, then publish it with a same-directory rename."""
+    """Fsync JSON and exclusively publish it without replacing a prior receipt."""
 
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -473,7 +480,7 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write(b"\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        os.link(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -511,6 +518,19 @@ def _run_status_artifact(output_path: Path) -> tuple[Path, dict[str, Any]] | Non
     return status_paths[0].parent, _read_json(status_paths[0])
 
 
+def _reconcile_unpublished_checkpoint(checkpoint_root: Path) -> CheckpointRef | None:
+    """Repair missing publication indexes for the latest committed directory."""
+
+    candidates = [CheckpointRef.from_directory(path) for path in list_complete_checkpoints(checkpoint_root)]
+    if not candidates:
+        return None
+    ref = max(candidates, key=lambda candidate: candidate.next_iteration)
+    # Gate the full-state payload before publishing any execution completion
+    # evidence. The checkpoint package owns every non-destructive index write.
+    read_manifest(ref.checkpoint_dir / "manifest.json", mode="train_resume")
+    return reconcile_publication(checkpoint_root, ref.checkpoint_dir)
+
+
 def _committed_checkpoint(run_dir: Path) -> CheckpointRef | None:
     """Read the latest committed full-state checkpoint through checkpoint APIs."""
 
@@ -521,15 +541,22 @@ def _committed_checkpoint(run_dir: Path) -> CheckpointRef | None:
     catalog_path = checkpoint_root / PUBLICATION_CATALOG_FILENAME
     if catalog_path.is_file():
         publications = read_publications(catalog_path)
-        if not publications:
-            return None
-        ref = max(publications, key=lambda candidate: candidate.next_iteration)
+        ref = (
+            max(publications, key=lambda candidate: candidate.next_iteration)
+            if publications else _reconcile_unpublished_checkpoint(checkpoint_root)
+        )
+    elif not (checkpoint_root / LATEST_JSON).is_file():
+        # A COMPLETE directory may have landed before either publication
+        # index. Reconcile it instead of resolving the root as a checkpoint.
+        ref = _reconcile_unpublished_checkpoint(checkpoint_root)
     else:
         # ``latest.json`` is the checkpoint package's durable convenience
         # pointer.  The resolver also requires the COMPLETE marker, so a
         # temporary or half-written directory cannot become completion facts.
         ref = CheckpointRef.from_directory(resolve_checkpoint_dir(checkpoint_root))
 
+    if ref is None:
+        return None
     # CheckpointRef owns identity and byte validation; the schema reader owns
     # the mode-specific full-state gate.  Do not infer counters from filenames
     # or trainer JSON in this execution layer.
@@ -620,11 +647,11 @@ class WorkerStartGateway:
     """Materialize one actual worker start before calling configured TPEN.
 
     The shared-filesystem guarantee is deliberately narrow: exclusive
-    directory creation, a fsynced temporary receipt, same-directory rename,
-    and parent-directory fsync make the published receipt durable before the
-    callback is entered.  A crash before rename can leave a namespace and a
-    temporary file; a crash after rename but before outcome publication leaves
-    a start receipt with no outcome.  Both states park during reconciliation.
+    directory creation, a fsynced temporary receipt, exclusive hard-link
+    publication, and parent-directory fsync make the receipt durable before
+    the callback is entered. A crash before publication can leave a namespace
+    and a temporary file; a crash after start publication can leave a start
+    receipt with no outcome. Both states park during reconciliation.
     """
 
     def __init__(self, output_root: str | Path, *, id_factory: Callable[[], str] | None = None) -> None:
@@ -769,22 +796,11 @@ class WorkerStartGateway:
     ) -> WorkerInvocation:
         """Run configured TPEN once after publishing the worker-start receipt."""
 
-        kwargs = dict(run_kwargs or {})
-        # The direct API keeps its historical ``raise_exceptions=False``
-        # default.  A worker gateway must see the named core refusal itself so
-        # it can classify it; an integer ``1`` would erase that distinction.
-        kwargs["raise_exceptions"] = True
-
-        def run_once(decision: RecoveryDecision, output_path: Path) -> Any:
-            worker_cfg = _materialize_configured_worker_config(
-                cfg,
-                intent=intent,
-                decision=decision,
-                output_path=output_path,
-                declared_overlays=declared_overlays,
+        def run_once(decision: RecoveryDecision, output_path: Path) -> CoreOutcomeFacts:
+            return run_bound_configured_once(
+                cfg, intent=intent, decision=decision, output_path=output_path,
+                declared_overlays=declared_overlays, **dict(run_kwargs or {}),
             )
-            run_configured_once(worker_cfg, decision=decision, output_path=output_path, **kwargs)
-            return _core_outcome_from_artifacts(output_path, decision=decision)
 
         return self.start(
             batch=batch,
@@ -865,15 +881,25 @@ def _is_config_path(path: str, prefixes: frozenset[str]) -> bool:
     return any(path == prefix or path.startswith(f"{prefix}.") for prefix in prefixes)
 
 
-def _has_concrete_config_path(values: Mapping[str, Any], prefix: str) -> bool:
-    """Return whether a named config path contains a non-null load value."""
+def _has_concrete_config_path(config: Mapping[str, Any], path: str) -> bool:
+    """Distinguish effective no-load values from concrete INITIAL loads."""
 
-    for path, value in values.items():
-        if path == prefix:
-            return value is not None
-        if path.startswith(f"{prefix}."):
-            return True
-    return False
+    from omegaconf import OmegaConf
+    from omegaconf.errors import OmegaConfBaseException
+
+    try:
+        # Resolve only the load node, including references such as ${load};
+        # unrelated science targets remain opaque captured syntax.
+        value = OmegaConf.select(OmegaConf.create(config), path, default=None)
+        if OmegaConf.is_config(value):
+            value = OmegaConf.to_container(value, resolve=True)
+    except OmegaConfBaseException as exc:
+        raise ReceiptBindingError(f"cannot resolve configured load at {path!r}") from exc
+    if value is None:
+        return False
+    if isinstance(value, Mapping):
+        return value.get("path") is not None or value.get("mode") not in (None, "none")
+    return True
 
 
 def _materialize_configured_worker_config(
@@ -943,8 +969,8 @@ def _materialize_configured_worker_config(
 
     for path in _RECOVERY_CONFIG_PATHS:
         if decision.load is None and (
-            _has_concrete_config_path(source_values, path)
-            or _has_concrete_config_path(supplied_values, path)
+            _has_concrete_config_path(source, path)
+            or _has_concrete_config_path(supplied, path)
         ):
             raise ReceiptBindingError(
                 "INITIAL configured run contains an undeclared concrete runner.load"
@@ -966,6 +992,33 @@ def _materialize_configured_worker_config(
         OmegaConf.update(worker_cfg, path, value, merge=False, force_add=True)
     OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
     return worker_cfg
+
+
+def run_bound_configured_once(
+    cfg: Any,
+    *,
+    intent: ScienceIntent,
+    decision: RecoveryDecision,
+    output_path: Path,
+    declared_overlays: Mapping[str, Any] | None = None,
+    **kwargs: Any,
+) -> CoreOutcomeFacts:
+    """Run a configured adapter callback through the gateway's intent binding.
+
+    Call this from the ``run_once`` seam of a worker-start gateway, after its
+    durable start receipt. Backend adapters share this materialization with
+    ``start_configured`` without importing or constructing a science object.
+    """
+
+    worker_cfg = _materialize_configured_worker_config(
+        cfg, intent=intent, decision=decision, output_path=output_path,
+        declared_overlays=declared_overlays,
+    )
+    # The legacy direct entry retains its default; adapter calls must retain
+    # the actual core exception for deterministic refusal classification.
+    kwargs["raise_exceptions"] = True
+    run_configured_once(worker_cfg, decision=decision, output_path=output_path, **kwargs)
+    return _core_outcome_from_artifacts(output_path, decision=decision)
 
 
 _MISSING_CONFIG_VALUE = object()
@@ -1014,6 +1067,7 @@ __all__ = [
     "WorkerStartGateway",
     "WorkerStartReceipt",
     "classify_core_outcome",
+    "run_bound_configured_once",
     "run_configured_once",
     "validate_start_receipt",
 ]
