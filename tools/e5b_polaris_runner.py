@@ -33,8 +33,8 @@ from tpen.execution.invocation import (
     _run_status_artifact,
     run_configured_once,
 )
-from tpen.execution.invocation import _atomic_write_json
 from tpen.execution.recovery import CheckpointEvidence
+from tools.e5b_records import write_replace_json
 
 
 class NoLiveBackendClient:
@@ -73,7 +73,7 @@ def _write_json(path: Path, data: Mapping[str, Any]) -> None:
     """Write one durable JSON marker before the next allocation can start."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(path, data)
+    write_replace_json(path, data)
 
 
 def _load_inputs(job_data: Mapping[str, Any]) -> tuple[ReadyBatch, ScienceIntent, Any, Path]:

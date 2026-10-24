@@ -60,8 +60,8 @@ def _run_pair(monkeypatch, tmp_path, *, equal_trainer: bool):
                 prefix_evidence = CheckpointEvidence.from_mapping(json.loads((root / "checkpoint-evidence.json").read_text()))
                 prefix_config = OmegaConf.load(prefix_evidence.ref.checkpoint_dir.parent.parent / "config.yaml")
                 copy = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
-                # Match the trainer section actually captured by the prefix;
-                # a hardcoded short horizon would reintroduce the fixed defect.
+                # R5 issue 1: 4 was the defective prefix value. Match the
+                # trainer section actually captured by the fixed prefix.
                 OmegaConf.update(copy, "trainer", OmegaConf.to_container(prefix_config.trainer, resolve=False), merge=False)
                 return original(copy, config_path=config_path, phase=phase, prefix_steps=prefix_steps)
             return original(config, config_path=config_path, phase=phase, prefix_steps=prefix_steps)

@@ -32,7 +32,7 @@ def test_real_e5b_two_start_restore_keeps_component_hashes(monkeypatch, tmp_path
     checkpoint = CheckpointEvidence.from_mapping(evidence).ref
     assert checkpoint is not None
     assert checkpoint.next_iteration == 4 < batch.target_iterations
-    manifest = read_manifest(checkpoint.checkpoint_dir, mode="train_resume")
+    manifest = read_manifest(checkpoint.checkpoint_dir / "manifest.json", mode="train_resume")
     expected = checkpoint_hashes(OmegaConf.load(FIXTURE))
     for component in ("model_config", "optimizer_config", "trainer_config", "sampler_config", "hamiltonian_config"):
         assert manifest.hashes[component] == expected[component], component

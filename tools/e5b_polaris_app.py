@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from balsam.api import ApplicationDefinition
-from tpen.execution.invocation import _atomic_write_json
+from tools.e5b_records import write_replace_json
 
 
 PRE_E3_FAILURE_EXIT_CODE = 2
@@ -136,7 +136,7 @@ def _write_pre_e3_failure(
     }
     if precheck is not None:
         record["precheck"] = dict(precheck)
-    _atomic_write_json(path, record)
+    write_replace_json(path, record)
 
 
 class PolarisE5bApp(ApplicationDefinition):
