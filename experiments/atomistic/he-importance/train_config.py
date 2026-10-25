@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from importlib import import_module
-import operator
 from pathlib import Path
 import sys
 from typing import Any
@@ -253,7 +252,8 @@ def resolve_train_config(source: Any) -> DictConfig:
     cfg = _compose_base_config()
     committed_walkers = stage_api.COMMITTED_WALKERS
     composed_walkers = OmegaConf.select(cfg, "sampler.n_walkers", default=None)
-    if type(composed_walkers) is not int or operator.ne(composed_walkers, committed_walkers):
+    # Exact-int plus int.__eq__ keeps this decision structural, not caller-overridable.
+    if type(composed_walkers) is not int or int.__eq__(composed_walkers, committed_walkers) is not True:
         raise TrainConfigResolutionError(
             "committed train config sampler.n_walkers must remain 4096"
         )

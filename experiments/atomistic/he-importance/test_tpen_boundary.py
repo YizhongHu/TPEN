@@ -56,7 +56,7 @@ class InventoryEntry:
 # Each key is (relative file, line, dotted target).  Each value is the
 # one-line disposition recorded for that exact crossing.
 EXPECTED_PRODUCTION_INVENTORY = {
-    ("train_config.py", 191, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 190, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("train_config.py", 273, "tpen.hi_schema"): InventoryEntry(
