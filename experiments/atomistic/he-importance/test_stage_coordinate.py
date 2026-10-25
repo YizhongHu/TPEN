@@ -590,6 +590,55 @@ def test_committed_intended_configuration_inventory_materializes_completely(tmp_
     assert {cell.manifest["stage"] for cell in cells} == {entry["stage"] for entry in inventory}
 
 
+def test_q_mechanics_walker_identity_rebuilds_hash_path_and_preserves_committed_cells(
+    tmp_path: Path,
+) -> None:
+    before = stage_coordinate.materialize_intended_configurations(tmp_path / "before")
+    q_cell = next(cell for cell in before if cell.manifest["stage"] == "Q")
+    rebuilt = stage_coordinate.with_q_mechanics_walkers(q_cell)
+    after = stage_coordinate.materialize_intended_configurations(tmp_path / "after")
+
+    assert stage_coordinate.walker_count(q_cell.manifest) == stage_coordinate.COMMITTED_WALKERS
+    assert stage_coordinate.walker_count(rebuilt.manifest) == stage_coordinate.Q_MECHANICS_WALKERS
+    assert rebuilt.content_hash != q_cell.content_hash
+    assert rebuilt.output_path != q_cell.output_path
+    assert rebuilt.output_path == tmp_path / "before" / "Q" / rebuilt.content_hash
+    assert rebuilt.seed_streams == q_cell.seed_streams
+    assert [cell.content_hash for cell in before] == [cell.content_hash for cell in after]
+
+
+@pytest.mark.parametrize("value", [1_000, 8_192, 4_096, True, "2048"])
+def test_walker_count_refuses_inadmissible_values(value: object) -> None:
+    manifest = _train_manifest()
+    manifest["stage"] = "Q"
+    manifest["scientific_identity"] = {"walkers": value}
+    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+        stage_coordinate.walker_count(manifest)
+
+
+def test_walker_count_refuses_q_exception_at_non_q_stage() -> None:
+    manifest = _train_manifest()
+    manifest["scientific_identity"] = {"walkers": stage_coordinate.Q_MECHANICS_WALKERS}
+    with pytest.raises(stage_coordinate.MaterializationError, match="stage must be 'Q'"):
+        stage_coordinate.walker_count(manifest)
+
+
+def test_q_mechanics_walker_rebuild_refuses_non_q_and_double_application(tmp_path: Path) -> None:
+    non_q = _packet_source_cells(tmp_path)[0]
+    with pytest.raises(stage_coordinate.MaterializationError, match="only for stage 'Q'"):
+        stage_coordinate.with_q_mechanics_walkers(non_q)
+
+    q_cell = next(
+        cell
+        for cell in stage_coordinate.materialize_intended_configurations(tmp_path / "q")
+        if cell.manifest["stage"] == "Q"
+    )
+    with pytest.raises(stage_coordinate.MaterializationError, match="already applied"):
+        stage_coordinate.with_q_mechanics_walkers(
+            stage_coordinate.with_q_mechanics_walkers(q_cell)
+        )
+
+
 def _packet_source_cells(tmp_path: Path) -> tuple[object, ...]:
     # Source-cell construction has no launch or allocation inputs.  This fixture
     # therefore records deliberately empty execution topology; a future

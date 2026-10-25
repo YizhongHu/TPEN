@@ -80,6 +80,48 @@ def test_resolve_maps_stage_horizon_to_trainer_max_steps(
         assert authority.updates == 2_000
 
 
+def test_resolve_consumes_q_mechanics_and_committed_walker_counts(tmp_path: Path) -> None:
+    committed = _cell(tmp_path / "committed", stage="Q")
+    mechanics = stage_coordinate.with_q_mechanics_walkers(committed)
+
+    committed_config = train_config.resolve_train_config(committed)
+    mechanics_config = train_config.resolve_train_config(mechanics)
+
+    assert committed_config.sampler.n_walkers == stage_coordinate.COMMITTED_WALKERS
+    assert committed_config.runner.sampler.n_walkers == stage_coordinate.COMMITTED_WALKERS
+    assert mechanics_config.sampler.n_walkers == stage_coordinate.Q_MECHANICS_WALKERS
+    assert mechanics_config.runner.sampler.n_walkers == stage_coordinate.Q_MECHANICS_WALKERS
+
+
+def test_resolve_refuses_drifted_composed_walker_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path, stage="Q")
+    original = train_config._compose_base_config
+
+    def drifted_config() -> DictConfig:
+        config = original()
+        config.sampler.n_walkers = 123
+        return config
+
+    monkeypatch.setattr(train_config, "_compose_base_config", drifted_config)
+    with pytest.raises(train_config.TrainConfigResolutionError, match="must remain 4096"):
+        train_config.resolve_train_config(cell)
+
+
+def test_resolve_refuses_hand_built_inadmissible_walker_identity(tmp_path: Path) -> None:
+    cell = _cell(tmp_path, stage="Q")
+    manifest = stage_coordinate._thaw(cell.manifest)
+    manifest["scientific_identity"]["walkers"] = 1_000
+    rebuilt = replace(
+        cell,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=stage_coordinate.content_hash(manifest),
+    )
+    with pytest.raises(Exception, match="exactly 2048"):
+        train_config.resolve_train_config(rebuilt)
+
+
 def test_resolve_binds_content_hash_to_run_identity(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
     resolved = train_config.resolve_train_config(cell)

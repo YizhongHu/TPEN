@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import importlib
 import json
 import os
@@ -308,10 +308,18 @@ def execute(args: argparse.Namespace) -> int:
         optimizer=args.optimizer,
         seed_label=args.seed_label,
     )
+    if args.walkers == stage_coordinate.COMMITTED_WALKERS:
+        cell = selection.cell
+    elif args.walkers == stage_coordinate.Q_MECHANICS_WALKERS:
+        cell = stage_coordinate.with_q_mechanics_walkers(selection.cell)
+    else:
+        raise StageQSelectionError(f"unsupported Stage-Q walker count: {args.walkers}")
+    selection = replace(selection, cell=cell)
     packet = _q_training_packet(selection.cell)
     resolved = train_config.resolve_train_config(packet)
     report = {
         "selection": selection.receipt(),
+        "walkers": stage_coordinate.walker_count(selection.cell.manifest),
         "roster_vs_design": roster_design_receipt(args.stage),
         "train_packet": {
             "content_hash": packet.cell.content_hash,
@@ -343,6 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--architecture", default=DEFAULT_ARCHITECTURE)
     parser.add_argument("--optimizer", default=DEFAULT_OPTIMIZER)
     parser.add_argument("--seed-label", type=int)
+    parser.add_argument("--walkers", type=int, default=stage_coordinate.COMMITTED_WALKERS)
     parser.add_argument("--output-root", type=Path, default=Path(__file__).with_name("outputs"))
     parser.add_argument("--dry-run", action="store_true")
     return parser

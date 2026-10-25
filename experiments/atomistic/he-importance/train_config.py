@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from importlib import import_module
+import operator
 from pathlib import Path
 import sys
 from typing import Any
@@ -250,6 +251,14 @@ def resolve_train_config(source: Any) -> DictConfig:
     model_seed = _integer_seed(streams, "model_initialization")
 
     cfg = _compose_base_config()
+    committed_walkers = stage_api.COMMITTED_WALKERS
+    composed_walkers = OmegaConf.select(cfg, "sampler.n_walkers", default=None)
+    if type(composed_walkers) is not int or operator.ne(composed_walkers, committed_walkers):
+        raise TrainConfigResolutionError(
+            "committed train config sampler.n_walkers must remain 4096"
+        )
+    walkers = stage_api.walker_count(manifest)
+    OmegaConf.update(cfg, "sampler.n_walkers", walkers, merge=False)
     OmegaConf.update(cfg, "trainer.max_steps", stage.updates, merge=False)
     OmegaConf.update(cfg, "run.root", str(output_path.parent.parent), merge=False)
     OmegaConf.update(cfg, "run.run_id", source_hash, merge=False)

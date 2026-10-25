@@ -113,6 +113,9 @@ SEED_STREAMS = (
     "evaluation_inference",
 )
 
+COMMITTED_WALKERS = 4_096
+Q_MECHANICS_WALKERS = 2_048
+
 
 class MaterializationError(ValueError):
     """A requested HI configuration cannot become an immutable row."""
@@ -351,6 +354,50 @@ def with_execution_topology(
     if content_hash(manifest) != source_hash:
         raise MaterializationError("execution topology changed the content identity")
     return replace(cell, manifest=_freeze(manifest))
+
+
+def walker_count(manifest: Mapping[str, Any]) -> int:
+    """Return the admissible walker count encoded by a materialized manifest."""
+
+    identity = manifest.get("scientific_identity") if isinstance(manifest, Mapping) else None
+    if not isinstance(identity, Mapping) or "walkers" not in identity:
+        return COMMITTED_WALKERS
+    value = identity["walkers"]
+    if type(value) is not int or value != Q_MECHANICS_WALKERS or manifest.get("stage") != "Q":
+        raise MaterializationError(
+            "scientific_identity.walkers must be exactly 2048 and manifest stage must be 'Q'"
+        )
+    return value
+
+
+def with_q_mechanics_walkers(cell: MaterializedCell) -> MaterializedCell:
+    """Return a Q cell carrying the identity-bearing mechanics walker exception."""
+
+    try:
+        source_manifest = cell.manifest
+        source_hash = cell.content_hash
+        source_path = cell.output_path
+    except AttributeError as error:
+        raise MaterializationError("cell must be a materialized training row") from error
+    validate_materialized_manifest(source_manifest)
+    if content_hash(source_manifest) != source_hash:
+        raise MaterializationError("cell content hash does not bind its manifest")
+    if source_manifest["stage"] != "Q":
+        raise MaterializationError("Q mechanics walkers are available only for stage 'Q'")
+    if "walkers" in source_manifest["scientific_identity"]:
+        raise MaterializationError("Q mechanics walker identity is already applied")
+
+    manifest = _thaw(source_manifest)
+    manifest["scientific_identity"]["walkers"] = Q_MECHANICS_WALKERS
+    validate_materialized_manifest(manifest)
+    digest = content_hash(manifest)
+    output_path = source_path.parent.parent / manifest["stage"] / digest
+    return replace(
+        cell,
+        manifest=_freeze(manifest),
+        content_hash=digest,
+        output_path=output_path,
+    )
 
 
 def _project_identity(value: Any, *, exclude_root_topology: bool, is_root: bool = True) -> Any:
