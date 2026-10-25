@@ -1692,14 +1692,7 @@ class VMCUpdateMethod(Generic[InputT], ABC):
 
 
 class LegacyAutogradUpdate(VMCUpdateMethod[AutogradUpdateInput]):
-    """Exact adapter for TPEN's historical zero-grad/backward/step sequence.
-
-    Raises
-    ------
-    ValueError
-        If the optimizer carrier is empty or contains parameters outside the
-        adapter's own ``model_parameters`` binding at construction.
-    """
+    """Exact adapter for TPEN's historical zero-grad/backward/step sequence."""
 
     def __init__(
         self,
@@ -1714,8 +1707,6 @@ class LegacyAutogradUpdate(VMCUpdateMethod[AutogradUpdateInput]):
             raise TypeError(
                 "LegacyAutogradUpdate.model_parameters must be a ModelParameterBinding"
             )
-        # Direct callers also need containment against this adapter's own binding.
-        validate_optimizer_parameter_containment(optimizer, model_parameters)
         self.optimizer = optimizer
         self.gradient_clip_norm = None if gradient_clip_norm is None else float(gradient_clip_norm)
         self.model_parameters = model_parameters

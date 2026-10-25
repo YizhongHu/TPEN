@@ -116,11 +116,7 @@ def _assert_refused(entry, model, optimizer, trainer, sampler, monkeypatch, mess
 
 @pytest.mark.parametrize("entry", ["fit", "resume"])
 def test_fresh_default_adapter_refuses_foreign_carrier(entry, monkeypatch) -> None:
-    """Behaviour witness defended by both constructor and trainer call sites.
-
-    Either remaining site refuses if the other is deleted; these default-path
-    tests deliberately do not claim to pin either site alone.
-    """
+    """The trainer site alone refuses a fresh default adapter's foreign carrier."""
 
     model, foreign = _Wavefunction(), _Wavefunction()
     assert {id(p) for p in model.parameters()}.isdisjoint(id(p) for p in foreign.parameters())
@@ -178,24 +174,25 @@ def test_trainer_refuses_empty_carrier(entry, empty_shape, monkeypatch) -> None:
                     "optimizer parameter carrier is empty")
 
 
-@pytest.mark.parametrize("carrier", ["foreign", "empty"])
-def test_direct_constructor_refuses_invalid_carrier(carrier) -> None:
-    """Direct construction enforces the adapter's own model parameter domain."""
+@pytest.mark.parametrize("entry", ["fit", "resume"])
+def test_preconstructed_adapter_refuses_foreign_carrier_at_trainer(entry, monkeypatch) -> None:
+    """Direct construction accepts the mismatch; the same adapter is refused by the trainer."""
 
     model, foreign = _Wavefunction(), _Wavefunction()
     optimizer = torch.optim.SGD(foreign.parameters(), lr=0.1)
-    if carrier == "empty":
-        optimizer.param_groups[0]["params"].clear()
     before = [p.detach().clone() for p in model.parameters()]
     rates = [g["lr"] for g in optimizer.param_groups]
-    message = "carrier is empty" if carrier == "empty" else "carrier contains foreign"
-    with pytest.raises(ValueError, match=message):
-        LegacyAutogradUpdate(
-            optimizer,
-            model_parameters=ModelParameterBinding(parameters=tuple(model.parameters())),
-        )
+    method = LegacyAutogradUpdate(
+        optimizer,
+        model_parameters=ModelParameterBinding(parameters=tuple(model.parameters())),
+    )
+    assert method.update_state().optimizer is optimizer
     assert all(torch.equal(old, live) for old, live in zip(before, model.parameters()))
     assert [g["lr"] for g in optimizer.param_groups] == rates
+    _assert_refused(
+        entry, model, optimizer, VMCTrainer(max_steps=1, update_method=method),
+        _Sampler(), monkeypatch, "carrier contains foreign model parameters",
+    )
 
 
 def test_trainer_strict_subset_is_accepted_and_trains() -> None:

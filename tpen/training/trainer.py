@@ -458,8 +458,6 @@ class VMCTrainer:
             it re-reads the CONSTRUCTOR's spec, so a trainer configured with
             one method and bound from an explicit override raises here on a
             plain call.
-            Also raised when legacy-adapter construction finds an empty
-            optimizer carrier or parameters outside its model binding.
 
         Notes
         -----
