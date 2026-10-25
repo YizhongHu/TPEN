@@ -182,6 +182,38 @@ def test_resolve_binds_output_path_to_run_root_and_dir(tmp_path: Path) -> None:
     assert resolved.run.dir == str(cell.output_path)
 
 
+def test_resolve_refuses_output_path_not_bound_to_identity_digest(tmp_path: Path) -> None:
+    committed = _cell(tmp_path, stage="Q")
+    mechanics = stage_coordinate.with_q_mechanics_walkers(committed)
+    broken = replace(mechanics, output_path=committed.output_path)
+
+    with pytest.raises(train_config.TrainConfigResolutionError, match="bind"):
+        train_config.resolve_train_config(broken)
+
+
+def test_q_gates_refuse_overridable_stage_subclass_in_builder_and_resolver(tmp_path: Path) -> None:
+    class Stage(str):
+        def __ne__(self, other: object) -> bool:
+            return False
+
+    source = _cell(tmp_path, stage="O1")
+    manifest = stage_coordinate._thaw(source.manifest)
+    manifest["stage"] = Stage("O1")
+    with pytest.raises(stage_coordinate.MaterializationError, match="only for stage 'Q'"):
+        stage_coordinate.with_q_mechanics_walkers(replace(source, manifest=stage_coordinate._freeze(manifest)))
+
+    manifest["scientific_identity"]["walkers"] = 2_048
+    digest = stage_coordinate.content_hash(manifest)
+    forged = replace(
+        source,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=digest,
+        output_path=source.output_path.parent / digest,
+    )
+    with pytest.raises(ValueError, match="exactly 2048"):
+        train_config.resolve_train_config(forged)
+
+
 def test_resolve_binds_seed_streams_to_runtime_and_named_initializers(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
     resolved = train_config.resolve_train_config(cell)
