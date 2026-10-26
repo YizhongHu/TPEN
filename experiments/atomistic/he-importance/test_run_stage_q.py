@@ -1161,7 +1161,7 @@ def _rehash_cell(cell: object, mutate: object) -> object:
     )
 
 
-def _mechanics_cell(cells: tuple[object, ...]) -> object:
+def _mechanics_cell(cells: tuple[object, ...], *, seed_label: int = 810001) -> object:
     return next(
         cell
         for cell in cells
@@ -1170,7 +1170,7 @@ def _mechanics_cell(cells: tuple[object, ...]) -> object:
         and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
-        and cell.manifest["seed_identity"]["label"] == 810001
+        and cell.manifest["seed_identity"]["label"] == seed_label
     )
 
 
@@ -1723,3 +1723,197 @@ def test_execute_accepts_committed_control_at_both_seed_labels(
         _args(tmp_path, seed_label=seed_label, walkers=walkers, dry_run=False)
     ) == 0
     assert observed["calls"] == 1
+
+
+def _with_seed_stream(cell: object, stream: str, value: object) -> object:
+    streams = dict(cell.seed_streams)
+    streams[stream] = value
+    return replace(cell, seed_streams=streams)
+
+
+def _update_initializer_seeds(config: object, value: object) -> None:
+    paths = (
+        "embedding.initializer.seed",
+        "layers.0.path_aggregation.initializer.seed",
+    )
+    for prefix in ("model", "runner.model"):
+        for path in paths:
+            runner.OmegaConf.update(
+                config,
+                f"{prefix}.{path}",
+                value,
+                merge=False,
+            )
+
+
+def _update_sampler_seeds(config: object, value: object) -> None:
+    for path in ("sampler.seed", "runner.sampler.seed"):
+        runner.OmegaConf.update(config, path, value, merge=False)
+
+
+@pytest.mark.parametrize("seed_label", [810001, 810002])
+def test_truthfulness_guard_refuses_wrong_carrier_stream_at_selection(
+    tmp_path: Path, seed_label: int
+) -> None:
+    target = next(
+        cell for cell in _cells(tmp_path)
+        if cell.manifest["stage"] == "Q"
+        and cell.manifest["seed_identity"]["label"] == seed_label
+        and cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
+    mutated = _with_seed_stream(target, "model_initialization", 7)
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match="cell.seed_streams.*model_initialization.*7.*dd964863",
+    ):
+        runner.select_cell((mutated,), seed_label=seed_label)
+
+
+@pytest.mark.parametrize("seed_label", [810001, 810002])
+@pytest.mark.parametrize("walkers", [stage_coordinate.COMMITTED_WALKERS, stage_coordinate.Q_MECHANICS_WALKERS])
+def test_execute_refuses_wrong_carrier_stream_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seed_label: int,
+    walkers: int,
+) -> None:
+    target = next(
+        cell for cell in _cells(tmp_path)
+        if cell.manifest["stage"] == "Q"
+        and cell.manifest["seed_identity"]["label"] == seed_label
+        and cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
+    mutated = _with_seed_stream(target, "model_initialization", 7)
+    monkeypatch.setattr(
+        runner.stage_coordinate,
+        "materialize_intended_configurations",
+        lambda *args, **kwargs: (mutated,),
+    )
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match="cell.seed_streams.*model_initialization.*7.*dd964863",
+    ):
+        runner.execute(_args(tmp_path, seed_label=seed_label, walkers=walkers, dry_run=False))
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+@pytest.mark.parametrize(
+    ("label", "value"),
+    [
+        ("another integer", 7),
+        ("null", None),
+        ("factory mapping", {"_target_": "torch.seed"}),
+    ],
+)
+@pytest.mark.parametrize("seed_label", [810001, 810002])
+def test_truthfulness_guard_refuses_consumed_initializer_seed_at_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    value: object,
+    seed_label: int,
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path), seed_label=seed_label)
+    original = runner.train_config.resolve_train_config
+
+    def resolve_with_seed_mutant(source: object) -> object:
+        resolved = original(source)
+        _update_initializer_seeds(resolved, value)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_with_seed_mutant)
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match="runner.model.*initializer.seed.*dd964863",
+    ) as refusal:
+        runner.select_cell((target,), seed_label=seed_label)
+    assert label in {"another integer", "null", "factory mapping"}
+    assert str(refusal.value)
+
+
+@pytest.mark.parametrize(
+    ("label", "value"),
+    [
+        ("another integer", 7),
+        ("null", None),
+        ("factory mapping", {"_target_": "torch.seed"}),
+    ],
+)
+@pytest.mark.parametrize("seed_label", [810001, 810002])
+@pytest.mark.parametrize("walkers", [stage_coordinate.COMMITTED_WALKERS, stage_coordinate.Q_MECHANICS_WALKERS])
+def test_execute_refuses_consumed_initializer_seed_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    value: object,
+    seed_label: int,
+    walkers: int,
+) -> None:
+    original = runner.train_config.resolve_train_config
+
+    def resolve_with_seed_mutant(source: object) -> object:
+        resolved = original(source)
+        _update_initializer_seeds(resolved, value)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_with_seed_mutant)
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match="runner.model.*initializer.seed.*dd964863",
+    ):
+        runner.execute(_args(tmp_path, seed_label=seed_label, walkers=walkers, dry_run=False))
+    assert label in {"another integer", "null", "factory mapping"}
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+@pytest.mark.parametrize("seed_label", [810001, 810002])
+def test_truthfulness_guard_refuses_wrong_sampler_seed_at_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seed_label: int
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path), seed_label=seed_label)
+    original = runner.train_config.resolve_train_config
+
+    def resolve_with_sampler_mutant(source: object) -> object:
+        resolved = original(source)
+        _update_sampler_seeds(resolved, 7)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_with_sampler_mutant)
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match="runner.sampler.seed.*7.*dd964863",
+    ):
+        runner.select_cell((target,), seed_label=seed_label)
+
+
+@pytest.mark.parametrize("seed_label", [810001, 810002])
+@pytest.mark.parametrize("walkers", [stage_coordinate.COMMITTED_WALKERS, stage_coordinate.Q_MECHANICS_WALKERS])
+def test_execute_refuses_wrong_sampler_seed_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seed_label: int,
+    walkers: int,
+) -> None:
+    original = runner.train_config.resolve_train_config
+
+    def resolve_with_sampler_mutant(source: object) -> object:
+        resolved = original(source)
+        _update_sampler_seeds(resolved, 7)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_with_sampler_mutant)
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match="runner.sampler.seed.*7.*dd964863",
+    ):
+        runner.execute(_args(tmp_path, seed_label=seed_label, walkers=walkers, dry_run=False))
+    assert not list(tmp_path.rglob("selection_receipt.json"))

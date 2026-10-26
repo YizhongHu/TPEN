@@ -364,6 +364,77 @@ def _model_fingerprint(model: Any) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _seed_refusal(field: str, declared: Any, consumed: Any) -> StageQSelectionError:
+    return StageQSelectionError(
+        f"truthfulness guard refused field '{field}': declared value {declared!r}, "
+        f"consumed value {consumed!r}; item dd964863"
+    )
+
+
+def _initializer_seed_items(
+    value: Any, path: str = "runner.model"
+) -> tuple[tuple[str, Any], ...]:
+    """Return every consumed initializer seed and its structural path."""
+
+    found: list[tuple[str, Any]] = []
+    if isinstance(value, Mapping):
+        initializer = value.get("initializer", _MISSING)
+        if isinstance(initializer, Mapping):
+            found.append((f"{path}.initializer.seed", initializer.get("seed", _MISSING)))
+        for key, nested in value.items():
+            found.extend(_initializer_seed_items(nested, f"{path}.{key}"))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, nested in enumerate(value):
+            found.extend(_initializer_seed_items(nested, f"{path}[{index}]"))
+    return tuple(found)
+
+
+def _require_seed_bindings(cell: Any, model: Any, sampler: Any) -> None:
+    """Bind carrier and consumed seeds to the cell's declared seed identity."""
+
+    seed_identity = cell.manifest["seed_identity"]
+    stage = seed_identity["stage"]
+    label = seed_identity["label"]
+    try:
+        expected_streams = stage_coordinate.seed_namespace(stage, label)
+    except Exception as error:
+        raise _seed_refusal(
+            "cell.manifest.seed_identity", seed_identity, "valid stage/label namespace"
+        ) from error
+
+    carrier = cell.seed_streams
+    if not isinstance(carrier, Mapping):
+        raise _seed_refusal("cell.seed_streams", carrier, expected_streams)
+    if set(carrier) != set(expected_streams):
+        raise _seed_refusal("cell.seed_streams", dict(carrier), expected_streams)
+    for stream, expected in expected_streams.items():
+        actual = carrier[stream]
+        if type(actual) is not int or actual != expected:
+            raise _seed_refusal(
+                f"cell.seed_streams[{stream!r}]", actual, expected
+            )
+
+    expected_model_seed = expected_streams["model_initialization"]
+    initializer_items = _initializer_seed_items(model)
+    if not initializer_items:
+        raise _seed_refusal(
+            "runner.model.initializer.seed", _MISSING, expected_model_seed
+        )
+    for field, actual in initializer_items:
+        if type(actual) is not int or actual != expected_model_seed:
+            raise _seed_refusal(field, actual, expected_model_seed)
+
+    # train_config._set_optional_execution_seeds binds sampler.seed from the
+    # training_sampler stream when that field exists (train_config.py:153-157).
+    if isinstance(sampler, Mapping) and "seed" in sampler:
+        expected_sampler_seed = expected_streams["training_sampler"]
+        actual_sampler_seed = sampler["seed"]
+        if type(actual_sampler_seed) is not int or actual_sampler_seed != expected_sampler_seed:
+            raise _seed_refusal(
+                "runner.sampler.seed", actual_sampler_seed, expected_sampler_seed
+            )
+
+
 def _first_config_difference(left: Any, right: Any, path: str) -> tuple[str, Any, Any] | None:
     """Return the first structural difference between two resolved values."""
 
@@ -635,6 +706,7 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
             )
 
     model = agreed["model"]
+    _require_seed_bindings(cell, model, agreed["sampler"])
     _require_b00_model(model, authority_overrides["input_features"])
     layers = model.get("layers", ()) if isinstance(model, Mapping) else ()
     if not layers:
