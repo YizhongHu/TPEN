@@ -75,10 +75,14 @@ def test_linear_oracles_are_independent_literal_records() -> None:
 
 
 def test_unfiltered_linear_generators_emit_support_three() -> None:
-    from tpen.data.paths import LinearPathMetadata
-
     for policy in ("coordinate_neighbor", "orbit_complete"):
-        metadata = LinearPathMetadata.generate(max_order=2, policy=policy)
+        metadata = instantiate(
+            {
+                "_target_": "tpen.data.paths.LinearPathMetadata.generate",
+                "max_order": 2,
+                "policy": policy,
+            }
+        )
         assert any(path.support_order == 3 for path in metadata.all_paths())
 
 
@@ -169,14 +173,20 @@ def test_fragment_splices_into_control_model(path_label: str, activation_label: 
 
 
 def _he_batch() -> object:
-    from tpen.data.batch import ElectronBatch
-
     generator = torch.Generator().manual_seed(1729)
     positions = torch.randn((2, 2, 3), generator=generator, dtype=torch.float64)
     spins = torch.tensor([[1.0, -1.0], [1.0, -1.0]], dtype=torch.float64)
     nuclei = torch.zeros((1, 3), dtype=torch.float64)
     charges = torch.tensor([2.0], dtype=torch.float64)
-    return ElectronBatch(positions, nuclear_positions=nuclei, nuclear_charges=charges, spins=spins)
+    return instantiate(
+        {
+            "_target_": "tpen.data.batch.ElectronBatch",
+            "positions": positions,
+            "nuclear_positions": nuclei,
+            "nuclear_charges": charges,
+            "spins": spins,
+        }
+    )
 
 
 def _inactive_order_one_parameters(model: object) -> set[int]:
