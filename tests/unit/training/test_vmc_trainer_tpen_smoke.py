@@ -438,7 +438,34 @@ def test_param_norm_describes_the_pre_update_model() -> None:
     assert metrics["param_norm"] != optimizer.norm_after_step
     # Moving the computation earlier must not move the key: CSV/JSONL readers
     # and anyone diffing records see the same column order as before.
-    assert list(metrics)[-4:] == ["grad_norm", "param_norm", "loss_has_grad", "optimizer_step"]
+    #
+    # Expressed as a CONTIGUOUS RUN rather than as "the last four keys". The
+    # `[-4:]` form this started as was never the invariant it appeared to be:
+    # a method that reports diagnostics has always had them merged in after
+    # `optimizer_step`, so the proxy held only on the legacy path, which
+    # happened to report nothing. The legacy adapter now reports an explicit
+    # minimal record too, so the proxy holds nowhere and the property it stood
+    # for has to be stated directly. This is a strengthening: it pins the
+    # trainer-owned columns' order AND what may follow them.
+    keys = list(metrics)
+    start = keys.index("grad_norm")
+    assert keys[start : start + 4] == [
+        "grad_norm",
+        "param_norm",
+        "loss_has_grad",
+        "optimizer_step",
+    ]
+    # Everything after that run is the attempt's own reporting: the trainer's
+    # generic reason, then the method-owned record. Appended, never
+    # interleaved, so the trainer-owned columns keep their positions.
+    assert keys[start + 4 :] == [
+        "update_reason",
+        "update_record_method",
+        "update_record_applied",
+        "update_record_reason",
+        "update_record_step",
+        "update_record_grad_norm",
+    ]
 
 
 def test_skipped_update_logs_the_same_train_record_shape() -> None:

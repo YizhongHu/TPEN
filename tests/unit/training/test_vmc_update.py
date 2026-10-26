@@ -29,6 +29,8 @@ from tpen.physics.kinetic import KineticEnergy
 from tpen.sampling import MetropolisSampler
 from tpen.training.trainer import VMCTrainer
 from tpen.training.update import (
+    UPDATE_REASON_APPLIED,
+    UPDATE_REASON_ZERO_ELECTRON_BATCH,
     AutogradUpdateInput,
     LegacyAutogradUpdate,
     ModelParameterBinding,
@@ -249,7 +251,14 @@ def test_legacy_adapter_matches_current_zero_grad_backward_clip_step_sequence() 
         model_parameters=ModelParameterBinding(parameters=(adapted,)),
     ).update(update_input)
 
-    assert result == VMCUpdateResult(applied=True, grad_norm=float(control_grad.norm().item()))
+    # Compared FIELD BY FIELD rather than by whole-record equality. The result
+    # now also carries this attempt's explicit reason and its detached
+    # diagnostics record; neither is part of the numerical equivalence this
+    # test owns, and a whole-record comparison would have to restate both just
+    # to assert a gradient norm.
+    assert result.applied is True
+    assert result.grad_norm == float(control_grad.norm().item())
+    assert result.reason == UPDATE_REASON_APPLIED
     assert torch.equal(adapted, control)
     assert adapted.grad is not None
     assert torch.equal(adapted.grad, control_grad)
@@ -376,7 +385,13 @@ def test_legacy_adapter_skips_vacuum_and_errors_for_disconnected_nonvacuum() -> 
             reevaluate=_reevaluation(vacuum),
         )
     )
-    assert skipped == VMCUpdateResult(applied=False, grad_norm=0.0)
+    # Field by field, for the same reason as above. The added assertion is the
+    # point of the change: this skip now NAMES itself, so it can be told apart
+    # from the disconnected-objective raise exercised just below, which shares
+    # its `applied=False` shape but is a different condition entirely.
+    assert skipped.applied is False
+    assert skipped.grad_norm == 0.0
+    assert skipped.reason == UPDATE_REASON_ZERO_ELECTRON_BATCH
     assert parameter.grad is None
 
     nonvacuum = _batch()
