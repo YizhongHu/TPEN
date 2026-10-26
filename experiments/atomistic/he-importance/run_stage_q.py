@@ -257,7 +257,11 @@ def _adam_signature_defaults() -> dict[str, object]:
 def _scheduler_configured(resolved: Any) -> bool:
     """Return whether the consumed config declares a scheduler block."""
 
-    config = OmegaConf.to_container(resolved, resolve=True)
+    config = (
+        resolved
+        if isinstance(resolved, Mapping)
+        else OmegaConf.to_container(resolved, resolve=True)
+    )
 
     def contains_scheduler(value: Any) -> bool:
         if isinstance(value, Mapping):
@@ -295,20 +299,171 @@ _FEATURE_UPDATE_TARGETS = {
 }
 
 
-def _resolved_config_entries(value: Any, key: str, path: str = "") -> tuple[tuple[str, Any], ...]:
-    """Find resolved configuration entries named *key* without importing TPEN."""
+_ROOT_RUNNER_TWINS = ("model", "optimizer", "sampler", "trainer", "hamiltonian_terms")
+_MISSING = object()
 
-    found: list[tuple[str, Any]] = []
-    if isinstance(value, Mapping):
-        for nested_key, nested in value.items():
-            nested_path = f"{path}.{nested_key}" if path else str(nested_key)
-            if nested_key == key:
-                found.append((nested_path, nested))
-            found.extend(_resolved_config_entries(nested, key, nested_path))
-    elif isinstance(value, (tuple, list)):
-        for index, nested in enumerate(value):
-            found.extend(_resolved_config_entries(nested, key, f"{path}[{index}]"))
-    return tuple(found)
+# B00 source mapping: RawCoordinateBasis is the raw-coordinate pass-through
+# at tpen/nn/basis.py:189-220, with spatial_dim=3 and include_spin=True from
+# the control's configs/train.yaml:model at :85-97.  Its raw one-body width is
+# 3 coordinates plus one spin channel (basis.py:130-145).  Embedding's
+# tpen/nn/embedding.py:91-125 defaults are in_features=None (derived raw
+# width) and pair_input_channels=0.  The control leaves basis, in_features,
+# and pair_input_channels absent, so the mapping admits those defaults or the
+# equivalent explicit raw values, never bounded-distance features.
+_B00_MODEL_REQUIREMENTS = {
+    "target": "tpen.nn.TPENWaveFunction",
+    "basis_targets": ("tpen.nn.RawCoordinateBasis", "tpen.nn.basis.RawCoordinateBasis"),
+    "raw_basis": {"spatial_dim": 3, "include_spin": True},
+    "embedding": {"in_features": 4, "pair_input_channels": 0},
+}
+
+
+def _first_config_difference(left: Any, right: Any, path: str) -> tuple[str, Any, Any] | None:
+    """Return the first structural difference between two resolved values."""
+
+    if type(left) is not type(right):
+        return path, left, right
+    if isinstance(left, Mapping):
+        for key in sorted(set(left) | set(right), key=repr):
+            difference = _first_config_difference(
+                left.get(key, _MISSING),
+                right.get(key, _MISSING),
+                f"{path}.{key}",
+            )
+            if difference is not None:
+                return difference
+        return None
+    if isinstance(left, list):
+        if len(left) != len(right):
+            return f"{path}.length", len(left), len(right)
+        for index, (left_item, right_item) in enumerate(zip(left, right)):
+            difference = _first_config_difference(
+                left_item,
+                right_item,
+                f"{path}[{index}]",
+            )
+            if difference is not None:
+                return difference
+        return None
+    if left != right:
+        return path, left, right
+    return None
+
+
+def _agreed_consumed_views(resolved: Any) -> dict[str, Any]:
+    """Require root and runner component views to be structurally identical."""
+
+    agreed: dict[str, Any] = {}
+    for name in _ROOT_RUNNER_TWINS:
+        root_selected = OmegaConf.select(resolved, name, default=_MISSING)
+        consumed_selected = OmegaConf.select(
+            resolved, f"runner.{name}", default=_MISSING
+        )
+        root_view = (
+            _MISSING
+            if root_selected is _MISSING
+            else OmegaConf.to_container(root_selected, resolve=True)
+        )
+        consumed_view = (
+            _MISSING
+            if consumed_selected is _MISSING
+            else OmegaConf.to_container(consumed_selected, resolve=True)
+        )
+        difference = _first_config_difference(
+            root_view, consumed_view, f"runner.{name}"
+        )
+        if difference is not None:
+            path, root_value, consumed_value = difference
+            raise StageQSelectionError(
+                "truthfulness guard refused root/consumed divergence at "
+                f"'{path}': root value {root_value!r}, consumed value {consumed_value!r}"
+            )
+        agreed[name] = consumed_view
+    return agreed
+
+
+def _input_feature_refusal(field: str, declared: Any, consumed: Any) -> StageQSelectionError:
+    return StageQSelectionError(
+        f"truthfulness guard refused field '{field}': declared value {declared!r}, "
+        f"consumed value {consumed!r}; item dd964863"
+    )
+
+
+def _require_b00_model(model: Mapping[str, Any], declared: Any) -> None:
+    """Require the consumed model to implement the authority's B00 mapping."""
+
+    expected = _B00_MODEL_REQUIREMENTS
+    if not isinstance(model, Mapping):
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model",
+            declared,
+            model,
+        )
+    if model.get("_target_") != expected["target"]:
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model._target_",
+            declared,
+            model.get("_target_"),
+        )
+
+    basis = model.get("basis", _MISSING)
+    if basis is not _MISSING and basis is not None:
+        if not isinstance(basis, Mapping):
+            raise _input_feature_refusal(
+                "context.overrides.input_features.model.basis",
+                declared,
+                basis,
+            )
+        target = basis.get("_target_")
+        if target not in expected["basis_targets"]:
+            raise _input_feature_refusal(
+                "context.overrides.input_features.model.basis._target_",
+                declared,
+                target,
+            )
+        raw_basis = expected["raw_basis"]
+        if basis.get("spatial_dim") != raw_basis["spatial_dim"]:
+            raise _input_feature_refusal(
+                "context.overrides.input_features.model.basis.spatial_dim",
+                declared,
+                basis.get("spatial_dim"),
+            )
+        if basis.get("include_spin", True) != raw_basis["include_spin"]:
+            raise _input_feature_refusal(
+                "context.overrides.input_features.model.basis.include_spin",
+                declared,
+                basis.get("include_spin", True),
+            )
+
+    embedding = model.get("embedding")
+    if not isinstance(embedding, Mapping):
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.embedding",
+            declared,
+            embedding,
+        )
+    raw_embedding = expected["embedding"]
+    in_features = embedding.get("in_features", _MISSING)
+    if (
+        in_features is not _MISSING
+        and in_features is not None
+        and in_features != raw_embedding["in_features"]
+    ):
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.embedding.in_features",
+            declared,
+            in_features,
+        )
+    pair_input_channels = embedding.get("pair_input_channels", _MISSING)
+    if (
+        pair_input_channels is not _MISSING
+        and pair_input_channels != raw_embedding["pair_input_channels"]
+    ):
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.embedding.pair_input_channels",
+            declared,
+            pair_input_channels,
+        )
 
 
 def _context_refusal(field: str, declared: Any, consumed: Any) -> StageQSelectionError:
@@ -319,10 +474,40 @@ def _context_refusal(field: str, declared: Any, consumed: Any) -> StageQSelectio
     )
 
 
+def _configured_optimizer_value(
+    optimizer: Mapping[str, Any], field: str, default: Any
+) -> Any:
+    """Read one Adam option, distinguishing absence from explicit null."""
+
+    if field not in optimizer:
+        return default
+    value = optimizer[field]
+    numeric = lambda item: isinstance(item, (int, float)) and not isinstance(item, bool)
+    if field == "betas":
+        valid = (
+            isinstance(value, Sequence)
+            and not isinstance(value, (str, bytes, bytearray))
+            and len(value) == 2
+            and all(numeric(item) for item in value)
+        )
+        expected = "a length-2 numeric sequence"
+    else:
+        valid = numeric(value)
+        expected = "a number"
+    if not valid:
+        raise StageQSelectionError(
+            f"truthfulness guard refused field 'optimizer.{field}': "
+            f"declared value {value!r}, consumed value must be {expected}; "
+            "explicit null does not select the runtime default"
+        )
+    return value
+
+
 def _require_truthful_cell(cell: Any, resolved: Any) -> None:
     """Refuse a cell whose declared context or Adam levels are not consumed."""
 
     identity = cell.manifest["scientific_identity"]
+    agreed = _agreed_consumed_views(resolved)
     declared_context = identity["context"]
     authority_context = _authority_o_raw_context()
     declared_context_keys = set(declared_context)
@@ -356,24 +541,12 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
                 f"context.overrides.{field}", declared_value, consumed_value
             )
 
-    resolved_container = OmegaConf.to_container(resolved, resolve=True)
-    input_feature_entries = _resolved_config_entries(resolved_container, "input_features")
-    if input_feature_entries:
-        for path, consumed_value in input_feature_entries:
-            if consumed_value != authority_overrides["input_features"]:
-                raise _context_refusal(
-                    "context.overrides.input_features",
-                    authority_overrides["input_features"],
-                    f"{path}={consumed_value}",
-                )
-    else:
-        # Source check: configs/train.yaml resolves model.embedding directly to
-        # tpen.nn.Embedding with no input_features, bounded-distance, or extra-
-        # term selector, and the HI schema has no such resolved model key. B00
-        # is therefore the only input-feature value consumable by this route.
-        pass
+    _require_b00_model(
+        agreed["model"], authority_overrides["input_features"]
+    )
 
-    layers = resolved_container.get("model", {}).get("layers", ())
+    model = agreed["model"]
+    layers = model.get("layers", ()) if isinstance(model, Mapping) else ()
     if not layers:
         raise _context_refusal(
             "context.overrides.feature_update", "residual", None
@@ -396,25 +569,13 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
         )
 
     declared = declared_optimizer["levels"]
-    optimizer_cfg = OmegaConf.select(resolved, "optimizer")
-    runner_optimizer_cfg = OmegaConf.select(resolved, "runner.optimizer")
-    if optimizer_cfg is None or runner_optimizer_cfg is None:
+    optimizer = agreed["optimizer"]
+    if not isinstance(optimizer, Mapping):
         raise StageQSelectionError(
-            "truthfulness guard refused field 'runner.optimizer': declared root "
-            f"value {optimizer_cfg!r}, consumed value {runner_optimizer_cfg!r}"
+            "truthfulness guard refused field 'optimizer': declared root "
+            f"value {optimizer!r}, consumed runner value {optimizer!r}"
         )
-    root_optimizer = OmegaConf.to_container(optimizer_cfg, resolve=True)
-    runner_optimizer = OmegaConf.to_container(runner_optimizer_cfg, resolve=True)
-    for field in sorted(set(root_optimizer) | set(runner_optimizer)):
-        declared_value = root_optimizer.get(field)
-        consumed_value = runner_optimizer.get(field)
-        if declared_value != consumed_value:
-            raise StageQSelectionError(
-                "truthfulness guard refused field "
-                f"'runner.optimizer.{field}': declared root value {declared_value!r}, "
-                f"consumed runner value {consumed_value!r}"
-            )
-    consumed_target = runner_optimizer.get("_target_")
+    consumed_target = optimizer.get("_target_")
     if consumed_target != "torch.optim.Adam":
         raise StageQSelectionError(
             "truthfulness guard refused field 'optimizer._target_': "
@@ -422,20 +583,20 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
             f"consumed value {consumed_target!r}"
         )
     defaults = _adam_signature_defaults()
-    configured_betas = runner_optimizer.get("betas")
-    betas = configured_betas if configured_betas is not None else defaults["betas"]
-    def configured_or_default(name: str, default: object) -> object:
-        value = runner_optimizer.get(name)
-        return default if value is None else value
+    betas = _configured_optimizer_value(optimizer, "betas", defaults["betas"])
+    epsilon = _configured_optimizer_value(optimizer, "eps", defaults["eps"])
+    weight_decay = _configured_optimizer_value(
+        optimizer, "weight_decay", defaults["weight_decay"]
+    )
 
     consumed = {
-        "lr": runner_optimizer.get("lr"),
+        "lr": optimizer.get("lr"),
         "beta1": betas[0],
         "beta2": betas[1],
-        "epsilon": configured_or_default("eps", defaults["eps"]),
-        "weight_decay": configured_or_default("weight_decay", defaults["weight_decay"]),
+        "epsilon": epsilon,
+        "weight_decay": weight_decay,
         "parameter_groups": 1,
-        "schedule": "constant" if not _scheduler_configured(resolved) else "scheduler",
+        "schedule": "constant" if not _scheduler_configured(optimizer) else "scheduler",
     }
     declared_keys = set(declared)
     consumed_keys = set(consumed)

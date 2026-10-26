@@ -1193,12 +1193,13 @@ def test_truthfulness_guard_refuses_consumed_replacement_updater(
 
     def resolve_replacement(source: object) -> object:
         resolved = original(source)
-        runner.OmegaConf.update(
-            resolved,
+        for path in (
             "model.layers.0.update._target_",
-            "tpen.nn.ReplacementUpdater",
-            merge=False,
-        )
+            "runner.model.layers.0.update._target_",
+        ):
+            runner.OmegaConf.update(
+                resolved, path, "tpen.nn.ReplacementUpdater", merge=False
+            )
         return resolved
 
     monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_replacement)
@@ -1215,12 +1216,13 @@ def test_execute_refuses_consumed_replacement_updater_before_claim(
 
     def resolve_replacement(source: object) -> object:
         resolved = original(source)
-        runner.OmegaConf.update(
-            resolved,
+        for path in (
             "model.layers.0.update._target_",
-            "tpen.nn.ReplacementUpdater",
-            merge=False,
-        )
+            "runner.model.layers.0.update._target_",
+        ):
+            runner.OmegaConf.update(
+                resolved, path, "tpen.nn.ReplacementUpdater", merge=False
+            )
         return resolved
 
     monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_replacement)
@@ -1322,3 +1324,177 @@ def test_truthfulness_guard_rejects_non_residual_base_and_consumed_updater(
         match="feature_update.*ReplacementUpdater.*dd964863",
     ):
         runner.select_cell((target,), seed_label=810001)
+
+
+def _update_model_views(config: object, updates: dict[str, object]) -> None:
+    for prefix in ("model", "runner.model"):
+        for field, value in updates.items():
+            runner.OmegaConf.update(
+                config,
+                f"{prefix}.{field}",
+                value,
+                merge=False,
+                force_add=True,
+            )
+
+
+def test_truthfulness_guard_refuses_runner_only_updater_at_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path))
+    original = runner.train_config.resolve_train_config
+
+    def resolve_runner_replacement(source: object) -> object:
+        resolved = original(source)
+        runner.OmegaConf.update(
+            resolved,
+            "runner.model.layers.0.update._target_",
+            "tpen.nn.ReplacementUpdater",
+            merge=False,
+        )
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_runner_replacement)
+    with pytest.raises(runner.StageQSelectionError, match="runner.model.layers.*ReplacementUpdater"):
+        runner.select_cell((target,), seed_label=810001)
+
+
+@pytest.mark.parametrize("walkers", [stage_coordinate.COMMITTED_WALKERS, stage_coordinate.Q_MECHANICS_WALKERS])
+def test_execute_refuses_runner_only_updater_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, walkers: int
+) -> None:
+    original = runner.train_config.resolve_train_config
+
+    def resolve_runner_replacement(source: object) -> object:
+        resolved = original(source)
+        runner.OmegaConf.update(
+            resolved,
+            "runner.model.layers.0.update._target_",
+            "tpen.nn.ReplacementUpdater",
+            merge=False,
+        )
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_runner_replacement)
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+    with pytest.raises(runner.StageQSelectionError, match="runner.model.layers.*ReplacementUpdater"):
+        runner.execute(_args(tmp_path, walkers=walkers, dry_run=False))
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+def _bounded_distance_basis() -> dict[str, object]:
+    return {
+        "_target_": "tpen.nn.basis.BoundedDistanceBasis",
+        "inner": {
+            "_target_": "tpen.nn.RawCoordinateBasis",
+            "spatial_dim": 3,
+            "include_spin": True,
+        },
+        "length": 1.0,
+    }
+
+
+def test_truthfulness_guard_refuses_bounded_distance_b00_counterexample_at_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path))
+    original = runner.train_config.resolve_train_config
+
+    def resolve_bounded(source: object) -> object:
+        resolved = original(source)
+        _update_model_views(
+            resolved,
+            {
+                "basis": _bounded_distance_basis(),
+                "embedding.in_features": 5,
+                "embedding.pair_input_channels": 3,
+            },
+        )
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_bounded)
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match="input_features.*BoundedDistanceBasis.*dd964863",
+    ):
+        runner.select_cell((target,), seed_label=810001)
+
+
+@pytest.mark.parametrize("walkers", [stage_coordinate.COMMITTED_WALKERS, stage_coordinate.Q_MECHANICS_WALKERS])
+def test_execute_refuses_bounded_distance_b00_counterexample_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, walkers: int
+) -> None:
+    original = runner.train_config.resolve_train_config
+
+    def resolve_bounded(source: object) -> object:
+        resolved = original(source)
+        _update_model_views(
+            resolved,
+            {
+                "basis": _bounded_distance_basis(),
+                "embedding.in_features": 5,
+                "embedding.pair_input_channels": 3,
+            },
+        )
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_bounded)
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+    with pytest.raises(runner.StageQSelectionError, match="input_features.*BoundedDistanceBasis.*dd964863"):
+        runner.execute(_args(tmp_path, walkers=walkers, dry_run=False))
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+def test_truthfulness_guard_refuses_bounded_distance_basis_only_variant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path))
+    original = runner.train_config.resolve_train_config
+
+    def resolve_bounded(source: object) -> object:
+        resolved = original(source)
+        _update_model_views(resolved, {"basis": _bounded_distance_basis()})
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_bounded)
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match="input_features.*BoundedDistanceBasis.*dd964863",
+    ):
+        runner.select_cell((target,), seed_label=810001)
+
+
+def test_truthfulness_guard_refuses_explicit_null_betas_at_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path))
+    original = runner.train_config.resolve_train_config
+
+    def resolve_null_betas(source: object) -> object:
+        resolved = original(source)
+        for path in ("optimizer.betas", "runner.optimizer.betas"):
+            runner.OmegaConf.update(resolved, path, None, merge=False, force_add=True)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_null_betas)
+    with pytest.raises(runner.StageQSelectionError, match="optimizer.betas"):
+        runner.select_cell((target,), seed_label=810001)
+
+
+@pytest.mark.parametrize("walkers", [stage_coordinate.COMMITTED_WALKERS, stage_coordinate.Q_MECHANICS_WALKERS])
+def test_execute_refuses_explicit_null_betas_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, walkers: int
+) -> None:
+    original = runner.train_config.resolve_train_config
+
+    def resolve_null_betas(source: object) -> object:
+        resolved = original(source)
+        for path in ("optimizer.betas", "runner.optimizer.betas"):
+            runner.OmegaConf.update(resolved, path, None, merge=False, force_add=True)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_null_betas)
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+    with pytest.raises(runner.StageQSelectionError, match="optimizer.betas"):
+        runner.execute(_args(tmp_path, walkers=walkers, dry_run=False))
+    assert not list(tmp_path.rglob("selection_receipt.json"))
