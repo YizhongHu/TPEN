@@ -1094,6 +1094,36 @@ class ModelParameterBinding:
         return type(self)(layout=current, parameters=parameters)
 
 
+def validate_optimizer_parameter_containment(
+    optimizer: torch.optim.Optimizer,
+    model_parameters: ModelParameterBinding,
+) -> None:
+    """Require a non-empty optimizer carrier within the live parameter binding.
+
+    Parameters
+    ----------
+    optimizer : torch.optim.Optimizer
+        Carrier whose current parameter groups are checked.
+    model_parameters : ModelParameterBinding
+        Live model parameter domain; a strict subset remains lawful.
+
+    Raises
+    ------
+    ValueError
+        If the carrier is empty or contains a parameter outside the binding.
+    """
+
+    # Parameter equality is tensor-valued; ownership is an identity relation.
+    live = {id(parameter) for parameter in model_parameters.parameters}
+    carried = {
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+    }
+    if not carried:
+        raise ValueError("optimizer parameter carrier is empty")
+    if not carried <= live:
+        raise ValueError("optimizer parameter carrier contains foreign model parameters")
+
+
 @dataclass(frozen=True, kw_only=True)
 class VMCUpdateState:
     """The single optimizer and parameter binding owned by an update method."""
@@ -1966,5 +1996,6 @@ __all__ = [
     "parameter_layout_fingerprint",
     "select_reevaluation_rows",
     "serialize_parameter_layout",
+    "validate_optimizer_parameter_containment",
     "vmc_objective_reevaluation",
 ]

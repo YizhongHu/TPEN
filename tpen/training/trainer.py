@@ -45,6 +45,7 @@ from tpen.training.update import (
     serialize_parameter_layout,
     VMCUpdateMethod,
     VMCUpdateState,
+    validate_optimizer_parameter_containment,
     vmc_objective_reevaluation,
 )
 from tpen.training.vmc import (
@@ -340,12 +341,21 @@ class VMCTrainer:
         loop could mutate one optimizer while publishing another.
         Stateless methods use the supplied optimizer as their authority.
 
+        Raises
+        ------
+        ValueError
+            If a stateful method's optimizer carrier is empty or contains
+            parameters outside the live model, or its binding is inconsistent.
+
         Notes
         -----
         This is where a runner-driven run BINDS its method, before checkpoint
         restore mutates anything. `fit` later reaches the same boundary and
         receives that same instance back, so the object that loads method
         state is the object that performs the next update.
+
+        After a containment refusal, discard this trainer: it may remain bound
+        to the refused carrier.
         """
 
         selected_update_method = self.bind_update_method(
@@ -451,6 +461,11 @@ class VMCTrainer:
 
         Notes
         -----
+        This is not a containment boundary. Containment is checked by
+        ``_resolve_method_state`` on the ``fit`` and ``resolve_update_state``
+        paths. After a containment refusal on those paths, discard this
+        trainer: it may remain bound to the refused carrier.
+
         BINDING IS IDEMPOTENT, AND THAT IS THE WHOLE POINT. A run reaches this
         boundary at least twice -- once from `resolve_update_state`, which the
         runner calls BEFORE checkpoint restore, and once from `fit` -- and the
@@ -564,6 +579,8 @@ class VMCTrainer:
                 optimizer=optimizer,
                 model_parameters=ModelParameterBinding.from_parameters(tuple(model.parameters())),
             )
+            # Stateless methods receive no optimizer in AutogradUpdateInput;
+            # the trainer never steps a foreign carrier on their behalf.
             return resolved_state
         if not isinstance(owned_state, VMCUpdateState):
             raise TypeError("VMCUpdateMethod.update_state must return VMCUpdateState or None")
@@ -573,6 +590,9 @@ class VMCTrainer:
         expected_binding = ModelParameterBinding.from_parameters(tuple(model.parameters()))
         if not owned_state.model_parameters.compare(expected_binding)[0]:
             raise ValueError("update method parameter binding does not match live model")
+        # A correct binding does not establish mutable carrier contents:
+        # revalidate at every sampling/restore boundary, without caching.
+        validate_optimizer_parameter_containment(optimizer, expected_binding)
         return owned_state
 
     def fit(
@@ -586,7 +606,19 @@ class VMCTrainer:
         emit: Callable[..., None],
         update_method: UpdateMethodSpec = None,
     ) -> TrainerState:
-        """Run the training loop and return the final `TrainerState`."""
+        """Run the training loop and return the final `TrainerState`.
+
+        Raises
+        ------
+        ValueError
+            If a stateful method's optimizer carrier is empty or contains
+            parameters outside the live model, or its binding is inconsistent.
+
+        Notes
+        -----
+        After a containment refusal, discard this trainer: it may remain bound
+        to the refused carrier.
+        """
 
         # Bind, or confirm the binding the runner already made. A direct
         # caller that never went through the runner binds here, once, and then
