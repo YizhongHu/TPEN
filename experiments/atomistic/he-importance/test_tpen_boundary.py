@@ -31,7 +31,7 @@ PENDING_516_SHA = "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
 # optimizer-grid crossing and dev/#528's now-present test_run_stage_q.py
 # crossing are measured, so the union has one more crossing than either
 # parent inventory counted.
-EXPECTED_UNSANCTIONED_COUNTS = {15}
+EXPECTED_UNSANCTIONED_COUNTS = {16}
 PENDING_516_POLICY = (
     "this is a historical, 516-scoped PR-516 capability fixture; a new pending PR needs its own pin"
 )
@@ -61,10 +61,10 @@ EXPECTED_PRODUCTION_INVENTORY = {
     ("optimizer_grid.py", 340, "tpen.hi_schema"): InventoryEntry(
         "remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 199, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 215, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 403, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 422, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("run_stage_q.py", 108, "tpen.hi_schema"): InventoryEntry(
@@ -94,13 +94,16 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 901, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_train_config.py", 309, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 128, "tpen.hi_schema"): InventoryEntry(
+        "item df8f8b31: test-only schema validation for the independent HI grid oracle."
+    ),
+    ("test_train_config.py", 378, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 409, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 514, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 502, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 607, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("test_run_stage_q.py", 382, "tpen.hi_schema"): InventoryEntry(
@@ -1198,6 +1201,8 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             ("repo_root and candidates are freshly resolved Path values owned by the checkout probe", 1),
         ("train_config.py", "_cell_from_source", "hasattr(cell, name)"):
             ("this is source-shape admission; false positives fail at the required downstream reads", 1),
+        ("train_config.py", "_scheduler_paths", 'key in {"scheduler", "lr_scheduler"}'):
+            ("keys are detached composed-config names and the set contains resolver-owned literals", 1),
         ("train_config.py", "_set_optional_execution_seeds", '"seed" in checker'):
             ("checker is a validated mapping from the composed config and the key is a module literal", 1),
         ("train_config.py", "_optimizer_entry", 'status not in {"available", "unavailable"}'):
@@ -1212,6 +1217,8 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             ("the authority entry is a detached JSON mapping and the family literal is resolver-owned", 1),
         ("train_config.py", "_declared_adam_levels", 'method != "adam"'):
             ("method is read from the detached manifest identity and Adam is the only resolver family", 1),
+        ("train_config.py", "_declared_adam_levels", 'set(optimizer) != {"method", "levels"}'):
+            ("optimizer is the detached manifest identity mapping and the exact key set is resolver-owned", 1),
         ("train_config.py", "_declared_adam_levels", "set(levels) != set(expected)"):
             ("both mappings are detached authority/manifest data and the exact key set is resolver-owned", 1),
         ("train_config.py", "_declared_adam_levels", 'levels["parameter_groups"] != expected["parameter_groups"]'):
@@ -1472,11 +1479,11 @@ def test_r2_boundary_count_is_exact_and_live(
     ]
     assert len(expected_nodes) == 1
     expected = ast.literal_eval(expected_nodes[0])
-    assert expected == {15}
+    assert expected == {16}
     boundary = importlib.import_module("experiments.atomistic.he-importance.test_tpen_boundary")
     synthetic = tmp_path / "synthetic.py"
-    synthetic.write_text("\n".join("import tpen.synthetic" for _ in range(15)) + "\n")
+    synthetic.write_text("\n".join("import tpen.synthetic" for _ in range(16)) + "\n")
     monkeypatch.setattr(boundary, "STUDY_DIR", tmp_path)
     _, crossings = boundary._scan_study()
-    assert len(crossings) == 15
+    assert len(crossings) == 16
     assert len(crossings) in expected

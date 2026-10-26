@@ -116,6 +116,22 @@ def _mapping(value: Any, label: str) -> Mapping[str, Any]:
     return value
 
 
+def _scheduler_paths(value: Any, path: str = "") -> tuple[str, ...]:
+    """Find every non-null scheduler declaration in a composed config tree."""
+
+    found: list[str] = []
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            child = f"{path}.{key}" if path else str(key)
+            if key in {"scheduler", "lr_scheduler"} and nested is not None:
+                found.append(child)
+            found.extend(_scheduler_paths(nested, child))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, nested in enumerate(value):
+            found.extend(_scheduler_paths(nested, f"{path}.{index}" if path else str(index)))
+    return tuple(found)
+
+
 def _integer_seed(streams: Mapping[str, Any], name: str) -> int:
     """Return one explicit seed stream, refusing implicit RNG fallback."""
 
@@ -236,6 +252,10 @@ def _declared_adam_levels(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
 
     identity = _mapping(manifest.get("scientific_identity"), "scientific_identity")
     optimizer = _mapping(identity.get("optimizer"), "scientific_identity.optimizer")
+    if set(optimizer) != {"method", "levels"}:
+        raise OptimizerLevelResolutionError(
+            "scientific_identity.optimizer must contain exactly method and levels"
+        )
     method = optimizer.get("method")
     if method != "adam":
         raise OptimizerLevelResolutionError(
@@ -389,12 +409,11 @@ def resolve_train_config(source: Any) -> DictConfig:
     OmegaConf.update(
         cfg, "optimizer.weight_decay", levels["weight_decay"], merge=False, force_add=True
     )
-    if any(
-        OmegaConf.select(cfg, path, default=None) is not None
-        for path in ("scheduler", "optimizer.scheduler", "optimizer.lr_scheduler")
-    ):
+    scheduler_paths = _scheduler_paths(OmegaConf.to_container(cfg, resolve=False))
+    if scheduler_paths:
         raise OptimizerLevelResolutionError(
-            "composed config contains a scheduler block; Adam schedule must be constant"
+            "composed config contains scheduler block(s) "
+            f"{scheduler_paths!r}; Adam schedule must be constant"
         )
     _set_named_initializer_seeds(cfg, model_seed)
     _set_optional_execution_seeds(cfg, streams)

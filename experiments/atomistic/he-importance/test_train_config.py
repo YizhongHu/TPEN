@@ -26,6 +26,15 @@ stage_coordinate = importlib.util.module_from_spec(_STAGE_SPEC)
 sys.modules[_STAGE_SPEC.name] = stage_coordinate
 _STAGE_SPEC.loader.exec_module(stage_coordinate)
 
+_GRID_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_optimizer_grid_for_train_config",
+    Path(__file__).with_name("optimizer_grid.py"),
+)
+assert _GRID_SPEC is not None and _GRID_SPEC.loader is not None
+optimizer_grid = importlib.util.module_from_spec(_GRID_SPEC)
+sys.modules[_GRID_SPEC.name] = optimizer_grid
+_GRID_SPEC.loader.exec_module(optimizer_grid)
+
 _RESOLVER_SPEC = importlib.util.spec_from_file_location(
     "he_importance_train_config",
     Path(__file__).with_name("train_config.py"),
@@ -79,6 +88,66 @@ def _callback_checkers(cfg: object) -> list[object]:
         for callback in cfg.callbacks
         for checker in callback.get("checkers", [])
     ]
+
+
+def _q_adam_cells(tmp_path: Path, context: str) -> list[object]:
+    """Materialize the sixteen Stage-Q Adam cells for one model context."""
+
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=optimizer_grid.roster_availability()
+    )
+    return [
+        cell
+        for cell in cells
+        if cell.manifest["stage"] == "Q"
+        and cell.manifest["scientific_identity"]["context"]["name"] == context
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+    ]
+
+
+def _authority_adam_levels() -> dict[str, object]:
+    """Read expected Adam levels independently from the committed authority."""
+
+    authority = json.loads(
+        Path(train_config.__file__).with_name("optimizer_grid_authority.json").read_text()
+    )
+    family = next(row for row in authority["families"] if row["family"] == "adam")
+    levels = dict(family["fixed"])
+    return {**levels, "lr": None, "beta2": None}
+
+
+def _assert_q_adam_grid_outputs(cells: list[object]) -> None:
+    """Assert the independent level oracle against both consumed config views."""
+
+    authority = _authority_adam_levels()
+    resolved_blocks: set[tuple[object, ...]] = set()
+    for cell in cells:
+        declared = cell.manifest["scientific_identity"]["optimizer"]["levels"]
+        expected = {**authority, "lr": declared["lr"], "beta2": declared["beta2"]}
+        resolved = train_config.resolve_train_config(cell)
+        import tpen.hi_schema as schema
+
+        schema.validate_hi_train_config(resolved)
+        for path in ("optimizer", "runner.optimizer"):
+            block = getattr(resolved, path.replace(".", "_"), None)
+            if block is None:
+                block = OmegaConf.select(resolved, path)
+            assert {
+                "lr": block.lr,
+                "betas": list(block.betas),
+                "eps": block.eps,
+                "weight_decay": block.weight_decay,
+            } == {
+                "lr": expected["lr"],
+                "betas": [expected["beta1"], expected["beta2"]],
+                "eps": expected["epsilon"],
+                "weight_decay": expected["weight_decay"],
+            }
+        resolved_blocks.add(
+            (expected["lr"], expected["beta1"], expected["beta2"], expected["epsilon"], expected["weight_decay"])
+        )
+    assert len(cells) == 16
+    assert len(resolved_blocks) == 8
 
 
 @pytest.mark.parametrize("stage_code", ("O1", "Q"))
@@ -325,6 +394,41 @@ def test_resolve_consumes_every_declared_adam_level_explicitly(tmp_path: Path) -
     assert "scheduler" not in resolved.optimizer
 
 
+def test_resolve_consumes_all_q_adam_levels_in_both_optimizer_views(tmp_path: Path) -> None:
+    """All sixteen O-raw cells match an independent authority oracle."""
+
+    _assert_q_adam_grid_outputs(_q_adam_cells(tmp_path, "O-raw"))
+
+
+def test_resolve_refuses_all_q_adam_o_composite_cells(tmp_path: Path) -> None:
+    """Every O-composite Adam cell is refused by the resolver itself."""
+
+    cells = _q_adam_cells(tmp_path, "O-composite")
+    assert len(cells) == 16
+    for cell in cells:
+        with pytest.raises(train_config.ContextResolutionError, match="7bae63d8.*dd964863"):
+            train_config.resolve_train_config(cell)
+
+
+def test_level_mapping_mutant_turns_grid_oracle_red(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid constant-output mapping mutant fails equality/distinctness."""
+
+    fixed = {
+        "lr": 0.005,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "epsilon": 1e-8,
+        "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
+    }
+    monkeypatch.setattr(train_config, "_declared_adam_levels", lambda _manifest: fixed)
+    with pytest.raises(AssertionError):
+        _assert_q_adam_grid_outputs(_q_adam_cells(tmp_path, "O-raw"))
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
@@ -380,8 +484,9 @@ def test_resolve_refuses_non_o_raw_context(tmp_path: Path) -> None:
         train_config.resolve_train_config(rebuilt)
 
 
-def test_resolve_refuses_composed_scheduler_block(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("path", ("scheduler", "optimizer.scheduler", "runner.lr_scheduler", "trainer.scheduler"))
+def test_resolve_refuses_any_composed_scheduler_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
 ) -> None:
     cell = _cell(tmp_path)
     original = train_config._compose_base_config
@@ -390,8 +495,8 @@ def test_resolve_refuses_composed_scheduler_block(
         config = original()
         OmegaConf.update(
             config,
-            "optimizer.scheduler",
-            {"_target_": "tests.Scheduler"},
+            path,
+            {},
             merge=False,
             force_add=True,
         )
