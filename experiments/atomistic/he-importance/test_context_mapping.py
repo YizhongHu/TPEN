@@ -260,7 +260,24 @@ def test_tensor_silu_matches_train_control_state_and_value() -> None:
     assert torch.equal(control_value, mapped_value)
 
 
-def test_biased_producer_channel_mlp_effect_is_measured(capsys: pytest.CaptureFixture[str]) -> None:
+def _zero_tuple_entries(*, diagonal: bool, distinct: bool):
+    """Build a hook that zeros selected post-Gamma order-2 entries."""
+
+    def hook(_module: object, _inputs: tuple[object, ...], output: torch.Tensor) -> torch.Tensor:
+        if output.ndim != 5:
+            return output
+        masked = output.clone()
+        if diagonal:
+            indices = torch.arange(output.shape[-1], device=output.device)
+            masked[..., indices, indices] = 0
+        if distinct:
+            masked[..., 0, 1] = 0
+        return masked
+
+    return hook
+
+
+def test_biased_producer_channel_mlp_non_distinct_leakage_is_measured() -> None:
     train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
     train.model.layers[0] = OmegaConf.create(
         context_mapping.context_fragment("tensor", activation="channel-MLP,SiLU")
@@ -269,12 +286,30 @@ def test_biased_producer_channel_mlp_effect_is_measured(capsys: pytest.CaptureFi
     torch.manual_seed(73)
     model = instantiate(train.model).to(dtype=torch.float64)
     batch = _he_batch()
-    before = model(batch).logabs.detach()
     with torch.no_grad():
         for name, parameter in model.named_parameters():
             if "mixing.activation" in name and name.endswith("bias"):
                 parameter.fill_(0.25)
-    after = model(batch).logabs.detach()
-    delta = float((after - before).abs().max())
-    print(f"C8 producer Gamma(0) biased logabs max_delta={delta:.17g}")
-    assert torch.isfinite(after).all()
+    full = model(batch).logabs.detach()
+    activation = model.stack.layers[0].mixing.activation
+    diagonal_handle = activation.register_forward_hook(
+        _zero_tuple_entries(diagonal=True, distinct=False)
+    )
+    try:
+        diagonal_masked = model(batch).logabs.detach()
+    finally:
+        diagonal_handle.remove()
+    distinct_handle = activation.register_forward_hook(
+        _zero_tuple_entries(diagonal=False, distinct=True)
+    )
+    try:
+        distinct_masked = model(batch).logabs.detach()
+    finally:
+        distinct_handle.remove()
+    non_distinct_delta = float((full - diagonal_masked).abs().max())
+    distinct_delta = float((full - distinct_masked).abs().max())
+    print(f"C8 non_distinct_post_gamma_zero max_delta={non_distinct_delta:.17g}")
+    print(f"C8 distinct_post_gamma_zero_control max_delta={distinct_delta:.17g}")
+    assert torch.isfinite(diagonal_masked).all()
+    assert torch.isfinite(distinct_masked).all()
+    assert distinct_delta > 0.0
