@@ -150,6 +150,11 @@ def _load_base_stage_coordinate() -> object:
     Path.read_text = read_text  # type: ignore[assignment]
     try:
         exec(compile(source, f"{base}:stage_coordinate.py", "exec"), module.__dict__)
+        # The base implementation reads its inventory lazily. Freeze the
+        # pinned blob in the loaded module before restoring the path reader so
+        # later materialization cannot silently consume the head checkout.
+        frozen_inventory = module.intended_configurations()
+        module.intended_configurations = lambda: frozen_inventory
     finally:
         Path.read_text = original_read_text  # type: ignore[assignment]
     return module
@@ -187,7 +192,7 @@ def _no_walker_override_pattern(stage: str) -> str:
 
 
 def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Rerun the base oracle and prove a deliberate identity perturbation is RED."""
 
@@ -211,6 +216,32 @@ def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
     assert _identity_pairs(base_mechanics, tmp_path / "base") == _identity_pairs(
         head_mechanics, tmp_path / "head"
     )
+
+    mutated_inventory = json.loads(
+        Path(__file__).with_name("intended_configurations.json").read_text()
+    )
+    mutated_entry = mutated_inventory[0]
+    mutated_levels = dict(mutated_entry["optimizer"]["levels"])
+    mutated_levels["lr"] = 0.0006
+    mutated_entry["optimizer"]["levels"] = mutated_levels
+    for configuration in mutated_entry["configurations"]:
+        configuration["scientific_identity"]["optimizer"]["levels"] = dict(mutated_levels)
+    mutated_path = tmp_path / "head-inventory-mutation.json"
+    mutated_path.write_text(json.dumps(mutated_inventory), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", mutated_path)
+    mutated_head = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "mutated-head", availability=_complete_available_roster()
+    )
+    base_after_head_mutation = base.materialize_intended_configurations(
+        tmp_path / "base-after-head-mutation", availability=_available_roster_for(base)
+    )
+    assert _identity_pairs(base_cells, tmp_path / "base") == _identity_pairs(
+        base_after_head_mutation, tmp_path / "base-after-head-mutation"
+    )
+    with pytest.raises(AssertionError, match="head inventory perturbation"):
+        assert _identity_pairs(base_after_head_mutation, tmp_path / "base-after-head-mutation") == _identity_pairs(
+            mutated_head, tmp_path / "mutated-head"
+        ), "head inventory perturbation should be RED"
 
     named = next(
         cell
