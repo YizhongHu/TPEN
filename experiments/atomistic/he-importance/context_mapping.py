@@ -19,6 +19,10 @@ class UnknownContextLabel(ContextMappingError):
     """Raised when a requested A1/A2 or A6 label is not declared."""
 
 
+class UnsupportedActivationLabel(ContextMappingError):
+    """Raised when a declared activation has no admissible implementation."""
+
+
 _PATH_LABELS = {
     "tensor": ("tensor", None),
     "linear/coordinate-neighbor": ("linear", "coordinate_neighbor"),
@@ -123,7 +127,7 @@ def _layer_fragment(
             "_target_": "tpen.nn.LinearEquivariantMixing",
             "max_order": 2,
             "channels": channels,
-            "metadata": "${layout.linear}",
+            "metadata": "${...layout.linear}",
             "aggregation": "sum",
             "implementation": "vectorized",
             "initial_weight": 0.5,
@@ -134,7 +138,7 @@ def _layer_fragment(
             "max_order": 2,
             "max_virtual_order": 2,
             "channels": channels,
-            "paths": "${layout.tensor_product}",
+            "paths": "${...layout.tensor_product}",
             "implementation": "vectorized",
             "activation": None,
             "initial_weight": 0.5,
@@ -144,7 +148,7 @@ def _layer_fragment(
         "layout": layout,
         "mixing": {
             "_target_": "tpen.nn.CompositeMixing",
-            "layout": "${layout}",
+            "layout": "${..layout}",
             "producers": producers,
             "activation": _activation(producer_activation, seed=seed, site="producer", channels=channels),
         },
@@ -152,7 +156,7 @@ def _layer_fragment(
             "_target_": "tpen.nn.PathAggregation",
             "max_order": 2,
             "channels": channels,
-            "layout": "${layout}",
+            "layout": "${..layout}",
             "activation": _activation(aggregation_activation, seed=seed, site="aggregation", channels=channels),
             "initializer": {
                 "_target_": "tpen.nn.TorchInitializer",
@@ -239,9 +243,10 @@ def _activation(name: str, *, seed: int, site: str, channels: int) -> Any:
     if name == "gelu":
         return {"_target_": "torch.nn.GELU", "approximate": "none"}
     if name == "softplus_beta2":
-        # Infinite threshold keeps the stable logaddexp branch for every
-        # finite input; the default threshold=20 is scientifically excluded.
-        return {"_target_": "torch.nn.Softplus", "beta": 2.0, "threshold": float("inf")}
+        # No dev module implements the required all-range logaddexp formula.
+        raise UnsupportedActivationLabel(
+            "Softplus beta2 requires stable logaddexp(0, 2*z)/2; no admissible dev module"
+        )
     if name == "channel_mlp":
         tuple_axes_start = 3 if site == "producer" else 2
         return {
@@ -277,4 +282,10 @@ def _activation(name: str, *, seed: int, site: str, channels: int) -> Any:
     raise AssertionError(f"unmapped internal activation {name!r}")
 
 
-__all__ = ["ContextMappingError", "UnknownContextLabel", "build_context_fragment", "context_fragment"]
+__all__ = [
+    "ContextMappingError",
+    "UnknownContextLabel",
+    "UnsupportedActivationLabel",
+    "build_context_fragment",
+    "context_fragment",
+]

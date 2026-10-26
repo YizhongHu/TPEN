@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 import sys
 
+import torch
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 import pytest
@@ -36,6 +37,9 @@ ACTIVATION_LABELS = (
     "SiLU,channel-MLP",
     "channel-MLP,channel-MLP",
 )
+ADMISSIBLE_ACTIVATION_LABELS = tuple(
+    label for label in ACTIVATION_LABELS if "Softplus" not in label
+)
 
 
 def test_unknown_labels_refuse_without_a_default() -> None:
@@ -45,22 +49,37 @@ def test_unknown_labels_refuse_without_a_default() -> None:
         context_mapping.context_fragment("tensor", activation="unknown")
 
 
-def test_linear_oracles_are_literal_and_support_bounded() -> None:
+def test_linear_oracles_are_independent_literal_records() -> None:
     coordinate = context_mapping.context_fragment("linear/coordinate-neighbor")
     orbit = context_mapping.context_fragment("linear/orbit-complete")
     coordinate_paths = coordinate["layout"]["linear"]["explicit"]["_args_"][0]
     orbit_paths = orbit["layout"]["linear"]["explicit"]["_args_"][0]
 
-    assert [(p["output_order"], p["input_order"], p["tau_in"]) for p in coordinate_paths] == [
-        (1, 1, [0]),
-        (1, 1, [1]),
-        (2, 2, [0, 1]),
+    assert [
+        (p["output_order"], p["input_order"], p["tau_out"], p["tau_in"])
+        for p in coordinate_paths
+    ] == [
+        (1, 1, [0], [0]),
+        (1, 1, [0], [1]),
+        (2, 2, [0, 1], [0, 1]),
     ]
-    assert len(orbit_paths) == 8
-    assert all(
-        p["output_order"] + p["input_order"] - len(set(p["tau_out"]) & set(p["tau_in"])) <= 2
+    assert [
+        (p["output_order"], p["input_order"], p["tau_out"], p["tau_in"])
         for p in orbit_paths
-    )
+    ] == [
+        (1, 1, [0], [0]), (1, 1, [0], [1]),
+        (1, 2, [0], [0, 1]), (1, 2, [0], [1, 0]),
+        (2, 1, [0, 1], [0]), (2, 1, [0, 1], [1]),
+        (2, 2, [0, 1], [0, 1]), (2, 2, [0, 1], [1, 0]),
+    ]
+
+
+def test_unfiltered_linear_generators_emit_support_three() -> None:
+    from tpen.data.paths import LinearPathMetadata
+
+    for policy in ("coordinate_neighbor", "orbit_complete"):
+        metadata = LinearPathMetadata.generate(max_order=2, policy=policy)
+        assert any(path.support_order == 3 for path in metadata.all_paths())
 
 
 def test_layout_and_explicit_execution_controls_are_written() -> None:
@@ -73,10 +92,22 @@ def test_layout_and_explicit_execution_controls_are_written() -> None:
             assert producer["implementation"] == "vectorized"
             if producer["_target_"].endswith("LinearEquivariantMixing"):
                 assert producer["aggregation"] == "sum"
+        if label.startswith("hybrid/"):
+            assert [p["_target_"] for p in fragment["mixing"]["producers"]] == [
+                "tpen.nn.LinearEquivariantMixing", "tpen.nn.EquivariantMixing"
+            ]
+            assert fragment["mixing"]["activation"] is not None
+
+
+def test_composite_owns_gamma_once() -> None:
+    for label in PATH_LABELS:
+        fragment = context_mapping.context_fragment(label)
+        assert fragment["mixing"]["activation"]["_target_"] == "torch.nn.SiLU"
+        assert all(producer.get("activation") is None for producer in fragment["mixing"]["producers"])
 
 
 @pytest.mark.parametrize("path_label", PATH_LABELS)
-@pytest.mark.parametrize("activation_label", ACTIVATION_LABELS)
+@pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
 def test_all_35_fragments_have_declared_targets(path_label: str, activation_label: str) -> None:
     fragment = context_mapping.context_fragment(path_label, activation=activation_label)
     assert fragment["mixing"]["_target_"] == "tpen.nn.CompositeMixing"
@@ -104,13 +135,12 @@ def test_activation_parameters_and_named_streams() -> None:
 def test_exact_gelu_and_softplus_beta_two_are_explicit() -> None:
     gelu = context_mapping.context_fragment("tensor", activation="exact GELU,exact GELU")
     assert gelu["mixing"]["activation"] == {"_target_": "torch.nn.GELU", "approximate": "none"}
-    softplus = context_mapping.context_fragment("tensor", activation="Softplus beta2,Softplus beta2")
-    assert softplus["mixing"]["activation"]["beta"] == 2.0
-    assert softplus["mixing"]["activation"]["threshold"] == float("inf")
+    with pytest.raises(context_mapping.UnsupportedActivationLabel):
+        context_mapping.context_fragment("tensor", activation="Softplus beta2,Softplus beta2")
 
 
 @pytest.mark.parametrize("path_label", PATH_LABELS)
-@pytest.mark.parametrize("activation_label", ACTIVATION_LABELS)
+@pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
 def test_every_fragment_instantiates(path_label: str, activation_label: str) -> None:
     config = OmegaConf.create(
         context_mapping.context_fragment(path_label, activation=activation_label)
@@ -122,3 +152,83 @@ def test_every_fragment_instantiates(path_label: str, activation_label: str) -> 
     assert mixing.layout.fingerprint == layout.fingerprint
     assert aggregation.layout.fingerprint == layout.fingerprint
     assert layer.layout.fingerprint == layout.fingerprint
+
+
+@pytest.mark.parametrize("path_label", PATH_LABELS)
+@pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
+def test_fragment_splices_into_control_model(path_label: str, activation_label: str) -> None:
+    """Resolve the fragment at the real ``model.layers[0]`` location."""
+
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model.layers[0] = OmegaConf.create(
+        context_mapping.context_fragment(path_label, activation=activation_label)
+    )
+    OmegaConf.resolve(train)
+    model = instantiate(train.model)
+    assert model.stack.layers[0].layout.fingerprint == model.stack.layers[0].mixing.layout.fingerprint
+
+
+def _he_batch() -> object:
+    from tpen.data.batch import ElectronBatch
+
+    generator = torch.Generator().manual_seed(1729)
+    positions = torch.randn((2, 2, 3), generator=generator, dtype=torch.float64)
+    spins = torch.tensor([[1.0, -1.0], [1.0, -1.0]], dtype=torch.float64)
+    nuclei = torch.zeros((1, 3), dtype=torch.float64)
+    charges = torch.tensor([2.0], dtype=torch.float64)
+    return ElectronBatch(positions, nuclear_positions=nuclei, nuclear_charges=charges, spins=spins)
+
+
+@pytest.mark.parametrize("path_label", PATH_LABELS)
+@pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
+def test_all_admissible_fragments_have_finite_he_value_and_gradients(path_label: str, activation_label: str) -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model.layers[0] = OmegaConf.create(
+        context_mapping.context_fragment(path_label, activation=activation_label)
+    )
+    OmegaConf.resolve(train)
+    model = instantiate(train.model).to(dtype=torch.float64)
+    output = model(_he_batch())
+    assert torch.isfinite(output.logabs).all()
+    output.logabs.sum().backward()
+    inactive = ("mixing.producers.0",) if path_label.startswith("tensor") else ()
+    for name, parameter in model.named_parameters():
+        if any(marker in name for marker in inactive):
+            continue
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        assert torch.any(parameter.grad != 0), name
+
+
+def test_tensor_silu_matches_train_control_state_and_value() -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    torch.manual_seed(41)
+    control = instantiate(train.model).to(dtype=torch.float64)
+    train.model.layers[0] = OmegaConf.create(context_mapping.context_fragment("tensor"))
+    OmegaConf.resolve(train)
+    torch.manual_seed(41)
+    mapped = instantiate(train.model).to(dtype=torch.float64)
+    assert tuple(control.state_dict()) == tuple(mapped.state_dict())
+    control_value = control(_he_batch()).logabs
+    mapped_value = mapped(_he_batch()).logabs
+    assert torch.equal(control_value, mapped_value)
+
+
+def test_biased_producer_channel_mlp_effect_is_measured(capsys: pytest.CaptureFixture[str]) -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model.layers[0] = OmegaConf.create(
+        context_mapping.context_fragment("tensor", activation="channel-MLP,SiLU")
+    )
+    OmegaConf.resolve(train)
+    torch.manual_seed(73)
+    model = instantiate(train.model).to(dtype=torch.float64)
+    batch = _he_batch()
+    before = model(batch).logabs.detach()
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if "mixing.activation" in name and name.endswith("bias"):
+                parameter.fill_(0.25)
+    after = model(batch).logabs.detach()
+    delta = float((after - before).abs().max())
+    print(f"C8 producer Gamma(0) biased logabs max_delta={delta:.17g}")
+    assert torch.isfinite(after).all()
