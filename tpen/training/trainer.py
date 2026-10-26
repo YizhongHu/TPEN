@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any, Callable
 
 from tpen.artifacts import RunContext
+from tpen.data.batch import WavefunctionOutput
 from tpen.dependencies import require_torch
 from tpen.physics.hamiltonian import LocalEnergyResult, local_energy
 from tpen.training.events import (
@@ -81,6 +82,39 @@ def _gradient_norm(model) -> float:
         value = param.grad.detach().pow(2).sum()
         total = value if total is None else total + value
     return float(torch.sqrt(total).item()) if total is not None else 0.0
+
+
+def _detach_wavefunction_output(output: WavefunctionOutput) -> WavefunctionOutput:
+    """Keep local-energy diagnostics while releasing their autograd graph."""
+
+    return WavefunctionOutput(
+        logabs=output.logabs.detach(),
+        sign=output.sign.detach(),
+        phase=None if output.phase is None else output.phase.detach(),
+        aux={
+            key: value.detach() if isinstance(value, torch.Tensor) else value
+            for key, value in output.aux.items()
+        },
+    )
+
+
+def _detach_local_energy_result(result: LocalEnergyResult) -> LocalEnergyResult:
+    """Materialize every local-energy output before the next forward pass."""
+
+    return LocalEnergyResult(
+        total=result.total.detach(),
+        terms={name: value.detach() for name, value in result.terms.items()},
+        wavefunction_output=(
+            None
+            if result.wavefunction_output is None
+            else _detach_wavefunction_output(result.wavefunction_output)
+        ),
+        per_electron_kinetic=(
+            None
+            if result.per_electron_kinetic is None
+            else result.per_electron_kinetic.detach()
+        ),
+    )
 
 
 class VMCTrainer:
@@ -696,6 +730,14 @@ class VMCTrainer:
                         batch,
                         return_terms=self.return_terms,
                     )
+                # The objective deliberately differentiates through the
+                # wavefunction output, not through local energy.  Its closure
+                # re-evaluation builds a fresh local-energy graph when needed,
+                # so no consumer in this step needs to retain this one.
+                if isinstance(result, LocalEnergyResult):
+                    result = _detach_local_energy_result(result)
+                elif isinstance(result, torch.Tensor):
+                    result = result.detach()
                 if isinstance(result, LocalEnergyResult):
                     total_local_energy = result.total
                     term_energies = result.terms
