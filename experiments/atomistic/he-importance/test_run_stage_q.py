@@ -1498,3 +1498,228 @@ def test_execute_refuses_explicit_null_betas_before_claim(
     with pytest.raises(runner.StageQSelectionError, match="optimizer.betas"):
         runner.execute(_args(tmp_path, walkers=walkers, dry_run=False))
     assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+def test_model_fingerprint_normalizes_only_initializer_seeds(tmp_path: Path) -> None:
+    cells = [
+        cell
+        for cell in _cells(tmp_path)
+        if cell.manifest["stage"] == "Q"
+        and cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    ]
+    first = next(cell for cell in cells if cell.manifest["seed_identity"]["label"] == 810001)
+    second = next(cell for cell in cells if cell.manifest["seed_identity"]["label"] == 810002)
+    first_model = runner.OmegaConf.to_container(
+        runner.train_config.resolve_train_config(first).runner.model,
+        resolve=True,
+    )
+    second_model = runner.OmegaConf.to_container(
+        runner.train_config.resolve_train_config(second).runner.model,
+        resolve=True,
+    )
+    assert runner._model_fingerprint(first_model) == runner._model_fingerprint(second_model)
+    assert runner._model_fingerprint(first_model) == runner._CONTROL_MODEL_FINGERPRINT
+
+    changed = json.loads(json.dumps(first_model))
+    changed["embedding"]["hidden_channels"] = 64
+    assert runner._model_fingerprint(changed) != runner._model_fingerprint(first_model)
+
+
+def test_truthfulness_guard_accepts_committed_control_at_both_seed_labels(
+    tmp_path: Path,
+) -> None:
+    cells = _cells(tmp_path)
+    for seed_label in (810001, 810002):
+        selected = runner.select_cell(cells, seed_label=seed_label)
+        assert selected.selected.seed_label == seed_label
+
+
+def test_truthfulness_guard_refuses_spinless_embedding_at_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path))
+    original = runner.train_config.resolve_train_config
+
+    def resolve_spinless(source: object) -> object:
+        resolved = original(source)
+        _update_model_views(resolved, {"embedding.include_spins": False})
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_spinless)
+    with pytest.raises(runner.StageQSelectionError, match="include_spins.*dd964863"):
+        runner.select_cell((target,), seed_label=810001)
+
+
+@pytest.mark.parametrize("walkers", [stage_coordinate.COMMITTED_WALKERS, stage_coordinate.Q_MECHANICS_WALKERS])
+def test_execute_refuses_spinless_embedding_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, walkers: int
+) -> None:
+    original = runner.train_config.resolve_train_config
+
+    def resolve_spinless(source: object) -> object:
+        resolved = original(source)
+        _update_model_views(resolved, {"embedding.include_spins": False})
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_spinless)
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+    with pytest.raises(runner.StageQSelectionError, match="include_spins.*dd964863"):
+        runner.execute(_args(tmp_path, walkers=walkers, dry_run=False))
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+def test_truthfulness_guard_refuses_auxiliary_embedding_channels_at_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path))
+    original = runner.train_config.resolve_train_config
+
+    def resolve_aux(source: object) -> object:
+        resolved = original(source)
+        _update_model_views(
+            resolved, {"embedding.aux_feature_channels": {"extra": 1}}
+        )
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_aux)
+    with pytest.raises(runner.StageQSelectionError, match="aux_feature_channels.*dd964863"):
+        runner.select_cell((target,), seed_label=810001)
+
+
+@pytest.mark.parametrize("walkers", [stage_coordinate.COMMITTED_WALKERS, stage_coordinate.Q_MECHANICS_WALKERS])
+def test_execute_refuses_auxiliary_embedding_channels_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, walkers: int
+) -> None:
+    original = runner.train_config.resolve_train_config
+
+    def resolve_aux(source: object) -> object:
+        resolved = original(source)
+        _update_model_views(
+            resolved, {"embedding.aux_feature_channels": {"extra": 1}}
+        )
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_aux)
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+    with pytest.raises(runner.StageQSelectionError, match="aux_feature_channels.*dd964863"):
+        runner.execute(_args(tmp_path, walkers=walkers, dry_run=False))
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+def _wrapped_spinless_embedding(resolved: object) -> dict[str, object]:
+    embedding = runner.OmegaConf.to_container(
+        runner.OmegaConf.select(resolved, "model.embedding"), resolve=True
+    )
+    embedding["include_spins"] = False
+    return {
+        "_target_": "hydra.utils.instantiate",
+        "_recursive_": False,
+        "config": embedding,
+    }
+
+
+def test_truthfulness_guard_refuses_wrapped_embedding_at_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path))
+    original = runner.train_config.resolve_train_config
+
+    def resolve_wrapped(source: object) -> object:
+        resolved = original(source)
+        _update_model_views(
+            resolved, {"embedding": _wrapped_spinless_embedding(resolved)}
+        )
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_wrapped)
+    with pytest.raises(runner.StageQSelectionError, match="embedding._target_.*instantiate.*dd964863"):
+        runner.select_cell((target,), seed_label=810001)
+
+
+@pytest.mark.parametrize("walkers", [stage_coordinate.COMMITTED_WALKERS, stage_coordinate.Q_MECHANICS_WALKERS])
+def test_execute_refuses_wrapped_embedding_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, walkers: int
+) -> None:
+    original = runner.train_config.resolve_train_config
+
+    def resolve_wrapped(source: object) -> object:
+        resolved = original(source)
+        _update_model_views(
+            resolved, {"embedding": _wrapped_spinless_embedding(resolved)}
+        )
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_wrapped)
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+    with pytest.raises(runner.StageQSelectionError, match="embedding._target_.*instantiate.*dd964863"):
+        runner.execute(_args(tmp_path, walkers=walkers, dry_run=False))
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+def test_truthfulness_guard_refuses_non_input_control_change_at_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path))
+    original = runner.train_config.resolve_train_config
+
+    def resolve_hidden_width(source: object) -> object:
+        resolved = original(source)
+        _update_model_views(resolved, {"embedding.hidden_channels": 64})
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_hidden_width)
+    with pytest.raises(runner.StageQSelectionError, match="fingerprint.*expected.*actual.*dd964863"):
+        runner.select_cell((target,), seed_label=810001)
+
+
+@pytest.mark.parametrize("walkers", [stage_coordinate.COMMITTED_WALKERS, stage_coordinate.Q_MECHANICS_WALKERS])
+def test_execute_refuses_non_input_control_change_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, walkers: int
+) -> None:
+    original = runner.train_config.resolve_train_config
+
+    def resolve_hidden_width(source: object) -> object:
+        resolved = original(source)
+        _update_model_views(resolved, {"embedding.hidden_channels": 64})
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_hidden_width)
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+    with pytest.raises(runner.StageQSelectionError, match="fingerprint.*expected.*actual.*dd964863"):
+        runner.execute(_args(tmp_path, walkers=walkers, dry_run=False))
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+@pytest.mark.parametrize(
+    ("seed_label", "walkers"),
+    [
+        (810001, stage_coordinate.COMMITTED_WALKERS),
+        (810001, stage_coordinate.Q_MECHANICS_WALKERS),
+        (810002, stage_coordinate.COMMITTED_WALKERS),
+        (810002, stage_coordinate.Q_MECHANICS_WALKERS),
+    ],
+)
+def test_execute_accepts_committed_control_at_both_seed_labels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seed_label: int,
+    walkers: int,
+) -> None:
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+
+    def recording_run_from_config(config: object, *, topology: object) -> int:
+        observed["calls"] = int(observed.get("calls", 0)) + 1
+        output = Path(config.run.dir) / "resolved_config.yaml"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("guarded: true\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(runner.launch, "run_from_config", recording_run_from_config)
+    assert runner.execute(
+        _args(tmp_path, seed_label=seed_label, walkers=walkers, dry_run=False)
+    ) == 0
+    assert observed["calls"] == 1

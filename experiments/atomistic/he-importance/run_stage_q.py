@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
+import hashlib
 import importlib
 import inspect
 import json
@@ -314,8 +315,53 @@ _B00_MODEL_REQUIREMENTS = {
     "target": "tpen.nn.TPENWaveFunction",
     "basis_targets": ("tpen.nn.RawCoordinateBasis", "tpen.nn.basis.RawCoordinateBasis"),
     "raw_basis": {"spatial_dim": 3, "include_spin": True},
-    "embedding": {"in_features": 4, "pair_input_channels": 0},
+    "embedding": {
+        "target": "tpen.nn.Embedding",
+        "spatial_dim": 3,
+        "in_features": 4,
+        "pair_input_channels": 0,
+    },
 }
+
+# Recompute this literal from the committed control config with:
+#
+#   cfg = train_config._compose_base_config(); OmegaConf.resolve(cfg)
+#   model = OmegaConf.to_container(cfg.runner.model, resolve=True)
+#   recursively replace only each mapping's initializer.seed value with
+#   "<initializer-seed>"; json.dumps(model, sort_keys=True, separators=(",", ":"));
+#   sha256 the resulting UTF-8 bytes.
+#
+# Any legitimate control-model edit must update this digest in review.  Only
+# initializer seed values are normalized because resolver-injected cell seeds
+# are expected to differ while every other control-model field is authoritative.
+_CONTROL_MODEL_FINGERPRINT = "66bfb3e38b28b50bbbb23caf3bcf8947183ed864b65058eb7511278ecb0f5682"
+_INITIALIZER_SEED_PLACEHOLDER = "<initializer-seed>"
+
+
+def _normalize_initializer_seeds(value: Any) -> Any:
+    """Normalize only values named ``seed`` inside ``initializer`` mappings."""
+
+    if isinstance(value, Mapping):
+        normalized = {
+            key: _normalize_initializer_seeds(nested) for key, nested in value.items()
+        }
+        initializer = normalized.get("initializer")
+        if isinstance(initializer, Mapping) and "seed" in initializer:
+            initializer = dict(initializer)
+            initializer["seed"] = _INITIALIZER_SEED_PLACEHOLDER
+            normalized["initializer"] = initializer
+        return normalized
+    if isinstance(value, list):
+        return [_normalize_initializer_seeds(nested) for nested in value]
+    return value
+
+
+def _model_fingerprint(model: Any) -> str:
+    """Return the canonical seed-normalized fingerprint of one model mapping."""
+
+    normalized = _normalize_initializer_seeds(model)
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _first_config_difference(left: Any, right: Any, path: str) -> tuple[str, Any, Any] | None:
@@ -443,6 +489,36 @@ def _require_b00_model(model: Mapping[str, Any], declared: Any) -> None:
             embedding,
         )
     raw_embedding = expected["embedding"]
+    if embedding.get("_target_") != raw_embedding["target"]:
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.embedding._target_",
+            declared,
+            embedding.get("_target_"),
+        )
+    if embedding.get("spatial_dim") != raw_embedding["spatial_dim"]:
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.embedding.spatial_dim",
+            declared,
+            embedding.get("spatial_dim"),
+        )
+    include_spins = embedding.get("include_spins", True)
+    if include_spins is not True:
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.embedding.include_spins",
+            declared,
+            include_spins,
+        )
+    aux_feature_channels = embedding.get("aux_feature_channels", _MISSING)
+    if (
+        aux_feature_channels is not _MISSING
+        and aux_feature_channels is not None
+        and aux_feature_channels != {}
+    ):
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.embedding.aux_feature_channels",
+            declared,
+            aux_feature_channels,
+        )
     in_features = embedding.get("in_features", _MISSING)
     if (
         in_features is not _MISSING
@@ -463,6 +539,23 @@ def _require_b00_model(model: Mapping[str, Any], declared: Any) -> None:
             "context.overrides.input_features.model.embedding.pair_input_channels",
             declared,
             pair_input_channels,
+        )
+    auxiliary_width = (
+        0
+        if aux_feature_channels is _MISSING or aux_feature_channels is None
+        else sum(aux_feature_channels.values())
+    )
+    derived_width = embedding["spatial_dim"] + (1 if include_spins else 0) + auxiliary_width
+    effective_width = (
+        derived_width
+        if in_features is _MISSING or in_features is None
+        else in_features
+    )
+    if effective_width != 4:
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.embedding.effective_input_width",
+            declared,
+            effective_width,
         )
 
 
@@ -541,11 +634,8 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
                 f"context.overrides.{field}", declared_value, consumed_value
             )
 
-    _require_b00_model(
-        agreed["model"], authority_overrides["input_features"]
-    )
-
     model = agreed["model"]
+    _require_b00_model(model, authority_overrides["input_features"])
     layers = model.get("layers", ()) if isinstance(model, Mapping) else ()
     if not layers:
         raise _context_refusal(
@@ -559,6 +649,13 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
                 "residual",
                 consumed_target,
             )
+    actual_fingerprint = _model_fingerprint(model)
+    if actual_fingerprint != _CONTROL_MODEL_FINGERPRINT:
+        raise StageQSelectionError(
+            "truthfulness guard refused field 'runner.model.fingerprint': "
+            f"expected digest {_CONTROL_MODEL_FINGERPRINT!r}, "
+            f"actual digest {actual_fingerprint!r}; item dd964863"
+        )
 
     declared_optimizer = identity["optimizer"]
     declared_method = declared_optimizer["method"]
