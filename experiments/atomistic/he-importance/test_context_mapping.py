@@ -11,6 +11,8 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 import pytest
 
+from tests.helpers.run_context import make_run_context
+
 
 _SPEC = importlib.util.spec_from_file_location(
     "he_importance_context_mapping_test", Path(__file__).with_name("context_mapping.py")
@@ -60,6 +62,102 @@ def test_raw_input_feature_package_preserves_the_literal_control() -> None:
     )
     OmegaConf.resolve(train)
     assert OmegaConf.to_container(train.model, resolve=True) == before
+
+
+def _compose_package(package: str, *, trainable: bool = True):
+    """Compose one B package onto a fresh copy of the real study config."""
+
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    fragment = context_mapping.package_fragment(package)
+    factors = list(train.model.factors)
+    if "factors" in fragment:
+        factor = dict(fragment.pop("factors")[0])
+        factor["trainable"] = trainable
+        factors.append(OmegaConf.create(factor))
+    train.model = OmegaConf.merge(train.model, OmegaConf.create(fragment))
+    train.model.factors = factors
+    return train
+
+
+def test_package_labels_are_the_declared_two_axis_grid() -> None:
+    assert context_mapping.package_fragment("B00") == {}
+    assert context_mapping.package_fragment("B10") == context_mapping.input_feature_fragment(
+        "raw plus bounded distances"
+    )
+    for package in ("B01", "B11"):
+        fragment = context_mapping.package_fragment(package)
+        assert fragment["factors"] == [
+            {
+                "_target_": "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
+                "trainable": True,
+                "length": 1.0,
+                "mean_coefficient": 0.0,
+                "difference_coefficient": 0.0,
+            }
+        ]
+    with pytest.raises(context_mapping.UnknownContextLabel):
+        context_mapping.package_fragment("B99")
+    with pytest.raises(context_mapping.UnknownContextLabel):
+        context_mapping.jastrow_fragment("implicit")
+
+
+def test_jastrow_is_appended_without_changing_existing_factors() -> None:
+    train = _compose_package("B01")
+    original = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    assert train.model.factors[:2] == original.model.factors
+    assert train.model.factors[2] == {
+        "_target_": "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
+        "trainable": True,
+        "length": 1.0,
+        "mean_coefficient": 0.0,
+        "difference_coefficient": 0.0,
+    }
+
+
+def _validate_through_hydra(train: object) -> None:
+    """Reach the closed HI validator only through its declared Hydra target."""
+
+    OmegaConf.resolve(train)
+    instantiate(
+        {
+            "_target_": "tpen.hi_schema.validate_hi_train_config",
+            "_recursive_": False,
+            "cfg": train,
+            "env": {},
+        }
+    )
+
+
+@pytest.mark.parametrize("package", ("B01", "B11"))
+def test_two_coefficient_jastrow_packages_pass_the_closed_hi_schema(package: str) -> None:
+    _validate_through_hydra(_compose_package(package))
+
+
+@pytest.mark.parametrize("package", ("B01", "B11"))
+def test_closed_hi_schema_refuses_a_frozen_two_coefficient_jastrow(package: str) -> None:
+    with pytest.raises(Exception, match="undeclared-trainability"):
+        _validate_through_hydra(_compose_package(package, trainable=False))
+
+
+@pytest.mark.parametrize(("jastrow_package", "control_package"), [("B01", "B00"), ("B11", "B10")])
+def test_zero_jastrow_is_exactly_the_corresponding_control(
+    jastrow_package: str, control_package: str
+) -> None:
+    mapped = _compose_package(jastrow_package)
+    control = _compose_package(control_package)
+    OmegaConf.resolve(mapped)
+    OmegaConf.resolve(control)
+    torch.manual_seed(1729)
+    mapped_model = instantiate(mapped.model).to(dtype=torch.float64)
+    torch.manual_seed(1729)
+    control_model = instantiate(control.model).to(dtype=torch.float64)
+    mapped_output = mapped_model(_he_batch())
+    control_output = control_model(_he_batch())
+    assert torch.equal(mapped_output.logabs, control_output.logabs)
+    assert torch.equal(mapped_output.sign, control_output.sign)
+    factor = mapped_model.factors[-1]
+    assert torch.equal(factor.mean_coefficient, torch.zeros_like(factor.mean_coefficient))
+    assert torch.equal(factor.difference_coefficient, torch.zeros_like(factor.difference_coefficient))
 
 
 def test_bounded_distance_input_fragment_is_explicit() -> None:
@@ -215,6 +313,66 @@ def _he_batch() -> object:
             "spins": spins,
         }
     )
+
+
+def _run_short_real_training(
+    package: str,
+    tmp_path: Path,
+    *,
+    trainable: bool = True,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[object, list[torch.Tensor | None]]:
+    """Run one reduced update through the runner composed by ``train.yaml``."""
+
+    train = _compose_package(package, trainable=trainable)
+    train.runtime.device = "cpu"
+    train.sampler.n_walkers = 4
+    train.sampler.burn_in = 1
+    train.sampler.n_steps = 1
+    train.trainer.max_steps = 1
+    OmegaConf.resolve(train)
+    runner = instantiate(train.runner)
+    factor = runner.model.factors[-1]
+    initial = (
+        factor.mean_coefficient.detach().clone(),
+        factor.difference_coefficient.detach().clone(),
+    )
+    assert torch.equal(initial[0], torch.zeros_like(initial[0]))
+    assert torch.equal(initial[1], torch.zeros_like(initial[1]))
+    captured: list[torch.Tensor | None] = []
+    original_step = torch.optim.Adam.step
+
+    def capture_step(optimizer: torch.optim.Adam, *args: object, **kwargs: object) -> object:
+        for parameter in (factor.theta_s, factor.theta_t) if trainable else ():
+            captured.append(None if parameter.grad is None else parameter.grad.detach().clone())
+        return original_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.Adam, "step", capture_step)
+    runner.run(make_run_context(tmp_path, run_id=f"{package}-{trainable}"))
+    return factor, captured
+
+
+@pytest.mark.parametrize("package", ("B01", "B11"))
+def test_jastrow_coefficients_move_in_a_real_short_training_run(
+    package: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factor, gradients = _run_short_real_training(package, tmp_path, monkeypatch=monkeypatch)
+    assert torch.equal(factor.mean_coefficient.detach(), torch.zeros_like(factor.mean_coefficient)) is False
+    assert torch.equal(factor.difference_coefficient.detach(), torch.zeros_like(factor.difference_coefficient)) is False
+    assert all(gradient is not None and torch.isfinite(gradient).all() and torch.any(gradient != 0) for gradient in gradients)
+    assert torch.isfinite(factor.mean_coefficient).all()
+    assert torch.isfinite(factor.difference_coefficient).all()
+
+
+def test_nontrainable_jastrow_is_inert_in_the_same_real_training_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factor, gradients = _run_short_real_training(
+        "B01", tmp_path, trainable=False, monkeypatch=monkeypatch
+    )
+    assert gradients == []
+    assert torch.equal(factor.mean_coefficient, torch.zeros_like(factor.mean_coefficient))
+    assert torch.equal(factor.difference_coefficient, torch.zeros_like(factor.difference_coefficient))
 
 
 def test_bounded_distance_features_match_independent_ordered_oracle() -> None:

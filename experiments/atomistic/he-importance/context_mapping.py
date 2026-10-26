@@ -29,6 +29,20 @@ _INPUT_FEATURE_LABELS = {
 }
 
 
+_JASTROW_AXIS_LABELS = {
+    "absent",
+    "two-coefficient",
+}
+
+
+_PACKAGE_LABELS = {
+    "B00": ("raw", "absent"),
+    "B10": ("raw plus bounded distances", "absent"),
+    "B01": ("raw", "two-coefficient"),
+    "B11": ("raw plus bounded distances", "two-coefficient"),
+}
+
+
 _PATH_LABELS = {
     "tensor": ("tensor", None),
     "linear/coordinate-neighbor": ("linear", "coordinate_neighbor"),
@@ -156,6 +170,63 @@ def build_input_feature_fragment(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """Alias for :func:`input_feature_fragment` used by materializers."""
 
     return input_feature_fragment(*args, **kwargs)
+
+
+def jastrow_fragment(label: str, *, length: float = 1.0) -> dict[str, Any]:
+    """Return the optional additive log-Jastrow factor fragment.
+
+    The absent axis is an empty fragment.  The two-coefficient axis writes all
+    constructor values explicitly so a package cannot inherit an identity
+    factor accidentally.  The caller appends this mapping to the existing
+    ``model.factors`` list; the control factor entries are never replaced here.
+    """
+
+    if label not in _JASTROW_AXIS_LABELS:
+        raise UnknownContextLabel(f"unknown Jastrow axis label: {label!r}")
+    if type(length) not in {int, float} or isinstance(length, bool) or length != 1.0:
+        raise ContextMappingError("Jastrow length is fixed at 1.0 bohr for this study")
+    if label == "absent":
+        return {}
+    return {
+        "_target_": "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
+        "trainable": True,
+        "length": 1.0,
+        "mean_coefficient": 0.0,
+        "difference_coefficient": 0.0,
+    }
+
+
+def build_jastrow_fragment(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Alias for :func:`jastrow_fragment` used by materializers."""
+
+    return jastrow_fragment(*args, **kwargs)
+
+
+def package_fragment(label: str) -> dict[str, Any]:
+    """Return the model override for one accepted B00/B10/B01/B11 package.
+
+    Input features are returned at the model root.  A Jastrow factor is
+    returned under ``factors`` as a one-entry append fragment; composition code
+    must concatenate it to the literal control factors rather than replacing
+    those factors.  B00 therefore returns the empty override exactly.
+    """
+
+    try:
+        input_label, jastrow_label = _PACKAGE_LABELS[label]
+    except KeyError as exc:
+        raise UnknownContextLabel(f"unknown B package label: {label!r}") from exc
+
+    fragment = input_feature_fragment(input_label)
+    factor = jastrow_fragment(jastrow_label)
+    if factor:
+        fragment["factors"] = [factor]
+    return fragment
+
+
+def build_package_fragment(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Alias for :func:`package_fragment` used by materializers."""
+
+    return package_fragment(*args, **kwargs)
 
 
 def _layer_fragment(
@@ -345,7 +416,11 @@ __all__ = [
     "UnknownContextLabel",
     "UnsupportedActivationLabel",
     "build_input_feature_fragment",
+    "build_jastrow_fragment",
+    "build_package_fragment",
     "build_context_fragment",
     "context_fragment",
     "input_feature_fragment",
+    "jastrow_fragment",
+    "package_fragment",
 ]
