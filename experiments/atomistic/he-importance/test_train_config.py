@@ -143,8 +143,9 @@ def _assert_q_adam_grid_outputs(cells: list[object]) -> None:
                 "eps": expected["epsilon"],
                 "weight_decay": expected["weight_decay"],
             }
+        observed = OmegaConf.select(resolved, "optimizer")
         resolved_blocks.add(
-            (expected["lr"], expected["beta1"], expected["beta2"], expected["epsilon"], expected["weight_decay"])
+            (observed.lr, observed.betas[0], observed.betas[1], observed.eps, observed.weight_decay)
         )
     assert len(cells) == 16
     assert len(resolved_blocks) == 8
@@ -424,7 +425,13 @@ def test_level_mapping_mutant_turns_grid_oracle_red(
         "parameter_groups": 1,
         "schedule": "constant",
     }
-    monkeypatch.setattr(train_config, "_declared_adam_levels", lambda _manifest: fixed)
+    original = train_config._declared_adam_levels
+
+    def validation_preserving_mutant(manifest: object) -> dict[str, object]:
+        original(manifest)
+        return fixed
+
+    monkeypatch.setattr(train_config, "_declared_adam_levels", validation_preserving_mutant)
     with pytest.raises(AssertionError):
         _assert_q_adam_grid_outputs(_q_adam_cells(tmp_path, "O-raw"))
 

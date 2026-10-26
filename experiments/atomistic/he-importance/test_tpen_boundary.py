@@ -97,13 +97,13 @@ EXPECTED_TEST_INVENTORY = {
     ("test_train_config.py", 128, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: test-only schema validation for the independent HI grid oracle."
     ),
-    ("test_train_config.py", 378, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 379, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 514, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 521, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 607, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 614, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("test_run_stage_q.py", 382, "tpen.hi_schema"): InventoryEntry(

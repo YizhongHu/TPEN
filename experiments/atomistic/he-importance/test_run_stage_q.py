@@ -1120,7 +1120,15 @@ def test_mutant_without_level_consumption_is_red_for_seven_of_eight_cells(
         "parameter_groups": 1,
         "schedule": "constant",
     }
-    monkeypatch.setattr(runner.train_config, "_declared_adam_levels", lambda _manifest: fixed)
+    original = runner.train_config._declared_adam_levels
+
+    def validation_preserving_mutant(manifest: object) -> dict[str, object]:
+        original(manifest)
+        return fixed
+
+    monkeypatch.setattr(
+        runner.train_config, "_declared_adam_levels", validation_preserving_mutant
+    )
 
     refused = 0
     for cell in cells:
