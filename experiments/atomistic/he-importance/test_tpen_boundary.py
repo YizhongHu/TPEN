@@ -27,9 +27,11 @@ INVENTORY_DATE = "2026-10-07"
 INVENTORY_HEAD = "3143e43ac170df33f61f2002b1011cd85c9cfc37"
 PENDING_516_SHA = "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
 # The re-landed Stage-Q files contribute their quarantined roster imports; the
-# former topology crossings are gone. Keep the measured merge-world count
-# explicit.
-EXPECTED_UNSANCTIONED_COUNTS = {14}
+# former topology crossings are gone. In the merged world, both PR-527's
+# optimizer-grid crossing and dev/#528's now-present test_run_stage_q.py
+# crossing are measured, so the union has one more crossing than either
+# parent inventory counted.
+EXPECTED_UNSANCTIONED_COUNTS = {15}
 PENDING_516_POLICY = (
     "this is a historical, 516-scoped PR-516 capability fixture; a new pending PR needs its own pin"
 )
@@ -56,13 +58,16 @@ class InventoryEntry:
 # Each key is (relative file, line, dotted target).  Each value is the
 # one-line disposition recorded for that exact crossing.
 EXPECTED_PRODUCTION_INVENTORY = {
+    ("optimizer_grid.py", 340, "tpen.hi_schema"): InventoryEntry(
+        "remedy blocked on pending HI authority ruling 99591859."
+    ),
     ("train_config.py", 190, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("train_config.py", 282, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("run_stage_q.py", 99, "tpen.hi_schema"): InventoryEntry(
+    ("run_stage_q.py", 108, "tpen.hi_schema"): InventoryEntry(
         "measured at reland subject ff7cde49; roster import remains quarantined under item df8f8b31.",
     ),
 }
@@ -98,7 +103,7 @@ EXPECTED_TEST_INVENTORY = {
     ("test_train_config.py", 399, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_run_stage_q.py", 264, "tpen.hi_schema"): InventoryEntry(
+    ("test_run_stage_q.py", 382, "tpen.hi_schema"): InventoryEntry(
         "measured at reland subject e524166a; roster assertion remains quarantined under item df8f8b31.",
     ),
 }
@@ -1451,11 +1456,11 @@ def test_r2_boundary_count_is_exact_and_live(
     ]
     assert len(expected_nodes) == 1
     expected = ast.literal_eval(expected_nodes[0])
-    assert expected == {14}
+    assert expected == {15}
     boundary = importlib.import_module("experiments.atomistic.he-importance.test_tpen_boundary")
     synthetic = tmp_path / "synthetic.py"
-    synthetic.write_text("\n".join("import tpen.synthetic" for _ in range(14)) + "\n")
+    synthetic.write_text("\n".join("import tpen.synthetic" for _ in range(15)) + "\n")
     monkeypatch.setattr(boundary, "STUDY_DIR", tmp_path)
     _, crossings = boundary._scan_study()
-    assert len(crossings) == 14
+    assert len(crossings) == 15
     assert len(crossings) in expected
