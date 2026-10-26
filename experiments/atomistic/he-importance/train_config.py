@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from importlib import import_module
+import json
 from pathlib import Path
 import sys
 from typing import Any
@@ -37,6 +38,14 @@ class CheckoutPreconditionError(TrainConfigResolutionError):
 
 class UnavailableOptimizerError(TrainConfigResolutionError):
     """A row names an optimizer cell that the build-time roster refuses."""
+
+
+class OptimizerLevelResolutionError(TrainConfigResolutionError):
+    """A row's declared optimizer levels cannot be consumed by the resolver."""
+
+
+class ContextResolutionError(TrainConfigResolutionError):
+    """A row declares a model context that this resolver does not consume."""
 
 
 def _require_checkout_root() -> Path:
@@ -201,6 +210,94 @@ def _optimizer_entry(manifest: Mapping[str, Any]) -> Any:
     return entry
 
 
+def _authority_adam_levels() -> Mapping[str, Any]:
+    """Load Adam's complete level vocabulary from the committed authority."""
+
+    authority_path = _CONFIG_PATH.parent.parent / "optimizer_grid_authority.json"
+    try:
+        authority = json.loads(authority_path.read_text(encoding="utf-8"))
+        family = next(item for item in authority["families"] if item["family"] == "adam")
+    except (OSError, KeyError, StopIteration, TypeError, json.JSONDecodeError) as error:
+        raise TrainConfigResolutionError(
+            f"cannot load Adam level authority from {authority_path}"
+        ) from error
+    levels = dict(family["fixed"])
+    levels.update(family["varied"])
+    return levels
+
+
+def _declared_adam_levels(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Validate and return one row's explicit Adam constructor coordinates.
+
+    The authority's fixed and varied keys form one closed set.  Fixed keys are
+    checked here as well as the scan coordinates so a resolver cannot silently
+    reintroduce an optimizer default or accept an unowned coordinate.
+    """
+
+    identity = _mapping(manifest.get("scientific_identity"), "scientific_identity")
+    optimizer = _mapping(identity.get("optimizer"), "scientific_identity.optimizer")
+    method = optimizer.get("method")
+    if method != "adam":
+        raise OptimizerLevelResolutionError(
+            f"scientific_identity.optimizer.method must be 'adam', got {method!r}"
+        )
+    levels = _mapping(optimizer.get("levels"), "scientific_identity.optimizer.levels")
+    expected = _authority_adam_levels()
+    if set(levels) != set(expected):
+        missing = sorted(set(expected) - set(levels))
+        extra = sorted(set(levels) - set(expected))
+        details = []
+        if missing:
+            details.append(f"missing level key(s) {missing!r}")
+        if extra:
+            details.append(f"extra level key(s) {extra!r}")
+        raise OptimizerLevelResolutionError(
+            "scientific_identity.optimizer.levels: " + "; ".join(details)
+        )
+
+    numeric_fields = ("lr", "beta1", "beta2", "epsilon", "weight_decay")
+    for field in numeric_fields:
+        value = levels[field]
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise OptimizerLevelResolutionError(
+                f"scientific_identity.optimizer.levels.{field} must be numeric"
+            )
+    if type(levels["parameter_groups"]) is not int:
+        raise OptimizerLevelResolutionError(
+            "scientific_identity.optimizer.levels.parameter_groups must be an integer"
+        )
+    if levels["parameter_groups"] != expected["parameter_groups"]:
+        raise OptimizerLevelResolutionError(
+            "scientific_identity.optimizer.levels.parameter_groups must equal 1"
+        )
+    if levels["schedule"] != expected["schedule"]:
+        raise OptimizerLevelResolutionError(
+            "scientific_identity.optimizer.levels.schedule must be 'constant'"
+        )
+    return levels
+
+
+def _require_o_raw_context(manifest: Mapping[str, Any]) -> None:
+    """Require the authority's literal O-raw model context."""
+
+    identity = _mapping(manifest.get("scientific_identity"), "scientific_identity")
+    context = _mapping(identity.get("context"), "scientific_identity.context")
+    expected = {"name": "O-raw", "overrides": {"input_features": "B00", "feature_update": "residual"}}
+    if dict(context) != expected:
+        differences = []
+        for field in sorted(set(context) | set(expected)):
+            if context.get(field) != expected.get(field):
+                differences.append(
+                    f"{field} declared={context.get(field)!r} consumed={expected.get(field)!r}"
+                )
+        raise ContextResolutionError(
+            "scientific_identity.context must be the authority's O-raw literal "
+            f"{expected!r}; "
+            + "; ".join(differences)
+            + "; O-composite remains refused (items 7bae63d8 and dd964863)"
+        )
+
+
 def resolve_train_config(source: Any) -> DictConfig:
     """Resolve one materialized cell or training packet into a Hydra config.
 
@@ -255,6 +352,13 @@ def resolve_train_config(source: Any) -> DictConfig:
         )
 
     optimizer_entry = _optimizer_entry(manifest)
+    _require_o_raw_context(manifest)
+    levels = _declared_adam_levels(manifest)
+    optimizer_identity = _mapping(manifest["scientific_identity"].get("optimizer"), "scientific_identity.optimizer")
+    if optimizer_identity.get("method") != manifest["scientific_identity"]["optimizer_cell"].get("method"):
+        raise OptimizerLevelResolutionError(
+            "scientific_identity.optimizer.method does not match optimizer_cell.method"
+        )
     streams = _mapping(cell.seed_streams, "cell.seed_streams")
     model_seed = _integer_seed(streams, "model_initialization")
 
@@ -275,6 +379,23 @@ def resolve_train_config(source: Any) -> DictConfig:
     OmegaConf.update(cfg, "run.dir", str(output_path), merge=False)
     OmegaConf.update(cfg, "runtime.seed", model_seed, merge=False)
     OmegaConf.update(cfg, "optimizer._target_", optimizer_entry.target, merge=False)
+    # Every Adam coordinate is explicit in the resolved config; no torch
+    # constructor default is allowed to stand in for a declared level.
+    OmegaConf.update(cfg, "optimizer.lr", levels["lr"], merge=False, force_add=True)
+    OmegaConf.update(
+        cfg, "optimizer.betas", [levels["beta1"], levels["beta2"]], merge=False, force_add=True
+    )
+    OmegaConf.update(cfg, "optimizer.eps", levels["epsilon"], merge=False, force_add=True)
+    OmegaConf.update(
+        cfg, "optimizer.weight_decay", levels["weight_decay"], merge=False, force_add=True
+    )
+    if any(
+        OmegaConf.select(cfg, path, default=None) is not None
+        for path in ("scheduler", "optimizer.scheduler", "optimizer.lr_scheduler")
+    ):
+        raise OptimizerLevelResolutionError(
+            "composed config contains a scheduler block; Adam schedule must be constant"
+        )
     _set_named_initializer_seeds(cfg, model_seed)
     _set_optional_execution_seeds(cfg, streams)
     OmegaConf.resolve(cfg)
@@ -289,6 +410,8 @@ resolve_training_config = resolve_train_config
 
 __all__ = [
     "CheckoutPreconditionError",
+    "ContextResolutionError",
+    "OptimizerLevelResolutionError",
     "TrainConfigResolutionError",
     "UnavailableOptimizerError",
     "resolve_train_config",

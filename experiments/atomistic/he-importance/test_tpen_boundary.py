@@ -61,10 +61,10 @@ EXPECTED_PRODUCTION_INVENTORY = {
     ("optimizer_grid.py", 340, "tpen.hi_schema"): InventoryEntry(
         "remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 190, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 199, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 282, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 403, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("run_stage_q.py", 108, "tpen.hi_schema"): InventoryEntry(
@@ -82,25 +82,25 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 21, "tpen.runner"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 574, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 591, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 616, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 633, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 672, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 689, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 884, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 901, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_train_config.py", 294, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 309, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 306, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 409, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 399, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 502, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("test_run_stage_q.py", 382, "tpen.hi_schema"): InventoryEntry(
@@ -1208,6 +1208,22 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             ("resolve_train_config's own _cell_from_source admission requires an exact-str hash on every direct and wrapped resolver route", 1),
         ("train_config.py", "resolve_train_config", "output_path.parent.parent == output_path"):
             ("output_path is freshly converted to an owned Path before this structural sanity check", 1),
+        ("train_config.py", "_authority_adam_levels", 'item["family"] == "adam"'):
+            ("the authority entry is a detached JSON mapping and the family literal is resolver-owned", 1),
+        ("train_config.py", "_declared_adam_levels", 'method != "adam"'):
+            ("method is read from the detached manifest identity and Adam is the only resolver family", 1),
+        ("train_config.py", "_declared_adam_levels", "set(levels) != set(expected)"):
+            ("both mappings are detached authority/manifest data and the exact key set is resolver-owned", 1),
+        ("train_config.py", "_declared_adam_levels", 'levels["parameter_groups"] != expected["parameter_groups"]'):
+            ("the level value and authority value are detached scalar data", 1),
+        ("train_config.py", "_declared_adam_levels", 'levels["schedule"] != expected["schedule"]'):
+            ("the level value and authority value are detached scalar data", 1),
+        ("train_config.py", "_require_o_raw_context", "dict(context) != expected"):
+            ("context is a detached manifest mapping and expected is the authority literal", 1),
+        ("train_config.py", "_require_o_raw_context", "context.get(field) != expected.get(field)"):
+            ("context and authority mappings are detached data used for refusal diagnostics", 1),
+        ("train_config.py", "resolve_train_config", 'optimizer_identity.get("method") != manifest["scientific_identity"]["optimizer_cell"].get("method")'):
+            ("both values are detached manifest identity fields and the equality binds their declarations", 1),
     }
     findings: list[str] = []
     observed: dict[tuple[str, str, str], int] = {}

@@ -44,11 +44,26 @@ def _cell(
     status: str = "available",
 ) -> object:
     reason = None if status == "available" else "qualification pending"
+    levels = {
+        "lr": 0.005,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "epsilon": 1e-8,
+        "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
+    }
     return stage_coordinate.materialize_stage(
         stage,
         [
             {
-                "scientific_identity": {"architecture": "control", "optimizer": method},
+                "scientific_identity": {
+                    "context": {
+                        "name": "O-raw",
+                        "overrides": {"input_features": "B00", "feature_update": "residual"},
+                    },
+                    "optimizer": {"method": method, "levels": levels},
+                },
                 "payload": {"updates": 50_000},
                 "topology": {},
             }
@@ -297,6 +312,94 @@ def test_resolve_binds_admitted_optimizer_cell_through_live_roster(tmp_path: Pat
     entry = {candidate.method: candidate for candidate in HI_METHOD_ROSTER}[method]
     assert entry.admitted
     assert resolved.optimizer._target_ == entry.target
+
+
+def test_resolve_consumes_every_declared_adam_level_explicitly(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    resolved = train_config.resolve_train_config(cell)
+
+    assert resolved.optimizer.lr == 0.005
+    assert list(resolved.optimizer.betas) == [0.9, 0.999]
+    assert resolved.optimizer.eps == 1e-8
+    assert resolved.optimizer.weight_decay == 0.0
+    assert "scheduler" not in resolved.optimizer
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("missing", None, "missing level key"),
+        ("extra", 1.0, "extra level key"),
+        ("lr", True, "lr must be numeric"),
+        ("beta2", "0.999", "beta2 must be numeric"),
+        ("parameter_groups", 2, "parameter_groups must equal 1"),
+        ("schedule", "cosine", "schedule must be 'constant'"),
+    ),
+)
+def test_resolve_refuses_each_malformed_adam_level(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    cell = _cell(tmp_path)
+    manifest = stage_coordinate._thaw(cell.manifest)
+    levels = manifest["scientific_identity"]["optimizer"]["levels"]
+    if field == "missing":
+        del levels["lr"]
+    elif field == "extra":
+        levels["unexpected"] = value
+    else:
+        levels[field] = value
+    rebuilt = replace(
+        cell,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=stage_coordinate.content_hash(manifest),
+        output_path=cell.output_path.parent / stage_coordinate.content_hash(manifest),
+    )
+    with pytest.raises(train_config.OptimizerLevelResolutionError, match=message):
+        train_config.resolve_train_config(rebuilt)
+
+
+def test_resolve_refuses_non_o_raw_context(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    manifest = stage_coordinate._thaw(cell.manifest)
+    manifest["scientific_identity"]["context"] = {
+        "name": "O-composite",
+        "overrides": {
+            "producer_policy": "hybrid/coordinate-neighbor",
+            "aggregation_activation": "channel-MLP at both activation sites",
+            "input_features": "B11",
+            "feature_update": "residual",
+        },
+    }
+    rebuilt = replace(
+        cell,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=stage_coordinate.content_hash(manifest),
+        output_path=cell.output_path.parent / stage_coordinate.content_hash(manifest),
+    )
+    with pytest.raises(train_config.ContextResolutionError, match="7bae63d8.*dd964863"):
+        train_config.resolve_train_config(rebuilt)
+
+
+def test_resolve_refuses_composed_scheduler_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path)
+    original = train_config._compose_base_config
+
+    def scheduled_config() -> DictConfig:
+        config = original()
+        OmegaConf.update(
+            config,
+            "optimizer.scheduler",
+            {"_target_": "tests.Scheduler"},
+            merge=False,
+            force_add=True,
+        )
+        return config
+
+    monkeypatch.setattr(train_config, "_compose_base_config", scheduled_config)
+    with pytest.raises(train_config.OptimizerLevelResolutionError, match="scheduler block"):
+        train_config.resolve_train_config(cell)
 
 
 def test_resolve_refuses_available_optimizer_when_roster_entry_is_not_admitted(
