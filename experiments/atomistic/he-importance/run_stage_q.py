@@ -200,15 +200,14 @@ def select_cell(
             "resolver does not consume context/levels (item dd964863)"
         )
 
-    # The current resolver consumes one fixed YAML optimizer block for every
-    # selected axis candidate. Resolve that consumed block once, then compare
-    # every declared candidate against it. This keeps selection deterministic
-    # without repeating Hydra composition and schema validation eight times.
-    resolved = train_config.resolve_train_config(_q_training_packet(requested[0][0]))
     truthful: list[tuple[Any, CellDescriptor]] = []
     refusals: list[str] = []
     for cell, descriptor in requested:
         try:
+            # Resolve each candidate's own packet. The resolver may eventually
+            # consume declared optimizer levels, so resolving requested[0]
+            # once would make that first candidate win by construction.
+            resolved = train_config.resolve_train_config(_q_training_packet(cell))
             _require_truthful_cell(cell, resolved)
         except StageQSelectionError as error:
             refusals.append(str(error))
@@ -286,8 +285,23 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
             "resolver does not consume context/levels (item dd964863)"
         )
 
-    declared = identity["optimizer"]["levels"]
+    declared_optimizer = identity["optimizer"]
+    declared_method = declared_optimizer["method"]
+    if declared_method != "adam":
+        raise StageQSelectionError(
+            "truthfulness guard refused field 'optimizer.method': "
+            f"declared value {declared_method!r}, consumed value 'adam'"
+        )
+
+    declared = declared_optimizer["levels"]
     optimizer_cfg = OmegaConf.select(resolved, "optimizer")
+    consumed_target = optimizer_cfg.get("_target_")
+    if consumed_target != "torch.optim.Adam":
+        raise StageQSelectionError(
+            "truthfulness guard refused field 'optimizer._target_': "
+            "declared value 'torch.optim.Adam' for method 'adam', "
+            f"consumed value {consumed_target!r}"
+        )
     defaults = _adam_signature_defaults()
     configured_betas = optimizer_cfg.get("betas")
     betas = configured_betas if configured_betas is not None else defaults["betas"]
@@ -304,6 +318,19 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
         "parameter_groups": 1,
         "schedule": "constant" if not _scheduler_configured(resolved) else "scheduler",
     }
+    declared_keys = set(declared)
+    consumed_keys = set(consumed)
+    if declared_keys != consumed_keys:
+        missing = sorted(consumed_keys - declared_keys)
+        extra = sorted(declared_keys - consumed_keys)
+        details = []
+        if missing:
+            details.append(f"missing declared key(s) {missing!r}")
+        if extra:
+            details.append(f"extra declared key(s) {extra!r}")
+        raise StageQSelectionError(
+            "truthfulness guard refused optimizer level keys: " + "; ".join(details)
+        )
     for field, consumed_value in consumed.items():
         declared_value = declared.get(field)
         if declared_value != consumed_value:
@@ -493,7 +520,6 @@ __all__ = [
     "CellDescriptor",
     "CellSelection",
     "StageQSelectionError",
-    "_require_truthful_cell",
     "build_parser",
     "main",
     "roster_design_receipt",

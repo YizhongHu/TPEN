@@ -1057,3 +1057,86 @@ def test_r2_r4_cooperative_execute_race_has_one_winner_and_preserves_winner_byte
             assert after_first["COMPLETE"] == b"completed\n"
         else:
             assert after_first["COMPLETE"] is None
+
+
+def test_selection_resolves_each_candidate_and_refuses_consuming_resolver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cells = _q_adam_cells(_cells(tmp_path), context="O-raw")
+    original = runner.train_config.resolve_train_config
+    resolved_sources: list[object] = []
+
+    def resolve_declared_levels(source: object) -> object:
+        resolved_sources.append(source)
+        resolved = original(source)
+        levels = source.cell.manifest["scientific_identity"]["optimizer"]["levels"]
+        runner.OmegaConf.update(resolved, "optimizer.lr", levels["lr"], merge=False)
+        runner.OmegaConf.update(
+            resolved,
+            "optimizer.betas",
+            [levels["beta1"], levels["beta2"]],
+            merge=False,
+            force_add=True,
+        )
+        runner.OmegaConf.update(
+            resolved, "optimizer.eps", levels["epsilon"], merge=False, force_add=True
+        )
+        runner.OmegaConf.update(
+            resolved,
+            "optimizer.weight_decay",
+            levels["weight_decay"],
+            merge=False,
+            force_add=True,
+        )
+        return resolved
+
+    monkeypatch.setattr(
+        runner.train_config, "resolve_train_config", resolve_declared_levels
+    )
+    with pytest.raises(runner.StageQSelectionError, match="ambiguous"):
+        runner.select_cell(cells, seed_label=810001)
+    assert len(resolved_sources) == 8
+
+
+def test_truthfulness_guard_refuses_consumed_non_adam_optimizer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = next(
+        cell
+        for cell in _q_adam_cells(_cells(tmp_path), context="O-raw")
+        if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
+    original = runner.train_config.resolve_train_config
+
+    def resolve_non_adam(source: object) -> object:
+        resolved = original(source)
+        resolved.optimizer._target_ = "torch.optim.SGD"
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_non_adam)
+    with pytest.raises(runner.StageQSelectionError, match="optimizer._target_"):
+        runner.select_cell((target,), seed_label=810001)
+
+
+def test_truthfulness_guard_refuses_extra_declared_level_key(
+    tmp_path: Path,
+) -> None:
+    target = next(
+        cell
+        for cell in _q_adam_cells(_cells(tmp_path), context="O-raw")
+        if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
+    manifest = stage._thaw(target.manifest)
+    manifest["scientific_identity"]["optimizer"]["levels"]["sentinel_extra"] = 1
+    stage.validate_materialized_manifest(manifest)
+    mutated_hash = stage.content_hash(manifest)
+    mutated = replace(
+        target,
+        manifest=stage._freeze(manifest),
+        content_hash=mutated_hash,
+        output_path=target.output_path.parent / mutated_hash,
+    )
+    with pytest.raises(runner.StageQSelectionError, match="sentinel_extra"):
+        runner.select_cell((mutated,), seed_label=810001)
