@@ -274,7 +274,7 @@ def test_r3_default_axes_reach_frozen_exact_cell(
     if not dry_run:
         monkeypatch.setattr(runner, "_execution_facts", lambda: {"device": "cuda:0"})
 
-        def injected_launch(packet: object, facts: object) -> int:
+        def injected_launch(packet: object, facts: object, **kwargs: object) -> int:
             observed["packet"] = packet
             observed["facts"] = facts
             return 7
@@ -641,19 +641,22 @@ def test_g4_execute_forwards_exact_facts_and_emits_completion_only_after_snapsho
     original = runner.launch.launch_train
     observed: dict[str, object] = {}
 
-    def launch_wrapper(source: object, topology: object) -> int:
+    def launch_wrapper(source: object, topology: object, **kwargs: object) -> int:
         observed["topology"] = topology
         observed["packet_type"] = type(source)
+        guarded_runner = kwargs["runner"]
 
-        def recording_runner(config: object, *, topology: object) -> int:
+        def recording_run_from_config(config: object, *, topology: object) -> int:
             observed["runner_topology"] = topology
-            output = Path(source.cell.output_path) / "resolved_config.yaml"
+            output = Path(config.run.dir) / "resolved_config.yaml"
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text("horizon: 2000\n", encoding="utf-8")
             observed["config"] = config
             return 0
 
-        return original(source, topology, runner=recording_runner)
+        monkeypatch.setattr(runner.launch, "run_from_config", recording_run_from_config)
+        assert callable(guarded_runner)
+        return original(source, topology, runner=guarded_runner)
 
     monkeypatch.setattr(runner.launch, "launch_train", launch_wrapper)
     assert runner.execute(_args(tmp_path, dry_run=False)) == 0
@@ -684,12 +687,7 @@ def test_g4_nonzero_runner_never_emits_complete(tmp_path: Path, monkeypatch: pyt
         "device": "cuda:0", "job_id": "job", "device_identity": None,
     }
     monkeypatch.setattr(runner, "_execution_facts", lambda: facts)
-    original = runner.launch.launch_train
-
-    def failing_launch(source: object, topology: object) -> int:
-        return original(source, topology, runner=lambda config, **kwargs: 7)
-
-    monkeypatch.setattr(runner.launch, "launch_train", failing_launch)
+    monkeypatch.setattr(runner.launch, "run_from_config", lambda config, *, topology: 7)
     assert runner.execute(_args(tmp_path, dry_run=False)) == 7
     assert not list(tmp_path.rglob("COMPLETE"))
 
@@ -703,12 +701,7 @@ def test_g4_success_without_snapshot_raises_and_never_emits_complete(
         "device": "cuda:0", "job_id": "job", "device_identity": None,
     }
     monkeypatch.setattr(runner, "_execution_facts", lambda: facts)
-    original = runner.launch.launch_train
-
-    def snapshotless_launch(source: object, topology: object) -> int:
-        return original(source, topology, runner=lambda config, **kwargs: 0)
-
-    monkeypatch.setattr(runner.launch, "launch_train", snapshotless_launch)
+    monkeypatch.setattr(runner.launch, "run_from_config", lambda config, *, topology: 0)
     with pytest.raises(RuntimeError, match="success without"):
         runner.execute(_args(tmp_path, dry_run=False))
     assert not list(tmp_path.rglob("COMPLETE"))
@@ -867,18 +860,13 @@ def test_r2_g2_train_execute_never_reads_evaluation_manifest(
 
     facts = _r2_facts()
     monkeypatch.setattr(runner, "_execution_facts", lambda: dict(facts))
-    original_launch = runner.launch.launch_train
+    def injected_run_from_config(config: object, *, topology: object) -> int:
+        output = Path(config.run.dir) / "resolved_config.yaml"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("r2: injected\n", encoding="utf-8")
+        return 0
 
-    def injected_launch(source: object, topology: object) -> int:
-        def fake_runner(config: object, *, topology: object) -> int:
-            output = Path(source.cell.output_path) / "resolved_config.yaml"
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text("r2: injected\n", encoding="utf-8")
-            return 0
-
-        return original_launch(source, topology, runner=fake_runner)
-
-    monkeypatch.setattr(runner.launch, "launch_train", injected_launch)
+    monkeypatch.setattr(runner.launch, "run_from_config", injected_run_from_config)
     assert runner.execute(_args(tmp_path / "real", dry_run=False)) == 0
     assert list((tmp_path / "real").rglob("COMPLETE"))
 
@@ -961,7 +949,7 @@ def _cooperative_execute_race(
     facts = _r2_facts()
     monkeypatch.setattr(runner, "_execution_facts", lambda: dict(facts))
 
-    def fake_launch(source: object, topology: object) -> int:
+    def fake_launch(source: object, topology: object, **kwargs: object) -> int:
         launches = state["launches"]
         assert isinstance(launches, list)
         label = f"launch-{len(launches) + 1}"
@@ -1071,6 +1059,7 @@ def test_selection_resolves_each_candidate_and_refuses_consuming_resolver(
         resolved = original(source)
         levels = source.cell.manifest["scientific_identity"]["optimizer"]["levels"]
         runner.OmegaConf.update(resolved, "optimizer.lr", levels["lr"], merge=False)
+        runner.OmegaConf.update(resolved, "runner.optimizer.lr", levels["lr"], merge=False)
         runner.OmegaConf.update(
             resolved,
             "optimizer.betas",
@@ -1079,11 +1068,28 @@ def test_selection_resolves_each_candidate_and_refuses_consuming_resolver(
             force_add=True,
         )
         runner.OmegaConf.update(
+            resolved,
+            "runner.optimizer.betas",
+            [levels["beta1"], levels["beta2"]],
+            merge=False,
+            force_add=True,
+        )
+        runner.OmegaConf.update(
             resolved, "optimizer.eps", levels["epsilon"], merge=False, force_add=True
+        )
+        runner.OmegaConf.update(
+            resolved, "runner.optimizer.eps", levels["epsilon"], merge=False, force_add=True
         )
         runner.OmegaConf.update(
             resolved,
             "optimizer.weight_decay",
+            levels["weight_decay"],
+            merge=False,
+            force_add=True,
+        )
+        runner.OmegaConf.update(
+            resolved,
+            "runner.optimizer.weight_decay",
             levels["weight_decay"],
             merge=False,
             force_add=True,
@@ -1140,3 +1146,155 @@ def test_truthfulness_guard_refuses_extra_declared_level_key(
     )
     with pytest.raises(runner.StageQSelectionError, match="sentinel_extra"):
         runner.select_cell((mutated,), seed_label=810001)
+
+
+def _rehash_cell(cell: object, mutate: object) -> object:
+    manifest = stage._thaw(cell.manifest)
+    mutate(manifest)
+    stage.validate_materialized_manifest(manifest)
+    mutated_hash = stage.content_hash(manifest)
+    return replace(
+        cell,
+        manifest=stage._freeze(manifest),
+        content_hash=mutated_hash,
+        output_path=cell.output_path.parent / mutated_hash,
+    )
+
+
+def _mechanics_cell(cells: tuple[object, ...]) -> object:
+    return next(
+        cell
+        for cell in cells
+        if cell.manifest["stage"] == "Q"
+        and cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+        and cell.manifest["seed_identity"]["label"] == 810001
+    )
+
+
+def test_truthfulness_guard_refuses_o_raw_b11_declared_override(tmp_path: Path) -> None:
+    target = _mechanics_cell(_cells(tmp_path))
+
+    def declare_b11(manifest: dict[str, object]) -> None:
+        manifest["scientific_identity"]["context"]["overrides"]["input_features"] = "B11"
+
+    mutated = _rehash_cell(target, declare_b11)
+    with pytest.raises(runner.StageQSelectionError, match="input_features.*B11.*B00.*dd964863"):
+        runner.select_cell((mutated,), seed_label=810001)
+
+
+def test_truthfulness_guard_refuses_consumed_replacement_updater(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path))
+    original = runner.train_config.resolve_train_config
+
+    def resolve_replacement(source: object) -> object:
+        resolved = original(source)
+        runner.OmegaConf.update(
+            resolved,
+            "model.layers.0.update._target_",
+            "tpen.nn.ReplacementUpdater",
+            merge=False,
+        )
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_replacement)
+    with pytest.raises(runner.StageQSelectionError, match="feature_update.*ReplacementUpdater.*dd964863"):
+        runner.select_cell((target,), seed_label=810001)
+
+
+def test_execute_refuses_consumed_replacement_updater_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    facts = _r2_facts()
+    monkeypatch.setattr(runner, "_execution_facts", lambda: dict(facts))
+    original = runner.train_config.resolve_train_config
+
+    def resolve_replacement(source: object) -> object:
+        resolved = original(source)
+        runner.OmegaConf.update(
+            resolved,
+            "model.layers.0.update._target_",
+            "tpen.nn.ReplacementUpdater",
+            merge=False,
+        )
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_replacement)
+    with pytest.raises(runner.StageQSelectionError, match="feature_update.*ReplacementUpdater"):
+        runner.execute(_args(tmp_path, dry_run=False))
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+def test_truthfulness_guard_refuses_runner_optimizer_lr_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path))
+    original = runner.train_config.resolve_train_config
+
+    def resolve_runner_lr(source: object) -> object:
+        resolved = original(source)
+        runner.OmegaConf.update(resolved, "runner.optimizer.lr", 0.015, merge=False)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_runner_lr)
+    with pytest.raises(runner.StageQSelectionError, match="runner.optimizer.lr"):
+        runner.select_cell((target,), seed_label=810001)
+
+
+@pytest.mark.parametrize("walkers", [stage_coordinate.COMMITTED_WALKERS, stage_coordinate.Q_MECHANICS_WALKERS])
+def test_execute_refuses_late_launch_resolution_drift_before_run_from_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, walkers: int
+) -> None:
+    original_select = runner.select_cell
+    original_resolve = runner.train_config.resolve_train_config
+    calls = {"resolve": 0, "run_from_config": 0}
+
+    def one_candidate_select(cells: object, **kwargs: object) -> object:
+        materialized = tuple(cells)
+        return original_select((_mechanics_cell(materialized),), **kwargs)
+
+    def resolve_with_late_drift(source: object) -> object:
+        calls["resolve"] += 1
+        resolved = original_resolve(source)
+        if calls["resolve"] == 3:
+            runner.OmegaConf.update(resolved, "runner.optimizer.lr", 0.015, merge=False)
+            runner.OmegaConf.update(resolved, "optimizer.lr", 0.015, merge=False)
+        return resolved
+
+    monkeypatch.setattr(runner, "select_cell", one_candidate_select)
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_with_late_drift)
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+    monkeypatch.setattr(
+        runner.launch,
+        "run_from_config",
+        lambda config, *, topology: calls.__setitem__("run_from_config", calls["run_from_config"] + 1),
+    )
+    with pytest.raises(runner.StageQSelectionError, match="lr"):
+        runner.execute(_args(tmp_path, walkers=walkers, dry_run=False))
+    assert calls == {"resolve": 3, "run_from_config": 0}
+
+
+def test_execute_guarded_runner_delegates_recorded_config_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    facts = _r2_facts()
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(runner, "_execution_facts", lambda: dict(facts))
+
+    def recording_run_from_config(config: object, *, topology: object) -> int:
+        observed["calls"] = int(observed.get("calls", 0)) + 1
+        observed["config"] = runner.OmegaConf.to_container(config, resolve=True)
+        output = Path(config.run.dir) / "resolved_config.yaml"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("guarded: true\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(runner.launch, "run_from_config", recording_run_from_config)
+    assert runner.execute(_args(tmp_path, dry_run=False)) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert observed["calls"] == 1
+    assert observed["config"] == report["resolved_config"]

@@ -273,17 +273,118 @@ def _scheduler_configured(resolved: Any) -> bool:
     return contains_scheduler(config)
 
 
+def _authority_o_raw_context() -> Mapping[str, Any]:
+    """Return the exact O-raw coordinate mapping from the loaded authority."""
+
+    authority = optimizer_grid.load_authority()
+    for context in authority["contexts"]:
+        if context["name"] == DEFAULT_CONTEXT:
+            return {
+                "name": context["name"],
+                "overrides": dict(context["overrides"]),
+            }
+    raise StageQSelectionError("optimizer-grid authority has no O-raw context")
+
+
+def _resolved_config_entries(value: Any, key: str, path: str = "") -> tuple[tuple[str, Any], ...]:
+    """Find resolved configuration entries named *key* without importing TPEN."""
+
+    found: list[tuple[str, Any]] = []
+    if isinstance(value, Mapping):
+        for nested_key, nested in value.items():
+            nested_path = f"{path}.{nested_key}" if path else str(nested_key)
+            if nested_key == key:
+                found.append((nested_path, nested))
+            found.extend(_resolved_config_entries(nested, key, nested_path))
+    elif isinstance(value, (tuple, list)):
+        for index, nested in enumerate(value):
+            found.extend(_resolved_config_entries(nested, key, f"{path}[{index}]"))
+    return tuple(found)
+
+
+def _control_residual_updater_target() -> Any:
+    """Read the residual updater class path from the resolved control config."""
+
+    control = train_config._compose_base_config()
+    OmegaConf.resolve(control)
+    control_config = OmegaConf.to_container(control, resolve=True)
+    layers = control_config["model"]["layers"]
+    targets = tuple(layer["update"]["_target_"] for layer in layers)
+    if not targets or any(target != targets[0] for target in targets):
+        raise StageQSelectionError(
+            "truthfulness guard cannot identify one residual updater in the control config"
+        )
+    return targets[0]
+
+
+def _context_refusal(field: str, declared: Any, consumed: Any) -> StageQSelectionError:
+    return StageQSelectionError(
+        f"truthfulness guard refused field '{field}': declared value {declared!r}, "
+        f"consumed value {consumed!r}; context/levels are not consumed by the resolver "
+        "(item dd964863)"
+    )
+
+
 def _require_truthful_cell(cell: Any, resolved: Any) -> None:
     """Refuse a cell whose declared context or Adam levels are not consumed."""
 
     identity = cell.manifest["scientific_identity"]
-    context = identity["context"]["name"]
-    if context != DEFAULT_CONTEXT:
-        raise StageQSelectionError(
-            "truthfulness guard refused field 'context': "
-            f"declared value {context!r}, consumed value {DEFAULT_CONTEXT!r}; "
-            "resolver does not consume context/levels (item dd964863)"
+    declared_context = identity["context"]
+    authority_context = _authority_o_raw_context()
+    declared_context_keys = set(declared_context)
+    authority_context_keys = set(authority_context)
+    for field in sorted(declared_context_keys | authority_context_keys):
+        if field == "overrides":
+            continue
+        declared_value = declared_context.get(field)
+        consumed_value = authority_context.get(field)
+        if declared_value != consumed_value:
+            raise _context_refusal(f"context.{field}", declared_value, consumed_value)
+    if declared_context_keys != authority_context_keys:
+        raise _context_refusal(
+            "context", dict(declared_context), dict(authority_context)
         )
+    declared_overrides = declared_context["overrides"]
+    authority_overrides = authority_context["overrides"]
+    for field in sorted(set(declared_overrides) | set(authority_overrides)):
+        declared_value = declared_overrides.get(field)
+        consumed_value = authority_overrides.get(field)
+        if declared_value != consumed_value:
+            raise _context_refusal(
+                f"context.overrides.{field}", declared_value, consumed_value
+            )
+
+    resolved_container = OmegaConf.to_container(resolved, resolve=True)
+    input_feature_entries = _resolved_config_entries(resolved_container, "input_features")
+    if input_feature_entries:
+        for path, consumed_value in input_feature_entries:
+            if consumed_value != authority_overrides["input_features"]:
+                raise _context_refusal(
+                    "context.overrides.input_features",
+                    authority_overrides["input_features"],
+                    f"{path}={consumed_value}",
+                )
+    else:
+        # Source check: configs/train.yaml resolves model.embedding directly to
+        # tpen.nn.Embedding with no input_features, bounded-distance, or extra-
+        # term selector, and the HI schema has no such resolved model key. B00
+        # is therefore the only input-feature value consumable by this route.
+        pass
+
+    layers = resolved_container.get("model", {}).get("layers", ())
+    residual_target = _control_residual_updater_target()
+    if not layers:
+        raise _context_refusal(
+            "context.overrides.feature_update", "residual", None
+        )
+    for index, layer in enumerate(layers):
+        consumed_target = layer.get("update", {}).get("_target_")
+        if consumed_target != residual_target:
+            raise _context_refusal(
+                f"context.overrides.feature_update.model.layers[{index}].update._target_",
+                "residual",
+                consumed_target,
+            )
 
     declared_optimizer = identity["optimizer"]
     declared_method = declared_optimizer["method"]
@@ -295,7 +396,24 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
 
     declared = declared_optimizer["levels"]
     optimizer_cfg = OmegaConf.select(resolved, "optimizer")
-    consumed_target = optimizer_cfg.get("_target_")
+    runner_optimizer_cfg = OmegaConf.select(resolved, "runner.optimizer")
+    if optimizer_cfg is None or runner_optimizer_cfg is None:
+        raise StageQSelectionError(
+            "truthfulness guard refused field 'runner.optimizer': declared root "
+            f"value {optimizer_cfg!r}, consumed value {runner_optimizer_cfg!r}"
+        )
+    root_optimizer = OmegaConf.to_container(optimizer_cfg, resolve=True)
+    runner_optimizer = OmegaConf.to_container(runner_optimizer_cfg, resolve=True)
+    for field in sorted(set(root_optimizer) | set(runner_optimizer)):
+        declared_value = root_optimizer.get(field)
+        consumed_value = runner_optimizer.get(field)
+        if declared_value != consumed_value:
+            raise StageQSelectionError(
+                "truthfulness guard refused field "
+                f"'runner.optimizer.{field}': declared root value {declared_value!r}, "
+                f"consumed runner value {consumed_value!r}"
+            )
+    consumed_target = runner_optimizer.get("_target_")
     if consumed_target != "torch.optim.Adam":
         raise StageQSelectionError(
             "truthfulness guard refused field 'optimizer._target_': "
@@ -303,14 +421,14 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
             f"consumed value {consumed_target!r}"
         )
     defaults = _adam_signature_defaults()
-    configured_betas = optimizer_cfg.get("betas")
+    configured_betas = runner_optimizer.get("betas")
     betas = configured_betas if configured_betas is not None else defaults["betas"]
     def configured_or_default(name: str, default: object) -> object:
-        value = optimizer_cfg.get(name)
+        value = runner_optimizer.get(name)
         return default if value is None else value
 
     consumed = {
-        "lr": optimizer_cfg.get("lr"),
+        "lr": runner_optimizer.get("lr"),
         "beta1": betas[0],
         "beta2": betas[1],
         "epsilon": configured_or_default("eps", defaults["eps"]),
@@ -468,6 +586,7 @@ def execute(args: argparse.Namespace) -> int:
     packet = _q_training_packet(selection.cell)
     resolved = train_config.resolve_train_config(packet)
     _require_truthful_cell(selection.cell, resolved)
+    recorded_resolved = OmegaConf.to_container(resolved, resolve=True)
     report = {
         "selection": selection.receipt(),
         "walkers": stage_coordinate.walker_count(selection.cell.manifest),
@@ -478,7 +597,7 @@ def execute(args: argparse.Namespace) -> int:
             "ranking_packets": 0,
             "independent_sampler_packets": 0,
         },
-        "resolved_config": OmegaConf.to_container(resolved, resolve=True),
+        "resolved_config": recorded_resolved,
     }
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
     if args.dry_run:
@@ -487,7 +606,22 @@ def execute(args: argparse.Namespace) -> int:
     output_path = Path(packet.cell.output_path)
     _refuse_occupied_output_path(output_path)
     _write_json(output_path / "selection_receipt.json", report)
-    exit_code = launch.launch_train(packet, _execution_facts())
+
+    def _guarded_runner(config: Any, *, topology: object) -> int:
+        """Validate launch.py's late resolution before delegating to TPEN."""
+
+        _require_truthful_cell(selection.cell, config)
+        launched_resolved = OmegaConf.to_container(config, resolve=True)
+        if launched_resolved != recorded_resolved:
+            raise StageQSelectionError(
+                "launch truthfulness guard refused field 'resolved_config': "
+                f"recorded value {recorded_resolved!r}, launched value {launched_resolved!r}"
+            )
+        return launch.run_from_config(config, topology=topology)
+
+    exit_code = launch.launch_train(
+        packet, _execution_facts(), runner=_guarded_runner
+    )
     if exit_code == 0:
         resolved_snapshot = output_path / "resolved_config.yaml"
         if not resolved_snapshot.is_file():
