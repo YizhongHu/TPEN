@@ -31,6 +31,7 @@ def _args(tmp_path: Path, **overrides: object) -> SimpleNamespace:
         "architecture": "control",
         "optimizer": "adam",
         "seed_label": 810001,
+        "walkers": stage_coordinate.COMMITTED_WALKERS,
         "dry_run": True,
     }
     values.update(overrides)
@@ -226,6 +227,36 @@ def test_cli_emits_no_analysis_packets(tmp_path: Path, capsys: pytest.CaptureFix
     assert "facility" not in report
     assert report["train_packet"]["ranking_packets"] == 0
     assert report["train_packet"]["independent_sampler_packets"] == 0
+
+
+def test_cli_2048_walkers_rebuilds_identity_and_consumes_resolved_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = runner.build_parser().parse_args(
+        ["--dry-run", "--walkers", "2048", "--seed-label", "810001", "--output-root", str(tmp_path)]
+    )
+    assert runner.execute(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["walkers"] == 2_048
+    assert report["resolved_config"]["sampler"]["n_walkers"] == 2_048
+    assert report["resolved_config"]["runner"]["sampler"]["n_walkers"] == 2_048
+
+    committed_root = tmp_path / "committed"
+    committed_args = runner.build_parser().parse_args(
+        ["--dry-run", "--seed-label", "810001", "--output-root", str(committed_root)]
+    )
+    assert runner.execute(committed_args) == 0
+    committed_report = json.loads(capsys.readouterr().out)
+    assert committed_report["walkers"] == 4_096
+    assert committed_report["train_packet"]["content_hash"] != report["train_packet"]["content_hash"]
+
+
+def test_cli_refuses_unsupported_walker_count(tmp_path: Path) -> None:
+    args = runner.build_parser().parse_args(
+        ["--dry-run", "--walkers", "1000", "--seed-label", "810001", "--output-root", str(tmp_path)]
+    )
+    with pytest.raises(runner.StageQSelectionError, match="unsupported Stage-Q walker count"):
+        runner.execute(args)
 
 
 def test_roster_design_receipt_is_live_and_names_every_unavailable_arm() -> None:

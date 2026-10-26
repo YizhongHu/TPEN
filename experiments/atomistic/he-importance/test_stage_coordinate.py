@@ -6,7 +6,7 @@ import importlib.util
 import json
 import sys
 import warnings
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -588,6 +588,113 @@ def test_committed_intended_configuration_inventory_materializes_completely(tmp_
     )
     assert len(cells) == expected
     assert {cell.manifest["stage"] for cell in cells} == {entry["stage"] for entry in inventory}
+
+
+def test_q_mechanics_walker_identity_rebuilds_hash_path_and_preserves_committed_cells(
+    tmp_path: Path,
+) -> None:
+    before = stage_coordinate.materialize_intended_configurations(tmp_path / "before")
+    q_cell = next(cell for cell in before if cell.manifest["stage"] == "Q")
+    rebuilt = stage_coordinate.with_q_mechanics_walkers(q_cell)
+    after = stage_coordinate.materialize_intended_configurations(tmp_path / "after")
+
+    assert stage_coordinate.walker_count(q_cell.manifest) == stage_coordinate.COMMITTED_WALKERS
+    assert stage_coordinate.walker_count(rebuilt.manifest) == stage_coordinate.Q_MECHANICS_WALKERS
+    assert rebuilt.content_hash != q_cell.content_hash
+    assert rebuilt.output_path != q_cell.output_path
+    assert rebuilt.output_path == tmp_path / "before" / "Q" / rebuilt.content_hash
+    assert rebuilt.seed_streams == q_cell.seed_streams
+    stage_coordinate.validate_materialized_manifest(rebuilt.manifest)
+    assert [cell.content_hash for cell in before] == [cell.content_hash for cell in after]
+
+
+@pytest.mark.parametrize("value", [1_000, 8_192, 4_096, True, "2048"])
+def test_walker_count_refuses_inadmissible_values(value: object) -> None:
+    manifest = _train_manifest()
+    manifest["stage"] = "Q"
+    manifest["scientific_identity"] = {"walkers": value}
+    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+        stage_coordinate.walker_count(manifest)
+
+
+def test_walker_count_refuses_q_exception_at_non_q_stage() -> None:
+    manifest = _train_manifest()
+    manifest["scientific_identity"] = {"walkers": stage_coordinate.Q_MECHANICS_WALKERS}
+    with pytest.raises(stage_coordinate.MaterializationError, match="stage must be 'Q'"):
+        stage_coordinate.walker_count(manifest)
+
+
+def test_q_mechanics_walker_rebuild_refuses_non_q_and_double_application(tmp_path: Path) -> None:
+    non_q = _packet_source_cells(tmp_path)[0]
+    with pytest.raises(stage_coordinate.MaterializationError, match="only for stage 'Q'"):
+        stage_coordinate.with_q_mechanics_walkers(non_q)
+
+    q_cell = next(
+        cell
+        for cell in stage_coordinate.materialize_intended_configurations(tmp_path / "q")
+        if cell.manifest["stage"] == "Q"
+    )
+    with pytest.raises(stage_coordinate.MaterializationError, match="already applied"):
+        stage_coordinate.with_q_mechanics_walkers(
+            stage_coordinate.with_q_mechanics_walkers(q_cell)
+        )
+
+
+@pytest.mark.parametrize("value", [1_000, 8_192, 4_096, True, "2048"])
+def test_public_materialized_routes_refuse_bad_walker_identity(
+    tmp_path: Path, value: object
+) -> None:
+    configuration = _configuration(
+        {"architecture": "control", "optimizer": "adam", "walkers": value},
+        {"updates": 2_000},
+    )
+    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+        stage_coordinate.materialize_stage(
+            "Q", [configuration], stage_coordinate.OptimizerCell("adam", "available"), tmp_path
+        )
+
+    source = next(
+        cell
+        for cell in stage_coordinate.materialize_intended_configurations(tmp_path / "source")
+        if cell.manifest["stage"] == "Q"
+    )
+    manifest = stage_coordinate._thaw(source.manifest)
+    manifest["scientific_identity"]["walkers"] = value
+    bad = replace(
+        source,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=stage_coordinate.content_hash(manifest),
+    )
+    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+        stage_coordinate.with_execution_topology(bad, {"global_rank": 0})
+    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+        stage_coordinate.materialize_job_packets(
+            (bad,),
+            stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+            {"statistic": "logabs_variance"},
+            (stage_coordinate.RankingStatistic.LOGABS_VARIANCE,),
+            {"walkers": 1, "burn_in_sweeps": 0},
+            ddp_provenance={"launcher": "test"},
+        )
+
+
+def test_evaluation_manifest_boundary_refuses_bad_walker_identity() -> None:
+    manifest = _evaluation_manifest()
+    manifest["stage"] = "Q"
+    manifest["scientific_identity"] = {"walkers": 1_000}
+    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+        stage_coordinate.validate_evaluation_manifest(manifest)
+
+
+def test_public_materialized_route_refuses_q_walker_identity_at_non_q_stage(tmp_path: Path) -> None:
+    configuration = _configuration(
+        {"architecture": "control", "optimizer": "adam", "walkers": 2_048},
+        {"updates": 50_000},
+    )
+    with pytest.raises(stage_coordinate.MaterializationError, match="stage must be 'Q'"):
+        stage_coordinate.materialize_stage(
+            "O1", [configuration], stage_coordinate.OptimizerCell("adam", "available"), tmp_path
+        )
 
 
 def _packet_source_cells(tmp_path: Path) -> tuple[object, ...]:
