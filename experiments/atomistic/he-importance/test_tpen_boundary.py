@@ -103,7 +103,7 @@ EXPECTED_TEST_INVENTORY = {
     ("test_train_config.py", 399, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_run_stage_q.py", 382, "tpen.hi_schema"): InventoryEntry(
+    ("test_run_stage_q.py", 408, "tpen.hi_schema"): InventoryEntry(
         "measured at reland subject e524166a; roster assertion remains quarantined under item df8f8b31.",
     ),
 }
@@ -1192,6 +1192,8 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             ("the preceding exact-type test makes value an exact float and the reference is module-owned", 1),
         ("stage_coordinate.py", "_validate_delegated_subtree", "value == _REFERENCE_ENERGY_TEXT"):
             ("the preceding exact-type test makes value an exact str and the reference is module-owned", 1),
+            ("stage_coordinate.py", "walker_count", "value not in declared"):
+                ("declared is loaded from the closed stage authority and value is an exact integer", 1),
         ("stage_coordinate.py", "_validate_common", 'manifest["schema"] != schema'):
             ("manifest has passed the exact-key and mapping checks and schema is a module-owned validator argument", 1),
         ("train_config.py", "_require_checkout_root", "repo_root not in candidates"):

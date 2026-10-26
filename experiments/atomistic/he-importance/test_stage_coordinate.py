@@ -58,17 +58,48 @@ def _configuration(
 
 def test_all_35_transcribed_stage_fields_are_pinned_against_committed_authority() -> None:
     expected = [
-        {"code": "Q", "purpose": "mechanics", "seeds_per_point": 2, "maximum_lineages": 480, "updates": 2_000},
-        {"code": "O1", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 1_920, "updates": 50_000},
-        {"code": "O2", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 320, "updates": 50_000},
-        {"code": "A", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 4_064, "updates": 50_000},
-        {"code": "B", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 960, "updates": 50_000},
-        {"code": "R", "purpose": "scientific", "seeds_per_point": 12, "maximum_lineages": 768, "updates": 50_000},
-        {"code": "F", "purpose": "confirmation", "seeds_per_point": 48, "maximum_lineages": 96, "updates": None},
+        {"code": "Q", "purpose": "mechanics", "seeds_per_point": 2, "maximum_lineages": 480, "updates": 2_000, "sampler_overrides": {"n_walkers": [2_048]}},
+        {"code": "O1", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 1_920, "updates": 50_000, "sampler_overrides": {}},
+        {"code": "O2", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 320, "updates": 50_000, "sampler_overrides": {}},
+        {"code": "A", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 4_064, "updates": 50_000, "sampler_overrides": {}},
+        {"code": "B", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 960, "updates": 50_000, "sampler_overrides": {}},
+        {"code": "R", "purpose": "scientific", "seeds_per_point": 12, "maximum_lineages": 768, "updates": 50_000, "sampler_overrides": {}},
+        {"code": "F", "purpose": "confirmation", "seeds_per_point": 48, "maximum_lineages": 96, "updates": None, "sampler_overrides": {}},
     ]
     authority = json.loads(Path(__file__).with_name("stage_coordinate_authority.json").read_text())
     assert authority == expected
-    assert [definition.__dict__ for definition in stage_coordinate.STAGE_DEFINITIONS] == expected
+    assert [
+        {
+            **{field.name: getattr(definition, field.name) for field in fields(stage_coordinate.StageDefinition) if field.name != "sampler_overrides"},
+            "sampler_overrides": {
+                coordinate: list(values)
+                for coordinate, values in definition.sampler_overrides.items()
+            },
+        }
+        for definition in stage_coordinate.STAGE_DEFINITIONS
+    ] == expected
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda entry: entry.pop("sampler_overrides"), "invalid schema"),
+        (lambda entry: entry["sampler_overrides"].update({"other": [2_048]}), "unknown stage sampler coordinate"),
+        (lambda entry: entry["sampler_overrides"].update({"n_walkers": [True]}), "values must be integers"),
+        (lambda entry: entry["sampler_overrides"].update({"n_walkers": []}), "non-empty list"),
+        (lambda entry: entry["sampler_overrides"].update({"n_walkers": [2_048, 2_048]}), "repeats a value"),
+    ],
+)
+def test_stage_authority_loader_rejects_each_sampler_override_malformed_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: object, message: str
+) -> None:
+    authority = json.loads(Path(__file__).with_name("stage_coordinate_authority.json").read_text())
+    mutation(authority[0])
+    broken = tmp_path / "stage_coordinate_authority.json"
+    broken.write_text(json.dumps(authority), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_AUTHORITY_PATH", broken)
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match=message):
+        stage_coordinate._load_stage_definitions()
 
 
 @pytest.mark.parametrize(
@@ -670,20 +701,20 @@ def test_walker_count_refuses_inadmissible_values(value: object) -> None:
     manifest = _train_manifest()
     manifest["stage"] = "Q"
     manifest["scientific_identity"] = {"walkers": value}
-    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
         stage_coordinate.walker_count(manifest)
 
 
 def test_walker_count_refuses_q_exception_at_non_q_stage() -> None:
     manifest = _train_manifest()
     manifest["scientific_identity"] = {"walkers": stage_coordinate.Q_MECHANICS_WALKERS}
-    with pytest.raises(stage_coordinate.MaterializationError, match="stage must be 'Q'"):
+    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
         stage_coordinate.walker_count(manifest)
 
 
 def test_q_mechanics_walker_rebuild_refuses_non_q_and_double_application(tmp_path: Path) -> None:
     non_q = _packet_source_cells(tmp_path)[0]
-    with pytest.raises(stage_coordinate.MaterializationError, match="only for stage 'Q'"):
+    with pytest.raises(stage_coordinate.MaterializationError, match="declares no n_walkers"):
         stage_coordinate.with_q_mechanics_walkers(non_q)
 
     q_cell = next(
@@ -707,7 +738,7 @@ def test_public_materialized_routes_refuse_bad_walker_identity(
         {"architecture": "control", "optimizer": "adam", "walkers": value},
         {"updates": 2_000},
     )
-    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
         stage_coordinate.materialize_stage(
             "Q", [configuration], stage_coordinate.OptimizerCell("adam", "available"), tmp_path
         )
@@ -726,9 +757,9 @@ def test_public_materialized_routes_refuse_bad_walker_identity(
         manifest=stage_coordinate._freeze(manifest),
         content_hash=stage_coordinate.content_hash(manifest),
     )
-    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
         stage_coordinate.with_execution_topology(bad, {"global_rank": 0})
-    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
         stage_coordinate.materialize_job_packets(
             (bad,),
             stage_coordinate.CheckpointCadence(1_000, (1_000,)),
@@ -743,7 +774,7 @@ def test_evaluation_manifest_boundary_refuses_bad_walker_identity() -> None:
     manifest = _evaluation_manifest()
     manifest["stage"] = "Q"
     manifest["scientific_identity"] = {"walkers": 1_000}
-    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
         stage_coordinate.validate_evaluation_manifest(manifest)
 
 
@@ -752,7 +783,7 @@ def test_public_materialized_route_refuses_q_walker_identity_at_non_q_stage(tmp_
         {"architecture": "control", "optimizer": "adam", "walkers": 2_048},
         {"updates": 50_000},
     )
-    with pytest.raises(stage_coordinate.MaterializationError, match="stage must be 'Q'"):
+    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
         stage_coordinate.materialize_stage(
             "O1", [configuration], stage_coordinate.OptimizerCell("adam", "available"), tmp_path
         )

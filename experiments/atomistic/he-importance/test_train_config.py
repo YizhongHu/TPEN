@@ -118,7 +118,7 @@ def test_resolve_refuses_hand_built_inadmissible_walker_identity(tmp_path: Path)
         manifest=stage_coordinate._freeze(manifest),
         content_hash=stage_coordinate.content_hash(manifest),
     )
-    with pytest.raises(Exception, match="exactly 2048"):
+    with pytest.raises(Exception, match="declared n_walkers"):
         train_config.resolve_train_config(rebuilt)
 
 
@@ -199,7 +199,7 @@ def test_q_gates_refuse_overridable_stage_subclass_in_builder_and_resolver(tmp_p
     source = _cell(tmp_path, stage="O1")
     manifest = stage_coordinate._thaw(source.manifest)
     manifest["stage"] = Stage("O1")
-    with pytest.raises(stage_coordinate.MaterializationError, match="only for stage 'Q'"):
+    with pytest.raises(stage_coordinate.MaterializationError, match="declares no n_walkers"):
         stage_coordinate.with_q_mechanics_walkers(replace(source, manifest=stage_coordinate._freeze(manifest)))
 
     manifest["scientific_identity"]["walkers"] = 2_048
@@ -210,7 +210,7 @@ def test_q_gates_refuse_overridable_stage_subclass_in_builder_and_resolver(tmp_p
         content_hash=digest,
         output_path=source.output_path.parent / digest,
     )
-    with pytest.raises(ValueError, match="exactly 2048"):
+    with pytest.raises(ValueError, match="declared n_walkers"):
         train_config.resolve_train_config(forged)
 
 

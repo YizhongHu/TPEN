@@ -911,9 +911,10 @@ def execute(args: argparse.Namespace) -> int:
         optimizer=args.optimizer,
         seed_label=args.seed_label,
     )
+    declared_walkers = stage_coordinate.sampler_override_values(args.stage, "n_walkers")
     if args.walkers == stage_coordinate.COMMITTED_WALKERS:
         cell = selection.cell
-    elif args.walkers == stage_coordinate.Q_MECHANICS_WALKERS:
+    elif args.walkers in declared_walkers:
         cell = stage_coordinate.with_q_mechanics_walkers(selection.cell)
     else:
         raise StageQSelectionError(f"unsupported Stage-Q walker count: {args.walkers}")

@@ -377,6 +377,32 @@ def test_cli_refuses_unsupported_walker_count(tmp_path: Path) -> None:
         runner.execute(args)
 
 
+def test_cli_uses_stage_authority_for_walker_admission(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = stage_coordinate.sampler_override_values
+
+    def mutated(stage_name: str, coordinate: str) -> tuple[int, ...]:
+        if stage_name == "Q" and coordinate == "n_walkers":
+            return (1_024,)
+        return original(stage_name, coordinate)
+
+    monkeypatch.setattr(stage_coordinate, "sampler_override_values", mutated)
+    monkeypatch.setattr(runner.stage_coordinate, "sampler_override_values", mutated)
+    admitted = runner.build_parser().parse_args(
+        ["--dry-run", "--walkers", "1024", "--seed-label", "810001", "--output-root", str(tmp_path / "admitted")]
+    )
+    assert runner.execute(admitted) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["walkers"] == 1_024
+
+    refused = runner.build_parser().parse_args(
+        ["--dry-run", "--walkers", "2048", "--seed-label", "810001", "--output-root", str(tmp_path / "refused")]
+    )
+    with pytest.raises(runner.StageQSelectionError, match="unsupported Stage-Q walker count"):
+        runner.execute(refused)
+
+
 def test_roster_design_receipt_is_live_and_names_every_unavailable_arm() -> None:
     receipt = runner.roster_design_receipt("Q")
     from tpen.hi_schema import HI_METHOD_ROSTER
