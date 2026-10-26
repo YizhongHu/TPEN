@@ -179,6 +179,27 @@ def _he_batch() -> object:
     return ElectronBatch(positions, nuclear_positions=nuclei, nuclear_charges=charges, spins=spins)
 
 
+def _inactive_order_one_parameters(model: object) -> set[int]:
+    """Return parameter identities in the deliberately inactive order-1 branch."""
+
+    layer = model.stack.layers[0]
+    inactive: set[int] = set()
+    for producer in layer.mixing.producers:
+        if hasattr(producer, "metadata"):
+            for index, path in enumerate(producer.paths):
+                if path.output_order == 1:
+                    inactive.add(id(producer.weights[index]))
+        else:
+            for path in producer.paths:
+                if path.m == 1:
+                    inactive.add(id(producer.weights[f"g{path.global_id}"]))
+    inactive.add(id(layer.path_aggregation.weights["o1"]))
+    for activation in (layer.mixing.activation, layer.path_aggregation.activation):
+        if hasattr(activation, "mlps"):
+            inactive.update(id(parameter) for parameter in activation.mlps[0].parameters())
+    return inactive
+
+
 @pytest.mark.parametrize("path_label", PATH_LABELS)
 @pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
 def test_all_admissible_fragments_have_finite_he_value_and_gradients(path_label: str, activation_label: str) -> None:
@@ -191,9 +212,8 @@ def test_all_admissible_fragments_have_finite_he_value_and_gradients(path_label:
     output = model(_he_batch())
     assert torch.isfinite(output.logabs).all()
     output.logabs.sum().backward()
-    inactive = ("mixing.producers.0",) if path_label.startswith("tensor") else ()
     for name, parameter in model.named_parameters():
-        if any(marker in name for marker in inactive):
+        if id(parameter) in _inactive_order_one_parameters(model):
             continue
         assert parameter.grad is not None, name
         assert torch.isfinite(parameter.grad).all(), name
@@ -208,7 +228,10 @@ def test_tensor_silu_matches_train_control_state_and_value() -> None:
     OmegaConf.resolve(train)
     torch.manual_seed(41)
     mapped = instantiate(train.model).to(dtype=torch.float64)
-    assert tuple(control.state_dict()) == tuple(mapped.state_dict())
+    control_state = {key: value for key, value in control.state_dict().items() if key != "_tpen_layout_fingerprint"}
+    mapped_state = {key: value for key, value in mapped.state_dict().items() if key != "_tpen_layout_fingerprint"}
+    assert tuple(control_state) == tuple(mapped_state)
+    assert all(torch.equal(control_state[key], mapped_state[key]) for key in control_state)
     control_value = control(_he_batch()).logabs
     mapped_value = mapped(_he_batch()).logabs
     assert torch.equal(control_value, mapped_value)
