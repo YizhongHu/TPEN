@@ -299,10 +299,11 @@ def test_legacy_run_adds_no_update_method_key_to_trainer_state() -> None:
 def test_a_factory_is_constructed_once_across_resolve_and_fit() -> None:
     """Resolve and fit must share one method instance, or resume loads the wrong one.
 
-    `_select_update_method` runs twice in a resumed run. If a Hydra `_partial_`
-    factory produced a new instance each time, the checkpoint would restore
-    into the instance that is then discarded, and the run would silently
-    continue with fresh method state.
+    `bind_update_method` runs twice in a resumed run -- once from
+    `resolve_update_state` before restore, once from `fit`. If a Hydra
+    `_partial_` factory produced a new instance each time, the checkpoint would
+    restore into the instance that is then discarded, and the run would
+    silently continue with fresh method state.
     """
 
     torch.manual_seed(0)
@@ -318,10 +319,10 @@ def test_a_factory_is_constructed_once_across_resolve_and_fit() -> None:
         )
 
     trainer = VMCTrainer(max_steps=1, update_method=factory)
-    first = trainer._select_update_method(
+    first = trainer.bind_update_method(
         model=model, optimizer=optimizer, update_method=None
     )
-    second = trainer._select_update_method(
+    second = trainer.bind_update_method(
         model=model, optimizer=optimizer, update_method=None
     )
 

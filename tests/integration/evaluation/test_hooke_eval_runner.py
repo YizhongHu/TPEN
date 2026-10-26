@@ -47,7 +47,13 @@ from tpen.runner import Evaluate, Train
 from tpen.sampling import SamplerStats
 from tpen.training.state import TrainerState
 from tpen.training.trainer import VMCTrainer
-from tpen.training.update import LegacyAutogradUpdate, ModelParameterBinding
+from tpen.training.update import (
+    AutogradUpdateInput,
+    LegacyAutogradUpdate,
+    ModelParameterBinding,
+    VMCUpdateMethod,
+    VMCUpdateResult,
+)
 from tests.helpers.hooke_models import build_tiny_sampler, build_tiny_spenn
 from tests.helpers.run_context import RecordingLogger, make_run_context
 
@@ -321,6 +327,250 @@ def test_train_rejects_legacy_optimizer_mismatch_before_resume_restore(
         runner.run(_recording_context(tmp_path, [])[0])
 
     assert restore_calls == []
+
+
+def test_train_rejects_parameter_binding_mismatch_before_resume_restore(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """The PARAMETER arm of the same clause, at the same boundary.
+
+    ACCEPTANCE: "a conflicting late selector or wrong model/optimizer binding
+    fails before sampling or mutable restore." That sentence carries TWO
+    disjunctions, so it names four obligations, not two. Three were pinned:
+    optimizer and parameter identity before sampling, and optimizer ownership
+    before restore -- the sibling test directly above. Parameter identity
+    before restore was not.
+
+    An independent verifier measured the hole (Cannon 52043410). A mutant that
+    masks only parameter identity during the runner's pre-restore resolve,
+    keeping the type and optimizer checks eager and performing the real
+    parameter check after restore returns, survived 43 focused tests, the full
+    unit suite and 8 selected integration tests. Its external witness recorded
+    ONE RESTORE AND A REAL MODEL-PARAMETER CHANGE before the correct
+    `ValueError`. Restore mutates optimizer and model state, so a refusal that
+    lands afterwards has already let the damage happen.
+
+    The optimizer is deliberately the same object the runner builds, so the
+    ownership guard above cannot fire and steal the kill: the factory returns
+    the pre-built carrier. The foreign binding has the SAME layout as the live
+    model, so the layout comparison passes and the refusal must come from
+    parameter-reference identity -- `ModelParameterBinding.compare` tests
+    `left is right` -- which is what "wrong model binding" means here.
+    """
+
+    model = nn.Linear(1, 1).double()
+    foreign_model = nn.Linear(1, 1).double()
+    owned_optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    trainer = VMCTrainer(
+        max_steps=0,
+        update_method=LegacyAutogradUpdate(
+            owned_optimizer,
+            model_parameters=ModelParameterBinding(
+                parameters=tuple(foreign_model.parameters())
+            ),
+        ),
+    )
+    restore_calls = []
+
+    def fake_restore_checkpoint_with_events(**kwargs):
+        restore_calls.append(kwargs)
+        raise AssertionError("restore must not run before parameter-binding validation")
+
+    monkeypatch.setattr(
+        train_runner_module,
+        "restore_checkpoint_with_events",
+        fake_restore_checkpoint_with_events,
+    )
+    runner = Train(
+        model=model,
+        sampler=object(),
+        hamiltonian_terms=[],
+        # The runner builds exactly one carrier from this factory. Returning
+        # the already-owned optimizer makes the ownership check pass by
+        # identity, which isolates the parameter arm.
+        optimizer=lambda params: owned_optimizer,
+        trainer=trainer,
+        load={"mode": "train_resume", "path": "unused"},
+    )
+
+    with pytest.raises(
+        ValueError, match="update method parameter binding does not match live model"
+    ):
+        runner.run(_recording_context(tmp_path, [])[0])
+
+    assert restore_calls == [], (
+        "the parameter binding was refused only AFTER restore; the contract "
+        "requires the refusal to land before any mutable restore"
+    )
+
+
+def test_train_rejects_a_conflicting_late_selector_before_resume_restore(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """The selector arm of the clause, at the restore boundary.
+
+    An independent verifier (Cannon 52065488) built `delay_selector_restore`,
+    which defers only the selector predicate past restore. It passed F 43 and
+    I 8 while its external witness recorded one restore that CHANGED REAL
+    MODEL TENSORS and moved the carrier learning rate from 0.01 to 0.03125
+    before the correct ValueError. Pristine restores zero times and leaves
+    weights and lr untouched. Restore mutates state, so a refusal landing
+    afterwards has already done the damage.
+
+    The conflict is built WITHOUT a late argument, because the runner never
+    passes one: the trainer is constructed carrying one spec and then
+    explicitly pre-bound to a different method, so the runner's own resolve
+    falls back to the constructor spec and conflicts with what is bound. The
+    model and optimizer are deliberately the same objects the runner uses --
+    the factory returns the pre-built carrier -- so the two binding guards that
+    precede the selector check cannot fire first and steal the kill.
+    """
+
+    model = nn.Linear(1, 1).double()
+    owned_optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    binding = ModelParameterBinding(parameters=tuple(model.parameters()))
+    configured = LegacyAutogradUpdate(owned_optimizer, model_parameters=binding)
+    already_bound = LegacyAutogradUpdate(owned_optimizer, model_parameters=binding)
+    trainer = VMCTrainer(max_steps=0, update_method=configured)
+    trainer.bind_update_method(
+        model=model,
+        optimizer=owned_optimizer,
+        update_method=already_bound,
+    )
+    restore_calls = []
+
+    def fake_restore_checkpoint_with_events(**kwargs):
+        restore_calls.append(kwargs)
+        raise AssertionError("restore must not run before late-selector validation")
+
+    monkeypatch.setattr(
+        train_runner_module,
+        "restore_checkpoint_with_events",
+        fake_restore_checkpoint_with_events,
+    )
+    runner = Train(
+        model=model,
+        sampler=object(),
+        hamiltonian_terms=[],
+        optimizer=lambda params: owned_optimizer,
+        trainer=trainer,
+        load={"mode": "train_resume", "path": "unused"},
+    )
+
+    with pytest.raises(ValueError, match="already bound from a different specification"):
+        runner.run(_recording_context(tmp_path, [])[0])
+
+    assert restore_calls == [], (
+        "the conflicting late selector was refused only AFTER restore; the "
+        "contract requires the refusal to land before any mutable restore"
+    )
+
+
+class _StatelessRunnerMethod(VMCUpdateMethod[AutogradUpdateInput]):
+    """A method with no owned state, for the stateless half of each pair.
+
+    `_resolve_method_state` returns early when `update_state()` is `None`, so
+    on this path neither the ownership guard nor the parameter guard runs and
+    the retained model/carrier checks are the only defence. The stateful half
+    of each pair below is shadowed by those method-state guards; the stateless
+    half is not. Independent measurement (Cannon 52093726) showed all four
+    retained-binding SINGLE deferrals crossing their boundary here.
+    """
+
+    def update(self, update_input: AutogradUpdateInput) -> VMCUpdateResult:
+        return VMCUpdateResult(applied=False, grad_norm=0.0, reason="declined_for_test")
+
+
+def _retained_method(stateless: bool, optimizer, binding):
+    if stateless:
+        return _StatelessRunnerMethod()
+    return LegacyAutogradUpdate(optimizer, model_parameters=binding)
+
+
+def _recording_restore(monkeypatch):
+    """Monkeypatch restore to record and refuse to proceed."""
+
+    restore_calls = []
+
+    def fake_restore_checkpoint_with_events(**kwargs):
+        restore_calls.append(kwargs)
+        raise AssertionError("restore must not run before binding validation")
+
+    monkeypatch.setattr(
+        train_runner_module,
+        "restore_checkpoint_with_events",
+        fake_restore_checkpoint_with_events,
+    )
+    return restore_calls
+
+
+# ---------------------------------------------------------------------------
+# ONE HARNESS owns construction, execution and assertion for both retained
+# guards on both paths. See the sibling harness in
+# tests/unit/training/test_update_binding_parameter_layout_guards.py for why
+# three shape-checking meta-tests were deleted rather than patched again.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
+@pytest.mark.parametrize("guard", ["model", "carrier"])
+def test_train_rejects_a_second_binding_before_resume_restore(
+    monkeypatch,
+    tmp_path: Path,
+    guard: str,
+    stateless: bool,
+) -> None:
+    """Retained model/carrier rebind guards must refuse before mutable restore.
+
+    Deletion of these guards is already killed by
+    `test_a_second_model_is_refused_after_binding` and its carrier twin, which
+    call `resolve_update_state` directly and observe nothing about restore.
+    Restore mutates model and optimizer state, so a refusal landing afterwards
+    has already done the damage.
+
+    The trainer is pre-bound to the FOREIGN model or carrier so the runner's own
+    is the second one; everything else is held identical to the runner's objects
+    so the guard under test is the one that can fire.
+    """
+
+    model = nn.Linear(1, 1).double()
+    owned_optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+
+    if guard == "model":
+        bound_model = nn.Linear(1, 1).double()
+        bound_optimizer = owned_optimizer
+        binding = ModelParameterBinding(parameters=tuple(bound_model.parameters()))
+        expected = "already bound to a different model"
+    else:
+        bound_model = model
+        bound_optimizer = torch.optim.Adam(model.parameters(), lr=0.2)
+        binding = ModelParameterBinding(parameters=tuple(model.parameters()))
+        expected = "already bound to a different optimizer"
+
+    trainer = VMCTrainer(
+        max_steps=0,
+        update_method=_retained_method(stateless, bound_optimizer, binding),
+    )
+    trainer.bind_update_method(model=bound_model, optimizer=bound_optimizer)
+    restore_calls = _recording_restore(monkeypatch)
+    runner = Train(
+        model=model,
+        sampler=object(),
+        hamiltonian_terms=[],
+        optimizer=lambda params: owned_optimizer,
+        trainer=trainer,
+        load={"mode": "train_resume", "path": "unused"},
+    )
+
+    with pytest.raises(ValueError, match=expected):
+        runner.run(_recording_context(tmp_path, [])[0])
+
+    assert restore_calls == [], (
+        f"the second {guard} was refused only AFTER restore; the contract "
+        "requires the refusal to land before any mutable restore"
+    )
 
 
 def test_evaluate_model_only_calls_runner_owned_restore(monkeypatch, tmp_path: Path) -> None:
