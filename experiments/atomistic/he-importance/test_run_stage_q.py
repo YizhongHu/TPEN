@@ -1298,3 +1298,27 @@ def test_execute_guarded_runner_delegates_recorded_config_once(
     report = json.loads(capsys.readouterr().out)
     assert observed["calls"] == 1
     assert observed["config"] == report["resolved_config"]
+
+
+def test_truthfulness_guard_rejects_non_residual_base_and_consumed_updater(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _mechanics_cell(_cells(tmp_path))
+    original_compose = runner.train_config._compose_base_config
+
+    def compose_non_residual() -> object:
+        config = original_compose()
+        runner.OmegaConf.update(
+            config,
+            "model.layers.0.update._target_",
+            "tpen.nn.ReplacementUpdater",
+            merge=False,
+        )
+        return config
+
+    monkeypatch.setattr(runner.train_config, "_compose_base_config", compose_non_residual)
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match="feature_update.*ReplacementUpdater.*dd964863",
+    ):
+        runner.select_cell((target,), seed_label=810001)

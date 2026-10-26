@@ -286,6 +286,15 @@ def _authority_o_raw_context() -> Mapping[str, Any]:
     raise StageQSelectionError("optimizer-grid authority has no O-raw context")
 
 
+# The authority's ``feature_update`` values are labels, so keep their consumer
+# mapping explicit rather than deriving an oracle from the config being checked.
+# ``residual`` is verified against configs/train.yaml:model.layers[].update and
+# tpen/nn/update.py:ResidualUpdater (exported from tpen.nn).
+_FEATURE_UPDATE_TARGETS = {
+    "residual": "tpen.nn.ResidualUpdater",
+}
+
+
 def _resolved_config_entries(value: Any, key: str, path: str = "") -> tuple[tuple[str, Any], ...]:
     """Find resolved configuration entries named *key* without importing TPEN."""
 
@@ -300,21 +309,6 @@ def _resolved_config_entries(value: Any, key: str, path: str = "") -> tuple[tupl
         for index, nested in enumerate(value):
             found.extend(_resolved_config_entries(nested, key, f"{path}[{index}]"))
     return tuple(found)
-
-
-def _control_residual_updater_target() -> Any:
-    """Read the residual updater class path from the resolved control config."""
-
-    control = train_config._compose_base_config()
-    OmegaConf.resolve(control)
-    control_config = OmegaConf.to_container(control, resolve=True)
-    layers = control_config["model"]["layers"]
-    targets = tuple(layer["update"]["_target_"] for layer in layers)
-    if not targets or any(target != targets[0] for target in targets):
-        raise StageQSelectionError(
-            "truthfulness guard cannot identify one residual updater in the control config"
-        )
-    return targets[0]
 
 
 def _context_refusal(field: str, declared: Any, consumed: Any) -> StageQSelectionError:
@@ -346,6 +340,14 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
         )
     declared_overrides = declared_context["overrides"]
     authority_overrides = authority_context["overrides"]
+    declared_feature_update = declared_overrides.get("feature_update")
+    residual_target = _FEATURE_UPDATE_TARGETS.get(declared_feature_update)
+    if residual_target is None:
+        raise _context_refusal(
+            "context.overrides.feature_update",
+            declared_feature_update,
+            authority_overrides.get("feature_update"),
+        )
     for field in sorted(set(declared_overrides) | set(authority_overrides)):
         declared_value = declared_overrides.get(field)
         consumed_value = authority_overrides.get(field)
@@ -372,7 +374,6 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
         pass
 
     layers = resolved_container.get("model", {}).get("layers", ())
-    residual_target = _control_residual_updater_target()
     if not layers:
         raise _context_refusal(
             "context.overrides.feature_update", "residual", None
