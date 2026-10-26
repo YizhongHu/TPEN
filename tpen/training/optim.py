@@ -17,7 +17,11 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from tpen.dependencies import require_torch
-from tpen.training.update import ModelParameterBinding, VMCUpdateMethod
+from tpen.training.update import (
+    LegacyAutogradUpdate,
+    ModelParameterBinding,
+    VMCUpdateMethod,
+)
 
 torch = require_torch(feature="optimizer construction")
 
@@ -159,4 +163,79 @@ def make_update_method(
     )
 
 
-__all__ = ["UpdateMethodSpec", "make_optimizer", "make_update_method"]
+def bind_update_method(
+    spec: UpdateMethodSpec,
+    *,
+    optimizer: torch.optim.Optimizer,
+    model_parameters: ModelParameterBinding,
+    gradient_clip_norm: float | None = None,
+) -> VMCUpdateMethod:
+    """Normalize any supported spec -- including ``None`` -- into one method.
+
+    This is the single construction entry point for an update method. It
+    differs from :func:`make_update_method` in exactly one way, and that way is
+    the point of it: ``make_update_method`` returns ``None`` for a ``None``
+    spec, leaving its caller to decide what an unconfigured run should use,
+    whereas this function resolves that decision here by building the historical
+    `LegacyAutogradUpdate` adapter.
+
+    Parameters
+    ----------
+    spec : VMCUpdateMethod or callable or Mapping or None
+        Update-method instance, Hydra ``_partial_`` factory, un-instantiated
+        config carrying ``_target_``, or ``None`` for the default adapter.
+    optimizer : torch.optim.Optimizer
+        The carrier the method will own. The same object is handed to the
+        default adapter, so a run has one carrier however it was configured.
+    model_parameters : ModelParameterBinding
+        The live parameter domain the method will update.
+    gradient_clip_norm : float or None, optional
+        Clipping bound forwarded to the default adapter only. A configured
+        method carries its own clipping policy, so this is deliberately not
+        forced onto one.
+
+    Returns
+    -------
+    VMCUpdateMethod
+        Exactly one constructed method. Never ``None``.
+
+    Notes
+    -----
+    Why the default lives HERE rather than in the trainer, which is where it
+    used to live: the trainer's copy of this decision was reachable only
+    through a private selection helper, and the memo that helper used to avoid
+    rebuilding was keyed on the spec's identity -- so it did not apply when the
+    spec was ``None``, and the default adapter was rebuilt on every selection.
+    Putting construction in the module that already owns construction lets the
+    trainer hold ONE bound method instead of re-deciding how to build one.
+
+    This resolves an explicit ``_target_`` to a class; it is not a registry and
+    performs no name-keyed lookup.
+    """
+
+    if spec is None:
+        return LegacyAutogradUpdate(
+            optimizer,
+            gradient_clip_norm,
+            model_parameters=model_parameters,
+        )
+    method = make_update_method(
+        spec,
+        optimizer=optimizer,
+        model_parameters=model_parameters,
+    )
+    if method is None:
+        # Unreachable today: `make_update_method` returns None only for a None
+        # spec, which the branch above already consumed, and it type-checks
+        # every other return path itself. Kept as a narrowing that fails loudly
+        # rather than letting None escape a non-optional return type.
+        raise TypeError("update-method spec resolved to no update method")
+    return method
+
+
+__all__ = [
+    "UpdateMethodSpec",
+    "bind_update_method",
+    "make_optimizer",
+    "make_update_method",
+]
