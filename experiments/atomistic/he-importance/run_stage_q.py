@@ -365,9 +365,11 @@ def _model_fingerprint(model: Any) -> str:
 
 
 def _seed_refusal(field: str, declared: Any, consumed: Any) -> StageQSelectionError:
+    declared_text = "<missing>" if declared is _MISSING else repr(declared)
+    consumed_text = "<missing>" if consumed is _MISSING else repr(consumed)
     return StageQSelectionError(
-        f"truthfulness guard refused field '{field}': declared value {declared!r}, "
-        f"consumed value {consumed!r}; item dd964863"
+        f"truthfulness guard refused field '{field}': declared value {declared_text}, "
+        f"consumed value {consumed_text}; item dd964863"
     )
 
 
@@ -425,14 +427,16 @@ def _require_seed_bindings(cell: Any, model: Any, sampler: Any) -> None:
             raise _seed_refusal(field, actual, expected_model_seed)
 
     # train_config._set_optional_execution_seeds binds sampler.seed from the
-    # training_sampler stream when that field exists (train_config.py:153-157).
-    if isinstance(sampler, Mapping) and "seed" in sampler:
-        expected_sampler_seed = expected_streams["training_sampler"]
-        actual_sampler_seed = sampler["seed"]
-        if type(actual_sampler_seed) is not int or actual_sampler_seed != expected_sampler_seed:
-            raise _seed_refusal(
-                "runner.sampler.seed", actual_sampler_seed, expected_sampler_seed
-            )
+    # training_sampler stream when that field exists (train_config.py:153-157),
+    # but the consumed MetropolisSampler must always receive that binding.
+    expected_sampler_seed = expected_streams["training_sampler"]
+    if not isinstance(sampler, Mapping) or "seed" not in sampler:
+        raise _seed_refusal("runner.sampler.seed", _MISSING, expected_sampler_seed)
+    actual_sampler_seed = sampler["seed"]
+    if type(actual_sampler_seed) is not int or actual_sampler_seed != expected_sampler_seed:
+        raise _seed_refusal(
+            "runner.sampler.seed", actual_sampler_seed, expected_sampler_seed
+        )
 
 
 def _first_config_difference(left: Any, right: Any, path: str) -> tuple[str, Any, Any] | None:

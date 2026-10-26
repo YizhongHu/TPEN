@@ -1751,6 +1751,22 @@ def _update_sampler_seeds(config: object, value: object) -> None:
         runner.OmegaConf.update(config, path, value, merge=False)
 
 
+def _remove_sampler_seed_from_composition(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = runner.train_config._compose_base_config
+
+    def compose_without_sampler_seed() -> object:
+        config = original()
+        runner.OmegaConf.set_struct(config.sampler, False)
+        del config.sampler["seed"]
+        return config
+
+    monkeypatch.setattr(
+        runner.train_config,
+        "_compose_base_config",
+        compose_without_sampler_seed,
+    )
+
+
 @pytest.mark.parametrize("seed_label", [810001, 810002])
 def test_truthfulness_guard_refuses_wrong_carrier_stream_at_selection(
     tmp_path: Path, seed_label: int
@@ -1914,6 +1930,37 @@ def test_execute_refuses_wrong_sampler_seed_before_claim(
     with pytest.raises(
         runner.StageQSelectionError,
         match="runner.sampler.seed.*7.*dd964863",
+    ):
+        runner.execute(_args(tmp_path, seed_label=seed_label, walkers=walkers, dry_run=False))
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+@pytest.mark.parametrize("seed_label", [810001, 810002])
+def test_truthfulness_guard_refuses_missing_sampler_seed_at_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seed_label: int
+) -> None:
+    _remove_sampler_seed_from_composition(monkeypatch)
+    target = _mechanics_cell(_cells(tmp_path), seed_label=seed_label)
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match="runner.sampler.seed.*missing.*dd964863",
+    ):
+        runner.select_cell((target,), seed_label=seed_label)
+
+
+@pytest.mark.parametrize("seed_label", [810001, 810002])
+@pytest.mark.parametrize("walkers", [stage_coordinate.COMMITTED_WALKERS, stage_coordinate.Q_MECHANICS_WALKERS])
+def test_execute_refuses_missing_sampler_seed_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seed_label: int,
+    walkers: int,
+) -> None:
+    _remove_sampler_seed_from_composition(monkeypatch)
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match="runner.sampler.seed.*missing.*dd964863",
     ):
         runner.execute(_args(tmp_path, seed_label=seed_label, walkers=walkers, dry_run=False))
     assert not list(tmp_path.rglob("selection_receipt.json"))
