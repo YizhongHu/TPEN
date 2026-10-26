@@ -244,12 +244,30 @@ def resolve_train_config(source: Any) -> DictConfig:
     output_path = Path(cell.output_path)
     if not output_path.is_absolute() or output_path.parent.parent == output_path:
         raise TrainConfigResolutionError("cell output_path must be an absolute stage/hash path")
+    if (
+        type(output_path.name) is not str
+        or str.__eq__(output_path.name, source_hash) is not True
+        or type(output_path.parent.name) is not str
+        or str.__eq__(output_path.parent.name, manifest["stage"]) is not True
+    ):
+        raise TrainConfigResolutionError(
+            "cell output_path must bind its leaf hash and stage to the manifest"
+        )
 
     optimizer_entry = _optimizer_entry(manifest)
     streams = _mapping(cell.seed_streams, "cell.seed_streams")
     model_seed = _integer_seed(streams, "model_initialization")
 
     cfg = _compose_base_config()
+    committed_walkers = stage_api.COMMITTED_WALKERS
+    composed_walkers = OmegaConf.select(cfg, "sampler.n_walkers", default=None)
+    # Exact-int plus int.__eq__ keeps this decision structural, not caller-overridable.
+    if type(composed_walkers) is not int or int.__eq__(composed_walkers, committed_walkers) is not True:
+        raise TrainConfigResolutionError(
+            "committed train config sampler.n_walkers must remain 4096"
+        )
+    walkers = stage_api.walker_count(manifest)
+    OmegaConf.update(cfg, "sampler.n_walkers", walkers, merge=False)
     OmegaConf.update(cfg, "trainer.max_steps", stage.updates, merge=False)
     OmegaConf.update(cfg, "run.root", str(output_path.parent.parent), merge=False)
     OmegaConf.update(cfg, "run.run_id", source_hash, merge=False)

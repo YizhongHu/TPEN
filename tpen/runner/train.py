@@ -70,13 +70,50 @@ class Train(Runner):
             _assert_eager_initialized(self.model)
             self.model.train()
 
+        # ONE carrier is constructed for this run, here, and nothing below
+        # builds a second.
         optimizer = make_optimizer(self.optimizer, self.model.parameters())
         resolve_update_state = getattr(self.trainer, "resolve_update_state", None)
         if callable(resolve_update_state):
-            # This validation must precede checkpoint restore: restore mutates
-            # the optimizer, so a mismatched legacy owner must be rejected
-            # before the runner can touch either state source.
+            # This binding and validation must precede checkpoint restore:
+            # restore mutates the optimizer, so a mismatched legacy owner must
+            # be rejected before the runner can touch either state source. It
+            # also binds the one update method the whole run will use, so the
+            # instance that `_load_trainer` restores method state into is the
+            # instance `fit` then steps with.
+            #
+            # THE RETURN VALUE IS DELIBERATELY DISCARDED. Do not "improve" this
+            # by taking the carrier from it. An earlier revision of this slice
+            # did exactly that, reasoning that reading one source removed the
+            # possibility of the runner's optimizer and the bound method's
+            # ever diverging. Two review rounds established that the reasoning
+            # was empty and the change was harmful:
+            #
+            #   - INSIDE `VMCTrainer` the alias is provably a no-op. Both
+            #     branches of `_resolve_method_state` guarantee
+            #     `update_state.optimizer is optimizer`, and a method owning a
+            #     different carrier RAISES before the alias could run. There is
+            #     no divergence available to prevent.
+            #   - OUTSIDE it, the alias is the only thing with observable
+            #     behaviour -- and what it does there is adopt a foreign
+            #     trainer's carrier, so `fit` and checkpoint restore receive an
+            #     optimizer this runner did not build. Before the alias existed
+            #     that return was discarded unconditionally. The acceptance
+            #     contract requires preserving other configured trainers'
+            #     existing runner path, so the one reachable effect of the
+            #     alias was a contract violation.
+            #
+            # A guard does not rescue it. An `is not None` test raised
+            # `AttributeError` on a foreign return lacking `.optimizer`
+            # (reviewer R1-5); an attribute guard fixed that and left the
+            # carrier-bearing branch adopting a foreign optimizer (reviewer
+            # R2-1). Both defects were introduced by the alias and both
+            # disappear with it. Removing a cause beats guarding a symptom.
             resolve_update_state(model=self.model, optimizer=optimizer)
+        # The duck-typed lookup above is deliberate. Other configured trainers
+        # reach this runner through the same path and are not required to
+        # implement the VMC binding contract; a trainer without it simply uses
+        # the optimizer this runner built.
         context.emit(ModelBuilt())
         mode = _load_mode(self.load)
         if mode == "model_only":
