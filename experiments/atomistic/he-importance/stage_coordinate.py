@@ -113,6 +113,10 @@ SEED_STREAMS = (
     "evaluation_inference",
 )
 
+COMMITTED_WALKERS = 4_096
+Q_MECHANICS_WALKERS = 2_048
+_WALKERS_MISSING = object()
+
 
 class MaterializationError(ValueError):
     """A requested HI configuration cannot become an immutable row."""
@@ -351,6 +355,58 @@ def with_execution_topology(
     if content_hash(manifest) != source_hash:
         raise MaterializationError("execution topology changed the content identity")
     return replace(cell, manifest=_freeze(manifest))
+
+
+def walker_count(manifest: Mapping[str, Any]) -> int:
+    """Return the admissible walker count encoded by a materialized manifest."""
+
+    identity = manifest.get("scientific_identity") if isinstance(manifest, Mapping) else None
+    if not isinstance(identity, Mapping):
+        return COMMITTED_WALKERS
+    value = identity.get("walkers", _WALKERS_MISSING)
+    if value is _WALKERS_MISSING:
+        return COMMITTED_WALKERS
+    stage = manifest.get("stage")
+    if (
+        type(value) is not int
+        or int.__eq__(value, Q_MECHANICS_WALKERS) is not True
+        or type(stage) is not str
+        or str.__eq__(stage, "Q") is not True
+    ):
+        raise MaterializationError(
+            "scientific_identity.walkers must be exactly 2048 and manifest stage must be 'Q'"
+        )
+    return value
+
+
+def with_q_mechanics_walkers(cell: MaterializedCell) -> MaterializedCell:
+    """Return a Q cell carrying the identity-bearing mechanics walker exception."""
+
+    try:
+        source_manifest = cell.manifest
+        source_hash = cell.content_hash
+        source_path = cell.output_path
+    except AttributeError as error:
+        raise MaterializationError("cell must be a materialized training row") from error
+    validate_materialized_manifest(source_manifest)
+    if content_hash(source_manifest) != source_hash:
+        raise MaterializationError("cell content hash does not bind its manifest")
+    if type(source_manifest["stage"]) is not str or str.__eq__(source_manifest["stage"], "Q") is not True:
+        raise MaterializationError("Q mechanics walkers are available only for stage 'Q'")
+    if "walkers" in source_manifest["scientific_identity"]:
+        raise MaterializationError("Q mechanics walker identity is already applied")
+
+    manifest = _thaw(source_manifest)
+    manifest["scientific_identity"]["walkers"] = Q_MECHANICS_WALKERS
+    validate_materialized_manifest(manifest)
+    digest = content_hash(manifest)
+    output_path = source_path.parent.parent / manifest["stage"] / digest
+    return replace(
+        cell,
+        manifest=_freeze(manifest),
+        content_hash=digest,
+        output_path=output_path,
+    )
 
 
 def _project_identity(value: Any, *, exclude_root_topology: bool, is_root: bool = True) -> Any:
@@ -701,6 +757,7 @@ def validate_materialized_manifest(manifest: Mapping[str, Any]) -> None:
     """
 
     validate_train_manifest(manifest)
+    walker_count(manifest)
     _require_exact_keys(manifest["seed_identity"], _L2B_SEED_IDENTITY_KEYS, "seed_identity")
     if manifest["seed_identity"]["stage"] != manifest["stage"]:
         raise MaterializationError("seed identity stage does not match manifest stage")
@@ -824,6 +881,7 @@ def validate_evaluation_manifest(manifest: Mapping[str, Any]) -> None:
     """Validate the distinct evaluation schema, which owns reference inputs."""
 
     _validate_common(manifest, EVALUATION_MANIFEST_SCHEMA, _EVALUATION_KEYS)
+    walker_count(manifest)
     _require_exact_keys(manifest["reference"], _REFERENCE_KEYS, "reference")
     _require_exact_keys(manifest["accuracy"], _ACCURACY_KEYS, "accuracy")
     _require_scalar(manifest["reference"]["energy"], float, "reference energy")
