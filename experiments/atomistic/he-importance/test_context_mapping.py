@@ -248,6 +248,53 @@ def test_bounded_distance_features_match_independent_ordered_oracle() -> None:
     assert torch.allclose(features.pair[..., 2], features.pair[..., 2].transpose(1, 2))
 
 
+def test_bounded_distance_features_match_literal_coordinate_oracle() -> None:
+    """Check the basis ingress against hand-evaluated, non-random coordinates."""
+
+    fragment = context_mapping.input_feature_fragment("raw plus bounded distances")
+    basis = instantiate(OmegaConf.create(fragment["basis"]))
+    positions = torch.tensor(
+        [
+            [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+            [[1.0, 1.0, 0.0], [2.0, 0.0, 0.0]],
+        ],
+        dtype=torch.float64,
+    )
+    batch = instantiate(
+        {
+            "_target_": "tpen.data.batch.ElectronBatch",
+            "positions": positions,
+            "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
+            "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
+            "spins": torch.tensor([[1.0, -1.0], [1.0, -1.0]], dtype=torch.float64),
+        }
+    )
+
+    features = basis(batch)
+    expected_one_body = torch.tensor(
+        [
+            [[1.0, 0.0, 0.0, 1.0, 1 / 2], [0.0, 2.0, 0.0, -1.0, 4 / 5]],
+            [[1.0, 1.0, 0.0, 1.0, 2 / 3], [2.0, 0.0, 0.0, -1.0, 4 / 5]],
+        ],
+        dtype=torch.float64,
+    )
+    expected_pair = torch.tensor(
+        [
+            [
+                [[1 / 2, 1 / 2, 0.0], [1 / 2, 4 / 5, 5 / 6]],
+                [[4 / 5, 1 / 2, 5 / 6], [4 / 5, 4 / 5, 0.0]],
+            ],
+            [
+                [[2 / 3, 2 / 3, 0.0], [2 / 3, 4 / 5, 2 / 3]],
+                [[4 / 5, 2 / 3, 2 / 3], [4 / 5, 4 / 5, 0.0]],
+            ],
+        ],
+        dtype=torch.float64,
+    )
+    torch.testing.assert_close(features.one_body, expected_one_body, rtol=1e-15, atol=1e-15)
+    torch.testing.assert_close(features.pair, expected_pair, rtol=1e-15, atol=1e-15)
+
+
 def test_bounded_distance_fragment_splices_into_real_control_and_reaches_added_columns() -> None:
     train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
     train.model = OmegaConf.merge(
