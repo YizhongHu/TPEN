@@ -211,7 +211,9 @@ def test_all_admissible_fragments_have_finite_he_value_and_gradients(path_label:
     model = instantiate(train.model).to(dtype=torch.float64)
     output = model(_he_batch())
     assert torch.isfinite(output.logabs).all()
-    output.logabs.sum().backward()
+    # A raw sum has an exact Pfaffian cancellation for one order-2 bias;
+    # squared seeded values probe reachability without changing the model.
+    (output.logabs.square()).sum().backward()
     for name, parameter in model.named_parameters():
         if id(parameter) in _inactive_order_one_parameters(model):
             continue
