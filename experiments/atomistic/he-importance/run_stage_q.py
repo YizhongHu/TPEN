@@ -2,8 +2,9 @@
 
 The command deliberately owns selection rather than relying on inventory order.
 It materializes the committed inventory, filters the live admitted method roster,
-and requires exactly one ``(stage, architecture, optimizer, seed_label)`` match.
-The default Q/control/Adam filters therefore require an explicit seed label while
+and requires exactly one ``(stage, context, optimizer, seed_label)`` match after
+checking that the declared optimizer cell is truthful about the resolver output.
+The default Q/O-raw/Adam filters therefore require an explicit seed label while
 the authority contains both Q seed labels.
 """
 
@@ -13,6 +14,7 @@ import argparse
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 import importlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -31,10 +33,11 @@ if str(_REPO_ROOT) not in sys.path:
 
 stage_coordinate = importlib.import_module("experiments.atomistic.he-importance.stage_coordinate")
 launch = importlib.import_module("experiments.atomistic.he-importance.launch")
+optimizer_grid = importlib.import_module("experiments.atomistic.he-importance.optimizer_grid")
 train_config = importlib.import_module("experiments.atomistic.he-importance.train_config")
 
 DEFAULT_STAGE = "Q"
-DEFAULT_ARCHITECTURE = "control"
+DEFAULT_CONTEXT = "O-raw"
 DEFAULT_OPTIMIZER = "adam"
 Q_CHECKPOINT_EVERY_N_UPDATES = 1_000
 
@@ -48,15 +51,15 @@ class CellDescriptor:
     """The auditable selection coordinates of one materialized cell."""
 
     stage: str
-    architecture: str
-    optimizer: str
+    context: str
+    optimizer: Mapping[str, object]
     seed_label: int
     status: str
 
     def as_dict(self) -> dict[str, object]:
         return {
             "stage": self.stage,
-            "architecture": self.architecture,
+            "context": self.context,
             "optimizer": self.optimizer,
             "seed_label": self.seed_label,
             "status": self.status,
@@ -74,7 +77,7 @@ class CellSelection:
     def receipt(self) -> dict[str, object]:
         return {
             "rule": (
-                "exactly one admitted cell matching stage + architecture + optimizer + seed_label; "
+                "exactly one truthful admitted cell matching stage + context + optimizer + seed_label; "
                 "refuse zero or multiple matches"
             ),
             "selected": self.selected.as_dict(),
@@ -85,11 +88,16 @@ class CellSelection:
 def _descriptor(cell: Any) -> CellDescriptor:
     manifest = cell.manifest
     identity = manifest["scientific_identity"]
+    context = identity["context"]
+    optimizer = identity["optimizer"]
     optimizer_cell = identity["optimizer_cell"]
     return CellDescriptor(
         stage=str(manifest["stage"]),
-        architecture=str(identity["architecture"]),
-        optimizer=str(identity["optimizer"]),
+        context=str(context["name"]),
+        optimizer={
+            "method": str(optimizer["method"]),
+            "levels": dict(optimizer["levels"]),
+        },
         seed_label=int(manifest["seed_identity"]["label"]),
         status=str(optimizer_cell["status"]),
     )
@@ -152,11 +160,16 @@ def select_cell(
     cells: Iterable[Any],
     *,
     stage: str = DEFAULT_STAGE,
-    architecture: str = DEFAULT_ARCHITECTURE,
+    context: str = DEFAULT_CONTEXT,
     optimizer: str = DEFAULT_OPTIMIZER,
     seed_label: int | None = None,
 ) -> CellSelection:
-    """Select one admitted cell and refuse ambiguity instead of first-match fallback."""
+    """Select one truthful admitted cell and refuse first-match fallback.
+
+    The resolver's consumed block is read before the exact-one decision. Each
+    candidate is then checked against that block, so a declared-but-unconsumed
+    optimizer level cannot win merely by appearing first in the inventory.
+    """
 
     _require_q_stage(stage)
     admitted_methods = {
@@ -168,29 +181,137 @@ def select_cell(
         (cell, descriptor)
         for cell, descriptor in zip(materialized, descriptors)
         if descriptor.stage == stage
-        and descriptor.architecture == architecture
-        and descriptor.optimizer == optimizer
-        and descriptor.optimizer in admitted_methods
+        and descriptor.context == context
+        and descriptor.optimizer["method"] == optimizer
+        and descriptor.optimizer["method"] in admitted_methods
         and descriptor.status == "available"
         and (seed_label is None or descriptor.seed_label == seed_label)
     ]
-    if len(requested) != 1:
-        candidates = [descriptor.as_dict() for _, descriptor in requested]
-        if not candidates:
+    if not requested:
+        raise StageQSelectionError(
+            "selection matched zero admitted cells for "
+            f"stage={stage!r}, context={context!r}, optimizer={optimizer!r}, "
+            f"seed_label={seed_label!r}"
+        )
+    if context != DEFAULT_CONTEXT:
+        raise StageQSelectionError(
+            "truthfulness guard refused field 'context': "
+            f"declared value {context!r}, consumed value {DEFAULT_CONTEXT!r}; "
+            "resolver does not consume context/levels (item dd964863)"
+        )
+
+    # The current resolver consumes one fixed YAML optimizer block for every
+    # selected axis candidate. Resolve that consumed block once, then compare
+    # every declared candidate against it. This keeps selection deterministic
+    # without repeating Hydra composition and schema validation eight times.
+    resolved = train_config.resolve_train_config(_q_training_packet(requested[0][0]))
+    truthful: list[tuple[Any, CellDescriptor]] = []
+    refusals: list[str] = []
+    for cell, descriptor in requested:
+        try:
+            _require_truthful_cell(cell, resolved)
+        except StageQSelectionError as error:
+            refusals.append(str(error))
+        else:
+            truthful.append((cell, descriptor))
+
+    if len(truthful) != 1:
+        if not truthful:
+            detail = refusals[0] if refusals else "no candidate survived the truthfulness guard"
             raise StageQSelectionError(
-                "selection matched zero admitted cells for "
-                f"stage={stage!r}, architecture={architecture!r}, optimizer={optimizer!r}, "
-                f"seed_label={seed_label!r}"
+                "truthfulness guard rejected every selected candidate: " + detail
             )
+        candidates = [descriptor.as_dict() for _, descriptor in truthful]
         raise StageQSelectionError(
             "selection is ambiguous; pass --seed-label explicitly: "
             + json.dumps(candidates, sort_keys=True)
         )
-    selected_cell, selected_descriptor = requested[0]
+    selected_cell, selected_descriptor = truthful[0]
     discarded = tuple(
         descriptor for descriptor in descriptors if descriptor != selected_descriptor
     )
     return CellSelection(selected_cell, selected_descriptor, discarded)
+
+
+def _adam_signature_defaults() -> dict[str, object]:
+    """Read Adam's constructor defaults from the runtime torch installation."""
+
+    try:
+        import torch
+    except ModuleNotFoundError as error:
+        raise StageQSelectionError(
+            "truthfulness guard requires the runtime torch.optim.Adam signature"
+        ) from error
+
+    signature = inspect.signature(torch.optim.Adam)
+    defaults: dict[str, object] = {}
+    for name in ("betas", "eps", "weight_decay"):
+        parameter = signature.parameters.get(name)
+        if parameter is None or parameter.default is inspect.Parameter.empty:
+            raise StageQSelectionError(
+                f"truthfulness guard cannot read torch.optim.Adam default for {name!r}"
+            )
+        defaults[name] = parameter.default
+    return defaults
+
+
+def _scheduler_configured(resolved: Any) -> bool:
+    """Return whether the consumed config declares a scheduler block."""
+
+    config = OmegaConf.to_container(resolved, resolve=True)
+
+    def contains_scheduler(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return any(
+                key in {"scheduler", "lr_scheduler"} and nested is not None
+                or contains_scheduler(nested)
+                for key, nested in value.items()
+            )
+        if isinstance(value, (tuple, list)):
+            return any(contains_scheduler(nested) for nested in value)
+        return False
+
+    return contains_scheduler(config)
+
+
+def _require_truthful_cell(cell: Any, resolved: Any) -> None:
+    """Refuse a cell whose declared context or Adam levels are not consumed."""
+
+    identity = cell.manifest["scientific_identity"]
+    context = identity["context"]["name"]
+    if context != DEFAULT_CONTEXT:
+        raise StageQSelectionError(
+            "truthfulness guard refused field 'context': "
+            f"declared value {context!r}, consumed value {DEFAULT_CONTEXT!r}; "
+            "resolver does not consume context/levels (item dd964863)"
+        )
+
+    declared = identity["optimizer"]["levels"]
+    optimizer_cfg = OmegaConf.select(resolved, "optimizer")
+    defaults = _adam_signature_defaults()
+    configured_betas = optimizer_cfg.get("betas")
+    betas = configured_betas if configured_betas is not None else defaults["betas"]
+    def configured_or_default(name: str, default: object) -> object:
+        value = optimizer_cfg.get(name)
+        return default if value is None else value
+
+    consumed = {
+        "lr": optimizer_cfg.get("lr"),
+        "beta1": betas[0],
+        "beta2": betas[1],
+        "epsilon": configured_or_default("eps", defaults["eps"]),
+        "weight_decay": configured_or_default("weight_decay", defaults["weight_decay"]),
+        "parameter_groups": 1,
+        "schedule": "constant" if not _scheduler_configured(resolved) else "scheduler",
+    }
+    for field, consumed_value in consumed.items():
+        declared_value = declared.get(field)
+        if declared_value != consumed_value:
+            raise StageQSelectionError(
+                "truthfulness guard refused optimizer level "
+                f"'{field}': declared value {declared_value!r}, "
+                f"consumed value {consumed_value!r}"
+            )
 
 
 def _q_training_packet(cell: Any) -> Any:
@@ -300,11 +421,13 @@ def _jsonable(value: Any) -> Any:
 def execute(args: argparse.Namespace) -> int:
     _require_q_stage(args.stage)
     output_root = Path(args.output_root).expanduser().resolve()
-    cells = stage_coordinate.materialize_intended_configurations(output_root)
+    cells = stage_coordinate.materialize_intended_configurations(
+        output_root, availability=optimizer_grid.roster_availability()
+    )
     selection = select_cell(
         cells,
         stage=args.stage,
-        architecture=args.architecture,
+        context=getattr(args, "context", DEFAULT_CONTEXT),
         optimizer=args.optimizer,
         seed_label=args.seed_label,
     )
@@ -317,6 +440,7 @@ def execute(args: argparse.Namespace) -> int:
     selection = replace(selection, cell=cell)
     packet = _q_training_packet(selection.cell)
     resolved = train_config.resolve_train_config(packet)
+    _require_truthful_cell(selection.cell, resolved)
     report = {
         "selection": selection.receipt(),
         "walkers": stage_coordinate.walker_count(selection.cell.manifest),
@@ -348,7 +472,7 @@ def execute(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", default=DEFAULT_STAGE)
-    parser.add_argument("--architecture", default=DEFAULT_ARCHITECTURE)
+    parser.add_argument("--context", default=DEFAULT_CONTEXT)
     parser.add_argument("--optimizer", default=DEFAULT_OPTIMIZER)
     parser.add_argument("--seed-label", type=int)
     parser.add_argument("--walkers", type=int, default=stage_coordinate.COMMITTED_WALKERS)
@@ -369,6 +493,7 @@ __all__ = [
     "CellDescriptor",
     "CellSelection",
     "StageQSelectionError",
+    "_require_truthful_cell",
     "build_parser",
     "main",
     "roster_design_receipt",

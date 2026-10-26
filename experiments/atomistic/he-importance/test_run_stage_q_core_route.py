@@ -31,6 +31,7 @@ Runner = tpen_run.Runner
 
 
 stage = importlib.import_module("experiments.atomistic.he-importance.stage_coordinate")
+optimizer_grid = importlib.import_module("experiments.atomistic.he-importance.optimizer_grid")
 runner = importlib.import_module("experiments.atomistic.he-importance.run_stage_q")
 
 
@@ -133,8 +134,18 @@ def test_r3_real_run_context_and_callback_paths_complete_without_training(
     assert observed["context_topology"] is observed["typed_topology"]
     context_run_dir = Path(observed["context_run_dir"])
     assert context_run_dir.is_dir()
-    materialized = stage.materialize_intended_configurations(tmp_path)
-    selected = next(cell for cell in materialized if cell.manifest["seed_identity"]["label"] == 810001)
+    materialized = stage.materialize_intended_configurations(
+        tmp_path, availability=optimizer_grid.roster_availability()
+    )
+    selected = next(
+        cell
+        for cell in materialized
+        if cell.manifest["seed_identity"]["label"] == 810001
+        and cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
     assert result == 0
     # The resolver freezes callback output_path at the cell path while the
     # ArtifactManager owns the flat context path.  Both are observed without
@@ -156,6 +167,16 @@ def test_r3_failed_core_result_returns_one_without_completion(
     assert observed["topology_factory_calls"] == 1
     assert observed["runner_constructor_calls"] == 1
     assert observed["facts_at_core_boundary"] == expected_facts
-    materialized = stage.materialize_intended_configurations(tmp_path)
-    selected = next(cell for cell in materialized if cell.manifest["seed_identity"]["label"] == 810001)
+    materialized = stage.materialize_intended_configurations(
+        tmp_path, availability=optimizer_grid.roster_availability()
+    )
+    selected = next(
+        cell
+        for cell in materialized
+        if cell.manifest["seed_identity"]["label"] == 810001
+        and cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
     assert not (selected.output_path / "COMPLETE").exists()

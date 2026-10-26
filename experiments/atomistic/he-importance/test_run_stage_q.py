@@ -16,19 +16,46 @@ import pytest
 
 
 stage_coordinate = importlib.import_module("experiments.atomistic.he-importance.stage_coordinate")
+optimizer_grid = importlib.import_module("experiments.atomistic.he-importance.optimizer_grid")
 runner = importlib.import_module("experiments.atomistic.he-importance.run_stage_q")
 stage = stage_coordinate
 
 
+def _fake_adam(
+    params: object,
+    lr: float = 0.001,
+    betas: tuple[float, float] = (0.9, 0.999),
+    eps: float = 1e-8,
+    weight_decay: float = 0.0,
+) -> None:
+    del params, lr, betas, eps, weight_decay
+
+
+@pytest.fixture(autouse=True)
+def _runtime_torch_signature(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the runtime-signature guard testable when the optional extra is absent."""
+
+    try:
+        import torch  # noqa: F401
+    except ModuleNotFoundError:
+        monkeypatch.setitem(
+            sys.modules,
+            "torch",
+            SimpleNamespace(optim=SimpleNamespace(Adam=_fake_adam)),
+        )
+
+
 def _cells(tmp_path: Path) -> tuple[object, ...]:
-    return stage_coordinate.materialize_intended_configurations(tmp_path)
+    return stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=optimizer_grid.roster_availability()
+    )
 
 
 def _args(tmp_path: Path, **overrides: object) -> SimpleNamespace:
     values = {
         "output_root": tmp_path,
         "stage": "Q",
-        "architecture": "control",
+        "context": "O-raw",
         "optimizer": "adam",
         "seed_label": 810001,
         "walkers": stage_coordinate.COMMITTED_WALKERS,
@@ -41,7 +68,9 @@ def _args(tmp_path: Path, **overrides: object) -> SimpleNamespace:
 def test_q_materialization_has_two_seed_labeled_cells_and_selection_is_explicit(tmp_path: Path) -> None:
     cells = _cells(tmp_path)
     q_cells = [cell for cell in cells if cell.manifest["stage"] == "Q"]
-    assert [cell.manifest["seed_identity"]["label"] for cell in q_cells] == [810_001, 810_002]
+    labels = [cell.manifest["seed_identity"]["label"] for cell in q_cells]
+    assert len(q_cells) == 480
+    assert labels.count(810_001) == labels.count(810_002) == 240
 
     with pytest.raises(runner.StageQSelectionError, match="ambiguous"):
         runner.select_cell(cells)
@@ -49,8 +78,19 @@ def test_q_materialization_has_two_seed_labeled_cells_and_selection_is_explicit(
     selected = runner.select_cell(cells, seed_label=810_002)
     assert selected.selected.as_dict() == {
         "stage": "Q",
-        "architecture": "control",
-        "optimizer": "adam",
+        "context": "O-raw",
+        "optimizer": {
+            "method": "adam",
+            "levels": {
+                "lr": 0.005,
+                "beta1": 0.9,
+                "beta2": 0.999,
+                "epsilon": 1e-8,
+                "weight_decay": 0.0,
+                "parameter_groups": 1,
+                "schedule": "constant",
+            },
+        },
         "seed_label": 810_002,
         "status": "available",
     }
@@ -63,9 +103,83 @@ def test_selection_refuses_zero_matches_and_never_first_matches(tmp_path: Path) 
         runner.select_cell(cells, seed_label=999_999)
 
 
+def _q_adam_cells(cells: tuple[object, ...], *, context: str) -> list[object]:
+    return [
+        cell
+        for cell in cells
+        if cell.manifest["stage"] == "Q"
+        and cell.manifest["scientific_identity"]["context"]["name"] == context
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["seed_identity"]["label"] == 810001
+    ]
+
+
+def test_truthfulness_guard_refuses_each_nonmatching_adam_level_cell(tmp_path: Path) -> None:
+    cells = _q_adam_cells(_cells(tmp_path), context="O-raw")
+    expected = {"lr": 0.005, "beta2": 0.999}
+    nonmatching = [
+        cell
+        for cell in cells
+        if any(cell.manifest["scientific_identity"]["optimizer"]["levels"][key] != value
+               for key, value in expected.items())
+    ]
+    assert len(nonmatching) == 7
+
+    for cell in nonmatching:
+        levels = cell.manifest["scientific_identity"]["optimizer"]["levels"]
+        with pytest.raises(runner.StageQSelectionError, match="lr|beta2") as refusal:
+            runner.select_cell((cell,), seed_label=810001)
+        assert any(field in str(refusal.value) for field in ("lr", "beta2")), levels
+
+
+def test_truthfulness_guard_refuses_o_composite_with_resolver_item(tmp_path: Path) -> None:
+    composite = _q_adam_cells(_cells(tmp_path), context="O-composite")
+    target = next(
+        cell
+        for cell in composite
+        if cell.manifest["scientific_identity"]["optimizer"]["levels"]
+        == {"lr": 0.005, "beta1": 0.9, "beta2": 0.999, "epsilon": 1e-8,
+            "weight_decay": 0.0, "parameter_groups": 1, "schedule": "constant"}
+    )
+    with pytest.raises(runner.StageQSelectionError, match="dd964863"):
+        runner.select_cell((target,), context="O-composite", seed_label=810001)
+
+
+def test_truthfulness_guard_leaves_exactly_one_mechanics_cell(tmp_path: Path) -> None:
+    selection = runner.select_cell(_cells(tmp_path), seed_label=810001)
+    levels = selection.selected.optimizer["levels"]
+    assert selection.selected.context == "O-raw"
+    assert selection.selected.optimizer["method"] == "adam"
+    assert levels["lr"] == 0.005
+    assert levels["beta2"] == 0.999
+    assert len([item for item in _q_adam_cells(_cells(tmp_path), context="O-raw")
+                 if item.manifest["scientific_identity"]["optimizer"]["levels"] == levels]) == 1
+
+
+def test_truthfulness_guard_reads_consumed_lr_from_resolved_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = next(
+        cell
+        for cell in _q_adam_cells(_cells(tmp_path), context="O-raw")
+        if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
+    original = runner.train_config.resolve_train_config
+
+    def resolve_with_different_lr(source: object) -> object:
+        resolved = original(source)
+        resolved.optimizer.lr = 0.006
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_with_different_lr)
+    with pytest.raises(runner.StageQSelectionError, match="lr"):
+        runner.select_cell((target,), seed_label=810001)
+
+
 @pytest.mark.parametrize(
     ("axis", "value"),
-    [("architecture", "hybrid"), ("optimizer", "kfac"), ("optimizer", "sr")],
+    [("context", "O-composite"), ("optimizer", "kfac"), ("optimizer", "sr")],
 )
 def test_r3_selection_axes_reject_unadmitted_values_before_all_execution_stages(
     tmp_path: Path,
@@ -73,11 +187,12 @@ def test_r3_selection_axes_reject_unadmitted_values_before_all_execution_stages(
     axis: str,
     value: str,
 ) -> None:
-    """Architecture and optimizer are both required admission coordinates."""
+    """Context and optimizer are both required admission coordinates."""
 
     cells = _cells(tmp_path)
     selection_kwargs = {axis: value, "seed_label": 810001}
-    with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
+    initial_message = "dd964863" if axis == "context" else "zero admitted"
+    with pytest.raises(runner.StageQSelectionError, match=initial_message):
         runner.select_cell(cells, **selection_kwargs)
 
     for name, target in (
@@ -111,7 +226,8 @@ def test_r3_selection_axes_reject_unadmitted_values_before_all_execution_stages(
             dry_run=dry_run,
             **selection_kwargs,
         )
-        with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
+        expected_message = "dd964863" if axis == "context" else "zero admitted"
+        with pytest.raises(runner.StageQSelectionError, match=expected_message):
             runner.execute(args)
         assert not list(args.output_root.rglob("selection_receipt.json"))
         assert not list(args.output_root.rglob("resolved_config.yaml"))
@@ -125,21 +241,23 @@ def test_r3_default_axes_reach_frozen_exact_cell(
     capsys: pytest.CaptureFixture[str],
     dry_run: bool,
 ) -> None:
-    """The valid Q/control/Adam axis remains a real executable selection."""
+    """The valid Q/O-raw/Adam axis remains a real executable selection."""
 
     cells = _cells(tmp_path)
     expected_cell = next(
         cell
         for cell in cells
         if cell.manifest["stage"] == "Q"
-        and cell.manifest["scientific_identity"]["architecture"] == "control"
-        and cell.manifest["scientific_identity"]["optimizer"] == "adam"
+        and cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
         and cell.manifest["seed_identity"]["label"] == 810001
     )
     expected_descriptor = {
         "stage": "Q",
-        "architecture": "control",
-        "optimizer": "adam",
+        "context": "O-raw",
+        "optimizer": expected_cell.manifest["scientific_identity"]["optimizer"],
         "seed_label": 810001,
         "status": "available",
     }
@@ -299,7 +417,11 @@ def test_execution_facts_cross_launch_boundary(tmp_path: Path, monkeypatch: pyte
             assert index == 0
             return SimpleNamespace(uuid="GPU-0")
 
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=FakeCUDA()))
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=FakeCUDA(), optim=SimpleNamespace(Adam=_fake_adam)),
+    )
     facts = runner._execution_facts()
     selected = runner.select_cell(_cells(tmp_path), seed_label=810_001)
     received: dict[str, object] = {}
@@ -332,12 +454,23 @@ def test_g1_reversed_inventory_is_hash_stable_and_zero_multiple_unavailable_refu
 ) -> None:
     expected = {
         "stage": "Q",
-        "architecture": "control",
-        "optimizer": "adam",
+        "context": "O-raw",
+        "optimizer": {
+            "method": "adam",
+            "levels": {
+                "lr": 0.005,
+                "beta1": 0.9,
+                "beta2": 0.999,
+                "epsilon": 1e-8,
+                "weight_decay": 0.0,
+                "parameter_groups": 1,
+                "schedule": "constant",
+            },
+        },
         "seed_label": 810001,
         "status": "available",
     }
-    cells = stage.materialize_intended_configurations(tmp_path)
+    cells = _cells(tmp_path)
     forward = runner.select_cell(cells, seed_label=810001)
     reverse = runner.select_cell(tuple(reversed(cells)), seed_label=810001)
     assert forward.selected.as_dict() == expected
@@ -349,7 +482,7 @@ def test_g1_reversed_inventory_is_hash_stable_and_zero_multiple_unavailable_refu
     with pytest.raises(runner.StageQSelectionError, match="ambiguous"):
         runner.select_cell(cells, seed_label=None)
     with pytest.raises(runner.StageQSelectionError, match="ambiguous"):
-        runner.select_cell(cells + (cells[0],), seed_label=810001)
+        runner.select_cell(cells + (forward.cell,), seed_label=810001)
 
     original_roster = runner._roster
     monkeypatch.setattr(
@@ -362,7 +495,13 @@ def test_g1_reversed_inventory_is_hash_stable_and_zero_multiple_unavailable_refu
 
     unavailable = stage.materialize_stage(
         "Q",
-        [{"scientific_identity": {"architecture": "control", "optimizer": "adam"},
+        [{"scientific_identity": {
+            "context": {"name": "O-raw", "overrides": {}},
+            "optimizer": {"method": "adam", "levels": {
+                "lr": 0.005, "beta1": 0.9, "beta2": 0.999, "epsilon": 1e-8,
+                "weight_decay": 0.0, "parameter_groups": 1, "schedule": "constant",
+            }},
+        },
           "payload": {"updates": 2000}, "topology": {}}],
         stage.OptimizerCell("adam", "unavailable", reason="sentinel"),
         tmp_path / "unavailable",
@@ -378,7 +517,7 @@ def test_runtime_roster_admission_negative_controls_are_not_receipt_only(
     baseline = runner.roster_design_receipt("Q")
     assert "adam" in baseline["admitted_methods"]
     assert baseline["unavailable_methods"]
-    cells = stage.materialize_intended_configurations(tmp_path)
+    cells = _cells(tmp_path)
     original = runner._roster()
     controls = (
         (False, "module.Adam", "not-admitted"),
@@ -423,7 +562,7 @@ def test_g3_q_cadence_refuses_evaluation_horizon_and_execute_dry_run_does_not_la
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     selected = runner.select_cell(
-        stage.materialize_intended_configurations(tmp_path), seed_label=810001
+        _cells(tmp_path), seed_label=810001
     )
     with pytest.raises(stage.MaterializationError, match="exceed the stage horizon"):
         stage.materialize_job_packets(
@@ -521,8 +660,15 @@ def test_g4_execute_forwards_exact_facts_and_emits_completion_only_after_snapsho
     assert observed["packet_type"] is expected_packet_type
     assert observed["topology"] == facts
     assert observed["runner_topology"] == facts
-    materialized = stage.materialize_intended_configurations(tmp_path)
-    selected = next(cell for cell in materialized if cell.manifest["seed_identity"]["label"] == 810001)
+    materialized = _cells(tmp_path)
+    selected = next(
+        cell for cell in materialized
+        if cell.manifest["seed_identity"]["label"] == 810001
+        and cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
     expected_filenames = {"selection_receipt.json", "resolved_config.yaml", "COMPLETE"}
     assert {path.name for path in selected.output_path.iterdir()} == expected_filenames
     resolved = selected.output_path / "resolved_config.yaml"
@@ -579,8 +725,15 @@ def test_reused_complete_snapshot_refuses_before_launch_and_preserves_evidence(
         "device": "cuda:0", "job_id": "job", "device_identity": None,
     }
     monkeypatch.setattr(runner, "_execution_facts", lambda: dict(expected_facts))
-    cells = stage.materialize_intended_configurations(tmp_path)
-    selected = next(cell for cell in cells if cell.manifest["seed_identity"]["label"] == 810001)
+    cells = _cells(tmp_path)
+    selected = next(
+        cell for cell in cells
+        if cell.manifest["seed_identity"]["label"] == 810001
+        and cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
     selected.output_path.mkdir(parents=True, exist_ok=True)
     sentinels = {
         selected.output_path / "selection_receipt.json": b'{"sentinel":"old-selection"}\n',
@@ -786,11 +939,15 @@ def _cooperative_execute_race(
     """Interleave a second real execute immediately before the first write."""
 
     args = _args(tmp_path, dry_run=False)
-    planned_cells = stage.materialize_intended_configurations(tmp_path)
+    planned_cells = _cells(tmp_path)
     selected_output = next(
         cell.output_path
         for cell in planned_cells
         if cell.manifest["seed_identity"]["label"] == 810001
+        and cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
     )
     state: dict[str, object] = {
         "reentered": False,
