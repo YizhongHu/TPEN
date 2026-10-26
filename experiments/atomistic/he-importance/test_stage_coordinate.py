@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import warnings
@@ -124,6 +125,14 @@ def _load_base_stage_coordinate() -> object:
         ],
         text=True,
     )
+    inventory = subprocess.check_output(
+        [
+            "git",
+            "show",
+            f"{base}:experiments/atomistic/he-importance/intended_configurations.json",
+        ],
+        text=True,
+    )
     name = "he_importance_stage_coordinate_a757ed76"
     spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("stage_coordinate.py"))
     assert spec is not None
@@ -134,6 +143,8 @@ def _load_base_stage_coordinate() -> object:
     def read_text(path: Path, *args: object, **kwargs: object) -> str:
         if path.name == "stage_coordinate_authority.json":
             return authority
+        if path.name == "intended_configurations.json":
+            return inventory
         return original_read_text(path, *args, **kwargs)
 
     Path.read_text = read_text  # type: ignore[assignment]
@@ -151,11 +162,28 @@ def _available_roster_for(module: object) -> dict[str, object]:
     }
 
 
-def _identity_pairs(cells: tuple[object, ...]) -> list[tuple[str, str, str]]:
-    return [
-        (cell.manifest["stage"], cell.content_hash, "/".join(cell.output_path.parts[-2:]))
-        for cell in cells
-    ]
+def _identity_pairs(cells: tuple[object, ...], output_root: Path) -> list[tuple[str, str, str]]:
+    pairs = []
+    for cell in cells:
+        try:
+            relative_path = cell.output_path.relative_to(output_root).as_posix()
+        except ValueError as error:
+            raise AssertionError(
+                f"output path escaped supplied root {output_root}: {cell.output_path}"
+            ) from error
+        pairs.append((cell.manifest["stage"], cell.content_hash, relative_path))
+    return pairs
+
+
+def _walker_refusal_pattern(stage: str, value: object, declared: object) -> str:
+    return (
+        rf"scientific_identity\.walkers={re.escape(repr(value))} is not declared for stage "
+        rf"{re.escape(repr(stage))}; declared n_walkers={re.escape(repr(declared))}"
+    )
+
+
+def _no_walker_override_pattern(stage: str) -> str:
+    return rf"stage {re.escape(repr(stage))} declares no n_walkers mechanics override"
 
 
 def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
@@ -170,7 +198,9 @@ def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
     head_cells = stage_coordinate.materialize_intended_configurations(
         tmp_path / "head", availability=_complete_available_roster()
     )
-    assert _identity_pairs(base_cells) == _identity_pairs(head_cells)
+    assert _identity_pairs(base_cells, tmp_path / "base") == _identity_pairs(
+        head_cells, tmp_path / "head"
+    )
 
     base_q = tuple(cell for cell in base_cells if cell.manifest["stage"] == "Q")
     head_q = tuple(cell for cell in head_cells if cell.manifest["stage"] == "Q")
@@ -178,7 +208,9 @@ def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
     head_mechanics = tuple(
         stage_coordinate.with_q_mechanics_walkers(cell, 2_048) for cell in head_q
     )
-    assert _identity_pairs(base_mechanics) == _identity_pairs(head_mechanics)
+    assert _identity_pairs(base_mechanics, tmp_path / "base") == _identity_pairs(
+        head_mechanics, tmp_path / "head"
+    )
 
     named = next(
         cell
@@ -191,10 +223,30 @@ def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
     )
     assert named.content_hash == "0b51514133bcb9e11ff8ad412390a994f29c0b8b9a222c92894a0374cd09f5da"
 
-    perturbed = list(head_mechanics)
-    perturbed[0] = replace(perturbed[0], content_hash="0" * 64)
+    original_canonical_json = stage_coordinate.canonical_json
+
+    def perturb_encoding(value: object) -> bytes:
+        return original_canonical_json(value) + b"__deliberate_encoding_mutation__"
+
+    stage_coordinate.canonical_json = perturb_encoding
+    try:
+        perturbed_cells = stage_coordinate.materialize_intended_configurations(
+            tmp_path / "perturbed", availability=_complete_available_roster()
+        )
+        perturbed_q = tuple(
+            cell for cell in perturbed_cells if cell.manifest["stage"] == "Q"
+        )
+        perturbed_mechanics = tuple(
+            stage_coordinate.with_q_mechanics_walkers(cell, 2_048)
+            for cell in perturbed_q
+        )
+    finally:
+        stage_coordinate.canonical_json = original_canonical_json
+
     with pytest.raises(AssertionError, match="base oracle perturbation"):
-        assert _identity_pairs(base_mechanics) == _identity_pairs(tuple(perturbed)), (
+        assert _identity_pairs(base_mechanics, tmp_path / "base") == _identity_pairs(
+            perturbed_mechanics, tmp_path / "perturbed"
+        ), (
             "base oracle perturbation should be RED"
         )
 
@@ -798,20 +850,28 @@ def test_walker_count_refuses_inadmissible_values(value: object) -> None:
     manifest = _train_manifest()
     manifest["stage"] = "Q"
     manifest["scientific_identity"] = {"walkers": value}
-    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("Q", value, (2_048,)),
+    ):
         stage_coordinate.walker_count(manifest)
 
 
 def test_walker_count_refuses_q_exception_at_non_q_stage() -> None:
     manifest = _train_manifest()
     manifest["scientific_identity"] = {"walkers": stage_coordinate.Q_MECHANICS_WALKERS}
-    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("O1", stage_coordinate.Q_MECHANICS_WALKERS, ()),
+    ):
         stage_coordinate.walker_count(manifest)
 
 
 def test_q_mechanics_walker_rebuild_refuses_non_q_and_double_application(tmp_path: Path) -> None:
     non_q = _packet_source_cells(tmp_path)[0]
-    with pytest.raises(stage_coordinate.MaterializationError, match="declares no n_walkers"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError, match=_no_walker_override_pattern("O1")
+    ):
         stage_coordinate.with_q_mechanics_walkers(non_q)
 
     q_cell = next(
@@ -835,7 +895,10 @@ def test_public_materialized_routes_refuse_bad_walker_identity(
         {"architecture": "control", "optimizer": "adam", "walkers": value},
         {"updates": 2_000},
     )
-    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("Q", value, (2_048,)),
+    ):
         stage_coordinate.materialize_stage(
             "Q", [configuration], stage_coordinate.OptimizerCell("adam", "available"), tmp_path
         )
@@ -854,9 +917,15 @@ def test_public_materialized_routes_refuse_bad_walker_identity(
         manifest=stage_coordinate._freeze(manifest),
         content_hash=stage_coordinate.content_hash(manifest),
     )
-    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("Q", value, (2_048,)),
+    ):
         stage_coordinate.with_execution_topology(bad, {"global_rank": 0})
-    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("Q", value, (2_048,)),
+    ):
         stage_coordinate.materialize_job_packets(
             (bad,),
             stage_coordinate.CheckpointCadence(1_000, (1_000,)),
@@ -871,7 +940,10 @@ def test_evaluation_manifest_boundary_refuses_bad_walker_identity() -> None:
     manifest = _evaluation_manifest()
     manifest["stage"] = "Q"
     manifest["scientific_identity"] = {"walkers": 1_000}
-    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("Q", 1_000, (2_048,)),
+    ):
         stage_coordinate.validate_evaluation_manifest(manifest)
 
 
@@ -880,7 +952,10 @@ def test_public_materialized_route_refuses_q_walker_identity_at_non_q_stage(tmp_
         {"architecture": "control", "optimizer": "adam", "walkers": 2_048},
         {"updates": 50_000},
     )
-    with pytest.raises(stage_coordinate.MaterializationError, match="declared n_walkers"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("O1", 2_048, ()),
+    ):
         stage_coordinate.materialize_stage(
             "O1", [configuration], stage_coordinate.OptimizerCell("adam", "available"), tmp_path
         )
