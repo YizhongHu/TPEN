@@ -56,7 +56,7 @@ later slice.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, Self
 
 from tpen.dependencies import require_torch
@@ -84,9 +84,14 @@ from tpen.training.vmc import (
 from tpen.training.update import (
     ModelParameterBinding,
     ScoreUpdateInput,
+    UpdateDiagnostics,
+    UpdateMethodDescription,
     VMCUpdateMethod,
     VMCUpdateResult,
     VMCUpdateState,
+    flatten_settings,
+    json_safe_metric_name,
+    json_safe_scalar,
 )
 
 torch = require_torch(feature="VMC stochastic reconfiguration")
@@ -198,7 +203,7 @@ class SRPolicy:
 
 
 @dataclass(frozen=True, kw_only=True)
-class SRTelemetry:
+class SRTelemetry(UpdateDiagnostics):
     """Observable record of one SR/minSR update attempt.
 
     Every field is a Python scalar so the record can go straight into a
@@ -218,19 +223,34 @@ class SRTelemetry:
     diagnostics: SolveDiagnostics | None = None
 
     def as_metrics(self, *, prefix: str = "sr") -> dict[str, Any]:
-        """Return JSON-safe telemetry keys for a training metrics record."""
+        """Return JSON-safe telemetry keys for a training metrics record.
+
+        EVERY FLOAT HERE ROUTES THROUGH `json_safe_scalar`, and that is
+        load-bearing rather than defensive. This method predates the explicit
+        result contract and used a bare ``float()``, which meant a NON-FINITE
+        norm reached ``tpen.logging.jsonl`` -- which calls
+        ``json.dumps(..., allow_nan=False)`` and RAISES.
+
+        This path is the one most likely to produce such a value, not the
+        least: a non-finite direction is an EXPECTED outcome here, with its own
+        skip reason, so the record written to explain the bad step was the
+        record that crashed the run writing it. A finite value passes through
+        unchanged, so no existing record changes meaning.
+        """
+
+        prefix = json_safe_metric_name(prefix)
 
         metrics: dict[str, Any] = {
             f"{prefix}_applied": bool(self.applied),
-            f"{prefix}_reason": self.reason,
+            f"{prefix}_reason": json_safe_scalar(self.reason),
             f"{prefix}_step": int(self.step),
             f"{prefix}_samples": int(self.n_samples),
             f"{prefix}_finite_samples": int(self.n_finite_samples),
             f"{prefix}_parameters": int(self.n_parameters),
-            f"{prefix}_energy_gradient_norm": float(self.energy_gradient_norm),
-            f"{prefix}_update_direction_norm": float(self.update_direction_norm),
-            f"{prefix}_applied_update_norm": float(self.applied_update_norm),
-            f"{prefix}_trust_scale": float(self.trust_scale),
+            f"{prefix}_energy_gradient_norm": json_safe_scalar(self.energy_gradient_norm),
+            f"{prefix}_update_direction_norm": json_safe_scalar(self.update_direction_norm),
+            f"{prefix}_applied_update_norm": json_safe_scalar(self.applied_update_norm),
+            f"{prefix}_trust_scale": json_safe_scalar(self.trust_scale),
         }
         if self.diagnostics is not None:
             metrics.update(self.diagnostics.as_metrics(prefix=f"{prefix}_qgt"))
@@ -313,7 +333,24 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         self.conventions = resolved_conventions
         self.reducer = resolved_reducer
         self.completed_updates = 0
-        self.last_telemetry: SRTelemetry | None = None
+        # The RESULT is the record; `last_telemetry` below reads out of it.
+        self._last_result: VMCUpdateResult | None = None
+
+    @property
+    def last_telemetry(self) -> SRTelemetry | None:
+        """Return this attempt's diagnostics, for callers predating the result.
+
+        COMPATIBILITY ONLY, AND NOT A SECOND AUTHORITY. It is derived from
+        :attr:`last_result`, so it cannot disagree with what ``update``
+        returned and cannot survive into a later attempt on its own.
+        """
+
+        result = self._last_result
+        if result is None:
+            return None
+        diagnostics = result.diagnostics
+        assert diagnostics is None or isinstance(diagnostics, SRTelemetry)
+        return diagnostics
 
     def forward_request(self) -> MaterializedParameterScoreRequest:
         """Request raw per-sample parameter score blocks from the forward pass.
@@ -329,6 +366,29 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
         """
 
         return MaterializedParameterScoreRequest(chunk_size=self.policy.score_chunk_size)
+
+    def norm_semantics(self) -> str:
+        """Report the norm as the ENERGY-GRADIENT norm, not the step's size.
+
+        Stated explicitly because this method writes a PRECONDITIONED
+        direction into ``.grad`` before stepping the carrier, so ``.grad`` is
+        not a gradient at all by the time an observer reads it. The reported
+        norm is the norm of the energy gradient; the size of what was actually
+        applied is a separate field of this method's diagnostics
+        (``applied_update_norm``).
+        """
+
+        return "energy_gradient_l2_preconditioned_direction_in_grad"
+
+    def describe(self) -> UpdateMethodDescription:
+        """Add SR's resolved policy to the generic description."""
+
+        base = super().describe()
+        settings = dict(base.settings)
+        settings.update(flatten_settings(self.policy.fingerprint(), prefix="policy_"))
+        settings.update(flatten_settings(self.conventions.fingerprint(), prefix="conventions_"))
+        settings["reducer_class"] = type(self.reducer).__qualname__
+        return replace(base, settings=settings)
 
     def update_state(self) -> VMCUpdateState:
         """Return the single optimizer and parameter binding this method owns."""
@@ -541,7 +601,7 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
 
         self._apply(direction * trust_scale)
         self.completed_updates += 1
-        self.last_telemetry = SRTelemetry(
+        telemetry = SRTelemetry(
             applied=True,
             reason="applied",
             step=update_input.step,
@@ -554,7 +614,12 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             trust_scale=trust_scale,
             diagnostics=diagnostics,
         )
-        return VMCUpdateResult(applied=True, grad_norm=energy_gradient_norm)
+        return self._record_result(
+            applied=True,
+            grad_norm=energy_gradient_norm,
+            reason=telemetry.reason,
+            diagnostics=telemetry,
+        )
 
     def _trust_scale(self, direction_norm: float) -> float:
         """Return the factor capping the applied displacement norm."""
@@ -589,7 +654,7 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
     ) -> VMCUpdateResult:
         """Record a non-applied step with an explicit reason."""
 
-        self.last_telemetry = SRTelemetry(
+        telemetry = SRTelemetry(
             applied=False,
             reason=reason,
             step=step,
@@ -602,7 +667,12 @@ class StochasticReconfigurationUpdate(VMCUpdateMethod[ScoreUpdateInput]):
             trust_scale=1.0,
             diagnostics=diagnostics,
         )
-        return VMCUpdateResult(applied=False, grad_norm=energy_gradient_norm)
+        return self._record_result(
+            applied=False,
+            grad_norm=energy_gradient_norm,
+            reason=reason,
+            diagnostics=telemetry,
+        )
 
     def _validate_real_wavefunction(self, update_input: ScoreUpdateInput) -> None:
         """Reject a complex wavefunction rather than silently ignoring its phase.

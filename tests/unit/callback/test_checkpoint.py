@@ -776,8 +776,9 @@ def test_cpu_rng_state_round_trips_unchanged(tmp_path: Path) -> None:
 
     Fidelity is asserted per stream, not just "restore did not raise". Dropping
     any single ``set_*`` call in `tpen.checkpoint.rng.apply_rng_state` has to
-    fail here, because nothing else in the suite compares restored RNG state
-    against saved RNG state.
+    fail here: this drives the function directly, so it pins the function body.
+    Its invocation from `restore_checkpoint` is pinned separately by
+    `test_train_resume_restores_global_rng_state`.
     """
 
     torch.manual_seed(1234)
@@ -806,6 +807,107 @@ def test_cpu_rng_state_round_trips_unchanged(tmp_path: Path) -> None:
     require_restorable_rng_state(state, "cpu", tmp_path)
     apply_rng_state(state, "cpu")
 
+    assert torch.equal(torch.get_rng_state(), saved_torch)
+    assert random.getstate() == saved_python
+    assert _numpy_states_equal(np.random.get_state(), saved_numpy)
+
+
+class _GlobalDrawingSampler(_Sampler):
+    """Sampler stand-in whose load consumes every global stream.
+
+    A loader that draws from global RNG is lawful, so `restore_checkpoint` has to
+    apply the RNG payload after loading the sampler, not before.
+    """
+
+    def load_mcmc_state_dict(self, state) -> None:
+        super().load_mcmc_state_dict(state)
+        torch.rand(4)
+        random.random()
+        np.random.random(4)
+
+
+@pytest.fixture
+def _preserve_global_rng():
+    """Hand the caller's global Torch/Python/NumPy streams back unchanged."""
+
+    incoming = (torch.get_rng_state().clone(), random.getstate(), np.random.get_state())
+    try:
+        yield
+    finally:
+        torch.set_rng_state(incoming[0])
+        random.setstate(incoming[1])
+        np.random.set_state(incoming[2])
+
+
+@pytest.mark.usefixtures("_preserve_global_rng")
+def test_train_resume_restores_global_rng_state(tmp_path: Path) -> None:
+    """`restore_checkpoint` itself puts every global stream back to its saved state.
+
+    `test_cpu_rng_state_round_trips_unchanged` calls `apply_rng_state` directly,
+    so it cannot see whether `restore_checkpoint` ever invokes it. This arm goes
+    through the production entry point: deleting the `apply_rng_state` call in
+    `restore_checkpoint`, replacing it with a reseed, or applying it before the
+    sampler load each leave some stream away from its saved state and have to
+    fail the closing equalities here.
+    """
+
+    # Build every module before capturing: parameter initialisation draws from
+    # the global Torch stream and would otherwise move it past the saved state.
+    trained = torch.nn.Linear(3, 2).double()
+    optimizer = torch.optim.Adam(trained.parameters(), lr=0.01)
+
+    # Draw past the seed before capturing, so the saved state is not one a
+    # restore could reproduce by reseeding instead of applying the payload.
+    torch.manual_seed(1234)
+    random.seed(1234)
+    np.random.seed(1234)
+    torch.rand(5)
+    random.random()
+    np.random.random(5)
+    saved_torch = torch.get_rng_state().clone()
+    saved_python = random.getstate()
+    saved_numpy = np.random.get_state()
+
+    checkpoint_dir = save_checkpoint(
+        output_dir=tmp_path / "checkpoints",
+        next_iteration=3,
+        completed_updates=3,
+        model=trained,
+        optimizer=optimizer,
+        trainer=_Trainer(),
+        sampler=_Sampler(),
+        context=_context(),
+    )
+
+    # Anchor the oracle to the artifact: the payload on disk is the state
+    # captured above, so "saved" below means what the checkpoint actually carries.
+    payload = torch.load(checkpoint_dir / "rng.pt", map_location="cpu", weights_only=False)
+    assert torch.equal(payload["torch_cpu"], saved_torch)
+    assert payload["python"] == saved_python
+    assert _numpy_states_equal(payload["numpy"], saved_numpy)
+
+    # The resuming objects are built here too, which draws from the Torch stream.
+    fresh = torch.nn.Linear(3, 2).double()
+    fresh_optimizer = torch.optim.Adam(fresh.parameters(), lr=0.01)
+
+    # Advance every stream so an unrestored one cannot coincidentally match.
+    torch.rand(8)
+    random.random()
+    np.random.random(8)
+    assert not torch.equal(torch.get_rng_state(), saved_torch)
+    assert random.getstate() != saved_python
+    assert not _numpy_states_equal(np.random.get_state(), saved_numpy)
+
+    report = restore_checkpoint(
+        load={"path": str(checkpoint_dir), "mode": "train_resume"},
+        model=fresh,
+        optimizer=fresh_optimizer,
+        trainer=_Trainer(),
+        sampler=_GlobalDrawingSampler(),
+        context=_context(),
+    )
+
+    assert report.loaded_rng is True
     assert torch.equal(torch.get_rng_state(), saved_torch)
     assert random.getstate() == saved_python
     assert _numpy_states_equal(np.random.get_state(), saved_numpy)
