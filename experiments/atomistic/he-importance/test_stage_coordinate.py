@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import warnings
 from dataclasses import fields, replace
@@ -86,8 +87,13 @@ def test_all_35_transcribed_stage_fields_are_pinned_against_committed_authority(
         (lambda entry: entry.pop("sampler_overrides"), "invalid schema"),
         (lambda entry: entry["sampler_overrides"].update({"other": [2_048]}), "unknown stage sampler coordinate"),
         (lambda entry: entry["sampler_overrides"].update({"n_walkers": [True]}), "values must be integers"),
+        (lambda entry: entry["sampler_overrides"].update({"n_walkers": [2_048.0]}), "values must be integers"),
+        (lambda entry: entry["sampler_overrides"].update({"n_walkers": ["2048"]}), "values must be integers"),
         (lambda entry: entry["sampler_overrides"].update({"n_walkers": []}), "non-empty list"),
         (lambda entry: entry["sampler_overrides"].update({"n_walkers": [2_048, 2_048]}), "repeats a value"),
+        (lambda entry: entry.__setitem__("sampler_overrides", []), "must be a mapping"),
+        (lambda entry: entry.__setitem__("sampler_overrides", None), "must be a mapping"),
+        (lambda entry: entry["sampler_overrides"].update({"n_walkers": 2_048}), "non-empty list"),
     ],
 )
 def test_stage_authority_loader_rejects_each_sampler_override_malformed_shape(
@@ -100,6 +106,97 @@ def test_stage_authority_loader_rejects_each_sampler_override_malformed_shape(
     monkeypatch.setattr(stage_coordinate, "_AUTHORITY_PATH", broken)
     with pytest.raises(stage_coordinate.ManifestSchemaError, match=message):
         stage_coordinate._load_stage_definitions()
+
+
+def _load_base_stage_coordinate() -> object:
+    """Load the exact base implementation without changing the checkout."""
+
+    base = "a757ed762f90dceac4e94ca6f10f90ee90d6e7c9"
+    source = subprocess.check_output(
+        ["git", "show", f"{base}:experiments/atomistic/he-importance/stage_coordinate.py"],
+        text=True,
+    )
+    authority = subprocess.check_output(
+        [
+            "git",
+            "show",
+            f"{base}:experiments/atomistic/he-importance/stage_coordinate_authority.json",
+        ],
+        text=True,
+    )
+    name = "he_importance_stage_coordinate_a757ed76"
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("stage_coordinate.py"))
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    original_read_text = Path.read_text
+
+    def read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if path.name == "stage_coordinate_authority.json":
+            return authority
+        return original_read_text(path, *args, **kwargs)
+
+    Path.read_text = read_text  # type: ignore[assignment]
+    try:
+        exec(compile(source, f"{base}:stage_coordinate.py", "exec"), module.__dict__)
+    finally:
+        Path.read_text = original_read_text  # type: ignore[assignment]
+    return module
+
+
+def _available_roster_for(module: object) -> dict[str, object]:
+    return {
+        method: module.OptimizerCell(method, "available")
+        for method in ("adam", "sr", "kfac", "spring", "linear_method")
+    }
+
+
+def _identity_pairs(cells: tuple[object, ...]) -> list[tuple[str, str, str]]:
+    return [
+        (cell.manifest["stage"], cell.content_hash, "/".join(cell.output_path.parts[-2:]))
+        for cell in cells
+    ]
+
+
+def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
+    tmp_path: Path,
+) -> None:
+    """Rerun the base oracle and prove a deliberate identity perturbation is RED."""
+
+    base = _load_base_stage_coordinate()
+    base_cells = base.materialize_intended_configurations(
+        tmp_path / "base", availability=_available_roster_for(base)
+    )
+    head_cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "head", availability=_complete_available_roster()
+    )
+    assert _identity_pairs(base_cells) == _identity_pairs(head_cells)
+
+    base_q = tuple(cell for cell in base_cells if cell.manifest["stage"] == "Q")
+    head_q = tuple(cell for cell in head_cells if cell.manifest["stage"] == "Q")
+    base_mechanics = tuple(base.with_q_mechanics_walkers(cell) for cell in base_q)
+    head_mechanics = tuple(
+        stage_coordinate.with_q_mechanics_walkers(cell, 2_048) for cell in head_q
+    )
+    assert _identity_pairs(base_mechanics) == _identity_pairs(head_mechanics)
+
+    named = next(
+        cell
+        for cell in head_mechanics
+        if cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["seed_identity"]["label"] == 810_001
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
+    assert named.content_hash == "0b51514133bcb9e11ff8ad412390a994f29c0b8b9a222c92894a0374cd09f5da"
+
+    perturbed = list(head_mechanics)
+    perturbed[0] = replace(perturbed[0], content_hash="0" * 64)
+    with pytest.raises(AssertionError, match="base oracle perturbation"):
+        assert _identity_pairs(base_mechanics) == _identity_pairs(tuple(perturbed)), (
+            "base oracle perturbation should be RED"
+        )
 
 
 @pytest.mark.parametrize(

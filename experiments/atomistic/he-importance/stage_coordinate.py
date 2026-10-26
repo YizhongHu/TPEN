@@ -426,8 +426,19 @@ def walker_count(manifest: Mapping[str, Any]) -> int:
     return value
 
 
-def with_q_mechanics_walkers(cell: MaterializedCell) -> MaterializedCell:
-    """Return a Q cell carrying the identity-bearing mechanics walker exception."""
+def with_q_mechanics_walkers(
+    cell: MaterializedCell, walkers: int | None = None
+) -> MaterializedCell:
+    """Return a cell carrying the requested declared mechanics walker value.
+
+    Parameters
+    ----------
+    cell
+        Materialized source cell without an identity-bearing walker override.
+    walkers
+        Exact declared override to encode. If omitted, the authority must
+        contain exactly one admissible value.
+    """
 
     try:
         source_manifest = cell.manifest
@@ -444,11 +455,17 @@ def with_q_mechanics_walkers(cell: MaterializedCell) -> MaterializedCell:
         raise MaterializationError(
             f"stage {stage!r} declares no n_walkers mechanics override"
         )
+    requested = declared[0] if walkers is None and len(declared) == 1 else walkers
+    if type(requested) is not int or requested not in declared:
+        raise MaterializationError(
+            f"requested n_walkers={requested!r} is not declared for stage {stage!r}; "
+            f"declared n_walkers={declared!r}"
+        )
     if "walkers" in source_manifest["scientific_identity"]:
         raise MaterializationError("Q mechanics walker identity is already applied")
 
     manifest = _thaw(source_manifest)
-    manifest["scientific_identity"]["walkers"] = declared[0]
+    manifest["scientific_identity"]["walkers"] = requested
     validate_materialized_manifest(manifest)
     digest = content_hash(manifest)
     output_path = source_path.parent.parent / manifest["stage"] / digest

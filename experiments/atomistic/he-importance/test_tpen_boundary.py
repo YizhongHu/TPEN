@@ -103,7 +103,7 @@ EXPECTED_TEST_INVENTORY = {
     ("test_train_config.py", 399, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_run_stage_q.py", 408, "tpen.hi_schema"): InventoryEntry(
+    ("test_run_stage_q.py", 450, "tpen.hi_schema"): InventoryEntry(
         "measured at reland subject e524166a; roster assertion remains quarantined under item df8f8b31.",
     ),
 }
