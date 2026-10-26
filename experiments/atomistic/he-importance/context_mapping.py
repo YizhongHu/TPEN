@@ -23,6 +23,12 @@ class UnsupportedActivationLabel(ContextMappingError):
     """Raised when a declared activation has no admissible implementation."""
 
 
+_INPUT_FEATURE_LABELS = {
+    "raw",
+    "raw plus bounded distances",
+}
+
+
 _PATH_LABELS = {
     "tensor": ("tensor", None),
     "linear/coordinate-neighbor": ("linear", "coordinate_neighbor"),
@@ -98,6 +104,58 @@ def build_context_fragment(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """Alias for :func:`context_fragment` used by materialization callers."""
 
     return context_fragment(*args, **kwargs)
+
+
+def input_feature_fragment(
+    label: str,
+    *,
+    spatial_dim: int = 3,
+    include_spin: bool = True,
+    length: float = 1.0,
+) -> dict[str, Any]:
+    """Return the model fragment for one B input-feature package.
+
+    ``"raw"`` is an empty override so composing it with the literal control
+    leaves that model exactly unchanged.  The bounded-distance package keeps
+    raw Cartesian and spin columns, appends one one-body distance column, and
+    consumes the typed ordered-pair channel ``(q_i, q_j, q_ij)``.
+    """
+
+    if label not in _INPUT_FEATURE_LABELS:
+        raise UnknownContextLabel(f"unknown input-feature context label: {label!r}")
+    if type(spatial_dim) is not int or spatial_dim <= 0:
+        raise ContextMappingError("spatial_dim must be a positive integer")
+    if type(include_spin) is not bool:
+        raise ContextMappingError("include_spin must be a boolean")
+    if type(length) not in {int, float} or isinstance(length, bool) or length != 1.0:
+        raise ContextMappingError("length is fixed at 1.0 bohr for this study")
+
+    if label == "raw":
+        return {}
+
+    raw_width = spatial_dim + (1 if include_spin else 0)
+    return {
+        "basis": {
+            "_target_": "tpen.nn.basis.BoundedDistanceBasis",
+            "inner": {
+                "_target_": "tpen.nn.RawCoordinateBasis",
+                "spatial_dim": spatial_dim,
+                "include_spin": include_spin,
+            },
+            # The study fixes the bounded-distance length to one bohr.
+            "length": 1.0,
+        },
+        "embedding": {
+            "in_features": raw_width + 1,
+            "pair_input_channels": 3,
+        },
+    }
+
+
+def build_input_feature_fragment(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Alias for :func:`input_feature_fragment` used by materializers."""
+
+    return input_feature_fragment(*args, **kwargs)
 
 
 def _layer_fragment(
@@ -286,6 +344,8 @@ __all__ = [
     "ContextMappingError",
     "UnknownContextLabel",
     "UnsupportedActivationLabel",
+    "build_input_feature_fragment",
     "build_context_fragment",
     "context_fragment",
+    "input_feature_fragment",
 ]
