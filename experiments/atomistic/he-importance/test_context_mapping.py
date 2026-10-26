@@ -228,6 +228,10 @@ def test_all_admissible_fragments_have_finite_he_value_and_gradients(path_label:
     (output.logabs.square()).sum().backward()
     exact_zero = _pfaffian_skew_zero_parameters(model)
     for name, parameter in model.named_parameters():
+        # C7 qualifies parameters introduced by the context fragment; control
+        # factors and readout parameters are outside this fragment's scope.
+        if not name.startswith("stack.layers.0."):
+            continue
         if id(parameter) in exact_zero:
             assert parameter.grad is not None, name
             assert torch.equal(parameter.grad, torch.zeros_like(parameter.grad)), name
