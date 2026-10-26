@@ -200,6 +200,18 @@ def _inactive_order_one_parameters(model: object) -> set[int]:
     return inactive
 
 
+def _pfaffian_skew_zero_parameters(model: object) -> set[int]:
+    """Return the aggregation output bias that cancels in the skew kernel."""
+
+    activation = model.stack.layers[0].path_aggregation.activation
+    if not hasattr(activation, "mlps"):
+        return set()
+    # The order-2 final bias is added identically to entries (i,j) and (j,i).
+    # PfaffianReadout antisymmetrizes those entries, so its gradient is exactly
+    # zero. Hidden biases, producer-site biases, and all weights remain tested.
+    return {id(activation.mlps[1].layers[-1].bias)}
+
+
 @pytest.mark.parametrize("path_label", PATH_LABELS)
 @pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
 def test_all_admissible_fragments_have_finite_he_value_and_gradients(path_label: str, activation_label: str) -> None:
@@ -214,7 +226,12 @@ def test_all_admissible_fragments_have_finite_he_value_and_gradients(path_label:
     # A raw sum has an exact Pfaffian cancellation for one order-2 bias;
     # squared seeded values probe reachability without changing the model.
     (output.logabs.square()).sum().backward()
+    exact_zero = _pfaffian_skew_zero_parameters(model)
     for name, parameter in model.named_parameters():
+        if id(parameter) in exact_zero:
+            assert parameter.grad is not None, name
+            assert torch.equal(parameter.grad, torch.zeros_like(parameter.grad)), name
+            continue
         if id(parameter) in _inactive_order_one_parameters(model):
             continue
         assert parameter.grad is not None, name
