@@ -261,46 +261,25 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
         )
     try:
         logabs = model(batch).logabs[0]
-        expected_inputs = {
-            1: torch.tensor([1.0, 0.0, 0.0, 1.0, 1 / 2], dtype=torch.float64),
+        expected_all = {
+            1: torch.tensor(
+                [
+                    [1.0, 0.0, 0.0, 1.0, 1 / 2],
+                    [0.0, 2.0, 0.0, -1.0, 4 / 5],
+                ],
+                dtype=torch.float64,
+            ),
             2: torch.tensor(
                 [
-                    1.0,
-                    0.0,
-                    0.0,
-                    1.0,
-                    1 / 2,
-                    0.0,
-                    2.0,
-                    0.0,
-                    -1.0,
-                    4 / 5,
-                    1 / 2,
-                    4 / 5,
-                    5 / 6,
+                    [1.0, 0.0, 0.0, 1.0, 1 / 2, 1.0, 0.0, 0.0, 1.0, 1 / 2, 1 / 2, 1 / 2, 0.0],
+                    [1.0, 0.0, 0.0, 1.0, 1 / 2, 0.0, 2.0, 0.0, -1.0, 4 / 5, 1 / 2, 4 / 5, 5 / 6],
+                    [0.0, 2.0, 0.0, -1.0, 4 / 5, 1.0, 0.0, 0.0, 1.0, 1 / 2, 4 / 5, 1 / 2, 5 / 6],
+                    [0.0, 2.0, 0.0, -1.0, 4 / 5, 0.0, 2.0, 0.0, -1.0, 4 / 5, 4 / 5, 4 / 5, 0.0],
                 ],
                 dtype=torch.float64,
             ),
         }
         for order in (1, 2):
-            x = captured[order][0]
-            torch.testing.assert_close(x, expected_inputs[order], rtol=1e-12, atol=1e-12)
-            expected_all = {
-                1: torch.tensor(
-                    [
-                        [1.0, 0.0, 0.0, 1.0, 1 / 2],
-                        [0.0, 2.0, 0.0, -1.0, 4 / 5],
-                    ],
-                    dtype=torch.float64,
-                ),
-                2: torch.tensor(
-                    [
-                        [1.0, 0.0, 0.0, 1.0, 1 / 2, 0.0, 2.0, 0.0, -1.0, 4 / 5, 1 / 2, 4 / 5, 5 / 6],
-                        [0.0, 2.0, 0.0, -1.0, 4 / 5, 1.0, 0.0, 0.0, 1.0, 1 / 2, 4 / 5, 1 / 2, 5 / 6],
-                    ],
-                    dtype=torch.float64,
-                ),
-            }[order]
             torch.testing.assert_close(captured[order][0], expected_all, rtol=1e-12, atol=1e-12)
             weight = model.embedding.order_mlps[str(order)].layers[0].weight
             gradient = torch.autograd.grad(logabs, weight, retain_graph=True)[0]
