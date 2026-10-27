@@ -69,7 +69,24 @@ _EXECUTION_FACT_KEY_PROBES = (
 
 
 def _cell(tmp_path: Path, *, identity: dict[str, object] | None = None) -> object:
-    scientific_identity = {"architecture": "control"}
+    scientific_identity = {
+        "context": {
+            "name": "O-raw",
+            "overrides": {"input_features": "B00", "feature_update": "residual"},
+        },
+        "optimizer": {
+            "method": "adam",
+            "levels": {
+                "lr": 0.005,
+                "beta1": 0.9,
+                "beta2": 0.999,
+                "epsilon": 1e-8,
+                "weight_decay": 0.0,
+                "parameter_groups": 1,
+                "schedule": "constant",
+            },
+        },
+    }
     if identity:
         scientific_identity.update(identity)
     return stage_coordinate.materialize_stage(
