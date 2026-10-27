@@ -150,15 +150,52 @@ def test_o_composite_selection_has_eight_adam_authority_cells_and_schema_validat
     tmp_path: Path,
 ) -> None:
     composite = _q_adam_cells(_cells(tmp_path), context="O-composite")
-    target = [
+    authority = optimizer_grid.load_authority()
+    adam = next(family for family in authority["families"] if family["family"] == "adam")
+    expected_pairs = {
+        (lr, beta2)
+        for lr in adam["varied"]["lr"]
+        for beta2 in adam["varied"]["beta2"]
+    }
+    seeded = [
         cell
         for cell in composite
+        if cell.manifest["seed_identity"]["label"] == 810001
+    ]
+    assert len(seeded) == len(expected_pairs)
+    observed_pairs = {
+        (
+            cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"],
+            cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"],
+        )
+        for cell in seeded
+    }
+    assert observed_pairs == expected_pairs
+    for lr, beta2 in expected_pairs:
+        matches = [
+            cell
+            for cell in seeded
+            if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == lr
+            and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == beta2
+        ]
+        assert len(matches) == 1
+        selection = runner.select_cell(
+            matches,
+            context="O-composite",
+            lr=lr,
+            beta2=beta2,
+            seed_label=810001,
+        )
+        assert selection.selected.context == "O-composite"
+        assert selection.selected.seed_label == 810001
+
+    target = next(
+        cell
+        for cell in seeded
         if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
-        and cell.manifest["seed_identity"]["label"] == 810001
-    ]
-    assert len(target) == 1
-    resolved = runner.train_config.resolve_train_config(target[0])
+    )
+    resolved = runner.train_config.resolve_train_config(target)
     import tpen.hi_schema as schema
 
     schema.validate_hi_train_config(resolved)
@@ -252,8 +289,10 @@ def test_o_composite_launch_path_matches_selection_path(tmp_path: Path) -> None:
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
         and cell.manifest["seed_identity"]["label"] == 810001
     )
-    packet = runner._q_training_packet(target)
-    selected = runner.train_config.resolve_train_config(packet)
+    selection = runner.select_cell(
+        (target,), context="O-composite", seed_label=810001
+    )
+    packet, selected = runner._resolve_selected_config(selection)
     launched = runner.launch.prepare_train_launch(packet, _r2_facts())
     assert runner.OmegaConf.to_container(launched.config, resolve=True) == runner.OmegaConf.to_container(
         selected, resolve=True

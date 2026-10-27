@@ -981,6 +981,15 @@ def _q_training_packet(cell: Any) -> Any:
     return packets.train[0]
 
 
+def _resolve_selected_config(selection: CellSelection) -> tuple[Any, Any]:
+    """Resolve and truthfulness-check the packet owned by one selection."""
+
+    packet = _q_training_packet(selection.cell)
+    resolved = train_config.resolve_train_config(packet)
+    _require_truthful_cell(selection.cell, resolved)
+    return packet, resolved
+
+
 def _execution_facts() -> dict[str, object]:
     """Collect one-process launcher facts without importing TPEN topology types."""
 
@@ -1076,9 +1085,7 @@ def execute(args: argparse.Namespace) -> int:
     else:
         raise StageQSelectionError(f"unsupported Stage-Q walker count: {args.walkers}")
     selection = replace(selection, cell=cell)
-    packet = _q_training_packet(selection.cell)
-    resolved = train_config.resolve_train_config(packet)
-    _require_truthful_cell(selection.cell, resolved)
+    packet, resolved = _resolve_selected_config(selection)
     recorded_resolved = OmegaConf.to_container(resolved, resolve=True)
     report = {
         "selection": selection.receipt(),
