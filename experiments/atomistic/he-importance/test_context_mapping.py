@@ -298,10 +298,18 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
             expected = expected_all[order]
             inputs = captured[order][0]
             delta = delta_gradient[0]
-            gradient = weight_gradient
-            assert delta.shape[0] == expected.shape[0]
+            hidden = weights[order].shape[0]
+            if order == 1:
+                assert inputs.shape == (2, 5)
+                assert delta.shape == (2, hidden)
+            else:
+                assert inputs.shape == (2, 2, 13)
+                assert delta.shape == (2, 2, hidden)
+            inputs = inputs.reshape(-1, inputs.shape[-1])
+            delta = delta.reshape(-1, delta.shape[-1])
             torch.testing.assert_close(inputs, expected, rtol=1e-12, atol=1e-12)
             assert inputs.shape == expected.shape
+            gradient = weight_gradient
             expected_gradient = delta.transpose(0, 1) @ inputs
             added = (4,) if order == 1 else (4, 9, 10, 11, 12)
             for added_index in added:
