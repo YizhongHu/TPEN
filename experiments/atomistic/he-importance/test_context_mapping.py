@@ -264,7 +264,21 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
         expected_inputs = {
             1: torch.tensor([1.0, 0.0, 0.0, 1.0, 1 / 2], dtype=torch.float64),
             2: torch.tensor(
-                [1.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, -1.0, 1 / 2, 4 / 5, 5 / 6],
+                [
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    1 / 2,
+                    0.0,
+                    2.0,
+                    0.0,
+                    -1.0,
+                    4 / 5,
+                    1 / 2,
+                    4 / 5,
+                    5 / 6,
+                ],
                 dtype=torch.float64,
             ),
         }
@@ -281,8 +295,8 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
                 ),
                 2: torch.tensor(
                     [
-                        [1.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, -1.0, 1 / 2, 4 / 5, 5 / 6],
-                        [0.0, 2.0, 0.0, -1.0, 1.0, 0.0, 0.0, 1.0, 4 / 5, 1 / 2, 5 / 6],
+                        [1.0, 0.0, 0.0, 1.0, 1 / 2, 0.0, 2.0, 0.0, -1.0, 4 / 5, 1 / 2, 4 / 5, 5 / 6],
+                        [0.0, 2.0, 0.0, -1.0, 4 / 5, 1.0, 0.0, 0.0, 1.0, 1 / 2, 4 / 5, 1 / 2, 5 / 6],
                     ],
                     dtype=torch.float64,
                 ),
