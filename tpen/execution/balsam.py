@@ -536,6 +536,7 @@ class BalsamAdapter:
         evidence: CheckpointEvidence | Mapping[str, Any] | str | Path | None = None,
         attempt_id: str | None = None,
         fault_injector: Callable[[str], None] | None = None,
+        declared_overlays: Mapping[str, Any] | None = None,
     ) -> BalsamStartResult:
         """Route one Balsam-launched process through E3 without backend calls.
 
@@ -591,6 +592,7 @@ class BalsamAdapter:
             evidence=evidence,
             attempt_id=attempt_id,
             fault_injector=fault_injector,
+            declared_overlays=declared_overlays,
         )
         return BalsamStartResult(
             status=BalsamAdapterStatus.STARTED,
@@ -630,6 +632,7 @@ class BalsamAdapter:
             evidence=evidence,
             attempt_id=attempt_id,
             fault_injector=fault_injector,
+            declared_overlays=declared_overlays,
             run_once=lambda decision, output_path: run_bound_configured_once(
                 cfg,
                 intent=intent,
