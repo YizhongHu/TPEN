@@ -982,7 +982,7 @@ def _q_training_packet(cell: Any) -> Any:
 
 
 def _resolve_selected_config(selection: CellSelection) -> tuple[Any, Any]:
-    """Resolve and truthfulness-check one selected packet.
+    """Run the single selection-side resolve-and-check route.
 
     Parameters
     ----------
