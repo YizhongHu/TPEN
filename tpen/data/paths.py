@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import hashlib
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import combinations, permutations
 from enum import Enum
@@ -293,7 +293,7 @@ class LinearPathMetadata:
         input_orders: tuple[int, ...] | None = None,
         output_orders: tuple[int, ...] | None = None,
         normalization: Literal["sum", "completion_mean"] = "completion_mean",
-        explicit: tuple[SupportPath, ...] | None = None,
+        explicit: Sequence[SupportPath] | None = None,
     ) -> "LinearPathMetadata":
         """Construct deterministic metadata without runtime or file access.
 
@@ -301,6 +301,13 @@ class LinearPathMetadata:
         replacement paths. ``orbit_complete`` emits every canonical partial
         matching for each configured order pair. ``explicit`` preserves the
         supplied path order and rejects paths outside the configured orders.
+
+        Parameters
+        ----------
+        explicit : collections.abc.Sequence[SupportPath] or None
+            Explicit paths to retain in the supplied order. Every element is
+            checked because collection type checks may inspect only the first
+            element.
         """
 
         policy = normalize_linear_path_policy(policy)
@@ -312,7 +319,18 @@ class LinearPathMetadata:
         if policy is LinearPathPolicy.COORDINATE_NEIGHBOR and inputs.values != outputs.values:
             raise ValueError("coordinate_neighbor requires matching input and output orders")
         by_output: list[OutputPathLayout] = []
-        explicit_paths = tuple(explicit or ())
+        if explicit is None:
+            explicit_paths: tuple[SupportPath, ...] = ()
+        elif isinstance(explicit, (str, bytes)) or not isinstance(explicit, Sequence):
+            raise TypeError("explicit must be a sequence of SupportPath values")
+        else:
+            invalid_index = next(
+                (index for index, path in enumerate(explicit) if not isinstance(path, SupportPath)),
+                None,
+            )
+            if invalid_index is not None:
+                raise TypeError(f"explicit[{invalid_index}] must be a SupportPath")
+            explicit_paths = tuple(explicit)
         for output_order in outputs.values:
             selected: list[SupportPath] = []
             if policy is LinearPathPolicy.COORDINATE_NEIGHBOR:
