@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from typeguard import TypeCheckError, suppress_type_checks
 
 from tpen.data.paths import LinearPathMetadata, LinearPathPolicy, SupportPath
 from tpen.data.real import Feature, zero_block
@@ -91,17 +92,24 @@ def test_linear_explicit_metadata_accepts_sequences_and_stores_tuple() -> None:
 
 
 @pytest.mark.parametrize(
-    "explicit",
-    [
-        ("not a SupportPath",),
-        (SupportPath(1, 1, (0,), (0,)), "not a SupportPath"),
-        "not a sequence of paths",
-        b"not a sequence of paths",
-    ],
+    "explicit", [("not a SupportPath",), "not a sequence of paths", b"not a sequence of paths"]
 )
-def test_linear_explicit_metadata_rejects_invalid_sequence_elements(explicit: object) -> None:
-    with pytest.raises(TypeError, match="explicit"):
+def test_linear_explicit_metadata_rejects_boundary_invalid_values(explicit: object) -> None:
+    with pytest.raises((TypeError, TypeCheckError), match="explicit"):
         LinearPathMetadata.generate(max_order=1, policy="explicit", explicit=explicit)  # type: ignore[arg-type]
+
+
+def test_linear_explicit_metadata_rejects_nonfirst_invalid_element_in_body() -> None:
+    explicit = (SupportPath(1, 1, (0,), (0,)), "not a SupportPath")
+    with pytest.raises(TypeError, match=r"explicit\[1\]"):
+        LinearPathMetadata.generate(max_order=1, policy="explicit", explicit=explicit)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("explicit", ["not a sequence of paths", b"not a sequence of paths"])
+def test_linear_explicit_metadata_body_rejects_text_with_typeguard_suppressed(explicit: object) -> None:
+    with suppress_type_checks():
+        with pytest.raises(TypeError, match="sequence"):
+            LinearPathMetadata.generate(max_order=1, policy="explicit", explicit=explicit)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("implementation", [MixingImplementation.SLOW, MixingImplementation.VECTORIZED])
