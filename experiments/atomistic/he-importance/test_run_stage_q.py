@@ -291,16 +291,17 @@ def test_o_composite_accepts_explicit_raw_width_defaults(
 
 
 @pytest.mark.parametrize(
-    "field_update",
+    "field_update,expected_refusal_field",
     [
-        {"embedding.raw.in_features": 6},
-        {"embedding.raw.include_spins": False},
+        ({"embedding.raw.in_features": 6}, "embedding.raw.in_features"),
+        ({"embedding.raw.include_spins": False}, "effective_input_width"),
     ],
 )
 def test_o_composite_refuses_wrong_effective_raw_width(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     field_update: dict[str, object],
+    expected_refusal_field: str,
 ) -> None:
     target = _o_composite_target(tmp_path)
     original = runner.train_config.resolve_train_config
@@ -313,7 +314,7 @@ def test_o_composite_refuses_wrong_effective_raw_width(
         return resolved
 
     monkeypatch.setattr(runner.train_config, "resolve_train_config", wrong_width)
-    with pytest.raises(runner.StageQSelectionError, match="effective_input_width"):
+    with pytest.raises(runner.StageQSelectionError, match=expected_refusal_field):
         runner.select_cell((target,), context="O-composite", seed_label=810001)
 
 
