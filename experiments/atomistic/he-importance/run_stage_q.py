@@ -366,6 +366,7 @@ _COMPOSITE_COORDINATE_PATHS = (
     {"output_order": 1, "input_order": 1, "tau_out": [0], "tau_in": [1], "normalization": "sum"},
     {"output_order": 2, "input_order": 2, "tau_out": [0, 1], "tau_in": [0, 1], "normalization": "sum"},
 )
+_SUPPORT_PATH_TARGET = "tpen.data.paths.SupportPath"
 
 # Literal control entries from configs/train.yaml.  These are the declared
 # specification, not values obtained from the resolver or compose_package.
@@ -386,6 +387,30 @@ _COMPOSITE_CONTROL_FACTORS = (
         },
     },
 )
+
+
+def _coordinate_path_semantics(paths: Any) -> tuple[tuple[Any, ...], ...] | None:
+    """Normalize coordinate-neighbor paths to their design semantics."""
+
+    if not isinstance(paths, Sequence) or isinstance(paths, (str, bytes, bytearray)):
+        return None
+    semantics: list[tuple[Any, ...]] = []
+    for path in paths:
+        if not isinstance(path, Mapping):
+            return None
+        try:
+            semantics.append(
+                (
+                    path["output_order"],
+                    path["input_order"],
+                    tuple(path["tau_out"]),
+                    tuple(path["tau_in"]),
+                    path["normalization"],
+                )
+            )
+        except (KeyError, TypeError):
+            return None
+    return tuple(semantics)
 
 # Recompute this literal from the committed control config with:
 #
@@ -745,7 +770,19 @@ def _require_o_composite_model(model: Mapping[str, Any], declared: Any) -> None:
             include_spins = nested.get("include_spins", True)
             auxiliary = nested.get("aux_feature_channels")
             auxiliary_width = 0 if auxiliary in (None, {}) else sum(auxiliary.values())
-            effective_width = 3 + (1 if include_spins else 0) + auxiliary_width
+            derived_width = 3 + (1 if include_spins else 0) + auxiliary_width
+            declared_width = nested.get("in_features", _MISSING)
+            effective_width = (
+                derived_width
+                if declared_width is _MISSING or declared_width is None
+                else declared_width
+            )
+            if declared_width is not _MISSING and declared_width is not None and declared_width != derived_width:
+                raise _input_feature_refusal(
+                    f"context.overrides.input_features.model.embedding.{member}.in_features",
+                    declared,
+                    declared_width,
+                )
             if include_spins is not True or effective_width != width:
                 raise _input_feature_refusal(
                     f"context.overrides.input_features.model.embedding.{member}.effective_input_width",
@@ -823,11 +860,23 @@ def _require_o_composite_model(model: Mapping[str, Any], declared: Any) -> None:
             )
         layout = layer.get("layout")
         linear = layout.get("linear") if isinstance(layout, Mapping) else None
-        if not isinstance(linear, Mapping) or linear.get("explicit") != list(_COMPOSITE_COORDINATE_PATHS):
+        actual_paths = linear.get("explicit") if isinstance(linear, Mapping) else None
+        actual_semantics = _coordinate_path_semantics(actual_paths)
+        expected_semantics = _coordinate_path_semantics(_COMPOSITE_COORDINATE_PATHS)
+        if (
+            not isinstance(linear, Mapping)
+            or not isinstance(actual_paths, Sequence)
+            or any(
+                not isinstance(path, Mapping)
+                or path.get("_target_") != _SUPPORT_PATH_TARGET
+                for path in actual_paths
+            )
+            or actual_semantics != expected_semantics
+        ):
             raise _input_feature_refusal(
                 f"context.overrides.producer_policy.model.layers[{index}].layout.linear.explicit",
                 declared,
-                linear,
+                actual_paths,
             )
         if linear.get("policy") != "explicit" or linear.get("normalization") != "sum":
             raise _input_feature_refusal(

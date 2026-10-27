@@ -212,7 +212,16 @@ def test_o_composite_selection_has_eight_adam_authority_cells_and_schema_validat
     raw_embedding = resolved.model.embedding.raw
     raw_auxiliary = raw_embedding.get("aux_feature_channels")
     raw_auxiliary_width = 0 if raw_auxiliary in (None, {}) else sum(raw_auxiliary.values())
-    assert raw_embedding.spatial_dim + (1 if raw_embedding.get("include_spins", True) else 0) + raw_auxiliary_width == 4
+    derived_raw_width = raw_embedding.spatial_dim + (
+        1 if raw_embedding.get("include_spins", True) else 0
+    ) + raw_auxiliary_width
+    declared_raw_width = raw_embedding.get("in_features")
+    effective_raw_width = (
+        derived_raw_width if declared_raw_width is None else declared_raw_width
+    )
+    assert effective_raw_width == 4
+    if declared_raw_width is not None:
+        assert declared_raw_width == derived_raw_width
     assert raw_embedding.get("pair_input_channels", 0) == 0
     assert resolved.model.embedding.augmented.in_features == 5
     assert resolved.model.embedding.augmented.pair_input_channels == 3
@@ -227,6 +236,27 @@ def test_o_composite_selection_has_eight_adam_authority_cells_and_schema_validat
         "tpen.nn.LinearEquivariantMixing",
         "tpen.nn.EquivariantMixing",
     ]
+    expected_coordinate_semantics = (
+        (1, 1, (0,), (0,), "sum"),
+        (1, 1, (0,), (1,), "sum"),
+        (2, 2, (0, 1), (0, 1), "sum"),
+    )
+    actual_coordinate_paths = layer.layout.linear.explicit
+    assert [path._target_ for path in actual_coordinate_paths] == [
+        "tpen.data.paths.SupportPath",
+        "tpen.data.paths.SupportPath",
+        "tpen.data.paths.SupportPath",
+    ]
+    assert tuple(
+        (
+            path.output_order,
+            path.input_order,
+            tuple(path.tau_out),
+            tuple(path.tau_in),
+            path.normalization,
+        )
+        for path in actual_coordinate_paths
+    ) == expected_coordinate_semantics
     assert layer.mixing.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
     assert layer.path_aggregation.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
     assert layer.update._target_ == "tpen.nn.ResidualUpdater"
