@@ -261,6 +261,8 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
         )
     try:
         logabs = model(batch).logabs[0]
+        assert len(captured) == 2
+        assert len(deltas) == 2
         expected_all = {
             1: torch.tensor(
                 [
@@ -281,10 +283,14 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
         }
         for order in (1, 2):
             expected = expected_all[order]
-            torch.testing.assert_close(captured[order][0], expected, rtol=1e-12, atol=1e-12)
+            inputs = captured[order][0]
+            delta = deltas[order][0]
+            torch.testing.assert_close(inputs, expected, rtol=1e-12, atol=1e-12)
+            assert inputs.shape == expected.shape
+            assert delta.shape[0] == expected.shape[0]
             weight = model.embedding.order_mlps[str(order)].layers[0].weight
             gradient = torch.autograd.grad(logabs, weight, retain_graph=True)[0]
-            expected_gradient = deltas[order][0].transpose(0, 1) @ captured[order][0]
+            expected_gradient = delta.transpose(0, 1) @ inputs
             added = (4,) if order == 1 else (4, 9, 10, 11, 12)
             for added_index in added:
                 torch.testing.assert_close(
