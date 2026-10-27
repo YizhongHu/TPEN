@@ -113,6 +113,10 @@ def _detach_aux_value(value: Any, path: str) -> Any:
 def _detach_wavefunction_output(output: WavefunctionOutput) -> WavefunctionOutput:
     """Keep local-energy diagnostics while releasing their autograd graph."""
 
+    if type(output.aux) is not dict:
+        raise TypeError(
+            f"unsupported local-energy aux value at aux: {type(output.aux).__name__}"
+        )
     detached_aux = _detach_aux_value(output.aux, "aux")
     return WavefunctionOutput(
         logabs=output.logabs.detach(),

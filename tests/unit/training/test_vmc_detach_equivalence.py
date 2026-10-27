@@ -504,6 +504,8 @@ def test_aux_contract_rejects_unadmitted_types_with_key_path(invalid_aux: Any) -
     UserDict({"tensor": torch.tensor([1.0])}),
     type("AuxDict", (dict,), {})(tensor=torch.tensor([1.0])),
     [torch.tensor([1.0])],
+    (torch.tensor([1.0]),),
+    torch.tensor([1.0]),
 ])
 def test_aux_contract_rejects_invalid_root_container(invalid_aux: Any) -> None:
     source = torch.tensor([1.0], dtype=torch.float64, requires_grad=True)
@@ -515,5 +517,5 @@ def test_aux_contract_rejects_invalid_root_container(invalid_aux: Any) -> None:
             aux=invalid_aux,
         ),
     )
-    with pytest.raises(TypeError, match=r"aux"):
+    with pytest.raises(TypeError, match=r"at aux:"):
         trainer_module._detach_local_energy_result(result)
