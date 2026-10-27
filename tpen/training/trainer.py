@@ -113,14 +113,12 @@ def _detach_aux_value(value: Any, path: str) -> Any:
 def _detach_wavefunction_output(output: WavefunctionOutput) -> WavefunctionOutput:
     """Keep local-energy diagnostics while releasing their autograd graph."""
 
-    for key in output.aux:
-        if type(key) is not str:
-            raise TypeError(f"unsupported local-energy aux key at aux: {key!r}")
+    detached_aux = _detach_aux_value(output.aux, "aux")
     return WavefunctionOutput(
         logabs=output.logabs.detach(),
         sign=output.sign.detach(),
         phase=None if output.phase is None else output.phase.detach(),
-        aux={key: _detach_aux_value(value, f"aux[{key!r}]") for key, value in output.aux.items()},
+        aux=detached_aux,
     )
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import weakref
-from collections import OrderedDict, deque, namedtuple
+from collections import OrderedDict, UserDict, deque, namedtuple
 from dataclasses import dataclass
 from typing import Any
 
@@ -468,6 +468,10 @@ def test_admitted_nested_aux_types_and_order_are_preserved() -> None:
     assert list(aux["nested"]) == ["tensor", "list"]
     assert type(aux["nested"]["list"]) is list
     assert type(aux["tuple"]) is tuple
+    assert torch.equal(aux["nested"]["tensor"], torch.tensor([1.0], dtype=torch.float64))
+    assert aux["nested"]["list"] == [None, True, 3, 2.5, "x"]
+    assert torch.equal(aux["tuple"][0], torch.tensor([1.0], dtype=torch.float64))
+    assert aux["tuple"][1] == "last"
     assert not aux["nested"]["tensor"].requires_grad
     assert not aux["tuple"][0].requires_grad
 
@@ -492,4 +496,24 @@ def test_aux_contract_rejects_unadmitted_types_with_key_path(invalid_aux: Any) -
         ),
     )
     with pytest.raises(TypeError, match=r"aux\['diagnostics'\]"):
+        trainer_module._detach_local_energy_result(result)
+
+
+@pytest.mark.parametrize("invalid_aux", [
+    OrderedDict([("tensor", torch.tensor([1.0]))]),
+    UserDict({"tensor": torch.tensor([1.0])}),
+    type("AuxDict", (dict,), {})(tensor=torch.tensor([1.0])),
+    [torch.tensor([1.0])],
+])
+def test_aux_contract_rejects_invalid_root_container(invalid_aux: Any) -> None:
+    source = torch.tensor([1.0], dtype=torch.float64, requires_grad=True)
+    result = LocalEnergyResult(
+        total=source,
+        wavefunction_output=WavefunctionOutput(
+            logabs=source,
+            sign=torch.ones_like(source),
+            aux=invalid_aux,
+        ),
+    )
+    with pytest.raises(TypeError, match=r"aux"):
         trainer_module._detach_local_energy_result(result)
