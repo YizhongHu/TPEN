@@ -128,6 +128,8 @@ def ready_batch_v2(
         )
     if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
         raise ValueError("v2 rows must be a sequence")
+    if not rows:
+        raise ValueError("v2 rows must not be empty")
     copied_rows = [dict(_row(row)) for row in rows]
     identities = [row.get("invocation_id") for row in copied_rows]
     if any(not isinstance(identity, str) or not identity.strip() for identity in identities):
