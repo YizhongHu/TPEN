@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 import torch
 
+from tpen.artifacts import RunContext
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.physics.hamiltonian import LocalEnergyResult
 from tpen.physics.kinetic import KineticEnergy
@@ -65,7 +66,7 @@ class _RecordingAdam(torch.optim.Adam):
         return result
 
 
-class _Records:
+class _Records(RunContext):
     def __init__(self) -> None:
         self.metadata = type("Metadata", (), {"device": "cpu", "dtype": "float64"})()
         self.records: list[tuple[str, dict[str, object]]] = []
