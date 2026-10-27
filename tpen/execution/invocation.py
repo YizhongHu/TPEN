@@ -541,10 +541,15 @@ def _committed_checkpoint(run_dir: Path) -> CheckpointRef | None:
     catalog_path = checkpoint_root / PUBLICATION_CATALOG_FILENAME
     if catalog_path.is_file():
         publications = read_publications(catalog_path)
-        ref = (
-            max(publications, key=lambda candidate: candidate.next_iteration)
-            if publications else _reconcile_unpublished_checkpoint(checkpoint_root)
-        )
+        # A readable catalog is an index, not the authority over newer
+        # committed checkpoint directories.  Scan all complete directories
+        # through CheckpointRef and the train-resume manifest gate, then let
+        # the checkpoint package reconcile any missing publication indexes.
+        # Keep the catalog read above outside the fallback so a corrupt
+        # catalog still refuses instead of silently falling back.
+        ref = _reconcile_unpublished_checkpoint(checkpoint_root)
+        if ref is None and publications:
+            ref = max(publications, key=lambda candidate: candidate.next_iteration)
     elif not (checkpoint_root / LATEST_JSON).is_file():
         # A COMPLETE directory may have landed before either publication
         # index. Reconcile it instead of resolving the root as a checkpoint.
