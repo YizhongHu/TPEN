@@ -8,7 +8,10 @@ the scientific labels separate from the resolver that consumes them later.
 from __future__ import annotations
 
 from copy import deepcopy
+from collections.abc import Mapping
 from typing import Any
+
+from omegaconf import OmegaConf
 
 
 class ContextMappingError(ValueError):
@@ -26,6 +29,20 @@ class UnsupportedActivationLabel(ContextMappingError):
 _INPUT_FEATURE_LABELS = {
     "raw",
     "raw plus bounded distances",
+}
+
+
+_JASTROW_AXIS_LABELS = {
+    "absent",
+    "two-coefficient",
+}
+
+
+_PACKAGE_LABELS = {
+    "B00": ("raw", "absent"),
+    "B10": ("raw plus bounded distances", "absent"),
+    "B01": ("raw", "two-coefficient"),
+    "B11": ("raw plus bounded distances", "two-coefficient"),
 }
 
 
@@ -156,6 +173,97 @@ def build_input_feature_fragment(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """Alias for :func:`input_feature_fragment` used by materializers."""
 
     return input_feature_fragment(*args, **kwargs)
+
+
+def jastrow_fragment(label: str, *, length: float = 1.0) -> dict[str, Any]:
+    """Return the optional additive log-Jastrow factor fragment.
+
+    The absent axis is an empty fragment.  The two-coefficient axis writes all
+    constructor values explicitly so a package cannot inherit an identity
+    factor accidentally.  The caller appends this mapping to the existing
+    ``model.factors`` list; the control factor entries are never replaced here.
+    """
+
+    if label not in _JASTROW_AXIS_LABELS:
+        raise UnknownContextLabel(f"unknown Jastrow axis label: {label!r}")
+    if type(length) not in {int, float} or isinstance(length, bool) or length != 1.0:
+        raise ContextMappingError("Jastrow length is fixed at 1.0 bohr for this study")
+    if label == "absent":
+        return {}
+    return {
+        "_target_": "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
+        "trainable": True,
+        "length": 1.0,
+        "mean_coefficient": 0.0,
+        "difference_coefficient": 0.0,
+    }
+
+
+def build_jastrow_fragment(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Alias for :func:`jastrow_fragment` used by materializers."""
+
+    return jastrow_fragment(*args, **kwargs)
+
+
+def package_fragment(label: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Return the input override and optional factor for one B package.
+
+    The factor is deliberately returned separately from the merge-shaped input
+    mapping.  This prevents a caller from passing a one-entry ``factors`` list
+    to ``OmegaConf.merge`` and silently replacing the control cusps.
+    """
+
+    try:
+        input_label, jastrow_label = _PACKAGE_LABELS[label]
+    except KeyError as exc:
+        raise UnknownContextLabel(f"unknown B package label: {label!r}") from exc
+
+    return input_feature_fragment(input_label), jastrow_fragment(jastrow_label) or None
+
+
+def compose_package(model_cfg: Mapping[str, Any], label: str) -> dict[str, Any]:
+    """Compose one package onto a model config without replacing its factors.
+
+    The returned mapping is fresh.  Nested input-feature overrides are merged,
+    while an optional Jastrow is appended after the existing factor entries.
+    Assign it back at the full configuration's model key (for example,
+    ``cfg.model = compose_package(cfg.model, label)``) before resolving it.
+    Interpolations are intentionally preserved unresolved and resolve against
+    that full configuration root; resolving the standalone mapping is invalid.
+    """
+
+    fragment, factor = package_fragment(label)
+    if OmegaConf.is_config(model_cfg):
+        # Detach from the source config before merging.  Otherwise deepcopy
+        # preserves DictConfig parent links and interpolation access can
+        # silently resolve against a different root.
+        base = OmegaConf.to_container(model_cfg, resolve=False)
+    else:
+        base = deepcopy(model_cfg)
+    composed = _merge_mappings(base, fragment)
+    if factor is not None:
+        factors = deepcopy(composed.get("factors", []))
+        factors.append(deepcopy(factor))
+        composed["factors"] = factors
+    return composed
+
+
+def _merge_mappings(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    """Deep-merge mappings while preserving list-valued fields verbatim."""
+
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(merged.get(key), Mapping) and isinstance(value, Mapping):
+            merged[key] = _merge_mappings(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def build_package_fragment(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Alias for :func:`package_fragment` used by materializers."""
+
+    return package_fragment(*args, **kwargs)
 
 
 def _layer_fragment(
@@ -345,7 +453,12 @@ __all__ = [
     "UnknownContextLabel",
     "UnsupportedActivationLabel",
     "build_input_feature_fragment",
+    "build_jastrow_fragment",
+    "build_package_fragment",
     "build_context_fragment",
+    "compose_package",
     "context_fragment",
     "input_feature_fragment",
+    "jastrow_fragment",
+    "package_fragment",
 ]
