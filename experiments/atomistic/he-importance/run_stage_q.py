@@ -982,7 +982,27 @@ def _q_training_packet(cell: Any) -> Any:
 
 
 def _resolve_selected_config(selection: CellSelection) -> tuple[Any, Any]:
-    """Resolve and truthfulness-check the packet owned by one selection."""
+    """Resolve and truthfulness-check one selected packet.
+
+    Parameters
+    ----------
+    selection : CellSelection
+        The single cell selected by the Stage-Q admission and truthfulness
+        route.
+
+    Returns
+    -------
+    tuple[Any, Any]
+        The materialized training packet and its resolved configuration. This
+        is the single selection-side resolve-and-check route used by execute
+        and by the launch-path equality test.
+
+    Raises
+    ------
+    StageQSelectionError
+        If packet materialization, resolution, or the consumed-model
+        truthfulness checks refuse the selected cell.
+    """
 
     packet = _q_training_packet(selection.cell)
     resolved = train_config.resolve_train_config(packet)

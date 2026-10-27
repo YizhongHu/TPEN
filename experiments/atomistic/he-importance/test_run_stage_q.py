@@ -299,6 +299,40 @@ def test_o_composite_launch_path_matches_selection_path(tmp_path: Path) -> None:
     )
 
 
+def test_o_composite_launch_config_divergence_is_red(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = next(
+        cell
+        for cell in _q_adam_cells(_cells(tmp_path), context="O-composite")
+        if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+        and cell.manifest["seed_identity"]["label"] == 810001
+    )
+    selection = runner.select_cell(
+        (target,), context="O-composite", seed_label=810001
+    )
+    packet, selected = runner._resolve_selected_config(selection)
+    original_prepare = runner.launch.prepare_train_launch
+
+    def divergent_prepare(source: object, topology: object) -> object:
+        plan = original_prepare(source, topology)
+        runner.OmegaConf.update(
+            plan.config,
+            "model.layers.0.update._target_",
+            "tpen.nn.ReplacementUpdater",
+            merge=False,
+        )
+        return plan
+
+    monkeypatch.setattr(runner.launch, "prepare_train_launch", divergent_prepare)
+    launched = runner.launch.prepare_train_launch(packet, _r2_facts())
+    with pytest.raises(AssertionError):
+        assert runner.OmegaConf.to_container(launched.config, resolve=True) == runner.OmegaConf.to_container(
+            selected, resolve=True
+        )
+
+
 def test_truthfulness_guard_leaves_exactly_one_mechanics_cell(tmp_path: Path) -> None:
     selection = runner.select_cell(_cells(tmp_path), seed_label=810001)
     levels = selection.selected.optimizer["levels"]
