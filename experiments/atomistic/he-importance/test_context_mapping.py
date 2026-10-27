@@ -203,6 +203,78 @@ def test_zero_jastrow_is_exactly_the_corresponding_control(
     assert torch.equal(factor.difference_coefficient, torch.zeros_like(factor.difference_coefficient))
 
 
+def test_all_four_matched_starts_have_exactly_the_same_initial_function() -> None:
+    """The B grid starts from one function, including the O-composite cells."""
+
+    outputs = []
+    for package in ("B00", "B10", "B01", "B11"):
+        train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+        train.model = context_mapping.compose_package(train.model, package)
+        OmegaConf.resolve(train)
+        torch.manual_seed(1729)
+        model = instantiate(train.model).to(dtype=torch.float64)
+        outputs.append(model(_he_batch()))
+
+    for output in outputs[1:]:
+        assert torch.equal(output.logabs, outputs[0].logabs)
+        assert torch.equal(output.sign, outputs[0].sign)
+
+
+@pytest.mark.parametrize("package", ("B10", "B11"))
+def test_matched_start_added_columns_have_the_right_first_layer_gradient(
+    package: str,
+) -> None:
+    """Check the outer-product identity for each order's first layer."""
+
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model = context_mapping.compose_package(train.model, package)
+    OmegaConf.resolve(train)
+    torch.manual_seed(1729)
+    model = instantiate(train.model).to(dtype=torch.float64)
+    batch = instantiate(
+        {
+            "_target_": "tpen.data.batch.ElectronBatch",
+            "positions": torch.tensor(
+                [[[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]], dtype=torch.float64
+            ),
+            "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
+            "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
+            "spins": torch.tensor([[1.0, -1.0]], dtype=torch.float64),
+        }
+    )
+    captured = {}
+    hooks = []
+    for order in (1, 2):
+        layer = model.embedding.order_mlps[str(order)].layers[0]
+        hooks.append(layer.register_forward_pre_hook(lambda module, inputs, order=order: captured.setdefault(order, inputs[0])))
+    try:
+        logabs = model(batch).logabs[0]
+        expected_inputs = {
+            1: torch.tensor([1.0, 0.0, 0.0, 1.0, 1 / 2], dtype=torch.float64),
+            2: torch.tensor(
+                [1.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, -1.0, 1 / 2, 4 / 5, 5 / 6],
+                dtype=torch.float64,
+            ),
+        }
+        for order in (1, 2):
+            x = captured[order][0]
+            torch.testing.assert_close(x, expected_inputs[order], rtol=1e-12, atol=1e-12)
+            weight = model.embedding.order_mlps[str(order)].layers[0].weight
+            gradient = torch.autograd.grad(logabs, weight, retain_graph=True)[0]
+            added = 4 if order == 1 else (4, 9)
+            for added_index in (added,) if isinstance(added, int) else added:
+                raw_index = 0 if added_index == 4 else 5
+                torch.testing.assert_close(
+                    gradient[:, added_index] * x[raw_index],
+                    gradient[:, raw_index] * x[added_index],
+                    rtol=1e-12,
+                    atol=1e-12,
+                )
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
 @pytest.mark.parametrize("package", ("B01", "B11"))
 def test_jastrow_coefficient_derivatives_match_the_explicit_two_electron_oracle(
     package: str,

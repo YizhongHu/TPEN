@@ -331,7 +331,40 @@ def _normalize_aux_feature_channels(value: Mapping[str, int]) -> dict[str, int]:
 
 
 __all__ = [
-    "transplant_raw_input_columns","Embedding"]
+    "matched_start_embedding",
+    "transplant_raw_input_columns",
+    "Embedding",
+]
+
+
+def matched_start_embedding(*, raw: "Embedding", augmented: "Embedding") -> "Embedding":
+    r"""Return ``augmented`` after constructing a matched raw-feature start.
+
+    Parameters
+    ----------
+    raw : Embedding
+        The same-seed control embedding consuming only the raw per-particle
+        features.
+    augmented : Embedding
+        The wider embedding consuming raw features plus bounded-distance
+        features. Its added columns remain trainable after they are zeroed.
+
+    Returns
+    -------
+    Embedding
+        The ``augmented`` instance, after its shared parameters have been
+        copied from ``raw`` and its added input columns have been zeroed.
+
+    Raises
+    ------
+    TypeError
+        If either argument is not an :class:`Embedding`.
+    """
+
+    if not isinstance(raw, Embedding) or not isinstance(augmented, Embedding):
+        raise TypeError("matched_start_embedding expects two constructed Embedding instances")
+    transplant_raw_input_columns(raw, augmented)
+    return augmented
 
 
 def transplant_raw_input_columns(source: "Embedding", target: "Embedding") -> None:

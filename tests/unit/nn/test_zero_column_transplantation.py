@@ -28,7 +28,7 @@ torch = pytest.importorskip("torch")
 
 from tpen.data.batch import ElectronBatch
 from tpen.nn.basis import BoundedDistanceBasis, RawCoordinateBasis
-from tpen.nn.embedding import Embedding, transplant_raw_input_columns
+from tpen.nn.embedding import Embedding, matched_start_embedding, transplant_raw_input_columns
 
 PAIR_CHANNELS = 3
 
@@ -207,3 +207,21 @@ class TestRefusals:
         _, augmented = _pair()
         with pytest.raises(ValueError, match="equal max_order"):
             transplant_raw_input_columns(raw, augmented)
+
+
+class TestMatchedStartFactory:
+    def test_returns_augmented_and_leaves_source_unchanged(self) -> None:
+        raw, augmented = _pair()
+        source_before = {name: value.detach().clone() for name, value in raw.named_parameters()}
+
+        returned = matched_start_embedding(raw=raw, augmented=augmented)
+
+        assert returned is augmented
+        for name, value in raw.named_parameters():
+            assert torch.equal(value, source_before[name])
+
+    def test_refuses_width_mismatch(self) -> None:
+        raw = _embedding(_raw_basis().out_features, 0, seed=0)
+        narrower = _embedding(_raw_basis().out_features - 1, 0, seed=1)
+        with pytest.raises(ValueError, match="at least as wide"):
+            matched_start_embedding(raw=raw, augmented=narrower)

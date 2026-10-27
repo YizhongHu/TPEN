@@ -241,6 +241,18 @@ def compose_package(model_cfg: Mapping[str, Any], label: str) -> dict[str, Any]:
     else:
         base = deepcopy(model_cfg)
     composed = _merge_mappings(base, fragment)
+    if fragment.get("embedding"):
+        # Construct the raw twin from the verbatim control embedding and the
+        # augmented target from the same config with only the package's input
+        # overrides. Hydra constructs both before the factory transplants the
+        # shared parameters, preserving the authoritative seed stream.
+        control_embedding = deepcopy(base["embedding"])
+        augmented_embedding = deepcopy(composed["embedding"])
+        composed["embedding"] = {
+            "_target_": "tpen.nn.embedding.matched_start_embedding",
+            "raw": control_embedding,
+            "augmented": augmented_embedding,
+        }
     if factor is not None:
         factors = deepcopy(composed.get("factors", []))
         factors.append(deepcopy(factor))
