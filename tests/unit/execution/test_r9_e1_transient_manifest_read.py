@@ -10,9 +10,11 @@ from tpen.checkpoint import CheckpointRef
 from tpen.checkpoint.payload import TrainResume
 from tpen.execution import (
     CheckpointEvidence,
+    InvocationOutcome,
     RecoveryOutcome,
     RecoveryPhase,
     RefusalCode,
+    classify_core_outcome,
     select_recovery,
 )
 import tpen.execution.recovery as recovery
@@ -56,6 +58,22 @@ def _checkpoint(root: Path) -> Path:
     }))
     (path / "COMPLETE").write_text("complete\n")
     return path
+
+
+def test_r9_transient_oserror_on_model_only_manifest_read_parks(tmp_path: Path, monkeypatch) -> None:
+    # GREEN: the core outcome classifier parks an incomplete recovery decision.
+    intent, evidence = _decision(tmp_path)
+    original = recovery.read_manifest
+
+    def injected(path, *, mode):
+        if mode == "model_only":
+            raise OSError("injected EIO")
+        return original(path, mode=mode)
+
+    monkeypatch.setattr(recovery, "read_manifest", injected)
+    decision = select_recovery(intent, phase=RecoveryPhase.RECOVERY, evidence=evidence)
+    outcome, _reason = classify_core_outcome(None, decision=decision)
+    assert outcome is InvocationOutcome.PARKED
 
 
 def test_r9_transient_oserror_on_model_only_manifest_read_is_incomplete(tmp_path: Path, monkeypatch) -> None:
