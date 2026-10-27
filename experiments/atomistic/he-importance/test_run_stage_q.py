@@ -1047,7 +1047,7 @@ def test_r2_r4_cooperative_execute_race_has_one_winner_and_preserves_winner_byte
             assert after_first["COMPLETE"] is None
 
 
-def test_selection_resolves_each_candidate_and_refuses_consuming_resolver(
+def test_selection_resolves_only_the_requested_level_cell(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cells = _q_adam_cells(_cells(tmp_path), context="O-raw")
@@ -1099,9 +1099,50 @@ def test_selection_resolves_each_candidate_and_refuses_consuming_resolver(
     monkeypatch.setattr(
         runner.train_config, "resolve_train_config", resolve_declared_levels
     )
-    with pytest.raises(runner.StageQSelectionError, match="ambiguous"):
-        runner.select_cell(cells, seed_label=810001)
-    assert len(resolved_sources) == 8
+    selected = runner.select_cell(cells, seed_label=810001, lr=0.005, beta2=0.999)
+    assert selected.selected.optimizer["levels"]["lr"] == 0.005
+    assert selected.selected.optimizer["levels"]["beta2"] == 0.999
+    assert len(resolved_sources) == 1
+
+
+def test_mutant_without_level_consumption_is_red_for_seven_of_eight_cells(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The level mapping is load-bearing: a no-op mutant rejects 7/8 cells."""
+
+    cells = _q_adam_cells(_cells(tmp_path), context="O-raw")
+    fixed = {
+        "lr": 0.005,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "epsilon": 1e-8,
+        "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
+    }
+    original = runner.train_config._declared_adam_levels
+
+    def validation_preserving_mutant(manifest: object) -> dict[str, object]:
+        original(manifest)
+        return fixed
+
+    monkeypatch.setattr(
+        runner.train_config, "_declared_adam_levels", validation_preserving_mutant
+    )
+
+    refused = 0
+    for cell in cells:
+        levels = cell.manifest["scientific_identity"]["optimizer"]["levels"]
+        try:
+            runner.select_cell(
+                (cell,),
+                lr=levels["lr"],
+                beta2=levels["beta2"],
+                seed_label=810001,
+            )
+        except runner.StageQSelectionError:
+            refused += 1
+    assert refused == 7
 
 
 def test_truthfulness_guard_refuses_consumed_non_adam_optimizer(
