@@ -622,12 +622,7 @@ def _run_short_embedding_training(
             if freeze_added:
                 weight.grad[:, _ADDED_INPUT_COLUMNS[order]] = 0
         captured_gradients.append(step_gradients)
-        result = original_step(optimizer, *args, **kwargs)
-        if freeze_added:
-            with torch.no_grad():
-                for order, weight in weights.items():
-                    weight[:, _ADDED_INPUT_COLUMNS[order]] = 0
-        return result
+        return original_step(optimizer, *args, **kwargs)
 
     monkeypatch.setattr(torch.optim.Adam, "step", capture_step)
     runner.run(make_run_context(tmp_path, run_id=f"{package}-embedding-{freeze_added}"))
@@ -662,6 +657,9 @@ def test_frozen_added_embedding_columns_stay_zero_while_raw_weights_move(
     assert len(gradients) == 2
     for order, weight in weights.items():
         added = _ADDED_INPUT_COLUMNS[order]
+        step_zero_gradient = gradients[0][order][:, added]
+        assert torch.isfinite(step_zero_gradient).all()
+        assert torch.any(step_zero_gradient != 0)
         raw = tuple(index for index in range(weight.shape[1]) if index not in added)
         assert torch.equal(weight[:, added].detach(), torch.zeros_like(weight[:, added]))
         assert torch.isfinite(weight[:, raw]).all()
