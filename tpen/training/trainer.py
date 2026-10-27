@@ -84,28 +84,43 @@ def _gradient_norm(model) -> float:
     return float(torch.sqrt(total).item()) if total is not None else 0.0
 
 
-def _detach_aux_value(value: Any) -> Any:
+def _detach_aux_value(value: Any, path: str) -> Any:
     """Detach tensor leaves while preserving supported diagnostic containers."""
 
     if isinstance(value, torch.Tensor):
         return value.detach()
-    if isinstance(value, Mapping):
-        return {key: _detach_aux_value(nested) for key, nested in value.items()}
-    if isinstance(value, list):
-        return [_detach_aux_value(nested) for nested in value]
-    if isinstance(value, tuple):
-        return tuple(_detach_aux_value(nested) for nested in value)
-    return value
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    if type(value) is dict:
+        detached = {}
+        for key, nested in value.items():
+            if type(key) is not str:
+                raise TypeError(f"unsupported local-energy aux key at {path}: {key!r}")
+            detached[key] = _detach_aux_value(nested, f"{path}[{key!r}]")
+        return detached
+    if type(value) is list:
+        return [_detach_aux_value(nested, f"{path}[{index}]") for index, nested in enumerate(value)]
+    if type(value) is tuple:
+        return tuple(
+            _detach_aux_value(nested, f"{path}[{index}]")
+            for index, nested in enumerate(value)
+        )
+    raise TypeError(
+        f"unsupported local-energy aux value at {path}: {type(value).__name__}"
+    )
 
 
 def _detach_wavefunction_output(output: WavefunctionOutput) -> WavefunctionOutput:
     """Keep local-energy diagnostics while releasing their autograd graph."""
 
+    for key in output.aux:
+        if type(key) is not str:
+            raise TypeError(f"unsupported local-energy aux key at aux: {key!r}")
     return WavefunctionOutput(
         logabs=output.logabs.detach(),
         sign=output.sign.detach(),
         phase=None if output.phase is None else output.phase.detach(),
-        aux={key: _detach_aux_value(value) for key, value in output.aux.items()},
+        aux={key: _detach_aux_value(value, f"aux[{key!r}]") for key, value in output.aux.items()},
     )
 
 
@@ -126,6 +141,16 @@ def _detach_local_energy_result(result: LocalEnergyResult) -> LocalEnergyResult:
             else result.per_electron_kinetic.detach()
         ),
     )
+
+
+def _detach_local_energy_value(result: Any) -> Any:
+    """Release either the structured or tensor local-energy handoff."""
+
+    if isinstance(result, LocalEnergyResult):
+        return _detach_local_energy_result(result)
+    if isinstance(result, torch.Tensor):
+        return result.detach()
+    return result
 
 
 class VMCTrainer:
@@ -745,10 +770,7 @@ class VMCTrainer:
                 # wavefunction output, not through local energy.  Its closure
                 # re-evaluation builds a fresh local-energy graph when needed,
                 # so no consumer in this step needs to retain this one.
-                if isinstance(result, LocalEnergyResult):
-                    result = _detach_local_energy_result(result)
-                elif isinstance(result, torch.Tensor):
-                    result = result.detach()
+                result = _detach_local_energy_value(result)
                 if isinstance(result, LocalEnergyResult):
                     total_local_energy = result.total
                     term_energies = result.terms
