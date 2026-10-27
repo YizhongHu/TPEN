@@ -477,7 +477,9 @@ def _checkpoint_refusal(ref: CheckpointRef, *, target_iterations: int) -> Recove
     manifest_path = checkpoint_dir / "manifest.json"
     try:
         model_manifest = read_manifest(manifest_path, mode="model_only")
-    except (FileNotFoundError, OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+    except (FileNotFoundError, OSError) as exc:
+        return RecoveryRefusal(RefusalCode.INCOMPLETE, f"checkpoint manifest is incomplete: {exc}")
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         return RecoveryRefusal(RefusalCode.UNSUPPORTED, f"checkpoint manifest is unsupported: {exc}")
 
     profile = None
