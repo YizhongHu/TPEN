@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +11,7 @@ import torch
 
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.physics.hamiltonian import LocalEnergyResult
+from tpen.physics.kinetic import KineticEnergy
 from tpen.training import trainer as trainer_module
 from tpen.training.trainer import VMCTrainer
 
@@ -91,11 +93,49 @@ def _batch() -> ElectronBatch:
     return ElectronBatch(positions=positions, spins=spins)
 
 
-def _run(*, skip_detach: bool) -> dict[str, object]:
+def _freeze_aux(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {key: _freeze_aux(nested) for key, nested in value.items()}
+    if isinstance(value, list):
+        return [_freeze_aux(nested) for nested in value]
+    if isinstance(value, tuple):
+        return tuple(_freeze_aux(nested) for nested in value)
+    return value
+
+
+def _freeze_result(result: LocalEnergyResult) -> LocalEnergyResult:
+    output = result.wavefunction_output
+    return LocalEnergyResult(
+        total=result.total.detach().clone(),
+        terms={name: value.detach().clone() for name, value in result.terms.items()},
+        wavefunction_output=(
+            None
+            if output is None
+            else WavefunctionOutput(
+                logabs=output.logabs.detach().clone(),
+                sign=output.sign.detach().clone(),
+                phase=None if output.phase is None else output.phase.detach().clone(),
+                aux={key: _freeze_aux(value) for key, value in output.aux.items()},
+            )
+        ),
+        per_electron_kinetic=(
+            None
+            if result.per_electron_kinetic is None
+            else result.per_electron_kinetic.detach().clone()
+        ),
+    )
+
+
+def _run(*, skip_detach: bool, handoff_mutant: str | None = None) -> dict[str, object]:
     model = _TinyWavefunction()
     optimizer = _RecordingAdam(model)
     sampler = _FixedSampler(_batch())
-    records: list[LocalEnergyResult] = []
+    snapshots: list[LocalEnergyResult] = []
+    objective_inputs: list[torch.Tensor] = []
+    original_local_energy = trainer_module.local_energy
+    original_objective = trainer_module.compute_vmc_objective
 
     def fake_local_energy(terms, wavefunction, batch, *, return_terms=False):
         del terms
@@ -113,14 +153,31 @@ def _run(*, skip_detach: bool) -> dict[str, object]:
             ),
             per_electron_kinetic=total[:, None].expand(-1, 2),
         )
-        records.append(result)
         return result if return_terms else result.total
 
-    original_local_energy = trainer_module.local_energy
     original_detach = trainer_module._detach_local_energy_result
     trainer_module.local_energy = fake_local_energy
-    if skip_detach:
-        trainer_module._detach_local_energy_result = lambda result: result
+
+    def record_objective_input(logabs, local_energy, *, nonfinite_policy):
+        objective_inputs.append(local_energy.detach().clone())
+        return original_objective(
+            logabs,
+            local_energy,
+            nonfinite_policy=nonfinite_policy,
+        )
+
+    trainer_module.compute_vmc_objective = record_objective_input
+
+    def handoff(result: LocalEnergyResult) -> LocalEnergyResult:
+        if handoff_mutant == "flip-sign":
+            assert result.wavefunction_output is not None
+            result.wavefunction_output.sign = -result.wavefunction_output.sign
+        elif handoff_mutant == "drop-term":
+            result.terms.pop("beta")
+        snapshots.append(_freeze_result(result))
+        return result if skip_detach else original_detach(result)
+
+    trainer_module._detach_local_energy_result = handoff
     try:
         context = _Records()
         trainer = VMCTrainer(
@@ -138,13 +195,16 @@ def _run(*, skip_detach: bool) -> dict[str, object]:
         )
     finally:
         trainer_module.local_energy = original_local_energy
+        trainer_module.compute_vmc_objective = original_objective
         trainer_module._detach_local_energy_result = original_detach
 
     return {
         "losses": [metrics["loss"] for namespace, metrics in context.records if namespace == "train"],
+        "metrics": [metrics for namespace, metrics in context.records if namespace == "train"],
+        "objective_inputs": objective_inputs,
         "gradients": optimizer.gradients,
         "parameters": optimizer.parameters_after_step,
-        "results": records,
+        "results": snapshots,
     }
 
 
@@ -154,6 +214,10 @@ def _assert_equal(left: dict[str, object], right: dict[str, object]) -> None:
         assert torch.equal(torch.nan_to_num(left_tensor), torch.nan_to_num(right_tensor))
 
     assert left["losses"] == right["losses"]
+    assert left["metrics"] == right["metrics"]
+    assert len(left["objective_inputs"]) == len(right["objective_inputs"]) == 3
+    for left_input, right_input in zip(left["objective_inputs"], right["objective_inputs"]):
+        equal_with_mask(left_input, right_input)
     assert len(left["gradients"]) == len(right["gradients"]) == 3
     assert len(left["parameters"]) == len(right["parameters"]) == 3
     assert len(left["results"]) == len(right["results"]) == 3
@@ -200,8 +264,7 @@ def test_current_and_detached_paths_are_bitwise_equivalent_over_three_updates() 
 
 def test_red_omitting_a_term_fails_the_equivalence_oracle() -> None:
     current = _run(skip_detach=True)
-    detached = _run(skip_detach=False)
-    del detached["results"][0].terms["beta"]
+    detached = _run(skip_detach=False, handoff_mutant="drop-term")
     with pytest.raises(AssertionError):
         _assert_equal(current, detached)
 
@@ -212,6 +275,96 @@ def test_red_changing_the_loss_input_fails_the_equivalence_oracle() -> None:
     detached["losses"][1] = detached["losses"][1] + 1.0
     with pytest.raises(AssertionError):
         _assert_equal(current, detached)
+
+
+def test_red_mutating_captured_sign_at_handoff_fails_the_equivalence_oracle() -> None:
+    current = _run(skip_detach=True)
+    detached = _run(skip_detach=False, handoff_mutant="flip-sign")
+    with pytest.raises(AssertionError):
+        _assert_equal(current, detached)
+
+
+def test_real_kinetic_evaluator_result_is_detached() -> None:
+    model = _TinyWavefunction()
+    result = KineticEnergy().local_energy(model, _batch())
+    detached = trainer_module._detach_local_energy_result(result)
+    assert detached.wavefunction_output is not None
+    assert not detached.total.requires_grad
+    assert not detached.wavefunction_output.logabs.requires_grad
+    assert not detached.per_electron_kinetic.requires_grad
+
+
+def _run_lifecycle(
+    *, tensor_fallback: bool, skip_handoff: bool, trainer_return_terms: bool = True
+) -> list[bool]:
+    model = _TinyWavefunction()
+    optimizer = _RecordingAdam(model)
+    sampler = _FixedSampler(_batch())
+    original_local_energy = trainer_module.local_energy
+    original_detach = trainer_module._detach_local_energy_result
+    previous_graphs: list[weakref.ReferenceType[torch.Tensor]] = []
+    released_before_next_call: list[bool] = []
+
+    def fake_local_energy(terms, wavefunction, batch, *, return_terms=False):
+        del terms, return_terms
+        if previous_graphs:
+            released_before_next_call.extend(reference() is None for reference in previous_graphs)
+            assert all(released_before_next_call[-len(previous_graphs) :])
+        output = wavefunction(batch)
+        total = output.logabs * 2.0
+        if tensor_fallback:
+            previous_graphs.append(weakref.ref(total))
+            return total
+        nested = output.logabs * 11.0
+        result = LocalEnergyResult(
+            total=total,
+            terms={"kinetic": total},
+            wavefunction_output=WavefunctionOutput(
+                logabs=output.logabs,
+                sign=output.sign,
+                aux={"nested": [{"kinetic": nested}]},
+            ),
+        )
+        previous_graphs.extend([weakref.ref(total), weakref.ref(nested)])
+        return result
+
+    trainer_module.local_energy = fake_local_energy
+    if skip_handoff:
+        trainer_module._detach_local_energy_result = lambda result: result
+    try:
+        trainer = VMCTrainer(max_steps=2, return_terms=trainer_return_terms)
+        trainer.fit(
+            model=model,
+            sampler=sampler,
+            hamiltonian_terms=[],
+            optimizer=optimizer,
+            context=_Records(),
+            emit=lambda *args, **kwargs: None,
+        )
+    finally:
+        trainer_module.local_energy = original_local_energy
+        trainer_module._detach_local_energy_result = original_detach
+    return released_before_next_call
+
+
+@pytest.mark.parametrize("tensor_fallback", [False, True])
+def test_fit_releases_graphs_before_next_local_energy_call(tensor_fallback: bool) -> None:
+    released = _run_lifecycle(tensor_fallback=tensor_fallback, skip_handoff=False)
+    assert released and all(released)
+
+
+def test_return_terms_false_uses_tensor_fallback_and_releases_graph() -> None:
+    released = _run_lifecycle(
+        tensor_fallback=True,
+        skip_handoff=False,
+        trainer_return_terms=False,
+    )
+    assert released and all(released)
+
+
+def test_fit_graph_release_integration_is_red_without_handoff() -> None:
+    with pytest.raises(AssertionError):
+        _run_lifecycle(tensor_fallback=False, skip_handoff=True)
 
 
 def test_detached_result_is_structurally_graph_free() -> None:

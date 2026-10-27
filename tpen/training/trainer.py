@@ -84,6 +84,20 @@ def _gradient_norm(model) -> float:
     return float(torch.sqrt(total).item()) if total is not None else 0.0
 
 
+def _detach_aux_value(value: Any) -> Any:
+    """Detach tensor leaves while preserving supported diagnostic containers."""
+
+    if isinstance(value, torch.Tensor):
+        return value.detach()
+    if isinstance(value, Mapping):
+        return {key: _detach_aux_value(nested) for key, nested in value.items()}
+    if isinstance(value, list):
+        return [_detach_aux_value(nested) for nested in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_aux_value(nested) for nested in value)
+    return value
+
+
 def _detach_wavefunction_output(output: WavefunctionOutput) -> WavefunctionOutput:
     """Keep local-energy diagnostics while releasing their autograd graph."""
 
@@ -91,10 +105,7 @@ def _detach_wavefunction_output(output: WavefunctionOutput) -> WavefunctionOutpu
         logabs=output.logabs.detach(),
         sign=output.sign.detach(),
         phase=None if output.phase is None else output.phase.detach(),
-        aux={
-            key: value.detach() if isinstance(value, torch.Tensor) else value
-            for key, value in output.aux.items()
-        },
+        aux={key: _detach_aux_value(value) for key, value in output.aux.items()},
     )
 
 
