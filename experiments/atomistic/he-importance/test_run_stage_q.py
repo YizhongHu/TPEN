@@ -2765,11 +2765,27 @@ def test_a5_o_composite_runner_route_closes_the_three_l5_traps(
     direct_b11 = instantiate(direct_root.model).to(dtype=torch.float64)
     assert not torch.equal(direct_b11(batch).logabs, b01(batch).logabs)
 
+    actual_resolver = runner.train_config.resolve_train_config
+
+    def direct_runner_route(source: object) -> object:
+        healthy = actual_resolver(source)
+        mutated = runner.OmegaConf.create(
+            runner.OmegaConf.to_container(healthy, resolve=False)
+        )
+        for prefix in ("model", "runner.model"):
+            runner.OmegaConf.update(
+                mutated,
+                f"{prefix}.embedding._target_",
+                "tpen.nn.Embedding",
+                merge=False,
+            )
+        return mutated
+
     with monkeypatch.context() as context:
-        context.setattr(runner.train_config, "resolve_train_config", lambda _: direct_root)
+        context.setattr(runner.train_config, "resolve_train_config", direct_runner_route)
         with pytest.raises(
             runner.StageQSelectionError,
-            match=r"input_features\.model\.embedding\._target_.*matched_start_embedding",
+            match=r"truthfulness guard refused field 'context\.overrides\.input_features\.model\.embedding\._target_'.*item dd964863",
         ):
             runner.select_cell(
                 (_o_composite_target(tmp_path),),
