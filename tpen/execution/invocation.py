@@ -558,7 +558,13 @@ def _committed_checkpoint(run_dir: Path) -> CheckpointRef | None:
         # ``latest.json`` is the checkpoint package's durable convenience
         # pointer.  The resolver also requires the COMPLETE marker, so a
         # temporary or half-written directory cannot become completion facts.
-        ref = CheckpointRef.from_directory(resolve_checkpoint_dir(checkpoint_root))
+        pointer_ref = CheckpointRef.from_directory(resolve_checkpoint_dir(checkpoint_root))
+        candidate = _reconcile_unpublished_checkpoint(checkpoint_root)
+        ref = (
+            candidate
+            if candidate is not None and candidate.next_iteration > pointer_ref.next_iteration
+            else pointer_ref
+        )
 
     if ref is None:
         return None
