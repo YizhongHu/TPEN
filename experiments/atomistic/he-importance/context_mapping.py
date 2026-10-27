@@ -8,6 +8,7 @@ the scientific labels separate from the resolver that consumes them later.
 from __future__ import annotations
 
 from copy import deepcopy
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -202,13 +203,12 @@ def build_jastrow_fragment(*args: Any, **kwargs: Any) -> dict[str, Any]:
     return jastrow_fragment(*args, **kwargs)
 
 
-def package_fragment(label: str) -> dict[str, Any]:
-    """Return the model override for one accepted B00/B10/B01/B11 package.
+def package_fragment(label: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Return the input override and optional factor for one B package.
 
-    Input features are returned at the model root.  A Jastrow factor is
-    returned under ``factors`` as a one-entry append fragment; composition code
-    must concatenate it to the literal control factors rather than replacing
-    those factors.  B00 therefore returns the empty override exactly.
+    The factor is deliberately returned separately from the merge-shaped input
+    mapping.  This prevents a caller from passing a one-entry ``factors`` list
+    to ``OmegaConf.merge`` and silently replacing the control cusps.
     """
 
     try:
@@ -216,14 +216,38 @@ def package_fragment(label: str) -> dict[str, Any]:
     except KeyError as exc:
         raise UnknownContextLabel(f"unknown B package label: {label!r}") from exc
 
-    fragment = input_feature_fragment(input_label)
-    factor = jastrow_fragment(jastrow_label)
-    if factor:
-        fragment["factors"] = [factor]
-    return fragment
+    return input_feature_fragment(input_label), jastrow_fragment(jastrow_label) or None
 
 
-def build_package_fragment(*args: Any, **kwargs: Any) -> dict[str, Any]:
+def compose_package(model_cfg: Mapping[str, Any], label: str) -> dict[str, Any]:
+    """Compose one package onto a model config without replacing its factors.
+
+    The returned mapping is fresh.  Nested input-feature overrides are merged,
+    while an optional Jastrow is appended after the existing factor entries.
+    """
+
+    fragment, factor = package_fragment(label)
+    composed = _merge_mappings(model_cfg, fragment)
+    if factor is not None:
+        factors = deepcopy(composed.get("factors", []))
+        factors.append(deepcopy(factor))
+        composed["factors"] = factors
+    return composed
+
+
+def _merge_mappings(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    """Deep-merge mappings while preserving list-valued fields verbatim."""
+
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(merged.get(key), Mapping) and isinstance(value, Mapping):
+            merged[key] = _merge_mappings(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def build_package_fragment(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Alias for :func:`package_fragment` used by materializers."""
 
     return package_fragment(*args, **kwargs)
@@ -419,6 +443,7 @@ __all__ = [
     "build_jastrow_fragment",
     "build_package_fragment",
     "build_context_fragment",
+    "compose_package",
     "context_fragment",
     "input_feature_fragment",
     "jastrow_fragment",

@@ -64,37 +64,21 @@ def test_raw_input_feature_package_preserves_the_literal_control() -> None:
     assert OmegaConf.to_container(train.model, resolve=True) == before
 
 
-def _compose_package(package: str, *, trainable: bool = True):
-    """Compose one B package onto a fresh copy of the real study config."""
-
-    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    fragment = context_mapping.package_fragment(package)
-    factors = list(train.model.factors)
-    if "factors" in fragment:
-        factor = dict(fragment.pop("factors")[0])
-        factor["trainable"] = trainable
-        factors.append(OmegaConf.create(factor))
-    train.model = OmegaConf.merge(train.model, OmegaConf.create(fragment))
-    train.model.factors = factors
-    return train
-
-
 def test_package_labels_are_the_declared_two_axis_grid() -> None:
-    assert context_mapping.package_fragment("B00") == {}
-    assert context_mapping.package_fragment("B10") == context_mapping.input_feature_fragment(
-        "raw plus bounded distances"
+    assert context_mapping.package_fragment("B00") == ({}, None)
+    assert context_mapping.package_fragment("B10") == (
+        context_mapping.input_feature_fragment("raw plus bounded distances"), None
     )
     for package in ("B01", "B11"):
-        fragment = context_mapping.package_fragment(package)
-        assert fragment["factors"] == [
-            {
-                "_target_": "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
-                "trainable": True,
-                "length": 1.0,
-                "mean_coefficient": 0.0,
-                "difference_coefficient": 0.0,
-            }
-        ]
+        fragment, factor = context_mapping.package_fragment(package)
+        assert fragment in ({}, context_mapping.input_feature_fragment("raw plus bounded distances"))
+        assert factor == {
+            "_target_": "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
+            "trainable": True,
+            "length": 1.0,
+            "mean_coefficient": 0.0,
+            "difference_coefficient": 0.0,
+        }
     with pytest.raises(context_mapping.UnknownContextLabel):
         context_mapping.package_fragment("B99")
     with pytest.raises(context_mapping.UnknownContextLabel):
@@ -102,16 +86,27 @@ def test_package_labels_are_the_declared_two_axis_grid() -> None:
 
 
 def test_jastrow_is_appended_without_changing_existing_factors() -> None:
-    train = _compose_package("B01")
     original = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    assert train.model.factors[:2] == original.model.factors
-    assert train.model.factors[2] == {
+    model = OmegaConf.create(context_mapping.compose_package(original.model, "B01"))
+    assert model.factors[:2] == original.model.factors
+    assert model.factors[2] == {
         "_target_": "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
         "trainable": True,
         "length": 1.0,
         "mean_coefficient": 0.0,
         "difference_coefficient": 0.0,
     }
+
+
+def test_naive_package_merge_would_replace_the_control_factors() -> None:
+    original = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    fragment, factor = context_mapping.package_fragment("B01")
+    naive = OmegaConf.merge(
+        original.model,
+        OmegaConf.create({**fragment, "factors": [factor]}),
+    )
+    assert list(naive.factors) == [factor]
+    assert list(original.model.factors) != list(naive.factors)
 
 
 def _validate_through_hydra(train: object) -> None:
@@ -130,21 +125,27 @@ def _validate_through_hydra(train: object) -> None:
 
 @pytest.mark.parametrize("package", ("B01", "B11"))
 def test_two_coefficient_jastrow_packages_pass_the_closed_hi_schema(package: str) -> None:
-    _validate_through_hydra(_compose_package(package))
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model = OmegaConf.create(context_mapping.compose_package(train.model, package))
+    _validate_through_hydra(train)
 
 
 @pytest.mark.parametrize("package", ("B01", "B11"))
 def test_closed_hi_schema_refuses_a_frozen_two_coefficient_jastrow(package: str) -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model = OmegaConf.create(context_mapping.compose_package(train.model, package))
+    train.model.factors[-1].trainable = False
     with pytest.raises(Exception, match="undeclared-trainability"):
-        _validate_through_hydra(_compose_package(package, trainable=False))
+        _validate_through_hydra(train)
 
 
 @pytest.mark.parametrize(("jastrow_package", "control_package"), [("B01", "B00"), ("B11", "B10")])
 def test_zero_jastrow_is_exactly_the_corresponding_control(
     jastrow_package: str, control_package: str
 ) -> None:
-    mapped = _compose_package(jastrow_package)
-    control = _compose_package(control_package)
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    mapped = OmegaConf.create(context_mapping.compose_package(train.model, jastrow_package))
+    control = OmegaConf.create(context_mapping.compose_package(train.model, control_package))
     OmegaConf.resolve(mapped)
     OmegaConf.resolve(control)
     torch.manual_seed(1729)
@@ -324,7 +325,10 @@ def _run_short_real_training(
 ) -> tuple[object, list[torch.Tensor | None]]:
     """Run one reduced update through the runner composed by ``train.yaml``."""
 
-    train = _compose_package(package, trainable=trainable)
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model = OmegaConf.create(context_mapping.compose_package(train.model, package))
+    if not trainable:
+        train.model.factors[-1].trainable = False
     train.runtime.device = "cpu"
     train.sampler.n_walkers = 4
     train.sampler.burn_in = 1
@@ -357,6 +361,7 @@ def test_jastrow_coefficients_move_in_a_real_short_training_run(
     package: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     factor, gradients = _run_short_real_training(package, tmp_path, monkeypatch=monkeypatch)
+    assert len(gradients) == 2
     assert torch.equal(factor.mean_coefficient.detach(), torch.zeros_like(factor.mean_coefficient)) is False
     assert torch.equal(factor.difference_coefficient.detach(), torch.zeros_like(factor.difference_coefficient)) is False
     assert all(gradient is not None and torch.isfinite(gradient).all() and torch.any(gradient != 0) for gradient in gradients)
