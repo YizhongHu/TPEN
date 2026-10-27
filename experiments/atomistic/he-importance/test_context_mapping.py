@@ -280,7 +280,8 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
             ),
         }
         for order in (1, 2):
-            torch.testing.assert_close(captured[order][0], expected_all, rtol=1e-12, atol=1e-12)
+            expected = expected_all[order]
+            torch.testing.assert_close(captured[order][0], expected, rtol=1e-12, atol=1e-12)
             weight = model.embedding.order_mlps[str(order)].layers[0].weight
             gradient = torch.autograd.grad(logabs, weight, retain_graph=True)[0]
             expected_gradient = deltas[order][0].transpose(0, 1) @ captured[order][0]
