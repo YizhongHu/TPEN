@@ -121,6 +121,23 @@ def _context_cell(tmp_path: Path, name: str = "O-composite") -> object:
     return next(cell for cell in _q_adam_cells(tmp_path, name) if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005)
 
 
+def _independent_initializer_paths(value: object, path: str = "") -> set[str]:
+    """Find TorchInitializer targets without using the production walker."""
+
+    found: set[str] = set()
+    if isinstance(value, Mapping):
+        target = value.get("_target_")
+        if isinstance(target, str) and target.endswith("TorchInitializer"):
+            found.add(path)
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            found.update(_independent_initializer_paths(child, child_path))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, child in enumerate(value):
+            found.update(_independent_initializer_paths(child, f"{path}.{index}" if path else str(index)))
+    return found
+
+
 def _q_adam_cells(tmp_path: Path, context: str) -> list[object]:
     """Materialize the sixteen Stage-Q Adam cells for one model context."""
 
@@ -513,13 +530,29 @@ def test_o_composite_trap_negatives_are_observable(tmp_path: Path) -> None:
 def test_o_composite_binds_every_initializer_including_both_embeddings(tmp_path: Path) -> None:
     cell = _context_cell(tmp_path)
     resolved = train_config.resolve_train_config(cell)
-    paths = train_config._initializer_paths(resolved.model, "model")
-    assert len(paths) == 3
-    assert all(OmegaConf.select(resolved, path).seed == cell.seed_streams["model_initialization"] for path in paths)
+    model_container = OmegaConf.to_container(resolved.model, resolve=False)
+    paths = _independent_initializer_paths(model_container)
+    expected = {
+        "embedding.raw.initializer",
+        "embedding.augmented.initializer",
+        "layers.0.path_aggregation.initializer",
+        "layers.0.mixing.activation.initializer",
+        "layers.0.path_aggregation.activation.initializer",
+    }
+    assert paths == expected
+    assert {
+        path for path in train_config._initializer_paths(resolved.model, "model")
+    } == {f"model.{path}" for path in expected}
+    assert all(
+        OmegaConf.select(resolved, f"model.{path}").seed
+        == cell.seed_streams["model_initialization"]
+        for path in paths
+    )
     changed = replace(cell, seed_streams={**cell.seed_streams, "model_initialization": cell.seed_streams["model_initialization"] + 1})
     changed_config = train_config.resolve_train_config(changed)
     assert all(
-        OmegaConf.select(changed_config, path).seed != OmegaConf.select(resolved, path).seed
+        OmegaConf.select(changed_config, f"model.{path}").seed
+        != OmegaConf.select(resolved, f"model.{path}").seed
         for path in paths
     )
 
@@ -527,6 +560,14 @@ def test_o_composite_binds_every_initializer_including_both_embeddings(tmp_path:
 def test_o_composite_instantiates_finitely_and_trains_added_parameters(tmp_path: Path) -> None:
     cell = _context_cell(tmp_path)
     composite = train_config.resolve_train_config(cell)
+    instantiate(
+        {
+            "_target_": "tpen.hi_schema.validate_hi_train_config",
+            "_recursive_": False,
+            "cfg": composite,
+            "env": {},
+        }
+    )
     b10 = train_config._compose_base_config()
     b10.model = context_mapping.compose_package(b10.model, "B10")
     b10.model.layers[0] = context_mapping.context_fragment(
