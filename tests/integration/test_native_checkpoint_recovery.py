@@ -336,6 +336,7 @@ def test_native_e1_to_e4_recovery_parity_divergence_and_receipt(tmp_path: Path) 
     assert reference.returncode == 0
     reference_result = _result_from_log(tmp_path, "reference")
     assert reference_result["invocation"]["outcome"] == "completed"
+    assert successor_result["invocation"]["completed_updates"] == reference_result["invocation"]["completed_updates"]
 
     resumed_output = Path(successor_result["invocation"]["output_path"])
     reference_output = Path(reference_result["invocation"]["output_path"])
