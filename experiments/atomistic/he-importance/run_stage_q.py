@@ -358,6 +358,35 @@ _COMPOSITE_FACTOR_TARGETS = (
     "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
 )
 
+# Design-derived helium coordinate-neighbor records.  The policy keeps the
+# aligned identity and one coordinate replacement, while excluding support
+# greater than two and cross-order or swapped records.
+_COMPOSITE_COORDINATE_PATHS = (
+    {"output_order": 1, "input_order": 1, "tau_out": [0], "tau_in": [0], "normalization": "sum"},
+    {"output_order": 1, "input_order": 1, "tau_out": [0], "tau_in": [1], "normalization": "sum"},
+    {"output_order": 2, "input_order": 2, "tau_out": [0, 1], "tau_in": [0, 1], "normalization": "sum"},
+)
+
+# Literal control entries from configs/train.yaml.  These are the declared
+# specification, not values obtained from the resolver or compose_package.
+_COMPOSITE_CONTROL_FACTORS = (
+    {"_target_": "tpen.nn.ElectronElectronCusp", "trainable_range": True},
+    {
+        "_target_": "tpen.nn.ElectronNucleusCusp",
+        "atoms": {
+            "_target_": "tpen.data.atomic_configuration.AtomicConfiguration",
+            "positions": {"_target_": "torch.tensor", "data": [[0.0, 0.0, 0.0]]},
+            "charges": {"_target_": "torch.tensor", "data": [2.0]},
+        },
+        "law": {
+            "_target_": "tpen.nn.TailSafeElectronNucleusCuspLaw",
+            "curvature_range": 1.0,
+            "tail_slope": 1.99,
+            "trainable": True,
+        },
+    },
+)
+
 # Recompute this literal from the committed control config with:
 #
 #   cfg = train_config._compose_base_config(); OmegaConf.resolve(cfg)
@@ -706,40 +735,58 @@ def _require_o_composite_model(model: Mapping[str, Any], declared: Any) -> None:
             raise _input_feature_refusal(
                 f"context.overrides.input_features.model.embedding.{member}", declared, nested
             )
-        for field, value in (("spatial_dim", 3), ("in_features", width), ("pair_input_channels", pair_channels)):
-            if nested.get(field, None if field != "pair_input_channels" else 0) != value:
+        if nested.get("spatial_dim") != 3:
+            raise _input_feature_refusal(
+                f"context.overrides.input_features.model.embedding.{member}.spatial_dim",
+                declared,
+                nested.get("spatial_dim"),
+            )
+        if member == "raw":
+            include_spins = nested.get("include_spins", True)
+            auxiliary = nested.get("aux_feature_channels")
+            auxiliary_width = 0 if auxiliary in (None, {}) else sum(auxiliary.values())
+            effective_width = 3 + (1 if include_spins else 0) + auxiliary_width
+            if include_spins is not True or effective_width != width:
                 raise _input_feature_refusal(
-                    f"context.overrides.input_features.model.embedding.{member}.{field}",
+                    f"context.overrides.input_features.model.embedding.{member}.effective_input_width",
                     declared,
-                    nested.get(field),
+                    effective_width,
                 )
+            actual_pair_channels = nested.get("pair_input_channels", 0)
+        else:
+            actual_pair_channels = nested.get("pair_input_channels")
+            if nested.get("in_features") != width:
+                raise _input_feature_refusal(
+                    f"context.overrides.input_features.model.embedding.{member}.in_features",
+                    declared,
+                    nested.get("in_features"),
+                )
+        if actual_pair_channels != pair_channels:
+            raise _input_feature_refusal(
+                f"context.overrides.input_features.model.embedding.{member}.pair_input_channels",
+                declared,
+                actual_pair_channels,
+            )
 
     factors = model.get("factors")
-    if not isinstance(factors, Sequence) or isinstance(factors, (str, bytes, bytearray)):
-        raise _input_feature_refusal("context.overrides.input_features.model.factors", declared, factors)
-    targets = tuple(factor.get("_target_") for factor in factors if isinstance(factor, Mapping))
-    if targets != _COMPOSITE_FACTOR_TARGETS:
-        raise _input_feature_refusal(
-            "context.overrides.input_features.model.factors", declared, targets
-        )
-    control_ee = factors[0]
-    if not isinstance(control_ee, Mapping) or control_ee.get("trainable_range") is not True:
-        raise _input_feature_refusal(
-            "context.overrides.input_features.model.factors[0]", declared, control_ee
-        )
-    control_en = factors[1]
-    expected_law = {
-        "_target_": "tpen.nn.TailSafeElectronNucleusCuspLaw",
-        "curvature_range": 1.0,
-        "tail_slope": 1.99,
-    }
     if (
-        not isinstance(control_en, Mapping)
-        or control_en.get("trainable") is not True
-        or control_en.get("law") != expected_law
+        not isinstance(factors, Sequence)
+        or isinstance(factors, (str, bytes, bytearray))
+        or len(factors) != 3
+        or not all(isinstance(factor, Mapping) for factor in factors)
     ):
+        raise _input_feature_refusal("context.overrides.input_features.model.factors", declared, factors)
+    if tuple(factor.get("_target_") for factor in factors) != _COMPOSITE_FACTOR_TARGETS:
         raise _input_feature_refusal(
-            "context.overrides.input_features.model.factors[1]", declared, control_en
+            "context.overrides.input_features.model.factors", declared, factors
+        )
+    if dict(factors[0]) != _COMPOSITE_CONTROL_FACTORS[0]:
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.factors[0]", declared, factors[0]
+        )
+    if dict(factors[1]) != _COMPOSITE_CONTROL_FACTORS[1]:
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.factors[1]", declared, factors[1]
         )
     jastrow = factors[-1]
     expected_jastrow = {
@@ -773,6 +820,26 @@ def _require_o_composite_model(model: Mapping[str, Any], declared: Any) -> None:
                 f"context.overrides.input_features.model.layers[{index}].mixing.producers",
                 declared,
                 producer_targets,
+            )
+        layout = layer.get("layout")
+        linear = layout.get("linear") if isinstance(layout, Mapping) else None
+        if not isinstance(linear, Mapping) or linear.get("explicit") != list(_COMPOSITE_COORDINATE_PATHS):
+            raise _input_feature_refusal(
+                f"context.overrides.producer_policy.model.layers[{index}].layout.linear.explicit",
+                declared,
+                linear,
+            )
+        if linear.get("policy") != "explicit" or linear.get("normalization") != "sum":
+            raise _input_feature_refusal(
+                f"context.overrides.producer_policy.model.layers[{index}].layout.linear",
+                declared,
+                linear,
+            )
+        if producers[0].get("metadata") != linear:
+            raise _input_feature_refusal(
+                f"context.overrides.producer_policy.model.layers[{index}].mixing.producers[0].metadata",
+                declared,
+                producers[0].get("metadata"),
             )
         for site in ("mixing", "path_aggregation"):
             activation = layer.get(site, {}).get("activation") if isinstance(layer.get(site), Mapping) else None

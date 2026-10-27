@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+from hydra.utils import instantiate
 import pytest
 
 
@@ -196,15 +197,23 @@ def test_o_composite_selection_has_eight_adam_authority_cells_and_schema_validat
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
     )
     resolved = runner.train_config.resolve_train_config(target)
-    import tpen.hi_schema as schema
-
-    schema.validate_hi_train_config(resolved)
+    instantiate(
+        {
+            "_target_": "tpen.hi_schema.validate_hi_train_config",
+            "_recursive_": False,
+            "cfg": resolved,
+            "env": {},
+        }
+    )
     assert resolved.model.basis._target_ == "tpen.nn.basis.BoundedDistanceBasis"
     assert resolved.model.basis.inner._target_ == "tpen.nn.RawCoordinateBasis"
     assert resolved.model.basis.length == 1.0
     assert resolved.model.embedding._target_ == "tpen.nn.embedding.matched_start_embedding"
-    assert resolved.model.embedding.raw.in_features == 4
-    assert resolved.model.embedding.raw.pair_input_channels == 0
+    raw_embedding = resolved.model.embedding.raw
+    raw_auxiliary = raw_embedding.get("aux_feature_channels")
+    raw_auxiliary_width = 0 if raw_auxiliary in (None, {}) else sum(raw_auxiliary.values())
+    assert raw_embedding.spatial_dim + (1 if raw_embedding.get("include_spins", True) else 0) + raw_auxiliary_width == 4
+    assert raw_embedding.get("pair_input_channels", 0) == 0
     assert resolved.model.embedding.augmented.in_features == 5
     assert resolved.model.embedding.augmented.pair_input_channels == 3
     assert [factor._target_ for factor in resolved.model.factors] == [
@@ -221,6 +230,130 @@ def test_o_composite_selection_has_eight_adam_authority_cells_and_schema_validat
     assert layer.mixing.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
     assert layer.path_aggregation.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
     assert layer.update._target_ == "tpen.nn.ResidualUpdater"
+
+
+def _o_composite_target(tmp_path: Path) -> object:
+    return next(
+        cell
+        for cell in _q_adam_cells(_cells(tmp_path), context="O-composite")
+        if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+        and cell.manifest["seed_identity"]["label"] == 810001
+    )
+
+
+def test_o_composite_accepts_explicit_raw_width_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _o_composite_target(tmp_path)
+    original = runner.train_config.resolve_train_config
+
+    def explicit_defaults(source: object) -> object:
+        resolved = original(source)
+        for prefix in ("model", "runner.model"):
+            runner.OmegaConf.update(resolved, f"{prefix}.embedding.raw.in_features", 4, merge=False, force_add=True)
+            runner.OmegaConf.update(resolved, f"{prefix}.embedding.raw.pair_input_channels", 0, merge=False, force_add=True)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", explicit_defaults)
+    selection = runner.select_cell((target,), context="O-composite", seed_label=810001)
+    assert selection.selected.context == "O-composite"
+
+
+@pytest.mark.parametrize(
+    "field_update",
+    [
+        {"embedding.raw.in_features": 6},
+        {"embedding.raw.include_spins": False},
+    ],
+)
+def test_o_composite_refuses_wrong_effective_raw_width(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field_update: dict[str, object],
+) -> None:
+    target = _o_composite_target(tmp_path)
+    original = runner.train_config.resolve_train_config
+
+    def wrong_width(source: object) -> object:
+        resolved = original(source)
+        for prefix in ("model", "runner.model"):
+            for field, value in field_update.items():
+                runner.OmegaConf.update(resolved, f"{prefix}.{field}", value, merge=False, force_add=True)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", wrong_width)
+    with pytest.raises(runner.StageQSelectionError, match="effective_input_width"):
+        runner.select_cell((target,), context="O-composite", seed_label=810001)
+
+
+def test_o_composite_refuses_law_trainability_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _o_composite_target(tmp_path)
+    original = runner.train_config.resolve_train_config
+
+    def untrainable_law(source: object) -> object:
+        resolved = original(source)
+        for prefix in ("model", "runner.model"):
+            runner.OmegaConf.update(resolved, f"{prefix}.factors.1.law.trainable", False, merge=False)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", untrainable_law)
+    with pytest.raises(runner.StageQSelectionError, match=r"factors\[1\]"):
+        runner.select_cell((target,), context="O-composite", seed_label=810001)
+
+
+def test_o_composite_refuses_changed_or_extra_control_factor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _o_composite_target(tmp_path)
+    original = runner.train_config.resolve_train_config
+
+    def changed_factor(source: object) -> object:
+        resolved = original(source)
+        for prefix in ("model", "runner.model"):
+            runner.OmegaConf.update(resolved, f"{prefix}.factors.0.range_parameter", 4.0, merge=False, force_add=True)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", changed_factor)
+    with pytest.raises(runner.StageQSelectionError, match=r"factors\[0\]"):
+        runner.select_cell((target,), context="O-composite", seed_label=810001)
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", original)
+
+    def extra_factor(source: object) -> object:
+        resolved = original(source)
+        for prefix in ("model", "runner.model"):
+            runner.OmegaConf.select(resolved, prefix).factors.append(None)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", extra_factor)
+    with pytest.raises(runner.StageQSelectionError, match="factors"):
+        runner.select_cell((target,), context="O-composite", seed_label=810001)
+
+
+def test_o_composite_refuses_orbit_complete_consumed_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _o_composite_target(tmp_path)
+    original = runner.train_config.resolve_train_config
+    orbit_paths = [
+        {"output_order": 1, "input_order": 1, "tau_out": [0], "tau_in": [0], "normalization": "sum"},
+        {"output_order": 1, "input_order": 1, "tau_out": [0], "tau_in": [1], "normalization": "sum"},
+        {"output_order": 1, "input_order": 2, "tau_out": [0], "tau_in": [0, 1], "normalization": "sum"},
+    ]
+
+    def orbit_policy(source: object) -> object:
+        resolved = original(source)
+        for prefix in ("model", "runner.model"):
+            runner.OmegaConf.update(resolved, f"{prefix}.layers.0.layout.linear.explicit", orbit_paths, merge=False)
+            runner.OmegaConf.update(resolved, f"{prefix}.layers.0.mixing.producers.0.metadata.explicit", orbit_paths, merge=False)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", orbit_policy)
+    with pytest.raises(runner.StageQSelectionError, match="producer_policy"):
+        runner.select_cell((target,), context="O-composite", seed_label=810001)
 
 
 def test_o_composite_seed_paths_are_independently_enumerated(
@@ -297,40 +430,6 @@ def test_o_composite_launch_path_matches_selection_path(tmp_path: Path) -> None:
     assert runner.OmegaConf.to_container(launched.config, resolve=True) == runner.OmegaConf.to_container(
         selected, resolve=True
     )
-
-
-def test_o_composite_launch_config_divergence_is_red(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    target = next(
-        cell
-        for cell in _q_adam_cells(_cells(tmp_path), context="O-composite")
-        if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
-        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
-        and cell.manifest["seed_identity"]["label"] == 810001
-    )
-    selection = runner.select_cell(
-        (target,), context="O-composite", seed_label=810001
-    )
-    packet, selected = runner._resolve_selected_config(selection)
-    original_prepare = runner.launch.prepare_train_launch
-
-    def divergent_prepare(source: object, topology: object) -> object:
-        plan = original_prepare(source, topology)
-        runner.OmegaConf.update(
-            plan.config,
-            "model.layers.0.update._target_",
-            "tpen.nn.ReplacementUpdater",
-            merge=False,
-        )
-        return plan
-
-    monkeypatch.setattr(runner.launch, "prepare_train_launch", divergent_prepare)
-    launched = runner.launch.prepare_train_launch(packet, _r2_facts())
-    with pytest.raises(AssertionError):
-        assert runner.OmegaConf.to_container(launched.config, resolve=True) == runner.OmegaConf.to_container(
-            selected, resolve=True
-        )
 
 
 def test_truthfulness_guard_leaves_exactly_one_mechanics_cell(tmp_path: Path) -> None:
