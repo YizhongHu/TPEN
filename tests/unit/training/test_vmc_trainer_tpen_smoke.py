@@ -14,6 +14,7 @@ from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.events import DomainState, Ended, Occurrence, Started
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.potential import ElectronElectronInteraction, HarmonicTrap
+from tpen.physics.hamiltonian import LocalEnergyResult
 from tpen.sampling import SamplerStats
 from tpen.training.events import (
     Backward,
@@ -30,7 +31,7 @@ from tpen.training.events import (
     UpdateSkipped,
 )
 from tpen.training.state import TrainerState
-from tpen.training.trainer import VMCTrainer, _parameter_norm
+from tpen.training.trainer import VMCTrainer, _detach_local_energy_result, _parameter_norm
 from tests.helpers.hooke_models import build_tiny_sampler, build_tiny_spenn
 
 
@@ -152,6 +153,39 @@ def _occurrence_labels(occurrences: list[Occurrence[Any]]) -> list[tuple[str, ty
         else:
             labels.append(("event", type(event)))
     return labels
+
+
+def test_local_energy_result_is_detached_without_dropping_diagnostics() -> None:
+    """The trainer's handoff keeps values but releases every graph-bearing field."""
+
+    source = torch.tensor([1.0, 2.0], dtype=torch.float64, requires_grad=True)
+    output = WavefunctionOutput(
+        logabs=source,
+        sign=torch.ones_like(source),
+        aux={"captured": source * 2.0, "label": "kept"},
+    )
+    detached = _detach_local_energy_result(
+        LocalEnergyResult(
+            total=source + 1.0,
+            terms={"first": source * 3.0, "second": source * 4.0},
+            wavefunction_output=output,
+            per_electron_kinetic=source[:, None] * 5.0,
+        )
+    )
+
+    assert list(detached.terms) == ["first", "second"]
+    assert torch.equal(detached.total, source.detach() + 1.0)
+    assert torch.equal(detached.terms["first"], source.detach() * 3.0)
+    assert torch.equal(detached.per_electron_kinetic, source.detach()[:, None] * 5.0)
+    assert detached.wavefunction_output is not None
+    assert torch.equal(detached.wavefunction_output.logabs, source.detach())
+    assert torch.equal(detached.wavefunction_output.aux["captured"], source.detach() * 2.0)
+    assert detached.wavefunction_output.aux["label"] == "kept"
+    assert not detached.total.requires_grad
+    assert all(not value.requires_grad for value in detached.terms.values())
+    assert not detached.per_electron_kinetic.requires_grad
+    assert not detached.wavefunction_output.logabs.requires_grad
+    assert not detached.wavefunction_output.aux["captured"].requires_grad
 
 
 def _record_legacy(context: _StubContext):

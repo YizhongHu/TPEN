@@ -31,7 +31,7 @@ PENDING_516_SHA = "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
 # optimizer-grid crossing and dev/#528's now-present test_run_stage_q.py
 # crossing are measured, so the union has one more crossing than either
 # parent inventory counted.
-EXPECTED_UNSANCTIONED_COUNTS = {15}
+EXPECTED_UNSANCTIONED_COUNTS = {16}
 PENDING_516_POLICY = (
     "this is a historical, 516-scoped PR-516 capability fixture; a new pending PR needs its own pin"
 )
@@ -61,10 +61,10 @@ EXPECTED_PRODUCTION_INVENTORY = {
     ("optimizer_grid.py", 340, "tpen.hi_schema"): InventoryEntry(
         "remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 190, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 215, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 282, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 422, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("run_stage_q.py", 108, "tpen.hi_schema"): InventoryEntry(
@@ -82,25 +82,28 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 21, "tpen.runner"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 574, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 591, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 616, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 633, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 672, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 689, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 884, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 901, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_train_config.py", 312, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 140, "tpen.hi_schema"): InventoryEntry(
+        "item df8f8b31: test-only schema validation for the independent HI grid oracle."
+    ),
+    ("test_train_config.py", 397, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 324, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 539, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 417, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 632, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("test_run_stage_q.py", 450, "tpen.hi_schema"): InventoryEntry(
@@ -1200,6 +1203,8 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             ("repo_root and candidates are freshly resolved Path values owned by the checkout probe", 1),
         ("train_config.py", "_cell_from_source", "hasattr(cell, name)"):
             ("this is source-shape admission; false positives fail at the required downstream reads", 1),
+        ("train_config.py", "_scheduler_paths", 'key in {"scheduler", "lr_scheduler"}'):
+            ("keys are detached composed-config names and the set contains resolver-owned literals", 1),
         ("train_config.py", "_set_optional_execution_seeds", '"seed" in checker'):
             ("checker is a validated mapping from the composed config and the key is a module literal", 1),
         ("train_config.py", "_optimizer_entry", 'status not in {"available", "unavailable"}'):
@@ -1210,6 +1215,24 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             ("resolve_train_config's own _cell_from_source admission requires an exact-str hash on every direct and wrapped resolver route", 1),
         ("train_config.py", "resolve_train_config", "output_path.parent.parent == output_path"):
             ("output_path is freshly converted to an owned Path before this structural sanity check", 1),
+        ("train_config.py", "_authority_adam_levels", 'item["family"] == "adam"'):
+            ("the authority entry is a detached JSON mapping and the family literal is resolver-owned", 1),
+        ("train_config.py", "_declared_adam_levels", 'method != "adam"'):
+            ("method is read from the detached manifest identity and Adam is the only resolver family", 1),
+        ("train_config.py", "_declared_adam_levels", 'set(optimizer) != {"method", "levels"}'):
+            ("optimizer is the detached manifest identity mapping and the exact key set is resolver-owned", 1),
+        ("train_config.py", "_declared_adam_levels", "set(levels) != set(expected)"):
+            ("both mappings are detached authority/manifest data and the exact key set is resolver-owned", 1),
+        ("train_config.py", "_declared_adam_levels", 'levels["parameter_groups"] != expected["parameter_groups"]'):
+            ("the level value and authority value are detached scalar data", 1),
+        ("train_config.py", "_declared_adam_levels", 'levels["schedule"] != expected["schedule"]'):
+            ("the level value and authority value are detached scalar data", 1),
+        ("train_config.py", "_require_o_raw_context", "dict(context) != expected"):
+            ("context is a detached manifest mapping and expected is the authority literal", 1),
+        ("train_config.py", "_require_o_raw_context", "context.get(field) != expected.get(field)"):
+            ("context and authority mappings are detached data used for refusal diagnostics", 1),
+        ("train_config.py", "resolve_train_config", 'optimizer_identity.get("method") != manifest["scientific_identity"]["optimizer_cell"].get("method")'):
+            ("both values are detached manifest identity fields and the equality binds their declarations", 1),
     }
     findings: list[str] = []
     observed: dict[tuple[str, str, str], int] = {}
@@ -1458,11 +1481,11 @@ def test_r2_boundary_count_is_exact_and_live(
     ]
     assert len(expected_nodes) == 1
     expected = ast.literal_eval(expected_nodes[0])
-    assert expected == {15}
+    assert expected == {16}
     boundary = importlib.import_module("experiments.atomistic.he-importance.test_tpen_boundary")
     synthetic = tmp_path / "synthetic.py"
-    synthetic.write_text("\n".join("import tpen.synthetic" for _ in range(15)) + "\n")
+    synthetic.write_text("\n".join("import tpen.synthetic" for _ in range(16)) + "\n")
     monkeypatch.setattr(boundary, "STUDY_DIR", tmp_path)
     _, crossings = boundary._scan_study()
-    assert len(crossings) == 15
+    assert len(crossings) == 16
     assert len(crossings) in expected

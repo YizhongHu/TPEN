@@ -78,7 +78,7 @@ class CellSelection:
     def receipt(self) -> dict[str, object]:
         return {
             "rule": (
-                "exactly one truthful admitted cell matching stage + context + optimizer + seed_label; "
+                "exactly one truthful admitted cell matching stage + context + optimizer levels + seed_label; "
                 "refuse zero or multiple matches"
             ),
             "selected": self.selected.as_dict(),
@@ -163,6 +163,8 @@ def select_cell(
     stage: str = DEFAULT_STAGE,
     context: str = DEFAULT_CONTEXT,
     optimizer: str = DEFAULT_OPTIMIZER,
+    lr: float = 0.005,
+    beta2: float = 0.999,
     seed_label: int | None = None,
 ) -> CellSelection:
     """Select one truthful admitted cell and refuse first-match fallback.
@@ -184,6 +186,8 @@ def select_cell(
         if descriptor.stage == stage
         and descriptor.context == context
         and descriptor.optimizer["method"] == optimizer
+        and descriptor.optimizer["levels"].get("lr") == lr
+        and descriptor.optimizer["levels"].get("beta2") == beta2
         and descriptor.optimizer["method"] in admitted_methods
         and descriptor.status == "available"
         and (seed_label is None or descriptor.seed_label == seed_label)
@@ -192,13 +196,13 @@ def select_cell(
         raise StageQSelectionError(
             "selection matched zero admitted cells for "
             f"stage={stage!r}, context={context!r}, optimizer={optimizer!r}, "
-            f"seed_label={seed_label!r}"
+            f"lr={lr!r}, beta2={beta2!r}, seed_label={seed_label!r}"
         )
     if context != DEFAULT_CONTEXT:
         raise StageQSelectionError(
             "truthfulness guard refused field 'context': "
             f"declared value {context!r}, consumed value {DEFAULT_CONTEXT!r}; "
-            "resolver does not consume context/levels (item dd964863)"
+            "O-composite is not consumed by the resolver (items 7bae63d8 and dd964863)"
         )
 
     truthful: list[tuple[Any, CellDescriptor]] = []
@@ -210,6 +214,10 @@ def select_cell(
             # once would make that first candidate win by construction.
             resolved = train_config.resolve_train_config(_q_training_packet(cell))
             _require_truthful_cell(cell, resolved)
+        except train_config.TrainConfigResolutionError as error:
+            # Resolver refusals remain resolver-owned, but selection reports
+            # them through its typed refusal surface and never first-matches.
+            refusals.append(str(error))
         except StageQSelectionError as error:
             refusals.append(str(error))
         else:
@@ -909,6 +917,8 @@ def execute(args: argparse.Namespace) -> int:
         stage=args.stage,
         context=getattr(args, "context", DEFAULT_CONTEXT),
         optimizer=args.optimizer,
+        lr=getattr(args, "lr", 0.005),
+        beta2=getattr(args, "beta2", 0.999),
         seed_label=args.seed_label,
     )
     declared_walkers = stage_coordinate.sampler_override_values(args.stage, "n_walkers")
@@ -974,6 +984,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage", default=DEFAULT_STAGE)
     parser.add_argument("--context", default=DEFAULT_CONTEXT)
     parser.add_argument("--optimizer", default=DEFAULT_OPTIMIZER)
+    parser.add_argument("--lr", type=float, default=0.005)
+    parser.add_argument("--beta2", type=float, default=0.999)
     parser.add_argument("--seed-label", type=int)
     parser.add_argument("--walkers", type=int, default=stage_coordinate.COMMITTED_WALKERS)
     parser.add_argument("--output-root", type=Path, default=Path(__file__).with_name("outputs"))
