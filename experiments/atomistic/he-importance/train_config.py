@@ -342,6 +342,7 @@ def _consumed_context(manifest: Mapping[str, Any]) -> str:
             "scientific_identity.context must be exactly the authority's O-raw or "
             f"O-composite literal; declared={dict(context)!r}; "
             + "; ".join(differences)
+            + "; run_stage_q retains the O-composite refusal (item dd964863)"
         )
 
     raise AssertionError("unreachable context validation branch")

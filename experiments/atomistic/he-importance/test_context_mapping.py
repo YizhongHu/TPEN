@@ -404,8 +404,8 @@ def test_bounded_distance_input_fragment_is_explicit() -> None:
 def test_linear_oracles_are_independent_literal_records() -> None:
     coordinate = context_mapping.context_fragment("linear/coordinate-neighbor")
     orbit = context_mapping.context_fragment("linear/orbit-complete")
-    coordinate_paths = coordinate["layout"]["linear"]["explicit"]["_args_"][0]
-    orbit_paths = orbit["layout"]["linear"]["explicit"]["_args_"][0]
+    coordinate_paths = coordinate["layout"]["linear"]["explicit"]
+    orbit_paths = orbit["layout"]["linear"]["explicit"]
 
     assert [
         (p["output_order"], p["input_order"], p["tau_out"], p["tau_in"])

@@ -366,10 +366,7 @@ def _linear_metadata(policy: str) -> dict[str, Any]:
         "max_order": 2,
         "policy": "explicit",
         "normalization": "sum",
-        "explicit": {
-            "_target_": "builtins.tuple",
-            "_args_": [deepcopy(explicit)],
-        },
+        "explicit": deepcopy(explicit),
     }
 
 

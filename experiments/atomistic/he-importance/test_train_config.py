@@ -680,12 +680,10 @@ def test_resolve_refuses_non_o_raw_context(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
     manifest = stage_coordinate._thaw(cell.manifest)
     manifest["scientific_identity"]["context"] = {
-        "name": "O-composite",
+        "name": "O-other",
         "overrides": {
-            "producer_policy": "hybrid/coordinate-neighbor",
-            "aggregation_activation": "channel-MLP at both activation sites",
-            "input_features": "B11",
-            "feature_update": "residual",
+            "input_features": "B00",
+            "feature_update": "replacement",
         },
     }
     rebuilt = replace(
