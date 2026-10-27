@@ -2389,7 +2389,8 @@ def test_a6_o_composite_full_authority_cardinality_and_ambiguity_arms(
         for lr in adam["varied"]["lr"]
         for beta2 in adam["varied"]["beta2"]
     }
-    composite = _q_adam_cells_all_labels(_cells(tmp_path), context="O-composite")
+    cells = _cells(tmp_path)
+    composite = _q_adam_cells_all_labels(cells, context="O-composite")
     assert len(composite) == 2 * len(expected_pairs)
     for label in (810001, 810002):
         labeled = [
@@ -2406,7 +2407,7 @@ def test_a6_o_composite_full_authority_cardinality_and_ambiguity_arms(
             ]
             assert len(matches) == 1
             selection = runner.select_cell(
-                composite,
+                cells,
                 context="O-composite",
                 lr=lr,
                 beta2=beta2,
@@ -2420,7 +2421,7 @@ def test_a6_o_composite_full_authority_cardinality_and_ambiguity_arms(
             ]["optimizer"]["levels"]
             assert selection.selected.seed_label == label
     with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
-        runner.select_cell(composite, context="O-composite", seed_label=810003)
+        runner.select_cell(cells, context="O-composite", seed_label=810003)
     exact = [
         cell for cell in composite
         if cell.manifest["seed_identity"]["label"] == 810002
@@ -2428,9 +2429,9 @@ def test_a6_o_composite_full_authority_cardinality_and_ambiguity_arms(
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
     ]
     with pytest.raises(runner.StageQSelectionError, match="ambiguous"):
-        runner.select_cell(exact + exact, context="O-composite", seed_label=810002)
+        runner.select_cell(tuple(cells) + (exact[0],), context="O-composite", seed_label=810002)
     with pytest.raises(runner.StageQSelectionError, match="ambiguous"):
-        runner.select_cell(composite, context="O-composite", seed_label=None)
+        runner.select_cell(cells, context="O-composite", seed_label=None)
 
 
 _A3_COMPOSITE_INITIALIZER_PATHS = (
@@ -2634,16 +2635,14 @@ def test_a5_o_composite_runner_route_closes_the_three_l5_traps(
         merge=False,
     )
     runner.OmegaConf.resolve(control)
-    for key in ("_target_", "trace_name", "readout"):
-        assert resolved_container["model"][key] == runner.OmegaConf.to_container(
-            control.model[key], resolve=True
-        )
+    control_model = runner.OmegaConf.to_container(control.model, resolve=True)
 
     def assert_declared_nonpackage_projection(config: object) -> None:
         observed = runner.OmegaConf.to_container(config.model, resolve=True)
-        expected = runner.OmegaConf.to_container(control.model, resolve=True)
         for key in ("_target_", "trace_name", "readout"):
-            assert observed[key] == expected[key]
+            assert observed[key] == control_model[key]
+
+    assert_declared_nonpackage_projection(resolved)
 
     original = runner.train_config.resolve_train_config
     with monkeypatch.context() as context:
@@ -2691,20 +2690,18 @@ def test_a5_o_composite_runner_route_closes_the_three_l5_traps(
     mapping = runner.train_config._context_mapping_api()
     from omegaconf.errors import InterpolationKeyError
 
-    detached_root = runner.train_config._compose_base_config()
-    detached = runner.OmegaConf.create(
-        mapping.compose_package(detached_root.model, "B11")
-    )
+    original_compose = runner.train_config._compose_base_config
+
+    def malformed_full_config() -> object:
+        full = original_compose()
+        model = runner.OmegaConf.to_container(full.model, resolve=False)
+        model["embedding"]["spatial_dim"] = "${detached_root.spatial_dim}"
+        full.model = runner.OmegaConf.create(model)
+        return full
 
     with monkeypatch.context() as context:
-        def detached_root_route(_: object) -> object:
-            # Resolve the standalone model before it is spliced into the full
-            # root, reproducing the L5 interpolation trap through selection.
-            runner.OmegaConf.to_container(detached, resolve=True)
-            return detached_root
-
-        context.setattr(runner.train_config, "resolve_train_config", detached_root_route)
-        with pytest.raises(InterpolationKeyError, match=r"system\.spatial_dim"):
+        context.setattr(runner.train_config, "_compose_base_config", malformed_full_config)
+        with pytest.raises(InterpolationKeyError, match=r"detached_root\.spatial_dim"):
             runner.select_cell(
                 (_o_composite_target(tmp_path),),
                 context="O-composite",
@@ -2747,20 +2744,35 @@ def test_a5_o_composite_runner_route_closes_the_three_l5_traps(
 
     direct_root = runner.train_config._compose_base_config()
     fragment, factor = mapping.package_fragment("B11")
-    direct_root.model = runner.OmegaConf.merge(
-        direct_root.model,
+    direct_model = runner.OmegaConf.merge(
+        runner.OmegaConf.create(
+            runner.OmegaConf.to_container(direct_root.model, resolve=False)
+        ),
         runner.OmegaConf.create(
             {**fragment, "factors": [*direct_root.model.factors, factor]}
         ),
     )
-    direct_root.model.layers[0] = runner.OmegaConf.create(
+    direct_model.layers[0] = runner.OmegaConf.create(
         mapping.context_fragment(
             "hybrid/coordinate-neighbor",
             activation="channel-MLP,channel-MLP",
             seed=seed,
         )
     )
+    direct_root.model = direct_model
     runner.OmegaConf.update(direct_root, "runtime.seed", seed, merge=False)
     runner.OmegaConf.resolve(direct_root)
     direct_b11 = instantiate(direct_root.model).to(dtype=torch.float64)
     assert not torch.equal(direct_b11(batch).logabs, b01(batch).logabs)
+
+    with monkeypatch.context() as context:
+        context.setattr(runner.train_config, "resolve_train_config", lambda _: direct_root)
+        with pytest.raises(
+            runner.StageQSelectionError,
+            match=r"input_features\.model\.embedding\._target_.*matched_start_embedding",
+        ):
+            runner.select_cell(
+                (_o_composite_target(tmp_path),),
+                context="O-composite",
+                seed_label=810001,
+            )
