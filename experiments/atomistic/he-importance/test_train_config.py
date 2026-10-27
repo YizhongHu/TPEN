@@ -456,10 +456,12 @@ def test_resolve_consumes_all_q_adam_o_composite_cells(tmp_path: Path) -> None:
     assert len(cells) == 16
     for cell in cells:
         resolved = train_config.resolve_train_config(cell)
-        assert resolved.model.layers[0].update._target_ == "tpen.nn.ResidualUpdater"
+        assert resolved.model.layers[0]["update"]["_target_"] == "tpen.nn.ResidualUpdater"
         assert resolved.model.layers[0].layout.linear.explicit[0].tau_in == [0]
         assert resolved.model.embedding._target_ == "tpen.nn.embedding.matched_start_embedding"
-        assert resolved.model.embedding.augmented.basis.length == 1.0
+        assert resolved.model.basis._target_ == "tpen.nn.basis.BoundedDistanceBasis"
+        assert resolved.model.basis.length == 1.0
+        assert "basis" not in resolved.model.embedding.augmented
         assert resolved.model.factors[-1]._target_ == "tpen.nn.jastrow.BoundedTwoCoefficientJastrow"
 
 
@@ -498,8 +500,9 @@ def test_o_composite_trap_negatives_are_observable(tmp_path: Path) -> None:
     cell = _context_cell(tmp_path)
     base = train_config._compose_base_config()
     fragment, factor = context_mapping.package_fragment("B11")
-    naive = OmegaConf.merge(base.model, OmegaConf.create({**fragment, "factors": [factor]}))
-    assert len(naive.factors) == 1
+    unstructured_model = OmegaConf.create(OmegaConf.to_container(base.model, resolve=False))
+    naive = OmegaConf.merge(unstructured_model, OmegaConf.create({**fragment, "factors": [factor]}))
+    assert OmegaConf.to_container(naive.factors, resolve=True) == [factor]
     assert len(base.model.factors) == 2
 
     standalone = OmegaConf.create(context_mapping.compose_package(base.model, "B11"))
@@ -588,8 +591,9 @@ def test_o_composite_instantiates_finitely_and_trains_added_parameters(tmp_path:
     factor = model.factors[-1]
     assert torch.any(factor.theta_s.grad != 0)
     assert torch.any(factor.theta_t.grad != 0)
+    assert type(model.embedding).__name__ == "Embedding"
     for order, columns in ((1, [4]), (2, [4, 9, 10, 11, 12])):
-        weight = model.embedding.augmented.order_mlps[str(order)].layers[0].weight
+        weight = model.embedding.order_mlps[str(order)].layers[0].weight
         assert torch.any(weight.grad[:, columns] != 0)
 
 
