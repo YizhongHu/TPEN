@@ -243,7 +243,7 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
         }
     )
     captured = {}
-    deltas = {}
+    outputs = {}
     hooks = []
     for order in (1, 2):
         layer = model.embedding.order_mlps[str(order)].layers[0]
@@ -253,10 +253,11 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
             )
         )
         hooks.append(
-            layer.register_full_backward_hook(
-                lambda module, grad_input, grad_output, order=order: deltas.setdefault(
-                    order, grad_output[0].detach()
-                )
+            layer.register_forward_hook(
+                lambda module, inputs, output, order=order: (
+                    output.retain_grad(),
+                    outputs.setdefault(order, output),
+                )[-1]
             )
         )
     try:
@@ -279,20 +280,28 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
                 dtype=torch.float64,
             ),
         }
-        gradients = {}
-        for order in (1, 2):
-            weight = model.embedding.order_mlps[str(order)].layers[0].weight
-            gradients[order] = torch.autograd.grad(
-                logabs, weight, retain_graph=True
-            )[0]
-            assert order in deltas
+        weights = {
+            order: model.embedding.order_mlps[str(order)].layers[0].weight
+            for order in (1, 2)
+        }
+        g = torch.autograd.grad(
+            logabs,
+            [outputs[1], outputs[2], weights[1], weights[2]],
+            retain_graph=True,
+        )
+        assert len(captured) == 2
+        assert len(outputs) == 2
+        for order, delta_gradient, weight_gradient in (
+            (1, g[0], g[2]),
+            (2, g[1], g[3]),
+        ):
             expected = expected_all[order]
             inputs = captured[order][0]
-            delta = deltas[order][0]
+            delta = delta_gradient[0]
+            gradient = weight_gradient
             assert delta.shape[0] == expected.shape[0]
             torch.testing.assert_close(inputs, expected, rtol=1e-12, atol=1e-12)
             assert inputs.shape == expected.shape
-            gradient = gradients[order]
             expected_gradient = delta.transpose(0, 1) @ inputs
             added = (4,) if order == 1 else (4, 9, 10, 11, 12)
             for added_index in added:
@@ -302,8 +311,6 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
                     rtol=1e-12,
                     atol=1e-12,
                 )
-        assert len(deltas) == 2
-        assert len(captured) == 2
     finally:
         for hook in hooks:
             hook.remove()
