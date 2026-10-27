@@ -30,6 +30,23 @@ def _digest(payload: Any) -> str:
     return sha256(_canonical(payload)).hexdigest()
 
 
+def _text(value: Any, name: str) -> str:
+    """Validate a required non-whitespace-only text field."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _digest_field(value: Any, name: str) -> str:
+    """Validate a lowercase SHA-256 digest without importing the core."""
+
+    value = _text(value, name)
+    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
 def _closed_mapping(
     data: Any, required: Mapping[str, type], *,
     optional: Mapping[str, type | tuple[type, ...]] | None = None, name: str,
@@ -97,34 +114,35 @@ def ready_batch_v2(
         Already materialized v2 task/dispatch rows.
     """
 
-    if not isinstance(lineage_id, str) or not lineage_id:
-        raise ValueError("lineage_id must be non-empty")
-    if not isinstance(batch_id, str) or not batch_id:
-        raise ValueError("batch_id must be non-empty")
-    if not isinstance(source_config_digest, str) or not source_config_digest:
-        raise ValueError("source_config_digest must be non-empty")
-    if not isinstance(science_input_digest, str) or not science_input_digest:
-        raise ValueError("science_input_digest must be non-empty")
+    lineage_id = _text(lineage_id, "lineage_id")
+    batch_id = _text(batch_id, "batch_id")
+    source_config_digest = _digest_field(source_config_digest, "source_config_digest")
+    science_input_digest = _digest_field(science_input_digest, "science_input_digest")
     if type(target_iterations) is not int or target_iterations < 0:
         raise ValueError("target_iterations must be a nonnegative integer")
-    if not isinstance(backend, str) or not backend:
-        raise ValueError("backend must be non-empty")
-    if not isinstance(recovery, str) or not recovery:
-        raise ValueError("recovery must be non-empty")
+    backend = _text(backend, "backend")
+    recovery = _text(recovery, "recovery")
+    if recovery_selection_digest is not None:
+        recovery_selection_digest = _digest_field(
+            recovery_selection_digest, "recovery_selection_digest"
+        )
     if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
         raise ValueError("v2 rows must be a sequence")
     copied_rows = [dict(_row(row)) for row in rows]
     identities = [row.get("invocation_id") for row in copied_rows]
-    if any(not isinstance(identity, str) or not identity for identity in identities):
+    if any(not isinstance(identity, str) or not identity.strip() for identity in identities):
         raise ValueError("every v2 row needs an opaque invocation_id")
     if len(identities) != len(set(identities)):
         raise ValueError("duplicate invocation_id in v2 ready batch")
+    outputs = [row.get("fresh_output_id") for row in copied_rows]
+    if len(outputs) != len(set(outputs)):
+        raise ValueError("duplicate fresh_output_id in v2 ready batch")
     payload_copy = json.loads(json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False))
     items = []
     for row in copied_rows:
         for name in ("logical_task_id", "fresh_output_id", "result_dir"):
             value = row.get(name)
-            if not isinstance(value, str) or not value:
+            if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"v2 row {name} must be a non-empty string")
         argv = row["argv"]
         if not isinstance(argv, (list, tuple)) or not argv or any(
