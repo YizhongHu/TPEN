@@ -47,6 +47,34 @@ def test_unknown_labels_refuse_without_a_default() -> None:
         context_mapping.context_fragment("linear/unknown")
     with pytest.raises(context_mapping.UnknownContextLabel):
         context_mapping.context_fragment("tensor", activation="unknown")
+    with pytest.raises(context_mapping.UnknownContextLabel):
+        context_mapping.input_feature_fragment("bounded distances")
+
+
+def test_raw_input_feature_package_preserves_the_literal_control() -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    before = OmegaConf.to_container(train.model, resolve=True)
+    train.model = OmegaConf.merge(
+        train.model,
+        OmegaConf.create(context_mapping.input_feature_fragment("raw")),
+    )
+    OmegaConf.resolve(train)
+    assert OmegaConf.to_container(train.model, resolve=True) == before
+
+
+def test_bounded_distance_input_fragment_is_explicit() -> None:
+    assert context_mapping.input_feature_fragment("raw plus bounded distances") == {
+        "basis": {
+            "_target_": "tpen.nn.basis.BoundedDistanceBasis",
+            "inner": {
+                "_target_": "tpen.nn.RawCoordinateBasis",
+                "spatial_dim": 3,
+                "include_spin": True,
+            },
+            "length": 1.0,
+        },
+        "embedding": {"in_features": 5, "pair_input_channels": 3},
+    }
 
 
 def test_linear_oracles_are_independent_literal_records() -> None:
@@ -187,6 +215,104 @@ def _he_batch() -> object:
             "spins": spins,
         }
     )
+
+
+def test_bounded_distance_features_match_independent_ordered_oracle() -> None:
+    fragment = context_mapping.input_feature_fragment("raw plus bounded distances")
+    basis = instantiate(OmegaConf.create(fragment["basis"]))
+    batch = _he_batch()
+    features = basis(batch)
+
+    positions = batch.positions
+    radius_squared = positions.square().sum(dim=-1)
+    separation_squared = (
+        positions[:, :, None, :] - positions[:, None, :, :]
+    ).square().sum(dim=-1)
+    expected_one_body_q = radius_squared / (1.0 + radius_squared)
+    expected_pair_q = separation_squared / (1.0 + separation_squared)
+    expected_one_body = torch.cat(
+        [positions, batch.spins.unsqueeze(-1), expected_one_body_q.unsqueeze(-1)],
+        dim=-1,
+    )
+    expected_pair = torch.stack(
+        [
+            expected_one_body_q[:, :, None].expand_as(expected_pair_q),
+            expected_one_body_q[:, None, :].expand_as(expected_pair_q),
+            expected_pair_q,
+        ],
+        dim=-1,
+    )
+    assert torch.allclose(features.one_body, expected_one_body)
+    assert torch.allclose(features.pair, expected_pair)
+    assert torch.allclose(features.pair[..., :2], features.pair.transpose(1, 2)[..., :2].flip(-1))
+    assert torch.allclose(features.pair[..., 2], features.pair[..., 2].transpose(1, 2))
+
+
+def test_bounded_distance_features_match_literal_coordinate_oracle() -> None:
+    """Check the basis ingress against hand-evaluated, non-random coordinates."""
+
+    fragment = context_mapping.input_feature_fragment("raw plus bounded distances")
+    basis = instantiate(OmegaConf.create(fragment["basis"]))
+    positions = torch.tensor(
+        [
+            [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+            [[1.0, 1.0, 0.0], [2.0, 0.0, 0.0]],
+        ],
+        dtype=torch.float64,
+    )
+    batch = instantiate(
+        {
+            "_target_": "tpen.data.batch.ElectronBatch",
+            "positions": positions,
+            "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
+            "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
+            "spins": torch.tensor([[1.0, -1.0], [1.0, -1.0]], dtype=torch.float64),
+        }
+    )
+
+    features = basis(batch)
+    expected_one_body = torch.tensor(
+        [
+            [[1.0, 0.0, 0.0, 1.0, 1 / 2], [0.0, 2.0, 0.0, -1.0, 4 / 5]],
+            [[1.0, 1.0, 0.0, 1.0, 2 / 3], [2.0, 0.0, 0.0, -1.0, 4 / 5]],
+        ],
+        dtype=torch.float64,
+    )
+    expected_pair = torch.tensor(
+        [
+            [
+                [[1 / 2, 1 / 2, 0.0], [1 / 2, 4 / 5, 5 / 6]],
+                [[4 / 5, 1 / 2, 5 / 6], [4 / 5, 4 / 5, 0.0]],
+            ],
+            [
+                [[2 / 3, 2 / 3, 0.0], [2 / 3, 4 / 5, 2 / 3]],
+                [[4 / 5, 2 / 3, 2 / 3], [4 / 5, 4 / 5, 0.0]],
+            ],
+        ],
+        dtype=torch.float64,
+    )
+    torch.testing.assert_close(features.one_body, expected_one_body, rtol=1e-15, atol=1e-15)
+    torch.testing.assert_close(features.pair, expected_pair, rtol=1e-15, atol=1e-15)
+
+
+def test_bounded_distance_fragment_splices_into_real_control_and_reaches_added_columns() -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model = OmegaConf.merge(
+        train.model,
+        OmegaConf.create(context_mapping.input_feature_fragment("raw plus bounded distances")),
+    )
+    OmegaConf.resolve(train)
+    model = instantiate(train.model).to(dtype=torch.float64)
+    output = model(_he_batch())
+    assert torch.isfinite(output.logabs).all()
+    output.logabs.square().sum().backward()
+
+    order_one = model.embedding.order_mlps["1"].layers[0].weight.grad[:, 4]
+    order_two = model.embedding.order_mlps["2"].layers[0].weight.grad[:, [4, 9, 10, 11, 12]]
+    assert torch.isfinite(order_one).all()
+    assert torch.isfinite(order_two).all()
+    assert torch.any(order_one != 0)
+    assert torch.all(torch.any(order_two != 0, dim=0))
 
 
 def _inactive_order_one_parameters(model: object) -> set[int]:
