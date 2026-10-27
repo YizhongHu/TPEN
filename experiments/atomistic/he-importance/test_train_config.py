@@ -492,8 +492,9 @@ def test_o_composite_preserves_control_factors_and_declares_complete_mapping(
     assert all(path.tau_in and len(path.tau_in) <= 2 for path in layer.layout.linear.explicit)
     assert layer.mixing.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
     assert layer.path_aggregation.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
-    assert resolved.model.embedding.augmented.basis._target_ == "tpen.nn.basis.BoundedDistanceBasis"
-    assert resolved.model.embedding.augmented.basis.length == 1.0
+    assert resolved.model.basis._target_ == "tpen.nn.basis.BoundedDistanceBasis"
+    assert resolved.model.basis.length == 1.0
+    assert "basis" not in resolved.model.embedding.augmented
 
 
 def test_o_composite_trap_negatives_are_observable(tmp_path: Path) -> None:

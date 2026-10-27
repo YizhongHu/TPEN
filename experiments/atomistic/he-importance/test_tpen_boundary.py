@@ -100,10 +100,10 @@ EXPECTED_TEST_INVENTORY = {
     ("test_train_config.py", 427, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 726, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 731, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 819, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 824, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("test_run_stage_q.py", 382, "tpen.hi_schema"): InventoryEntry(
