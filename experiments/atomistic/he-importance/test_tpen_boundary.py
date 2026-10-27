@@ -1227,8 +1227,12 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             ("the level value and authority value are detached scalar data", 1),
         ("train_config.py", "_consumed_context", "dict(context) not in expected.values()"):
             ("context is a detached manifest mapping and expected is the authority literal", 1),
+        ("train_config.py", "_consumed_context", "dict(context) == literal"):
+            ("context is detached manifest data compared only against resolver-owned literal mappings", 1),
         ("train_config.py", "_consumed_context", "context.get(field) != declared.get(field)"):
             ("context and authority mappings are detached data used for refusal diagnostics", 1),
+        ("train_config.py", "resolve_train_config", 'context_name == "O-composite"'):
+            ("context_name is the resolver-owned literal selecting the composite splice", 1),
         ("train_config.py", "resolve_train_config", 'optimizer_identity.get("method") != manifest["scientific_identity"]["optimizer_cell"].get("method")'):
             ("both values are detached manifest identity fields and the equality binds their declarations", 1),
     }

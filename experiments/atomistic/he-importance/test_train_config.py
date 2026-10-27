@@ -481,7 +481,7 @@ def test_o_composite_preserves_control_factors_and_declares_complete_mapping(
     resolved = train_config.resolve_train_config(cell)
     control = train_config._compose_base_config()
     OmegaConf.resolve(control)
-    assert OmegaConf.to_container(resolved.model.factors[:2], resolve=True) == OmegaConf.to_container(
+    assert OmegaConf.to_container(OmegaConf.create(resolved.model.factors[:2]), resolve=True) == OmegaConf.to_container(
         control.model.factors, resolve=True
     )
     assert list(resolved.model.factors)[-1]._target_ == "tpen.nn.jastrow.BoundedTwoCoefficientJastrow"
