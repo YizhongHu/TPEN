@@ -581,6 +581,93 @@ def _run_short_real_training(
     return factor, captured
 
 
+_ADDED_INPUT_COLUMNS = {1: (4,), 2: (4, 9, 10, 11, 12)}
+
+
+def _run_short_embedding_training(
+    package: str,
+    tmp_path: Path,
+    *,
+    freeze_added: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], list[dict[int, torch.Tensor]]]:
+    """Run two real training updates while observing embedding first-layer columns."""
+
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model = context_mapping.compose_package(train.model, package)
+    train.runtime.device = "cpu"
+    train.sampler.n_walkers = 4
+    train.sampler.burn_in = 1
+    train.sampler.n_steps = 1
+    train.trainer.max_steps = 2
+    OmegaConf.resolve(train)
+    runner = instantiate(train.runner)
+    weights = {
+        order: runner.model.embedding.order_mlps[str(order)].layers[0].weight
+        for order in (1, 2)
+    }
+    initial = {order: weight.detach().clone() for order, weight in weights.items()}
+    for order, weight in weights.items():
+        added = _ADDED_INPUT_COLUMNS[order]
+        torch.testing.assert_close(weight[:, added], torch.zeros_like(weight[:, added]))
+
+    captured_gradients: list[dict[int, torch.Tensor]] = []
+    original_step = torch.optim.Adam.step
+
+    def capture_step(optimizer: torch.optim.Adam, *args: object, **kwargs: object) -> object:
+        step_gradients = {}
+        for order, weight in weights.items():
+            assert weight.grad is not None
+            step_gradients[order] = weight.grad.detach().clone()
+            if freeze_added:
+                weight.grad[:, _ADDED_INPUT_COLUMNS[order]] = 0
+        captured_gradients.append(step_gradients)
+        result = original_step(optimizer, *args, **kwargs)
+        if freeze_added:
+            with torch.no_grad():
+                for order, weight in weights.items():
+                    weight[:, _ADDED_INPUT_COLUMNS[order]] = 0
+        return result
+
+    monkeypatch.setattr(torch.optim.Adam, "step", capture_step)
+    runner.run(make_run_context(tmp_path, run_id=f"{package}-embedding-{freeze_added}"))
+    return weights, initial, captured_gradients
+
+
+@pytest.mark.parametrize("package", ("B10", "B11"))
+def test_added_embedding_columns_move_in_a_real_short_training_run(
+    package: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    weights, initial, gradients = _run_short_embedding_training(
+        package, tmp_path, freeze_added=False, monkeypatch=monkeypatch
+    )
+    assert len(gradients) == 2
+    for order, weight in weights.items():
+        added = _ADDED_INPUT_COLUMNS[order]
+        step_zero_gradient = gradients[0][order][:, added]
+        assert torch.isfinite(step_zero_gradient).all()
+        assert torch.any(step_zero_gradient != 0)
+        final_added = weight[:, added].detach()
+        assert torch.isfinite(final_added).all()
+        assert torch.any(final_added != 0)
+
+
+@pytest.mark.parametrize("package", ("B10", "B11"))
+def test_frozen_added_embedding_columns_stay_zero_while_raw_weights_move(
+    package: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    weights, initial, gradients = _run_short_embedding_training(
+        package, tmp_path, freeze_added=True, monkeypatch=monkeypatch
+    )
+    assert len(gradients) == 2
+    for order, weight in weights.items():
+        added = _ADDED_INPUT_COLUMNS[order]
+        raw = tuple(index for index in range(weight.shape[1]) if index not in added)
+        assert torch.equal(weight[:, added].detach(), torch.zeros_like(weight[:, added]))
+        assert torch.isfinite(weight[:, raw]).all()
+        assert torch.any(weight[:, raw].detach() != initial[order][:, raw])
+
+
 @pytest.mark.parametrize("package", ("B01", "B11"))
 def test_jastrow_coefficients_move_in_a_real_short_training_run(
     package: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
