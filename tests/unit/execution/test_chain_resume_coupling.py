@@ -37,7 +37,7 @@ def test_native_coupled_attribution_passes_before_wrong_attribution_mutant():
 def test_native_cursor_omission_uses_first_restarted_event_and_names_mismatch():
     reference = ProcessEvidence("reference", 1, 1, "runtime", (), 0, _events(3))
     resumed = ProcessEvidence("recovery", 2, 1, "checkpoint", (), 0,
-                              _events(0, {"process_random"}) + _events(3))
+                              _events(0, {"trainer_cursor"}) + _events(3))
     result = compare_channel_parity(reference, resumed, resume_step=2,
                                     disabled_limbs=("trainer_cursor",),
                                     expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES)

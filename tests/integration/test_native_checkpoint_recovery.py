@@ -696,6 +696,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         outputs=outputs,
         phase="initial",
         label="channel-prefix",
+        trace=tmp_path / "channel-prefix.trace.json",
     )
     # Establish two distinct committed prefix cursors before stopping the
     # worker.  The lower evidence used by the cursor control must come from
@@ -738,6 +739,30 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     reference_trace = _trace(tmp_path / "channel-reference.trace.json")
 
     resume_cursor = prefix_checkpoint.next_iteration
+    full_trace_path = tmp_path / "channel-full.trace.json"
+    full = _launch(
+        root=tmp_path,
+        batch_path=batch_path,
+        intent_path=intent_path,
+        config_path=FIXTURE,
+        receipts=receipts,
+        outputs=outputs,
+        phase="recovery",
+        label="channel-full",
+        evidence=evidence_path,
+        trace=full_trace_path,
+        resume_step=resume_cursor,
+    )
+    full.wait(timeout=180)
+    assert full.returncode == 0
+    full_trace = _trace(full_trace_path)
+    compare_channel_parity(
+        reference_trace,
+        full_trace,
+        resume_step=resume_cursor - 1,
+        disabled_limbs=(),
+        expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
+    )
     lower_refs = [ref for ref in observed_prefix_refs if ref.next_iteration < resume_cursor]
     assert lower_refs, "native prefix did not leave a lower cursor for the positive control"
     lower_evidence = CheckpointEvidence.from_ref(
@@ -837,6 +862,12 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
 
     assert set(results) == {spec.limb for spec in E5_CHANNEL_MAP}
+    process_spec = next(spec for spec in E5_CHANNEL_MAP if spec.channel == "process_random")
+    full_process = first_subsequent_event(full_trace, process_spec, resume_step=resume_cursor - 1)
+    omitted_process = first_subsequent_event(
+        disabled_traces["process_rng"], process_spec, resume_step=resume_cursor - 1
+    )
+    assert omitted_process.value != full_process.value
 
     # Positive controls now consume the vectors emitted by the real native
     # workers above.  The synthetic probe has a separate adapter-unit label

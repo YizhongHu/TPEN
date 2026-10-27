@@ -125,7 +125,7 @@ def install_native_trace(trace: NativeTrace) -> ExitStack:
 
     The returned stack must be kept alive for the complete configured run.
     Instrumentation points correspond to the public CR declaration:
-    ``MetropolisSampler.collect_samples`` (proposal), the fixture model's
+    ``MetropolisSampler._propose`` (first pre-acceptance proposal per step), the fixture model's
     ``forward`` (model evaluation), ``torch.optim.Adam.step`` (optimizer), the
     observation-only global ``torch.rand`` draw above (process RNG), and the
     sampler-call boundary (trainer cursor).

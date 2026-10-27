@@ -82,7 +82,9 @@ def r5_traces(tmp_path_factory):
 
     lane = _Lane(tmp_path_factory.mktemp("r5-native"))
     target = lane.batch.target_iterations
-    prefix = lane.launch(phase="initial", label="r5-prefix")
+    prefix = lane.launch(
+        phase="initial", label="r5-prefix", trace=lane.root / "r5-prefix.trace.json"
+    )
     run_dir, observed_refs = native._wait_for_prefix_checkpoints(
         lane.outputs, target=target, minimum=2, process=prefix
     )

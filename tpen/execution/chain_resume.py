@@ -105,11 +105,11 @@ E5_CHANNEL_MAP: tuple[ChannelSpec, ...] = (
 # mismatch sets, not independent-owner claims. Callers must opt in; synthetic
 # adapter-unit fixtures retain the independent single-channel contract.
 E5_NATIVE_EXPECTED_MISMATCHES: Mapping[str, frozenset[str]] = {
-    "model": frozenset({"model_logabs", "optimizer_update", "process_random"}),
-    "optimizer": frozenset({"optimizer_update", "process_random"}),
+    "model": frozenset({"model_logabs", "optimizer_update"}),
+    "optimizer": frozenset({"optimizer_update"}),
     "process_rng": frozenset({"process_random"}),
-    "sampler_mcmc": frozenset({"model_logabs", "optimizer_update", "sampler_proposal", "process_random"}),
-    "trainer_cursor": frozenset({"trainer_cursor", "process_random"}),
+    "sampler_mcmc": frozenset({"model_logabs", "optimizer_update", "sampler_proposal"}),
+    "trainer_cursor": frozenset({"trainer_cursor"}),
 }
 
 

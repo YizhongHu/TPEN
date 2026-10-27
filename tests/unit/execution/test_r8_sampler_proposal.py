@@ -128,8 +128,7 @@ def test_two_acceptance_regimes_have_equal_proposal_channel_after_helper_fix() -
     rejected_move, _rejected_walkers, rejected_trace = _run_traced(_RejectNonzeroProposal())
     assert torch.equal(accepted_move.proposals[0], rejected_move.proposals[0])
 
-    # This is the parity requirement for the proposed _propose-only spy.  It
-    # is intentionally RED on the current helper and GREEN on the cloned fix.
+    # This is the parity requirement for the proposed _propose-only spy.
     assert _first_event(accepted_trace, "sampler_proposal").value == _first_event(
         rejected_trace, "sampler_proposal"
     ).value
