@@ -2323,3 +2323,327 @@ def test_execute_refuses_missing_sampler_seed_before_claim(
     ):
         runner.execute(_args(tmp_path, seed_label=seed_label, walkers=walkers, dry_run=False))
     assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("producer_policy", "aggregation_activation", "input_features", "feature_update"),
+)
+@pytest.mark.parametrize("remove", (False, True))
+def test_a6_o_composite_override_fields_refuse_through_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    remove: bool,
+) -> None:
+    """Every authority-declared composite override remains selection-bound."""
+
+    authority = optimizer_grid.load_authority()
+    expected = next(
+        context["overrides"]
+        for context in authority["contexts"]
+        if context["name"] == "O-composite"
+    )
+    target = _o_composite_target(tmp_path)
+    manifest = stage._thaw(target.manifest)
+    overrides = manifest["scientific_identity"]["context"]["overrides"]
+    if remove:
+        del overrides[field]
+    else:
+        overrides[field] = f"wrong-{field}"
+    mutated = replace(
+        target,
+        manifest=stage._freeze(manifest),
+        content_hash=stage.content_hash(manifest),
+        output_path=target.output_path.parent / stage.content_hash(manifest),
+    )
+    original = runner.train_config.resolve_train_config
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", lambda _: original(target))
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match=f"context\\.overrides\\.{field}.*dd964863",
+    ):
+        runner.select_cell((mutated,), context="O-composite", seed_label=810001)
+    assert field in expected
+
+
+def test_a6_o_composite_full_authority_cardinality_and_ambiguity_arms(
+    tmp_path: Path,
+) -> None:
+    """Both seed labels cover every authority pair exactly once."""
+
+    authority = optimizer_grid.load_authority()
+    adam = next(family for family in authority["families"] if family["family"] == "adam")
+    expected_pairs = {
+        (lr, beta2)
+        for lr in adam["varied"]["lr"]
+        for beta2 in adam["varied"]["beta2"]
+    }
+    composite = _q_adam_cells(_cells(tmp_path), context="O-composite")
+    assert len(composite) == 2 * len(expected_pairs)
+    for label in (810001, 810002):
+        labeled = [
+            cell for cell in composite
+            if cell.manifest["seed_identity"]["label"] == label
+        ]
+        assert len(labeled) == len(expected_pairs)
+        for lr, beta2 in expected_pairs:
+            matches = [
+                cell for cell in labeled
+                if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == lr
+                and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == beta2
+            ]
+            assert len(matches) == 1
+            assert runner.select_cell(
+                matches,
+                context="O-composite",
+                lr=lr,
+                beta2=beta2,
+                seed_label=label,
+            ).selected.seed_label == label
+    with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
+        runner.select_cell(composite, context="O-composite", seed_label=810003)
+    exact = [
+        cell for cell in composite
+        if cell.manifest["seed_identity"]["label"] == 810002
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    ]
+    with pytest.raises(runner.StageQSelectionError, match="ambiguous"):
+        runner.select_cell(exact + exact, context="O-composite", seed_label=810002)
+    with pytest.raises(runner.StageQSelectionError, match="ambiguous"):
+        runner.select_cell(composite, context="O-composite", seed_label=None)
+
+
+_A3_COMPOSITE_INITIALIZER_PATHS = (
+    "model.embedding.raw.initializer.seed",
+    "model.embedding.augmented.initializer.seed",
+    "model.layers.0.mixing.activation.initializer.seed",
+    "model.layers.0.path_aggregation.initializer.seed",
+    "model.layers.0.path_aggregation.activation.initializer.seed",
+)
+
+
+def _delete_config_path(config: object, path: str) -> None:
+    parent_path, key = path.rsplit(".", 1)
+    parent = runner.OmegaConf.select(config, parent_path)
+    del parent[key]
+
+
+@pytest.mark.parametrize("seed_label", (810001, 810002))
+def test_a3_o_composite_sampler_seed_is_bound_for_both_labels(
+    tmp_path: Path, seed_label: int,
+) -> None:
+    """The consumed sampler seed follows the authority seed namespace."""
+
+    target = next(
+        cell for cell in _q_adam_cells(_cells(tmp_path), context="O-composite")
+        if cell.manifest["seed_identity"]["label"] == seed_label
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
+    resolved = runner.train_config.resolve_train_config(target)
+    expected = stage_coordinate.seed_namespace("Q", seed_label)["training_sampler"]
+    assert resolved.runner.sampler.seed == expected
+
+
+@pytest.mark.parametrize("seed_label", (810001, 810002))
+@pytest.mark.parametrize("mode", ("corrupt", "delete"))
+@pytest.mark.parametrize("path", _A3_COMPOSITE_INITIALIZER_PATHS)
+def test_a3_o_composite_initializer_path_refuses_before_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    seed_label: int,
+    mode: str,
+    path: str,
+) -> None:
+    """Every consumed initializer path is independently enforced for both labels."""
+
+    target = next(
+        cell for cell in _q_adam_cells(_cells(tmp_path), context="O-composite")
+        if cell.manifest["seed_identity"]["label"] == seed_label
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
+    original = runner.train_config.resolve_train_config
+    runner_path = path.replace("model.", "runner.model.", 1)
+
+    def resolve_mutated(source: object) -> object:
+        resolved = original(source)
+        for current in (path, runner_path):
+            if mode == "delete":
+                _delete_config_path(resolved, current)
+            else:
+                runner.OmegaConf.update(resolved, current, 7, merge=False)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_mutated)
+    monkeypatch.setattr(runner, "_refuse_occupied_output_path", lambda *_: pytest.fail("claim reached"))
+    field = runner_path.replace(".", r"\.")
+    with pytest.raises(runner.StageQSelectionError, match=field):
+        runner.execute(
+            _args(
+                tmp_path,
+                context="O-composite",
+                seed_label=seed_label,
+                dry_run=False,
+            )
+        )
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+_A4_CONSUMED_DIVERGENCES = {
+    "model": ("runner.model.embedding.augmented.in_features", 6),
+    "optimizer": ("runner.optimizer.lr", 0.015),
+    "sampler": ("runner.sampler.proposal_scale", 0.75),
+    "trainer": ("runner.trainer.max_steps", 1999),
+    "hamiltonian_terms": ("runner.hamiltonian_terms.electron_nucleus.eps", 0.1),
+}
+
+
+@pytest.mark.parametrize("dry_run", (True, False))
+@pytest.mark.parametrize("component", tuple(_A4_CONSUMED_DIVERGENCES))
+def test_a4_o_composite_root_consumed_divergence_refuses_before_output_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dry_run: bool,
+    component: str,
+) -> None:
+    """Every root/runner twin is checked before either output claim or launch."""
+
+    target_path, value = _A4_CONSUMED_DIVERGENCES[component]
+    original = runner.train_config.resolve_train_config
+
+    def resolve_diverged(source: object) -> object:
+        resolved = original(source)
+        runner.OmegaConf.update(resolved, target_path, value, merge=False)
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_diverged)
+    monkeypatch.setattr(runner, "_refuse_occupied_output_path", lambda *_: pytest.fail("claim reached"))
+    monkeypatch.setattr(runner.launch, "launch_train", lambda *_args, **_kwargs: pytest.fail("launch reached"))
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match=f"root/consumed divergence.*runner\\.{component}",
+    ):
+        runner.execute(
+            _args(
+                tmp_path,
+                context="O-composite",
+                dry_run=dry_run,
+                seed_label=810001,
+            )
+        )
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+    assert not list(tmp_path.rglob("COMPLETE"))
+
+
+def test_a5_o_composite_runner_route_closes_the_three_l5_traps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner route preserves factors, root interpolation, and matched starts."""
+
+    selection = runner.select_cell(
+        (_o_composite_target(tmp_path),),
+        context="O-composite",
+        seed_label=810001,
+    )
+    packet, resolved = runner._resolve_selected_config(selection)
+    del packet
+    factors = runner.OmegaConf.to_container(resolved.model.factors, resolve=True)
+    assert factors == [
+        {"_target_": "tpen.nn.ElectronElectronCusp", "trainable_range": True},
+        {
+            "_target_": "tpen.nn.ElectronNucleusCusp",
+            "atoms": {
+                "_target_": "tpen.data.atomic_configuration.AtomicConfiguration",
+                "positions": {"_target_": "torch.tensor", "data": [[0.0, 0.0, 0.0]]},
+                "charges": {"_target_": "torch.tensor", "data": [2.0]},
+            },
+            "law": {
+                "_target_": "tpen.nn.TailSafeElectronNucleusCuspLaw",
+                "curvature_range": 1.0,
+                "tail_slope": 1.99,
+                "trainable": True,
+            },
+        },
+        {
+            "_target_": "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
+            "trainable": True,
+            "length": 1.0,
+            "mean_coefficient": 0.0,
+            "difference_coefficient": 0.0,
+        },
+    ]
+    resolved_container = runner.OmegaConf.to_container(resolved, resolve=True)
+    assert "${" not in json.dumps(resolved_container)
+
+    original = runner.train_config.resolve_train_config
+
+    def naive_factor_route(source: object) -> object:
+        mutated = original(source)
+        for prefix in ("model", "runner.model"):
+            runner.OmegaConf.update(
+                mutated,
+                f"{prefix}.factors",
+                [runner.OmegaConf.to_container(mutated, resolve=False)["model"]["factors"][-1]],
+                merge=False,
+            )
+        return mutated
+
+    with monkeypatch.context() as context:
+        context.setattr(runner.train_config, "resolve_train_config", naive_factor_route)
+        with pytest.raises(runner.StageQSelectionError, match=r"factors\[0\]"):
+            runner.select_cell(
+                (_o_composite_target(tmp_path),),
+                context="O-composite",
+                seed_label=810001,
+            )
+
+    mapping = runner.train_config._context_mapping_api()
+    detached = runner.OmegaConf.create(
+        mapping.compose_package(runner.train_config._compose_base_config().model, "B11")
+    )
+
+    with monkeypatch.context() as context:
+        context.setattr(runner.train_config, "resolve_train_config", lambda _: detached)
+        with pytest.raises(Exception, match="Interpolation key"):
+            runner.select_cell(
+                (_o_composite_target(tmp_path),),
+                context="O-composite",
+                seed_label=810001,
+            )
+
+    import torch
+
+    batch = instantiate(
+        {
+            "_target_": "tpen.data.batch.ElectronBatch",
+            "positions": torch.tensor(
+                [[[0.7, 0.1, -0.2], [-0.4, 0.3, 0.5]]], dtype=torch.float64
+            ),
+            "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
+            "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
+            "spins": torch.tensor([[1.0, -1.0]], dtype=torch.float64),
+        }
+    )
+    seed = stage_coordinate.seed_namespace("Q", 810001)["model_initialization"]
+
+    def twin_model(label: str) -> object:
+        config = runner.train_config._compose_base_config()
+        config.model = mapping.compose_package(config.model, label)
+        config.model.layers[0] = runner.OmegaConf.create(
+            mapping.context_fragment(
+                "hybrid/coordinate-neighbor",
+                activation="channel-MLP,channel-MLP",
+                seed=seed,
+            )
+        )
+        runner.OmegaConf.update(config, "runtime.seed", seed, merge=False)
+        runner.OmegaConf.resolve(config)
+        return instantiate(config.model).to(dtype=torch.float64)
+
+    b00, b01, b10 = (twin_model(label) for label in ("B00", "B01", "B10"))
+    b11 = instantiate(resolved.model).to(dtype=torch.float64)
+    assert torch.equal(b10(batch).logabs, b00(batch).logabs)
+    assert torch.equal(b11(batch).logabs, b01(batch).logabs)
