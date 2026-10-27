@@ -175,6 +175,12 @@ def select_cell(
     """
 
     _require_q_stage(stage)
+    if context not in {DEFAULT_CONTEXT, "O-composite"}:
+        raise StageQSelectionError(
+            "truthfulness guard refused field 'context.name': "
+            f"declared value {context!r}; only O-raw and O-composite are admitted "
+            "(item dd964863)"
+        )
     admitted_methods = {
         entry.method for entry in _roster() if entry.admitted and entry.target
     }
@@ -198,13 +204,6 @@ def select_cell(
             f"stage={stage!r}, context={context!r}, optimizer={optimizer!r}, "
             f"lr={lr!r}, beta2={beta2!r}, seed_label={seed_label!r}"
         )
-    if context != DEFAULT_CONTEXT:
-        raise StageQSelectionError(
-            "truthfulness guard refused field 'context': "
-            f"declared value {context!r}, consumed value {DEFAULT_CONTEXT!r}; "
-            "O-composite is not consumed by the resolver (items 7bae63d8 and dd964863)"
-        )
-
     truthful: list[tuple[Any, CellDescriptor]] = []
     refusals: list[str] = []
     for cell, descriptor in requested:
@@ -289,14 +288,20 @@ def _scheduler_configured(resolved: Any) -> bool:
 def _authority_o_raw_context() -> Mapping[str, Any]:
     """Return the exact O-raw coordinate mapping from the loaded authority."""
 
+    return _authority_context(DEFAULT_CONTEXT)
+
+
+def _authority_context(name: str) -> Mapping[str, Any]:
+    """Return one named context mapping from the committed authority."""
+
     authority = optimizer_grid.load_authority()
     for context in authority["contexts"]:
-        if context["name"] == DEFAULT_CONTEXT:
+        if context["name"] == name:
             return {
                 "name": context["name"],
                 "overrides": dict(context["overrides"]),
             }
-    raise StageQSelectionError("optimizer-grid authority has no O-raw context")
+    raise StageQSelectionError(f"optimizer-grid authority has no {name!r} context")
 
 
 # The authority's ``feature_update`` values are labels, so keep their consumer
@@ -330,6 +335,28 @@ _B00_MODEL_REQUIREMENTS = {
         "pair_input_channels": 0,
     },
 }
+
+_COMPOSITE_MODEL_REQUIREMENTS = {
+    "target": "tpen.nn.TPENWaveFunction",
+    "basis": "tpen.nn.basis.BoundedDistanceBasis",
+    "raw_basis": "tpen.nn.RawCoordinateBasis",
+    "embedding": "tpen.nn.embedding.matched_start_embedding",
+    "embedding_target": "tpen.nn.Embedding",
+    "raw_in_features": 4,
+    "augmented_in_features": 5,
+    "pair_input_channels": 3,
+    "length": 1.0,
+    "mixing": "tpen.nn.CompositeMixing",
+    "linear_producer": "tpen.nn.LinearEquivariantMixing",
+    "tensor_producer": "tpen.nn.EquivariantMixing",
+    "activation": "tpen.nn.ChannelPreservingMLPActivation",
+}
+
+_COMPOSITE_FACTOR_TARGETS = (
+    "tpen.nn.ElectronElectronCusp",
+    "tpen.nn.ElectronNucleusCusp",
+    "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
+)
 
 # Recompute this literal from the committed control config with:
 #
@@ -642,6 +669,121 @@ def _require_b00_model(model: Mapping[str, Any], declared: Any) -> None:
         )
 
 
+def _require_o_composite_model(model: Mapping[str, Any], declared: Any) -> None:
+    """Require the design-derived B11 model structure consumed by O-composite."""
+
+    expected = _COMPOSITE_MODEL_REQUIREMENTS
+    if not isinstance(model, Mapping):
+        raise _input_feature_refusal("context.overrides.input_features.model", declared, model)
+    if model.get("_target_") != expected["target"]:
+        raise _input_feature_refusal("context.overrides.input_features.model._target_", declared, model.get("_target_"))
+
+    basis = model.get("basis")
+    if not isinstance(basis, Mapping) or basis.get("_target_") != expected["basis"]:
+        raise _input_feature_refusal("context.overrides.input_features.model.basis._target_", declared, basis)
+    inner = basis.get("inner")
+    if not isinstance(inner, Mapping) or inner.get("_target_") not in {
+        expected["raw_basis"],
+        "tpen.nn.basis.RawCoordinateBasis",
+    }:
+        raise _input_feature_refusal("context.overrides.input_features.model.basis.inner._target_", declared, inner)
+    for field, value in (("spatial_dim", 3), ("include_spin", True), ("length", expected["length"])):
+        actual = inner.get(field) if field != "length" else basis.get(field)
+        if actual != value:
+            raise _input_feature_refusal(
+                f"context.overrides.input_features.model.basis.{field}", declared, actual
+            )
+
+    embedding = model.get("embedding")
+    if not isinstance(embedding, Mapping) or embedding.get("_target_") != expected["embedding"]:
+        raise _input_feature_refusal("context.overrides.input_features.model.embedding._target_", declared, embedding)
+    for member, width, pair_channels in (
+        ("raw", expected["raw_in_features"], 0),
+        ("augmented", expected["augmented_in_features"], expected["pair_input_channels"]),
+    ):
+        nested = embedding.get(member)
+        if not isinstance(nested, Mapping) or nested.get("_target_") != expected["embedding_target"]:
+            raise _input_feature_refusal(
+                f"context.overrides.input_features.model.embedding.{member}", declared, nested
+            )
+        for field, value in (("spatial_dim", 3), ("in_features", width), ("pair_input_channels", pair_channels)):
+            if nested.get(field, None if field != "pair_input_channels" else 0) != value:
+                raise _input_feature_refusal(
+                    f"context.overrides.input_features.model.embedding.{member}.{field}",
+                    declared,
+                    nested.get(field),
+                )
+
+    factors = model.get("factors")
+    if not isinstance(factors, Sequence) or isinstance(factors, (str, bytes, bytearray)):
+        raise _input_feature_refusal("context.overrides.input_features.model.factors", declared, factors)
+    targets = tuple(factor.get("_target_") for factor in factors if isinstance(factor, Mapping))
+    if targets != _COMPOSITE_FACTOR_TARGETS:
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.factors", declared, targets
+        )
+    control_ee = factors[0]
+    if not isinstance(control_ee, Mapping) or control_ee.get("trainable_range") is not True:
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.factors[0]", declared, control_ee
+        )
+    control_en = factors[1]
+    expected_law = {
+        "_target_": "tpen.nn.TailSafeElectronNucleusCuspLaw",
+        "curvature_range": 1.0,
+        "tail_slope": 1.99,
+    }
+    if (
+        not isinstance(control_en, Mapping)
+        or control_en.get("trainable") is not True
+        or control_en.get("law") != expected_law
+    ):
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.factors[1]", declared, control_en
+        )
+    jastrow = factors[-1]
+    expected_jastrow = {
+        "_target_": _COMPOSITE_FACTOR_TARGETS[-1],
+        "trainable": True,
+        "length": 1.0,
+        "mean_coefficient": 0.0,
+        "difference_coefficient": 0.0,
+    }
+    if dict(jastrow) != expected_jastrow:
+        raise _input_feature_refusal(
+            "context.overrides.input_features.model.factors[-1]", declared, jastrow
+        )
+
+    layers = model.get("layers")
+    if not isinstance(layers, Sequence) or isinstance(layers, (str, bytes, bytearray)) or not layers:
+        raise _input_feature_refusal("context.overrides.input_features.model.layers", declared, layers)
+    for index, layer in enumerate(layers):
+        if not isinstance(layer, Mapping):
+            raise _input_feature_refusal(f"context.overrides.input_features.model.layers[{index}]", declared, layer)
+        mixing = layer.get("mixing")
+        if not isinstance(mixing, Mapping) or mixing.get("_target_") != expected["mixing"]:
+            raise _input_feature_refusal(f"context.overrides.input_features.model.layers[{index}].mixing", declared, mixing)
+        producers = mixing.get("producers")
+        producer_targets = tuple(
+            producer.get("_target_") for producer in producers
+            if isinstance(producer, Mapping)
+        ) if isinstance(producers, Sequence) else ()
+        if producer_targets != (expected["linear_producer"], expected["tensor_producer"]):
+            raise _input_feature_refusal(
+                f"context.overrides.input_features.model.layers[{index}].mixing.producers",
+                declared,
+                producer_targets,
+            )
+        for site in ("mixing", "path_aggregation"):
+            activation = layer.get(site, {}).get("activation") if isinstance(layer.get(site), Mapping) else None
+            if not isinstance(activation, Mapping) or activation.get("_target_") != expected["activation"]:
+                raise _input_feature_refusal(
+                    f"context.overrides.input_features.model.layers[{index}].{site}.activation",
+                    declared,
+                    activation,
+                )
+
+
 def _context_refusal(field: str, declared: Any, consumed: Any) -> StageQSelectionError:
     return StageQSelectionError(
         f"truthfulness guard refused field '{field}': declared value {declared!r}, "
@@ -685,7 +827,10 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
     identity = cell.manifest["scientific_identity"]
     agreed = _agreed_consumed_views(resolved)
     declared_context = identity["context"]
-    authority_context = _authority_o_raw_context()
+    context_name = declared_context.get("name")
+    if context_name not in {DEFAULT_CONTEXT, "O-composite"}:
+        raise _context_refusal("context.name", context_name, "O-raw or O-composite")
+    authority_context = _authority_context(context_name)
     declared_context_keys = set(declared_context)
     authority_context_keys = set(authority_context)
     for field in sorted(declared_context_keys | authority_context_keys):
@@ -719,7 +864,10 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
 
     model = agreed["model"]
     _require_seed_bindings(cell, model, agreed["sampler"])
-    _require_b00_model(model, authority_overrides["input_features"])
+    if context_name == DEFAULT_CONTEXT:
+        _require_b00_model(model, authority_overrides["input_features"])
+    else:
+        _require_o_composite_model(model, authority_overrides["input_features"])
     layers = model.get("layers", ()) if isinstance(model, Mapping) else ()
     if not layers:
         raise _context_refusal(
@@ -734,7 +882,7 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
                 consumed_target,
             )
     actual_fingerprint = _model_fingerprint(model)
-    if actual_fingerprint != _CONTROL_MODEL_FINGERPRINT:
+    if context_name == DEFAULT_CONTEXT and actual_fingerprint != _CONTROL_MODEL_FINGERPRINT:
         raise StageQSelectionError(
             "truthfulness guard refused field 'runner.model.fingerprint': "
             f"expected digest {_CONTROL_MODEL_FINGERPRINT!r}, "

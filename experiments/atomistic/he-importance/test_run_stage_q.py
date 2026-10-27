@@ -132,7 +132,7 @@ def test_truthfulness_guard_refuses_each_nonmatching_adam_level_cell(tmp_path: P
         assert any(field in str(refusal.value) for field in ("lr", "beta2")), levels
 
 
-def test_truthfulness_guard_refuses_o_composite_with_resolver_item(tmp_path: Path) -> None:
+def test_o_composite_selection_consumes_the_authority_literal(tmp_path: Path) -> None:
     composite = _q_adam_cells(_cells(tmp_path), context="O-composite")
     target = next(
         cell
@@ -141,8 +141,123 @@ def test_truthfulness_guard_refuses_o_composite_with_resolver_item(tmp_path: Pat
         == {"lr": 0.005, "beta1": 0.9, "beta2": 0.999, "epsilon": 1e-8,
             "weight_decay": 0.0, "parameter_groups": 1, "schedule": "constant"}
     )
-    with pytest.raises(runner.StageQSelectionError, match="dd964863"):
-        runner.select_cell((target,), context="O-composite", seed_label=810001)
+    selection = runner.select_cell((target,), context="O-composite", seed_label=810001)
+    assert selection.selected.context == "O-composite"
+    assert selection.selected.seed_label == 810001
+
+
+def test_o_composite_selection_has_eight_adam_authority_cells_and_schema_validates(
+    tmp_path: Path,
+) -> None:
+    composite = _q_adam_cells(_cells(tmp_path), context="O-composite")
+    target = [
+        cell
+        for cell in composite
+        if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+        and cell.manifest["seed_identity"]["label"] == 810001
+    ]
+    assert len(target) == 1
+    resolved = runner.train_config.resolve_train_config(target[0])
+    import tpen.hi_schema as schema
+
+    schema.validate_hi_train_config(resolved)
+    assert resolved.model.basis._target_ == "tpen.nn.basis.BoundedDistanceBasis"
+    assert resolved.model.basis.inner._target_ == "tpen.nn.RawCoordinateBasis"
+    assert resolved.model.basis.length == 1.0
+    assert resolved.model.embedding._target_ == "tpen.nn.embedding.matched_start_embedding"
+    assert resolved.model.embedding.raw.in_features == 4
+    assert resolved.model.embedding.raw.pair_input_channels == 0
+    assert resolved.model.embedding.augmented.in_features == 5
+    assert resolved.model.embedding.augmented.pair_input_channels == 3
+    assert [factor._target_ for factor in resolved.model.factors] == [
+        "tpen.nn.ElectronElectronCusp",
+        "tpen.nn.ElectronNucleusCusp",
+        "tpen.nn.jastrow.BoundedTwoCoefficientJastrow",
+    ]
+    layer = resolved.model.layers[0]
+    assert layer.mixing._target_ == "tpen.nn.CompositeMixing"
+    assert [producer._target_ for producer in layer.mixing.producers] == [
+        "tpen.nn.LinearEquivariantMixing",
+        "tpen.nn.EquivariantMixing",
+    ]
+    assert layer.mixing.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
+    assert layer.path_aggregation.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
+    assert layer.update._target_ == "tpen.nn.ResidualUpdater"
+
+
+def test_o_composite_seed_paths_are_independently_enumerated(
+    tmp_path: Path,
+) -> None:
+    target = next(
+        cell
+        for cell in _q_adam_cells(_cells(tmp_path), context="O-composite")
+        if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+        and cell.manifest["seed_identity"]["label"] == 810001
+    )
+    resolved = runner.train_config.resolve_train_config(target)
+    model = runner.OmegaConf.to_container(resolved.model, resolve=False)
+
+    def walk(value: object, path: str = "model") -> set[str]:
+        if isinstance(value, dict):
+            found = set()
+            if isinstance(value.get("initializer"), dict):
+                found.add(f"{path}.initializer.seed")
+            for key, nested in value.items():
+                found.update(walk(nested, f"{path}.{key}"))
+            return found
+        if isinstance(value, (tuple, list)):
+            found = set()
+            for index, nested in enumerate(value):
+                found.update(walk(nested, f"{path}.{index}"))
+            return found
+        return set()
+
+    paths = walk(model)
+    assert paths == {
+        "model.embedding.raw.initializer.seed",
+        "model.embedding.augmented.initializer.seed",
+        "model.layers.0.mixing.activation.initializer.seed",
+        "model.layers.0.path_aggregation.initializer.seed",
+        "model.layers.0.path_aggregation.activation.initializer.seed",
+    }
+    expected = target.seed_streams["model_initialization"]
+    assert all(runner.OmegaConf.select(resolved, path) == expected for path in paths)
+
+
+def test_o_composite_jastrow_removal_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    original = runner.train_config.resolve_train_config
+
+    def drop_jastrow(source: object) -> object:
+        resolved = original(source)
+        resolved.model.factors.pop()
+        resolved.runner.model.factors.pop()
+        return resolved
+
+    monkeypatch.setattr(runner.train_config, "resolve_train_config", drop_jastrow)
+    with pytest.raises(runner.StageQSelectionError, match="factors.*dd964863"):
+        runner.select_cell(
+            _q_adam_cells(_cells(tmp_path), context="O-composite"),
+            context="O-composite",
+            seed_label=810001,
+        )
+
+
+def test_o_composite_launch_path_matches_selection_path(tmp_path: Path) -> None:
+    target = next(
+        cell
+        for cell in _q_adam_cells(_cells(tmp_path), context="O-composite")
+        if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+        and cell.manifest["seed_identity"]["label"] == 810001
+    )
+    packet = runner._q_training_packet(target)
+    selected = runner.train_config.resolve_train_config(packet)
+    launched = runner.launch.prepare_train_launch(packet, _r2_facts())
+    assert runner.OmegaConf.to_container(launched.config, resolve=True) == runner.OmegaConf.to_container(
+        selected, resolve=True
+    )
 
 
 def test_truthfulness_guard_leaves_exactly_one_mechanics_cell(tmp_path: Path) -> None:
@@ -179,7 +294,7 @@ def test_truthfulness_guard_reads_consumed_lr_from_resolved_config(
 
 @pytest.mark.parametrize(
     ("axis", "value"),
-    [("context", "O-composite"), ("optimizer", "kfac"), ("optimizer", "sr")],
+    [("context", "O-unadmitted"), ("optimizer", "kfac"), ("optimizer", "sr")],
 )
 def test_r3_selection_axes_reject_unadmitted_values_before_all_execution_stages(
     tmp_path: Path,
