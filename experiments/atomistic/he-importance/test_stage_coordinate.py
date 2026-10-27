@@ -112,7 +112,7 @@ def test_stage_authority_loader_rejects_each_sampler_override_malformed_shape(
 def _load_base_stage_coordinate() -> object:
     """Load the exact base implementation without changing the checkout."""
 
-    base = "a757ed762f90dceac4e94ca6f10f90ee90d6e7c9"
+    base = "d7649753b108ed36fdd3e7c30276eb341e3f8059"
     source = subprocess.check_output(
         ["git", "show", f"{base}:experiments/atomistic/he-importance/stage_coordinate.py"],
         text=True,
