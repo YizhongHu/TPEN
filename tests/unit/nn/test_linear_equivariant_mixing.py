@@ -74,6 +74,36 @@ def test_linear_explicit_metadata_preserves_declared_order() -> None:
     assert metadata.all_paths() == paths
 
 
+def test_linear_explicit_metadata_accepts_sequences_and_stores_tuple() -> None:
+    paths = [
+        SupportPath(1, 1, (0,), (1,), "sum"),
+        SupportPath(1, 1, (0,), (0,), "sum"),
+    ]
+    from_list = LinearPathMetadata.generate(max_order=1, policy="explicit", explicit=paths)
+    from_tuple = LinearPathMetadata.generate(max_order=1, policy="explicit", explicit=tuple(paths))
+
+    assert from_list == from_tuple
+    assert from_list.fingerprint == from_tuple.fingerprint
+    assert from_list.all_paths() == tuple(paths)
+    assert isinstance(from_list.outputs[0].entries, tuple)
+
+    assert LinearPathMetadata.generate(max_order=1, policy="explicit").all_paths() == ()
+
+
+@pytest.mark.parametrize(
+    "explicit",
+    [
+        ("not a SupportPath",),
+        (SupportPath(1, 1, (0,), (0,)), "not a SupportPath"),
+        "not a sequence of paths",
+        b"not a sequence of paths",
+    ],
+)
+def test_linear_explicit_metadata_rejects_invalid_sequence_elements(explicit: object) -> None:
+    with pytest.raises(TypeError, match="explicit"):
+        LinearPathMetadata.generate(max_order=1, policy="explicit", explicit=explicit)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("implementation", [MixingImplementation.SLOW, MixingImplementation.VECTORIZED])
 @pytest.mark.parametrize("aggregation", [Aggregation.SUM, Aggregation.COMPLETION_MEAN])
 def test_unary_hand_computed_one_body_values(
