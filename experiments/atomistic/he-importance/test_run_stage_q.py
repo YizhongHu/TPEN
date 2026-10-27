@@ -2325,6 +2325,16 @@ def test_execute_refuses_missing_sampler_seed_before_claim(
     assert not list(tmp_path.rglob("selection_receipt.json"))
 
 
+def _q_adam_cells_all_labels(cells: tuple[object, ...], *, context: str) -> list[object]:
+    return [
+        cell
+        for cell in cells
+        if cell.manifest["stage"] == "Q"
+        and cell.manifest["scientific_identity"]["context"]["name"] == context
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+    ]
+
+
 @pytest.mark.parametrize(
     "field",
     ("producer_policy", "aggregation_activation", "input_features", "feature_update"),
@@ -2379,7 +2389,7 @@ def test_a6_o_composite_full_authority_cardinality_and_ambiguity_arms(
         for lr in adam["varied"]["lr"]
         for beta2 in adam["varied"]["beta2"]
     }
-    composite = _q_adam_cells(_cells(tmp_path), context="O-composite")
+    composite = _q_adam_cells_all_labels(_cells(tmp_path), context="O-composite")
     assert len(composite) == 2 * len(expected_pairs)
     for label in (810001, 810002):
         labeled = [
@@ -2389,18 +2399,26 @@ def test_a6_o_composite_full_authority_cardinality_and_ambiguity_arms(
         assert len(labeled) == len(expected_pairs)
         for lr, beta2 in expected_pairs:
             matches = [
-                cell for cell in labeled
+                cell for cell in composite
                 if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == lr
                 and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == beta2
+                and cell.manifest["seed_identity"]["label"] == label
             ]
             assert len(matches) == 1
-            assert runner.select_cell(
-                matches,
+            selection = runner.select_cell(
+                composite,
                 context="O-composite",
                 lr=lr,
                 beta2=beta2,
                 seed_label=label,
-            ).selected.seed_label == label
+            )
+            assert selection.selected.stage == "Q"
+            assert selection.selected.context == "O-composite"
+            assert selection.selected.optimizer["method"] == "adam"
+            assert selection.selected.optimizer["levels"] == matches[0].manifest[
+                "scientific_identity"
+            ]["optimizer"]["levels"]
+            assert selection.selected.seed_label == label
     with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
         runner.select_cell(composite, context="O-composite", seed_label=810003)
     exact = [
@@ -2437,7 +2455,7 @@ def test_a3_o_composite_sampler_seed_is_bound_for_both_labels(
     """The consumed sampler seed follows the authority seed namespace."""
 
     target = next(
-        cell for cell in _q_adam_cells(_cells(tmp_path), context="O-composite")
+        cell for cell in _q_adam_cells_all_labels(_cells(tmp_path), context="O-composite")
         if cell.manifest["seed_identity"]["label"] == seed_label
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
@@ -2445,6 +2463,29 @@ def test_a3_o_composite_sampler_seed_is_bound_for_both_labels(
     resolved = runner.train_config.resolve_train_config(target)
     expected = stage_coordinate.seed_namespace("Q", seed_label)["training_sampler"]
     assert resolved.runner.sampler.seed == expected
+
+    def walk(value: object, path: str = "model") -> set[str]:
+        if isinstance(value, dict):
+            found = set()
+            if isinstance(value.get("initializer"), dict):
+                found.add(f"{path}.initializer.seed")
+            for key, nested in value.items():
+                found.update(walk(nested, f"{path}.{key}"))
+            return found
+        if isinstance(value, (tuple, list)):
+            found = set()
+            for index, nested in enumerate(value):
+                found.update(walk(nested, f"{path}.{index}"))
+            return found
+        return set()
+
+    assert walk(runner.OmegaConf.to_container(resolved.model, resolve=False)) == set(
+        _A3_COMPOSITE_INITIALIZER_PATHS
+    )
+    assert all(
+        runner.OmegaConf.select(resolved, path) == target.seed_streams["model_initialization"]
+        for path in _A3_COMPOSITE_INITIALIZER_PATHS
+    )
 
 
 @pytest.mark.parametrize("seed_label", (810001, 810002))
@@ -2460,7 +2501,7 @@ def test_a3_o_composite_initializer_path_refuses_before_claim(
     """Every consumed initializer path is independently enforced for both labels."""
 
     target = next(
-        cell for cell in _q_adam_cells(_cells(tmp_path), context="O-composite")
+        cell for cell in _q_adam_cells_all_labels(_cells(tmp_path), context="O-composite")
         if cell.manifest["seed_identity"]["label"] == seed_label
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
         and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
@@ -2479,8 +2520,16 @@ def test_a3_o_composite_initializer_path_refuses_before_claim(
 
     monkeypatch.setattr(runner.train_config, "resolve_train_config", resolve_mutated)
     monkeypatch.setattr(runner, "_refuse_occupied_output_path", lambda *_: pytest.fail("claim reached"))
-    field = runner_path.replace(".", r"\.")
-    with pytest.raises(runner.StageQSelectionError, match=field):
+    diagnostic_path = runner_path.replace(".0.", "[0].")
+    field = (
+        diagnostic_path.replace(".", r"\.")
+        .replace("[", r"\[")
+        .replace("]", r"\]")
+    )
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match=f"truthfulness guard refused field '{field}'.*item dd964863",
+    ):
         runner.execute(
             _args(
                 tmp_path,
@@ -2577,6 +2626,42 @@ def test_a5_o_composite_runner_route_closes_the_three_l5_traps(
     ]
     resolved_container = runner.OmegaConf.to_container(resolved, resolve=True)
     assert "${" not in json.dumps(resolved_container)
+    control = runner.train_config._compose_base_config()
+    runner.OmegaConf.update(
+        control,
+        "runtime.seed",
+        stage_coordinate.seed_namespace("Q", 810001)["model_initialization"],
+        merge=False,
+    )
+    runner.OmegaConf.resolve(control)
+    for key in ("_target_", "trace_name", "readout"):
+        assert resolved_container["model"][key] == runner.OmegaConf.to_container(
+            control.model[key], resolve=True
+        )
+
+    def assert_declared_nonpackage_projection(config: object) -> None:
+        observed = runner.OmegaConf.to_container(config.model, resolve=True)
+        expected = runner.OmegaConf.to_container(control.model, resolve=True)
+        for key in ("_target_", "trace_name", "readout"):
+            assert observed[key] == expected[key]
+
+    original = runner.train_config.resolve_train_config
+    with monkeypatch.context() as context:
+        def nonpackage_drift(source: object) -> object:
+            mutated = original(source)
+            for prefix in ("model", "runner.model"):
+                runner.OmegaConf.update(mutated, f"{prefix}.trace_name", "drift", merge=False)
+            return mutated
+
+        context.setattr(runner.train_config, "resolve_train_config", nonpackage_drift)
+        drift_selection = runner.select_cell(
+            (_o_composite_target(tmp_path),),
+            context="O-composite",
+            seed_label=810001,
+        )
+        _, drifted = runner._resolve_selected_config(drift_selection)
+        with pytest.raises(AssertionError):
+            assert_declared_nonpackage_projection(drifted)
 
     original = runner.train_config.resolve_train_config
 
@@ -2593,7 +2678,10 @@ def test_a5_o_composite_runner_route_closes_the_three_l5_traps(
 
     with monkeypatch.context() as context:
         context.setattr(runner.train_config, "resolve_train_config", naive_factor_route)
-        with pytest.raises(runner.StageQSelectionError, match=r"factors\[0\]"):
+        with pytest.raises(
+            runner.StageQSelectionError,
+            match=r"context\.overrides\.input_features\.model\.factors.*dd964863",
+        ):
             runner.select_cell(
                 (_o_composite_target(tmp_path),),
                 context="O-composite",
@@ -2601,13 +2689,22 @@ def test_a5_o_composite_runner_route_closes_the_three_l5_traps(
             )
 
     mapping = runner.train_config._context_mapping_api()
+    from omegaconf.errors import InterpolationKeyError
+
+    detached_root = runner.train_config._compose_base_config()
     detached = runner.OmegaConf.create(
-        mapping.compose_package(runner.train_config._compose_base_config().model, "B11")
+        mapping.compose_package(detached_root.model, "B11")
     )
 
     with monkeypatch.context() as context:
-        context.setattr(runner.train_config, "resolve_train_config", lambda _: detached)
-        with pytest.raises(Exception, match="Interpolation key"):
+        def detached_root_route(_: object) -> object:
+            # Resolve the standalone model before it is spliced into the full
+            # root, reproducing the L5 interpolation trap through selection.
+            runner.OmegaConf.to_container(detached, resolve=True)
+            return detached_root
+
+        context.setattr(runner.train_config, "resolve_train_config", detached_root_route)
+        with pytest.raises(InterpolationKeyError, match=r"system\.spatial_dim"):
             runner.select_cell(
                 (_o_composite_target(tmp_path),),
                 context="O-composite",
@@ -2647,3 +2744,23 @@ def test_a5_o_composite_runner_route_closes_the_three_l5_traps(
     b11 = instantiate(resolved.model).to(dtype=torch.float64)
     assert torch.equal(b10(batch).logabs, b00(batch).logabs)
     assert torch.equal(b11(batch).logabs, b01(batch).logabs)
+
+    direct_root = runner.train_config._compose_base_config()
+    fragment, factor = mapping.package_fragment("B11")
+    direct_root.model = runner.OmegaConf.merge(
+        direct_root.model,
+        runner.OmegaConf.create(
+            {**fragment, "factors": [*direct_root.model.factors, factor]}
+        ),
+    )
+    direct_root.model.layers[0] = runner.OmegaConf.create(
+        mapping.context_fragment(
+            "hybrid/coordinate-neighbor",
+            activation="channel-MLP,channel-MLP",
+            seed=seed,
+        )
+    )
+    runner.OmegaConf.update(direct_root, "runtime.seed", seed, merge=False)
+    runner.OmegaConf.resolve(direct_root)
+    direct_b11 = instantiate(direct_root.model).to(dtype=torch.float64)
+    assert not torch.equal(direct_b11(batch).logabs, b01(batch).logabs)
