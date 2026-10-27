@@ -779,7 +779,7 @@ class BalsamAdapter:
         registration = self._load_registration(batch)
         if registration is not None:
             return registration
-        if park_path.is_file():
+        if park_path.is_file() and not owns_registration:
             # A prior ambiguous client call is durable evidence against a
             # second registration.  Do not let a fresh process silently retry.
             return None
