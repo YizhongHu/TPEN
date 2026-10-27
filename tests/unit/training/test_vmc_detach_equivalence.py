@@ -333,7 +333,7 @@ def test_red_mutating_captured_sign_at_handoff_fails_the_equivalence_oracle() ->
 
 
 def test_real_kinetic_evaluator_result_is_detached() -> None:
-    model = _TinyWavefunction()
+    model = _TinyWavefunction(nonlinear=True)
     result = KineticEnergy().local_energy(model, _batch())
     detached = trainer_module._detach_local_energy_result(result)
     assert detached.wavefunction_output is not None
