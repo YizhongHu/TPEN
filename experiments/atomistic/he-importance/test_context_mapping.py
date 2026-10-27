@@ -243,10 +243,22 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
         }
     )
     captured = {}
+    deltas = {}
     hooks = []
     for order in (1, 2):
         layer = model.embedding.order_mlps[str(order)].layers[0]
-        hooks.append(layer.register_forward_pre_hook(lambda module, inputs, order=order: captured.setdefault(order, inputs[0])))
+        hooks.append(
+            layer.register_forward_pre_hook(
+                lambda module, inputs, order=order: captured.setdefault(order, inputs[0])
+            )
+        )
+        hooks.append(
+            layer.register_full_backward_hook(
+                lambda module, grad_input, grad_output, order=order: deltas.setdefault(
+                    order, grad_output[0].detach()
+                )
+            )
+        )
     try:
         logabs = model(batch).logabs[0]
         expected_inputs = {
@@ -259,14 +271,31 @@ def test_matched_start_added_columns_have_the_right_first_layer_gradient(
         for order in (1, 2):
             x = captured[order][0]
             torch.testing.assert_close(x, expected_inputs[order], rtol=1e-12, atol=1e-12)
+            expected_all = {
+                1: torch.tensor(
+                    [
+                        [1.0, 0.0, 0.0, 1.0, 1 / 2],
+                        [0.0, 2.0, 0.0, -1.0, 4 / 5],
+                    ],
+                    dtype=torch.float64,
+                ),
+                2: torch.tensor(
+                    [
+                        [1.0, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, -1.0, 1 / 2, 4 / 5, 5 / 6],
+                        [0.0, 2.0, 0.0, -1.0, 1.0, 0.0, 0.0, 1.0, 4 / 5, 1 / 2, 5 / 6],
+                    ],
+                    dtype=torch.float64,
+                ),
+            }[order]
+            torch.testing.assert_close(captured[order][0], expected_all, rtol=1e-12, atol=1e-12)
             weight = model.embedding.order_mlps[str(order)].layers[0].weight
             gradient = torch.autograd.grad(logabs, weight, retain_graph=True)[0]
-            added = 4 if order == 1 else (4, 9)
-            for added_index in (added,) if isinstance(added, int) else added:
-                raw_index = 0 if added_index == 4 else 5
+            expected_gradient = deltas[order][0].transpose(0, 1) @ captured[order][0]
+            added = (4,) if order == 1 else (4, 9, 10, 11, 12)
+            for added_index in added:
                 torch.testing.assert_close(
-                    gradient[:, added_index] * x[raw_index],
-                    gradient[:, raw_index] * x[added_index],
+                    gradient[:, added_index],
+                    expected_gradient[:, added_index],
                     rtol=1e-12,
                     atol=1e-12,
                 )
