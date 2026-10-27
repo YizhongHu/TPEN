@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
+from fractions import Fraction
 
 import torch
 from hydra.utils import instantiate
@@ -98,6 +99,40 @@ def test_jastrow_is_appended_without_changing_existing_factors() -> None:
     }
 
 
+def test_composed_mapping_preserves_unresolved_root_interpolations() -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    composed = context_mapping.compose_package(train.model, "B01")
+    assert composed.embedding.spatial_dim == "${system.spatial_dim}"
+    assert composed.embedding.initializer.seed == "${runtime.seed}"
+    assert composed.factors[1].atoms == "${atoms}"
+
+
+@pytest.mark.parametrize("package", ("B00", "B10", "B01", "B11"))
+def test_spliced_package_preserves_all_nonpackage_config_values(package: str) -> None:
+    control = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    expected = OmegaConf.to_container(control, resolve=True)
+    cfg = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    cfg.model = OmegaConf.merge(
+        cfg.model,
+        context_mapping.compose_package(cfg.model, package),
+    )
+    OmegaConf.resolve(cfg)
+    actual = OmegaConf.to_container(cfg, resolve=True)
+    assert {key: actual[key] for key in actual if key != "model"} == {
+        key: expected[key] for key in expected if key != "model"
+    }
+    for key in expected["model"]:
+        if key not in {"basis", "embedding", "factors"}:
+            assert actual["model"][key] == expected["model"][key]
+
+
+def test_standalone_composed_mapping_exposes_the_root_resolution_hazard() -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    standalone = OmegaConf.create(context_mapping.compose_package(train.model, "B01"))
+    with pytest.raises(Exception, match="Interpolation key"):
+        OmegaConf.to_container(standalone, resolve=True)
+
+
 def test_naive_package_merge_would_replace_the_control_factors() -> None:
     original = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
     fragment, factor = context_mapping.package_fragment("B01")
@@ -143,9 +178,16 @@ def test_closed_hi_schema_refuses_a_frozen_two_coefficient_jastrow(package: str)
 def test_zero_jastrow_is_exactly_the_corresponding_control(
     jastrow_package: str, control_package: str
 ) -> None:
-    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    mapped = OmegaConf.create(context_mapping.compose_package(train.model, jastrow_package))
-    control = OmegaConf.create(context_mapping.compose_package(train.model, control_package))
+    mapped = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    mapped.model = OmegaConf.merge(
+        mapped.model,
+        context_mapping.compose_package(mapped.model, jastrow_package),
+    )
+    control = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    control.model = OmegaConf.merge(
+        control.model,
+        context_mapping.compose_package(control.model, control_package),
+    )
     OmegaConf.resolve(mapped)
     OmegaConf.resolve(control)
     torch.manual_seed(1729)
@@ -159,6 +201,71 @@ def test_zero_jastrow_is_exactly_the_corresponding_control(
     factor = mapped_model.factors[-1]
     assert torch.equal(factor.mean_coefficient, torch.zeros_like(factor.mean_coefficient))
     assert torch.equal(factor.difference_coefficient, torch.zeros_like(factor.difference_coefficient))
+
+
+@pytest.mark.parametrize("package", ("B01", "B11"))
+def test_jastrow_coefficient_derivatives_match_the_explicit_two_electron_oracle(
+    package: str,
+) -> None:
+    """Check each sample's coefficient derivatives against the stated formula.
+
+    The coordinates and q values are literal rational values, so this oracle
+    does not share the factor's distance implementation.  Float64 arithmetic
+    makes 1e-12 tight enough to distinguish an incorrect pair, coefficient, or
+    factor of two while allowing only roundoff in the explicit fractions.
+    """
+
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model = OmegaConf.merge(
+        train.model,
+        context_mapping.compose_package(train.model, package),
+    )
+    OmegaConf.resolve(train)
+    model = instantiate(train.model).to(dtype=torch.float64)
+    factor = model.factors[-1]
+    positions = torch.tensor(
+        [
+            [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+            [[1.0, 1.0, 0.0], [2.0, 0.0, 0.0]],
+        ],
+        dtype=torch.float64,
+    )
+    batch = instantiate(
+        {
+            "_target_": "tpen.data.batch.ElectronBatch",
+            "positions": positions,
+            "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
+            "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
+            "spins": torch.tensor([[1.0, -1.0], [1.0, -1.0]], dtype=torch.float64),
+        }
+    )
+    logabs = model(batch).logabs
+    mean_gradients = []
+    difference_gradients = []
+    for sample in range(2):
+        mean_gradients.append(
+            torch.autograd.grad(logabs[sample], factor.theta_s, retain_graph=True)[0]
+        )
+        difference_gradients.append(
+            torch.autograd.grad(logabs[sample], factor.theta_t, retain_graph=True)[0]
+        )
+    q_one = (Fraction(1, 2), Fraction(2, 3))
+    q_two = (Fraction(4, 5), Fraction(4, 5))
+    q_pair = (Fraction(5, 6), Fraction(2, 3))
+    expected_mean = torch.tensor(
+        [float(pair * (first + second) / 2) for first, second, pair in zip(q_one, q_two, q_pair)],
+        dtype=torch.float64,
+    )
+    expected_difference = torch.tensor(
+        [float(pair * (first - second) ** 2) for first, second, pair in zip(q_one, q_two, q_pair)],
+        dtype=torch.float64,
+    )
+    torch.testing.assert_close(
+        torch.stack(mean_gradients), expected_mean, rtol=1e-12, atol=1e-12
+    )
+    torch.testing.assert_close(
+        torch.stack(difference_gradients), expected_difference, rtol=1e-12, atol=1e-12
+    )
 
 
 def test_bounded_distance_input_fragment_is_explicit() -> None:

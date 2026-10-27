@@ -224,6 +224,10 @@ def compose_package(model_cfg: Mapping[str, Any], label: str) -> dict[str, Any]:
 
     The returned mapping is fresh.  Nested input-feature overrides are merged,
     while an optional Jastrow is appended after the existing factor entries.
+    Assign it back at the full configuration's model key (for example,
+    ``cfg.model = compose_package(cfg.model, label)``) before resolving it.
+    Interpolations are intentionally preserved unresolved and resolve against
+    that full configuration root; resolving the standalone mapping is invalid.
     """
 
     fragment, factor = package_fragment(label)
