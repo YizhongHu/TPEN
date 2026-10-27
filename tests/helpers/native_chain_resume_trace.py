@@ -137,6 +137,7 @@ def install_native_trace(trace: NativeTrace) -> ExitStack:
 
     stack = ExitStack()
     original_collect = MetropolisSampler.collect_samples
+    original_propose = MetropolisSampler._propose
     original_forward = TrainableHookeSingletAnsatz.forward
     original_step = torch.optim.Adam.step
     original_fit = VMCTrainer.fit
@@ -148,15 +149,18 @@ def install_native_trace(trace: NativeTrace) -> ExitStack:
         if trace.checkpoint_rng_source is not None:
             trace.seed_source = f"checkpoint:{trace.checkpoint_rng_source}:rng_state"
 
-    def collect_samples(self, model, *args, **kwargs):
-        trace.begin_step()
-        result = original_collect(self, model, *args, **kwargs)
-        walkers, _stats = result
+    def propose(self, model, walkers):
+        proposals, log_q_ratio = original_propose(self, model, walkers)
         trace._record(
             "sampler_proposal",
             "first_sampler_proposal",
-            float(walkers.positions.detach().mean().item()),
+            float(proposals.detach().mean().item()),
         )
+        return proposals, log_q_ratio
+
+    def collect_samples(self, model, *args, **kwargs):
+        trace.begin_step()
+        result = original_collect(self, model, *args, **kwargs)
         return result
 
     def forward(self, batch):
@@ -181,6 +185,7 @@ def install_native_trace(trace: NativeTrace) -> ExitStack:
         trace.trainer = self
         return original_fit(self, *args, **kwargs)
 
+    MetropolisSampler._propose = propose
     MetropolisSampler.collect_samples = collect_samples
     TrainableHookeSingletAnsatz.forward = forward
     torch.optim.Adam.step = optimizer_step
@@ -188,6 +193,7 @@ def install_native_trace(trace: NativeTrace) -> ExitStack:
     restore.apply_rng_state = apply_rng
 
     def undo() -> None:
+        MetropolisSampler._propose = original_propose
         MetropolisSampler.collect_samples = original_collect
         TrainableHookeSingletAnsatz.forward = original_forward
         torch.optim.Adam.step = original_step
