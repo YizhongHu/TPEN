@@ -26,6 +26,7 @@ from omegaconf import DictConfig, OmegaConf
 
 _CONFIG_PATH = Path(__file__).with_name("configs") / "train.yaml"
 _STAGE_MODULE = "experiments.atomistic.he-importance.stage_coordinate"
+_CONTEXT_MAPPING_MODULE = "experiments.atomistic.he-importance.context_mapping"
 
 
 class TrainConfigResolutionError(ValueError):
@@ -82,6 +83,13 @@ def _stage_api() -> Any:
 
     _require_checkout_root()
     return import_module(_STAGE_MODULE)
+
+
+def _context_mapping_api() -> Any:
+    """Load the literal context mapper only after the checkout precondition."""
+
+    _require_checkout_root()
+    return import_module(_CONTEXT_MAPPING_MODULE)
 
 
 def _compose_base_config() -> DictConfig:
@@ -297,25 +305,46 @@ def _declared_adam_levels(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
     return levels
 
 
-def _require_o_raw_context(manifest: Mapping[str, Any]) -> None:
-    """Require the authority's literal O-raw model context."""
+def _consumed_context(manifest: Mapping[str, Any]) -> str:
+    """Validate and return one of the two resolver-consumed context literals."""
 
     identity = _mapping(manifest.get("scientific_identity"), "scientific_identity")
     context = _mapping(identity.get("context"), "scientific_identity.context")
-    expected = {"name": "O-raw", "overrides": {"input_features": "B00", "feature_update": "residual"}}
-    if dict(context) != expected:
+    expected = {
+        "O-raw": {
+            "name": "O-raw",
+            "overrides": {"input_features": "B00", "feature_update": "residual"},
+        },
+        "O-composite": {
+            "name": "O-composite",
+            "overrides": {
+                "producer_policy": "hybrid/coordinate-neighbor",
+                "aggregation_activation": "channel-MLP at both activation sites",
+                "input_features": "B11",
+                "feature_update": "residual",
+            },
+        },
+    }
+    for name, literal in expected.items():
+        if dict(context) == literal:
+            return name
+
+    if dict(context) not in expected.values():
         differences = []
-        for field in sorted(set(context) | set(expected)):
-            if context.get(field) != expected.get(field):
+        declared_name = context.get("name")
+        declared = expected.get(declared_name, {})
+        for field in sorted(set(context) | set(declared)):
+            if context.get(field) != declared.get(field):
                 differences.append(
-                    f"{field} declared={context.get(field)!r} consumed={expected.get(field)!r}"
+                    f"{field} declared={context.get(field)!r} consumed={declared.get(field)!r}"
                 )
         raise ContextResolutionError(
-            "scientific_identity.context must be the authority's O-raw literal "
-            f"{expected!r}; "
+            "scientific_identity.context must be exactly the authority's O-raw or "
+            f"O-composite literal; declared={dict(context)!r}; "
             + "; ".join(differences)
-            + "; O-composite remains refused (items 7bae63d8 and dd964863)"
         )
+
+    raise AssertionError("unreachable context validation branch")
 
 
 def resolve_train_config(source: Any) -> DictConfig:
@@ -372,7 +401,7 @@ def resolve_train_config(source: Any) -> DictConfig:
         )
 
     optimizer_entry = _optimizer_entry(manifest)
-    _require_o_raw_context(manifest)
+    context_name = _consumed_context(manifest)
     levels = _declared_adam_levels(manifest)
     optimizer_identity = _mapping(manifest["scientific_identity"].get("optimizer"), "scientific_identity.optimizer")
     if optimizer_identity.get("method") != manifest["scientific_identity"]["optimizer_cell"].get("method"):
@@ -409,6 +438,18 @@ def resolve_train_config(source: Any) -> DictConfig:
     OmegaConf.update(
         cfg, "optimizer.weight_decay", levels["weight_decay"], merge=False, force_add=True
     )
+    if context_name == "O-composite":
+        context_mapping = _context_mapping_api()
+        # Splice the composed package back into the full root so its Hydra
+        # interpolations continue to resolve against system/runtime values.
+        cfg.model = context_mapping.compose_package(cfg.model, "B11")
+        cfg.model.layers[0] = OmegaConf.create(
+            context_mapping.context_fragment(
+                "hybrid/coordinate-neighbor",
+                activation="channel-MLP,channel-MLP",
+                seed=model_seed,
+            )
+        )
     scheduler_paths = _scheduler_paths(OmegaConf.to_container(cfg, resolve=False))
     if scheduler_paths:
         raise OptimizerLevelResolutionError(
