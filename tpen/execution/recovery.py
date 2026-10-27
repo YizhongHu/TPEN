@@ -274,7 +274,7 @@ class CheckpointEvidence:
         }
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any]) -> "CheckpointEvidence":
+    def from_mapping(cls, data: Any) -> "CheckpointEvidence":
         """Deserialize typed evidence and verify its CheckpointRef identity."""
 
         decode_fields(data, {

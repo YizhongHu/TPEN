@@ -579,9 +579,22 @@ def test_canonical_hash_preserves_the_typed_non_string_key_failure() -> None:
         stage_coordinate.content_hash({1: "not-json"})
 
 
+def _complete_available_roster() -> dict[str, "stage_coordinate.OptimizerCell"]:
+    # Every family declared in the committed inventory, all marked
+    # available: enough to materialize the whole inventory without pulling
+    # in the live tpen roster. Fail-closed coverage of a roster that omits a
+    # family lives in test_optimizer_grid.py.
+    return {
+        method: stage_coordinate.OptimizerCell(method, "available")
+        for method in ("adam", "sr", "kfac", "spring", "linear_method")
+    }
+
+
 def test_committed_intended_configuration_inventory_materializes_completely(tmp_path: Path) -> None:
     inventory = json.loads(Path(__file__).with_name("intended_configurations.json").read_text())
-    cells = stage_coordinate.materialize_intended_configurations(tmp_path)
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=_complete_available_roster()
+    )
     expected = sum(
         len(entry["configurations"]) * stage_coordinate.stage_definition(entry["stage"]).seeds_per_point
         for entry in inventory
@@ -590,13 +603,57 @@ def test_committed_intended_configuration_inventory_materializes_completely(tmp_
     assert {cell.manifest["stage"] for cell in cells} == {entry["stage"] for entry in inventory}
 
 
+def test_intended_configurations_loader_rejects_a_smuggled_status_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A committed entry's ``optimizer`` must declare exactly method and levels.
+
+    Availability status is a separate, build-time judgement
+    (``optimizer_grid.roster_availability``); it must never be smuggled into
+    the committed inventory itself, which would let a declared cell's
+    identity silently carry a roster-dependent fact.
+    """
+
+    entries = json.loads(Path(__file__).with_name("intended_configurations.json").read_text())
+    entries[0]["optimizer"]["status"] = "available"
+    broken_path = tmp_path / "intended_configurations.json"
+    broken_path.write_text(json.dumps(entries), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", broken_path)
+    with pytest.raises(stage_coordinate.MaterializationError, match="exactly method and levels"):
+        stage_coordinate.intended_configurations()
+
+
+def test_intended_configurations_loader_rejects_a_configuration_optimizer_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each configuration's ``scientific_identity.optimizer`` must mirror the entry-level ``optimizer`` exactly.
+
+    The generator always writes both from the same source, so generated
+    output cannot drift; this loader also accepts a hand-edited file that was
+    never regenerated, so the two copies can otherwise fall out of step
+    silently.
+    """
+
+    entries = json.loads(Path(__file__).with_name("intended_configurations.json").read_text())
+    entries[0]["configurations"][0]["scientific_identity"]["optimizer"]["levels"]["lr"] = -1.0
+    broken_path = tmp_path / "intended_configurations.json"
+    broken_path.write_text(json.dumps(entries), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", broken_path)
+    with pytest.raises(
+        stage_coordinate.MaterializationError, match="entry optimizer and scientific_identity optimizer must be identical"
+    ):
+        stage_coordinate.intended_configurations()
 def test_q_mechanics_walker_identity_rebuilds_hash_path_and_preserves_committed_cells(
     tmp_path: Path,
 ) -> None:
-    before = stage_coordinate.materialize_intended_configurations(tmp_path / "before")
+    before = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "before", availability=_complete_available_roster()
+    )
     q_cell = next(cell for cell in before if cell.manifest["stage"] == "Q")
     rebuilt = stage_coordinate.with_q_mechanics_walkers(q_cell)
-    after = stage_coordinate.materialize_intended_configurations(tmp_path / "after")
+    after = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "after", availability=_complete_available_roster()
+    )
 
     assert stage_coordinate.walker_count(q_cell.manifest) == stage_coordinate.COMMITTED_WALKERS
     assert stage_coordinate.walker_count(rebuilt.manifest) == stage_coordinate.Q_MECHANICS_WALKERS
@@ -631,7 +688,9 @@ def test_q_mechanics_walker_rebuild_refuses_non_q_and_double_application(tmp_pat
 
     q_cell = next(
         cell
-        for cell in stage_coordinate.materialize_intended_configurations(tmp_path / "q")
+        for cell in stage_coordinate.materialize_intended_configurations(
+            tmp_path / "q", availability=_complete_available_roster()
+        )
         if cell.manifest["stage"] == "Q"
     )
     with pytest.raises(stage_coordinate.MaterializationError, match="already applied"):
@@ -655,7 +714,9 @@ def test_public_materialized_routes_refuse_bad_walker_identity(
 
     source = next(
         cell
-        for cell in stage_coordinate.materialize_intended_configurations(tmp_path / "source")
+        for cell in stage_coordinate.materialize_intended_configurations(
+            tmp_path / "source", availability=_complete_available_roster()
+        )
         if cell.manifest["stage"] == "Q"
     )
     manifest = stage_coordinate._thaw(source.manifest)
