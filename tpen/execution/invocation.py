@@ -666,7 +666,7 @@ class WorkerStartGateway:
     """
 
     def __init__(self, output_root: str | Path, *, id_factory: Callable[[], str] | None = None) -> None:
-        self.output_root = Path(output_root)
+        self.output_root = Path(output_root).absolute()
         self._id_factory = id_factory or (lambda: uuid4().hex)
 
     def start(
