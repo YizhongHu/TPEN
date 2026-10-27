@@ -154,10 +154,14 @@ def _assert_equal(left: dict[str, object], right: dict[str, object]) -> None:
         assert torch.equal(torch.nan_to_num(left_tensor), torch.nan_to_num(right_tensor))
 
     assert left["losses"] == right["losses"]
+    assert len(left["gradients"]) == len(right["gradients"]) == 3
+    assert len(left["parameters"]) == len(right["parameters"]) == 3
+    assert len(left["results"]) == len(right["results"]) == 3
     for left_gradients, right_gradients in zip(left["gradients"], right["gradients"]):
         for left_gradient, right_gradient in zip(left_gradients, right_gradients):
-            assert left_gradient is not None and right_gradient is not None
-            assert torch.equal(left_gradient, right_gradient)
+            assert (left_gradient is None) == (right_gradient is None)
+            if left_gradient is not None and right_gradient is not None:
+                assert torch.equal(left_gradient, right_gradient)
     for left_parameters, right_parameters in zip(left["parameters"], right["parameters"]):
         for left_parameter, right_parameter in zip(left_parameters, right_parameters):
             assert torch.equal(left_parameter, right_parameter)
@@ -170,6 +174,23 @@ def _assert_equal(left: dict[str, object], right: dict[str, object]) -> None:
         assert right_result.wavefunction_output is not None
         assert torch.equal(left_result.wavefunction_output.logabs, right_result.wavefunction_output.logabs)
         assert torch.equal(left_result.wavefunction_output.sign, right_result.wavefunction_output.sign)
+        assert (left_result.wavefunction_output.phase is None) == (
+            right_result.wavefunction_output.phase is None
+        )
+        if left_result.wavefunction_output.phase is not None:
+            assert torch.equal(
+                left_result.wavefunction_output.phase,
+                right_result.wavefunction_output.phase,
+            )
+        assert set(left_result.wavefunction_output.aux) == set(right_result.wavefunction_output.aux)
+        for name in left_result.wavefunction_output.aux:
+            left_aux = left_result.wavefunction_output.aux[name]
+            right_aux = right_result.wavefunction_output.aux[name]
+            if isinstance(left_aux, torch.Tensor):
+                assert isinstance(right_aux, torch.Tensor)
+                equal_with_mask(left_aux, right_aux)
+            else:
+                assert left_aux == right_aux
         equal_with_mask(left_result.per_electron_kinetic, right_result.per_electron_kinetic)
 
 
