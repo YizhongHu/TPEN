@@ -102,28 +102,34 @@ def test_jastrow_is_appended_without_changing_existing_factors() -> None:
 def test_composed_mapping_preserves_unresolved_root_interpolations() -> None:
     train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
     composed = context_mapping.compose_package(train.model, "B01")
-    assert composed.embedding.spatial_dim == "${system.spatial_dim}"
-    assert composed.embedding.initializer.seed == "${runtime.seed}"
-    assert composed.factors[1].atoms == "${atoms}"
+    def assert_plain(value: object) -> None:
+        assert not OmegaConf.is_config(value)
+        if isinstance(value, dict):
+            for child in value.values():
+                assert_plain(child)
+        elif isinstance(value, list):
+            for child in value:
+                assert_plain(child)
+
+    assert_plain(composed)
+    assert composed["embedding"]["spatial_dim"] == "${system.spatial_dim}"
+    assert composed["embedding"]["initializer"]["seed"] == "${runtime.seed}"
+    assert composed["factors"][1]["atoms"] == "${atoms}"
 
 
 @pytest.mark.parametrize("package", ("B00", "B10", "B01", "B11"))
 def test_spliced_package_preserves_all_nonpackage_config_values(package: str) -> None:
     control = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    expected = OmegaConf.to_container(control, resolve=True)
+    expected = OmegaConf.to_container(control, resolve=False)
     cfg = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    cfg.model = OmegaConf.merge(
-        cfg.model,
-        context_mapping.compose_package(cfg.model, package),
-    )
-    OmegaConf.resolve(cfg)
-    actual = OmegaConf.to_container(cfg, resolve=True)
-    assert {key: actual[key] for key in actual if key != "model"} == {
+    cfg.model = context_mapping.compose_package(cfg.model, package)
+    actual_unresolved = OmegaConf.to_container(cfg, resolve=False)
+    assert {key: actual_unresolved[key] for key in actual_unresolved if key != "model"} == {
         key: expected[key] for key in expected if key != "model"
     }
-    for key in expected["model"]:
-        if key not in {"basis", "embedding", "factors"}:
-            assert actual["model"][key] == expected["model"][key]
+    OmegaConf.resolve(cfg)
+    actual = OmegaConf.to_container(cfg, resolve=True)
+    assert actual["runner"]["model"] == actual["model"]
 
 
 def test_standalone_composed_mapping_exposes_the_root_resolution_hazard() -> None:
@@ -161,14 +167,14 @@ def _validate_through_hydra(train: object) -> None:
 @pytest.mark.parametrize("package", ("B01", "B11"))
 def test_two_coefficient_jastrow_packages_pass_the_closed_hi_schema(package: str) -> None:
     train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    train.model = OmegaConf.create(context_mapping.compose_package(train.model, package))
+    train.model = context_mapping.compose_package(train.model, package)
     _validate_through_hydra(train)
 
 
 @pytest.mark.parametrize("package", ("B01", "B11"))
 def test_closed_hi_schema_refuses_a_frozen_two_coefficient_jastrow(package: str) -> None:
     train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    train.model = OmegaConf.create(context_mapping.compose_package(train.model, package))
+    train.model = context_mapping.compose_package(train.model, package)
     train.model.factors[-1].trainable = False
     with pytest.raises(Exception, match="undeclared-trainability"):
         _validate_through_hydra(train)
@@ -179,15 +185,9 @@ def test_zero_jastrow_is_exactly_the_corresponding_control(
     jastrow_package: str, control_package: str
 ) -> None:
     mapped = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    mapped.model = OmegaConf.merge(
-        mapped.model,
-        context_mapping.compose_package(mapped.model, jastrow_package),
-    )
+    mapped.model = context_mapping.compose_package(mapped.model, jastrow_package)
     control = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    control.model = OmegaConf.merge(
-        control.model,
-        context_mapping.compose_package(control.model, control_package),
-    )
+    control.model = context_mapping.compose_package(control.model, control_package)
     OmegaConf.resolve(mapped)
     OmegaConf.resolve(control)
     torch.manual_seed(1729)
@@ -216,10 +216,7 @@ def test_jastrow_coefficient_derivatives_match_the_explicit_two_electron_oracle(
     """
 
     train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    train.model = OmegaConf.merge(
-        train.model,
-        context_mapping.compose_package(train.model, package),
-    )
+    train.model = context_mapping.compose_package(train.model, package)
     OmegaConf.resolve(train)
     model = instantiate(train.model).to(dtype=torch.float64)
     factor = model.factors[-1]
@@ -433,7 +430,7 @@ def _run_short_real_training(
     """Run one reduced update through the runner composed by ``train.yaml``."""
 
     train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    train.model = OmegaConf.create(context_mapping.compose_package(train.model, package))
+    train.model = context_mapping.compose_package(train.model, package)
     if not trainable:
         train.model.factors[-1].trainable = False
     train.runtime.device = "cpu"

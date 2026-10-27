@@ -11,6 +11,8 @@ from copy import deepcopy
 from collections.abc import Mapping
 from typing import Any
 
+from omegaconf import OmegaConf
+
 
 class ContextMappingError(ValueError):
     """Base error for malformed or unsupported context labels."""
@@ -231,7 +233,14 @@ def compose_package(model_cfg: Mapping[str, Any], label: str) -> dict[str, Any]:
     """
 
     fragment, factor = package_fragment(label)
-    composed = _merge_mappings(model_cfg, fragment)
+    if OmegaConf.is_config(model_cfg):
+        # Detach from the source config before merging.  Otherwise deepcopy
+        # preserves DictConfig parent links and interpolation access can
+        # silently resolve against a different root.
+        base = OmegaConf.to_container(model_cfg, resolve=False)
+    else:
+        base = deepcopy(model_cfg)
+    composed = _merge_mappings(base, fragment)
     if factor is not None:
         factors = deepcopy(composed.get("factors", []))
         factors.append(deepcopy(factor))
