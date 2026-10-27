@@ -2768,15 +2768,23 @@ def test_a5_o_composite_runner_route_closes_the_three_l5_traps(
     actual_resolver = runner.train_config.resolve_train_config
 
     def direct_runner_route(source: object) -> object:
+        import copy
+
         healthy = actual_resolver(source)
+        augmented = copy.deepcopy(
+            runner.OmegaConf.to_container(
+                healthy.model.embedding.augmented,
+                resolve=True,
+            )
+        )
         mutated = runner.OmegaConf.create(
             runner.OmegaConf.to_container(healthy, resolve=False)
         )
         for prefix in ("model", "runner.model"):
             runner.OmegaConf.update(
                 mutated,
-                f"{prefix}.embedding._target_",
-                "tpen.nn.Embedding",
+                f"{prefix}.embedding",
+                copy.deepcopy(augmented),
                 merge=False,
             )
         return mutated
