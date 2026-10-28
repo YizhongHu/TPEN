@@ -20,6 +20,17 @@ output-directory checks before `qsub`. The job reconstructs its venv offline
 under `/local/scratch/$PBS_JOBID` and writes per-arm logs, JUnit, JSON, and a
 `results.json` verdict under the cell evidence directory.
 
+Facility-specific interpreter, uv version, uv environment policy, and the
+compute-host guard are versioned once in `facility_profile.json`; staging and
+the job both read that profile. The stored PBS script uses bash without a login
+profile and receives only the staged run-environment path. The harness checkout
+SHA and target checkout SHA are both recorded in `manifest.json`.
+
+The deliberately failing class-9 canary is `fixtures/canary.py`. Its filename
+is intentionally outside normal pytest discovery; the end-to-end command may
+select it explicitly as an arm. The self-test also proves that a normal repo
+collection does not collect it.
+
 Exit status 0 means every selected arm produced parseable JUnit with at least
 one testcase and no failures or errors. Nonzero means a staging/preflight
 assertion or arm verdict failed. Scheduler state and job exit are not the

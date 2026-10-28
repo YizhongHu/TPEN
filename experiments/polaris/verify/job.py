@@ -11,6 +11,30 @@ import shlex
 import tomllib
 
 
+def expected_versions(lock: dict) -> dict[str, str]:
+    """Select the CPU torch resolution and the unique test dependencies."""
+    packages = lock.get("package", [])
+    expected: dict[str, str] = {}
+    for package in packages:
+        name = package.get("name")
+        if name in {"pytest", "typeguard"}:
+            if name in expected:
+                raise ValueError(f"ambiguous lock entry for {name}")
+            expected[name] = package["version"]
+    cpu_torch = [
+        package for package in packages
+        if package.get("name") == "torch"
+        and package.get("source", {}).get("registry", "").rstrip("/").endswith("/cpu")
+    ]
+    if len(cpu_torch) != 2:
+        raise ValueError("lock must contain torch's plain and +cpu CPU resolutions")
+    cpu_torch.sort(key=lambda package: package["version"].endswith("+cpu"), reverse=True)
+    expected["torch"] = cpu_torch[0]["version"]
+    if set(expected) != {"torch", "pytest", "typeguard"}:
+        raise ValueError("lock is missing a required verification package")
+    return expected
+
+
 def main() -> int:
     env_path = Path(os.environ["RUN_ENV_PATH"])
     manifest_path = Path(shlex.split(next(line for line in env_path.read_text().splitlines() if line.startswith("RUN_MANIFEST=")), posix=True)[0].split("=", 1)[1])
@@ -24,7 +48,7 @@ def main() -> int:
     evidence = Path(manifest["evidence_dir"]) / os.environ["PBS_JOBID"]
     evidence.mkdir(parents=True, exist_ok=True)
     node = subprocess.check_output(["hostname", "-s"], text=True).strip()
-    if node.startswith("polaris-login-"):
+    if node.startswith(manifest["profile"]["compute_host_guard"]["refuse_prefix"]):
         return 70
     nodefile = Path(os.environ["PBS_NODEFILE"])
     if not nodefile.is_file() or not any(line.strip().split(".", 1)[0] == node for line in nodefile.read_text().splitlines()):
@@ -35,7 +59,10 @@ def main() -> int:
     if list(repo.rglob("._*")):
         return 73
     lock = tomllib.loads((repo / "uv.lock").read_text())
-    expected = {package["name"]: package["version"] for package in lock.get("package", []) if package.get("name") in {"torch", "pytest", "typeguard"}}
+    try:
+        expected = expected_versions(lock)
+    except (KeyError, TypeError, ValueError):
+        return 78
     profile = manifest["profile"]
     env = os.environ.copy()
     env.update(dict(item.split("=", 1) for item in profile["uv_flags"]))
@@ -43,6 +70,9 @@ def main() -> int:
     job_env = Path("/local/scratch") / os.environ["PBS_JOBID"] / "tpen-verify-env"
     env["UV_PROJECT_ENVIRONMENT"] = str(job_env)
     uv = [profile["facility_python"], "-m", "uv"]
+    uv_version = subprocess.check_output(uv + ["--version"], text=True).strip()
+    if profile["uv_version"] not in uv_version:
+        return 77
     subprocess.run(uv + ["sync", "--offline", "--extra", "cpu", "--locked", "--project", str(repo)], env=env, check=True)
     python = job_env / "bin" / "python"
     if not python.is_file():

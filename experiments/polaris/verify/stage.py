@@ -58,7 +58,7 @@ def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, 
     target_sha = _git(target_repo, "rev-parse", "HEAD")
     if not HEX40.fullmatch(target_sha) or target_sha != args.target_sha:
         raise RuntimeError("target checkout is not at the requested full SHA")
-    harness_sha = _git(VERIFY_DIR.parents[3], "rev-parse", "HEAD")
+    harness_sha = _git(VERIFY_DIR.parents[2], "rev-parse", "HEAD")
     profile = json.loads((VERIFY_DIR / "facility_profile.json").read_text())
     arms = [validate_arm(arm, target_repo) for arm in args.arm]
     manifest = {
@@ -86,6 +86,9 @@ def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, 
 
 def stage(args: argparse.Namespace) -> int:
     """Perform login-node staging and submit the stored PBS script."""
+    harness_repo = VERIFY_DIR.parents[2]
+    if _git(harness_repo, "status", "--porcelain", "--untracked-files=no"):
+        raise RuntimeError("harness checkout has tracked changes; refuse staging")
     evidence_root = Path(args.evidence_root).expanduser().resolve()
     run_root = evidence_root / args.cell_id
     if run_root.exists():
@@ -110,12 +113,15 @@ def stage(args: argparse.Namespace) -> int:
     env["UV_CACHE_DIR"] = str(run_root / "uv-cache")
     env["UV_PROJECT_ENVIRONMENT"] = str(run_root / "prime-env")
     uv = [profile["facility_python"], "-m", "uv"]
-    _run(uv + ["--version"])
+    uv_version = _run(uv + ["--version"], capture=True)
+    if profile["uv_version"] not in uv_version:
+        raise RuntimeError(f"facility uv version mismatch: expected {profile['uv_version']}, got {uv_version}")
     _run(uv + ["sync", "--extra", "cpu", "--locked", "--project", str(target_repo)], cwd=target_repo, env=env)
     dry_log = run_root / "offline-dry.log"
     with dry_log.open("w", encoding="utf-8") as stream:
         subprocess.run(uv + ["sync", "--offline", "--extra", "cpu", "--locked", "--project", str(target_repo)], env=env, check=True, text=True, stdout=stream, stderr=subprocess.STDOUT)
     manifest = build_manifest(args, run_root, target_repo, harness_dir)
+    manifest["harness_clean_tracked"] = True
     manifest_path = run_root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     env_path = run_root / "run.env"
