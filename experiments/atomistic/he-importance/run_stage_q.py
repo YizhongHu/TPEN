@@ -921,12 +921,16 @@ def execute(args: argparse.Namespace) -> int:
         beta2=getattr(args, "beta2", 0.999),
         seed_label=args.seed_label,
     )
+    declared_walkers = stage_coordinate.sampler_override_values(args.stage, "n_walkers")
     if args.walkers == stage_coordinate.COMMITTED_WALKERS:
         cell = selection.cell
-    elif args.walkers == stage_coordinate.Q_MECHANICS_WALKERS:
-        cell = stage_coordinate.with_q_mechanics_walkers(selection.cell)
+    elif args.walkers in declared_walkers:
+        cell = stage_coordinate.with_q_mechanics_walkers(selection.cell, args.walkers)
     else:
-        raise StageQSelectionError(f"unsupported Stage-Q walker count: {args.walkers}")
+        raise StageQSelectionError(
+            f"unsupported Stage-Q walker count: {args.walkers}; "
+            f"stage {args.stage!r} declares n_walkers={declared_walkers!r}"
+        )
     selection = replace(selection, cell=cell)
     packet = _q_training_packet(selection.cell)
     resolved = train_config.resolve_train_config(packet)

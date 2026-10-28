@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
+import subprocess
 import sys
 import warnings
 from dataclasses import fields, replace
@@ -58,17 +60,226 @@ def _configuration(
 
 def test_all_35_transcribed_stage_fields_are_pinned_against_committed_authority() -> None:
     expected = [
-        {"code": "Q", "purpose": "mechanics", "seeds_per_point": 2, "maximum_lineages": 480, "updates": 2_000},
-        {"code": "O1", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 1_920, "updates": 50_000},
-        {"code": "O2", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 320, "updates": 50_000},
-        {"code": "A", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 4_064, "updates": 50_000},
-        {"code": "B", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 960, "updates": 50_000},
-        {"code": "R", "purpose": "scientific", "seeds_per_point": 12, "maximum_lineages": 768, "updates": 50_000},
-        {"code": "F", "purpose": "confirmation", "seeds_per_point": 48, "maximum_lineages": 96, "updates": None},
+        {"code": "Q", "purpose": "mechanics", "seeds_per_point": 2, "maximum_lineages": 480, "updates": 2_000, "sampler_overrides": {"n_walkers": [2_048]}},
+        {"code": "O1", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 1_920, "updates": 50_000, "sampler_overrides": {}},
+        {"code": "O2", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 320, "updates": 50_000, "sampler_overrides": {}},
+        {"code": "A", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 4_064, "updates": 50_000, "sampler_overrides": {}},
+        {"code": "B", "purpose": "scientific", "seeds_per_point": 8, "maximum_lineages": 960, "updates": 50_000, "sampler_overrides": {}},
+        {"code": "R", "purpose": "scientific", "seeds_per_point": 12, "maximum_lineages": 768, "updates": 50_000, "sampler_overrides": {}},
+        {"code": "F", "purpose": "confirmation", "seeds_per_point": 48, "maximum_lineages": 96, "updates": None, "sampler_overrides": {}},
     ]
     authority = json.loads(Path(__file__).with_name("stage_coordinate_authority.json").read_text())
     assert authority == expected
-    assert [definition.__dict__ for definition in stage_coordinate.STAGE_DEFINITIONS] == expected
+    assert [
+        {
+            **{field.name: getattr(definition, field.name) for field in fields(stage_coordinate.StageDefinition) if field.name != "sampler_overrides"},
+            "sampler_overrides": {
+                coordinate: list(values)
+                for coordinate, values in definition.sampler_overrides.items()
+            },
+        }
+        for definition in stage_coordinate.STAGE_DEFINITIONS
+    ] == expected
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda entry: entry.pop("sampler_overrides"), "invalid schema"),
+        (lambda entry: entry["sampler_overrides"].update({"other": [2_048]}), "unknown stage sampler coordinate"),
+        (lambda entry: entry["sampler_overrides"].update({"n_walkers": [True]}), "values must be integers"),
+        (lambda entry: entry["sampler_overrides"].update({"n_walkers": [2_048.0]}), "values must be integers"),
+        (lambda entry: entry["sampler_overrides"].update({"n_walkers": ["2048"]}), "values must be integers"),
+        (lambda entry: entry["sampler_overrides"].update({"n_walkers": []}), "non-empty list"),
+        (lambda entry: entry["sampler_overrides"].update({"n_walkers": [2_048, 2_048]}), "repeats a value"),
+        (lambda entry: entry.__setitem__("sampler_overrides", []), "must be a mapping"),
+        (lambda entry: entry.__setitem__("sampler_overrides", None), "must be a mapping"),
+        (lambda entry: entry["sampler_overrides"].update({"n_walkers": 2_048}), "non-empty list"),
+    ],
+)
+def test_stage_authority_loader_rejects_each_sampler_override_malformed_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: object, message: str
+) -> None:
+    authority = json.loads(Path(__file__).with_name("stage_coordinate_authority.json").read_text())
+    mutation(authority[0])
+    broken = tmp_path / "stage_coordinate_authority.json"
+    broken.write_text(json.dumps(authority), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_AUTHORITY_PATH", broken)
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match=message):
+        stage_coordinate._load_stage_definitions()
+
+
+def _load_base_stage_coordinate() -> object:
+    """Load the exact base implementation without changing the checkout."""
+
+    base = "d7649753b108ed36fdd3e7c30276eb341e3f8059"
+    source = subprocess.check_output(
+        ["git", "show", f"{base}:experiments/atomistic/he-importance/stage_coordinate.py"],
+        text=True,
+    )
+    authority = subprocess.check_output(
+        [
+            "git",
+            "show",
+            f"{base}:experiments/atomistic/he-importance/stage_coordinate_authority.json",
+        ],
+        text=True,
+    )
+    inventory = subprocess.check_output(
+        [
+            "git",
+            "show",
+            f"{base}:experiments/atomistic/he-importance/intended_configurations.json",
+        ],
+        text=True,
+    )
+    name = "he_importance_stage_coordinate_a757ed76"
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("stage_coordinate.py"))
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    original_read_text = Path.read_text
+
+    def read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if path.name == "stage_coordinate_authority.json":
+            return authority
+        if path.name == "intended_configurations.json":
+            return inventory
+        return original_read_text(path, *args, **kwargs)
+
+    Path.read_text = read_text  # type: ignore[assignment]
+    try:
+        exec(compile(source, f"{base}:stage_coordinate.py", "exec"), module.__dict__)
+        # The base implementation reads its inventory lazily. Freeze the
+        # pinned blob in the loaded module before restoring the path reader so
+        # later materialization cannot silently consume the head checkout.
+        frozen_inventory = module.intended_configurations()
+        module.intended_configurations = lambda: frozen_inventory
+    finally:
+        Path.read_text = original_read_text  # type: ignore[assignment]
+    return module
+
+
+def _available_roster_for(module: object) -> dict[str, object]:
+    return {
+        method: module.OptimizerCell(method, "available")
+        for method in ("adam", "sr", "kfac", "spring", "linear_method")
+    }
+
+
+def _identity_pairs(cells: tuple[object, ...], output_root: Path) -> list[tuple[str, str, str]]:
+    pairs = []
+    for cell in cells:
+        try:
+            relative_path = cell.output_path.relative_to(output_root).as_posix()
+        except ValueError as error:
+            raise AssertionError(
+                f"output path escaped supplied root {output_root}: {cell.output_path}"
+            ) from error
+        pairs.append((cell.manifest["stage"], cell.content_hash, relative_path))
+    return pairs
+
+
+def _walker_refusal_pattern(stage: str, value: object, declared: object) -> str:
+    return (
+        rf"scientific_identity\.walkers={re.escape(repr(value))} is not declared for stage "
+        rf"{re.escape(repr(stage))}; declared n_walkers={re.escape(repr(declared))}"
+    )
+
+
+def _no_walker_override_pattern(stage: str) -> str:
+    return rf"stage {re.escape(repr(stage))} declares no n_walkers mechanics override"
+
+
+def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rerun the base oracle and prove a deliberate identity perturbation is RED."""
+
+    base = _load_base_stage_coordinate()
+    base_cells = base.materialize_intended_configurations(
+        tmp_path / "base", availability=_available_roster_for(base)
+    )
+    head_cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "head", availability=_complete_available_roster()
+    )
+    assert _identity_pairs(base_cells, tmp_path / "base") == _identity_pairs(
+        head_cells, tmp_path / "head"
+    )
+
+    base_q = tuple(cell for cell in base_cells if cell.manifest["stage"] == "Q")
+    head_q = tuple(cell for cell in head_cells if cell.manifest["stage"] == "Q")
+    base_mechanics = tuple(base.with_q_mechanics_walkers(cell) for cell in base_q)
+    head_mechanics = tuple(
+        stage_coordinate.with_q_mechanics_walkers(cell, 2_048) for cell in head_q
+    )
+    assert _identity_pairs(base_mechanics, tmp_path / "base") == _identity_pairs(
+        head_mechanics, tmp_path / "head"
+    )
+
+    mutated_inventory = json.loads(
+        Path(__file__).with_name("intended_configurations.json").read_text()
+    )
+    mutated_entry = mutated_inventory[0]
+    mutated_levels = dict(mutated_entry["optimizer"]["levels"])
+    mutated_levels["lr"] = 0.0006
+    mutated_entry["optimizer"]["levels"] = mutated_levels
+    for configuration in mutated_entry["configurations"]:
+        configuration["scientific_identity"]["optimizer"]["levels"] = dict(mutated_levels)
+    mutated_path = tmp_path / "head-inventory-mutation.json"
+    mutated_path.write_text(json.dumps(mutated_inventory), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", mutated_path)
+    mutated_head = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "mutated-head", availability=_complete_available_roster()
+    )
+    base_after_head_mutation = base.materialize_intended_configurations(
+        tmp_path / "base-after-head-mutation", availability=_available_roster_for(base)
+    )
+    assert _identity_pairs(base_cells, tmp_path / "base") == _identity_pairs(
+        base_after_head_mutation, tmp_path / "base-after-head-mutation"
+    )
+    with pytest.raises(AssertionError, match="head inventory perturbation"):
+        assert _identity_pairs(base_after_head_mutation, tmp_path / "base-after-head-mutation") == _identity_pairs(
+            mutated_head, tmp_path / "mutated-head"
+        ), "head inventory perturbation should be RED"
+
+    named = next(
+        cell
+        for cell in head_mechanics
+        if cell.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and cell.manifest["seed_identity"]["label"] == 810_001
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005
+        and cell.manifest["scientific_identity"]["optimizer"]["levels"]["beta2"] == 0.999
+    )
+    assert named.content_hash == "0b51514133bcb9e11ff8ad412390a994f29c0b8b9a222c92894a0374cd09f5da"
+
+    original_canonical_json = stage_coordinate.canonical_json
+
+    def perturb_encoding(value: object) -> bytes:
+        return original_canonical_json(value) + b"__deliberate_encoding_mutation__"
+
+    stage_coordinate.canonical_json = perturb_encoding
+    try:
+        perturbed_cells = stage_coordinate.materialize_intended_configurations(
+            tmp_path / "perturbed", availability=_complete_available_roster()
+        )
+        perturbed_q = tuple(
+            cell for cell in perturbed_cells if cell.manifest["stage"] == "Q"
+        )
+        perturbed_mechanics = tuple(
+            stage_coordinate.with_q_mechanics_walkers(cell, 2_048)
+            for cell in perturbed_q
+        )
+    finally:
+        stage_coordinate.canonical_json = original_canonical_json
+
+    with pytest.raises(AssertionError, match="base oracle perturbation"):
+        assert _identity_pairs(base_mechanics, tmp_path / "base") == _identity_pairs(
+            perturbed_mechanics, tmp_path / "perturbed"
+        ), (
+            "base oracle perturbation should be RED"
+        )
 
 
 @pytest.mark.parametrize(
@@ -670,20 +881,28 @@ def test_walker_count_refuses_inadmissible_values(value: object) -> None:
     manifest = _train_manifest()
     manifest["stage"] = "Q"
     manifest["scientific_identity"] = {"walkers": value}
-    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("Q", value, (2_048,)),
+    ):
         stage_coordinate.walker_count(manifest)
 
 
 def test_walker_count_refuses_q_exception_at_non_q_stage() -> None:
     manifest = _train_manifest()
     manifest["scientific_identity"] = {"walkers": stage_coordinate.Q_MECHANICS_WALKERS}
-    with pytest.raises(stage_coordinate.MaterializationError, match="stage must be 'Q'"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("O1", stage_coordinate.Q_MECHANICS_WALKERS, ()),
+    ):
         stage_coordinate.walker_count(manifest)
 
 
 def test_q_mechanics_walker_rebuild_refuses_non_q_and_double_application(tmp_path: Path) -> None:
     non_q = _packet_source_cells(tmp_path)[0]
-    with pytest.raises(stage_coordinate.MaterializationError, match="only for stage 'Q'"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError, match=_no_walker_override_pattern("O1")
+    ):
         stage_coordinate.with_q_mechanics_walkers(non_q)
 
     q_cell = next(
@@ -707,7 +926,10 @@ def test_public_materialized_routes_refuse_bad_walker_identity(
         {"architecture": "control", "optimizer": "adam", "walkers": value},
         {"updates": 2_000},
     )
-    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("Q", value, (2_048,)),
+    ):
         stage_coordinate.materialize_stage(
             "Q", [configuration], stage_coordinate.OptimizerCell("adam", "available"), tmp_path
         )
@@ -726,9 +948,15 @@ def test_public_materialized_routes_refuse_bad_walker_identity(
         manifest=stage_coordinate._freeze(manifest),
         content_hash=stage_coordinate.content_hash(manifest),
     )
-    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("Q", value, (2_048,)),
+    ):
         stage_coordinate.with_execution_topology(bad, {"global_rank": 0})
-    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("Q", value, (2_048,)),
+    ):
         stage_coordinate.materialize_job_packets(
             (bad,),
             stage_coordinate.CheckpointCadence(1_000, (1_000,)),
@@ -743,7 +971,10 @@ def test_evaluation_manifest_boundary_refuses_bad_walker_identity() -> None:
     manifest = _evaluation_manifest()
     manifest["stage"] = "Q"
     manifest["scientific_identity"] = {"walkers": 1_000}
-    with pytest.raises(stage_coordinate.MaterializationError, match="exactly 2048"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("Q", 1_000, (2_048,)),
+    ):
         stage_coordinate.validate_evaluation_manifest(manifest)
 
 
@@ -752,7 +983,10 @@ def test_public_materialized_route_refuses_q_walker_identity_at_non_q_stage(tmp_
         {"architecture": "control", "optimizer": "adam", "walkers": 2_048},
         {"updates": 50_000},
     )
-    with pytest.raises(stage_coordinate.MaterializationError, match="stage must be 'Q'"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError,
+        match=_walker_refusal_pattern("O1", 2_048, ()),
+    ):
         stage_coordinate.materialize_stage(
             "O1", [configuration], stage_coordinate.OptimizerCell("adam", "available"), tmp_path
         )

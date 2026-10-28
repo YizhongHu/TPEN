@@ -373,8 +373,76 @@ def test_cli_refuses_unsupported_walker_count(tmp_path: Path) -> None:
     args = runner.build_parser().parse_args(
         ["--dry-run", "--walkers", "1000", "--seed-label", "810001", "--output-root", str(tmp_path)]
     )
-    with pytest.raises(runner.StageQSelectionError, match="unsupported Stage-Q walker count"):
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match=r"unsupported Stage-Q walker count: 1000; stage 'Q' declares n_walkers=\(2048,\)",
+    ):
         runner.execute(args)
+
+
+def _bind_authority_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, q_values: list[int]
+) -> None:
+    """Reload stage declarations through the production authority loader."""
+
+    authority = json.loads(
+        Path(__file__).with_name("stage_coordinate_authority.json").read_text()
+    )
+    next(entry for entry in authority if entry["code"] == "Q")["sampler_overrides"] = {
+        "n_walkers": q_values
+    }
+    fixture = tmp_path / "stage_coordinate_authority.json"
+    fixture.write_text(json.dumps(authority), encoding="utf-8")
+    monkeypatch.setattr(stage_coordinate, "_AUTHORITY_PATH", fixture)
+    definitions = stage_coordinate._load_stage_definitions()
+    monkeypatch.setattr(stage_coordinate, "STAGE_DEFINITIONS", definitions)
+    monkeypatch.setattr(
+        stage_coordinate,
+        "STAGES",
+        {definition.code: definition for definition in definitions},
+    )
+
+
+def test_cli_uses_real_loader_mutation_for_admission_and_refusal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bind_authority_fixture(tmp_path, monkeypatch, [1_024])
+    source = next(cell for cell in _cells(tmp_path / "source") if cell.manifest["stage"] == "Q")
+    manifest = stage_coordinate._thaw(source.manifest)
+    manifest["scientific_identity"]["walkers"] = 2_048
+    with pytest.raises(stage_coordinate.MaterializationError, match=r"stage 'Q'.*\(1024,\)"):
+        stage_coordinate.walker_count(manifest)
+    with pytest.raises(stage_coordinate.MaterializationError, match=r"stage 'Q'.*\(1024,\)"):
+        stage_coordinate.with_q_mechanics_walkers(source, 2_048)
+
+    admitted = runner.build_parser().parse_args(
+        ["--dry-run", "--walkers", "1024", "--seed-label", "810001", "--output-root", str(tmp_path / "admitted")]
+    )
+    assert runner.execute(admitted) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["walkers"] == 1_024
+
+    refused = runner.build_parser().parse_args(
+        ["--dry-run", "--walkers", "2048", "--seed-label", "810001", "--output-root", str(tmp_path / "refused")]
+    )
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match=r"unsupported Stage-Q walker count: 2048; stage 'Q' declares n_walkers=\(1024,\)",
+    ):
+        runner.execute(refused)
+
+
+def test_two_member_authority_encodes_requested_value_and_resolver_consumes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bind_authority_fixture(tmp_path, monkeypatch, [1_024, 2_048])
+    source = next(cell for cell in _cells(tmp_path / "cells") if cell.manifest["stage"] == "Q")
+    for requested in (1_024, 2_048):
+        rebuilt = stage_coordinate.with_q_mechanics_walkers(source, requested)
+        assert stage_coordinate.walker_count(rebuilt.manifest) == requested
+        resolved = runner.train_config.resolve_train_config(rebuilt)
+        assert resolved.sampler.n_walkers == requested
+        assert resolved.runner.sampler.n_walkers == requested
 
 
 def test_roster_design_receipt_is_live_and_names_every_unavailable_arm() -> None:
