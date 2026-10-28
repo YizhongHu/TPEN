@@ -399,8 +399,8 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
                     "max_run_res.nodect = [o:PBS_ALL=24]\n"
                     "resources_min.walltime = 00:05:00\n")
         if queue_mode == "wrapped-limit":
-            text = ("Queue: debug\nmax_queued = [u:rhu=1,\n"
-                    "\tu:PBS_GENERIC=1]\nresources_min.walltime = 00:05:00\n")
+            text = ("Queue: debug\nmax_queued = [u:PBS_GENERIC=1],\n"
+                    "\t[u:rhu=2]\nresources_min.walltime = 00:05:00\n")
         if queue_mode == "unterminated-limit":
             text = "Queue: debug\nmax_queued = [u:rhu=1\n"
         if queue_mode == "unknown-user-limit":
@@ -459,6 +459,9 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
             if queue_mode == "alternate-only":
                 return subprocess.CompletedProcess(args, 0, table_text(queue), "")
             return subprocess.CompletedProcess(args, 0, jobs_text(queue), "")
+        if args[:3] == ["qstat", "-f", "-u"]:
+            queue = stage.read_profile(ROOT / "facility_profile.json")["pbs"]["queue"]
+            return subprocess.CompletedProcess(args, 0, table_text(queue), "")
         if args[:2] == ["qstat", "-u"]:
             queue = stage.read_profile(ROOT / "facility_profile.json")["pbs"]["queue"]
             return subprocess.CompletedProcess(args, 0, table_text(queue), "")

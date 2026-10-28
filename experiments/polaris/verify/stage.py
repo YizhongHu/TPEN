@@ -33,7 +33,8 @@ def _git(repo: Path, *args: str) -> str:
     return _run(["git", "-C", str(repo), *args], capture=True)
 
 
-_LIMIT = re.compile(r"^\s*([A-Za-z0-9_.]+)\s*=\s*\[(.*?)\]\s*$")
+_LIMIT = re.compile(r"^\s*([A-Za-z0-9_.]+)\s*=\s*((?:\[[^\[\]]*\])(?:\s*,\s*\[[^\[\]]*\])*)\s*$")
+_LIMIT_GROUP = re.compile(r"\[([^\[\]]*)\]")
 _LIMIT_ENTRY = re.compile(r"([ugpo]):([^=,\s]+)=(\d+)")
 
 
@@ -60,9 +61,15 @@ def _queue_limits(raw: str) -> tuple[bool, dict[str, list[tuple[str, str, int]]]
         match = _LIMIT.match(line)
         if not match:
             continue
-        entries = [(prefix, klass, int(value)) for prefix, klass, value in _LIMIT_ENTRY.findall(match.group(2))]
-        if not entries or "]" in match.group(2):
+        groups = _LIMIT_GROUP.findall(match.group(2))
+        if not groups or "," in groups[0]:
             return False, limits, "malformed bracketed PBS limit"
+        entries: list[tuple[str, str, int]] = []
+        for group in groups:
+            entry = _LIMIT_ENTRY.fullmatch(group.strip())
+            if entry is None:
+                return False, limits, "malformed bracketed PBS limit"
+            entries.append((entry.group(1), entry.group(2), int(entry.group(3))))
         limits.setdefault(match.group(1), []).extend(entries)
     if not saw_queue or not limits:
         return False, limits, "unparseable qstat -Qf output"
