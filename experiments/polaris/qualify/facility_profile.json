@@ -1,0 +1,10 @@
+{
+  "runtime_kind": "polaris-gpu-qualification",
+  "overlay_python": "",
+  "overlay_root": "",
+  "facility_site_packages": "",
+  "libshim": "/home/rhu/tpen-libshim-20260823",
+  "cuda13_lib": "/soft/compilers/cudatoolkit/cuda-13.0.1/lib64",
+  "cuda129_lib": "/soft/compilers/cudatoolkit/cuda-12.9.1/lib64",
+  "provenance": "operator-supplied approved Polaris facility overlay; path must be filled in a copied runtime profile"
+}
