@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tomllib
 import shlex
-from common import build_env, copied_hashes, is_ancestor, layout, read_profile
+from common import build_env, copied_hashes, is_ancestor
 
 
 def expected_versions(lock: dict) -> dict[str, str]:
@@ -66,12 +66,22 @@ def receipt_code(manifest: dict, receipt_path: Path) -> int:
     return 0 if receipt_matches(manifest, receipt) else 61
 
 
-def preflight_decision(*, login_host: bool, node_match: bool, apple_double_count: int, python_exists: bool, interpreter_ok: bool, versions_ok: bool, uv_ok: bool, lock_ok: bool, sync_ok: bool, copied_ok: bool) -> int:
+def preflight_decision(*, receipt_status: int = 0, login_host: bool, node_match: bool,
+                       head_ok: bool = True, ancestor_ok: bool = True,
+                       apple_double_count: int, python_exists: bool,
+                       interpreter_ok: bool, versions_ok: bool, uv_ok: bool,
+                       lock_ok: bool, sync_ok: bool, copied_ok: bool) -> int:
     """Map injected preflight observations to the stable exit-code contract."""
+    if receipt_status:
+        return receipt_status
     if login_host:
         return 70
     if not node_match:
         return 71
+    if not head_ok:
+        return 72
+    if not ancestor_ok:
+        return 79
     if apple_double_count:
         return 73
     if not python_exists:
@@ -97,34 +107,47 @@ def head_code(repo: Path, target_sha: str) -> int:
     return 0 if head == target_sha else 72
 
 
-class _Tee:
-    """Mirror job output into durable evidence while retaining PBS output."""
-
-    def __init__(self, original, path: Path):
-        self.original = original
-        self.stream = path.open("a", encoding="utf-8")
-
-    def write(self, text: str) -> int:
-        self.original.write(text)
-        self.stream.write(text)
-        self.stream.flush()
-        return len(text)
-
-    def flush(self) -> None:
-        self.original.flush()
-        self.stream.flush()
-
-
 def _record(path: Path, checks: list[dict], name: str, expected, observed, ok: bool, exit_code: int | None = None) -> bool:
     pending = {"name": name, "expected": expected, "observed": observed, "ok": None, "exit_code": None}
     checks.append(pending)
     path.write_text(json.dumps({"checks": checks, "exit_code": None}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     pending.update(ok=ok, exit_code=None if ok else exit_code)
     path.write_text(json.dumps({"checks": checks, "exit_code": None if ok else exit_code}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"CHECK {name} ok={ok} observed={observed}", flush=True)
     return ok
 
 
-def main() -> int:
+def _injected_main(deps) -> int:
+    """Run the decision path with injected observations for seam tests."""
+    env_path = Path(os.environ["RUN_ENV_PATH"])
+    values = _read_env(env_path)
+    manifest_path = Path(values["RUN_MANIFEST"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    job_id = os.environ["PBS_JOBID"]
+    evidence = Path(manifest["evidence_dir"]) / job_id
+    evidence.mkdir(parents=True, exist_ok=True)
+    preflight = evidence / "preflight.json"
+    checks: list[dict] = []
+    observed = {name: (value() if callable(value) else value) for name, value in deps.items() if name != "driver_runner"}
+    status = preflight_decision(**observed)
+    observations = {
+        "receipt": observed.get("receipt_status", 0), "login_host": observed["login_host"],
+        "node_match": observed["node_match"], "head": observed.get("head_ok", True),
+        "ancestor": observed.get("ancestor_ok", True),
+        "apple_double": observed["apple_double_count"], "python": observed["python_exists"],
+        "interpreter": observed["interpreter_ok"], "versions": observed["versions_ok"],
+        "uv": observed["uv_ok"], "lock": observed["lock_ok"], "sync": observed["sync_ok"],
+        "copied": observed["copied_ok"],
+    }
+    _record(preflight, checks, "injected_observations", "all preflight checks", observations, status == 0, status or 1)
+    if status:
+        return status
+    driver_rc = int(deps["driver_runner"]())
+    _record(preflight, checks, "driver", 0, driver_rc, driver_rc == 0, driver_rc or 1)
+    return driver_rc
+
+
+def _real_main() -> int:
     """Run preflight checks and invoke the manifest-selected driver."""
     env_path = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ["RUN_ENV_PATH"])
     values = _read_env(env_path)
@@ -133,10 +156,14 @@ def main() -> int:
     job_id = os.environ["PBS_JOBID"]
     evidence = Path(manifest["evidence_dir"]) / job_id
     evidence.mkdir(parents=True, exist_ok=True)
-    sys.stdout = _Tee(sys.stdout, evidence / "job.stdout.log")
-    sys.stderr = _Tee(sys.stderr, evidence / "job.stderr.log")
     preflight = evidence / "preflight.json"
     checks: list[dict] = []
+
+    # Verify copied code before invoking any other copied harness helper.
+    copied_expected = manifest["copied_file_sha256"]
+    copied_observed = copied_hashes([Path(manifest["job_helper"]).parent / name for name in copied_expected])
+    if not _record(preflight, checks, "copied_harness_hashes", copied_expected, copied_observed, copied_observed == copied_expected, 81):
+        return 81
 
     receipt_path = Path(manifest["staging_receipt"])
     receipt_status = receipt_code(manifest, receipt_path)
@@ -201,14 +228,21 @@ def main() -> int:
     observed = json.loads(subprocess.check_output([str(python), "-c", "import importlib.metadata as m, json; print(json.dumps({n:m.version(n) for n in ('torch','pytest','typeguard')}))"], text=True))
     if not _record(preflight, checks, "package_versions", expected, observed, observed == expected, 75):
         return 75
-    copied_expected = manifest["copied_file_sha256"]
-    copied_observed = copied_hashes([Path(manifest["job_helper"]).parent / name for name in copied_expected])
-    if not _record(preflight, checks, "copied_harness_hashes", copied_expected, copied_observed, copied_observed == copied_expected, 81):
-        return 81
     with (evidence / "driver.stdout.log").open("w", encoding="utf-8") as stdout, (evidence / "driver.stderr.log").open("w", encoding="utf-8") as stderr:
         driver_rc = subprocess.run([str(python), "-B", manifest["driver"], "--manifest", str(manifest_path), "--evidence", str(evidence), "--job-python", str(python), "--job-env", str(job_env)], env=env, stdout=stdout, stderr=stderr).returncode
     _record(preflight, checks, "driver", 0, driver_rc, driver_rc == 0, driver_rc or 1)
     return driver_rc
+
+
+def main(deps=None) -> int:
+    """Run preflight checks and invoke the manifest-selected driver.
+
+    Parameters
+    ----------
+    deps : dict, optional
+        Injected observations and a ``driver_runner`` callable for seam tests.
+    """
+    return _injected_main(deps) if deps is not None else _real_main()
 
 
 if __name__ == "__main__":

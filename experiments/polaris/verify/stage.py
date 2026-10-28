@@ -92,7 +92,7 @@ def validate_cell_id(cell_id: str) -> str:
     return cell_id
 
 
-def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, harness_dir: Path) -> dict:
+def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path) -> dict:
     """Build the single-source manifest after target checkout is verified."""
     target_sha = _git(target_repo, "rev-parse", "HEAD")
     if not HEX40.fullmatch(target_sha) or target_sha != args.target_sha:
@@ -101,7 +101,6 @@ def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, 
     harness_sha = _git(harness_repo, "rev-parse", "HEAD")
     paths = layout(run_root)
     profile = read_profile(VERIFY_DIR / "facility_profile.json")
-    arms = [validate_arm(arm, target_repo) for arm in args.arm]
     manifest = {
         "schema": 1,
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -116,7 +115,7 @@ def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, 
         "dry_env": str(paths["dry_env"]),
         "evidence_dir": str(paths["evidence_dir"]),
         "pbs_dir": str(paths["pbs_dir"]),
-        "arms": arms,
+        "arms": list(args.arm),
         "profile": profile,
         "profile_path": str(paths["profile"]),
         "job_script": str(paths["job_script"]),
@@ -167,10 +166,10 @@ def stage(args: argparse.Namespace) -> int:
     if run_root.exists():
         raise RuntimeError(f"run root already exists: {run_root}")
     run_root.mkdir(parents=True)
-    for name in ("evidence", "pbs", "harness"):
-        (run_root / name).mkdir()
-    harness_dir = paths["harness_dir"]
     paths = layout(run_root)
+    for key in ("evidence_dir", "pbs_dir", "harness_dir"):
+        paths[key].mkdir()
+    harness_dir = paths["harness_dir"]
     for name in COPIED_FILES:
         shutil.copy2(VERIFY_DIR / name, harness_dir / name)
     target_repo = run_root / "target"
@@ -191,7 +190,7 @@ def stage(args: argparse.Namespace) -> int:
     if uv_version.split()[:2] != ["uv", profile["uv_version"]]:
         raise RuntimeError(f"facility uv version mismatch: expected {profile['uv_version']}, got {uv_version}")
     dry_log = prime_and_dry_sync(target_repo, profile, paths, uv)
-    manifest = build_manifest(args, run_root, target_repo, harness_dir)
+    manifest = build_manifest(args, run_root, target_repo)
     manifest["harness_clean_tracked"] = True
     manifest["copied_file_sha256"] = copied_hashes(paths["copied_files"])
     manifest["arms"] = arms

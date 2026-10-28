@@ -68,7 +68,8 @@ def test_harness_has_no_embedded_commit_or_run_path() -> None:
 def scan_identity_literals(paths) -> bool:
     """Return whether any harness file contains a forbidden run identity literal."""
     pattern = re.compile(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])")
-    return any(pattern.search(path.read_text()) or "/eagle/" in path.read_text() for path in paths)
+    run_root_marker = "/" + "eagle/"
+    return any(pattern.search(path.read_text()) or run_root_marker in path.read_text() for path in paths)
 
 
 def scan_shell_defects(paths) -> set[str]:
@@ -184,7 +185,7 @@ def test_stored_job_has_bash_and_manifest_boundary() -> None:
 
 
 def test_static_defect_scanners_have_positive_and_failing_controls() -> None:
-    files = [ROOT / name for name in ("README.md", "facility_profile.json", "stage.py", "job.py", "driver.py", "job.pbs")]
+    files = [ROOT / name for name in ("README.md", "facility_profile.json", "stage.py", "job.py", "driver.py", "common.py", "job.pbs")]
     assert scan_shell_defects(files) == set()
     with tempfile.TemporaryDirectory() as raw:
         planted = Path(raw) / "planted.pbs"
@@ -239,6 +240,44 @@ def test_injected_preflight_codes_and_controls() -> None:
         altered = dict(base)
         altered[field] = 1 if field in {"login_host", "apple_double_count"} else False
         assert job.preflight_decision(**altered) == code
+
+
+def test_job_main_uses_injected_decision_path_and_driver() -> None:
+    """The verify/ directory is inserted at sys.path[0], so common imports
+    resolve to the copied harness module rather than an unrelated package.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        evidence = root / "evidence"
+        manifest = root / "manifest.json"
+        manifest.write_text(json.dumps({"evidence_dir": str(evidence)}))
+        env = root / "run.env"
+        env.write_text(f"RUN_MANIFEST={manifest}\n")
+        import os
+        old_env = dict(os.environ)
+        os.environ.update({"RUN_ENV_PATH": str(env), "PBS_JOBID": "123"})
+        try:
+            base = {
+                "receipt_status": 0, "login_host": False, "node_match": True,
+                "head_ok": True, "ancestor_ok": True, "apple_double_count": 0,
+                "python_exists": True, "interpreter_ok": True, "versions_ok": True,
+                "uv_ok": True, "lock_ok": True, "sync_ok": True,
+                "copied_ok": True, "driver_runner": lambda: 0,
+            }
+            for field, code in (("receipt_status", 60), ("receipt_status", 61),
+                                ("login_host", 70), ("node_match", 71),
+                                ("head_ok", 72), ("ancestor_ok", 79),
+                                ("apple_double_count", 73), ("python_exists", 74),
+                                ("versions_ok", 75), ("interpreter_ok", 76),
+                                ("uv_ok", 77), ("lock_ok", 78),
+                                ("sync_ok", 80), ("copied_ok", 81)):
+                deps = dict(base)
+                deps[field] = code if field == "receipt_status" else (1 if field in {"login_host", "apple_double_count"} else False)
+                assert job.main(deps) == code
+            assert job.main(dict(base, driver_runner=lambda: 7)) == 7
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
 
 
 def test_copied_hash_positive_and_tamper_control(tmp_path) -> None:
@@ -301,6 +340,119 @@ def test_stage_sync_failure_precedes_receipt(monkeypatch, tmp_path) -> None:
     else:
         raise AssertionError("synthetic prime failure did not propagate")
     assert not paths["staging_receipt"].exists()
+
+
+def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> None:
+    """Exercise stage() through clone, both syncs, receipts, and qsub."""
+    real_run = subprocess.run
+
+    def git_repo(path: Path, filename: str = "test_target.py") -> str:
+        path.mkdir()
+        real_run(["git", "init", "-q", str(path)], check=True)
+        real_run(["git", "-C", str(path), "config", "user.email", "test@example.invalid"], check=True)
+        real_run(["git", "-C", str(path), "config", "user.name", "Harness Test"], check=True)
+        (path / filename).write_text("def test_target(): pass\n")
+        real_run(["git", "-C", str(path), "add", filename], check=True)
+        real_run(["git", "-C", str(path), "commit", "-q", "-m", "target"], check=True)
+        return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
+
+    target_source = tmp_path / "target-source"
+    target_sha = git_repo(target_source)
+    bare = tmp_path / "remote.git"
+    real_run(["git", "clone", "-q", "--bare", str(target_source), str(bare)], check=True)
+    harness_repo = tmp_path / "harness-repo"
+    git_repo(harness_repo, "placeholder")
+    monkeypatch.setattr(stage, "_harness_repo", lambda: harness_repo)
+    monkeypatch.setattr(stage.getpass, "getuser", lambda: "rhu")
+
+    qsub_calls = []
+    uv_envs = []
+    qstat_calls = 0
+
+    def fake_subprocess(args, **kwargs):
+        nonlocal qstat_calls
+        if args[:2] == ["qstat", "-u"]:
+            qstat_calls += 1
+            output = "" if qstat_calls < 2 else ""
+            return subprocess.CompletedProcess(args, 0, output, "")
+        if "sync" in args:
+            uv_envs.append(kwargs["env"])
+            Path(kwargs["env"]["UV_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+            Path(kwargs["env"]["UV_PROJECT_ENVIRONMENT"]).mkdir(parents=True, exist_ok=True)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return real_run(args, **kwargs)
+
+    original_stage_run = stage._run
+
+    def fake_run(args, cwd=None, *, capture=False, env=None):
+        if "--version" in args and "uv" in args:
+            return "uv 0.8.23"
+        if args and args[0] == "qsub":
+            qsub_calls.append(args)
+            return "123.polaris-pbs-01"
+        if "sync" in args:
+            uv_envs.append(env)
+            Path(env["UV_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+            Path(env["UV_PROJECT_ENVIRONMENT"]).mkdir(parents=True, exist_ok=True)
+            return ""
+        return original_stage_run(args, cwd=cwd, capture=capture, env=env)
+
+    monkeypatch.setattr(stage.subprocess, "run", fake_subprocess)
+    monkeypatch.setattr(stage, "_run", fake_run)
+    args = type("Args", (), {"target_sha": target_sha, "arm": ["test_target.py"],
+                              "evidence_root": str(tmp_path / "cells"), "cell_id": "cell-ok",
+                              "required_ancestor": [], "remote": str(bare)})()
+    assert stage.stage(args) == 0
+    run_root = Path(args.evidence_root) / args.cell_id
+    manifest = json.loads((run_root / "manifest.json").read_text())
+    assert (run_root / "run.env").is_file() and (run_root / "staging-receipt.json").is_file()
+    assert (run_root / "submission.txt").is_file()
+    assert len(uv_envs) == 2
+    assert all(env["UV_CACHE_DIR"] == manifest["cache_dir"] for env in uv_envs)
+    profile = manifest["profile"]
+    expected_qsub = ["qsub", "-A", profile["pbs"]["account"], "-q", profile["pbs"]["queue"],
+                     "-l", f"select={profile['pbs']['select']}", "-l", f"walltime={profile['pbs']['walltime']}",
+                     "-l", f"filesystems={profile['pbs']['filesystems']}", "-o", manifest["pbs_dir"] + "/",
+                     "-e", manifest["pbs_dir"] + "/", "-v", f"RUN_ENV_PATH={run_root.resolve() / 'run.env'}",
+                     manifest["job_script"]]
+    assert qsub_calls == [expected_qsub]
+
+    def run_control(name, mode):
+        nonlocal qstat_calls
+        qstat_calls = 0
+        cell = tmp_path / "cells" / name
+        control_args = type("Args", (), {"target_sha": target_sha, "arm": ["test_target.py"],
+                                          "evidence_root": str(tmp_path / "cells"), "cell_id": name,
+                                          "required_ancestor": [], "remote": str(bare)})()
+        def control_run(call_args, cwd=None, *, capture=False, env=None):
+            if "--version" in call_args and "uv" in call_args:
+                return "uv 0.8.23"
+            if "sync" in call_args and mode == "prime-fail":
+                raise RuntimeError("prime failed")
+            if call_args and call_args[0] == "qsub":
+                raise AssertionError("qsub reached control")
+            return original_stage_run(call_args, cwd=cwd, capture=capture, env=env)
+        def control_subprocess(call_args, **kwargs):
+            nonlocal qstat_calls
+            if call_args[:2] == ["qstat", "-u"]:
+                qstat_calls += 1
+                return subprocess.CompletedProcess(call_args, 0, "" if qstat_calls < 2 else "occupied", "")
+            if "sync" in call_args and mode == "dry-fail":
+                raise subprocess.CalledProcessError(1, call_args)
+            return fake_subprocess(call_args, **kwargs)
+        monkeypatch.setattr(stage, "_run", control_run)
+        monkeypatch.setattr(stage.subprocess, "run", control_subprocess)
+        try:
+            stage.stage(control_args)
+        except (RuntimeError, subprocess.CalledProcessError):
+            pass
+        assert not (cell / "submission.txt").exists()
+        if mode != "qstat":
+            assert not (cell / "staging-receipt.json").exists()
+
+    run_control("cell-prime-fail", "prime-fail")
+    run_control("cell-dry-fail", "dry-fail")
+    run_control("cell-qstat", "qstat")
 
 
 def test_driver_exit_and_evidence_boundaries(monkeypatch) -> None:

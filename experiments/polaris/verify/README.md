@@ -45,13 +45,30 @@ one passing testcase and no failures or errors. Nonzero means a staging/prefligh
 assertion or arm verdict failed. Scheduler state and job exit are not the
 scientific verdict by themselves; inspect `results.json` and the JUnit files.
 
-Important preflight codes are 60 (missing receipt), 61 (receipt identity
-mismatch), 70 (login host), 71 (PBS node mismatch), 72 (target SHA), 73
-(AppleDouble), 74/76 (venv interpreter), 75 (package versions), 77 (uv
-version), 78 (lock resolution), 79 (ancestor), 80 (offline sync), and 81
-(copied harness identity); driver failures use exit 1. The driver writes
-`preflight.json`, `driver-preflight.json`, and mirrored stdout/stderr under the
-per-job evidence directory. PBS stdout/stderr are directed to the staged
+The preflight exit-code table is:
+
+| Code | Meaning |
+| --- | --- |
+| 60 | staging receipt missing |
+| 61 | staging receipt identity mismatch |
+| 70 | login host guard failed |
+| 71 | PBS nodefile host mismatch |
+| 72 | target checkout SHA mismatch |
+| 73 | AppleDouble files present |
+| 74 | job venv Python missing |
+| 75 | package versions differ from the lock |
+| 76 | job venv interpreter identity mismatch |
+| 77 | facility uv version mismatch |
+| 78 | CPU lock resolution invalid |
+| 79 | required ancestor missing |
+| 80 | offline sync failed |
+| 81 | copied harness identity mismatch |
+| 1 | driver arm verdict failed |
+
+The driver writes
+`preflight.json`, `driver-preflight.json`, and captured stdout/stderr under the
+per-job evidence directory. Watch the captured driver output at
+`evidence/<PBS_JOBID>/driver.stdout.log`. PBS stdout/stderr are directed to the staged
 `pbs/` directory; the detailed evidence of record is under
 `evidence/<PBS_JOBID>/`. Read `preflight.json` for identity checks and
 `results.json` plus its JUnit files for per-arm counts and the verdict.
