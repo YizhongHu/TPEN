@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from collections import UserList, UserString, deque
 from collections.abc import Buffer, Mapping, Sequence
 from importlib import import_module
@@ -144,9 +145,27 @@ class _FakeContext(RunContext):
 def test_fake_context_tracks_run_context_init_fields() -> None:
     context = _FakeContext()
     init_fields = {field.name for field in fields(RunContext) if field.init}
-    missing = sorted(name for name in init_fields if not hasattr(context, name))
+    missing = sorted(name for name in init_fields if name not in vars(context))
 
     assert not missing, f"_FakeContext is missing RunContext init fields: {missing}"
+
+
+def test_fake_context_doubles_use_shared_contract() -> None:
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    context_double_names = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+        and any(
+            isinstance(base, ast.Name) and base.id == "RunContext"
+            for base in node.bases
+        )
+    }
+
+    assert context_double_names == {"_FakeContext"}, (
+        "RunContext doubles must use _FakeContext; found "
+        f"{sorted(context_double_names)}"
+    )
 
 
 def test_launch_populates_topology_under_designated_key(tmp_path: Path) -> None:
