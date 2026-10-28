@@ -375,22 +375,23 @@ def test_c2_control_q_identity_comparison_fails_on_a_perturbed_q_entry(
 def test_c3_every_non_adam_o1_row_is_materialized_unavailable_with_the_roster_reason(
     tmp_path: Path,
 ) -> None:
-    from tpen.hi_schema import HI_METHOD_ROSTER
-
-    roster = {entry.method: entry for entry in HI_METHOD_ROSTER}
+    # The live roster's verdicts, through the optimizer grid's roster adapter
+    # (no direct tpen import: see test_tpen_boundary.py's inventory).
+    roster = _availability()
     cells = _materialize_o1(tmp_path)
     by_status: dict[str, int] = {}
     for cell in cells:
         optimizer_cell = dict(cell.manifest["scientific_identity"]["optimizer_cell"])
         method = optimizer_cell["method"]
-        entry = roster[method]
-        if entry.admitted:
+        verdict = roster[method]
+        if verdict.status == "available":
             assert optimizer_cell == {"method": method, "status": "available"}
         else:
+            assert verdict.reason
             assert optimizer_cell == {
                 "method": method,
                 "status": "unavailable",
-                "unavailable_reason": entry.requires,
+                "unavailable_reason": verdict.reason,
             }
         by_status[optimizer_cell["status"]] = by_status.get(optimizer_cell["status"], 0) + 1
 
@@ -399,7 +400,7 @@ def test_c3_every_non_adam_o1_row_is_materialized_unavailable_with_the_roster_re
     assert report["lineages"]["runnable"] == by_status.get("available", 0)
     assert report["lineages"]["unavailable"] == by_status.get("unavailable", 0)
     # Under the current roster Adam is the only admitted method.
-    assert {method for method, entry in roster.items() if entry.admitted} == {"adam"}
+    assert {method for method, verdict in roster.items() if verdict.status == "available"} == {"adam"}
     assert by_status == {"available": 128, "unavailable": 1_792}
 
 

@@ -58,7 +58,7 @@ class InventoryEntry:
 # Each key is (relative file, line, dotted target).  Each value is the
 # one-line disposition recorded for that exact crossing.
 EXPECTED_PRODUCTION_INVENTORY = {
-    ("optimizer_grid.py", 340, "tpen.hi_schema"): InventoryEntry(
+    ("optimizer_grid.py", 375, "tpen.hi_schema"): InventoryEntry(
         "remedy blocked on pending HI authority ruling 99591859."
     ),
     ("train_config.py", 223, "tpen.hi_schema"): InventoryEntry(
@@ -67,7 +67,7 @@ EXPECTED_PRODUCTION_INVENTORY = {
     ("train_config.py", 464, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("run_stage_q.py", 108, "tpen.hi_schema"): InventoryEntry(
+    ("run_stage_q.py", 118, "tpen.hi_schema"): InventoryEntry(
         "measured at reland subject ff7cde49; roster import remains quarantined under item df8f8b31.",
     ),
 }
@@ -106,7 +106,7 @@ EXPECTED_TEST_INVENTORY = {
     ("test_train_config.py", 842, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_run_stage_q.py", 770, "tpen.hi_schema"): InventoryEntry(
+    ("test_run_stage_q.py", 774, "tpen.hi_schema"): InventoryEntry(
         "measured at reland subject e524166a; roster assertion remains quarantined under item df8f8b31.",
     ),
 }
