@@ -13,7 +13,13 @@ import re
 
 
 def junit_counts(path: Path) -> dict[str, int]:
-    """Return reconciled testcase counts from one JUnit document."""
+    """Return reconciled testcase counts from one JUnit document.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        JUnit XML file produced by pytest.
+    """
     root = ET.parse(path).getroot()
     cases = list(root.iter("testcase"))
     failed = sum(case.find("failure") is not None for case in cases)
@@ -23,6 +29,7 @@ def junit_counts(path: Path) -> dict[str, int]:
 
 
 def run_arm(name: str, repo: Path, arm: str, evidence: Path) -> dict:
+    """Run one selected pytest arm and persist its reconciled result."""
     xml = evidence / f"{name}.xml"
     log = evidence / f"{name}.log"
     command = [sys.executable, "-B", "-m", "pytest", arm, "-q", "--junitxml", str(xml)]
@@ -46,6 +53,7 @@ def run_arm(name: str, repo: Path, arm: str, evidence: Path) -> dict:
 
 
 def main() -> int:
+    """Run all manifest arms and return the aggregate verification status."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--evidence", required=True)

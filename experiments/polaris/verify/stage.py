@@ -36,7 +36,15 @@ def _safe_arg(value: str, name: str) -> str:
 
 
 def validate_arm(arm: str, repo: Path) -> str:
-    """Return an arm after refusing overrides and paths outside ``repo``."""
+    """Return an arm after refusing overrides and paths outside ``repo``.
+
+    Parameters
+    ----------
+    arm : str
+        Relative pytest path or node id.
+    repo : pathlib.Path
+        Target checkout that owns the selection.
+    """
     _safe_arg(arm, "arm")
     if "=" in arm or arm.startswith("-"):
         raise ValueError("pytest overrides and options are not valid arms")
@@ -100,7 +108,13 @@ def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, 
 
 
 def stage(args: argparse.Namespace) -> int:
-    """Perform login-node staging and submit the stored PBS script."""
+    """Perform login-node staging and submit the stored PBS script.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed target, selection, evidence, and provenance arguments.
+    """
     harness_repo = _harness_repo()
     if _git(harness_repo, "status", "--porcelain"):
         raise RuntimeError("harness checkout has tracked changes; refuse staging")

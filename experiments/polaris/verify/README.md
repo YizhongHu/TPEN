@@ -11,7 +11,7 @@ The operator runs one command with the facility Python:
 /soft/applications/conda/2025-09-25/mconda3/bin/python \
   experiments/polaris/verify/stage.py \
   --target-sha <full-sha> --arm <pytest-path-or-node-id> \
-  --evidence-root /eagle/HetRxnEnergy/rhu/runs --cell-id <unique-cell>
+  --evidence-root <evidence-root> --cell-id <unique-cell>
 ```
 
 Staging performs the full clone, all-ref fetch, AppleDouble scan, facility-uv
@@ -39,7 +39,8 @@ scientific verdict by themselves; inspect `results.json` and the JUnit files.
 Important preflight codes are 60 (missing receipt), 61 (receipt identity
 mismatch), 70 (login host), 71 (PBS node mismatch), 72 (target SHA), 73
 (AppleDouble), 74/76 (venv interpreter), 75 (package versions), 77 (uv
-version), 78 (lock resolution), and 79 (ancestor/sync). The driver writes
+version), 78 (lock resolution), and 79 (ancestor/sync); driver failures use
+exit 1. The driver writes
 `preflight.json`, `driver-preflight.json`, and mirrored stdout/stderr under the
 per-job evidence directory. `results.json` plus its JUnit files are the verdict
 of record.

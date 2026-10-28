@@ -53,9 +53,14 @@ def test_literal_env_round_trip_and_single_manifest_source() -> None:
 
 
 def test_harness_has_no_embedded_commit_or_run_path() -> None:
-    source = "\n".join(path.read_text() for path in ROOT.iterdir() if path.is_file())
+    harness_files = [path for path in ROOT.rglob("*") if path.is_file() and "__pycache__" not in path.parts]
+    source = "\n".join(path.read_text() for path in harness_files)
     assert not re.search(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])", source)
-    assert "/eagle/" not in source
+    run_root_marker = "/" + "eagle/"
+    assert run_root_marker not in source
+    planted = source + "\nrun_root=" + run_root_marker + "fake\n" + "a" * 40
+    assert re.search(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])", planted)
+    assert run_root_marker in planted
 
 
 def test_junit_counts_reconcile_and_empty_control() -> None:
@@ -162,6 +167,20 @@ def test_host_and_receipt_controls() -> None:
         assert job.receipt_code(manifest, receipt) == 0
 
 
+def test_head_mismatch_control(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Harness Test"], check=True)
+    (repo / "file").write_text("one")
+    subprocess.run(["git", "-C", str(repo), "add", "file"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "one"], check=True)
+    head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    assert job.head_code(repo, head) == 0
+    assert job.head_code(repo, "b" * 40) == 72
+
+
 def test_required_ancestor_control(tmp_path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -208,3 +227,12 @@ def test_driver_exit_and_evidence_boundaries(monkeypatch) -> None:
         assert rows["counts"]["failed"] == 1 and rows["counts"]["passed"] == 1
         rc, _ = invoke(["test_arms.py::test_skip"], "skipped")
         assert rc == 1
+
+        class Completed:
+            returncode = 1
+
+        monkeypatch.setattr(driver.subprocess, "run", lambda *args, **kwargs: Completed())
+        missing = evidence / "missing-junit"
+        missing.mkdir()
+        result = driver.run_arm("missing", repo, "test_arms.py::test_pass", missing)
+        assert result["status"] == "FAIL" and result["reason"] == "missing JUnit"

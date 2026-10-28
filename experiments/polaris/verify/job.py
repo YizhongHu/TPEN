@@ -72,6 +72,12 @@ def receipt_code(manifest: dict, receipt_path: Path) -> int:
     return 0 if receipt_matches(manifest, receipt) else 61
 
 
+def head_code(repo: Path, target_sha: str) -> int:
+    """Return zero for an exact checkout or the contract's stale-head code."""
+    head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    return 0 if head == target_sha else 72
+
+
 class _Tee:
     """Mirror job output into durable evidence while retaining PBS output."""
 
@@ -91,7 +97,10 @@ class _Tee:
 
 
 def _record(path: Path, checks: list[dict], name: str, expected, observed, ok: bool, exit_code: int | None = None) -> bool:
-    checks.append({"name": name, "expected": expected, "observed": observed, "ok": ok, "exit_code": None if ok else exit_code})
+    pending = {"name": name, "expected": expected, "observed": observed, "ok": None, "exit_code": None}
+    checks.append(pending)
+    path.write_text(json.dumps({"checks": checks, "exit_code": None}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    pending.update(ok=ok, exit_code=None if ok else exit_code)
     path.write_text(json.dumps({"checks": checks, "exit_code": None if ok else exit_code}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return ok
 
@@ -134,7 +143,7 @@ def main() -> int:
         if not _record(preflight, checks, f"required_ancestor:{ancestor}", True, ok, ok, 79):
             return 79
     head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-    if not _record(preflight, checks, "target_head", manifest["target_sha"], head, head == manifest["target_sha"], 72):
+    if not _record(preflight, checks, "target_head", manifest["target_sha"], head, head_code(repo, manifest["target_sha"]) == 0, 72):
         return 72
     apple_doubles = [str(path) for path in repo.rglob("._*")]
     if not _record(preflight, checks, "appledouble", 0, len(apple_doubles), not apple_doubles, 73):
