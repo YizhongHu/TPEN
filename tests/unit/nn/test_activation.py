@@ -35,7 +35,13 @@ from tpen.equivariance.checks import (
     FullModelEquivarianceChecker,
     TraceEquivarianceChecker,
 )
-from tpen.nn import EquivariantMixing, GaussianActivation, PathAggregation, TorchInitializer
+from tpen.nn import (
+    EquivariantMixing,
+    GaussianActivation,
+    PathAggregation,
+    SoftplusBeta,
+    TorchInitializer,
+)
 from tpen.nn.readout import PfaffianReadout
 from tests.helpers.equivariance import assert_equivariant_all
 
@@ -332,6 +338,76 @@ def test_is_a_new_activation_and_not_the_squared_radius_decay_gate() -> None:
 
     assert not torch.allclose(activation_values, gate_values)
     assert torch.isfinite(activation_values).all()
+
+
+# --------------------------------------------------------------------------
+# Stable Softplus-beta contract (helium-importance design section 2.4)
+# --------------------------------------------------------------------------
+
+
+def _softplus_oracle(
+    x: torch.Tensor, beta: float = 2.0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Independent closed-form value, first derivative, and second derivative."""
+
+    sigmoid = torch.sigmoid(beta * x)
+    value = torch.logaddexp(torch.zeros_like(x), beta * x) / beta
+    first = sigmoid
+    second = beta * sigmoid * (1.0 - sigmoid)
+    return value, first, second
+
+
+def test_softplus_beta_matches_closed_form_value_and_derivatives_at_extremes() -> None:
+    points = torch.tensor(
+        [-1000.0, -100.0, -20.0, -11.0, 0.0, 11.0, 20.0, 100.0, 1000.0],
+        dtype=_DTYPE,
+    )
+    x = points.clone().requires_grad_()
+    values = SoftplusBeta()(x)
+    first = torch.autograd.grad(values.sum(), x, create_graph=True)[0]
+    second = torch.autograd.grad(first.sum(), x)[0]
+    expected_value, expected_first, expected_second = _softplus_oracle(points)
+    torch.testing.assert_close(values, expected_value, rtol=1e-13, atol=0.0)
+    torch.testing.assert_close(first, expected_first, rtol=1e-12, atol=1e-300)
+    torch.testing.assert_close(second, expected_second, rtol=1e-12, atol=1e-300)
+    assert torch.isfinite(values).all()
+    assert torch.isfinite(first).all()
+    assert torch.isfinite(second).all()
+
+
+def test_softplus_beta_threshold_regime_catches_torch_linear_mutant() -> None:
+    x = torch.tensor([11.0], dtype=_DTYPE, requires_grad=True)
+    library = torch.nn.Softplus(beta=2.0)(x)
+    library_first = torch.autograd.grad(library.sum(), x, create_graph=True)[0]
+    library_second = torch.autograd.grad(library_first.sum(), x)[0]
+    _, _, expected_second = _softplus_oracle(x.detach())
+    assert not torch.allclose(library_second, expected_second, rtol=1e-6, atol=1e-12)
+    assert library_second.item() == 0.0
+    assert expected_second.item() > 0.0
+
+
+def test_softplus_beta_rejects_invalid_beta_and_is_exported() -> None:
+    with pytest.raises(ValueError, match="beta"):
+        SoftplusBeta(beta=0.0)
+    with pytest.raises(ValueError, match="beta"):
+        SoftplusBeta(beta=float("inf"))
+    import tpen.nn as tpen_nn
+
+    assert tpen_nn.SoftplusBeta is SoftplusBeta
+    assert "SoftplusBeta" in tpen_nn.__all__
+
+
+def test_softplus_beta_gradcheck_and_gradgradcheck() -> None:
+    x = torch.tensor([-1.25, -0.125, 0.375, 1.5], dtype=_DTYPE, requires_grad=True)
+    activation = SoftplusBeta().to(dtype=_DTYPE)
+    assert torch.autograd.gradcheck(activation, (x,), eps=1e-6, atol=1e-8, rtol=1e-6)
+    assert torch.autograd.gradgradcheck(activation, (x,), eps=1e-6, atol=1e-8, rtol=1e-6)
+
+
+def test_naive_softplus_control_overflows_on_the_same_grid() -> None:
+    points = torch.tensor([-1000.0, 1000.0], dtype=_DTYPE)
+    naive = torch.log1p(torch.exp(2.0 * points)) / 2.0
+    assert not torch.isfinite(naive).all()
 
 
 # --------------------------------------------------------------------------

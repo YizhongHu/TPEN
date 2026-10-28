@@ -491,12 +491,27 @@ def test_activation_parameters_and_named_streams() -> None:
 def test_exact_gelu_and_softplus_beta_two_are_explicit() -> None:
     gelu = context_mapping.context_fragment("tensor", activation="exact GELU,exact GELU")
     assert gelu["mixing"]["activation"] == {"_target_": "torch.nn.GELU", "approximate": "none"}
-    with pytest.raises(context_mapping.UnsupportedActivationLabel):
-        context_mapping.context_fragment("tensor", activation="Softplus beta2,Softplus beta2")
+    softplus = context_mapping.context_fragment(
+        "tensor", activation="Softplus beta2,Softplus beta2"
+    )
+    assert softplus["mixing"]["activation"] == {
+        "_target_": "tpen.nn.SoftplusBeta", "beta": 2.0
+    }
+    assert softplus["path_aggregation"]["activation"] == {
+        "_target_": "tpen.nn.SoftplusBeta", "beta": 2.0
+    }
+    assert "torch.nn.Softplus" not in repr(softplus)
+
+
+def test_unmapped_internal_activation_still_raises() -> None:
+    with pytest.raises(AssertionError, match="unmapped internal activation"):
+        context_mapping._activation(
+            "not-a-real-activation", seed=0, site="producer", channels=32
+        )
 
 
 @pytest.mark.parametrize("path_label", PATH_LABELS)
-@pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
+@pytest.mark.parametrize("activation_label", ACTIVATION_LABELS)
 def test_every_fragment_instantiates(path_label: str, activation_label: str) -> None:
     config = OmegaConf.create(
         context_mapping.context_fragment(path_label, activation=activation_label)
