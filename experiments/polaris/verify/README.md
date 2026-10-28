@@ -19,13 +19,18 @@ versioned `facility_profile.json` (do not duplicate that path here):
 
 Run this from a clean git clone of the harness. Before work and again
 immediately before `qsub`, stage reads the target queue's live `qstat -Qf`
-limits and the user's `qstat -u` jobs. It refuses only when a declared
-`max_queued` per-user limit is reached; `max_run` does not refuse because PBS
-serializes running jobs. Unknown or unparseable queue-limit output fails
-closed. These limits are read live and never hard-coded (measured on Polaris
-2026-10-28). Both raw qstat outputs and the admission decision are saved at
-each gate. Never use `qdel` or `qhold`. Use a new cell id when a run root
-already exists; never delete evidence.
+limits and full queue/job/state records from `qstat -f -u`. Limits are read
+live and never hard-coded (measured on Polaris 2026-10-28). A per-user
+`queued_jobs_threshold` counts only `Q`/`H`; a per-user `max_queued` counts
+`Q`, `H`, `R`, `E`, `W`, `T`, and `B`. `max_run` and `max_run.res.*` never
+refuse because PBS serializes running jobs, and overall (`o:`) limits never
+refuse. Any unknown per-user/group/project limit, malformed output, or failed
+qstat fails closed. Full queue names are required; truncated names do not
+count. Both raw qstat outputs and the admission decision are saved at each
+gate. If refused, watch the queued job in that queue for `Q` to `R` (the slot
+opens at start, not finish), then rerun stage once with a new cell id. Never
+loop, use `qdel`, or use `qhold`; never delete evidence. Use a new cell id when
+a run root already exists.
 
 Staging performs the full clone, all-ref fetch, AppleDouble scan, facility-uv
 cache prime, same-binary offline locked resolve, manifest serialization, and

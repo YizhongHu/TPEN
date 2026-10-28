@@ -380,6 +380,44 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
     uv_envs = []
     qstat_calls = 0
     queue_mode = "debug-other"
+    original_read_profile = stage.read_profile
+
+    def full_job(job_id: str, user: str, queue: str, state: str) -> str:
+        return (f"Job Id: {job_id}\n    Job_Owner = {user}@polaris-login\n"
+                f"    job_state = {state}\n    queue = {queue}\n")
+
+    def queue_text(queue: str) -> str:
+        if queue == "debug-scaling":
+            text = ("Queue: debug-scaling\n"
+                    "max_queued = [u:PBS_GENERIC=1]\n"
+                    "queued_jobs_threshold = [u:PBS_GENERIC=1]\n"
+                    "resources_min.walltime = 00:05:00\n")
+        else:
+            text = ("Queue: debug\n"
+                    "max_run = [u:PBS_GENERIC=1]\n"
+                    "queued_jobs_threshold = [u:PBS_GENERIC=1]\n"
+                    "max_run.res.nodect = [o:PBS_ALL=24]\n"
+                    "resources_min.walltime = 00:05:00\n")
+        if queue_mode == "unknown-user-limit":
+            text += "mystery_limit = [u:PBS_GENERIC=1]\n"
+        return text
+
+    def jobs_text(queue: str) -> str:
+        if queue_mode in {"debug-other", "debug-running"} and queue == "debug":
+            records = [full_job("7795000.polaris", "rhu", "debug", "R")]
+            if queue_mode == "debug-other":
+                records += [full_job("7795001.polaris", "other", "debug", "Q"),
+                            full_job("7795002.polaris", "other", "debug", "R")]
+            return "".join(records)
+        if queue_mode == "debug-queued" and queue == "debug":
+            return full_job("7795003.polaris", "rhu", "debug", "Q")
+        if queue_mode == "debug-truncated" and queue == "debug":
+            return full_job("7795004.polaris", "rhu", "debug-s*", "Q")
+        if queue_mode == "scaling-running" and queue == "debug-scaling":
+            return full_job("7795005.polaris", "rhu", "debug-scaling", "R")
+        if queue_mode == "scaling-flip" and queue == "debug-scaling" and qstat_calls >= 2:
+            return full_job("7795006.polaris", "rhu", "debug-scaling", "Q")
+        return ""
 
     def fake_subprocess(args, **kwargs):
         nonlocal qstat_calls
@@ -387,20 +425,11 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
             queue = args[2]
             if queue_mode == "unparseable":
                 return subprocess.CompletedProcess(args, 0, "not qstat output\n", "")
-            if queue == "debug-scaling":
-                return subprocess.CompletedProcess(args, 0, "Queue: debug-scaling\nmax_queued = [u:PBS_GENERIC=1]\n", "")
-            return subprocess.CompletedProcess(args, 0, "Queue: debug\nmax_run = [u:PBS_GENERIC=1]\n", "")
-        if args[:2] == ["qstat", "-u"]:
+            return subprocess.CompletedProcess(args, 0, queue_text(queue), "")
+        if args[:3] == ["qstat", "-f", "-u"]:
             qstat_calls += 1
-            if queue_mode == "debug-other":
-                output = "Job ID Username Queue Jobname\n7795000.polaris-pbs rhu debug running\n7795001.polaris-pbs other debug queued\n7795002.polaris-pbs other debug running\n"
-            elif queue_mode == "scaling-occupied":
-                output = "Job ID Username Queue Jobname\n7795003.polaris-pbs rhu debug-scaling queued\n"
-            elif queue_mode == "scaling-flip" and qstat_calls >= 2:
-                output = "Job ID Username Queue Jobname\n7795004.polaris-pbs rhu debug-scaling queued\n"
-            else:
-                output = "Job ID Username Queue Jobname\n"
-            return subprocess.CompletedProcess(args, 0, output, "")
+            queue = stage.read_profile(ROOT / "facility_profile.json")["pbs"]["queue"]
+            return subprocess.CompletedProcess(args, 0, jobs_text(queue), "")
         if "sync" in args:
             uv_envs.append(kwargs["env"])
             Path(kwargs["env"]["UV_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
@@ -433,8 +462,8 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
     manifest = json.loads((run_root / "manifest.json").read_text())
     assert (run_root / "run.env").is_file() and (run_root / "staging-receipt.json").is_file()
     assert (run_root / "submission.txt").is_file()
-    assert all((Path(args.evidence_root) / name).is_file() for name in ("cell-ok.pre-submit-qstat-Qf.txt", "cell-ok.pre-submit-qstat-u.txt", "cell-ok.pre-submit-qstat-decision.json"))
-    assert all((run_root / name).is_file() for name in ("pre-submit-qstat-Qf.txt", "pre-submit-qstat-u.txt", "pre-submit-qstat-decision.json"))
+    assert all((Path(args.evidence_root) / name).is_file() for name in ("cell-ok.pre-submit-qstat-Qf.txt", "cell-ok.pre-submit-qstat-f-u.txt", "cell-ok.pre-submit-qstat-decision.json"))
+    assert all((run_root / name).is_file() for name in ("pre-submit-qstat-Qf.txt", "pre-submit-qstat-f-u.txt", "pre-submit-qstat-decision.json"))
     assert json.loads((run_root / "pre-submit-qstat-decision.json").read_text())["allowed"] is True
     assert len(uv_envs) == 2
     assert all(env["UV_CACHE_DIR"] == manifest["cache_dir"] for env in uv_envs)
@@ -450,6 +479,7 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
         nonlocal qstat_calls, queue_mode
         qstat_calls = 0
         queue_mode = mode
+        monkeypatch.setattr(stage, "read_profile", original_read_profile)
         if mode.startswith("scaling"):
             control_profile = json.loads((ROOT / "facility_profile.json").read_text())
             control_profile["pbs"]["queue"] = "debug-scaling"
@@ -464,14 +494,14 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
             if "sync" in call_args and mode == "prime-fail":
                 raise RuntimeError("prime failed")
             if call_args and call_args[0] == "qsub":
-                if mode == "scaling-empty":
+                if mode in {"scaling-empty", "debug-truncated"}:
                     qsub_calls.append(call_args)
                     return "123.polaris-pbs-01"
                 raise AssertionError("qsub reached control")
             return original_stage_run(call_args, cwd=cwd, capture=capture, env=env)
         def control_subprocess(call_args, **kwargs):
             nonlocal qstat_calls
-            if call_args[:2] in (["qstat", "-Qf"], ["qstat", "-u"]):
+            if call_args[:2] == ["qstat", "-Qf"] or call_args[:3] == ["qstat", "-f", "-u"]:
                 return fake_subprocess(call_args, **kwargs)
             if "--offline" in call_args and mode == "dry-fail":
                 Path(kwargs["env"]["UV_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
@@ -486,14 +516,17 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
             stage.stage(control_args)
         except (RuntimeError, subprocess.CalledProcessError):
             pass
-        if mode == "scaling-empty":
+        if mode in {"scaling-empty", "debug-truncated"}:
             assert (cell / "submission.txt").exists()
         else:
             assert not (cell / "submission.txt").exists()
             if mode not in {"scaling-flip"}:
                 assert not (cell / "staging-receipt.json").exists()
 
-    run_control("cell-scaling-occupied", "scaling-occupied")
+    run_control("cell-debug-queued", "debug-queued")
+    run_control("cell-debug-truncated", "debug-truncated")
+    run_control("cell-scaling-running", "scaling-running")
+    run_control("cell-unknown-user-limit", "unknown-user-limit")
     run_control("cell-scaling-empty", "scaling-empty")
     run_control("cell-unparseable", "unparseable")
     run_control("cell-scaling-flip", "scaling-flip")

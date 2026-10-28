@@ -31,38 +31,97 @@ def _git(repo: Path, *args: str) -> str:
     return _run(["git", "-C", str(repo), *args], capture=True)
 
 
-def _queue_limit(raw: str, name: str) -> int | None:
-    """Parse one live PBS per-user queue limit, if the queue declares it."""
-    match = re.search(rf"^\s*{name}\s*=\s*\[u:PBS_GENERIC=(\d+)\]\s*$", raw, re.MULTILINE)
-    return int(match.group(1)) if match else None
+_LIMIT = re.compile(r"^\s*([A-Za-z0-9_.]+)\s*=\s*\[(.*?)\]\s*$")
+_LIMIT_ENTRY = re.compile(r"([ugpo]):([^=,\s]+)=(\d+)")
 
 
-def _queue_jobs(raw: str, user: str, queue: str) -> int:
-    """Count the user's queued or running jobs in one PBS queue."""
-    count = 0
+def _queue_limits(raw: str) -> tuple[bool, dict[str, list[tuple[str, str, int]]], str]:
+    """Parse every bracketed PBS limit and reject malformed queue metadata."""
+    limits: dict[str, list[tuple[str, str, int]]] = {}
+    saw_queue = False
     for line in raw.splitlines():
-        fields = line.split()
-        if len(fields) >= 3 and fields[1] == user and fields[2] == queue and fields[0][0].isdigit():
-            count += 1
-    return count
+        if line.strip().startswith("Queue:"):
+            saw_queue = True
+        match = _LIMIT.match(line)
+        if not match:
+            continue
+        entries = [(prefix, klass, int(value)) for prefix, klass, value in _LIMIT_ENTRY.findall(match.group(2))]
+        if entries:
+            limits[match.group(1)] = entries
+    if not saw_queue or not limits:
+        return False, limits, "unparseable qstat -Qf output"
+    return True, limits, "parsed qstat -Qf output"
+
+
+def _queue_jobs(raw: str, user: str, queue: str) -> list[dict[str, str]]:
+    """Parse full qstat records, retaining only exact user and queue matches."""
+    jobs: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+
+    def flush() -> None:
+        if current.get("user") == user and current.get("queue") == queue:
+            jobs.append({key: current[key] for key in ("job_id", "state", "queue")})
+
+    for line in raw.splitlines():
+        if line.startswith("Job Id:"):
+            flush()
+            current = {"job_id": line.split(":", 1)[1].strip()}
+            continue
+        match = re.match(r"\s*Job_Owner\s*=\s*([^@\s]+)", line)
+        if match:
+            current["user"] = match.group(1)
+        match = re.match(r"\s*job_state\s*=\s*(\S+)", line)
+        if match:
+            current["state"] = match.group(1)
+        match = re.match(r"\s*queue\s*=\s*(\S+)", line)
+        if match:
+            current["queue"] = match.group(1)
+    flush()
+    return jobs
 
 
 def _queue_gate(queue: str, user: str, output_dir: Path, prefix: str) -> bool:
     """Apply the live queue-aware PBS admission rule and save raw evidence."""
     limits_result = subprocess.run(["qstat", "-Qf", queue], check=False, text=True, capture_output=True)
-    jobs_result = subprocess.run(["qstat", "-u", user], check=False, text=True, capture_output=True)
+    jobs_result = subprocess.run(["qstat", "-f", "-u", user], check=False, text=True, capture_output=True)
     limits_raw = limits_result.stdout + limits_result.stderr
     jobs_raw = jobs_result.stdout + jobs_result.stderr
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / f"{prefix}-qstat-Qf.txt").write_text(limits_raw, encoding="utf-8")
-    (output_dir / f"{prefix}-qstat-u.txt").write_text(jobs_raw, encoding="utf-8")
-    max_queued = _queue_limit(limits_raw, "max_queued")
-    max_run = _queue_limit(limits_raw, "max_run")
-    parseable = ("Queue:" in limits_raw or "queue_type" in limits_raw) and (max_queued is not None or max_run is not None or "max_queued" not in limits_raw)
+    (output_dir / f"{prefix}-qstat-f-u.txt").write_text(jobs_raw, encoding="utf-8")
+    parseable, limits, reason = _queue_limits(limits_raw)
     jobs = _queue_jobs(jobs_raw, user, queue)
-    allowed = parseable and (max_queued is None or jobs < max_queued)
-    reason = "allowed: no max_queued limit" if allowed and max_queued is None else (f"allowed: {jobs} jobs below max_queued={max_queued}" if allowed else ("refused: unparseable qstat -Qf" if not parseable else f"refused: {jobs} jobs reaches max_queued={max_queued}"))
-    decision = {"queue": queue, "user": user, "max_queued": max_queued, "max_run": max_run, "queue_jobs": jobs, "allowed": allowed, "reason": reason}
+    allowed = parseable and jobs_result.returncode == 0 and limits_result.returncode == 0
+    refusal = ""
+    if allowed:
+        for attribute, entries in limits.items():
+            for prefix_kind, _limit_class, threshold in entries:
+                if prefix_kind == "o" or attribute == "max_run" or attribute.startswith("max_run.res."):
+                    continue
+                if prefix_kind != "u" or attribute not in {"queued_jobs_threshold", "max_queued"}:
+                    allowed = False
+                    refusal = f"refused: unknown PBS limit {attribute} ({prefix_kind}:*)"
+                    break
+                if attribute == "queued_jobs_threshold":
+                    count = sum(job["state"] in {"Q", "H"} for job in jobs)
+                else:
+                    count = sum(job["state"] in {"Q", "H", "R", "E", "W", "T", "B"} for job in jobs)
+                if count >= threshold:
+                    allowed = False
+                    refusal = f"refused: {count} jobs reaches {attribute}={threshold}"
+                    break
+            if not allowed:
+                break
+    if not parseable:
+        allowed = False
+    if limits_result.returncode != 0 or jobs_result.returncode != 0:
+        allowed = False
+        refusal = "refused: qstat command failed"
+    if allowed:
+        reason = "allowed: live PBS limits admit this user in this queue"
+    elif refusal:
+        reason = refusal
+    decision = {"queue": queue, "user": user, "limits": limits, "jobs": jobs, "allowed": allowed, "reason": reason}
     (output_dir / f"{prefix}-qstat-decision.json").write_text(json.dumps(decision, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if not allowed:
         print(limits_raw + jobs_raw, file=sys.stderr)
