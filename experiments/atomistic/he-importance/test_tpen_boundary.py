@@ -61,10 +61,10 @@ EXPECTED_PRODUCTION_INVENTORY = {
     ("optimizer_grid.py", 340, "tpen.hi_schema"): InventoryEntry(
         "remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 215, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 223, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 422, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 464, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("run_stage_q.py", 108, "tpen.hi_schema"): InventoryEntry(
@@ -94,16 +94,16 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 901, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_train_config.py", 140, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 188, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: test-only schema validation for the independent HI grid oracle."
     ),
-    ("test_train_config.py", 397, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 445, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 539, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 749, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 632, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 842, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("test_run_stage_q.py", 450, "tpen.hi_schema"): InventoryEntry(
@@ -1227,10 +1227,14 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             ("the level value and authority value are detached scalar data", 1),
         ("train_config.py", "_declared_adam_levels", 'levels["schedule"] != expected["schedule"]'):
             ("the level value and authority value are detached scalar data", 1),
-        ("train_config.py", "_require_o_raw_context", "dict(context) != expected"):
+        ("train_config.py", "_consumed_context", "dict(context) not in expected.values()"):
             ("context is a detached manifest mapping and expected is the authority literal", 1),
-        ("train_config.py", "_require_o_raw_context", "context.get(field) != expected.get(field)"):
+        ("train_config.py", "_consumed_context", "dict(context) == literal"):
+            ("context is detached manifest data compared only against resolver-owned literal mappings", 1),
+        ("train_config.py", "_consumed_context", "context.get(field) != declared.get(field)"):
             ("context and authority mappings are detached data used for refusal diagnostics", 1),
+        ("train_config.py", "resolve_train_config", 'context_name == "O-composite"'):
+            ("context_name is the resolver-owned literal selecting the composite splice", 1),
         ("train_config.py", "resolve_train_config", 'optimizer_identity.get("method") != manifest["scientific_identity"]["optimizer_cell"].get("method")'):
             ("both values are detached manifest identity fields and the equality binds their declarations", 1),
     }

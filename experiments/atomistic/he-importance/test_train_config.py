@@ -15,6 +15,8 @@ from pathlib import Path
 import sys
 
 import pytest
+import torch
+from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
 
@@ -44,6 +46,15 @@ assert _RESOLVER_SPEC is not None and _RESOLVER_SPEC.loader is not None
 train_config = importlib.util.module_from_spec(_RESOLVER_SPEC)
 sys.modules[_RESOLVER_SPEC.name] = train_config
 _RESOLVER_SPEC.loader.exec_module(train_config)
+
+_CONTEXT_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_context_mapping_for_train_config",
+    Path(__file__).with_name("context_mapping.py"),
+)
+assert _CONTEXT_SPEC is not None and _CONTEXT_SPEC.loader is not None
+context_mapping = importlib.util.module_from_spec(_CONTEXT_SPEC)
+sys.modules[_CONTEXT_SPEC.name] = context_mapping
+_CONTEXT_SPEC.loader.exec_module(context_mapping)
 
 
 def _walker_refusal_pattern(stage: str, value: object, declared: object) -> str:
@@ -100,6 +111,43 @@ def _callback_checkers(cfg: object) -> list[object]:
         for callback in cfg.callbacks
         for checker in callback.get("checkers", [])
     ]
+
+
+def _he_batch() -> object:
+    """Build the fixed helium batch through a Hydra target only."""
+
+    return instantiate(
+        {
+            "_target_": "tpen.data.batch.ElectronBatch",
+            "positions": torch.tensor(
+                [[[0.7, 0.1, -0.2], [-0.4, 0.3, 0.5]]], dtype=torch.float64
+            ),
+            "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
+            "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
+            "spins": torch.tensor([[1.0, -1.0]], dtype=torch.float64),
+        }
+    )
+
+
+def _context_cell(tmp_path: Path, name: str = "O-composite") -> object:
+    return next(cell for cell in _q_adam_cells(tmp_path, name) if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005)
+
+
+def _independent_initializer_paths(value: object, path: str = "") -> set[str]:
+    """Find TorchInitializer targets without using the production walker."""
+
+    found: set[str] = set()
+    if isinstance(value, Mapping):
+        target = value.get("_target_")
+        if isinstance(target, str) and target.endswith("TorchInitializer"):
+            found.add(path)
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            found.update(_independent_initializer_paths(child, child_path))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, child in enumerate(value):
+            found.update(_independent_initializer_paths(child, f"{path}.{index}" if path else str(index)))
+    return found
 
 
 def _q_adam_cells(tmp_path: Path, context: str) -> list[object]:
@@ -419,14 +467,178 @@ def test_resolve_consumes_all_q_adam_levels_in_both_optimizer_views(tmp_path: Pa
     _assert_q_adam_grid_outputs(_q_adam_cells(tmp_path, "O-raw"))
 
 
-def test_resolve_refuses_all_q_adam_o_composite_cells(tmp_path: Path) -> None:
-    """Every O-composite Adam cell is refused by the resolver itself."""
+def test_resolve_consumes_all_q_adam_o_composite_cells(tmp_path: Path) -> None:
+    """Every O-composite Adam cell resolves through the literal context route."""
 
     cells = _q_adam_cells(tmp_path, "O-composite")
     assert len(cells) == 16
     for cell in cells:
-        with pytest.raises(train_config.ContextResolutionError, match="7bae63d8.*dd964863"):
-            train_config.resolve_train_config(cell)
+        resolved = train_config.resolve_train_config(cell)
+        assert resolved.model.layers[0]["update"]["_target_"] == "tpen.nn.ResidualUpdater"
+        assert resolved.model.layers[0].layout.linear.explicit[0].tau_in == [0]
+        assert resolved.model.embedding._target_ == "tpen.nn.embedding.matched_start_embedding"
+        assert resolved.model.basis._target_ == "tpen.nn.basis.BoundedDistanceBasis"
+        assert resolved.model.basis.length == 1.0
+        assert "basis" not in resolved.model.embedding.augmented
+        assert resolved.model.factors[-1]._target_ == "tpen.nn.jastrow.BoundedTwoCoefficientJastrow"
+
+
+def test_o_raw_model_is_byte_equal_to_the_committed_control(tmp_path: Path) -> None:
+    cell = _context_cell(tmp_path, "O-raw")
+    resolved = train_config.resolve_train_config(cell)
+    control = train_config._compose_base_config()
+    OmegaConf.update(control, "runtime.seed", cell.seed_streams["model_initialization"], merge=False)
+    OmegaConf.resolve(control)
+    assert OmegaConf.to_container(resolved.model, resolve=False) == OmegaConf.to_container(
+        control.model, resolve=False
+    )
+
+
+def test_o_composite_preserves_control_factors_and_declares_complete_mapping(
+    tmp_path: Path,
+) -> None:
+    cell = _context_cell(tmp_path)
+    resolved = train_config.resolve_train_config(cell)
+    control = train_config._compose_base_config()
+    OmegaConf.resolve(control)
+    assert OmegaConf.to_container(OmegaConf.create(resolved.model.factors[:2]), resolve=True) == OmegaConf.to_container(
+        control.model.factors, resolve=True
+    )
+    assert list(resolved.model.factors)[-1]._target_ == "tpen.nn.jastrow.BoundedTwoCoefficientJastrow"
+    layer = resolved.model.layers[0]
+    assert layer.mixing.producers[0]._target_ == "tpen.nn.LinearEquivariantMixing"
+    assert all(path.tau_in and len(path.tau_in) <= 2 for path in layer.layout.linear.explicit)
+    assert layer.mixing.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
+    assert layer.path_aggregation.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
+    assert resolved.model.basis._target_ == "tpen.nn.basis.BoundedDistanceBasis"
+    assert resolved.model.basis.length == 1.0
+    assert "basis" not in resolved.model.embedding.augmented
+
+
+def test_o_composite_trap_negatives_are_observable(tmp_path: Path) -> None:
+    cell = _context_cell(tmp_path)
+    base = train_config._compose_base_config()
+    fragment, factor = context_mapping.package_fragment("B11")
+    unstructured_model = OmegaConf.create(OmegaConf.to_container(base.model, resolve=False))
+    naive = OmegaConf.merge(unstructured_model, OmegaConf.create({**fragment, "factors": [factor]}))
+    assert OmegaConf.to_container(naive.factors, resolve=True) == [factor]
+    assert len(base.model.factors) == 2
+
+    standalone = OmegaConf.create(context_mapping.compose_package(base.model, "B11"))
+    with pytest.raises(Exception, match="Interpolation key"):
+        OmegaConf.to_container(standalone, resolve=True)
+
+    direct = OmegaConf.load(Path(train_config.__file__).with_name("configs") / "train.yaml")
+    direct.model = OmegaConf.merge(
+        direct.model, OmegaConf.create({**fragment, "factors": [*direct.model.factors, factor]})
+    )
+    OmegaConf.update(direct, "runtime.seed", cell.seed_streams["model_initialization"], merge=False)
+    OmegaConf.resolve(direct)
+    direct_model = instantiate(direct.model).to(dtype=torch.float64)
+    b01 = train_config._compose_base_config()
+    b01.model = context_mapping.compose_package(b01.model, "B01")
+    b01.model.layers[0] = context_mapping.context_fragment(
+        "hybrid/coordinate-neighbor",
+        activation="channel-MLP,channel-MLP",
+        seed=cell.seed_streams["model_initialization"],
+    )
+    OmegaConf.update(b01, "runtime.seed", cell.seed_streams["model_initialization"], merge=False)
+    OmegaConf.resolve(b01)
+    composed_model = instantiate(b01.model).to(dtype=torch.float64)
+    assert not hasattr(direct_model.embedding, "raw")
+    assert not torch.equal(direct_model(_he_batch()).logabs, composed_model(_he_batch()).logabs)
+
+
+def test_o_composite_binds_every_initializer_including_both_embeddings(tmp_path: Path) -> None:
+    cell = _context_cell(tmp_path)
+    resolved = train_config.resolve_train_config(cell)
+    model_container = OmegaConf.to_container(resolved.model, resolve=False)
+    paths = _independent_initializer_paths(model_container)
+    expected = {
+        "embedding.raw.initializer",
+        "embedding.augmented.initializer",
+        "layers.0.path_aggregation.initializer",
+        "layers.0.mixing.activation.initializer",
+        "layers.0.path_aggregation.activation.initializer",
+    }
+    assert paths == expected
+    assert {
+        path for path in train_config._initializer_paths(resolved.model, "model")
+    } == {f"model.{path}" for path in expected}
+    assert all(
+        OmegaConf.select(resolved, f"model.{path}").seed
+        == cell.seed_streams["model_initialization"]
+        for path in paths
+    )
+    changed = replace(cell, seed_streams={**cell.seed_streams, "model_initialization": cell.seed_streams["model_initialization"] + 1})
+    changed_config = train_config.resolve_train_config(changed)
+    assert all(
+        OmegaConf.select(changed_config, f"model.{path}").seed
+        != OmegaConf.select(resolved, f"model.{path}").seed
+        for path in paths
+    )
+
+
+def test_o_composite_instantiates_finitely_and_trains_added_parameters(tmp_path: Path) -> None:
+    cell = _context_cell(tmp_path)
+    composite = train_config.resolve_train_config(cell)
+    instantiate(
+        {
+            "_target_": "tpen.hi_schema.validate_hi_train_config",
+            "_recursive_": False,
+            "cfg": composite,
+            "env": {},
+        }
+    )
+    b10 = train_config._compose_base_config()
+    b10.model = context_mapping.compose_package(b10.model, "B10")
+    b10.model.layers[0] = context_mapping.context_fragment(
+        "hybrid/coordinate-neighbor",
+        activation="channel-MLP,channel-MLP",
+        seed=cell.seed_streams["model_initialization"],
+    )
+    OmegaConf.update(b10, "runtime.seed", cell.seed_streams["model_initialization"], merge=False)
+    OmegaConf.resolve(b10)
+    model = instantiate(composite.model).to(dtype=torch.float64)
+    control_model = instantiate(b10.model).to(dtype=torch.float64)
+    batch = _he_batch()
+    output = model(batch)
+    control_output = control_model(batch)
+    assert torch.isfinite(output.logabs).all()
+    assert torch.equal(output.logabs, control_output.logabs)
+    output.logabs.square().sum().backward()
+    factor = model.factors[-1]
+    assert torch.any(factor.theta_s.grad != 0)
+    assert torch.any(factor.theta_t.grad != 0)
+    assert type(model.embedding).__name__ == "Embedding"
+    for order, columns in ((1, [4]), (2, [4, 9, 10, 11, 12])):
+        weight = model.embedding.order_mlps[str(order)].layers[0].weight
+        assert torch.any(weight.grad[:, columns] != 0)
+
+
+@pytest.mark.parametrize("field", ("name", "producer_policy", "aggregation_activation", "input_features", "feature_update"))
+@pytest.mark.parametrize("remove", (False, True))
+def test_o_composite_literal_is_closed_over_each_field(
+    tmp_path: Path, field: str, remove: bool
+) -> None:
+    cell = _context_cell(tmp_path)
+    manifest = stage_coordinate._thaw(cell.manifest)
+    context = manifest["scientific_identity"]["context"]
+    if field == "name":
+        context[field] = "O-raw"
+    elif remove:
+        context["overrides"].pop(field, None)
+    else:
+        context["overrides"][field] = "wrong"
+    rebuilt_manifest = stage_coordinate._freeze(manifest)
+    rebuilt = replace(
+        cell,
+        manifest=rebuilt_manifest,
+        content_hash=stage_coordinate.content_hash(manifest),
+        output_path=cell.output_path.parent / stage_coordinate.content_hash(manifest),
+    )
+    with pytest.raises(train_config.ContextResolutionError, match=field):
+        train_config.resolve_train_config(rebuilt)
 
 
 def test_level_mapping_mutant_turns_grid_oracle_red(
@@ -491,12 +703,10 @@ def test_resolve_refuses_non_o_raw_context(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
     manifest = stage_coordinate._thaw(cell.manifest)
     manifest["scientific_identity"]["context"] = {
-        "name": "O-composite",
+        "name": "O-other",
         "overrides": {
-            "producer_policy": "hybrid/coordinate-neighbor",
-            "aggregation_activation": "channel-MLP at both activation sites",
-            "input_features": "B11",
-            "feature_update": "residual",
+            "input_features": "B00",
+            "feature_update": "replacement",
         },
     }
     rebuilt = replace(
@@ -505,7 +715,7 @@ def test_resolve_refuses_non_o_raw_context(tmp_path: Path) -> None:
         content_hash=stage_coordinate.content_hash(manifest),
         output_path=cell.output_path.parent / stage_coordinate.content_hash(manifest),
     )
-    with pytest.raises(train_config.ContextResolutionError, match="7bae63d8.*dd964863"):
+    with pytest.raises(train_config.ContextResolutionError, match="exactly the authority"):
         train_config.resolve_train_config(rebuilt)
 
 
