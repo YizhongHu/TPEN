@@ -77,6 +77,13 @@ from .recovery import (
     select_recovery,
     train_resume_load_overlay,
 )
+from .native_profile import (
+    SUPPORTED_CALLBACK_TARGETS,
+    SUPPORTED_LOGGER_TARGETS,
+    SUPPORTED_STATE_OWNERS,
+    UnsupportedMutableStateError,
+    validate_native_recovery_profile,
+)
 
 __all__ = [
     "AllocationObservation",
@@ -106,6 +113,11 @@ __all__ = [
     "require_lineage_payload",
     "select_recovery",
     "train_resume_load_overlay",
+    "SUPPORTED_CALLBACK_TARGETS",
+    "SUPPORTED_LOGGER_TARGETS",
+    "SUPPORTED_STATE_OWNERS",
+    "UnsupportedMutableStateError",
+    "validate_native_recovery_profile",
     "validate_receipt_binding",
     "CoreOutcomeFacts",
     "CoreStatus",
