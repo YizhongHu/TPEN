@@ -118,6 +118,37 @@ def _topology(*, host: str = "test-host", device: str = "cuda:0") -> ExecutionTo
     )
 
 
+class _FakeContext(RunContext):
+    """Small test double built through the production context constructor."""
+
+    def __init__(
+        self, cfg: object = None, topology: object = None
+    ) -> None:
+        super().__init__(
+            cfg=cfg,
+            source_cfg=cfg,
+            artifact_manager=SimpleNamespace(run_dir=Path(".")),
+            metadata=SimpleNamespace(status="initialized"),
+            clock=SimpleNamespace(),
+            callbacks=[],
+            loggers=[],
+            topology=topology,
+            profile_writer=None,
+        )
+        self.events: list[object] = []
+
+    def emit(self, event: object) -> None:
+        self.events.append(event)
+
+
+def test_fake_context_tracks_run_context_init_fields() -> None:
+    context = _FakeContext()
+    init_fields = {field.name for field in fields(RunContext) if field.init}
+    missing = sorted(name for name in init_fields if not hasattr(context, name))
+
+    assert not missing, f"_FakeContext is missing RunContext init fields: {missing}"
+
+
 def test_launch_populates_topology_under_designated_key(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
 
@@ -590,25 +621,15 @@ def test_default_runner_receives_supplied_topology_at_consumer(
 
     import tpen.run as production_run
 
-    class FakeContext(RunContext):
-        def __init__(self, received_topology: object) -> None:
-            self.cfg = None
-            self.loggers: tuple[object, ...] = ()
-            self.metadata = SimpleNamespace(status="initialized")
-            self.topology = received_topology
-
-        def emit(self, _: object) -> None:
-            return None
-
     class RecordingRunner(Runner):
         def run(self, context: object) -> RunResult:
             received_contexts.append(context)
             return RunResult(status="completed")
 
-    def consumer(cfg: object, **kwargs: object) -> FakeContext:
+    def consumer(cfg: object, **kwargs: object) -> _FakeContext:
         del cfg
         consumer_topologies.append(kwargs.get("topology"))
-        return FakeContext(kwargs.get("topology"))
+        return _FakeContext(topology=kwargs.get("topology"))
 
     monkeypatch.setattr(production_run, "prepare_run_context", consumer)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -632,27 +653,17 @@ def test_default_runner_topology_is_per_call_not_process_global(
 
     import tpen.run as production_run
 
-    class FakeContext(RunContext):
-        def __init__(self, cfg: object, topology: object) -> None:
-            self.cfg = cfg
-            self.loggers: tuple[object, ...] = ()
-            self.metadata = SimpleNamespace(status="initialized")
-            self.topology = topology
-
-        def emit(self, _: object) -> None:
-            return None
-
     class RecordingRunner(Runner):
         def run(self, _: object) -> RunResult:
             return RunResult(status="completed")
 
-    def consumer(cfg: object, **kwargs: object) -> FakeContext:
+    def consumer(cfg: object, **kwargs: object) -> _FakeContext:
         topology = kwargs.get("topology")
         seen.append(topology)
         if topology is not None:
             entered.set()
             assert release.wait(5)
-        return FakeContext(cfg, topology)
+        return _FakeContext(cfg, topology)
 
     monkeypatch.setattr(production_run, "prepare_run_context", consumer)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -688,24 +699,14 @@ def _install_default_runner_witness(
 ) -> object:
     import tpen.run as production_run
 
-    class FakeContext(RunContext):
-        def __init__(self, cfg: object, topology: object) -> None:
-            self.cfg = cfg
-            self.loggers: tuple[object, ...] = ()
-            self.metadata = SimpleNamespace(status="initialized")
-            self.topology = topology
-
-        def emit(self, _: object) -> None:
-            return None
-
     class RecordingRunner(Runner):
         def run(self, _: object) -> RunResult:
             return RunResult(status="completed")
 
-    def consumer(cfg: object, **kwargs: object) -> FakeContext:
+    def consumer(cfg: object, **kwargs: object) -> _FakeContext:
         topology = kwargs.get("topology")
         seen.append(topology)
-        return FakeContext(cfg, topology)
+        return _FakeContext(cfg, topology)
 
     monkeypatch.setattr(production_run, "prepare_run_context", consumer)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -900,21 +901,11 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
 
     import tpen.run as production_run
 
-    class FakeContext(RunContext):
-        def __init__(self) -> None:
-            self.cfg = None
-            self.loggers: tuple[object, ...] = ()
-            self.metadata = SimpleNamespace(status="initialized")
-            self.events: list[object] = []
-
-        def emit(self, event: object) -> None:
-            self.events.append(event)
-
     class HandledFailureRunner(Runner):
         def run(self, _: object) -> RunResult:
             return RunResult(status="failed")
 
-    context = FakeContext()
+    context = _FakeContext()
 
     monkeypatch.setattr(production_run, "validate_hi_train_config", lambda _: None)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
