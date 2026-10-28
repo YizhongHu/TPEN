@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -35,31 +37,45 @@ _LIMIT = re.compile(r"^\s*([A-Za-z0-9_.]+)\s*=\s*\[(.*?)\]\s*$")
 _LIMIT_ENTRY = re.compile(r"([ugpo]):([^=,\s]+)=(\d+)")
 
 
+def _join_qstat_lines(raw: str) -> list[str]:
+    """Join PBS tab-indented continuation lines before parsing attributes."""
+    lines: list[str] = []
+    for line in raw.splitlines():
+        if line.startswith("\t") and lines:
+            lines[-1] += line.strip()
+        else:
+            lines.append(line)
+    return lines
+
+
 def _queue_limits(raw: str) -> tuple[bool, dict[str, list[tuple[str, str, int]]], str]:
     """Parse every bracketed PBS limit and reject malformed queue metadata."""
     limits: dict[str, list[tuple[str, str, int]]] = {}
     saw_queue = False
-    for line in raw.splitlines():
+    for line in _join_qstat_lines(raw):
         if line.strip().startswith("Queue:"):
             saw_queue = True
+        if "= [" in line and not _LIMIT.match(line):
+            return False, limits, "unterminated or malformed bracketed PBS limit"
         match = _LIMIT.match(line)
         if not match:
             continue
         entries = [(prefix, klass, int(value)) for prefix, klass, value in _LIMIT_ENTRY.findall(match.group(2))]
-        if entries:
-            limits[match.group(1)] = entries
+        if not entries or "]" in match.group(2):
+            return False, limits, "malformed bracketed PBS limit"
+        limits.setdefault(match.group(1), []).extend(entries)
     if not saw_queue or not limits:
         return False, limits, "unparseable qstat -Qf output"
     return True, limits, "parsed qstat -Qf output"
 
 
-def _queue_jobs(raw: str, user: str, queue: str) -> list[dict[str, str]]:
-    """Parse full qstat records, retaining only exact user and queue matches."""
+def _queue_jobs(raw: str, user: str) -> list[dict[str, str]]:
+    """Parse plain full qstat records, retaining records owned by ``user``."""
     jobs: list[dict[str, str]] = []
     current: dict[str, str] = {}
 
     def flush() -> None:
-        if current.get("user") == user and current.get("queue") == queue:
+        if current.get("user") == user and all(key in current for key in ("job_id", "state", "queue")):
             jobs.append({key: current[key] for key in ("job_id", "state", "queue")})
 
     for line in raw.splitlines():
@@ -80,25 +96,53 @@ def _queue_jobs(raw: str, user: str, queue: str) -> list[dict[str, str]]:
     return jobs
 
 
+def _queue_table_rows(raw: str) -> int:
+    """Count data rows in qstat's alternate user table."""
+    return sum(bool(re.match(r"^\s*\d+\S*\s+\S+\s+\S+\s+", line)) for line in raw.splitlines())
+
+
 def _queue_gate(queue: str, user: str, output_dir: Path, prefix: str) -> bool:
     """Apply the live queue-aware PBS admission rule and save raw evidence."""
     limits_result = subprocess.run(["qstat", "-Qf", queue], check=False, text=True, capture_output=True)
-    jobs_result = subprocess.run(["qstat", "-f", "-u", user], check=False, text=True, capture_output=True)
+    jobs_result = subprocess.run(["qstat", "-f"], check=False, text=True, capture_output=True)
+    table_result = subprocess.run(["qstat", "-u", user], check=False, text=True, capture_output=True)
     limits_raw = limits_result.stdout + limits_result.stderr
     jobs_raw = jobs_result.stdout + jobs_result.stderr
+    table_raw = table_result.stdout + table_result.stderr
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / f"{prefix}-qstat-Qf.txt").write_text(limits_raw, encoding="utf-8")
-    (output_dir / f"{prefix}-qstat-f-u.txt").write_text(jobs_raw, encoding="utf-8")
+    jobs_path = output_dir / f"{prefix}-qstat-f.txt.gz"
+    with gzip.open(jobs_path, "wt", encoding="utf-8") as stream:
+        stream.write(jobs_raw)
+    (output_dir / f"{prefix}-qstat-u.txt").write_text(table_raw, encoding="utf-8")
     parseable, limits, reason = _queue_limits(limits_raw)
-    jobs = _queue_jobs(jobs_raw, user, queue)
-    allowed = parseable and jobs_result.returncode == 0 and limits_result.returncode == 0
+    all_user_jobs = _queue_jobs(jobs_raw, user)
+    jobs = [job for job in all_user_jobs if job["queue"] == queue]
+    full_records = sum(line.startswith("Job Id:") for line in jobs_raw.splitlines())
+    table_rows = _queue_table_rows(table_raw)
+    allowed = (parseable and jobs_result.returncode == 0 and table_result.returncode == 0
+               and limits_result.returncode == 0 and bool(jobs_raw.strip()) == bool(full_records)
+               and len(all_user_jobs) >= table_rows)
     refusal = ""
+    if jobs_raw.strip() and not full_records:
+        refusal = "refused: non-empty qstat -f has no parseable Job Id records"
+    elif len(all_user_jobs) < table_rows:
+        refusal = f"refused: qstat -f records {len(all_user_jobs)} jobs but qstat -u lists {table_rows}"
     if allowed:
         for attribute, entries in limits.items():
-            for prefix_kind, _limit_class, threshold in entries:
-                if prefix_kind == "o" or attribute == "max_run" or attribute.startswith("max_run.res."):
-                    continue
-                if prefix_kind != "u" or attribute not in {"queued_jobs_threshold", "max_queued"}:
+            if attribute == "max_run" or attribute.startswith("max_run_res."):
+                continue
+            if any(prefix_kind in {"g", "p"} for prefix_kind, _, _ in entries):
+                allowed = False
+                refusal = f"refused: unsupported scoped PBS limit {attribute}"
+                break
+            applicable = [(prefix_kind, limit_class, threshold) for prefix_kind, limit_class, threshold in entries
+                          if prefix_kind == "u" and limit_class in {user, "PBS_GENERIC"}]
+            chosen = [entry for entry in applicable if entry[1] == user] or [entry for entry in applicable if entry[1] == "PBS_GENERIC"]
+            if not chosen:
+                continue
+            for prefix_kind, _limit_class, threshold in chosen:
+                if attribute not in {"queued_jobs_threshold", "max_queued"}:
                     allowed = False
                     refusal = f"refused: unknown PBS limit {attribute} ({prefix_kind}:*)"
                     break
@@ -114,14 +158,18 @@ def _queue_gate(queue: str, user: str, output_dir: Path, prefix: str) -> bool:
                 break
     if not parseable:
         allowed = False
-    if limits_result.returncode != 0 or jobs_result.returncode != 0:
+    if limits_result.returncode != 0 or jobs_result.returncode != 0 or table_result.returncode != 0:
         allowed = False
         refusal = "refused: qstat command failed"
     if allowed:
         reason = "allowed: live PBS limits admit this user in this queue"
     elif refusal:
         reason = refusal
-    decision = {"queue": queue, "user": user, "limits": limits, "jobs": jobs, "allowed": allowed, "reason": reason}
+    decision = {"queue": queue, "user": user, "limits": limits, "jobs": jobs,
+                "qstat_table_rows": table_rows, "qstat_full_records": full_records,
+                "qstat_full_sha256": hashlib.sha256(jobs_raw.encode()).hexdigest(),
+                "qstat_full_bytes": len(jobs_raw.encode()), "qstat_full_storage": str(jobs_path),
+                "allowed": allowed, "reason": reason}
     (output_dir / f"{prefix}-qstat-decision.json").write_text(json.dumps(decision, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if not allowed:
         print(limits_raw + jobs_raw, file=sys.stderr)
