@@ -7,15 +7,19 @@ before it contributes to the final wavefunction.
 
 from __future__ import annotations
 
+import math
+
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.data.partition import Partition
 from tpen.data.real import Feature
 from tpen.dependencies import require_torch, require_torch_nn
+from tpen.nn.initialization import TorchInitializer
 
 torch = require_torch(feature="Pfaffian readout")
 nn = require_torch_nn(feature="Pfaffian readout")
 
 _ODD_PADDING_IRREP = Partition((1,))
+_READOUT_INITIALIZATIONS = {"equal", "signed_l1", "random_direction_l2"}
 
 
 def _pfaffian_single(matrix: torch.Tensor) -> torch.Tensor:
@@ -153,6 +157,15 @@ class PfaffianReadout(nn.Module):
     trainable : bool, optional
         Whether the per-channel readout weights ``w_c`` are trainable. The
         default keeps them as fixed buffers for scaffold determinism.
+    initialization : {"equal", "signed_l1", "random_direction_l2"}, optional
+        A12 readout-weight parameterization from design section 2.4. ``equal``
+        keeps the control weights ``1 / C2``. ``signed_l1`` uses
+        ``w = z / sum(abs(z))`` and ``random_direction_l2`` uses
+        ``w = z / (sqrt(C2) * norm(z))`` for a float64 standard-normal vector
+        ``z`` from the supplied named stream.
+    initializer : TorchInitializer, optional
+        Explicitly seeded named stream used by the two random initializations.
+        It is required for those modes and is ignored by ``equal``.
     """
 
     def __init__(
@@ -162,15 +175,27 @@ class PfaffianReadout(nn.Module):
         channels: int | None = None,
         pair_channels: int | None = None,
         trainable: bool = False,
+        initialization: str = "equal",
+        initializer: TorchInitializer | None = None,
     ) -> None:
         super().__init__()
         self.eps = float(eps)
         self.trainable = bool(trainable)
+        if initialization not in _READOUT_INITIALIZATIONS:
+            raise ValueError(
+                f"Unknown PfaffianReadout initialization {initialization!r}; "
+                f"expected one of {sorted(_READOUT_INITIALIZATIONS)}"
+            )
+        self.initialization = initialization
         pair_channels = channels if pair_channels is None else pair_channels
         if pair_channels is None:
             raise ValueError("PfaffianReadout requires pair_channels or channels for eager initialization")
         self.pair_channels = _positive_int(pair_channels, "pair_channels")
-        initial = torch.full((self.pair_channels,), 1.0 / self.pair_channels)
+        initial = _initial_channel_weights(
+            self.pair_channels,
+            initialization=initialization,
+            initializer=initializer,
+        )
         if self.trainable:
             self.channel_weights = nn.Parameter(initial)
             self.register_buffer("channel_weight_buffer", None, persistent=False)
@@ -263,6 +288,30 @@ def _positive_int(value: int, name: str) -> int:
     if result <= 0:
         raise ValueError(f"{name} must be positive, got {result}")
     return result
+
+
+def _initial_channel_weights(
+    pair_channels: int,
+    *,
+    initialization: str,
+    initializer: TorchInitializer | None,
+) -> torch.Tensor:
+    """Construct readout weights for the A12 initialization coordinate."""
+
+    if initialization == "equal":
+        # Preserve the historical control tensor construction byte-for-byte.
+        return torch.full((pair_channels,), 1.0 / pair_channels)
+    if initializer is None or initializer.seed is None:
+        raise ValueError(
+            f"PfaffianReadout initialization={initialization!r} requires an explicitly seeded TorchInitializer"
+        )
+    z = torch.empty(pair_channels, dtype=torch.float64)
+    initializer.normal_(z)
+    if initialization == "signed_l1":
+        weights = z / z.abs().sum()
+    else:
+        weights = z / (math.sqrt(pair_channels) * torch.linalg.vector_norm(z))
+    return weights.to(dtype=torch.get_default_dtype())
 
 
 __all__ = ["PfaffianReadout", "pfaffian"]
