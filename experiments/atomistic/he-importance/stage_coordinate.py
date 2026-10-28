@@ -40,6 +40,7 @@ class StageDefinition:
     seeds_per_point: int
     maximum_lineages: int | None
     updates: int | None
+    sampler_overrides: Mapping[str, tuple[int, ...]]
 
 
 def _load_stage_definitions() -> tuple[StageDefinition, ...]:
@@ -48,12 +49,43 @@ def _load_stage_definitions() -> tuple[StageDefinition, ...]:
     raw = json.loads(_AUTHORITY_PATH.read_text(encoding="utf-8"))
     if not isinstance(raw, list):
         raise ManifestSchemaError("stage authority must be a list")
-    expected = frozenset({"code", "purpose", "seeds_per_point", "maximum_lineages", "updates"})
+    expected = frozenset(
+        {"code", "purpose", "seeds_per_point", "maximum_lineages", "updates", "sampler_overrides"}
+    )
     definitions = []
     for entry in raw:
         if not isinstance(entry, Mapping) or frozenset(entry) != expected:
             raise ManifestSchemaError("stage authority entry has an invalid schema")
-        definitions.append(StageDefinition(**entry))
+        overrides = entry["sampler_overrides"]
+        if not isinstance(overrides, Mapping):
+            raise ManifestSchemaError("stage sampler_overrides must be a mapping")
+        for coordinate, values in overrides.items():
+            if coordinate not in {"n_walkers"}:
+                raise ManifestSchemaError(f"unknown stage sampler coordinate {coordinate!r}")
+            if not isinstance(values, list) or not values:
+                raise ManifestSchemaError(
+                    f"stage sampler coordinate {coordinate!r} must declare a non-empty list"
+                )
+            if any(type(value) is not int for value in values):
+                raise ManifestSchemaError(
+                    f"stage sampler coordinate {coordinate!r} values must be integers"
+                )
+            if len(set(values)) != len(values):
+                raise ManifestSchemaError(
+                    f"stage sampler coordinate {coordinate!r} repeats a value"
+                )
+        definitions.append(
+            StageDefinition(
+                code=entry["code"],
+                purpose=entry["purpose"],
+                seeds_per_point=entry["seeds_per_point"],
+                maximum_lineages=entry["maximum_lineages"],
+                updates=entry["updates"],
+                sampler_overrides=MappingProxyType(
+                    {coordinate: tuple(values) for coordinate, values in overrides.items()}
+                ),
+            )
+        )
     if len({definition.code for definition in definitions}) != len(definitions):
         raise ManifestSchemaError("stage authority repeats a code")
     return tuple(definitions)
@@ -114,8 +146,26 @@ SEED_STREAMS = (
 )
 
 COMMITTED_WALKERS = 4_096
-Q_MECHANICS_WALKERS = 2_048
 _WALKERS_MISSING = object()
+
+
+def sampler_override_values(stage: str, coordinate: str) -> tuple[int, ...]:
+    """Return the authority-declared values for one stage-local sampler coordinate."""
+
+    definition = STAGES.get(stage)
+    if definition is None:
+        raise ManifestSchemaError(f"unknown HI stage {stage!r}")
+    return definition.sampler_overrides.get(coordinate, ())
+
+
+# Compatibility alias for callers that report the operator-ruling value. The
+# admission decision itself always reads the stage authority above.
+Q_MECHANICS_WALKERS = next(
+    values[0]
+    for definition in STAGE_DEFINITIONS
+    for coordinate, values in definition.sampler_overrides.items()
+    if coordinate == "n_walkers" and definition.purpose == "mechanics"
+)
 
 
 class MaterializationError(ValueError):
@@ -367,20 +417,28 @@ def walker_count(manifest: Mapping[str, Any]) -> int:
     if value is _WALKERS_MISSING:
         return COMMITTED_WALKERS
     stage = manifest.get("stage")
-    if (
-        type(value) is not int
-        or int.__eq__(value, Q_MECHANICS_WALKERS) is not True
-        or type(stage) is not str
-        or str.__eq__(stage, "Q") is not True
-    ):
+    declared = sampler_override_values(stage, "n_walkers") if type(stage) is str else ()
+    if type(value) is not int or value not in declared:
         raise MaterializationError(
-            "scientific_identity.walkers must be exactly 2048 and manifest stage must be 'Q'"
+            f"scientific_identity.walkers={value!r} is not declared for stage {stage!r}; "
+            f"declared n_walkers={declared!r}"
         )
     return value
 
 
-def with_q_mechanics_walkers(cell: MaterializedCell) -> MaterializedCell:
-    """Return a Q cell carrying the identity-bearing mechanics walker exception."""
+def with_q_mechanics_walkers(
+    cell: MaterializedCell, walkers: int | None = None
+) -> MaterializedCell:
+    """Return a cell carrying the requested declared mechanics walker value.
+
+    Parameters
+    ----------
+    cell
+        Materialized source cell without an identity-bearing walker override.
+    walkers
+        Exact declared override to encode. If omitted, the authority must
+        contain exactly one admissible value.
+    """
 
     try:
         source_manifest = cell.manifest
@@ -391,13 +449,23 @@ def with_q_mechanics_walkers(cell: MaterializedCell) -> MaterializedCell:
     validate_materialized_manifest(source_manifest)
     if content_hash(source_manifest) != source_hash:
         raise MaterializationError("cell content hash does not bind its manifest")
-    if type(source_manifest["stage"]) is not str or str.__eq__(source_manifest["stage"], "Q") is not True:
-        raise MaterializationError("Q mechanics walkers are available only for stage 'Q'")
+    stage = source_manifest["stage"]
+    declared = sampler_override_values(stage, "n_walkers") if type(stage) is str else ()
+    if not declared:
+        raise MaterializationError(
+            f"stage {stage!r} declares no n_walkers mechanics override"
+        )
+    requested = declared[0] if walkers is None and len(declared) == 1 else walkers
+    if type(requested) is not int or requested not in declared:
+        raise MaterializationError(
+            f"requested n_walkers={requested!r} is not declared for stage {stage!r}; "
+            f"declared n_walkers={declared!r}"
+        )
     if "walkers" in source_manifest["scientific_identity"]:
         raise MaterializationError("Q mechanics walker identity is already applied")
 
     manifest = _thaw(source_manifest)
-    manifest["scientific_identity"]["walkers"] = Q_MECHANICS_WALKERS
+    manifest["scientific_identity"]["walkers"] = requested
     validate_materialized_manifest(manifest)
     digest = content_hash(manifest)
     output_path = source_path.parent.parent / manifest["stage"] / digest
