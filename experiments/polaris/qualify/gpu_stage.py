@@ -23,6 +23,7 @@ VERIFY = Path(__file__).resolve().parents[1] / "verify"
 if str(VERIFY) not in sys.path:
     sys.path.insert(0, str(VERIFY))
 from common import COPIED_FILES, copied_hashes, is_ancestor, layout, read_profile  # noqa: E402
+from stage import _queue_gate  # noqa: E402
 
 
 RUNTIME_KIND = "polaris-gpu-qualification"
@@ -61,11 +62,6 @@ def _profile(path: Path) -> dict:
     if profile.get("runtime_kind") != RUNTIME_KIND:
         raise ValueError("runtime profile has the wrong runtime_kind")
     return profile
-
-
-def _qstat() -> str:
-    result = subprocess.run(["qstat", "-u", getpass.getuser()], check=True, text=True, capture_output=True)
-    return (result.stdout + result.stderr).strip()
 
 
 def _harness_repo() -> Path:
@@ -155,9 +151,8 @@ def stage(args: argparse.Namespace) -> int:
     run_root = evidence_root / args.cell_id
     if run_root.exists():
         raise RuntimeError(f"run root already exists: {run_root}")
-    first_qstat = _qstat()
-    if first_qstat:
-        raise RuntimeError("refusing staging while qstat is non-empty")
+    if not _queue_gate(args.queue, getpass.getuser(), evidence_root, f"{args.cell_id}.pre-submit"):
+        raise RuntimeError("refusing staging because the queue-aware gate refused admission")
     run_root.mkdir(parents=True)
     paths = gpu_layout(run_root)
     paths["run_root"].joinpath("output").mkdir(parents=True, exist_ok=True)
@@ -191,10 +186,8 @@ def stage(args: argparse.Namespace) -> int:
     for key in ("evidence_dir", "pbs_dir", "harness_dir"):
         if not paths[key].is_dir():
             raise RuntimeError(f"missing staged directory: {paths[key]}")
-    second_qstat = _qstat()
-    (run_root / "pre-submit-qstat.txt").write_text(second_qstat + ("\n" if second_qstat else ""), encoding="utf-8")
-    if second_qstat:
-        raise RuntimeError("refusing qsub because qstat became non-empty")
+    if not _queue_gate(manifest["scheduler"]["queue"], getpass.getuser(), run_root, "pre-submit"):
+        raise RuntimeError("refusing qsub because the queue-aware gate refused admission")
     scheduler = manifest["scheduler"]
     qsub = ["qsub", "-V", "-A", scheduler["account"], "-q", scheduler["queue"],
             "-l", f"select={manifest['nodes']}:system=polaris", "-l", f"walltime={scheduler['walltime']}",
