@@ -68,6 +68,12 @@ def _qstat() -> str:
     return (result.stdout + result.stderr).strip()
 
 
+def _harness_repo() -> Path:
+    """Return the checkout whose files are being staged."""
+    harness = Path(__file__).resolve().parent
+    return Path(_git(harness, "rev-parse", "--show-toplevel"))
+
+
 def validate_evidence_root(value: str) -> str:
     """Reject paths that cannot survive PBS variable serialization."""
     if not value or any(char.isspace() or char in ",'\"" for char in value):
@@ -135,7 +141,7 @@ def stage(args: argparse.Namespace) -> int:
     if not all(Path(profile[key]).is_dir() for key in ("libshim", "cuda13_lib", "cuda129_lib")):
         raise RuntimeError("approved library profile paths are not readable")
     harness = Path(__file__).resolve().parent
-    harness_repo = Path(_git(harness, "rev-parse", "--show-toplevel"))
+    harness_repo = _harness_repo()
     if _git(harness_repo, "status", "--porcelain", "--untracked-files=no"):
         raise RuntimeError("harness checkout has tracked changes")
     evidence_root = Path(args.evidence_root).expanduser().resolve()

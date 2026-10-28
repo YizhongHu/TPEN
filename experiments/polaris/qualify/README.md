@@ -27,9 +27,10 @@ only when every required predicate passes. Exit 0 means PASS; 1 means a
 qualification or real-route failure; 2 means required evidence is incomplete
 or unmeasured; 60 means a missing staging receipt; 61 means a mismatched
 receipt; 64 means an invalid route entry; 70--73 and 79 are identity checks;
-82 means the library profile failed; 83 means GPU/runtime or overlay
-immutability failed; 84 means the runtime kind failed; 85 means topology
-failed.
+81 means copied harness hashes failed; 82 means the library profile failed;
+83 means GPU/runtime or overlay immutability failed; 84 means the runtime kind
+failed; 85 means topology failed. The submit shell must inherit the Cray
+libfabric path through `-V`; the job stops at 82 if that tail is absent.
 
 Not yet implemented: rungs 1/2/3-at-20/5 need the production-controls slice
 for explicit horizon/cadence, bounded stop, resume, and callback-state audit.
