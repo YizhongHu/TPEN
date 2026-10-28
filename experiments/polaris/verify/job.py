@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tomllib
 import shlex
+from common import build_env, copied_hashes, is_ancestor, layout, read_profile
 
 
 def expected_versions(lock: dict) -> dict[str, str]:
@@ -25,15 +26,11 @@ def expected_versions(lock: dict) -> dict[str, str]:
             if name in expected:
                 raise ValueError(f"ambiguous lock entry for {name}")
             expected[name] = package["version"]
-    cpu_torch = [
-        package for package in packages
-        if package.get("name") == "torch"
-        and package.get("source", {}).get("registry", "").rstrip("/").endswith("/cpu")
-        and "sys_platform != 'darwin'" in package.get("marker", "")
-    ]
-    if len(cpu_torch) != 1:
-        raise ValueError("lock must contain one Linux torch resolution for its cpu extra")
-    expected["torch"] = cpu_torch[0]["version"]
+    cpu_entries = [entry for entry in cpu_requirements if entry.get("name") == "torch"]
+    linux_cpu = [entry for entry in cpu_entries if "sys_platform != 'darwin'" in entry.get("marker", "")]
+    if len(linux_cpu) != 1 or "version" not in linux_cpu[0]:
+        raise ValueError("lock must contain one Linux torch resolution in the cpu extra")
+    expected["torch"] = linux_cpu[0]["version"]
     if set(expected) != {"torch", "pytest", "typeguard"}:
         raise ValueError("lock is missing a required verification package")
     return expected
@@ -49,13 +46,6 @@ def _read_env(path: Path) -> dict[str, str]:
             raise ValueError(f"run.env value is not one literal token: {key}")
         values[key] = parsed[0]
     return values
-
-
-def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
-    return subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
-        check=False,
-    ).returncode == 0
 
 
 def host_matches(node: str, nodefile_entries: list[str]) -> bool:
@@ -74,6 +64,31 @@ def receipt_code(manifest: dict, receipt_path: Path) -> int:
         return 60
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     return 0 if receipt_matches(manifest, receipt) else 61
+
+
+def preflight_decision(*, login_host: bool, node_match: bool, apple_double_count: int, python_exists: bool, interpreter_ok: bool, versions_ok: bool, uv_ok: bool, lock_ok: bool, sync_ok: bool, copied_ok: bool) -> int:
+    """Map injected preflight observations to the stable exit-code contract."""
+    if login_host:
+        return 70
+    if not node_match:
+        return 71
+    if apple_double_count:
+        return 73
+    if not python_exists:
+        return 74
+    if not interpreter_ok:
+        return 76
+    if not versions_ok:
+        return 75
+    if not uv_ok:
+        return 77
+    if not lock_ok:
+        return 78
+    if not sync_ok:
+        return 80
+    if not copied_ok:
+        return 81
+    return 0
 
 
 def head_code(repo: Path, target_sha: str) -> int:
@@ -143,7 +158,7 @@ def main() -> int:
 
     repo = Path(manifest["target_repo"])
     for ancestor in manifest.get("required_ancestors", []):
-        ok = _is_ancestor(repo, ancestor, manifest["target_sha"])
+        ok = is_ancestor(repo, ancestor, manifest["target_sha"])
         if not _record(preflight, checks, f"required_ancestor:{ancestor}", True, ok, ok, 79):
             return 79
     head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
@@ -161,31 +176,37 @@ def main() -> int:
         return 78
 
     profile = manifest["profile"]
-    env = os.environ.copy()
-    env.update(dict(item.split("=", 1) for item in profile["uv_flags"]))
-    env["UV_CACHE_DIR"] = manifest["cache_dir"]
-    job_env = Path("/local/scratch") / job_id / "tpen-verify-env"
-    env["UV_PROJECT_ENVIRONMENT"] = str(job_env)
+    job_env = Path(profile["job_scratch_root"]) / job_id / "tpen-verify-env"
+    job_env.parent.mkdir(parents=True, exist_ok=True)
+    env = build_env(profile, Path(manifest["cache_dir"]), job_env)
     uv = [profile["facility_python"], "-m", "uv"]
     uv_version = subprocess.check_output(uv + ["--version"], text=True).strip()
-    if not _record(preflight, checks, "uv_version", "uv " + profile["uv_version"], uv_version, uv_version == "uv " + profile["uv_version"], 77):
+    if not _record(preflight, checks, "uv_version", ["uv", profile["uv_version"]], uv_version, uv_version.split()[:2] == ["uv", profile["uv_version"]], 77):
         return 77
     try:
-        subprocess.run(uv + ["sync", "--offline", "--extra", "cpu", "--locked", "--project", str(repo)], env=env, check=True)
+        with (evidence / "offline-sync.stdout.log").open("w", encoding="utf-8") as sync_log:
+            subprocess.run(uv + ["sync", "--offline", "--extra", "cpu", "--locked", "--project", str(repo)], env=env, check=True, stdout=sync_log, stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError as exc:
         _record(preflight, checks, "offline_sync", 0, exc.returncode, False, 80)
         return 80
     python = job_env / "bin" / "python"
     if not _record(preflight, checks, "venv_python_exists", str(python), str(python) if python.is_file() else None, python.is_file(), 74):
         return 74
-    identity = json.loads(subprocess.check_output([str(python), "-c", "import json,sys; print(json.dumps({'executable':sys.executable,'prefix':sys.prefix}))"], text=True))
-    interpreter_ok = Path(identity["executable"]).resolve() == python.resolve() and Path(identity["prefix"]).resolve() == job_env.resolve()
-    if not _record(preflight, checks, "venv_interpreter", {"executable": str(python), "prefix": str(job_env)}, identity, interpreter_ok, 76):
+    identity = json.loads(subprocess.check_output([str(python), "-c", "import json,sys; print(json.dumps({'executable':sys.executable,'prefix':sys.prefix,'base_prefix':sys.base_prefix,'base_executable':sys._base_executable}))"], text=True))
+    facility = Path(profile["facility_python"]).resolve()
+    base_prefix = facility.parent.parent
+    interpreter_ok = Path(identity["prefix"]).resolve() == job_env.resolve() and Path(identity["base_executable"]).resolve() == facility and Path(identity["base_prefix"]).resolve() == base_prefix.resolve()
+    if not _record(preflight, checks, "venv_interpreter", {"prefix": str(job_env), "base_executable": str(facility), "base_prefix": str(base_prefix)}, identity, interpreter_ok, 76):
         return 76
     observed = json.loads(subprocess.check_output([str(python), "-c", "import importlib.metadata as m, json; print(json.dumps({n:m.version(n) for n in ('torch','pytest','typeguard')}))"], text=True))
     if not _record(preflight, checks, "package_versions", expected, observed, observed == expected, 75):
         return 75
-    driver_rc = subprocess.run([str(python), "-B", manifest["driver"], "--manifest", str(manifest_path), "--evidence", str(evidence), "--job-python", str(python)], env=env).returncode
+    copied_expected = manifest["copied_file_sha256"]
+    copied_observed = copied_hashes([Path(manifest["job_helper"]).parent / name for name in copied_expected])
+    if not _record(preflight, checks, "copied_harness_hashes", copied_expected, copied_observed, copied_observed == copied_expected, 81):
+        return 81
+    with (evidence / "driver.stdout.log").open("w", encoding="utf-8") as stdout, (evidence / "driver.stderr.log").open("w", encoding="utf-8") as stderr:
+        driver_rc = subprocess.run([str(python), "-B", manifest["driver"], "--manifest", str(manifest_path), "--evidence", str(evidence), "--job-python", str(python), "--job-env", str(job_env)], env=env, stdout=stdout, stderr=stderr).returncode
     _record(preflight, checks, "driver", 0, driver_rc, driver_rc == 0, driver_rc or 1)
     return driver_rc
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Stored job script. All run-specific values come from RUN_ENV_PATH.
 #PBS -N tpen-polaris-verify
 #PBS -S /bin/bash
+# Stored job script. All run-specific values come from RUN_ENV_PATH.
 set -euo pipefail
 : "${RUN_ENV_PATH:?RUN_ENV_PATH is required}"
 test -f "$RUN_ENV_PATH"

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
+import getpass
 import json
 import os
 from pathlib import Path
@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
+from common import COPIED_FILES, build_env, copied_hashes, is_ancestor, layout, read_profile
 
 
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -36,6 +37,22 @@ def _safe_arg(value: str, name: str) -> str:
     return value
 
 
+def validate_evidence_root(value: str) -> str:
+    """Reject PBS -v hazardous evidence-root characters before any work."""
+    if not value or any(char.isspace() or char in ",'\"" for char in value):
+        raise ValueError("evidence-root must contain no whitespace, comma, or quote")
+    return value
+
+
+def validate_arm_syntax(arm: str) -> str:
+    """Validate an arm before cloning or creating a run root."""
+    _safe_arg(arm, "arm")
+    outside_params = re.sub(r"\[[^\]]*\]", "", arm)
+    if arm.startswith("-") or "=" in outside_params:
+        raise ValueError("arm must be a pytest path/node id, not an option or override")
+    return arm
+
+
 def validate_arm(arm: str, repo: Path) -> str:
     """Return an arm after refusing overrides and paths outside ``repo``.
 
@@ -47,8 +64,7 @@ def validate_arm(arm: str, repo: Path) -> str:
         Target checkout that owns the selection.
     """
     _safe_arg(arm, "arm")
-    if "=" in arm or arm.startswith("-"):
-        raise ValueError("pytest overrides and options are not valid arms")
+    validate_arm_syntax(arm)
     path_part = arm.split("::", 1)[0]
     candidate = (repo / path_part).resolve()
     if repo.resolve() not in candidate.parents and candidate != repo.resolve():
@@ -61,13 +77,6 @@ def validate_arm(arm: str, repo: Path) -> str:
 def _harness_repo() -> Path:
     """Return the checkout root containing this harness."""
     return Path(_git(VERIFY_DIR, "rev-parse", "--show-toplevel"))
-
-
-def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
-    return subprocess.run(
-        ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
-        check=False,
-    ).returncode == 0
 
 
 def _write_literal_env(path: Path, manifest: Path, facility_python: str, job_helper: Path | None = None) -> None:
@@ -90,7 +99,8 @@ def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, 
         raise RuntimeError("target checkout is not at the requested full SHA")
     harness_repo = _harness_repo()
     harness_sha = _git(harness_repo, "rev-parse", "HEAD")
-    profile = json.loads((VERIFY_DIR / "facility_profile.json").read_text())
+    paths = layout(run_root)
+    profile = read_profile(VERIFY_DIR / "facility_profile.json")
     arms = [validate_arm(arm, target_repo) for arm in args.arm]
     manifest = {
         "schema": 1,
@@ -99,21 +109,34 @@ def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, 
         "target_sha": target_sha,
         "harness_sha": harness_sha,
         "required_ancestors": args.required_ancestor,
-        "run_root": str(run_root),
+        "run_root": str(paths["run_root"]),
         "target_repo": str(target_repo),
-        "cache_dir": str(run_root / "uv-cache"),
-        "prime_env": str(run_root / "prime-env"),
-        "evidence_dir": str(run_root / "evidence"),
-        "pbs_dir": str(run_root / "pbs"),
+        "cache_dir": str(paths["cache_dir"]),
+        "prime_env": str(paths["prime_env"]),
+        "dry_env": str(paths["dry_env"]),
+        "evidence_dir": str(paths["evidence_dir"]),
+        "pbs_dir": str(paths["pbs_dir"]),
         "arms": arms,
         "profile": profile,
-        "job_script": str(harness_dir / "job.pbs"),
-        "job_helper": str(harness_dir / "job.py"),
-        "driver": str(harness_dir / "driver.py"),
-        "staging_receipt": str(run_root / "staging-receipt.json"),
+        "profile_path": str(paths["profile"]),
+        "job_script": str(paths["job_script"]),
+        "job_helper": str(paths["job_helper"]),
+        "driver": str(paths["driver"]),
+        "staging_receipt": str(paths["staging_receipt"]),
         "copied_file_sha256": {},
     }
     return manifest
+
+
+def prime_and_dry_sync(target_repo: Path, profile: dict, paths: dict[str, Path], uv: list[str]) -> Path:
+    """Prime the cache, then sync a separate fresh dry environment."""
+    env = build_env(profile, paths["cache_dir"], paths["prime_env"])
+    _run(uv + ["sync", "--extra", "cpu", "--locked", "--project", str(target_repo)], cwd=target_repo, env=env)
+    dry_log = paths["run_root"] / "offline-dry.log"
+    dry_env = build_env(profile, paths["cache_dir"], paths["dry_env"])
+    with dry_log.open("w", encoding="utf-8") as stream:
+        subprocess.run(uv + ["sync", "--offline", "--extra", "cpu", "--locked", "--project", str(target_repo)], env=dry_env, check=True, text=True, stdout=stream, stderr=subprocess.STDOUT)
+    return dry_log
 
 
 def stage(args: argparse.Namespace) -> int:
@@ -125,13 +148,16 @@ def stage(args: argparse.Namespace) -> int:
         Parsed target, selection, evidence, and provenance arguments.
     """
     validate_cell_id(args.cell_id)
+    validate_evidence_root(args.evidence_root)
+    for arm in args.arm:
+        validate_arm_syntax(arm)
     harness_repo = _harness_repo()
-    if _git(harness_repo, "status", "--porcelain"):
+    if _git(harness_repo, "status", "--porcelain", "--untracked-files=no"):
         raise RuntimeError("harness checkout has tracked changes; refuse staging")
     evidence_root = Path(args.evidence_root).expanduser().resolve()
     run_root = evidence_root / args.cell_id
     evidence_root.mkdir(parents=True, exist_ok=True)
-    initial_qstat = subprocess.run(["qstat", "-u", os.environ.get("USER", "")], check=True, text=True, capture_output=True)
+    initial_qstat = subprocess.run(["qstat", "-u", getpass.getuser()], check=True, text=True, capture_output=True)
     initial_qstat_output = (initial_qstat.stdout + initial_qstat.stderr).strip()
     initial_qstat_receipt = evidence_root / f"{args.cell_id}.pre-submit-qstat.txt"
     initial_qstat_receipt.write_text(initial_qstat_output + ("\n" if initial_qstat_output else ""), encoding="utf-8")
@@ -143,8 +169,9 @@ def stage(args: argparse.Namespace) -> int:
     run_root.mkdir(parents=True)
     for name in ("evidence", "pbs", "harness"):
         (run_root / name).mkdir()
-    harness_dir = run_root / "harness"
-    for name in ("facility_profile.json", "job.pbs", "job.py", "driver.py"):
+    harness_dir = paths["harness_dir"]
+    paths = layout(run_root)
+    for name in COPIED_FILES:
         shutil.copy2(VERIFY_DIR / name, harness_dir / name)
     target_repo = run_root / "target"
     _run(["git", "clone", "--no-single-branch", args.remote, str(target_repo)])
@@ -154,44 +181,36 @@ def stage(args: argparse.Namespace) -> int:
         raise RuntimeError("target clone is shallow")
     if list(target_repo.rglob("._*")):
         raise RuntimeError("AppleDouble files found in target clone")
+    arms = [validate_arm(arm, target_repo) for arm in args.arm]
     for ancestor in args.required_ancestor:
-        if not _is_ancestor(target_repo, ancestor, args.target_sha):
+        if not is_ancestor(target_repo, ancestor, args.target_sha):
             raise RuntimeError(f"required ancestor is not an ancestor of target: {ancestor}")
-    profile = json.loads((VERIFY_DIR / "facility_profile.json").read_text())
-    env = os.environ.copy()
-    env.update({key: value for key, value in (item.split("=", 1) for item in profile["uv_flags"])})
-    env["UV_CACHE_DIR"] = str(run_root / "uv-cache")
-    env["UV_PROJECT_ENVIRONMENT"] = str(run_root / "prime-env")
+    profile = read_profile(VERIFY_DIR / "facility_profile.json")
     uv = [profile["facility_python"], "-m", "uv"]
     uv_version = _run(uv + ["--version"], capture=True)
-    if uv_version != "uv " + profile["uv_version"]:
+    if uv_version.split()[:2] != ["uv", profile["uv_version"]]:
         raise RuntimeError(f"facility uv version mismatch: expected {profile['uv_version']}, got {uv_version}")
-    _run(uv + ["sync", "--extra", "cpu", "--locked", "--project", str(target_repo)], cwd=target_repo, env=env)
-    dry_log = run_root / "offline-dry.log"
-    with dry_log.open("w", encoding="utf-8") as stream:
-        subprocess.run(uv + ["sync", "--offline", "--extra", "cpu", "--locked", "--project", str(target_repo)], env=env, check=True, text=True, stdout=stream, stderr=subprocess.STDOUT)
+    dry_log = prime_and_dry_sync(target_repo, profile, paths, uv)
     manifest = build_manifest(args, run_root, target_repo, harness_dir)
     manifest["harness_clean_tracked"] = True
-    manifest["copied_file_sha256"] = {
-        name: hashlib.sha256((harness_dir / name).read_bytes()).hexdigest()
-        for name in ("facility_profile.json", "job.pbs", "job.py", "driver.py")
-    }
+    manifest["copied_file_sha256"] = copied_hashes(paths["copied_files"])
+    manifest["arms"] = arms
     manifest_path = run_root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     env_path = run_root / "run.env"
     _write_literal_env(env_path, manifest_path, profile["facility_python"], harness_dir / "job.py")
-    receipt = {"target_sha": args.target_sha, "cache_dir": manifest["cache_dir"], "manifest": str(manifest_path), "offline_dry_log": str(dry_log), "facility_python": profile["facility_python"]}
+    receipt = {"target_sha": args.target_sha, "cache_dir": manifest["cache_dir"], "manifest": str(manifest_path), "offline_dry_log": str(dry_log), "dry_env": manifest["dry_env"], "facility_python": profile["facility_python"]}
     Path(manifest["staging_receipt"]).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    for path in (manifest["evidence_dir"], manifest["pbs_dir"], manifest["cache_dir"], manifest["prime_env"], manifest["staging_receipt"]):
+    for path in (manifest["evidence_dir"], manifest["pbs_dir"], manifest["cache_dir"], manifest["prime_env"], manifest["dry_env"], manifest["staging_receipt"]):
         if not Path(path).exists():
             raise RuntimeError(f"staging path missing: {path}")
-    final_qstat = subprocess.run(["qstat", "-u", os.environ.get("USER", "")], check=True, text=True, capture_output=True)
+    final_qstat = subprocess.run(["qstat", "-u", getpass.getuser()], check=True, text=True, capture_output=True)
     final_qstat_output = (final_qstat.stdout + final_qstat.stderr).strip()
     (run_root / "pre-submit-qstat.txt").write_text(final_qstat_output + ("\n" if final_qstat_output else ""), encoding="utf-8")
     if final_qstat_output:
         print(final_qstat_output, file=sys.stderr)
         raise RuntimeError("refusing qsub because another job appeared during staging")
-    qsub = ["qsub", "-A", profile["pbs"]["account"], "-q", profile["pbs"]["queue"], "-l", f"select={profile['pbs']['select']},walltime={profile['pbs']['walltime']},filesystems={profile['pbs']['filesystems']}", "-k", "doe", "-o", str(manifest["pbs_dir"]) + "/", "-e", str(manifest["pbs_dir"]) + "/", "-v", f"RUN_ENV_PATH={env_path}", str(harness_dir / "job.pbs")]
+    qsub = ["qsub", "-A", profile["pbs"]["account"], "-q", profile["pbs"]["queue"], "-l", f"select={profile['pbs']['select']}", "-l", f"walltime={profile['pbs']['walltime']}", "-l", f"filesystems={profile['pbs']['filesystems']}", "-o", str(manifest["pbs_dir"]) + "/", "-e", str(manifest["pbs_dir"]) + "/", "-v", f"RUN_ENV_PATH={env_path}", str(paths["job_script"])]
     print("SUBMIT " + shlex.join(qsub), flush=True)
     job_id = _run(qsub, capture=True)
     (run_root / "submission.txt").write_text(job_id + "\n" + shlex.join(qsub) + "\n", encoding="utf-8")
