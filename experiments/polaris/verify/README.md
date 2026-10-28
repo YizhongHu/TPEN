@@ -17,11 +17,15 @@ versioned `facility_profile.json` (do not duplicate that path here):
   --remote <git-remote>
 ```
 
-Run this from a clean git clone of the harness. The stage refuses any listed
-job from `qstat -u <operator>` before doing work and checks again immediately
-before `qsub`; all lanes share the user and debug slot, so an occupied queue
-must be allowed to drain. Use a new cell id when a run root already exists;
-never delete evidence.
+Run this from a clean git clone of the harness. Before work and again
+immediately before `qsub`, stage reads the target queue's live `qstat -Qf`
+limits and the user's `qstat -u` jobs. It refuses only when a declared
+`max_queued` per-user limit is reached; `max_run` does not refuse because PBS
+serializes running jobs. Unknown or unparseable queue-limit output fails
+closed. These limits are read live and never hard-coded (measured on Polaris
+2026-10-28). Both raw qstat outputs and the admission decision are saved at
+each gate. Never use `qdel` or `qhold`. Use a new cell id when a run root
+already exists; never delete evidence.
 
 Staging performs the full clone, all-ref fetch, AppleDouble scan, facility-uv
 cache prime, same-binary offline locked resolve, manifest serialization, and
