@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import random
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 import sys
@@ -43,6 +44,17 @@ assert _RESOLVER_SPEC is not None and _RESOLVER_SPEC.loader is not None
 train_config = importlib.util.module_from_spec(_RESOLVER_SPEC)
 sys.modules[_RESOLVER_SPEC.name] = train_config
 _RESOLVER_SPEC.loader.exec_module(train_config)
+
+
+def _walker_refusal_pattern(stage: str, value: object, declared: object) -> str:
+    return (
+        rf"scientific_identity\.walkers={re.escape(repr(value))} is not declared for stage "
+        rf"{re.escape(repr(stage))}; declared n_walkers={re.escape(repr(declared))}"
+    )
+
+
+def _no_walker_override_pattern(stage: str) -> str:
+    return rf"stage {re.escape(repr(stage))} declares no n_walkers mechanics override"
 
 
 def _cell(
@@ -203,7 +215,9 @@ def test_resolve_refuses_hand_built_inadmissible_walker_identity(tmp_path: Path)
         manifest=stage_coordinate._freeze(manifest),
         content_hash=stage_coordinate.content_hash(manifest),
     )
-    with pytest.raises(Exception, match="exactly 2048"):
+    with pytest.raises(
+        Exception, match=_walker_refusal_pattern("Q", 1_000, (2_048,))
+    ):
         train_config.resolve_train_config(rebuilt)
 
 
@@ -284,7 +298,9 @@ def test_q_gates_refuse_overridable_stage_subclass_in_builder_and_resolver(tmp_p
     source = _cell(tmp_path, stage="O1")
     manifest = stage_coordinate._thaw(source.manifest)
     manifest["stage"] = Stage("O1")
-    with pytest.raises(stage_coordinate.MaterializationError, match="only for stage 'Q'"):
+    with pytest.raises(
+        stage_coordinate.MaterializationError, match=_no_walker_override_pattern("O1")
+    ):
         stage_coordinate.with_q_mechanics_walkers(replace(source, manifest=stage_coordinate._freeze(manifest)))
 
     manifest["scientific_identity"]["walkers"] = 2_048
@@ -295,7 +311,9 @@ def test_q_gates_refuse_overridable_stage_subclass_in_builder_and_resolver(tmp_p
         content_hash=digest,
         output_path=source.output_path.parent / digest,
     )
-    with pytest.raises(ValueError, match="exactly 2048"):
+    with pytest.raises(
+        ValueError, match=_walker_refusal_pattern("O1", 2_048, ())
+    ):
         train_config.resolve_train_config(forged)
 
 
