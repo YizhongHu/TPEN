@@ -876,9 +876,12 @@ def intended_configurations() -> tuple[Mapping[str, Any], ...]:
 
 
 def materialize_intended_configurations(
-    output_root: Path, *, availability: Mapping[str, OptimizerCell]
+    output_root: Path,
+    *,
+    availability: Mapping[str, OptimizerCell],
+    stages: Iterable[str] | None = None,
 ) -> tuple[MaterializedCell, ...]:
-    """Materialize every configuration in the committed L2b inventory.
+    """Materialize configurations from the committed L2b inventory.
 
     Parameters
     ----------
@@ -890,10 +893,36 @@ def materialize_intended_configurations(
         but absent from this mapping fails closed: it is never treated as
         available by default. Callers typically supply
         ``optimizer_grid.roster_availability()``.
+    stages
+        Optional stage codes to restrict materialization to. ``None``
+        materializes every committed entry. Each requested code must be a
+        known stage and must have at least one committed entry: a stage with
+        no declared universe is refused, never returned as an empty tuple
+        that would read as a complete, empty stage.
+
+    Raises
+    ------
+    MaterializationError
+        If a requested stage has no committed inventory entry, or a method
+        is absent from ``availability``.
     """
 
+    entries = intended_configurations()
+    if stages is not None:
+        requested = tuple(stages)
+        for stage in requested:
+            stage_definition(stage)
+        present = {entry["stage"] for entry in entries}
+        missing = [stage for stage in requested if stage not in present]
+        if missing:
+            raise MaterializationError(
+                f"stage(s) {missing!r} have no declared intended-configuration universe "
+                "in the committed inventory"
+            )
+        entries = tuple(entry for entry in entries if entry["stage"] in requested)
+
     cells: list[MaterializedCell] = []
-    for entry in intended_configurations():
+    for entry in entries:
         method = entry["optimizer"]["method"]
         optimizer = availability.get(method)
         if optimizer is None:

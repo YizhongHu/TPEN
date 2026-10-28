@@ -1,11 +1,18 @@
-"""Select, resolve, and optionally run exactly one Stage-Q mechanics cell.
+"""Select, resolve, and optionally run exactly one optimizer-grid stage cell.
 
 The command deliberately owns selection rather than relying on inventory order.
-It materializes the committed inventory, filters the live admitted method roster,
-and requires exactly one ``(stage, context, optimizer, seed_label)`` match after
-checking that the declared optimizer cell is truthful about the resolver output.
-The default Q/O-raw/Adam filters therefore require an explicit seed label while
-the authority contains both Q seed labels.
+It materializes the committed inventory for the requested stage, filters the
+live admitted method roster, and requires exactly one
+``(stage, context, optimizer, seed_label)`` match after checking that the
+declared optimizer cell is truthful about the resolver output. The default
+Q/O-raw/Adam filters therefore require an explicit seed label while the
+authority contains both Q seed labels.
+
+Only the stages in ``optimizer_grid.OPTIMIZER_GRID_STAGES`` (Q and O1) have a
+declared universe and are admitted. Every other stage is refused before any
+materialization with the reason recorded in
+``optimizer_grid.UNDECLARED_STAGE_REASONS``. The module keeps its historical
+``run_stage_q`` name; Q is its default stage, not its only stage.
 """
 
 from __future__ import annotations
@@ -40,11 +47,14 @@ train_config = importlib.import_module("experiments.atomistic.he-importance.trai
 DEFAULT_STAGE = "Q"
 DEFAULT_CONTEXT = "O-raw"
 DEFAULT_OPTIMIZER = "adam"
-Q_CHECKPOINT_EVERY_N_UPDATES = 1_000
+# Section 2.3/4.3 target cadence: one dense checkpoint every 1000 completed
+# updates, for every optimizer-grid stage.
+CHECKPOINT_EVERY_N_UPDATES = 1_000
+Q_CHECKPOINT_EVERY_N_UPDATES = CHECKPOINT_EVERY_N_UPDATES
 
 
 class StageQSelectionError(ValueError):
-    """The inventory does not identify exactly one admitted Stage-Q cell."""
+    """The inventory does not identify exactly one admitted stage cell."""
 
 
 @dataclass(frozen=True)
@@ -110,25 +120,37 @@ def _roster() -> tuple[Any, ...]:
     return tuple(HI_METHOD_ROSTER)
 
 
-def _require_q_stage(stage: str) -> None:
-    """Refuse non-Q stages before this mechanics-only route does any work.
+def _require_executable_stage(stage: str) -> None:
+    """Refuse every stage without a declared universe before any work.
 
     Parameters
     ----------
     stage : str
-        Requested stage code.  This runner admits only the committed Stage-Q
-        mechanics cell and must reject every other stage before materializing
-        selection input or resolving a training packet.
+        Requested stage code. Only a stage in
+        ``optimizer_grid.OPTIMIZER_GRID_STAGES`` is admitted; every other
+        stage must be rejected before materializing selection input or
+        resolving a training packet.
 
     Raises
     ------
     StageQSelectionError
-        If *stage* is not ``"Q"``.
+        If *stage* is unknown, or is a declared stage-authority code with no
+        declared intended-configuration universe. The latter message names
+        the stage's recorded reason, so an absent universe is distinguishable
+        from an unavailable optimizer method.
     """
 
-    if stage != DEFAULT_STAGE:
+    try:
+        reason = optimizer_grid.undeclared_stage_reason(stage)
+    except optimizer_grid.OptimizerGridError as error:
         raise StageQSelectionError(
-            f"Stage-Q runner accepts only stage {DEFAULT_STAGE!r}; got {stage!r}"
+            f"runner admits only optimizer-grid stages "
+            f"{optimizer_grid.OPTIMIZER_GRID_STAGES!r}; {error}"
+        ) from error
+    if reason is not None:
+        raise StageQSelectionError(
+            f"stage {stage!r} has no declared intended-configuration universe: {reason}; "
+            f"runner admits only optimizer-grid stages {optimizer_grid.OPTIMIZER_GRID_STAGES!r}"
         )
 
 
@@ -174,7 +196,7 @@ def select_cell(
     optimizer level cannot win merely by appearing first in the inventory.
     """
 
-    _require_q_stage(stage)
+    _require_executable_stage(stage)
     if context not in {DEFAULT_CONTEXT, "O-composite"}:
         raise StageQSelectionError(
             "truthfulness guard refused field 'context.name': "
@@ -211,7 +233,7 @@ def select_cell(
             # Resolve each candidate's own packet. The resolver may eventually
             # consume declared optimizer levels, so resolving requested[0]
             # once would make that first candidate win by construction.
-            resolved = train_config.resolve_train_config(_q_training_packet(cell))
+            resolved = train_config.resolve_train_config(_training_packet(cell))
             _require_truthful_cell(cell, resolved)
         except train_config.TrainConfigResolutionError as error:
             # Resolver refusals remain resolver-owned, but selection reports
@@ -1066,17 +1088,23 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
             )
 
 
-def _q_training_packet(cell: Any) -> Any:
+def _training_packet(cell: Any) -> Any:
+    """Build the one train packet for a selected cell at the stage horizon.
+
+    The dense cadence selects every :data:`CHECKPOINT_EVERY_N_UPDATES`
+    boundary through the stage authority's horizon (2 for Q, 50 for O1).
+    """
+
     definition = stage_coordinate.stage_definition(cell.manifest["stage"])
     if definition.updates is None:
         raise StageQSelectionError("selected stage has no fixed training horizon")
     cadence = stage_coordinate.CheckpointCadence(
-        Q_CHECKPOINT_EVERY_N_UPDATES,
+        CHECKPOINT_EVERY_N_UPDATES,
         tuple(
             range(
-                Q_CHECKPOINT_EVERY_N_UPDATES,
+                CHECKPOINT_EVERY_N_UPDATES,
                 definition.updates + 1,
-                Q_CHECKPOINT_EVERY_N_UPDATES,
+                CHECKPOINT_EVERY_N_UPDATES,
             )
         ),
     )
@@ -1089,11 +1117,11 @@ def _q_training_packet(cell: Any) -> Any:
         ddp_provenance={"launcher": "single-process-cli"},
     )
     if len(packets.train) != 1:
-        raise StageQSelectionError("Stage-Q mechanics route did not produce exactly one train packet")
+        raise StageQSelectionError("training route did not produce exactly one train packet")
     # The shared materializer has one API for all HI stages and consequently
-    # constructs analysis packets in memory. Stage Q is mechanics-only: retain
-    # only ``train`` here; ranking and independent-sampler packets are discarded
-    # in memory and are never written, scheduled, or run by this entry point.
+    # constructs analysis packets in memory. This entry point is training-only:
+    # retain only ``train`` here; ranking and independent-sampler packets are
+    # discarded in memory and are never written, scheduled, or run by it.
     return packets.train[0]
 
 
@@ -1103,7 +1131,7 @@ def _resolve_selected_config(selection: CellSelection) -> tuple[Any, Any]:
     Parameters
     ----------
     selection : CellSelection
-        The single cell selected by the Stage-Q admission and truthfulness
+        The single cell selected by the stage admission and truthfulness
         route.
 
     Returns
@@ -1120,7 +1148,7 @@ def _resolve_selected_config(selection: CellSelection) -> tuple[Any, Any]:
         truthfulness checks refuse the selected cell.
     """
 
-    packet = _q_training_packet(selection.cell)
+    packet = _training_packet(selection.cell)
     resolved = train_config.resolve_train_config(packet)
     _require_truthful_cell(selection.cell, resolved)
     return packet, resolved
@@ -1132,7 +1160,7 @@ def _execution_facts() -> dict[str, object]:
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
-        raise RuntimeError("Stage-Q launch requires one visible CUDA device")
+        raise RuntimeError("stage launch requires one visible CUDA device")
     properties = torch.cuda.get_device_properties(0)
     return {
         "global_rank": 0,
@@ -1200,10 +1228,14 @@ def _jsonable(value: Any) -> Any:
 
 
 def execute(args: argparse.Namespace) -> int:
-    _require_q_stage(args.stage)
+    _require_executable_stage(args.stage)
     output_root = Path(args.output_root).expanduser().resolve()
+    # Materialize only the requested stage so the selection receipt's discard
+    # record is that stage's universe, not every committed stage.
     cells = stage_coordinate.materialize_intended_configurations(
-        output_root, availability=optimizer_grid.roster_availability()
+        output_root,
+        availability=optimizer_grid.roster_availability(),
+        stages=(args.stage,),
     )
     selection = select_cell(
         cells,
@@ -1221,7 +1253,7 @@ def execute(args: argparse.Namespace) -> int:
         cell = stage_coordinate.with_q_mechanics_walkers(selection.cell, args.walkers)
     else:
         raise StageQSelectionError(
-            f"unsupported Stage-Q walker count: {args.walkers}; "
+            f"unsupported stage walker count: {args.walkers}; "
             f"stage {args.stage!r} declares n_walkers={declared_walkers!r}"
         )
     selection = replace(selection, cell=cell)

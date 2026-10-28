@@ -1,11 +1,21 @@
-"""The Stage-Q optimizer grid: declared cell enumeration and availability.
+"""The HI optimizer grid: declared cell enumeration and availability.
 
 This module owns the executable transcription of consolidated-design
 sections 2.7 (the 120-cell VMC-first optimizer grid) and 2.8 (the two
-Stage-Q optimizer contexts, O-raw and O-composite). It reads the literal,
+optimizer contexts, O-raw and O-composite). It reads the literal,
 reviewable ``optimizer_grid_authority.json`` transcription, expands it into
 the declared cell universe, and renders the committed
-``intended_configurations.json`` Stage-Q inventory from that universe.
+``intended_configurations.json`` inventory from that universe for every
+stage in :data:`OPTIMIZER_GRID_STAGES`.
+
+Section 2.8 constructs exactly two stages from this grid: Q ("120 optimizer
+cells x 2 contexts, 2000-update mechanics runlets") and O1 ("Same 120 x 2
+contexts, prospective 50k scientific tuning"). They differ only in the
+stage-authority facts (horizon, seed namespace, seeds per point, sampler
+overrides), which are read from ``stage_coordinate_authority.json`` and never
+retyped here. Every other stage is constructed from selection outputs or the
+A-package union and is recorded in :data:`UNDECLARED_STAGE_REASONS`, so an
+absent universe is an explicit, named refusal rather than a silent gap.
 
 Two concerns are kept structurally separate, per the lane's design
 decisions (Task Orchestrator item 993de93d, note
@@ -44,7 +54,32 @@ from typing import Any
 
 _AUTHORITY_PATH = Path(__file__).with_name("optimizer_grid_authority.json")
 _INTENDED_CONFIGURATIONS_PATH = Path(__file__).with_name("intended_configurations.json")
-_STAGE_CODE = "Q"
+# The declared set of stages whose section-2.8 construction is exactly the
+# section-2.7 cell grid crossed with the section-2.8 contexts. This is a
+# positive declaration, not "every stage except the undeclared ones".
+OPTIMIZER_GRID_STAGES = ("Q", "O1")
+
+# Every other section-2.8 stage, with the reason it has no declared universe
+# yet. The keys together with OPTIMIZER_GRID_STAGES must cover the stage
+# authority exactly; see :func:`undeclared_stage_reason`.
+UNDECLARED_STAGE_REASONS = MappingProxyType(
+    {
+        "O2": (
+            "needs the best two eligible O1 cells per family, a selection output "
+            "that does not exist yet"
+        ),
+        "A": (
+            "needs the 254-package architecture union of section 2.8, which is a "
+            "separate materialization slice"
+        ),
+        "B": (
+            "needs O* (the qualified specialized cell selected after O2) and the "
+            "B-grid packages, which do not exist yet"
+        ),
+        "R": "needs eight architecture packages selected after A/B, which do not exist yet",
+        "F": "needs one frozen selected procedure, which does not exist yet",
+    }
+)
 
 _FAMILY_REQUIRED_KEYS = frozenset({"family", "varied", "fixed", "declared_cells"})
 _FAMILY_OPTIONAL_KEYS = frozenset({"units"})
@@ -356,18 +391,50 @@ def roster_availability(roster: Any = None) -> dict[str, "stage_coordinate.Optim
     return resolved
 
 
-def render_intended_configurations() -> list[dict[str, Any]]:
-    """Render the exact Stage-Q entry list that ``intended_configurations.json`` commits.
+def _require_stage_partition(
+    declared: tuple[str, ...] = OPTIMIZER_GRID_STAGES,
+    undeclared: Mapping[str, str] = UNDECLARED_STAGE_REASONS,
+) -> frozenset[str]:
+    """Require the declared and undeclared stage sets to partition the authority.
 
-    Each of the 120 declared cells becomes one entry carrying its family and
-    complete levels (no availability status, no reason), expanded against
-    both section-2.8 optimizer contexts. Q's ``updates`` is read from the
-    committed stage-coordinate authority, never retyped here.
+    The check means a stage added to the stage authority can never fall
+    silently into neither set, and no stage can be both. Returns the
+    authority's stage codes.
     """
 
-    stage = stage_coordinate.stage_definition(_STAGE_CODE)
+    authority_codes = frozenset(definition.code for definition in stage_coordinate.STAGE_DEFINITIONS)
+    declared_set = set(declared)
+    undeclared_set = set(undeclared)
+    if declared_set & undeclared_set or declared_set | undeclared_set != authority_codes:
+        raise OptimizerGridError(
+            "optimizer-grid stages and undeclared stages must partition the stage authority: "
+            f"declared={sorted(declared_set)}, undeclared={sorted(undeclared_set)}, "
+            f"authority={sorted(authority_codes)}"
+        )
+    return authority_codes
+
+
+def undeclared_stage_reason(stage: str) -> str | None:
+    """Return why ``stage`` has no declared universe, or ``None`` if it has one.
+
+    Raises
+    ------
+    OptimizerGridError
+        If ``stage`` is not a stage-authority code, or if the declared and
+        undeclared sets do not partition the stage authority exactly.
+    """
+
+    if stage not in _require_stage_partition():
+        raise OptimizerGridError(f"unknown HI stage {stage!r}")
+    return UNDECLARED_STAGE_REASONS.get(stage)
+
+
+def _render_stage_entries(stage_code: str) -> list[dict[str, Any]]:
+    """Render one optimizer-grid stage's 120 entries x two contexts."""
+
+    stage = stage_coordinate.stage_definition(stage_code)
     if stage.updates is None:
-        raise OptimizerGridError(f"stage {_STAGE_CODE!r} has no fixed training horizon")
+        raise OptimizerGridError(f"stage {stage_code!r} has no fixed training horizon")
     contexts = load_authority()["contexts"]
     entries: list[dict[str, Any]] = []
     for cell in declared_cells():
@@ -388,11 +455,28 @@ def render_intended_configurations() -> list[dict[str, Any]]:
         ]
         entries.append(
             {
-                "stage": _STAGE_CODE,
+                "stage": stage_code,
                 "optimizer": {"method": cell.family, "levels": levels},
                 "configurations": configurations,
             }
         )
+    return entries
+
+
+def render_intended_configurations() -> list[dict[str, Any]]:
+    """Render the exact entry list that ``intended_configurations.json`` commits.
+
+    For each stage in :data:`OPTIMIZER_GRID_STAGES`, in declared order, each
+    of the 120 declared cells becomes one entry carrying its family and
+    complete levels (no availability status, no reason), expanded against
+    both section-2.8 optimizer contexts. Each stage's ``updates`` is read
+    from the committed stage-coordinate authority, never retyped here.
+    """
+
+    _require_stage_partition()
+    entries: list[dict[str, Any]] = []
+    for stage_code in OPTIMIZER_GRID_STAGES:
+        entries.extend(_render_stage_entries(stage_code))
     return entries
 
 
@@ -402,16 +486,32 @@ def render_intended_configurations_text() -> str:
     return json.dumps(render_intended_configurations(), indent=2) + "\n"
 
 
-def stage_q_report(*, roster: Any = None) -> dict[str, Any]:
-    """Return the machine-readable Stage-Q inventory report.
+def stage_report(stage: str, *, roster: Any = None) -> dict[str, Any]:
+    """Return the machine-readable inventory report for one optimizer-grid stage.
 
-    Every count is computed from :func:`declared_cells` and
-    :func:`roster_availability`; nothing here is a literal runnable count,
-    and nothing here asserts that all 120 cells can launch.
+    Every count is computed from :func:`declared_cells`,
+    :func:`roster_availability`, and the stage authority; nothing here is a
+    literal runnable count, and nothing here asserts that all 120 cells can
+    launch. ``declared``/``runnable``/``unavailable`` count optimizer cells;
+    the ``lineages`` block multiplies each by the two contexts and the
+    stage's seed labels, so an unavailable lineage is reported, not dropped.
+
+    Raises
+    ------
+    OptimizerGridError
+        If ``stage`` is unknown or has no declared universe. The message
+        carries the stage's :data:`UNDECLARED_STAGE_REASONS` entry.
     """
 
+    reason = undeclared_stage_reason(stage)
+    if reason is not None:
+        raise OptimizerGridError(
+            f"stage {stage!r} has no declared intended-configuration universe: {reason}"
+        )
     cells = declared_cells()
     availability = roster_availability(roster)
+    contexts = len(load_authority()["contexts"])
+    seeds = len(stage_coordinate.seed_labels(stage))
     per_family: dict[str, dict[str, Any]] = {}
     for cell in cells:
         state = availability[cell.family]
@@ -424,34 +524,50 @@ def stage_q_report(*, roster: Any = None) -> dict[str, Any]:
         else:
             bucket["unavailable"] += 1
             bucket["reason"] = state.reason
+    declared = sum(bucket["declared"] for bucket in per_family.values())
+    runnable = sum(bucket["runnable"] for bucket in per_family.values())
+    unavailable = sum(bucket["unavailable"] for bucket in per_family.values())
+    per_lineage = contexts * seeds
     return {
-        "stage": _STAGE_CODE,
-        "declared": sum(bucket["declared"] for bucket in per_family.values()),
-        "runnable": sum(bucket["runnable"] for bucket in per_family.values()),
-        "unavailable": sum(bucket["unavailable"] for bucket in per_family.values()),
-        "excluded_stages": {
-            "O1": (
-                "independently derivable from the same 120 cells x 2 contexts; deferred to a "
-                "follow-up slice, not declared here (lane-design-decisions-2026-10-09, item 2)"
-            ),
-            "R": "needs eight architecture packages selected after A/B, which do not exist yet",
-            "F": "needs one frozen selected procedure, which does not exist yet",
+        "stage": stage,
+        "declared": declared,
+        "runnable": runnable,
+        "unavailable": unavailable,
+        "lineages": {
+            "contexts": contexts,
+            "seeds_per_point": seeds,
+            "declared": declared * per_lineage,
+            "runnable": runnable * per_lineage,
+            "unavailable": unavailable * per_lineage,
         },
+        "excluded_stages": dict(UNDECLARED_STAGE_REASONS),
         "families": per_family,
     }
 
 
+def stage_q_report(*, roster: Any = None) -> dict[str, Any]:
+    """Return :func:`stage_report` for Stage Q (compatibility entry point)."""
+
+    return stage_report("Q", roster=roster)
+
+
 def main(argv: list[str] | None = None) -> None:
-    """Print the Stage-Q report, and on ``--write`` regenerate the committed file."""
+    """Print a stage report, and on ``--write`` regenerate the committed file."""
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--stage",
+        default="Q",
+        choices=OPTIMIZER_GRID_STAGES,
+        help="Optimizer-grid stage whose report to print.",
+    )
     parser.add_argument(
         "--write",
         action="store_true",
         help="Rewrite intended_configurations.json from the authority.",
     )
     args = parser.parse_args(argv)
-    print(json.dumps(stage_q_report(), indent=2, sort_keys=True))
+    print(json.dumps(stage_report(args.stage), indent=2, sort_keys=True))
     if args.write:
         _INTENDED_CONFIGURATIONS_PATH.write_text(render_intended_configurations_text(), encoding="utf-8")
 
@@ -462,11 +578,15 @@ if __name__ == "__main__":
 
 __all__ = [
     "GridCell",
+    "OPTIMIZER_GRID_STAGES",
     "OptimizerGridError",
+    "UNDECLARED_STAGE_REASONS",
     "declared_cells",
     "load_authority",
     "render_intended_configurations",
     "render_intended_configurations_text",
     "roster_availability",
     "stage_q_report",
+    "stage_report",
+    "undeclared_stage_reason",
 ]
