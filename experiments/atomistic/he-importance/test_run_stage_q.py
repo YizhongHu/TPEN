@@ -13,6 +13,7 @@ import sys
 from types import SimpleNamespace
 
 from hydra.utils import instantiate
+from omegaconf import open_dict
 import pytest
 
 
@@ -259,7 +260,7 @@ def test_o_composite_selection_has_eight_adam_authority_cells_and_schema_validat
     ) == expected_coordinate_semantics
     assert layer.mixing.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
     assert layer.path_aggregation.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
-    assert layer.update._target_ == "tpen.nn.ResidualUpdater"
+    assert layer["update"]["_target_"] == "tpen.nn.ResidualUpdater"
 
 
 def _o_composite_target(tmp_path: Path) -> object:
@@ -432,8 +433,9 @@ def test_o_composite_jastrow_removal_is_refused(tmp_path: Path, monkeypatch: pyt
 
     def drop_jastrow(source: object) -> object:
         resolved = original(source)
-        resolved.model.factors.pop()
-        resolved.runner.model.factors.pop()
+        with open_dict(resolved.model), open_dict(resolved.runner.model):
+            del resolved.model["factors"][-1]
+            del resolved.runner.model["factors"][-1]
         return resolved
 
     monkeypatch.setattr(runner.train_config, "resolve_train_config", drop_jastrow)
@@ -2446,7 +2448,8 @@ _A3_COMPOSITE_INITIALIZER_PATHS = (
 def _delete_config_path(config: object, path: str) -> None:
     parent_path, key = path.rsplit(".", 1)
     parent = runner.OmegaConf.select(config, parent_path)
-    del parent[key]
+    with open_dict(parent):
+        del parent[key]
 
 
 @pytest.mark.parametrize("seed_label", (810001, 810002))
