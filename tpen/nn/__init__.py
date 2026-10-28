@@ -6,6 +6,7 @@ from tpen.nn.activation import (
     GaussianActivation,
     OrderMLPLayout,
     OrderMLPSpec,
+    SoftplusBeta,
 )
 from tpen.nn.basis import (
     ElectronBasis,
@@ -100,6 +101,7 @@ __all__ = [
     "MaterializedParameterScoreRequest",
     "OrderMLPLayout",
     "OrderMLPSpec",
+    "SoftplusBeta",
     "ParameterScoreRequest",
     "ParameterScoreProvider",
     "PathAggregation",

@@ -418,10 +418,7 @@ def _activation(name: str, *, seed: int, site: str, channels: int) -> Any:
     if name == "gelu":
         return {"_target_": "torch.nn.GELU", "approximate": "none"}
     if name == "softplus_beta2":
-        # No dev module implements the required all-range logaddexp formula.
-        raise UnsupportedActivationLabel(
-            "Softplus beta2 requires stable logaddexp(0, 2*z)/2; no admissible dev module"
-        )
+        return {"_target_": "tpen.nn.SoftplusBeta", "beta": 2.0}
     if name == "channel_mlp":
         tuple_axes_start = 3 if site == "producer" else 2
         return {
