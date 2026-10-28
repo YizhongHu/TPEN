@@ -1,4 +1,4 @@
-"""Tests for the single-cell Stage-Q mechanics launcher."""
+"""Tests for the single-cell optimizer-grid stage launcher (Stage Q and Stage O1)."""
 
 from __future__ import annotations
 
@@ -699,7 +699,7 @@ def test_cli_refuses_unsupported_walker_count(tmp_path: Path) -> None:
     )
     with pytest.raises(
         runner.StageQSelectionError,
-        match=r"unsupported Stage-Q walker count: 1000; stage 'Q' declares n_walkers=\(2048,\)",
+        match=r"unsupported stage walker count: 1000; stage 'Q' declares n_walkers=\(2048,\)",
     ):
         runner.execute(args)
 
@@ -751,7 +751,7 @@ def test_cli_uses_real_loader_mutation_for_admission_and_refusal(
     )
     with pytest.raises(
         runner.StageQSelectionError,
-        match=r"unsupported Stage-Q walker count: 2048; stage 'Q' declares n_walkers=\(1024,\)",
+        match=r"unsupported stage walker count: 2048; stage 'Q' declares n_walkers=\(1024,\)",
     ):
         runner.execute(refused)
 
@@ -2944,20 +2944,134 @@ def test_o1_execute_dry_run_reports_only_the_o1_universe(
     assert not list(tmp_path.rglob("selection_receipt.json"))
 
 
-@pytest.mark.parametrize("method", ["sr", "kfac", "spring", "linear_method"])
-def test_o1_refuses_every_unavailable_method(tmp_path: Path, method: str) -> None:
+def test_o1_unavailable_rows_are_materialized_and_observable(tmp_path: Path) -> None:
+    """Every non-admitted method's O1 rows exist with status unavailable."""
+
+    admitted = {entry.method for entry in runner._roster() if entry.admitted and entry.target}
     cells = _cells(tmp_path, "O1")
-    # The unavailable rows ARE materialized (observable), and selection still refuses them.
-    present = [
-        cell for cell in cells
-        if cell.manifest["scientific_identity"]["optimizer_cell"]["method"] == method
-    ]
-    assert present
-    assert {cell.manifest["scientific_identity"]["optimizer_cell"]["status"] for cell in present} == {
-        "unavailable"
-    }
+    for method in ("sr", "kfac", "spring", "linear_method"):
+        present = [
+            cell for cell in cells
+            if cell.manifest["scientific_identity"]["optimizer_cell"]["method"] == method
+        ]
+        assert len(present) == {"sr": 32, "kfac": 32, "spring": 32, "linear_method": 16}[method] * 2 * 8
+        expected = {"available"} if method in admitted else {"unavailable"}
+        assert {
+            cell.manifest["scientific_identity"]["optimizer_cell"]["status"] for cell in present
+        } == expected
+
+
+def _o1_cells_with(tmp_path: Path, adam: object) -> tuple[object, ...]:
+    availability = dict(optimizer_grid.roster_availability())
+    availability["adam"] = adam
+    return stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=availability, stages=("O1",)
+    )
+
+
+def test_o1_matched_but_unavailable_cell_is_refused_with_its_reason(tmp_path: Path) -> None:
+    """Status unavailable alone refuses, and the refusal carries the recorded reason."""
+
+    cells = _o1_cells_with(
+        tmp_path, stage.OptimizerCell("adam", "unavailable", "ADAM-SENTINEL-REASON")
+    )
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match=r"zero admitted.*declared but unavailable: ADAM-SENTINEL-REASON",
+    ):
+        runner.select_cell(cells, stage="O1", seed_label=820_001)
+
+
+def test_o1_available_status_without_roster_admission_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Roster non-admission alone refuses, even when the row says available."""
+
+    cells = _o1_cells_with(tmp_path, stage.OptimizerCell("adam", "available"))
+    original = runner._roster()
+    monkeypatch.setattr(
+        runner, "_roster", lambda: tuple(entry for entry in original if entry.method != "adam")
+    )
+    with pytest.raises(runner.StageQSelectionError, match="zero admitted.*declared but unavailable"):
+        runner.select_cell(cells, stage="O1", seed_label=820_001)
+
+
+def test_o1_and_q_selection_from_mixed_stage_input_respects_the_stage(tmp_path: Path) -> None:
+    """With every stage materialized together, the stage coordinate still selects."""
+
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=optimizer_grid.roster_availability()
+    )
+    assert {cell.manifest["stage"] for cell in cells} == {"Q", "O1"}
+    o1 = runner.select_cell(cells, stage="O1", seed_label=820_001)
+    assert o1.selected.stage == "O1"
+    assert o1.cell.manifest["payload"]["updates"] == 50_000
+    q = runner.select_cell(cells, stage="Q", seed_label=810_001)
+    assert q.selected.stage == "Q"
     with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
-        runner.select_cell(cells, stage="O1", optimizer=method, seed_label=820_001)
+        runner.select_cell(cells, stage="Q", seed_label=820_001)
+
+
+def test_o1_resolved_config_trains_with_the_dense_1k_checkpoint_callback(tmp_path: Path) -> None:
+    """The cadence that trains is the resolved callback, not only the packet field."""
+
+    selection = runner.select_cell(_cells(tmp_path, "O1"), stage="O1", seed_label=820_001)
+    _, resolved = runner._resolve_selected_config(selection)
+    checkpoints = [
+        callback for callback in resolved.callbacks
+        if callback.get("_target_") == "tpen.callback.Checkpoint"
+    ]
+    assert len(checkpoints) == 1
+    checkpoint = checkpoints[0]
+    assert checkpoint.schedule._target_ == "tpen.checkpoint.EveryNUpdates"
+    assert checkpoint.schedule.every_n == runner.CHECKPOINT_EVERY_N_UPDATES == 1_000
+    assert checkpoint.keep_last is None
+    assert checkpoint.payload._target_ == "tpen.checkpoint.TrainResume"
+    assert Path(checkpoint.output_dir) == selection.cell.output_path / "checkpoints"
+    assert resolved.trainer.max_steps % checkpoint.schedule.every_n == 0
+
+
+def test_o1_execute_launches_under_the_o1_path_with_the_o1_horizon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-dry O1 execute: receipt, guarded launch config and COMPLETE land under O1/<hash>."""
+
+    facts = {
+        "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
+        "node_rank": 0, "node_size": 1, "host": "o1-host", "pid": 1,
+        "device": "cuda:0", "job_id": "o1-job",
+        "device_identity": {"kind": "cuda", "index": 0, "uuid": "GPU-o1"},
+    }
+    monkeypatch.setattr(runner, "_execution_facts", lambda: dict(facts))
+    original = runner.launch.launch_train
+    observed: dict[str, object] = {}
+
+    def launch_wrapper(source: object, topology: object, **kwargs: object) -> int:
+        def recording_run_from_config(config: object, *, topology: object) -> int:
+            observed["max_steps"] = config.trainer.max_steps
+            observed["n_walkers"] = config.sampler.n_walkers
+            observed["run_dir"] = Path(config.run.dir)
+            output = Path(config.run.dir) / "resolved_config.yaml"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("stage: O1\n", encoding="utf-8")
+            return 0
+
+        monkeypatch.setattr(runner.launch, "run_from_config", recording_run_from_config)
+        return original(source, topology, runner=kwargs["runner"])
+
+    monkeypatch.setattr(runner.launch, "launch_train", launch_wrapper)
+    assert runner.execute(_args(tmp_path, stage="O1", seed_label=820_002, dry_run=False)) == 0
+    assert observed["max_steps"] == 50_000
+    assert observed["n_walkers"] == 4_096
+    run_dir = observed["run_dir"]
+    assert run_dir.parent == tmp_path.resolve() / "O1"
+    assert {path.name for path in run_dir.iterdir()} == {
+        "selection_receipt.json", "resolved_config.yaml", "COMPLETE"
+    }
+    receipt = json.loads((run_dir / "selection_receipt.json").read_text(encoding="utf-8"))
+    assert receipt["selection"]["selected"]["stage"] == "O1"
+    assert receipt["selection"]["selected"]["seed_label"] == 820_002
+    assert receipt["train_packet"]["content_hash"] == run_dir.name
 
 
 def test_o1_refuses_an_unadmitted_context(tmp_path: Path) -> None:

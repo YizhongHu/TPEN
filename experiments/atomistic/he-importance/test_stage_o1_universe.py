@@ -150,14 +150,40 @@ def _row_key(cell: Any) -> tuple[str, str, str, str, int, int]:
     )
 
 
-def _universe_mismatch(cells: Iterable[Any]) -> tuple[set, set, list]:
-    """Return (missing, extra, duplicated) O1 row keys against the design."""
+_IDENTITY_KEYS = frozenset({"context", "optimizer", "optimizer_cell"})
 
+
+def _shape_defects(cell: Any) -> list[str]:
+    """Report identity-bearing content outside the row key's coordinates.
+
+    The row key covers method, levels, context, seed and horizon. Anything else
+    in the identity, payload or topology would change the content hash without
+    changing the key, so it must be absent.
+    """
+
+    manifest = stage_coordinate._thaw(cell.manifest)
+    defects = []
+    if set(manifest["scientific_identity"]) != _IDENTITY_KEYS:
+        defects.append(f"identity keys {sorted(manifest['scientific_identity'])}")
+    if set(manifest["scientific_identity"]["context"]) != {"name", "overrides"}:
+        defects.append(f"context keys {sorted(manifest['scientific_identity']['context'])}")
+    if manifest["payload"] != {"updates": _O1_UPDATES, "configuration": {"updates": _O1_UPDATES}}:
+        defects.append(f"payload {manifest['payload']!r}")
+    if manifest["topology"] != {}:
+        defects.append(f"topology {manifest['topology']!r}")
+    return defects
+
+
+def _universe_mismatch(cells: Iterable[Any]) -> tuple[set, set, list, list]:
+    """Return (missing, extra, duplicated, shape defects) against the design."""
+
+    cells = tuple(cells)
     keys = [_row_key(cell) for cell in cells]
     expected = _design_o1_rows()
     actual = set(keys)
     duplicated = sorted({key for key in keys if keys.count(key) > 1}) if len(keys) != len(actual) else []
-    return expected - actual, actual - expected, duplicated
+    shape = sorted({defect for cell in cells for defect in _shape_defects(cell)})
+    return expected - actual, actual - expected, duplicated, shape
 
 
 def _availability() -> dict[str, Any]:
@@ -197,10 +223,11 @@ def test_design_tables_themselves_expand_to_the_declared_design_totals() -> None
 
 def test_c1_materialized_o1_universe_equals_the_design_grid(tmp_path: Path) -> None:
     cells = _materialize_o1(tmp_path)
-    missing, extra, duplicated = _universe_mismatch(cells)
+    missing, extra, duplicated, shape = _universe_mismatch(cells)
     assert not missing, f"{len(missing)} design O1 rows were not materialized"
     assert not extra, f"{len(extra)} materialized O1 rows are not in the design"
     assert not duplicated
+    assert not shape, shape
     assert len(cells) == 1_920
     assert {cell.manifest["stage"] for cell in cells} == {"O1"}
     assert len({cell.content_hash for cell in cells}) == 1_920
@@ -256,34 +283,94 @@ def _drop_one_o1_family(entries: list[Any]) -> None:
     ]
 
 
+def _append_duplicate_o1_entry(entries: list[Any]) -> None:
+    entries.append(copy.deepcopy(next(entry for entry in entries if entry["stage"] == "O1")))
+
+
+def _append_undesigned_adam_cell(entries: list[Any]) -> None:
+    entry = copy.deepcopy(
+        next(e for e in entries if e["stage"] == "O1" and e["optimizer"]["method"] == "adam")
+    )
+    entry["optimizer"]["levels"]["lr"] = 0.05
+    for configuration in entry["configurations"]:
+        configuration["scientific_identity"]["optimizer"]["levels"]["lr"] = 0.05
+    entries.append(entry)
+
+
+def _append_third_context(entries: list[Any]) -> None:
+    entry = next(e for e in entries if e["stage"] == "O1")
+    extra = copy.deepcopy(entry["configurations"][0])
+    extra["scientific_identity"]["context"] = {"name": "O-third", "overrides": {"input_features": "B10"}}
+    entry["configurations"].append(extra)
+
+
+def _add_identity_key_to_every_o1_row(entries: list[Any]) -> None:
+    for entry in entries:
+        if entry["stage"] == "O1":
+            for configuration in entry["configurations"]:
+                configuration["scientific_identity"]["architecture"] = "control"
+
+
+def _add_payload_key_to_every_o1_row(entries: list[Any]) -> None:
+    for entry in entries:
+        if entry["stage"] == "O1":
+            for configuration in entry["configurations"]:
+                configuration["payload"]["n_walkers"] = 2_048
+
+
 def _o1_entries_relabelled_as_q(entries: list[Any]) -> None:
     for entry in entries:
         if entry["stage"] == "O1" and entry["optimizer"]["method"] == "spring":
             entry["stage"] = "Q"
 
 
+# Each mutant names the mismatch component(s) it must light up, so a mutant
+# cannot pass merely because some unrelated component happened to be non-empty.
 @pytest.mark.parametrize(
-    "mutate",
+    ("mutate", "expected"),
     [
-        _drop_last_o1_entry,
-        _drop_one_o1_context,
-        _alter_one_o1_level,
-        _alter_one_o1_horizon,
-        _drop_one_o1_family,
-        _o1_entries_relabelled_as_q,
+        (_drop_last_o1_entry, {"missing"}),
+        (_drop_one_o1_context, {"missing"}),
+        (_alter_one_o1_level, {"missing", "extra"}),
+        (_drop_one_o1_family, {"missing"}),
+        (_o1_entries_relabelled_as_q, {"missing"}),
+        (_append_duplicate_o1_entry, {"duplicated"}),
+        (_append_undesigned_adam_cell, {"extra"}),
+        (_append_third_context, {"extra"}),
+        (_add_identity_key_to_every_o1_row, {"shape"}),
+        (_add_payload_key_to_every_o1_row, {"shape"}),
     ],
-    ids=lambda mutate: mutate.__name__,
+    ids=lambda value: value.__name__ if callable(value) else "-".join(sorted(value)),
 )
 def test_c1_control_universe_comparison_fails_on_each_mutant_inventory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutate: Any
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutate: Any, expected: set[str]
 ) -> None:
-    """The C1 comparison is red for a missing, extra, or altered O1 cell."""
+    """The C1 comparison is red for a missing, extra, duplicated or reshaped O1 cell."""
 
     entries = _committed_entries()
     mutate(entries)
     _with_inventory(monkeypatch, tmp_path / "mutant.json", entries)
-    missing, extra, duplicated = _universe_mismatch(_materialize_o1(tmp_path / "out"))
-    assert missing or extra or duplicated
+    missing, extra, duplicated, shape = _universe_mismatch(_materialize_o1(tmp_path / "out"))
+    lit = {
+        name
+        for name, value in (
+            ("missing", missing), ("extra", extra), ("duplicated", duplicated), ("shape", shape)
+        )
+        if value
+    }
+    assert lit == expected
+
+
+def test_c1_control_off_horizon_o1_row_is_refused_at_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An identity horizon that would not be the trained horizon never materializes."""
+
+    entries = _committed_entries()
+    _alter_one_o1_horizon(entries)
+    _with_inventory(monkeypatch, tmp_path / "mutant.json", entries)
+    with pytest.raises(stage_coordinate.MaterializationError, match="disagree with stage 'O1' horizon 50000"):
+        _materialize_o1(tmp_path / "out")
 
 
 def test_c1_control_universe_comparison_fails_on_a_truncated_seed_namespace(
@@ -296,7 +383,7 @@ def test_c1_control_universe_comparison_fails_on_a_truncated_seed_namespace(
         return labels[:-1] if stage == "O1" else labels
 
     monkeypatch.setattr(stage_coordinate, "seed_labels", truncated)
-    missing, extra, _ = _universe_mismatch(_materialize_o1(tmp_path))
+    missing, extra, _, _ = _universe_mismatch(_materialize_o1(tmp_path))
     assert missing and not extra
     assert {key[4] for key in missing} == {_O1_SEEDS[-1]}
 
@@ -307,7 +394,7 @@ def test_c1_control_unmutated_copy_of_the_inventory_stays_green(
     """Negative control for the mutants: the copy mechanism alone is not a mutation."""
 
     _with_inventory(monkeypatch, tmp_path / "copy.json", _committed_entries())
-    assert _universe_mismatch(_materialize_o1(tmp_path / "out")) == (set(), set(), [])
+    assert _universe_mismatch(_materialize_o1(tmp_path / "out")) == (set(), set(), [], [])
 
 
 # ---------------------------------------------------------------------------
@@ -372,36 +459,80 @@ def test_c2_control_q_identity_comparison_fails_on_a_perturbed_q_entry(
 # ---------------------------------------------------------------------------
 
 
-def test_c3_every_non_adam_o1_row_is_materialized_unavailable_with_the_roster_reason(
-    tmp_path: Path,
-) -> None:
-    # The live roster's verdicts, through the optimizer grid's roster adapter
-    # (no direct tpen import: see test_tpen_boundary.py's inventory).
-    roster = _availability()
-    cells = _materialize_o1(tmp_path)
-    by_status: dict[str, int] = {}
+class _Entry:
+    """A roster entry with the shape of ``tpen.hi_schema.MethodAvailability``."""
+
+    def __init__(self, method: str, admitted: bool, target: str | None, requires: str) -> None:
+        self.method = method
+        self.admitted = admitted
+        self.target = target
+        self.requires = requires
+
+
+# Known sentinel reasons, including the admitted-without-target case that must
+# never be materialized or counted as runnable.
+_INJECTED_ROSTER = (
+    _Entry("adam", True, "torch.optim.Adam", "admitted"),
+    _Entry("sr", False, None, "SR-SENTINEL"),
+    _Entry("kfac", True, None, "KFAC-SENTINEL"),
+    _Entry("spring", False, None, "SPRING-SENTINEL"),
+    _Entry("linear_method", False, None, "LM-SENTINEL"),
+)
+_INJECTED_EXPECTED = {
+    "adam": {"method": "adam", "status": "available"},
+    "sr": {"method": "sr", "status": "unavailable", "unavailable_reason": "SR-SENTINEL"},
+    "kfac": {
+        "method": "kfac",
+        "status": "unavailable",
+        "unavailable_reason": "admitted but has no constructor target; KFAC-SENTINEL",
+    },
+    "spring": {"method": "spring", "status": "unavailable", "unavailable_reason": "SPRING-SENTINEL"},
+    "linear_method": {
+        "method": "linear_method",
+        "status": "unavailable",
+        "unavailable_reason": "LM-SENTINEL",
+    },
+}
+
+
+def test_c3_injected_roster_reasons_reach_every_o1_row_verbatim(tmp_path: Path) -> None:
+    availability = optimizer_grid.roster_availability(_INJECTED_ROSTER)
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=availability, stages=("O1",)
+    )
+    per_method: dict[str, int] = {}
     for cell in cells:
         optimizer_cell = dict(cell.manifest["scientific_identity"]["optimizer_cell"])
         method = optimizer_cell["method"]
-        verdict = roster[method]
-        if verdict.status == "available":
-            assert optimizer_cell == {"method": method, "status": "available"}
-        else:
-            assert verdict.reason
-            assert optimizer_cell == {
-                "method": method,
-                "status": "unavailable",
-                "unavailable_reason": verdict.reason,
-            }
-        by_status[optimizer_cell["status"]] = by_status.get(optimizer_cell["status"], 0) + 1
+        assert optimizer_cell == _INJECTED_EXPECTED[method]
+        per_method[method] = per_method.get(method, 0) + 1
+    # Rows per method = design cells x 2 contexts x 8 seeds; nothing dropped.
+    assert per_method == {"adam": 128, "sr": 512, "kfac": 512, "spring": 512, "linear_method": 256}
 
+    report = optimizer_grid.stage_report("O1", roster=_INJECTED_ROSTER)
+    assert report["lineages"] == {
+        "contexts": 2,
+        "seeds_per_point": 8,
+        "declared": 1_920,
+        "runnable": 128,
+        "unavailable": 1_792,
+    }
+    assert report["families"]["kfac"]["runnable"] == 0
+    assert report["families"]["kfac"]["reason"] == _INJECTED_EXPECTED["kfac"]["unavailable_reason"]
+
+
+def test_c3_live_roster_report_agrees_with_materialized_statuses(tmp_path: Path) -> None:
+    """The live report's lineage counts are the materialized status counts."""
+
+    cells = _materialize_o1(tmp_path)
+    by_status: dict[str, int] = {}
+    for cell in cells:
+        status = cell.manifest["scientific_identity"]["optimizer_cell"]["status"]
+        by_status[status] = by_status.get(status, 0) + 1
     report = optimizer_grid.stage_report("O1")
     assert report["lineages"]["declared"] == len(cells) == 1_920
     assert report["lineages"]["runnable"] == by_status.get("available", 0)
     assert report["lineages"]["unavailable"] == by_status.get("unavailable", 0)
-    # Under the current roster Adam is the only admitted method.
-    assert {method for method, verdict in roster.items() if verdict.status == "available"} == {"adam"}
-    assert by_status == {"available": 128, "unavailable": 1_792}
 
 
 def test_c3_resolving_an_unavailable_o1_row_is_refused_not_rerouted(tmp_path: Path) -> None:
@@ -454,3 +585,18 @@ def test_c3_declared_and_undeclared_stages_partition_the_stage_authority() -> No
 def test_c3_control_partition_check_fails_on_a_broken_partition(declared: tuple[str, ...]) -> None:
     with pytest.raises(optimizer_grid.OptimizerGridError, match="partition the stage authority"):
         optimizer_grid._require_stage_partition(declared)
+
+
+@pytest.mark.parametrize("stages", [(), "O1", b"O1"], ids=["empty", "str", "bytes"])
+def test_stage_selection_must_be_a_non_empty_iterable_of_codes(tmp_path: Path, stages: Any) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match="stage"):
+        stage_coordinate.materialize_intended_configurations(
+            tmp_path, availability=_availability(), stages=stages
+        )
+
+
+def test_unknown_stage_selection_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(stage_coordinate.ManifestSchemaError, match="unknown HI stage"):
+        stage_coordinate.materialize_intended_configurations(
+            tmp_path, availability=_availability(), stages=("Z",)
+        )

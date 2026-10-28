@@ -208,7 +208,10 @@ def select_cell(
     }
     materialized = tuple(cells)
     descriptors = tuple(_descriptor(cell) for cell in materialized)
-    requested = [
+    # Match the requested coordinates first, then apply admission, so a
+    # matched-but-unavailable request is refused with its recorded reason
+    # rather than reading like a request for a cell that does not exist.
+    matched = [
         (cell, descriptor)
         for cell, descriptor in zip(materialized, descriptors)
         if descriptor.stage == stage
@@ -216,15 +219,35 @@ def select_cell(
         and descriptor.optimizer["method"] == optimizer
         and descriptor.optimizer["levels"].get("lr") == lr
         and descriptor.optimizer["levels"].get("beta2") == beta2
-        and descriptor.optimizer["method"] in admitted_methods
-        and descriptor.status == "available"
         and (seed_label is None or descriptor.seed_label == seed_label)
     ]
+    requested = [
+        (cell, descriptor)
+        for cell, descriptor in matched
+        if descriptor.optimizer["method"] in admitted_methods
+        and descriptor.status == "available"
+    ]
     if not requested:
+        detail = ""
+        if matched:
+            reasons = sorted(
+                {
+                    str(
+                        cell.manifest["scientific_identity"]["optimizer_cell"].get(
+                            "unavailable_reason", "method not admitted by HI_METHOD_ROSTER"
+                        )
+                    )
+                    for cell, _ in matched
+                }
+            )
+            detail = (
+                f"; {len(matched)} matching cell(s) are declared but unavailable: "
+                + " | ".join(reasons)
+            )
         raise StageQSelectionError(
             "selection matched zero admitted cells for "
             f"stage={stage!r}, context={context!r}, optimizer={optimizer!r}, "
-            f"lr={lr!r}, beta2={beta2!r}, seed_label={seed_label!r}"
+            f"lr={lr!r}, beta2={beta2!r}, seed_label={seed_label!r}" + detail
         )
     truthful: list[tuple[Any, CellDescriptor]] = []
     refusals: list[str] = []
@@ -1091,8 +1114,23 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
 def _training_packet(cell: Any) -> Any:
     """Build the one train packet for a selected cell at the stage horizon.
 
-    The dense cadence selects every :data:`CHECKPOINT_EVERY_N_UPDATES`
-    boundary through the stage authority's horizon (2 for Q, 50 for O1).
+    Parameters
+    ----------
+    cell
+        One materialized training row.
+
+    Returns
+    -------
+    TrainingPacket
+        The packet whose dense cadence selects every
+        :data:`CHECKPOINT_EVERY_N_UPDATES` boundary through the stage
+        authority's horizon (2 for Q, 50 for O1).
+
+    Raises
+    ------
+    StageQSelectionError
+        If the stage has no fixed horizon or packet construction does not
+        yield exactly one train packet.
     """
 
     definition = stage_coordinate.stage_definition(cell.manifest["stage"])
@@ -1228,6 +1266,25 @@ def _jsonable(value: Any) -> Any:
 
 
 def execute(args: argparse.Namespace) -> int:
+    """Select, resolve and (unless ``--dry-run``) launch one stage cell.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed :func:`build_parser` arguments.
+
+    Returns
+    -------
+    int
+        ``0`` for a dry run, otherwise the launcher's exit code.
+
+    Raises
+    ------
+    StageQSelectionError
+        If the stage has no declared universe, selection is not exactly one
+        truthful admitted cell, or the walker count is not declared.
+    """
+
     _require_executable_stage(args.stage)
     output_root = Path(args.output_root).expanduser().resolve()
     # Materialize only the requested stage so the selection receipt's discard

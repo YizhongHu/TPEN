@@ -384,8 +384,15 @@ def roster_availability(roster: Any = None) -> dict[str, "stage_coordinate.Optim
             raise OptimizerGridError(
                 f"family {family!r} has no HI_METHOD_ROSTER entry; a missing entry is never available"
             )
-        if entry.admitted:
+        # Same rule the runner and resolver apply: admitted AND constructible.
+        # An admitted entry with no target cannot be built, so it is never
+        # materialized or counted as runnable.
+        if entry.admitted and entry.target:
             resolved[family] = stage_coordinate.OptimizerCell(family, "available")
+        elif entry.admitted:
+            resolved[family] = stage_coordinate.OptimizerCell(
+                family, "unavailable", f"admitted but has no constructor target; {entry.requires}"
+            )
         else:
             resolved[family] = stage_coordinate.OptimizerCell(family, "unavailable", entry.requires)
     return resolved
@@ -398,8 +405,24 @@ def _require_stage_partition(
     """Require the declared and undeclared stage sets to partition the authority.
 
     The check means a stage added to the stage authority can never fall
-    silently into neither set, and no stage can be both. Returns the
-    authority's stage codes.
+    silently into neither set, and no stage can be both.
+
+    Parameters
+    ----------
+    declared
+        Stage codes with a declared optimizer-grid universe.
+    undeclared
+        Stage codes without one, mapped to their reasons.
+
+    Returns
+    -------
+    frozenset[str]
+        The stage authority's codes.
+
+    Raises
+    ------
+    OptimizerGridError
+        If the two sets overlap or their union is not the authority.
     """
 
     authority_codes = frozenset(definition.code for definition in stage_coordinate.STAGE_DEFINITIONS)
@@ -417,6 +440,17 @@ def _require_stage_partition(
 def undeclared_stage_reason(stage: str) -> str | None:
     """Return why ``stage`` has no declared universe, or ``None`` if it has one.
 
+    Parameters
+    ----------
+    stage
+        A stage-authority code.
+
+    Returns
+    -------
+    str or None
+        The recorded reason for an undeclared stage; ``None`` for a stage in
+        :data:`OPTIMIZER_GRID_STAGES`.
+
     Raises
     ------
     OptimizerGridError
@@ -430,7 +464,19 @@ def undeclared_stage_reason(stage: str) -> str | None:
 
 
 def _render_stage_entries(stage_code: str) -> list[dict[str, Any]]:
-    """Render one optimizer-grid stage's 120 entries x two contexts."""
+    """Render one optimizer-grid stage's 120 entries x two contexts.
+
+    Parameters
+    ----------
+    stage_code
+        A code in :data:`OPTIMIZER_GRID_STAGES`.
+
+    Returns
+    -------
+    list[dict]
+        One entry per declared cell, each carrying both contexts at the
+        stage authority's horizon.
+    """
 
     stage = stage_coordinate.stage_definition(stage_code)
     if stage.updates is None:
@@ -495,6 +541,18 @@ def stage_report(stage: str, *, roster: Any = None) -> dict[str, Any]:
     launch. ``declared``/``runnable``/``unavailable`` count optimizer cells;
     the ``lineages`` block multiplies each by the two contexts and the
     stage's seed labels, so an unavailable lineage is reported, not dropped.
+
+    Parameters
+    ----------
+    stage
+        A code in :data:`OPTIMIZER_GRID_STAGES`.
+    roster
+        Optional roster passed through to :func:`roster_availability`.
+
+    Returns
+    -------
+    dict
+        The stage report.
 
     Raises
     ------

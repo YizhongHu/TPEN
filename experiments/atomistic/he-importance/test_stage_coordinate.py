@@ -201,7 +201,7 @@ def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
         tmp_path / "base", availability=_available_roster_for(base)
     )
     head_cells = stage_coordinate.materialize_intended_configurations(
-        tmp_path / "head", availability=_complete_available_roster()
+        tmp_path / "head", availability=_complete_available_roster(), stages=("Q",)
     )
     assert _identity_pairs(base_cells, tmp_path / "base") == _identity_pairs(
         head_cells, tmp_path / "head"
@@ -230,7 +230,7 @@ def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
     mutated_path.write_text(json.dumps(mutated_inventory), encoding="utf-8")
     monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", mutated_path)
     mutated_head = stage_coordinate.materialize_intended_configurations(
-        tmp_path / "mutated-head", availability=_complete_available_roster()
+        tmp_path / "mutated-head", availability=_complete_available_roster(), stages=("Q",)
     )
     base_after_head_mutation = base.materialize_intended_configurations(
         tmp_path / "base-after-head-mutation", availability=_available_roster_for(base)
@@ -262,7 +262,7 @@ def test_inventory_and_every_q_override_match_exact_base_with_deliberate_red(
     stage_coordinate.canonical_json = perturb_encoding
     try:
         perturbed_cells = stage_coordinate.materialize_intended_configurations(
-            tmp_path / "perturbed", availability=_complete_available_roster()
+            tmp_path / "perturbed", availability=_complete_available_roster(), stages=("Q",)
         )
         perturbed_q = tuple(
             cell for cell in perturbed_cells if cell.manifest["stage"] == "Q"

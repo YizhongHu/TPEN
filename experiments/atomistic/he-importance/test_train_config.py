@@ -96,7 +96,7 @@ def _cell(
                     },
                     "optimizer": {"method": method, "levels": levels},
                 },
-                "payload": {"updates": 50_000},
+                "payload": {"updates": stage_coordinate.stage_definition(stage).updates},  # stage horizon
                 "topology": {},
             }
         ],
