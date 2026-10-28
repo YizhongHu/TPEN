@@ -39,7 +39,7 @@ scientific verdict by themselves; inspect `results.json` and the JUnit files.
 Important preflight codes are 60 (missing receipt), 61 (receipt identity
 mismatch), 70 (login host), 71 (PBS node mismatch), 72 (target SHA), 73
 (AppleDouble), 74/76 (venv interpreter), 75 (package versions), 77 (uv
-version), 78 (lock resolution), and 79 (ancestor/sync); driver failures use
+version), 78 (lock resolution), 79 (ancestor), and 80 (offline sync); driver failures use
 exit 1. The driver writes
 `preflight.json`, `driver-preflight.json`, and mirrored stdout/stderr under the
 per-job evidence directory. `results.json` plus its JUnit files are the verdict

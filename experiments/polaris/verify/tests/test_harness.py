@@ -44,11 +44,12 @@ def test_valid_arm_and_override_control() -> None:
 
 def test_literal_env_round_trip_and_single_manifest_source() -> None:
     with tempfile.TemporaryDirectory() as raw:
-        manifest = Path(raw) / "manifest with $X.json"
+        manifest = Path(raw) / "manifest with 'quote' $X.json"
         env = Path(raw) / "run.env"
         manifest.write_text(json.dumps({"literal": "$X `quoted`"}))
-        stage._write_literal_env(env, manifest, "/facility/python")
+        stage._write_literal_env(env, manifest, "/facility/python", Path(raw) / "job's helper.py")
         assert str(manifest) in env.read_text()
+        assert job._read_env(env) == {"RUN_MANIFEST": str(manifest), "RUN_PYTHON": "/facility/python", "RUN_JOB_PY": str(Path(raw) / "job's helper.py")}
         assert "EXPECTED_HEAD" not in (ROOT / "job.pbs").read_text()
 
 
@@ -137,6 +138,8 @@ def test_stored_job_has_bash_and_manifest_boundary() -> None:
     assert "RUN_ENV_PATH" in job
     assert "source \"$RUN_ENV_PATH\"" in job
     assert 'exec "$RUN_PYTHON"' in job
+    assert '"$RUN_JOB_PY"' in job
+    assert "$0" not in job and "dirname" not in job and "BASH_SOURCE" not in job
     assert "qsub" not in job
 
 
@@ -150,6 +153,19 @@ def test_static_defect_scanners_have_positive_and_failing_controls() -> None:
     assert "#!/bin/sh" in planted
     assert "LD_LIBRARY_PATH" in planted
     assert "<<" in planted
+    planted_job = job + '\nexec "$RUN_PYTHON" "$(dirname "$0")/job.py"\n'
+    assert "$0" in planted_job and "dirname" in planted_job
+
+
+def test_cell_id_is_one_safe_path_component() -> None:
+    assert stage.validate_cell_id("verify-20261028T190602Z")
+    for bad in ("../x", "a/b", ".", ".."):
+        try:
+            stage.validate_cell_id(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted unsafe cell id: {bad}")
 
 
 def test_host_and_receipt_controls() -> None:

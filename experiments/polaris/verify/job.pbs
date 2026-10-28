@@ -6,4 +6,4 @@ set -euo pipefail
 : "${RUN_ENV_PATH:?RUN_ENV_PATH is required}"
 test -f "$RUN_ENV_PATH"
 source "$RUN_ENV_PATH"
-exec "$RUN_PYTHON" "$(dirname "$0")/job.py" "$RUN_ENV_PATH"
+exec "$RUN_PYTHON" "$RUN_JOB_PY" "$RUN_ENV_PATH"

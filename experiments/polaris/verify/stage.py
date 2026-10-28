@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
+CELL_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 VERIFY_DIR = Path(__file__).resolve().parent
 
 
@@ -69,9 +70,17 @@ def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     ).returncode == 0
 
 
-def _write_literal_env(path: Path, manifest: Path, facility_python: str) -> None:
-    """Write only the manifest pointer; shared values remain in JSON."""
-    path.write_text("RUN_MANIFEST=" + shlex.quote(str(manifest)) + "\nRUN_PYTHON=" + shlex.quote(facility_python) + "\n", encoding="utf-8")
+def _write_literal_env(path: Path, manifest: Path, facility_python: str, job_helper: Path | None = None) -> None:
+    """Write literal paths for the manifest, Python, and stored job helper."""
+    helper = job_helper or manifest.parent / "job.py"
+    path.write_text("RUN_MANIFEST=" + shlex.quote(str(manifest)) + "\nRUN_PYTHON=" + shlex.quote(facility_python) + "\nRUN_JOB_PY=" + shlex.quote(str(helper)) + "\n", encoding="utf-8")
+
+
+def validate_cell_id(cell_id: str) -> str:
+    """Validate the cell directory name used below the evidence root."""
+    if not CELL_ID.fullmatch(cell_id) or cell_id in {".", ".."}:
+        raise ValueError("cell-id must be one safe path component")
+    return cell_id
 
 
 def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, harness_dir: Path) -> dict:
@@ -115,23 +124,25 @@ def stage(args: argparse.Namespace) -> int:
     args : argparse.Namespace
         Parsed target, selection, evidence, and provenance arguments.
     """
+    validate_cell_id(args.cell_id)
     harness_repo = _harness_repo()
     if _git(harness_repo, "status", "--porcelain"):
         raise RuntimeError("harness checkout has tracked changes; refuse staging")
     evidence_root = Path(args.evidence_root).expanduser().resolve()
     run_root = evidence_root / args.cell_id
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    initial_qstat = subprocess.run(["qstat", "-u", os.environ.get("USER", "")], check=True, text=True, capture_output=True)
+    initial_qstat_output = (initial_qstat.stdout + initial_qstat.stderr).strip()
+    initial_qstat_receipt = evidence_root / f"{args.cell_id}.pre-submit-qstat.txt"
+    initial_qstat_receipt.write_text(initial_qstat_output + ("\n" if initial_qstat_output else ""), encoding="utf-8")
+    if initial_qstat_output:
+        print(initial_qstat_output, file=sys.stderr)
+        raise RuntimeError("refusing staging while the user has a queued or running job")
     if run_root.exists():
         raise RuntimeError(f"run root already exists: {run_root}")
     run_root.mkdir(parents=True)
     for name in ("evidence", "pbs", "harness"):
         (run_root / name).mkdir()
-    qstat_path = run_root / "pre-submit-qstat.txt"
-    qstat = subprocess.run(["qstat", "-u", os.environ.get("USER", "")], check=True, text=True, capture_output=True)
-    qstat_output = (qstat.stdout + qstat.stderr).strip()
-    qstat_path.write_text(qstat_output + ("\n" if qstat_output else ""), encoding="utf-8")
-    if qstat_output:
-        print(qstat_output, file=sys.stderr)
-        raise RuntimeError("refusing qsub while the user has a queued or running job")
     harness_dir = run_root / "harness"
     for name in ("facility_profile.json", "job.pbs", "job.py", "driver.py"):
         shutil.copy2(VERIFY_DIR / name, harness_dir / name)
@@ -168,12 +179,18 @@ def stage(args: argparse.Namespace) -> int:
     manifest_path = run_root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     env_path = run_root / "run.env"
-    _write_literal_env(env_path, manifest_path, profile["facility_python"])
+    _write_literal_env(env_path, manifest_path, profile["facility_python"], harness_dir / "job.py")
     receipt = {"target_sha": args.target_sha, "cache_dir": manifest["cache_dir"], "manifest": str(manifest_path), "offline_dry_log": str(dry_log), "facility_python": profile["facility_python"]}
     Path(manifest["staging_receipt"]).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     for path in (manifest["evidence_dir"], manifest["pbs_dir"], manifest["cache_dir"], manifest["prime_env"], manifest["staging_receipt"]):
         if not Path(path).exists():
             raise RuntimeError(f"staging path missing: {path}")
+    final_qstat = subprocess.run(["qstat", "-u", os.environ.get("USER", "")], check=True, text=True, capture_output=True)
+    final_qstat_output = (final_qstat.stdout + final_qstat.stderr).strip()
+    (run_root / "pre-submit-qstat.txt").write_text(final_qstat_output + ("\n" if final_qstat_output else ""), encoding="utf-8")
+    if final_qstat_output:
+        print(final_qstat_output, file=sys.stderr)
+        raise RuntimeError("refusing qsub because another job appeared during staging")
     qsub = ["qsub", "-A", profile["pbs"]["account"], "-q", profile["pbs"]["queue"], "-l", f"select={profile['pbs']['select']},walltime={profile['pbs']['walltime']},filesystems={profile['pbs']['filesystems']}", "-k", "doe", "-o", str(manifest["pbs_dir"]) + "/", "-e", str(manifest["pbs_dir"]) + "/", "-v", f"RUN_ENV_PATH={env_path}", str(harness_dir / "job.pbs")]
     print("SUBMIT " + shlex.join(qsub), flush=True)
     job_id = _run(qsub, capture=True)

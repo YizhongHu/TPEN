@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tomllib
+import shlex
 
 
 def expected_versions(lock: dict) -> dict[str, str]:
@@ -43,7 +44,10 @@ def _read_env(path: Path) -> dict[str, str]:
     values = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         key, value = line.split("=", 1)
-        values[key] = value.strip("'")
+        parsed = shlex.split(value, posix=True)
+        if len(parsed) != 1:
+            raise ValueError(f"run.env value is not one literal token: {key}")
+        values[key] = parsed[0]
     return values
 
 
@@ -169,8 +173,8 @@ def main() -> int:
     try:
         subprocess.run(uv + ["sync", "--offline", "--extra", "cpu", "--locked", "--project", str(repo)], env=env, check=True)
     except subprocess.CalledProcessError as exc:
-        _record(preflight, checks, "offline_sync", 0, exc.returncode, False, 79)
-        return 79
+        _record(preflight, checks, "offline_sync", 0, exc.returncode, False, 80)
+        return 80
     python = job_env / "bin" / "python"
     if not _record(preflight, checks, "venv_python_exists", str(python), str(python) if python.is_file() else None, python.is_file(), 74):
         return 74
