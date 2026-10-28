@@ -446,7 +446,11 @@ def test_c2_control_q_identity_comparison_fails_on_a_perturbed_q_entry(
     base_entries = json.loads(_base_inventory_text())
     perturbed = copy.deepcopy(_committed_entries())
     q_entry = next(entry for entry in perturbed if entry["stage"] == "Q")
-    q_entry["configurations"][0]["payload"]["updates"] = 2_001
+    # Perturb a level, not the horizon: an off-horizon row is refused at
+    # materialization before any identity comparison could run.
+    q_entry["optimizer"]["levels"]["lr"] = 0.0006
+    for configuration in q_entry["configurations"]:
+        configuration["scientific_identity"]["optimizer"]["levels"]["lr"] = 0.0006
 
     root = tmp_path / "root"
     base_ids = _q_identities(monkeypatch, tmp_path / "base.json", base_entries, root)
