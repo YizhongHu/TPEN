@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import getpass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,6 +31,156 @@ def _run(args: list[str], cwd: Path | None = None, *, capture: bool = False, env
 
 def _git(repo: Path, *args: str) -> str:
     return _run(["git", "-C", str(repo), *args], capture=True)
+
+
+_LIMIT = re.compile(r"^\s*([A-Za-z0-9_.]+)\s*=\s*((?:\[[^\[\]]*\])(?:\s*,\s*\[[^\[\]]*\])*)\s*$")
+_LIMIT_GROUP = re.compile(r"\[([^\[\]]*)\]")
+_LIMIT_ENTRY = re.compile(r"([ugpo]):([^=,\s]+)=(\d+)")
+
+
+def _join_qstat_lines(raw: str) -> list[str]:
+    """Join PBS tab-indented continuation lines before parsing attributes."""
+    lines: list[str] = []
+    for line in raw.splitlines():
+        if line.startswith("\t") and lines:
+            lines[-1] += line.strip()
+        else:
+            lines.append(line)
+    return lines
+
+
+def _queue_limits(raw: str) -> tuple[bool, dict[str, list[tuple[str, str, int]]], str]:
+    """Parse every bracketed PBS limit and reject malformed queue metadata."""
+    limits: dict[str, list[tuple[str, str, int]]] = {}
+    saw_queue = False
+    for line in _join_qstat_lines(raw):
+        if line.strip().startswith("Queue:"):
+            saw_queue = True
+        if "= [" in line and not _LIMIT.match(line):
+            return False, limits, "unterminated or malformed bracketed PBS limit"
+        match = _LIMIT.match(line)
+        if not match:
+            continue
+        groups = _LIMIT_GROUP.findall(match.group(2))
+        if not groups or "," in groups[0]:
+            return False, limits, "malformed bracketed PBS limit"
+        entries: list[tuple[str, str, int]] = []
+        for group in groups:
+            entry = _LIMIT_ENTRY.fullmatch(group.strip())
+            if entry is None:
+                return False, limits, "malformed bracketed PBS limit"
+            entries.append((entry.group(1), entry.group(2), int(entry.group(3))))
+        limits.setdefault(match.group(1), []).extend(entries)
+    if not saw_queue or not limits:
+        return False, limits, "unparseable qstat -Qf output"
+    return True, limits, "parsed qstat -Qf output"
+
+
+def _queue_jobs(raw: str, user: str) -> list[dict[str, str]]:
+    """Parse plain full qstat records, retaining records owned by ``user``."""
+    jobs: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+
+    def flush() -> None:
+        if current.get("user") == user and all(key in current for key in ("job_id", "state", "queue")):
+            jobs.append({key: current[key] for key in ("job_id", "state", "queue")})
+
+    for line in raw.splitlines():
+        if line.startswith("Job Id:"):
+            flush()
+            current = {"job_id": line.split(":", 1)[1].strip()}
+            continue
+        match = re.match(r"\s*Job_Owner\s*=\s*([^@\s]+)", line)
+        if match:
+            current["user"] = match.group(1)
+        match = re.match(r"\s*job_state\s*=\s*(\S+)", line)
+        if match:
+            current["state"] = match.group(1)
+        match = re.match(r"\s*queue\s*=\s*(\S+)", line)
+        if match:
+            current["queue"] = match.group(1)
+    flush()
+    return jobs
+
+
+def _queue_table_rows(raw: str) -> int:
+    """Count data rows in qstat's alternate user table."""
+    return sum(bool(re.match(r"^\s*\d+\S*\s+\S+\s+\S+\s+", line)) for line in raw.splitlines())
+
+
+def _queue_gate(queue: str, user: str, output_dir: Path, prefix: str) -> bool:
+    """Apply the live queue-aware PBS admission rule and save raw evidence."""
+    limits_result = subprocess.run(["qstat", "-Qf", queue], check=False, text=True, capture_output=True)
+    jobs_result = subprocess.run(["qstat", "-f"], check=False, text=True, capture_output=True)
+    table_result = subprocess.run(["qstat", "-u", user], check=False, text=True, capture_output=True)
+    limits_raw = limits_result.stdout + limits_result.stderr
+    jobs_raw = jobs_result.stdout + jobs_result.stderr
+    table_raw = table_result.stdout + table_result.stderr
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / f"{prefix}-qstat-Qf.txt").write_text(limits_raw, encoding="utf-8")
+    jobs_path = output_dir / f"{prefix}-qstat-f.txt.gz"
+    with gzip.open(jobs_path, "wt", encoding="utf-8") as stream:
+        stream.write(jobs_raw)
+    (output_dir / f"{prefix}-qstat-u.txt").write_text(table_raw, encoding="utf-8")
+    parseable, limits, reason = _queue_limits(limits_raw)
+    all_user_jobs = _queue_jobs(jobs_raw, user)
+    jobs = [job for job in all_user_jobs if job["queue"] == queue]
+    full_records = sum(line.startswith("Job Id:") for line in jobs_raw.splitlines())
+    table_rows = _queue_table_rows(table_raw)
+    allowed = (parseable and jobs_result.returncode == 0 and table_result.returncode == 0
+               and limits_result.returncode == 0 and bool(jobs_raw.strip()) == bool(full_records)
+               and len(all_user_jobs) >= table_rows)
+    refusal = ""
+    if jobs_raw.strip() and not full_records:
+        refusal = "refused: non-empty qstat -f has no parseable Job Id records"
+    elif len(all_user_jobs) < table_rows:
+        refusal = f"refused: qstat -f records {len(all_user_jobs)} jobs but qstat -u lists {table_rows}"
+    if allowed:
+        for attribute, entries in limits.items():
+            if attribute == "max_run" or attribute.startswith("max_run_res."):
+                continue
+            if any(prefix_kind in {"g", "p"} for prefix_kind, _, _ in entries):
+                allowed = False
+                refusal = f"refused: unsupported scoped PBS limit {attribute}"
+                break
+            applicable = [(prefix_kind, limit_class, threshold) for prefix_kind, limit_class, threshold in entries
+                          if prefix_kind == "u" and limit_class in {user, "PBS_GENERIC"}]
+            chosen = [entry for entry in applicable if entry[1] == user] or [entry for entry in applicable if entry[1] == "PBS_GENERIC"]
+            if not chosen:
+                continue
+            for prefix_kind, _limit_class, threshold in chosen:
+                if attribute not in {"queued_jobs_threshold", "max_queued"}:
+                    allowed = False
+                    refusal = f"refused: unknown PBS limit {attribute} ({prefix_kind}:*)"
+                    break
+                if attribute == "queued_jobs_threshold":
+                    count = sum(job["state"] in {"Q", "H"} for job in jobs)
+                else:
+                    count = sum(job["state"] in {"Q", "H", "R", "E", "W", "T", "B"} for job in jobs)
+                if count >= threshold:
+                    allowed = False
+                    refusal = f"refused: {count} jobs reaches {attribute}={threshold}"
+                    break
+            if not allowed:
+                break
+    if not parseable:
+        allowed = False
+    if limits_result.returncode != 0 or jobs_result.returncode != 0 or table_result.returncode != 0:
+        allowed = False
+        refusal = "refused: qstat command failed"
+    if allowed:
+        reason = "allowed: live PBS limits admit this user in this queue"
+    elif refusal:
+        reason = refusal
+    decision = {"queue": queue, "user": user, "limits": limits, "jobs": jobs,
+                "qstat_table_rows": table_rows, "qstat_full_records": full_records,
+                "qstat_full_sha256": hashlib.sha256(jobs_raw.encode()).hexdigest(),
+                "qstat_full_bytes": len(jobs_raw.encode()), "qstat_full_storage": str(jobs_path),
+                "allowed": allowed, "reason": reason}
+    (output_dir / f"{prefix}-qstat-decision.json").write_text(json.dumps(decision, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if not allowed:
+        print(limits_raw + jobs_raw, file=sys.stderr)
+    return allowed
 
 
 def _safe_arg(value: str, name: str) -> str:
@@ -156,13 +308,9 @@ def stage(args: argparse.Namespace) -> int:
     evidence_root = Path(args.evidence_root).expanduser().resolve()
     run_root = evidence_root / args.cell_id
     evidence_root.mkdir(parents=True, exist_ok=True)
-    initial_qstat = subprocess.run(["qstat", "-u", getpass.getuser()], check=True, text=True, capture_output=True)
-    initial_qstat_output = (initial_qstat.stdout + initial_qstat.stderr).strip()
-    initial_qstat_receipt = evidence_root / f"{args.cell_id}.pre-submit-qstat.txt"
-    initial_qstat_receipt.write_text(initial_qstat_output + ("\n" if initial_qstat_output else ""), encoding="utf-8")
-    if initial_qstat_output:
-        print(initial_qstat_output, file=sys.stderr)
-        raise RuntimeError("refusing staging while the user has a queued or running job")
+    profile = read_profile(VERIFY_DIR / "facility_profile.json")
+    if not _queue_gate(profile["pbs"]["queue"], getpass.getuser(), evidence_root, f"{args.cell_id}.pre-submit"):
+        raise RuntimeError("refusing staging because the live PBS queue limit is reached or unreadable")
     if run_root.exists():
         raise RuntimeError(f"run root already exists: {run_root}")
     run_root.mkdir(parents=True)
@@ -184,7 +332,6 @@ def stage(args: argparse.Namespace) -> int:
     for ancestor in args.required_ancestor:
         if not is_ancestor(target_repo, ancestor, args.target_sha):
             raise RuntimeError(f"required ancestor is not an ancestor of target: {ancestor}")
-    profile = read_profile(VERIFY_DIR / "facility_profile.json")
     uv = [profile["facility_python"], "-m", "uv"]
     uv_version = _run(uv + ["--version"], capture=True)
     if uv_version.split()[:2] != ["uv", profile["uv_version"]]:
@@ -203,12 +350,8 @@ def stage(args: argparse.Namespace) -> int:
     for path in (manifest["evidence_dir"], manifest["pbs_dir"], manifest["cache_dir"], manifest["prime_env"], manifest["dry_env"], manifest["staging_receipt"]):
         if not Path(path).exists():
             raise RuntimeError(f"staging path missing: {path}")
-    final_qstat = subprocess.run(["qstat", "-u", getpass.getuser()], check=True, text=True, capture_output=True)
-    final_qstat_output = (final_qstat.stdout + final_qstat.stderr).strip()
-    (run_root / "pre-submit-qstat.txt").write_text(final_qstat_output + ("\n" if final_qstat_output else ""), encoding="utf-8")
-    if final_qstat_output:
-        print(final_qstat_output, file=sys.stderr)
-        raise RuntimeError("refusing qsub because another job appeared during staging")
+    if not _queue_gate(profile["pbs"]["queue"], getpass.getuser(), run_root, "pre-submit"):
+        raise RuntimeError("refusing qsub because the live PBS queue limit is reached or unreadable")
     qsub = ["qsub", "-A", profile["pbs"]["account"], "-q", profile["pbs"]["queue"], "-l", f"select={profile['pbs']['select']}", "-l", f"walltime={profile['pbs']['walltime']}", "-l", f"filesystems={profile['pbs']['filesystems']}", "-o", str(manifest["pbs_dir"]) + "/", "-e", str(manifest["pbs_dir"]) + "/", "-v", f"RUN_ENV_PATH={env_path}", str(paths["job_script"])]
     print("SUBMIT " + shlex.join(qsub), flush=True)
     job_id = _run(qsub, capture=True)

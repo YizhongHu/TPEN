@@ -17,11 +17,23 @@ versioned `facility_profile.json` (do not duplicate that path here):
   --remote <git-remote>
 ```
 
-Run this from a clean git clone of the harness. The stage refuses any listed
-job from `qstat -u <operator>` before doing work and checks again immediately
-before `qsub`; all lanes share the user and debug slot, so an occupied queue
-must be allowed to drain. Use a new cell id when a run root already exists;
-never delete evidence.
+Run this from a clean git clone of the harness. Before work and again
+immediately before `qsub`, stage reads the target queue's live `qstat -Qf`
+limits and full queue/job/state records from plain `qstat -f`, cross-checked
+against the user's alternate `qstat -u` table. Limits are read
+live and never hard-coded (measured on Polaris 2026-10-28). A per-user
+`queued_jobs_threshold` counts only `Q`/`H`; a per-user `max_queued` counts
+`Q`, `H`, `R`, `E`, `W`, `T`, and `B`. `max_run` and `max_run_res.*` never
+refuse because PBS serializes running jobs, and overall (`o:`) limits never
+refuse. Any unknown per-user/group/project limit, malformed output, or failed
+qstat fails closed. A queue with no bracketed limit is unparseable and is
+refused. Full queue names are required; truncated names do not count. The
+full qstat text is gzip-compressed with its byte count and SHA-256 recorded;
+the alternate table and admission decision are saved at each
+gate. If refused, watch the queued job in that queue for `Q` to `R` (the slot
+opens at start, not finish), then rerun stage once with a new cell id. Never
+loop, use `qdel`, or use `qhold`; never delete evidence. Use a new cell id when
+a run root already exists.
 
 Staging performs the full clone, all-ref fetch, AppleDouble scan, facility-uv
 cache prime, same-binary offline locked resolve, manifest serialization, and
