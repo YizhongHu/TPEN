@@ -6,7 +6,6 @@ import argparse
 import json
 from pathlib import Path
 import math
-import os
 import tempfile
 
 
@@ -96,20 +95,21 @@ def qualify(manifest_path: Path, evidence: Path, *, artifact_root: Path | None =
     tensor_files = [path for path in root.rglob("*.json") if path.name in {"final-tensors.json", "tensors.json"}]
     finite = all(_numbers_finite(_json(path)) for path in tensor_files) if tensor_files else _torch_tensors_finite(root)
     predicates.append(_predicate("final_tensors_finite", True, finite, "PASS" if finite else "FAIL"))
-    owners = sorted({str(path.parent) for path in selection + resolved})
-    predicates.append(_predicate("artifact_owners", "selection and resolved owners recorded", owners, "PASS" if owners else "FAIL"))
-    resolved_identity = {"context": cell["context"], "walkers": cell["walkers"]}
+    owner_record = {"selection": str(selection[0].parent) if selection else None, "resolved": str(resolved[0].parent) if resolved else None}
+    predicates.append(_predicate("artifact_owners", "selection and resolved owners recorded", owner_record, "PASS" if all(owner_record.values()) else "FAIL"))
+    resolved_identity: dict[str, object] = {}
     if selection:
         try:
             selected = _json(selection[0]).get("selection", {}).get("selected", {})
-            resolved_identity = {"context": selected.get("context", cell["context"]), "walkers": cell["walkers"]}
-        except (AttributeError, OSError, json.JSONDecodeError):
+            report = _json(selection[0])
+            resolved_identity = {"context": selected["context"], "walkers": report["walkers"]}
+        except (AttributeError, KeyError, OSError, json.JSONDecodeError):
             pass
     predicates.append(_predicate("resolved_cell_identity", {"context": cell["context"], "walkers": cell["walkers"]}, resolved_identity, "PASS" if resolved_identity == {"context": cell["context"], "walkers": cell["walkers"]} else "FAIL"))
     if not checkpoint_manifests or not trainer_states:
         predicates.append(_predicate("artifact_counters", True, False, "UNMEASURED"))
     status = "PASS" if all(row["status"] == "PASS" for row in predicates) else ("UNMEASURED" if any(row["status"] == "UNMEASURED" for row in predicates) else "FAIL")
-    verdict = {"schema": 1, "runtime_kind": manifest["runtime_kind"], "status": status, "exit_code": 0 if status == "PASS" else 2, "manifest": str(manifest_path), "predicates": predicates, "artifact_root": str(root)}
+    verdict = {"schema": 1, "runtime_kind": manifest["runtime_kind"], "status": status, "exit_code": 0 if status == "PASS" else (2 if status == "UNMEASURED" else 1), "manifest": str(manifest_path), "predicates": predicates, "artifact_root": str(root), "artifact_owners": owner_record}
     evidence.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", dir=evidence, prefix="qualification.", suffix=".tmp", delete=False, encoding="utf-8") as stream:
         json.dump(verdict, stream, indent=2, sort_keys=True); stream.write("\n"); temporary = Path(stream.name)
