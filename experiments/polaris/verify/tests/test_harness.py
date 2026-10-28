@@ -281,7 +281,8 @@ def test_job_main_uses_one_injected_observation_path(monkeypatch, tmp_path) -> N
         monkeypatch.setattr(job, "receipt_code", lambda manifest, path: 0)
 
     monkeypatch.setattr(sys, "argv", ["job.py", str(env)])
-    for name, code in (("receipt_code", 60), ("receipt_code", 61), ("_hostname", 70), ("_nodefile_entries", 71), ("_git_head", 72), ("_appledoubles", 73), ("python", 74), ("_package_versions", 75), ("identity", 76), ("_uv_version", 77), ("expected_versions", 78), ("_offline_sync", 80), ("ancestor", 79), ("copied", 81)):
+    for name, code in (("receipt_code", 60), ("receipt_code", 61), ("_hostname", 70), ("_nodefile_entries", 71), ("ancestor", 79), ("_git_head", 72), ("_appledoubles", 73), ("expected_versions", 78), ("_uv_version", 77), ("_offline_sync", 80), ("python", 74), ("identity", 76), ("_package_versions", 75), ("copied", 81)):
+        # Reset setup before each arm; this also undoes monkeypatches made before the loop.
         monkeypatch.undo()
         monkeypatch.setenv("RUN_ENV_PATH", str(env)); monkeypatch.setenv("PBS_JOBID", "123"); monkeypatch.setenv("PBS_NODEFILE", str(nodefile)); monkeypatch.setattr(sys, "argv", ["job.py", str(env)])
         configure()

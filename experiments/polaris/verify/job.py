@@ -79,14 +79,14 @@ def preflight_decision(*, receipt_status: int | None = None, login_host: bool | 
         return 81
     if receipt_status:
         return receipt_status
-    if login_host is True:
+    if login_host:
         return 70
     if node_match is False:
         return 71
-    if head_ok is False:
-        return 72
     if ancestor_ok is False:
         return 79
+    if head_ok is False:
+        return 72
     if apple_double_count not in (None, 0):
         return 73
     if lock_ok is False:
