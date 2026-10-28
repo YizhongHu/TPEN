@@ -5,8 +5,14 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
+
+import torch
+from omegaconf import OmegaConf
+from tpen.checkpoint.save import save_checkpoint
 
 
 ROOT = Path(__file__).parents[1]
@@ -52,26 +58,42 @@ def test_job_script_has_literal_manifest_boundary_and_no_uv() -> None:
 
 def test_verifier_writes_pass_and_copy_controls_fail(tmp_path: Path) -> None:
     output = tmp_path / "output" / "owner"
-    step = output / "checkpoints" / "step_002000"
-    step.mkdir(parents=True)
-    (step / "COMPLETE").write_text("ok\n")
-    (output / "selection_receipt.json").write_text("{}\n")
+    output.mkdir(parents=True)
+    model = torch.nn.Linear(2, 1)
+    context = SimpleNamespace(
+        cfg=OmegaConf.create({}), run_dir=output,
+        metadata=SimpleNamespace(dtype="float32", device="cpu", run_id="fixture", run_name="fixture", extra={}, git_commit=None, git_branch=None, dirty_worktree=False, command=None),
+    )
+    trainer = SimpleNamespace(state_dict=lambda: {"completed_updates": 1000, "next_iteration": 1000})
+    save_checkpoint(output_dir=output / "checkpoints", next_iteration=1000, completed_updates=1000, model=model, context=context, trainer=trainer, save_optimizer=False, save_sampler=False, save_rng=False, save_trainer=True)
+    trainer.state_dict = lambda: {"completed_updates": 2000, "next_iteration": 2000}
+    save_checkpoint(output_dir=output / "checkpoints", next_iteration=2000, completed_updates=2000, model=model, context=context, trainer=trainer, save_optimizer=False, save_sampler=False, save_rng=False, save_trainer=True)
+    (output / "selection_receipt.json").write_text(json.dumps({"selection": {"selected": {"context": "O-composite"}}}) + "\n")
     (output / "resolved_config.yaml").write_text("context: O-composite\n")
-    (output / "checkpoint-manifest.json").write_text(json.dumps({"completed_updates": 2000}) + "\n")
-    (output / "trainer.json").write_text(json.dumps({"completed_updates": 2000, "next_iteration": 2000}) + "\n")
-    (output / "final-tensors.json").write_text(json.dumps({"weight": [1.0, 2.0]}) + "\n")
     (output / "COMPLETE").write_text("completed\n")
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"runtime_kind": stage.RUNTIME_KIND, "cell": {"context": "O-composite", "walkers": 2048, "updates": 2000, "checkpoint_every": 1000}, "output_root": str(tmp_path / "output"), "evidence_dir": str(tmp_path / "evidence")}) + "\n")
-    assert qualification.qualify(manifest, tmp_path / "evidence") == 2
-    verdict = json.loads((tmp_path / "evidence" / "qualification.json").read_text())
-    assert verdict["status"] in {"FAIL", "UNMEASURED"}
-
-    # The fixture deliberately omits step_001000, so a zero-success shortcut
-    # cannot accidentally become a qualification PASS.
-    (output / "checkpoints" / "step_001000").mkdir()
-    (output / "checkpoints" / "step_001000" / "COMPLETE").write_text("ok\n")
     assert qualification.qualify(manifest, tmp_path / "evidence") == 0
+
+    # Every negative arm is run against a copy of the writer-produced layout.
+    copied = tmp_path / "copies"
+    shutil.copytree(tmp_path / "output", copied)
+    shutil.copytree(tmp_path / "output", copied / "h1")
+    for filename in ("manifest.json", "trainer.json"):
+        path = copied / "h1" / "owner" / "checkpoints" / "step_002000" / filename
+        value = json.loads(path.read_text())
+        value["completed_updates"] = 1999
+        value["next_iteration"] = 1999
+        path.write_text(json.dumps(value) + "\n")
+    assert qualification.qualify(manifest, tmp_path / "evidence-h1-updates", artifact_root=copied / "h1") != 0
+    (copied / "owner" / "checkpoints" / "step_002000" / "COMPLETE").unlink()
+    assert qualification.qualify(manifest, tmp_path / "evidence-h1", artifact_root=copied) != 0
+    shutil.copytree(tmp_path / "output", copied / "nan")
+    torch.save({"weight": torch.tensor([float("nan")])}, copied / "nan" / "owner" / "checkpoints" / "step_002000" / "model.pt")
+    assert qualification.qualify(manifest, tmp_path / "evidence-nan", artifact_root=copied / "nan") != 0
+    shutil.copytree(tmp_path / "output", copied / "wrong-cell")
+    (copied / "wrong-cell" / "owner" / "selection_receipt.json").write_text(json.dumps({"selection": {"selected": {"context": "O-raw"}}}) + "\n")
+    assert qualification.qualify(manifest, tmp_path / "evidence-cell", artifact_root=copied / "wrong-cell") != 0
 
 
 def test_no_hydra_or_run_root_literals_in_launcher_sources() -> None:

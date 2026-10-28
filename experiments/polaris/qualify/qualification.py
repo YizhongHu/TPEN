@@ -75,7 +75,18 @@ def qualify(manifest_path: Path, evidence: Path, *, artifact_root: Path | None =
                         completed_values.append(value[key])
         except (OSError, json.JSONDecodeError):
             continue
-    predicates.append(_predicate("completed_updates", cell["updates"], completed_values, "PASS" if cell["updates"] in completed_values and len(completed_values) >= 2 else "FAIL"))
+    final_dirs = list(root.rglob(f"step_{cell['updates']:06d}")) + list(root.rglob(f"step_{cell['updates']:04d}"))
+    final_counters: list[int] = []
+    for directory in final_dirs:
+        for filename in ("manifest.json", "trainer.json"):
+            try:
+                value = _json(directory / filename)
+                if isinstance(value, dict):
+                    final_counters.extend(value.get(key) for key in ("completed_updates", "next_iteration") if isinstance(value.get(key), int))
+            except (OSError, json.JSONDecodeError):
+                pass
+    counters_ok = len(final_counters) >= 2 and all(value == cell["updates"] for value in final_counters)
+    predicates.append(_predicate("completed_updates", cell["updates"], final_counters or completed_values, "PASS" if counters_ok else "FAIL"))
     expected_steps = range(cell["checkpoint_every"], cell["updates"] + 1, cell["checkpoint_every"])
     step_results = []
     for step in expected_steps:
