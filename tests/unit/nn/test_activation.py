@@ -350,20 +350,23 @@ def _softplus_oracle(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Independent closed-form value, first derivative, and second derivative."""
 
-    sigmoid = torch.sigmoid(beta * x)
-    value = torch.logaddexp(torch.zeros_like(x), beta * x) / beta
+    scaled = beta * x
+    sigmoid = torch.sigmoid(scaled)
+    value = (torch.maximum(scaled, torch.zeros_like(scaled)) + torch.log1p(
+        torch.exp(-torch.abs(scaled))
+    )) / beta
     first = sigmoid
     second = beta * sigmoid * (1.0 - sigmoid)
     return value, first, second
 
 
-def test_softplus_beta_matches_closed_form_value_and_derivatives_at_extremes() -> None:
+def _assert_softplus_contract(activation) -> None:
     points = torch.tensor(
         [-1000.0, -100.0, -20.0, -11.0, 0.0, 11.0, 20.0, 100.0, 1000.0],
         dtype=_DTYPE,
     )
     x = points.clone().requires_grad_()
-    values = SoftplusBeta()(x)
+    values = activation(x)
     first = torch.autograd.grad(values.sum(), x, create_graph=True)[0]
     second = torch.autograd.grad(first.sum(), x)[0]
     expected_value, expected_first, expected_second = _softplus_oracle(points)
@@ -373,6 +376,15 @@ def test_softplus_beta_matches_closed_form_value_and_derivatives_at_extremes() -
     assert torch.isfinite(values).all()
     assert torch.isfinite(first).all()
     assert torch.isfinite(second).all()
+
+
+def test_softplus_beta_matches_closed_form_value_and_derivatives_at_extremes() -> None:
+    _assert_softplus_contract(SoftplusBeta())
+
+
+def test_softplus_beta_acceptance_arm_catches_library_mutant() -> None:
+    with pytest.raises(AssertionError):
+        _assert_softplus_contract(torch.nn.Softplus(beta=2.0))
 
 
 def test_softplus_beta_threshold_regime_catches_torch_linear_mutant() -> None:

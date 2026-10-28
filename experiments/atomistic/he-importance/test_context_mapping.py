@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
 import sys
 from fractions import Fraction
@@ -43,6 +45,40 @@ ACTIVATION_LABELS = (
 ADMISSIBLE_ACTIVATION_LABELS = tuple(
     label for label in ACTIVATION_LABELS if "Softplus" not in label
 )
+
+_LEGACY_FRAGMENT_SHA256 = {
+    # Generated from origin/dev at 3425ecf7 with json.dumps(..., sort_keys=True).
+    ("tensor", "SiLU,SiLU"): "3f4aaac5619d25881b8936e19b074e1d3c71fd742e5f8cd6f922b8f1b9b7b814",
+    ("tensor", "tanh,tanh"): "09bbfae2f3192fb25a2e73f03a2ccb51b26576f9b86afc9fb9550834b43eabce",
+    ("tensor", "exact GELU,exact GELU"): "9390244cdc71b8514ff87443e7664a7871bc3976b0a3ef5707f42d3aa5917d28",
+    ("tensor", "channel-MLP,SiLU"): "b3c3e702215b938b3f23ed83abb6b99ce36025a8c209fe7dcd651ea969d55383",
+    ("tensor", "SiLU,channel-MLP"): "8c1ddf30138090620cff8ca1509341e1d5d6e441408a3e0f0053f7714b2ef5d0",
+    ("tensor", "channel-MLP,channel-MLP"): "f0b39561065fff2e66c4fd0200e6772294fd6bf1c50aa76d8827448ff65b5d92",
+    ("linear/coordinate-neighbor", "SiLU,SiLU"): "11c131247d10ec168172febf6ee9484cb826fc26359afea9226cc9a2e054eb4e",
+    ("linear/coordinate-neighbor", "tanh,tanh"): "92942a9f5b875ccd37c51a13c50be4c0983cab236327e8aa6d415bf6e070e54d",
+    ("linear/coordinate-neighbor", "exact GELU,exact GELU"): "12f355b1c7ec591c2228edc51e98d1e12375adfd4e2971bf253fc05f802b5f5f",
+    ("linear/coordinate-neighbor", "channel-MLP,SiLU"): "ada614a60693f7a06f3034920a0df58de08f08af4a2c9e8989e98a5a7859f18b",
+    ("linear/coordinate-neighbor", "SiLU,channel-MLP"): "1170399d00f9d81b2b1e64b5c870ce3b0c8ce62f61febe1f215ff8869a00ad5c",
+    ("linear/coordinate-neighbor", "channel-MLP,channel-MLP"): "39e5378967a27059f9404f5ee6a94f357109750c3c187b9ca6fc05bd37c0c5db",
+    ("linear/orbit-complete", "SiLU,SiLU"): "f94f408bc9644735887bb66eff0a98551f54991ccc843c13fcc5131e3afdecfd",
+    ("linear/orbit-complete", "tanh,tanh"): "e090a69eb062f06727ec8231615db4c8265ed786f538d60485195bb19603a056",
+    ("linear/orbit-complete", "exact GELU,exact GELU"): "71e06aa6c959824a492077ebaedecd37f6ba947744d7815b1e5b0fdfa7f23ab5",
+    ("linear/orbit-complete", "channel-MLP,SiLU"): "6dcbf2eb916864bd4fba04804675ffba2efcc623a581181289e2c539a55a72e6",
+    ("linear/orbit-complete", "SiLU,channel-MLP"): "ff5a40ac96d87c39f3239c8c6dc95f89f8cd6b9377fb4c9facfcc651163b56bc",
+    ("linear/orbit-complete", "channel-MLP,channel-MLP"): "34f3900e45fbc1aa35c5410446df2929e4440f5d0020ff63c04e57c7cf04eda2",
+    ("hybrid/coordinate-neighbor", "SiLU,SiLU"): "d003c046e26feff754dcf3b8140105952518dda3f1340cfa15554d54d7fa1f94",
+    ("hybrid/coordinate-neighbor", "tanh,tanh"): "971ef92710005aa8f93e8eab64dbea4a36dac1248f04e1d9f77aeb29469d089c",
+    ("hybrid/coordinate-neighbor", "exact GELU,exact GELU"): "0a5a9ac8ba8dede3aa96c7ad68622cc0302170a913385655631234bb1681a399",
+    ("hybrid/coordinate-neighbor", "channel-MLP,SiLU"): "f6102f8f518218d6f4f088cba650becec1ce057a0bac7f88f81d49ff019f4b1f",
+    ("hybrid/coordinate-neighbor", "SiLU,channel-MLP"): "ba3bb52186de07bb589a250ff83d26969c4b572c6ee9ebf284cd07e4cfcb8e21",
+    ("hybrid/coordinate-neighbor", "channel-MLP,channel-MLP"): "e5dfc51452cf83cdc3b9c926278f92f4f843937fe0fada588ccc45063332a7c2",
+    ("hybrid/orbit-complete", "SiLU,SiLU"): "a42449e85edba499e2d99eacdad8c659ecd55bee831f4722834ea8d105570e49",
+    ("hybrid/orbit-complete", "tanh,tanh"): "4893894dc565a9046a2f5ece1ec0c1f27874db21ca43aba6b8d0825cef5ee354",
+    ("hybrid/orbit-complete", "exact GELU,exact GELU"): "7a2dc659032f5117759ea0acf00944205372da4a9fae5c8f8e285b57be6e50e4",
+    ("hybrid/orbit-complete", "channel-MLP,SiLU"): "5f9e6ec7b024098e2c3b667ae98ffbaeb86baee3abb0030c20067ac0431ad83b",
+    ("hybrid/orbit-complete", "SiLU,channel-MLP"): "e02dadf34c4aa8bbe264dcfcdd688da3d2fc0b06bb7fc4c4b47cc237ee220513",
+    ("hybrid/orbit-complete", "channel-MLP,channel-MLP"): "aa1a29fdc670a1b9ff901e67ae0f16455ef3153d245aaebee95305add7e03ace",
+}
 
 
 def test_unknown_labels_refuse_without_a_default() -> None:
@@ -503,6 +539,16 @@ def test_exact_gelu_and_softplus_beta_two_are_explicit() -> None:
     assert "torch.nn.Softplus" not in repr(softplus)
 
 
+@pytest.mark.parametrize("path_label", PATH_LABELS)
+@pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
+def test_legacy_a6_fragments_are_byte_identical_to_dev(
+    path_label: str, activation_label: str
+) -> None:
+    fragment = context_mapping.context_fragment(path_label, activation=activation_label)
+    digest = hashlib.sha256(json.dumps(fragment, sort_keys=True).encode()).hexdigest()
+    assert digest == _LEGACY_FRAGMENT_SHA256[(path_label, activation_label)]
+
+
 def test_unmapped_internal_activation_still_raises() -> None:
     with pytest.raises(AssertionError, match="unmapped internal activation"):
         context_mapping._activation(
@@ -537,6 +583,36 @@ def test_fragment_splices_into_control_model(path_label: str, activation_label: 
     OmegaConf.resolve(train)
     model = instantiate(train.model)
     assert model.stack.layers[0].layout.fingerprint == model.stack.layers[0].mixing.layout.fingerprint
+
+
+def test_softplus_fragment_has_finite_nonzero_coordinate_second_derivative() -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model.layers[0] = OmegaConf.create(
+        context_mapping.context_fragment(
+            "tensor", activation="Softplus beta2,Softplus beta2"
+        )
+    )
+    OmegaConf.resolve(train)
+    model = instantiate(train.model).to(dtype=torch.float64)
+    positions = torch.tensor(
+        [[[0.7, -0.4, 0.2], [-0.3, 0.8, -0.6]]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    batch = instantiate(
+        {
+            "_target_": "tpen.data.batch.ElectronBatch",
+            "positions": positions,
+            "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
+            "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
+            "spins": torch.tensor([[1.0, -1.0]], dtype=torch.float64),
+        }
+    )
+    logabs = model(batch).logabs.sum()
+    first = torch.autograd.grad(logabs, positions, create_graph=True)[0]
+    second = torch.autograd.grad(first.sum(), positions)[0]
+    assert torch.isfinite(second).all()
+    assert torch.any(second != 0.0)
 
 
 def _he_batch() -> object:
