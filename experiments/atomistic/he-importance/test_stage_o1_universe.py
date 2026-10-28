@@ -587,9 +587,15 @@ def test_c3_control_partition_check_fails_on_a_broken_partition(declared: tuple[
         optimizer_grid._require_stage_partition(declared)
 
 
-@pytest.mark.parametrize("stages", [(), "O1", b"O1"], ids=["empty", "str", "bytes"])
-def test_stage_selection_must_be_a_non_empty_iterable_of_codes(tmp_path: Path, stages: Any) -> None:
-    with pytest.raises(stage_coordinate.MaterializationError, match="stage"):
+@pytest.mark.parametrize(
+    ("stages", "message"),
+    [((), "at least one stage"), ("O1", "not a string"), (b"O1", "not a string")],
+    ids=["empty", "str", "bytes"],
+)
+def test_stage_selection_must_be_a_non_empty_iterable_of_codes(
+    tmp_path: Path, stages: Any, message: str
+) -> None:
+    with pytest.raises(stage_coordinate.MaterializationError, match=message):
         stage_coordinate.materialize_intended_configurations(
             tmp_path, availability=_availability(), stages=stages
         )
