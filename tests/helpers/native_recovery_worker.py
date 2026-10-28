@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from tpen.execution import (
     WorkerStartGateway,
     decode_ready_batch,
     validate_native_recovery_profile,
+    CheckpointEvidence,
 )
 from tpen.checkpoint.restore import restore_checkpoint
 from tpen.execution.invocation import (
@@ -33,6 +36,11 @@ from tpen.execution.invocation import (
 from tpen.runner import Train
 from tpen.runner.base import _assert_eager_initialized, _is_torch_module, _place_module_for_runtime
 from tpen.training.optim import make_optimizer
+from tests.helpers.native_chain_resume_trace import (
+    NativeTrace,
+    install_native_trace,
+    skip_restore_owners,
+)
 
 
 class NoLiveBackendClient:
@@ -116,6 +124,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--label", default="worker")
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--partial-restore", action="store_true")
+    parser.add_argument("--trace", type=Path)
+    parser.add_argument("--resume-step", type=int, default=0)
+    parser.add_argument(
+        "--disable-limb",
+        action="append",
+        choices=("model", "optimizer", "trainer_cursor", "sampler_mcmc", "process_rng"),
+    )
+    parser.add_argument("--suppress-channel")
+    parser.add_argument("--pause-before-science", action="store_true")
     return parser
 
 
@@ -145,6 +162,22 @@ def main() -> int:
 
     run_cfg = cfg
     selected_decision = None
+    trace = (
+        NativeTrace(
+            phase=args.phase,
+            seed=int(cfg.runtime.seed),
+            resume_step=args.resume_step,
+            command=json.loads(os.environ.get("TPEN_NATIVE_LAUNCH_ARGV", "[]")),
+            checkpoint_rng_source=None if args.evidence is None else str(
+                CheckpointEvidence.from_mapping(evidence).ref.checkpoint_dir
+            ),
+            suppress_channels=()
+            if args.suppress_channel is None
+            else (args.suppress_channel,),
+        )
+        if args.trace is not None
+        else None
+    )
 
     def run_once(decision, output_path):
         nonlocal run_cfg, selected_decision
@@ -169,14 +202,22 @@ def main() -> int:
                 "path": str(decision.checkpoint.checkpoint_dir),
             }
             selected_decision = replace(decision, load=partial_load)
-        run_configured_once(
-            run_cfg,
-            decision=selected_decision or decision,
-            output_path=output_path,
-            config_path=str(args.config),
-            command="e5-native-worker",
-            raise_exceptions=True,
-        )
+        trace_stack = install_native_trace(trace) if trace is not None else None
+        try:
+            with skip_restore_owners(args.disable_limb or ()):
+                run_configured_once(
+                    run_cfg,
+                    decision=selected_decision or decision,
+                    output_path=output_path,
+                    config_path=str(args.config),
+                    command="e5-native-worker",
+                    raise_exceptions=True,
+                )
+        finally:
+            if trace_stack is not None:
+                trace_stack.close()
+            if trace is not None:
+                trace.write(args.trace)
         return _core_outcome_from_artifacts(output_path, decision=decision)
 
     if args.partial_restore:
@@ -187,11 +228,28 @@ def main() -> int:
             run_once=run_once, job_id=args.job_id, evidence=evidence,
         )
     else:
-        result = adapter.start_configured(
-            cfg=cfg, batch=batch, intent=intent, phase=RecoveryPhase(args.phase),
-            job_id=args.job_id, evidence=evidence,
-            config_path=str(args.config), command="e5-native-worker",
-        )
+        # CR instrumentation surrounds the configured entry; it must not be
+        # bypassed when E5 routes ordinary workers through start_configured.
+        trace_stack = install_native_trace(trace) if trace is not None else None
+        if args.pause_before_science:
+            from tpen import run as core
+            def paused_run(*_args, **_kwargs):
+                # E3's start receipt is durable before this core-call boundary.
+                while True:
+                    time.sleep(1)
+            core.run_from_config = paused_run
+        try:
+            with skip_restore_owners(args.disable_limb or ()):
+                result = adapter.start_configured(
+                    cfg=cfg, batch=batch, intent=intent, phase=RecoveryPhase(args.phase),
+                    job_id=args.job_id, evidence=evidence,
+                    config_path=str(args.config), command="e5-native-worker",
+                )
+        finally:
+            if trace_stack is not None:
+                trace_stack.close()
+            if trace is not None:
+                trace.write(args.trace)
     invocation = result.invocation
     output = {
         "status": result.status.value,
@@ -204,6 +262,7 @@ def main() -> int:
             "outcome": invocation.outcome.outcome.value,
             "status": invocation.outcome.status.value,
             "reason": invocation.outcome.reason,
+            "refusal_code": invocation.outcome.refusal_code,
             "next_iteration": invocation.outcome.next_iteration,
             "completed_updates": invocation.outcome.completed_updates,
         },
