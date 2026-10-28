@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Stored job script. All run-specific values come from RUN_ENV_PATH.
+#PBS -N tpen-polaris-verify
+set -euo pipefail
+: "${RUN_ENV_PATH:?RUN_ENV_PATH is required}"
+test -f "$RUN_ENV_PATH"
+source "$RUN_ENV_PATH"
+manifest=$($RUN_PYTHON -c 'import shlex,sys; print(shlex.split(next(x for x in open(sys.argv[1]) if x.startswith("RUN_MANIFEST=")))[0].split("=",1)[1])' "$RUN_ENV_PATH")
+helper=$($RUN_PYTHON -c 'import json,sys; print(json.load(open(sys.argv[1]))["job_helper"])' "$manifest")
+exec "$RUN_PYTHON" "$helper"
