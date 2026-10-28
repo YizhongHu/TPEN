@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tomllib
-import shlex
+
 from common import build_env, copied_hashes, is_ancestor
 
 
@@ -66,45 +67,111 @@ def receipt_code(manifest: dict, receipt_path: Path) -> int:
     return 0 if receipt_matches(manifest, receipt) else 61
 
 
-def preflight_decision(*, receipt_status: int = 0, login_host: bool, node_match: bool,
-                       head_ok: bool = True, ancestor_ok: bool = True,
-                       apple_double_count: int, python_exists: bool,
-                       interpreter_ok: bool, versions_ok: bool, uv_ok: bool,
-                       lock_ok: bool, sync_ok: bool, copied_ok: bool) -> int:
-    """Map injected preflight observations to the stable exit-code contract."""
+def preflight_decision(*, receipt_status: int | None = None, login_host: bool | None = None,
+                       node_match: bool | None = None, head_ok: bool | None = None,
+                       ancestor_ok: bool | None = None, apple_double_count: int | None = None,
+                       lock_ok: bool | None = None, uv_ok: bool | None = None,
+                       sync_ok: bool | None = None, python_exists: bool | None = None,
+                       interpreter_ok: bool | None = None, versions_ok: bool | None = None,
+                       copied_ok: bool | None = None) -> int:
+    """Return the first failed check in the same order as ``main``."""
+    if copied_ok is False:
+        return 81
     if receipt_status:
         return receipt_status
-    if login_host:
+    if login_host is True:
         return 70
-    if not node_match:
+    if node_match is False:
         return 71
-    if not head_ok:
+    if head_ok is False:
         return 72
-    if not ancestor_ok:
+    if ancestor_ok is False:
         return 79
-    if apple_double_count:
+    if apple_double_count not in (None, 0):
         return 73
-    if not python_exists:
-        return 74
-    if not interpreter_ok:
-        return 76
-    if not versions_ok:
-        return 75
-    if not uv_ok:
-        return 77
-    if not lock_ok:
+    if lock_ok is False:
         return 78
-    if not sync_ok:
+    if uv_ok is False:
+        return 77
+    if sync_ok is False:
         return 80
-    if not copied_ok:
-        return 81
+    if python_exists is False:
+        return 74
+    if interpreter_ok is False:
+        return 76
+    if versions_ok is False:
+        return 75
     return 0
+
+
+def _hostname() -> str:
+    """Read the short hostname used by the compute-node guard."""
+    return subprocess.check_output(["hostname", "-s"], text=True).strip()
+
+
+def _nodefile_entries() -> list[str]:
+    """Read PBS nodefile entries for host matching."""
+    path = Path(os.environ["PBS_NODEFILE"])
+    return path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+
+
+def _git_head(repo: Path) -> str:
+    """Read the target checkout HEAD."""
+    return subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
 
 
 def head_code(repo: Path, target_sha: str) -> int:
     """Return zero for an exact checkout or the contract's stale-head code."""
-    head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-    return 0 if head == target_sha else 72
+    return 0 if _git_head(repo) == target_sha else 72
+
+
+def _appledoubles(repo: Path) -> list[str]:
+    """Find macOS AppleDouble files in the target checkout."""
+    return [str(path) for path in repo.rglob("._*")]
+
+
+def _lock_text(repo: Path) -> str:
+    """Read the target lockfile for CPU package derivation."""
+    return (repo / "uv.lock").read_text(encoding="utf-8")
+
+
+def _uv_version(uv: list[str]) -> str:
+    """Read the facility uv version through its pinned interpreter."""
+    return subprocess.check_output(uv + ["--version"], text=True).strip()
+
+
+def _offline_sync(uv: list[str], repo: Path, env: dict[str, str], log: Path) -> int:
+    """Run the locked offline sync and return its process status."""
+    try:
+        with log.open("w", encoding="utf-8") as stream:
+            subprocess.run(uv + ["sync", "--offline", "--extra", "cpu", "--locked", "--project", str(repo)], env=env, check=True, stdout=stream, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as exc:
+        return exc.returncode
+    return 0
+
+
+def _venv_exists(python: Path) -> bool:
+    """Return whether the offline sync produced the job interpreter."""
+    return python.is_file()
+
+
+def _venv_identity(python: Path) -> dict:
+    """Read interpreter identity from inside the job venv."""
+    command = "import json,sys; print(json.dumps({'executable':sys.executable,'prefix':sys.prefix,'base_prefix':sys.base_prefix,'base_executable':sys._base_executable}))"
+    return json.loads(subprocess.check_output([str(python), "-c", command], text=True))
+
+
+def _package_versions(python: Path) -> dict:
+    """Read verification package versions from inside the job venv."""
+    command = "import importlib.metadata as m, json; print(json.dumps({n:m.version(n) for n in ('torch','pytest','typeguard')}))"
+    return json.loads(subprocess.check_output([str(python), "-c", command], text=True))
+
+
+def _run_driver(python: Path, manifest: dict, manifest_path: Path, evidence: Path, env: dict[str, str], job_env: Path) -> int:
+    """Run the manifest-selected driver with captured stdout and stderr."""
+    command = [str(python), "-B", manifest["driver"], "--manifest", str(manifest_path), "--evidence", str(evidence), "--job-python", str(python), "--job-env", str(job_env)]
+    with (evidence / "driver.stdout.log").open("w", encoding="utf-8") as stdout, (evidence / "driver.stderr.log").open("w", encoding="utf-8") as stderr:
+        return subprocess.run(command, env=env, stdout=stdout, stderr=stderr).returncode
 
 
 def _record(path: Path, checks: list[dict], name: str, expected, observed, ok: bool, exit_code: int | None = None) -> bool:
@@ -117,38 +184,8 @@ def _record(path: Path, checks: list[dict], name: str, expected, observed, ok: b
     return ok
 
 
-def _injected_main(deps) -> int:
-    """Run the decision path with injected observations for seam tests."""
-    env_path = Path(os.environ["RUN_ENV_PATH"])
-    values = _read_env(env_path)
-    manifest_path = Path(values["RUN_MANIFEST"])
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    job_id = os.environ["PBS_JOBID"]
-    evidence = Path(manifest["evidence_dir"]) / job_id
-    evidence.mkdir(parents=True, exist_ok=True)
-    preflight = evidence / "preflight.json"
-    checks: list[dict] = []
-    observed = {name: (value() if callable(value) else value) for name, value in deps.items() if name != "driver_runner"}
-    status = preflight_decision(**observed)
-    observations = {
-        "receipt": observed.get("receipt_status", 0), "login_host": observed["login_host"],
-        "node_match": observed["node_match"], "head": observed.get("head_ok", True),
-        "ancestor": observed.get("ancestor_ok", True),
-        "apple_double": observed["apple_double_count"], "python": observed["python_exists"],
-        "interpreter": observed["interpreter_ok"], "versions": observed["versions_ok"],
-        "uv": observed["uv_ok"], "lock": observed["lock_ok"], "sync": observed["sync_ok"],
-        "copied": observed["copied_ok"],
-    }
-    _record(preflight, checks, "injected_observations", "all preflight checks", observations, status == 0, status or 1)
-    if status:
-        return status
-    driver_rc = int(deps["driver_runner"]())
-    _record(preflight, checks, "driver", 0, driver_rc, driver_rc == 0, driver_rc or 1)
-    return driver_rc
-
-
-def _real_main() -> int:
-    """Run preflight checks and invoke the manifest-selected driver."""
+def main() -> int:
+    """Run the single ordered preflight path and invoke the selected driver."""
     env_path = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ["RUN_ENV_PATH"])
     values = _read_env(env_path)
     manifest_path = Path(values["RUN_MANIFEST"])
@@ -158,91 +195,97 @@ def _real_main() -> int:
     evidence.mkdir(parents=True, exist_ok=True)
     preflight = evidence / "preflight.json"
     checks: list[dict] = []
+    state = {name: None for name in ("copied_ok", "receipt_status", "login_host", "node_match", "head_ok", "ancestor_ok", "apple_double_count", "lock_ok", "uv_ok", "sync_ok", "python_exists", "interpreter_ok", "versions_ok")}
 
-    # Verify copied code before invoking any other copied harness helper.
+    def decide() -> int:
+        """Route every early exit through the one ordered decision table."""
+        return preflight_decision(**state)
+
     copied_expected = manifest["copied_file_sha256"]
     copied_observed = copied_hashes([Path(manifest["job_helper"]).parent / name for name in copied_expected])
-    if not _record(preflight, checks, "copied_harness_hashes", copied_expected, copied_observed, copied_observed == copied_expected, 81):
-        return 81
+    state["copied_ok"] = copied_observed == copied_expected
+    _record(preflight, checks, "copied_harness_hashes", copied_expected, copied_observed, state["copied_ok"], 81)
+    if decide():
+        return decide()
 
     receipt_path = Path(manifest["staging_receipt"])
-    receipt_status = receipt_code(manifest, receipt_path)
-    if not _record(preflight, checks, "staging_receipt_exists", True, receipt_path.is_file(), receipt_status != 60, 60):
-        return 60
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    receipt_match = receipt_matches(manifest, receipt)
-    if not _record(preflight, checks, "staging_receipt_matches", {"target_sha": manifest["target_sha"], "cache_dir": manifest["cache_dir"]}, {"target_sha": receipt.get("target_sha"), "cache_dir": receipt.get("cache_dir")}, receipt_match, 61):
-        return 61
+    state["receipt_status"] = receipt_code(manifest, receipt_path)
+    _record(preflight, checks, "staging_receipt", 0, state["receipt_status"], state["receipt_status"] == 0, state["receipt_status"] or 1)
+    if decide():
+        return decide()
 
-    node = subprocess.check_output(["hostname", "-s"], text=True).strip()
+    node = _hostname()
     guard_prefix = manifest["profile"]["compute_host_guard"]["refuse_prefix"]
-    if not _record(preflight, checks, "compute_host_guard", f"not prefix {guard_prefix}", node, not node.startswith(guard_prefix), 70):
-        return 70
-    nodefile = Path(os.environ["PBS_NODEFILE"])
-    entries = nodefile.read_text(encoding="utf-8").splitlines() if nodefile.is_file() else []
-    if not _record(preflight, checks, "pbs_nodefile_host", node, entries, host_matches(node, entries), 71):
-        return 71
+    state["login_host"] = node.startswith(guard_prefix)
+    _record(preflight, checks, "compute_host_guard", f"not prefix {guard_prefix}", node, not state["login_host"], 70)
+    if decide():
+        return decide()
+    entries = _nodefile_entries()
+    state["node_match"] = host_matches(node, entries)
+    _record(preflight, checks, "pbs_nodefile_host", node, entries, state["node_match"], 71)
+    if decide():
+        return decide()
 
     repo = Path(manifest["target_repo"])
     for ancestor in manifest.get("required_ancestors", []):
-        ok = is_ancestor(repo, ancestor, manifest["target_sha"])
-        if not _record(preflight, checks, f"required_ancestor:{ancestor}", True, ok, ok, 79):
-            return 79
-    head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-    if not _record(preflight, checks, "target_head", manifest["target_sha"], head, head_code(repo, manifest["target_sha"]) == 0, 72):
-        return 72
-    apple_doubles = [str(path) for path in repo.rglob("._*")]
-    if not _record(preflight, checks, "appledouble", 0, len(apple_doubles), not apple_doubles, 73):
-        return 73
+        state["ancestor_ok"] = is_ancestor(repo, ancestor, manifest["target_sha"])
+        _record(preflight, checks, f"required_ancestor:{ancestor}", True, state["ancestor_ok"], state["ancestor_ok"], 79)
+        if decide():
+            return decide()
+    head = _git_head(repo)
+    state["head_ok"] = head == manifest["target_sha"]
+    _record(preflight, checks, "target_head", manifest["target_sha"], head, state["head_ok"], 72)
+    if decide():
+        return decide()
+    apple_doubles = _appledoubles(repo)
+    state["apple_double_count"] = len(apple_doubles)
+    _record(preflight, checks, "appledouble", 0, len(apple_doubles), not apple_doubles, 73)
+    if decide():
+        return decide()
     try:
-        expected = expected_versions(tomllib.loads((repo / "uv.lock").read_text(encoding="utf-8")))
-        lock_ok = True
+        expected = expected_versions(tomllib.loads(_lock_text(repo)))
+        state["lock_ok"] = True
     except (KeyError, TypeError, ValueError) as exc:
-        expected, lock_ok = {"error": str(exc)}, False
-    if not _record(preflight, checks, "lock_versions", "CPU extra resolution", expected, lock_ok, 78):
-        return 78
+        expected, state["lock_ok"] = {"error": str(exc)}, False
+    _record(preflight, checks, "lock_versions", "CPU extra resolution", expected, state["lock_ok"], 78)
+    if decide():
+        return decide()
 
     profile = manifest["profile"]
     job_env = Path(profile["job_scratch_root"]) / job_id / "tpen-verify-env"
     job_env.parent.mkdir(parents=True, exist_ok=True)
     env = build_env(profile, Path(manifest["cache_dir"]), job_env)
     uv = [profile["facility_python"], "-m", "uv"]
-    uv_version = subprocess.check_output(uv + ["--version"], text=True).strip()
-    if not _record(preflight, checks, "uv_version", ["uv", profile["uv_version"]], uv_version, uv_version.split()[:2] == ["uv", profile["uv_version"]], 77):
-        return 77
-    try:
-        with (evidence / "offline-sync.stdout.log").open("w", encoding="utf-8") as sync_log:
-            subprocess.run(uv + ["sync", "--offline", "--extra", "cpu", "--locked", "--project", str(repo)], env=env, check=True, stdout=sync_log, stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError as exc:
-        _record(preflight, checks, "offline_sync", 0, exc.returncode, False, 80)
-        return 80
+    uv_version = _uv_version(uv)
+    state["uv_ok"] = uv_version.split()[:2] == ["uv", profile["uv_version"]]
+    _record(preflight, checks, "uv_version", ["uv", profile["uv_version"]], uv_version, state["uv_ok"], 77)
+    if decide():
+        return decide()
+    sync_rc = _offline_sync(uv, repo, env, evidence / "offline-sync.stdout.log")
+    state["sync_ok"] = sync_rc == 0
+    _record(preflight, checks, "offline_sync", 0, sync_rc, state["sync_ok"], 80)
+    if decide():
+        return decide()
     python = job_env / "bin" / "python"
-    if not _record(preflight, checks, "venv_python_exists", str(python), str(python) if python.is_file() else None, python.is_file(), 74):
-        return 74
-    identity = json.loads(subprocess.check_output([str(python), "-c", "import json,sys; print(json.dumps({'executable':sys.executable,'prefix':sys.prefix,'base_prefix':sys.base_prefix,'base_executable':sys._base_executable}))"], text=True))
+    state["python_exists"] = _venv_exists(python)
+    _record(preflight, checks, "venv_python_exists", str(python), str(python) if state["python_exists"] else None, state["python_exists"], 74)
+    if decide():
+        return decide()
+    identity = _venv_identity(python)
     facility = Path(profile["facility_python"]).resolve()
     base_prefix = facility.parent.parent
-    interpreter_ok = Path(identity["prefix"]).resolve() == job_env.resolve() and Path(identity["base_executable"]).resolve() == facility and Path(identity["base_prefix"]).resolve() == base_prefix.resolve()
-    if not _record(preflight, checks, "venv_interpreter", {"prefix": str(job_env), "base_executable": str(facility), "base_prefix": str(base_prefix)}, identity, interpreter_ok, 76):
-        return 76
-    observed = json.loads(subprocess.check_output([str(python), "-c", "import importlib.metadata as m, json; print(json.dumps({n:m.version(n) for n in ('torch','pytest','typeguard')}))"], text=True))
-    if not _record(preflight, checks, "package_versions", expected, observed, observed == expected, 75):
-        return 75
-    with (evidence / "driver.stdout.log").open("w", encoding="utf-8") as stdout, (evidence / "driver.stderr.log").open("w", encoding="utf-8") as stderr:
-        driver_rc = subprocess.run([str(python), "-B", manifest["driver"], "--manifest", str(manifest_path), "--evidence", str(evidence), "--job-python", str(python), "--job-env", str(job_env)], env=env, stdout=stdout, stderr=stderr).returncode
+    state["interpreter_ok"] = (Path(identity["prefix"]).resolve() == job_env.resolve() and Path(identity["base_executable"]).resolve() == facility and Path(identity["base_prefix"]).resolve() == base_prefix.resolve())
+    _record(preflight, checks, "venv_interpreter", {"prefix": str(job_env), "base_executable": str(facility), "base_prefix": str(base_prefix)}, identity, state["interpreter_ok"], 76)
+    if decide():
+        return decide()
+    observed = _package_versions(python)
+    state["versions_ok"] = observed == expected
+    _record(preflight, checks, "package_versions", expected, observed, state["versions_ok"], 75)
+    if decide():
+        return decide()
+    driver_rc = _run_driver(python, manifest, manifest_path, evidence, env, job_env)
     _record(preflight, checks, "driver", 0, driver_rc, driver_rc == 0, driver_rc or 1)
     return driver_rc
-
-
-def main(deps=None) -> int:
-    """Run preflight checks and invoke the manifest-selected driver.
-
-    Parameters
-    ----------
-    deps : dict, optional
-        Injected observations and a ``driver_runner`` callable for seam tests.
-    """
-    return _injected_main(deps) if deps is not None else _real_main()
 
 
 if __name__ == "__main__":

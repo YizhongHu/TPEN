@@ -139,8 +139,6 @@ def test_layout_is_one_source_for_sync_paths() -> None:
     paths = stage.layout(Path("/run-root"))
     env = stage.build_env(json.loads((ROOT / "facility_profile.json").read_text()), paths["cache_dir"], paths["prime_env"], base={})
     assert env["UV_CACHE_DIR"] == str(paths["cache_dir"])
-    perturbed = dict(env, UV_CACHE_DIR="/wrong-cache")
-    assert perturbed["UV_CACHE_DIR"] != str(paths["cache_dir"])
 
 
 def test_canary_is_not_normal_collection_name() -> None:
@@ -242,42 +240,76 @@ def test_injected_preflight_codes_and_controls() -> None:
         assert job.preflight_decision(**altered) == code
 
 
-def test_job_main_uses_injected_decision_path_and_driver() -> None:
+def test_job_main_uses_one_injected_observation_path(monkeypatch, tmp_path) -> None:
     """The verify/ directory is inserted at sys.path[0], so common imports
     resolve to the copied harness module rather than an unrelated package.
     """
-    with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
-        evidence = root / "evidence"
-        manifest = root / "manifest.json"
-        manifest.write_text(json.dumps({"evidence_dir": str(evidence)}))
-        env = root / "run.env"
-        env.write_text(f"RUN_MANIFEST={manifest}\n")
-        import os
-        old_env = dict(os.environ)
-        os.environ.update({"RUN_ENV_PATH": str(env), "PBS_JOBID": "123"})
-        try:
-            base = {
-                "receipt_status": 0, "login_host": False, "node_match": True,
-                "head_ok": True, "ancestor_ok": True, "apple_double_count": 0,
-                "python_exists": True, "interpreter_ok": True, "versions_ok": True,
-                "uv_ok": True, "lock_ok": True, "sync_ok": True,
-                "copied_ok": True, "driver_runner": lambda: 0,
-            }
-            for field, code in (("receipt_status", 60), ("receipt_status", 61),
-                                ("login_host", 70), ("node_match", 71),
-                                ("head_ok", 72), ("ancestor_ok", 79),
-                                ("apple_double_count", 73), ("python_exists", 74),
-                                ("versions_ok", 75), ("interpreter_ok", 76),
-                                ("uv_ok", 77), ("lock_ok", 78),
-                                ("sync_ok", 80), ("copied_ok", 81)):
-                deps = dict(base)
-                deps[field] = code if field == "receipt_status" else (1 if field in {"login_host", "apple_double_count"} else False)
-                assert job.main(deps) == code
-            assert job.main(dict(base, driver_runner=lambda: 7)) == 7
-        finally:
-            os.environ.clear()
-            os.environ.update(old_env)
+    root = tmp_path
+    evidence = root / "evidence"
+    repo = root / "repo"
+    repo.mkdir()
+    manifest = root / "manifest.json"
+    env = root / "run.env"
+    profile = {"compute_host_guard": {"refuse_prefix": "login"}, "job_scratch_root": str(root / "scratch"), "facility_python": sys.executable, "uv_version": "0.8.23", "uv_flags": [], "thread_limits": {}, "timezone": "UTC"}
+    copied = {"common.py": "expected"}
+    manifest.write_text(json.dumps({"evidence_dir": str(evidence), "target_repo": str(repo), "target_sha": "a" * 40, "required_ancestors": [], "profile": profile, "cache_dir": str(root / "cache"), "staging_receipt": str(root / "receipt.json"), "job_helper": str(root / "harness" / "job.py"), "copied_file_sha256": copied, "driver": str(ROOT / "driver.py")}))
+    env.write_text(f"RUN_MANIFEST={manifest}\n")
+    (root / "receipt.json").write_text(json.dumps({"target_sha": "a" * 40, "cache_dir": str(root / "cache")}))
+    nodefile = root / "nodefile"
+    nodefile.write_text("nid001.fqdn\n")
+    monkeypatch.setenv("RUN_ENV_PATH", str(env))
+    monkeypatch.setenv("PBS_JOBID", "123")
+    monkeypatch.setenv("PBS_NODEFILE", str(nodefile))
+
+    def configure() -> None:
+        manifest_data = json.loads(manifest.read_text())
+        manifest_data["required_ancestors"] = []
+        manifest.write_text(json.dumps(manifest_data))
+        monkeypatch.setattr(job, "copied_hashes", lambda paths: copied)
+        monkeypatch.setattr(job, "_hostname", lambda: "nid001")
+        monkeypatch.setattr(job, "_nodefile_entries", lambda: ["nid001.fqdn"])
+        monkeypatch.setattr(job, "_git_head", lambda path: "a" * 40)
+        monkeypatch.setattr(job, "_appledoubles", lambda path: [])
+        monkeypatch.setattr(job, "_lock_text", lambda path: "")
+        monkeypatch.setattr(job, "expected_versions", lambda lock: {"torch": "cpu", "pytest": "p", "typeguard": "t"})
+        monkeypatch.setattr(job, "_uv_version", lambda uv: "uv 0.8.23")
+        monkeypatch.setattr(job, "_offline_sync", lambda uv, path, runtime, log: 0)
+        monkeypatch.setattr(job, "_venv_exists", lambda path: True)
+        monkeypatch.setattr(job, "_venv_identity", lambda path: {"prefix": str(root / "scratch" / "123" / "tpen-verify-env"), "base_executable": sys.executable, "base_prefix": str(Path(sys.executable).resolve().parent.parent)})
+        monkeypatch.setattr(job, "_package_versions", lambda path: {"torch": "cpu", "pytest": "p", "typeguard": "t"})
+        monkeypatch.setattr(job, "_run_driver", lambda *args: 7)
+        monkeypatch.setattr(job, "receipt_code", lambda manifest, path: 0)
+
+    monkeypatch.setattr(sys, "argv", ["job.py", str(env)])
+    for name, code in (("receipt_code", 60), ("receipt_code", 61), ("_hostname", 70), ("_nodefile_entries", 71), ("_git_head", 72), ("_appledoubles", 73), ("python", 74), ("_package_versions", 75), ("identity", 76), ("_uv_version", 77), ("expected_versions", 78), ("_offline_sync", 80), ("ancestor", 79), ("copied", 81)):
+        monkeypatch.undo()
+        monkeypatch.setenv("RUN_ENV_PATH", str(env)); monkeypatch.setenv("PBS_JOBID", "123"); monkeypatch.setenv("PBS_NODEFILE", str(nodefile)); monkeypatch.setattr(sys, "argv", ["job.py", str(env)])
+        configure()
+        if name == "receipt_code": monkeypatch.setattr(job, "receipt_code", lambda manifest, path, value=code: value)
+        elif name == "_hostname": monkeypatch.setattr(job, "_hostname", lambda: "login-node")
+        elif name == "_nodefile_entries": monkeypatch.setattr(job, "_nodefile_entries", lambda: ["other.fqdn"])
+        elif name == "_git_head": monkeypatch.setattr(job, "_git_head", lambda path: "b" * 40)
+        elif name == "_appledoubles": monkeypatch.setattr(job, "_appledoubles", lambda path: ["._bad"])
+        elif name == "python": monkeypatch.setattr(job, "_venv_exists", lambda path: False)
+        elif name == "_package_versions": monkeypatch.setattr(job, "_package_versions", lambda path: {"torch": "wrong"})
+        elif name == "identity": monkeypatch.setattr(job, "_venv_identity", lambda path: {"prefix": "/wrong", "base_executable": "/wrong", "base_prefix": "/wrong"})
+        elif name == "_uv_version": monkeypatch.setattr(job, "_uv_version", lambda uv: "uv 9.9.9")
+        elif name == "expected_versions": monkeypatch.setattr(job, "expected_versions", lambda lock: (_ for _ in ()).throw(ValueError("bad lock")))
+        elif name == "_offline_sync": monkeypatch.setattr(job, "_offline_sync", lambda uv, path, runtime, log: 1)
+        elif name == "ancestor":
+            manifest_data = json.loads(manifest.read_text())
+            manifest_data["required_ancestors"] = ["c" * 40]
+            manifest.write_text(json.dumps(manifest_data))
+            monkeypatch.setattr(job, "is_ancestor", lambda *args: False)
+        elif name == "copied": monkeypatch.setattr(job, "copied_hashes", lambda paths: {"common.py": "wrong"})
+        assert job.main() == code
+    monkeypatch.undo()
+    monkeypatch.setenv("RUN_ENV_PATH", str(env)); monkeypatch.setenv("PBS_JOBID", "123"); monkeypatch.setenv("PBS_NODEFILE", str(nodefile)); monkeypatch.setattr(sys, "argv", ["job.py", str(env)])
+    configure()
+    manifest_data = json.loads(manifest.read_text())
+    manifest_data["required_ancestors"] = []
+    manifest.write_text(json.dumps(manifest_data))
+    assert job.main() == 7
 
 
 def test_copied_hash_positive_and_tamper_control(tmp_path) -> None:
@@ -320,28 +352,6 @@ def test_required_ancestor_control(tmp_path) -> None:
     assert not stage.is_ancestor(repo, target, ancestor)
 
 
-def test_stage_sync_failure_precedes_receipt(monkeypatch, tmp_path) -> None:
-    target = tmp_path / "target"
-    target.mkdir()
-    paths = stage.layout(tmp_path / "run")
-    paths["run_root"].mkdir()
-    profile = json.loads((ROOT / "facility_profile.json").read_text())
-
-    def fail_sync(args, **kwargs):
-        if "sync" in args:
-            raise RuntimeError("synthetic sync failure")
-        return ""
-
-    monkeypatch.setattr(stage, "_run", fail_sync)
-    try:
-        stage.prime_and_dry_sync(target, profile, paths, ["uv"])
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("synthetic prime failure did not propagate")
-    assert not paths["staging_receipt"].exists()
-
-
 def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> None:
     """Exercise stage() through clone, both syncs, receipts, and qsub."""
     real_run = subprocess.run
@@ -373,8 +383,7 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
         nonlocal qstat_calls
         if args[:2] == ["qstat", "-u"]:
             qstat_calls += 1
-            output = "" if qstat_calls < 2 else ""
-            return subprocess.CompletedProcess(args, 0, output, "")
+            return subprocess.CompletedProcess(args, 0, "", "")
         if "sync" in args:
             uv_envs.append(kwargs["env"])
             Path(kwargs["env"]["UV_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
@@ -437,8 +446,12 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
             if call_args[:2] == ["qstat", "-u"]:
                 qstat_calls += 1
                 return subprocess.CompletedProcess(call_args, 0, "" if qstat_calls < 2 else "occupied", "")
-            if "sync" in call_args and mode == "dry-fail":
-                raise subprocess.CalledProcessError(1, call_args)
+            if "--offline" in call_args and mode == "dry-fail":
+                Path(kwargs["env"]["UV_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+                Path(kwargs["env"]["UV_PROJECT_ENVIRONMENT"]).mkdir(parents=True, exist_ok=True)
+                if kwargs.get("check", False):
+                    raise subprocess.CalledProcessError(1, call_args)
+                return subprocess.CompletedProcess(call_args, 1, "", "")
             return fake_subprocess(call_args, **kwargs)
         monkeypatch.setattr(stage, "_run", control_run)
         monkeypatch.setattr(stage.subprocess, "run", control_subprocess)
