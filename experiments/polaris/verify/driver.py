@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+import re
 
 
 def junit_counts(path: Path) -> dict[str, int]:
@@ -35,7 +36,9 @@ def run_arm(name: str, repo: Path, arm: str, evidence: Path) -> dict:
         try:
             result["counts"] = junit_counts(xml)
             counts = result["counts"]
-            result["status"] = "PASS" if rc == 0 and counts["total"] > 0 and counts["failed"] == 0 and counts["errors"] == 0 else "FAIL"
+            lines = [line.strip() for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+            result["pytest_summary"] = next((line for line in reversed(lines) if re.search(r"=+ .* in .* =+$", line)), lines[-1] if lines else "")
+            result["status"] = "PASS" if rc == 0 and counts["passed"] > 0 and counts["failed"] == 0 and counts["errors"] == 0 else "FAIL"
         except (ET.ParseError, OSError) as exc:
             result.update(status="FAIL", reason=f"unparseable JUnit: {exc}")
     (evidence / f"{name}.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
@@ -46,11 +49,17 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--evidence", required=True)
+    parser.add_argument("--job-python", required=True)
     args = parser.parse_args()
     manifest = json.loads(Path(args.manifest).read_text())
     repo = Path(manifest["target_repo"])
     evidence = Path(args.evidence)
     evidence.mkdir(parents=True, exist_ok=True)
+    expected_python = Path(args.job_python).resolve()
+    actual_python = Path(sys.executable).resolve()
+    (evidence / "driver-preflight.json").write_text(json.dumps({"expected_python": str(expected_python), "observed_python": str(actual_python), "ok": actual_python == expected_python}, indent=2) + "\n", encoding="utf-8")
+    if actual_python != expected_python:
+        return 76
     results = [run_arm(f"arm-{index}", repo, arm, evidence) for index, arm in enumerate(manifest["arms"])]
     output = {"manifest": str(args.manifest), "target_sha": manifest["target_sha"], "arms": results, "all_pass": all(row["status"] == "PASS" for row in results)}
     (evidence / "results.json").write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")

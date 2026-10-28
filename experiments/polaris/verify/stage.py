@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -48,6 +49,18 @@ def validate_arm(arm: str, repo: Path) -> str:
     return arm
 
 
+def _harness_repo() -> Path:
+    """Return the checkout root containing this harness."""
+    return Path(_git(VERIFY_DIR, "rev-parse", "--show-toplevel"))
+
+
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
+        check=False,
+    ).returncode == 0
+
+
 def _write_literal_env(path: Path, manifest: Path, facility_python: str) -> None:
     """Write only the manifest pointer; shared values remain in JSON."""
     path.write_text("RUN_MANIFEST=" + shlex.quote(str(manifest)) + "\nRUN_PYTHON=" + shlex.quote(facility_python) + "\n", encoding="utf-8")
@@ -58,7 +71,8 @@ def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, 
     target_sha = _git(target_repo, "rev-parse", "HEAD")
     if not HEX40.fullmatch(target_sha) or target_sha != args.target_sha:
         raise RuntimeError("target checkout is not at the requested full SHA")
-    harness_sha = _git(VERIFY_DIR.parents[2], "rev-parse", "HEAD")
+    harness_repo = _harness_repo()
+    harness_sha = _git(harness_repo, "rev-parse", "HEAD")
     profile = json.loads((VERIFY_DIR / "facility_profile.json").read_text())
     arms = [validate_arm(arm, target_repo) for arm in args.arm]
     manifest = {
@@ -80,14 +94,15 @@ def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, 
         "job_helper": str(harness_dir / "job.py"),
         "driver": str(harness_dir / "driver.py"),
         "staging_receipt": str(run_root / "staging-receipt.json"),
+        "copied_file_sha256": {},
     }
     return manifest
 
 
 def stage(args: argparse.Namespace) -> int:
     """Perform login-node staging and submit the stored PBS script."""
-    harness_repo = VERIFY_DIR.parents[2]
-    if _git(harness_repo, "status", "--porcelain", "--untracked-files=no"):
+    harness_repo = _harness_repo()
+    if _git(harness_repo, "status", "--porcelain"):
         raise RuntimeError("harness checkout has tracked changes; refuse staging")
     evidence_root = Path(args.evidence_root).expanduser().resolve()
     run_root = evidence_root / args.cell_id
@@ -96,6 +111,13 @@ def stage(args: argparse.Namespace) -> int:
     run_root.mkdir(parents=True)
     for name in ("evidence", "pbs", "harness"):
         (run_root / name).mkdir()
+    qstat_path = run_root / "pre-submit-qstat.txt"
+    qstat = subprocess.run(["qstat", "-u", os.environ.get("USER", "")], check=True, text=True, capture_output=True)
+    qstat_output = (qstat.stdout + qstat.stderr).strip()
+    qstat_path.write_text(qstat_output + ("\n" if qstat_output else ""), encoding="utf-8")
+    if qstat_output:
+        print(qstat_output, file=sys.stderr)
+        raise RuntimeError("refusing qsub while the user has a queued or running job")
     harness_dir = run_root / "harness"
     for name in ("facility_profile.json", "job.pbs", "job.py", "driver.py"):
         shutil.copy2(VERIFY_DIR / name, harness_dir / name)
@@ -107,6 +129,9 @@ def stage(args: argparse.Namespace) -> int:
         raise RuntimeError("target clone is shallow")
     if list(target_repo.rglob("._*")):
         raise RuntimeError("AppleDouble files found in target clone")
+    for ancestor in args.required_ancestor:
+        if not _is_ancestor(target_repo, ancestor, args.target_sha):
+            raise RuntimeError(f"required ancestor is not an ancestor of target: {ancestor}")
     profile = json.loads((VERIFY_DIR / "facility_profile.json").read_text())
     env = os.environ.copy()
     env.update({key: value for key, value in (item.split("=", 1) for item in profile["uv_flags"])})
@@ -114,7 +139,7 @@ def stage(args: argparse.Namespace) -> int:
     env["UV_PROJECT_ENVIRONMENT"] = str(run_root / "prime-env")
     uv = [profile["facility_python"], "-m", "uv"]
     uv_version = _run(uv + ["--version"], capture=True)
-    if profile["uv_version"] not in uv_version:
+    if uv_version != "uv " + profile["uv_version"]:
         raise RuntimeError(f"facility uv version mismatch: expected {profile['uv_version']}, got {uv_version}")
     _run(uv + ["sync", "--extra", "cpu", "--locked", "--project", str(target_repo)], cwd=target_repo, env=env)
     dry_log = run_root / "offline-dry.log"
@@ -122,6 +147,10 @@ def stage(args: argparse.Namespace) -> int:
         subprocess.run(uv + ["sync", "--offline", "--extra", "cpu", "--locked", "--project", str(target_repo)], env=env, check=True, text=True, stdout=stream, stderr=subprocess.STDOUT)
     manifest = build_manifest(args, run_root, target_repo, harness_dir)
     manifest["harness_clean_tracked"] = True
+    manifest["copied_file_sha256"] = {
+        name: hashlib.sha256((harness_dir / name).read_bytes()).hexdigest()
+        for name in ("facility_profile.json", "job.pbs", "job.py", "driver.py")
+    }
     manifest_path = run_root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     env_path = run_root / "run.env"
@@ -131,7 +160,7 @@ def stage(args: argparse.Namespace) -> int:
     for path in (manifest["evidence_dir"], manifest["pbs_dir"], manifest["cache_dir"], manifest["prime_env"], manifest["staging_receipt"]):
         if not Path(path).exists():
             raise RuntimeError(f"staging path missing: {path}")
-    qsub = ["qsub", "-A", profile["pbs"]["account"], "-q", profile["pbs"]["queue"], "-l", f"select={profile['pbs']['select']},walltime={profile['pbs']['walltime']},filesystems={profile['pbs']['filesystems']}", "-k", "doe", "-v", f"RUN_ENV_PATH={env_path}", str(harness_dir / "job.pbs")]
+    qsub = ["qsub", "-A", profile["pbs"]["account"], "-q", profile["pbs"]["queue"], "-l", f"select={profile['pbs']['select']},walltime={profile['pbs']['walltime']},filesystems={profile['pbs']['filesystems']}", "-k", "doe", "-o", str(manifest["pbs_dir"]) + "/", "-e", str(manifest["pbs_dir"]) + "/", "-v", f"RUN_ENV_PATH={env_path}", str(harness_dir / "job.pbs")]
     print("SUBMIT " + shlex.join(qsub), flush=True)
     job_id = _run(qsub, capture=True)
     (run_root / "submission.txt").write_text(job_id + "\n" + shlex.join(qsub) + "\n", encoding="utf-8")

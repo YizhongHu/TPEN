@@ -32,9 +32,17 @@ select it explicitly as an arm. The self-test also proves that a normal repo
 collection does not collect it.
 
 Exit status 0 means every selected arm produced parseable JUnit with at least
-one testcase and no failures or errors. Nonzero means a staging/preflight
+one passing testcase and no failures or errors. Nonzero means a staging/preflight
 assertion or arm verdict failed. Scheduler state and job exit are not the
 scientific verdict by themselves; inspect `results.json` and the JUnit files.
+
+Important preflight codes are 60 (missing receipt), 61 (receipt identity
+mismatch), 70 (login host), 71 (PBS node mismatch), 72 (target SHA), 73
+(AppleDouble), 74/76 (venv interpreter), 75 (package versions), 77 (uv
+version), 78 (lock resolution), and 79 (ancestor/sync). The driver writes
+`preflight.json`, `driver-preflight.json`, and mirrored stdout/stderr under the
+per-job evidence directory. `results.json` plus its JUnit files are the verdict
+of record.
 
 The harness is CPU-only. It does not launch experiments, change Hydra
 configuration, edit `uv.lock`, or manage the operator's facility overlay.
