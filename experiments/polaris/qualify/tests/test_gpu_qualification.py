@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import shlex
@@ -182,16 +183,25 @@ def test_job_main_green_and_seam_controls(monkeypatch, tmp_path: Path) -> None:
         manifest_path.write_text(json.dumps(manifest)); receipt.write_text(json.dumps({"runtime_kind": job.RUNTIME_KIND, "target_sha": manifest["target_sha"], "overlay": {key: profile[key] for key in ("overlay_python", "overlay_root", "facility_site_packages")}}))
         run_env.write_text(f"RUN_MANIFEST={manifest_path}\nRUN_PYTHON={sys.executable}\nRUN_JOB_PY={harness / 'gpu_job.py'}\n")
         (tmp_path / "nodes").write_text("nid001.fqdn\n")
+    probe_envs: list[dict[str, str]] = []
     def configure() -> None:
         write_inputs(); monkeypatch.setenv("RUN_ENV_PATH", str(run_env)); monkeypatch.setenv("PBS_JOBID", "job"); monkeypatch.setenv("PBS_NODEFILE", str(tmp_path / "nodes")); monkeypatch.setenv("LD_LIBRARY_PATH", ":".join((str(tmp_path), str(tmp_path), str(tmp_path), "/opt/cray/libfabric/lib")))
-        monkeypatch.setattr(job, "hostname", lambda: "nid001"); monkeypatch.setattr(job, "nodefile_entries", lambda: ["nid001.fqdn"]); monkeypatch.setattr(job, "git_head", lambda repo: manifest["target_sha"]); monkeypatch.setattr(job, "appledoubles", lambda repo: []); monkeypatch.setattr(job, "overlay_snapshot", lambda profile: {"tree": "same"}); monkeypatch.setattr(job, "torch_probe", lambda python, env: {"torch": "2.8.0", "cuda": "12.9", "file": str(tmp_path / "site-packages" / "torch.py"), "available": True, "count": 1, "name": "A100", "op": 2.0, "visible": "0", "ld": env["LD_LIBRARY_PATH"]}); monkeypatch.setattr(job, "run_route", lambda *args: 0); monkeypatch.setattr(job, "run_qualification", lambda *args: 0)
-    configure(); assert job.main() == 0
+        sys.argv = ["gpu_job.py", str(run_env)]
+        def fake_probe(python: str, env: dict[str, str]) -> dict:
+            probe_envs.append(dict(env))
+            return {"torch": "2.8.0", "cuda": "12.9", "file": str(tmp_path / "site-packages" / "torch.py"), "available": True, "count": 1, "name": "A100", "op": 2.0, "visible": "0", "ld": env.get("LD_LIBRARY_PATH", "")}
+        monkeypatch.setattr(job, "hostname", lambda: "nid001"); monkeypatch.setattr(job, "nodefile_entries", lambda: ["nid001.fqdn"]); monkeypatch.setattr(job, "git_head", lambda repo: manifest["target_sha"]); monkeypatch.setattr(job, "appledoubles", lambda repo: []); monkeypatch.setattr(job, "overlay_snapshot", lambda profile: {"tree": "same"}); monkeypatch.setattr(job, "torch_probe", fake_probe); monkeypatch.setattr(job, "run_route", lambda *args: 0); monkeypatch.setattr(job, "run_qualification", lambda *args: 0)
+    configure(); assert job.main() == 0; assert probe_envs[-1]["LD_LIBRARY_PATH"] == os.environ["LD_LIBRARY_PATH"]
     controls = [("60", lambda: receipt.unlink(), 60), ("61", lambda: receipt.write_text("{}"), 61), ("64", lambda: (target / job.CANONICAL_STAGE).unlink(), 64), ("79", lambda: manifest.update(required_ancestors=["0" * 40]), 79), ("81", lambda: manifest.update(copied_file_sha256={"gpu_job.py": "0" * 64}), 81), ("82", lambda: manifest["runtime_profile"].update(libshim=str(tmp_path / "missing")), 82), ("84", lambda: manifest.update(runtime_kind="wrong"), 84), ("85", lambda: manifest.update(nodes=2), 85)]
     for name, mutate, expected in controls:
         (target / job.CANONICAL_STAGE).parent.mkdir(parents=True, exist_ok=True)
         (target / job.CANONICAL_STAGE).write_text("# fixture route\n")
         profile["libshim"] = str(tmp_path)
         manifest.update(runtime_kind=job.RUNTIME_KIND, target_sha=target_sha, required_ancestors=[], nodes=1, copied_file_sha256={}, job_helper=str(harness / "gpu_job.py"), staging_receipt=str(receipt), runtime_profile=profile); write_inputs(); mutate(); manifest_path.write_text(json.dumps(manifest)); assert job.main() == expected, name
+    legacy_controls = [("login", lambda: monkeypatch.setattr(job, "hostname", lambda: "polaris-login-01"), 70), ("node", lambda: monkeypatch.setattr(job, "nodefile_entries", lambda: ["other"]), 71), ("head", lambda: monkeypatch.setattr(job, "git_head", lambda repo: "c" * 40), 72), ("apple", lambda: monkeypatch.setattr(job, "appledoubles", lambda repo: ["._bad"]), 73), ("probe", lambda: monkeypatch.setattr(job, "torch_probe", lambda python, env: {"torch": "bad"}), 83), ("route", lambda: monkeypatch.setattr(job, "run_route", lambda *args: 7), 1), ("qualify", lambda: monkeypatch.setattr(job, "run_qualification", lambda *args: 2), 2)]
+    for name, mutate, expected in legacy_controls:
+        manifest.update(runtime_kind=job.RUNTIME_KIND, target_sha=target_sha, required_ancestors=[], nodes=1, copied_file_sha256={}, job_helper=str(harness / "gpu_job.py"), staging_receipt=str(receipt), runtime_profile=profile); configure(); mutate(); assert job.main() == expected, name
+    manifest["nodes"] = 1
     configure(); changed = iter(({"tree": "same"}, {"tree": "changed"})); monkeypatch.setattr(job, "overlay_snapshot", lambda profile: next(changed)); assert job.main() == 83
 
 
@@ -215,11 +225,18 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
         return original_run(args, **kwargs)
     monkeypatch.setattr(stage, "_run", fake_run)
     args = type("Args", (), {"target_sha": target_sha, "cell_id": "cell", "context": "O-composite", "optimizer": "adam", "lr": 0.005, "beta2": 0.999, "seed_label": 810001, "walkers": 2048, "updates": 2000, "checkpoint_every": 1000, "stage": "Q", "nodes": 1, "queue": "debug", "walltime": "00:30:00", "account": "HetRxnEnergy", "runtime_profile": str(profile), "evidence_root": str(tmp_path / "runs"), "required_ancestor": [], "remote": str(remote)})()
-    assert stage.stage(args) == 0
+    try:
+        result = stage.stage(args)
+    except Exception as error:  # noqa: BLE001
+        raise AssertionError(f"stage raised before qsub: {error}") from error
+    assert result == 0
     assert len(qsub_calls) == 1 and qsub_calls[0][1] == "-V" and qsub_calls[0].count("-l") == 3
     assert qsub_calls[0][qsub_calls[0].index("-l") + 1] == "select=1:system=polaris"
     manifest = json.loads((tmp_path / "runs" / "cell" / "manifest.json").read_text())
     assert Path(manifest["job_helper"]).name == "gpu_job.py"
+    run_root = (tmp_path / "runs" / "cell").resolve()
+    expected_qsub = ["qsub", "-V", "-A", manifest["scheduler"]["account"], "-q", manifest["scheduler"]["queue"], "-l", "select=1:system=polaris", "-l", "walltime=" + manifest["scheduler"]["walltime"], "-l", "filesystems=" + manifest["scheduler"]["filesystems"], "-o", str(run_root / "pbs") + "/", "-e", str(run_root / "pbs") + "/", "-v", "RUN_ENV_PATH=" + str(run_root / "run.env"), str(run_root / "harness" / "job.pbs")]
+    assert qsub_calls[0] == expected_qsub
 
     def isolated_profile(name: str, **changes: str) -> Path:
         value = json.loads(profile.read_text())
@@ -227,7 +244,8 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
         path = tmp_path / f"{name}.json"; path.write_text(json.dumps(value)); return path
 
     def isolated_args(name: str, runtime_profile: Path) -> object:
-        values = vars(args).copy(); values.update(cell_id=name, runtime_profile=str(runtime_profile), evidence_root=str(tmp_path / f"runs-{name}"))
+        values = {key: value for key, value in vars(args.__class__).items() if not key.startswith("__")}
+        values.update(cell_id=name, runtime_profile=str(runtime_profile), evidence_root=str(tmp_path / f"runs-{name}"))
         return type("Args", (), values)()
 
     monkeypatch.setattr(stage, "_qstat", lambda: "busy")

@@ -74,6 +74,18 @@ def _harness_repo() -> Path:
     return Path(_git(harness, "rev-parse", "--show-toplevel"))
 
 
+def gpu_layout(run_root: Path) -> dict[str, Path]:
+    """Extend the shared layout with GPU-specific runtime artefacts."""
+    paths = layout(run_root)
+    paths.update({
+        "overlay_receipt": run_root / "overlay-receipt.json",
+        "runtime_profile": run_root / "runtime-profile.json",
+        "selection_argv": run_root / "selection-argv.json",
+        "job_helper": run_root / "harness" / "gpu_job.py",
+    })
+    return paths
+
+
 def validate_evidence_root(value: str) -> str:
     """Reject paths that cannot survive PBS variable serialization."""
     if not value or any(char.isspace() or char in ",'\"" for char in value):
@@ -98,12 +110,7 @@ def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path, 
     target_sha = _git(target_repo, "rev-parse", "HEAD")
     if target_sha != args.target_sha:
         raise RuntimeError("target checkout is not at the requested full SHA")
-    paths = layout(run_root)
-    paths.update({
-        "overlay_receipt": run_root / "overlay-receipt.json",
-        "runtime_profile": run_root / "runtime-profile.json",
-        "selection_argv": run_root / "selection-argv.json",
-    })
+    paths = gpu_layout(run_root)
     return {
         "schema": 1,
         "runtime_kind": RUNTIME_KIND,
@@ -152,7 +159,7 @@ def stage(args: argparse.Namespace) -> int:
     if first_qstat:
         raise RuntimeError("refusing staging while qstat is non-empty")
     run_root.mkdir(parents=True)
-    paths = layout(run_root)
+    paths = gpu_layout(run_root)
     paths["run_root"].joinpath("output").mkdir(parents=True, exist_ok=True)
     for key in ("evidence_dir", "pbs_dir", "harness_dir"):
         paths[key].mkdir(parents=True, exist_ok=True)
