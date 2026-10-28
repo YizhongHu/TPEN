@@ -203,6 +203,127 @@ def test_zero_jastrow_is_exactly_the_corresponding_control(
     assert torch.equal(factor.difference_coefficient, torch.zeros_like(factor.difference_coefficient))
 
 
+def test_all_four_matched_starts_have_exactly_the_same_initial_function() -> None:
+    """The B grid starts from one function, including the O-composite cells."""
+
+    outputs = []
+    for package in ("B00", "B10", "B01", "B11"):
+        train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+        train.model = context_mapping.compose_package(train.model, package)
+        OmegaConf.resolve(train)
+        torch.manual_seed(1729)
+        model = instantiate(train.model).to(dtype=torch.float64)
+        outputs.append(model(_he_batch()))
+
+    for output in outputs[1:]:
+        assert torch.equal(output.logabs, outputs[0].logabs)
+        assert torch.equal(output.sign, outputs[0].sign)
+
+
+@pytest.mark.parametrize("package", ("B10", "B11"))
+def test_matched_start_added_columns_have_the_right_first_layer_gradient(
+    package: str,
+) -> None:
+    """Check the outer-product identity for each order's first layer."""
+
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model = context_mapping.compose_package(train.model, package)
+    OmegaConf.resolve(train)
+    torch.manual_seed(1729)
+    model = instantiate(train.model).to(dtype=torch.float64)
+    batch = instantiate(
+        {
+            "_target_": "tpen.data.batch.ElectronBatch",
+            "positions": torch.tensor(
+                [[[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]], dtype=torch.float64
+            ),
+            "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
+            "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
+            "spins": torch.tensor([[1.0, -1.0]], dtype=torch.float64),
+        }
+    )
+    captured = {}
+    outputs = {}
+    hooks = []
+    for order in (1, 2):
+        layer = model.embedding.order_mlps[str(order)].layers[0]
+        hooks.append(
+            layer.register_forward_pre_hook(
+                lambda module, inputs, order=order: captured.setdefault(order, inputs[0])
+            )
+        )
+        hooks.append(
+            layer.register_forward_hook(
+                lambda module, inputs, output, order=order: (
+                    output.retain_grad(),
+                    outputs.setdefault(order, output),
+                )[-1]
+            )
+        )
+    try:
+        logabs = model(batch).logabs[0]
+        expected_all = {
+            1: torch.tensor(
+                [
+                    [1.0, 0.0, 0.0, 1.0, 1 / 2],
+                    [0.0, 2.0, 0.0, -1.0, 4 / 5],
+                ],
+                dtype=torch.float64,
+            ),
+            2: torch.tensor(
+                [
+                    [1.0, 0.0, 0.0, 1.0, 1 / 2, 1.0, 0.0, 0.0, 1.0, 1 / 2, 1 / 2, 1 / 2, 0.0],
+                    [1.0, 0.0, 0.0, 1.0, 1 / 2, 0.0, 2.0, 0.0, -1.0, 4 / 5, 1 / 2, 4 / 5, 5 / 6],
+                    [0.0, 2.0, 0.0, -1.0, 4 / 5, 1.0, 0.0, 0.0, 1.0, 1 / 2, 4 / 5, 1 / 2, 5 / 6],
+                    [0.0, 2.0, 0.0, -1.0, 4 / 5, 0.0, 2.0, 0.0, -1.0, 4 / 5, 4 / 5, 4 / 5, 0.0],
+                ],
+                dtype=torch.float64,
+            ),
+        }
+        weights = {
+            order: model.embedding.order_mlps[str(order)].layers[0].weight
+            for order in (1, 2)
+        }
+        g = torch.autograd.grad(
+            logabs,
+            [outputs[1], outputs[2], weights[1], weights[2]],
+            retain_graph=True,
+        )
+        assert len(captured) == 2
+        assert len(outputs) == 2
+        for order, delta_gradient, weight_gradient in (
+            (1, g[0], g[2]),
+            (2, g[1], g[3]),
+        ):
+            expected = expected_all[order]
+            inputs = captured[order][0]
+            delta = delta_gradient[0]
+            hidden = weights[order].shape[0]
+            if order == 1:
+                assert inputs.shape == (2, 5)
+                assert delta.shape == (2, hidden)
+            else:
+                assert inputs.shape == (2, 2, 13)
+                assert delta.shape == (2, 2, hidden)
+            inputs = inputs.reshape(-1, inputs.shape[-1])
+            delta = delta.reshape(-1, delta.shape[-1])
+            torch.testing.assert_close(inputs, expected, rtol=1e-12, atol=1e-12)
+            assert inputs.shape == expected.shape
+            gradient = weight_gradient
+            expected_gradient = delta.transpose(0, 1) @ inputs
+            added = (4,) if order == 1 else (4, 9, 10, 11, 12)
+            for added_index in added:
+                torch.testing.assert_close(
+                    gradient[:, added_index],
+                    expected_gradient[:, added_index],
+                    rtol=1e-12,
+                    atol=1e-12,
+                )
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
 @pytest.mark.parametrize("package", ("B01", "B11"))
 def test_jastrow_coefficient_derivatives_match_the_explicit_two_electron_oracle(
     package: str,
@@ -458,6 +579,91 @@ def _run_short_real_training(
     monkeypatch.setattr(torch.optim.Adam, "step", capture_step)
     runner.run(make_run_context(tmp_path, run_id=f"{package}-{trainable}"))
     return factor, captured
+
+
+_ADDED_INPUT_COLUMNS = {1: (4,), 2: (4, 9, 10, 11, 12)}
+
+
+def _run_short_embedding_training(
+    package: str,
+    tmp_path: Path,
+    *,
+    freeze_added: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], list[dict[int, torch.Tensor]]]:
+    """Run two real training updates while observing embedding first-layer columns."""
+
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model = context_mapping.compose_package(train.model, package)
+    train.runtime.device = "cpu"
+    train.sampler.n_walkers = 4
+    train.sampler.burn_in = 1
+    train.sampler.n_steps = 1
+    train.trainer.max_steps = 2
+    OmegaConf.resolve(train)
+    runner = instantiate(train.runner)
+    weights = {
+        order: runner.model.embedding.order_mlps[str(order)].layers[0].weight
+        for order in (1, 2)
+    }
+    initial = {order: weight.detach().clone() for order, weight in weights.items()}
+    for order, weight in weights.items():
+        added = _ADDED_INPUT_COLUMNS[order]
+        torch.testing.assert_close(weight[:, added], torch.zeros_like(weight[:, added]))
+
+    captured_gradients: list[dict[int, torch.Tensor]] = []
+    original_step = torch.optim.Adam.step
+
+    def capture_step(optimizer: torch.optim.Adam, *args: object, **kwargs: object) -> object:
+        step_gradients = {}
+        for order, weight in weights.items():
+            assert weight.grad is not None
+            step_gradients[order] = weight.grad.detach().clone()
+            if freeze_added:
+                weight.grad[:, _ADDED_INPUT_COLUMNS[order]] = 0
+        captured_gradients.append(step_gradients)
+        return original_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.Adam, "step", capture_step)
+    runner.run(make_run_context(tmp_path, run_id=f"{package}-embedding-{freeze_added}"))
+    return weights, initial, captured_gradients
+
+
+@pytest.mark.parametrize("package", ("B10", "B11"))
+def test_added_embedding_columns_move_in_a_real_short_training_run(
+    package: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    weights, initial, gradients = _run_short_embedding_training(
+        package, tmp_path, freeze_added=False, monkeypatch=monkeypatch
+    )
+    assert len(gradients) == 2
+    for order, weight in weights.items():
+        added = _ADDED_INPUT_COLUMNS[order]
+        step_zero_gradient = gradients[0][order][:, added]
+        assert torch.isfinite(step_zero_gradient).all()
+        assert torch.any(step_zero_gradient != 0)
+        final_added = weight[:, added].detach()
+        assert torch.isfinite(final_added).all()
+        assert torch.any(final_added != 0)
+
+
+@pytest.mark.parametrize("package", ("B10", "B11"))
+def test_frozen_added_embedding_columns_stay_zero_while_raw_weights_move(
+    package: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    weights, initial, gradients = _run_short_embedding_training(
+        package, tmp_path, freeze_added=True, monkeypatch=monkeypatch
+    )
+    assert len(gradients) == 2
+    for order, weight in weights.items():
+        added = _ADDED_INPUT_COLUMNS[order]
+        step_zero_gradient = gradients[0][order][:, added]
+        assert torch.isfinite(step_zero_gradient).all()
+        assert torch.any(step_zero_gradient != 0)
+        raw = tuple(index for index in range(weight.shape[1]) if index not in added)
+        assert torch.equal(weight[:, added].detach(), torch.zeros_like(weight[:, added]))
+        assert torch.isfinite(weight[:, raw]).all()
+        assert torch.any(weight[:, raw].detach() != initial[order][:, raw])
 
 
 @pytest.mark.parametrize("package", ("B01", "B11"))
