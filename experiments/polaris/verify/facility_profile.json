@@ -1,0 +1,10 @@
+{
+  "facility_python": "/soft/applications/conda/2025-09-25/mconda3/bin/python",
+  "uv_version": "0.8.23",
+  "uv_flags": ["UV_NO_MANAGED_PYTHON=1", "UV_PYTHON_DOWNLOADS=never", "UV_LINK_MODE=copy"],
+  "timezone": "UTC",
+  "job_scratch_root": "/local/scratch",
+  "compute_host_guard": {"refuse_prefix": "polaris-login-"},
+  "thread_limits": {"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"},
+  "pbs": {"account": "HetRxnEnergy", "queue": "debug", "allowed_queues": ["debug", "debug-scaling"], "select": "1:system=polaris", "walltime": "01:00:00", "filesystems": "home:eagle"}
+}
