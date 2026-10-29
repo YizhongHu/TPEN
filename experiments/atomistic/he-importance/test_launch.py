@@ -15,7 +15,7 @@ import threading
 import pytest
 from omegaconf import OmegaConf
 
-from tpen.artifacts import RunContext, RunResult
+from tpen.artifacts import ArtifactManager, RunClock, RunContext, RunMetadata, RunResult
 from tpen.distributed import AcceleratorIdentity, AcceleratorKind, ExecutionTopology
 from tpen.run import run_from_config
 from tpen.runner import Runner
@@ -523,7 +523,7 @@ def test_identity_unknown_keys_follow_runner_strictness_split(
     assert launch.launch_train(cell, facts, runner=lambda _: 0) == 0
 
     # The TPEN crossing remains strict: the same nested unknown key is rejected.
-    runner = _install_default_runner_witness(monkeypatch, [])
+    runner = _install_default_runner_witness(monkeypatch, [], tmp_path)
     with pytest.raises(launch.LaunchValidationError, match="caller_note"):
         launch.launch_train(cell, facts, runner=runner)
 
@@ -590,25 +590,15 @@ def test_default_runner_receives_supplied_topology_at_consumer(
 
     import tpen.run as production_run
 
-    class FakeContext(RunContext):
-        def __init__(self, received_topology: object) -> None:
-            self.cfg = None
-            self.loggers: tuple[object, ...] = ()
-            self.metadata = SimpleNamespace(status="initialized")
-            self.topology = received_topology
-
-        def emit(self, _: object) -> None:
-            return None
-
     class RecordingRunner(Runner):
         def run(self, context: object) -> RunResult:
             received_contexts.append(context)
             return RunResult(status="completed")
 
-    def consumer(cfg: object, **kwargs: object) -> FakeContext:
+    def consumer(cfg: object, **kwargs: object) -> _FakeContext:
         del cfg
         consumer_topologies.append(kwargs.get("topology"))
-        return FakeContext(kwargs.get("topology"))
+        return _FakeContext(topology=kwargs.get("topology"), run_root=tmp_path)
 
     monkeypatch.setattr(production_run, "prepare_run_context", consumer)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -632,27 +622,17 @@ def test_default_runner_topology_is_per_call_not_process_global(
 
     import tpen.run as production_run
 
-    class FakeContext(RunContext):
-        def __init__(self, cfg: object, topology: object) -> None:
-            self.cfg = cfg
-            self.loggers: tuple[object, ...] = ()
-            self.metadata = SimpleNamespace(status="initialized")
-            self.topology = topology
-
-        def emit(self, _: object) -> None:
-            return None
-
     class RecordingRunner(Runner):
         def run(self, _: object) -> RunResult:
             return RunResult(status="completed")
 
-    def consumer(cfg: object, **kwargs: object) -> FakeContext:
+    def consumer(cfg: object, **kwargs: object) -> _FakeContext:
         topology = kwargs.get("topology")
         seen.append(topology)
         if topology is not None:
             entered.set()
             assert release.wait(5)
-        return FakeContext(cfg, topology)
+        return _FakeContext(run_root=tmp_path, cfg=cfg, topology=topology)
 
     monkeypatch.setattr(production_run, "prepare_run_context", consumer)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -684,28 +664,18 @@ def test_default_runner_topology_is_per_call_not_process_global(
 
 
 def _install_default_runner_witness(
-    monkeypatch: pytest.MonkeyPatch, seen: list[object]
+    monkeypatch: pytest.MonkeyPatch, seen: list[object], run_root: Path
 ) -> object:
     import tpen.run as production_run
-
-    class FakeContext(RunContext):
-        def __init__(self, cfg: object, topology: object) -> None:
-            self.cfg = cfg
-            self.loggers: tuple[object, ...] = ()
-            self.metadata = SimpleNamespace(status="initialized")
-            self.topology = topology
-
-        def emit(self, _: object) -> None:
-            return None
 
     class RecordingRunner(Runner):
         def run(self, _: object) -> RunResult:
             return RunResult(status="completed")
 
-    def consumer(cfg: object, **kwargs: object) -> FakeContext:
+    def consumer(cfg: object, **kwargs: object) -> _FakeContext:
         topology = kwargs.get("topology")
         seen.append(topology)
-        return FakeContext(cfg, topology)
+        return _FakeContext(run_root=run_root, cfg=cfg, topology=topology)
 
     monkeypatch.setattr(production_run, "prepare_run_context", consumer)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -718,7 +688,7 @@ def test_default_runner_accepts_canonical_mapping_at_consumer(
 ) -> None:
     cell = _cell(tmp_path)
     seen: list[object] = []
-    runner = _install_default_runner_witness(monkeypatch, seen)
+    runner = _install_default_runner_witness(monkeypatch, seen, tmp_path)
     facts = launch.execution_topology_facts(_topology())
 
     assert launch.launch_train(cell, facts, runner=runner) == 0
@@ -735,7 +705,7 @@ def test_default_runner_refuses_unsupported_mapping_provenance(
         launcher_job_id="EXTRA-SCHEDULER-JOB",
         cuda_visible_devices="EXTRA-DEVICE-VISIBILITY",
     )
-    runner = _install_default_runner_witness(monkeypatch, [])
+    runner = _install_default_runner_witness(monkeypatch, [], tmp_path)
 
     with pytest.raises(launch.LaunchValidationError, match="unsupported production runner"):
         launch.launch_train(cell, facts, runner=runner)
@@ -748,7 +718,7 @@ def test_default_mapping_required_and_identity_guards_have_both_polarities(
     facts = launch.execution_topology_facts(_topology())
     facts["device_identity"] = {"kind": "cuda", "index": 0, "uuid": "GPU-0"}
     seen: list[object] = []
-    runner = _install_default_runner_witness(monkeypatch, seen)
+    runner = _install_default_runner_witness(monkeypatch, seen, tmp_path)
 
     assert launch.launch_train(cell, facts, runner=runner) == 0
     assert seen[0].device_identity.uuid == "GPU-0"
@@ -900,21 +870,11 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
 
     import tpen.run as production_run
 
-    class FakeContext(RunContext):
-        def __init__(self) -> None:
-            self.cfg = None
-            self.loggers: tuple[object, ...] = ()
-            self.metadata = SimpleNamespace(status="initialized")
-            self.events: list[object] = []
-
-        def emit(self, event: object) -> None:
-            self.events.append(event)
-
     class HandledFailureRunner(Runner):
         def run(self, _: object) -> RunResult:
             return RunResult(status="failed")
 
-    context = FakeContext()
+    context = _FakeContext(run_root=tmp_path)
 
     monkeypatch.setattr(production_run, "validate_hi_train_config", lambda _: None)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -931,6 +891,11 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
 
     assert launch.launch_train(cell, _topology(), runner=production_run.run_from_config) == 1
     assert context.metadata.status == "failed"
+    # The handled-failure path is the raise-free path: the runner's verdict
+    # rides RunCompleted. A RunFailed here would mean run_from_config raised
+    # and exit code 1 came from the exception path instead.
+    assert [type(event).__name__ for event in context.events] == ["RunStarted", "RunCompleted"]
+    assert context.events[-1].status == "failed"
 
 
 @pytest.mark.parametrize("status", ["completed", "not-a-run-result"])
@@ -1396,3 +1361,165 @@ def test_content_hash_is_exact_and_binds_all_public_launch_entries(
             launch.prepare_train_launch(forged, _topology())
         with pytest.raises(launch.LaunchValidationError, match=message):
             launch.launch_train(forged, _topology(), runner=lambda _: 0)
+
+
+class _FakeContext(RunContext):
+    """Small test double built through the production context constructor."""
+
+    # Placement below the call sites is forced by test_tpen_boundary.py's line-keyed inventory.
+
+    def __init__(
+        self,
+        *,
+        run_root: Path,
+        cfg: object = None,
+        topology: object = None,
+    ) -> None:
+        from datetime import timezone
+
+        # These imports stay local so the line-keyed boundary inventory remains stable.
+
+        super().__init__(
+            cfg=cfg,
+            source_cfg=cfg,
+            artifact_manager=ArtifactManager(
+                root=run_root,
+                experiment="tests",
+                sector="he-importance",
+                run_id="fake-context",
+            ),
+            metadata=RunMetadata(
+                run_id="fake-context",
+                run_name="fake-context",
+                timestamp="1970-01-01T00:00:00+00:00",
+                timezone="UTC",
+                git_commit="test",
+                git_branch="test",
+                dirty_worktree=False,
+                command=None,
+                config_path=None,
+                resolved_config_path="test",
+                run_dir="",
+                device="cpu",
+                dtype="float32",
+            ),
+            clock=RunClock(timezone="UTC", tzinfo=timezone.utc),
+            callbacks=[],
+            loggers=[],
+            topology=topology,
+            profile_writer=None,
+        )
+        self.events: list[object] = []
+
+    def emit(self, event: object, *, state: object = None) -> object:
+        # Load-bearing: G1 and G2 assert on context.events emitted by this override.
+        del state
+        self.events.append(event)
+        return event
+
+
+def test_fake_context_tracks_run_context_init_fields(tmp_path: Path) -> None:
+    context = _FakeContext(run_root=tmp_path)
+    init_fields = {field.name for field in fields(RunContext) if field.init}
+    missing = sorted(name for name in init_fields if name not in vars(context))
+
+    assert not missing, f"_FakeContext is missing RunContext init fields: {missing}"
+
+
+def test_fake_context_doubles_use_shared_contract() -> None:
+    import ast
+
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    class _ContextDoubleVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.parents: list[ast.AST] = []
+            self.direct_doubles: list[tuple[str, bool]] = []
+            self.shared_subclasses: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            base_names = {base.id for base in node.bases if isinstance(base, ast.Name)}
+            if "RunContext" in base_names:
+                module_level = not any(
+                    isinstance(parent, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                    for parent in self.parents
+                )
+                self.direct_doubles.append((node.name, module_level))
+            if "_FakeContext" in base_names:
+                self.shared_subclasses.append(node.name)
+            self.parents.append(node)
+            self.generic_visit(node)
+            self.parents.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.parents.append(node)
+            self.generic_visit(node)
+            self.parents.pop()
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self.parents.append(node)
+            self.generic_visit(node)
+            self.parents.pop()
+
+    visitor = _ContextDoubleVisitor()
+    visitor.visit(tree)
+    assert visitor.direct_doubles == [("_FakeContext", True)], (
+        "RunContext doubles must be exactly one module-level _FakeContext; found "
+        f"{visitor.direct_doubles}"
+    )
+    assert not visitor.shared_subclasses, (
+        "RunContext doubles must not subclass _FakeContext; found "
+        f"{visitor.shared_subclasses}"
+    )
+    # I3 limit: aliased or dynamic bases are intentionally not detected statically.
+
+
+# Pin issue I6: the double's emit must retain production's keyword-only
+# parameters, so a future `context.emit(event, state=...)` remains supported.
+def test_fake_context_emit_accepts_production_keywords() -> None:
+    production = inspect.signature(RunContext.emit).parameters
+    double = inspect.signature(_FakeContext.emit).parameters
+    missing = sorted(
+        name
+        for name, parameter in production.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY and name not in double
+    )
+
+    assert not missing, f"_FakeContext.emit lacks production keyword(s): {missing}"
+
+
+def test_default_runner_exception_path_reports_run_failed_without_touching_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path)
+    # Resolved from the already-imported function rather than a new
+    # `import tpen.run` statement, which would add a boundary-inventory crossing.
+    production_run = inspect.getmodule(run_from_config)
+    context = _FakeContext(run_root=tmp_path)
+
+    def refuse_runner(_: object) -> object:
+        raise RuntimeError("runner construction raised")
+
+    monkeypatch.setattr(production_run, "validate_hi_train_config", lambda _: None)
+    monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
+    monkeypatch.setattr(production_run, "prepare_run_context", lambda *args, **kwargs: context)
+    monkeypatch.setattr(production_run, "_instantiate_runner", refuse_runner)
+
+    assert launch.launch_train(cell, _topology(), runner=production_run.run_from_config) == 1
+    assert context.metadata.status == "failed"
+    assert [type(event).__name__ for event in context.events] == ["RunStarted", "RunFailed"]
+    assert context.events[-1].exception_type == "RuntimeError"
+    # _FakeContext points run_dir at pytest's managed temporary root, not the
+    # repository checkout. The exception path must not leave error.json in CWD.
+    assert not (Path.cwd() / "error.json").exists()
+    # GREEN pin (G-r2): with real metadata and clock the failure artifact
+    # is actually written, and it lands where the context says, not elsewhere.
+    assert (context.run_dir / "error.json").is_file()
+
+
+def test_fake_context_run_dir_is_pytest_managed(tmp_path_factory: pytest.TempPathFactory) -> None:
+    context = _FakeContext(run_root=tmp_path_factory.mktemp("fake-context"))
+    base = tmp_path_factory.getbasetemp().resolve()
+
+    assert base in context.run_dir.resolve().parents, (
+        f"_FakeContext.run_dir={context.run_dir} is outside pytest's basetemp {base}"
+    )
