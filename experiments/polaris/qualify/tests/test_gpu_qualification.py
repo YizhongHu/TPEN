@@ -301,3 +301,20 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
         else:
             raise AssertionError(f"stage accepted control {name}")
         assert len(qsub_calls) == before, name
+
+    work_started = False
+    def unexpected_work() -> Path:
+        nonlocal work_started
+        work_started = True
+        raise AssertionError("disallowed queue reached staging work")
+    monkeypatch.setattr(stage, "_harness_repo", unexpected_work)
+    invalid_args = isolated_args("invalid-queue", profile)
+    invalid_args.queue = "prod"
+    try:
+        stage.stage(invalid_args)
+    except ValueError as error:
+        assert "not allowed" in str(error)
+    else:
+        raise AssertionError("disallowed queue was accepted")
+    assert not work_started
+    assert not (tmp_path / "runs-invalid-queue").exists()

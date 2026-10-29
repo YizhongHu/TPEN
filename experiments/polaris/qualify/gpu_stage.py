@@ -89,6 +89,15 @@ def validate_evidence_root(value: str) -> str:
     return value
 
 
+def validate_queue(queue: str) -> str:
+    """Require the requested queue to be admitted by the shared verify profile."""
+    profile = read_profile(VERIFY / "facility_profile.json")
+    allowed = profile.get("pbs", {}).get("allowed_queues")
+    if not isinstance(allowed, list) or queue not in allowed:
+        raise ValueError(f"queue is not allowed by the facility profile: {queue}")
+    return queue
+
+
 def _validate(args: argparse.Namespace) -> None:
     if len(args.target_sha) != 40 or any(char not in "0123456789abcdef" for char in args.target_sha):
         raise ValueError("target-sha must be a full lowercase 40-hex SHA")
@@ -138,6 +147,7 @@ def stage(args: argparse.Namespace) -> int:
     """Clone, stage, and submit one manifest-driven GPU qualification cell."""
     _validate(args)
     validate_evidence_root(args.evidence_root)
+    validate_queue(args.queue)
     profile = _profile(Path(args.runtime_profile).expanduser().resolve())
     if not Path(profile["overlay_python"]).is_file() or not Path(profile["overlay_root"]).is_dir() or not Path(profile["facility_site_packages"]).is_dir():
         raise RuntimeError("approved overlay paths are not readable")
