@@ -1370,6 +1370,7 @@ class _FakeContext(RunContext):
 
     def __init__(
         self,
+        *,
         run_root: Path,
         cfg: object = None,
         topology: object = None,
@@ -1411,7 +1412,7 @@ class _FakeContext(RunContext):
         self.events: list[object] = []
 
     def emit(self, event: object, *, state: object = None) -> object:
-        # This override is load-bearing: production emit dispatches artifact writers that read these stubs.
+        # Load-bearing: G1 and G2 assert on context.events emitted by this override.
         del state
         self.events.append(event)
         return event
@@ -1510,7 +1511,7 @@ def test_default_runner_exception_path_reports_run_failed_without_touching_cwd(
     # _FakeContext points run_dir at pytest's managed temporary root, not the
     # repository checkout. The exception path must not leave error.json in CWD.
     assert not (Path.cwd() / "error.json").exists()
-    # GREEN pin (G1): with real metadata and clock the failure artifact
+    # GREEN pin (G-r2): with real metadata and clock the failure artifact
     # is actually written, and it lands where the context says, not elsewhere.
     assert (context.run_dir / "error.json").is_file()
 
