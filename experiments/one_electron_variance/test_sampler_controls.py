@@ -21,6 +21,9 @@ from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.physics.one_electron import OneElectronExponential, OneElectronGaussian
 from tpen.sampling.metropolis import MetropolisSampler
 
+# Preserve the classification previously supplied by tests/integration/conftest.py.
+pytestmark = pytest.mark.integration
+
 PROBABILITIES = np.array([.1, .25, .5, .75, .9, .99, .999])
 
 

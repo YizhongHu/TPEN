@@ -88,14 +88,18 @@ variation, actual parameter gradients, and all 50,000 completed updates.
 
 ## Qualification and execution
 
-All tests run inside cluster allocations. Relevant selections are:
+All tests run inside cluster allocations. Study qualification tests live beside
+the experiment, separately from the core package test suite:
 
 ```
-tests/unit/physics/test_one_electron_references.py
-tests/unit/evaluation/test_readout_trajectory.py
-tests/integration/sampling/test_one_electron_qualification.py
 experiments/one_electron_variance
 ```
+
+`test_reference_controls.py` contains the independent scalar and imperfect-state
+controls, `test_sampler_controls.py` contains the full-budget radial and
+wrong-target controls, and `test_readout_records.py` checks the study's complete
+readout records. The protocol, admission, and configured integration tests also
+remain in this experiment directory.
 
 Also run the unchanged Hooke exact-energy, local-energy, sampler,
 electron-count training, envelope, checkpoint, and trajectory regression tests.
