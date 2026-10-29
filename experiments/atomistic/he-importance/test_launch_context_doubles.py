@@ -1,4 +1,4 @@
-"""Review round 1 controls for the shared RunContext double in test_launch.py.
+"""Review controls for the shared RunContext double in test_launch.py.
 
 Each control loads a MUTATED COPY of ``test_launch.py`` from ``tmp_path`` and
 asks the PR's own drift arms (field arm and structural arm) to reject it. A
@@ -36,11 +36,11 @@ def _mutated_source(*, append: str = "", replace: tuple[str, str] | None = None)
 
 
 def _load(tmp_path: Path, name: str, source: str) -> ModuleType:
-    """Load *source* as a throwaway module named ``review_r1_<name>``."""
+    """Load *source* as a throwaway module named ``review_<name>``."""
 
-    path = tmp_path / f"review_r1_{name}.py"
+    path = tmp_path / f"review_{name}.py"
     path.write_text(source, encoding="utf-8")
-    spec = importlib.util.spec_from_file_location(f"review_r1_{name}", path)
+    spec = importlib.util.spec_from_file_location(f"review_{name}", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -48,11 +48,11 @@ def _load(tmp_path: Path, name: str, source: str) -> ModuleType:
     return module
 
 
-def _arms_reject(module: ModuleType) -> bool:
+def _arms_reject(module: ModuleType, tmp_path: Path) -> bool:
     """Return whether either PR drift arm fails on *module*."""
 
     arms = (
-        module.test_fake_context_tracks_run_context_init_fields,
+        lambda: module.test_fake_context_tracks_run_context_init_fields(tmp_path),
         module.test_fake_context_doubles_use_shared_contract,
     )
     for arm in arms:
@@ -65,7 +65,7 @@ def _arms_reject(module: ModuleType) -> bool:
 
 _NESTED_SAME_NAME = '''
 
-def test_review_r1_nested_same_name_double() -> None:
+def test_nested_same_name_double() -> None:
     class _FakeContext(RunContext):  # bypasses RunContext.__init__
         def __init__(self) -> None:
             self.cfg = None
@@ -82,7 +82,7 @@ class _ReviewVariant(_FakeContext):  # bypasses RunContext.__init__
 
 _NESTED_OTHER_NAME = '''
 
-def test_review_r1_nested_other_name_double() -> None:
+def test_nested_other_name_double() -> None:
     class FakeContext(RunContext):  # bypasses RunContext.__init__
         def __init__(self) -> None:
             self.cfg = None
@@ -99,23 +99,23 @@ _SKIP_INIT = (
 # Test 4's handled-failure runner replaced by one whose construction raises.
 _RAISING_RUNNER = (
     "        lambda _: HandledFailureRunner(),\n",
-    "        lambda _: (_ for _ in ()).throw(RuntimeError('review r1: runner construction raised')),\n",
+    "        lambda _: (_ for _ in ()).throw(RuntimeError('runner construction raised')),\n",
 )
 
 
-# RED at 4eac71dd (issue I1): a nested double named _FakeContext defeats both arms.
+# RED at 4eac71dd (I1): a nested double named _FakeContext defeats both arms.
 def test_drift_arms_reject_nested_same_name_double(tmp_path: Path) -> None:
     module = _load(tmp_path, "nested_same_name", _mutated_source(append=_NESTED_SAME_NAME))
-    assert _arms_reject(module)
+    assert _arms_reject(module, tmp_path)
 
 
-# RED at 4eac71dd (issue I2): a subclass of _FakeContext that skips __init__ defeats both arms.
+# RED at 4eac71dd (I2): a subclass of _FakeContext that skips __init__ defeats both arms.
 def test_drift_arms_reject_subclass_of_shared_double(tmp_path: Path) -> None:
     module = _load(tmp_path, "subclass_of_double", _mutated_source(append=_SUBCLASS_OF_DOUBLE))
-    assert _arms_reject(module)
+    assert _arms_reject(module, tmp_path)
 
 
-# RED at 4eac71dd (issue I4): test 4 passes even when run_from_config raises instead of
+# RED at 4eac71dd (I4): test 4 passes even when run_from_config raises instead of
 # returning the handled failure, because the shared double now survives the exception path.
 def test_handled_failure_control_rejects_raising_runner(tmp_path: Path) -> None:
     module = _load(tmp_path, "raising_runner", _mutated_source(replace=_RAISING_RUNNER))
@@ -131,22 +131,22 @@ def test_handled_failure_control_rejects_raising_runner(tmp_path: Path) -> None:
 # CONTROL, GREEN at 4eac71dd: the writer's mutant-B shape (nested, other name) IS caught.
 def test_control_drift_arms_reject_nested_other_name_double(tmp_path: Path) -> None:
     module = _load(tmp_path, "nested_other_name", _mutated_source(append=_NESTED_OTHER_NAME))
-    assert _arms_reject(module)
+    assert _arms_reject(module, tmp_path)
 
 
 # CONTROL, GREEN at 4eac71dd: a _FakeContext that skips RunContext.__init__ IS caught.
 def test_control_drift_arms_reject_skipped_init(tmp_path: Path) -> None:
     module = _load(tmp_path, "skip_init", _mutated_source(replace=_SKIP_INIT))
-    assert _arms_reject(module)
+    assert _arms_reject(module, tmp_path)
 
 
 # CONTROL, GREEN at 4eac71dd: the unmutated file is accepted by both arms.
 def test_control_drift_arms_accept_unmutated_source(tmp_path: Path) -> None:
     module = _load(tmp_path, "unmutated", _LAUNCH_TESTS.read_text(encoding="utf-8"))
-    assert not _arms_reject(module)
+    assert not _arms_reject(module, tmp_path)
 
 
-# RED at 77f9d7be (round-2 F1): the structural arm's visitor pushes only ClassDef
+# RED at 77f9d7be (F1): the structural arm's visitor pushes only ClassDef
 # nodes onto its parent stack, so a double nested inside a FUNCTION is reported
 # as module-level. Duplicates are still caught by count, but the arm's
 # "exactly one module-level _FakeContext" claim is not what it measures.

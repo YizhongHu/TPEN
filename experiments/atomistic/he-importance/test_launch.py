@@ -523,7 +523,7 @@ def test_identity_unknown_keys_follow_runner_strictness_split(
     assert launch.launch_train(cell, facts, runner=lambda _: 0) == 0
 
     # The TPEN crossing remains strict: the same nested unknown key is rejected.
-    runner = _install_default_runner_witness(monkeypatch, [])
+    runner = _install_default_runner_witness(monkeypatch, [], tmp_path)
     with pytest.raises(launch.LaunchValidationError, match="caller_note"):
         launch.launch_train(cell, facts, runner=runner)
 
@@ -598,7 +598,7 @@ def test_default_runner_receives_supplied_topology_at_consumer(
     def consumer(cfg: object, **kwargs: object) -> _FakeContext:
         del cfg
         consumer_topologies.append(kwargs.get("topology"))
-        return _FakeContext(topology=kwargs.get("topology"))
+        return _FakeContext(topology=kwargs.get("topology"), run_root=tmp_path)
 
     monkeypatch.setattr(production_run, "prepare_run_context", consumer)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -632,7 +632,7 @@ def test_default_runner_topology_is_per_call_not_process_global(
         if topology is not None:
             entered.set()
             assert release.wait(5)
-        return _FakeContext(cfg, topology)
+        return _FakeContext(run_root=tmp_path, cfg=cfg, topology=topology)
 
     monkeypatch.setattr(production_run, "prepare_run_context", consumer)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -664,7 +664,7 @@ def test_default_runner_topology_is_per_call_not_process_global(
 
 
 def _install_default_runner_witness(
-    monkeypatch: pytest.MonkeyPatch, seen: list[object]
+    monkeypatch: pytest.MonkeyPatch, seen: list[object], run_root: Path
 ) -> object:
     import tpen.run as production_run
 
@@ -675,7 +675,7 @@ def _install_default_runner_witness(
     def consumer(cfg: object, **kwargs: object) -> _FakeContext:
         topology = kwargs.get("topology")
         seen.append(topology)
-        return _FakeContext(cfg, topology)
+        return _FakeContext(run_root=run_root, cfg=cfg, topology=topology)
 
     monkeypatch.setattr(production_run, "prepare_run_context", consumer)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -688,7 +688,7 @@ def test_default_runner_accepts_canonical_mapping_at_consumer(
 ) -> None:
     cell = _cell(tmp_path)
     seen: list[object] = []
-    runner = _install_default_runner_witness(monkeypatch, seen)
+    runner = _install_default_runner_witness(monkeypatch, seen, tmp_path)
     facts = launch.execution_topology_facts(_topology())
 
     assert launch.launch_train(cell, facts, runner=runner) == 0
@@ -705,7 +705,7 @@ def test_default_runner_refuses_unsupported_mapping_provenance(
         launcher_job_id="EXTRA-SCHEDULER-JOB",
         cuda_visible_devices="EXTRA-DEVICE-VISIBILITY",
     )
-    runner = _install_default_runner_witness(monkeypatch, [])
+    runner = _install_default_runner_witness(monkeypatch, [], tmp_path)
 
     with pytest.raises(launch.LaunchValidationError, match="unsupported production runner"):
         launch.launch_train(cell, facts, runner=runner)
@@ -718,7 +718,7 @@ def test_default_mapping_required_and_identity_guards_have_both_polarities(
     facts = launch.execution_topology_facts(_topology())
     facts["device_identity"] = {"kind": "cuda", "index": 0, "uuid": "GPU-0"}
     seen: list[object] = []
-    runner = _install_default_runner_witness(monkeypatch, seen)
+    runner = _install_default_runner_witness(monkeypatch, seen, tmp_path)
 
     assert launch.launch_train(cell, facts, runner=runner) == 0
     assert seen[0].device_identity.uuid == "GPU-0"
@@ -874,7 +874,7 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
         def run(self, _: object) -> RunResult:
             return RunResult(status="failed")
 
-    context = _FakeContext()
+    context = _FakeContext(run_root=tmp_path)
 
     monkeypatch.setattr(production_run, "validate_hi_train_config", lambda _: None)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -1369,16 +1369,20 @@ class _FakeContext(RunContext):
     # Placement below the call sites is forced by test_tpen_boundary.py's line-keyed inventory.
 
     def __init__(
-        self, cfg: object = None, topology: object = None
+        self,
+        run_root: Path,
+        cfg: object = None,
+        topology: object = None,
     ) -> None:
         from datetime import timezone
-        import tempfile
+
+        # These imports stay local so the line-keyed boundary inventory remains stable.
 
         super().__init__(
             cfg=cfg,
             source_cfg=cfg,
             artifact_manager=ArtifactManager(
-                root=Path(tempfile.mkdtemp(prefix="tpen-fake-context-")),
+                root=run_root,
                 experiment="tests",
                 sector="he-importance",
                 run_id="fake-context",
@@ -1413,8 +1417,8 @@ class _FakeContext(RunContext):
         return event
 
 
-def test_fake_context_tracks_run_context_init_fields() -> None:
-    context = _FakeContext()
+def test_fake_context_tracks_run_context_init_fields(tmp_path: Path) -> None:
+    context = _FakeContext(run_root=tmp_path)
     init_fields = {field.name for field in fields(RunContext) if field.init}
     missing = sorted(name for name in init_fields if name not in vars(context))
 
@@ -1441,6 +1445,16 @@ def test_fake_context_doubles_use_shared_contract() -> None:
                 self.direct_doubles.append((node.name, module_level))
             if "_FakeContext" in base_names:
                 self.shared_subclasses.append(node.name)
+            self.parents.append(node)
+            self.generic_visit(node)
+            self.parents.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.parents.append(node)
+            self.generic_visit(node)
+            self.parents.pop()
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
             self.parents.append(node)
             self.generic_visit(node)
             self.parents.pop()
@@ -1479,10 +1493,10 @@ def test_default_runner_exception_path_reports_run_failed_without_touching_cwd(
     # Resolved from the already-imported function rather than a new
     # `import tpen.run` statement, which would add a boundary-inventory crossing.
     production_run = inspect.getmodule(run_from_config)
-    context = _FakeContext()
+    context = _FakeContext(run_root=tmp_path)
 
     def refuse_runner(_: object) -> object:
-        raise RuntimeError("review r1: runner construction raised")
+        raise RuntimeError("runner construction raised")
 
     monkeypatch.setattr(production_run, "validate_hi_train_config", lambda _: None)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -1493,19 +1507,16 @@ def test_default_runner_exception_path_reports_run_failed_without_touching_cwd(
     assert context.metadata.status == "failed"
     assert [type(event).__name__ for event in context.events] == ["RunStarted", "RunFailed"]
     assert context.events[-1].exception_type == "RuntimeError"
-    # _FakeContext points run_dir at Path("."), i.e. the pytest CWD (the repo
-    # checkout). The exception path must not leave error.json there.
+    # _FakeContext points run_dir at pytest's managed temporary root, not the
+    # repository checkout. The exception path must not leave error.json in CWD.
     assert not (Path.cwd() / "error.json").exists()
-    # GREEN pin (round-2 G1): with real metadata and clock the failure artifact
+    # GREEN pin (G1): with real metadata and clock the failure artifact
     # is actually written, and it lands where the context says, not elsewhere.
     assert (context.run_dir / "error.json").is_file()
 
 
-# RED at 77f9d7be (round-2 F2): _FakeContext builds its run root with
-# tempfile.mkdtemp, which creates one directory per construction that nothing
-# removes. A pytest-managed root (under basetemp, e.g. tmp_path) is cleaned.
 def test_fake_context_run_dir_is_pytest_managed(tmp_path_factory: pytest.TempPathFactory) -> None:
-    context = _FakeContext()
+    context = _FakeContext(run_root=tmp_path_factory.mktemp("fake-context"))
     base = tmp_path_factory.getbasetemp().resolve()
 
     assert base in context.run_dir.resolve().parents, (
