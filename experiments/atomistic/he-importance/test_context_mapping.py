@@ -495,6 +495,148 @@ def test_exact_gelu_and_softplus_beta_two_are_explicit() -> None:
         context_mapping.context_fragment("tensor", activation="Softplus beta2,Softplus beta2")
 
 
+@pytest.mark.parametrize("label", ("(16,16)", "(24,24)", "(32,32)", "(48,48)", "(40,24)", "(24,40)"))
+def test_a4_a5_channel_fragments_reach_embedding_and_readout(label: str) -> None:
+    fragment = context_mapping.channel_fragment(label)
+    expected = tuple(int(value) for value in label.strip("()").split(","))
+    assert fragment["embedding"]["out_channels"]["values"] == [
+        [1, expected[0]], [2, expected[1]]
+    ]
+    assert fragment["readout"]["pair_channels"] == expected[1]
+    # A stale control readout is a deliberate falsifier for the A4/A5 route.
+    assert fragment["readout"]["pair_channels"] != 32 or expected[1] == 32
+
+
+def test_a4_a5_channel_vocabulary_refuses_near_miss() -> None:
+    with pytest.raises(context_mapping.UnknownContextLabel):
+        context_mapping.channel_fragment("(32,24)")
+
+
+@pytest.mark.parametrize("label", ("(64,1)", "(128,1)", "(128,2)", "(256,2)"))
+def test_a7_embedding_fragments_are_exact(label: str) -> None:
+    hidden, depth = (int(value) for value in label.strip("()").split(","))
+    assert context_mapping.embedding_fragment(label) == {
+        "embedding": {"hidden_channels": hidden, "num_hidden_layers": depth}
+    }
+    with pytest.raises(context_mapping.UnknownContextLabel):
+        context_mapping.embedding_fragment("(128,3)")
+
+
+def test_a8_fragments_select_the_update_seam_and_only_gaussian_adds_an_envelope() -> None:
+    residual = context_mapping.update_fragment("residual")
+    replacement = context_mapping.update_fragment("replacement")
+    gaussian = context_mapping.update_fragment("Gaussian residual")
+    assert residual == {"update": {"_target_": "tpen.nn.ResidualUpdater"}}
+    assert replacement == {"update": {"_target_": "tpen.nn.ReplaceUpdater"}}
+    assert gaussian["update"] == residual["update"]
+    assert gaussian["update_envelope"] == {
+        "_target_": "tpen.nn.coordinate_envelopes.GaussianCoordinateEnvelope",
+        "sigma": 1.0,
+    }
+    with pytest.raises(context_mapping.UnknownContextLabel):
+        context_mapping.update_fragment("Gaussian residual sigma=2")
+
+
+@pytest.mark.parametrize(("builder", "labels"), [
+    (context_mapping.producer_initialization_fragment, (".25", ".50", "1.0")),
+    (context_mapping.electron_electron_fragment, (".25", "1", "4")),
+    (context_mapping.electron_nucleus_fragment, ("(.0025,.25)", "(.01,1)", "(.04,4)")),
+    (context_mapping.readout_initialization_fragment, ("equal", "signed L1", "random-direction L2")),
+])
+def test_a9_to_a12_vocabularies_refuse_undeclared_levels(builder: object, labels: tuple[str, ...]) -> None:
+    for label in labels:
+        builder(label)  # type: ignore[operator]
+    with pytest.raises(context_mapping.UnknownContextLabel):
+        builder("not-a-declared-level")  # type: ignore[operator]
+
+
+def test_a10_and_a11_fragments_preserve_trainability_and_invert_at_helium() -> None:
+    e_e = context_mapping.electron_electron_fragment(".25")
+    assert e_e["same_range_parameter"] == 1.0
+    assert e_e["opposite_range_parameter"] == 0.25
+    assert e_e["trainable_range"] is True
+    for label, (curvature, radius) in {
+        "(.0025,.25)": (0.0025, 0.25),
+        "(.01,1)": (0.01, 1.0),
+        "(.04,4)": (0.04, 4.0),
+    }.items():
+        law = context_mapping.electron_nucleus_fragment(label)
+        assert law["law"]["curvature_range"] == radius
+        assert law["law"]["tail_slope"] == pytest.approx(2.0 - curvature / radius)
+        assert law["trainable"] is True
+
+
+def test_a12_random_modes_use_the_model_seed_named_stream() -> None:
+    for label, mode in (("equal", "equal"), ("signed L1", "signed_l1"), ("random-direction L2", "random_direction_l2")):
+        fragment = context_mapping.readout_initialization_fragment(label, seed=830001)
+        assert fragment["initialization"] == mode
+        if mode == "equal":
+            assert "initializer" not in fragment
+        else:
+            assert fragment["initializer"] == {
+                "_target_": "tpen.nn.initialization.TorchInitializer",
+                "seed": 830001,
+                "stream": "readout/a12",
+            }
+
+
+def test_full_architecture_composition_is_merge_shaped_and_preserves_factor_list() -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    original_factors = OmegaConf.to_container(train.model.factors, resolve=False)
+    composed = context_mapping.compose_architecture_package(
+        train.model,
+        channels="(40,24)",
+        embedding="(256,2)",
+        update="Gaussian residual",
+        producer_initialization=".25",
+        electron_electron="4",
+        electron_nucleus="(.04,4)",
+        readout_initialization="signed L1",
+        seed=830001,
+    )
+    assert len(composed["factors"]) == len(original_factors)
+    assert composed["factors"][0]["opposite_range_parameter"] == 4.0
+    assert composed["factors"][1]["law"]["curvature_range"] == 4.0
+    assert composed["readout"]["pair_channels"] == 24
+    assert composed["layers"][0]["update_envelope"]["sigma"] == 1.0
+    assert composed["embedding"]["spatial_dim"] == "${system.spatial_dim}"
+    assert composed["embedding"]["initializer"]["seed"] == "${runtime.seed}"
+    assert "factors" not in context_mapping.architecture_fragment()
+
+
+@pytest.mark.parametrize("package", ("B00", "B10", "B01", "B11"))
+def test_full_architecture_composes_each_b_package_without_factor_replacement(package: str) -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    composed = context_mapping.compose_architecture_package(train.model, package=package)
+    assert len(composed["factors"]) == (3 if package in {"B01", "B11"} else 2)
+    assert [factor["_target_"] for factor in composed["factors"]].count(
+        "tpen.nn.jastrow.BoundedTwoCoefficientJastrow"
+    ) == (1 if package in {"B01", "B11"} else 0)
+
+
+def test_literal_control_architecture_has_same_model_state_as_base_config() -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    mapped = OmegaConf.create(context_mapping.compose_architecture_package(train.model))
+    control = OmegaConf.create(OmegaConf.to_container(train.model, resolve=False))
+    OmegaConf.resolve(mapped)
+    OmegaConf.resolve(control)
+    torch.manual_seed(830001)
+    mapped_model = instantiate(mapped).to(dtype=torch.float64)
+    torch.manual_seed(830001)
+    control_model = instantiate(control).to(dtype=torch.float64)
+    mapped_state = {key: value for key, value in mapped_model.state_dict().items() if key != "_tpen_layout_fingerprint"}
+    control_state = {key: value for key, value in control_model.state_dict().items() if key != "_tpen_layout_fingerprint"}
+    assert tuple(mapped_state) == tuple(control_state)
+    assert all(torch.equal(mapped_state[key], control_state[key]) for key in control_state)
+    assert sum(parameter.numel() for parameter in mapped_model.parameters()) == sum(
+        parameter.numel() for parameter in control_model.parameters()
+    )
+    mapped_output = mapped_model(_he_batch())
+    control_output = control_model(_he_batch())
+    assert torch.equal(mapped_output.logabs, control_output.logabs)
+    assert torch.equal(mapped_output.sign, control_output.sign)
+
+
 @pytest.mark.parametrize("path_label", PATH_LABELS)
 @pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
 def test_every_fragment_instantiates(path_label: str, activation_label: str) -> None:

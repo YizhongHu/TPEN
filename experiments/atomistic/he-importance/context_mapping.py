@@ -54,6 +54,38 @@ _PATH_LABELS = {
     "hybrid/orbit-complete": ("hybrid", "orbit_complete"),
 }
 
+
+# These labels are deliberately strings rather than generated numeric ranges.
+# The experiment vocabulary is closed: a near miss must not silently select a
+# nearby architecture.
+_CHANNEL_LEVELS = {
+    "(16,16)": (16, 16),
+    "(24,24)": (24, 24),
+    "(32,32)": (32, 32),
+    "(48,48)": (48, 48),
+    "(40,24)": (40, 24),
+    "(24,40)": (24, 40),
+}
+_EMBEDDING_LEVELS = {
+    "(64,1)": (64, 1),
+    "(128,1)": (128, 1),
+    "(128,2)": (128, 2),
+    "(256,2)": (256, 2),
+}
+_UPDATE_LEVELS = {"residual", "replacement", "Gaussian residual"}
+_PRODUCER_INITIALIZATION_LEVELS = {".25": 0.25, ".50": 0.50, "1.0": 1.0}
+_EE_RANGE_LEVELS = {".25": 0.25, "1": 1.0, "4": 4.0}
+_EN_INITIALIZATION_LEVELS = {
+    "(.0025,.25)": (0.0025, 0.25),
+    "(.01,1)": (0.01, 1.0),
+    "(.04,4)": (0.04, 4.0),
+}
+_READOUT_INITIALIZATION_LEVELS = {
+    "equal": "equal",
+    "signed L1": "signed_l1",
+    "random-direction L2": "random_direction_l2",
+}
+
 _ACTIVATION_LABELS = {
     "SiLU,SiLU": ("silu", "silu"),
     "tanh,tanh": ("tanh", "tanh"),
@@ -121,6 +153,235 @@ def build_context_fragment(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """Alias for :func:`context_fragment` used by materialization callers."""
 
     return context_fragment(*args, **kwargs)
+
+
+def channel_fragment(label: str) -> dict[str, Any]:
+    """Return the A4/A5 persistent-channel Hydra fragment.
+
+    Parameters
+    ----------
+    label
+        One of the six declared ``(C1,C2)`` levels.
+
+    Raises
+    ------
+    UnknownContextLabel
+        If ``label`` is not one of the declared levels.
+    """
+
+    try:
+        c1, c2 = _CHANNEL_LEVELS[label]
+    except KeyError as exc:
+        raise UnknownContextLabel(f"unknown channel context label: {label!r}") from exc
+    return {
+        "embedding": {"out_channels": _channels_by_order(c1, c2)},
+        "readout": {"pair_channels": c2},
+    }
+
+
+def embedding_fragment(label: str) -> dict[str, Any]:
+    """Return the A7 embedding hidden-width/depth Hydra fragment."""
+
+    try:
+        hidden_channels, num_hidden_layers = _EMBEDDING_LEVELS[label]
+    except KeyError as exc:
+        raise UnknownContextLabel(f"unknown embedding context label: {label!r}") from exc
+    return {
+        "embedding": {
+            "hidden_channels": hidden_channels,
+            "num_hidden_layers": num_hidden_layers,
+        }
+    }
+
+
+def update_fragment(label: str) -> dict[str, Any]:
+    """Return the A8 feature-update Hydra fragment."""
+
+    if label not in _UPDATE_LEVELS:
+        raise UnknownContextLabel(f"unknown feature-update context label: {label!r}")
+    if label == "replacement":
+        return {"update": {"_target_": "tpen.nn.ReplaceUpdater"}}
+    fragment = {"update": {"_target_": "tpen.nn.ResidualUpdater"}}
+    if label == "Gaussian residual":
+        fragment["update_envelope"] = {
+            "_target_": "tpen.nn.coordinate_envelopes.GaussianCoordinateEnvelope",
+            "sigma": 1.0,
+        }
+    return fragment
+
+
+def producer_initialization_fragment(label: str) -> dict[str, Any]:
+    """Return the A9 constant producer-weight initialization fragment."""
+
+    try:
+        initial_weight = _PRODUCER_INITIALIZATION_LEVELS[label]
+    except KeyError as exc:
+        raise UnknownContextLabel(
+            f"unknown producer-initialization context label: {label!r}"
+        ) from exc
+    return {"initial_weight": initial_weight}
+
+
+def electron_electron_fragment(label: str) -> dict[str, Any]:
+    """Return the A10 trainable same/opposite-spin range fragment."""
+
+    try:
+        opposite_range = _EE_RANGE_LEVELS[label]
+    except KeyError as exc:
+        raise UnknownContextLabel(f"unknown e-e range context label: {label!r}") from exc
+    return {
+        "_target_": "tpen.nn.ElectronElectronCusp",
+        "trainable_range": True,
+        "same_range_parameter": 1.0,
+        "opposite_range_parameter": opposite_range,
+    }
+
+
+def electron_nucleus_fragment(label: str) -> dict[str, Any]:
+    """Return the A11 ``(c,d)``-to-``(d,kappa)`` Hydra fragment at ``Z=2``."""
+
+    try:
+        curvature_coefficient, curvature_range = _EN_INITIALIZATION_LEVELS[label]
+    except KeyError as exc:
+        raise UnknownContextLabel(f"unknown e-n initialization label: {label!r}") from exc
+    return {
+        "law": {
+            "_target_": "tpen.nn.TailSafeElectronNucleusCuspLaw",
+            "curvature_range": curvature_range,
+            "tail_slope": 2.0 - curvature_coefficient / curvature_range,
+        },
+        "trainable": True,
+    }
+
+
+def readout_initialization_fragment(label: str, *, seed: int = 0) -> dict[str, Any]:
+    """Return the A12 readout initialization and named-stream fragment."""
+
+    try:
+        initialization = _READOUT_INITIALIZATION_LEVELS[label]
+    except KeyError as exc:
+        raise UnknownContextLabel(f"unknown readout-initialization label: {label!r}") from exc
+    if type(seed) is not int or seed < 0:
+        raise ContextMappingError("seed must be a non-negative integer")
+    fragment: dict[str, Any] = {"initialization": initialization}
+    if initialization != "equal":
+        fragment["initializer"] = {
+            "_target_": "tpen.nn.initialization.TorchInitializer",
+            "seed": seed,
+            "stream": "readout/a12",
+        }
+    return fragment
+
+
+def architecture_fragment(
+    *,
+    producer_path: str = "tensor",
+    activation: str = "SiLU,SiLU",
+    channels: str = "(32,32)",
+    embedding: str = "(128,1)",
+    update: str = "residual",
+    producer_initialization: str = ".50",
+    electron_electron: str = "1",
+    electron_nucleus: str = "(.01,1)",
+    readout_initialization: str = "equal",
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Return one complete A-axis model fragment.
+
+    The returned mapping is merge-shaped for a literal ``model`` config.  Its
+    factor list is intentionally omitted: :func:`compose_architecture_package`
+    applies factor overrides by position so existing control factors cannot be
+    replaced by a one-entry list.
+    """
+
+    channel = channel_fragment(channels)
+    embedding_override = embedding_fragment(embedding)["embedding"]
+    layer = _layer_fragment(
+        family=_require_path_label(producer_path)[0],
+        policy=_require_path_label(producer_path)[1],
+        producer_activation=_require_activation_label(activation)[0],
+        aggregation_activation=_require_activation_label(activation)[1],
+        channels=_CHANNEL_LEVELS[channels],
+        seed=_validate_seed(seed),
+        update=update,
+        initial_weight=_PRODUCER_INITIALIZATION_LEVELS[_require_level(
+            producer_initialization, _PRODUCER_INITIALIZATION_LEVELS, "producer initialization"
+        )],
+    )
+    # Validate the factor labels here even though factor-list mutation belongs
+    # to the composition entry point below.
+    electron_electron_fragment(electron_electron)
+    electron_nucleus_fragment(electron_nucleus)
+    return {
+        "embedding": {**embedding_override, **channel["embedding"]},
+        "layers": [layer],
+        "readout": {
+            **channel["readout"],
+            **readout_initialization_fragment(readout_initialization, seed=seed),
+        },
+    }
+
+
+def compose_architecture_package(
+    model_cfg: Mapping[str, Any],
+    *,
+    package: str | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Apply a complete A package to a literal model config.
+
+    Nested mappings are merged and interpolations remain unresolved.  The
+    existing ``factors`` list is copied and its two declared control factors
+    are updated in place; it is never replaced.  If ``package`` is supplied,
+    the ordinary B composition is applied after the A package.
+    """
+
+    fragment = architecture_fragment(**kwargs)
+    factor_overrides = {
+        "electron_electron": electron_electron_fragment(kwargs.get("electron_electron", "1")),
+        "electron_nucleus": electron_nucleus_fragment(kwargs.get("electron_nucleus", "(.01,1)")),
+    }
+    composed = _merge_mappings(
+        OmegaConf.to_container(model_cfg, resolve=False)
+        if OmegaConf.is_config(model_cfg)
+        else deepcopy(model_cfg),
+        fragment,
+    )
+    factors = deepcopy(composed.get("factors", []))
+    if len(factors) < 2:
+        raise ContextMappingError("literal control model must declare e-e and e-n factors")
+    factors[0] = _merge_mappings(factors[0], factor_overrides["electron_electron"])
+    factors[1] = _merge_mappings(factors[1], factor_overrides["electron_nucleus"])
+    composed["factors"] = factors
+    if package is not None:
+        composed = compose_package(composed, package)
+    return composed
+
+
+def _validate_seed(seed: int) -> int:
+    if type(seed) is not int or seed < 0:
+        raise ContextMappingError("seed must be a non-negative integer")
+    return seed
+
+
+def _require_level(label: str, levels: Mapping[str, Any], name: str) -> str:
+    if label not in levels:
+        raise UnknownContextLabel(f"unknown {name} context label: {label!r}")
+    return label
+
+
+def _require_path_label(label: str) -> tuple[str, str | None]:
+    try:
+        return _PATH_LABELS[label]
+    except KeyError as exc:
+        raise UnknownContextLabel(f"unknown producer/path context label: {label!r}") from exc
+
+
+def _require_activation_label(label: str) -> tuple[str, str]:
+    try:
+        return _ACTIVATION_LABELS[label]
+    except KeyError as exc:
+        raise UnknownContextLabel(f"unknown activation context label: {label!r}") from exc
 
 
 def input_feature_fragment(
@@ -284,10 +545,14 @@ def _layer_fragment(
     policy: str | None,
     producer_activation: str,
     aggregation_activation: str,
-    channels: int,
+    channels: int | tuple[int, int],
     seed: int,
+    update: str = "residual",
+    initial_weight: float = 0.5,
 ) -> dict[str, Any]:
     """Build the literal layer tree after labels have been validated."""
+
+    channel_map = _channels_by_order(*channels) if isinstance(channels, tuple) else _channels(channels)
 
     layout = {
         "_target_": "tpen.data.paths.compose_path_layout",
@@ -295,8 +560,8 @@ def _layer_fragment(
         "tensor_product": _tensor_product_metadata() if family in {"tensor", "hybrid"} else None,
         "input_orders": _orders(),
         "output_orders": _orders(),
-        "input_channels": _channels(channels),
-        "output_channels": _channels(channels),
+        "input_channels": channel_map,
+        "output_channels": deepcopy(channel_map),
         "max_virtual_order": 2,
     }
     producers = []
@@ -304,22 +569,22 @@ def _layer_fragment(
         producers.append({
             "_target_": "tpen.nn.LinearEquivariantMixing",
             "max_order": 2,
-            "channels": channels,
+            "channels": channel_map,
             "metadata": "${...layout.linear}",
             "aggregation": "sum",
             "implementation": "vectorized",
-            "initial_weight": 0.5,
+            "initial_weight": initial_weight,
         })
     if family in {"tensor", "hybrid"}:
         producers.append({
             "_target_": "tpen.nn.EquivariantMixing",
             "max_order": 2,
             "max_virtual_order": 2,
-            "channels": channels,
+            "channels": channel_map,
             "paths": "${...layout.tensor_product}",
             "implementation": "vectorized",
             "activation": None,
-            "initial_weight": 0.5,
+            "initial_weight": initial_weight,
         })
     fragment = {
         "_target_": "tpen.nn.TPENLayer",
@@ -342,7 +607,7 @@ def _layer_fragment(
                 "stream": "layer0/path_aggregation",
             },
         },
-        "update": {"_target_": "tpen.nn.ResidualUpdater"},
+        "update": update_fragment(update),
     }
     return fragment
 
@@ -352,9 +617,13 @@ def _orders() -> dict[str, Any]:
 
 
 def _channels(channels: int) -> dict[str, Any]:
+    return _channels_by_order(channels, channels)
+
+
+def _channels_by_order(order_one: int, order_two: int) -> dict[str, Any]:
     return {
         "_target_": "tpen.data.paths.NormalizedChannels",
-        "values": [[1, channels], [2, channels]],
+        "values": [[1, order_one], [2, order_two]],
     }
 
 
@@ -410,6 +679,20 @@ def _tensor_product_metadata() -> dict[str, Any]:
     }
 
 
+def _channel_widths(channels: int | Mapping[int, int] | tuple[int, int]) -> dict[int, int]:
+    """Normalize persistent channel widths for activation construction."""
+
+    if isinstance(channels, Mapping):
+        normalized = {int(order): int(width) for order, width in channels.items()}
+    elif isinstance(channels, tuple):
+        normalized = {1: int(channels[0]), 2: int(channels[1])}
+    else:
+        normalized = {1: int(channels), 2: int(channels)}
+    if set(normalized) != {1, 2} or any(width <= 0 for width in normalized.values()):
+        raise ContextMappingError(f"channels must declare positive order-1/order-2 widths: {channels!r}")
+    return normalized
+
+
 def _activation(name: str, *, seed: int, site: str, channels: int) -> Any:
     if name == "silu":
         return {"_target_": "torch.nn.SiLU"}
@@ -424,6 +707,7 @@ def _activation(name: str, *, seed: int, site: str, channels: int) -> Any:
         )
     if name == "channel_mlp":
         tuple_axes_start = 3 if site == "producer" else 2
+        channel_widths = _channel_widths(channels)
         return {
             "_target_": "tpen.nn.ChannelPreservingMLPActivation",
             "layout": {
@@ -439,8 +723,8 @@ def _activation(name: str, *, seed: int, site: str, channels: int) -> Any:
                     {
                         "_target_": "tpen.nn.OrderMLPSpec",
                         "order": order,
-                        "channels": channels,
-                        "hidden_channels": 4 * channels,
+                        "channels": channel_widths[order],
+                        "hidden_channels": 4 * channel_widths[order],
                         "num_hidden_layers": 1,
                         "activation": {"_target_": "torch.nn.SiLU"},
                         "bias": True,
@@ -458,7 +742,13 @@ def _activation(name: str, *, seed: int, site: str, channels: int) -> Any:
 
 
 __all__ = [
+    "architecture_fragment",
+    "channel_fragment",
     "ContextMappingError",
+    "compose_architecture_package",
+    "electron_electron_fragment",
+    "electron_nucleus_fragment",
+    "embedding_fragment",
     "UnknownContextLabel",
     "UnsupportedActivationLabel",
     "build_input_feature_fragment",
@@ -467,6 +757,9 @@ __all__ = [
     "build_context_fragment",
     "compose_package",
     "context_fragment",
+    "producer_initialization_fragment",
+    "readout_initialization_fragment",
+    "update_fragment",
     "input_feature_fragment",
     "jastrow_fragment",
     "package_fragment",
