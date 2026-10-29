@@ -162,7 +162,11 @@ class PfaffianReadout(nn.Module):
         keeps the control weights ``1 / C2``. ``signed_l1`` uses
         ``w = z / sum(abs(z))`` and ``random_direction_l2`` uses
         ``w = z / (sqrt(C2) * norm(z))`` for a float64 standard-normal vector
-        ``z`` from the supplied named stream.
+        ``z`` from the supplied named stream. Random-mode weights remain
+        float64 regardless of the default dtype; ``equal`` follows the default
+        dtype. Consequently a float32-constructed module's forward promotes to
+        float64. The coordinate packet path requires one uniform module dtype,
+        which the runner supplies with ``module.to(runtime_dtype)``.
     initializer : TorchInitializer, optional
         Explicitly seeded named stream used by the two random initializations.
         It is required for those modes and is ignored by ``equal``.

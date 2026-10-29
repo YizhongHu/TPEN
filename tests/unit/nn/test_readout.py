@@ -477,18 +477,37 @@ def test_pfaffian_readout_random_initializations_match_closed_form(
         assert torch.isclose(
             weights.abs().sum(),
             torch.ones((), dtype=torch.float64),
-            rtol=1e-6,
-            atol=1e-6,
+            rtol=1e-12,
+            atol=1e-12,
         )
     else:
         expected = z / (math.sqrt(4) * torch.linalg.vector_norm(z))
         assert torch.isclose(
             math.sqrt(4) * torch.linalg.vector_norm(weights),
             torch.ones((), dtype=torch.float64),
-            rtol=1e-6,
-            atol=1e-6,
+            rtol=1e-12,
+            atol=1e-12,
         )
     assert torch.equal(weights, expected)
+
+
+@pytest.mark.parametrize("initialization", ["signed_l1", "random_direction_l2"])
+def test_pfaffian_readout_runner_upcast_preserves_float64_closed_form(initialization: str) -> None:
+    z = torch.empty(4, dtype=torch.float64, device="cpu")
+    TorchInitializer(seed=810012, stream="readout/a12").normal_(z)
+    expected = (
+        z / z.abs().sum()
+        if initialization == "signed_l1"
+        else z / (math.sqrt(4) * torch.linalg.vector_norm(z))
+    )
+    readout = PfaffianReadout(
+        pair_channels=4,
+        initialization=initialization,
+        trainable=True,
+        initializer=TorchInitializer(seed=810012, stream="readout/a12"),
+    ).to(dtype=torch.float64)
+
+    assert torch.equal(readout.channel_weights.detach(), expected)
 
 
 @pytest.mark.parametrize("trainable", [False, True])
@@ -590,12 +609,12 @@ def test_pfaffian_readout_random_modes_forward_with_float32_features() -> None:
     output = readout(features, batch)
 
     assert output.logabs.shape == (1,)
+    assert output.logabs.dtype == torch.float64
 
 
 def test_pfaffian_readout_random_modes_pin_normal_draw_to_cpu() -> None:
     if not hasattr(torch, "set_default_device") or not hasattr(torch, "get_default_device"):
         pytest.skip("torch default-device controls unavailable; CPU draw is UNMEASURED")
-    original_device = torch.get_default_device()
     try:
         torch.set_default_device("cpu")
         cpu = PfaffianReadout(
@@ -610,7 +629,7 @@ def test_pfaffian_readout_random_modes_pin_normal_draw_to_cpu() -> None:
             initializer=TorchInitializer(seed=810019, stream="readout/a12"),
         ).channel_weight_buffer
     finally:
-        torch.set_default_device(original_device)
+        torch.set_default_device(None)
 
     assert cpu.device.type == "cpu"
     assert other.device.type == "cpu"
