@@ -174,7 +174,7 @@ def channel_fragment(label: str) -> dict[str, Any]:
     except KeyError as exc:
         raise UnknownContextLabel(f"unknown channel context label: {label!r}") from exc
     return {
-        "embedding": {"out_channels": _channels_by_order(c1, c2)},
+        "embedding": {"out_channels": {1: c1, 2: c2}},
         "readout": {"pair_channels": c2},
     }
 
@@ -249,8 +249,8 @@ def electron_nucleus_fragment(label: str) -> dict[str, Any]:
             "_target_": "tpen.nn.TailSafeElectronNucleusCuspLaw",
             "curvature_range": curvature_range,
             "tail_slope": 2.0 - curvature_coefficient / curvature_range,
+            "trainable": True,
         },
-        "trainable": True,
     }
 
 
@@ -552,7 +552,15 @@ def _layer_fragment(
 ) -> dict[str, Any]:
     """Build the literal layer tree after labels have been validated."""
 
-    channel_map = _channels_by_order(*channels) if isinstance(channels, tuple) else _channels(channels)
+    if isinstance(channels, tuple):
+        constructor_channels: int | dict[int, int] = {
+            1: int(channels[0]),
+            2: int(channels[1]),
+        }
+        channel_map = _channels_by_order(*channels)
+    else:
+        constructor_channels = channels
+        channel_map = _channels(channels)
 
     layout = {
         "_target_": "tpen.data.paths.compose_path_layout",
@@ -569,7 +577,7 @@ def _layer_fragment(
         producers.append({
             "_target_": "tpen.nn.LinearEquivariantMixing",
             "max_order": 2,
-            "channels": channel_map,
+            "channels": constructor_channels,
             "metadata": "${...layout.linear}",
             "aggregation": "sum",
             "implementation": "vectorized",
@@ -580,7 +588,7 @@ def _layer_fragment(
             "_target_": "tpen.nn.EquivariantMixing",
             "max_order": 2,
             "max_virtual_order": 2,
-            "channels": channel_map,
+            "channels": constructor_channels,
             "paths": "${...layout.tensor_product}",
             "implementation": "vectorized",
             "activation": None,
@@ -593,21 +601,31 @@ def _layer_fragment(
             "_target_": "tpen.nn.CompositeMixing",
             "layout": "${..layout}",
             "producers": producers,
-            "activation": _activation(producer_activation, seed=seed, site="producer", channels=channels),
+            "activation": _activation(
+                producer_activation,
+                seed=seed,
+                site="producer",
+                channels=constructor_channels,
+            ),
         },
         "path_aggregation": {
             "_target_": "tpen.nn.PathAggregation",
             "max_order": 2,
-            "channels": channels,
+            "channels": constructor_channels,
             "layout": "${..layout}",
-            "activation": _activation(aggregation_activation, seed=seed, site="aggregation", channels=channels),
+            "activation": _activation(
+                aggregation_activation,
+                seed=seed,
+                site="aggregation",
+                channels=constructor_channels,
+            ),
             "initializer": {
                 "_target_": "tpen.nn.TorchInitializer",
                 "seed": seed,
                 "stream": "layer0/path_aggregation",
             },
         },
-        "update": update_fragment(update),
+        **update_fragment(update),
     }
     return fragment
 

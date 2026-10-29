@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
+import subprocess
 import sys
 from fractions import Fraction
 
@@ -12,6 +15,8 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 import pytest
 
+from tpen.data.real import Feature, Update
+from tpen.nn.context import TPENForwardContext
 from tests.helpers.run_context import make_run_context
 
 
@@ -499,9 +504,7 @@ def test_exact_gelu_and_softplus_beta_two_are_explicit() -> None:
 def test_a4_a5_channel_fragments_reach_embedding_and_readout(label: str) -> None:
     fragment = context_mapping.channel_fragment(label)
     expected = tuple(int(value) for value in label.strip("()").split(","))
-    assert fragment["embedding"]["out_channels"]["values"] == [
-        [1, expected[0]], [2, expected[1]]
-    ]
+    assert fragment["embedding"]["out_channels"] == {1: expected[0], 2: expected[1]}
     assert fragment["readout"]["pair_channels"] == expected[1]
     # A stale control readout is a deliberate falsifier for the A4/A5 route.
     assert fragment["readout"]["pair_channels"] != 32 or expected[1] == 32
@@ -537,6 +540,53 @@ def test_a8_fragments_select_the_update_seam_and_only_gaussian_adds_an_envelope(
         context_mapping.update_fragment("Gaussian residual sigma=2")
 
 
+@pytest.mark.parametrize("label", ("residual", "replacement", "Gaussian residual"))
+def test_a8_fragments_instantiate_a_layer_with_the_declared_update(label: str) -> None:
+    layer_config = context_mapping.architecture_fragment(update=label)["layers"][0]
+    layer = instantiate(OmegaConf.create(layer_config))
+    assert layer.update.__class__.__name__ == (
+        "ReplaceUpdater" if label == "replacement" else "ResidualUpdater"
+    )
+    if label == "Gaussian residual":
+        assert layer.update_envelope.__class__.__name__ == "GaussianCoordinateEnvelope"
+        assert layer.update_envelope.sigma == 1.0
+    else:
+        assert layer.update_envelope is None
+
+
+@pytest.mark.parametrize("label", ("residual", "replacement", "Gaussian residual"))
+def test_a8_instantiated_update_has_the_declared_zero_and_nonzero_falsifier(label: str) -> None:
+    layer = instantiate(OmegaConf.create(context_mapping.architecture_fragment(update=label)["layers"][0]))
+    x = Feature([
+        torch.zeros(1, 0, dtype=torch.float64),
+        torch.full((1, 2, 2), 3.0, dtype=torch.float64),
+        torch.full((1, 2, 2, 2), 3.0, dtype=torch.float64),
+    ])
+    zero = Update([torch.zeros_like(block) for block in x.blocks])
+    zero_output = layer.update(x, zero)
+    if label == "replacement":
+        assert all(torch.equal(block, torch.zeros_like(block)) for block in zero_output.blocks)
+    else:
+        assert all(torch.equal(left, right) for left, right in zip(x.blocks, zero_output.blocks))
+
+    update = Update([torch.ones_like(block) for block in x.blocks])
+    if layer.update_envelope is not None:
+        update = layer.update_envelope(update, TPENForwardContext(batch=_he_batch()))
+    output = layer.update(x, update)
+    if label == "replacement":
+        assert all(torch.equal(block, torch.ones_like(block)) for block in output.blocks)
+    elif label == "residual":
+        assert all(torch.equal(block, expected) for block, expected in zip(output.blocks, [
+            torch.zeros(1, 0, dtype=torch.float64),
+            torch.full((1, 2, 2), 4.0, dtype=torch.float64),
+            torch.full((1, 2, 2, 2), 4.0, dtype=torch.float64),
+        ]))
+    else:
+        gate = torch.exp(torch.tensor(-5.0 / 2.0, dtype=torch.float64))
+        assert torch.allclose(output.blocks[1], torch.full_like(output.blocks[1], 3.0 + gate))
+        assert torch.allclose(output.blocks[2], torch.full_like(output.blocks[2], 3.0 + gate))
+
+
 @pytest.mark.parametrize(("builder", "labels"), [
     (context_mapping.producer_initialization_fragment, (".25", ".50", "1.0")),
     (context_mapping.electron_electron_fragment, (".25", "1", "4")),
@@ -563,7 +613,27 @@ def test_a10_and_a11_fragments_preserve_trainability_and_invert_at_helium() -> N
         law = context_mapping.electron_nucleus_fragment(label)
         assert law["law"]["curvature_range"] == radius
         assert law["law"]["tail_slope"] == pytest.approx(2.0 - curvature / radius)
-        assert law["trainable"] is True
+        assert law["law"]["trainable"] is True
+
+
+@pytest.mark.parametrize("label", ("(.0025,.25)", "(.01,1)", "(.04,4)"))
+def test_a11_laws_instantiate_with_trainable_raw_coordinates(label: str) -> None:
+    law = instantiate(OmegaConf.create(context_mapping.electron_nucleus_fragment(label)))
+    assert law.raw_range.requires_grad
+    assert law.raw_kappa.requires_grad
+    curvature, radius = {
+        "(.0025,.25)": (0.0025, 0.25),
+        "(.01,1)": (0.01, 1.0),
+        "(.04,4)": (0.04, 4.0),
+    }[label]
+    charges = torch.tensor([2.0], dtype=torch.float64)
+    torch.testing.assert_close(law.curvature_range, torch.tensor(radius, dtype=torch.float64))
+    torch.testing.assert_close(
+        law.curvature_coefficient(charges),
+        torch.tensor([curvature], dtype=torch.float64),
+        rtol=1e-12,
+        atol=1e-12,
+    )
 
 
 def test_a12_random_modes_use_the_model_seed_named_stream() -> None:
@@ -604,6 +674,127 @@ def test_full_architecture_composition_is_merge_shaped_and_preserves_factor_list
     assert "factors" not in context_mapping.architecture_fragment()
 
 
+def test_existing_context_fragment_output_is_pinned_to_the_ab2_head() -> None:
+    """Compare the current public output with AB-2's mechanically loaded output."""
+
+    source = subprocess.check_output(
+        [
+            "git",
+            "show",
+            "fd91de8cb7af7ecbff27536ff9dc474e8832df66:experiments/atomistic/he-importance/context_mapping.py",
+        ],
+        text=True,
+    )
+    legacy = importlib.util.module_from_spec(importlib.util.spec_from_loader("legacy_mapping", loader=None))
+    exec(compile(source, "legacy_context_mapping.py", "exec"), legacy.__dict__)
+    cases = (
+        ("tensor", "SiLU,SiLU", 32, 0),
+        ("linear/coordinate-neighbor", "tanh,tanh", 32, 17),
+        ("hybrid/orbit-complete", "channel-MLP,channel-MLP", 32, 99),
+    )
+    for path, activation, channels, seed in cases:
+        current = context_mapping.context_fragment(
+            path, activation=activation, channels=channels, seed=seed
+        )
+        previous = legacy.context_fragment(
+            path, activation=activation, channels=channels, seed=seed
+        )
+        current_bytes = json.dumps(current, sort_keys=True, separators=(",", ":")).encode()
+        previous_bytes = json.dumps(previous, sort_keys=True, separators=(",", ":")).encode()
+        assert hashlib.sha256(current_bytes).digest() == hashlib.sha256(previous_bytes).digest()
+
+
+@pytest.mark.parametrize("path_label", PATH_LABELS)
+@pytest.mark.parametrize("initialization", (".25", ".50", "1.0"))
+def test_a9_instantiated_constant_reaches_every_producer(
+    path_label: str, initialization: str
+) -> None:
+    config = OmegaConf.create(
+        context_mapping.architecture_fragment(
+            producer_path=path_label,
+            producer_initialization=initialization,
+        )["layers"][0]
+    )
+    layer = instantiate(config)
+    expected = float(initialization)
+    for producer in layer.mixing.producers:
+        weights = producer.weights.values() if isinstance(producer.weights, dict) else producer.weights
+        for weight in weights:
+            assert torch.equal(weight.detach(), torch.full_like(weight.detach(), expected))
+
+
+@pytest.mark.parametrize("path_label", PATH_LABELS)
+@pytest.mark.parametrize("update", ("residual", "replacement", "Gaussian residual"))
+@pytest.mark.parametrize("package", ("B00", "B10", "B01", "B11"))
+def test_b_composition_instantiates_every_producer_update_and_package(
+    path_label: str, update: str, package: str
+) -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model = context_mapping.compose_architecture_package(
+        train.model,
+        package=package,
+        producer_path=path_label,
+        update=update,
+    )
+    OmegaConf.resolve(train)
+    model = instantiate(train.model).to(dtype=torch.float64)
+    assert len(model.factors) == (3 if package in {"B01", "B11"} else 2)
+    jastrow_count = sum(
+        factor.__class__.__name__ == "BoundedTwoCoefficientJastrow"
+        for factor in model.factors
+    )
+    assert jastrow_count == (1 if package in {"B01", "B11"} else 0)
+    if package in {"B01", "B11"}:
+        jastrow = model.factors[-1]
+        assert jastrow.trainable is True
+        assert torch.equal(jastrow.mean_coefficient, torch.zeros_like(jastrow.mean_coefficient))
+        assert torch.equal(jastrow.difference_coefficient, torch.zeros_like(jastrow.difference_coefficient))
+        assert jastrow.length == 1.0
+
+
+@pytest.mark.parametrize("label", ("(16,16)", "(24,24)", "(32,32)", "(48,48)", "(40,24)", "(24,40)"))
+def test_instantiated_channel_package_reaches_order_specific_consumers(label: str) -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model = context_mapping.compose_architecture_package(train.model, channels=label)
+    OmegaConf.resolve(train)
+    model = instantiate(train.model).to(dtype=torch.float64)
+    expected = tuple(int(value) for value in label.strip("()").split(","))
+    assert model.embedding.order_mlps["1"].layers[-1].out_features == expected[0]
+    assert model.embedding.order_mlps["2"].layers[-1].out_features == expected[1]
+    assert model.readout.pair_channels == expected[1]
+    for producer in model.stack.layers[0].mixing.producers:
+        assert producer.output_channels.for_order(1) == expected[0]
+        assert producer.output_channels.for_order(2) == expected[1]
+
+
+@pytest.mark.parametrize("label", ("signed L1", "random-direction L2"))
+@pytest.mark.parametrize("seed", (830001, 830002))
+def test_a12_mapped_random_modes_are_named_streamed_and_paired(
+    label: str, seed: int
+) -> None:
+    fragment = context_mapping.readout_initialization_fragment(label, seed=seed)
+    config = {
+        "_target_": "tpen.nn.readout.PfaffianReadout",
+        "pair_channels": 8,
+        "trainable": True,
+        **fragment,
+    }
+    torch.manual_seed(7)
+    first = instantiate(OmegaConf.create(config))
+    torch.manual_seed(7000007)
+    second = instantiate(OmegaConf.create(config))
+    assert torch.equal(first.channel_weights.detach(), second.channel_weights.detach())
+    l2_config = {
+        "_target_": "tpen.nn.readout.PfaffianReadout",
+        "pair_channels": 8,
+        "trainable": True,
+        **context_mapping.readout_initialization_fragment("random-direction L2", seed=seed),
+    }
+    l2 = instantiate(OmegaConf.create(l2_config))
+    ratio = first.channel_weights.detach() / l2.channel_weights.detach()
+    assert torch.all(ratio > 0)
+
+
 @pytest.mark.parametrize("package", ("B00", "B10", "B01", "B11"))
 def test_full_architecture_composes_each_b_package_without_factor_replacement(package: str) -> None:
     train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
@@ -616,14 +807,19 @@ def test_full_architecture_composes_each_b_package_without_factor_replacement(pa
 
 def test_literal_control_architecture_has_same_model_state_as_base_config() -> None:
     train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    mapped = OmegaConf.create(context_mapping.compose_architecture_package(train.model))
-    control = OmegaConf.create(OmegaConf.to_container(train.model, resolve=False))
-    OmegaConf.resolve(mapped)
-    OmegaConf.resolve(control)
-    torch.manual_seed(830001)
-    mapped_model = instantiate(mapped).to(dtype=torch.float64)
-    torch.manual_seed(830001)
-    control_model = instantiate(control).to(dtype=torch.float64)
+    seed = 830001
+    mapped_root = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    mapped_root.model = context_mapping.compose_architecture_package(
+        mapped_root.model, seed=seed
+    )
+    train.runtime.seed = seed
+    mapped_root.runtime.seed = seed
+    OmegaConf.resolve(train)
+    OmegaConf.resolve(mapped_root)
+    torch.manual_seed(1729)
+    control_model = instantiate(train.model).to(dtype=torch.float64)
+    torch.manual_seed(7000007)
+    mapped_model = instantiate(mapped_root.model).to(dtype=torch.float64)
     mapped_state = {key: value for key, value in mapped_model.state_dict().items() if key != "_tpen_layout_fingerprint"}
     control_state = {key: value for key, value in control_model.state_dict().items() if key != "_tpen_layout_fingerprint"}
     assert tuple(mapped_state) == tuple(control_state)
