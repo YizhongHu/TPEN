@@ -19,6 +19,8 @@ import numpy as np
 import yaml
 from omegaconf import OmegaConf
 
+from experiments.one_electron_variance.admission import validate_science_admission
+
 from experiments.one_electron_variance.protocol import (
     CHECKPOINTS, DESIGN_SHA256, EXACT_ENERGY, WINDOWS,
     evaluation_config, evaluation_seed, train_config,
@@ -46,17 +48,22 @@ def file_hash(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
-def load_profile(directory: Path) -> Profile:
+def load_profile(directory: Path, *, expected_seed: int | None = None) -> Profile:
     """Refuse missing, nonfinite, selected, reordered, or shortened science records."""
     path = directory / "sampled_eval_table.csv"
     metadata = json.loads(path.with_suffix(".metadata.json").read_text())
-    if (metadata["schema"] != "trajectory_records/v1"
+    if (metadata["schema"] not in ("trajectory_records/v1", "trajectory_records/v2")
             or metadata["row_semantics"] != "complete_draw_walker_grid"
             or (metadata["draw_count"], metadata["walker_count"], metadata["row_count"]) != (64, 4096, 262144)
             or metadata["n_electrons"] != 1 or metadata["spatial_dim"] != 3
             or metadata["nonfinite_count"] != 0
+            or metadata["finite_count"] != 262144
+            or metadata["draw_stride"] != 20 or metadata["burn_in_draws"] != 0
+            or metadata["observable"] != "local_energy"
+            or metadata["byte_count"] != path.stat().st_size
             or metadata["csv_sha256"] != file_hash(path)):
         raise ValueError("invalid complete-trajectory receipt")
+    _verify_sampling_receipt(directory, expected_seed)
     readout_path = directory / "raw_readout.csv"
     readout_receipt = json.loads(readout_path.with_suffix(".json").read_text())
     if (readout_receipt["row_count"] != 262144 or readout_receipt["readout_eps"] != 1e-12
@@ -67,6 +74,14 @@ def load_profile(directory: Path) -> Profile:
     radii, virials = [], []
     if metadata["term_names"] not in (["kinetic", "harmonic_trap"], ["kinetic", "electron_nucleus"]):
         raise ValueError("unexpected one-electron Hamiltonian")
+    if "harmonic_trap" in metadata["term_names"]:
+        if (metadata["schema"] != "trajectory_records/v2"
+                or metadata["atomic_configuration"] is not None
+                or metadata["atomic_configuration_id"] is not None):
+            raise ValueError("Hooke records must explicitly have no nuclei")
+    elif (metadata["schema"] != "trajectory_records/v1"
+          or metadata["atomic_configuration"] != {"positions": [[0., 0., 0.]], "charges": [1.]}):
+        raise ValueError("hydrogen records must contain the specified proton")
     count = floor_count = 0
     with path.open(newline="") as handle, readout_path.open(newline="") as readout:
         for row, diagnostic in zip(csv.DictReader(handle), csv.DictReader(readout), strict=True):
@@ -101,6 +116,41 @@ def load_profile(directory: Path) -> Profile:
                 "radial_cdf": {str(r): float(np.mean(radius <= r)) for r in (.1, .5, 1., 2., 4., 8.)},
                 "virial_mean": float(np.mean(virials)), "virial_is_pointwise_oracle": False}
     return Profile(energies, floor_count, physical)
+
+
+def _verify_sampling_receipt(directory: Path, expected_seed: int | None) -> None:
+    """Bind observed sampler settings, separate from discarded collector draws."""
+    receipt = json.loads((directory / "sampler_trajectory_diagnostics.json").read_text())
+    if (receipt["schema"] != "sampler_trajectory_diagnostics/v1"
+            or receipt["n_walkers"] != 4096 or receipt["draw_stride"] != 20
+            or receipt["sampler_burn_in"] != 1000 or receipt["proposal_scale"] != .5
+            or receipt["discarded_draws"] != [] or len(receipt["retained_draws"]) != 64):
+        raise ValueError("sampler receipt does not match the frozen budget")
+    rows = receipt["retained_draws"]
+    seed = rows[0]["seed"] if expected_seed is None else expected_seed
+    for index, row in enumerate(rows):
+        if (row["seed"] != seed or row["collection_index"] != index or row["region_index"] != index
+                or row["n_walkers"] != 4096 or row["draw_stride"] != 20 or row["burn_in"] != 1000
+                or row["proposal_scale"] != .5 or row["transition_count"] != 4096 * 20):
+            raise ValueError("sampler draw identity or settings changed")
+
+
+def _verify_restore_receipt(directory: Path, checkpoint: Path, step: int) -> None:
+    """Require the emitted strict model-only restore, without reusing training RNG."""
+    reports = []
+    with (directory / "occurrences.jsonl").open() as handle:
+        for line in handle:
+            record = json.loads(line)
+            if record.get("event") == "tpen.checkpoint.events.CheckpointRestored":
+                reports.append(record["fields"]["report"])
+    if len(reports) != 1:
+        raise ValueError("evaluation must record exactly one checkpoint restore")
+    report = reports[0]
+    if (report["checkpoint_dir"] != str(checkpoint) or report["mode"] != "model_only"
+            or report["completed_updates"] != step or report["next_iteration"] != step
+            or report["loaded_model"] is not True
+            or any(report[key] for key in ("loaded_optimizer", "loaded_rng", "loaded_sampler", "loaded_trainer"))):
+        raise ValueError("evaluation restore receipt differs from the intended fresh-chain restore")
 
 
 def describe(profile: Profile, exact_energy: float) -> dict:
@@ -281,16 +331,13 @@ def _verify_training(directory: Path, *, source_sha: str, lineage: int, floor: f
 
 def collect(root: Path, *, qualification: Path, interpretation: Path | None = None) -> dict:
     """Collect the fixed six lineages only after an independently checked gate receipt."""
-    gate = json.loads(qualification.read_text())
-    if gate.get("status") != "passed" or gate.get("instrument_controls") != "passed":
-        raise ValueError("a complete qualification receipt is required")
     protocol = json.loads((root / "protocol.json").read_text())
+    admission = validate_science_admission(qualification, protocol["source_sha"])
+    gate = admission["gate"]
     if gate["source_sha"] != protocol["source_sha"] or protocol["design_sha256"] != DESIGN_SHA256:
         raise ValueError("qualification and frozen protocol source disagree")
     assessments = {} if interpretation is None else json.loads(interpretation.read_text())
-    exact_variance = float(gate["max_exact_ordinary_grid_variance"])
-    if not math.isfinite(exact_variance) or not 0 <= exact_variance <= 1e-10:
-        raise ValueError("exact-reference variance did not pass qualification")
+    exact_variance = admission["max_exact_ordinary_grid_variance"]
     floor = max(1e-10, 100 * exact_variance)
     results = {}
     for system, exact in EXACT_ENERGY.items():
@@ -314,7 +361,10 @@ def collect(root: Path, *, qualification: Path, interpretation: Path | None = No
                                 or cfg["load"]["path"] != str(train_dir / "checkpoints" / f"step_{step:06d}")
                                 or cfg["load"]["strict"] is not True):
                             raise ValueError("evaluation identity or restore differs from protocol")
-                        profiles[step, stream] = load_profile(directory / "trajectory")
+                        _verify_restore_receipt(directory, train_dir / "checkpoints" / f"step_{step:06d}", step)
+                        profiles[step, stream] = load_profile(
+                            directory / "trajectory", expected_seed=evaluation_seed(system, lineage, step, stream),
+                        )
                 assessment = assessments.get(f"{system}:{lineage}", {})
                 accepted = assessment.get("energy_uncertainty_adequate") is True and bool(assessment.get("rationale"))
                 result = classify_lineage(profiles, exact_energy=exact, floor=floor,

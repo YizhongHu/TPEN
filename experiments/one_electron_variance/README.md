@@ -60,6 +60,9 @@ uses all 262,144 local energies, without clipping or finite-only filtering.
 The raw channel-summed readout amplitude is replayed on every retained
 coordinate in bounded chunks. Signed log amplitudes must reconcile. This
 diagnostic shares the learned forward; it is not another independent oracle.
+Hooke records explicitly use `trajectory_records/v2` with null nuclear geometry.
+This is opt-in; nuclear systems retain their existing version-one records.
+The atomic-configuration type still requires real, positive-charge nuclei.
 
 The intended population is each checkpoint's learned squared wavefunction.
 Exact-ground-state draws, selected grids, and the final draw alone cannot
@@ -124,12 +127,23 @@ The pilot's time projection includes process setup and checkpoint writing
 conservatively. Both lineages must fit six hours with 20% spare capacity.
 Missing memory evidence is unresolved admission, not a pass.
 
-Science is permitted only on qualified released-main source. Its supplied
-admission document must identify `source_sha`, `released_main_sha`,
-`design_sha256`, and true values for `instrument_controls_passed`,
-`independent_tip_verified`, `timing_admitted`, and `memory_admitted`, backed
-by the corresponding immutable receipts. Development tests and pilots do not
-authorize science. Then one allocation runs one lineage and its 18 evaluations:
+Science is permitted only on qualified released-main source. Both launcher and
+collector require the same `one-electron-admission/v1` document, identifying
+`source_sha`, equal `released_main_sha`, `design_sha256`, and `writer_id`.
+Its `evidence` mapping must contain `instrument_controls`, `gpu_correctness`,
+`independent_verification`, `timing`, `memory`, and `release`. Each reference has
+a `path` and `sha256`. Each referenced receipt names its `kind`, exact
+`source_sha`, `status: passed`, and a nonempty `artifacts` list of hashed raw
+evidence references. Relative paths resolve beside the referring document.
+
+Instrument receipts require every check named in `admission.CONTROL_CHECKS`
+and the measured `max_exact_ordinary_grid_variance`. Independent verification
+names a distinct `verifier_id`. Release names `ref: refs/heads/main`; timing
+records each system's `fits_six_hours_with_twenty_percent_margin`; memory records
+`full_a100_verified` and `full_4096_batch_and_stream_verified`. These checks bind
+and preserve the inspected evidence; they do not authenticate the people making
+release or review decisions. Development tests and pilots do not authorize
+science. Then one allocation runs one lineage and its 18 evaluations:
 
 ```sh
 python -m experiments.one_electron_variance.launch lineage \
@@ -148,9 +162,9 @@ evaluation stream; those are planning assumptions, not measured performance.
 
 `analysis.py` checks source, completed-update records, fresh evaluation seeds,
 strict restore identities, complete coordinate grids and checksums. Missing
-or invalid lineages remain incomplete. Its qualification document requires
-`status: passed`, `instrument_controls: passed`, `source_sha`, and the measured
-`max_exact_ordinary_grid_variance`. An optional interpretation document maps
+or invalid lineages remain incomplete. It also reconciles observed sampler
+settings and the emitted model-only restore receipt. The qualification argument
+is the same complete admission document used for launch. An optional interpretation document maps
 `hooke:0` through `hydrogen:2` to `energy_uncertainty_adequate` and a nonempty
 `rationale`. Preserve its hash and the evidence behind every assessment.
 

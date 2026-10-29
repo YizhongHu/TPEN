@@ -52,6 +52,7 @@ def _generator():
                                   spatial_dim=3, seed=11, dtype=torch.float64),
         hamiltonian_terms={"kinetic": KineticEnergy(), "trap": HarmonicTrap(omega=.5)},
         n_draws=3, reset=True, readout_eps=1e-12, replay_chunk_size=5,
+        allow_nucleus_free_records=True,
     )
 
 
@@ -65,6 +66,23 @@ def test_sum_floor_and_every_retained_row_are_recorded(tmp_path):
     assert all(float(row["raw_channel_sum"]) == 5e-7 for row in rows)
     assert all(row["floor_active"] == "True" for row in rows)
     assert json.loads((tmp_path / "raw_readout.json").read_text())["floor_count"] == 12
+    metadata_path = tmp_path / "sampled_eval_table.metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["schema"] == "trajectory_records/v2"
+    assert metadata["atomic_configuration"] is None
+    assert metadata["atomic_configuration_id"] is None
+    # Missing geometry is different from a recorded absence of nuclei.
+    del metadata["atomic_configuration"]
+    metadata_path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="atomic_configuration"):
+        generated.trajectory_records.validate(check_files=True)
+
+
+def test_nucleus_free_recording_requires_explicit_admission(tmp_path):
+    generator = _generator()
+    generator.allow_nucleus_free_records = False
+    with pytest.raises(ValueError, match="require Walkers.atomic_configuration"):
+        generator.generate(model=CancelledChannels().eval(), context=_context(tmp_path))
 
 
 @pytest.mark.parametrize("mode,reason", [("missing", "channel-summed"), ("mismatch", "disagrees")])

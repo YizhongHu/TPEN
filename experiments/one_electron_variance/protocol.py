@@ -112,6 +112,7 @@ def evaluation_config(system: str, lineage: int, checkpoint: int, stream: int,
                 "sampler": "${sampler}", "hamiltonian_terms": "${hamiltonian_terms}",
                 "n_draws": 64, "discard_draws": 0, "seed": seed, "reset": True,
                 "verify_model_unchanged": True, "readout_eps": 1e-12, "replay_chunk_size": 4096,
+                "allow_nucleus_free_records": system == "hooke",
             },
             "calculators": [
                 {"_target_": "tpen.evaluation.LocalEnergyCalculator",

@@ -11,6 +11,7 @@ from __future__ import annotations
 import itertools
 import json
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -39,8 +40,8 @@ def _batch(system: str, positions: torch.Tensor) -> ElectronBatch:
     if system == "hooke":
         return ElectronBatch(positions=positions)
     return ElectronBatch(positions=positions,
-                         nuclear_positions=torch.zeros((1, 3), dtype=torch.float64),
-                         nuclear_charges=torch.ones(1, dtype=torch.float64))
+                         nuclear_positions=torch.zeros((1, 3), dtype=torch.float64, device=positions.device),
+                         nuclear_charges=torch.ones(1, dtype=torch.float64, device=positions.device))
 
 
 def _model_and_terms(system: str, scale: float):
@@ -70,14 +71,16 @@ def _oracle(system: str, scale: float, positions: torch.Tensor):
 @pytest.mark.parametrize("system,scale", [("hooke", 0.5), ("hooke", 0.6),
                                            ("hydrogen", 1.0), ("hydrogen", 1.2)])
 @pytest.mark.parametrize("stress", [False, True])
-def test_pointwise_scalar_oracle(tmp_path, system: str, scale: float, stress: bool) -> None:
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="accelerator qualification requires an allocated CUDA device"))])
+def test_pointwise_scalar_oracle(tmp_path, system: str, scale: float, stress: bool, device: str) -> None:
     radii = (1e-8, 1e-6, 1e-4, 12., 20.) if stress else (1e-3, 1e-2, .1, .5, 1., 2., 4., 8.)
-    positions = _grid(radii)
+    positions = _grid(radii).to(device)
     batch = _batch(system, positions)
     model, terms = _model_and_terms(system, scale)
     result = local_energy(terms, model, batch, return_terms=True)
     assert isinstance(result, LocalEnergyResult)
-    kinetic, potential, logabs = _oracle(system, scale, positions)
+    kinetic, potential, logabs = (value.to(device) for value in _oracle(system, scale, positions))
     budget = torch.maximum(torch.full_like(kinetic, 1e-7), 1e-14*(kinetic.abs()+potential.abs()))
     assert torch.isfinite(result.total).all()
     assert torch.all((result.terms["kinetic"]-kinetic).abs() <= budget)
@@ -86,9 +89,9 @@ def test_pointwise_scalar_oracle(tmp_path, system: str, scale: float, stress: bo
     assert torch.all((result.total-kinetic-potential).abs() <= budget)
     assert torch.allclose(model(batch).logabs, logabs, atol=1e-12, rtol=1e-14)
     (tmp_path / "pointwise-control.json").write_text(json.dumps({
-        "system": system, "scale": scale, "stress": stress,
-        "maximum_energy_error": float((result.total-kinetic-potential).abs().max()),
-        "variance": float(result.total.var(unbiased=False)), "rows": len(positions),
+        "system": system, "scale": scale, "stress": stress, "device": device,
+        "maximum_energy_error": float((result.total-kinetic-potential).detach().abs().max()),
+        "variance": float(result.total.detach().var(unbiased=False)), "rows": len(positions),
         "oracle": "independent_python_scalar_math", "learned_forward_used": False,
     }, indent=2))
     if not stress and ((system, scale) in (("hooke", .5), ("hydrogen", 1.))):
@@ -103,7 +106,9 @@ def test_scalar_control_detects_wrong_kinetic_prefactor_and_missing_potential(sy
     class WrongKinetic:
         def local_energy(self, wavefunction, batch):
             result = KineticEnergy().local_energy(wavefunction, batch)
-            return result.total / 2
+            return replace(result, total=result.total / 2,
+                           terms={name: value / 2 for name, value in result.terms.items()},
+                           per_electron_kinetic=result.per_electron_kinetic / 2)
 
     positions = _grid((.1, .5, 1., 2., 4.))
     model, terms = _model_and_terms(system, scale)

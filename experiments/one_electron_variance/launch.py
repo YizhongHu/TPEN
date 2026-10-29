@@ -19,6 +19,8 @@ import time
 
 import yaml
 
+from experiments.one_electron_variance.admission import validate_science_admission
+
 from experiments.one_electron_variance.protocol import (
     DESIGN_SHA256, evaluation_config, run_directory, train_config,
 )
@@ -127,12 +129,7 @@ def run_pilot(root: Path, source_sha: str, admission_id: str) -> dict:
 
 def run_lineage(root: Path, source_sha: str, admission_id: str, *, system: str, lineage: int, gate: Path) -> None:
     """Execute exactly one released-source lineage after qualified timing/memory admission."""
-    admission = json.loads(gate.read_text())
-    if (admission.get("released_main_sha") != source_sha or admission.get("source_sha") != source_sha
-            or admission.get("design_sha256") != DESIGN_SHA256
-            or any(admission.get(key) is not True for key in
-                   ("instrument_controls_passed", "independent_tip_verified", "timing_admitted", "memory_admitted"))):
-        raise ValueError("science needs released-source, independent-control, timing and memory admission")
+    validate_science_admission(gate, source_sha)
     protocol = json.loads((root / "protocol.json").read_text())
     if protocol["source_sha"] != source_sha or protocol["design_sha256"] != DESIGN_SHA256:
         raise ValueError("source does not match the frozen protocol")
