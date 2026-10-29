@@ -137,7 +137,7 @@ def _load_base_stage_coordinate() -> object:
     spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("stage_coordinate.py"))
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
+    sys.modules[spec.name] = module
     original_read_text = Path.read_text
 
     def read_text(path: Path, *args: object, **kwargs: object) -> str:
