@@ -48,7 +48,7 @@ LEGACY_ACTIVATION_LABELS = tuple(
 
 _LEGACY_FRAGMENT_SHA256 = json.loads(
     # Generated mechanically from origin/dev at 3425ecf7 with:
-    # git show origin/dev:experiments/atomistic/he-importance/context_mapping.py | python3 -c
+    # git show 3425ecf7d8c0812c2075f4b8c5aaf2adf8cfba67:experiments/atomistic/he-importance/context_mapping.py | python3 -c
     # 'import sys,types,importlib.util,hashlib,json; m=types.ModuleType("omegaconf"); m.OmegaConf=object; sys.modules["omegaconf"]=m; src=sys.stdin.read(); mod=importlib.util.module_from_spec(importlib.util.spec_from_loader("cm",loader=None)); exec(compile(src,"context_mapping.py","exec"),mod.__dict__); paths=("tensor","linear/coordinate-neighbor","linear/orbit-complete","hybrid/coordinate-neighbor","hybrid/orbit-complete"); acts=("SiLU,SiLU","tanh,tanh","exact GELU,exact GELU","channel-MLP,SiLU","SiLU,channel-MLP","channel-MLP,channel-MLP"); print(json.dumps({f"{path}|{act}":hashlib.sha256(json.dumps(mod.context_fragment(path,activation=act),sort_keys=True).encode()).hexdigest() for path in paths for act in acts},indent=2,sort_keys=True))'
     # The complete generated table is kept in the JSON fixture, not retyped.
     (Path(__file__).with_name("legacy_fragment_hashes.json")).read_text()

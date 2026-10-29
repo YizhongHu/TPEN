@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import io
+import importlib.util
+from pathlib import Path
+import sys
 
 import pytest
 import torch
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
 
 from tpen.data.batch import ElectronBatch, ParameterScoreForwardPacket, WavefunctionOutput
 from tpen.data.paths import (
@@ -31,6 +36,16 @@ from tpen.nn import (
 from tpen.nn.readout import PfaffianReadout
 
 from tests.helpers.score_reachability import disconnected_parameter_names
+
+
+_MAPPING_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_context_mapping_parameter_scores",
+    Path(__file__).parents[3] / "experiments" / "atomistic" / "he-importance" / "context_mapping.py",
+)
+assert _MAPPING_SPEC is not None and _MAPPING_SPEC.loader is not None
+_MAPPING = importlib.util.module_from_spec(_MAPPING_SPEC)
+sys.modules[_MAPPING_SPEC.name] = _MAPPING
+_MAPPING_SPEC.loader.exec_module(_MAPPING)
 
 
 def _build_model(
@@ -76,6 +91,23 @@ def _batch() -> ElectronBatch:
         positions=torch.randn(2, 2, 3, 3, generator=generator, dtype=torch.float64),
         spins=torch.tensor([[[1.0, -1.0, 1.0]] * 2] * 2, dtype=torch.float64),
     )
+
+
+def _softplus_fragment_model() -> TPENWaveFunction:
+    """Build a model from the production Softplus beta-2 Hydra fragment."""
+
+    fragment = _MAPPING.context_fragment(
+        "tensor", activation="Softplus beta2,Softplus beta2", channels=1
+    )
+    config = OmegaConf.create({"layer": fragment})
+    OmegaConf.resolve(config)
+    layer = instantiate(config.layer)
+    return TPENWaveFunction(
+        embedding=Embedding(max_order=2, spatial_dim=3, out_channels=1, hidden_channels=4, num_hidden_layers=1),
+        layers=(layer,),
+        readout=PfaffianReadout(channels=1),
+        layout=layer.layout,
+    ).to(dtype=torch.float64)
 
 
 class _EmptyShapeEmbedding(torch.nn.Module):
@@ -139,6 +171,24 @@ def test_slow_and_chunked_scores_agree_for_all_landed_modes(mode: InteractionMod
         assert not slow_block.requires_grad
         assert not chunked_block.requires_grad
         torch.testing.assert_close(slow_block, chunked_block, rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_softplus_fragment_chunked_scores_match_slow_batched_vjps() -> None:
+    """Exercise the custom Function under the production batched-VJP path."""
+
+    model = _softplus_fragment_model()
+    batch = _batch()
+    slow = model(batch, request=MaterializedParameterScoreRequest())
+    chunked = model(batch, request=MaterializedParameterScoreRequest(chunk_size=2))
+
+    assert isinstance(slow, ParameterScoreForwardPacket)
+    assert isinstance(chunked, ParameterScoreForwardPacket)
+    for slow_block, chunked_block in zip(
+        slow.parameter_scores.blocks, chunked.parameter_scores.blocks, strict=True
+    ):
+        assert torch.isfinite(slow_block).all()
+        assert torch.isfinite(chunked_block).all()
+        torch.testing.assert_close(slow_block, chunked_block, rtol=0.0, atol=0.0)
 
 
 def test_flattened_j_and_jt_products_match_ordinary_autograd() -> None:

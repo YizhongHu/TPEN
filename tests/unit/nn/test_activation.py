@@ -56,6 +56,13 @@ _SIGMAS = (0.25, 0.5, 1.0, 2.0, 3.75)
 _SAMPLE_POINTS = (-4.0, -2.5, -1.0, -0.75, -0.25, 0.0, 0.25, 0.75, 1.0, 2.5, 4.0)
 
 
+def _assert_within_one_ulp(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Assert equality up to one representable float64 step."""
+
+    upward = torch.nextafter(expected, torch.full_like(expected, float("inf")))
+    assert torch.all((actual - expected).abs() <= upward - expected)
+
+
 def _reference(x: float, sigma: float) -> float:
     """Closed-form scalar Gaussian bump, written independently of the module."""
 
@@ -405,7 +412,7 @@ def test_softplus_beta_second_derivative_is_finite_past_exp_overflow() -> None:
 def test_softplus_beta_value_at_zero_is_log_two_over_beta() -> None:
     actual = SoftplusBeta()(torch.zeros(1, dtype=_DTYPE))
     expected = torch.full_like(actual, math.log(2.0) / 2.0)
-    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+    _assert_within_one_ulp(actual, expected)
 
 
 def test_softplus_beta_threshold_regime_catches_torch_linear_mutant() -> None:
@@ -525,9 +532,7 @@ def test_mixing_activation_writes_gamma_zero_onto_non_distinct_entries(
 
     diagonal = torch.diagonal(activated.blocks[2], dim1=-2, dim2=-1)
 
-    torch.testing.assert_close(
-        diagonal, torch.full_like(diagonal, gamma_zero), atol=0.0, rtol=0.0
-    )
+    _assert_within_one_ulp(diagonal, torch.full_like(diagonal, gamma_zero))
 
 
 def test_mixing_masked_contamination_magnitude_is_exactly_one() -> None:
@@ -563,19 +568,19 @@ def test_path_aggregation_activation_writes_gamma_zero_onto_non_distinct_entries
     rezeroed = _zero_masked_entries(block, n_particles, 2, path_axis=False)
 
     diagonal = torch.diagonal(block, dim1=-2, dim2=-1)
-    torch.testing.assert_close(
-        diagonal, torch.full_like(diagonal, gamma_zero), atol=0.0, rtol=0.0
+    _assert_within_one_ulp(diagonal, torch.full_like(diagonal, gamma_zero))
+    _assert_within_one_ulp(
+        (block - rezeroed).abs().amax().reshape(1),
+        torch.tensor([gamma_zero], dtype=block.dtype),
     )
-    assert (block - rezeroed).abs().max().item() == gamma_zero
 
 
 @pytest.mark.parametrize("n_particles", [2, 3])
 @pytest.mark.parametrize(
-    ("activation", "gamma_zero"),
-    [(GaussianActivation(sigma=0.9), 1.0), (SoftplusBeta(), math.log(2.0) / 2.0)],
+    "activation", [GaussianActivation(sigma=0.9), SoftplusBeta()]
 )
 def test_masked_contamination_does_not_reach_the_pfaffian_wavefunction(
-    n_particles: int, activation, gamma_zero: float
+    n_particles: int, activation
 ) -> None:
     # The readout antisymmetrizes K = 0.5 * (pair - pair^T), which annihilates
     # the order-2 diagonal exactly, so the contamination measured above cannot

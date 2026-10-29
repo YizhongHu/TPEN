@@ -388,6 +388,8 @@ class SoftplusBeta(nn.Module):
     The A6 beta-2 instance is nonzero at zero, with ``f(0) = log(2) / 2``.
     First and second coordinate derivatives use explicit sigmoid products so
     the Laplacian path remains finite beyond the exponent overflow range.
+    Because the derivative path is implemented by a custom autograd Function,
+    forward-mode AD and ``torch.func``/``vmap`` transforms are unsupported.
     """
 
     def __init__(self, *, beta: float = 2.0) -> None:
