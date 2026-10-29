@@ -83,7 +83,7 @@ def _queue_jobs(raw: str, user: str) -> list[dict[str, str]]:
 
     def flush() -> None:
         if current.get("user") == user and all(key in current for key in ("job_id", "state", "queue")):
-            jobs.append({key: current[key] for key in ("job_id", "state", "queue")})
+            jobs.append({key: current[key] for key in ("job_id", "state", "queue", "hold_types") if key in current})
 
     for line in raw.splitlines():
         if line.startswith("Job Id:"):
@@ -96,6 +96,9 @@ def _queue_jobs(raw: str, user: str) -> list[dict[str, str]]:
         match = re.match(r"\s*job_state\s*=\s*(\S+)", line)
         if match:
             current["state"] = match.group(1)
+        match = re.match(r"\s*Hold_Types\s*=\s*(\S+)", line)
+        if match:
+            current["hold_types"] = match.group(1)
         match = re.match(r"\s*queue\s*=\s*(\S+)", line)
         if match:
             current["queue"] = match.group(1)
@@ -154,7 +157,7 @@ def _queue_gate(queue: str, user: str, output_dir: Path, prefix: str) -> bool:
                     refusal = f"refused: unknown PBS limit {attribute} ({prefix_kind}:*)"
                     break
                 if attribute == "queued_jobs_threshold":
-                    count = sum(job["state"] in {"Q", "H"} for job in jobs)
+                    count = sum(job["state"] == "Q" for job in jobs)
                 else:
                     count = sum(job["state"] in {"Q", "H", "R", "E", "W", "T", "B"} for job in jobs)
                 if count >= threshold:
@@ -172,7 +175,12 @@ def _queue_gate(queue: str, user: str, output_dir: Path, prefix: str) -> bool:
         reason = "allowed: live PBS limits admit this user in this queue"
     elif refusal:
         reason = refusal
-    decision = {"queue": queue, "user": user, "limits": limits, "jobs": jobs,
+    held_jobs = [{"job_id": job["job_id"], "hold_types": job.get("hold_types", "")}
+                 for job in jobs if job["state"] == "H"]
+    if held_jobs:
+        print("WARNING held jobs do not count toward queued_jobs_threshold and never transition Q->R: "
+              + ", ".join(job["job_id"] for job in held_jobs), file=sys.stderr)
+    decision = {"queue": queue, "user": user, "limits": limits, "jobs": jobs, "held_jobs": held_jobs,
                 "qstat_table_rows": table_rows, "qstat_full_records": full_records,
                 "qstat_full_sha256": hashlib.sha256(jobs_raw.encode()).hexdigest(),
                 "qstat_full_bytes": len(jobs_raw.encode()), "qstat_full_storage": str(jobs_path),

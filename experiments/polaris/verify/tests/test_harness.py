@@ -416,6 +416,9 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
             return "".join(records)
         if queue_mode == "debug-queued" and queue == "debug":
             return full_job("7795003.polaris", "rhu", "debug", "Q")
+        if queue_mode == "debug-held" and queue == "debug":
+            return (full_job("7795010.polaris", "rhu", "debug", "H")
+                    .replace("    queue = debug\n", "    Hold_Types = s\n    queue = debug\n"))
         if queue_mode == "debug-truncated" and queue == "debug":
             return full_job("7795004.polaris", "rhu", "debug-s*", "Q")
         if queue_mode == "scaling-running" and queue == "debug-scaling":
@@ -428,10 +431,12 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
 
     def table_text(queue: str) -> str:
         records = []
-        if queue_mode in {"debug-other", "debug-running", "debug-queued", "debug-truncated"} and queue == "debug":
+        if queue_mode in {"debug-other", "debug-running", "debug-queued", "debug-truncated", "debug-held"} and queue == "debug":
             records.append("7795000.polaris rhu 00:00:00 R debug\n")
         if queue_mode == "debug-queued":
             records = ["7795003.polaris rhu 00:00:00 Q debug\n"]
+        if queue_mode == "debug-held":
+            records = ["7795010.polaris rhu 00:00:00 H debug\n"]
         if queue_mode == "debug-truncated":
             records = ["7795004.polaris rhu 00:00:00 Q debug-s*\n"]
         if queue_mode == "debug-other-only":
@@ -529,7 +534,7 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
             if "sync" in call_args and mode == "prime-fail":
                 raise RuntimeError("prime failed")
             if call_args and call_args[0] == "qsub":
-                if mode in {"scaling-empty", "debug-truncated", "debug-other-only", "wrapped-limit"}:
+                if mode in {"scaling-empty", "debug-truncated", "debug-other-only", "wrapped-limit", "debug-held"}:
                     qsub_calls.append(call_args)
                     return "123.polaris-pbs-01"
                 raise AssertionError("qsub reached control")
@@ -551,14 +556,18 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
             stage.stage(control_args)
         except (RuntimeError, subprocess.CalledProcessError):
             pass
-        if mode in {"scaling-empty", "debug-truncated", "debug-other-only", "wrapped-limit"}:
+        if mode in {"scaling-empty", "debug-truncated", "debug-other-only", "wrapped-limit", "debug-held"}:
             assert (cell / "submission.txt").exists()
+            if mode == "debug-held":
+                decision = json.loads((cell / "pre-submit-qstat-decision.json").read_text())
+                assert decision["held_jobs"] == [{"job_id": "7795010.polaris", "hold_types": "s"}]
         else:
             assert not (cell / "submission.txt").exists()
             if mode not in {"scaling-flip"}:
                 assert not (cell / "staging-receipt.json").exists()
 
     run_control("cell-debug-queued", "debug-queued")
+    run_control("cell-debug-held", "debug-held")
     run_control("cell-debug-truncated", "debug-truncated")
     run_control("cell-debug-other-only", "debug-other-only")
     run_control("cell-alternate-only", "alternate-only")
