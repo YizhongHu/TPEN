@@ -144,3 +144,14 @@ def test_control_drift_arms_reject_skipped_init(tmp_path: Path) -> None:
 def test_control_drift_arms_accept_unmutated_source(tmp_path: Path) -> None:
     module = _load(tmp_path, "unmutated", _LAUNCH_TESTS.read_text(encoding="utf-8"))
     assert not _arms_reject(module)
+
+
+# RED at 77f9d7be (round-2 F1): the structural arm's visitor pushes only ClassDef
+# nodes onto its parent stack, so a double nested inside a FUNCTION is reported
+# as module-level. Duplicates are still caught by count, but the arm's
+# "exactly one module-level _FakeContext" claim is not what it measures.
+def test_structural_arm_reports_function_nested_double_as_nested(tmp_path: Path) -> None:
+    module = _load(tmp_path, "function_nested_flag", _mutated_source(append=_NESTED_SAME_NAME))
+    with pytest.raises(AssertionError) as excinfo:
+        module.test_fake_context_doubles_use_shared_contract()
+    assert "('_FakeContext', False)" in str(excinfo.value), str(excinfo.value)

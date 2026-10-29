@@ -1496,3 +1496,18 @@ def test_default_runner_exception_path_reports_run_failed_without_touching_cwd(
     # _FakeContext points run_dir at Path("."), i.e. the pytest CWD (the repo
     # checkout). The exception path must not leave error.json there.
     assert not (Path.cwd() / "error.json").exists()
+    # GREEN pin (round-2 G1): with real metadata and clock the failure artifact
+    # is actually written, and it lands where the context says, not elsewhere.
+    assert (context.run_dir / "error.json").is_file()
+
+
+# RED at 77f9d7be (round-2 F2): _FakeContext builds its run root with
+# tempfile.mkdtemp, which creates one directory per construction that nothing
+# removes. A pytest-managed root (under basetemp, e.g. tmp_path) is cleaned.
+def test_fake_context_run_dir_is_pytest_managed(tmp_path_factory: pytest.TempPathFactory) -> None:
+    context = _FakeContext()
+    base = tmp_path_factory.getbasetemp().resolve()
+
+    assert base in context.run_dir.resolve().parents, (
+        f"_FakeContext.run_dir={context.run_dir} is outside pytest's basetemp {base}"
+    )
