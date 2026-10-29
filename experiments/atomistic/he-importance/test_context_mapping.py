@@ -576,18 +576,19 @@ def test_a8_instantiated_update_has_the_declared_zero_and_nonzero_falsifier(labe
         "blocks": [torch.ones_like(block) for block in blocks],
     })
     if layer.update_envelope is not None:
-        explicit_batch = instantiate({
-            "_target_": "tpen.data.batch.ElectronBatch",
-            "positions": torch.tensor(
-                [[[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]], dtype=torch.float64
-            ),
-            "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
-            "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
-        })
         context = instantiate({
             "_target_": "tpen.nn.context.TPENForwardContext",
-            "batch": explicit_batch,
+            "_convert_": "object",
+            "batch": {
+                "_target_": "tpen.data.batch.ElectronBatch",
+                "positions": torch.tensor(
+                    [[[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]], dtype=torch.float64
+                ),
+                "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
+                "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
+            },
         })
+        assert context.batch.__class__.__name__ == "ElectronBatch"
         update = layer.update_envelope(update, context)
     output = layer.update(x, update)
     if label == "replacement":
@@ -856,6 +857,7 @@ def test_a12_mapped_random_modes_are_named_streamed_and_paired(
     }))
     ratio = l1.channel_weights.detach() / l2.channel_weights.detach()
     assert torch.all(ratio > 0)
+    assert torch.allclose(ratio, torch.full_like(ratio, ratio[0]))
     assert torch.equal(l1.channel_weights.detach(), first.channel_weights.detach()) if label == "signed L1" else True
     assert torch.isclose(l1.channel_weights.detach().abs().sum(), torch.tensor(1.0, dtype=torch.float64))
     assert torch.isclose(
@@ -866,7 +868,9 @@ def test_a12_mapped_random_modes_are_named_streamed_and_paired(
     nonuniform = l1.channel_weights.detach() * torch.linspace(
         1.0, 2.0, 8, dtype=torch.float64
     )
-    assert not torch.allclose(nonuniform / l2.channel_weights.detach(), torch.full((8,), ratio.mean()))
+    nonuniform = nonuniform / nonuniform.abs().sum()
+    mutant_ratio = nonuniform / l2.channel_weights.detach()
+    assert not torch.allclose(mutant_ratio, torch.full_like(mutant_ratio, mutant_ratio.mean()))
 
 
 @pytest.mark.parametrize("package", ("B00", "B10", "B01", "B11"))
