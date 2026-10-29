@@ -277,6 +277,7 @@ def build_manifest(args: argparse.Namespace, run_root: Path, target_repo: Path) 
         "pbs_dir": str(paths["pbs_dir"]),
         "arms": list(args.arm),
         "profile": profile,
+        "scheduler": {"queue": args.queue},
         "profile_path": str(paths["profile"]),
         "job_script": str(paths["job_script"]),
         "job_helper": str(paths["job_helper"]),
@@ -310,14 +311,18 @@ def stage(args: argparse.Namespace) -> int:
     validate_evidence_root(args.evidence_root)
     for arm in args.arm:
         validate_arm_syntax(arm)
+    profile = read_profile(VERIFY_DIR / "facility_profile.json")
+    queue = getattr(args, "queue", None) or profile["pbs"]["queue"]
+    if queue not in profile["pbs"]["allowed_queues"]:
+        raise ValueError(f"queue is not allowed by the facility profile: {queue}")
+    args.queue = queue
     harness_repo = _harness_repo()
     if _git(harness_repo, "status", "--porcelain", "--untracked-files=no"):
         raise RuntimeError("harness checkout has tracked changes; refuse staging")
     evidence_root = Path(args.evidence_root).expanduser().resolve()
     run_root = evidence_root / args.cell_id
     evidence_root.mkdir(parents=True, exist_ok=True)
-    profile = read_profile(VERIFY_DIR / "facility_profile.json")
-    if not _queue_gate(profile["pbs"]["queue"], getpass.getuser(), evidence_root, f"{args.cell_id}.pre-submit"):
+    if not _queue_gate(queue, getpass.getuser(), evidence_root, f"{args.cell_id}.pre-submit"):
         raise RuntimeError("refusing staging because the live PBS queue limit is reached or unreadable")
     if run_root.exists():
         raise RuntimeError(f"run root already exists: {run_root}")
@@ -358,9 +363,10 @@ def stage(args: argparse.Namespace) -> int:
     for path in (manifest["evidence_dir"], manifest["pbs_dir"], manifest["cache_dir"], manifest["prime_env"], manifest["dry_env"], manifest["staging_receipt"]):
         if not Path(path).exists():
             raise RuntimeError(f"staging path missing: {path}")
-    if not _queue_gate(profile["pbs"]["queue"], getpass.getuser(), run_root, "pre-submit"):
+    queue = manifest["scheduler"]["queue"]
+    if not _queue_gate(queue, getpass.getuser(), run_root, "pre-submit"):
         raise RuntimeError("refusing qsub because the live PBS queue limit is reached or unreadable")
-    qsub = ["qsub", "-A", profile["pbs"]["account"], "-q", profile["pbs"]["queue"], "-l", f"select={profile['pbs']['select']}", "-l", f"walltime={profile['pbs']['walltime']}", "-l", f"filesystems={profile['pbs']['filesystems']}", "-o", str(manifest["pbs_dir"]) + "/", "-e", str(manifest["pbs_dir"]) + "/", "-v", f"RUN_ENV_PATH={env_path}", str(paths["job_script"])]
+    qsub = ["qsub", "-A", profile["pbs"]["account"], "-q", queue, "-l", f"select={profile['pbs']['select']}", "-l", f"walltime={profile['pbs']['walltime']}", "-l", f"filesystems={profile['pbs']['filesystems']}", "-o", str(manifest["pbs_dir"]) + "/", "-e", str(manifest["pbs_dir"]) + "/", "-v", f"RUN_ENV_PATH={env_path}", str(paths["job_script"])]
     print("SUBMIT " + shlex.join(qsub), flush=True)
     job_id = _run(qsub, capture=True)
     (run_root / "submission.txt").write_text(job_id + "\n" + shlex.join(qsub) + "\n", encoding="utf-8")
@@ -375,6 +381,7 @@ def main() -> int:
     parser.add_argument("--cell-id", required=True)
     parser.add_argument("--required-ancestor", action="append", default=[])
     parser.add_argument("--remote", default="https://github.com/YizhongHu/TPEN.git")
+    parser.add_argument("--queue")
     args = parser.parse_args()
     if not HEX40.fullmatch(args.target_sha):
         parser.error("--target-sha must be a full 40-hex SHA")

@@ -6,5 +6,5 @@
   "job_scratch_root": "/local/scratch",
   "compute_host_guard": {"refuse_prefix": "polaris-login-"},
   "thread_limits": {"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"},
-  "pbs": {"account": "HetRxnEnergy", "queue": "debug", "select": "1:system=polaris", "walltime": "01:00:00", "filesystems": "home:eagle"}
+  "pbs": {"account": "HetRxnEnergy", "queue": "debug", "allowed_queues": ["debug", "debug-scaling"], "select": "1:system=polaris", "walltime": "01:00:00", "filesystems": "home:eagle"}
 }

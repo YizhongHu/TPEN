@@ -14,8 +14,13 @@ versioned `facility_profile.json` (do not duplicate that path here):
   --target-sha <full-sha> --arm <pytest-path-or-node-id> \
   --arm <another-path-or-node-id> --evidence-root <evidence-root> \
   --cell-id <unique-cell> --required-ancestor <full-sha> \
-  --remote <git-remote>
+  --queue debug --remote <git-remote>
 ```
+
+`--queue` is optional and defaults to `debug`; the facility profile permits
+`debug` and `debug-scaling` only. The live gate reads limits for the chosen
+queue at both admission points. On `debug-scaling`, `max_queued` counts running
+jobs too, so a slot opens only when this user's job there finishes.
 
 Run this from a clean git clone of the harness. Before work and again
 immediately before `qsub`, stage reads the target queue's live `qstat -Qf`

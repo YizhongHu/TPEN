@@ -380,6 +380,7 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
     uv_envs = []
     qstat_calls = 0
     queue_mode = "debug-other"
+    requested_queue = None
     original_read_profile = stage.read_profile
 
     def full_job(job_id: str, user: str, queue: str, state: str) -> str:
@@ -460,15 +461,15 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
             return subprocess.CompletedProcess(args, 0, queue_text(queue), "")
         if args == ["qstat", "-f"]:
             qstat_calls += 1
-            queue = stage.read_profile(ROOT / "facility_profile.json")["pbs"]["queue"]
+            queue = requested_queue or stage.read_profile(ROOT / "facility_profile.json")["pbs"]["queue"]
             if queue_mode == "alternate-only":
                 return subprocess.CompletedProcess(args, 0, table_text(queue), "")
             return subprocess.CompletedProcess(args, 0, jobs_text(queue), "")
         if args[:3] == ["qstat", "-f", "-u"]:
-            queue = stage.read_profile(ROOT / "facility_profile.json")["pbs"]["queue"]
+            queue = requested_queue or stage.read_profile(ROOT / "facility_profile.json")["pbs"]["queue"]
             return subprocess.CompletedProcess(args, 0, table_text(queue), "")
         if args[:2] == ["qstat", "-u"]:
-            queue = stage.read_profile(ROOT / "facility_profile.json")["pbs"]["queue"]
+            queue = requested_queue or stage.read_profile(ROOT / "facility_profile.json")["pbs"]["queue"]
             return subprocess.CompletedProcess(args, 0, table_text(queue), "")
         if "sync" in args:
             uv_envs.append(kwargs["env"])
@@ -500,11 +501,14 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
     assert stage.stage(args) == 0
     run_root = Path(args.evidence_root) / args.cell_id
     manifest = json.loads((run_root / "manifest.json").read_text())
+    assert manifest["scheduler"]["queue"] == "debug"
     assert (run_root / "run.env").is_file() and (run_root / "staging-receipt.json").is_file()
     assert (run_root / "submission.txt").is_file()
     assert all((Path(args.evidence_root) / name).is_file() for name in ("cell-ok.pre-submit-qstat-Qf.txt", "cell-ok.pre-submit-qstat-f.txt.gz", "cell-ok.pre-submit-qstat-u.txt", "cell-ok.pre-submit-qstat-decision.json"))
     assert all((run_root / name).is_file() for name in ("pre-submit-qstat-Qf.txt", "pre-submit-qstat-f.txt.gz", "pre-submit-qstat-u.txt", "pre-submit-qstat-decision.json"))
     assert json.loads((run_root / "pre-submit-qstat-decision.json").read_text())["allowed"] is True
+    assert json.loads((run_root / "pre-submit-qstat-decision.json").read_text())["queue"] == "debug"
+    assert json.loads((tmp_path / "cells" / "cell-ok.pre-submit-qstat-decision.json").read_text())["queue"] == "debug"
     assert len(uv_envs) == 2
     assert all(env["UV_CACHE_DIR"] == manifest["cache_dir"] for env in uv_envs)
     profile = manifest["profile"]
@@ -516,18 +520,15 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
     assert qsub_calls == [expected_qsub]
 
     def run_control(name, mode):
-        nonlocal qstat_calls, queue_mode
+        nonlocal qstat_calls, queue_mode, requested_queue
         qstat_calls = 0
         queue_mode = mode
+        requested_queue = "debug-scaling" if mode.startswith("scaling") else None
         monkeypatch.setattr(stage, "read_profile", original_read_profile)
-        if mode.startswith("scaling"):
-            control_profile = json.loads((ROOT / "facility_profile.json").read_text())
-            control_profile["pbs"]["queue"] = "debug-scaling"
-            monkeypatch.setattr(stage, "read_profile", lambda path, value=control_profile: value)
         cell = tmp_path / "cells" / name
         control_args = type("Args", (), {"target_sha": target_sha, "arm": ["test_target.py"],
                                           "evidence_root": str(tmp_path / "cells"), "cell_id": name,
-                                          "required_ancestor": [], "remote": str(bare)})()
+                                          "required_ancestor": [], "remote": str(bare), "queue": requested_queue})()
         def control_run(call_args, cwd=None, *, capture=False, env=None):
             if "--version" in call_args and "uv" in call_args:
                 return "uv 0.8.23"
@@ -558,6 +559,11 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
             pass
         if mode in {"scaling-empty", "debug-truncated", "debug-other-only", "wrapped-limit", "debug-held"}:
             assert (cell / "submission.txt").exists()
+            if mode == "scaling-empty":
+                assert json.loads((cell / "manifest.json").read_text())["scheduler"]["queue"] == "debug-scaling"
+                assert qsub_calls[-1][qsub_calls[-1].index("-q") + 1] == "debug-scaling"
+                assert json.loads((cell / "pre-submit-qstat-decision.json").read_text())["queue"] == "debug-scaling"
+                assert json.loads((tmp_path / "cells" / f"{name}.pre-submit-qstat-decision.json").read_text())["queue"] == "debug-scaling"
             if mode == "debug-held":
                 decision = json.loads((cell / "pre-submit-qstat-decision.json").read_text())
                 assert decision["held_jobs"] == [{"job_id": "7795010.polaris", "hold_types": "s"}]
@@ -579,6 +585,24 @@ def test_stage_end_to_end_fakes_and_ordering_controls(monkeypatch, tmp_path) -> 
     run_control("cell-scaling-empty", "scaling-empty")
     run_control("cell-unparseable", "unparseable")
     run_control("cell-scaling-flip", "scaling-flip")
+
+    invalid_called = False
+    def invalid_harness_repo():
+        nonlocal invalid_called
+        invalid_called = True
+        raise AssertionError("invalid queue must be refused before clone/work")
+    monkeypatch.setattr(stage, "_harness_repo", invalid_harness_repo)
+    invalid_args = type("Args", (), {"target_sha": target_sha, "arm": ["test_target.py"],
+                                      "evidence_root": str(tmp_path / "invalid-cells"), "cell_id": "invalid",
+                                      "required_ancestor": [], "remote": str(bare), "queue": "prod"})()
+    try:
+        stage.stage(invalid_args)
+    except ValueError as exc:
+        assert "not allowed" in str(exc)
+    else:
+        raise AssertionError("invalid queue was accepted")
+    assert not invalid_called
+    assert not (tmp_path / "invalid-cells").exists()
 
 
 def test_driver_exit_and_evidence_boundaries(monkeypatch) -> None:
