@@ -176,6 +176,13 @@ class GaussianConfinement(Envelope):
         assert output.shape == (batch.batch_size,)
         return output
 
+    def scalar_diagnostics(self) -> dict[str, float]:
+        """Expose the physical confinement strength to FactorScalars."""
+        values = {"coefficient": float(self.coefficient.detach().item())}
+        if self.trainable:
+            values["raw_coefficient"] = float(self.raw_coefficient.detach().item())
+        return values
+
 
 class HookeGaussianConfinement(GaussianConfinement):
     """Gaussian ground-state envelope for the Hooke / harmonic oscillator.

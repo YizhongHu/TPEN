@@ -27,6 +27,9 @@ TRAJECTORY_RECORD_FILENAME = "sampled_eval_table.csv"
 TRAJECTORY_RECORD_SCHEMA = "trajectory_records/v1"
 """Versioned serialized trajectory-record schema."""
 
+NUCLEUS_FREE_TRAJECTORY_RECORD_SCHEMA = "trajectory_records/v2"
+"""Explicit null nuclear geometry; v1 nuclear records remain byte-compatible."""
+
 
 @dataclass(frozen=True)
 class TrajectoryRecordBatch:
@@ -192,8 +195,19 @@ class TrajectoryRecordArtifact:
     observable_values_content_id: str
     csv_sha256: str
     byte_count: int
-    atomic_configuration: AtomicConfiguration
+    atomic_configuration: AtomicConfiguration | None
     final_draw: TrajectoryRecordBatch
+
+    @property
+    def schema(self) -> str:
+        """Return the schema that represents this artifact's nuclear geometry."""
+        return (NUCLEUS_FREE_TRAJECTORY_RECORD_SCHEMA if self.atomic_configuration is None
+                else TRAJECTORY_RECORD_SCHEMA)
+
+    @property
+    def atomic_configuration_id(self) -> str | None:
+        """Return the nuclear geometry identity, or explicit absence of nuclei."""
+        return None if self.atomic_configuration is None else self.atomic_configuration.content_id()
 
     @property
     def nonfinite_count(self) -> int:
@@ -218,9 +232,10 @@ class TrajectoryRecordArtifact:
             raise ValueError("trajectory record term_names must be non-empty and unique")
         if any(not name.strip() for name in self.term_names):
             raise ValueError("trajectory record term_names must not contain blanks")
-        self.atomic_configuration.validate()
-        if self.atomic_configuration.spatial_dim != self.spatial_dim:
-            raise ValueError("trajectory record geometry dimension disagrees with coordinates")
+        if self.atomic_configuration is not None:
+            self.atomic_configuration.validate()
+            if self.atomic_configuration.spatial_dim != self.spatial_dim:
+                raise ValueError("trajectory record geometry dimension disagrees with coordinates")
         final_draw = self.final_draw.validate()
         if final_draw.retained_draw_index != self.n_draws - 1:
             raise ValueError("trajectory record final_draw must be the last retained draw")
@@ -291,28 +306,37 @@ class TrajectoryRecordArtifact:
         if not torch.equal(positions, self.final_draw.positions[:n_rows]):
             raise ValueError("generated snapshot is not the final retained trajectory draw")
         atoms = flat.atomic_configuration
-        if atoms is None or atoms.content_id() != self.atomic_configuration.content_id():
+        if (None if atoms is None else atoms.content_id()) != self.atomic_configuration_id:
             raise ValueError("generated snapshot atomic geometry disagrees with trajectory records")
         return n_rows
 
     def _validate_serialized_metadata(self) -> None:
         metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
         expected_scalars = {
-            "schema": TRAJECTORY_RECORD_SCHEMA,
+            "schema": self.schema,
+            "row_semantics": "complete_draw_walker_grid",
             "csv_filename": self.path.name,
             "observable": self.observable,
             "draw_count": self.n_draws,
             "walker_count": self.n_walkers,
+            "draw_stride": self.draw_stride,
+            "burn_in_draws": self.burn_in_draws,
+            "n_electrons": self.n_electrons,
+            "spatial_dim": self.spatial_dim,
+            "term_names": list(self.term_names),
             "row_count": self.row_count,
             "finite_count": self.finite_count,
             "nonfinite_count": self.nonfinite_count,
+            "mean": _json_float(self.mean),
+            "variance": _json_float(self.variance),
             "observable_values_content_id": self.observable_values_content_id,
             "csv_sha256": self.csv_sha256,
             "byte_count": self.byte_count,
-            "atomic_configuration_id": self.atomic_configuration.content_id(),
+            "atomic_configuration_id": self.atomic_configuration_id,
+            "atomic_configuration": _atomic_geometry_payload(self.atomic_configuration),
         }
         for key, expected in expected_scalars.items():
-            if metadata.get(key) != expected:
+            if key not in metadata or metadata[key] != expected:
                 raise ValueError(f"trajectory record metadata {key!r} disagrees with typed manifest")
 
 
@@ -327,7 +351,7 @@ class TrajectoryRecordStreamWriter:
         n_draws: int,
         n_walkers: int,
         term_names: tuple[str, ...],
-        atomic_configuration: AtomicConfiguration,
+        atomic_configuration: AtomicConfiguration | None,
         first_draw: TrajectoryRecordBatch,
     ) -> None:
         self.path = Path(path)
@@ -341,7 +365,8 @@ class TrajectoryRecordStreamWriter:
             raise ValueError("first trajectory record draw must contain every walker")
         if tuple(first_draw.term_energies) != self.term_names:
             raise ValueError("first trajectory record draw terms disagree with configured terms")
-        if self.atomic_configuration.spatial_dim != first_draw.spatial_dim:
+        if (self.atomic_configuration is not None
+                and self.atomic_configuration.spatial_dim != first_draw.spatial_dim):
             raise ValueError("trajectory record coordinates disagree with AtomicConfiguration")
 
         self.n_electrons = first_draw.n_electrons
@@ -521,7 +546,7 @@ class TrajectoryRecordStreamWriter:
 def _write_metadata(artifact: TrajectoryRecordArtifact) -> None:
     atoms = artifact.atomic_configuration
     metadata = {
-        "schema": TRAJECTORY_RECORD_SCHEMA,
+        "schema": artifact.schema,
         "row_semantics": "complete_draw_walker_grid",
         "csv_filename": artifact.path.name,
         "observable": artifact.observable,
@@ -540,15 +565,20 @@ def _write_metadata(artifact: TrajectoryRecordArtifact) -> None:
         "observable_values_content_id": artifact.observable_values_content_id,
         "csv_sha256": artifact.csv_sha256,
         "byte_count": artifact.byte_count,
-        "atomic_configuration_id": atoms.content_id(),
-        "atomic_configuration": {
-            "positions": atoms.positions.detach().to(torch.float64).cpu().tolist(),
-            "charges": atoms.charges.detach().to(torch.float64).cpu().tolist(),
-        },
+        "atomic_configuration_id": artifact.atomic_configuration_id,
+        "atomic_configuration": _atomic_geometry_payload(atoms),
     }
     with artifact.metadata_path.open("x", encoding="utf-8") as handle:
         json.dump(metadata, handle, sort_keys=True, indent=2, allow_nan=False)
         handle.write("\n")
+
+
+def _atomic_geometry_payload(atoms: AtomicConfiguration | None) -> dict[str, Any] | None:
+    """Serialize actual nuclei without inventing one for external confinement."""
+    if atoms is None:
+        return None
+    return {"positions": atoms.positions.detach().to(torch.float64).cpu().tolist(),
+            "charges": atoms.charges.detach().to(torch.float64).cpu().tolist()}
 
 
 def _owned_cpu(value: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
@@ -615,6 +645,7 @@ def _same_reconciliation(
 __all__ = [
     "TRAJECTORY_RECORD_FILENAME",
     "TRAJECTORY_RECORD_SCHEMA",
+    "NUCLEUS_FREE_TRAJECTORY_RECORD_SCHEMA",
     "TrajectoryRecordArtifact",
     "TrajectoryRecordBatch",
     "TrajectoryRecordStreamWriter",

@@ -216,7 +216,7 @@ class SampledRecordWriter:
                         "selection": "complete_draw_walker_grid",
                         "content_id": trajectory.csv_sha256,
                         "observable_content_id": trajectory.observable_values_content_id,
-                        "atomic_configuration_id": trajectory.atomic_configuration.content_id(),
+                        "atomic_configuration_id": trajectory.atomic_configuration_id,
                         "metadata_path": str(trajectory.metadata_path),
                         "bytes": trajectory.byte_count,
                     },

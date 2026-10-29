@@ -86,6 +86,9 @@ class TrajectoryMCMCGenerator:
         Force a fresh, re-burned-in chain before the first draw.
     verify_model_unchanged : bool, optional
         Fingerprint parameters before and after collection. Defaults to ``True``.
+    allow_nucleus_free_records : bool, optional
+        Explicitly permit a system with no nuclei. Such records use schema v2
+        with null nuclear geometry; the default retains the v1 nuclear contract.
 
     Raises
     ------
@@ -109,6 +112,7 @@ class TrajectoryMCMCGenerator:
         record_filename: str = TRAJECTORY_RECORD_FILENAME,
         reset: bool = False,
         verify_model_unchanged: bool = True,
+        allow_nucleus_free_records: bool = False,
     ) -> None:
         self.sampler = sampler
         self.hamiltonian_terms = normalize_hamiltonian_terms(hamiltonian_terms)
@@ -129,6 +133,7 @@ class TrajectoryMCMCGenerator:
             raise ValueError("record_filename must be non-empty")
         self.reset = bool(reset)
         self.verify_model_unchanged = bool(verify_model_unchanged)
+        self.allow_nucleus_free_records = bool(allow_nucleus_free_records)
 
     def generate(
         self,
@@ -166,7 +171,7 @@ class TrajectoryMCMCGenerator:
                     )
                     if record_stream is None:
                         atoms = walkers.atomic_configuration
-                        if atoms is None:
+                        if atoms is None and not self.allow_nucleus_free_records:
                             raise ValueError(
                                 "trajectory records require Walkers.atomic_configuration "
                                 "so geometry is retained once as a typed reference"
