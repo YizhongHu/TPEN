@@ -221,8 +221,9 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
     original_subprocess_run = stage.subprocess.run
     queue_mode = "debug-own-running"
 
-    def full_job(job_id: str, user: str, state: str) -> str:
-        return f"Job Id: {job_id}\n    Job_Owner = {user}@polaris-login\n    job_state = {state}\n    queue = debug\n"
+    def full_job(job_id: str, user: str, state: str, hold_types: str = "") -> str:
+        held = f"    Hold_Types = {hold_types}\n" if hold_types else ""
+        return f"Job Id: {job_id}\n    Job_Owner = {user}@polaris-login\n    job_state = {state}\n{held}    queue = debug\n"
 
     def fake_subprocess(args, **kwargs):
         if args[:2] == ["qstat", "-Qf"]:
@@ -233,9 +234,12 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
         if args == ["qstat", "-f"]:
             if queue_mode == "debug-own-queued":
                 return subprocess.CompletedProcess(args, 0, full_job("1.polaris", "rhu", "Q"), "")
+            if queue_mode == "debug-own-held":
+                return subprocess.CompletedProcess(args, 0, full_job("1.polaris", "rhu", "H", "s"), "")
             return subprocess.CompletedProcess(args, 0, full_job("1.polaris", "rhu", "R") + full_job("2.polaris", "other", "Q") + full_job("3.polaris", "other", "R"), "")
         if args[:2] == ["qstat", "-u"]:
-            row = "1.polaris rhu 00:00:00 " + ("Q" if queue_mode == "debug-own-queued" else "R") + " debug\n"
+            state = "Q" if queue_mode == "debug-own-queued" else ("H" if queue_mode == "debug-own-held" else "R")
+            row = "1.polaris rhu 00:00:00 " + state + " debug\n"
             return subprocess.CompletedProcess(args, 0, "Job id User Time Use S Queue\n" + row, "")
         return original_subprocess_run(args, **kwargs)
 
@@ -275,6 +279,14 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
         if args and args[0] == "qsub":
             raise AssertionError("qsub reached queue refusal control")
         return original_run(args, **kwargs)
+
+    queue_mode = "debug-own-held"
+    monkeypatch.setattr(stage, "_run", fake_run)
+    held_args = isolated_args("debug-own-held", profile)
+    assert stage.stage(held_args) == 0
+    held_root = (tmp_path / "runs-debug-own-held" / "debug-own-held").resolve()
+    held_decision = json.loads((held_root / "pre-submit-qstat-decision.json").read_text())
+    assert held_decision["allowed"] is True and held_decision["held_jobs"] == [{"job_id": "1.polaris", "hold_types": "s"}]
 
     for name, mode, runtime_profile in (("debug-own-queued", "debug-own-queued", profile), ("debug-unknown-limit", "debug-unknown-limit", profile), ("missing-overlay", "debug-own-running", isolated_profile("missing-overlay", overlay_root=str(tmp_path / "missing"))), ("wrong-kind", "debug-own-running", isolated_profile("wrong-kind", runtime_kind="other")), ("unfilled", "debug-own-running", isolated_profile("unfilled", overlay_python=""))):
         queue_mode = mode
