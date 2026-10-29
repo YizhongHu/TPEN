@@ -1407,3 +1407,18 @@ def test_fake_context_doubles_use_shared_contract() -> None:
         "RunContext doubles must use _FakeContext; found "
         f"{sorted(context_double_names)}"
     )
+
+
+# RED at 4eac71dd (issue I6): the double's emit drops production's keyword-only
+# parameters, so a future `context.emit(event, state=...)` in tpen.run would
+# TypeError inside these launch tests without any drift arm noticing.
+def test_fake_context_emit_accepts_production_keywords() -> None:
+    production = inspect.signature(RunContext.emit).parameters
+    double = inspect.signature(_FakeContext.emit).parameters
+    missing = sorted(
+        name
+        for name, parameter in production.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY and name not in double
+    )
+
+    assert not missing, f"_FakeContext.emit lacks production keyword(s): {missing}"
