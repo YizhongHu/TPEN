@@ -158,10 +158,23 @@ def test_three_electron_block_ng_float64_oracle_and_float32_sentinels(
         # The absolute calibration was 1.663939e-4, so this bound also rounds
         # upward rather than excluding its own observation. It does not catch
         # the no-centering mutant: its absolute error falls to 1.6209e-4.
-        assert max(absolute_errors) <= 1.664e-4
+        max_absolute_error = max(absolute_errors)
+        max_relative_error = max(relative_errors)
+        # Both maxima and both bounds go into every failure message, so a red
+        # on either limb still reports the discriminator.
+        limbs = (
+            f"max relative error {max_relative_error!r} (bound 9.0e-3); "
+            f"max absolute error {max_absolute_error!r} (bound 1.664e-4)"
+        )
         # The relative limb is the discriminating guard: the no-centering
         # mutant reaches 0.01021381958083481 and must exceed this sentinel.
-        assert max(relative_errors) <= 9.0e-3
+        # It is asserted first so that an absolute false-red on another
+        # facility cannot hide it.
+        assert max_relative_error <= 9.0e-3, f"relative limb failed: {limbs}"
+        # The absolute limb stays: the relative error is masked to zero where
+        # the expected update is exactly zero, so only this limb checks those
+        # entries.
+        assert max_absolute_error <= 1.664e-4, f"absolute limb failed: {limbs}"
     assert method.last_telemetry is not None
     assert method.last_telemetry.solve_dtype == str(solve_dtype)
 
