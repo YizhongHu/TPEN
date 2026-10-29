@@ -305,13 +305,16 @@ def _initial_channel_weights(
         raise ValueError(
             f"PfaffianReadout initialization={initialization!r} requires an explicitly seeded TorchInitializer"
         )
-    z = torch.empty(pair_channels, dtype=torch.float64)
+    z = torch.empty(pair_channels, dtype=torch.float64, device="cpu")
     initializer.normal_(z)
     if initialization == "signed_l1":
         weights = z / z.abs().sum()
     else:
         weights = z / (math.sqrt(pair_channels) * torch.linalg.vector_norm(z))
-    return weights.to(dtype=torch.get_default_dtype())
+    # Keep the float64 result so the runner's later ``module.to(dtype=...)``
+    # does not have to reconstruct a rounded normalization. Float32 feature
+    # inputs still promote safely during the weighted sum in ``forward``.
+    return weights
 
 
 __all__ = ["PfaffianReadout", "pfaffian"]
