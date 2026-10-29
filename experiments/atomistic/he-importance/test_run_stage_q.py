@@ -1,4 +1,4 @@
-"""Tests for the single-cell Stage-Q mechanics launcher."""
+"""Tests for the single-cell optimizer-grid stage launcher (Stage Q and Stage O1)."""
 
 from __future__ import annotations
 
@@ -47,10 +47,14 @@ def _runtime_torch_signature(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
-def _cells(tmp_path: Path) -> tuple[object, ...]:
+def _cells(tmp_path: Path, stage_code: str = "Q") -> tuple[object, ...]:
     return stage_coordinate.materialize_intended_configurations(
-        tmp_path, availability=optimizer_grid.roster_availability()
+        tmp_path, availability=optimizer_grid.roster_availability(), stages=(stage_code,)
     )
+
+
+_UNDECLARED_STAGES = ("O2", "A", "B", "R", "F")
+_UNDECLARED_MATCH = "no declared intended-configuration universe"
 
 
 def _args(tmp_path: Path, **overrides: object) -> SimpleNamespace:
@@ -516,7 +520,7 @@ def test_r3_selection_axes_reject_unadmitted_values_before_all_execution_stages(
         runner.select_cell(cells, **selection_kwargs)
 
     for name, target in (
-        ("_q_training_packet", runner),
+        ("_training_packet", runner),
         ("_execution_facts", runner),
     ):
         monkeypatch.setattr(
@@ -617,7 +621,7 @@ def test_r3_default_axes_reach_frozen_exact_cell(
 
 def test_q_cadence_is_accepted_at_the_horizon_and_only_train_is_emitted(tmp_path: Path) -> None:
     selected = runner.select_cell(_cells(tmp_path), seed_label=810_001)
-    packet = runner._q_training_packet(selected.cell)
+    packet = runner._training_packet(selected.cell)
     assert packet.checkpoint_cadence.every_n_updates == 1_000
     assert packet.checkpoint_cadence.selected_updates == (1_000, 2_000)
 
@@ -636,7 +640,7 @@ def test_shared_analysis_packets_are_discarded_after_materialization(
         return replace(packets, ranking=(object(),), independent_sampler_test=(object(),))
 
     monkeypatch.setattr(stage_coordinate, "materialize_job_packets", materialize_and_witness)
-    packet = runner._q_training_packet(selected.cell)
+    packet = runner._training_packet(selected.cell)
 
     assert packet.cell is selected.cell
     assert observed["ranking"]
@@ -695,7 +699,7 @@ def test_cli_refuses_unsupported_walker_count(tmp_path: Path) -> None:
     )
     with pytest.raises(
         runner.StageQSelectionError,
-        match=r"unsupported Stage-Q walker count: 1000; stage 'Q' declares n_walkers=\(2048,\)",
+        match=r"unsupported stage walker count: 1000; stage 'Q' declares n_walkers=\(2048,\)",
     ):
         runner.execute(args)
 
@@ -747,7 +751,7 @@ def test_cli_uses_real_loader_mutation_for_admission_and_refusal(
     )
     with pytest.raises(
         runner.StageQSelectionError,
-        match=r"unsupported Stage-Q walker count: 2048; stage 'Q' declares n_walkers=\(1024,\)",
+        match=r"unsupported stage walker count: 2048; stage 'Q' declares n_walkers=\(1024,\)",
     ):
         runner.execute(refused)
 
@@ -982,19 +986,25 @@ def test_cadence_acceptance_and_refusal_are_both_explicit() -> None:
         stage.CheckpointCadence(1000, ())
 
 
-def test_r1_o1_select_cell_refuses_before_consuming_cells() -> None:
+@pytest.mark.parametrize("stage_code", _UNDECLARED_STAGES)
+def test_r1_undeclared_stage_select_cell_refuses_before_consuming_cells(stage_code: str) -> None:
     class ExplodingCells:
         def __iter__(self):
-            raise AssertionError("non-Q selection consumed cell input")
+            raise AssertionError("undeclared-stage selection consumed cell input")
 
-    with pytest.raises(runner.StageQSelectionError, match="only stage 'Q'"):
-        runner.select_cell(ExplodingCells(), stage="O1", seed_label=820001)
+    with pytest.raises(runner.StageQSelectionError, match=_UNDECLARED_MATCH):
+        runner.select_cell(
+            ExplodingCells(), stage=stage_code, seed_label=stage.seed_labels(stage_code)[0]
+        )
 
 
-def test_r1_o1_execute_refuses_before_artifact_output(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("stage_code", _UNDECLARED_STAGES)
+def test_r1_undeclared_stage_execute_refuses_before_artifact_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage_code: str
 ) -> None:
-    args = _args(tmp_path, stage="O1", seed_label=820001, dry_run=False)
+    args = _args(
+        tmp_path, stage=stage_code, seed_label=stage.seed_labels(stage_code)[0], dry_run=False
+    )
     facts = {
         "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
         "node_rank": 0, "node_size": 1, "host": "host", "pid": 1,
@@ -1009,8 +1019,9 @@ def test_r1_o1_execute_refuses_before_artifact_output(
     except BaseException as caught:
         error = caught
     assert isinstance(error, runner.StageQSelectionError), (
-        f"O1 execute must refuse before packet resolution/launch, got {error!r}"
+        f"{stage_code} execute must refuse before packet resolution/launch, got {error!r}"
     )
+    assert _UNDECLARED_MATCH in str(error)
     assert not calls
     assert not list(tmp_path.rglob("selection_receipt.json"))
 
@@ -1171,34 +1182,45 @@ def _r2_facts() -> dict[str, object]:
     }
 
 
-def test_r2_g1_execute_non_q_refuses_before_materialization_and_output(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("stage_code", _UNDECLARED_STAGES)
+def test_r2_g1_execute_undeclared_stage_refuses_before_materialization_and_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage_code: str
 ) -> None:
-    """The execute-only Q guard must precede materialization and all output."""
+    """The execute stage guard must precede materialization and all output."""
 
     materialize_calls: list[object] = []
 
     def exploding_materializer(*args: object, **kwargs: object) -> object:
         materialize_calls.append((args, kwargs))
-        raise AssertionError("non-Q execute reached materialization")
+        raise AssertionError("undeclared-stage execute reached materialization")
 
     monkeypatch.setattr(stage, "materialize_intended_configurations", exploding_materializer)
     monkeypatch.setattr(runner, "_execution_facts", lambda: _r2_facts())
     monkeypatch.setattr(runner.launch, "launch_train", lambda *a, **k: pytest.fail("launched"))
 
-    with pytest.raises(runner.StageQSelectionError, match="only stage 'Q'"):
-        runner.execute(_args(tmp_path, stage="O1", dry_run=False, seed_label=820001))
+    with pytest.raises(runner.StageQSelectionError, match=_UNDECLARED_MATCH):
+        runner.execute(
+            _args(
+                tmp_path,
+                stage=stage_code,
+                dry_run=False,
+                seed_label=stage.seed_labels(stage_code)[0],
+            )
+        )
 
     assert not materialize_calls
     assert not list(tmp_path.rglob("selection_receipt.json"))
 
 
 def test_r2_g1_execute_guard_rejects_both_directions(tmp_path: Path) -> None:
-    """The positive Q path remains callable while non-Q remains refused."""
+    """Declared stages remain callable while undeclared and unknown stages are refused."""
 
     assert runner.execute(_args(tmp_path, dry_run=True)) == 0
-    with pytest.raises(runner.StageQSelectionError, match="only stage 'Q'"):
-        runner.execute(_args(tmp_path / "non-q", stage="O1"))
+    assert runner.execute(_args(tmp_path / "o1", stage="O1", seed_label=820001)) == 0
+    with pytest.raises(runner.StageQSelectionError, match=_UNDECLARED_MATCH):
+        runner.execute(_args(tmp_path / "o2", stage="O2", seed_label=821001))
+    with pytest.raises(runner.StageQSelectionError, match="unknown HI stage"):
+        runner.execute(_args(tmp_path / "unknown", stage="Z", seed_label=820001))
 
 
 @pytest.mark.parametrize("opener_name", ["path", "builtins", "io"])
@@ -2871,3 +2893,212 @@ def test_a5_o_composite_runner_route_closes_the_three_l5_traps(
                 context="O-composite",
                 seed_label=810001,
             )
+
+
+# ---------------------------------------------------------------------------
+# Stage O1 through the same selection/launch path (Task Orchestrator 14d596d1, C4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("context", ["O-raw", "O-composite"])
+def test_o1_selects_exactly_one_truthful_cell_and_resolves_the_o1_horizon(
+    tmp_path: Path, context: str
+) -> None:
+    cells = _cells(tmp_path, "O1")
+    assert len(cells) == 1_920
+    with pytest.raises(runner.StageQSelectionError, match="ambiguous"):
+        runner.select_cell(cells, stage="O1", context=context)
+
+    selection = runner.select_cell(cells, stage="O1", context=context, seed_label=820_003)
+    assert selection.selected.stage == "O1"
+    assert selection.selected.context == context
+    assert selection.selected.seed_label == 820_003
+    assert selection.selected.status == "available"
+    assert len(selection.discarded) == 1_919
+    assert {item.stage for item in selection.discarded} == {"O1"}
+
+    packet, resolved = runner._resolve_selected_config(selection)
+    assert resolved.trainer.max_steps == 50_000
+    assert resolved.sampler.n_walkers == stage_coordinate.COMMITTED_WALKERS == 4_096
+    assert resolved.runtime.seed == stage.seed_namespace("O1", 820_003)["model_initialization"]
+    assert Path(resolved.run.dir) == selection.cell.output_path
+    assert selection.cell.output_path.parent.name == "O1"
+    cadence = packet.checkpoint_cadence
+    assert cadence.every_n_updates == 1_000
+    assert cadence.selected_updates == tuple(range(1_000, 50_001, 1_000))
+
+
+def test_o1_execute_dry_run_reports_only_the_o1_universe(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert runner.execute(_args(tmp_path, stage="O1", seed_label=820_001)) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["selection"]["selected"]["stage"] == "O1"
+    assert len(report["selection"]["discarded"]) == 1_919
+    assert {item["stage"] for item in report["selection"]["discarded"]} == {"O1"}
+    assert report["walkers"] == 4_096
+    assert report["roster_vs_design"]["intended_count_from_authority"] == 1_920
+    assert report["resolved_config"]["trainer"]["max_steps"] == 50_000
+    assert report["train_packet"]["checkpoint_cadence"]["selected_updates"][-1] == 50_000
+    # Dry run writes nothing.
+    assert not list(tmp_path.rglob("selection_receipt.json"))
+
+
+def test_o1_unavailable_rows_are_materialized_and_observable(tmp_path: Path) -> None:
+    """Every non-admitted method's O1 rows exist with status unavailable."""
+
+    admitted = {entry.method for entry in runner._roster() if entry.admitted and entry.target}
+    cells = _cells(tmp_path, "O1")
+    for method in ("sr", "kfac", "spring", "linear_method"):
+        present = [
+            cell for cell in cells
+            if cell.manifest["scientific_identity"]["optimizer_cell"]["method"] == method
+        ]
+        assert len(present) == {"sr": 32, "kfac": 32, "spring": 32, "linear_method": 16}[method] * 2 * 8
+        expected = {"available"} if method in admitted else {"unavailable"}
+        assert {
+            cell.manifest["scientific_identity"]["optimizer_cell"]["status"] for cell in present
+        } == expected
+
+
+def _o1_cells_with(tmp_path: Path, adam: object) -> tuple[object, ...]:
+    availability = dict(optimizer_grid.roster_availability())
+    availability["adam"] = adam
+    return stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=availability, stages=("O1",)
+    )
+
+
+def test_o1_matched_but_unavailable_cell_is_refused_with_its_reason(tmp_path: Path) -> None:
+    """Status unavailable alone refuses, and the refusal carries the recorded reason."""
+
+    cells = _o1_cells_with(
+        tmp_path, stage.OptimizerCell("adam", "unavailable", "ADAM-SENTINEL-REASON")
+    )
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match=r"zero admitted.*declared but unavailable: ADAM-SENTINEL-REASON",
+    ):
+        runner.select_cell(cells, stage="O1", seed_label=820_001)
+
+
+def test_o1_available_status_without_roster_admission_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Roster non-admission alone refuses, even when the row says available."""
+
+    cells = _o1_cells_with(tmp_path, stage.OptimizerCell("adam", "available"))
+    original = runner._roster()
+    monkeypatch.setattr(
+        runner, "_roster", lambda: tuple(entry for entry in original if entry.method != "adam")
+    )
+    with pytest.raises(runner.StageQSelectionError, match="zero admitted.*declared but unavailable"):
+        runner.select_cell(cells, stage="O1", seed_label=820_001)
+
+
+def test_o1_and_q_selection_from_mixed_stage_input_respects_the_stage(tmp_path: Path) -> None:
+    """With every stage materialized together, the stage coordinate still selects."""
+
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=optimizer_grid.roster_availability()
+    )
+    assert {cell.manifest["stage"] for cell in cells} == {"Q", "O1"}
+    o1 = runner.select_cell(cells, stage="O1", seed_label=820_001)
+    assert o1.selected.stage == "O1"
+    assert o1.cell.manifest["payload"]["updates"] == 50_000
+    q = runner.select_cell(cells, stage="Q", seed_label=810_001)
+    assert q.selected.stage == "Q"
+    with pytest.raises(runner.StageQSelectionError, match="zero admitted"):
+        runner.select_cell(cells, stage="Q", seed_label=820_001)
+
+
+def test_o1_resolved_config_trains_with_the_dense_1k_checkpoint_callback(tmp_path: Path) -> None:
+    """The cadence that trains is the resolved callback, not only the packet field."""
+
+    selection = runner.select_cell(_cells(tmp_path, "O1"), stage="O1", seed_label=820_001)
+    _, resolved = runner._resolve_selected_config(selection)
+    checkpoints = [
+        callback for callback in resolved.callbacks
+        if callback.get("_target_") == "tpen.callback.Checkpoint"
+    ]
+    assert len(checkpoints) == 1
+    checkpoint = checkpoints[0]
+    assert checkpoint.schedule._target_ == "tpen.checkpoint.EveryNUpdates"
+    assert checkpoint.schedule.every_n == runner.CHECKPOINT_EVERY_N_UPDATES == 1_000
+    assert checkpoint.keep_last is None
+    assert checkpoint.payload._target_ == "tpen.checkpoint.TrainResume"
+    assert Path(checkpoint.output_dir) == selection.cell.output_path / "checkpoints"
+    assert resolved.trainer.max_steps % checkpoint.schedule.every_n == 0
+
+
+def test_o1_execute_launches_under_the_o1_path_with_the_o1_horizon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-dry O1 execute: receipt, guarded launch config and COMPLETE land under O1/<hash>."""
+
+    facts = {
+        "global_rank": 0, "global_size": 1, "local_rank": 0, "local_size": 1,
+        "node_rank": 0, "node_size": 1, "host": "o1-host", "pid": 1,
+        "device": "cuda:0", "job_id": "o1-job",
+        "device_identity": {"kind": "cuda", "index": 0, "uuid": "GPU-o1"},
+    }
+    monkeypatch.setattr(runner, "_execution_facts", lambda: dict(facts))
+    original = runner.launch.launch_train
+    observed: dict[str, object] = {}
+
+    def launch_wrapper(source: object, topology: object, **kwargs: object) -> int:
+        def recording_run_from_config(config: object, *, topology: object) -> int:
+            observed["max_steps"] = config.trainer.max_steps
+            observed["n_walkers"] = config.sampler.n_walkers
+            observed["run_dir"] = Path(config.run.dir)
+            output = Path(config.run.dir) / "resolved_config.yaml"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("stage: O1\n", encoding="utf-8")
+            return 0
+
+        monkeypatch.setattr(runner.launch, "run_from_config", recording_run_from_config)
+        return original(source, topology, runner=kwargs["runner"])
+
+    monkeypatch.setattr(runner.launch, "launch_train", launch_wrapper)
+    assert runner.execute(_args(tmp_path, stage="O1", seed_label=820_002, dry_run=False)) == 0
+    assert observed["max_steps"] == 50_000
+    assert observed["n_walkers"] == 4_096
+    run_dir = observed["run_dir"]
+    assert run_dir.parent == tmp_path.resolve() / "O1"
+    assert {path.name for path in run_dir.iterdir()} == {
+        "selection_receipt.json", "resolved_config.yaml", "COMPLETE"
+    }
+    receipt = json.loads((run_dir / "selection_receipt.json").read_text(encoding="utf-8"))
+    assert receipt["selection"]["selected"]["stage"] == "O1"
+    assert receipt["selection"]["selected"]["seed_label"] == 820_002
+    assert receipt["train_packet"]["content_hash"] == run_dir.name
+
+
+def test_o1_refuses_an_unadmitted_context(tmp_path: Path) -> None:
+    with pytest.raises(runner.StageQSelectionError, match="dd964863"):
+        runner.select_cell(_cells(tmp_path, "O1"), stage="O1", context="O-other", seed_label=820_001)
+
+
+def test_o1_refuses_the_q_mechanics_walker_override(tmp_path: Path) -> None:
+    assert stage.sampler_override_values("O1", "n_walkers") == ()
+    with pytest.raises(runner.StageQSelectionError, match="unsupported stage walker count"):
+        runner.execute(
+            _args(tmp_path, stage="O1", seed_label=820_001, walkers=stage.Q_MECHANICS_WALKERS)
+        )
+
+
+def test_q_execute_materializes_only_stage_q(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Q receipts keep their pre-O1 discard record: O1 rows never enter Q selection."""
+
+    original = stage_coordinate.materialize_intended_configurations
+    observed: list[object] = []
+
+    def witness(*args: object, **kwargs: object) -> object:
+        observed.append(kwargs.get("stages"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(stage_coordinate, "materialize_intended_configurations", witness)
+    assert runner.execute(_args(tmp_path)) == 0
+    assert observed == [("Q",)]

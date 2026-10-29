@@ -135,7 +135,7 @@ def test_r3_real_run_context_and_callback_paths_complete_without_training(
     context_run_dir = Path(observed["context_run_dir"])
     assert context_run_dir.is_dir()
     materialized = stage.materialize_intended_configurations(
-        tmp_path, availability=optimizer_grid.roster_availability()
+        tmp_path, availability=optimizer_grid.roster_availability(), stages=("Q",)
     )
     selected = next(
         cell
@@ -168,7 +168,7 @@ def test_r3_failed_core_result_returns_one_without_completion(
     assert observed["runner_constructor_calls"] == 1
     assert observed["facts_at_core_boundary"] == expected_facts
     materialized = stage.materialize_intended_configurations(
-        tmp_path, availability=optimizer_grid.roster_availability()
+        tmp_path, availability=optimizer_grid.roster_availability(), stages=("Q",)
     )
     selected = next(
         cell
