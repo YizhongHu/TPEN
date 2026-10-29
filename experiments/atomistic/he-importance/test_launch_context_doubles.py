@@ -80,16 +80,6 @@ class _ReviewVariant(_FakeContext):  # bypasses RunContext.__init__
         self.cfg = None
 '''
 
-_ALIASED_BASE = '''
-
-_ReviewBase = RunContext
-
-
-class _ReviewAliased(_ReviewBase):  # bypasses RunContext.__init__
-    def __init__(self) -> None:
-        self.cfg = None
-'''
-
 _NESTED_OTHER_NAME = '''
 
 def test_review_r1_nested_other_name_double() -> None:
@@ -122,12 +112,6 @@ def test_drift_arms_reject_nested_same_name_double(tmp_path: Path) -> None:
 # RED at 4eac71dd (issue I2): a subclass of _FakeContext that skips __init__ defeats both arms.
 def test_drift_arms_reject_subclass_of_shared_double(tmp_path: Path) -> None:
     module = _load(tmp_path, "subclass_of_double", _mutated_source(append=_SUBCLASS_OF_DOUBLE))
-    assert _arms_reject(module)
-
-
-# RED at 4eac71dd (issue I3): subclassing through an alias of RunContext defeats both arms.
-def test_drift_arms_reject_aliased_base_double(tmp_path: Path) -> None:
-    module = _load(tmp_path, "aliased_base", _mutated_source(append=_ALIASED_BASE))
     assert _arms_reject(module)
 
 

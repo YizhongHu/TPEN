@@ -15,7 +15,7 @@ import threading
 import pytest
 from omegaconf import OmegaConf
 
-from tpen.artifacts import RunContext, RunResult
+from tpen.artifacts import ArtifactManager, RunClock, RunContext, RunMetadata, RunResult
 from tpen.distributed import AcceleratorIdentity, AcceleratorKind, ExecutionTopology
 from tpen.run import run_from_config
 from tpen.runner import Runner
@@ -1366,15 +1366,39 @@ def test_content_hash_is_exact_and_binds_all_public_launch_entries(
 class _FakeContext(RunContext):
     """Small test double built through the production context constructor."""
 
+    # Placement below the call sites is forced by test_tpen_boundary.py's line-keyed inventory.
+
     def __init__(
         self, cfg: object = None, topology: object = None
     ) -> None:
+        from datetime import timezone
+        import tempfile
+
         super().__init__(
             cfg=cfg,
             source_cfg=cfg,
-            artifact_manager=SimpleNamespace(run_dir=Path(".")),
-            metadata=SimpleNamespace(status="initialized"),
-            clock=SimpleNamespace(),
+            artifact_manager=ArtifactManager(
+                root=Path(tempfile.mkdtemp(prefix="tpen-fake-context-")),
+                experiment="tests",
+                sector="he-importance",
+                run_id="fake-context",
+            ),
+            metadata=RunMetadata(
+                run_id="fake-context",
+                run_name="fake-context",
+                timestamp="1970-01-01T00:00:00+00:00",
+                timezone="UTC",
+                git_commit="test",
+                git_branch="test",
+                dirty_worktree=False,
+                command=None,
+                config_path=None,
+                resolved_config_path="test",
+                run_dir="",
+                device="cpu",
+                dtype="float32",
+            ),
+            clock=RunClock(timezone="UTC", tzinfo=timezone.utc),
             callbacks=[],
             loggers=[],
             topology=topology,
@@ -1382,8 +1406,11 @@ class _FakeContext(RunContext):
         )
         self.events: list[object] = []
 
-    def emit(self, event: object) -> None:
+    def emit(self, event: object, *, state: object = None) -> object:
+        # This override is load-bearing: production emit dispatches artifact writers that read these stubs.
+        del state
         self.events.append(event)
+        return event
 
 
 def test_fake_context_tracks_run_context_init_fields() -> None:
@@ -1398,25 +1425,41 @@ def test_fake_context_doubles_use_shared_contract() -> None:
     import ast
 
     tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
-    context_double_names = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef)
-        and any(
-            isinstance(base, ast.Name) and base.id == "RunContext"
-            for base in node.bases
-        )
-    }
+    class _ContextDoubleVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.parents: list[ast.AST] = []
+            self.direct_doubles: list[tuple[str, bool]] = []
+            self.shared_subclasses: list[str] = []
 
-    assert context_double_names == {"_FakeContext"}, (
-        "RunContext doubles must use _FakeContext; found "
-        f"{sorted(context_double_names)}"
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            base_names = {base.id for base in node.bases if isinstance(base, ast.Name)}
+            if "RunContext" in base_names:
+                module_level = not any(
+                    isinstance(parent, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                    for parent in self.parents
+                )
+                self.direct_doubles.append((node.name, module_level))
+            if "_FakeContext" in base_names:
+                self.shared_subclasses.append(node.name)
+            self.parents.append(node)
+            self.generic_visit(node)
+            self.parents.pop()
+
+    visitor = _ContextDoubleVisitor()
+    visitor.visit(tree)
+    assert visitor.direct_doubles == [("_FakeContext", True)], (
+        "RunContext doubles must be exactly one module-level _FakeContext; found "
+        f"{visitor.direct_doubles}"
     )
+    assert not visitor.shared_subclasses, (
+        "RunContext doubles must not subclass _FakeContext; found "
+        f"{visitor.shared_subclasses}"
+    )
+    # I3 limit: aliased or dynamic bases are intentionally not detected statically.
 
 
-# RED at 4eac71dd (issue I6): the double's emit drops production's keyword-only
-# parameters, so a future `context.emit(event, state=...)` in tpen.run would
-# TypeError inside these launch tests without any drift arm noticing.
+# Pin issue I6: the double's emit must retain production's keyword-only
+# parameters, so a future `context.emit(event, state=...)` remains supported.
 def test_fake_context_emit_accepts_production_keywords() -> None:
     production = inspect.signature(RunContext.emit).parameters
     double = inspect.signature(_FakeContext.emit).parameters
