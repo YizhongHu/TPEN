@@ -569,7 +569,7 @@ def materialize_stage(
     an arbitrary display-name representative.
     """
 
-    stage_definition(stage)
+    definition = stage_definition(stage)
     namespaces = seed_namespaces(stage)
     identities: dict[str, Mapping[str, Any]] = {}
     seen_paths: set[Path] = set()
@@ -604,9 +604,17 @@ def materialize_stage(
         optimizer_identity = {"method": optimizer.method, "status": optimizer.status}
         if optimizer.reason is not None:
             optimizer_identity["unavailable_reason"] = optimizer.reason
+        if not isinstance(payload.get("updates"), int):
+            raise MaterializationError("payload updates must be an integer")
+        # The identity-bearing horizon must be the horizon that trains: the
+        # resolver sets trainer.max_steps from the stage authority, so a row
+        # declaring any other value would hash as one horizon and train another.
+        if definition.updates is not None and payload["updates"] != definition.updates:
+            raise MaterializationError(
+                f"payload updates {payload['updates']!r} disagree with stage {stage!r} "
+                f"horizon {definition.updates!r}"
+            )
         for label in seed_labels(stage):
-            if not isinstance(payload.get("updates"), int):
-                raise MaterializationError("payload updates must be an integer")
             manifest = {
                 "schema": TRAIN_MANIFEST_SCHEMA,
                 "stage": stage,
@@ -876,9 +884,12 @@ def intended_configurations() -> tuple[Mapping[str, Any], ...]:
 
 
 def materialize_intended_configurations(
-    output_root: Path, *, availability: Mapping[str, OptimizerCell]
+    output_root: Path,
+    *,
+    availability: Mapping[str, OptimizerCell],
+    stages: Iterable[str] | None = None,
 ) -> tuple[MaterializedCell, ...]:
-    """Materialize every configuration in the committed L2b inventory.
+    """Materialize configurations from the committed L2b inventory.
 
     Parameters
     ----------
@@ -890,10 +901,47 @@ def materialize_intended_configurations(
         but absent from this mapping fails closed: it is never treated as
         available by default. Callers typically supply
         ``optimizer_grid.roster_availability()``.
+    stages
+        Optional stage codes to restrict materialization to. ``None``
+        materializes every committed entry. Each requested code must be a
+        known stage and must have at least one committed entry: a stage with
+        no declared universe is refused, never returned as an empty tuple
+        that would read as a complete, empty stage; an empty selection or a
+        bare string is likewise refused.
+
+    Returns
+    -------
+    tuple[MaterializedCell, ...]
+        The materialized rows, in committed inventory order.
+
+    Raises
+    ------
+    MaterializationError
+        If the stage selection is empty or a string, a requested stage has
+        no committed inventory entry, or a method is absent from
+        ``availability``.
     """
 
+    entries = intended_configurations()
+    if stages is not None:
+        if isinstance(stages, (str, bytes)):
+            raise MaterializationError("stages must be an iterable of stage codes, not a string")
+        requested = tuple(stages)
+        if not requested:
+            raise MaterializationError("an explicit stage selection must name at least one stage")
+        for stage in requested:
+            stage_definition(stage)
+        present = {entry["stage"] for entry in entries}
+        missing = [stage for stage in requested if stage not in present]
+        if missing:
+            raise MaterializationError(
+                f"stage(s) {missing!r} have no declared intended-configuration universe "
+                "in the committed inventory"
+            )
+        entries = tuple(entry for entry in entries if entry["stage"] in requested)
+
     cells: list[MaterializedCell] = []
-    for entry in intended_configurations():
+    for entry in entries:
         method = entry["optimizer"]["method"]
         optimizer = availability.get(method)
         if optimizer is None:

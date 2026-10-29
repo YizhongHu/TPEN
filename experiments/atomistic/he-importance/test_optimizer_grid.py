@@ -1,4 +1,4 @@
-"""Tests for the Stage-Q optimizer grid: declaration versus runnability.
+"""Tests for the HI optimizer grid: declaration versus runnability.
 
 These tests prove the two halves of the acceptance contract on Task
 Orchestrator item 993de93d: the declared 120-cell universe reconciles to the
@@ -175,7 +175,7 @@ def test_stage_q_report_is_derived_from_the_injected_roster() -> None:
     assert report["families"]["linear_method"]["declared"] == 16
     assert report["families"]["linear_method"]["unavailable"] == 16
     assert report["families"]["linear_method"]["runnable"] == 0
-    assert set(report["excluded_stages"]) == {"O1", "R", "F"}
+    assert set(report["excluded_stages"]) == {"O2", "A", "B", "R", "F"}
 
     # A second roster, admitting one more family: clause 5 forbids a
     # hard-coded runnable count, so the totals must move with the roster.
@@ -197,7 +197,9 @@ def test_stage_q_report_is_derived_from_the_injected_roster() -> None:
 
 def test_materialized_q_inventory_has_no_unintended_duplicate_identities(tmp_path: Path) -> None:
     availability = optimizer_grid.roster_availability(_all_available_roster())
-    cells = stage_coordinate.materialize_intended_configurations(tmp_path, availability=availability)
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=availability, stages=("Q",)
+    )
     assert len(cells) == 480
     assert len({cell.content_hash for cell in cells}) == 480
 
@@ -226,14 +228,17 @@ def test_duplicate_identity_detector_fires_on_a_cross_entry_duplicate(
     """
 
     entries = json.loads(Path(__file__).with_name("intended_configurations.json").read_text(encoding="utf-8"))
-    assert len(entries) == 120
+    assert len(entries) == 240
+    assert entries[0]["stage"] == entries[1]["stage"] == "Q"
     entries[1] = copy.deepcopy(entries[0])
     broken_path = tmp_path / "intended_configurations.json"
     broken_path.write_text(json.dumps(entries), encoding="utf-8")
     monkeypatch.setattr(stage_coordinate, "_INTENDED_CONFIGURATIONS_PATH", broken_path)
 
     availability = optimizer_grid.roster_availability(_all_available_roster())
-    cells = stage_coordinate.materialize_intended_configurations(tmp_path, availability=availability)
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=availability, stages=("Q",)
+    )
     assert len(cells) == 480
 
     signatures = [_declared_signature(cell) for cell in cells]
@@ -263,8 +268,12 @@ def test_contract_clause_4_roster_change_leaves_declared_universe_fixed(tmp_path
 
     declared_ids_before = {cell.cell_id for cell in optimizer_grid.declared_cells()}
 
-    cells_a = stage_coordinate.materialize_intended_configurations(tmp_path / "a", availability=availability_a)
-    cells_b = stage_coordinate.materialize_intended_configurations(tmp_path / "b", availability=availability_b)
+    cells_a = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "a", availability=availability_a, stages=("Q",)
+    )
+    cells_b = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "b", availability=availability_b, stages=("Q",)
+    )
 
     # declared_cells() takes no roster argument at all: its universe cannot
     # have moved between the two materializations.
@@ -320,7 +329,9 @@ def test_unavailable_arms_are_present_and_carry_the_roster_reason_verbatim(tmp_p
         requires={"kfac": reason},
     )
     availability = optimizer_grid.roster_availability(roster)
-    cells = stage_coordinate.materialize_intended_configurations(tmp_path, availability=availability)
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=availability, stages=("Q",)
+    )
 
     kfac_cells = [
         cell
@@ -352,7 +363,7 @@ def test_committed_intended_configurations_has_no_status_or_reason_key() -> None
     assert '"reason"' not in raw_text
 
     entries = json.loads(raw_text)
-    assert len(entries) == 120
+    assert len(entries) == 240
     for entry in entries:
         assert frozenset(entry["optimizer"]) == frozenset({"method", "levels"})
         assert len(entry["configurations"]) == 2
