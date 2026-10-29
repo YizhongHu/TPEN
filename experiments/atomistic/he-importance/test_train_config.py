@@ -96,7 +96,7 @@ def _cell(
                     },
                     "optimizer": {"method": method, "levels": levels},
                 },
-                "payload": {"updates": 50_000},
+                "payload": {"updates": stage_coordinate.stage_definition(stage).updates},  # stage horizon
                 "topology": {},
             }
         ],
@@ -154,7 +154,7 @@ def _q_adam_cells(tmp_path: Path, context: str) -> list[object]:
     """Materialize the sixteen Stage-Q Adam cells for one model context."""
 
     cells = stage_coordinate.materialize_intended_configurations(
-        tmp_path, availability=optimizer_grid.roster_availability()
+        tmp_path, availability=optimizer_grid.roster_availability(), stages=("Q",)
     )
     return [
         cell
