@@ -15,8 +15,6 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 import pytest
 
-from tpen.data.real import Feature, Update
-from tpen.nn.context import TPENForwardContext
 from tests.helpers.run_context import make_run_context
 
 
@@ -557,21 +555,40 @@ def test_a8_fragments_instantiate_a_layer_with_the_declared_update(label: str) -
 @pytest.mark.parametrize("label", ("residual", "replacement", "Gaussian residual"))
 def test_a8_instantiated_update_has_the_declared_zero_and_nonzero_falsifier(label: str) -> None:
     layer = instantiate(OmegaConf.create(context_mapping.architecture_fragment(update=label)["layers"][0]))
-    x = Feature([
+    blocks = [
         torch.zeros(1, 0, dtype=torch.float64),
         torch.full((1, 2, 2), 3.0, dtype=torch.float64),
         torch.full((1, 2, 2, 2), 3.0, dtype=torch.float64),
-    ])
-    zero = Update([torch.zeros_like(block) for block in x.blocks])
+    ]
+    x = instantiate({"_target_": "tpen.data.real.Feature", "blocks": blocks})
+    zero = instantiate({
+        "_target_": "tpen.data.real.Update",
+        "blocks": [torch.zeros_like(block) for block in blocks],
+    })
     zero_output = layer.update(x, zero)
     if label == "replacement":
         assert all(torch.equal(block, torch.zeros_like(block)) for block in zero_output.blocks)
     else:
         assert all(torch.equal(left, right) for left, right in zip(x.blocks, zero_output.blocks))
 
-    update = Update([torch.ones_like(block) for block in x.blocks])
+    update = instantiate({
+        "_target_": "tpen.data.real.Update",
+        "blocks": [torch.ones_like(block) for block in blocks],
+    })
     if layer.update_envelope is not None:
-        update = layer.update_envelope(update, TPENForwardContext(batch=_he_batch()))
+        explicit_batch = instantiate({
+            "_target_": "tpen.data.batch.ElectronBatch",
+            "positions": torch.tensor(
+                [[[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]], dtype=torch.float64
+            ),
+            "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
+            "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
+        })
+        context = instantiate({
+            "_target_": "tpen.nn.context.TPENForwardContext",
+            "batch": explicit_batch,
+        })
+        update = layer.update_envelope(update, context)
     output = layer.update(x, update)
     if label == "replacement":
         assert all(torch.equal(block, torch.ones_like(block)) for block in output.blocks)
@@ -618,7 +635,13 @@ def test_a10_and_a11_fragments_preserve_trainability_and_invert_at_helium() -> N
 
 @pytest.mark.parametrize("label", ("(.0025,.25)", "(.01,1)", "(.04,4)"))
 def test_a11_laws_instantiate_with_trainable_raw_coordinates(label: str) -> None:
-    law = instantiate(OmegaConf.create(context_mapping.electron_nucleus_fragment(label)))
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model = context_mapping.compose_architecture_package(
+        train.model, electron_nucleus=label
+    )
+    OmegaConf.resolve(train)
+    factor = instantiate(train.model.factors[1])
+    law = factor.law
     assert law.raw_range.requires_grad
     assert law.raw_kappa.requires_grad
     curvature, radius = {
@@ -718,7 +741,8 @@ def test_a9_instantiated_constant_reaches_every_producer(
     layer = instantiate(config)
     expected = float(initialization)
     for producer in layer.mixing.producers:
-        weights = producer.weights.values() if isinstance(producer.weights, dict) else producer.weights
+        weights = tuple(producer.parameters())
+        assert weights
         for weight in weights:
             assert torch.equal(weight.detach(), torch.full_like(weight.detach(), expected))
 
@@ -752,19 +776,44 @@ def test_b_composition_instantiates_every_producer_update_and_package(
         assert jastrow.length == 1.0
 
 
-@pytest.mark.parametrize("label", ("(16,16)", "(24,24)", "(32,32)", "(48,48)", "(40,24)", "(24,40)"))
-def test_instantiated_channel_package_reaches_order_specific_consumers(label: str) -> None:
+@pytest.mark.parametrize("path_label", PATH_LABELS)
+@pytest.mark.parametrize("label", ("(40,24)", "(24,40)"))
+def test_instantiated_channel_package_reaches_every_order_specific_consumer(
+    path_label: str, label: str
+) -> None:
     train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
-    train.model = context_mapping.compose_architecture_package(train.model, channels=label)
+    train.model = context_mapping.compose_architecture_package(
+        train.model,
+        producer_path=path_label,
+        activation="channel-MLP,channel-MLP",
+        channels=label,
+    )
     OmegaConf.resolve(train)
     model = instantiate(train.model).to(dtype=torch.float64)
     expected = tuple(int(value) for value in label.strip("()").split(","))
-    assert model.embedding.order_mlps["1"].layers[-1].out_features == expected[0]
-    assert model.embedding.order_mlps["2"].layers[-1].out_features == expected[1]
+    features = model.embedding(_he_batch())
+    layer = model.stack.layers[0]
+    interaction = layer.mixing(features)
+    update = layer.path_aggregation(interaction)
+    layer.update(features, update)
+    assert features.blocks[1].shape[1] == expected[0]
+    assert features.blocks[2].shape[1] == expected[1]
+    assert interaction.blocks[1].shape[1] == expected[0]
+    assert interaction.blocks[2].shape[1] == expected[1]
+    assert update.blocks[1].shape[1] == expected[0]
+    assert update.blocks[2].shape[1] == expected[1]
     assert model.readout.pair_channels == expected[1]
     for producer in model.stack.layers[0].mixing.producers:
-        assert producer.output_channels.for_order(1) == expected[0]
-        assert producer.output_channels.for_order(2) == expected[1]
+        output_channels = getattr(producer, "output_channels", None)
+        if output_channels is not None:
+            assert output_channels.for_order(1) == expected[0]
+            assert output_channels.for_order(2) == expected[1]
+        else:
+            assert producer.out_channels[1] == expected[0]
+            assert producer.out_channels[2] == expected[1]
+    for activation_module in (layer.mixing.activation, layer.path_aggregation.activation):
+        assert activation_module.mlps[0].layers[0].out_features == 4 * expected[0]
+        assert activation_module.mlps[1].layers[0].out_features == 4 * expected[1]
 
 
 @pytest.mark.parametrize("label", ("signed L1", "random-direction L2"))
@@ -784,6 +833,14 @@ def test_a12_mapped_random_modes_are_named_streamed_and_paired(
     torch.manual_seed(7000007)
     second = instantiate(OmegaConf.create(config))
     assert torch.equal(first.channel_weights.detach(), second.channel_weights.detach())
+    other_seed_config = {
+        "_target_": "tpen.nn.readout.PfaffianReadout",
+        "pair_channels": 8,
+        "trainable": True,
+        **context_mapping.readout_initialization_fragment(label, seed=seed + 1),
+    }
+    other_seed = instantiate(OmegaConf.create(other_seed_config))
+    assert not torch.equal(first.channel_weights.detach(), other_seed.channel_weights.detach())
     l2_config = {
         "_target_": "tpen.nn.readout.PfaffianReadout",
         "pair_channels": 8,
@@ -791,8 +848,25 @@ def test_a12_mapped_random_modes_are_named_streamed_and_paired(
         **context_mapping.readout_initialization_fragment("random-direction L2", seed=seed),
     }
     l2 = instantiate(OmegaConf.create(l2_config))
-    ratio = first.channel_weights.detach() / l2.channel_weights.detach()
+    l1 = instantiate(OmegaConf.create({
+        "_target_": "tpen.nn.readout.PfaffianReadout",
+        "pair_channels": 8,
+        "trainable": True,
+        **context_mapping.readout_initialization_fragment("signed L1", seed=seed),
+    }))
+    ratio = l1.channel_weights.detach() / l2.channel_weights.detach()
     assert torch.all(ratio > 0)
+    assert torch.equal(l1.channel_weights.detach(), first.channel_weights.detach()) if label == "signed L1" else True
+    assert torch.isclose(l1.channel_weights.detach().abs().sum(), torch.tensor(1.0, dtype=torch.float64))
+    assert torch.isclose(
+        torch.sqrt(torch.tensor(8.0, dtype=torch.float64))
+        * torch.linalg.vector_norm(l2.channel_weights.detach()),
+        torch.tensor(1.0, dtype=torch.float64),
+    )
+    nonuniform = l1.channel_weights.detach() * torch.linspace(
+        1.0, 2.0, 8, dtype=torch.float64
+    )
+    assert not torch.allclose(nonuniform / l2.channel_weights.detach(), torch.full((8,), ratio.mean()))
 
 
 @pytest.mark.parametrize("package", ("B00", "B10", "B01", "B11"))
