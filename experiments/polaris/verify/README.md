@@ -22,11 +22,13 @@ immediately before `qsub`, stage reads the target queue's live `qstat -Qf`
 limits and full queue/job/state records from plain `qstat -f`, cross-checked
 against the user's alternate `qstat -u` table. Limits are read
 live and never hard-coded (measured on Polaris 2026-10-28). A per-user
-`queued_jobs_threshold` counts only `Q`/`H`; a per-user `max_queued` counts
+`queued_jobs_threshold` counts only `Q`; a per-user `max_queued` counts
 `Q`, `H`, `R`, `E`, `W`, `T`, and `B`. `max_run` and `max_run_res.*` never
 refuse because PBS serializes running jobs, and overall (`o:`) limits never
 refuse. Any unknown per-user/group/project limit, malformed output, or failed
-qstat fails closed. A queue with no bracketed limit is unparseable and is
+qstat fails closed. Held jobs are recorded and warned about, but never count
+for `queued_jobs_threshold` and never transition `Q` to `R`; nobody may
+`qrls` or `qdel` one without operator approval. A queue with no bracketed limit is unparseable and is
 refused. Full queue names are required; truncated names do not count. The
 full qstat text is gzip-compressed with its byte count and SHA-256 recorded;
 the alternate table and admission decision are saved at each
