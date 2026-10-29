@@ -1,0 +1,126 @@
+# Shared learned model. No exact-state control is substituted into training.
+experiment:
+  name: one_electron_variance
+  sector: null
+  run_name: null
+run:
+  root: null
+  run_id: null
+  timezone: America/New_York
+runtime:
+  seed: null
+  device: cuda
+  dtype: float64
+system:
+  n_particles: 1
+  spatial_dim: 3
+  spin: {n_up: 1, n_down: 0}
+  reference_energy: null
+model:
+  _target_: tpen.nn.TPENWaveFunction
+  trace_name: tpen
+  basis: null
+  embedding:
+    _target_: tpen.nn.Embedding
+    max_order: 2
+    spatial_dim: 3
+    out_channels: 32
+    hidden_channels: 128
+    num_hidden_layers: 1
+    include_spins: true
+  layers:
+    - _target_: tpen.nn.TPENLayer
+      mixing:
+        _target_: tpen.nn.EquivariantMixing
+        max_order: 2
+        max_virtual_order: 2
+        channels: 32
+        implementation: vectorized
+        initial_weight: 0.5
+        activation: {_target_: torch.nn.SiLU}
+      path_aggregation:
+        _target_: tpen.nn.PathAggregation
+        max_order: 2
+        max_virtual_order: 2
+        channels: 32
+        activation: {_target_: torch.nn.SiLU}
+      update: {_target_: tpen.nn.ResidualUpdater}
+  readout:
+    _target_: tpen.nn.readout.PfaffianReadout
+    channels: 32
+    trainable: true
+    eps: 1.0e-12
+  factors: []
+hamiltonian_terms:
+  kinetic: {_target_: tpen.physics.kinetic.KineticEnergy}
+sampler:
+  _target_: tpen.sampling.metropolis.MetropolisSampler
+  n_walkers: 4096
+  burn_in: 100
+  n_steps: 10
+  proposal_scale: 0.5
+  seed: null
+  n_electrons: 1
+  spatial_dim: 3
+  n_up: 1
+  n_down: 0
+  dtype: ${runtime.dtype}
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.005
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+trainer:
+  _target_: tpen.training.trainer.VMCTrainer
+  max_steps: 50000
+  log_every_n_steps: 1
+  return_terms: true
+  # Fail instead of dropping nonfinite records from the learning objective.
+  nonfinite_local_energy_policy: fail
+runner:
+  _target_: tpen.runner.Train
+  model: ${model}
+  sampler: ${sampler}
+  hamiltonian_terms: ${hamiltonian_terms}
+  optimizer: ${optimizer}
+  trainer: ${trainer}
+callbacks:
+  - {_target_: tpen.callback.ConfigSnapshot, output_path: '${run.dir}/config.yaml'}
+  - {_target_: tpen.callback.ResolvedConfigSnapshot, output_path: '${run.dir}/resolved_config.yaml'}
+  - {_target_: tpen.callback.Metadata, output_path: '${run.dir}/metadata.json'}
+  - {_target_: tpen.callback.Status, output_path: '${run.dir}/status.json'}
+  - _target_: tpen.callback.initial_checkpoint.InitialCheckpoint
+    output_dir: ${run.dir}/checkpoints
+  - _target_: tpen.callback.DataIntegrity
+    every_n_steps: 1
+    fail_fast: true
+    max_nonfinite_energy_fraction: 0.0
+    max_nonfinite_logabs_fraction: 0.0
+    check_loss: true
+    check_wavefunction_output: true
+    check_batch: true
+    strict_sign_values: true
+  - _target_: tpen.callback.GradientStats
+    every_n_steps: 1
+    fail_fast: true
+    check_finite: true
+  - _target_: tpen.callback.parameter_activity.ParameterActivity
+    output_path: ${run.dir}/parameter_activity.json
+  - {_target_: tpen.callback.SamplerHealth, every_n_steps: 1}
+  - {_target_: tpen.callback.FactorScalars, every_n_steps: 1, fail_fast: true}
+  - {_target_: tpen.callback.TrainStepTiming, every_n_steps: 1}
+  - _target_: tpen.callback.ResourceUsage
+    allocator_probe:
+      _target_: tpen.accelerator.TorchAllocatorPeakProbe
+      device: ${runtime.device}
+  - _target_: tpen.callback.Checkpoint
+    terminal: true
+    schedule: {_target_: tpen.checkpoint.EveryNUpdates, every_n: 2500}
+    payload: {_target_: tpen.checkpoint.TrainResume}
+    keep_last: null
+    output_dir: ${run.dir}/checkpoints
+loggers:
+  - {_target_: tpen.logging.CSV, path: '${run.dir}/metrics.csv'}
+  - {_target_: tpen.logging.JSONL, path: '${run.dir}/metrics.jsonl'}
