@@ -1,4 +1,4 @@
-"""Unit tests for the pointwise :class:`tpen.nn.GaussianActivation` (P0-b).
+"""Unit tests for TPEN's pointwise Gaussian and Softplus-beta activations.
 
 Pins the D3 elementwise activation form ``f(x) = exp(-x**2 / (2 sigma**2))``
 with a fixed, non-trainable ``sigma``: closed-form values, ``f(0) == 1``,
@@ -8,11 +8,11 @@ and :class:`tpen.nn.PathAggregation` permutation-equivariant under the
 production checkers in :mod:`tpen.equivariance.checks`.
 
 Also records the masked-entry characterization required by the downstream
-activation scan: because ``f(0) == 1`` this is a ``Gamma(0) != 0`` activation,
-so it writes the invariant constant ``1`` onto the non-distinct tuple entries
-that mixing never writes (``EquivariantMixing`` docstring; ``Embedding``
-deliberately zeroes those entries). The tests below measure that contamination
-and check whether it reaches the wavefunction through
+activation scan: both Gaussian and Softplus beta2 are ``Gamma(0) != 0``
+activations, so they write an invariant constant onto the non-distinct tuple
+entries that mixing never writes (``EquivariantMixing`` docstring; ``Embedding``
+deliberately zeroes those entries). The tests measure that contamination and
+check whether it reaches the wavefunction through
 :class:`tpen.nn.readout.PfaffianReadout`.
 
 Logged times in this suite use UTC per repository convention.
@@ -356,13 +356,13 @@ def _softplus_oracle(
         torch.exp(-torch.abs(scaled))
     )) / beta
     first = sigmoid
-    second = beta * sigmoid * (1.0 - sigmoid)
+    second = beta * sigmoid * torch.sigmoid(-scaled)
     return value, first, second
 
 
 def _assert_softplus_contract(activation) -> None:
     points = torch.tensor(
-        [-1000.0, -100.0, -20.0, -11.0, 0.0, 11.0, 20.0, 100.0, 1000.0],
+        [-1000.0, -400.0, -100.0, -20.0, -11.0, 0.0, 11.0, 20.0, 100.0, 1000.0],
         dtype=_DTYPE,
     )
     x = points.clone().requires_grad_()
@@ -382,9 +382,30 @@ def test_softplus_beta_matches_closed_form_value_and_derivatives_at_extremes() -
     _assert_softplus_contract(SoftplusBeta())
 
 
+def test_softplus_oracle_second_derivative_stays_positive_in_finite_range() -> None:
+    points = torch.tensor([-100.0, -20.0, 0.0, 20.0, 100.0], dtype=_DTYPE)
+    _, _, second = _softplus_oracle(points)
+    assert (second[points.abs() <= 100.0] > 0.0).all()
+
+
 def test_softplus_beta_acceptance_arm_catches_library_mutant() -> None:
+    _assert_softplus_contract(SoftplusBeta())
     with pytest.raises(AssertionError):
         _assert_softplus_contract(torch.nn.Softplus(beta=2.0))
+
+
+def test_softplus_beta_second_derivative_is_finite_past_exp_overflow() -> None:
+    x = torch.tensor([-400.0, -1000.0], dtype=_DTYPE, requires_grad=True)
+    first = torch.autograd.grad(SoftplusBeta()(x).sum(), x, create_graph=True)[0]
+    second = torch.autograd.grad(first.sum(), x)[0]
+    assert torch.isfinite(second).all()
+    torch.testing.assert_close(second, torch.zeros_like(second), rtol=0.0, atol=1e-300)
+
+
+def test_softplus_beta_value_at_zero_is_log_two_over_beta() -> None:
+    actual = SoftplusBeta()(torch.zeros(1, dtype=_DTYPE))
+    expected = torch.full_like(actual, math.log(2.0) / 2.0)
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
 
 
 def test_softplus_beta_threshold_regime_catches_torch_linear_mutant() -> None:
@@ -483,22 +504,30 @@ def test_stages_with_gaussian_activation_are_equivariant_for_all_permutations(
 
 
 # --------------------------------------------------------------------------
-# Masked-entry characterization: Gamma(0) == 1 writes onto non-distinct tuples
+# Masked-entry characterization: nonzero Gamma(0) writes onto non-distinct tuples
 # --------------------------------------------------------------------------
 
 
-def test_mixing_activation_writes_one_onto_non_distinct_entries() -> None:
+@pytest.mark.parametrize(
+    ("activation", "gamma_zero"),
+    [(GaussianActivation(), 1.0), (SoftplusBeta(), math.log(2.0) / 2.0)],
+)
+def test_mixing_activation_writes_gamma_zero_onto_non_distinct_entries(
+    activation, gamma_zero: float
+) -> None:
     # EquivariantMixing applies Gamma to the full block, and never writes the
-    # non-distinct tuple entries, so they enter Gamma as exact zeros. With
-    # f(0) == 1 every order-2 diagonal entry becomes exactly 1.
+    # non-distinct tuple entries, so they enter Gamma as exact zeros. The
+    # nonzero f(0) value is written onto every order-2 diagonal entry.
     n_particles = 3
-    activated = _mixing(GaussianActivation())(
+    activated = _mixing(activation)(
         _random_feature(n_particles, channels=2, max_order=2, seed=131)
     )
 
     diagonal = torch.diagonal(activated.blocks[2], dim1=-2, dim2=-1)
 
-    torch.testing.assert_close(diagonal, torch.ones_like(diagonal), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(
+        diagonal, torch.full_like(diagonal, gamma_zero), atol=0.0, rtol=0.0
+    )
 
 
 def test_mixing_masked_contamination_magnitude_is_exactly_one() -> None:
@@ -519,27 +548,41 @@ def test_mixing_masked_contamination_magnitude_is_exactly_one() -> None:
     assert int((difference > 0).sum().item()) == block.shape[0] * block.shape[1] * block.shape[2] * n_masked
 
 
-def test_path_aggregation_activation_writes_one_onto_non_distinct_entries() -> None:
+@pytest.mark.parametrize(
+    ("activation", "gamma_zero"),
+    [(GaussianActivation(), 1.0), (SoftplusBeta(), math.log(2.0) / 2.0)],
+)
+def test_path_aggregation_activation_writes_gamma_zero_onto_non_distinct_entries(
+    activation, gamma_zero: float
+) -> None:
     # Same statement one stage later: the path contraction of masked-zero input
-    # entries is zero, so Gamma(0) = 1 lands on them again.
+    # entries is zero, so the nonzero Gamma(0) lands on them again.
     n_particles = 3
-    aggregated = _aggregation(GaussianActivation())(_masked_interaction(n_particles, seed=139))
+    aggregated = _aggregation(activation)(_masked_interaction(n_particles, seed=139))
     block = aggregated.blocks[2]
     rezeroed = _zero_masked_entries(block, n_particles, 2, path_axis=False)
 
     diagonal = torch.diagonal(block, dim1=-2, dim2=-1)
-    torch.testing.assert_close(diagonal, torch.ones_like(diagonal), atol=0.0, rtol=0.0)
-    assert (block - rezeroed).abs().max().item() == 1.0
+    torch.testing.assert_close(
+        diagonal, torch.full_like(diagonal, gamma_zero), atol=0.0, rtol=0.0
+    )
+    assert (block - rezeroed).abs().max().item() == gamma_zero
 
 
 @pytest.mark.parametrize("n_particles", [2, 3])
-def test_masked_contamination_does_not_reach_the_pfaffian_wavefunction(n_particles: int) -> None:
+@pytest.mark.parametrize(
+    ("activation", "gamma_zero"),
+    [(GaussianActivation(sigma=0.9), 1.0), (SoftplusBeta(), math.log(2.0) / 2.0)],
+)
+def test_masked_contamination_does_not_reach_the_pfaffian_wavefunction(
+    n_particles: int, activation, gamma_zero: float
+) -> None:
     # The readout antisymmetrizes K = 0.5 * (pair - pair^T), which annihilates
     # the order-2 diagonal exactly, so the contamination measured above cannot
     # change logabs or sign. This is the null the downstream activation scan
     # relies on.
-    mixing = _mixing(GaussianActivation(sigma=0.9))
-    aggregation = _chained_aggregation(GaussianActivation(sigma=0.9), seed=61)
+    mixing = _mixing(activation)
+    aggregation = _chained_aggregation(activation, seed=61)
     feature = _random_feature(n_particles, channels=2, max_order=2, seed=149, batch=2)
 
     update = aggregation(mixing(feature))
@@ -550,7 +593,7 @@ def test_masked_contamination_does_not_reach_the_pfaffian_wavefunction(n_particl
 
     # The contamination really is present in the readout input. After the full
     # mixing -> aggregation chain the masked entries are no longer Gamma(0)
-    # itself: mixing writes Gamma(0) = 1 there, the path contraction turns that
+    # itself: mixing writes Gamma(0) there, the path contraction turns that
     # into sum_p U[c, p], and the aggregation Gamma maps it to a channel-wise
     # invariant constant. It is still an invariant constant, which is why it
     # cannot break equivariance -- and it is still nonzero.
