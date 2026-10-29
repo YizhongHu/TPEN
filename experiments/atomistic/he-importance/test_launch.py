@@ -891,6 +891,11 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
 
     assert launch.launch_train(cell, _topology(), runner=production_run.run_from_config) == 1
     assert context.metadata.status == "failed"
+    # The handled-failure path is the raise-free path: the runner's verdict
+    # rides RunCompleted. A RunFailed here would mean run_from_config raised
+    # and exit code 1 came from the exception path instead.
+    assert [type(event).__name__ for event in context.events] == ["RunStarted", "RunCompleted"]
+    assert context.events[-1].status == "failed"
 
 
 @pytest.mark.parametrize("status", ["completed", "not-a-run-result"])
@@ -1422,3 +1427,29 @@ def test_fake_context_emit_accepts_production_keywords() -> None:
     )
 
     assert not missing, f"_FakeContext.emit lacks production keyword(s): {missing}"
+
+
+def test_default_runner_exception_path_reports_run_failed_without_touching_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path)
+    # Resolved from the already-imported function rather than a new
+    # `import tpen.run` statement, which would add a boundary-inventory crossing.
+    production_run = inspect.getmodule(run_from_config)
+    context = _FakeContext()
+
+    def refuse_runner(_: object) -> object:
+        raise RuntimeError("review r1: runner construction raised")
+
+    monkeypatch.setattr(production_run, "validate_hi_train_config", lambda _: None)
+    monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
+    monkeypatch.setattr(production_run, "prepare_run_context", lambda *args, **kwargs: context)
+    monkeypatch.setattr(production_run, "_instantiate_runner", refuse_runner)
+
+    assert launch.launch_train(cell, _topology(), runner=production_run.run_from_config) == 1
+    assert context.metadata.status == "failed"
+    assert [type(event).__name__ for event in context.events] == ["RunStarted", "RunFailed"]
+    assert context.events[-1].exception_type == "RuntimeError"
+    # _FakeContext points run_dir at Path("."), i.e. the pytest CWD (the repo
+    # checkout). The exception path must not leave error.json there.
+    assert not (Path.cwd() / "error.json").exists()
