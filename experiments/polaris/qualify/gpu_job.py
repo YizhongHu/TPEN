@@ -161,6 +161,7 @@ def main() -> int:
     code = check("job_env_export", "JOB_ENV", job_env_value, bool(job_env_value), 76)
     if code is not None: return code
     job_env = Path(job_env_value).resolve()
+    job_env.parent.mkdir(parents=True, exist_ok=True)
     sync_env = build_env(manifest["verify_profile"], Path(values["RUN_CACHE_DIR"]), job_env, base=dict(os.environ))
     sync_log = evidence / "offline-sync.stdout.log"
     sync_error = evidence / "offline-sync.stderr.log"

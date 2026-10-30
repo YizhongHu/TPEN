@@ -10,4 +10,4 @@ export PYTHONDONTWRITEBYTECODE=1
 JOB_ROOT="/local/scratch/$PBS_JOBID"
 JOB_ENV="$JOB_ROOT/tpen-gpu-env"
 export JOB_ENV
-exec "$JOB_ENV/bin/python" "$RUN_JOB_PY" "$RUN_ENV_PATH"
+exec "$RUN_PYTHON" "$RUN_JOB_PY" "$RUN_ENV_PATH"

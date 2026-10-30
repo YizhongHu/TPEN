@@ -226,7 +226,7 @@ def test_job_main_green_and_seam_controls(monkeypatch, tmp_path: Path) -> None:
     receipt = tmp_path / "receipt.json"
     run_env = tmp_path / "run.env"
     job_env = tmp_path / "job-env"
-    values = {"RUN_MANIFEST": str(manifest_path), "RUN_PYTHON": sys.executable, "RUN_JOB_PY": str(harness / "gpu_job.py"), "RUN_PROJECT": str(target), "RUN_CACHE_DIR": str(tmp_path / "cache"), "RUN_EXTRA": "cu126"}
+    values = {"RUN_MANIFEST": str(manifest_path), "RUN_PYTHON": sys.executable, "RUN_JOB_PY": str(harness / "gpu_job.py"), "RUN_PROJECT": str(target), "RUN_CACHE_DIR": str(tmp_path / "cache")}
     verify_profile = json.loads((ROOT.parent / "verify" / "facility_profile.json").read_text(encoding="utf-8"))
     manifest = {"runtime_kind": job.RUNTIME_KIND, "target_sha": target_sha, "required_ancestors": [], "nodes": 1, "target_repo": str(target), "job_helper": str(harness / "gpu_job.py"), "copied_file_sha256": {}, "staging_receipt": str(receipt), "evidence_dir": str(tmp_path / "evidence"), "output_root": str(tmp_path / "output"), "extra": "cu126", "expected_torch": "2.12.0+cu126", "cache_dir": str(tmp_path / "cache"), "verify_profile": verify_profile, "cell": {"stage": "Q", "context": "O-composite", "optimizer": "adam", "lr": 0.005, "beta2": 0.999, "seed_label": 810001, "walkers": 2048}}
     identity = {"prefix": str(job_env.resolve()), "executable": str((job_env / "bin" / "python").resolve()), "base_prefix": "/facility"}
@@ -295,17 +295,13 @@ def test_job_main_green_and_seam_controls(monkeypatch, tmp_path: Path) -> None:
 def test_job_pbs_exports_child_environment_and_cuda_control(tmp_path: Path) -> None:
     root = tmp_path / "run"
     root.mkdir()
-    fake_uv = root / "facility-python"
-    fake_uv.write_text("#!/usr/bin/env bash\nif [[ \"$3\" == \"--version\" ]]; then echo \"uv 0.8.23\"; exit 0; fi\nif [[ \"$3\" == \"sync\" ]]; then exit 0; fi\nexit 99\n", encoding="utf-8")
-    fake_uv.chmod(0o755)
-    job_env = root / "scratch" / "job" / "tpen-gpu-env"
-    child = job_env / "bin" / "python"
-    child.parent.mkdir(parents=True)
+    fake_python = root / "facility-python"
     observed = root / "observed"
-    child.write_text("#!/usr/bin/env bash\nprintf '%s|%s|%s|%s|%s\n' \"$CUDA_VISIBLE_DEVICES\" \"$JOB_ENV\" \"$UV_CACHE_DIR\" \"$UV_PROJECT_ENVIRONMENT\" \"$PYTHONDONTWRITEBYTECODE\" > '" + str(observed) + "'\n", encoding="utf-8")
-    child.chmod(0o755)
+    fake_python.write_text("#!/usr/bin/env bash\nprintf '%s|%s|%s|%s|%s' \"$CUDA_VISIBLE_DEVICES\" \"$JOB_ENV\" \"$1\" \"$2\" \"$RUN_PYTHON\" > '" + str(observed) + "'\n", encoding="utf-8")
+    fake_python.chmod(0o755)
+    job_env = root / "scratch" / "job" / "tpen-gpu-env"
     env_file = root / "run.env"
-    env_file.write_text("RUN_PYTHON=" + str(fake_uv) + "\nRUN_UV_EXPECTED=0.8.23\nRUN_EVIDENCE_DIR=" + str(root / "evidence") + "\nRUN_CACHE_DIR=" + str(root / "cache") + "\nRUN_PROJECT=" + str(root) + "\nRUN_EXTRA=cu126\nRUN_JOB_PY=" + str(root / "helper.py") + "\n", encoding="utf-8")
+    env_file.write_text("RUN_PYTHON=" + str(fake_python) + "\nRUN_JOB_PY=" + str(root / "helper.py") + "\n", encoding="utf-8")
     (root / "helper.py").write_text("helper\n")
     script = ROOT / "job.pbs"
     executable = root / "job.pbs"
@@ -313,13 +309,12 @@ def test_job_pbs_exports_child_environment_and_cuda_control(tmp_path: Path) -> N
     base_env = {"RUN_ENV_PATH": str(env_file), "PBS_JOBID": "job", "PATH": os.environ.get("PATH", "")}
     result = subprocess.run(["bash", str(executable)], env=base_env, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr + result.stdout
-    assert observed.read_text().strip() == "0|" + str(job_env) + "|||1"
+    assert observed.read_text().strip() == "0|" + str(job_env) + "|" + str(root / "helper.py") + "|" + str(env_file) + "|"
     mutant = root / "mutant.pbs"
-    mutant.write_text(executable.read_text(encoding="utf-8").replace("export CUDA_VISIBLE_DEVICES=0\n", ""), encoding="utf-8")
+    mutant.write_text(executable.read_text(encoding="utf-8").replace('exec "$RUN_PYTHON"', 'exec "$JOB_ENV/bin/python"'), encoding="utf-8")
     observed.unlink()
     result = subprocess.run(["bash", str(mutant)], env=base_env, text=True, capture_output=True)
-    assert result.returncode == 0
-    assert observed.read_text().split("|", 1)[0] != "0"
+    assert result.returncode != 0
 
 
 def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
@@ -345,16 +340,10 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
     subprocess.run(["git", "-C", str(harness), "commit", "-q", "-m", "harness"], check=True)
     monkeypatch.setattr(stage, "_harness_repo", lambda: harness)
     monkeypatch.setattr(stage.getpass, "getuser", lambda: "rhu")
-    gate_state = {"values": None}
-    def fake_gate(queue, user, output_dir, prefix):
-        allowed = True if gate_state["values"] is None else next(gate_state["values"])
-        output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / f"{prefix}-qstat-decision.json").write_text(json.dumps({"queue": queue, "allowed": allowed}) + "\n")
-        return allowed
-    monkeypatch.setattr(stage, "_queue_gate", fake_gate)
     original_run = stage._run
     original_subprocess = stage.subprocess.run
     mode = {"value": "ok"}
+    qstat_calls = {"count": 0}
     qsub_calls = []
 
     def fake_run(args, **kwargs):
@@ -373,6 +362,18 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
         return original_run(args, **kwargs)
 
     def fake_subprocess(args, **kwargs):
+        if args and args[0] == "qstat":
+            qstat_calls["count"] += 1
+        if args[:2] == ["qstat", "-Qf"]:
+            return subprocess.CompletedProcess(args, 0, "Queue: debug\nmax_queued = [u:PBS_GENERIC=1]\nqueued_jobs_threshold = [u:PBS_GENERIC=1]\n", "")
+        if args == ["qstat", "-f"]:
+            if mode["value"] == "gate-fail" and qstat_calls["count"] > 3:
+                return subprocess.CompletedProcess(args, 0, "Job Id: 123.polaris\n    Job_Owner = rhu@polaris\n    job_state = Q\n    queue = debug\n", "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[:2] == ["qstat", "-u"]:
+            if mode["value"] == "gate-fail" and qstat_calls["count"] > 3:
+                return subprocess.CompletedProcess(args, 0, "Job id User Time Use S Queue\n123.polaris rhu 00:00:00 Q debug\n", "")
+            return subprocess.CompletedProcess(args, 0, "Job id User Time Use S Queue\n", "")
         if "--offline" in args:
             if mode["value"] == "dry-fail":
                 raise subprocess.CalledProcessError(9, args)
@@ -398,7 +399,7 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
     expected = ["qsub", "-V", "-A", "HetRxnEnergy", "-q", "debug", "-l", "select=1:system=polaris", "-l", "walltime=00:20:00", "-l", "filesystems=home:eagle", "-o", str(run_root / "pbs") + "/", "-e", str(run_root / "pbs") + "/", "-v", "RUN_ENV_PATH=" + str(run_root / "run.env"), str(run_root / "harness" / "job.pbs")]
     assert qsub_calls[-1] == expected and manifest["extra"] == "cu126", repr(qsub_calls[-1]) + " != " + repr(expected)
     run_env_text = (run_root / "run.env").read_text()
-    for key, value in (("RUN_EXTRA", "cu126"), ("RUN_CACHE_DIR", manifest["cache_dir"]), ("RUN_EVIDENCE_DIR", manifest["evidence_dir"]), ("RUN_UV_EXPECTED", "0.8.23")):
+    for key, value in (("RUN_CACHE_DIR", manifest["cache_dir"]), ("RUN_PROJECT", manifest["target_repo"])):
         assert f"{key}=" in run_env_text and value in run_env_text
     assert json.loads((run_root / "staging-receipt.json").read_text()) == {"runtime_kind": stage.RUNTIME_KIND, "target_sha": target_sha, "cache_dir": manifest["cache_dir"], "extra": "cu126", "manifest": str(run_root / "manifest.json")}
     for name, failure in (("prime", "prime-fail"), ("dry", "dry-fail")):
@@ -413,8 +414,9 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
         assert not (failure_root / name / "staging-receipt.json").exists()
     mode["value"] = "ok"
     gate_root = tmp_path / "runs-gate"
-    gate_state["values"] = iter((True, False))
     before = len(qsub_calls)
+    qstat_calls["count"] = 0
+    mode["value"] = "gate-fail"
     try:
         stage.stage(args("gate", gate_root))
     except RuntimeError:
@@ -422,4 +424,5 @@ def test_stage_real_clone_and_qsub_fakes(monkeypatch, tmp_path: Path) -> None:
     else:
         raise AssertionError("second queue gate unexpectedly admitted qsub")
     assert len(qsub_calls) == before and (gate_root / "gate" / "staging-receipt.json").is_file()
-    assert json.loads(next(gate_root.glob("**/pre-submit-qstat-decision.json")).read_text())["allowed"] is False
+    decisions = list(gate_root.glob("**/*qstat-decision.json"))
+    assert decisions and json.loads(decisions[-1].read_text())["allowed"] is False

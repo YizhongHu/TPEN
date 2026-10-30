@@ -150,12 +150,9 @@ def stage(args: argparse.Namespace) -> int:
     env_path = run_root / "run.env"; env_path.write_text(
         "RUN_MANIFEST=" + shlex.quote(str(manifest_path)) + "\n"
         + "RUN_PYTHON=" + shlex.quote(verify_profile["facility_python"]) + "\n"
-        + "RUN_UV_EXPECTED=" + shlex.quote(verify_profile["uv_version"]) + "\n"
         + "RUN_JOB_PY=" + shlex.quote(str(paths["harness_dir"] / "gpu_job.py")) + "\n"
         + "RUN_PROJECT=" + shlex.quote(str(target_repo)) + "\n"
-        + "RUN_CACHE_DIR=" + shlex.quote(str(paths["cache_dir"])) + "\n"
-        + "RUN_EXTRA=" + shlex.quote(profile["extra"]) + "\n"
-        + "RUN_EVIDENCE_DIR=" + shlex.quote(str(paths["evidence_dir"])) + "\n",
+        + "RUN_CACHE_DIR=" + shlex.quote(str(paths["cache_dir"])) + "\n",
         encoding="utf-8")
     _atomic_json(Path(manifest["staging_receipt"]), {"runtime_kind": RUNTIME_KIND, "target_sha": args.target_sha, "cache_dir": manifest["cache_dir"], "extra": profile["extra"], "manifest": str(manifest_path)})
     if not _queue_gate(args.queue, getpass.getuser(), run_root, "pre-submit"): raise RuntimeError("refusing qsub because the queue-aware gate refused admission")
