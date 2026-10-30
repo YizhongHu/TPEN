@@ -14,6 +14,8 @@ try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
     import tomli as tomllib
+from common import build_env
+from lock import expected_torch_version
 
 RUNTIME_KIND = "polaris-gpu-qualification"
 CANONICAL_STAGE = "experiments/atomistic/he-importance/run_stage_q.py"
@@ -62,15 +64,6 @@ def appledoubles(repo: Path) -> list[str]:
 
 def _short_hosts(entries: list[str]) -> set[str]:
     return {entry.strip().split(".", 1)[0] for entry in entries if entry.strip()}
-
-
-def expected_torch_version(lock: dict, extra: str) -> str:
-    project = next((p for p in lock.get("package", []) if p.get("source", {}).get("editable") == "."), None)
-    entries = (project or {}).get("optional-dependencies", {}).get(extra, [])
-    torch = [entry for entry in entries if entry.get("name") == "torch" and (not entry.get("marker") or "sys_platform != 'darwin'" in entry.get("marker", ""))]
-    if len(torch) != 1 or "version" not in torch[0]:
-        raise ValueError(f"lock has no unique Linux torch resolution for extra {extra}")
-    return torch[0]["version"]
 
 
 def _uv_version(uv: list[str]) -> str:
@@ -149,15 +142,38 @@ def main() -> int:
         ok = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, manifest["target_sha"]], check=False).returncode == 0
         code = check(f"required_ancestor:{ancestor}", True, ok, ok, 79)
         if code is not None: return code
-    lock = tomllib.loads((repo / "uv.lock").read_text(encoding="utf-8"))
-    expected = expected_torch_version(lock, manifest["extra"])
-    code = check("lock_torch_version", expected, expected, True, 78)
+    try:
+        lock = tomllib.loads((repo / "uv.lock").read_text(encoding="utf-8"))
+        expected = expected_torch_version(lock, manifest["extra"])
+        lock_ok = expected == manifest["expected_torch"]
+        lock_observed = expected
+    except (OSError, TypeError, ValueError) as error:
+        lock_ok = False
+        lock_observed = str(error)
+        expected = manifest.get("expected_torch")
+    code = check("lock_torch_version", manifest.get("expected_torch"), lock_observed, lock_ok, 78)
     if code is not None: return code
     uv = [values["RUN_PYTHON"], "-m", "uv"]
     uv_text = _uv_version(uv)
     code = check("uv_version", manifest["verify_profile"]["uv_version"], uv_text, uv_text.split()[:2] == ["uv", manifest["verify_profile"]["uv_version"]], 77)
     if code is not None: return code
-    job_env = Path(os.environ["JOB_ENV"]).resolve()
+    job_env_value = os.environ.get("JOB_ENV")
+    code = check("job_env_export", "JOB_ENV", job_env_value, bool(job_env_value), 76)
+    if code is not None: return code
+    job_env = Path(job_env_value).resolve()
+    sync_env = build_env(manifest["verify_profile"], Path(values["RUN_CACHE_DIR"]), job_env, base=dict(os.environ))
+    sync_log = evidence / "offline-sync.stdout.log"
+    sync_error = evidence / "offline-sync.stderr.log"
+    try:
+        with sync_log.open("w", encoding="utf-8") as stdout, sync_error.open("w", encoding="utf-8") as stderr:
+            subprocess.run([values["RUN_PYTHON"], "-m", "uv", "sync", "--offline", "--extra", manifest["extra"], "--locked", "--project", values["RUN_PROJECT"]], env=sync_env, stdout=stdout, stderr=stderr, check=True, text=True)
+        sync_ok = True
+        sync_observed = 0
+    except (OSError, subprocess.CalledProcessError) as error:
+        sync_ok = False
+        sync_observed = getattr(error, "returncode", str(error))
+    code = check("offline_sync", 0, sync_observed, sync_ok, 80)
+    if code is not None: return code
     python = job_env / "bin" / "python"
     identity = _venv_identity(python)
     identity_ok = Path(identity["prefix"]).resolve() == job_env and identity["executable"].startswith(str(job_env) + os.sep)

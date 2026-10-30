@@ -17,14 +17,18 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
     import tomli as tomllib
 
 VERIFY = Path(__file__).resolve().parents[1] / "verify"
+QUALIFY = Path(__file__).resolve().parent
+if str(QUALIFY) not in sys.path:
+    sys.path.insert(0, str(QUALIFY))
 if str(VERIFY) not in sys.path:
     sys.path.insert(0, str(VERIFY))
 from common import build_env, copied_hashes, is_ancestor, layout, read_profile  # noqa: E402
 from stage import _queue_gate  # noqa: E402
+from lock import expected_torch_version  # noqa: E402
 
 RUNTIME_KIND = "polaris-gpu-qualification"
 ALLOWED_WALKERS = {2048, 4096}
-STORED_FILES = ("common.py", "gpu_job.py", "qualification.py", "job.pbs", "facility_profile.json")
+STORED_FILES = ("common.py", "lock.py", "gpu_job.py", "qualification.py", "job.pbs", "facility_profile.json")
 PROFILE_PATH = Path(__file__).resolve().parent / "facility_profile.json"
 
 
@@ -52,18 +56,9 @@ def _safe_component(value: str, name: str) -> str:
 def _profile(path: Path | None = None) -> dict:
     path = PROFILE_PATH if path is None else path
     profile = read_profile(path)
-    if profile.get("runtime_kind") != RUNTIME_KIND or profile.get("extra") != "cu126":
-        raise ValueError("qualification profile must admit runtime_kind and cu126")
+    if profile.get("runtime_kind") != RUNTIME_KIND or not isinstance(profile.get("extra"), str) or not profile["extra"]:
+        raise ValueError("qualification profile must admit a runtime_kind and non-empty extra")
     return profile
-
-
-def expected_torch_version(lock: dict, extra: str) -> str:
-    project = next((p for p in lock.get("package", []) if p.get("source", {}).get("editable") == "."), None)
-    entries = (project or {}).get("optional-dependencies", {}).get(extra, [])
-    torch = [entry for entry in entries if entry.get("name") == "torch" and (not entry.get("marker") or "sys_platform != 'darwin'" in entry.get("marker", ""))]
-    if len(torch) != 1 or "version" not in torch[0]:
-        raise ValueError(f"lock has no unique Linux torch resolution for extra {extra}")
-    return torch[0]["version"]
 
 
 def _harness_repo() -> Path:
