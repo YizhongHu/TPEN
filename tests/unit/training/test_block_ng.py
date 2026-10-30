@@ -83,7 +83,9 @@ def test_tensor_blocks_cover_the_parameter_layout_once() -> None:
     assert sum(slot.numel for slot in layout.slots) == layout.total_numel
 
 
-def _block_ng_oracle_pairs(solve_dtype: torch.dtype, energy_shift: float = 0.0):
+def _block_ng_oracle_pairs(
+    solve_dtype: torch.dtype, energy_shift: float = 0.0
+) -> list[tuple[np.ndarray, np.ndarray]]:
     """Apply one block-NG update and pair each block with its float64 oracle.
 
     The update sees ``energies + energy_shift``; the oracle always sees the
@@ -133,16 +135,19 @@ def _block_ng_oracle_pairs(solve_dtype: torch.dtype, energy_shift: float = 0.0):
     return pairs
 
 
-def _max_oracle_errors(pairs) -> tuple[float, float]:
+def _max_oracle_errors(pairs: list[tuple[np.ndarray, np.ndarray]]) -> tuple[float, float]:
     """Return the all-block maximum absolute and relative errors.
 
     Relative error is zero wherever the oracle entry is exactly zero, so only
-    the absolute error sees those entries.
+    the absolute error sees those entries.  Every update entry must be finite:
+    Python ``max`` ignores NaN (``max(0.0, nan) == 0.0``), so a non-finite
+    update would otherwise report zero error and pass every bound.
     """
 
     absolute = 0.0
     relative = 0.0
-    for actual, expected in pairs:
+    for block, (actual, expected) in enumerate(pairs):
+        assert np.isfinite(actual).all(), f"block {block} update is not finite: {actual!r}"
         error = np.abs(actual - expected)
         absolute = max(absolute, float(error.max()))
         relative = max(
@@ -199,12 +204,21 @@ def test_three_electron_float32_block_ng_is_invariant_to_an_energy_shift() -> No
     # ``build_block_ng_directions``.  The bound sits near the geometric mean
     # of the worst healthy ratio (1.044) and the weakest mutant ratio (114.5),
     # leaving roughly 10x on each side.  Across every shift tried (-10 to
-    # 1000) the healthy ratios stayed within 0.67-1.04 on Cannon and
+    # 1000) the healthy ratios stayed within 0.67-1.044 on Cannon and
     # 0.997-1.022 on Polaris; the weakest mutant ratio at this shift is the
-    # Polaris absolute 114.5.  Smaller shifts separate less: at a
-    # shift of 10 the mutant ratio was only about 1.6 to 2.2 on Cannon.  For
-    # contrast, the UNSHIFTED mutant error sits only 14% above healthy on
-    # Cannon and only 1% above it on Polaris, which is why a fixed error
+    # Polaris absolute 114.5.  Smaller shifts separate less: at a shift of 10
+    # the mutant ratios were only about 1.6-2.2 on Cannon and 1.0-1.7 on
+    # Polaris.
+    #
+    # Larger shifts break the HEALTHY side instead: float32 cannot represent
+    # ``E + C`` exactly, and that quantization grows with ``C``.  Healthy
+    # ratios on FASRC Cannon (threads 1/2/4 identical; a shift of -1000 gave
+    # the same as +1000) were absolute/relative 8.50/2.45 at a shift of 1e4
+    # and 83.2/31.9 at 1e5, the absolute limb crossing 10 first.  Do not raise
+    # the shift without re-measuring both sides on more than one facility.
+    #
+    # For contrast, the UNSHIFTED mutant error sits only 14% above healthy
+    # on Cannon and only 1% above it on Polaris, which is why a fixed error
     # threshold could not separate them portably.
     ratio_bound = 10.0
     base_absolute, base_relative = _max_oracle_errors(_block_ng_oracle_pairs(torch.float32))
