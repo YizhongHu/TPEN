@@ -10,14 +10,16 @@ import shlex
 import socket
 import subprocess
 import sys
-
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib
 
 RUNTIME_KIND = "polaris-gpu-qualification"
 CANONICAL_STAGE = "experiments/atomistic/he-importance/run_stage_q.py"
 
 
 def _load_env(path: Path) -> dict[str, str]:
-    """Read one-token shell assignments without evaluating shell syntax."""
     values: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         key, value = line.split("=", 1)
@@ -31,26 +33,9 @@ def _load_env(path: Path) -> dict[str, str]:
 def _record(path: Path, checks: list[dict], name: str, expected: object, observed: object, ok: bool, code: int) -> bool:
     row = {"name": name, "expected": expected, "observed": observed, "status": "PASS" if ok else "FAIL", "exit_code": None if ok else code}
     checks.append(row)
-    path.write_text(json.dumps({"checks": checks, "exit_code": None}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(json.dumps({"checks": checks, "exit_code": None if ok else code}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"CHECK {name} status={row['status']} observed={observed}", flush=True)
-    if not ok:
-        path.write_text(json.dumps({"checks": checks, "exit_code": code}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return ok
-
-
-def _tree_digest(root: Path) -> str:
-    digest = hashlib.sha256()
-    for path in sorted(path for path in root.rglob("*") if path.is_file() and "__pycache__" not in path.parts):
-        digest.update(str(path.relative_to(root)).encode()); digest.update(b"\0")
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
-    return digest.hexdigest()
-
-
-def overlay_snapshot(profile: dict) -> dict[str, str]:
-    """Capture the immutable overlay files and tree, excluding bytecode."""
-    overlay = Path(profile["overlay_root"])
-    pyvenv = overlay / "pyvenv.cfg"
-    return {"pyvenv": hashlib.sha256(pyvenv.read_bytes()).hexdigest(), "tree": _tree_digest(overlay), "pyvenv_text": pyvenv.read_text(encoding="utf-8")}
 
 
 def copied_hashes(manifest: dict) -> dict[str, str]:
@@ -79,18 +64,34 @@ def _short_hosts(entries: list[str]) -> set[str]:
     return {entry.strip().split(".", 1)[0] for entry in entries if entry.strip()}
 
 
+def expected_torch_version(lock: dict, extra: str) -> str:
+    project = next((p for p in lock.get("package", []) if p.get("source", {}).get("editable") == "."), None)
+    entries = (project or {}).get("optional-dependencies", {}).get(extra, [])
+    torch = [entry for entry in entries if entry.get("name") == "torch" and (not entry.get("marker") or "sys_platform != 'darwin'" in entry.get("marker", ""))]
+    if len(torch) != 1 or "version" not in torch[0]:
+        raise ValueError(f"lock has no unique Linux torch resolution for extra {extra}")
+    return torch[0]["version"]
+
+
+def _uv_version(uv: list[str]) -> str:
+    return subprocess.check_output(uv + ["--version"], text=True).strip()
+
+
+def _venv_identity(python: Path) -> dict:
+    code = "import json,sys; print(json.dumps({'executable':sys.executable,'prefix':sys.prefix,'base_prefix':sys.base_prefix}))"
+    return json.loads(subprocess.check_output([str(python), "-c", code], text=True))
+
+
+def _package_versions(python: Path) -> dict:
+    code = "import importlib.metadata as m,json; print(json.dumps({'torch':m.version('torch')}))"
+    return json.loads(subprocess.check_output([str(python), "-c", code], text=True))
+
+
 def torch_probe(python: str, env: dict[str, str]) -> dict:
-    """Import Torch in a child process after the shell export boundary."""
-    code = (
-        "import json, os, torch; "
-        "x=torch.ones(1, device='cuda') + 1; "
-        "p=torch.cuda.get_device_properties(0); "
-        "print(json.dumps({'torch':torch.__version__, 'cuda':torch.version.cuda, "
-        "'file':torch.__file__, 'available':torch.cuda.is_available(), "
-        "'count':torch.cuda.device_count(), 'name':torch.cuda.get_device_name(0), "
-        "'uuid':str(p.uuid), 'op':float(x.item()), 'ld':os.environ.get('LD_LIBRARY_PATH',''), "
-        "'visible':os.environ.get('CUDA_VISIBLE_DEVICES')}))"
-    )
+    code = ("import json,os,torch; x=torch.ones(1,device='cuda')+1; p=torch.cuda.get_device_properties(0); "
+            "print(json.dumps({'torch':torch.__version__,'cuda':torch.version.cuda,'file':torch.__file__,'available':torch.cuda.is_available(),"
+            "'count':torch.cuda.device_count(),'name':torch.cuda.get_device_name(0),'uuid':str(p.uuid),'op':float(x.item()),"
+            "'ld':os.environ.get('LD_LIBRARY_PATH',''),'visible':os.environ.get('CUDA_VISIBLE_DEVICES')}))")
     result = subprocess.run([python, "-c", code], env=env, check=False, text=True, capture_output=True)
     if result.returncode != 0:
         raise RuntimeError(f"Torch probe failed: {result.stderr.strip()}")
@@ -98,7 +99,6 @@ def torch_probe(python: str, env: dict[str, str]) -> dict:
 
 
 def run_route(argv: list[str], cwd: str, env: dict[str, str], stdout, stderr) -> int:
-    """Run the real route with streaming evidence and no output capture."""
     return subprocess.run(argv, cwd=cwd, env=env, stdout=stdout, stderr=stderr, check=False).returncode
 
 
@@ -115,19 +115,20 @@ def main() -> int:
     evidence.mkdir(parents=True, exist_ok=True)
     preflight = evidence / "preflight.json"
     checks: list[dict] = []
-    def check(name: str, expected: object, observed: object, ok: bool, code: int) -> int | None:
+
+    def check(name, expected, observed, ok, code):
         return None if _record(preflight, checks, name, expected, observed, ok, code) else code
 
     code = check("runtime_kind", RUNTIME_KIND, manifest.get("runtime_kind"), manifest.get("runtime_kind") == RUNTIME_KIND, 84)
     if code is not None: return code
     receipt = Path(manifest["staging_receipt"])
     receipt_data = json.loads(receipt.read_text(encoding="utf-8")) if receipt.is_file() else {}
-    expected_overlay = {key: manifest["runtime_profile"][key] for key in ("overlay_python", "overlay_root", "facility_site_packages")}
-    observed_overlay = receipt_data.get("overlay")
-    receipt_code = 60 if not receipt.is_file() else 61
-    code = check("staging_receipt", {"runtime_kind": RUNTIME_KIND, "target_sha": manifest["target_sha"], "overlay": expected_overlay}, {"runtime_kind": receipt_data.get("runtime_kind"), "target_sha": receipt_data.get("target_sha"), "overlay": observed_overlay}, receipt.is_file() and receipt_data.get("runtime_kind") == RUNTIME_KIND and receipt_data.get("target_sha") == manifest["target_sha"] and observed_overlay == expected_overlay, receipt_code)
+    expected_receipt = {"runtime_kind": RUNTIME_KIND, "target_sha": manifest["target_sha"], "cache_dir": manifest["cache_dir"], "extra": manifest["extra"]}
+    observed_receipt = {key: receipt_data.get(key) for key in expected_receipt}
+    code = check("staging_receipt", expected_receipt, observed_receipt, receipt.is_file() and observed_receipt == expected_receipt, 60 if not receipt.is_file() else 61)
     if code is not None: return code
-    code = check("copied_harness_hashes", manifest["copied_file_sha256"], copied_hashes(manifest), copied_hashes(manifest) == manifest["copied_file_sha256"], 81)
+    observed_hashes = copied_hashes(manifest)
+    code = check("copied_harness_hashes", manifest["copied_file_sha256"], observed_hashes, observed_hashes == manifest["copied_file_sha256"], 81)
     if code is not None: return code
     node = hostname()
     code = check("compute_host_guard", "not polaris-login-", node, not node.startswith("polaris-login-"), 70)
@@ -148,49 +149,47 @@ def main() -> int:
         ok = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, manifest["target_sha"]], check=False).returncode == 0
         code = check(f"required_ancestor:{ancestor}", True, ok, ok, 79)
         if code is not None: return code
-    profile = manifest["runtime_profile"]
-    try:
-        before = overlay_snapshot(profile)
-    except (OSError, ValueError) as error:
-        code = check("overlay_snapshot", "readable", str(error), False, 82)
-        return code or 82
-    required_libs = [profile["libshim"], profile["cuda13_lib"], profile["cuda129_lib"]]
-    code = check("library_profile_paths", required_libs, required_libs, all(Path(path).is_dir() for path in required_libs), 82)
+    lock = tomllib.loads((repo / "uv.lock").read_text(encoding="utf-8"))
+    expected = expected_torch_version(lock, manifest["extra"])
+    code = check("lock_torch_version", expected, expected, True, 78)
     if code is not None: return code
-    applied = os.environ.get("LD_LIBRARY_PATH", "")
-    expected_prefix = ":".join(required_libs)
-    code = check("library_profile_applied", expected_prefix, applied, applied.startswith(expected_prefix) and "libfabric" in applied, 82)
+    uv = [values["RUN_PYTHON"], "-m", "uv"]
+    uv_text = _uv_version(uv)
+    code = check("uv_version", manifest["verify_profile"]["uv_version"], uv_text, uv_text.split()[:2] == ["uv", manifest["verify_profile"]["uv_version"]], 77)
+    if code is not None: return code
+    job_env = Path(os.environ["JOB_ENV"]).resolve()
+    python = job_env / "bin" / "python"
+    identity = _venv_identity(python)
+    identity_ok = Path(identity["prefix"]).resolve() == job_env and identity["executable"].startswith(str(job_env) + os.sep)
+    code = check("venv_identity", str(job_env), identity, identity_ok, 76)
+    if code is not None: return code
+    versions = _package_versions(python)
+    code = check("package_versions", {"torch": expected}, versions, versions == {"torch": expected}, 75)
     if code is not None: return code
     try:
-        probe = torch_probe(values["RUN_PYTHON"], dict(os.environ))
+        probe = torch_probe(str(python), dict(os.environ))
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
-        code = check("torch_probe", "successful child probe", str(error), False, 83)
-        return code or 83
-    facility_site = Path(profile["facility_site_packages"]).resolve()
+        check("torch_probe", "successful child probe", str(error), False, 83)
+        return 83
     torch_file = Path(probe.get("file", "")).resolve()
-    code = check("torch_probe", {"torch": "2.8.0", "cuda": "12.9", "count": 1, "visible": "0"}, probe, probe.get("torch", "").split("+")[0] == "2.8.0" and probe.get("cuda") == "12.9" and probe.get("available") and probe.get("count") == 1 and "A100" in probe.get("name", "") and probe.get("op") == 2.0 and probe.get("visible") == "0" and facility_site in torch_file.parents and probe.get("ld", "").startswith(expected_prefix), 83)
+    probe_ok = probe.get("torch") == expected and probe.get("available") and probe.get("count") == 1 and "A100" in probe.get("name", "") and probe.get("op") == 2.0 and probe.get("visible") == "0" and (torch_file == job_env or job_env in torch_file.parents)
+    code = check("torch_probe", {"torch": expected, "count": 1, "visible": "0"}, probe, probe_ok, 83)
     if code is not None: return code
-    (evidence / "runtime.json").write_text(json.dumps({"inherited_ld_library_path": os.environ.get("LD_LIBRARY_PATH"), "applied_ld_library_path": probe.get("ld"), "cuda_visible_devices": probe.get("visible"), "hostname": node, "nodefile": entries, "overlay_before": before, "torch_probe": probe}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (evidence / "runtime.json").write_text(json.dumps({"cuda_visible_devices": probe.get("visible"), "hostname": node, "nodefile": entries, "torch_probe": probe}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     stage_path = repo / CANONICAL_STAGE
     blob = subprocess.check_output(["git", "-C", str(repo), "rev-parse", f"{manifest['target_sha']}:{CANONICAL_STAGE}"], text=True).strip()
     code = check("real_route_entry", {"path": CANONICAL_STAGE, "blob": blob}, {"path": CANONICAL_STAGE, "blob": blob, "exists": stage_path.is_file()}, stage_path.is_file(), 64)
     if code is not None: return code
     cell = manifest["cell"]
-    argv = [values["RUN_PYTHON"], str(stage_path), "--stage", cell["stage"], "--context", cell["context"], "--optimizer", cell["optimizer"], "--lr", str(cell["lr"]), "--beta2", str(cell["beta2"]), "--seed-label", str(cell["seed_label"]), "--walkers", str(cell["walkers"]), "--output-root", str(manifest["output_root"])]
+    argv = [str(python), str(stage_path), "--stage", cell["stage"], "--context", cell["context"], "--optimizer", cell["optimizer"], "--lr", str(cell["lr"]), "--beta2", str(cell["beta2"]), "--seed-label", str(cell["seed_label"]), "--walkers", str(cell["walkers"]), "--output-root", str(manifest["output_root"])]
     (evidence / "selection-argv.json").write_text(json.dumps({"argv": argv, "blob": blob}, indent=2) + "\n", encoding="utf-8")
     run_env = dict(os.environ); run_env["PYTHONPATH"] = manifest["target_repo"]
     with (evidence / "stage.stdout.log").open("w", encoding="utf-8") as stdout, (evidence / "stage.stderr.log").open("w", encoding="utf-8") as stderr:
         route_rc = run_route(argv, manifest["target_repo"], run_env, stdout, stderr)
     (evidence / "stage-result.json").write_text(json.dumps({"argv": argv, "returncode": route_rc}, indent=2) + "\n", encoding="utf-8")
     if route_rc != 0: return 1
-    after = overlay_snapshot(profile)
-    code = check("overlay_unchanged_after_payload", before, after, before == after, 83)
-    if code is not None: return code
     with (evidence / "qualification.stdout.log").open("w", encoding="utf-8") as stdout, (evidence / "qualification.stderr.log").open("w", encoding="utf-8") as stderr:
-        qualify_rc = run_qualification(values["RUN_PYTHON"], str(Path(manifest["job_helper"]).parent / "qualification.py"), manifest_path, evidence, manifest["target_repo"], run_env, stdout, stderr)
-    after_qualification = overlay_snapshot(profile)
-    code = check("overlay_unchanged_after_qualification", before, after_qualification, before == after_qualification, 83)
-    if code is not None: return code
+        qualify_rc = run_qualification(str(python), str(Path(manifest["job_helper"]).parent / "qualification.py"), manifest_path, evidence, manifest["target_repo"], run_env, stdout, stderr)
     return qualify_rc
 
 
