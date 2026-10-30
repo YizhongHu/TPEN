@@ -19,6 +19,7 @@ from tpen.checkpoint.save import save_checkpoint
 
 
 ROOT = Path(__file__).parents[1]
+REPO = ROOT.parents[2]
 sys.path.insert(0, str(ROOT))
 
 
@@ -36,7 +37,7 @@ qualification = _load("qualification")
 
 
 def test_cu126_lock_derivation_and_missing_entry_control() -> None:
-    lock = stage.tomllib.loads((ROOT.parents[2] / "uv.lock").read_text(encoding="utf-8"))
+    lock = stage.tomllib.loads((REPO / "uv.lock").read_text(encoding="utf-8"))
     assert stage.expected_torch_version(lock, "cu126") == "2.12.0+cu126"
     missing = copy.deepcopy(lock)
     project = next(package for package in missing["package"] if package.get("source", {}).get("editable") == ".")
@@ -152,7 +153,8 @@ def test_no_hydra_or_run_root_literals_in_launcher_sources(tmp_path: Path) -> No
 
 
 def test_actual_run_stage_q_parser_rejects_unsupported_argument() -> None:
-    target = ROOT.parents[2] / "atomistic" / "he-importance" / "run_stage_q.py"
+    target = REPO / job.CANONICAL_STAGE
+    assert target.is_file(), target
     spec = importlib.util.spec_from_file_location("real_run_stage_q", target)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
