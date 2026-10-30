@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
 import sys
 from fractions import Fraction
@@ -40,10 +42,17 @@ ACTIVATION_LABELS = (
     "SiLU,channel-MLP",
     "channel-MLP,channel-MLP",
 )
-ADMISSIBLE_ACTIVATION_LABELS = tuple(
+LEGACY_ACTIVATION_LABELS = tuple(
     label for label in ACTIVATION_LABELS if "Softplus" not in label
 )
 
+_LEGACY_FRAGMENT_SHA256 = json.loads(
+    # Generated mechanically from origin/dev at 3425ecf7 with:
+    # git show 3425ecf7d8c0812c2075f4b8c5aaf2adf8cfba67:experiments/atomistic/he-importance/context_mapping.py | python3 -c
+    # 'import sys,types,importlib.util,hashlib,json; m=types.ModuleType("omegaconf"); m.OmegaConf=object; sys.modules["omegaconf"]=m; src=sys.stdin.read(); mod=importlib.util.module_from_spec(importlib.util.spec_from_loader("cm",loader=None)); exec(compile(src,"context_mapping.py","exec"),mod.__dict__); paths=("tensor","linear/coordinate-neighbor","linear/orbit-complete","hybrid/coordinate-neighbor","hybrid/orbit-complete"); acts=("SiLU,SiLU","tanh,tanh","exact GELU,exact GELU","channel-MLP,SiLU","SiLU,channel-MLP","channel-MLP,channel-MLP"); print(json.dumps({f"{path}|{act}":hashlib.sha256(json.dumps(mod.context_fragment(path,activation=act),sort_keys=True).encode()).hexdigest() for path in paths for act in acts},indent=2,sort_keys=True))'
+    # The complete generated table is kept in the JSON fixture, not retyped.
+    (Path(__file__).with_name("legacy_fragment_hashes.json")).read_text()
+)
 
 def test_unknown_labels_refuse_without_a_default() -> None:
     with pytest.raises(context_mapping.UnknownContextLabel):
@@ -463,7 +472,7 @@ def test_composite_owns_gamma_once() -> None:
 
 
 @pytest.mark.parametrize("path_label", PATH_LABELS)
-@pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
+@pytest.mark.parametrize("activation_label", ACTIVATION_LABELS)
 def test_all_35_fragments_have_declared_targets(path_label: str, activation_label: str) -> None:
     fragment = context_mapping.context_fragment(path_label, activation=activation_label)
     assert fragment["mixing"]["_target_"] == "tpen.nn.CompositeMixing"
@@ -491,12 +500,37 @@ def test_activation_parameters_and_named_streams() -> None:
 def test_exact_gelu_and_softplus_beta_two_are_explicit() -> None:
     gelu = context_mapping.context_fragment("tensor", activation="exact GELU,exact GELU")
     assert gelu["mixing"]["activation"] == {"_target_": "torch.nn.GELU", "approximate": "none"}
-    with pytest.raises(context_mapping.UnsupportedActivationLabel):
-        context_mapping.context_fragment("tensor", activation="Softplus beta2,Softplus beta2")
+    softplus = context_mapping.context_fragment(
+        "tensor", activation="Softplus beta2,Softplus beta2"
+    )
+    assert softplus["mixing"]["activation"] == {
+        "_target_": "tpen.nn.SoftplusBeta", "beta": 2.0
+    }
+    assert softplus["path_aggregation"]["activation"] == {
+        "_target_": "tpen.nn.SoftplusBeta", "beta": 2.0
+    }
+    assert "torch.nn.Softplus" not in repr(softplus)
 
 
 @pytest.mark.parametrize("path_label", PATH_LABELS)
-@pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
+@pytest.mark.parametrize("activation_label", LEGACY_ACTIVATION_LABELS)
+def test_legacy_a6_fragments_are_byte_identical_to_dev(
+    path_label: str, activation_label: str
+) -> None:
+    fragment = context_mapping.context_fragment(path_label, activation=activation_label)
+    digest = hashlib.sha256(json.dumps(fragment, sort_keys=True).encode()).hexdigest()
+    assert digest == _LEGACY_FRAGMENT_SHA256[f"{path_label}|{activation_label}"]
+
+
+def test_unmapped_internal_activation_still_raises() -> None:
+    with pytest.raises(AssertionError, match="unmapped internal activation"):
+        context_mapping._activation(
+            "not-a-real-activation", seed=0, site="producer", channels=32
+        )
+
+
+@pytest.mark.parametrize("path_label", PATH_LABELS)
+@pytest.mark.parametrize("activation_label", ACTIVATION_LABELS)
 def test_every_fragment_instantiates(path_label: str, activation_label: str) -> None:
     config = OmegaConf.create(
         context_mapping.context_fragment(path_label, activation=activation_label)
@@ -511,7 +545,7 @@ def test_every_fragment_instantiates(path_label: str, activation_label: str) -> 
 
 
 @pytest.mark.parametrize("path_label", PATH_LABELS)
-@pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
+@pytest.mark.parametrize("activation_label", ACTIVATION_LABELS)
 def test_fragment_splices_into_control_model(path_label: str, activation_label: str) -> None:
     """Resolve the fragment at the real ``model.layers[0]`` location."""
 
@@ -522,6 +556,47 @@ def test_fragment_splices_into_control_model(path_label: str, activation_label: 
     OmegaConf.resolve(train)
     model = instantiate(train.model)
     assert model.stack.layers[0].layout.fingerprint == model.stack.layers[0].mixing.layout.fingerprint
+
+
+def test_softplus_fragment_has_finite_nonzero_coordinate_second_derivative() -> None:
+    train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
+    train.model.layers[0] = OmegaConf.create(
+        context_mapping.context_fragment(
+            "tensor", activation="Softplus beta2,Softplus beta2"
+        )
+    )
+    OmegaConf.resolve(train)
+    model = instantiate(train.model).to(dtype=torch.float64)
+    positions = torch.tensor(
+        [[[0.7, -0.4, 0.2], [-0.3, 0.8, -0.6]]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    batch = instantiate(
+        {
+            "_target_": "tpen.data.batch.ElectronBatch",
+            "positions": positions,
+            "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
+            "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
+            "spins": torch.tensor([[1.0, -1.0]], dtype=torch.float64),
+        }
+    )
+    logabs = model(batch).logabs.sum()
+    first = torch.autograd.grad(logabs, positions, create_graph=True)[0]
+    second = torch.autograd.grad(first.sum(), positions)[0]
+    assert torch.isfinite(second).all()
+    assert torch.any(second != 0.0)
+
+
+@pytest.mark.parametrize("path_label", PATH_LABELS)
+def test_softplus_names_the_stable_module_at_both_sites(path_label: str) -> None:
+    fragment = context_mapping.context_fragment(
+        path_label, activation="Softplus beta2,Softplus beta2"
+    )
+    expected = {"_target_": "tpen.nn.SoftplusBeta", "beta": 2.0}
+    for site in ("mixing", "path_aggregation"):
+        assert fragment[site]["activation"] == expected
+    assert "torch.nn.Softplus" not in json.dumps(fragment)
 
 
 def _he_batch() -> object:
@@ -822,8 +897,8 @@ def _pfaffian_skew_zero_parameters(model: object) -> set[int]:
 
 
 @pytest.mark.parametrize("path_label", PATH_LABELS)
-@pytest.mark.parametrize("activation_label", ADMISSIBLE_ACTIVATION_LABELS)
-def test_all_admissible_fragments_have_finite_he_value_and_gradients(path_label: str, activation_label: str) -> None:
+@pytest.mark.parametrize("activation_label", ACTIVATION_LABELS)
+def test_all_fragments_have_finite_he_value_and_gradients(path_label: str, activation_label: str) -> None:
     train = OmegaConf.load(Path(__file__).with_name("configs") / "train.yaml")
     train.model.layers[0] = OmegaConf.create(
         context_mapping.context_fragment(path_label, activation=activation_label)

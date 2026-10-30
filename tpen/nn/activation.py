@@ -333,10 +333,88 @@ class GaussianActivation(nn.Module):
         return f"sigma={self.sigma}"
 
 
+class _SigmoidStableGrad(torch.autograd.Function):
+    """Sigmoid whose double backward avoids ``1 - sigmoid`` cancellation."""
+
+    @staticmethod
+    def forward(ctx, z: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(z)
+        return torch.sigmoid(z)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
+        (z,) = ctx.saved_tensors
+        return (grad_output * torch.sigmoid(z) * torch.sigmoid(-z),)
+
+
+class _SoftplusBetaFunction(torch.autograd.Function):
+    """Forward formula with explicit stable first and second derivatives."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, beta: float) -> torch.Tensor:
+        ctx.save_for_backward(x)
+        ctx.beta = beta
+        return torch.logaddexp(torch.zeros_like(x), beta * x) / beta
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
+        (x,) = ctx.saved_tensors
+        return grad_output * _SigmoidStableGrad.apply(ctx.beta * x), None
+
+
+class SoftplusBeta(nn.Module):
+    """Stable elementwise softplus ``logaddexp(0, beta*x) / beta``.
+
+    This is the smooth A6 activation specified by the helium-importance scan
+    design, section 2.4.  Unlike :class:`torch.nn.Softplus`, it has no finite
+    threshold at which the function is replaced by a linear branch, so its
+    coordinate second derivatives remain nonzero throughout the finite input
+    domain.
+
+    Parameters
+    ----------
+    beta : float, optional
+        Positive inverse width. Defaults to ``2.0``.
+
+    Raises
+    ------
+    ValueError
+        If ``beta`` is not positive and finite.
+
+    Notes
+    -----
+    The A6 beta-2 instance is nonzero at zero, with ``f(0) = log(2) / 2``.
+    First and second coordinate derivatives use explicit sigmoid products so
+    the Laplacian path remains finite beyond the exponent overflow range.
+    Because the derivative path is implemented by a custom autograd Function,
+    forward-mode AD and ``torch.func``/``vmap`` transforms are unsupported.
+    """
+
+    def __init__(self, *, beta: float = 2.0) -> None:
+        super().__init__()
+        beta = float(beta)
+        if not math.isfinite(beta) or beta <= 0.0:
+            raise ValueError(f"beta must be positive and finite, got {beta}")
+        self.beta = beta
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the stable softplus formula elementwise."""
+
+        return _SoftplusBetaFunction.apply(x, self.beta)
+
+    def extra_repr(self) -> str:
+        """Return the inverse width in the module representation."""
+
+        return f"beta={self.beta}"
+
+
 __all__ = [
     "ChannelActivationAxes",
     "ChannelPreservingMLPActivation",
     "GaussianActivation",
     "OrderMLPLayout",
     "OrderMLPSpec",
+    "SoftplusBeta",
 ]
