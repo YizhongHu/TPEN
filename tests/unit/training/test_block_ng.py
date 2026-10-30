@@ -150,31 +150,44 @@ def test_three_electron_block_ng_float64_oracle_and_float32_sentinels(
                 )
             )
     if solve_dtype == torch.float32:
-        # Measured independently across ALL blocks: max abs lives in a P=4
-        # block, while max relative lives in a different P=32 block. The
-        # full-precision relative measurement was 0.008931180836996507; 9e-3
-        # rounds upward with enough portability headroom while still rejecting
-        # the 0.01021 regression caused by removing energy centering.
-        # The absolute calibration was 1.663939e-4, so this bound also rounds
-        # upward rather than excluding its own observation. It does not catch
-        # the no-centering mutant: its absolute error falls to 1.6209e-4.
+        # Maxima are taken across ALL blocks: max abs lives in a P=4 block,
+        # while max relative lives in a different P=32 block. Both limbs are
+        # facility-sensitive (CPU microarchitecture changes float32 rounding),
+        # so every figure below names the facility it was measured on.
+        #
+        # Relative limb, bound 9.2e-3. This is the discriminating guard: the
+        # no-centering mutant (drop ``energies - energies.mean()`` in
+        # ``build_block_ng_directions``) reaches 0.01021381958083481 on FASRC
+        # Cannon. Observed, unmutated:
+        #   FASRC Cannon  0.008931180836996507  (2.9% below the bound)
+        #   ALCF Polaris  0.008983845429877318  (2.4% below the bound)
+        # The Cannon mutant exceeds the bound by 11.0%. That margin is the
+        # detection power; loosening this bound spends it directly, and at
+        # 1.0e-2 it would be about 2%.
+        #
+        # Absolute limb, bound 3.0e-4. It cannot detect the no-centering
+        # mutant (absolute error 1.6209e-4 on Cannon, below both unmutated
+        # observations), so loosening it costs no detection power. Observed,
+        # unmutated:
+        #   FASRC Cannon  1.663939e-4         (44.5% below the bound)
+        #   ALCF Polaris  2.412932198959071e-4 (19.6% below the bound)
+        # It stays because the relative error is masked to zero where the
+        # expected update is exactly zero, so only this limb checks those
+        # entries.
+        relative_bound = 9.2e-3
+        absolute_bound = 3.0e-4
         max_absolute_error = max(absolute_errors)
         max_relative_error = max(relative_errors)
         # Both maxima and both bounds go into every failure message, so a red
         # on either limb still reports the discriminator.
         limbs = (
-            f"max relative error {max_relative_error!r} (bound 9.0e-3); "
-            f"max absolute error {max_absolute_error!r} (bound 1.664e-4)"
+            f"max relative error {max_relative_error!r} (bound {relative_bound!r}); "
+            f"max absolute error {max_absolute_error!r} (bound {absolute_bound!r})"
         )
-        # The relative limb is the discriminating guard: the no-centering
-        # mutant reaches 0.01021381958083481 and must exceed this sentinel.
-        # It is asserted first so that an absolute false-red on another
-        # facility cannot hide it.
-        assert max_relative_error <= 9.0e-3, f"relative limb failed: {limbs}"
-        # The absolute limb stays: the relative error is masked to zero where
-        # the expected update is exactly zero, so only this limb checks those
-        # entries.
-        assert max_absolute_error <= 1.664e-4, f"absolute limb failed: {limbs}"
+        # The relative limb is asserted first so that an absolute red cannot
+        # hide it.
+        assert max_relative_error <= relative_bound, f"relative limb failed: {limbs}"
+        assert max_absolute_error <= absolute_bound, f"absolute limb failed: {limbs}"
     assert method.last_telemetry is not None
     assert method.last_telemetry.solve_dtype == str(solve_dtype)
 
