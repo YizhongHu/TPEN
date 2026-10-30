@@ -83,19 +83,13 @@ def test_tensor_blocks_cover_the_parameter_layout_once() -> None:
     assert sum(slot.numel for slot in layout.slots) == layout.total_numel
 
 
-@pytest.mark.parametrize(
-    ("solve_dtype", "rtol", "atol"),
-    [(torch.float64, 1.0e-11, 1.0e-11), (torch.float32, 2.0e-4, 2.0e-4)],
-)
-def test_three_electron_block_ng_float64_oracle_and_float32_sentinels(
-    solve_dtype: torch.dtype, rtol: float, atol: float
-) -> None:
-    """Check float64 correctness and frozen-fixture float32 sentinels.
+def _block_ng_oracle_pairs(solve_dtype: torch.dtype, energy_shift: float = 0.0):
+    """Apply one block-NG update and pair each block with its float64 oracle.
 
-    The float32 arm is not an oracle-equivalence claim.  Its all-block error
-    sentinels are specific to this frozen fixture; changing its seeds, sample
-    count, damping, width, or arithmetic sequence invalidates them and
-    requires re-measurement.
+    The update sees ``energies + energy_shift``; the oracle always sees the
+    unshifted energies.  Centering makes the exact update invariant to a
+    constant energy shift, so both sides describe the same mathematical
+    answer for every shift.
     """
 
     model = _connected_model()
@@ -110,7 +104,9 @@ def test_three_electron_block_ng_float64_oracle_and_float32_sentinels(
         policy=BlockNGPolicy(damping=damping, learning_rate=1.0, solve_dtype=solve_dtype),
     )
 
-    assert method.update(_input(model, batch, packet, energies)).applied
+    assert method.update(_input(model, batch, packet, energies + energy_shift)).applied
+    assert method.last_telemetry is not None
+    assert method.last_telemetry.solve_dtype == str(solve_dtype)
     # Build reference and observed pairings independently by slot ordinal. A
     # same-shape block permutation must therefore disagree with its owner.
     scores_by_ordinal = {
@@ -125,8 +121,7 @@ def test_three_electron_block_ng_float64_oracle_and_float32_sentinels(
         slot.ordinal: (before[slot.ordinal] - tuple(model.parameters())[slot.ordinal].detach())
         for slot in model.parameter_binding.layout.slots
     }
-    absolute_errors = []
-    relative_errors = []
+    pairs = []
     for slot in model.parameter_binding.layout.slots:
         expected = _numpy_block_oracle(
             scores_by_ordinal[slot.ordinal].detach().numpy().reshape(6, -1),
@@ -134,62 +129,98 @@ def test_three_electron_block_ng_float64_oracle_and_float32_sentinels(
             damping,
         )
         actual = updates_by_ordinal[slot.ordinal].numpy().reshape(-1)
-        if solve_dtype == torch.float64:
-            np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol)
-        else:
-            error = np.abs(actual - expected)
-            absolute_errors.append(float(error.max()))
-            relative_errors.append(
-                float(
-                    np.divide(
-                        error,
-                        np.abs(expected),
-                        out=np.zeros_like(error),
-                        where=np.abs(expected) > 0.0,
-                    ).max()
-                )
-            )
-    if solve_dtype == torch.float32:
-        # Maxima are taken across ALL blocks: max abs lives in a P=4 block,
-        # while max relative lives in a different P=32 block. Both limbs are
-        # facility-sensitive (CPU microarchitecture changes float32 rounding),
-        # so every figure below names the facility it was measured on.
-        #
-        # Relative limb, bound 9.2e-3. This is the discriminating guard: the
-        # no-centering mutant (drop ``energies - energies.mean()`` in
-        # ``build_block_ng_directions``) reaches 0.01021381958083481 on FASRC
-        # Cannon. Observed, unmutated:
-        #   FASRC Cannon  0.008931180836996507  (2.9% below the bound)
-        #   ALCF Polaris  0.008983845429877318  (2.4% below the bound)
-        # The Cannon mutant exceeds the bound by 11.0%. That margin is the
-        # detection power; loosening this bound spends it directly, and at
-        # 1.0e-2 it would be about 2%.
-        #
-        # Absolute limb, bound 3.0e-4. It cannot detect the no-centering
-        # mutant (absolute error 1.6209e-4 on Cannon, below both unmutated
-        # observations), so loosening it costs no detection power. Observed,
-        # unmutated:
-        #   FASRC Cannon  1.663939e-4         (44.5% below the bound)
-        #   ALCF Polaris  2.412932198959071e-4 (19.6% below the bound)
-        # It stays because the relative error is masked to zero where the
-        # expected update is exactly zero, so only this limb checks those
-        # entries.
-        relative_bound = 9.2e-3
-        absolute_bound = 3.0e-4
-        max_absolute_error = max(absolute_errors)
-        max_relative_error = max(relative_errors)
-        # Both maxima and both bounds go into every failure message, so a red
-        # on either limb still reports the discriminator.
-        limbs = (
-            f"max relative error {max_relative_error!r} (bound {relative_bound!r}); "
-            f"max absolute error {max_absolute_error!r} (bound {absolute_bound!r})"
+        pairs.append((actual, expected))
+    return pairs
+
+
+def _max_oracle_errors(pairs) -> tuple[float, float]:
+    """Return the all-block maximum absolute and relative errors.
+
+    Relative error is zero wherever the oracle entry is exactly zero, so only
+    the absolute error sees those entries.
+    """
+
+    absolute = 0.0
+    relative = 0.0
+    for actual, expected in pairs:
+        error = np.abs(actual - expected)
+        absolute = max(absolute, float(error.max()))
+        relative = max(
+            relative,
+            float(
+                np.divide(
+                    error,
+                    np.abs(expected),
+                    out=np.zeros_like(error),
+                    where=np.abs(expected) > 0.0,
+                ).max()
+            ),
         )
-        # The relative limb is asserted first so that an absolute red cannot
-        # hide it.
-        assert max_relative_error <= relative_bound, f"relative limb failed: {limbs}"
-        assert max_absolute_error <= absolute_bound, f"absolute limb failed: {limbs}"
-    assert method.last_telemetry is not None
-    assert method.last_telemetry.solve_dtype == str(solve_dtype)
+    return absolute, relative
+
+
+def test_three_electron_block_ng_matches_the_float64_oracle() -> None:
+    """A float64 solve reproduces the independent NumPy oracle block by block."""
+
+    for actual, expected in _block_ng_oracle_pairs(torch.float64):
+        np.testing.assert_allclose(actual, expected, rtol=1.0e-11, atol=1.0e-11)
+
+
+def test_three_electron_float32_block_ng_is_invariant_to_an_energy_shift() -> None:
+    """A constant energy shift must not change the float32 error against the oracle.
+
+    This is a same-run comparison, not a calibrated threshold.  Energy
+    centering makes the exact update invariant to a constant shift ``C``.
+    Without centering, the float32 gradient picks up a term proportional to
+    ``mean(E + C)`` times the rounding residue of the centered score column
+    sums (zero in exact arithmetic), so the error grows with ``C``.  Both
+    sides of the ratio come from the same process on the same machine, so the
+    machine's float32 rounding level divides out.
+    """
+
+    shift = 1.0e3
+    # Bound on (shifted error) / (unshifted error), all-block maxima, measured
+    # at this shift with torch 2.12.0+cpu.  Each facility was run at two
+    # torch thread counts (Cannon 1 and 4, Polaris 1 and 32), which agreed to
+    # within 0.1% at this shift:
+    #
+    #                                   relative ratio   absolute ratio
+    #   healthy  FASRC Cannon (8480CL)       0.887            1.044
+    #   healthy  ALCF Polaris (7543P)        1.022            1.022
+    #   mutant   FASRC Cannon (8480CL)     159.5            221.3
+    #   mutant   ALCF Polaris (7543P)      164.0            114.5
+    #
+    # "mutant" drops ``energies - energies.mean()`` in
+    # ``build_block_ng_directions``.  The bound sits near the geometric mean
+    # of the worst healthy ratio (1.044) and the weakest mutant ratio (114.5),
+    # leaving roughly 10x on each side.  Smaller shifts separate less: at a
+    # shift of 10 the mutant ratio was only about 1.6 to 2.2 on Cannon.  For
+    # contrast, the UNSHIFTED mutant error sits only 14% above healthy on
+    # Cannon and only 1% above it on Polaris, which is why a fixed error
+    # threshold could not separate them portably.
+    ratio_bound = 10.0
+    base_absolute, base_relative = _max_oracle_errors(_block_ng_oracle_pairs(torch.float32))
+    shifted_absolute, shifted_relative = _max_oracle_errors(
+        _block_ng_oracle_pairs(torch.float32, energy_shift=shift)
+    )
+    report = (
+        f"shift {shift!r}: max relative error {base_relative!r} -> {shifted_relative!r}; "
+        f"max absolute error {base_absolute!r} -> {shifted_absolute!r}"
+    )
+    # Relative limb first: it is the one the shift amplifies most.
+    assert shifted_relative <= ratio_bound * base_relative, f"relative limb failed: {report}"
+    # The absolute limb also covers entries whose oracle value is exactly
+    # zero (this fixture currently has none; the limb keeps that true if the
+    # fixture changes).
+    assert shifted_absolute <= ratio_bound * base_absolute, f"absolute limb failed: {report}"
+    # Deliberately UNCALIBRATED backstop.  It catches an unshifted float32
+    # solve that is wrong by an order of magnitude, which the ratio above
+    # cannot see because both of its sides would be wrong together.  These
+    # numbers were chosen as round orders of magnitude well clear of any
+    # healthy observation, not fitted to one; do not tighten them toward a
+    # measured value, because that recreates a hardware-calibrated bound.
+    assert base_relative <= 1.0e-1, f"backstop failed: {report}"
+    assert base_absolute <= 1.0e-2, f"backstop failed: {report}"
 
 
 def test_zero_score_column_stays_exactly_zero_with_a_live_block_direction() -> None:
