@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import importlib
 import importlib.util
 import json
 import os
@@ -155,10 +156,8 @@ def test_no_hydra_or_run_root_literals_in_launcher_sources(tmp_path: Path) -> No
 def test_actual_run_stage_q_parser_rejects_unsupported_argument() -> None:
     target = REPO / job.CANONICAL_STAGE
     assert target.is_file(), target
-    spec = importlib.util.spec_from_file_location("real_run_stage_q", target)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
+    module = importlib.import_module("experiments.atomistic.he-importance.run_stage_q")
+    assert Path(module.__file__).resolve() == target.resolve()
     try:
         module.build_parser().parse_args(["--not-a-real-override"])
     except SystemExit as error:
