@@ -176,6 +176,11 @@ def test_three_electron_float32_block_ng_is_invariant_to_an_energy_shift() -> No
     sums (zero in exact arithmetic), so the error grows with ``C``.  Both
     sides of the ratio come from the same process on the same machine, so the
     machine's float32 rounding level divides out.
+
+    Do not replace the ratio with a difference or a fixed error threshold: a
+    difference needs a magnitude, and a magnitude is a hardware calibration
+    again.  The previous fixed thresholds were correct on the machine they
+    were measured on and failed on the next one.
     """
 
     shift = 1.0e3
@@ -193,7 +198,10 @@ def test_three_electron_float32_block_ng_is_invariant_to_an_energy_shift() -> No
     # "mutant" drops ``energies - energies.mean()`` in
     # ``build_block_ng_directions``.  The bound sits near the geometric mean
     # of the worst healthy ratio (1.044) and the weakest mutant ratio (114.5),
-    # leaving roughly 10x on each side.  Smaller shifts separate less: at a
+    # leaving roughly 10x on each side.  Across every shift tried (-10 to
+    # 1000) the healthy ratios stayed within 0.67-1.04 on Cannon and
+    # 0.997-1.022 on Polaris; the weakest mutant ratio at this shift is the
+    # Polaris absolute 114.5.  Smaller shifts separate less: at a
     # shift of 10 the mutant ratio was only about 1.6 to 2.2 on Cannon.  For
     # contrast, the UNSHIFTED mutant error sits only 14% above healthy on
     # Cannon and only 1% above it on Polaris, which is why a fixed error
@@ -207,11 +215,14 @@ def test_three_electron_float32_block_ng_is_invariant_to_an_energy_shift() -> No
         f"shift {shift!r}: max relative error {base_relative!r} -> {shifted_relative!r}; "
         f"max absolute error {base_absolute!r} -> {shifted_absolute!r}"
     )
-    # Relative limb first: it is the one the shift amplifies most.
+    # Relative limb first, then absolute; at this shift either limb alone
+    # separates the mutant on both facilities.
     assert shifted_relative <= ratio_bound * base_relative, f"relative limb failed: {report}"
-    # The absolute limb also covers entries whose oracle value is exactly
-    # zero (this fixture currently has none; the limb keeps that true if the
-    # fixture changes).
+    # Relative error is masked to zero where the oracle entry is exactly
+    # zero, so only the absolute limb would see such entries.  This fixture
+    # has NONE (measured on both facilities), so that role is currently
+    # vacuous; the absolute limb is kept because it separates the mutant on
+    # its own, not to protect zero entries.
     assert shifted_absolute <= ratio_bound * base_absolute, f"absolute limb failed: {report}"
     # Deliberately UNCALIBRATED backstop.  It catches an unshifted float32
     # solve that is wrong by an order of magnitude, which the ratio above
