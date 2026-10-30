@@ -41,6 +41,16 @@ def test_initializer_seed_changes_initialized_parameters() -> None:
         assert not torch.equal(first.weight, second.weight)
 
 
+def test_fresh_named_stream_generators_repeat_the_same_normal_draws() -> None:
+    first = torch.empty(7, dtype=torch.float64)
+    second = torch.empty(7, dtype=torch.float64)
+
+    TorchInitializer(seed=37, stream="readout/a12").normal_(first)
+    TorchInitializer(seed=37, stream="readout/a12").normal_(second)
+
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+
 def test_mlp_uses_explicit_initializer_without_global_rng_mutation() -> None:
     torch.manual_seed(999)
     before = torch.get_rng_state()

@@ -11,6 +11,7 @@ from typeguard import TypeCheckError
 from tpen.data.batch import ElectronBatch
 from tpen.data.permutation import all_permutations
 from tpen.data.real import Feature, zero_block
+from tpen.nn import TorchInitializer
 from tpen.nn.readout import PfaffianReadout
 from tpen.nn.readout.pfaffian import _ODD_PADDING_IRREP, _pfaffian_single, pfaffian
 
@@ -432,3 +433,234 @@ def test_pfaffian_readout_gradients_reach_channel_weights() -> None:
     assert gradient is not None
     assert torch.all(torch.isfinite(gradient))
     assert gradient.abs().sum() > 0
+
+
+def test_pfaffian_readout_default_initialization_preserves_control_surface() -> None:
+    readout = PfaffianReadout(pair_channels=3)
+
+    assert readout.initialization == "equal"
+    assert torch.equal(readout.channel_weight_buffer, torch.full((3,), 1.0 / 3))
+    assert set(readout.state_dict()) == set()
+    assert set(dict(readout.named_parameters())) == set()
+    assert set(dict(readout.named_buffers())) == {"channel_weight_buffer"}
+
+
+def _weights(readout: PfaffianReadout, trainable: bool) -> torch.Tensor:
+    return readout.channel_weights.detach() if trainable else readout.channel_weight_buffer
+
+
+@pytest.mark.parametrize("initialization", ["signed_l1", "random_direction_l2"])
+@pytest.mark.parametrize("trainable", [False, True])
+def test_pfaffian_readout_random_initializations_match_closed_form(
+    initialization: str,
+    trainable: bool,
+) -> None:
+    initializer = TorchInitializer(seed=810012, stream="readout/a12")
+    readout = PfaffianReadout(
+        pair_channels=4,
+        initialization=initialization,
+        trainable=trainable,
+        initializer=initializer,
+    )
+    frozen = PfaffianReadout(
+        pair_channels=4,
+        initialization=initialization,
+        initializer=TorchInitializer(seed=810012, stream="readout/a12"),
+    )
+    weights = _weights(readout, trainable)
+    assert torch.equal(weights, frozen.channel_weight_buffer)
+
+    z = torch.empty(4, dtype=torch.float64, device="cpu")
+    TorchInitializer(seed=810012, stream="readout/a12").normal_(z)
+    if initialization == "signed_l1":
+        expected = z / z.abs().sum()
+        assert torch.isclose(
+            weights.abs().sum(),
+            torch.ones((), dtype=torch.float64),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+    else:
+        expected = z / (math.sqrt(4) * torch.linalg.vector_norm(z))
+        assert torch.isclose(
+            math.sqrt(4) * torch.linalg.vector_norm(weights),
+            torch.ones((), dtype=torch.float64),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+    assert torch.equal(weights, expected)
+
+
+@pytest.mark.parametrize("initialization", ["signed_l1", "random_direction_l2"])
+def test_pfaffian_readout_runner_upcast_preserves_float64_closed_form(initialization: str) -> None:
+    z = torch.empty(4, dtype=torch.float64, device="cpu")
+    TorchInitializer(seed=810012, stream="readout/a12").normal_(z)
+    expected = (
+        z / z.abs().sum()
+        if initialization == "signed_l1"
+        else z / (math.sqrt(4) * torch.linalg.vector_norm(z))
+    )
+    readout = PfaffianReadout(
+        pair_channels=4,
+        initialization=initialization,
+        trainable=True,
+        initializer=TorchInitializer(seed=810012, stream="readout/a12"),
+    ).to(dtype=torch.float64)
+
+    assert torch.equal(readout.channel_weights.detach(), expected)
+
+
+@pytest.mark.parametrize("trainable", [False, True])
+def test_pfaffian_readout_a12_random_modes_share_paired_direction(trainable: bool) -> None:
+    seed_stream = TorchInitializer(seed=810013, stream="readout/a12")
+    l1 = PfaffianReadout(
+        pair_channels=4,
+        initialization="signed_l1",
+        initializer=seed_stream,
+        trainable=trainable,
+    )
+    l2 = PfaffianReadout(
+        pair_channels=4,
+        initialization="random_direction_l2",
+        initializer=TorchInitializer(seed=810013, stream="readout/a12"),
+        trainable=trainable,
+    )
+
+    l1_weights = _weights(l1, trainable)
+    l2_weights = _weights(l2, trainable)
+    ratio = l1_weights / l2_weights
+    torch.testing.assert_close(ratio, ratio[0].expand_as(ratio), rtol=1e-6, atol=1e-7)
+    assert torch.all(ratio > 0)
+
+
+@pytest.mark.parametrize("trainable", [False, True])
+def test_pfaffian_readout_named_stream_is_independent_of_global_rng_and_construction_order(
+    trainable: bool,
+) -> None:
+    torch.manual_seed(1)
+    before = torch.get_rng_state()
+    first = PfaffianReadout(
+        pair_channels=4,
+        initialization="signed_l1",
+        initializer=TorchInitializer(seed=810014, stream="readout/a12"),
+        trainable=trainable,
+    )
+    assert torch.equal(before, torch.get_rng_state())
+    torch.manual_seed(2)
+    _ = PfaffianReadout(pair_channels=9)
+    second = PfaffianReadout(
+        pair_channels=4,
+        initialization="signed_l1",
+        initializer=TorchInitializer(seed=810014, stream="readout/a12"),
+        trainable=trainable,
+    )
+
+    first_weights = _weights(first, trainable)
+    second_weights = _weights(second, trainable)
+    other_seed = PfaffianReadout(
+        pair_channels=4,
+        initialization="signed_l1",
+        initializer=TorchInitializer(seed=810015, stream="readout/a12"),
+        trainable=trainable,
+    )
+    other_stream = PfaffianReadout(
+        pair_channels=4,
+        initialization="signed_l1",
+        initializer=TorchInitializer(seed=810014, stream="readout/other"),
+        trainable=trainable,
+    )
+    assert torch.equal(first_weights, second_weights)
+    assert not torch.equal(first_weights, _weights(other_seed, trainable))
+    assert not torch.equal(first_weights, _weights(other_stream, trainable))
+
+
+@pytest.mark.parametrize("initialization", ["signed_l1", "random_direction_l2"])
+def test_pfaffian_readout_random_modes_refuse_unseeded_initializers(initialization: str) -> None:
+    for initializer in (None, TorchInitializer(seed=None, stream="readout/a12")):
+        with pytest.raises(ValueError, match="explicitly seeded"):
+            PfaffianReadout(pair_channels=2, initialization=initialization, initializer=initializer)
+
+
+@pytest.mark.parametrize("initialization", ["signed_l1", "random_direction_l2"])
+@pytest.mark.parametrize("trainable", [False, True])
+def test_pfaffian_readout_random_c2_one_is_exactly_unit_magnitude(
+    initialization: str,
+    trainable: bool,
+) -> None:
+    readout = PfaffianReadout(
+        pair_channels=1,
+        initialization=initialization,
+        trainable=trainable,
+        initializer=TorchInitializer(seed=810017, stream="readout/a12"),
+    )
+    weights = _weights(readout, trainable)
+    assert torch.equal(weights.abs(), torch.ones(1, dtype=torch.float64))
+
+
+def test_pfaffian_readout_random_modes_forward_with_float32_features() -> None:
+    features = Feature([block.to(dtype=torch.float32) for block in _pfaffian_features().blocks])
+    batch = ElectronBatch(positions=torch.zeros(1, 2, 1, dtype=torch.float32))
+    readout = PfaffianReadout(
+        pair_channels=2,
+        initialization="signed_l1",
+        initializer=TorchInitializer(seed=810018, stream="readout/a12"),
+    )
+
+    output = readout(features, batch)
+
+    assert output.logabs.shape == (1,)
+    assert output.logabs.dtype == torch.float64
+
+
+def test_pfaffian_readout_random_modes_pin_normal_draw_to_cpu() -> None:
+    if not hasattr(torch, "set_default_device") or not hasattr(torch, "get_default_device"):
+        pytest.skip("torch default-device controls unavailable; CPU draw is UNMEASURED")
+    try:
+        torch.set_default_device("cpu")
+        cpu = PfaffianReadout(
+            pair_channels=3,
+            initialization="signed_l1",
+            initializer=TorchInitializer(seed=810019, stream="readout/a12"),
+        ).channel_weight_buffer
+        torch.set_default_device("meta")
+        other = PfaffianReadout(
+            pair_channels=3,
+            initialization="signed_l1",
+            initializer=TorchInitializer(seed=810019, stream="readout/a12"),
+        ).channel_weight_buffer
+    finally:
+        torch.set_default_device(None)
+
+    assert cpu.device.type == "cpu"
+    assert other.device.type == "cpu"
+    assert torch.equal(cpu, other)
+
+
+@pytest.mark.parametrize("initialization", ["equal", "signed_l1", "random_direction_l2"])
+@pytest.mark.parametrize("trainable", [False, True])
+def test_pfaffian_readout_initialization_preserves_trainability(
+    initialization: str,
+    trainable: bool,
+) -> None:
+    kwargs = {} if initialization == "equal" else {
+        "initializer": TorchInitializer(seed=810016, stream="readout/a12")
+    }
+    readout = PfaffianReadout(
+        pair_channels=2,
+        initialization=initialization,
+        trainable=trainable,
+        **kwargs,
+    )
+    if trainable:
+        readout(_pfaffian_features(), _batch()).aux["pfaffian"].sum().backward()
+        assert isinstance(readout.channel_weights, torch.nn.Parameter)
+        assert readout.channel_weights.grad is not None
+        assert readout.channel_weights.grad.abs().sum() > 0
+    else:
+        assert "channel_weights" not in dict(readout.named_parameters())
+        assert "channel_weight_buffer" in dict(readout.named_buffers())
+
+
+def test_pfaffian_readout_rejects_unknown_initialization() -> None:
+    with pytest.raises(ValueError, match="Unknown PfaffianReadout initialization"):
+        PfaffianReadout(pair_channels=2, initialization="normal")
