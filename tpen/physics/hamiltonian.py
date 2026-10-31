@@ -28,7 +28,7 @@ from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 import torch
 
 from tpen.data.atomic_configuration import strict_equal_atomic_configurations
-from tpen.data.batch import ElectronBatch, WavefunctionOutput
+from tpen.data.batch import ElectronBatch, WavefunctionOutput, slice_flat_batch
 from tpen.naming import camel_to_snake
 from tpen.physics.operators import (
     ELECTRON_NUCLEUS_COULOMB,
@@ -650,6 +650,141 @@ def local_energy(
     return _NAIVE_EVALUATOR.evaluate(terms, context, return_terms=return_terms)
 
 
+def evaluate_local_energy_in_chunks(
+    terms: Mapping[str, HamiltonianTerm],
+    wavefunction,
+    batch: ElectronBatch,
+    *,
+    return_terms: bool = False,
+    chunk_size: int | None = None,
+    evaluator: LocalEnergyEvaluator | None = None,
+) -> torch.Tensor | LocalEnergyResult:
+    """Evaluate local energy on bounded flattened batches.
+
+    Peak device memory of the autodiff kinetic term grows with the number of
+    configurations evaluated at once. This executor bounds it by evaluating
+    consecutive slices of the flattened sample axis and concatenating the
+    detached per-configuration values in order.
+
+    Parameters
+    ----------
+    terms : Mapping[str, HamiltonianTerm]
+        Hamiltonian contributions, as accepted by `normalize_hamiltonian_terms`.
+    wavefunction : callable
+        Wavefunction model or exact reference returning ``WavefunctionOutput``.
+    batch : ElectronBatch
+        Electron configuration batch; all sample axes are flattened first.
+    return_terms : bool, optional
+        If ``True``, return a ``LocalEnergyResult`` with the ordered named
+        decomposition, the signed-log values (``logabs`` and ``sign`` only),
+        and any per-electron kinetic attribution.
+    chunk_size : int or None, optional
+        Maximum configurations per evaluation. ``None`` or a non-positive value
+        evaluates the whole flattened batch as one chunk.
+    evaluator : LocalEnergyEvaluator or None, optional
+        Evaluator applied to each chunk; defaults to the naive reference.
+
+    Returns
+    -------
+    torch.Tensor or LocalEnergyResult
+        Detached local energy with shape ``[n_configurations]``, or the
+        detached decomposition when ``return_terms=True``.
+
+    Notes
+    -----
+    Every returned tensor is detached, so no gradient flows through local
+    energy. That is the VMC score-function contract: the objective
+    differentiates only ``logabs`` from a separate forward pass.
+    """
+
+    flat = batch.flatten_samples()
+    batch_size = flat.batch_size
+    if batch_size == 0:
+        total = torch.empty(0, device=flat.device, dtype=flat.dtype)
+        return LocalEnergyResult(total=total, terms={}) if return_terms else total
+
+    size = batch_size if chunk_size is None or int(chunk_size) <= 0 else int(chunk_size)
+    total_chunks: list[torch.Tensor] = []
+    term_chunks: dict[str, list[torch.Tensor]] = {}
+    logabs_chunks: list[torch.Tensor] = []
+    sign_chunks: list[torch.Tensor] = []
+    per_electron_kinetic_chunks: list[torch.Tensor] = []
+    term_order: tuple[str, ...] | None = None
+    captured_wavefunction = False
+    captured_per_electron_kinetic = False
+    selected_evaluator = _NAIVE_EVALUATOR if evaluator is None else evaluator
+    for start in range(0, batch_size, size):
+        chunk = slice_flat_batch(flat, start, min(start + size, batch_size))
+        result = selected_evaluator.evaluate(
+            terms,
+            selected_evaluator.make_context(wavefunction, chunk),
+            return_terms=return_terms,
+        )
+        value = None
+        if return_terms:
+            if not isinstance(result, LocalEnergyResult):
+                raise TypeError("local_energy(return_terms=True) must return LocalEnergyResult")
+            chunk_terms = tuple(result.terms)
+            if term_order is None:
+                term_order = chunk_terms
+            elif chunk_terms != term_order:
+                raise ValueError("chunked local-energy terms changed between chunks")
+            total_chunks.append(result.total.detach())
+            for name, value in result.terms.items():
+                term_chunks.setdefault(name, []).append(value.detach())
+            output = result.wavefunction_output
+            if output is not None:
+                captured_wavefunction = True
+                # Keep only the signed-log primitives. ``aux`` and the original
+                # output may retain the derivative graph used by the kinetic
+                # term, so neither may escape the current chunk.
+                logabs_chunks.append(output.logabs.detach().reshape(-1))
+                sign_chunks.append(output.sign.detach().reshape(-1))
+            if result.per_electron_kinetic is not None:
+                captured_per_electron_kinetic = True
+                per_electron_kinetic_chunks.append(
+                    result.per_electron_kinetic.detach()
+                )
+        else:
+            if not isinstance(result, torch.Tensor):
+                raise TypeError("local_energy(return_terms=False) must return a torch.Tensor")
+            total_chunks.append(result.detach())
+            output = None
+
+        # The evaluator's result, output, and term tensors can own the
+        # derivative graph.  Return only detached tensors above, then end all
+        # bindings to graph-bearing values before the next evaluator call.
+        del result, output, value, chunk
+    total = torch.cat(total_chunks, dim=0)
+    if not return_terms:
+        return total
+    wavefunction_output = None
+    if captured_wavefunction:
+        if len(logabs_chunks) != len(total_chunks):
+            raise ValueError("wavefunction output was not produced for every local-energy chunk")
+        wavefunction_output = WavefunctionOutput(
+            logabs=torch.cat(logabs_chunks, dim=0),
+            sign=torch.cat(sign_chunks, dim=0),
+        )
+    per_electron_kinetic = None
+    if captured_per_electron_kinetic:
+        if len(per_electron_kinetic_chunks) != len(total_chunks):
+            raise ValueError(
+                "per-electron kinetic attribution was not produced for every "
+                "local-energy chunk"
+            )
+        per_electron_kinetic = torch.cat(
+            per_electron_kinetic_chunks,
+            dim=0,
+        )
+    return LocalEnergyResult(
+        total=total,
+        terms={name: torch.cat(chunks, dim=0) for name, chunks in term_chunks.items()},
+        wavefunction_output=wavefunction_output,
+        per_electron_kinetic=per_electron_kinetic,
+    )
+
+
 def _validate_local_energy_result(
     name: str,
     result: object,
@@ -811,6 +946,7 @@ __all__ = [
     "AnalyticCuspEvaluator",
     "NaiveLocalEnergyContext",
     "NaiveLocalEnergyEvaluator",
+    "evaluate_local_energy_in_chunks",
     "local_energy",
     "normalize_hamiltonian_terms",
     "summarize_local_energy",

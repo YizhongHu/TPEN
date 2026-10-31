@@ -418,6 +418,69 @@ def test_return_terms_false_uses_tensor_fallback_and_releases_graph() -> None:
     assert released and all(released)
 
 
+def test_enabled_chunk_size_selects_bounded_local_energy_route(monkeypatch) -> None:
+    model = _TinyWavefunction()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    sampler = _FixedSampler(_batch())
+    calls: list[int | None] = []
+    original = trainer_module.evaluate_local_energy_in_chunks
+
+    def bounded(*args, **kwargs):
+        calls.append(kwargs["chunk_size"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(trainer_module, "evaluate_local_energy_in_chunks", bounded)
+    VMCTrainer(max_steps=1, local_energy_chunk_size=2).fit(
+        model=model,
+        sampler=sampler,
+        hamiltonian_terms=[],
+        optimizer=optimizer,
+        context=_Records(),
+        emit=lambda *args, **kwargs: None,
+    )
+
+    assert calls == [2]
+
+
+def test_none_chunk_size_keeps_legacy_local_energy_route(monkeypatch) -> None:
+    model = _TinyWavefunction()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    sampler = _FixedSampler(_batch())
+    legacy_calls = 0
+    bounded_calls = 0
+    original_legacy = trainer_module.local_energy
+
+    def legacy(*args, **kwargs):
+        nonlocal legacy_calls
+        legacy_calls += 1
+        return original_legacy(*args, **kwargs)
+
+    def bounded(*args, **kwargs):
+        nonlocal bounded_calls
+        bounded_calls += 1
+        return original_legacy(*args, **kwargs)
+
+    monkeypatch.setattr(trainer_module, "local_energy", legacy)
+    monkeypatch.setattr(trainer_module, "evaluate_local_energy_in_chunks", bounded)
+    VMCTrainer(max_steps=1).fit(
+        model=model,
+        sampler=sampler,
+        hamiltonian_terms=[],
+        optimizer=optimizer,
+        context=_Records(),
+        emit=lambda *args, **kwargs: None,
+    )
+
+    assert legacy_calls == 1
+    assert bounded_calls == 0
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, 1.5, "2"])
+def test_invalid_local_energy_chunk_size_rejects_before_sampling(invalid) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        VMCTrainer(max_steps=1, local_energy_chunk_size=invalid)
+
+
 def test_fit_graph_release_integration_is_red_without_handoff() -> None:
     with pytest.raises(AssertionError):
         _run_lifecycle(tensor_fallback=False, skip_handoff=True)
