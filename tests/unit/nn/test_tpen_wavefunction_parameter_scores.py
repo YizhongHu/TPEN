@@ -180,17 +180,22 @@ def _is_vmapped(tensor: torch.Tensor) -> bool:
 
     ``torch.autograd.grad(..., is_grads_batched=True)`` runs the backward under
     vmap, so a custom backward sees batched cotangents there and ordinary ones
-    on the per-sample route. Both the functorch and the legacy batched-tensor
-    predicates are consulted because which one the batched-VJP path produces is
-    a PyTorch implementation detail.
+    on the per-sample route. On current PyTorch that path is the legacy
+    prototype vmap (``torch._vmap_internals._vmap`` wrapping cotangents with
+    ``torch._add_batch_dim``), so ``is_legacy_batchedtensor`` is the predicate
+    that fires; ``is_batchedtensor`` is consulted for forward compatibility in
+    case the batched-VJP path moves to ``torch.func.vmap``.
     """
 
+    return any(predicate(tensor) for predicate in _batched_tensor_predicates())
+
+
+def _batched_tensor_predicates() -> tuple:
+    """Return whichever private batched-tensor predicates this PyTorch has."""
+
     functorch = torch._C._functorch
-    predicates = (
-        getattr(functorch, "is_batchedtensor", None),
-        getattr(functorch, "is_legacy_batchedtensor", None),
-    )
-    return any(predicate is not None and predicate(tensor) for predicate in predicates)
+    names = ("is_batchedtensor", "is_legacy_batchedtensor")
+    return tuple(getattr(functorch, name) for name in names if hasattr(functorch, name))
 
 
 class _BatchedRouteOnlyWrongSoftplusFunction(torch.autograd.Function):
@@ -233,7 +238,8 @@ def _assert_slow_and_chunked_scores_close(model: TPENWaveFunction) -> None:
     The bar is ``rtol=atol=1e-10``, the convention
     `test_slow_and_chunked_scores_agree_for_all_landed_modes` and
     `test_flattened_j_and_jt_products_match_ordinary_autograd` already apply
-    to this same comparison. It is NOT bitwise equality, because bitwise
+    to the same two routes (the latter writes the per-sample route as its own
+    ``autograd.grad`` loop). It is NOT bitwise equality, because bitwise
     equality is not a property these two routes have:
 
     * Chunking is not the difference. Each chunk is an independent
@@ -250,6 +256,13 @@ def _assert_slow_and_chunked_scores_close(model: TPENWaveFunction) -> None:
     Do not tighten this back to zero. Do not loosen it to fit an observed
     difference either: `test_softplus_batched_route_defect_is_caught_by_the_bar`
     is the evidence that this bar still resolves a real derivative defect.
+
+    What this comparison CANNOT prove: it only detects defects that DIFFER
+    between the two routes. A defect common to both, such as a wrong
+    derivative formula applied identically on each, cancels in the comparison
+    and passes under any tolerance, including exact equality. Correctness of
+    the derivative itself must come from an independent reference, such as the
+    activation's own derivative tests; do not read this test as covering it.
     """
 
     batch = _batch()
@@ -275,17 +288,29 @@ def test_softplus_fragment_chunked_scores_match_slow_batched_vjps() -> None:
 def test_softplus_batched_route_defect_is_caught_by_the_bar(monkeypatch: pytest.MonkeyPatch) -> None:
     """The slow-versus-chunked bar must reject a batched-route-only defect."""
 
-    monkeypatch.setattr(activation_module, "_SoftplusBetaFunction", _BatchedRouteOnlyWrongSoftplusFunction)
-    monkeypatch.setattr(_BatchedRouteOnlyWrongSoftplusFunction, "hits", {"batched": 0, "ordinary": 0})
+    # Without a predicate the mutant is correct on both routes and the red
+    # below would fail as an unexplained DID NOT RAISE.
+    assert _batched_tensor_predicates(), "no batched-tensor predicate in torch._C._functorch"
+    mutant = _BatchedRouteOnlyWrongSoftplusFunction
+    monkeypatch.setattr(activation_module, "_SoftplusBetaFunction", mutant)
     model = _softplus_fragment_model()
-    assert any(isinstance(module, SoftplusBeta) for module in model.modules())
+    # At beta == 1 the mutant would be the identity and prove nothing.
+    assert any(
+        isinstance(module, SoftplusBeta) and module.beta != 1.0 for module in model.modules()
+    )
+
+    # Attribute hits to each route by measurement: the per-sample route must
+    # reach only the ordinary branch and the batched route only the batched one.
+    batch = _batch()
+    monkeypatch.setattr(mutant, "hits", {"batched": 0, "ordinary": 0})
+    model(batch, request=MaterializedParameterScoreRequest())
+    assert mutant.hits["batched"] == 0 and mutant.hits["ordinary"] > 0
+    monkeypatch.setattr(mutant, "hits", {"batched": 0, "ordinary": 0})
+    model(batch, request=MaterializedParameterScoreRequest(chunk_size=2))
+    assert mutant.hits["batched"] > 0 and mutant.hits["ordinary"] == 0
 
     with pytest.raises(AssertionError, match="Tensor-likes are not close"):
         _assert_slow_and_chunked_scores_close(model)
-
-    # Both routes must have run the mutant; otherwise the red above proves nothing.
-    assert _BatchedRouteOnlyWrongSoftplusFunction.hits["batched"] > 0
-    assert _BatchedRouteOnlyWrongSoftplusFunction.hits["ordinary"] > 0
 
 
 def test_flattened_j_and_jt_products_match_ordinary_autograd() -> None:
