@@ -487,8 +487,10 @@ def launch_train(
     accepts_runtime_callbacks = any(
         (
             str.__eq__(parameter.name, "runtime_callbacks") is True
-            and parameter.kind
-            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+            and (
+                parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+                or parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            )
         )
         or parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
@@ -504,8 +506,10 @@ def launch_train(
         kwargs["topology"] = facts
     has_keyword_runtime_callbacks = any(
         str.__eq__(parameter.name, "runtime_callbacks") is True
-        and parameter.kind
-        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        and (
+            parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+            or parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        )
         for parameter in parameters
     )
     if has_keyword_runtime_callbacks or (accepts_runtime_callbacks and runtime_callbacks):
