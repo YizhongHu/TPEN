@@ -358,7 +358,10 @@ def test_chunked_local_energy_preserves_mapped_batch_metadata() -> None:
     evaluate_local_energy_in_chunks(
         {}, None, batch, chunk_size=2, evaluator=_MetadataEvaluator()
     )
-    assert [chunk.spins.tolist() for chunk in seen] == [[[1.0, -1.0]], [[1.0, -1.0]]]
+    assert [chunk.spins.tolist() for chunk in seen] == [
+        [[1.0, -1.0], [1.0, -1.0]],
+        [[1.0, -1.0], [1.0, -1.0]],
+    ]
     assert [chunk.nuclear_positions.shape for chunk in seen] == [(2, 1, 3), (2, 1, 3)]
     assert [chunk.aux["sample_id"].tolist() for chunk in seen] == [[0, 1], [2, 3]]
 
