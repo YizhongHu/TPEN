@@ -619,7 +619,7 @@ def test_runtime_callbacks_route_to_custom_runner_without_config_leak(
     assert received == [observer]
 
 
-def test_runtime_callbacks_are_not_added_to_resolved_science_config(
+def test_runtime_callbacks_do_not_change_resolved_science_config(
     tmp_path: Path,
 ) -> None:
     cell = _cell(tmp_path)
@@ -655,6 +655,104 @@ def test_runtime_callbacks_are_not_added_to_resolved_science_config(
         return False
 
     assert not contains_key(received[0], "runtime_callbacks")
+
+
+def test_runtime_callbacks_preserve_launch_identity_without_observers(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    observed: list[tuple[object, object, tuple[object, ...]]] = []
+
+    def recording_runner(
+        config: object,
+        *,
+        topology: object,
+        runtime_callbacks: Sequence[object] = (),
+    ) -> int:
+        observed.append(
+            (
+                OmegaConf.to_container(config, resolve=True),
+                dict(topology),
+                tuple(runtime_callbacks),
+            )
+        )
+        return 0
+
+    observer = object()
+    assert launch.launch_train(cell, _topology(), runner=recording_runner) == 0
+    assert (
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=recording_runner,
+            runtime_callbacks=[observer],
+        )
+        == 0
+    )
+    assert observed[0][0] == observed[1][0]
+    assert observed[0][1] == observed[1][1]
+    assert observed[0][2] == ()
+    assert observed[1][2] == (observer,)
+    assert cell.content_hash == launch.prepare_train_launch(cell, _topology()).cell.content_hash
+
+
+def test_malformed_runtime_callback_refuses_before_run_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path)
+    production_run = inspect.getmodule(run_from_config)
+    context = _FakeContext(run_root=tmp_path)
+    monkeypatch.setattr(production_run, "validate_hi_train_config", lambda _: None)
+    monkeypatch.setattr(production_run, "prepare_run_context", lambda *args, **kwargs: context)
+
+    assert (
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=production_run.run_from_config,
+            runtime_callbacks=[object()],
+        )
+        == 1
+    )
+    assert context.callbacks == []
+    assert [type(event).__name__ for event in context.events] == ["RunFailed"]
+
+
+def test_required_runtime_callback_keyword_receives_empty_default(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    received: list[object] = []
+
+    def recording_runner(config: object, *, runtime_callbacks: Sequence[object]) -> int:
+        del config
+        received.append(tuple(runtime_callbacks))
+        return 0
+
+    assert launch.launch_train(cell, _topology(), runner=recording_runner) == 0
+    assert received == [()]
+
+
+def test_uninspectable_runner_accepts_empty_and_refuses_nonempty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path)
+
+    class Uninspectable:
+        def __call__(self, config: object) -> int:
+            del config
+            return 0
+
+    runner = Uninspectable()
+    original_signature = launch.inspect.signature
+
+    def signature(value: object) -> object:
+        if value is runner:
+            raise ValueError("signature unavailable")
+        return original_signature(value)
+
+    monkeypatch.setattr(launch.inspect, "signature", signature)
+    assert launch.launch_train(cell, _topology(), runner=runner) == 0
+    with pytest.raises(launch.LaunchValidationError, match="cannot accept non-empty runtime_callbacks"):
+        launch.launch_train(cell, _topology(), runner=runner, runtime_callbacks=[object()])
 
 
 @pytest.mark.parametrize("key", ["WORLD_SIZE", "hostname", "process_id", "cuda_visible_devices"])
@@ -962,6 +1060,12 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
 
     context = _FakeContext(run_root=tmp_path)
 
+    class Observer:
+        def handle_occurrence(self, occurrence: object, context: object, state: object) -> None:
+            del occurrence, context, state
+
+    observer = Observer()
+
     monkeypatch.setattr(production_run, "validate_hi_train_config", lambda _: None)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
     monkeypatch.setattr(
@@ -975,7 +1079,16 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
         lambda _: HandledFailureRunner(),
     )
 
-    assert launch.launch_train(cell, _topology(), runner=production_run.run_from_config) == 1
+    assert (
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=production_run.run_from_config,
+            runtime_callbacks=[observer],
+        )
+        == 1
+    )
+    assert context.callbacks == [observer]
     assert context.metadata.status == "failed"
     # The handled-failure path is the raise-free path: the runner's verdict
     # rides RunCompleted. A RunFailed here would mean run_from_config raised

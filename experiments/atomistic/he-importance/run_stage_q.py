@@ -1276,6 +1276,9 @@ def execute(
     ----------
     args : argparse.Namespace
         Parsed :func:`build_parser` arguments.
+    runtime_callbacks : sequence of object, optional
+        Operational observers appended after configured callbacks. A non-empty
+        sequence is refused when the guarded runner cannot accept this keyword.
 
     Returns
     -------

@@ -425,6 +425,18 @@ def launch_train(
 ) -> int:
     """Resolve one topology-bound row and execute TPEN's production runner.
 
+    Parameters
+    ----------
+    source : Any
+        Materialized HI cell or compatible launch source.
+    topology : object, optional
+        Runtime execution topology supplied by the caller.
+    runner : callable, optional
+        Runner receiving the resolved config and accepted runtime keywords.
+    runtime_callbacks : sequence of object, optional
+        Operational observers appended after configured callbacks. A non-empty
+        sequence is refused when the runner cannot accept this keyword.
+
     Custom runners receive the canonical execution-facts mapping when their
     signature can accept a ``topology`` keyword or arbitrary keyword
     arguments; plain config-only doubles retain the existing config-only call.
@@ -453,7 +465,10 @@ def launch_train(
             )
         )
 
-    parameters = inspect.signature(runner).parameters.values()
+    try:
+        parameters = inspect.signature(runner).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
     accepts_topology = any(
         str.__eq__(parameter.name, "topology") is True
         or parameter.kind is inspect.Parameter.VAR_KEYWORD

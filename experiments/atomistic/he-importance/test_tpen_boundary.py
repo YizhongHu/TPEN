@@ -31,7 +31,7 @@ PENDING_516_SHA = "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
 # optimizer-grid crossing and dev/#528's now-present test_run_stage_q.py
 # crossing are measured, so the union has one more crossing than either
 # parent inventory counted.
-EXPECTED_UNSANCTIONED_COUNTS = {16}
+EXPECTED_UNSANCTIONED_COUNTS = {17}
 PENDING_516_POLICY = (
     "this is a historical, 516-scoped PR-516 capability fixture; a new pending PR needs its own pin"
 )
@@ -82,16 +82,16 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 21, "tpen.runner"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 677, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 775, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 709, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 807, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 755, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 853, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 957, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 1055, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
     ("test_train_config.py", 188, "tpen.hi_schema"): InventoryEntry(
@@ -100,13 +100,13 @@ EXPECTED_TEST_INVENTORY = {
     ("test_train_config.py", 251, "tpen.hi_schema"): InventoryEntry(
         "item 1c0b06fd: executed A9 schema measurement for the HI train-resume load shape."
     ),
-    ("test_train_config.py", 445, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 460, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 749, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 764, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 842, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 857, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("test_run_stage_q.py", 775, "tpen.hi_schema"): InventoryEntry(
