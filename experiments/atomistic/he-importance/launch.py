@@ -485,7 +485,11 @@ def launch_train(
         for parameter in parameters
     )
     accepts_runtime_callbacks = any(
-        str.__eq__(parameter.name, "runtime_callbacks") is True
+        (
+            str.__eq__(parameter.name, "runtime_callbacks") is True
+            and parameter.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        )
         or parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
     )
@@ -498,11 +502,13 @@ def launch_train(
     if topology is not None and accepts_topology:
         _validate_runner_topology_facts(facts)
         kwargs["topology"] = facts
-    has_named_runtime_callbacks = any(
+    has_keyword_runtime_callbacks = any(
         str.__eq__(parameter.name, "runtime_callbacks") is True
+        and parameter.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
         for parameter in parameters
     )
-    if has_named_runtime_callbacks or (accepts_runtime_callbacks and runtime_callbacks):
+    if has_keyword_runtime_callbacks or (accepts_runtime_callbacks and runtime_callbacks):
         kwargs["runtime_callbacks"] = runtime_callbacks
     return _exit_code(runner(plan.config, **kwargs))
 

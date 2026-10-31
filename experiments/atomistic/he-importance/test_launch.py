@@ -753,6 +753,62 @@ def test_uninspectable_runner_accepts_empty_and_refuses_nonempty(
         launch.launch_train(cell, _topology(), runner=runner, runtime_callbacks=[object()])
 
 
+def test_positional_only_runtime_callback_name_is_refused_when_nonempty(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+
+    def runner(config: object, runtime_callbacks: Sequence[object] = (), /) -> int:
+        del config, runtime_callbacks
+        return 0
+
+    with pytest.raises(launch.LaunchValidationError, match="cannot accept non-empty runtime_callbacks"):
+        launch.launch_train(cell, _topology(), runner=runner, runtime_callbacks=[object()])
+
+
+def test_positional_only_runtime_callback_name_preserves_empty_legacy_call(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    received: list[tuple[object, ...]] = []
+
+    def runner(config: object, runtime_callbacks: Sequence[object] = (), /) -> int:
+        del config
+        received.append(tuple(runtime_callbacks))
+        return 0
+
+    assert launch.launch_train(cell, _topology(), runner=runner) == 0
+    assert received == [()]
+
+
+def test_var_positional_runtime_callback_name_is_refused_when_nonempty(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+
+    def runner(config: object, *runtime_callbacks: object) -> int:
+        del config, runtime_callbacks
+        return 0
+
+    with pytest.raises(launch.LaunchValidationError, match="cannot accept non-empty runtime_callbacks"):
+        launch.launch_train(cell, _topology(), runner=runner, runtime_callbacks=[object()])
+
+
+def test_var_positional_runtime_callback_name_preserves_empty_legacy_call(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    received: list[tuple[object, ...]] = []
+
+    def runner(config: object, *runtime_callbacks: object) -> int:
+        del config
+        received.append(runtime_callbacks)
+        return 0
+
+    assert launch.launch_train(cell, _topology(), runner=runner) == 0
+    assert received == [()]
+
+
 @pytest.mark.parametrize("key", ["WORLD_SIZE", "hostname", "process_id", "cuda_visible_devices"])
 def test_public_launch_accepts_execution_aliases_inside_topology(tmp_path: Path, key: str) -> None:
     cell = _cell(tmp_path)
