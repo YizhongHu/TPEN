@@ -204,6 +204,8 @@ def _run(
     trainer_module.local_energy = fake_local_energy
     if chunk_size is not None:
         def bounded(*args, **kwargs):
+            if real_kinetic:
+                return original_chunked([KineticEnergy(),], *args[1:], **kwargs)
             return original_chunked(
                 *args,
                 evaluator=_SyntheticChunkEvaluator(),
@@ -404,6 +406,16 @@ def test_real_kinetic_current_and_detached_paths_are_bitwise_over_three_updates(
 def test_enabled_chunk_route_matches_legacy_adam_steps_and_states() -> None:
     legacy = _run(skip_detach=False, chunk_size=None)
     chunked = _run(skip_detach=False, chunk_size=2)
+    _assert_equal(legacy, chunked)
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(legacy["parameters"][0], legacy["parameters"][1])
+    )
+
+
+def test_real_kinetic_chunk_route_matches_legacy_adam_steps_and_states() -> None:
+    legacy = _run(skip_detach=False, real_kinetic=True, chunk_size=None)
+    chunked = _run(skip_detach=False, real_kinetic=True, chunk_size=2)
     _assert_equal(legacy, chunked)
     assert any(
         not torch.equal(before, after)
