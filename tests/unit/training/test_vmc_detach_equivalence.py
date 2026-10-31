@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 import torch
+from typeguard import TypeCheckError
 
 from tpen.artifacts import RunContext
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
@@ -69,6 +70,9 @@ def _synthetic_local_energy(wavefunction: torch.nn.Module, batch: ElectronBatch)
 
 
 class _SyntheticChunkEvaluator:
+    def validate_for_generator(self, terms, wavefunction, generator):
+        del terms, wavefunction, generator
+
     def make_context(self, wavefunction, batch):
         return wavefunction, batch
 
@@ -558,7 +562,7 @@ def test_none_chunk_size_keeps_legacy_local_energy_route(monkeypatch) -> None:
 
 @pytest.mark.parametrize("invalid", [0, -1, True, 1.5, "2"])
 def test_invalid_local_energy_chunk_size_rejects_before_sampling(invalid) -> None:
-    with pytest.raises(ValueError, match="positive integer"):
+    with pytest.raises((ValueError, TypeCheckError), match="positive integer|did not match"):
         VMCTrainer(max_steps=1, local_energy_chunk_size=invalid)
 
 

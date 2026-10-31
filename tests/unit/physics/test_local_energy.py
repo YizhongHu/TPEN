@@ -84,6 +84,9 @@ class _GraphLifetimeEvaluator:
         self._prior_refs: list[weakref.ReferenceType[torch.Tensor]] = []
         self.calls = 0
 
+    def validate_for_generator(self, terms, wavefunction, generator):
+        del terms, wavefunction, generator
+
     def make_context(self, wavefunction, batch):
         return batch
 
@@ -340,10 +343,13 @@ def test_chunked_local_energy_preserves_mapped_batch_metadata() -> None:
     seen: list[ElectronBatch] = []
 
     class _MetadataEvaluator:
-        def make_context(self, wavefunction, chunk):
+        def validate_for_generator(self, terms, wavefunction, generator):
+            del terms, wavefunction, generator
+
+        def make_context(self, wavefunction, batch):
             del wavefunction
-            seen.append(chunk)
-            return chunk
+            seen.append(batch)
+            return batch
 
         def evaluate(self, terms, context, *, return_terms=False):
             del terms, return_terms
