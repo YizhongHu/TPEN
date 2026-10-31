@@ -13,7 +13,7 @@ from typeguard import TypeCheckError
 
 from tpen.artifacts import RunContext
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
-from tpen.physics.hamiltonian import LocalEnergyResult
+from tpen.physics.hamiltonian import LocalEnergyResult, NaiveLocalEnergyEvaluator
 from tpen.physics.kinetic import KineticEnergy
 from tpen.training import trainer as trainer_module
 from tpen.training.trainer import VMCTrainer
@@ -52,10 +52,9 @@ class _TinyWavefunction(torch.nn.Module):
 
 def _synthetic_local_energy(wavefunction: torch.nn.Module, batch: ElectronBatch) -> LocalEnergyResult:
     output = wavefunction(batch)
-    base = output.logabs * 0 + torch.arange(batch.batch_size, dtype=batch.dtype)
-    finite = torch.ones_like(base, dtype=torch.bool)
-    if base.numel() > 2:
-        finite[2] = False
+    row_ids = batch.aux["sample_id"].to(dtype=batch.dtype)
+    base = output.logabs * 0 + row_ids
+    finite = row_ids != 2
     total = torch.where(finite, base, torch.full_like(base, float("nan")))
     return LocalEnergyResult(
         total=total,
@@ -70,13 +69,22 @@ def _synthetic_local_energy(wavefunction: torch.nn.Module, batch: ElectronBatch)
 
 
 class _SyntheticChunkEvaluator:
+    def __init__(self, batch_sizes: list[int], delegate=None) -> None:
+        self.batch_sizes = batch_sizes
+        self.delegate = delegate
+
     def validate_for_generator(self, terms, wavefunction, generator):
         del terms, wavefunction, generator
 
     def make_context(self, wavefunction, batch):
+        self.batch_sizes.append(batch.batch_size)
+        if self.delegate is not None:
+            return self.delegate.make_context(wavefunction, batch)
         return wavefunction, batch
 
     def evaluate(self, terms, context, *, return_terms=False):
+        if self.delegate is not None:
+            return self.delegate.evaluate(terms, context, return_terms=return_terms)
         del terms
         result = _synthetic_local_energy(*context)
         return result if return_terms else result.total
@@ -139,7 +147,7 @@ def _batch() -> ElectronBatch:
         dtype=torch.float64,
     )
     spins = torch.tensor([[1.0, -1.0]] * 4, dtype=torch.float64)
-    return ElectronBatch(positions=positions, spins=spins)
+    return ElectronBatch(positions=positions, spins=spins, aux={"sample_id": torch.arange(4)})
 
 
 def _freeze_aux(value: Any) -> Any:
@@ -207,15 +215,23 @@ def _run(
 
     trainer_module.local_energy = fake_local_energy
     bounded_calls: list[int] = []
+    chunk_batch_sizes: list[int] = []
     if chunk_size is not None:
         def bounded(*args, **kwargs):
             assert kwargs["chunk_size"] == chunk_size
             bounded_calls.append(kwargs["chunk_size"])
             if real_kinetic:
-                return original_chunked([KineticEnergy(),], *args[1:], **kwargs)
+                return original_chunked(
+                    [KineticEnergy()],
+                    *args[1:],
+                    evaluator=_SyntheticChunkEvaluator(
+                        chunk_batch_sizes, delegate=NaiveLocalEnergyEvaluator()
+                    ),
+                    **kwargs,
+                )
             return original_chunked(
                 *args,
-                evaluator=_SyntheticChunkEvaluator(),
+                evaluator=_SyntheticChunkEvaluator(chunk_batch_sizes),
                 **kwargs,
             )
 
@@ -302,11 +318,14 @@ def _run(
         "parameters": optimizer.parameters_after_step,
         "optimizer_states": optimizer.optimizer_states,
         "bounded_calls": bounded_calls,
+        "chunk_batch_sizes": chunk_batch_sizes,
         "results": snapshots,
     }
 
 
-def _assert_equal(left: dict[str, object], right: dict[str, object]) -> None:
+def _assert_equal(
+    left: dict[str, object], right: dict[str, object], *, compare_aux: bool = True
+) -> None:
     def equal_with_mask(left_tensor: torch.Tensor, right_tensor: torch.Tensor) -> None:
         assert torch.equal(torch.isfinite(left_tensor), torch.isfinite(right_tensor))
         assert torch.equal(torch.nan_to_num(left_tensor), torch.nan_to_num(right_tensor))
@@ -358,15 +377,16 @@ def _assert_equal(left: dict[str, object], right: dict[str, object]) -> None:
                 left_result.wavefunction_output.phase,
                 right_result.wavefunction_output.phase,
             )
-        assert set(left_result.wavefunction_output.aux) == set(right_result.wavefunction_output.aux)
-        for name in left_result.wavefunction_output.aux:
-            left_aux = left_result.wavefunction_output.aux[name]
-            right_aux = right_result.wavefunction_output.aux[name]
-            if isinstance(left_aux, torch.Tensor):
-                assert isinstance(right_aux, torch.Tensor)
-                equal_with_mask(left_aux, right_aux)
-            else:
-                assert left_aux == right_aux
+        if compare_aux:
+            assert set(left_result.wavefunction_output.aux) == set(right_result.wavefunction_output.aux)
+            for name in left_result.wavefunction_output.aux:
+                left_aux = left_result.wavefunction_output.aux[name]
+                right_aux = right_result.wavefunction_output.aux[name]
+                if isinstance(left_aux, torch.Tensor):
+                    assert isinstance(right_aux, torch.Tensor)
+                    equal_with_mask(left_aux, right_aux)
+                else:
+                    assert left_aux == right_aux
         equal_with_mask(left_result.per_electron_kinetic, right_result.per_electron_kinetic)
 
 
@@ -415,9 +435,11 @@ def test_real_kinetic_current_and_detached_paths_are_bitwise_over_three_updates(
 def test_enabled_chunk_route_matches_legacy_adam_steps_and_states() -> None:
     legacy = _run(skip_detach=False, chunk_size=None)
     chunked = _run(skip_detach=False, chunk_size=2)
-    _assert_equal(legacy, chunked)
+    _assert_equal(legacy, chunked, compare_aux=False)
     assert legacy["bounded_calls"] == []
     assert chunked["bounded_calls"] == [2, 2, 2]
+    assert chunked["chunk_batch_sizes"]
+    assert all(0 < size <= 2 for size in chunked["chunk_batch_sizes"])
     assert any(
         not torch.equal(before, after)
         for before, after in zip(legacy["parameters"][0], legacy["parameters"][1])
@@ -427,9 +449,11 @@ def test_enabled_chunk_route_matches_legacy_adam_steps_and_states() -> None:
 def test_real_kinetic_chunk_route_matches_legacy_adam_steps_and_states() -> None:
     legacy = _run(skip_detach=False, real_kinetic=True, chunk_size=None)
     chunked = _run(skip_detach=False, real_kinetic=True, chunk_size=2)
-    _assert_equal(legacy, chunked)
+    _assert_equal(legacy, chunked, compare_aux=False)
     assert legacy["bounded_calls"] == []
     assert chunked["bounded_calls"] == [2, 2, 2]
+    assert chunked["chunk_batch_sizes"]
+    assert all(0 < size <= 2 for size in chunked["chunk_batch_sizes"])
     assert any(
         not torch.equal(before, after)
         for before, after in zip(legacy["parameters"][0], legacy["parameters"][1])
