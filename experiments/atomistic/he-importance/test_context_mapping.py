@@ -6,7 +6,6 @@ import importlib.util
 import hashlib
 import json
 from pathlib import Path
-import subprocess
 import sys
 from fractions import Fraction
 
@@ -714,33 +713,40 @@ def test_full_architecture_composition_is_merge_shaped_and_preserves_factor_list
 
 
 def test_existing_context_fragment_output_is_pinned_to_the_ab2_head() -> None:
-    """Compare the current public output with AB-2's mechanically loaded output."""
+    """Compare the current public output with AB-2's mechanically recorded output.
 
-    source = subprocess.check_output(
-        [
-            "git",
-            "show",
-            "fd91de8cb7af7ecbff27536ff9dc474e8832df66:experiments/atomistic/he-importance/context_mapping.py",
-        ],
-        text=True,
+    The AB-2 head (``fd91de8c``) was orphaned by a squash merge and exists on
+    no remote ref, so its output is vendored in ``ab2_context_fragments.json``
+    instead of being loaded with ``git show`` at test time.  The fixture holds
+    the canonical JSON of the AB-2 ``context_fragment`` for each case, generated
+    mechanically from blob ``0a48cd87`` (``context_mapping.py`` at that head).
+    That function is standard-library only, so its recorded output is a pure
+    function of the case arguments and the comparison is unchanged.
+    """
+
+    fixture = json.loads(
+        Path(__file__).with_name("ab2_context_fragments.json").read_text()
     )
-    legacy = importlib.util.module_from_spec(importlib.util.spec_from_loader("legacy_mapping", loader=None))
-    exec(compile(source, "legacy_context_mapping.py", "exec"), legacy.__dict__)
+    assert fixture["provenance"]["commit"] == "fd91de8cb7af7ecbff27536ff9dc474e8832df66"
     cases = (
         ("tensor", "SiLU,SiLU", 32, 0),
         ("linear/coordinate-neighbor", "tanh,tanh", 32, 17),
         ("hybrid/orbit-complete", "channel-MLP,channel-MLP", 32, 99),
     )
+    # Every vendored case must be exercised, and nothing else may be vendored.
+    assert set(fixture["fragments"]) == {
+        f"{path}|{activation}|{channels}|{seed}" for path, activation, channels, seed in cases
+    }
     for path, activation, channels, seed in cases:
         current = context_mapping.context_fragment(
             path, activation=activation, channels=channels, seed=seed
         )
-        previous = legacy.context_fragment(
-            path, activation=activation, channels=channels, seed=seed
-        )
         current_bytes = json.dumps(current, sort_keys=True, separators=(",", ":")).encode()
-        previous_bytes = json.dumps(previous, sort_keys=True, separators=(",", ":")).encode()
-        assert hashlib.sha256(current_bytes).digest() == hashlib.sha256(previous_bytes).digest()
+        previous_bytes = fixture["fragments"][f"{path}|{activation}|{channels}|{seed}"].encode()
+        # Compare digests rather than the long strings to keep a failure report small.
+        assert hashlib.sha256(current_bytes).digest() == hashlib.sha256(previous_bytes).digest(), (
+            f"{path}|{activation}|{channels}|{seed}"
+        )
 
 
 @pytest.mark.parametrize("path_label", PATH_LABELS)
