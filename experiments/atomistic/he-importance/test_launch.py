@@ -575,7 +575,9 @@ def test_nonempty_runtime_callbacks_refuse_config_only_runner(tmp_path: Path) ->
     cell = _cell(tmp_path)
 
     class Observer:
-        def handle_occurrence(self, occurrence: object, context: object, state: object) -> None:
+        def handle_occurrence(
+            self, occurrence: object, context: object, state: object = None
+        ) -> None:
             del occurrence, context, state
 
     with pytest.raises(
