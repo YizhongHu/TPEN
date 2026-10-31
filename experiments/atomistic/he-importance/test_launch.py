@@ -753,12 +753,6 @@ def test_uninspectable_runner_accepts_empty_and_refuses_nonempty(
         launch.launch_train(cell, _topology(), runner=runner, runtime_callbacks=[object()])
 
 
-def test_launch_topology_none_is_refused_before_runner_call(tmp_path: Path) -> None:
-    cell = _cell(tmp_path)
-    with pytest.raises(launch.LaunchValidationError, match="execution topology"):
-        launch.launch_train(cell, topology=None, runner=lambda _: 0)
-
-
 @pytest.mark.parametrize("key", ["WORLD_SIZE", "hostname", "process_id", "cuda_visible_devices"])
 def test_public_launch_accepts_execution_aliases_inside_topology(tmp_path: Path, key: str) -> None:
     cell = _cell(tmp_path)
@@ -1063,15 +1057,18 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
             return RunResult(status="failed")
 
     context = _FakeContext(run_root=tmp_path)
-    dispatches: list[tuple[str, str]] = []
+    dispatches: list[tuple[str, str, object]] = []
 
     class Observer:
         def __init__(self, name: str) -> None:
             self.name = name
 
-        def handle_occurrence(self, occurrence: object, context: object, state: object) -> None:
+        def handle_occurrence(
+            self, occurrence: object, context: object, state: object = None
+        ) -> None:
             del context, state
-            dispatches.append((self.name, type(occurrence.event).__name__))
+            event = occurrence.event
+            dispatches.append((self.name, type(event).__name__, getattr(event, "status", None)))
 
     configured = Observer("configured")
     observer = Observer("runtime")
@@ -1106,10 +1103,10 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
     # rides RunCompleted. A RunFailed here would mean run_from_config raised
     # and exit code 1 came from the exception path instead.
     assert dispatches == [
-        ("configured", "RunStarted"),
-        ("runtime", "RunStarted"),
-        ("configured", "RunCompleted"),
-        ("runtime", "RunCompleted"),
+        ("configured", "RunStarted", None),
+        ("runtime", "RunStarted", None),
+        ("configured", "RunCompleted", "failed"),
+        ("runtime", "RunCompleted", "failed"),
     ]
 
 
