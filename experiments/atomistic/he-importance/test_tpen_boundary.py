@@ -82,16 +82,16 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 21, "tpen.runner"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 591, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 677, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 623, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 709, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 669, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 755, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 871, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 957, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
     ("test_train_config.py", 188, "tpen.hi_schema"): InventoryEntry(
@@ -106,7 +106,7 @@ EXPECTED_TEST_INVENTORY = {
     ("test_train_config.py", 842, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_run_stage_q.py", 774, "tpen.hi_schema"): InventoryEntry(
+    ("test_run_stage_q.py", 775, "tpen.hi_schema"): InventoryEntry(
         "measured at reland subject e524166a; roster assertion remains quarantined under item df8f8b31.",
     ),
 }
