@@ -1488,11 +1488,11 @@ def test_r2_boundary_count_is_exact_and_live(
     ]
     assert len(expected_nodes) == 1
     expected = ast.literal_eval(expected_nodes[0])
-    assert expected == {16}
+    assert expected == {17}
     boundary = importlib.import_module("experiments.atomistic.he-importance.test_tpen_boundary")
     synthetic = tmp_path / "synthetic.py"
-    synthetic.write_text("\n".join("import tpen.synthetic" for _ in range(16)) + "\n")
+    synthetic.write_text("\n".join("import tpen.synthetic" for _ in range(17)) + "\n")
     monkeypatch.setattr(boundary, "STUDY_DIR", tmp_path)
     _, crossings = boundary._scan_study()
-    assert len(crossings) == 16
+    assert len(crossings) == 17
     assert len(crossings) in expected
