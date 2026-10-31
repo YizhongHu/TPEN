@@ -30,9 +30,11 @@ from tpen.nn import (
     MaterializedParameterScoreRequest,
     PathAggregation,
     ResidualUpdater,
+    SoftplusBeta,
     TPENLayer,
     TPENWaveFunction,
 )
+from tpen.nn import activation as activation_module
 from tpen.nn.readout import PfaffianReadout
 
 from tests.helpers.score_reachability import disconnected_parameter_names
@@ -173,10 +175,83 @@ def test_slow_and_chunked_scores_agree_for_all_landed_modes(mode: InteractionMod
         torch.testing.assert_close(slow_block, chunked_block, rtol=1.0e-10, atol=1.0e-10)
 
 
-def test_softplus_fragment_chunked_scores_match_slow_batched_vjps() -> None:
-    """Exercise the custom Function under the production batched-VJP path."""
+def _is_vmapped(tensor: torch.Tensor) -> bool:
+    """Return whether ``tensor`` carries a hidden vmap batch dimension.
 
-    model = _softplus_fragment_model()
+    ``torch.autograd.grad(..., is_grads_batched=True)`` runs the backward under
+    vmap, so a custom backward sees batched cotangents there and ordinary ones
+    on the per-sample route. Both the functorch and the legacy batched-tensor
+    predicates are consulted because which one the batched-VJP path produces is
+    a PyTorch implementation detail.
+    """
+
+    functorch = torch._C._functorch
+    predicates = (
+        getattr(functorch, "is_batchedtensor", None),
+        getattr(functorch, "is_legacy_batchedtensor", None),
+    )
+    return any(predicate is not None and predicate(tensor) for predicate in predicates)
+
+
+class _BatchedRouteOnlyWrongSoftplusFunction(torch.autograd.Function):
+    """COMMITTED MUTANT: Softplus backward that is wrong ONLY under batched VJPs.
+
+    On the ordinary per-sample route the derivative is the correct
+    ``sigmoid(beta * x)``; under ``is_grads_batched=True`` it drops ``beta``
+    from the sigmoid argument. A slow-versus-chunked comparison can only ever
+    see a defect that differs BETWEEN the two routes: one present on both
+    cancels in the comparison and is the business of the activation's own
+    derivative tests. So this is the defect class the comparison exists to
+    catch, and the bar must turn it RED.
+
+    ``hits`` counts backward calls by route so the test can prove the mutant was
+    actually reached on both, rather than reporting a red or green from a model
+    that never called it.
+    """
+
+    hits = {"batched": 0, "ordinary": 0}
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, beta: float) -> torch.Tensor:
+        ctx.save_for_backward(x)
+        ctx.beta = beta
+        return torch.logaddexp(torch.zeros_like(x), beta * x) / beta
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        (x,) = ctx.saved_tensors
+        if _is_vmapped(grad_output):
+            _BatchedRouteOnlyWrongSoftplusFunction.hits["batched"] += 1
+            return grad_output * torch.sigmoid(x), None
+        _BatchedRouteOnlyWrongSoftplusFunction.hits["ordinary"] += 1
+        return grad_output * torch.sigmoid(ctx.beta * x), None
+
+
+def _assert_slow_and_chunked_scores_close(model: TPENWaveFunction) -> None:
+    """Compare the per-sample and batched-VJP score routes at the repo bar.
+
+    The bar is ``rtol=atol=1e-10``, the convention
+    `test_slow_and_chunked_scores_agree_for_all_landed_modes` and
+    `test_flattened_j_and_jt_products_match_ordinary_autograd` already apply
+    to this same comparison. It is NOT bitwise equality, because bitwise
+    equality is not a property these two routes have:
+
+    * Chunking is not the difference. Each chunk is an independent
+      ``autograd.grad`` call and chunks are joined by ``torch.cat`` with no
+      cross-chunk arithmetic, so the chunk boundary is exact by construction.
+    * The difference is ``is_grads_batched=True``. It runs the whole backward
+      under vmap, where batching rules dispatch to batched or batch-folded
+      matmul and reduction kernels. Same graph, same cotangents, same formulas,
+      but a different kernel with its own blocking and accumulation order, so
+      float64 results agree to rounding and not bit for bit. Whether two kernels
+      happen to coincide depends on the CPU and BLAS dispatch, so an exact bar
+      gives a machine-dependent verdict.
+
+    Do not tighten this back to zero. Do not loosen it to fit an observed
+    difference either: `test_softplus_batched_route_defect_is_caught_by_the_bar`
+    is the evidence that this bar still resolves a real derivative defect.
+    """
+
     batch = _batch()
     slow = model(batch, request=MaterializedParameterScoreRequest())
     chunked = model(batch, request=MaterializedParameterScoreRequest(chunk_size=2))
@@ -188,7 +263,29 @@ def test_softplus_fragment_chunked_scores_match_slow_batched_vjps() -> None:
     ):
         assert torch.isfinite(slow_block).all()
         assert torch.isfinite(chunked_block).all()
-        torch.testing.assert_close(slow_block, chunked_block, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(slow_block, chunked_block, rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_softplus_fragment_chunked_scores_match_slow_batched_vjps() -> None:
+    """Exercise the custom Function under the production batched-VJP path."""
+
+    _assert_slow_and_chunked_scores_close(_softplus_fragment_model())
+
+
+def test_softplus_batched_route_defect_is_caught_by_the_bar(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The slow-versus-chunked bar must reject a batched-route-only defect."""
+
+    monkeypatch.setattr(activation_module, "_SoftplusBetaFunction", _BatchedRouteOnlyWrongSoftplusFunction)
+    monkeypatch.setattr(_BatchedRouteOnlyWrongSoftplusFunction, "hits", {"batched": 0, "ordinary": 0})
+    model = _softplus_fragment_model()
+    assert any(isinstance(module, SoftplusBeta) for module in model.modules())
+
+    with pytest.raises(AssertionError, match="Tensor-likes are not close"):
+        _assert_slow_and_chunked_scores_close(model)
+
+    # Both routes must have run the mutant; otherwise the red above proves nothing.
+    assert _BatchedRouteOnlyWrongSoftplusFunction.hits["batched"] > 0
+    assert _BatchedRouteOnlyWrongSoftplusFunction.hits["ordinary"] > 0
 
 
 def test_flattened_j_and_jt_products_match_ordinary_autograd() -> None:
