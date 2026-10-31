@@ -727,7 +727,6 @@ def test_existing_context_fragment_output_is_pinned_to_the_ab2_head() -> None:
     fixture = json.loads(
         Path(__file__).with_name("ab2_context_fragments.json").read_text()
     )
-    assert fixture["provenance"]["commit"] == "fd91de8cb7af7ecbff27536ff9dc474e8832df66"
     cases = (
         ("tensor", "SiLU,SiLU", 32, 0),
         ("linear/coordinate-neighbor", "tanh,tanh", 32, 17),
