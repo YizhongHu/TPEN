@@ -206,8 +206,11 @@ def _run(
         return result if return_terms else result.total
 
     trainer_module.local_energy = fake_local_energy
+    bounded_calls: list[int] = []
     if chunk_size is not None:
         def bounded(*args, **kwargs):
+            assert kwargs["chunk_size"] == chunk_size
+            bounded_calls.append(kwargs["chunk_size"])
             if real_kinetic:
                 return original_chunked([KineticEnergy(),], *args[1:], **kwargs)
             return original_chunked(
@@ -254,6 +257,7 @@ def _run(
             max_steps=3,
             return_terms=True,
             nonfinite_local_energy_policy="mask",
+            local_energy_chunk_size=chunk_size,
         )
         update_inputs: list[torch.Tensor] = []
         original_bind = trainer.bind_update_method
@@ -297,6 +301,7 @@ def _run(
         "gradients": optimizer.gradients,
         "parameters": optimizer.parameters_after_step,
         "optimizer_states": optimizer.optimizer_states,
+        "bounded_calls": bounded_calls,
         "results": snapshots,
     }
 
@@ -411,6 +416,8 @@ def test_enabled_chunk_route_matches_legacy_adam_steps_and_states() -> None:
     legacy = _run(skip_detach=False, chunk_size=None)
     chunked = _run(skip_detach=False, chunk_size=2)
     _assert_equal(legacy, chunked)
+    assert legacy["bounded_calls"] == []
+    assert chunked["bounded_calls"] == [2, 2, 2]
     assert any(
         not torch.equal(before, after)
         for before, after in zip(legacy["parameters"][0], legacy["parameters"][1])
@@ -421,6 +428,8 @@ def test_real_kinetic_chunk_route_matches_legacy_adam_steps_and_states() -> None
     legacy = _run(skip_detach=False, real_kinetic=True, chunk_size=None)
     chunked = _run(skip_detach=False, real_kinetic=True, chunk_size=2)
     _assert_equal(legacy, chunked)
+    assert legacy["bounded_calls"] == []
+    assert chunked["bounded_calls"] == [2, 2, 2]
     assert any(
         not torch.equal(before, after)
         for before, after in zip(legacy["parameters"][0], legacy["parameters"][1])
