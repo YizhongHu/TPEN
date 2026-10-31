@@ -8,7 +8,11 @@ from typing import Any, Callable
 from tpen.artifacts import RunContext
 from tpen.data.batch import WavefunctionOutput
 from tpen.dependencies import require_torch
-from tpen.physics.hamiltonian import LocalEnergyResult, local_energy
+from tpen.physics.hamiltonian import (
+    LocalEnergyResult,
+    evaluate_local_energy_in_chunks,
+    local_energy,
+)
 from tpen.training.events import (
     Backward,
     BuildBatch,
@@ -173,6 +177,14 @@ class VMCTrainer:
         Whether to request and summarize the per-term local-energy decomposition.
     gradient_clip_norm : float or None, optional
         Maximum gradient norm. When ``None``, gradients are not clipped.
+    local_energy_chunk_size : int or None, optional
+        Maximum walkers per local-energy evaluation. ``None`` (default) keeps
+        the single full-batch evaluation. A positive integer evaluates the
+        batch in consecutive chunks of at most that many walkers, bounding the
+        peak memory of the derivative graph. The objective does not
+        differentiate through local energy; numerical equivalence is a
+        property to verify for a fixed evaluator and batch, not a general
+        consequence of detachment.
 
     Notes
     -----
@@ -202,8 +214,21 @@ class VMCTrainer:
         gradient_clip_norm: float | None = None,
         update_method: UpdateMethodSpec = None,
         nonfinite_local_energy_policy: str = DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
+        local_energy_chunk_size: int | None = None,
     ) -> None:
         self.max_steps = int(max_steps)
+        # Validated at construction so an invalid bound refuses before any
+        # sampling. ``bool`` is rejected explicitly because it is an ``int``.
+        if local_energy_chunk_size is not None and (
+            isinstance(local_energy_chunk_size, bool)
+            or not isinstance(local_energy_chunk_size, int)
+            or local_energy_chunk_size <= 0
+        ):
+            raise ValueError(
+                "local_energy_chunk_size must be None or a positive integer, "
+                f"got {local_energy_chunk_size!r}"
+            )
+        self.local_energy_chunk_size = local_energy_chunk_size
         self.log_every_n_steps = int(log_every_n_steps)
         self.return_terms = bool(return_terms)
         self.gradient_clip_norm = None if gradient_clip_norm is None else float(gradient_clip_norm)
@@ -762,12 +787,23 @@ class VMCTrainer:
                 with context.scope(BuildBatch(step=step), state=state):
                     batch = walkers.make_batch()
                 with context.scope(LocalEnergy(step=step), state=state):
-                    result = local_energy(
-                        hamiltonian_terms,
-                        model,
-                        batch,
-                        return_terms=self.return_terms,
-                    )
+                    if self.local_energy_chunk_size is None:
+                        result = local_energy(
+                            hamiltonian_terms,
+                            model,
+                            batch,
+                            return_terms=self.return_terms,
+                        )
+                    else:
+                        # Bounded route: each chunk's derivative graph is
+                        # released before the next chunk is evaluated.
+                        result = evaluate_local_energy_in_chunks(
+                            hamiltonian_terms,
+                            model,
+                            batch,
+                            return_terms=self.return_terms,
+                            chunk_size=self.local_energy_chunk_size,
+                        )
                 # The objective deliberately differentiates through the
                 # wavefunction output, not through local energy.  Its closure
                 # re-evaluation builds a fresh local-energy graph when needed,
