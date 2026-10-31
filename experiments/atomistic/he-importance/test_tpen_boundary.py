@@ -97,6 +97,9 @@ EXPECTED_TEST_INVENTORY = {
     ("test_train_config.py", 188, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: test-only schema validation for the independent HI grid oracle."
     ),
+    ("test_train_config.py", 251, "tpen.hi_schema"): InventoryEntry(
+        "item 1c0b06fd: executed A9 schema measurement for the HI train-resume load shape."
+    ),
     ("test_train_config.py", 445, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
