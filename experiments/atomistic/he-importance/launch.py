@@ -421,6 +421,7 @@ def launch_train(
     topology: object | None = None,
     *,
     runner: Callable[..., object] = run_from_config,
+    runtime_callbacks: Sequence[object] = (),
 ) -> int:
     """Resolve one topology-bound row and execute TPEN's production runner.
 
@@ -444,18 +445,41 @@ def launch_train(
             # Backstop: L1's empty-mapping refusal is reached first.
             raise LaunchValidationError("launch topology is required")
         _validate_runner_topology_facts(facts)
-        return _exit_code(runner(plan.config, topology=facts))
-    if topology is not None:
-        parameters = inspect.signature(runner).parameters.values()
-        accepts_topology = any(
-            str.__eq__(parameter.name, "topology") is True
-            or parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
+        return _exit_code(
+            runner(
+                plan.config,
+                topology=facts,
+                runtime_callbacks=runtime_callbacks,
+            )
         )
-        if accepts_topology:
-            _validate_runner_topology_facts(facts)
-            return _exit_code(runner(plan.config, topology=facts))
-    return _exit_code(runner(plan.config))
+
+    parameters = inspect.signature(runner).parameters.values()
+    accepts_topology = any(
+        str.__eq__(parameter.name, "topology") is True
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    accepts_runtime_callbacks = any(
+        str.__eq__(parameter.name, "runtime_callbacks") is True
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if runtime_callbacks and not accepts_runtime_callbacks:
+        raise LaunchValidationError(
+            "runner cannot accept non-empty runtime_callbacks"
+        )
+
+    kwargs: dict[str, object] = {}
+    if topology is not None and accepts_topology:
+        _validate_runner_topology_facts(facts)
+        kwargs["topology"] = facts
+    has_named_runtime_callbacks = any(
+        str.__eq__(parameter.name, "runtime_callbacks") is True
+        for parameter in parameters
+    )
+    if has_named_runtime_callbacks or (accepts_runtime_callbacks and runtime_callbacks):
+        kwargs["runtime_callbacks"] = runtime_callbacks
+    return _exit_code(runner(plan.config, **kwargs))
 
 
 __all__ = [

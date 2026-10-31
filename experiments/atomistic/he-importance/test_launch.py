@@ -571,6 +571,92 @@ def test_plain_injected_runner_keeps_config_only_contract(tmp_path: Path) -> Non
     assert len(received) == 1
 
 
+def test_nonempty_runtime_callbacks_refuse_config_only_runner(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+
+    class Observer:
+        def handle_occurrence(self, occurrence: object, context: object, state: object) -> None:
+            del occurrence, context, state
+
+    with pytest.raises(
+        launch.LaunchValidationError,
+        match="cannot accept non-empty runtime_callbacks",
+    ):
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=lambda config: 0,
+            runtime_callbacks=[Observer()],
+        )
+
+
+def test_runtime_callbacks_route_to_custom_runner_without_config_leak(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    observer = object()
+    received: list[object] = []
+
+    def recording_runner(
+        config: object,
+        *,
+        topology: object,
+        runtime_callbacks: Sequence[object],
+    ) -> int:
+        del config, topology
+        received.extend(runtime_callbacks)
+        return 0
+
+    assert (
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=recording_runner,
+            runtime_callbacks=[observer],
+        )
+        == 0
+    )
+    assert received == [observer]
+
+
+def test_runtime_callbacks_are_not_added_to_resolved_science_config(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    observer = object()
+    received: list[object] = []
+
+    def recording_runner(
+        config: object,
+        *,
+        runtime_callbacks: Sequence[object],
+    ) -> int:
+        received.append(OmegaConf.to_container(config, resolve=True))
+        assert list(runtime_callbacks) == [observer]
+        return 0
+
+    assert (
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=recording_runner,
+            runtime_callbacks=[observer],
+        )
+        == 0
+    )
+    def contains_key(value: object, target: str) -> bool:
+        if isinstance(value, Mapping):
+            return any(
+                key == target or contains_key(nested, target)
+                for key, nested in value.items()
+            )
+        if isinstance(value, (tuple, list)):
+            return any(contains_key(nested, target) for nested in value)
+        return False
+
+    assert not contains_key(received[0], "runtime_callbacks")
+
+
 @pytest.mark.parametrize("key", ["WORLD_SIZE", "hostname", "process_id", "cuda_visible_devices"])
 def test_public_launch_accepts_execution_aliases_inside_topology(tmp_path: Path, key: str) -> None:
     cell = _cell(tmp_path)

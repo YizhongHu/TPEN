@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import importlib
 import io
+from collections.abc import Sequence
 import json
 from dataclasses import replace
 import os
@@ -1750,6 +1751,36 @@ def test_execute_guarded_runner_delegates_recorded_config_once(
     assert runner.execute(_args(tmp_path, dry_run=False)) == 0
     report = json.loads(capsys.readouterr().out)
     assert observed["calls"] == 1
+    assert observed["config"] == report["resolved_config"]
+
+
+def test_execute_forwards_runtime_callbacks_to_guarded_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    observer = object()
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(runner, "_execution_facts", _r2_facts)
+
+    def recording_run_from_config(
+        config: object,
+        *,
+        topology: object,
+        runtime_callbacks: Sequence[object],
+    ) -> int:
+        del topology
+        observed["config"] = runner.OmegaConf.to_container(config, resolve=True)
+        observed["runtime_callbacks"] = list(runtime_callbacks)
+        output = Path(config.run.dir) / "resolved_config.yaml"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("guarded: true\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(runner.launch, "run_from_config", recording_run_from_config)
+    assert runner.execute(
+        _args(tmp_path, dry_run=False), runtime_callbacks=[observer]
+    ) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert observed["runtime_callbacks"] == [observer]
     assert observed["config"] == report["resolved_config"]
 
 
