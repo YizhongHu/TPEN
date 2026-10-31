@@ -9,7 +9,7 @@ import inspect
 import os
 from dataclasses import fields, replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 import threading
 
 import pytest
@@ -571,6 +571,244 @@ def test_plain_injected_runner_keeps_config_only_contract(tmp_path: Path) -> Non
     assert len(received) == 1
 
 
+def test_nonempty_runtime_callbacks_refuse_config_only_runner(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+
+    class Observer:
+        def handle_occurrence(
+            self, occurrence: object, context: object, state: object = None
+        ) -> None:
+            del occurrence, context, state
+
+    with pytest.raises(
+        launch.LaunchValidationError,
+        match="cannot accept non-empty runtime_callbacks",
+    ):
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=lambda config: 0,
+            runtime_callbacks=[Observer()],
+        )
+
+
+def test_runtime_callbacks_route_to_custom_runner(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    observer = object()
+    received: list[object] = []
+
+    def recording_runner(
+        config: object,
+        *,
+        topology: object,
+        runtime_callbacks: Sequence[object],
+    ) -> int:
+        del config, topology
+        received.extend(runtime_callbacks)
+        return 0
+
+    assert (
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=recording_runner,
+            runtime_callbacks=[observer],
+        )
+        == 0
+    )
+    assert received == [observer]
+
+
+def test_runtime_callbacks_are_not_added_to_resolved_science_config(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    observer = object()
+    received: list[object] = []
+
+    def recording_runner(
+        config: object,
+        *,
+        runtime_callbacks: Sequence[object],
+    ) -> int:
+        received.append(OmegaConf.to_container(config, resolve=True))
+        assert list(runtime_callbacks) == [observer]
+        return 0
+
+    assert (
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=recording_runner,
+            runtime_callbacks=[observer],
+        )
+        == 0
+    )
+    def contains_key(value: object, target: str) -> bool:
+        if isinstance(value, Mapping):
+            return any(
+                key == target or contains_key(nested, target)
+                for key, nested in value.items()
+            )
+        if isinstance(value, (tuple, list)):
+            return any(contains_key(nested, target) for nested in value)
+        return False
+
+    assert not contains_key(received[0], "runtime_callbacks")
+
+
+def test_runtime_callbacks_preserve_launch_identity_without_observers(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    observed: list[tuple[object, dict[str, object]]] = []
+
+    def recording_runner(
+        config: object,
+        *,
+        topology: object,
+        **kwargs: object,
+    ) -> int:
+        del topology
+        observed.append(
+            (
+                OmegaConf.to_container(config, resolve=True),
+                kwargs,
+            )
+        )
+        return 0
+
+    observer = object()
+    assert launch.launch_train(cell, _topology(), runner=recording_runner) == 0
+    assert (
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=recording_runner,
+            runtime_callbacks=[observer],
+        )
+        == 0
+    )
+    assert observed[0][0] == observed[1][0]
+    assert observed[0][1] == {}
+    assert observed[1][1] == {"runtime_callbacks": [observer]}
+    assert cell.content_hash == launch.prepare_train_launch(cell, _topology()).cell.content_hash
+
+
+def test_malformed_runtime_callback_refuses_before_run_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path)
+    production_run = inspect.getmodule(run_from_config)
+    context = _FakeContext(run_root=tmp_path)
+    monkeypatch.setattr(production_run, "validate_hi_train_config", lambda _: None)
+    monkeypatch.setattr(production_run, "prepare_run_context", lambda *args, **kwargs: context)
+    monkeypatch.setattr(production_run, "_instantiate_runner", lambda _: pytest.fail("runner instantiated"))
+
+    assert (
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=production_run.run_from_config,
+            runtime_callbacks=[object()],
+        )
+        == 1
+    )
+    assert context.callbacks == []
+    assert [type(event).__name__ for event in context.events] == ["RunFailed"]
+    assert context.events[0].exception_type == "TypeError"
+    assert "handle_occurrence" in context.events[0].exception_message
+    assert context.metadata.status == "failed"
+
+
+def test_required_runtime_callback_keyword_receives_empty_default(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    received: list[object] = []
+
+    def recording_runner(config: object, *, runtime_callbacks: Sequence[object]) -> int:
+        del config
+        received.append(tuple(runtime_callbacks))
+        return 0
+
+    assert launch.launch_train(cell, _topology(), runner=recording_runner) == 0
+    assert received == [()]
+
+
+def test_uninspectable_runner_accepts_empty_and_refuses_nonempty(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+
+    class Uninspectable:
+        def __call__(self, config: object) -> int:
+            del config
+            return 0
+
+    runner = Uninspectable()
+    runner.__signature__ = "opaque"
+    assert launch.launch_train(cell, _topology(), runner=runner) == 0
+    with pytest.raises(launch.LaunchValidationError, match="cannot accept non-empty runtime_callbacks"):
+        launch.launch_train(cell, _topology(), runner=runner, runtime_callbacks=[object()])
+
+
+def test_positional_only_runtime_callback_name_is_refused_when_nonempty(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+
+    def runner(config: object, runtime_callbacks: Sequence[object] = (), /) -> int:
+        del config, runtime_callbacks
+        return 0
+
+    with pytest.raises(launch.LaunchValidationError, match="cannot accept non-empty runtime_callbacks"):
+        launch.launch_train(cell, _topology(), runner=runner, runtime_callbacks=[object()])
+
+
+def test_positional_only_runtime_callback_name_preserves_empty_legacy_call(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    received: list[tuple[object, ...]] = []
+
+    def runner(config: object, runtime_callbacks: Sequence[object] = (), /) -> int:
+        del config
+        received.append(tuple(runtime_callbacks))
+        return 0
+
+    assert launch.launch_train(cell, _topology(), runner=runner) == 0
+    assert received == [()]
+
+
+def test_var_positional_runtime_callback_name_is_refused_when_nonempty(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+
+    def runner(config: object, *runtime_callbacks: object) -> int:
+        del config, runtime_callbacks
+        return 0
+
+    with pytest.raises(launch.LaunchValidationError, match="cannot accept non-empty runtime_callbacks"):
+        launch.launch_train(cell, _topology(), runner=runner, runtime_callbacks=[object()])
+
+
+def test_var_positional_runtime_callback_name_preserves_empty_legacy_call(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    received: list[tuple[object, ...]] = []
+
+    def runner(config: object, *runtime_callbacks: object) -> int:
+        del config
+        received.append(runtime_callbacks)
+        return 0
+
+    assert launch.launch_train(cell, _topology(), runner=runner) == 0
+    assert received == [()]
+
+
 @pytest.mark.parametrize("key", ["WORLD_SIZE", "hostname", "process_id", "cuda_visible_devices"])
 def test_public_launch_accepts_execution_aliases_inside_topology(tmp_path: Path, key: str) -> None:
     cell = _cell(tmp_path)
@@ -875,6 +1113,23 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
             return RunResult(status="failed")
 
     context = _FakeContext(run_root=tmp_path)
+    dispatches: list[tuple[str, str, object]] = []
+
+    class Observer:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def handle_occurrence(
+            self, occurrence: object, context: object, state: object = None
+        ) -> None:
+            del context, state
+            event = occurrence.event
+            dispatches.append((self.name, type(event).__name__, getattr(event, "status", None)))
+
+    configured = Observer("configured")
+    observer = Observer("runtime")
+    context.callbacks.append(configured)
+    context.emit = MethodType(RunContext.emit, context)
 
     monkeypatch.setattr(production_run, "validate_hi_train_config", lambda _: None)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -889,13 +1144,26 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
         lambda _: HandledFailureRunner(),
     )
 
-    assert launch.launch_train(cell, _topology(), runner=production_run.run_from_config) == 1
+    assert (
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=production_run.run_from_config,
+            runtime_callbacks=[observer],
+        )
+        == 1
+    )
+    assert context.callbacks == [configured, observer]
     assert context.metadata.status == "failed"
     # The handled-failure path is the raise-free path: the runner's verdict
     # rides RunCompleted. A RunFailed here would mean run_from_config raised
     # and exit code 1 came from the exception path instead.
-    assert [type(event).__name__ for event in context.events] == ["RunStarted", "RunCompleted"]
-    assert context.events[-1].status == "failed"
+    assert dispatches == [
+        ("configured", "RunStarted", None),
+        ("runtime", "RunStarted", None),
+        ("configured", "RunCompleted", "failed"),
+        ("runtime", "RunCompleted", "failed"),
+    ]
 
 
 @pytest.mark.parametrize("status", ["completed", "not-a-run-result"])

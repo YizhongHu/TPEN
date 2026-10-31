@@ -238,6 +238,21 @@ def test_resolve_consumes_q_mechanics_and_committed_walker_counts(tmp_path: Path
     assert mechanics_config.runner.sampler.n_walkers == stage_coordinate.Q_MECHANICS_WALKERS
 
 
+def test_hi_schema_admits_runner_load_train_resume_shape(tmp_path: Path) -> None:
+    """Pin the executed HI schema outcome for the resume-load shape (A9)."""
+
+    config = train_config.resolve_train_config(_cell(tmp_path, stage="Q"))
+    OmegaConf.update(
+        config,
+        "runner.load",
+        {"mode": "train_resume", "path": str(tmp_path / "checkpoint")},
+        force_add=True,
+    )
+    import tpen.hi_schema as schema
+
+    schema.validate_hi_train_config(config, env={})
+
+
 def test_resolve_refuses_drifted_composed_walker_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

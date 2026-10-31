@@ -31,7 +31,7 @@ PENDING_516_SHA = "1ec5f658a19c227ad7e30d1e8d7e82f0b50dd879"
 # optimizer-grid crossing and dev/#528's now-present test_run_stage_q.py
 # crossing are measured, so the union has one more crossing than either
 # parent inventory counted.
-EXPECTED_UNSANCTIONED_COUNTS = {16}
+EXPECTED_UNSANCTIONED_COUNTS = {17}
 PENDING_516_POLICY = (
     "this is a historical, 516-scoped PR-516 capability fixture; a new pending PR needs its own pin"
 )
@@ -82,31 +82,34 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 21, "tpen.runner"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 591, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 829, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 623, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 861, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 669, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 907, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 871, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 1109, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
     ("test_train_config.py", 188, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: test-only schema validation for the independent HI grid oracle."
     ),
-    ("test_train_config.py", 445, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 251, "tpen.hi_schema"): InventoryEntry(
+        "item 1c0b06fd: executed A9 schema measurement for the HI train-resume load shape."
+    ),
+    ("test_train_config.py", 460, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 749, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 764, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 842, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 857, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_run_stage_q.py", 774, "tpen.hi_schema"): InventoryEntry(
+    ("test_run_stage_q.py", 775, "tpen.hi_schema"): InventoryEntry(
         "measured at reland subject e524166a; roster assertion remains quarantined under item df8f8b31.",
     ),
 }
@@ -1485,11 +1488,11 @@ def test_r2_boundary_count_is_exact_and_live(
     ]
     assert len(expected_nodes) == 1
     expected = ast.literal_eval(expected_nodes[0])
-    assert expected == {16}
+    assert expected == {17}
     boundary = importlib.import_module("experiments.atomistic.he-importance.test_tpen_boundary")
     synthetic = tmp_path / "synthetic.py"
-    synthetic.write_text("\n".join("import tpen.synthetic" for _ in range(16)) + "\n")
+    synthetic.write_text("\n".join("import tpen.synthetic" for _ in range(17)) + "\n")
     monkeypatch.setattr(boundary, "STUDY_DIR", tmp_path)
     _, crossings = boundary._scan_study()
-    assert len(crossings) == 16
+    assert len(crossings) == 17
     assert len(crossings) in expected
