@@ -287,6 +287,76 @@ def test_chunked_local_energy_preserves_ordered_structured_values(chunk_size: in
     assert torch.equal(chunked.per_electron_kinetic, full.per_electron_kinetic)
 
 
+@pytest.mark.parametrize("terms", [[KineticEnergy()], {"kinetic": KineticEnergy()}])
+def test_chunked_local_energy_accepts_sequence_and_mapping_terms(terms) -> None:
+    batch = ElectronBatch(
+        positions=torch.tensor(
+            [
+                [[0.2, -0.1, 0.3], [-0.4, 0.5, -0.2]],
+                [[0.3, 0.2, -0.5], [0.6, -0.1, 0.4]],
+                [[-0.2, 0.7, 0.1], [0.5, 0.3, -0.6]],
+                [[0.4, -0.3, 0.2], [-0.7, 0.1, 0.5]],
+            ],
+            dtype=torch.float64,
+        )
+    )
+    model = GaussianOutputModel(alpha=0.3)
+    full = local_energy(terms, model, batch, return_terms=True)
+    chunked = evaluate_local_energy_in_chunks(
+        terms, model, batch, return_terms=True, chunk_size=2
+    )
+    assert isinstance(full, LocalEnergyResult)
+    assert isinstance(chunked, LocalEnergyResult)
+    assert torch.equal(chunked.total, full.total)
+    assert list(chunked.terms) == list(full.terms)
+    for name in full.terms:
+        assert torch.equal(chunked.terms[name], full.terms[name])
+    assert chunked.wavefunction_output is not None
+    assert full.wavefunction_output is not None
+    assert torch.equal(chunked.wavefunction_output.logabs, full.wavefunction_output.logabs)
+    assert torch.equal(chunked.wavefunction_output.sign, full.wavefunction_output.sign)
+    assert chunked.per_electron_kinetic is not None
+    assert full.per_electron_kinetic is not None
+    assert torch.equal(chunked.per_electron_kinetic, full.per_electron_kinetic)
+
+
+def test_chunked_local_energy_preserves_mapped_batch_metadata() -> None:
+    positions = torch.arange(24, dtype=torch.float64).reshape(4, 2, 3) / 10
+    batch = ElectronBatch(
+        positions=positions,
+        spins=torch.tensor([[1.0, -1.0]] * 4),
+        nuclear_positions=torch.tensor(
+            [
+                [[0.0, 0.0, 0.0]],
+                [[0.1, 0.0, 0.0]],
+                [[0.2, 0.0, 0.0]],
+                [[0.3, 0.0, 0.0]],
+            ],
+            dtype=torch.float64,
+        ),
+        nuclear_charges=torch.ones(4, 1, dtype=torch.float64),
+        aux={"sample_id": torch.arange(4)},
+    )
+    seen: list[ElectronBatch] = []
+
+    class _MetadataEvaluator:
+        def make_context(self, wavefunction, chunk):
+            del wavefunction
+            seen.append(chunk)
+            return chunk
+
+        def evaluate(self, terms, context, *, return_terms=False):
+            del terms, return_terms
+            return context.positions.sum(dim=(1, 2))
+
+    evaluate_local_energy_in_chunks(
+        {}, None, batch, chunk_size=2, evaluator=_MetadataEvaluator()
+    )
+    assert [chunk.spins.tolist() for chunk in seen] == [[[1.0, -1.0]], [[1.0, -1.0]]]
+    assert [chunk.nuclear_positions.shape for chunk in seen] == [(2, 1, 3), (2, 1, 3)]
+    assert [chunk.aux["sample_id"].tolist() for chunk in seen] == [[0, 1], [2, 3]]
+
+
 # --- normalize_hamiltonian_terms ---
 
 

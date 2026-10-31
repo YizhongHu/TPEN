@@ -651,7 +651,7 @@ def local_energy(
 
 
 def evaluate_local_energy_in_chunks(
-    terms: Mapping[str, HamiltonianTerm],
+    terms: Mapping[Any, Any] | Sequence[Any],
     wavefunction,
     batch: ElectronBatch,
     *,
@@ -668,7 +668,7 @@ def evaluate_local_energy_in_chunks(
 
     Parameters
     ----------
-    terms : Mapping[str, HamiltonianTerm]
+    terms : Mapping or Sequence of HamiltonianTerm
         Hamiltonian contributions, as accepted by `normalize_hamiltonian_terms`.
     wavefunction : callable
         Wavefunction model or exact reference returning ``WavefunctionOutput``.

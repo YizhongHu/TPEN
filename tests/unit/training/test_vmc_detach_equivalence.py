@@ -49,11 +49,41 @@ class _TinyWavefunction(torch.nn.Module):
         return WavefunctionOutput(logabs=logabs, sign=torch.ones_like(logabs))
 
 
+def _synthetic_local_energy(wavefunction: torch.nn.Module, batch: ElectronBatch) -> LocalEnergyResult:
+    output = wavefunction(batch)
+    base = output.logabs * 0 + torch.arange(batch.batch_size, dtype=batch.dtype)
+    finite = torch.ones_like(base, dtype=torch.bool)
+    if base.numel() > 2:
+        finite[2] = False
+    total = torch.where(finite, base, torch.full_like(base, float("nan")))
+    return LocalEnergyResult(
+        total=total,
+        terms={"alpha": total * 2.0, "beta": total * 3.0},
+        wavefunction_output=WavefunctionOutput(
+            logabs=output.logabs,
+            sign=output.sign,
+            aux={"captured": output.logabs * 7.0},
+        ),
+        per_electron_kinetic=total[:, None].expand(-1, batch.n_electrons),
+    )
+
+
+class _SyntheticChunkEvaluator:
+    def make_context(self, wavefunction, batch):
+        return wavefunction, batch
+
+    def evaluate(self, terms, context, *, return_terms=False):
+        del terms
+        result = _synthetic_local_energy(*context)
+        return result if return_terms else result.total
+
+
 class _RecordingAdam(torch.optim.Adam):
     def __init__(self, model: torch.nn.Module) -> None:
         super().__init__(model.parameters(), lr=0.01)
         self.gradients: list[tuple[torch.Tensor | None, ...]] = []
         self.parameters_after_step: list[tuple[torch.Tensor, ...]] = []
+        self.optimizer_states: list[tuple[dict[str, object], ...]] = []
 
     def step(self, closure=None):
         self.gradients.append(
@@ -62,6 +92,15 @@ class _RecordingAdam(torch.optim.Adam):
         result = super().step(closure)
         self.parameters_after_step.append(
             tuple(parameter.detach().clone() for parameter in self.param_groups[0]["params"])
+        )
+        self.optimizer_states.append(
+            tuple(
+                {
+                    key: value.detach().clone() if isinstance(value, torch.Tensor) else value
+                    for key, value in self.state[parameter].items()
+                }
+                for parameter in self.param_groups[0]["params"]
+            )
         )
         return result
 
@@ -140,6 +179,7 @@ def _run(
     handoff_mutant: str | None = None,
     loss_mutant: bool = False,
     real_kinetic: bool = False,
+    chunk_size: int | None = None,
 ) -> dict[str, object]:
     model = _TinyWavefunction(nonlinear=real_kinetic)
     optimizer = _RecordingAdam(model)
@@ -148,6 +188,7 @@ def _run(
     objective_inputs: list[torch.Tensor] = []
     original_local_energy = trainer_module.local_energy
     original_objective = trainer_module.compute_vmc_objective
+    original_chunked = trainer_module.evaluate_local_energy_in_chunks
     original_value_detach = trainer_module._detach_local_energy_value
     original_wavefunction_detach = trainer_module._detach_wavefunction_output
 
@@ -157,23 +198,19 @@ def _run(
             return original_local_energy(
                 [KineticEnergy()], wavefunction, batch, return_terms=return_terms
             )
-        output = wavefunction(batch)
-        base = output.logabs * 0 + torch.arange(4, dtype=batch.dtype)
-        finite = torch.tensor([True, True, False, True])
-        total = torch.where(finite, base, torch.full_like(base, float("nan")))
-        result = LocalEnergyResult(
-            total=total,
-            terms={"alpha": total * 2.0, "beta": total * 3.0},
-            wavefunction_output=WavefunctionOutput(
-                logabs=output.logabs,
-                sign=output.sign,
-                aux={"captured": output.logabs * 7.0},
-            ),
-            per_electron_kinetic=total[:, None].expand(-1, 2),
-        )
+        result = _synthetic_local_energy(wavefunction, batch)
         return result if return_terms else result.total
 
     trainer_module.local_energy = fake_local_energy
+    if chunk_size is not None:
+        def bounded(*args, **kwargs):
+            return original_chunked(
+                *args,
+                evaluator=_SyntheticChunkEvaluator(),
+                **kwargs,
+            )
+
+        trainer_module.evaluate_local_energy_in_chunks = bounded
 
     def record_objective_input(logabs, local_energy, *, nonfinite_policy):
         if loss_mutant:
@@ -242,6 +279,7 @@ def _run(
     finally:
         trainer_module.local_energy = original_local_energy
         trainer_module.compute_vmc_objective = original_objective
+        trainer_module.evaluate_local_energy_in_chunks = original_chunked
         trainer_module._detach_local_energy_value = original_value_detach
         trainer_module._detach_wavefunction_output = original_wavefunction_detach
 
@@ -252,6 +290,7 @@ def _run(
         "update_inputs": update_inputs,
         "gradients": optimizer.gradients,
         "parameters": optimizer.parameters_after_step,
+        "optimizer_states": optimizer.optimizer_states,
         "results": snapshots,
     }
 
@@ -279,6 +318,18 @@ def _assert_equal(left: dict[str, object], right: dict[str, object]) -> None:
     for left_parameters, right_parameters in zip(left["parameters"], right["parameters"]):
         for left_parameter, right_parameter in zip(left_parameters, right_parameters):
             assert torch.equal(left_parameter, right_parameter)
+    assert len(left["optimizer_states"]) == len(right["optimizer_states"]) == 3
+    for left_states, right_states in zip(left["optimizer_states"], right["optimizer_states"]):
+        for left_state, right_state in zip(left_states, right_states):
+            assert left_state.keys() == right_state.keys()
+            for key in left_state:
+                left_value = left_state[key]
+                right_value = right_state[key]
+                if isinstance(left_value, torch.Tensor):
+                    assert isinstance(right_value, torch.Tensor)
+                    assert torch.equal(left_value, right_value)
+                else:
+                    assert left_value == right_value
     for left_result, right_result in zip(left["results"], right["results"]):
         equal_with_mask(left_result.total, right_result.total)
         assert list(left_result.terms) == list(right_result.terms)
@@ -348,6 +399,24 @@ def test_real_kinetic_current_and_detached_paths_are_bitwise_over_three_updates(
         _run(skip_detach=True, real_kinetic=True),
         _run(skip_detach=False, real_kinetic=True),
     )
+
+
+def test_enabled_chunk_route_matches_legacy_adam_steps_and_states() -> None:
+    legacy = _run(skip_detach=False, chunk_size=None)
+    chunked = _run(skip_detach=False, chunk_size=2)
+    _assert_equal(legacy, chunked)
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(legacy["parameters"][0], legacy["parameters"][1])
+    )
+
+
+def test_red_adam_state_mutation_fails_route_equivalence_oracle() -> None:
+    legacy = _run(skip_detach=False, chunk_size=None)
+    mutant = _run(skip_detach=False, chunk_size=2)
+    mutant["optimizer_states"][1][0]["exp_avg"] += 1.0
+    with pytest.raises(AssertionError):
+        _assert_equal(legacy, mutant)
 
 
 def _run_lifecycle(
