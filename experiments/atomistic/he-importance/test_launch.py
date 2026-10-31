@@ -9,7 +9,7 @@ import inspect
 import os
 from dataclasses import fields, replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 import threading
 
 import pytest
@@ -590,7 +590,7 @@ def test_nonempty_runtime_callbacks_refuse_config_only_runner(tmp_path: Path) ->
         )
 
 
-def test_runtime_callbacks_route_to_custom_runner_without_config_leak(
+def test_runtime_callbacks_route_to_custom_runner(
     tmp_path: Path,
 ) -> None:
     cell = _cell(tmp_path)
@@ -619,7 +619,7 @@ def test_runtime_callbacks_route_to_custom_runner_without_config_leak(
     assert received == [observer]
 
 
-def test_runtime_callbacks_do_not_change_resolved_science_config(
+def test_runtime_callbacks_are_not_added_to_resolved_science_config(
     tmp_path: Path,
 ) -> None:
     cell = _cell(tmp_path)
@@ -661,19 +661,19 @@ def test_runtime_callbacks_preserve_launch_identity_without_observers(
     tmp_path: Path,
 ) -> None:
     cell = _cell(tmp_path)
-    observed: list[tuple[object, object, tuple[object, ...]]] = []
+    observed: list[tuple[object, dict[str, object]]] = []
 
     def recording_runner(
         config: object,
         *,
         topology: object,
-        runtime_callbacks: Sequence[object] = (),
+        **kwargs: object,
     ) -> int:
+        del topology
         observed.append(
             (
                 OmegaConf.to_container(config, resolve=True),
-                dict(topology),
-                tuple(runtime_callbacks),
+                kwargs,
             )
         )
         return 0
@@ -690,9 +690,8 @@ def test_runtime_callbacks_preserve_launch_identity_without_observers(
         == 0
     )
     assert observed[0][0] == observed[1][0]
-    assert observed[0][1] == observed[1][1]
-    assert observed[0][2] == ()
-    assert observed[1][2] == (observer,)
+    assert observed[0][1] == {}
+    assert observed[1][1] == {"runtime_callbacks": [observer]}
     assert cell.content_hash == launch.prepare_train_launch(cell, _topology()).cell.content_hash
 
 
@@ -704,6 +703,7 @@ def test_malformed_runtime_callback_refuses_before_run_started(
     context = _FakeContext(run_root=tmp_path)
     monkeypatch.setattr(production_run, "validate_hi_train_config", lambda _: None)
     monkeypatch.setattr(production_run, "prepare_run_context", lambda *args, **kwargs: context)
+    monkeypatch.setattr(production_run, "_instantiate_runner", lambda _: pytest.fail("runner instantiated"))
 
     assert (
         launch.launch_train(
@@ -716,6 +716,9 @@ def test_malformed_runtime_callback_refuses_before_run_started(
     )
     assert context.callbacks == []
     assert [type(event).__name__ for event in context.events] == ["RunFailed"]
+    assert context.events[0].exception_type == "TypeError"
+    assert "handle_occurrence" in context.events[0].exception_message
+    assert context.metadata.status == "failed"
 
 
 def test_required_runtime_callback_keyword_receives_empty_default(tmp_path: Path) -> None:
@@ -732,7 +735,7 @@ def test_required_runtime_callback_keyword_receives_empty_default(tmp_path: Path
 
 
 def test_uninspectable_runner_accepts_empty_and_refuses_nonempty(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     cell = _cell(tmp_path)
 
@@ -742,17 +745,16 @@ def test_uninspectable_runner_accepts_empty_and_refuses_nonempty(
             return 0
 
     runner = Uninspectable()
-    original_signature = launch.inspect.signature
-
-    def signature(value: object) -> object:
-        if value is runner:
-            raise ValueError("signature unavailable")
-        return original_signature(value)
-
-    monkeypatch.setattr(launch.inspect, "signature", signature)
+    runner.__signature__ = "opaque"
     assert launch.launch_train(cell, _topology(), runner=runner) == 0
     with pytest.raises(launch.LaunchValidationError, match="cannot accept non-empty runtime_callbacks"):
         launch.launch_train(cell, _topology(), runner=runner, runtime_callbacks=[object()])
+
+
+def test_launch_topology_none_is_refused_before_runner_call(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    with pytest.raises(launch.LaunchValidationError, match="execution topology"):
+        launch.launch_train(cell, topology=None, runner=lambda _: 0)
 
 
 @pytest.mark.parametrize("key", ["WORLD_SIZE", "hostname", "process_id", "cuda_visible_devices"])
@@ -1059,12 +1061,20 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
             return RunResult(status="failed")
 
     context = _FakeContext(run_root=tmp_path)
+    dispatches: list[tuple[str, str]] = []
 
     class Observer:
-        def handle_occurrence(self, occurrence: object, context: object, state: object) -> None:
-            del occurrence, context, state
+        def __init__(self, name: str) -> None:
+            self.name = name
 
-    observer = Observer()
+        def handle_occurrence(self, occurrence: object, context: object, state: object) -> None:
+            del context, state
+            dispatches.append((self.name, type(occurrence.event).__name__))
+
+    configured = Observer("configured")
+    observer = Observer("runtime")
+    context.callbacks.append(configured)
+    context.emit = MethodType(RunContext.emit, context)
 
     monkeypatch.setattr(production_run, "validate_hi_train_config", lambda _: None)
     monkeypatch.setattr(production_run, "_seed_runtime_rngs", lambda _: None)
@@ -1088,13 +1098,17 @@ def test_launch_propagates_success_and_handled_failure_exit_codes(
         )
         == 1
     )
-    assert context.callbacks == [observer]
+    assert context.callbacks == [configured, observer]
     assert context.metadata.status == "failed"
     # The handled-failure path is the raise-free path: the runner's verdict
     # rides RunCompleted. A RunFailed here would mean run_from_config raised
     # and exit code 1 came from the exception path instead.
-    assert [type(event).__name__ for event in context.events] == ["RunStarted", "RunCompleted"]
-    assert context.events[-1].status == "failed"
+    assert dispatches == [
+        ("configured", "RunStarted"),
+        ("runtime", "RunStarted"),
+        ("configured", "RunCompleted"),
+        ("runtime", "RunCompleted"),
+    ]
 
 
 @pytest.mark.parametrize("status", ["completed", "not-a-run-result"])

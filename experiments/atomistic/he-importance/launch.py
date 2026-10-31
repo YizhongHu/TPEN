@@ -425,6 +425,14 @@ def launch_train(
 ) -> int:
     """Resolve one topology-bound row and execute TPEN's production runner.
 
+    Custom runners receive the canonical execution-facts mapping when their
+    signature can accept a ``topology`` keyword or arbitrary keyword
+    arguments; plain config-only doubles retain the existing config-only call.
+    The mapping is the declared experiment-side contract because the typed
+    TPEN topology is owned behind this boundary. This closes the named
+    capability-blind identity-dispatch mechanism, not every way a callable
+    could ignore or mishandle a topology it accepts.
+
     Parameters
     ----------
     source : Any
@@ -437,13 +445,15 @@ def launch_train(
         Operational observers appended after configured callbacks. A non-empty
         sequence is refused when the runner cannot accept this keyword.
 
-    Custom runners receive the canonical execution-facts mapping when their
-    signature can accept a ``topology`` keyword or arbitrary keyword
-    arguments; plain config-only doubles retain the existing config-only call.
-    The mapping is the declared experiment-side contract because the typed
-    TPEN topology is owned behind this boundary. This closes the named
-    capability-blind identity-dispatch mechanism, not every way a callable
-    could ignore or mishandle a topology it accepts.
+    Returns
+    -------
+    int
+        The runner's integer process code.
+
+    Raises
+    ------
+    LaunchValidationError
+        If launch facts, the runner contract, or the returned code is invalid.
     """
 
     facts = execution_topology_facts(topology) if topology is not None else {}
