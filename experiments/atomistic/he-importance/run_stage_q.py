@@ -1265,13 +1265,20 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def execute(args: argparse.Namespace) -> int:
+def execute(
+    args: argparse.Namespace,
+    *,
+    runtime_callbacks: Sequence[object] = (),
+) -> int:
     """Select, resolve and (unless ``--dry-run``) launch one stage cell.
 
     Parameters
     ----------
     args : argparse.Namespace
         Parsed :func:`build_parser` arguments.
+    runtime_callbacks : sequence of object, optional
+        Operational observers forwarded to the guarded runner after configured
+        callbacks, outside the science configuration.
 
     Returns
     -------
@@ -1336,7 +1343,12 @@ def execute(args: argparse.Namespace) -> int:
     _refuse_occupied_output_path(output_path)
     _write_json(output_path / "selection_receipt.json", report)
 
-    def _guarded_runner(config: Any, *, topology: object) -> int:
+    def _guarded_runner(
+        config: Any,
+        *,
+        topology: object,
+        runtime_callbacks: Sequence[object] = (),
+    ) -> int:
         """Validate launch.py's late resolution before delegating to TPEN."""
 
         _require_truthful_cell(selection.cell, config)
@@ -1346,10 +1358,16 @@ def execute(args: argparse.Namespace) -> int:
                 "launch truthfulness guard refused field 'resolved_config': "
                 f"recorded value {recorded_resolved!r}, launched value {launched_resolved!r}"
             )
-        return launch.run_from_config(config, topology=topology)
+        runner_kwargs: dict[str, object] = {"topology": topology}
+        if runtime_callbacks:
+            runner_kwargs["runtime_callbacks"] = runtime_callbacks
+        return launch.run_from_config(config, **runner_kwargs)
 
     exit_code = launch.launch_train(
-        packet, _execution_facts(), runner=_guarded_runner
+        packet,
+        _execution_facts(),
+        runner=_guarded_runner,
+        runtime_callbacks=runtime_callbacks,
     )
     if exit_code == 0:
         resolved_snapshot = output_path / "resolved_config.yaml"
