@@ -1,0 +1,4 @@
+{
+  "runtime_kind": "polaris-gpu-qualification",
+  "extra": "cu126"
+}
