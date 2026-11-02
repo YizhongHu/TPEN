@@ -658,3 +658,28 @@ def test_driver_exit_and_evidence_boundaries(monkeypatch) -> None:
         malformed_dir.mkdir()
         result = driver.run_arm("malformed", repo, "test_arms.py::test_pass", malformed_dir)
         assert result["status"] == "FAIL" and "unparseable JUnit" in result["reason"]
+
+
+def test_run_arm_prepends_job_venv_bin_so_bare_python_resolves(monkeypatch, tmp_path) -> None:
+    """A test that shells out to bare `python` must resolve the job venv, not
+    an unrelated interpreter on the caller's PATH, mirroring `uv run`.
+    """
+    repo = tmp_path / "repo"
+    evidence = tmp_path / "evidence"
+    repo.mkdir()
+    evidence.mkdir()
+    (repo / "test_bare_python.py").write_text(
+        "import subprocess, sys\n"
+        "def test_bare_python_matches_job_prefix():\n"
+        "    result = subprocess.run(['python', '-c', 'import sys; print(sys.prefix)'],\n"
+        "                            capture_output=True, text=True, check=True)\n"
+        "    assert result.stdout.strip() == sys.prefix\n"
+    )
+    empty_path_dir = tmp_path / "empty-path"
+    empty_path_dir.mkdir()
+    monkeypatch.setenv("PATH", str(empty_path_dir))
+    result = driver.run_arm("bare-python", repo, "test_bare_python.py", evidence)
+    assert result["status"] == "PASS"
+    assert result["counts"]["passed"] == 1
+    log = json.loads((evidence / "bare-python.log").read_text().splitlines()[0])
+    assert log["command"][0] == sys.executable
