@@ -13,6 +13,7 @@ from tpen.checkpoint import (
     PUBLICATION_CATALOG_FILENAME,
     list_complete_checkpoints,
     read_publications,
+    reconcile_publication,
     resolve_checkpoint_dir,
 )
 from tpen.checkpoint.schema import read_manifest
@@ -189,6 +190,7 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
     complete_dirs = list_complete_checkpoints(root)
     for directory in complete_dirs:
         try:
+            reconcile_publication(root, directory)
             ref = CheckpointRef.from_directory(directory)
             manifest = read_manifest(directory / "manifest.json", mode="train_resume")
             declared_model_hash = manifest.hashes.get("model_sha256")
