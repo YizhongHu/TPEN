@@ -142,7 +142,7 @@ def render_a_packages() -> tuple[dict[str, Any], ...]:
         candidates.append(_package("A", number, _configuration(
             producer_path="tensor", activation="SiLU,SiLU", producer_initialization=producer_initialization,
             electron_electron=electron_electron, electron_nucleus=electron_nucleus,
-            readout_initialization=readout_initialization
+            readout_initialization=readout_initialization, update="residual"
         ), None))
         number += 1
     return _deduplicate(candidates)
