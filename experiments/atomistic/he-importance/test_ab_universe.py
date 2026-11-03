@@ -82,7 +82,7 @@ def _expected_a() -> set[str]:
         _configuration(
             producer_path="tensor", activation="SiLU,SiLU",
             producer_initialization=i9, electron_electron=i10,
-            electron_nucleus=i11, readout_initialization=i12,
+            electron_nucleus=i11, readout_initialization=i12, update="residual",
         )
         for i9, i10, i11, i12 in product(_A9, _A10, _A11, _A12)
     )
@@ -103,7 +103,12 @@ def _identities(packages: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> 
 def _assert_o_star_honest(packages: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> None:
     for package in packages:
         slots = package["optimizer_slots"]
-        o_star = next(slot for slot in slots if slot["method"] == "O*")
+        o_star_slots = [slot for slot in slots if slot["method"] == "O*"]
+        assert len(o_star_slots) == 1
+        adam_slots = [slot for slot in slots if slot["method"] == "adam"]
+        assert len(adam_slots) == 1
+        assert slots[0]["method"] == "adam"
+        o_star = o_star_slots[0]
         assert o_star["status"] == "unavailable"
         assert o_star["levels"] is None
         assert o_star["unavailable_reason"] == "selection output of O2 is pending"
@@ -165,7 +170,10 @@ def test_duplicate_under_new_display_name_is_detected() -> None:
 def test_o_star_is_explicit_pending_and_never_adam(axis: str) -> None:
     _assert_o_star_honest(ab_universe.render_ab_universe()[axis])
     mutant = copy.deepcopy(ab_universe.render_ab_universe()[axis][0])
-    mutant["optimizer_slots"][1] = copy.deepcopy(mutant["optimizer_slots"][0])
+    mutant["optimizer_slots"] = [
+        mutant["optimizer_slots"][0],
+        copy.deepcopy(mutant["optimizer_slots"][0]),
+    ]
     with pytest.raises(AssertionError):
         _assert_o_star_honest((mutant,))
 
