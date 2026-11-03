@@ -109,7 +109,7 @@ def test_each_refusal_code_is_distinct_and_noncompleted(tmp_path: Path, case: st
         run_dir = _write_run(tmp_path / "corrupt-publication-run")
         (run_dir / "checkpoints" / PUBLICATION_CATALOG_FILENAME).write_text("garbage\n", encoding="utf-8")
     elif case == "missing-checkpoint":
-        _write_run(run_dir, checkpoint=False)
+        run_dir = _write_run(run_dir, checkpoint=False)
 
     evidence = inspect_run(run_dir)
     assert evidence.verdict == "refused"
