@@ -33,10 +33,17 @@ def run_arm(name: str, repo: Path, arm: str, evidence: Path) -> dict:
     xml = evidence / f"{name}.xml"
     log = evidence / f"{name}.log"
     command = [sys.executable, "-B", "-m", "pytest", arm, "-q", "--junitxml", str(xml)]
+    # Prepend the running interpreter's env bin dir, mirroring `uv run`, so a
+    # test that shells out to bare `python` finds the job venv instead of a
+    # stray PATH entry (e.g. Polaris PBS jobs have no venv bin on PATH).
+    venv_bin = str(Path(sys.prefix) / "bin")
+    path = os.pathsep.join([venv_bin, os.environ["PATH"]]) if os.environ.get("PATH") else venv_bin
+    env = {**os.environ, "PYTHONPATH": str(repo), "PYTEST_ADDOPTS": "", "PATH": path}
     print(f"BEGIN {name} {arm}", flush=True)
     with log.open("w", encoding="utf-8") as stream:
-        stream.write(json.dumps({"command": command, "cwd": str(repo)}) + "\n")
-        rc = subprocess.run(command, cwd=repo, env={**os.environ, "PYTHONPATH": str(repo), "PYTEST_ADDOPTS": ""}, stdout=stream, stderr=subprocess.STDOUT).returncode
+        stream.write(json.dumps({"command": command, "cwd": str(repo), "path": path}) + "\n")
+        stream.flush()
+        rc = subprocess.run(command, cwd=repo, env=env, stdout=stream, stderr=subprocess.STDOUT).returncode
     result = {"arm": name, "selection": arm, "rc": rc, "junit": str(xml), "log": str(log)}
     if not xml.is_file():
         result.update(status="FAIL", reason="missing JUnit")
