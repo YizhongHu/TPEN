@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import tpen.inspection as inspection
+from tpen.checkpoint import PUBLICATION_CATALOG_FILENAME
 from tpen.checkpoint.manifest import CheckpointManifest
 from tpen.inspection import RUN_EVIDENCE_SCHEMA, RunEvidence, inspect_run
 
@@ -105,8 +106,8 @@ def test_each_refusal_code_is_distinct_and_noncompleted(tmp_path: Path, case: st
         checkpoint = run_dir / "checkpoints" / "step_000007"
         (checkpoint / "model.pt").write_bytes(b"changed-model")
     elif case == "corrupt-publication-catalog":
-        _write_run(run_dir)
-        (run_dir / "checkpoints" / "publications.jsonl").write_text("garbage\n", encoding="utf-8")
+        run_dir = _write_run(tmp_path / "corrupt-publication-run")
+        (run_dir / "checkpoints" / PUBLICATION_CATALOG_FILENAME).write_text("garbage\n", encoding="utf-8")
     elif case == "missing-checkpoint":
         _write_run(run_dir, checkpoint=False)
 
