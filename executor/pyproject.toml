@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tpen-executor"
+version = "0.1.0"
+description = "Independent execution boundary for TPEN workflows."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest==9.0.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tpen_executor*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
