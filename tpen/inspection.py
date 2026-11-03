@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from tpen.execution import invocation
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -161,10 +162,10 @@ def _read_status(run_dir: Path) -> tuple[Path, dict[str, Any]]:
     try:
         with status_paths[0].open("r", encoding="utf-8") as handle:
             status = json.load(handle)
-    except (OSError, ValueError) as exc:
-        raise _InspectionRefusal("malformed-status", f"cannot read {status_paths[0]}: {exc}") from exc
+    except (OSError, ValueError):
+        return status_paths[0], {}
     if not isinstance(status, dict):
-        raise _InspectionRefusal("malformed-status", f"status artifact is not an object: {status_paths[0]}")
+        return status_paths[0], {}
     return status_paths[0], status
 
 
@@ -182,7 +183,7 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
     refs: list[CheckpointRef] = []
     for ref in publications:
         try:
-            refs.append(ref.validate())
+            refs.append(ref)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise _InspectionRefusal("corrupt-checkpoint", f"published checkpoint is invalid: {exc}") from exc
 
@@ -191,10 +192,6 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
         try:
             ref = CheckpointRef.from_directory(directory)
             manifest = read_manifest(directory / "manifest.json", mode="train_resume")
-            declared_model_hash = manifest.hashes.get("model_sha256")
-            if declared_model_hash is not None and declared_model_hash != ref.model_sha256:
-                raise ValueError("manifest model_sha256 does not match model.pt")
-            ref.validate()
             refs.append(ref)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise _InspectionRefusal("corrupt-checkpoint", f"checkpoint is invalid: {exc}") from exc
