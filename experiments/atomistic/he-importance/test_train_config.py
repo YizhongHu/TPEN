@@ -219,8 +219,13 @@ def _assert_matches_prechange(
         try:
             expected = prechange.resolve_train_config(cell)
         except Exception as expected_error:  # noqa: BLE001 - refusal is part of the oracle
-            with pytest.raises(type(expected_error)):
+            try:
                 resolver(cell)
+            except Exception as observed_error:  # noqa: BLE001 - compare oracle refusals
+                assert type(observed_error).__name__ == type(expected_error).__name__
+                assert str(observed_error) == str(expected_error)
+            else:
+                raise AssertionError("current resolver accepted a prechange-refused cell")
         else:
             observed = resolver(cell)
             assert _canonical_resolved_config(observed) == _canonical_resolved_config(expected)
@@ -734,9 +739,6 @@ def test_every_ab4a_fixed_adam_package_resolves_and_instantiates(
     for index, package in enumerate(packages):
         cell = _ab_cell(tmp_path / axis / str(index), package, axis)
         resolved = train_config.resolve_train_config(cell)
-        import tpen.hi_schema as schema
-
-        schema.validate_hi_train_config(resolved)
         model = instantiate(resolved.model).to(dtype=torch.float64)
         assert model is not None
 

@@ -248,12 +248,16 @@ def _optimizer_entry(manifest: Mapping[str, Any]) -> Any:
     by_method = {entry.method: entry for entry in roster}
     entry = by_method.get(method)
     if entry is None:
+        unavailable_reason = optimizer_cell.get("unavailable_reason")
+        status_is_unavailable = {"available": False, "unavailable": True}.get(status, False)
+        if status_is_unavailable and unavailable_reason:
+            raise UnavailableOptimizerError(
+                f"optimizer method {method!r} is unavailable: {unavailable_reason}"
+            )
         raise UnavailableOptimizerError(f"optimizer method {method!r} is absent from the HI roster")
     if not entry.admitted or status != "available" or not entry.target:
         reason = (
-            optimizer_cell.get("unavailable_reason")
-            or optimizer_cell.get("reason")
-            or entry.requires
+            optimizer_cell.get("reason")
             or "not admitted by HI_METHOD_ROSTER"
         )
         raise UnavailableOptimizerError(
@@ -374,17 +378,21 @@ def _consumed_context(manifest: Mapping[str, Any]) -> str:
         if dict(context) == literal:
             return name
 
-    if set(context) == {"axis", "literal_configuration"}:
+    context_keys = frozenset(context)
+    if not context_keys.symmetric_difference({"axis", "literal_configuration"}):
         axis = context.get("axis")
         literal = context.get("literal_configuration")
-        if axis in {"A", "B"} and isinstance(literal, Mapping):
+        axis_name = {"A": "A", "B": "B"}.get(axis) if type(axis) is str else None
+        if axis_name is not None and isinstance(literal, Mapping):
             labels = dict(literal)
             expected_keys = set(_AB_CONTEXT_KEYS)
-            if axis == "B":
+            if {"A": False, "B": True}.get(axis_name, False):
                 expected_keys.add("package")
-            if set(labels) != expected_keys:
-                missing = sorted(expected_keys - set(labels))
-                extra = sorted(set(labels) - expected_keys)
+            label_keys = frozenset(labels)
+            key_differences = label_keys.symmetric_difference(expected_keys)
+            if key_differences:
+                missing = sorted(expected_keys - label_keys)
+                extra = sorted(label_keys - expected_keys)
                 details = []
                 if missing:
                     details.append(f"missing coordinate(s) {missing!r}")
@@ -394,9 +402,7 @@ def _consumed_context(manifest: Mapping[str, Any]) -> str:
                     f"scientific_identity.context.literal_configuration for {axis} must be closed: "
                     + "; ".join(details)
                 )
-            if axis == "A" and "package" in labels:
-                raise ContextResolutionError("A context must not declare a B package coordinate")
-            return axis
+            return axis_name
 
     if dict(context) not in expected.values():
         differences = []
@@ -438,7 +444,7 @@ def _ab_context_labels(manifest: Mapping[str, Any], axis: str) -> dict[str, str]
     literal = _mapping(context.get("literal_configuration"), "scientific_identity.context.literal_configuration")
     labels = dict(_AB_CONTROL)
     labels.update(literal)
-    if axis == "A":
+    if {"A": True, "B": False}.get(axis, False):
         labels.pop("package", None)
     return labels
 
@@ -546,19 +552,26 @@ def resolve_train_config(source: Any) -> DictConfig:
                 seed=model_seed,
             )
         )
-    elif context_name in {"A", "B"}:
+    elif {"A": True, "B": True}.get(context_name, False):
         context_mapping = _context_mapping_api()
         labels = _ab_context_labels(manifest, context_name)
         package = labels.pop("package", None)
         # AB-3 owns architecture composition.  Assign the returned model at
         # the full Hydra root so its relative interpolations resolve against
         # ``cfg`` rather than against a detached model fragment.
-        cfg.model = context_mapping.compose_architecture_package(
-            cfg.model,
-            package=package,
-            seed=model_seed,
-            **labels,
-        )
+        try:
+            cfg.model = context_mapping.compose_architecture_package(
+                cfg.model,
+                package=package,
+                seed=model_seed,
+                **labels,
+            )
+        except Exception as error:
+            if isinstance(error, context_mapping.UnknownContextLabel):
+                raise ContextResolutionError(
+                    "scientific_identity.context contains an unknown A/B coordinate label"
+                ) from error
+            raise
     scheduler_paths = _scheduler_paths(OmegaConf.to_container(cfg, resolve=False))
     if scheduler_paths:
         raise OptimizerLevelResolutionError(
