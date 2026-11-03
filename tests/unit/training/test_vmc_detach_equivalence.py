@@ -9,10 +9,11 @@ from typing import Any
 
 import pytest
 import torch
+from typeguard import TypeCheckError
 
 from tpen.artifacts import RunContext
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
-from tpen.physics.hamiltonian import LocalEnergyResult
+from tpen.physics.hamiltonian import LocalEnergyResult, NaiveLocalEnergyEvaluator
 from tpen.physics.kinetic import KineticEnergy
 from tpen.training import trainer as trainer_module
 from tpen.training.trainer import VMCTrainer
@@ -49,11 +50,52 @@ class _TinyWavefunction(torch.nn.Module):
         return WavefunctionOutput(logabs=logabs, sign=torch.ones_like(logabs))
 
 
+def _synthetic_local_energy(wavefunction: torch.nn.Module, batch: ElectronBatch) -> LocalEnergyResult:
+    output = wavefunction(batch)
+    row_ids = batch.aux["sample_id"].to(dtype=batch.dtype)
+    base = output.logabs * 0 + row_ids
+    finite = row_ids != 2
+    total = torch.where(finite, base, torch.full_like(base, float("nan")))
+    return LocalEnergyResult(
+        total=total,
+        terms={"alpha": total * 2.0, "beta": total * 3.0},
+        wavefunction_output=WavefunctionOutput(
+            logabs=output.logabs,
+            sign=output.sign,
+            aux={"captured": output.logabs * 7.0},
+        ),
+        per_electron_kinetic=total[:, None].expand(-1, batch.n_electrons),
+    )
+
+
+class _SyntheticChunkEvaluator:
+    def __init__(self, batch_sizes: list[int], delegate=None) -> None:
+        self.batch_sizes = batch_sizes
+        self.delegate = delegate
+
+    def validate_for_generator(self, terms, wavefunction, generator):
+        del terms, wavefunction, generator
+
+    def make_context(self, wavefunction, batch):
+        self.batch_sizes.append(batch.batch_size)
+        if self.delegate is not None:
+            return self.delegate.make_context(wavefunction, batch)
+        return wavefunction, batch
+
+    def evaluate(self, terms, context, *, return_terms=False):
+        if self.delegate is not None:
+            return self.delegate.evaluate(terms, context, return_terms=return_terms)
+        del terms
+        result = _synthetic_local_energy(*context)
+        return result if return_terms else result.total
+
+
 class _RecordingAdam(torch.optim.Adam):
     def __init__(self, model: torch.nn.Module) -> None:
         super().__init__(model.parameters(), lr=0.01)
         self.gradients: list[tuple[torch.Tensor | None, ...]] = []
         self.parameters_after_step: list[tuple[torch.Tensor, ...]] = []
+        self.optimizer_states: list[tuple[dict[str, object], ...]] = []
 
     def step(self, closure=None):
         self.gradients.append(
@@ -62,6 +104,15 @@ class _RecordingAdam(torch.optim.Adam):
         result = super().step(closure)
         self.parameters_after_step.append(
             tuple(parameter.detach().clone() for parameter in self.param_groups[0]["params"])
+        )
+        self.optimizer_states.append(
+            tuple(
+                {
+                    key: value.detach().clone() if isinstance(value, torch.Tensor) else value
+                    for key, value in self.state[parameter].items()
+                }
+                for parameter in self.param_groups[0]["params"]
+            )
         )
         return result
 
@@ -96,7 +147,7 @@ def _batch() -> ElectronBatch:
         dtype=torch.float64,
     )
     spins = torch.tensor([[1.0, -1.0]] * 4, dtype=torch.float64)
-    return ElectronBatch(positions=positions, spins=spins)
+    return ElectronBatch(positions=positions, spins=spins, aux={"sample_id": torch.arange(4)})
 
 
 def _freeze_aux(value: Any) -> Any:
@@ -140,6 +191,7 @@ def _run(
     handoff_mutant: str | None = None,
     loss_mutant: bool = False,
     real_kinetic: bool = False,
+    chunk_size: int | None = None,
 ) -> dict[str, object]:
     model = _TinyWavefunction(nonlinear=real_kinetic)
     optimizer = _RecordingAdam(model)
@@ -148,6 +200,7 @@ def _run(
     objective_inputs: list[torch.Tensor] = []
     original_local_energy = trainer_module.local_energy
     original_objective = trainer_module.compute_vmc_objective
+    original_chunked = trainer_module.evaluate_local_energy_in_chunks
     original_value_detach = trainer_module._detach_local_energy_value
     original_wavefunction_detach = trainer_module._detach_wavefunction_output
 
@@ -157,23 +210,32 @@ def _run(
             return original_local_energy(
                 [KineticEnergy()], wavefunction, batch, return_terms=return_terms
             )
-        output = wavefunction(batch)
-        base = output.logabs * 0 + torch.arange(4, dtype=batch.dtype)
-        finite = torch.tensor([True, True, False, True])
-        total = torch.where(finite, base, torch.full_like(base, float("nan")))
-        result = LocalEnergyResult(
-            total=total,
-            terms={"alpha": total * 2.0, "beta": total * 3.0},
-            wavefunction_output=WavefunctionOutput(
-                logabs=output.logabs,
-                sign=output.sign,
-                aux={"captured": output.logabs * 7.0},
-            ),
-            per_electron_kinetic=total[:, None].expand(-1, 2),
-        )
+        result = _synthetic_local_energy(wavefunction, batch)
         return result if return_terms else result.total
 
     trainer_module.local_energy = fake_local_energy
+    bounded_calls: list[int] = []
+    chunk_batch_sizes: list[int] = []
+    if chunk_size is not None:
+        def bounded(*args, **kwargs):
+            assert kwargs["chunk_size"] == chunk_size
+            bounded_calls.append(kwargs["chunk_size"])
+            if real_kinetic:
+                return original_chunked(
+                    [KineticEnergy()],
+                    *args[1:],
+                    evaluator=_SyntheticChunkEvaluator(
+                        chunk_batch_sizes, delegate=NaiveLocalEnergyEvaluator()
+                    ),
+                    **kwargs,
+                )
+            return original_chunked(
+                *args,
+                evaluator=_SyntheticChunkEvaluator(chunk_batch_sizes),
+                **kwargs,
+            )
+
+        trainer_module.evaluate_local_energy_in_chunks = bounded
 
     def record_objective_input(logabs, local_energy, *, nonfinite_policy):
         if loss_mutant:
@@ -211,6 +273,7 @@ def _run(
             max_steps=3,
             return_terms=True,
             nonfinite_local_energy_policy="mask",
+            local_energy_chunk_size=chunk_size,
         )
         update_inputs: list[torch.Tensor] = []
         original_bind = trainer.bind_update_method
@@ -242,6 +305,7 @@ def _run(
     finally:
         trainer_module.local_energy = original_local_energy
         trainer_module.compute_vmc_objective = original_objective
+        trainer_module.evaluate_local_energy_in_chunks = original_chunked
         trainer_module._detach_local_energy_value = original_value_detach
         trainer_module._detach_wavefunction_output = original_wavefunction_detach
 
@@ -252,11 +316,16 @@ def _run(
         "update_inputs": update_inputs,
         "gradients": optimizer.gradients,
         "parameters": optimizer.parameters_after_step,
+        "optimizer_states": optimizer.optimizer_states,
+        "bounded_calls": bounded_calls,
+        "chunk_batch_sizes": chunk_batch_sizes,
         "results": snapshots,
     }
 
 
-def _assert_equal(left: dict[str, object], right: dict[str, object]) -> None:
+def _assert_equal(
+    left: dict[str, object], right: dict[str, object], *, compare_aux: bool = True
+) -> None:
     def equal_with_mask(left_tensor: torch.Tensor, right_tensor: torch.Tensor) -> None:
         assert torch.equal(torch.isfinite(left_tensor), torch.isfinite(right_tensor))
         assert torch.equal(torch.nan_to_num(left_tensor), torch.nan_to_num(right_tensor))
@@ -279,6 +348,18 @@ def _assert_equal(left: dict[str, object], right: dict[str, object]) -> None:
     for left_parameters, right_parameters in zip(left["parameters"], right["parameters"]):
         for left_parameter, right_parameter in zip(left_parameters, right_parameters):
             assert torch.equal(left_parameter, right_parameter)
+    assert len(left["optimizer_states"]) == len(right["optimizer_states"]) == 3
+    for left_states, right_states in zip(left["optimizer_states"], right["optimizer_states"]):
+        for left_state, right_state in zip(left_states, right_states):
+            assert left_state.keys() == right_state.keys()
+            for key in left_state:
+                left_value = left_state[key]
+                right_value = right_state[key]
+                if isinstance(left_value, torch.Tensor):
+                    assert isinstance(right_value, torch.Tensor)
+                    assert torch.equal(left_value, right_value)
+                else:
+                    assert left_value == right_value
     for left_result, right_result in zip(left["results"], right["results"]):
         equal_with_mask(left_result.total, right_result.total)
         assert list(left_result.terms) == list(right_result.terms)
@@ -296,15 +377,16 @@ def _assert_equal(left: dict[str, object], right: dict[str, object]) -> None:
                 left_result.wavefunction_output.phase,
                 right_result.wavefunction_output.phase,
             )
-        assert set(left_result.wavefunction_output.aux) == set(right_result.wavefunction_output.aux)
-        for name in left_result.wavefunction_output.aux:
-            left_aux = left_result.wavefunction_output.aux[name]
-            right_aux = right_result.wavefunction_output.aux[name]
-            if isinstance(left_aux, torch.Tensor):
-                assert isinstance(right_aux, torch.Tensor)
-                equal_with_mask(left_aux, right_aux)
-            else:
-                assert left_aux == right_aux
+        if compare_aux:
+            assert set(left_result.wavefunction_output.aux) == set(right_result.wavefunction_output.aux)
+            for name in left_result.wavefunction_output.aux:
+                left_aux = left_result.wavefunction_output.aux[name]
+                right_aux = right_result.wavefunction_output.aux[name]
+                if isinstance(left_aux, torch.Tensor):
+                    assert isinstance(right_aux, torch.Tensor)
+                    equal_with_mask(left_aux, right_aux)
+                else:
+                    assert left_aux == right_aux
         equal_with_mask(left_result.per_electron_kinetic, right_result.per_electron_kinetic)
 
 
@@ -348,6 +430,42 @@ def test_real_kinetic_current_and_detached_paths_are_bitwise_over_three_updates(
         _run(skip_detach=True, real_kinetic=True),
         _run(skip_detach=False, real_kinetic=True),
     )
+
+
+def test_enabled_chunk_route_matches_legacy_adam_steps_and_states() -> None:
+    legacy = _run(skip_detach=False, chunk_size=None)
+    chunked = _run(skip_detach=False, chunk_size=2)
+    _assert_equal(legacy, chunked, compare_aux=False)
+    assert legacy["bounded_calls"] == []
+    assert chunked["bounded_calls"] == [2, 2, 2]
+    assert chunked["chunk_batch_sizes"]
+    assert all(0 < size <= 2 for size in chunked["chunk_batch_sizes"])
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(legacy["parameters"][0], legacy["parameters"][1])
+    )
+
+
+def test_real_kinetic_chunk_route_matches_legacy_adam_steps_and_states() -> None:
+    legacy = _run(skip_detach=False, real_kinetic=True, chunk_size=None)
+    chunked = _run(skip_detach=False, real_kinetic=True, chunk_size=2)
+    _assert_equal(legacy, chunked, compare_aux=False)
+    assert legacy["bounded_calls"] == []
+    assert chunked["bounded_calls"] == [2, 2, 2]
+    assert chunked["chunk_batch_sizes"]
+    assert all(0 < size <= 2 for size in chunked["chunk_batch_sizes"])
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(legacy["parameters"][0], legacy["parameters"][1])
+    )
+
+
+def test_red_adam_state_mutation_fails_route_equivalence_oracle() -> None:
+    legacy = _run(skip_detach=False, chunk_size=None)
+    mutant = _run(skip_detach=False, chunk_size=2)
+    mutant["optimizer_states"][1][0]["exp_avg"] += 1.0
+    with pytest.raises(AssertionError):
+        _assert_equal(legacy, mutant)
 
 
 def _run_lifecycle(
@@ -416,6 +534,69 @@ def test_return_terms_false_uses_tensor_fallback_and_releases_graph() -> None:
         trainer_return_terms=False,
     )
     assert released and all(released)
+
+
+def test_enabled_chunk_size_selects_bounded_local_energy_route(monkeypatch) -> None:
+    model = _TinyWavefunction()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    sampler = _FixedSampler(_batch())
+    calls: list[int | None] = []
+    original = trainer_module.evaluate_local_energy_in_chunks
+
+    def bounded(*args, **kwargs):
+        calls.append(kwargs["chunk_size"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(trainer_module, "evaluate_local_energy_in_chunks", bounded)
+    VMCTrainer(max_steps=1, local_energy_chunk_size=2).fit(
+        model=model,
+        sampler=sampler,
+        hamiltonian_terms=[],
+        optimizer=optimizer,
+        context=_Records(),
+        emit=lambda *args, **kwargs: None,
+    )
+
+    assert calls == [2]
+
+
+def test_none_chunk_size_keeps_legacy_local_energy_route(monkeypatch) -> None:
+    model = _TinyWavefunction()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    sampler = _FixedSampler(_batch())
+    legacy_calls = 0
+    bounded_calls = 0
+    original_legacy = trainer_module.local_energy
+
+    def legacy(*args, **kwargs):
+        nonlocal legacy_calls
+        legacy_calls += 1
+        return original_legacy(*args, **kwargs)
+
+    def bounded(*args, **kwargs):
+        nonlocal bounded_calls
+        bounded_calls += 1
+        return original_legacy(*args, **kwargs)
+
+    monkeypatch.setattr(trainer_module, "local_energy", legacy)
+    monkeypatch.setattr(trainer_module, "evaluate_local_energy_in_chunks", bounded)
+    VMCTrainer(max_steps=1).fit(
+        model=model,
+        sampler=sampler,
+        hamiltonian_terms=[],
+        optimizer=optimizer,
+        context=_Records(),
+        emit=lambda *args, **kwargs: None,
+    )
+
+    assert legacy_calls == 1
+    assert bounded_calls == 0
+
+
+@pytest.mark.parametrize("invalid", [0, -1, True, 1.5, "2"])
+def test_invalid_local_energy_chunk_size_rejects_before_sampling(invalid) -> None:
+    with pytest.raises((ValueError, TypeCheckError), match="positive integer|did not match"):
+        VMCTrainer(max_steps=1, local_energy_chunk_size=invalid)
 
 
 def test_fit_graph_release_integration_is_red_without_handoff() -> None:

@@ -421,6 +421,7 @@ def launch_train(
     topology: object | None = None,
     *,
     runner: Callable[..., object] = run_from_config,
+    runtime_callbacks: Sequence[object] = (),
 ) -> int:
     """Resolve one topology-bound row and execute TPEN's production runner.
 
@@ -431,6 +432,28 @@ def launch_train(
     TPEN topology is owned behind this boundary. This closes the named
     capability-blind identity-dispatch mechanism, not every way a callable
     could ignore or mishandle a topology it accepts.
+
+    Parameters
+    ----------
+    source : Any
+        Materialized HI cell or compatible launch source.
+    topology : object, optional
+        Runtime execution topology supplied by the caller.
+    runner : callable, optional
+        Runner receiving the resolved config and accepted runtime keywords.
+    runtime_callbacks : sequence of object, optional
+        Operational observers appended after configured callbacks. A non-empty
+        sequence is refused when the runner cannot accept this keyword.
+
+    Returns
+    -------
+    int
+        The runner's integer process code.
+
+    Raises
+    ------
+    LaunchValidationError
+        If launch facts, the runner contract, or the returned code is invalid.
     """
 
     facts = execution_topology_facts(topology) if topology is not None else {}
@@ -444,18 +467,54 @@ def launch_train(
             # Backstop: L1's empty-mapping refusal is reached first.
             raise LaunchValidationError("launch topology is required")
         _validate_runner_topology_facts(facts)
-        return _exit_code(runner(plan.config, topology=facts))
-    if topology is not None:
-        parameters = inspect.signature(runner).parameters.values()
-        accepts_topology = any(
-            str.__eq__(parameter.name, "topology") is True
-            or parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
+        return _exit_code(
+            runner(
+                plan.config,
+                topology=facts,
+                runtime_callbacks=runtime_callbacks,
+            )
         )
-        if accepts_topology:
-            _validate_runner_topology_facts(facts)
-            return _exit_code(runner(plan.config, topology=facts))
-    return _exit_code(runner(plan.config))
+
+    try:
+        parameters = inspect.signature(runner).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    accepts_topology = any(
+        str.__eq__(parameter.name, "topology") is True
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    accepts_runtime_callbacks = any(
+        (
+            str.__eq__(parameter.name, "runtime_callbacks") is True
+            and (
+                parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+                or parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            )
+        )
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+    if runtime_callbacks and not accepts_runtime_callbacks:
+        raise LaunchValidationError(
+            "runner cannot accept non-empty runtime_callbacks"
+        )
+
+    kwargs: dict[str, object] = {}
+    if topology is not None and accepts_topology:
+        _validate_runner_topology_facts(facts)
+        kwargs["topology"] = facts
+    has_keyword_runtime_callbacks = any(
+        str.__eq__(parameter.name, "runtime_callbacks") is True
+        and (
+            parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+            or parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        )
+        for parameter in parameters
+    )
+    if has_keyword_runtime_callbacks or (accepts_runtime_callbacks and runtime_callbacks):
+        kwargs["runtime_callbacks"] = runtime_callbacks
+    return _exit_code(runner(plan.config, **kwargs))
 
 
 __all__ = [
