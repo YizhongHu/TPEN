@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from tpen.checkpoint import (
     CheckpointRef,
+    PUBLICATION_CATALOG_FILENAME,
     list_complete_checkpoints,
     read_publications,
     resolve_checkpoint_dir,
@@ -126,6 +127,7 @@ def inspect_run(path: str | Path) -> RunEvidence:
     """
 
     run_dir = Path(path)
+    run_status: str | None = None
     try:
         if not run_dir.is_dir():
             raise _InspectionRefusal("missing-run-dir", f"run directory not found: {run_dir}")
@@ -142,7 +144,7 @@ def inspect_run(path: str | Path) -> RunEvidence:
             RUN_EVIDENCE_SCHEMA,
             str(run_dir),
             "refused",
-            locals().get("run_status"),
+            run_status,
             None,
             {"code": exc.code, "reason": exc.reason},
         )
@@ -171,7 +173,7 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
     if not root.is_dir():
         raise _InspectionRefusal("missing-checkpoint", f"checkpoint root not found: {root}")
 
-    catalog_path = root / "publications.jsonl"
+    catalog_path = root / PUBLICATION_CATALOG_FILENAME
     try:
         publications = read_publications(catalog_path) if catalog_path.is_file() else ()
     except (OSError, ValueError, TypeError, KeyError) as exc:
@@ -207,17 +209,11 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
         raise _InspectionRefusal("missing-checkpoint", f"no committed checkpoint under {root}")
 
     ref = max(refs, key=lambda candidate: candidate.next_iteration)
-    manifest = read_manifest(ref.checkpoint_dir / "manifest.json", mode="train_resume")
-    if manifest.completed_updates is None:
-        raise _InspectionRefusal("incomplete-checkpoint", "checkpoint has no completed_updates counter")
-    declared_model_hash = manifest.hashes.get("model_sha256")
-    if declared_model_hash is not None and declared_model_hash != ref.model_sha256:
-        raise _InspectionRefusal("corrupt-checkpoint", "manifest model_sha256 does not match model.pt")
     return {
         "checkpoint_dir": str(ref.checkpoint_dir),
-        "schema_version": manifest.schema_version,
-        "next_iteration": manifest.next_iteration,
-        "completed_updates": manifest.completed_updates,
+        "schema_version": ref.schema_version,
+        "next_iteration": ref.next_iteration,
+        "completed_updates": ref.completed_updates,
     }
 
 
