@@ -36,7 +36,7 @@ work_item_schemas:
         role: work
         required: true
         description: "Orchestrator: spawn an isolated implementation worker."
-        guidance: "Use Paseo to create a dedicated worktree and agent-namespaced branch from dev or the stack predecessor, then spawn the worker. Run check_authoritative_edit before its first edit. Record agent ID, workspace ID, branch, launch-guard result, agent provider, thinking effort, speed, permissions, and other relevant information, including record of exceptions to the norm."
+        guidance: "Use Paseo to create a dedicated worktree and agent-namespaced branch from dev or the stack predecessor, then spawn the worker. Record agent ID, workspace ID, branch, agent provider, thinking effort, speed, permissions, and other relevant information, including record of exceptions to the norm."
         skill: paseo
         maxLength: 1000
 

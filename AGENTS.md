@@ -10,6 +10,18 @@
   action on Cannon, Polaris, Aurora, or Frontier, read and follow
   `cluster-access` and the current Task Orchestrator cluster notes. Do not infer
   facility policy from another cluster or an older receipt.
+- Before any Paseo action - creating, staffing, messaging, or scheduling an
+  agent, or arming a heartbeat - read and follow the `paseo` skill. This is
+  mandatory, not advisory.
+- All TPEN tests are conducted on clusters. Use FASRC-cannon unless otherwise
+  specified.
+- Agents that did not finish their task are not allowed to go completely
+  idle (stop working or thinking) unless it is blocked by human decision or
+  some other process such as cluster job and other agents' work.
+- When blocked by another process, agents are strongly encouraged to use
+  `paseo-monitor` so that they can be woken up later by a monitoring daemon.
+  Since `paseo-monitor` is experimental, agents are encouraged to use heartbeats
+  as a failsafe. Heartbeat needs to be cancelled when agents return.
 
 ## Orchestrators
 
@@ -20,13 +32,13 @@
   PR layer. Use `gh-stack` for stacks.
 - If a Paseo child must report back, tell it which events to report with
   `paseo-queue add <agent> "msg"` including completion.
-- For urgent messages, `paseo send "msg"` should be used instead.
-- For ongoing observation, use `monitor-with-subagent`. The monitoring child
-  stays active and reports declared events; the orchestrator owns only the
-  bounded failsafe heartbeat described by the skill.
+- Before messages are sent, there needs to be an urgency evaluation.
+  For urgent messages, `paseo send "msg"` should be used instead.
 - When blocked with no safe next action, record the blocker in Task
   Orchestrator, schedule a bounded heartbeat only when needed, then yield.
-  Delete the heartbeat when work resumes.
+  Delete the monitoring heartbeat when work resumes.
+- Keep a standing heartbeat that re-reads `CLAUDE.md` or `AGENTS.md` from start to finish every few
+  hours to refresh your memory. DO NOT take shortcuts such as running a diff.
 
 # Repo Instructions
 
@@ -89,102 +101,35 @@ and currently important information should not.
 
 Do not place helper functions wherever they are first needed. Put each helper in the module that owns the relevant concept.
 
-Examples:
-
-```text
-Permutation logic       -> tpen/data/permutation.py
-Tuple-index logic       -> tpen/data/indices.py
-Virtual path logic      -> tpen/data/paths.py
-Partition logic         -> tpen/data/partition.py
-Trainable modules       -> tpen/nn/
-```
-
-Bad:
-
-```python
-# tpen/nn/equivariant_mixing.py
-def ordered_tuples(...):
-    ...
-```
-
-Good:
-
-```python
-from tpen.data.indices import ordered_tuples
-```
-
 ### Prefer small PR steps
 
 For this project, correctness is more important than breadth. Prefer small changes with strong tests.
 
 Avoid large PRs that change multiple things at the same time.
 
-### Require an authoritative-edit launch receipt
+### Implementation worker lifecycle
 
-Before the first repository edit for any implementation slice, run:
+For each TO implementation slice:
 
-```bash
-uv run --no-project python tools/check_authoritative_edit.py --item <task-orchestrator-item-id>
-```
+1. The orchestrator claims the item and advances it to `work` before dispatch.
+2. Use Paseo to create a dedicated worktree and agent-namespaced branch from `dev` or the stack predecessor.
+3. Spawn one implementation worker in that workspace.
+4. After implementation, confirm the PR is pushed and no unpreserved local changes remain.
+5. Archive the implementation worker's workspace through Paseo.
+6. Spawn a verifier worker in a separate Paseo workspace to test the implemented code.
+7. Record verification results, then archive the verifier's workspace through Paseo.
+8. Upon successful verification, advance the item to `review` and release its claim. This unblocks downstream slices with `unblockAt: review`.
+9. When the PR is resolved, record its disposition and complete or cancel the TO item accordingly.
 
-Proceed only when it emits `"status": "ok"`. The guard requires a clean tracked
-tree on an agent-namespaced branch plus a claimed TPEN `implementation-slice`
-already in `work` with a non-empty `acceptance-contract`. Existing untracked
-research and run data are deliberately ignored and must remain untouched.
-
-The guard requires Python 3.9+ because it uses `str.removesuffix`. The
-`uv run --no-project python` form skips project and workspace discovery, but it
-still selects an interpreter from ambient state such as a discovered or
-activated `.venv`, `VIRTUAL_ENV`, `UV_PYTHON`, or `.python-version`; it does not
-guarantee the project interpreter. Before relying on that invocation, settle
-the selection with `uv run --no-project python -c 'import sys; print(sys.version)'`.
-The sanctioned interpreter-direct deviation is precisely where a stale ambient
-`python3` may be selected, so name an explicitly installed 3.9+ interpreter
-when invoking the script directly. A `blocked` verdict whose reason says the
-interpreter is unsupported means no guard precondition was evaluated: rerun
-with the `uv run --no-project python` command above or a named 3.9+ interpreter.
-Any other `blocked` reason is a genuine guard precondition failure; repair that
-precondition before editing. Because the gate runs ahead of `parse_args()`, on
-an interpreter where the gate is reachable but unsupported, `--help`, unknown
-options, and a missing `--item` return exit 1 with the structured interpreter
-refusal instead of argparse's usage or help output. On Python 3.9+ argparse
-behaviour is unchanged by this guard. The version predicate refuses every
-version tuple below 3.9, but that predicate is not a claim of delivered runtime
-coverage: the structured refusal is implemented for Python 3.7 and 3.8.
-Python <=3.6 raises `SyntaxError` before the gate can run because `from
-__future__ import annotations` requires Python 3.7+.
-
-**Run the guard outside the agent sandbox.** This is allowed and encouraged, not
-a workaround. The guard reads the Task Orchestrator HTTP API, and sandboxed
-coding agents deny outbound network, so it returns
-`{"status": "blocked"}` with `urlopen error [Errno 1] Operation not permitted`.
-The same sandboxes deny paths named `.git`, which breaks `uv` outright because
-`uv` writes a zero-byte `.git` marker into every cache directory on init;
-redirecting `UV_CACHE_DIR` does not help, because `uv` recreates the marker
-wherever it is pointed. Do not send a sandboxed agent at this guard and do not
-escalate sandbox permissions for it.
-
-Instead, an unsandboxed party — normally the orchestrator — runs it from the
-lane's own worktree, and records the output as an
-`authoritative-edit-launch-receipt` note on that lane's item. Invoking the
-script through an interpreter directly instead of `uv run --no-project` is
-acceptable here: the script performs no dependency resolution. However,
-`uv run --no-project` does not guarantee the project interpreter; it can follow
-the ambient environment-selection inputs described above, so check
-`uv run --no-project python -c 'import sys; print(sys.version)'` before relying
-on it. Record both deviations in the receipt — interpreter-direct, and
-executed by someone other than the editing agent — together with what that does
-*not* establish: the editing agent did not confirm its own preconditions. The receipt is
-point-in-time, so the lane must not reset, rebase, or switch branches between
-the receipt and its first edit. One caution: an agent may run the guard
-successfully early in a session and be denied later, so an early success is not
-evidence the restriction is absent.
+Before spawning a worker, check for existing agents or workspaces associated with the item. Preserve workspaces containing uncommitted or unpushed work, and retain verification evidence before cleanup. Failed verification triggers the next round of implementation work starting at step 3.
 
 ## Branches
 
 ### Sectioning
 
-Coding agents may push only to agent-namespaced branches: Codex to `codex/**`, Claude to `claude/**`.
+Coding agents may push only to agent-namespaced branches `agent/**`. 
+
+They may also push to legacy `codex/**` and `claude/**` branches.
 
 Agents must not push to branches other than these mentioned above, such as `main`,
  merge PRs, or force-push unless the user explicitly asks. Feature branches open PRs against `dev`.
