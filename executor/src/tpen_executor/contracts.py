@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-from ._codec import _freeze, canonical_bytes, digest, fields, sequence, sha256_text, text, thaw
+from ._codec import _freeze, canonical_bytes, decode_json, digest, fields, sequence, sha256_text, text, thaw
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +26,9 @@ class _Identity:
 
         return {"schema": self.schema, "value": self.value}
 
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
     @classmethod
     def from_mapping(cls, data: Any) -> "_Identity":
         """Decode one identity while preserving its concrete type."""
@@ -35,19 +38,26 @@ class _Identity:
             raise TypeError(f"{cls.__name__}.value must be a string")
         return cls(data["value"])
 
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "_Identity":
+        return cls.from_mapping(decode_json(data))
 
+
+@dataclass(frozen=True, slots=True)
 class AttemptId(_Identity):
     """Identity of one fresh execution attempt."""
 
     schema: ClassVar[str] = "tpen-executor/attempt-id-v1"
 
 
+@dataclass(frozen=True, slots=True)
 class AllocationId(_Identity):
     """Identity of one backend allocation."""
 
     schema: ClassVar[str] = "tpen-executor/allocation-id-v1"
 
 
+@dataclass(frozen=True, slots=True)
 class BackendJobId(_Identity):
     """Identity assigned by a backend to one submitted job."""
 
@@ -56,7 +66,15 @@ class BackendJobId(_Identity):
 
 @dataclass(frozen=True, slots=True)
 class ProgramSpecRef:
-    """Opaque unresolved program configuration and its content digest."""
+    """Opaque unresolved program configuration and its content digest.
+
+    Parameters
+    ----------
+    config_ref : object
+        JSON-shaped unresolved configuration.
+    content_digest : str
+        SHA-256 digest of the canonical configuration bytes.
+    """
 
     schema: ClassVar[str] = "tpen-executor/program-spec-ref-v1"
     config_ref: Any
@@ -76,15 +94,36 @@ class ProgramSpecRef:
     def to_dict(self) -> dict[str, Any]:
         return {"schema": self.schema, "config_ref": thaw(self.config_ref), "content_digest": self.content_digest}
 
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
     @classmethod
     def from_mapping(cls, data: Any) -> "ProgramSpecRef":
         fields(data, {"schema", "config_ref", "content_digest"}, cls.schema, "ProgramSpecRef")
         return cls(data["config_ref"], data["content_digest"])
 
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "ProgramSpecRef":
+        return cls.from_mapping(decode_json(data))
+
 
 @dataclass(frozen=True, slots=True)
 class TaskSpec:
-    """One logical task admitted to an executor group."""
+    """One logical task admitted to an executor group.
+
+    Parameters
+    ----------
+    task_id, lineage_id : str
+        Stable logical and lineage identities.
+    program : ProgramSpecRef
+        Unresolved program configuration reference.
+    science_digest : str
+        Digest of the science inputs.
+    target_horizon : int
+        Nonnegative target amount.
+    target_horizon_units : str
+        Units for ``target_horizon``.
+    """
 
     schema: ClassVar[str] = "tpen-executor/task-spec-v1"
     task_id: str
@@ -105,16 +144,27 @@ class TaskSpec:
     def to_dict(self) -> dict[str, Any]:
         return {"schema": self.schema, "task_id": self.task_id, "lineage_id": self.lineage_id, "program": self.program.to_dict(), "science_digest": self.science_digest, "target_horizon": self.target_horizon, "target_horizon_units": self.target_horizon_units}
 
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
     @classmethod
     def from_mapping(cls, data: Any) -> "TaskSpec":
         fields(data, {"schema", "task_id", "lineage_id", "program", "science_digest", "target_horizon", "target_horizon_units"}, cls.schema, "TaskSpec")
         if type(data["task_id"]) is not str or type(data["lineage_id"]) is not str or type(data["science_digest"]) is not str or type(data["target_horizon"]) is not int or type(data["target_horizon_units"]) is not str: raise TypeError("TaskSpec has an invalid field type")
         return cls(data["task_id"], data["lineage_id"], ProgramSpecRef.from_mapping(data["program"]), data["science_digest"], data["target_horizon"], data["target_horizon_units"])
 
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "TaskSpec":
+        return cls.from_mapping(decode_json(data))
+
 
 @dataclass(frozen=True, slots=True)
 class ReadyGroup:
-    """Ordered, heterogeneous group of tasks ready for one allocation plan."""
+    """Ordered, heterogeneous group of tasks ready for one allocation plan.
+
+    The identity is the SHA-256 digest of this record's canonical bytes.
+    Member order is significant and changing it changes ``identity``.
+    """
 
     schema: ClassVar[str] = "tpen-executor/ready-group-v1"
     group_id: str
@@ -132,11 +182,17 @@ class ReadyGroup:
     def to_dict(self) -> dict[str, Any]:
         return {"schema": self.schema, "group_id": self.group_id, "members": [member.to_dict() for member in self.members], "execution_plan_digest": self.execution_plan_digest}
 
-    def encode(self) -> bytes: return canonical_bytes(self.to_dict())
+    @property
+    def identity(self) -> str:
+        """Return the order-sensitive canonical identity of this group."""
+
+        return digest(self.to_dict())
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
 
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "ReadyGroup":
-        from ._codec import decode_json
         return cls.from_mapping(decode_json(data))
 
     @classmethod

@@ -1,1 +1,1 @@
-{"allocation_id":"allocation-1","attempt_id":"attempt-1","backend_job_id":"job-1","output_dir":"/runs/group-1/task-a/attempt-1","schema":"tpen-executor/start-receipt-v1","started_at_utc":"2026-11-04T00:00:00Z","task_id":"task-a"}
+{"allocation_id":"allocation-1","attempt_id":"attempt-1","backend_job_id":"job-1","group_digest":"76a21ab64e2533a35421b67a8c16c832967fcc6cadf730c9fdfd505840389ebf","output_dir":"/runs/group-1/task-a/attempt-1","schema":"tpen-executor/start-receipt-v1","started_at_utc":"2026-11-04T00:00:00Z","task_id":"task-a"}

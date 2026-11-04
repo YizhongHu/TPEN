@@ -160,6 +160,6 @@ def test_identity_types_are_not_interchangeable() -> None:
     """Attempt, allocation, and backend-job identities remain nominally distinct."""
 
     with pytest.raises(TypeError):
-        StartReceipt("task-a", AllocationId("wrong"), AllocationId("allocation-1"), BackendJobId("job-1"), "now", "/out")
+        StartReceipt("task-a", AllocationId("wrong"), AllocationId("allocation-1"), BackendJobId("job-1"), digest({"group": 1}), "now", "/out")
     with pytest.raises(TypeError):
-        StartReceipt("task-a", AttemptId("attempt-1"), AttemptId("wrong"), BackendJobId("job-1"), "now", "/out")
+        StartReceipt("task-a", AttemptId("attempt-1"), AttemptId("wrong"), BackendJobId("job-1"), digest({"group": 1}), "now", "/out")

@@ -61,7 +61,7 @@ def test_completed_evidence_preserves_manifest_counters(tmp_path: Path) -> None:
 
     assert evidence.verdict == "completed"
     assert evidence.checkpoint == {
-        "checkpoint_dir": str(tmp_path / "run" / "checkpoints" / "step_000007"),
+        "checkpoint_dir": str((tmp_path / "run" / "checkpoints" / "step_000007").resolve()),
         "schema_version": 2,
         "next_iteration": 7,
         "completed_updates": 5,
