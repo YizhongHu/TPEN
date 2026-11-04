@@ -15,6 +15,7 @@ from tpen.checkpoint import (
     read_publications,
     resolve_checkpoint_dir,
 )
+from tpen.checkpoint.manifest import CheckpointManifest
 from tpen.checkpoint.schema import read_manifest
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
@@ -122,6 +123,10 @@ class _InspectionRefusal(ValueError):
         self.reason = reason
 
 
+class _TrainResumeModeGate(ValueError):
+    """Internal marker for a valid artifact excluded by the train-resume gate."""
+
+
 def inspect_run(path: str | Path) -> RunEvidence:
     """Inspect a core run without modifying any file.
 
@@ -147,9 +152,10 @@ def inspect_run(path: str | Path) -> RunEvidence:
             raise _InspectionRefusal("missing-run-dir", f"run directory not found: {run_dir}")
         status_path, status = _read_status(run_dir)
         run_dir = status_path.parent.resolve()
-        run_status = status.get("status")
-        if run_status is not None and not isinstance(run_status, str):
+        raw_status: object = status.get("status")
+        if raw_status is not None and not isinstance(raw_status, str):
             raise _InspectionRefusal("malformed-status", f"status value is not a string: {status_path}")
+        run_status = raw_status
         checkpoint: dict[str, Any] | None = None
         try:
             checkpoint = _read_checkpoint(run_dir)
@@ -210,8 +216,10 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
     refs: list[CheckpointRef] = []
     for ref in publications:
         try:
-            read_manifest(ref.checkpoint_dir / "manifest.json", mode="train_resume")
+            _read_train_resume_manifest(ref.checkpoint_dir / "manifest.json")
             refs.append(ref.validate())
+        except _TrainResumeModeGate:
+            continue
         except OSError as exc:
             raise _InspectionRefusal("checkpoint-io-error", f"published checkpoint cannot be read: {exc}") from exc
         except (ValueError, TypeError, KeyError, OverflowError) as exc:
@@ -221,12 +229,14 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
     for directory in complete_dirs:
         try:
             ref = CheckpointRef.from_directory(directory)
-            manifest = read_manifest(directory / "manifest.json", mode="train_resume")
+            manifest = _read_train_resume_manifest(directory / "manifest.json")
             declared_model_hash = manifest.hashes.get("model_sha256")
             if declared_model_hash is not None and declared_model_hash != ref.model_sha256:
                 raise ValueError("manifest model_sha256 does not match model.pt")
             ref.validate()
             refs.append(ref)
+        except _TrainResumeModeGate:
+            continue
         except OSError as exc:
             raise _InspectionRefusal("checkpoint-io-error", f"checkpoint cannot be read: {exc}") from exc
         except (ValueError, TypeError, KeyError, OverflowError) as exc:
@@ -250,6 +260,16 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
         "next_iteration": ref.next_iteration,
         "completed_updates": ref.completed_updates,
     }
+
+
+def _read_train_resume_manifest(path: Path) -> CheckpointManifest:
+    """Read a manifest, marking only a valid non-train-resume artifact."""
+
+    read_manifest(path, mode="model_only")
+    try:
+        return read_manifest(path, mode="train_resume")
+    except ValueError as exc:
+        raise _TrainResumeModeGate(str(exc)) from exc
 
 
 def _main(argv: list[str] | None = None) -> int:
