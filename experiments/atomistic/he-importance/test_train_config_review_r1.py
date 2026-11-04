@@ -111,9 +111,7 @@ def test_resolver_forwards_exactly_the_package_labels_to_ab3(
 ) -> None:
     """Clause 2: the resolved model is AB-3's composition for the package's own labels.
 
-    A spy on the composition entry point the resolver actually imports records
-    Every package must forward exactly its literal configuration (plus
-    ``package`` and the model-initialization seed) on the committed base model.
+    A spy on the composition entry point the resolver actually imports records every call. Every package must forward exactly its literal configuration (plus ``package`` and the model-initialization seed) on the committed base model; the former ``_AB_CONTROL`` table is asserted absent.
     """
 
     composer = train_config._context_mapping_api()
@@ -197,14 +195,11 @@ def test_near_miss_in_every_coordinate_is_wrapped_with_its_cause(
     assert repr(near_miss) in str(info.value.__cause__)
 
 
-# T4 (expected RED at eeb302f2; evidence for the value-shape finding) -------
+# T4 (evidence for the value-shape finding) -------------------------------
 def test_mapping_valued_coordinate_is_refused_as_context_resolution_error(tmp_path: Path) -> None:
     """Clause 3 discipline over value shape, not only key set.
 
-    A mapping-valued coordinate passes the manifest firewall and the closed-key
-    check, then reaches AB-3 where an unhashable label raises TypeError, which
-    the resolver's narrow wrap does not convert.  Expected to FAIL at the
-    reviewed head with ``TypeError: unhashable type: 'dict'``.
+    Regression test for the value-type refusal: a mapping-valued coordinate passes the manifest firewall and the closed-key check and must be refused by the resolver as ``ContextResolutionError`` before it can reach AB-3 (where an unhashable label would raise ``TypeError``).
     """
 
     package = ab_universe.render_a_packages()[0]
