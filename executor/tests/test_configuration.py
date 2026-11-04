@@ -62,13 +62,13 @@ def test_capture_does_not_construct_and_materialize_constructs_once(tmp_path: Pa
 
     result = staged.program.materialize({"remote_only": {"value": "worker-value"}})  # type: ignore[union-attr]
     assert staged_targets.CONSTRUCTIONS == 1
-    assert isinstance(result.worker, WorkerProgram)
+    assert isinstance(result.process.worker, WorkerProgram)
     worker = staged.programs["program.process.worker"]
-    assert result.worker.spec.content_digest == worker.spec.content_digest
+    assert result["process"].worker.spec.content_digest == worker.spec.content_digest
 
     runner = worker.materialize({"remote_only": {"value": "worker-value"}})
     assert staged_targets.CONSTRUCTIONS == 2
-    assert runner.command == "worker-value"
+    assert runner.runner.command == "worker-value"
 
 
 def test_program_digest_is_stable_local_and_sensitive_only_to_program_changes(tmp_path: Path) -> None:

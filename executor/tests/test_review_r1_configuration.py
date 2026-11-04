@@ -40,7 +40,7 @@ def test_t1_environment_does_not_leak_into_target_kwargs(tmp_path: Path) -> None
     review_targets.reset()
     staged = _compose(tmp_path)
     result = staged.program.materialize({"remote_only": {"value": "x"}})
-    assert result.label == "x"
+    assert result.payload.label == "x"
     assert review_targets.CONSTRUCTIONS == 1
 
 
@@ -104,7 +104,7 @@ program:
     assert raw["payload"]["extra"] == "${program.allocation_label}"
     review_targets.reset()
     result = staged.program.materialize({})
-    assert result.extra == "lbl"
+    assert result.payload.extra == "lbl"
 
 
 def test_t3_nested_program_marker_becomes_handle_before_parent_instantiate(tmp_path: Path) -> None:
@@ -132,7 +132,7 @@ program:
     review_targets.reset()
     result = staged.program.materialize({"remote_only": {"value": "cmd"}})
     assert review_targets.CONSTRUCTIONS == 1
-    assert isinstance(result.worker, WorkerProgram)
+    assert isinstance(result.payload.worker, WorkerProgram)
 
 
 def test_orchestrator_stage_captures_already_composed_config(tmp_path: Path) -> None:
@@ -290,7 +290,7 @@ staged_targets.reset()
 ref = ProgramSpecRef.decode(Path(sys.argv[1]).read_bytes())
 result = WorkerProgram(ref).materialize({"remote_only": {"value": "w"}})
 print(staged_targets.CONSTRUCTIONS)
-print(result.command)
+print(result.runner.command)
 """
     result = subprocess.run(
         [sys.executable, "-c", code, str(ref_path), str(src), str(tests)],
@@ -324,8 +324,8 @@ def test_t7_capture_precedes_resolver_evaluation(tmp_path: Path, monkeypatch: py
     assert staged.program.spec.config_ref["payload"]["extra"] == "${remote_only.other}"
     monkeypatch.setenv(variable, "v")
     result = staged.program.materialize({"remote_only": {"other": "o"}})
-    assert result.options["secret"] == "v"
-    assert result.options["extra"] == "o"
+    assert result.payload.options["secret"] == "v"
+    assert result.payload.options["extra"] == "o"
 
 
 def test_t8_contracts_import_without_hydra_or_omegaconf(tmp_path: Path) -> None:

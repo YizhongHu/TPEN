@@ -3,12 +3,15 @@
 from importlib import import_module
 
 from .contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
+from .delivery import PreparedInputBundle
+from .environments import PreparedPythonEnvironment, SourceScript
 from .results import AllocationObservation, ManifestAttempt, OutcomeReceipt, RunManifest, StartReceipt, decode_manifest, encode_manifest
 
 __version__ = "0.1.0"
 
 _LAZY_EXPORTS = {
     "AllocationProgram": (".programs", "AllocationProgram"),
+    "MaterializedProgram": (".programs", "MaterializedProgram"),
     "StagedConfig": (".configuration", "StagedConfig"),
     "StagedHydra": (".configuration", "StagedHydra"),
     "WorkerProgram": (".programs", "WorkerProgram"),
@@ -28,8 +31,9 @@ def __getattr__(name: str):
 
 __all__ = [
     "__version__", "AllocationId", "AllocationObservation", "AllocationProgram",
-    "AttemptId", "BackendJobId", "ManifestAttempt", "OutcomeReceipt",
+    "AttemptId", "BackendJobId", "ManifestAttempt", "MaterializedProgram", "OutcomeReceipt",
     "ProgramSpecRef", "ReadyGroup", "RunManifest", "StagedConfig", "StagedHydra",
-    "StartReceipt", "TaskSpec", "WorkerProgram",
+    "PreparedInputBundle", "PreparedPythonEnvironment", "SourceScript", "StartReceipt",
+    "TaskSpec", "WorkerProgram",
     "decode_manifest", "encode_manifest",
 ]

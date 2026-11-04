@@ -33,7 +33,7 @@ from omegaconf.grammar_parser import parse as parse_interpolation
 
 from ._codec import digest
 from .contracts import ProgramSpecRef
-from .programs import AllocationProgram, WorkerProgram
+from .programs import AllocationProgram, WorkerProgram, payload_entries, validate_marker_shape
 
 
 _PROGRAM_TYPES = {
@@ -168,6 +168,8 @@ def _capture(value: Any, path: str, found: dict[str, Any], raw_config: Any) -> N
         if marked and target in _PROGRAM_TYPES:
             if not path:
                 raise ValueError("a program marker cannot be the configuration root")
+            validate_marker_shape(value, path)
+            payload_entries(value, path)
             _validate_marker(value, path, raw_config)
             ref = ProgramSpecRef(value, digest(value))
             found[path] = _PROGRAM_TYPES[target](ref, path)

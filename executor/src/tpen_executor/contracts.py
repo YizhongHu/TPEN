@@ -97,6 +97,11 @@ class ProgramSpecRef:
     def encode(self) -> bytes:
         return canonical_bytes(self.to_dict())
 
+    def __hash__(self) -> int:
+        """Hash the canonical wire form of the frozen specification."""
+
+        return hash(self.encode())
+
     @classmethod
     def from_mapping(cls, data: Any) -> "ProgramSpecRef":
         fields(data, {"schema", "config_ref", "content_digest"}, cls.schema, "ProgramSpecRef")
