@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ast
+import builtins
+import io
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -59,6 +62,19 @@ def test_subprocess_worker_preserves_setup_env_and_argument_boundaries(tmp_path:
     assert "MODE=overlay" in out.read_text()
     assert "SETUP=yes" in out.read_text()
     assert set(tmp_path.iterdir()) >= {out, err}
+
+
+def test_subprocess_worker_real_child_preserves_no_setup_argument_boundaries(tmp_path: Path) -> None:
+    child = tmp_path / "child.py"
+    child.write_text("import json,sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
+    environment = PreparedPythonEnvironment(sys.executable, None, {"PYTHONDONTWRITEBYTECODE": "1"})
+    args = (str(child), "space value", 'quote"value', "$HOME")
+    out, err = tmp_path / "args.out", tmp_path / "args.err"
+
+    outcome = SubprocessWorker().run(environment, args, cwd=tmp_path, stdout_path=out, stderr_path=err)
+
+    assert outcome.returncode == 0
+    assert json.loads(out.read_text(encoding="utf-8")) == list(args[1:])
 
 
 def test_tpen_command_has_exact_public_run_argv() -> None:
@@ -126,16 +142,47 @@ def test_tpen_evidence_decodes_all_verdicts_and_never_reads_run_dir(tmp_path: Pa
     }
     environment = PreparedPythonEnvironment(environment.python, environment.setup, {**environment.env, "EVIDENCE": json.dumps(payload)})
     out, err = tmp_path / "evidence.out", tmp_path / "evidence.err"
-    original_open = Path.open
+    hits: list[str] = []
+    root = run_dir.resolve()
 
-    def guarded_open(self: Path, *args, **kwargs):
-        if run_dir in self.parents or self == run_dir:
-            raise AssertionError("evidence client opened run_dir directly")
-        return original_open(self, *args, **kwargs)
+    def under_run_dir(value: object) -> bool:
+        try:
+            candidate = Path(os.fspath(value)).resolve()
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return candidate == root or root in candidate.parents
 
-    monkeypatch.setattr(Path, "open", guarded_open)
-    evidence = TPENEvidence().read(SubprocessWorker(), environment, run_dir, cwd=tmp_path, stdout_path=out, stderr_path=err)
+    def guarded(name: str, original):
+        def wrapper(*args, **kwargs):
+            values = args[:1]
+            if any(under_run_dir(value) for value in values):
+                hits.append(name)
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    def guarded_path(name: str, original):
+        def wrapper(self: Path, *args, **kwargs):
+            if under_run_dir(self):
+                hits.append(name)
+            return original(self, *args, **kwargs)
+
+        return wrapper
+
+    with monkeypatch.context() as patch:
+        for module, name in (
+            (builtins, "open"), (io, "open"), (os, "open"), (os, "stat"), (os, "lstat"),
+            (os, "scandir"), (os, "listdir"), (os.path, "exists"), (os.path, "isfile"),
+            (os.path, "isdir"),
+        ):
+            patch.setattr(module, name, guarded(f"{module.__name__}.{name}", getattr(module, name)))
+        for name in ("stat", "exists", "is_file", "is_dir", "iterdir", "open", "read_text", "read_bytes"):
+            patch.setattr(Path, name, guarded_path(f"Path.{name}", getattr(Path, name)))
+        evidence = TPENEvidence().read(
+            SubprocessWorker(), environment, run_dir, cwd=tmp_path, stdout_path=out, stderr_path=err
+        )
     assert isinstance(evidence, CoreRunEvidence) and evidence.verdict == "completed"
+    assert hits == []
 
 
 @pytest.mark.parametrize(
