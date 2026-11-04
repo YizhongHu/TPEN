@@ -42,7 +42,7 @@ def test_r2_t1_nested_worker_absolute_self_reference(tmp_path: Path) -> None:
     staged = _compose(tmp_path)
     assert staged.programs["program.payload.worker"].spec.config_ref["runner"]["command"] == "${program.payload.worker.label}"
     runner = staged.programs["program.payload.worker"].materialize({})
-    assert runner.command == "wl"
+    assert runner.runner.command == "wl"
 
 
 def test_r2_t2_marker_under_different_top_level_key(tmp_path: Path) -> None:
@@ -62,7 +62,7 @@ def test_r2_t2_marker_under_different_top_level_key(tmp_path: Path) -> None:
     staged = _compose(tmp_path)
     assert "allocation" in staged.programs
     assert staged.program is None
-    assert staged.programs["allocation"].materialize({}).python == "al"
+    assert staged.programs["allocation"].materialize({}).payload.python == "al"
 
 
 def test_r2_t3_environment_shadows_marker_alias(tmp_path: Path) -> None:
@@ -85,7 +85,7 @@ def test_r2_t3_environment_shadows_marker_alias(tmp_path: Path) -> None:
         raise
     except ValueError:
         return
-    assert result.extra == "lbl"
+    assert result.payload.extra == "lbl"
 
 
 def test_r2_t4_relative_reference_climbs_out_of_payload(tmp_path: Path) -> None:
@@ -104,7 +104,7 @@ def test_r2_t4_relative_reference_climbs_out_of_payload(tmp_path: Path) -> None:
     )
     staged = _compose(tmp_path)
     assert staged.program.spec.config_ref["payload"]["extra"] == "${..allocation_label}"
-    assert staged.program.materialize({}).extra == "lbl"
+    assert staged.program.materialize({}).payload.extra == "lbl"
 
 
 def test_r2_t5_key_reference_hidden_in_resolver_arguments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -233,11 +233,11 @@ def test_r2_g2_nested_handles_inside_list(tmp_path: Path) -> None:
     review_targets.reset()
     result = staged.program.materialize({})
     assert review_targets.CONSTRUCTIONS == 1
-    workers = result.options["workers"]
+    workers = result.payload.options["workers"]
     assert len(workers) == 2
     assert all(isinstance(worker, WorkerProgram) for worker in workers)
     assert workers[1].spec.content_digest == staged.programs["program.payload.workers[1]"].spec.content_digest
-    assert workers[1].materialize({}).command == "b"
+    assert workers[1].materialize({}).runner.command == "b"
     assert review_targets.CONSTRUCTIONS == 2
 
 
@@ -276,14 +276,14 @@ def test_r2_g3_nested_handles_inside_list_containers(tmp_path: Path) -> None:
     review_targets.reset()
     result = staged.program.materialize({})
     assert review_targets.CONSTRUCTIONS == 1
-    mapping_worker = result.options["workers"][0]["slot"]
-    nested_list_worker = result.options["groups"][0][0]
+    mapping_worker = result.payload.options["workers"][0]["slot"]
+    nested_list_worker = result.payload.options["groups"][0][0]
     assert isinstance(mapping_worker, WorkerProgram)
     assert isinstance(nested_list_worker, WorkerProgram)
     assert mapping_worker.path == mapping_path
     assert nested_list_worker.path == nested_list_path
 
-    assert mapping_worker.materialize({}).command == "mapping-in-list"
+    assert mapping_worker.materialize({}).runner.command == "mapping-in-list"
     assert review_targets.CONSTRUCTIONS == 2
-    assert nested_list_worker.materialize({}).command == "list-in-list"
+    assert nested_list_worker.materialize({}).runner.command == "list-in-list"
     assert review_targets.CONSTRUCTIONS == 3

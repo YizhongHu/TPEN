@@ -1,20 +1,36 @@
 defaults: []
 
 program:
-  # A marker has exactly one concrete payload. Nested program markers become
-  # process-local handles before the payload is instantiated; multi-payload
-  # layouts are introduced by P5a.
+  # A marker has named concrete payload slots. Nested program markers become
+  # process-local handles before all slots are instantiated. Program subtrees
+  # must not use resolver-argument key references or parent references into a
+  # nested marker; submitter-interpolated intermediate nodes are not allowed.
   _target_: tpen_executor.programs.AllocationProgram
   _recursive_: false
-  process:
-    _target_: tpen_executor.programs.DummyAllocation
+  environment:
+    _target_: tpen_executor.environments.PreparedPythonEnvironment
+    python: ${paths.control_python}
+    setup:
+      _target_: tpen_executor.environments.SourceScript
+      path: ${paths.control_setup}
+  dispatcher:
+    _target_: tpen_executor.programs.DummyDispatcher
     _recursive_: false
     worker:
       _target_: tpen_executor.programs.WorkerProgram
       _recursive_: false
-      runner:
-        _target_: tpen_executor.programs.DummyWorker
+      environment:
+        _target_: tpen_executor.environments.PreparedPythonEnvironment
+        python: ${paths.science_python}
+        setup:
+          _target_: tpen_executor.environments.SourceScript
+          path: ${paths.science_setup}
+      process:
+        _target_: tpen_executor.programs.DummyProcess
         _recursive_: false
-        # remote_only is owner-process input and is intentionally absent here;
-        # submitter-known keys outside this program subtree are rejected.
-        command: "${remote_only.value}"
+      runner:
+        _target_: tpen_executor.programs.DummyRunner
+        _recursive_: false
+      evidence:
+        _target_: tpen_executor.programs.DummyEvidence
+        _recursive_: false
