@@ -16,6 +16,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from omegaconf import OmegaConf
+
 
 stage_coordinate = importlib.import_module(
     "experiments.atomistic.he-importance.stage_coordinate"
@@ -233,6 +235,30 @@ def _validate_ab_resolved(cell: Any, resolved: Any) -> None:
         raise ArchitectureStageFamilyError(
             f"family stage {manifest['stage']!r} consumed optimizer target {target!r}, expected Adam"
         )
+    train_config = importlib.import_module("experiments.atomistic.he-importance.train_config")
+    context_mapping = importlib.import_module(
+        "experiments.atomistic.he-importance.context_mapping"
+    )
+    axis = str(context["axis"])
+    labels = train_config._ab_context_labels(manifest, axis)
+    package = labels.pop("package", None)
+    model_seed = int(cell.seed_streams["model_initialization"])
+    expected_config = train_config._compose_base_config()
+    expected_config.model = context_mapping.compose_architecture_package(
+        expected_config.model,
+        package=package,
+        seed=model_seed,
+        **labels,
+    )
+    train_config._set_named_initializer_seeds(expected_config, model_seed)
+    OmegaConf.resolve(expected_config)
+    expected_model = OmegaConf.to_container(expected_config.model, resolve=True)
+    actual_model = OmegaConf.to_container(resolved.model, resolve=True)
+    if _canonical(actual_model) != _canonical(expected_model):
+        raise ArchitectureStageFamilyError(
+            f"family stage {manifest['stage']!r} resolved model does not match "
+            "context_mapping.compose_architecture_package for its literal configuration"
+        )
 
 
 def _ab_renderer(stage: str) -> Sequence[Mapping[str, Any]]:
@@ -347,14 +373,28 @@ def validate_descriptor(
         raise ArchitectureStageFamilyError(
             f"family seed namespace for {descriptor.stage!r} does not match the stage authority"
         )
-    if descriptor.packet_policy(descriptor.stage).get("updates") != updates:
+    packet_policy = descriptor.packet_policy(descriptor.stage)
+    if not isinstance(packet_policy, Mapping):
+        raise ArchitectureStageFamilyError("family packet policy must return a mapping")
+    if packet_policy.get("updates") != updates:
         raise ArchitectureStageFamilyError("family packet policy does not bind authority horizon")
+    cadence = packet_policy.get("checkpoint_every_n_updates")
+    if type(cadence) is not int or cadence <= 0 or cadence > updates:
+        raise ArchitectureStageFamilyError(
+            "family packet policy checkpoint cadence must be a positive integer "
+            f"no greater than the horizon ({updates})"
+        )
     for row in first:
         if row.get("stage") != descriptor.stage:
             raise ArchitectureStageFamilyError("family renderer emitted a row for another stage")
         configurations = row.get("configurations")
         if not isinstance(configurations, Sequence) or len(configurations) != 1:
             raise ArchitectureStageFamilyError("family rows must contain one literal configuration")
+        payload = configurations[0].get("payload")
+        if not isinstance(payload, Mapping) or payload.get("updates") != updates:
+            raise ArchitectureStageFamilyError(
+                "family row payload updates must match the packet policy horizon"
+            )
         identity = configurations[0].get("scientific_identity")
         if not isinstance(identity, Mapping):
             raise ArchitectureStageFamilyError("family rows need a scientific identity")
@@ -470,7 +510,6 @@ def select_exact_one(
     optimizer: str,
     seed_label: int | None,
     literal_configuration: Mapping[str, str] | None = None,
-    optimizer_levels: Mapping[str, Any] | None = None,
     lr: float | None = None,
     beta2: float | None = None,
 ) -> FamilySelection:
@@ -499,8 +538,6 @@ def select_exact_one(
         if requested_literal is not None and dict(item.literal_configuration) != requested_literal:
             continue
         if item.optimizer.method != optimizer:
-            continue
-        if optimizer_levels is not None and item.optimizer.levels != optimizer_levels:
             continue
         if optimizer == "adam" and lr is not None:
             if not isinstance(item.optimizer.levels, Mapping):

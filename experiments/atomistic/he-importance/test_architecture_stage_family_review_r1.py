@@ -209,9 +209,9 @@ def test_t3_family_launch_route_agrees_selection_and_launch_views(
 
 
 # ---------------------------------------------------------------------------
-# T4 (GREEN after F1(a)). The original clause-8 fixture is materializable
-# through the generic route once validation and materialization agree on the
-# package-optional row schema.
+# T4 (GREEN after F1(a)). The clause-8 fixture supplies a package and is
+# materializable through the generic route once validation and materialization
+# agree on the package-bearing row schema.
 # ---------------------------------------------------------------------------
 def _clause_8_fixture() -> tuple[dict, family.ArchitectureStageDescriptor]:
     authority = {

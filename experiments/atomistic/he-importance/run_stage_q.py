@@ -227,14 +227,25 @@ def select_cell(
         if literal_configuration is not None:
             selector_kwargs["literal_configuration"] = literal_configuration
         selector_parameters = inspect.signature(descriptor.selector).parameters
-        if not any(
+        accepts_kwargs = any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD
             for parameter in selector_parameters.values()
-        ):
+        )
+        if not accepts_kwargs:
+            unaccepted = sorted(
+                name
+                for name, value in selector_kwargs.items()
+                if value is not None and name not in selector_parameters
+            )
+            if unaccepted:
+                raise StageQSelectionError(
+                    "family selector does not accept supplied coordinate(s): "
+                    f"{unaccepted!r}"
+                )
             selector_kwargs = {
                 name: value
                 for name, value in selector_kwargs.items()
-                if name in selector_parameters
+                if value is not None or name in selector_parameters
             }
         try:
             family_selection = descriptor.selector(cells, **selector_kwargs)
@@ -1296,16 +1307,24 @@ def _training_packet(cell: Any) -> Any:
         cadence_every = CHECKPOINT_EVERY_N_UPDATES
     if updates is None:
         raise StageQSelectionError("selected stage has no fixed training horizon")
-    cadence = stage_coordinate.CheckpointCadence(
-        cadence_every,
-        tuple(
-            range(
-                cadence_every,
-                updates + 1,
-                cadence_every,
-            )
-        ),
-    )
+    try:
+        cadence = stage_coordinate.CheckpointCadence(
+            cadence_every,
+            tuple(
+                range(
+                    cadence_every,
+                    updates + 1,
+                    cadence_every,
+                )
+            ),
+        )
+    except stage_coordinate.MaterializationError as error:
+        if architecture_stage_family.is_family_stage(stage):
+            raise StageQSelectionError(
+                f"family stage {stage!r} packet policy produced an invalid checkpoint cadence: "
+                f"{error}"
+            ) from error
+        raise
     packets = stage_coordinate.materialize_job_packets(
         (cell,),
         cadence,
