@@ -268,10 +268,17 @@ def test_p5a_r1_t7_authoring_comments_state_the_interpolation_and_env_rules() ->
     root = Path(__file__).parents[1]
     readme = (root / "README.md").read_text(encoding="utf-8")
     config = (root / "src" / "tpen_executor" / "conf" / "executor.yaml").read_text(encoding="utf-8")
+    readme = " ".join(readme.split())
+    config_comments = " ".join(
+        line.lstrip()[1:]
+        for line in config.splitlines()
+        if line.lstrip().startswith("#")
+    )
+    config_comments = " ".join(config_comments.split())
     assert "${oc.env:NAME}" in readme
     assert "on keys referenced by a program" in readme
-    assert "on keys referenced by a program" in config
-    assert "env: values must be strings" in config
+    assert "on keys referenced by a program" in config_comments
+    assert "env: values must be strings" in config_comments
 
 
 _CONFIG_DRIVEN = """
