@@ -147,6 +147,7 @@ def _context_cell(tmp_path: Path, name: str = "O-composite") -> object:
 def _ab_cell(tmp_path: Path, package: Mapping[str, object], axis: str) -> object:
     """Materialize one AB-4a package in the resolver's closed context shape."""
 
+    adam = next(slot for slot in package["optimizer_slots"] if slot["method"] == "adam")
     return stage_coordinate.materialize_stage(
         axis,
         [
@@ -157,30 +158,23 @@ def _ab_cell(tmp_path: Path, package: Mapping[str, object], axis: str) -> object
                         "literal_configuration": package["literal_configuration"],
                     },
                     "optimizer": {
-                        "method": "adam",
-                        "levels": {
-                            "lr": 0.005,
-                            "beta1": 0.9,
-                            "beta2": 0.999,
-                            "epsilon": 1e-8,
-                            "weight_decay": 0.0,
-                            "parameter_groups": 1,
-                            "schedule": "constant",
-                        },
+                        "method": adam["method"],
+                        "levels": dict(adam["levels"]),
                     },
                 },
                 "payload": {"updates": stage_coordinate.stage_definition(axis).updates},
                 "topology": {},
             }
         ],
-        stage_coordinate.OptimizerCell("adam", "available"),
+        stage_coordinate.OptimizerCell(adam["method"], adam["status"]),
         tmp_path,
     )[0]
 
 
 def _load_prechange_resolver() -> types.ModuleType:
-    """Load the resolver blob pinned at the AB-4a tip for byte comparison."""
+    """Load the pre-change resolver source for byte comparison."""
 
+    # Pre-change resolver source, blob 7ede61e8, identical to the PR base's train_config.py.
     # Generating command, mechanically: git show 040a5b8e87befc59bb21a9c64f8ec1782c8fa283:
     # experiments/atomistic/he-importance/train_config.py
     source = subprocess.run(
@@ -774,6 +768,7 @@ def test_ab_o_star_refusal_names_pending_reason_and_control_resolves(tmp_path: P
     """An AB O* slot is refused; the fixed-Adam slot is the control."""
 
     package = ab_universe.render_a_packages()[0]
+    o_star = next(slot for slot in package["optimizer_slots"] if slot["method"] == "O*")
     fixed = _ab_cell(tmp_path / "fixed", package, "A")
     resolved = train_config.resolve_train_config(fixed)
     assert resolved.optimizer._target_ == "torch.optim.Adam"
@@ -784,20 +779,20 @@ def test_ab_o_star_refusal_names_pending_reason_and_control_resolves(tmp_path: P
             {
                 "scientific_identity": {
                     "context": fixed.manifest["scientific_identity"]["context"],
-                    "optimizer": fixed.manifest["scientific_identity"]["optimizer"],
+                    "optimizer": {"method": o_star["method"], "levels": None},
                 },
                 "payload": {"updates": stage_coordinate.stage_definition("A").updates},
                 "topology": {},
             }
         ],
         stage_coordinate.OptimizerCell(
-            "O*", "unavailable", "selection output of O2 is pending"
+            o_star["method"], o_star["status"], o_star["unavailable_reason"]
         ),
         tmp_path / "pending",
     )[0]
     with pytest.raises(
         train_config.UnavailableOptimizerError,
-        match="selection output of O2 is pending",
+        match=re.escape(o_star["unavailable_reason"]),
     ):
         train_config.resolve_train_config(pending)
 

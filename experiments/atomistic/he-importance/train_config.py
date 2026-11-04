@@ -49,14 +49,6 @@ class ContextResolutionError(TrainConfigResolutionError):
     """A row declares a model context that this resolver does not consume."""
 
 
-_AB_CONTROL = {
-    "channels": "(32,32)",
-    "embedding": "(128,1)",
-    "producer_initialization": ".50",
-    "electron_electron": "1",
-    "electron_nucleus": "(.01,1)",
-    "readout_initialization": "equal",
-}
 _AB_CONTEXT_KEYS = frozenset(
     {
         "producer_path",
@@ -342,9 +334,9 @@ def _consumed_context(manifest: Mapping[str, Any]) -> str:
 
     A/B rows use the AB-4a literal package vocabulary.  The accepted shape is
     ``{"axis": "A" or "B", "literal_configuration": {...}}``; the
-    configuration is checked as a closed set here and expanded from the
-    declared control values below.  O rows retain their pre-existing named
-    ``overrides`` shape so their resolved configuration remains unchanged.
+    configuration is checked as a closed set here; no control expansion is
+    performed.  O rows retain their pre-existing named ``overrides`` shape so
+    their resolved configuration remains unchanged.
 
     Returns
     -------
@@ -379,30 +371,53 @@ def _consumed_context(manifest: Mapping[str, Any]) -> str:
             return name
 
     context_keys = frozenset(context)
-    if not context_keys.symmetric_difference({"axis", "literal_configuration"}):
+    if context_keys.intersection({"axis", "literal_configuration"}):
+        if context_keys.symmetric_difference({"axis", "literal_configuration"}):
+            raise ContextResolutionError(
+                "scientific_identity.context A/B shape must have exactly the keys "
+                "['axis', 'literal_configuration']; "
+                f"declared keys={sorted(context_keys)!r}"
+            )
         axis = context.get("axis")
         literal = context.get("literal_configuration")
         axis_name = {"A": "A", "B": "B"}.get(axis) if type(axis) is str else None
-        if axis_name is not None and isinstance(literal, Mapping):
-            labels = dict(literal)
-            expected_keys = set(_AB_CONTEXT_KEYS)
-            if {"A": False, "B": True}.get(axis_name, False):
-                expected_keys.add("package")
-            label_keys = frozenset(labels)
-            key_differences = label_keys.symmetric_difference(expected_keys)
-            if key_differences:
-                missing = sorted(expected_keys - label_keys)
-                extra = sorted(label_keys - expected_keys)
-                details = []
-                if missing:
-                    details.append(f"missing coordinate(s) {missing!r}")
-                if extra:
-                    details.append(f"extra coordinate(s) {extra!r}")
-                raise ContextResolutionError(
-                    f"scientific_identity.context.literal_configuration for {axis} must be closed: "
-                    + "; ".join(details)
-                )
-            return axis_name
+        if axis_name is None:
+            raise ContextResolutionError(
+                f"scientific_identity.context A/B shape has unknown axis {axis!r}"
+            )
+        if not isinstance(literal, Mapping):
+            raise ContextResolutionError(
+                "scientific_identity.context A/B shape requires "
+                f"literal_configuration to be a mapping, got {type(literal).__name__}"
+            )
+        labels = dict(literal)
+        expected_keys = set(_AB_CONTEXT_KEYS)
+        if {"A": False, "B": True}.get(axis_name, False):
+            expected_keys.add("package")
+        label_keys = frozenset(labels)
+        key_differences = label_keys.symmetric_difference(expected_keys)
+        if key_differences:
+            missing = sorted(expected_keys - label_keys)
+            extra = sorted(label_keys - expected_keys)
+            details = []
+            if missing:
+                details.append(f"missing coordinate(s) {missing!r}")
+            if extra:
+                details.append(f"extra coordinate(s) {extra!r}")
+            raise ContextResolutionError(
+                f"scientific_identity.context.literal_configuration for {axis} must be closed: "
+                + "; ".join(details)
+            )
+        invalid_coordinate = next(
+            (coordinate for coordinate, value in labels.items() if type(value) is not str),
+            None,
+        )
+        if invalid_coordinate is not None:
+            raise ContextResolutionError(
+                "scientific_identity.context.literal_configuration coordinate "
+                f"{invalid_coordinate!r} must be an exact str label"
+            )
+        return axis_name
 
     if dict(context) not in expected.values():
         differences = []
@@ -442,11 +457,7 @@ def _ab_context_labels(manifest: Mapping[str, Any], axis: str) -> dict[str, str]
 
     context = _mapping(manifest["scientific_identity"].get("context"), "scientific_identity.context")
     literal = _mapping(context.get("literal_configuration"), "scientific_identity.context.literal_configuration")
-    labels = dict(_AB_CONTROL)
-    labels.update(literal)
-    if {"A": True, "B": False}.get(axis, False):
-        labels.pop("package", None)
-    return labels
+    return dict(literal)
 
 
 def resolve_train_config(source: Any) -> DictConfig:
@@ -569,7 +580,8 @@ def resolve_train_config(source: Any) -> DictConfig:
         except Exception as error:
             if isinstance(error, context_mapping.UnknownContextLabel):
                 raise ContextResolutionError(
-                    "scientific_identity.context contains an unknown A/B coordinate label"
+                    "scientific_identity.context contains an unknown A/B coordinate label: "
+                    f"{error}"
                 ) from error
             raise
     scheduler_paths = _scheduler_paths(OmegaConf.to_container(cfg, resolve=False))

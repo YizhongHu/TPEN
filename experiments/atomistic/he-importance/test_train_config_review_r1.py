@@ -112,10 +112,8 @@ def test_resolver_forwards_exactly_the_package_labels_to_ab3(
     """Clause 2: the resolved model is AB-3's composition for the package's own labels.
 
     A spy on the composition entry point the resolver actually imports records
-    every call.  ``train_config._AB_CONTROL`` is replaced by garbage for the
-    whole loop: every package must still forward exactly its literal
-    configuration (plus ``package`` and the model-initialization seed) on the
-    committed base model, which shows the control table is never consulted.
+    Every package must forward exactly its literal configuration (plus
+    ``package`` and the model-initialization seed) on the committed base model.
     """
 
     composer = train_config._context_mapping_api()
@@ -128,9 +126,7 @@ def test_resolver_forwards_exactly_the_package_labels_to_ab3(
         return real(model_cfg, package=package, **kwargs)
 
     monkeypatch.setattr(composer, "compose_architecture_package", spy)
-    monkeypatch.setattr(
-        train_config, "_AB_CONTROL", {key: "<never consulted>" for key in train_config._AB_CONTROL}
-    )
+    assert not hasattr(train_config, "_AB_CONTROL")
     base_model = OmegaConf.to_container(train_config._compose_base_config().model, resolve=False)
 
     packages = ab_universe.render_ab_universe()[axis]
@@ -208,7 +204,7 @@ def test_mapping_valued_coordinate_is_refused_as_context_resolution_error(tmp_pa
     A mapping-valued coordinate passes the manifest firewall and the closed-key
     check, then reaches AB-3 where an unhashable label raises TypeError, which
     the resolver's narrow wrap does not convert.  Expected to FAIL at the
-    reviewed head with ``TypeError: unhashable type: 'mappingproxy'``.
+    reviewed head with ``TypeError: unhashable type: 'dict'``.
     """
 
     package = ab_universe.render_a_packages()[0]
