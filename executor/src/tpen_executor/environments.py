@@ -122,6 +122,11 @@ class PreparedPythonEnvironment:
 
         return canonical_bytes(self.to_dict())
 
+    def __hash__(self) -> int:
+        """Hash the canonical wire form, including frozen environment values."""
+
+        return hash(self.encode())
+
     @classmethod
     def from_mapping(cls, data: Any) -> "PreparedPythonEnvironment":
         """Decode one strict mapping."""

@@ -48,7 +48,7 @@ def _payload_entries(raw: Mapping[str, Any]) -> tuple[tuple[str, Mapping[str, An
     ]
     if not candidates:
         raise ValueError("a program marker must contain at least one concrete payload slot")
-    return tuple(candidates)
+    return tuple(sorted(candidates))
 
 
 def _path_parts(path: str) -> list[str | int]:
@@ -194,6 +194,12 @@ class MaterializedProgram:
             raise TypeError("slots must be a mapping")
         if any(type(key) is not str or not key for key in self.slots):
             raise TypeError("slot names must be non-empty strings")
+        reserved = set(dir(type(self))) | {"keys", "items", "values", "get"}
+        collisions = sorted(
+            name for name in self.slots if name in reserved or (name.startswith("__") and name.endswith("__"))
+        )
+        if collisions:
+            raise ValueError(f"slot names collide with MaterializedProgram attributes: {collisions!r}")
         object.__setattr__(self, "slots", MappingProxyType(dict(self.slots)))
 
     def __getitem__(self, name: str) -> Any:
@@ -211,7 +217,7 @@ class MaterializedProgram:
             raise AttributeError(name) from error
 
     def __iter__(self):
-        """Iterate over slot names in source order."""
+        """Iterate over slot names in deterministic sorted-key order."""
 
         return iter(self.slots)
 
