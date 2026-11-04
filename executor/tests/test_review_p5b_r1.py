@@ -16,6 +16,32 @@ from tpen_executor.runners import CoreRunEvidence, EvidenceUnavailable, TPENComm
 from tpen_executor.workers import SubprocessWorker
 
 
+def _science_environment():
+    python = os.environ.get("P5B_REVIEW_SCIENCE_PYTHON")
+    if python is None:
+        pytest.skip("independent root --extra cpu environment required")
+    return PreparedPythonEnvironment(python)
+
+
+def test_r1_t0_real_core_module_help_prints_usage(tmp_path):
+    out = tmp_path / "out"
+    outcome = SubprocessWorker().run(
+        _science_environment(), ("-m", "tpen.run", "--help"), cwd=tmp_path,
+        stdout_path=out, stderr_path=tmp_path / "err",
+    )
+    assert outcome.returncode == 0
+    assert "--config" in out.read_text(), "rc=0 alone does not prove the CLI ran"
+
+
+def test_r1_t0_real_core_missing_config_is_not_success(tmp_path):
+    command = TPENCommand(str(tmp_path / "missing-config.yaml"))
+    outcome = SubprocessWorker().run(
+        _science_environment(), command.args, cwd=tmp_path,
+        stdout_path=tmp_path / "out", stderr_path=tmp_path / "err",
+    )
+    assert outcome.returncode != 0, "missing config must not be reported as a successful process"
+
+
 def _payload(verdict="completed"):
     return {
         "schema": "tpen.run-evidence/v1", "run_dir": "/run", "verdict": verdict,
