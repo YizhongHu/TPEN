@@ -44,8 +44,11 @@ def test_result_round_trip_and_golden_bytes(name: str, record: object) -> None:
     """Every result record round-trips and matches its canonical fixture."""
 
     decoder = type(record)
+    expected = _fixture_bytes(name)
     assert decoder.from_mapping(record.to_dict()) == record
-    assert canonical_bytes(record.to_dict()) == _fixture_bytes(name)
+    assert record.encode() == expected
+    assert decoder.decode(record.encode()) == record
+    assert canonical_bytes(record.to_dict()) == expected
 
 
 @pytest.mark.parametrize("record", list(_records().values()))
