@@ -8,6 +8,18 @@ from tpen_executor.configuration import StagedHydra
 from tpen_executor.programs import MaterializedProgram, WorkerProgram
 
 
+def test_materialized_program_is_frozen_slotted_and_has_immutable_slots() -> None:
+    """Materialized slots cannot be replaced, extended, or mutated in place."""
+
+    record = MaterializedProgram({"payload": object()})
+    with pytest.raises(AttributeError):
+        record.slots = {}  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        record.extra = "not allowed"  # type: ignore[attr-defined]
+    with pytest.raises((TypeError, AttributeError)):
+        record.slots["payload"] = None  # type: ignore[index]
+
+
 def test_packaged_plan_shape_materializes_without_submitter_construction() -> None:
     """The plan-shaped config has independent allocation and worker slots."""
 

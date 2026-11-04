@@ -33,6 +33,16 @@ def test_bundle_round_trip_and_optional_digest() -> None:
         assert PreparedInputBundle.from_mapping(record.to_dict()) == record
 
 
+def test_bundle_record_is_frozen_and_slotted() -> None:
+    """Bundle descriptors reject field reassignment and new attributes."""
+
+    record = PreparedInputBundle("/prepared/inputs")
+    with pytest.raises(AttributeError):
+        record.root = "/other/inputs"  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        record.extra = "not allowed"  # type: ignore[attr-defined]
+
+
 @pytest.mark.parametrize("root", ["", "inputs", "./inputs"])
 def test_bundle_root_requires_nonempty_absolute_path(root: str) -> None:
     """Bundle construction validates syntax but does not inspect the root."""

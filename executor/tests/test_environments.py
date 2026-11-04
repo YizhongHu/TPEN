@@ -13,8 +13,10 @@ def test_source_script_round_trip_is_frozen() -> None:
     record = SourceScript("/prepared/setup.sh")
     assert SourceScript.decode(record.encode()) == record
     assert SourceScript.from_mapping(record.to_dict()) == record
-    with pytest.raises((AttributeError, TypeError)):
+    with pytest.raises(AttributeError):
         record.path = "/other/setup.sh"  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        record.extra = "not allowed"  # type: ignore[attr-defined]
 
 
 def test_prepared_environment_round_trip_freezes_setup_and_env() -> None:
@@ -27,6 +29,12 @@ def test_prepared_environment_round_trip_freezes_setup_and_env() -> None:
     )
     assert PreparedPythonEnvironment.decode(record.encode()) == record
     assert record.env["MODE"] == "control"
+    with pytest.raises(AttributeError):
+        record.python = "/other/bin/python"  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        record.extra = "not allowed"  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        record.setup.path = "/other/setup.sh"  # type: ignore[union-attr,assignment]
     with pytest.raises((TypeError, AttributeError)):
         record.env["MODE"] = "science"  # type: ignore[index]
 
@@ -38,6 +46,15 @@ def test_environment_paths_require_nonempty_absolute_strings(constructor, path: 
 
     with pytest.raises((TypeError, ValueError)):
         constructor(path)
+
+
+def test_each_environment_path_field_rejects_relative_values() -> None:
+    """Every environment path-bearing field independently rejects relatives."""
+
+    with pytest.raises(ValueError, match="python must be an absolute path"):
+        PreparedPythonEnvironment("python")
+    with pytest.raises(ValueError, match="path must be an absolute path"):
+        PreparedPythonEnvironment("/prepared/bin/python", SourceScript("setup.sh"))
 
 
 def test_environment_decoders_reject_unknown_missing_and_wrong_types() -> None:
