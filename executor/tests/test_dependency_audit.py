@@ -49,7 +49,7 @@ def test_source_imports_only_stdlib_or_executor() -> None:
                 for root in _import_roots(node):
                     if root in FORBIDDEN_ROOTS or (root in CONFIGURATION_ROOTS and path.name not in {"configuration.py", "programs.py"}):
                         violations.append(f"{path}: {root}")
-                    elif root != "tpen_executor" and root not in sys.stdlib_module_names:
+                    elif root not in {"tpen_executor", *CONFIGURATION_ROOTS} and root not in sys.stdlib_module_names:
                         violations.append(f"{path}: non-stdlib {root}")
     assert not violations, "forbidden executor imports: " + ", ".join(violations)
 
@@ -70,6 +70,6 @@ def test_source_has_no_dynamic_forbidden_imports() -> None:
             root = _dynamic_import_root(node)
             if root in FORBIDDEN_ROOTS or (root in CONFIGURATION_ROOTS and path.name not in {"configuration.py", "programs.py"}):
                 violations.append(f"{path}:{node.lineno}: {root}")
-            elif root is not None and root != "tpen_executor" and root not in sys.stdlib_module_names:
+            elif root is not None and root not in {"tpen_executor", *CONFIGURATION_ROOTS} and root not in sys.stdlib_module_names:
                 violations.append(f"{path}:{node.lineno}: non-stdlib {root}")
     assert not violations, "forbidden dynamic executor imports: " + ", ".join(violations)

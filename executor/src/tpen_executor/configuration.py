@@ -14,7 +14,10 @@ from .contracts import ProgramSpecRef
 from .programs import AllocationProgram, WorkerProgram
 
 
-_PROGRAM_TYPES = {"AllocationProgram": AllocationProgram, "WorkerProgram": WorkerProgram}
+_PROGRAM_TYPES = {
+    "tpen_executor.programs.AllocationProgram": AllocationProgram,
+    "tpen_executor.programs.WorkerProgram": WorkerProgram,
+}
 
 
 def _raw(value: Any) -> Any:
@@ -24,20 +27,23 @@ def _raw(value: Any) -> Any:
 
 
 def _target_name(value: Mapping[str, Any]) -> str | None:
-    """Return the short target class name for a raw Hydra mapping."""
+    """Return the fully qualified target name for a raw Hydra mapping."""
 
     target = value.get("_target_")
-    return target.rsplit(".", maxsplit=1)[-1] if isinstance(target, str) else None
+    return target if isinstance(target, str) else None
 
 
 def _capture(value: Any, path: str, found: dict[str, Any]) -> Any:
     """Capture marked program subtrees recursively before Hydra sees them."""
 
     if isinstance(value, Mapping):
-        kind = _target_name(value)
-        if kind in _PROGRAM_TYPES:
+        target = _target_name(value)
+        marked = value.get("_recursive_") is False
+        is_root_program = path == "program" and isinstance(target, str)
+        if marked and (target in _PROGRAM_TYPES or is_root_program):
+            program_type = _PROGRAM_TYPES.get(target, AllocationProgram)
             ref = ProgramSpecRef(value, digest(value))
-            found[path] = _PROGRAM_TYPES[kind](ref)
+            found[path] = program_type(ref)
             # Walk the opaque payload too: nested WorkerProgram descriptions
             # must receive their own handles without being instantiated.
             for key, child in value.items():
