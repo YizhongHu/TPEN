@@ -57,8 +57,11 @@ def test_contract_round_trip_and_golden_bytes(name: str, record: object, decoder
     """Every contract has a stable mapping and canonical JSON representation."""
 
     mapping = record.to_dict()
+    expected = _fixture_bytes(name)
     assert decoder.from_mapping(mapping) == record
-    assert canonical_bytes(mapping) == _fixture_bytes(name)
+    assert record.encode() == expected
+    assert decoder.decode(record.encode()) == record
+    assert canonical_bytes(mapping) == expected
 
 
 @pytest.mark.parametrize("identity_cls", [AttemptId, AllocationId, BackendJobId])
@@ -68,7 +71,10 @@ def test_identity_round_trip_and_golden_bytes(identity_cls: type) -> None:
     identity = identity_cls({AttemptId: "attempt-1", AllocationId: "allocation-1", BackendJobId: "job-1"}[identity_cls])
     assert identity_cls.from_mapping(identity.to_dict()) == identity
     name = {AttemptId: "attempt-id", AllocationId: "allocation-id", BackendJobId: "backend-job-id"}[identity_cls]
-    assert canonical_bytes(identity.to_dict()) == _fixture_bytes(name)
+    expected = _fixture_bytes(name)
+    assert identity.encode() == expected
+    assert identity_cls.decode(identity.encode()) == identity
+    assert canonical_bytes(identity.to_dict()) == expected
 
 
 @pytest.mark.parametrize("identity_cls", [AttemptId, AllocationId, BackendJobId])

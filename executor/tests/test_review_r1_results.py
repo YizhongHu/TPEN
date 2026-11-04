@@ -6,7 +6,7 @@ import operator
 
 import pytest
 
-from tpen_executor._codec import canonical_bytes, digest
+from tpen_executor._codec import canonical_bytes, decode_json, digest
 from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId
 from tpen_executor.results import (
     AllocationObservation,
@@ -66,6 +66,24 @@ def test_manifest_attempt_rejects_inconsistent_receipts(kwargs: dict[str, object
     values.update(kwargs)
     with pytest.raises(ValueError):
         ManifestAttempt(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("task_id", "attempt_id", "output_dir"),
+    [
+        ("task-z", AttemptId("attempt-1"), "/runs/group-1/task-a/attempt-1"),
+        ("task-a", AttemptId("attempt-9"), "/runs/group-1/task-a/attempt-1"),
+        ("task-a", AttemptId("attempt-1"), "/elsewhere"),
+    ],
+)
+def test_manifest_attempt_rejects_each_start_receipt_mismatch_without_outcome(
+    task_id: str, attempt_id: AttemptId, output_dir: str
+) -> None:
+    """F2: each redundant field is checked even when no outcome can mask it."""
+
+    start = _records()["start"]
+    with pytest.raises(ValueError):
+        ManifestAttempt(task_id, attempt_id, start, None, output_dir)  # type: ignore[arg-type]
 
 
 def test_run_manifest_rejects_duplicate_attempt_ids() -> None:
@@ -210,5 +228,8 @@ def test_manifest_rejects_receipt_group_digest_mismatch() -> None:
 def test_decode_rejects_duplicate_json_keys() -> None:
     """Orchestrator regression: duplicate JSON members are not last-write-wins."""
 
+    raw = b'{"schema":"tpen-executor/start-receipt-v1","schema":"duplicate"}'
     with pytest.raises(ValueError):
-        StartReceipt.decode(b'{"schema":"tpen-executor/start-receipt-v1","schema":"duplicate"}')
+        StartReceipt.decode(raw)
+    with pytest.raises(ValueError):
+        decode_json(raw)
