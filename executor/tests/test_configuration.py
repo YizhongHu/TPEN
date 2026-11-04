@@ -6,6 +6,7 @@ from importlib import resources
 from pathlib import Path
 
 from tpen_executor.configuration import StagedHydra
+from tpen_executor.programs import WorkerProgram
 
 from helpers import staged_targets
 
@@ -61,9 +62,10 @@ def test_capture_does_not_construct_and_materialize_constructs_once(tmp_path: Pa
 
     result = staged.program.materialize({"remote_only": {"value": "worker-value"}})  # type: ignore[union-attr]
     assert staged_targets.CONSTRUCTIONS == 1
-    assert result.worker.runner.command == "worker-value"
-
+    assert isinstance(result.worker, WorkerProgram)
     worker = staged.programs["program.process.worker"]
+    assert result.worker.spec.content_digest == worker.spec.content_digest
+
     runner = worker.materialize({"remote_only": {"value": "worker-value"}})
     assert staged_targets.CONSTRUCTIONS == 2
     assert runner.command == "worker-value"
