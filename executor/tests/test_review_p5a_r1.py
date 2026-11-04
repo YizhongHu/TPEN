@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from hydra.errors import InstantiationException
 
+from tpen_executor._codec import digest
 from tpen_executor.configuration import StagedConfig, StagedHydra
 from tpen_executor.contracts import ProgramSpecRef
 from tpen_executor.delivery import PreparedInputBundle
@@ -172,24 +173,52 @@ program:
 """
 
 
-def test_p5a_r1_t3_direct_nested_marker_list_and_grouped_targets_are_not_slots(tmp_path: Path) -> None:
-    """GREEN on 33d2a6b4, documenting.  F3: only a direct mapping child carrying a non-program
-    ``_target_`` is a slot.  A nested program marker placed directly under the marker, a list of
-    targets, and a target under a plain grouping mapping are neither instantiated nor exposed by
-    ``materialize()``, and no error is raised.  The submitter still sees the nested marker in
-    ``staged.programs``; an owner process holding only the decoded ref cannot reach it."""
+@pytest.mark.parametrize(
+    ("child_name", "child"),
+    [
+        (
+            "worker",
+            """worker:
+    _target_: tpen_executor.programs.WorkerProgram
+    _recursive_: false
+    runner:
+      _target_: tpen_executor.programs.DummyRunner
+      _recursive_: false
+""",
+        ),
+        (
+            "evidence_list",
+            """evidence_list:
+    - _target_: tpen_executor.programs.DummyEvidence
+      _recursive_: false
+""",
+        ),
+        (
+            "grouped",
+            """grouped:
+    inner:
+      _target_: tpen_executor.programs.DummyEvidence
+      _recursive_: false
+""",
+        ),
+    ],
+)
+def test_p5a_r1_t3_direct_nested_marker_list_and_grouped_targets_are_rejected(
+    tmp_path: Path, child_name: str, child: str
+) -> None:
+    """F3: unsupported direct children fail at compose and name their marker path."""
 
-    staged = _compose(tmp_path, _NON_SLOT_CHILDREN)
-    assert set(staged.programs) == {"program", "program.worker"}
-    assert staged.program is not None
-    result = staged.program.materialize({})
-    assert set(result) == {"environment"}
-    for absent in ("worker", "evidence_list", "grouped"):
-        assert absent not in set(result)
-        with pytest.raises(KeyError):
-            result[absent]
-        with pytest.raises(AttributeError):
-            getattr(result, absent)
+    text = f"""
+program:
+  _target_: tpen_executor.programs.AllocationProgram
+  _recursive_: false
+  environment:
+    _target_: tpen_executor.environments.PreparedPythonEnvironment
+    python: /prepared/bin/python
+  {child.rstrip().replace(chr(10), chr(10) + '  ')}
+"""
+    with pytest.raises(ValueError, match=rf"program\.{child_name}"):
+        _compose(tmp_path, text)
 
 
 _NO_SLOTS = """
@@ -218,21 +247,31 @@ def test_p5a_r1_t5_prepared_environment_is_hashable_like_its_sibling_descriptors
     second = PreparedPythonEnvironment("/prepared/bin/python", SourceScript("/prepared/setup.sh"), {"B": "2", "A": "1"})
     assert first == second
     assert hash(first) == hash(second)
-    assert len({first, second, SourceScript("/prepared/setup.sh"), PreparedInputBundle("/prepared/inputs")}) == 3
+    payload = {"_target_": "example.Target"}
+    ref = ProgramSpecRef(payload, digest(payload))
+    assert hash(ref) == hash(ProgramSpecRef.decode(ref.encode()))
+    assert len({first, second, SourceScript("/prepared/setup.sh"), PreparedInputBundle("/prepared/inputs"), ref}) == 4
 
 
-def test_p5a_r1_t6_slot_names_colliding_with_record_attributes_are_mapping_only() -> None:
-    """GREEN on 33d2a6b4, documenting.  F6: a slot named like a ``MaterializedProgram`` attribute is
-    reachable by key only (``program.slots`` is the frozen mapping, not the slot), and a slot named
-    ``keys`` makes ``dict(program)`` raise.  Whether to reject such names or document them is the
-    orchestrator's call."""
+def test_p5a_r1_t6_slot_names_colliding_with_record_attributes_are_rejected() -> None:
+    """F6: record attributes, mapping protocol names, and dunders are not valid slots."""
 
     marker = object()
-    program = MaterializedProgram({"slots": marker, "keys": marker})
-    assert program["slots"] is marker
-    assert program.slots is not marker
-    with pytest.raises(TypeError):
-        dict(program)  # type: ignore[call-overload]
+    for name in ("slots", "keys", "__dict__"):
+        with pytest.raises(ValueError, match="collide"):
+            MaterializedProgram({name: marker})
+
+
+def test_p5a_r1_t7_authoring_comments_state_the_interpolation_and_env_rules() -> None:
+    """F7: shipped authoring guidance matches the accepted R3-2 wording."""
+
+    root = Path(__file__).parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    config = (root / "src" / "tpen_executor" / "conf" / "executor.yaml").read_text(encoding="utf-8")
+    assert "${oc.env:NAME}" in readme
+    assert "on keys referenced by a program" in readme
+    assert "on keys referenced by a program" in config
+    assert "env: values must be strings" in config
 
 
 _CONFIG_DRIVEN = """

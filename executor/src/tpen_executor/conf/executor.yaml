@@ -4,7 +4,8 @@ program:
   # A marker has named concrete payload slots. Nested program markers become
   # process-local handles before all slots are instantiated. Program subtrees
   # must not use resolver-argument key references or parent references into a
-  # nested marker; submitter-interpolated intermediate nodes are not allowed.
+  # nested marker; submitter-interpolated intermediate nodes on keys referenced
+  # by a program are not allowed. ${oc.env:NAME} is fine; env: values must be strings.
   _target_: tpen_executor.programs.AllocationProgram
   _recursive_: false
   environment:

@@ -15,8 +15,10 @@ and attribute view of those slots. Nested program markers remain handles until
 their owning process materializes them. Marker subtrees must not use key-taking
 resolver arguments, references from a parent marker into a nested marker's
 interior, or submitter-interpolated intermediate nodes on keys referenced by a
-program. Pass values that exist only in the owner process through the
-`materialize()` environment. The packaged config demonstrates independent
+program. `${oc.env:NAME}` without a key-taking argument remains fine. Pass
+values that exist only in the owner process through the `materialize()`
+environment. Descriptor `env:` values must be strings; unquoted YAML integers
+are rejected. The packaged config demonstrates independent
 control and science environment slots; they may point at the same prepared
 environment, but no descriptor provisions, writes, or existence-checks paths.
 
