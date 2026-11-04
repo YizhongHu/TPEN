@@ -239,3 +239,51 @@ def test_r2_g2_nested_handles_inside_list(tmp_path: Path) -> None:
     assert workers[1].spec.content_digest == staged.programs["program.payload.workers[1]"].spec.content_digest
     assert workers[1].materialize({}).command == "b"
     assert review_targets.CONSTRUCTIONS == 2
+
+
+def test_r2_g3_nested_handles_inside_list_containers(tmp_path: Path) -> None:
+    """R2-6b: recurse through list elements that contain nested lists/maps."""
+    _write(
+        tmp_path,
+        """program:
+  _target_: tpen_executor.programs.AllocationProgram
+  _recursive_: false
+  payload:
+    _target_: helpers.review_targets.Dispatcher
+    _recursive_: false
+    workers:
+      - slot:
+          _target_: tpen_executor.programs.WorkerProgram
+          _recursive_: false
+          runner:
+            _target_: helpers.review_targets.Runner
+            _recursive_: false
+            command: mapping-in-list
+    groups:
+      - - _target_: tpen_executor.programs.WorkerProgram
+          _recursive_: false
+          runner:
+            _target_: helpers.review_targets.Runner
+            _recursive_: false
+            command: list-in-list
+""",
+    )
+    staged = _compose(tmp_path)
+    mapping_path = "program.payload.workers[0].slot"
+    nested_list_path = "program.payload.groups[0][0]"
+    assert set(staged.programs) == {"program", mapping_path, nested_list_path}
+
+    review_targets.reset()
+    result = staged.program.materialize({})
+    assert review_targets.CONSTRUCTIONS == 1
+    mapping_worker = result.options["workers"][0]["slot"]
+    nested_list_worker = result.options["groups"][0][0]
+    assert isinstance(mapping_worker, WorkerProgram)
+    assert isinstance(nested_list_worker, WorkerProgram)
+    assert mapping_worker.path == mapping_path
+    assert nested_list_worker.path == nested_list_path
+
+    assert mapping_worker.materialize({}).command == "mapping-in-list"
+    assert review_targets.CONSTRUCTIONS == 2
+    assert nested_list_worker.materialize({}).command == "list-in-list"
+    assert review_targets.CONSTRUCTIONS == 3
