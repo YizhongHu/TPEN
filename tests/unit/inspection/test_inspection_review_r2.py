@@ -131,7 +131,23 @@ def test_model_only_committed_checkpoint_is_not_reported_incomplete(tmp_path: Pa
 
     assert evidence.verdict == "refused"
     assert evidence.refusal is not None
-    assert evidence.refusal["code"] == "missing-checkpoint"
+    assert evidence.refusal["code"] == "no-train-resume-checkpoint"
+
+
+def test_torn_publication_catalog_has_distinct_refusal_code(tmp_path: Path) -> None:
+    """An unterminated catalog tail is repairable rather than corrupt."""
+
+    run_dir = tmp_path / "run"
+    _write_status(run_dir, "completed")
+    catalog = run_dir / "checkpoints" / PUBLICATION_CATALOG_FILENAME
+    catalog.parent.mkdir(parents=True)
+    catalog.write_text('{"schema":', encoding="utf-8")
+
+    evidence = inspect_run(run_dir)
+
+    assert evidence.verdict == "refused"
+    assert evidence.refusal is not None
+    assert evidence.refusal["code"] == "torn-publication-catalog"
 
 
 def test_hash_corrupt_published_ref_outside_root_is_refused(tmp_path: Path) -> None:
