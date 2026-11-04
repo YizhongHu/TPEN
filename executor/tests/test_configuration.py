@@ -15,12 +15,18 @@ def _write_config(directory: Path, label: str = "base") -> None:
 
     (directory / "config.yaml").write_text(
         f"""program:
-  _target_: helpers.staged_targets.CountedAllocation
+  _target_: tpen_executor.programs.AllocationProgram
   _recursive_: false
-  workers:
-    _target_: tpen_executor.programs.WorkerProgram
+  process:
+    _target_: helpers.staged_targets.CountedAllocation
     _recursive_: false
-    command: ${{remote_only.value}}
+    worker:
+      _target_: tpen_executor.programs.WorkerProgram
+      _recursive_: false
+      runner:
+        _target_: helpers.staged_targets.CountedWorker
+        _recursive_: false
+        command: ${{remote_only.value}}
   allocation_label: {label}
 outside: base
 """,
@@ -40,7 +46,9 @@ def test_capture_preserves_absent_remote_interpolation(tmp_path: Path) -> None:
     _write_config(tmp_path)
     staged = _staged(tmp_path)
     raw = staged.program.spec.config_ref  # type: ignore[union-attr]
-    assert raw["workers"]["command"] == "${remote_only.value}"
+    assert raw["process"]["worker"]["runner"]["command"] == "${remote_only.value}"
+    worker = staged.programs["program.process.worker"]
+    assert worker.spec.config_ref["runner"]["command"] == "${remote_only.value}"
 
 
 def test_capture_does_not_construct_and_materialize_constructs_once(tmp_path: Path) -> None:
@@ -53,7 +61,12 @@ def test_capture_does_not_construct_and_materialize_constructs_once(tmp_path: Pa
 
     result = staged.program.materialize({"remote_only": {"value": "worker-value"}})  # type: ignore[union-attr]
     assert staged_targets.CONSTRUCTIONS == 1
-    assert result.workers.command == "worker-value"
+    assert result.worker.runner.command == "worker-value"
+
+    worker = staged.programs["program.process.worker"]
+    runner = worker.materialize({"remote_only": {"value": "worker-value"}})
+    assert staged_targets.CONSTRUCTIONS == 2
+    assert runner.command == "worker-value"
 
 
 def test_program_digest_is_stable_local_and_sensitive_only_to_program_changes(tmp_path: Path) -> None:
@@ -66,6 +79,23 @@ def test_program_digest_is_stable_local_and_sensitive_only_to_program_changes(tm
     changed = _staged(tmp_path, "program.allocation_label=changed").program.spec.content_digest  # type: ignore[union-attr]
     assert first == second == outside
     assert changed != first
+
+
+def test_non_program_subtree_named_program_is_not_captured(tmp_path: Path) -> None:
+    """A same-named subtree is not staged without a recognized target."""
+
+    (tmp_path / "config.yaml").write_text(
+        """program:
+  _target_: helpers.staged_targets.CountedAllocation
+  _recursive_: false
+  command: literal
+outside: base
+""",
+        encoding="utf-8",
+    )
+    staged = _staged(tmp_path)
+    assert staged.program is None
+    assert staged.programs == {}
 
 
 def test_packaged_executor_config_is_a_package_resource() -> None:

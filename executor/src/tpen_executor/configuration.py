@@ -39,11 +39,9 @@ def _capture(value: Any, path: str, found: dict[str, Any]) -> Any:
     if isinstance(value, Mapping):
         target = _target_name(value)
         marked = value.get("_recursive_") is False
-        is_root_program = path == "program" and isinstance(target, str)
-        if marked and (target in _PROGRAM_TYPES or is_root_program):
-            program_type = _PROGRAM_TYPES.get(target, AllocationProgram)
+        if marked and target in _PROGRAM_TYPES:
             ref = ProgramSpecRef(value, digest(value))
-            found[path] = program_type(ref)
+            found[path] = _PROGRAM_TYPES[target](ref)
             # Walk the opaque payload too: nested WorkerProgram descriptions
             # must receive their own handles without being instantiated.
             for key, child in value.items():

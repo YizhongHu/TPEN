@@ -3,8 +3,14 @@ defaults: []
 program:
   _target_: tpen_executor.programs.AllocationProgram
   _recursive_: false
-  workers:
-    _target_: tpen_executor.programs.WorkerProgram
+  process:
+    _target_: tpen_executor.programs.DummyAllocation
     _recursive_: false
-    command: "${remote_only.value}"
+    worker:
+      _target_: tpen_executor.programs.WorkerProgram
+      _recursive_: false
+      runner:
+        _target_: tpen_executor.programs.DummyWorker
+        _recursive_: false
+        command: "${remote_only.value}"
   allocation_label: "executor-example"

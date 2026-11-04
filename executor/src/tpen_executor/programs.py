@@ -13,10 +13,33 @@ from ._codec import thaw
 from .contracts import ProgramSpecRef
 
 
+_PROGRAM_TARGETS = {
+    "tpen_executor.programs.AllocationProgram",
+    "tpen_executor.programs.WorkerProgram",
+}
+
+
+def _payload(raw: Mapping[str, Any]) -> Any:
+    """Select the concrete target nested inside a program marker."""
+
+    candidates = [
+        value
+        for key, value in raw.items()
+        if key not in {"_target_", "_recursive_"}
+        and isinstance(value, Mapping)
+        and value.get("_target_") not in _PROGRAM_TARGETS
+    ]
+    if len(candidates) != 1:
+        raise ValueError("a program marker must contain exactly one concrete payload")
+    return candidates[0]
+
+
 def _materialize(ref: ProgramSpecRef, env: Mapping[str, Any] | None) -> Any:
     """Resolve and instantiate one captured specification in the owner process."""
 
     raw = thaw(ref.config_ref)
+    if raw.get("_target_") in _PROGRAM_TARGETS:
+        raw = _payload(raw)
     config = OmegaConf.create(raw)
     if env:
         # Environment values are deliberately merged only at materialization;
@@ -52,8 +75,8 @@ class AllocationProgram:
 class DummyAllocation:
     """Minimal packaged target used by the configuration composition example."""
 
-    def __init__(self, workers: Any = None, **kwargs: Any) -> None:
-        self.workers = workers
+    def __init__(self, worker: Any = None, **kwargs: Any) -> None:
+        self.worker = worker
         self.options = kwargs
 
 
