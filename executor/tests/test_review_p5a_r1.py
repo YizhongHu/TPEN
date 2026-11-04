@@ -67,30 +67,35 @@ _FS_PROBES = [
 ]
 
 
-def test_p5a_r1_t2a_descriptors_never_touch_the_filesystem(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_p5a_r1_t2a_descriptors_never_touch_the_filesystem() -> None:
     """GREEN on 33d2a6b4.  F2: runtime control for acceptance D.  Every filesystem entry point a
-    descriptor could reach (reads, existence checks, writes) is trapped while each descriptor is
+    descriptor could reach (reads, existence checks, writes) is recorded while each descriptor is
     constructed and round-tripped; the only path operation allowed is the lexical ``os.path.isabs``.
-    Kills the existence-check and bare-``open`` mutants that the static AST control misses."""
+    The wrappers delegate to the real functions and every patch is undone before the assertion, so
+    a kill is reported by pytest cleanly.  Kills the existence-check and bare-``open`` mutants that
+    the static AST control misses."""
 
     calls: list[str] = []
 
-    def _trap(name: str):
-        def _raise(*args, **kwargs):
+    def _recording(name: str, original):
+        def _wrapped(*args, **kwargs):
             calls.append(name)
-            raise AssertionError(f"descriptor touched the filesystem via {name}")
+            return original(*args, **kwargs)
 
-        return _raise
+        return _wrapped
 
-    for module, name in _FS_PROBES:
-        monkeypatch.setattr(module, name, _trap(f"{module.__name__}.{name}"))
-    script = SourceScript("/prepared/does-not-exist/setup.sh")
-    environment = PreparedPythonEnvironment("/prepared/does-not-exist/bin/python", script, {"MODE": "control"})
-    bundle = PreparedInputBundle("/prepared/does-not-exist/inputs", "a" * 64)
-    for record in (script, environment, bundle):
-        assert type(record).decode(record.encode()) == record
-        assert type(record).from_mapping(record.to_dict()) == record
-    assert calls == []
+    with pytest.MonkeyPatch.context() as patch:
+        for module, name in _FS_PROBES:
+            patch.setattr(module, name, _recording(f"{module.__name__}.{name}", getattr(module, name)))
+        script = SourceScript("/prepared/does-not-exist/setup.sh")
+        environment = PreparedPythonEnvironment("/prepared/does-not-exist/bin/python", script, {"MODE": "control"})
+        bundle = PreparedInputBundle("/prepared/does-not-exist/inputs", "a" * 64)
+        records = (script, environment, bundle)
+        decoded = [(type(record).decode(record.encode()), type(record).from_mapping(record.to_dict())) for record in records]
+    for record, (from_bytes, from_mapping) in zip(records, decoded):
+        assert from_bytes == record
+        assert from_mapping == record
+    assert calls == [], f"descriptor reached the filesystem via {sorted(set(calls))}"
 
 
 _DESCRIPTOR_MODULES = ("environments.py", "delivery.py")
