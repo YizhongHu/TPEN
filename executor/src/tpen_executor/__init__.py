@@ -7,4 +7,4 @@ from .results import AllocationObservation, ManifestAttempt, OutcomeReceipt, Run
 
 __version__ = "0.1.0"
 
-__all__ = ["AllocationProgram", "ProgramSpecRef", "StagedConfig", "StagedHydra", "WorkerProgram", "__version__"]
+__all__ = ["__version__"]
