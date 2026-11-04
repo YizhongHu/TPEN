@@ -1,0 +1,1 @@
+{"config_ref":{"entrypoint":"tpen.run","options":{"mode":"attached","workers":2}},"content_digest":"a746b68e67decd22e45e755d86a246f1379171600dca4751dbd4935d3fe6aa07","schema":"tpen-executor/program-spec-ref-v1"}

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar, Generic, TypeVar
+from typing import Any, ClassVar
 
 from ._codec import _freeze, canonical_bytes, digest, fields, sequence, sha256_text, text, thaw
 
@@ -12,6 +12,7 @@ from ._codec import _freeze, canonical_bytes, digest, fields, sequence, sha256_t
 class _Identity:
     """Base for deliberately non-interchangeable opaque identities."""
 
+    schema: ClassVar[str] = "tpen-executor/identity-v1"
     value: str
 
     def __post_init__(self) -> None:
@@ -20,17 +21,37 @@ class _Identity:
     def __str__(self) -> str:
         return self.value
 
+    def to_dict(self) -> dict[str, str]:
+        """Return the strict wire representation of this identity."""
+
+        return {"schema": self.schema, "value": self.value}
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "_Identity":
+        """Decode one identity while preserving its concrete type."""
+
+        fields(data, {"schema", "value"}, cls.schema, cls.__name__)
+        if type(data["value"]) is not str:
+            raise TypeError(f"{cls.__name__}.value must be a string")
+        return cls(data["value"])
+
 
 class AttemptId(_Identity):
     """Identity of one fresh execution attempt."""
+
+    schema: ClassVar[str] = "tpen-executor/attempt-id-v1"
 
 
 class AllocationId(_Identity):
     """Identity of one backend allocation."""
 
+    schema: ClassVar[str] = "tpen-executor/allocation-id-v1"
+
 
 class BackendJobId(_Identity):
     """Identity assigned by a backend to one submitted job."""
+
+    schema: ClassVar[str] = "tpen-executor/backend-job-id-v1"
 
 
 @dataclass(frozen=True, slots=True)
