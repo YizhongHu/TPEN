@@ -10,13 +10,14 @@ from typing import Any, Mapping
 
 from tpen.checkpoint import (
     CheckpointRef,
+    IncompletePublicationRecordError,
     PUBLICATION_CATALOG_FILENAME,
     list_complete_checkpoints,
     read_publications,
     resolve_checkpoint_dir,
 )
 from tpen.checkpoint.manifest import CheckpointManifest
-from tpen.checkpoint.schema import read_manifest
+from tpen.checkpoint.schema import validate_manifest_schema
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
 _EVIDENCE_KEYS = {"schema", "run_dir", "verdict", "run_status", "checkpoint", "refusal"}
@@ -141,8 +142,17 @@ def inspect_run(path: str | Path) -> RunEvidence:
         A completed, failed, incomplete, or refused evidence record. Expected
         artifact problems are represented as ``verdict="refused"`` rather than
         escaping as an exception. A committed train-resume checkpoint is
-        reported for any status, including failed and incomplete runs; a
-        corrupt checkpoint refuses inspection regardless of run status.
+        reported for any status, including failed and incomplete runs. Stable
+        refusal codes are ``missing-run-dir``, ``missing-status``,
+        ``multiple-status``, ``status-io-error``, ``malformed-status``,
+        ``missing-checkpoint``, ``incomplete-checkpoint`` (completed runs
+        whose checkpoint is uncommitted), ``no-train-resume-checkpoint``
+        (completed runs with only committed model-only checkpoints),
+        ``checkpoint-io-error``, ``corrupt-checkpoint``,
+        ``corrupt-publication-catalog``, and ``torn-publication-catalog``.
+        In-flight or uncommitted checkpoint directories do not refuse
+        non-completed runs; they yield a null checkpoint and an ``incomplete``
+        or ``failed`` verdict.
     """
 
     run_dir = Path(path).resolve()
@@ -160,7 +170,13 @@ def inspect_run(path: str | Path) -> RunEvidence:
         try:
             checkpoint = _read_checkpoint(run_dir)
         except _InspectionRefusal as exc:
-            if exc.code != "missing-checkpoint":
+            if run_status != "completed" and exc.code in {
+                "missing-checkpoint",
+                "incomplete-checkpoint",
+                "no-train-resume-checkpoint",
+            }:
+                checkpoint = None
+            elif exc.code != "missing-checkpoint":
                 raise
         if run_status == "failed":
             return RunEvidence(RUN_EVIDENCE_SCHEMA, str(run_dir), "failed", run_status, checkpoint, None)
@@ -210,14 +226,17 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
         publications = read_publications(catalog_path) if catalog_path.is_file() else ()
     except OSError as exc:
         raise _InspectionRefusal("checkpoint-io-error", f"cannot read {catalog_path}: {exc}") from exc
+    except IncompletePublicationRecordError as exc:
+        raise _InspectionRefusal("torn-publication-catalog", f"cannot read {catalog_path}: {exc}") from exc
     except (ValueError, TypeError, KeyError, OverflowError) as exc:
         raise _InspectionRefusal("corrupt-publication-catalog", f"cannot read {catalog_path}: {exc}") from exc
 
     refs: list[CheckpointRef] = []
     for ref in publications:
         try:
-            _read_train_resume_manifest(ref.checkpoint_dir / "manifest.json")
-            refs.append(ref.validate())
+            validated_ref = ref.validate()
+            _read_train_resume_manifest(validated_ref.checkpoint_dir / "manifest.json")
+            refs.append(validated_ref)
         except _TrainResumeModeGate:
             continue
         except OSError as exc:
@@ -245,8 +264,16 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
     if not refs:
         if any(candidate.name.endswith(".tmp") for candidate in root.glob("step_*")):
             raise _InspectionRefusal("incomplete-checkpoint", f"no committed checkpoint under {root}")
-        if any(candidate.is_dir() for candidate in root.glob("step_*")):
+        if any(
+            candidate.is_dir() and candidate not in complete_dirs
+            for candidate in root.glob("step_*")
+        ):
             raise _InspectionRefusal("incomplete-checkpoint", f"no committed checkpoint under {root}")
+        if complete_dirs or publications:
+            raise _InspectionRefusal(
+                "no-train-resume-checkpoint",
+                f"committed published checkpoints under {root} do not support train resume",
+            )
         try:
             resolve_checkpoint_dir(root)
         except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
@@ -265,11 +292,14 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
 def _read_train_resume_manifest(path: Path) -> CheckpointManifest:
     """Read a manifest, marking only a valid non-train-resume artifact."""
 
-    read_manifest(path, mode="model_only")
+    with path.open("r", encoding="utf-8") as handle:
+        manifest = CheckpointManifest.from_mapping(json.load(handle))
+    validate_manifest_schema(manifest, mode="model_only", path=path)
     try:
-        return read_manifest(path, mode="train_resume")
+        validate_manifest_schema(manifest, mode="train_resume", path=path)
     except ValueError as exc:
         raise _TrainResumeModeGate(str(exc)) from exc
+    return manifest
 
 
 def _main(argv: list[str] | None = None) -> int:

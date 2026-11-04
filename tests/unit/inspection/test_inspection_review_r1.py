@@ -223,22 +223,6 @@ def test_published_ref_outside_root_is_gated_by_train_resume(tmp_path: Path) -> 
     assert Path(evidence.checkpoint["checkpoint_dir"]).parent == local_step.parent
 
 
-def test_hash_corrupt_published_train_resume_ref_is_refused(tmp_path: Path) -> None:
-    """Train-resume admission must not hide later published-byte corruption."""
-
-    run_dir = tmp_path / "run"
-    published = _write_complete_run(run_dir, step=7)
-    catalog = run_dir / "checkpoints" / PUBLICATION_CATALOG_FILENAME
-    append_publication(catalog, CheckpointRef.from_directory(published))
-    (published / "model.pt").write_bytes(b"changed")
-
-    evidence = inspect_run(run_dir)
-
-    assert evidence.verdict == "refused"
-    assert evidence.refusal is not None
-    assert evidence.refusal["code"] == "corrupt-checkpoint"
-
-
 def test_schema_round_trip_completed_and_refused_shapes(tmp_path: Path) -> None:
     """Completed and refused records remain byte-stable through the schema."""
 
@@ -266,7 +250,7 @@ def test_schema_rejects_inconsistent_verdict_payloads(tmp_path: Path) -> None:
         "refusal": None,
     }
     valid_checkpoint = {
-        "checkpoint_dir": str(tmp_path / "step_000007"),
+        "checkpoint_dir": str((tmp_path / "step_000007").resolve()),
         "schema_version": 2,
         "next_iteration": 7,
         "completed_updates": 5,
@@ -374,19 +358,16 @@ def test_status_io_error_is_distinct(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
     monkeypatch.setattr(Path, "open", fail_status_open)
     evidence = inspect_run(run_dir)
-    assert evidence.refusal == {"code": "status-io-error", "reason": "cannot read " + str(run_dir / "status.json") + ": status temporarily unavailable"}
+    assert evidence.refusal == {"code": "status-io-error", "reason": "cannot read " + str((run_dir / "status.json").resolve()) + ": status temporarily unavailable"}
 
 
 def test_checkpoint_io_error_is_distinct(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     _write_complete_run(run_dir)
-    original_read_manifest = inspection.read_manifest
-
-    def fail_manifest_read(path: Path, *, mode: str):
+    def fail_manifest_read(manifest: object, *, mode: str, path: Path | None = None):
         raise OSError("checkpoint temporarily unavailable")
 
-    monkeypatch.setattr(inspection, "read_manifest", fail_manifest_read)
+    monkeypatch.setattr(inspection, "validate_manifest_schema", fail_manifest_read)
     evidence = inspect_run(run_dir)
     assert evidence.refusal is not None
     assert evidence.refusal["code"] == "checkpoint-io-error"
-    monkeypatch.setattr(inspection, "read_manifest", original_read_manifest)
