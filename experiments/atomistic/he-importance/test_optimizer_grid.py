@@ -420,8 +420,17 @@ def test_partition_mutants_delete_or_duplicate_codes() -> None:
     authority = tuple(definition.code for definition in stage_coordinate.STAGE_DEFINITIONS)
     with pytest.raises(optimizer_grid.OptimizerGridError, match="partition"):
         optimizer_grid._require_stage_partition(declared=("Q",), undeclared=optimizer_grid.UNDECLARED_STAGE_REASONS)
-    with pytest.raises(optimizer_grid.OptimizerGridError, match="repeat"):
+    with pytest.raises(family.ArchitectureStageFamilyError, match="repeat"):
         family.validate_partition(("Q", "Q"), ("A", "B"), optimizer_grid.UNDECLARED_STAGE_REASONS, authority)
+    with pytest.raises(family.ArchitectureStageFamilyError, match="repeat"):
+        family.validate_partition(("Q", "O1"), ("A", "A"), optimizer_grid.UNDECLARED_STAGE_REASONS, authority)
+    with pytest.raises(family.ArchitectureStageFamilyError, match="partition"):
+        family.validate_partition(
+            ("Q", "O1"),
+            ("A", "B"),
+            {"O2": "pending", "R": "pending", "F": "pending", "Q": "duplicate"},
+            authority,
+        )
 
 
 def test_a_and_b_family_renderers_keep_two_explicit_optimizer_slots() -> None:

@@ -29,6 +29,9 @@ import pytest
 
 stage_coordinate = importlib.import_module("experiments.atomistic.he-importance.stage_coordinate")
 optimizer_grid = importlib.import_module("experiments.atomistic.he-importance.optimizer_grid")
+architecture_stage_family = importlib.import_module(
+    "experiments.atomistic.he-importance.architecture_stage_family"
+)
 train_config = importlib.import_module("experiments.atomistic.he-importance.train_config")
 
 _HERE = Path(__file__).resolve().parent
@@ -552,7 +555,7 @@ def test_c3_resolving_an_unavailable_o1_row_is_refused_not_rerouted(tmp_path: Pa
     assert "no declared intended-configuration universe" not in str(error.value)
 
 
-@pytest.mark.parametrize("stage_code", ["O2", "A", "B", "R", "F"])
+@pytest.mark.parametrize("stage_code", ["O2", "R", "F"])
 def test_c3_undeclared_stage_is_refused_with_its_named_reason(
     tmp_path: Path, stage_code: str
 ) -> None:
@@ -569,11 +572,15 @@ def test_c3_undeclared_stage_is_refused_with_its_named_reason(
 
 def test_c3_declared_and_undeclared_stages_partition_the_stage_authority() -> None:
     codes = {definition.code for definition in stage_coordinate.STAGE_DEFINITIONS}
-    declared = set(optimizer_grid.OPTIMIZER_GRID_STAGES)
+    grid = set(optimizer_grid.OPTIMIZER_GRID_STAGES)
+    family = set(architecture_stage_family.family_stage_codes())
     undeclared = set(optimizer_grid.UNDECLARED_STAGE_REASONS)
-    assert declared == {"Q", "O1"}
-    assert not declared & undeclared
-    assert declared | undeclared == codes
+    assert grid == {"Q", "O1"}
+    assert family == {"A", "B"}
+    assert not grid & family
+    assert not grid & undeclared
+    assert not family & undeclared
+    assert grid | family | undeclared == codes
     with pytest.raises(optimizer_grid.OptimizerGridError, match="unknown HI stage"):
         optimizer_grid.undeclared_stage_reason("Z")
 
