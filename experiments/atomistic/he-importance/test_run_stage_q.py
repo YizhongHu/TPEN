@@ -3184,17 +3184,10 @@ def test_q_execute_materializes_only_stage_q(
 
 
 def test_family_selection_is_by_literal_configuration_and_slot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path
 ) -> None:
     family = importlib.import_module(
         "experiments.atomistic.he-importance.architecture_stage_family"
-    )
-    original = family.ARCHITECTURE_STAGE_REGISTRY["A"]
-    fake_resolved = runner.OmegaConf.create({"optimizer": {"_target_": "torch.optim.Adam"}})
-    monkeypatch.setitem(
-        family.ARCHITECTURE_STAGE_REGISTRY,
-        "A",
-        replace(original, resolver=lambda cell: fake_resolved, resolved_validator=lambda cell, resolved: None),
     )
     package = family.ab_universe.render_a_packages()[0]
     cells = family.materialize_family_stage("A", tmp_path)
@@ -3221,13 +3214,6 @@ def test_family_dry_run_uses_the_shared_packet_and_report_route(
 ) -> None:
     family = importlib.import_module(
         "experiments.atomistic.he-importance.architecture_stage_family"
-    )
-    original = family.ARCHITECTURE_STAGE_REGISTRY[stage_code]
-    fake_resolved = runner.OmegaConf.create({"optimizer": {"_target_": "torch.optim.Adam"}})
-    monkeypatch.setitem(
-        family.ARCHITECTURE_STAGE_REGISTRY,
-        stage_code,
-        replace(original, resolver=lambda cell: fake_resolved, resolved_validator=lambda cell, resolved: None),
     )
     package = family.ab_universe.render_ab_universe()[stage_code][0]
     monkeypatch.setattr(runner, "roster_design_receipt", lambda stage: {"stage": stage})

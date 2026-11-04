@@ -209,11 +209,9 @@ def test_t3_family_launch_route_agrees_selection_and_launch_views(
 
 
 # ---------------------------------------------------------------------------
-# T4 (RED by design -> finding on clause 8 vacuity). The PR's clause-8
-# fixture, copied verbatim, passes register_stage_descriptor but cannot be
-# materialized: validate_descriptor tolerates a row without "package"
-# (row.get("package", row)) while materialize_family_stage requires
-# row["package"].  Expected failure at this head: KeyError: 'package'.
+# T4 (GREEN after F1(a)). The original clause-8 fixture is materializable
+# through the generic route once validation and materialization agree on the
+# package-optional row schema.
 # ---------------------------------------------------------------------------
 def _clause_8_fixture() -> tuple[dict, family.ArchitectureStageDescriptor]:
     authority = {
@@ -223,8 +221,10 @@ def _clause_8_fixture() -> tuple[dict, family.ArchitectureStageDescriptor]:
     slot = family.OptimizerSlot("adam", "available", {"lr": 1.0})
 
     def renderer(stage: str):
+        package = {"optimizer_slots": [slot.as_dict()]}
         return ({
             "stage": stage,
+            "package": package,
             "optimizer": slot.as_dict(),
             "configurations": ({
                 "scientific_identity": {
@@ -244,7 +244,7 @@ def _clause_8_fixture() -> tuple[dict, family.ArchitectureStageDescriptor]:
         resolver=lambda cell: object(),
         resolved_validator=lambda cell, resolved: None,
         slot_policy=lambda row: (slot,),
-        seed_namespace=lambda stage: (1, 2),
+        seed_namespace=lambda stage: stage_coordinate.seed_labels(stage),
         selector=lambda *args, **kwargs: None,
         packet_policy=lambda stage: {"updates": 7},
         launch_adapter=lambda *args, **kwargs: None,
@@ -255,14 +255,22 @@ def _clause_8_fixture() -> tuple[dict, family.ArchitectureStageDescriptor]:
 def test_t4_the_pr_clause_8_fixture_is_materializable_on_the_generic_route(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A descriptor that passes registration must also pass materialization.
-
-    Establishes whether clause 8's "shares the generic route" holds for the
-    very fixture the PR uses to claim it.  Expected RED at this head with
-    KeyError: 'package' from materialize_family_stage.
-    """
+    """A descriptor that passes registration must also pass materialization."""
 
     authority, descriptor = _clause_8_fixture()
+    definition = stage_coordinate.StageDefinition(
+        code="X",
+        purpose="review fixture",
+        seeds_per_point=2,
+        maximum_lineages=1,
+        updates=7,
+        sampler_overrides=MappingProxyType({}),
+    )
+    copies = {id(stage_coordinate): stage_coordinate, id(optimizer_grid.stage_coordinate): optimizer_grid.stage_coordinate}
+    for module in copies.values():
+        monkeypatch.setattr(module, "STAGE_DEFINITIONS", module.STAGE_DEFINITIONS + (definition,))
+        monkeypatch.setitem(module.STAGES, "X", definition)
+        monkeypatch.setitem(module.SEED_NAMESPACE_STARTS, "X", 880_001)
     registry = dict(family.ARCHITECTURE_STAGE_REGISTRY)
     family.register_stage_descriptor(descriptor, registry=registry, authority=authority)
     monkeypatch.setattr(family, "ARCHITECTURE_STAGE_REGISTRY", registry)
@@ -323,8 +331,31 @@ def _complete_fake_stage(monkeypatch: pytest.MonkeyPatch) -> family.Architecture
         if context["axis"] != "X" or dict(context["literal_configuration"]) != {"label": "x"}:
             raise family.ArchitectureStageFamilyError("X context values")
 
+    streams = stage_coordinate.seed_namespace("X", 870_001)
+    model = {"initializer": {"seed": streams["model_initialization"]}}
+    optimizer = {
+        "_target_": "torch.optim.Adam",
+        "lr": _ADAM_LEVELS["lr"],
+        "betas": [_ADAM_LEVELS["beta1"], _ADAM_LEVELS["beta2"]],
+        "eps": _ADAM_LEVELS["epsilon"],
+        "weight_decay": _ADAM_LEVELS["weight_decay"],
+    }
+    sampler = {"seed": streams["training_sampler"]}
     resolved = OmegaConf.create(
-        {"optimizer": {"_target_": "torch.optim.Adam"}, "trainer": {"max_steps": 2000}}
+        {
+            "model": model,
+            "optimizer": optimizer,
+            "sampler": sampler,
+            "trainer": {"max_steps": 2000},
+            "hamiltonian_terms": {},
+            "runner": {
+                "model": model,
+                "optimizer": optimizer,
+                "sampler": sampler,
+                "trainer": {"max_steps": 2000},
+                "hamiltonian_terms": {},
+            },
+        }
     )
     descriptor = family.ArchitectureStageDescriptor(
         stage="X",

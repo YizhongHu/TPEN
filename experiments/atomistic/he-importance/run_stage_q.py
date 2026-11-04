@@ -1,4 +1,4 @@
-"""Select, resolve, and optionally run exactly one optimizer-grid stage cell.
+"""Select, resolve, and optionally run exactly one admitted HI stage cell.
 
 The command deliberately owns selection rather than relying on inventory order.
 It materializes the committed inventory for the requested stage, filters the
@@ -8,11 +8,10 @@ declared optimizer cell is truthful about the resolver output. The default
 Q/O-raw/Adam filters therefore require an explicit seed label while the
 authority contains both Q seed labels.
 
-Only the stages in ``optimizer_grid.OPTIMIZER_GRID_STAGES`` (Q and O1) have a
-declared universe and are admitted. Every other stage is refused before any
-materialization with the reason recorded in
-``optimizer_grid.UNDECLARED_STAGE_REASONS``. The module keeps its historical
-``run_stage_q`` name; Q is its default stage, not its only stage.
+Optimizer-grid stages and declared architecture-family stages have admitted
+universes. Every other stage is refused before materialization with the reason
+recorded in ``optimizer_grid.UNDECLARED_STAGE_REASONS``. The module keeps its
+historical ``run_stage_q`` name; Q is its default stage, not its only stage.
 """
 
 from __future__ import annotations
@@ -62,7 +61,7 @@ class CellDescriptor:
     """The auditable selection coordinates of one materialized cell."""
 
     stage: str
-    context: str
+    context: object
     optimizer: Mapping[str, object]
     seed_label: int
     status: str
@@ -143,9 +142,9 @@ def _require_executable_stage(stage: str) -> None:
     ----------
     stage : str
         Requested stage code. Only a stage in
-        ``optimizer_grid.OPTIMIZER_GRID_STAGES`` is admitted; every other
-        stage must be rejected before materializing selection input or
-        resolving a training packet.
+        ``optimizer_grid.OPTIMIZER_GRID_STAGES`` and declared family stages
+        are admitted; every other stage must be rejected before materializing
+        selection input or resolving a training packet.
 
     Raises
     ------
@@ -160,13 +159,14 @@ def _require_executable_stage(stage: str) -> None:
         reason = optimizer_grid.undeclared_stage_reason(stage)
     except optimizer_grid.OptimizerGridError as error:
         raise StageQSelectionError(
-            f"runner admits only optimizer-grid stages "
-            f"{optimizer_grid.OPTIMIZER_GRID_STAGES!r}; {error}"
+            f"runner admits grid stages {optimizer_grid.OPTIMIZER_GRID_STAGES!r} "
+            f"and family stages {architecture_stage_family.family_stage_codes()!r}; {error}"
         ) from error
     if reason is not None:
         raise StageQSelectionError(
             f"stage {stage!r} has no declared intended-configuration universe: {reason}; "
-            f"runner admits only optimizer-grid stages {optimizer_grid.OPTIMIZER_GRID_STAGES!r}"
+            f"runner admits grid stages {optimizer_grid.OPTIMIZER_GRID_STAGES!r} "
+            f"and family stages {architecture_stage_family.family_stage_codes()!r}"
         )
 
 
@@ -215,35 +215,36 @@ def select_cell(
 
     _require_executable_stage(stage)
     if architecture_stage_family.is_family_stage(stage):
+        descriptor = architecture_stage_family.descriptor_for(stage)
+        selector_kwargs: dict[str, object] = {
+            "stage": stage,
+            "context": context,
+            "optimizer": optimizer,
+            "seed_label": seed_label,
+            "lr": lr,
+            "beta2": beta2,
+        }
+        if literal_configuration is not None:
+            selector_kwargs["literal_configuration"] = literal_configuration
+        selector_parameters = inspect.signature(descriptor.selector).parameters
+        if not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in selector_parameters.values()
+        ):
+            selector_kwargs = {
+                name: value
+                for name, value in selector_kwargs.items()
+                if name in selector_parameters
+            }
         try:
-            family_selection = architecture_stage_family.select_exact_one(
-                cells,
-                stage=stage,
-                context=context,
-                optimizer=optimizer,
-                seed_label=seed_label,
-                literal_configuration=literal_configuration,
-                optimizer_levels=(
-                    {
-                        "lr": lr,
-                        "beta1": 0.9,
-                        "beta2": beta2,
-                        "epsilon": 1e-8,
-                        "weight_decay": 0.0,
-                        "parameter_groups": 1,
-                        "schedule": "constant",
-                    }
-                    if optimizer == DEFAULT_OPTIMIZER
-                    else None
-                ),
-            )
+            family_selection = descriptor.selector(cells, **selector_kwargs)
         except (architecture_stage_family.ArchitectureStageFamilyError, train_config.TrainConfigResolutionError) as error:
             raise StageQSelectionError(str(error)) from error
         return CellSelection(
             family_selection.cell,
             CellDescriptor(
                 stage=family_selection.selected.stage,
-                context=family_selection.selected.axis,
+                context=family_selection.selected.context,
                 optimizer={
                     "method": family_selection.selected.optimizer.method,
                     "levels": (
@@ -254,12 +255,12 @@ def select_cell(
                 },
                 seed_label=family_selection.selected.seed_label,
                 status=family_selection.selected.optimizer.status,
-                literal_configuration=dict(family_selection.selected.literal_configuration),
+                literal_configuration=family_selection.selected.literal_configuration,
             ),
             tuple(
                 CellDescriptor(
                     stage=item.stage,
-                    context=item.axis,
+                    context=item.context,
                     optimizer={
                         "method": item.optimizer.method,
                         "levels": (
@@ -270,7 +271,7 @@ def select_cell(
                     },
                     seed_label=item.seed_label,
                     status=item.optimizer.status,
-                    literal_configuration=dict(item.literal_configuration),
+                    literal_configuration=item.literal_configuration,
                 )
                 for item in family_selection.discarded
             ),
@@ -280,6 +281,10 @@ def select_cell(
             "truthfulness guard refused field 'context.name': "
             f"declared value {context!r}; only O-raw and O-composite are admitted "
             "(item dd964863)"
+        )
+    if literal_configuration is not None:
+        raise StageQSelectionError(
+            "literal_configuration is only supported for declared family stages"
         )
     admitted_methods = {
         entry.method for entry in _roster() if entry.admitted and entry.target
@@ -1060,6 +1065,65 @@ def _configured_optimizer_value(
     return value
 
 
+def _require_family_common_truthfulness(cell: Any, resolved: Any) -> None:
+    """Apply runner-owned consumed-view, seed, and Adam checks to a family row."""
+
+    agreed = _agreed_consumed_views(resolved)
+    _require_seed_bindings(cell, agreed["model"], agreed["sampler"])
+    optimizer = agreed["optimizer"]
+    if not isinstance(optimizer, Mapping):
+        raise StageQSelectionError(
+            "truthfulness guard refused field 'optimizer': consumed value "
+            f"{optimizer!r} is not a mapping"
+        )
+    consumed_target = optimizer.get("_target_")
+    if consumed_target != "torch.optim.Adam":
+        raise StageQSelectionError(
+            "truthfulness guard refused field 'optimizer._target_': "
+            "family Adam row consumed value "
+            f"{consumed_target!r}"
+        )
+    defaults = _adam_signature_defaults()
+    betas = _configured_optimizer_value(optimizer, "betas", defaults["betas"])
+    epsilon = _configured_optimizer_value(optimizer, "eps", defaults["eps"])
+    weight_decay = _configured_optimizer_value(
+        optimizer, "weight_decay", defaults["weight_decay"]
+    )
+    consumed = {
+        "lr": optimizer.get("lr"),
+        "beta1": betas[0],
+        "beta2": betas[1],
+        "epsilon": epsilon,
+        "weight_decay": weight_decay,
+        "parameter_groups": 1,
+        "schedule": "constant" if not _scheduler_configured(resolved) else "scheduler",
+    }
+    declared_optimizer = cell.manifest["scientific_identity"]["optimizer"]
+    if declared_optimizer.get("method") != "adam":
+        raise StageQSelectionError(
+            "truthfulness guard refused field 'optimizer.method': "
+            f"declared value {declared_optimizer.get('method')!r}, consumed value 'adam'"
+        )
+    declared = declared_optimizer.get("levels")
+    if not isinstance(declared, Mapping):
+        raise StageQSelectionError(
+            "truthfulness guard refused field 'optimizer.levels': "
+            f"declared value {declared!r} is not a mapping"
+        )
+    if set(declared) != set(consumed):
+        raise StageQSelectionError(
+            "truthfulness guard refused optimizer level keys: "
+            f"declared={sorted(declared)!r}, consumed={sorted(consumed)!r}"
+        )
+    for field, consumed_value in consumed.items():
+        if declared.get(field) != consumed_value:
+            raise StageQSelectionError(
+                "truthfulness guard refused optimizer level "
+                f"'{field}': declared value {declared.get(field)!r}, "
+                f"consumed value {consumed_value!r}"
+            )
+
+
 def _require_truthful_cell(cell: Any, resolved: Any) -> None:
     """Refuse a cell whose declared context or Adam levels are not consumed."""
 
@@ -1067,6 +1131,7 @@ def _require_truthful_cell(cell: Any, resolved: Any) -> None:
     if architecture_stage_family.is_family_stage(str(cell.manifest["stage"])):
         descriptor = architecture_stage_family.descriptor_for(str(cell.manifest["stage"]))
         try:
+            _require_family_common_truthfulness(cell, resolved)
             descriptor.resolved_validator(cell, resolved)
         except architecture_stage_family.ArchitectureStageFamilyError as error:
             raise StageQSelectionError(str(error)) from error
@@ -1218,16 +1283,26 @@ def _training_packet(cell: Any) -> Any:
         yield exactly one train packet.
     """
 
-    definition = stage_coordinate.stage_definition(cell.manifest["stage"])
-    if definition.updates is None:
+    stage = str(cell.manifest["stage"])
+    if architecture_stage_family.is_family_stage(stage):
+        policy = architecture_stage_family.descriptor_for(stage).packet_policy(stage)
+        updates = policy.get("updates")
+        cadence_every = policy.get(
+            "checkpoint_every_n_updates", CHECKPOINT_EVERY_N_UPDATES
+        )
+    else:
+        definition = stage_coordinate.stage_definition(stage)
+        updates = definition.updates
+        cadence_every = CHECKPOINT_EVERY_N_UPDATES
+    if updates is None:
         raise StageQSelectionError("selected stage has no fixed training horizon")
     cadence = stage_coordinate.CheckpointCadence(
-        CHECKPOINT_EVERY_N_UPDATES,
+        cadence_every,
         tuple(
             range(
-                CHECKPOINT_EVERY_N_UPDATES,
-                definition.updates + 1,
-                CHECKPOINT_EVERY_N_UPDATES,
+                cadence_every,
+                updates + 1,
+                cadence_every,
             )
         ),
     )

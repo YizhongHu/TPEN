@@ -394,10 +394,10 @@ def _require_stage_partition(
     declared: tuple[str, ...] = OPTIMIZER_GRID_STAGES,
     undeclared: Mapping[str, str] = UNDECLARED_STAGE_REASONS,
 ) -> frozenset[str]:
-    """Require the declared and undeclared stage sets to partition the authority.
+    """Require grid, architecture-family, and undeclared stages to partition the authority.
 
     The check means a stage added to the stage authority can never fall
-    silently into neither set, and no stage can be both.
+    silently into neither set, and no stage can be in more than one set.
 
     Parameters
     ----------
@@ -414,7 +414,7 @@ def _require_stage_partition(
     Raises
     ------
     OptimizerGridError
-        If the two sets overlap or their union is not the authority.
+        If the three sets overlap or their union is not the authority.
     """
 
     authority_codes = frozenset(definition.code for definition in stage_coordinate.STAGE_DEFINITIONS)

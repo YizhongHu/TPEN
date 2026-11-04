@@ -67,7 +67,7 @@ EXPECTED_PRODUCTION_INVENTORY = {
     ("train_config.py", 597, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("run_stage_q.py", 129, "tpen.hi_schema"): InventoryEntry(
+    ("run_stage_q.py", 128, "tpen.hi_schema"): InventoryEntry(
         "measured at reland subject ff7cde49; roster import remains quarantined under item df8f8b31.",
     ),
 }

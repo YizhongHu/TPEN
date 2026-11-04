@@ -14,7 +14,6 @@ from dataclasses import dataclass
 import importlib
 import json
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any
 
 
@@ -64,23 +63,45 @@ class OptimizerSlot:
 
 @dataclass(frozen=True)
 class FamilyCellDescriptor:
-    """Identity-bearing coordinates used by the family exact-one selector."""
+    """Generic identity-bearing coordinates returned by a family selector."""
 
     stage: str
-    axis: str
-    literal_configuration: Mapping[str, str]
+    context: Any
     optimizer: OptimizerSlot
     seed_label: int
+    coordinates: Any = None
+
+    @property
+    def axis(self) -> str:
+        """Return the A/B axis for compatibility with the A/B selector."""
+
+        source = self.coordinates if self.coordinates is not None else self.context
+        if isinstance(source, Mapping) and "axis" in source:
+            return str(source["axis"])
+        return str(self.context)
+
+    @property
+    def literal_configuration(self) -> Mapping[str, str] | None:
+        """Return the A/B literal coordinate when the selector provides it."""
+
+        source = self.coordinates if self.coordinates is not None else self.context
+        if isinstance(source, Mapping) and "literal_configuration" in source:
+            literal = source["literal_configuration"]
+            return dict(literal) if isinstance(literal, Mapping) else None
+        return None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "stage": self.stage,
-            "context": self.axis,
-            "literal_configuration": dict(self.literal_configuration),
+            "context": self.context,
             "optimizer": self.optimizer.as_dict(),
             "seed_label": self.seed_label,
             "status": self.optimizer.status,
         }
+        literal = self.literal_configuration
+        if literal is not None:
+            result["literal_configuration"] = literal
+        return result
 
 
 @dataclass(frozen=True)
@@ -94,8 +115,8 @@ class FamilySelection:
     def receipt(self) -> dict[str, Any]:
         return {
             "rule": (
-                "exactly one truthful family cell matching stage + literal "
-                "configuration + optimizer slot + seed_label; refuse zero or multiple matches"
+                "exactly one truthful family cell matching stage + selector-owned "
+                "context + optimizer slot + seed_label; refuse zero or multiple matches"
             ),
             "selected": self.selected.as_dict(),
             "discarded": [item.as_dict() for item in self.discarded],
@@ -129,10 +150,10 @@ class ArchitectureStageDescriptor:
 
 STAGE_AUTHORITY: Mapping[str, Any] = stage_coordinate.STAGES
 ARCHITECTURE_STAGE_REGISTRY: dict[str, ArchitectureStageDescriptor] = {}
-# Short aliases keep the registry's public ownership obvious to later stage
-# slices without making the runner depend on a particular spelling.
-STAGE_FAMILY_REGISTRY = ARCHITECTURE_STAGE_REGISTRY
-STAGE_REGISTRY = ARCHITECTURE_STAGE_REGISTRY
+
+_AB_RENDER_CACHE: tuple[object, Mapping[str, Sequence[Mapping[str, Any]]]] | None = None
+_AB_LITERAL_KEYS: dict[str, frozenset[str]] = {}
+_AB_LITERAL_VALUES: dict[str, frozenset[str]] = {}
 
 
 def _canonical(value: Any) -> str:
@@ -153,6 +174,28 @@ def _resolver(source: Any) -> Any:
     return module.resolve_train_config(source)
 
 
+def _ab_universe_snapshot() -> Mapping[str, Sequence[Mapping[str, Any]]]:
+    """Memoize the renderer output while preserving test-time replacement."""
+
+    global _AB_RENDER_CACHE, _AB_LITERAL_KEYS, _AB_LITERAL_VALUES
+    renderer = ab_universe.render_ab_universe
+    if _AB_RENDER_CACHE is None or _AB_RENDER_CACHE[0] is not renderer:
+        rendered = renderer()
+        if not isinstance(rendered, Mapping):
+            raise ArchitectureStageFamilyError("A/B renderer must return a stage mapping")
+        _AB_RENDER_CACHE = (renderer, rendered)
+        _AB_LITERAL_KEYS = {
+            stage: frozenset(package["literal_configuration"])
+            for stage, packages in rendered.items()
+            for package in packages[:1]
+        }
+        _AB_LITERAL_VALUES = {
+            stage: frozenset(_canonical(package["literal_configuration"]) for package in packages)
+            for stage, packages in rendered.items()
+        }
+    return _AB_RENDER_CACHE[1]
+
+
 def _validate_ab_context(context: Mapping[str, Any]) -> None:
     if frozenset(context) != frozenset({"axis", "literal_configuration"}):
         raise ArchitectureStageFamilyError(
@@ -164,15 +207,13 @@ def _validate_ab_context(context: Mapping[str, Any]) -> None:
         raise ArchitectureStageFamilyError("A/B context has an invalid axis or literal configuration")
     if any(type(key) is not str or type(value) is not str for key, value in literal.items()):
         raise ArchitectureStageFamilyError("A/B literal configuration must map exact strings to strings")
-    expected = {key for key in ab_universe.render_ab_universe()[axis][0]["literal_configuration"]}
+    _ab_universe_snapshot()
+    expected = _AB_LITERAL_KEYS[axis]
     if frozenset(literal) != frozenset(expected):
         raise ArchitectureStageFamilyError(
             f"A/B literal configuration for {axis} has a closed-vocabulary mismatch"
         )
-    if not any(
-        _canonical(package["literal_configuration"]) == _canonical(dict(literal))
-        for package in ab_universe.render_ab_universe()[axis]
-    ):
+    if _canonical(dict(literal)) not in _AB_LITERAL_VALUES[axis]:
         raise ArchitectureStageFamilyError(
             f"A/B literal configuration for {axis} is not in the rendered universe"
         )
@@ -198,7 +239,7 @@ def _ab_renderer(stage: str) -> Sequence[Mapping[str, Any]]:
     if stage not in {"A", "B"}:
         raise ArchitectureStageFamilyError(f"A/B renderer cannot render stage {stage!r}")
     rows: list[Mapping[str, Any]] = []
-    for package in ab_universe.render_ab_universe()[stage]:
+    for package in _ab_universe_snapshot()[stage]:
         context = {
             "axis": stage,
             "literal_configuration": dict(package["literal_configuration"]),
@@ -255,7 +296,7 @@ def _ab_packet_policy(stage: str) -> Mapping[str, Any]:
 
 def _ab_launch_adapter(*args: Any, **kwargs: Any) -> Any:
     launch = importlib.import_module("experiments.atomistic.he-importance.launch")
-    return launch.launch_train(*args, **kwargs, resolver=_resolver)
+    return launch.launch_train(*args, **kwargs)
 
 
 def _ab_seed_namespace(stage: str) -> tuple[int, ...]:
@@ -302,6 +343,10 @@ def validate_descriptor(
     updates = getattr(definition, "updates", definition.get("updates") if isinstance(definition, Mapping) else None)
     if updates is None:
         raise ArchitectureStageFamilyError("family descriptor requires a fixed authority horizon")
+    if labels != tuple(stage_coordinate.seed_labels(descriptor.stage)):
+        raise ArchitectureStageFamilyError(
+            f"family seed namespace for {descriptor.stage!r} does not match the stage authority"
+        )
     if descriptor.packet_policy(descriptor.stage).get("updates") != updates:
         raise ArchitectureStageFamilyError("family packet policy does not bind authority horizon")
     for row in first:
@@ -314,7 +359,10 @@ def validate_descriptor(
         if not isinstance(identity, Mapping):
             raise ArchitectureStageFamilyError("family rows need a scientific identity")
         descriptor.context_validator(identity.get("context", {}))
-        slots = tuple(descriptor.slot_policy(row.get("package", row)))
+        source = row.get("package", row)
+        if not isinstance(source, Mapping):
+            raise ArchitectureStageFamilyError("family rows need a mapping for slot policy")
+        slots = tuple(descriptor.slot_policy(source))
         if not slots or len({slot.method for slot in slots}) != len(slots):
             raise ArchitectureStageFamilyError("family rows need one complete policy per optimizer slot")
         if row["optimizer"]["method"] not in {slot.method for slot in slots}:
@@ -376,7 +424,7 @@ def materialize_family_stage(stage: str, output_root: Path) -> tuple[Any, ...]:
     for row in rows:
         slot = next(
             item
-            for item in descriptor.slot_policy(row["package"])
+            for item in descriptor.slot_policy(row.get("package", row))
             if item.method == row["optimizer"]["method"]
         )
         optimizer = stage_coordinate.OptimizerCell(
@@ -408,8 +456,7 @@ def _cell_descriptor(cell: Any) -> FamilyCellDescriptor:
     context = identity["context"]
     return FamilyCellDescriptor(
         stage=str(cell.manifest["stage"]),
-        axis=str(context["axis"]),
-        literal_configuration=MappingProxyType(dict(context["literal_configuration"])),
+        context=dict(context) if isinstance(context, Mapping) else context,
         optimizer=slot,
         seed_label=int(cell.manifest["seed_identity"]["label"]),
     )
@@ -424,8 +471,10 @@ def select_exact_one(
     seed_label: int | None,
     literal_configuration: Mapping[str, str] | None = None,
     optimizer_levels: Mapping[str, Any] | None = None,
+    lr: float | None = None,
+    beta2: float | None = None,
 ) -> FamilySelection:
-    """Select by literal identity and optimizer slot, never display name."""
+    """Select one A/B row by its literal identity and optimizer slot."""
 
     descriptor = descriptor_for(stage)
     if isinstance(context, Mapping):
@@ -453,6 +502,11 @@ def select_exact_one(
             continue
         if optimizer_levels is not None and item.optimizer.levels != optimizer_levels:
             continue
+        if optimizer == "adam" and lr is not None:
+            if not isinstance(item.optimizer.levels, Mapping):
+                continue
+            if item.optimizer.levels.get("lr") != lr or item.optimizer.levels.get("beta2") != beta2:
+                continue
         if seed_label is not None and item.seed_label != seed_label:
             continue
         matched.append((cell, item))
@@ -464,8 +518,9 @@ def select_exact_one(
         )
     if len(matched) != 1:
         raise ArchitectureStageFamilyError(
-            "selection is ambiguous; request literal configuration and seed_label explicitly: "
-            + json.dumps([item.as_dict() for _, item in matched], sort_keys=True)
+            "selection is ambiguous for "
+            f"stage={stage!r}, context={axis!r}, literal_configuration={requested_literal!r}, "
+            f"optimizer={optimizer!r}, seed_label={seed_label!r}: {len(matched)} matches"
         )
     cell, selected = matched[0]
     if selected.optimizer.status != "available":
@@ -475,8 +530,25 @@ def select_exact_one(
         )
     resolved = descriptor.resolver(cell)
     descriptor.resolved_validator(cell, resolved)
-    discarded = tuple(item for item in all_descriptors if item != selected)
-    return FamilySelection(cell, selected, discarded)
+    selected_public = FamilyCellDescriptor(
+        stage=selected.stage,
+        context=axis,
+        optimizer=selected.optimizer,
+        seed_label=selected.seed_label,
+        coordinates=selected.context,
+    )
+    discarded = tuple(
+        FamilyCellDescriptor(
+            stage=item.stage,
+            context=item.axis,
+            optimizer=item.optimizer,
+            seed_label=item.seed_label,
+            coordinates=item.context,
+        )
+        for item in all_descriptors
+        if item != selected
+    )
+    return FamilySelection(cell, selected_public, discarded)
 
 
 def validate_partition(
@@ -507,16 +579,6 @@ def validate_partition(
         )
     return frozenset(authority_codes)
 
-
-_ADAM_LEVELS = {
-    "lr": 0.005,
-    "beta1": 0.9,
-    "beta2": 0.999,
-    "epsilon": 1e-8,
-    "weight_decay": 0.0,
-    "parameter_groups": 1,
-    "schedule": "constant",
-}
 
 _A_DESCRIPTOR = ArchitectureStageDescriptor(
     stage="A",
@@ -556,8 +618,6 @@ __all__ = [
     "FamilySelection",
     "OptimizerSlot",
     "STAGE_AUTHORITY",
-    "STAGE_FAMILY_REGISTRY",
-    "STAGE_REGISTRY",
     "descriptor_for",
     "family_stage_codes",
     "is_family_stage",
