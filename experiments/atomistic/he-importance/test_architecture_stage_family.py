@@ -164,7 +164,10 @@ def test_test_only_descriptor_with_its_own_context_and_selector_uses_the_real_ro
         slot_policy=lambda row: (slot,),
         seed_namespace=lambda stage: stage_coordinate.seed_labels(stage),
         selector=select_own_context,
-        packet_policy=lambda stage: {"updates": 7},
+        packet_policy=lambda stage: {
+            "updates": 7,
+            "checkpoint_every_n_updates": 1,
+        },
         launch_adapter=lambda *args, **kwargs: 0,
     )
     monkeypatch.setitem(family.ARCHITECTURE_STAGE_REGISTRY, "X", descriptor)
