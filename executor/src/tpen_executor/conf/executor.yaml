@@ -27,11 +27,12 @@ program:
           _target_: tpen_executor.environments.SourceScript
           path: ${paths.science_setup}
       process:
-        _target_: tpen_executor.programs.DummyProcess
+        _target_: tpen_executor.workers.SubprocessWorker
         _recursive_: false
       runner:
-        _target_: tpen_executor.programs.DummyRunner
+        _target_: tpen_executor.runners.TPENCommand
         _recursive_: false
+        config: /prepared/science/config.yaml
       evidence:
-        _target_: tpen_executor.programs.DummyEvidence
+        _target_: tpen_executor.runners.TPENEvidence
         _recursive_: false
