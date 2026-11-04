@@ -223,6 +223,22 @@ def test_published_ref_outside_root_is_gated_by_train_resume(tmp_path: Path) -> 
     assert Path(evidence.checkpoint["checkpoint_dir"]).parent == local_step.parent
 
 
+def test_hash_corrupt_published_train_resume_ref_is_refused(tmp_path: Path) -> None:
+    """Train-resume admission must not hide later published-byte corruption."""
+
+    run_dir = tmp_path / "run"
+    published = _write_complete_run(run_dir, step=7)
+    catalog = run_dir / "checkpoints" / PUBLICATION_CATALOG_FILENAME
+    append_publication(catalog, CheckpointRef.from_directory(published))
+    (published / "model.pt").write_bytes(b"changed")
+
+    evidence = inspect_run(run_dir)
+
+    assert evidence.verdict == "refused"
+    assert evidence.refusal is not None
+    assert evidence.refusal["code"] == "corrupt-checkpoint"
+
+
 def test_schema_round_trip_completed_and_refused_shapes(tmp_path: Path) -> None:
     """Completed and refused records remain byte-stable through the schema."""
 
