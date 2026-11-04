@@ -17,7 +17,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from omegaconf.nodes import AnyNode
 
-from ._codec import thaw
+from ._codec import digest, thaw
 from .contracts import ProgramSpecRef
 
 

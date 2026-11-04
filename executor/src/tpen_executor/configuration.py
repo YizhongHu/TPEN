@@ -92,7 +92,7 @@ def _validate_marker(value: Any, path: str, config: DictConfig, subtree: str | N
         subtree = path
     if isinstance(value, Mapping):
         target = _target_name(value)
-        if target in _PROGRAM_TYPES and path != "":
+        if target in _PROGRAM_TYPES and path != "" and path != subtree:
             # A nested marker has its own self-contained reference boundary;
             # it is validated when the recursive capture reaches that marker.
             return
