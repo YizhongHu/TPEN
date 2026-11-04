@@ -33,7 +33,7 @@ from omegaconf.grammar_parser import parse as parse_interpolation
 
 from ._codec import digest
 from .contracts import ProgramSpecRef
-from .programs import AllocationProgram, WorkerProgram, _payload_entries
+from .programs import AllocationProgram, WorkerProgram, payload_entries, validate_marker_shape
 
 
 _PROGRAM_TYPES = {
@@ -168,8 +168,8 @@ def _capture(value: Any, path: str, found: dict[str, Any], raw_config: Any) -> N
         if marked and target in _PROGRAM_TYPES:
             if not path:
                 raise ValueError("a program marker cannot be the configuration root")
-            _validate_marker_shape(value, path)
-            _payload_entries(value)
+            validate_marker_shape(value, path)
+            payload_entries(value, path)
             _validate_marker(value, path, raw_config)
             ref = ProgramSpecRef(value, digest(value))
             found[path] = _PROGRAM_TYPES[target](ref, path)
@@ -186,46 +186,6 @@ def _capture(value: Any, path: str, found: dict[str, Any], raw_config: Any) -> N
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         for index, child in enumerate(value):
             _capture(child, f"{path}[{index}]", found, raw_config)
-
-
-def _contains_concrete_target(value: Any) -> bool:
-    """Return whether a child subtree contains a non-program Hydra target."""
-
-    if isinstance(value, Mapping):
-        target = _target_name(value)
-        if target is not None and target not in _PROGRAM_TYPES:
-            return True
-        return any(_contains_concrete_target(child) for child in value.values())
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return any(_contains_concrete_target(child) for child in value)
-    return False
-
-
-def _validate_marker_shape(value: Mapping[str, Any], path: str) -> None:
-    """Reject direct marker children that cannot be named concrete slots."""
-
-    for key, child in value.items():
-        if key in {"_target_", "_recursive_"}:
-            continue
-        child_path = f"{path}.{key}"
-        if isinstance(child, Mapping):
-            target = _target_name(child)
-            if target in _PROGRAM_TYPES:
-                raise ValueError(
-                    f"program marker child {child_path!r} is a nested program marker; "
-                    "nested workers must be inside a concrete slot payload"
-                )
-            if target is None and _contains_concrete_target(child):
-                raise ValueError(
-                    f"program marker child {child_path!r} groups concrete targets; "
-                    "name each concrete target as a slot"
-                )
-        elif isinstance(child, Sequence) and not isinstance(child, (str, bytes, bytearray)):
-            if _contains_concrete_target(child):
-                raise ValueError(
-                    f"program marker child {child_path!r} is a list of concrete targets; "
-                    "name each concrete target as a slot"
-                )
 
 
 def _stage(config: DictConfig) -> StagedConfig:

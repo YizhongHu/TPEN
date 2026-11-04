@@ -301,7 +301,7 @@ program:
 """
 
 
-def test_p5a_r1_t7_yaml_authored_descriptors_materialize_as_frozen_plain_values(tmp_path: Path) -> None:
+def test_p5a_r1_t8_yaml_authored_descriptors_materialize_as_frozen_plain_values(tmp_path: Path) -> None:
     """GREEN on 33d2a6b4.  The packaged config carries no ``env:`` block and no bundle, so the
     Hydra path into ``PreparedPythonEnvironment.env`` (a ``DictConfig`` at instantiate time) and
     into ``PreparedInputBundle`` is otherwise untested.  Values must arrive as plain frozen strings

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from operator import itemgetter
 import re
 from types import MappingProxyType
 from typing import Any
@@ -35,20 +36,37 @@ _HYDRA_RESERVED_KEYS = {"_target_", "_recursive_", "_convert_", "_partial_", "_a
 _PROGRAM_MOUNT_KEY = "__program__"
 
 
-def _payload_entries(raw: Mapping[str, Any]) -> tuple[tuple[str, Mapping[str, Any]], ...]:
-    """Return all named concrete target slots in a program marker."""
+def _validate_slot_name(name: Any, path: str) -> None:
+    """Validate one concrete slot name and identify its marker path."""
 
-    candidates = [
-        (key, value)
-        for key, value in raw.items()
-        if key not in _HYDRA_RESERVED_KEYS
-        and isinstance(value, Mapping)
-        and isinstance(value.get("_target_"), str)
-        and value.get("_target_") not in _PROGRAM_TARGETS
-    ]
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"program marker {path!r} has invalid slot name {name!r}; names must be non-empty strings")
+    reserved = set(dir(MaterializedProgram)) | {"keys", "items", "values", "get"}
+    if name in reserved or (name.startswith("__") and name.endswith("__")):
+        raise ValueError(f"program marker {path!r} has reserved slot name {name!r}")
+
+
+def payload_entries(raw: Mapping[str, Any], path: str = "program") -> tuple[tuple[str, Mapping[str, Any]], ...]:
+    """Return all named concrete target slots in a program marker.
+
+    Parameters
+    ----------
+    raw : Mapping[str, Any]
+        Raw program marker mapping.
+    path : str, default="program"
+        Shared configuration path used in validation errors.
+    """
+
+    candidates = []
+    for key, value in raw.items():
+        if key in _HYDRA_RESERVED_KEYS:
+            continue
+        if isinstance(value, Mapping) and isinstance(value.get("_target_"), str) and value.get("_target_") not in _PROGRAM_TARGETS:
+            _validate_slot_name(key, path)
+            candidates.append((key, value))
     if not candidates:
-        raise ValueError("a program marker must contain at least one concrete payload slot")
-    return tuple(sorted(candidates))
+        raise ValueError(f"program marker {path!r} must contain at least one concrete payload slot")
+    return tuple(sorted(candidates, key=itemgetter(0)))
 
 
 def _path_parts(path: str) -> list[str | int]:
@@ -110,6 +128,59 @@ def _child_path(path: str, key: str | int) -> str:
     return f"{path}[{key}]" if isinstance(key, int) else f"{path}.{key}"
 
 
+def _contains_concrete_target(value: Any) -> bool:
+    """Return whether a child subtree contains a non-program Hydra target."""
+
+    if isinstance(value, Mapping):
+        target = value.get("_target_")
+        if isinstance(target, str) and target not in _PROGRAM_TARGETS:
+            return True
+        return any(_contains_concrete_target(child) for child in value.values())
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_contains_concrete_target(child) for child in value)
+    return False
+
+
+def validate_marker_shape(value: Mapping[str, Any], path: str) -> None:
+    """Reject direct marker children that cannot be named concrete slots.
+
+    Parameters
+    ----------
+    value : Mapping[str, Any]
+        Raw program marker mapping.
+    path : str
+        Shared configuration path used in validation errors.
+    """
+
+    for key, child in value.items():
+        if key in {"_target_", "_recursive_"}:
+            continue
+        child_path = f"{path}.{key}"
+        if isinstance(child, Mapping):
+            target = child.get("_target_")
+            if target in _PROGRAM_TARGETS:
+                raise ValueError(
+                    f"program marker child {child_path!r} is a nested program marker; "
+                    "nested workers must be inside a concrete slot payload"
+                )
+            if target is None and _contains_concrete_target(child):
+                raise ValueError(
+                    f"program marker child {child_path!r} groups concrete targets; "
+                    "name each concrete target as a slot"
+                )
+        elif isinstance(child, Sequence) and not isinstance(child, (str, bytes, bytearray)):
+            if _contains_concrete_target(child):
+                nested_markers = any(
+                    isinstance(entry, Mapping) and entry.get("_target_") in _PROGRAM_TARGETS
+                    for entry in child
+                )
+                description = "nested program markers" if nested_markers else "concrete targets"
+                raise ValueError(
+                    f"program marker child {child_path!r} is a list of {description}; "
+                    "name each concrete target as a slot"
+                )
+
+
 def _program_handle(raw: Mapping[str, Any], path: str) -> AllocationProgram | WorkerProgram:
     """Build the handle represented by one nested program marker."""
 
@@ -160,7 +231,8 @@ def _materialize(ref: ProgramSpecRef, path: str, env: Mapping[str, Any] | None) 
     raw = thaw(ref.config_ref)
     if not isinstance(raw, Mapping) or raw.get("_target_") not in _PROGRAM_TARGETS:
         raise ValueError("program materialization requires a recognized program marker")
-    payloads = _payload_entries(raw)
+    validate_marker_shape(raw, path or "program")
+    payloads = payload_entries(raw, path or "program")
     environment = dict(env or {})
     path_parts = _path_parts(path)
     first_segment = path_parts[0] if path_parts else "program"
@@ -185,15 +257,20 @@ def _materialize(ref: ProgramSpecRef, path: str, env: Mapping[str, Any] | None) 
 
 @dataclass(frozen=True, slots=True)
 class MaterializedProgram:
-    """Frozen named slots produced by one owner-process materialization."""
+    """Frozen named slots produced by one owner-process materialization.
+
+    This record intentionally retains dataclass value equality but is
+    unhashable because its slots contain arbitrary owner-process objects.
+    """
 
     slots: Mapping[str, Any]
 
     def __post_init__(self) -> None:
         if not isinstance(self.slots, Mapping):
             raise TypeError("slots must be a mapping")
-        if any(type(key) is not str or not key for key in self.slots):
-            raise TypeError("slot names must be non-empty strings")
+        for key in self.slots:
+            if not isinstance(key, str) or not key:
+                raise TypeError("slot names must be non-empty strings")
         reserved = set(dir(type(self))) | {"keys", "items", "values", "get"}
         collisions = sorted(
             name for name in self.slots if name in reserved or (name.startswith("__") and name.endswith("__"))
@@ -307,5 +384,7 @@ __all__ = [
     "DummyRunner",
     "DummyWorker",
     "MaterializedProgram",
+    "payload_entries",
+    "validate_marker_shape",
     "WorkerProgram",
 ]

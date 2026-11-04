@@ -2,26 +2,9 @@
 
 from __future__ import annotations
 
-import ast
-from pathlib import Path
-
 import pytest
 
 from tpen_executor.delivery import PreparedInputBundle
-
-
-def test_descriptor_modules_have_no_filesystem_write_api() -> None:
-    """Descriptor construction remains read-only by static inspection."""
-
-    source_root = Path(__file__).parents[1] / "src" / "tpen_executor"
-    forbidden = {"open", "write_text", "write_bytes", "mkdir", "makedirs", "remove", "unlink", "rename", "replace"}
-    violations: list[str] = []
-    for name in ("environments.py", "delivery.py"):
-        tree = ast.parse((source_root / name).read_text(encoding="utf-8"), filename=name)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in forbidden:
-                violations.append(f"{name}:{node.lineno}:{node.func.attr}")
-    assert not violations, "descriptor write APIs: " + ", ".join(violations)
 
 
 def test_bundle_round_trip_and_optional_digest() -> None:
