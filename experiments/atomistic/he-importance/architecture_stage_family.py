@@ -450,13 +450,13 @@ def _cell_descriptor(cell: Any) -> FamilyCellDescriptor:
     slot = OptimizerSlot(
         method=str(optimizer["method"]),
         status=str(slot_identity["status"]),
-        levels=optimizer.get("levels"),
+        levels=stage_coordinate._thaw(optimizer.get("levels")),
         unavailable_reason=slot_identity.get("unavailable_reason"),
     )
     context = identity["context"]
     return FamilyCellDescriptor(
         stage=str(cell.manifest["stage"]),
-        context=dict(context) if isinstance(context, Mapping) else context,
+        context=stage_coordinate._thaw(context),
         optimizer=slot,
         seed_label=int(cell.manifest["seed_identity"]["label"]),
     )
