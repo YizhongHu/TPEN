@@ -24,11 +24,14 @@ def _science(tmp_path: Path) -> tuple[PreparedPythonEnvironment, Path]:
     (package / "__init__.py").write_text("", encoding="utf-8")
     (package / "run.py").write_text(
         "import os,sys,time\n"
-        "if os.environ.get('SLEEP'): time.sleep(float(os.environ['SLEEP']))\n"
-        "print('ARGS=' + repr(sys.argv[1:]))\n"
-        "print('MODE=' + os.environ.get('MODE',''))\n"
-        "print('SETUP=' + os.environ.get('SETUP_WAS_SOURCED',''))\n"
-        "sys.exit(int(os.environ.get('EXIT_CODE','0')))\n",
+        "def main(argv):\n"
+        "    if os.environ.get('SLEEP'): time.sleep(float(os.environ['SLEEP']))\n"
+        "    print('ARGS=' + repr(list(argv)))\n"
+        "    print('MODE=' + os.environ.get('MODE',''))\n"
+        "    print('SETUP=' + os.environ.get('SETUP_WAS_SOURCED',''))\n"
+        "    return int(os.environ.get('EXIT_CODE','0'))\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main(sys.argv[1:]))\n",
         encoding="utf-8",
     )
     (package / "inspection.py").write_text(
@@ -113,7 +116,13 @@ def test_subprocess_worker_only_writes_named_logs(tmp_path: Path) -> None:
 def test_tpen_command_launches_stub_with_exact_args(tmp_path: Path) -> None:
     environment, _ = _science(tmp_path)
     (tmp_path / "tpen" / "run.py").write_text(
-        "import json,sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8"
+        "import json\n"
+        "def main(argv):\n"
+        "    print(json.dumps(list(argv)))\n"
+        "    return 0\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main(__import__('sys').argv[1:]))\n",
+        encoding="utf-8",
     )
     config = str(tmp_path / "config.yaml")
     command = TPENCommand(config, ("a=1", "b=x y"))
