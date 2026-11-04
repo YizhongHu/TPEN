@@ -25,8 +25,9 @@ def _science_environment():
 
 def test_r1_t0_real_core_module_help_prints_usage(tmp_path):
     out = tmp_path / "out"
+    command = TPENCommand(str(tmp_path / "config.yaml"))
     outcome = SubprocessWorker().run(
-        _science_environment(), ("-m", "tpen.run", "--help"), cwd=tmp_path,
+        _science_environment(), (*command.args, "--help"), cwd=tmp_path,
         stdout_path=out, stderr_path=tmp_path / "err",
     )
     assert outcome.returncode == 0

@@ -6,12 +6,15 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-from typing import Any, ClassVar
+from types import MappingProxyType
+from typing import Any, ClassVar, Mapping
 
+from ._codec import canonical_bytes
 from .environments import PreparedPythonEnvironment
 from .workers import SubprocessWorker
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
+RUN_SHIM = "import sys; from tpen.run import main; raise SystemExit(main(sys.argv[1:]))"
 REFUSAL_CODES = frozenset(
     {
         "missing-run-dir", "missing-status", "multiple-status", "malformed-status",
@@ -28,14 +31,24 @@ class EvidenceUnavailable(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class CoreRunEvidence:
-    """Strict executor-owned mirror of the public core evidence record."""
+    """Strict, immutable executor-owned mirror of core run evidence.
+
+    Parameters
+    ----------
+    schema, run_dir, verdict : str
+        Validated public evidence fields.
+    run_status : str or None
+        Core-reported run status.
+    checkpoint, refusal : mapping or None
+        Validated nested evidence, copied into read-only mappings.
+    """
 
     schema: str
     run_dir: str
     verdict: str
     run_status: str | None
-    checkpoint: dict[str, Any] | None
-    refusal: dict[str, str] | None
+    checkpoint: Mapping[str, Any] | None
+    refusal: Mapping[str, str] | None
 
     SCHEMA: ClassVar[str] = RUN_EVIDENCE_SCHEMA
     VERDICTS: ClassVar[frozenset[str]] = frozenset({"completed", "incomplete", "failed", "refused"})
@@ -43,7 +56,23 @@ class CoreRunEvidence:
 
     @classmethod
     def from_mapping(cls, value: Any) -> "CoreRunEvidence":
-        """Decode one strict public evidence mapping."""
+        """Decode one strict public evidence mapping.
+
+        Parameters
+        ----------
+        value : mapping
+            JSON-shaped public evidence.
+
+        Returns
+        -------
+        CoreRunEvidence
+            A validated record with frozen nested mappings.
+
+        Raises
+        ------
+        EvidenceUnavailable
+            If the schema, keys, types, or verdict invariants are invalid.
+        """
 
         if type(value) is not dict:
             raise EvidenceUnavailable("evidence is not a JSON object")
@@ -72,8 +101,20 @@ class CoreRunEvidence:
             raise EvidenceUnavailable("non-refused evidence cannot contain refusal")
         return cls(value["schema"], value["run_dir"], verdict, run_status, checkpoint, refusal)
 
+    def __hash__(self) -> int:
+        """Hash the canonical JSON representation used by equality fields."""
+
+        return hash(canonical_bytes({
+            "schema": self.schema,
+            "run_dir": self.run_dir,
+            "verdict": self.verdict,
+            "run_status": self.run_status,
+            "checkpoint": self.checkpoint,
+            "refusal": self.refusal,
+        }))
+
     @staticmethod
-    def _checkpoint(value: Any) -> dict[str, Any] | None:
+    def _checkpoint(value: Any) -> MappingProxyType | None:
         if value is None:
             return None
         keys = {"checkpoint_dir", "schema_version", "next_iteration", "completed_updates"}
@@ -85,10 +126,10 @@ class CoreRunEvidence:
             raise EvidenceUnavailable("checkpoint counters have invalid types")
         if value["next_iteration"] < 0 or value["completed_updates"] < 0:
             raise EvidenceUnavailable("checkpoint counters must be nonnegative")
-        return dict(value)
+        return MappingProxyType(dict(value))
 
     @classmethod
-    def _refusal(cls, value: Any) -> dict[str, str] | None:
+    def _refusal(cls, value: Any) -> MappingProxyType | None:
         if value is None:
             return None
         if type(value) is not dict or set(value) != {"code", "reason"}:
@@ -97,12 +138,27 @@ class CoreRunEvidence:
             raise EvidenceUnavailable("unknown refusal code")
         if type(value["reason"]) is not str:
             raise EvidenceUnavailable("refusal reason must be a string")
-        return {"code": value["code"], "reason": value["reason"]}
+        return MappingProxyType({"code": value["code"], "reason": value["reason"]})
 
 
 @dataclass(frozen=True, slots=True)
 class TPENCommand:
-    """Command specification for the public configured-run entrypoint."""
+    """Command specification for the public configured-run entrypoint.
+
+    Parameters
+    ----------
+    config : str
+        Absolute path to the Hydra configuration.
+    overrides : sequence of str, optional
+        Positional dot-list overrides passed unchanged to core.
+
+    Raises
+    ------
+    TypeError
+        If overrides is a scalar string/bytes value or contains non-strings.
+    ValueError
+        If config is not an absolute path.
+    """
 
     config: str
     overrides: tuple[str, ...] = ()
@@ -110,6 +166,8 @@ class TPENCommand:
     def __post_init__(self) -> None:
         if type(self.config) is not str or not os.path.isabs(self.config):
             raise ValueError("config must be an absolute path")
+        if isinstance(self.overrides, (str, bytes, bytearray)):
+            raise TypeError("overrides must be a sequence of strings")
         if any(type(item) is not str for item in self.overrides):
             raise TypeError("overrides must be strings")
         object.__setattr__(self, "overrides", tuple(self.overrides))
@@ -118,12 +176,19 @@ class TPENCommand:
     def args(self) -> tuple[str, ...]:
         """Return arguments following the selected Python interpreter."""
 
-        return ("-m", "tpen.run", "--config", self.config, *self.overrides)
+        return ("-c", RUN_SHIM, "--config", self.config, *self.overrides)
 
 
 @dataclass(frozen=True, slots=True)
 class TPENEvidence:
-    """Read public run evidence through a child inspection process."""
+    """Read public run evidence through a child inspection process.
+
+    Notes
+    -----
+    Inspection output is obtained only from the named stdout log.  The
+    decoder rejects duplicate JSON members at every depth and never opens
+    ``run_dir`` directly.
+    """
 
     def read(
         self,
@@ -136,16 +201,46 @@ class TPENEvidence:
         stderr_path: str | os.PathLike[str],
         timeout: float | None = None,
     ) -> CoreRunEvidence:
-        """Launch ``tpen.inspection`` and decode exactly one JSON object."""
+        """Launch inspection and decode exactly one JSON object.
 
-        outcome = worker.run(
-            environment,
-            ("-m", "tpen.inspection", os.fspath(run_dir)),
-            cwd=cwd,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            timeout=timeout,
-        )
+        Parameters
+        ----------
+        worker : SubprocessWorker
+            Worker used to launch the selected science interpreter.
+        environment : PreparedPythonEnvironment
+            Prepared environment consumed by the worker.
+        run_dir : str or os.PathLike
+            Run directory passed to public inspection; it is not read here.
+        cwd, stdout_path, stderr_path, timeout : optional
+            Child working directory, named logs, and timeout in seconds.
+
+        Returns
+        -------
+        CoreRunEvidence
+            Frozen, validated public evidence.
+
+        Raises
+        ------
+        EvidenceUnavailable
+            If transport, process, decoding, or evidence validation fails.
+
+        Notes
+        -----
+        The worker's setup script runs before environment overlay and the
+        timeout covers the worker's complete process group.
+        """
+
+        try:
+            outcome = worker.run(
+                environment,
+                ("-m", "tpen.inspection", os.fspath(run_dir)),
+                cwd=cwd,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout=timeout,
+            )
+        except OSError as exc:
+            raise EvidenceUnavailable("inspection process could not be launched") from exc
         if outcome.timed_out or outcome.returncode != 0:
             raise EvidenceUnavailable("inspection process did not complete successfully")
         try:
@@ -155,10 +250,21 @@ class TPENEvidence:
         if not payload.strip():
             raise EvidenceUnavailable("inspection stdout is empty")
         try:
-            decoded = json.loads(payload)
+            decoded = json.loads(payload, object_pairs_hook=_reject_duplicate_keys)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise EvidenceUnavailable("inspection stdout is not one JSON object") from exc
         return CoreRunEvidence.from_mapping(decoded)
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Reject duplicate JSON member names while decoding every object."""
+
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        value[key] = item
+    return value
 
 
 __all__ = ["CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "TPENCommand", "TPENEvidence"]

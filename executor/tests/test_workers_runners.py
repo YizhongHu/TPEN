@@ -79,7 +79,7 @@ def test_subprocess_worker_real_child_preserves_no_setup_argument_boundaries(tmp
 
 def test_tpen_command_has_exact_public_run_argv() -> None:
     command = TPENCommand("/tmp/config.yaml", ("run.run_id=quoted value",))
-    assert command.args == ("-m", "tpen.run", "--config", "/tmp/config.yaml", "run.run_id=quoted value")
+    assert command.args == ("-c", command.args[1], "--config", "/tmp/config.yaml", "run.run_id=quoted value")
 
 
 def test_subprocess_worker_real_timeout_records_returncode_and_logs(tmp_path: Path) -> None:

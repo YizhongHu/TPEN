@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import signal
 import subprocess
 
 from .environments import PreparedPythonEnvironment
@@ -13,7 +14,19 @@ from .environments import PreparedPythonEnvironment
 
 @dataclass(frozen=True, slots=True)
 class ProcessOutcome:
-    """Immutable outcome of one subprocess invocation."""
+    """Immutable outcome of one subprocess invocation.
+
+    Parameters
+    ----------
+    argv : tuple of str
+        Interpreter and arguments passed to the child.
+    returncode : int or None
+        Reaped child return code.
+    stdout_path, stderr_path : str
+        The two caller-named log paths.
+    timed_out : bool
+        Whether the process-group timeout path was taken.
+    """
 
     argv: tuple[str, ...]
     returncode: int | None
@@ -24,7 +37,14 @@ class ProcessOutcome:
 
 @dataclass(frozen=True, slots=True)
 class SubprocessWorker:
-    """Launch one prepared Python child without shell-interpolated arguments."""
+    """Launch one prepared Python child without shell-interpolated arguments.
+
+    Notes
+    -----
+    Setup is sourced through positional shell parameters, then the child
+    environment overlay is applied.  Each invocation starts a new POSIX
+    session so timeout cleanup owns the complete process group.
+    """
 
     def run(
         self,
@@ -36,7 +56,31 @@ class SubprocessWorker:
         stderr_path: str | os.PathLike[str],
         timeout: float | None = None,
     ) -> ProcessOutcome:
-        """Run the prepared interpreter with exact argument boundaries."""
+        """Run the prepared interpreter with exact argument boundaries.
+
+        Parameters
+        ----------
+        environment : PreparedPythonEnvironment
+            Prepared interpreter, optional setup, and environment overlay.
+        args : sequence of str
+            Child arguments; strings are never interpolated into shell text.
+        cwd, stdout_path, stderr_path : str or os.PathLike
+            Child working directory and caller-named binary logs.
+        timeout : float or None, optional
+            Positive timeout in seconds for the whole process group.
+
+        Returns
+        -------
+        ProcessOutcome
+            Reaped return code, log paths, and timeout status.
+
+        Raises
+        ------
+        TypeError, ValueError
+            If inputs have invalid types or timeout is not positive.
+        OSError
+            If process launch or log creation fails.
+        """
 
         if not isinstance(environment, PreparedPythonEnvironment):
             raise TypeError("environment must be PreparedPythonEnvironment")
@@ -67,12 +111,17 @@ class SubprocessWorker:
                 env=child_env,
                 stdout=stdout,
                 stderr=stderr,
+                start_new_session=True,
             )
             try:
                 returncode = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                process.kill()
+                # Kill the isolated session so setup/science descendants stop too.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 returncode = process.wait()
         return ProcessOutcome(logical_argv, returncode, stdout_name, stderr_name, timed_out)
 
