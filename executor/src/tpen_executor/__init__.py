@@ -1,8 +1,10 @@
 """Public immutable records for the independent TPEN executor project."""
 
 from .contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
+from .configuration import StagedConfig, StagedHydra
+from .programs import AllocationProgram, WorkerProgram
 from .results import AllocationObservation, ManifestAttempt, OutcomeReceipt, RunManifest, StartReceipt
 
 __version__ = "0.1.0"
 
-__all__ = ["__version__"]
+__all__ = ["AllocationProgram", "ProgramSpecRef", "StagedConfig", "StagedHydra", "WorkerProgram", "__version__"]

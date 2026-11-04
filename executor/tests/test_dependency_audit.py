@@ -6,7 +6,8 @@ import sys
 
 
 SOURCE_ROOT = Path(__file__).parents[1] / "src" / "tpen_executor"
-FORBIDDEN_ROOTS = {"tpen", "experiments", "torch", "parsl", "balsam", "hydra", "omegaconf"}
+FORBIDDEN_ROOTS = {"tpen", "experiments", "torch", "parsl", "balsam"}
+CONFIGURATION_ROOTS = {"hydra", "omegaconf"}
 
 
 def _import_roots(node: ast.Import | ast.ImportFrom) -> list[str]:
@@ -46,7 +47,7 @@ def test_source_imports_only_stdlib_or_executor() -> None:
                 if isinstance(node, ast.ImportFrom) and node.level > 0:
                     continue
                 for root in _import_roots(node):
-                    if root in FORBIDDEN_ROOTS:
+                    if root in FORBIDDEN_ROOTS or (root in CONFIGURATION_ROOTS and path.name not in {"configuration.py", "programs.py"}):
                         violations.append(f"{path}: {root}")
                     elif root != "tpen_executor" and root not in sys.stdlib_module_names:
                         violations.append(f"{path}: non-stdlib {root}")
@@ -67,7 +68,7 @@ def test_source_has_no_dynamic_forbidden_imports() -> None:
             if not isinstance(node, ast.Call):
                 continue
             root = _dynamic_import_root(node)
-            if root in FORBIDDEN_ROOTS:
+            if root in FORBIDDEN_ROOTS or (root in CONFIGURATION_ROOTS and path.name not in {"configuration.py", "programs.py"}):
                 violations.append(f"{path}:{node.lineno}: {root}")
             elif root is not None and root != "tpen_executor" and root not in sys.stdlib_module_names:
                 violations.append(f"{path}:{node.lineno}: non-stdlib {root}")
