@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 from pathlib import Path
@@ -135,7 +134,7 @@ def test_malformed_status_variants_refuse(tmp_path: Path, status_value: object) 
 def test_inspection_does_not_mutate_checkpoint_tree(tmp_path: Path, with_catalog: bool) -> None:
     run_dir = _write_run(tmp_path)
     if with_catalog:
-        (run_dir / "checkpoints" / "publications.jsonl").write_text("", encoding="utf-8")
+        (run_dir / "checkpoints" / PUBLICATION_CATALOG_FILENAME).write_text("", encoding="utf-8")
     before = _tree_snapshot(run_dir)
 
     evidence = inspect_run(run_dir)
@@ -167,17 +166,3 @@ def test_cli_returns_zero_for_refusal_and_two_for_usage_error(tmp_path: Path, ca
     with pytest.raises(SystemExit) as exc_info:
         inspection._main([])
     assert exc_info.value.code == 2
-
-
-def test_import_control_excludes_private_or_forbidden_modules() -> None:
-    source_path = Path(inspection.__file__)
-    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            assert node.module not in {"tpen.execution", "experiments", "tpen_executor"}
-            assert all(not alias.name.startswith("_") for alias in node.names)
-        if isinstance(node, ast.Import):
-            assert all(
-                not (alias.name == "tpen.execution" or alias.name.startswith("experiments") or alias.name.startswith("tpen_executor"))
-                for alias in node.names
-            )

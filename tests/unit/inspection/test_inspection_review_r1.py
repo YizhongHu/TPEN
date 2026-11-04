@@ -239,7 +239,7 @@ def test_schema_round_trip_completed_and_refused_shapes(tmp_path: Path) -> None:
         assert json.dumps(restored.to_dict(), sort_keys=True, separators=(",", ":")) == encoded
 
 
-def test_schema_rejects_inconsistent_verdict_payloads() -> None:
+def test_schema_rejects_inconsistent_verdict_payloads(tmp_path: Path) -> None:
     """Verdicts must agree with the checkpoint and refusal payload fields."""
 
     base = {
@@ -248,6 +248,12 @@ def test_schema_rejects_inconsistent_verdict_payloads() -> None:
         "run_status": None,
         "checkpoint": None,
         "refusal": None,
+    }
+    valid_checkpoint = {
+        "checkpoint_dir": str(tmp_path / "step_000007"),
+        "schema_version": 2,
+        "next_iteration": 7,
+        "completed_updates": 5,
     }
     cases = [
         {"verdict": "completed", "checkpoint": None},
@@ -259,6 +265,9 @@ def test_schema_rejects_inconsistent_verdict_payloads() -> None:
         data = {**base, "verdict": "incomplete", **update}
         with pytest.raises(ValueError):
             RunEvidence.from_mapping(data)
+
+    accepted = {**base, "verdict": "incomplete", "checkpoint": valid_checkpoint}
+    assert RunEvidence.from_mapping(accepted).checkpoint == valid_checkpoint
 
 
 def test_cli_module_entry_prints_one_json_line(tmp_path: Path) -> None:
@@ -321,18 +330,47 @@ def test_tmp_only_checkpoint_root_is_incomplete_not_missing(tmp_path: Path) -> N
     assert evidence.refusal["code"] == "incomplete-checkpoint"
 
 
-def test_incomplete_run_with_committed_checkpoint_reports_no_checkpoint_facts(tmp_path: Path) -> None:
-    """Pin CURRENT behaviour: recovery consumers cannot see committed checkpoint facts for non-completed runs.
+@pytest.mark.parametrize("status", ["running", "failed"])
+def test_noncompleted_run_with_committed_checkpoint_reports_counters(tmp_path: Path, status: str) -> None:
+    """Committed train-resume facts remain visible for non-completed runs."""
 
-    This characterization may be deleted if the public contract changes.
-    """
-
-    run_dir = tmp_path / "run"
-    _write_status(run_dir, {"status": "running"})
-    _write_complete_run(run_dir)
-    (run_dir / "status.json").write_text(json.dumps({"status": "running"}), encoding="utf-8")
+    run_dir = tmp_path / status
+    _write_status(run_dir, {"status": status})
+    _write_checkpoint(run_dir, step=7, completed_updates=5)
 
     evidence = inspect_run(run_dir)
 
-    assert evidence.verdict == "incomplete"
-    assert evidence.checkpoint is None
+    assert evidence.verdict == ("failed" if status == "failed" else "incomplete")
+    assert evidence.checkpoint is not None
+    assert evidence.checkpoint["next_iteration"] == 7
+    assert evidence.checkpoint["completed_updates"] == 5
+
+
+def test_status_io_error_is_distinct(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    _write_status(run_dir, {"status": "completed"})
+    original_open = Path.open
+
+    def fail_status_open(path: Path, *args: object, **kwargs: object):
+        if path.name == "status.json":
+            raise OSError("status temporarily unavailable")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_status_open)
+    evidence = inspect_run(run_dir)
+    assert evidence.refusal == {"code": "status-io-error", "reason": "cannot read " + str(run_dir / "status.json") + ": status temporarily unavailable"}
+
+
+def test_checkpoint_io_error_is_distinct(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    _write_complete_run(run_dir)
+    original_read_manifest = inspection.read_manifest
+
+    def fail_manifest_read(path: Path, *, mode: str):
+        raise OSError("checkpoint temporarily unavailable")
+
+    monkeypatch.setattr(inspection, "read_manifest", fail_manifest_read)
+    evidence = inspect_run(run_dir)
+    assert evidence.refusal is not None
+    assert evidence.refusal["code"] == "checkpoint-io-error"
+    monkeypatch.setattr(inspection, "read_manifest", original_read_manifest)

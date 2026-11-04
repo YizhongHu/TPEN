@@ -55,6 +55,18 @@ class RunEvidence:
             raise ValueError(f"unsupported run-evidence schema {self.schema!r}")
         if self.verdict not in {"completed", "incomplete", "failed", "refused"}:
             raise ValueError(f"unsupported run-evidence verdict {self.verdict!r}")
+        if not isinstance(self.run_dir, str):
+            raise TypeError("run_dir must be a string")
+        if self.run_status is not None and not isinstance(self.run_status, str):
+            raise TypeError("run_status must be a string or null")
+        if self.verdict == "completed":
+            if self.checkpoint is None or self.refusal is not None:
+                raise ValueError("completed evidence requires checkpoint and no refusal")
+        elif self.verdict == "refused":
+            if self.refusal is None or self.checkpoint is not None:
+                raise ValueError("refused evidence requires refusal and no checkpoint")
+        elif self.refusal is not None:
+            raise ValueError(f"{self.verdict} evidence cannot contain a refusal")
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe copy of this evidence."""
@@ -123,21 +135,33 @@ def inspect_run(path: str | Path) -> RunEvidence:
     RunEvidence
         A completed, failed, incomplete, or refused evidence record. Expected
         artifact problems are represented as ``verdict="refused"`` rather than
-        escaping as an exception.
+        escaping as an exception. A committed train-resume checkpoint is
+        reported for any status, including failed and incomplete runs; a
+        corrupt checkpoint refuses inspection regardless of run status.
     """
 
-    run_dir = Path(path)
+    run_dir = Path(path).resolve()
     run_status: str | None = None
     try:
         if not run_dir.is_dir():
             raise _InspectionRefusal("missing-run-dir", f"run directory not found: {run_dir}")
-        _status_path, status = _read_status(run_dir)
+        status_path, status = _read_status(run_dir)
+        run_dir = status_path.parent.resolve()
         run_status = status.get("status")
+        if run_status is not None and not isinstance(run_status, str):
+            raise _InspectionRefusal("malformed-status", f"status value is not a string: {status_path}")
+        checkpoint: dict[str, Any] | None = None
+        try:
+            checkpoint = _read_checkpoint(run_dir)
+        except _InspectionRefusal as exc:
+            if exc.code != "missing-checkpoint":
+                raise
         if run_status == "failed":
-            return RunEvidence(RUN_EVIDENCE_SCHEMA, str(run_dir), "failed", run_status, None, None)
+            return RunEvidence(RUN_EVIDENCE_SCHEMA, str(run_dir), "failed", run_status, checkpoint, None)
         if run_status != "completed":
-            return RunEvidence(RUN_EVIDENCE_SCHEMA, str(run_dir), "incomplete", run_status, None, None)
-        checkpoint = _read_checkpoint(run_dir)
+            return RunEvidence(RUN_EVIDENCE_SCHEMA, str(run_dir), "incomplete", run_status, checkpoint, None)
+        if checkpoint is None:
+            raise _InspectionRefusal("missing-checkpoint", f"no committed checkpoint under {run_dir / 'checkpoints'}")
         return RunEvidence(RUN_EVIDENCE_SCHEMA, str(run_dir), "completed", run_status, checkpoint, None)
     except _InspectionRefusal as exc:
         return RunEvidence(
@@ -161,7 +185,9 @@ def _read_status(run_dir: Path) -> tuple[Path, dict[str, Any]]:
     try:
         with status_paths[0].open("r", encoding="utf-8") as handle:
             status = json.load(handle)
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
+        raise _InspectionRefusal("status-io-error", f"cannot read {status_paths[0]}: {exc}") from exc
+    except ValueError as exc:
         raise _InspectionRefusal("malformed-status", f"cannot read {status_paths[0]}: {exc}") from exc
     if not isinstance(status, dict):
         raise _InspectionRefusal("malformed-status", f"status artifact is not an object: {status_paths[0]}")
@@ -176,14 +202,19 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
     catalog_path = root / PUBLICATION_CATALOG_FILENAME
     try:
         publications = read_publications(catalog_path) if catalog_path.is_file() else ()
-    except (OSError, ValueError, TypeError, KeyError) as exc:
+    except OSError as exc:
+        raise _InspectionRefusal("checkpoint-io-error", f"cannot read {catalog_path}: {exc}") from exc
+    except (ValueError, TypeError, KeyError, OverflowError) as exc:
         raise _InspectionRefusal("corrupt-publication-catalog", f"cannot read {catalog_path}: {exc}") from exc
 
     refs: list[CheckpointRef] = []
     for ref in publications:
         try:
+            read_manifest(ref.checkpoint_dir / "manifest.json", mode="train_resume")
             refs.append(ref.validate())
-        except (OSError, ValueError, TypeError, KeyError) as exc:
+        except OSError as exc:
+            raise _InspectionRefusal("checkpoint-io-error", f"published checkpoint cannot be read: {exc}") from exc
+        except (ValueError, TypeError, KeyError, OverflowError) as exc:
             raise _InspectionRefusal("corrupt-checkpoint", f"published checkpoint is invalid: {exc}") from exc
 
     complete_dirs = list_complete_checkpoints(root)
@@ -196,21 +227,25 @@ def _read_checkpoint(run_dir: Path) -> dict[str, Any]:
                 raise ValueError("manifest model_sha256 does not match model.pt")
             ref.validate()
             refs.append(ref)
-        except (OSError, ValueError, TypeError, KeyError) as exc:
+        except OSError as exc:
+            raise _InspectionRefusal("checkpoint-io-error", f"checkpoint cannot be read: {exc}") from exc
+        except (ValueError, TypeError, KeyError, OverflowError) as exc:
             raise _InspectionRefusal("corrupt-checkpoint", f"checkpoint is invalid: {exc}") from exc
 
     if not refs:
-        if any(candidate.is_dir() for candidate in root.glob("step_*") if not candidate.name.endswith(".tmp")):
+        if any(candidate.name.endswith(".tmp") for candidate in root.glob("step_*")):
+            raise _InspectionRefusal("incomplete-checkpoint", f"no committed checkpoint under {root}")
+        if any(candidate.is_dir() for candidate in root.glob("step_*")):
             raise _InspectionRefusal("incomplete-checkpoint", f"no committed checkpoint under {root}")
         try:
             resolve_checkpoint_dir(root)
-        except (OSError, ValueError, TypeError, KeyError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
             raise _InspectionRefusal("missing-checkpoint", f"no committed checkpoint under {root}: {exc}") from exc
         raise _InspectionRefusal("missing-checkpoint", f"no committed checkpoint under {root}")
 
     ref = max(refs, key=lambda candidate: candidate.next_iteration)
     return {
-        "checkpoint_dir": str(ref.checkpoint_dir),
+        "checkpoint_dir": str(ref.checkpoint_dir.resolve()),
         "schema_version": ref.schema_version,
         "next_iteration": ref.next_iteration,
         "completed_updates": ref.completed_updates,
