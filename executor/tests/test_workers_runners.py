@@ -143,29 +143,54 @@ def test_tpen_evidence_decodes_all_verdicts_and_never_reads_run_dir(tmp_path: Pa
     environment = PreparedPythonEnvironment(environment.python, environment.setup, {**environment.env, "EVIDENCE": json.dumps(payload)})
     out, err = tmp_path / "evidence.out", tmp_path / "evidence.err"
     hits: list[str] = []
-    root = run_dir.resolve()
+    # Compute this before patching: abspath/normpath are lexical and do not
+    # consult the filesystem, unlike Path.resolve().
+    root = os.path.normpath(os.path.abspath(str(run_dir)))
+    reentrant = False
 
     def under_run_dir(value: object) -> bool:
+        if isinstance(value, int):
+            # os.stat accepts file descriptors; they are not path evidence.
+            return False
         try:
-            candidate = Path(os.fspath(value)).resolve()
+            candidate_value = os.fspath(value)
+            if isinstance(candidate_value, bytes):
+                candidate_value = os.fsdecode(candidate_value)
+            candidate = os.path.normpath(os.path.abspath(candidate_value))
         except (AttributeError, TypeError, ValueError):
             return False
-        return candidate == root or root in candidate.parents
+        return candidate == root or candidate.startswith(root + os.sep)
 
     def guarded(name: str, original):
         def wrapper(*args, **kwargs):
-            values = args[:1]
-            if any(under_run_dir(value) for value in values):
-                hits.append(name)
-            return original(*args, **kwargs)
+            nonlocal reentrant
+            if reentrant:
+                return original(*args, **kwargs)
+            reentrant = True
+            try:
+                values = args[:1]
+                if any(under_run_dir(value) for value in values):
+                    hits.append(name)
+                # Keep the original call inside the guard: e.g. os.stat can
+                # itself call another patched filesystem wrapper.
+                return original(*args, **kwargs)
+            finally:
+                reentrant = False
 
         return wrapper
 
     def guarded_path(name: str, original):
         def wrapper(self: Path, *args, **kwargs):
-            if under_run_dir(self):
-                hits.append(name)
-            return original(self, *args, **kwargs)
+            nonlocal reentrant
+            if reentrant:
+                return original(self, *args, **kwargs)
+            reentrant = True
+            try:
+                if under_run_dir(self):
+                    hits.append(name)
+                return original(self, *args, **kwargs)
+            finally:
+                reentrant = False
 
         return wrapper
 
