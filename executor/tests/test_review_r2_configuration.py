@@ -108,7 +108,7 @@ def test_r2_t4_relative_reference_climbs_out_of_payload(tmp_path: Path) -> None:
 
 
 def test_r2_t5_key_reference_hidden_in_resolver_arguments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """R2-3: key references nested in resolver arguments must be validated."""
+    """R2-3: resolver-argument key references are deferred to materialization."""
     monkeypatch.delenv("TPEN_P4_R2_UNSET", raising=False)
     _write(
         tmp_path,
@@ -122,8 +122,9 @@ program:
     python: ${oc.env:TPEN_P4_R2_UNSET,${outside}}
 """,
     )
-    with pytest.raises(ValueError):
-        _compose(tmp_path)
+    staged = _compose(tmp_path)
+    with pytest.raises(InterpolationResolutionError):
+        staged.program.materialize({})
 
 
 def test_r2_t6_submitter_existence_check_does_not_resolve_resolvers(tmp_path: Path) -> None:
