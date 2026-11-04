@@ -321,16 +321,18 @@ def test_t13_a_resolver_that_ignores_the_literal_configuration_is_refused(
     monkeypatch.setitem(
         family.ARCHITECTURE_STAGE_REGISTRY, "A", replace(original, resolver=lambda source: real_zero)
     )
-    selection = runner.select_cell(
-        cells,
-        stage="A",
-        context="A",
-        optimizer="adam",
-        seed_label=830001,
-        literal_configuration=packages[1]["literal_configuration"],
-    )
-    assert selection.selected.literal_configuration == packages[1]["literal_configuration"]
-    with pytest.raises(runner.StageQSelectionError):
+    with pytest.raises(
+        runner.StageQSelectionError,
+        match="does not match context_mapping.compose_architecture_package",
+    ):
+        selection = runner.select_cell(
+            cells,
+            stage="A",
+            context="A",
+            optimizer="adam",
+            seed_label=830001,
+            literal_configuration=packages[1]["literal_configuration"],
+        )
         runner._resolve_selected_config(selection)
 
 
@@ -373,7 +375,7 @@ def test_t14_a_package_less_row_schema_is_materializable(
         slot_policy=lambda row: (slot,),
         seed_namespace=lambda stage: stage_coordinate.seed_labels(stage),
         selector=lambda *args, **kwargs: None,
-        packet_policy=lambda stage: {"updates": 7},
+        packet_policy=lambda stage: {"updates": 7, "checkpoint_every_n_updates": 1},
         launch_adapter=lambda *args, **kwargs: None,
     )
     registry = dict(family.ARCHITECTURE_STAGE_REGISTRY)

@@ -246,7 +246,7 @@ def _clause_8_fixture() -> tuple[dict, family.ArchitectureStageDescriptor]:
         slot_policy=lambda row: (slot,),
         seed_namespace=lambda stage: stage_coordinate.seed_labels(stage),
         selector=lambda *args, **kwargs: None,
-        packet_policy=lambda stage: {"updates": 7},
+        packet_policy=lambda stage: {"updates": 7, "checkpoint_every_n_updates": 1},
         launch_adapter=lambda *args, **kwargs: None,
     )
     return authority, descriptor
