@@ -18,6 +18,7 @@ from tpen_executor.results import (
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
+GROUP_DIGEST = "76a21ab64e2533a35421b67a8c16c832967fcc6cadf730c9fdfd505840389ebf"
 
 
 def _fixture_bytes(name: str) -> bytes:
@@ -30,8 +31,8 @@ def _records() -> dict[str, object]:
     attempt = AttemptId("attempt-1")
     allocation = AllocationId("allocation-1")
     job = BackendJobId("job-1")
-    start = StartReceipt("task-a", attempt, allocation, job, "2026-11-04T00:00:00Z", "/runs/group-1/task-a/attempt-1")
-    outcome = OutcomeReceipt("task-a", attempt, "2026-11-04T00:01:00Z", "completed", start.output_dir, digest({"energy": -2.0}))
+    start = StartReceipt("task-a", attempt, allocation, job, GROUP_DIGEST, "2026-11-04T00:00:00Z", "/runs/group-1/task-a/attempt-1")
+    outcome = OutcomeReceipt("task-a", attempt, GROUP_DIGEST, "2026-11-04T00:01:00Z", "completed", start.output_dir, digest({"energy": -2.0}))
     observation = AllocationObservation(allocation, "2026-11-04T00:00:01Z", "running", {"host": "node-1", "slots": 2})
     member = ManifestAttempt("task-a", attempt, start, outcome, start.output_dir)
     manifest = RunManifest("group-1", "76a21ab64e2533a35421b67a8c16c832967fcc6cadf730c9fdfd505840389ebf", (member,))

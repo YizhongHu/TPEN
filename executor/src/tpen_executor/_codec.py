@@ -1,10 +1,16 @@
-"""Small, dependency-free codec helpers for executor records."""
+"""Small, dependency-free codec helpers for executor records.
+
+Records cross process boundaries as canonical bytes rather than pickled Python
+objects; frozen mappings therefore use ``MappingProxyType`` for C-level
+read-only enforcement.
+"""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
 from hashlib import sha256
+from types import MappingProxyType
 from typing import Any
 
 
@@ -18,19 +24,10 @@ def _freeze(value: Any, path: str = "value") -> Any:
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
             raise TypeError(f"{path} keys must be strings")
-        return _FrozenMapping({key: _freeze(item, f"{path}.{key}") for key, item in value.items()})
+        return MappingProxyType({key: _freeze(item, f"{path}.{key}") for key, item in value.items()})
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return tuple(_freeze(item, f"{path}[]") for item in value)
     raise TypeError(f"{path} is not JSON-shaped")
-
-
-class _FrozenMapping(dict[str, Any]):
-    """Hash-independent immutable mapping with a useful mapping API."""
-
-    def _immutable(self, *args: Any, **kwargs: Any) -> None:
-        raise TypeError("mapping is immutable")
-
-    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = _immutable
 
 
 def thaw(value: Any) -> Any:
@@ -62,9 +59,20 @@ payload_digest = digest
 def decode_json(data: bytes | str | Mapping[str, Any]) -> Mapping[str, Any]:
     """Decode a mapping or JSON document, rejecting non-object documents."""
 
-    value = data if isinstance(data, Mapping) else json.loads(data)
+    value = data if isinstance(data, Mapping) else json.loads(data, object_pairs_hook=_reject_duplicate_keys)
     if not isinstance(value, Mapping):
         raise ValueError("record must decode to a mapping")
+    return value
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build a JSON object while refusing duplicate member names."""
+
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        value[key] = item
     return value
 
 
@@ -84,7 +92,7 @@ def fields(data: Any, expected: set[str], schema: str, name: str) -> Mapping[str
 def text(value: Any, name: str) -> str:
     """Validate a non-empty string."""
 
-    if type(value) is not str or not value:
+    if type(value) is not str or not value.strip():
         raise TypeError(f"{name} must be a non-empty string")
     return value
 

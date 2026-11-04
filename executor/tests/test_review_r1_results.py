@@ -18,13 +18,15 @@ from tpen_executor.results import (
     encode_manifest,
 )
 
+GROUP_DIGEST = "76a21ab64e2533a35421b67a8c16c832967fcc6cadf730c9fdfd505840389ebf"
+
 
 def _records() -> dict[str, object]:
     attempt = AttemptId("attempt-1")
     allocation = AllocationId("allocation-1")
     job = BackendJobId("job-1")
-    start = StartReceipt("task-a", attempt, allocation, job, "2026-11-04T00:00:00Z", "/runs/group-1/task-a/attempt-1")
-    outcome = OutcomeReceipt("task-a", attempt, "2026-11-04T00:01:00Z", "completed", start.output_dir, digest({"energy": -2.0}))
+    start = StartReceipt("task-a", attempt, allocation, job, GROUP_DIGEST, "2026-11-04T00:00:00Z", "/runs/group-1/task-a/attempt-1")
+    outcome = OutcomeReceipt("task-a", attempt, GROUP_DIGEST, "2026-11-04T00:01:00Z", "completed", start.output_dir, digest({"energy": -2.0}))
     observation = AllocationObservation(allocation, "2026-11-04T00:00:01Z", "running", {"host": "node-1", "slots": 2})
     member = ManifestAttempt("task-a", attempt, start, outcome, start.output_dir)
     manifest = RunManifest("group-1", "76a21ab64e2533a35421b67a8c16c832967fcc6cadf730c9fdfd505840389ebf", (member,))
@@ -48,8 +50,8 @@ def test_manifest_attempt_requires_start_receipt_type() -> None:
     [
         {"attempt_id": AttemptId("attempt-9")},
         {"task_id": "task-z"},
-        {"outcome_receipt": OutcomeReceipt("task-a", AttemptId("attempt-9"), "2026-11-04T00:01:00Z", "completed", "/runs/group-1/task-a/attempt-1", digest({"energy": -2.0}))},
-        {"outcome_receipt": OutcomeReceipt("task-z", AttemptId("attempt-1"), "2026-11-04T00:01:00Z", "completed", "/runs/group-1/task-a/attempt-1", digest({"energy": -2.0}))},
+        {"outcome_receipt": OutcomeReceipt("task-a", AttemptId("attempt-9"), GROUP_DIGEST, "2026-11-04T00:01:00Z", "completed", "/runs/group-1/task-a/attempt-1", digest({"energy": -2.0}))},
+        {"outcome_receipt": OutcomeReceipt("task-z", AttemptId("attempt-1"), GROUP_DIGEST, "2026-11-04T00:01:00Z", "completed", "/runs/group-1/task-a/attempt-1", digest({"energy": -2.0}))},
         {"output_dir": "/elsewhere"},
     ],
 )
@@ -89,7 +91,7 @@ def test_outcome_receipt_without_result_digest_round_trips() -> None:
 
     records = _records()
     start = records["start"]
-    receipt = OutcomeReceipt("task-a", start.attempt_id, "2026-11-04T00:01:00Z", "completed", start.output_dir, None)  # type: ignore[union-attr]
+    receipt = OutcomeReceipt("task-a", start.attempt_id, GROUP_DIGEST, "2026-11-04T00:01:00Z", "completed", start.output_dir, None)  # type: ignore[union-attr]
     mapping = receipt.to_dict()
     assert mapping["result_digest"] is None
     assert b'"result_digest":null' in canonical_bytes(mapping)
@@ -106,12 +108,12 @@ def test_manifest_expresses_in_flight_and_retried_attempts() -> None:
     records = _records()
     start = records["start"]
     first = ManifestAttempt("task-a", AttemptId("attempt-1"), start, None, start.output_dir)
-    second_start = StartReceipt("task-a", AttemptId("attempt-2"), AllocationId("allocation-2"), BackendJobId("job-2"), "2026-11-04T00:02:00Z", "/runs/a2")
-    second_outcome = OutcomeReceipt("task-a", AttemptId("attempt-2"), "2026-11-04T00:02:30Z", "completed", "/runs/a2", digest({"energy": -2.0}))
+    second_start = StartReceipt("task-a", AttemptId("attempt-2"), AllocationId("allocation-2"), BackendJobId("job-2"), GROUP_DIGEST, "2026-11-04T00:02:00Z", "/runs/a2")
+    second_outcome = OutcomeReceipt("task-a", AttemptId("attempt-2"), GROUP_DIGEST, "2026-11-04T00:02:30Z", "completed", "/runs/a2", digest({"energy": -2.0}))
     second = ManifestAttempt("task-a", AttemptId("attempt-2"), second_start, second_outcome, "/runs/a2")
-    third_start = StartReceipt("task-b", AttemptId("attempt-3"), AllocationId("allocation-3"), BackendJobId("job-3"), "2026-11-04T00:03:00Z", "/runs/b1")
+    third_start = StartReceipt("task-b", AttemptId("attempt-3"), AllocationId("allocation-3"), BackendJobId("job-3"), GROUP_DIGEST, "2026-11-04T00:03:00Z", "/runs/b1")
     third = ManifestAttempt("task-b", AttemptId("attempt-3"), third_start, None, third_start.output_dir)
-    manifest = RunManifest("group-1", digest({"group": 1}), (first, second, third))
+    manifest = RunManifest("group-1", GROUP_DIGEST, (first, second, third))
     assert RunManifest.decode(manifest.encode()) == manifest
     assert decode_manifest(encode_manifest(manifest)) == manifest
     assert [attempt.task_id for attempt in manifest.attempts] == ["task-a", "task-a", "task-b"]
@@ -194,3 +196,19 @@ def test_identity_wire_forms_differ_between_receipt_and_standalone() -> None:
     mapping["attempt_id"] = AttemptId("attempt-1").to_dict()
     with pytest.raises(TypeError):
         StartReceipt.from_mapping(mapping)
+
+
+def test_manifest_rejects_receipt_group_digest_mismatch() -> None:
+    """Orchestrator regression: receipt group identity must match its manifest."""
+
+    records = _records()
+    member = records["member"]
+    with pytest.raises(ValueError):
+        RunManifest("group-1", digest({"different": True}), (member,))
+
+
+def test_decode_rejects_duplicate_json_keys() -> None:
+    """Orchestrator regression: duplicate JSON members are not last-write-wins."""
+
+    with pytest.raises(ValueError):
+        StartReceipt.decode(b'{"schema":"tpen-executor/start-receipt-v1","schema":"duplicate"}')
