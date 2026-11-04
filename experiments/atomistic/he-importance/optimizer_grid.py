@@ -68,14 +68,6 @@ UNDECLARED_STAGE_REASONS = MappingProxyType(
             "needs the best two eligible O1 cells per family, a selection output "
             "that does not exist yet"
         ),
-        "A": (
-            "needs the 254-package architecture union of section 2.8, which is a "
-            "separate materialization slice"
-        ),
-        "B": (
-            "needs O* (the qualified specialized cell selected after O2) and the "
-            "B-grid packages, which do not exist yet"
-        ),
         "R": "needs eight architecture packages selected after A/B, which do not exist yet",
         "F": "needs one frozen selected procedure, which does not exist yet",
     }
@@ -426,15 +418,21 @@ def _require_stage_partition(
     """
 
     authority_codes = frozenset(definition.code for definition in stage_coordinate.STAGE_DEFINITIONS)
-    declared_set = set(declared)
-    undeclared_set = set(undeclared)
-    if declared_set & undeclared_set or declared_set | undeclared_set != authority_codes:
-        raise OptimizerGridError(
-            "optimizer-grid stages and undeclared stages must partition the stage authority: "
-            f"declared={sorted(declared_set)}, undeclared={sorted(undeclared_set)}, "
-            f"authority={sorted(authority_codes)}"
+    family = importlib.import_module(
+        "experiments.atomistic.he-importance.architecture_stage_family"
+    )
+    try:
+        return family.validate_partition(
+            declared,
+            family.family_stage_codes(),
+            undeclared,
+            authority_codes,
         )
-    return authority_codes
+    except (OptimizerGridError, family.ArchitectureStageFamilyError) as error:
+        raise OptimizerGridError(
+            "optimizer-grid, architecture-family, and undeclared stages must partition "
+            f"the stage authority: {error}"
+        ) from error
 
 
 def undeclared_stage_reason(stage: str) -> str | None:

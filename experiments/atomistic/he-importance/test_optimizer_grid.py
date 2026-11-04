@@ -175,7 +175,7 @@ def test_stage_q_report_is_derived_from_the_injected_roster() -> None:
     assert report["families"]["linear_method"]["declared"] == 16
     assert report["families"]["linear_method"]["unavailable"] == 16
     assert report["families"]["linear_method"]["runnable"] == 0
-    assert set(report["excluded_stages"]) == {"O2", "A", "B", "R", "F"}
+    assert set(report["excluded_stages"]) == {"O2", "R", "F"}
 
     # A second roster, admitting one more family: clause 5 forbids a
     # hard-coded runnable count, so the totals must move with the roster.
@@ -400,3 +400,36 @@ def test_o_raw_and_o_composite_identities_differ_by_more_than_the_name() -> None
     o_composite_without_name = {k: v for k, v in contexts_by_name["O-composite"].items() if k != "name"}
     assert o_raw_without_name != o_composite_without_name
     assert o_raw_without_name["overrides"] != o_composite_without_name["overrides"]
+
+
+def test_architecture_family_is_in_the_authority_partition() -> None:
+    family = importlib.import_module(
+        "experiments.atomistic.he-importance.architecture_stage_family"
+    )
+    assert optimizer_grid._require_stage_partition() == frozenset(
+        definition.code for definition in stage_coordinate.STAGE_DEFINITIONS
+    )
+    assert family.family_stage_codes() == ("A", "B")
+    assert set(optimizer_grid.UNDECLARED_STAGE_REASONS) == {"O2", "R", "F"}
+
+
+def test_partition_mutants_delete_or_duplicate_codes() -> None:
+    family = importlib.import_module(
+        "experiments.atomistic.he-importance.architecture_stage_family"
+    )
+    authority = tuple(definition.code for definition in stage_coordinate.STAGE_DEFINITIONS)
+    with pytest.raises(optimizer_grid.OptimizerGridError, match="partition"):
+        optimizer_grid._require_stage_partition(declared=("Q",), undeclared=optimizer_grid.UNDECLARED_STAGE_REASONS)
+    with pytest.raises(optimizer_grid.OptimizerGridError, match="repeat"):
+        family.validate_partition(("Q", "Q"), ("A", "B"), optimizer_grid.UNDECLARED_STAGE_REASONS, authority)
+
+
+def test_a_and_b_family_renderers_keep_two_explicit_optimizer_slots() -> None:
+    family = importlib.import_module(
+        "experiments.atomistic.he-importance.architecture_stage_family"
+    )
+    for stage_code, expected_packages in (("A", 254), ("B", 60)):
+        rows = family.render_family_inventory(stage_code)
+        assert len(rows) == expected_packages * 2
+        assert {row["optimizer"]["method"] for row in rows} == {"adam", "O*"}
+        assert all(row["package"]["optimizer_slots"] for row in rows)

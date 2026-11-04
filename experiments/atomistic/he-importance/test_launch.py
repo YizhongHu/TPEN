@@ -1791,3 +1791,14 @@ def test_fake_context_run_dir_is_pytest_managed(tmp_path_factory: pytest.TempPat
     assert base in context.run_dir.resolve().parents, (
         f"_FakeContext.run_dir={context.run_dir} is outside pytest's basetemp {base}"
     )
+
+
+def test_launch_accepts_a_registry_owned_resolver(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    resolved = OmegaConf.create({"optimizer": {"_target_": "test.resolver"}})
+    assert launch.launch_train(
+        cell,
+        _topology(),
+        resolver=lambda source: resolved,
+        runner=lambda config: 0,
+    ) == 0

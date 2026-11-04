@@ -54,7 +54,7 @@ def _cells(tmp_path: Path, stage_code: str = "Q") -> tuple[object, ...]:
     )
 
 
-_UNDECLARED_STAGES = ("O2", "A", "B", "R", "F")
+_UNDECLARED_STAGES = ("O2", "R", "F")
 _UNDECLARED_MATCH = "no declared intended-configuration universe"
 
 
@@ -3181,3 +3181,65 @@ def test_q_execute_materializes_only_stage_q(
     monkeypatch.setattr(stage_coordinate, "materialize_intended_configurations", witness)
     assert runner.execute(_args(tmp_path)) == 0
     assert observed == [("Q",)]
+
+
+def test_family_selection_is_by_literal_configuration_and_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    family = importlib.import_module(
+        "experiments.atomistic.he-importance.architecture_stage_family"
+    )
+    original = family.ARCHITECTURE_STAGE_REGISTRY["A"]
+    fake_resolved = runner.OmegaConf.create({"optimizer": {"_target_": "torch.optim.Adam"}})
+    monkeypatch.setitem(
+        family.ARCHITECTURE_STAGE_REGISTRY,
+        "A",
+        replace(original, resolver=lambda cell: fake_resolved, resolved_validator=lambda cell, resolved: None),
+    )
+    package = family.ab_universe.render_a_packages()[0]
+    cells = family.materialize_family_stage("A", tmp_path)
+    selected = runner.select_cell(
+        cells,
+        stage="A",
+        context="A",
+        literal_configuration=package["literal_configuration"],
+        optimizer="adam",
+        seed_label=830001,
+    )
+    assert selected.selected.context == "A"
+    assert selected.selected.literal_configuration == package["literal_configuration"]
+    assert selected.selected.optimizer["method"] == "adam"
+
+
+@pytest.mark.parametrize("stage_code, seed_label", [("A", 830001), ("B", 840001)])
+def test_family_dry_run_uses_the_shared_packet_and_report_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    stage_code: str,
+    seed_label: int,
+) -> None:
+    family = importlib.import_module(
+        "experiments.atomistic.he-importance.architecture_stage_family"
+    )
+    original = family.ARCHITECTURE_STAGE_REGISTRY[stage_code]
+    fake_resolved = runner.OmegaConf.create({"optimizer": {"_target_": "torch.optim.Adam"}})
+    monkeypatch.setitem(
+        family.ARCHITECTURE_STAGE_REGISTRY,
+        stage_code,
+        replace(original, resolver=lambda cell: fake_resolved, resolved_validator=lambda cell, resolved: None),
+    )
+    package = family.ab_universe.render_ab_universe()[stage_code][0]
+    monkeypatch.setattr(runner, "roster_design_receipt", lambda stage: {"stage": stage})
+    args = _args(
+        tmp_path,
+        stage=stage_code,
+        context=stage_code,
+        literal_configuration=package["literal_configuration"],
+        seed_label=seed_label,
+        dry_run=True,
+    )
+    assert runner.execute(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["selection"]["selected"]["context"] == stage_code
+    assert report["resolved_config"]["optimizer"]["_target_"] == "torch.optim.Adam"
