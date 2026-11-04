@@ -93,17 +93,19 @@ def _package(axis: str, number: int, configuration: Mapping[str, str], package: 
         literal["package"] = package
     producer = literal["producer_path"]
     update = literal["update"]
+    # A has no paired-start rule; B retains its producer/update key for the four paired cells.
+    stream_key = (
+        {"stage": axis, "literal_configuration": _canonical(literal)}
+        if axis == "A"
+        else {"stage": axis, "producer_path": producer, "update": update}
+    )
     return {
         "axis": axis,
         "display_name": f"{axis}{number:03d}",
         "literal_configuration": literal,
         "optimizer_slots": deepcopy(_OPTIMIZER_SLOTS),
         "seed_labels": list(_SEED_LABELS[axis]),
-        "model_initialization_stream_key": {
-            "stage": axis,
-            "producer_path": producer,
-            "update": update,
-        },
+        "model_initialization_stream_key": stream_key,
     }
 
 
@@ -121,7 +123,10 @@ def _deduplicate(packages: Iterable[dict[str, Any]]) -> tuple[dict[str, Any], ..
 
 
 def render_a_packages() -> tuple[dict[str, Any], ...]:
-    """Render the 254 deduplicated A packages from the three design blocks."""
+    """Render the 254 deduplicated A packages from the three design blocks.
+
+    Display names are pre-deduplication candidate indices A001-A258, so the four shared rows leave holes at A133, A134, A135, and A217; display names are not identity.
+    """
 
     candidates: list[dict[str, Any]] = []
     number = 1
