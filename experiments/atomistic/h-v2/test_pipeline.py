@@ -53,7 +53,7 @@ def test_configured_local_energy_sampler_and_model_only_restore(tmp_path: Path) 
         rows = list(csv.DictReader(handle))
     assert len(rows) == 24
     assert all(row["finite"] == "True" for row in rows)
-    occurrences = train_dir.parent.parent / "eval" / "occurrences.jsonl"
+    occurrences = train_dir.parent / "eval" / "occurrences.jsonl"
     reports = [json.loads(line) for line in occurrences.read_text().splitlines() if "CheckpointRestored" in line]
     assert len(reports) == 1
     report = reports[0]["fields"]["report"]
