@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+from typing import Any
 
 from .environments import PreparedPythonEnvironment
 
@@ -61,6 +62,7 @@ class SubprocessWorker:
         stdout_path: str | os.PathLike[str],
         stderr_path: str | os.PathLike[str],
         timeout: float | None = None,
+        process_handle: Any = None,
     ) -> ProcessOutcome:
         """Run the prepared interpreter with exact argument boundaries.
 
@@ -76,6 +78,10 @@ class SubprocessWorker:
             Required caller-named binary logs, truncated for this run.
         timeout : float or None, optional
             Positive timeout in seconds for the whole process group.
+        process_handle : object, optional
+            Thread-safe owner handle notified of the child process group. The
+            handle must provide ``attach(process)`` and ``clear(process)``;
+            it may request an owner-side cancellation before attachment.
 
         Returns
         -------
@@ -124,6 +130,8 @@ class SubprocessWorker:
                 start_new_session=True,
             )
             try:
+                if process_handle is not None:
+                    process_handle.attach(process)
                 try:
                     returncode = process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
@@ -150,6 +158,9 @@ class SubprocessWorker:
                 for cleanup_error in cleanup_errors:
                     original.add_note(f"cleanup wait interruption: {cleanup_error!r}")
                 raise
+            finally:
+                if process_handle is not None:
+                    process_handle.clear(process)
         return ProcessOutcome(logical_argv, returncode, stdout_name, stderr_name, timed_out)
 
 

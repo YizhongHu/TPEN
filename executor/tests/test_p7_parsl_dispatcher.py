@@ -24,6 +24,7 @@ from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.programs import WorkerProgram
 from tpen_executor.results import RunManifest
+from tpen_executor.runners import RUN_SHIM
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.tasks import ConfiguredRun
 from tpen_executor.workers import ProcessOutcome
@@ -182,7 +183,10 @@ def test_p7_b_exact_argv_payload_and_fresh_output_namespace(tmp_path: Path, disp
     for task_id, configured in runs.items():
         output_dir = Path(attempts[task_id].start_receipt.output_dir)  # type: ignore[union-attr]
         observed = json.loads((output_dir / "core" / "argv-and-binding.json").read_text(encoding="utf-8"))
-        assert observed["argv"][: len(configured.command().args)] == list(configured.command().args)
+        expected_args = configured.command().args
+        if expected_args[:2] == ("-c", RUN_SHIM):
+            expected_args = expected_args[2:]
+        assert observed["argv"][: len(expected_args)] == list(expected_args)
         assert observed["argv"][-3:] == [f"run.root={output_dir}", "run.layout=flat", "run.run_id=core"]
         assert observed["cwd"] == str(output_dir)
     assert attempts["one"].start_receipt.output_dir != attempts["two"].start_receipt.output_dir  # type: ignore[union-attr]
@@ -281,12 +285,32 @@ def test_p7_g_mutant_reused_dfk_is_rejected_by_fresh_lifecycle(tmp_path: Path) -
         pytest.skip("requires the approved executor parsl extra")
     package = _make_stub_package(tmp_path)
     dispatcher = ParslDispatcher(_worker_spec(PreparedPythonEnvironment(sys.executable, env={"PYTHONPATH": str(package)})))
+    created = []
+    cleaned = []
+    dfk_type = dispatcher._dfk_type
+
+    def make_dfk(**kwargs):
+        dfk = dfk_type(**kwargs)
+        original_cleanup = dfk.cleanup
+
+        def cleanup():
+            cleaned.append(dfk)
+            return original_cleanup()
+
+        dfk.cleanup = cleanup
+        created.append(dfk)
+        return dfk
+
+    object.__setattr__(dispatcher, "_dfk_type", make_dfk)
     first_store = DirectoryStore(tmp_path / "first")
     second_store = DirectoryStore(tmp_path / "second")
-    dispatcher.run(_group("first"), _runs(tmp_path, "first"), AttachedAllocation(_allocation(allocation_id="first"), first_store))
-    dispatcher.run(_group("second"), _runs(tmp_path, "second"), AttachedAllocation(_allocation(allocation_id="second"), second_store))
-    assert (first_store.root / "groups").exists()
-    assert (second_store.root / "groups").exists()
+    first_manifest = dispatcher.run(_group("first"), _runs(tmp_path, "first"), AttachedAllocation(_allocation(allocation_id="first"), first_store))
+    second_manifest = dispatcher.run(_group("second"), _runs(tmp_path, "second"), AttachedAllocation(_allocation(allocation_id="second"), second_store))
+    assert Path(first_store.root, "groups").exists()
+    assert Path(second_store.root, "groups").exists()
+    assert len(created) == len(cleaned) == 2 and created[0] is not created[1]
+    assert first_manifest.attempts[0].outcome_receipt.status == "completed"  # type: ignore[union-attr]
+    assert second_manifest.attempts[0].outcome_receipt.status == "completed"  # type: ignore[union-attr]
 
 
 @PARSL_REQUIRED

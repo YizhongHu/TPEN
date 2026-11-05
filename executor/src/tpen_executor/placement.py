@@ -14,6 +14,24 @@ class BindingError(ValueError):
     """Raised when a worker binding is absent or cannot be trusted."""
 
 
+def _normalize_nodes(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize one generic node shape or refuse ambiguous geometry."""
+
+    if "nodes" not in value:
+        return dict(value)
+    nodes = value["nodes"]
+    if isinstance(nodes, (str, bytes, bytearray)) or not isinstance(nodes, Sequence):
+        raise BindingError("worker binding nodes must be a sequence")
+    if len(nodes) != 1 or type(nodes[0]) is not str or not nodes[0]:
+        raise BindingError("worker binding must identify exactly one worker node")
+    normalized = dict(value)
+    existing = normalized.get("node")
+    if existing is not None and existing != nodes[0]:
+        raise BindingError("worker binding node and nodes disagree")
+    normalized["node"] = nodes[0]
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerBinding:
     """Immutable environment binding for one Parsl worker.
@@ -72,6 +90,7 @@ class WorkerBinding:
             return value
         if not isinstance(value, Mapping):
             raise BindingError("worker binding must be a mapping")
+        value = _normalize_nodes(value)
         environment = value.get("environment", value.get("env"))
         if environment is None:
             environment = {
@@ -127,14 +146,6 @@ def binding_from_allocation(allocation: ConfiguredAllocation) -> WorkerBinding:
         }
     if not raw:
         raise BindingError("configured allocation has no worker binding")
-    if isinstance(raw, Mapping) and "node" not in raw and "nodes" in raw:
-        nodes = raw["nodes"]
-        if isinstance(nodes, Sequence) and not isinstance(nodes, (str, bytes, bytearray)):
-            if len(nodes) != 1:
-                raise BindingError("allocation binding must identify one worker node")
-            raw = {**raw, "node": nodes[0]}
-        else:
-            raw = {**raw, "node": nodes}
     return WorkerBinding.from_mapping(raw)
 
 
