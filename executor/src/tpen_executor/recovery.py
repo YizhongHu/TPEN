@@ -130,7 +130,23 @@ class CoreProfileReference:
         stderr_path: str | os.PathLike[str],
         timeout: float | None = None,
     ) -> ProfileCheck:
-        """Launch core's profile CLI and decode exactly one profile record."""
+        """Launch core's profile CLI and decode one bound profile record.
+
+        Returns
+        -------
+        ProfileCheck
+            The decoded supported or refused result for ``self.profile``. A
+            refused result is a valid, typed capability response and is
+            returned to the caller.
+
+        Raises
+        ------
+        ProfileUnavailable
+            If the process, transport, JSON payload, strict v1 record, or
+            requested-profile binding cannot be trusted. A response naming a
+            different profile is unavailable rather than a refusal for this
+            reference.
+        """
 
         try:
             outcome = worker.run(
@@ -155,7 +171,10 @@ class CoreProfileReference:
             decoded = decode_json(payload)
         except (TypeError, ValueError) as exc:
             raise ProfileUnavailable("profile stdout is not one JSON object") from exc
-        return ProfileCheck.from_mapping(decoded)
+        result = ProfileCheck.from_mapping(decoded)
+        if result.profile != self.profile:
+            raise ProfileUnavailable("profile response does not match requested profile")
+        return result
 
 
 __all__ = [
