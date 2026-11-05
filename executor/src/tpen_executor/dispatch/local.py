@@ -202,6 +202,9 @@ class LocalDispatcher:
                     # Evidence absence never changes the process outcome or
                     # fabricates a digest.
                     result_digest = None
+                except Exception:
+                    status = "launch_failed"
+                    result_digest = None
                 except BaseException:
                     # Cancellation and interpreter exits still receive the
                     # one finish attempt before propagating to the caller.
@@ -212,9 +215,6 @@ class LocalDispatcher:
                     except BaseException:
                         pass
                     raise
-                except Exception:
-                    status = "launch_failed"
-                    result_digest = None
                 try:
                     lifecycle.finish(fence, status, _utc_now(), result_digest)
                 except Exception as error:
