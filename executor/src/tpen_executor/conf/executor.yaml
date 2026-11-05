@@ -42,7 +42,7 @@ program:
       _target_: tpen_executor.environments.SourceScript
       path: ${paths.control_setup}
   dispatcher:
-    _target_: tpen_executor.programs.DummyDispatcher
+    _target_: tpen_executor.dispatch.LocalDispatcher
     _recursive_: false
     worker:
       _target_: tpen_executor.programs.WorkerProgram
