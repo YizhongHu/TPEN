@@ -337,13 +337,11 @@ class ParslDispatcher(DispatcherContract):
         except BaseException as original:
             process_handle.request_kill()
             reap_errors: list[BaseException] = []
-            while True:
+            while not future.done():
                 try:
                     future.result(None)
                 except BaseException as reap_error:
                     reap_errors.append(reap_error)
-                else:
-                    break
             for reap_error in reap_errors:
                 original.add_note(f"Parsl child reap result: {reap_error!r}")
             raise
