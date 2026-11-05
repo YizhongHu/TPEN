@@ -52,3 +52,32 @@ Store-owned directories and receipt files must not be pre-existing symlinks;
 the store refuses them before use. The task namespace is deliberately limited
 to reversible `[A-Za-z0-9._-]+` path components. Resistance to a concurrent
 adversary swapping a link after these checks is outside this layer's contract.
+
+## Local dispatch
+
+`LocalDispatcher` is the attached-allocation baseline. It admits an exact
+mapping from `ReadyGroup` member IDs to `ConfiguredRun` records, then launches
+members sequentially through the materialized worker slots. Each member gets a
+fresh store fence, and its child receives the configured command arguments plus
+`run.root=<fence output>`, `run.layout=flat`, and `run.run_id=core`. With the
+flat layout, core therefore writes its run directory at `<fence output>/core`.
+Child and inspection logs are kept in the fence directory. Operational status
+is independent of decoded core evidence; missing evidence leaves
+`result_digest` unset. This dispatcher does not provide concurrency, retries,
+recovery, Parsl, Balsam, scheduler integration, or facility qualification.
+
+Admission also rejects a concrete store path containing the literal `${` before
+the first lifecycle `begin`, because unresolved OmegaConf syntax must not be
+allowed to redirect a core run. Any supplied timeout must be finite and
+strictly positive. If cancellation interrupts a begun member, the dispatcher
+attempts exactly one `finish`: it preserves an already-established
+`timed_out` status and otherwise records `failed`, then propagates the original
+cancellation. The subprocess worker kills its owned process group and keeps
+waiting until the leader is reaped; further cleanup interruptions are attached
+to the original exception rather than silently discarded.
+
+Member `begin` failures are independent: later members are still visited and
+their fences are finished. After processing, the first `begin` exception is
+raised as the primary error. A later `finish` exception is retained as a note
+on that same exception; when there was no `begin` failure, a `finish` exception
+is raised normally.
