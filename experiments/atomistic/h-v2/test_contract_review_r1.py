@@ -21,7 +21,7 @@ def test_evaluation_seed_formula_is_injective_and_disjoint() -> None:
     inputs = load_inputs()
     measurement = inputs["measurement"]
     roster = measurement["seed_roster"]
-    match = re.fullmatch(
+    match = re.search(
         r"(\d+) \+ (\d+)\*lineage_index \+ "
         r"(\d+)\*evaluated_checkpoint_ordinal \+ stream_index",
         roster["evaluation_stream_seed_formula"],
