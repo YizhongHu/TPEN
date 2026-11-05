@@ -48,7 +48,7 @@ def _payload(verdict="completed"):
         "schema": "tpen.run-evidence/v1", "run_dir": "/run", "verdict": verdict,
         "run_status": verdict,
         "checkpoint": None if verdict == "refused" else {
-            "checkpoint_dir": "/run/checkpoints/c", "schema_version": "v2",
+            "checkpoint_dir": "/run/checkpoints/c", "schema_version": 2,
             "next_iteration": 2, "completed_updates": 1,
         },
         "refusal": {"code": "missing-run-dir", "reason": "absent"} if verdict == "refused" else None,
@@ -175,8 +175,10 @@ def test_r1_t6_real_inspection_child_decodes_every_verdict(tmp_path, verdict):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("schema_version", 2), ("checkpoint_dir", None),
-    ("next_iteration", True), ("completed_updates", -1),
+    pytest.param("schema_version", "v2", id="schema-version-string"),
+    pytest.param("checkpoint_dir", None, id="checkpoint-dir-null"),
+    pytest.param("next_iteration", True, id="next-iteration-bool"),
+    pytest.param("completed_updates", -1, id="completed-updates-negative"),
 ])
 def test_r1_t6_invalid_nested_checkpoint_fields_are_rejected(field, value):
     payload = _payload()
