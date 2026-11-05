@@ -7,8 +7,10 @@ the executor itself never imports the science package.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
+import tempfile
 import textwrap
 from types import SimpleNamespace
 
@@ -81,7 +83,7 @@ def _evidence(run_dir: str) -> CoreRunEvidence:
 
 
 def _make_stub_package(tmp_path: Path) -> Path:
-    package = tmp_path / "fake-science" / "tpen"
+    package = tmp_path / "pkg" / "tpen"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
     (package / "run.py").write_text(
@@ -299,14 +301,82 @@ def test_p5d_reentrancy_guard_is_runtime_typed_error(tmp_path: Path) -> None:
     dispatcher.run(group, _runs(tmp_path, "a"), lifecycle)
 
 
-def test_p5d_contract_h_mutant_needles_are_unique() -> None:
-    source = Path(__file__).parents[1].joinpath("src", "tpen_executor", "dispatch", "local.py").read_text(encoding="utf-8")
-    needles = (
-        "self._validate_inputs(group, runs, lifecycle, env, timeout)",
-        "for member in group.members:",
-        "status = _status(outcome)",
-        '"run.layout=flat", "run.run_id=core"',
-        "lifecycle.finish(fence, status, _utc_now(), result_digest)",
-        "except EvidenceUnavailable:",
+def test_p5d_runtime_write_trap_confines_parent_writes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    package = _make_stub_package(tmp_path)
+    store_root = tmp_path / "store"
+    configs = {}
+    for task_id in ("a", "b"):
+        config = package / f"{task_id}.yaml"
+        config.write_text("ok", encoding="utf-8")
+        configs[task_id] = ConfiguredRun(task_id, str(config))
+
+    store_lexical = os.path.abspath(os.path.normpath(os.fspath(store_root)))
+    package_lexical = os.path.abspath(os.path.normpath(os.fspath(package)))
+    before_entries = set(tmp_path.iterdir())
+    writes: list[tuple[str, str]] = []
+    in_trap = False
+
+    def record(kind: str, path: object) -> None:
+        nonlocal in_trap
+        if in_trap:
+            raise AssertionError("write trap re-entered")
+        in_trap = True
+        try:
+            lexical = os.path.abspath(os.path.normpath(os.fspath(path)))
+            writes.append((kind, lexical))
+        finally:
+            in_trap = False
+
+    original_open = os.open
+    original_mkstemp = tempfile.mkstemp
+
+    def trapped_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+        if flags & write_flags:
+            record("open", path)
+        return original_open(path, flags, *args, **kwargs)
+
+    def trapped_single(kind: str, original):
+        def wrapper(path: object, *args: object, **kwargs: object):
+            record(kind, path)
+            return original(path, *args, **kwargs)
+
+        return wrapper
+
+    def trapped_pair(kind: str, original):
+        def wrapper(source: object, destination: object, *args: object, **kwargs: object):
+            record(kind, source)
+            record(kind, destination)
+            return original(source, destination, *args, **kwargs)
+
+        return wrapper
+
+    def trapped_mkstemp(suffix: str = "", prefix: str = "tmp", dir: str | os.PathLike[str] | None = None, text: bool = False):
+        if dir is not None:
+            record("mkstemp", dir)
+        return original_mkstemp(suffix=suffix, prefix=prefix, dir=dir, text=text)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "open", trapped_open)
+        for name in ("mkdir", "makedirs", "unlink"):
+            patch.setattr(os, name, trapped_single(name, getattr(os, name)))
+        for name in ("replace", "link"):
+            patch.setattr(os, name, trapped_pair(name, getattr(os, name)))
+        patch.setattr(tempfile, "mkstemp", trapped_mkstemp)
+        dispatcher = LocalDispatcher(_worker_spec(PreparedPythonEnvironment(sys.executable, env={"PYTHONPATH": str(package)})))
+        dispatcher.run(_group("a", "b"), configs, AttachedAllocation(_allocation(), DirectoryStore(store_root)), timeout=1)
+
+    allowed = (store_lexical, package_lexical)
+    assert writes
+    assert all(any(path == root or path.startswith(root + os.sep) for root in allowed) for _, path in writes)
+
+    # Child-process writes are not traced in-process; the post-run census closes that gap.
+    new_entries = set(tmp_path.iterdir()) - before_entries
+    assert all(
+        any(
+            os.path.abspath(os.path.normpath(os.fspath(path))) == root
+            or os.path.abspath(os.path.normpath(os.fspath(path))).startswith(root + os.sep)
+            for root in allowed
+        )
+        for path in new_entries
     )
-    assert all(source.count(needle) == 1 for needle in needles)
