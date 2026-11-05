@@ -213,5 +213,47 @@ def test_p8_store_accept_segment_is_durable_fenced_and_one_shot(tmp_path: Path) 
         foreign.accept_segment(fence, evidence)
 
 
+def test_p8_store_rejects_replayed_equal_coordinate_before_publish(tmp_path: Path) -> None:
+    group = _group()
+    store = DirectoryStore(tmp_path / "store")
+    allocation = _allocation()
+
+    first_fence = store.begin_attempt(group, "task-a", allocation, "2026-11-05T00:00:00Z")
+    store.finish_attempt(first_fence, "completed", "2026-11-05T00:01:00Z")
+    first_evidence = _evidence(
+        str(Path(first_fence.output_dir) / "core"),
+        checkpoint_dir=str(Path(first_fence.output_dir) / "core" / "checkpoint-1"),
+        step=1,
+    )
+    first = store.accept_segment(first_fence, first_evidence)
+
+    replay_fence = store.begin_attempt(group, "task-a", allocation, "2026-11-05T00:02:00Z")
+    store.finish_attempt(replay_fence, "completed", "2026-11-05T00:03:00Z")
+    replay_evidence = _evidence(
+        str(Path(replay_fence.output_dir) / "core"),
+        checkpoint_dir=str(Path(replay_fence.output_dir) / "core" / "checkpoint-replay"),
+        step=1,
+    )
+
+    def snapshot() -> dict[str, bytes]:
+        return {str(path.relative_to(store.root)): path.read_bytes() for path in Path(store.root).rglob("*") if path.is_file()}
+
+    before = snapshot()
+    # Equal coordinates are a replayed segment per f033d377.
+    with pytest.raises(FenceRejected, match="not strictly increasing"):
+        store.accept_segment(replay_fence, replay_evidence, first.checkpoint_dir)
+    assert snapshot() == before
+
+    control_fence = store.begin_attempt(group, "task-a", allocation, "2026-11-05T00:04:00Z")
+    store.finish_attempt(control_fence, "completed", "2026-11-05T00:05:00Z")
+    control_evidence = _evidence(
+        str(Path(control_fence.output_dir) / "core"),
+        checkpoint_dir=str(Path(control_fence.output_dir) / "core" / "checkpoint-2"),
+        step=2,
+    )
+    control = store.accept_segment(control_fence, control_evidence, first.checkpoint_dir)
+    assert (control.next_iteration, control.completed_updates) == (2, 2)
+
+
 def test_p8_fixture_is_generated_by_executor_helper() -> None:
     assert cross_project_manifest().encode().rstrip(b"\n") == (Path(__file__).parent / "fixtures" / "run-manifest-v2.json").read_bytes().rstrip(b"\n")
