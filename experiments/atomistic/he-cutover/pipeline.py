@@ -75,7 +75,18 @@ def preflight_dispatch(*, context: AllocationContext, cwd: str | Path, admission
 
 
 def executor_inputs(train_plan: StagePlanV2, eval_plan: StagePlanV2) -> tuple[dict[str, object], dict[str, object]]:
-    """Emit both executor input mappings without changing the legacy route."""
+    """Emit both executor input mappings without changing the legacy route.
+
+    Parameters
+    ----------
+    train_plan, eval_plan : StagePlanV2
+        Validated training and evaluation plans.
+
+    Returns
+    -------
+    tuple of dict
+        Training and evaluation ``ReadyGroup`` wire mappings, respectively.
+    """
 
     return ready_group(train_plan), ready_group(eval_plan)
 

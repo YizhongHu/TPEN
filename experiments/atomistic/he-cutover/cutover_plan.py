@@ -185,7 +185,18 @@ def build_plans(grid: Mapping[str, Any], *, facility: str, results_root: str | P
 
 
 def executor_inputs(train_plan: StagePlanV2, eval_plan: StagePlanV2) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Emit executor inputs for both plans without activating execution."""
+    """Emit executor inputs for both plans without activating execution.
+
+    Parameters
+    ----------
+    train_plan, eval_plan : StagePlanV2
+        Validated training and evaluation plans.
+
+    Returns
+    -------
+    tuple of dict
+        Training and evaluation ``ReadyGroup`` wire mappings, respectively.
+    """
 
     return ready_group(train_plan), ready_group(eval_plan)
 

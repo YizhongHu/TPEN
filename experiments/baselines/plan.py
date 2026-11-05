@@ -99,7 +99,18 @@ def build_plan(
 
 
 def executor_input(plan: StagePlanV2) -> dict[str, object]:
-    """Emit the executor input mapping for a built plan."""
+    """Emit the executor input mapping for a built plan.
+
+    Parameters
+    ----------
+    plan : StagePlanV2
+        Validated baseline plan to describe.
+
+    Returns
+    -------
+    dict
+        Plain executor ``ReadyGroup`` wire mapping.
+    """
 
     return ready_group(plan)
 
