@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from experiments.toolkit.dispatch import AllocationContext, DispatchSpec, StagePlanV2, write_dispatch_records
-from experiments.toolkit.executor_inputs import ready_group, write_ready_group
+from experiments.toolkit.executor_inputs import ready_group, write_additive_ready_group
 from experiments.toolkit.parsl_attach import ParslAttachExecutor
 
 # Siblings are loaded study-scoped, not by bare import: experiments/ has several
@@ -96,8 +96,8 @@ def run_pipeline(*, train_plan: StagePlanV2, eval_plan: StagePlanV2, facility: s
 
     launch = Path(launch_dir)
     launch.mkdir(parents=True, exist_ok=True)
-    write_ready_group(launch / "02_train" / "executor_input.json", train_plan)
-    write_ready_group(launch / "03_eval" / "executor_input.json", eval_plan)
+    write_additive_ready_group(launch / "02_train" / "executor_input.json", train_plan)
+    write_additive_ready_group(launch / "03_eval" / "executor_input.json", eval_plan)
     context = allocation_context(facility=facility, run_root=launch, environ=environ)
     executor = executor or ParslAttachExecutor()
     records = []

@@ -11,7 +11,7 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 from experiments.toolkit.dispatch import LogicalTaskSpec, StagePlanV2, logical_task_id_from_parts
-from experiments.toolkit.executor_inputs import ready_group, write_ready_group
+from experiments.toolkit.executor_inputs import ready_group, write_additive_ready_group
 from experiments.toolkit.resources import ResourceSpec
 from experiments.toolkit.specs import CompletionSpec
 
@@ -205,8 +205,8 @@ def write_plans(output_dir: str | Path, train_plan: StagePlanV2, eval_plan: Stag
     output = Path(output_dir)
     train_plan.write(output / "02_train")
     eval_plan.write(output / "03_eval")
-    write_ready_group(output / "02_train" / "executor_input.json", train_plan)
-    write_ready_group(output / "03_eval" / "executor_input.json", eval_plan)
+    write_additive_ready_group(output / "02_train" / "executor_input.json", train_plan)
+    write_additive_ready_group(output / "03_eval" / "executor_input.json", eval_plan)
     output.mkdir(parents=True, exist_ok=True)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     with (output / "rows.csv").open("w", encoding="utf-8", newline="") as handle:

@@ -20,7 +20,146 @@ from typing import Any
 PROGRAM_SCHEMA = "tpen-executor/program-spec-ref-v1"
 TASK_SCHEMA = "tpen-executor/task-spec-v1"
 GROUP_SCHEMA = "tpen-executor/ready-group-v1"
+DIAGNOSTICS_SCHEMA = "tpen-experiments/executor-input-diagnostics-v1"
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_PATH_FIELDS = frozenset(
+    {
+        "config",
+        "config_file",
+        "config_path",
+        "checkpoint",
+        "checkpoint_dir",
+        "checkpoint_path",
+        "inputs",
+        "log",
+        "log_path",
+        "logs",
+        "output",
+        "output_dir",
+        "outputs",
+        "output_paths",
+        "path",
+        "paths",
+        "result_dir",
+        "results_dir",
+        "results_root",
+        "run.root",
+        "script",
+        "script_path",
+        "status_path",
+    }
+)
+_REPO_RELATIVE_PATH_FIELDS = frozenset(
+    {"config", "config_file", "config_path", "script", "script_path"}
+)
+
+
+class UnrepresentableInput(ValueError):
+    """A producer value that cannot be carried by an executor wire record.
+
+    The additive producer route catches only this exception, writes a
+    toolkit-owned diagnostic record, and leaves the legacy dispatch route
+    untouched.  Other exceptions are programming or validation errors and
+    continue to propagate.
+    """
+
+    def __init__(
+        self,
+        field: str,
+        value: Any,
+        reason: str,
+        *,
+        diagnostics: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self.field = field
+        self.value_repr = repr(value)
+        self.reason = reason
+        self.diagnostics = diagnostics
+        super().__init__(f"{field}: {reason}; value={self.value_repr}")
+
+    def detail(self, *, task_id: str | None = None) -> dict[str, Any]:
+        """Return the stable diagnostic shape for this refusal."""
+
+        detail = {
+            "field": self.field,
+            "value": self.value_repr,
+            "reason": self.reason,
+        }
+        if task_id is not None:
+            detail["task_id"] = task_id
+        return detail
+
+
+def _path_projection(value: Any, field: str, path_roots: tuple[Path, ...]) -> Any:
+    """Tag one declared path/reference with its owning root namespace."""
+
+    if isinstance(value, Path):
+        text = value.as_posix()
+    elif type(value) is str:
+        text = value
+    elif isinstance(value, Mapping):
+        return _project_declared_paths(value, path_roots)
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
+        return [_path_projection(item, field, path_roots) for item in value]
+    else:
+        return value
+
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        root = "repo" if field in _REPO_RELATIVE_PATH_FIELDS else "results"
+        return {"root": root, "path": candidate.as_posix()}
+    for root in path_roots:
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError:
+            continue
+        return {"root": "results", "path": relative.as_posix() or "."}
+    try:
+        relative = candidate.relative_to(_REPO_ROOT)
+    except ValueError:
+        return {"root": "external", "path": candidate.as_posix()}
+    return {"root": "repo", "path": relative.as_posix() or "."}
+
+
+def _command_projection(value: Any, path_roots: tuple[Path, ...]) -> Any:
+    """Project absolute script tokens in an argv field for plan digests."""
+
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return value
+    projected = []
+    for token in value:
+        if type(token) is str and token.startswith("/") and Path(token).suffix == ".py":
+            try:
+                Path(token).relative_to(_REPO_ROOT)
+            except ValueError:
+                projected.append(token)
+            else:
+                projected.append(_path_projection(token, "script", path_roots))
+            continue
+        projected.append(token)
+    return projected
+
+
+def _project_declared_paths(value: Any, path_roots: tuple[Path, ...] = ()) -> Any:
+    """Project only declared path/reference fields before canonical encoding."""
+
+    value = _omega_container(value)
+    if isinstance(value, Mapping):
+        if type(value) is not dict:
+            return value
+        return {
+            key: _command_projection(item, path_roots)
+            if key == "command"
+            else _path_projection(item, key, path_roots)
+            if key in _PATH_FIELDS
+            else _project_declared_paths(item, path_roots)
+            for key, item in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        if type(value) not in (list, tuple):
+            return value
+        return [_project_declared_paths(item, path_roots) for item in value]
+    return value
 
 
 def _omega_container(value: Any) -> Any:
@@ -35,22 +174,6 @@ def _omega_container(value: Any) -> Any:
     return value
 
 
-def _portable_text(value: str, path_roots: tuple[Path, ...]) -> str:
-    """Return a location-independent POSIX representation of an absolute path."""
-
-    if not value.startswith("/"):
-        return value
-    candidate = Path(value)
-    for root in (*path_roots, _REPO_ROOT):
-        try:
-            return candidate.resolve().relative_to(root.resolve()).as_posix() or "."
-        except ValueError:
-            continue
-    # An external absolute path is still not allowed into a digest.  The
-    # marker keeps its spelling visible without making it an absolute path.
-    return f"<absolute>/{candidate.as_posix().lstrip('/')}"
-
-
 def _json_safe(
     value: Any,
     path: str = "value",
@@ -62,8 +185,8 @@ def _json_safe(
     value = _omega_container(value)
     if value is None or isinstance(value, (str, int, float, bool)):
         if isinstance(value, float) and not math.isfinite(value):
-            raise ValueError(f"{path} contains a non-finite number")
-        return _portable_text(value, path_roots) if isinstance(value, str) else value
+            raise UnrepresentableInput(path, value, "wire JSON cannot carry a non-finite number")
+        return value
     if isinstance(value, Mapping):
         if type(value) is not dict:
             raise TypeError(f"{path} must be a plain mapping or OmegaConf container")
@@ -77,7 +200,7 @@ def _json_safe(
         if type(value) not in (list, tuple):
             raise TypeError(f"{path} must be a plain sequence or OmegaConf container")
         return [_json_safe(item, f"{path}[]", path_roots=path_roots) for item in value]
-    raise TypeError(f"{path} is not JSON-shaped")
+    raise UnrepresentableInput(path, value, "wire JSON cannot carry this value")
 
 
 def canonical_bytes(value: Any, *, path_roots: tuple[str | Path, ...] = ()) -> bytes:
@@ -88,13 +211,16 @@ def canonical_bytes(value: Any, *, path_roots: tuple[str | Path, ...] = ()) -> b
     value : object
         JSON-shaped mapping or sequence to encode.
     path_roots : sequence of str or pathlib.Path, optional
-        Absolute roots whose paths are emitted relative to the root.  The
-        repository root is always included; this keeps digests portable across
-        checkouts while preserving result paths relative to a plan root.
+        Compatibility argument retained for callers of the r2 API.  It does
+        not alter canonical encoding; declared path/reference fields must be
+        projected explicitly before calling this function.
     """
 
+    # ``path_roots`` remains accepted for callers that used the r2 API, but
+    # canonical encoding itself never rewrites values.  Projection is an
+    # explicit producer-boundary operation performed before this function.
     return json.dumps(
-        _json_safe(value, path_roots=tuple(Path(root) for root in path_roots)),
+        _json_safe(value),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -146,12 +272,20 @@ def program_spec_ref(
     -------
     dict
         Plain executor ``ProgramSpecRef`` wire mapping.
+
+    Raises
+    ------
+    UnrepresentableInput
+        If a config value cannot be carried by the JSON wire schema.  Decimal
+        integer strings are not coerced here; the coercion rule applies to
+        declared integer horizon fields in :func:`task_spec`.
     """
 
     if not isinstance(config_ref, Mapping):
         raise TypeError("config_ref must be a mapping")
     roots = tuple(Path(root) for root in path_roots)
-    payload = _json_safe(config_ref, "config_ref", path_roots=roots)
+    payload = _project_declared_paths(config_ref, roots)
+    payload = _json_safe(payload, "config_ref")
     return {
         "schema": PROGRAM_SCHEMA,
         "config_ref": payload,
@@ -222,14 +356,10 @@ def _target(task: Any) -> tuple[int, str, dict[str, Any] | None]:
                 return value, units, None
             if isinstance(value, str) and re.fullmatch(r"\+?\d+", value.strip()):
                 return int(value.strip()), units, None
-            return (
-                0,
-                "unrepresentable",
-                {
-                    "field": key,
-                    "value": repr(value),
-                    "reason": "wire target_horizon requires a nonnegative integer",
-                },
+            raise UnrepresentableInput(
+                key,
+                value,
+                "wire target_horizon requires a nonnegative integer",
             )
     # A generic baseline pipeline may receive an intentionally minimal test or
     # adapter task with no declared scientific horizon.  Preserve the task
@@ -264,19 +394,26 @@ def task_spec(
     -------
     dict
         Plain executor ``TaskSpec`` wire mapping.
+
+    Notes
+    -----
+    Decimal integer strings such as ``"100"`` are normalized to integer
+    horizons.  Values that are not representable by the wire schema raise
+    :class:`UnrepresentableInput`; the additive producer boundary records that
+    refusal separately and does not block legacy dispatch.
     """
 
     task_id = _text(task.logical_task_id, "task_id")
     lineage_id = _text(task.run_id, "lineage_id")
     horizon, units, _ = _target(task)
+    params = _project_declared_paths(dict(task.params), tuple(Path(root) for root in path_roots))
     return {
         "schema": TASK_SCHEMA,
         "task_id": task_id,
         "lineage_id": lineage_id,
         "program": program_spec_ref(_task_config(task), path_roots=path_roots),
         "science_digest": payload_digest(
-            {"stage": task.stage, "run_id": task.run_id, "params": dict(task.params)},
-            path_roots=path_roots,
+            {"stage": task.stage, "run_id": task.run_id, "params": params},
         ),
         "target_horizon": horizon,
         "target_horizon_units": units,
@@ -297,23 +434,40 @@ def ready_group(plan: Any, *, group_id: str | None = None) -> dict[str, Any]:
     Returns
     -------
     dict
-        Plain executor ``ReadyGroup`` wire mapping.  If a horizon cannot be
-        represented by the wire schema, an ``unrepresentable`` entry records
-        the task, value, and reason without blocking legacy dispatch.
+        Plain executor ``ReadyGroup`` wire mapping.  Every member must be
+        decoder-valid; a group containing any unrepresentable member raises
+        :class:`UnrepresentableInput` so no partial group can be emitted.
+
+    Raises
+    ------
+    UnrepresentableInput
+        If any member or plan field cannot be represented.  The additive
+        producer boundary writes ``executor_input_diagnostics.json`` and keeps
+        the legacy dispatch route running.
     """
 
     tasks = _sequence(plan.tasks, "tasks")
     if not tasks:
         raise ValueError("tasks must be a non-empty sequence")
     path_roots = (Path(plan.results_root),)
-    encoded = [task_spec(task, path_roots=path_roots) for task in tasks]
+    encoded = []
+    diagnostics = []
+    for task in tasks:
+        try:
+            encoded.append(task_spec(task, path_roots=path_roots))
+        except UnrepresentableInput as exc:
+            diagnostics.extend(
+                exc.diagnostics
+                or [exc.detail(task_id=str(task.logical_task_id))]
+            )
+    if diagnostics:
+        raise UnrepresentableInput(
+            "group",
+            diagnostics,
+            "at least one group member is not representable",
+            diagnostics=diagnostics,
+        )
     members = encoded
-    unrepresentable = [
-        {"task_id": task.logical_task_id, **detail}
-        for task in tasks
-        for _, _, detail in [_target(task)]
-        if detail is not None
-    ]
     resolved_group_id = group_id or f"{plan.study}:{plan.stage}:{plan.plan_id}"
     _text(resolved_group_id, "group_id")
     group = {
@@ -321,16 +475,31 @@ def ready_group(plan: Any, *, group_id: str | None = None) -> dict[str, Any]:
         "group_id": resolved_group_id,
         "members": members,
         "execution_plan_digest": payload_digest(
-            _plan_payload(plan), path_roots=path_roots
+            _project_declared_paths(_plan_payload(plan), path_roots)
         ),
     }
-    if unrepresentable:
-        group["unrepresentable"] = unrepresentable
     return group
 
 
+def _diagnostic_payload(
+    plan: Any, exc: UnrepresentableInput, *, group_id: str | None = None
+) -> dict[str, Any]:
+    """Build the separate, non-executor diagnostic envelope."""
+
+    resolved_group_id = group_id or f"{plan.study}:{plan.stage}:{plan.plan_id}"
+    details = exc.diagnostics or [exc.detail()]
+    normalized = []
+    for detail in details:
+        normalized.append({"group_id": resolved_group_id, **detail})
+    return {
+        "schema": DIAGNOSTICS_SCHEMA,
+        "group_id": resolved_group_id,
+        "unrepresentable": normalized,
+    }
+
+
 def write_ready_group(path: str | Path, plan: Any, *, group_id: str | None = None) -> Path:
-    """Write one ready-group mapping as canonical bytes and return its path.
+    """Write canonical group bytes, or a diagnostic envelope on refusal.
 
     Parameters
     ----------
@@ -345,22 +514,82 @@ def write_ready_group(path: str | Path, plan: Any, *, group_id: str | None = Non
     -------
     pathlib.Path
         The destination path.
+
+    Notes
+    -----
+    Producer pipelines should use :func:`write_additive_ready_group` so a
+    refusal is written to the sibling ``executor_input_diagnostics.json`` and
+    the requested ``executor_input.json`` remains decoder-valid-only.
     """
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(canonical_bytes(ready_group(plan, group_id=group_id)))
+    try:
+        payload = ready_group(plan, group_id=group_id)
+    except UnrepresentableInput as exc:
+        # This low-level helper is retained for callers that explicitly name a
+        # diagnostic artifact.  Producer pipelines use the additive helper
+        # below so executor_input.json is never a diagnostic envelope.
+        payload = _diagnostic_payload(plan, exc, group_id=group_id)
+    target.write_bytes(canonical_bytes(payload))
+    return target
+
+
+def write_additive_ready_group(
+    path: str | Path, plan: Any, *, group_id: str | None = None
+) -> Path | None:
+    """Write a valid group or a sibling diagnostic without blocking dispatch.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Destination for the decoder-valid ``executor_input.json`` document.
+    plan : object
+        Stage-plan object accepted by :func:`ready_group`.
+    group_id : str, optional
+        Optional stable group identity override.
+
+    Returns
+    -------
+    pathlib.Path or None
+        The executor-input path on success, or ``None`` when a diagnostic was
+        recorded because a group member was unrepresentable.
+
+    Raises
+    ------
+    UnrepresentableInput
+        Never escapes this additive boundary; it is recorded in the sibling
+        ``executor_input_diagnostics.json`` file.
+    Exception
+        Any exception other than :class:`UnrepresentableInput` propagates.
+    """
+
+    target = Path(path)
+    try:
+        payload = ready_group(plan, group_id=group_id)
+    except UnrepresentableInput as exc:
+        diagnostic = target.with_name("executor_input_diagnostics.json")
+        diagnostic.parent.mkdir(parents=True, exist_ok=True)
+        diagnostic.write_bytes(
+            canonical_bytes(_diagnostic_payload(plan, exc, group_id=group_id))
+        )
+        return None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(canonical_bytes(payload))
     return target
 
 
 __all__ = [
     "GROUP_SCHEMA",
+    "DIAGNOSTICS_SCHEMA",
     "PROGRAM_SCHEMA",
     "TASK_SCHEMA",
+    "UnrepresentableInput",
     "canonical_bytes",
     "payload_digest",
     "program_spec_ref",
     "ready_group",
     "task_spec",
+    "write_additive_ready_group",
     "write_ready_group",
 ]
