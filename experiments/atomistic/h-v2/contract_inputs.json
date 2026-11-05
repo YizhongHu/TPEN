@@ -1,0 +1,61 @@
+{
+  "schema": "tpen.h-v2.scientific-contract/v1",
+  "study": {
+    "name": "H-v2",
+    "system": "atomic hydrogen",
+    "electron_count": 1,
+    "nuclear_charge": 1,
+    "exact_ground_energy_hartree": -0.5,
+    "excluded_systems": ["molecular hydrogen", "Hooke's atom"]
+  },
+  "source_identity": {
+    "comparison_commit": "67beab2095cc987eb044abceeecfdb549a5793fb",
+    "comparison_paths": [
+      "experiments/atomistic/he-v1/README.md",
+      "experiments/atomistic/he-v1/configs/production_grid.yaml",
+      "experiments/atomistic/he-v1/collect.py",
+      "experiments/atomistic/he-v1/report.py"
+    ],
+    "preserved_evidence": [
+      {"path": "/Users/yizhonghu/TPEN/HANDOFF-he-v1-2026-08-31.md", "commit": "untracked-read-only"},
+      {"path": "/Users/yizhonghu/TPEN/HE-V1-SESSION-SYNTHESIS-2026-08-28.md", "commit": "untracked-read-only"}
+    ]
+  },
+  "measurement": {
+    "estimand": "MAD of local energy over complete draw-by-walker records from a fresh evaluation of a frozen checkpoint",
+    "primary_dispersion": "median_absolute_deviation",
+    "secondary_dispersion": ["median", "IQR"],
+    "complete_record_rule": "every planned draw-by-walker record exactly once; finite coordinates and local energy; source, checkpoint, config, and schema identities reconcile; no clipping or replacement",
+    "checkpoint_window": "fresh evaluation stream for each frozen checkpoint with declared burn-in, stride, walkers, draws, and evaluation seed",
+    "seed_identity_rule": "training and evaluation seeds use separate namespaces and must be distinct",
+    "tail_rule": {
+      "diagnostic": "Hill estimator on upper tail of absolute median-centered local energy",
+      "status": "pending_operator_decision",
+      "proposal": {"variance_boundary_alpha": 2.0, "tail_fraction": 0.01, "minimum_order_statistics": 1024, "stability_interval": "operator-selected uncertainty interval wholly below alpha=2"},
+      "when_present": "use MAD, IQR, and quantiles as primary dispersion; variance and conventional MCSE descriptive only"
+    }
+  },
+  "decision_rules": {
+    "categories": ["recurrence", "bounded_null", "unresolved"],
+    "recurrence": "complete declared horizon/checkpoints; accepted tail handling; declared independent-lineage count shows early-to-middle decrease and middle-to-late increase in MAD beyond operator-approved margins, sustained at required late checkpoints",
+    "bounded_null": "complete declared horizon/checkpoints; no lineage meets recurrence; every lineage remains within operator-approved bound relative to helium reference behavior",
+    "unresolved": "any required identity, record, tail decision, checkpoint, threshold, or operator decision is absent, or evidence falls between the other rules"
+  },
+  "operator_decisions": {
+    "helium_reference_behavior_to_match": {"status": "absent", "proposal": "match only the He-v1 common-estimand tail-safe dispersion behavior after operator selects the exact reference window and margin"},
+    "update_horizon_and_checkpoints": {"status": "absent", "proposal": "50_000 updates with operator-selected early, middle, and late checkpoints"},
+    "lineage_count": {"status": "absent", "proposal": 3},
+    "walker_and_fresh_evaluation_budget": {"status": "absent", "proposal": {"walkers": 4096, "fresh_evaluations_per_checkpoint": 4}},
+    "acceptable_tail_diagnostic": {"status": "absent", "proposal": "Hill diagnostic with operator-selected tail fraction, stability interval, and order-statistic minimum"},
+    "science_facility_and_resource_ceiling": {"status": "absent", "proposal": {"facility": "FASRC Cannon", "ceiling": "operator-selected allocation and wall-time ceiling"}}
+  },
+  "admission": {"allowed_only_if_all_operator_decisions_status": "decided", "current_status": "prohibited"},
+  "controls": [
+    "exact hydrogen energy -1/2 Ha",
+    "independently coded scalar local-energy oracle",
+    "known-imperfect-state rejection",
+    "sampler target and mutation rejection",
+    "strict no-regularization rule at zero radius",
+    "source and resolved-input identity checks"
+  ]
+}
