@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from parsl.dataflow.dflow import DataFlowKernel
 from tpen_executor.dispatch.parsl import ParslDispatcher, UnsupportedParslExecutorError
 from tpen_executor.dispatch.contract import DispatcherContract
 from tpen_executor.environments import PreparedPythonEnvironment, SourceScript
@@ -26,7 +27,7 @@ def _real_dfk(dispatcher, tmp_path):
     config = dispatcher._config_type(executors=[dispatcher._thread_pool_type(max_threads=1)],
         run_dir=str(tmp_path / "parsl"), usage_tracking=False)
     dfk = dispatcher._dfk_type(config=config)
-    assert isinstance(dfk, dispatcher._dfk_class)
+    assert isinstance(dfk, DataFlowKernel)
     object.__setattr__(dispatcher, "_active_dfk", dfk)
     return dfk
 
@@ -176,7 +177,8 @@ def test_r2_t3_real_owner_cancellation_quiesces_app_before_finish(tmp_path, monk
         if timer.ident is not None:
             timer.join()
     print(json.dumps({"phase": phase, "error": error_type.__name__, "finishes": finishes, "spawned_after_terminal": spawned_after_terminal, "child_pids": [p.pid for p in processes], "child_returncodes": [p.returncode for p in processes]}))
-    assert fired and len(futures) == len(processes) == 1
+    expected_processes = 0 if phase == "before_spawn" else 1
+    assert fired and len(futures) == 1 and len(processes) == expected_processes
     assert all(process.poll() is not None for process in processes), "test-owned leader was not reaped"
     assert len(finishes) == 1 and finishes[0][:2] == ("a", "failed")
     assert finishes[0][2], "attempt finished while its real app was still active"
