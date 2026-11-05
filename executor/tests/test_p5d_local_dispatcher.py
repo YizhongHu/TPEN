@@ -7,6 +7,7 @@ the executor itself never imports the science package.
 
 from __future__ import annotations
 
+import io
 import os
 from pathlib import Path
 import sys
@@ -100,7 +101,7 @@ def _make_stub_package(tmp_path: Path) -> Path:
                 overrides = dict(item.split("=", 1) for item in argv if "=" in item)
                 run_dir = Path(overrides["run.root"]) / overrides["run.run_id"]
                 if mode == "sleep":
-                    time.sleep(2)
+                    time.sleep(4)
                 if mode == "fail":
                     return 3
                 run_dir.mkdir(parents=True, exist_ok=True)
@@ -145,7 +146,7 @@ def test_p5d_three_members_publish_independent_statuses_and_evidence(tmp_path: P
     group = _group("ok", "bad", "late")
     store = DirectoryStore(tmp_path / "store")
     dispatcher = LocalDispatcher(_worker_spec(PreparedPythonEnvironment(sys.executable, env={"PYTHONPATH": str(package)})))
-    manifest = dispatcher.run(group, configs, AttachedAllocation(_allocation(), store), timeout=0.1)
+    manifest = dispatcher.run(group, configs, AttachedAllocation(_allocation(), store), timeout=2)
     attempts = {item.task_id: item for item in manifest.attempts}
     assert attempts["ok"].outcome_receipt.status == "completed"  # type: ignore[union-attr]
     assert attempts["bad"].outcome_receipt.status == "failed"  # type: ignore[union-attr]
@@ -169,7 +170,7 @@ def test_p5d_admission_rejects_each_mapping_mutation_before_store_write(tmp_path
         runs = "not-a-mapping"
     dispatcher = LocalDispatcher(SimpleNamespace(materialize=lambda env: {}))
     store = DirectoryStore(tmp_path / "store")
-    with pytest.raises((TypeError, ValueError)):
+    with pytest.raises(ValueError):
         dispatcher.run(group, runs, AttachedAllocation(_allocation(), store))  # type: ignore[arg-type]
     assert not (tmp_path / "store").exists()
 
@@ -211,12 +212,14 @@ def test_p5d_unexpected_member_exception_finishes_and_continues(tmp_path: Path) 
         def run(self, environment, args, **kwargs):
             return ProcessOutcome(tuple(args), 0, kwargs["stdout_path"], kwargs["stderr_path"], False)
 
+    state = {"calls": 0}
     class Evidence:
-        calls = 0
+        def __init__(self, shared_state):
+            self.shared_state = shared_state
 
         def read(self, *args, **kwargs):
-            self.calls += 1
-            if self.calls == 1:
+            self.shared_state["calls"] += 1
+            if self.shared_state["calls"] == 1:
                 raise RuntimeError("injected evidence failure")
             return _evidence(args[2])
 
@@ -225,7 +228,7 @@ def test_p5d_unexpected_member_exception_finishes_and_continues(tmp_path: Path) 
             finished.append(fence.task_id)
             return super().finish(fence, status, finished_at_utc, result_digest)
 
-    worker = SimpleNamespace(materialize=lambda env: {"environment": object(), "process": Process(), "runner": object(), "evidence": Evidence()})
+    worker = SimpleNamespace(materialize=lambda env: {"environment": object(), "process": Process(), "runner": object(), "evidence": Evidence(state)})
     group = _group("a", "b")
     store = DirectoryStore(tmp_path / "store")
     LocalDispatcher(worker).run(group, _runs(tmp_path, "a", "b"), Lifecycle(_allocation(), store))
@@ -312,7 +315,7 @@ def test_p5d_runtime_write_trap_confines_parent_writes(tmp_path: Path, monkeypat
 
     store_lexical = os.path.abspath(os.path.normpath(os.fspath(store_root)))
     package_lexical = os.path.abspath(os.path.normpath(os.fspath(package)))
-    before_entries = set(tmp_path.iterdir())
+    before_paths = set(tmp_path.rglob("*"))
     writes: list[tuple[str, str]] = []
     in_trap = False
 
@@ -328,6 +331,7 @@ def test_p5d_runtime_write_trap_confines_parent_writes(tmp_path: Path, monkeypat
             in_trap = False
 
     original_open = os.open
+    original_io_open = io.open
     original_mkstemp = tempfile.mkstemp
 
     def trapped_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
@@ -335,6 +339,11 @@ def test_p5d_runtime_write_trap_confines_parent_writes(tmp_path: Path, monkeypat
         if flags & write_flags:
             record("open", path)
         return original_open(path, flags, *args, **kwargs)
+
+    def trapped_io_open(path: object, mode: str = "r", *args: object, **kwargs: object):
+        if isinstance(mode, str) and any(char in mode for char in "wax+") and not isinstance(path, int):
+            record("io.open", path)
+        return original_io_open(path, mode, *args, **kwargs)
 
     def trapped_single(kind: str, original):
         def wrapper(path: object, *args: object, **kwargs: object):
@@ -358,20 +367,23 @@ def test_p5d_runtime_write_trap_confines_parent_writes(tmp_path: Path, monkeypat
 
     with monkeypatch.context() as patch:
         patch.setattr(os, "open", trapped_open)
+        patch.setattr(io, "open", trapped_io_open)
         for name in ("mkdir", "makedirs", "unlink"):
             patch.setattr(os, name, trapped_single(name, getattr(os, name)))
         for name in ("replace", "link"):
             patch.setattr(os, name, trapped_pair(name, getattr(os, name)))
         patch.setattr(tempfile, "mkstemp", trapped_mkstemp)
         dispatcher = LocalDispatcher(_worker_spec(PreparedPythonEnvironment(sys.executable, env={"PYTHONPATH": str(package)})))
-        dispatcher.run(_group("a", "b"), configs, AttachedAllocation(_allocation(), DirectoryStore(store_root)), timeout=1)
+        manifest = dispatcher.run(_group("a", "b"), configs, AttachedAllocation(_allocation(), DirectoryStore(store_root)), timeout=2)
 
     allowed = (store_lexical, package_lexical)
     assert writes
     assert all(any(path == root or path.startswith(root + os.sep) for root in allowed) for _, path in writes)
+    assert [item.outcome_receipt.status for item in manifest.attempts] == ["completed", "completed"]
+    assert all(item.outcome_receipt.result_digest is not None for item in manifest.attempts)
 
-    # Child-process writes are not traced in-process; the post-run census closes that gap.
-    new_entries = set(tmp_path.iterdir()) - before_entries
+    # Child-process writes are not traced in-process; the recursive post-run census closes that gap.
+    new_entries = set(tmp_path.rglob("*")) - before_paths
     assert all(
         any(
             os.path.abspath(os.path.normpath(os.fspath(path))) == root
