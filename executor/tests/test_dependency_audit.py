@@ -8,6 +8,23 @@ import sys
 SOURCE_ROOT = Path(__file__).parents[1] / "src" / "tpen_executor"
 FORBIDDEN_ROOTS = {"tpen", "experiments", "torch", "parsl", "balsam"}
 CONFIGURATION_ROOTS = {"hydra", "omegaconf"}
+OPTIONAL_IMPORT_PATH = Path("dispatch/parsl.py")
+
+
+def _constructor_lines(tree: ast.AST) -> set[int]:
+    """Return source lines inside ``ParslDispatcher.__post_init__``."""
+
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__post_init__":
+            lines.update(child.lineno for child in ast.walk(node) if hasattr(child, "lineno"))
+    return lines
+
+
+def _allowed_parsl_import(path: Path, node: ast.AST, constructor_lines: set[int]) -> bool:
+    """Allow only constructor-local Parsl imports in the optional adapter."""
+
+    return path == OPTIONAL_IMPORT_PATH and getattr(node, "lineno", -1) in constructor_lines
 
 
 def _import_roots(node: ast.Import | ast.ImportFrom) -> list[str]:
@@ -42,12 +59,15 @@ def test_source_imports_only_stdlib_or_executor() -> None:
     violations: list[str] = []
     for path in sorted(SOURCE_ROOT.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        constructor_lines = _constructor_lines(tree)
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 if isinstance(node, ast.ImportFrom) and node.level > 0:
                     continue
                 for root in _import_roots(node):
                     relative = path.relative_to(SOURCE_ROOT)
+                    if root == "parsl" and _allowed_parsl_import(relative, node, constructor_lines):
+                        continue
                     if root in FORBIDDEN_ROOTS or (root in CONFIGURATION_ROOTS and relative not in {Path("configuration.py"), Path("programs.py")}):
                         violations.append(f"{path}: {root}")
                     elif root not in {"tpen_executor", *CONFIGURATION_ROOTS} and root not in sys.stdlib_module_names:
@@ -65,11 +85,14 @@ def test_source_has_no_dynamic_forbidden_imports() -> None:
     violations: list[str] = []
     for path in sorted(SOURCE_ROOT.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        constructor_lines = _constructor_lines(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             root = _dynamic_import_root(node)
             relative = path.relative_to(SOURCE_ROOT)
+            if root == "parsl" and _allowed_parsl_import(relative, node, constructor_lines):
+                continue
             if root in FORBIDDEN_ROOTS or (root in CONFIGURATION_ROOTS and relative not in {Path("configuration.py"), Path("programs.py")}):
                 violations.append(f"{path}:{node.lineno}: {root}")
             elif root is not None and root not in {"tpen_executor", *CONFIGURATION_ROOTS} and root not in sys.stdlib_module_names:

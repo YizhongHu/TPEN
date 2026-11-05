@@ -42,6 +42,10 @@ program:
       _target_: tpen_executor.environments.SourceScript
       path: ${paths.control_setup}
   dispatcher:
+    # LocalDispatcher is the default attached backend. To select Parsl in an
+    # environment installed with the optional `parsl` extra, replace the target
+    # below with `tpen_executor.dispatch.ParslDispatcher`; its worker binding is
+    # resolved from allocation.facts before the first attempt fence.
     _target_: tpen_executor.dispatch.LocalDispatcher
     _recursive_: false
     worker:
