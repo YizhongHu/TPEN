@@ -1,136 +1,93 @@
 # H-v2 atomic-hydrogen scientific contract
 
-H-v2 is a study of **atomic hydrogen**: one electron, nuclear charge `Z = 1`,
-and the exact nonrelativistic infinite-nuclear-mass ground-state energy
-`E_0 = -0.5 Ha`. It is **not molecular hydrogen (H2)** and **not Hooke's
-atom**. The hydrogen reference is an instrument control, not a replacement for
-the energy of a trained state.
+H-v2 studies **atomic hydrogen**, with one electron, nuclear charge `Z = 1`,
+and exact nonrelativistic infinite-nuclear-mass ground-state energy `-0.5 Ha`.
+It is not molecular hydrogen (`H2`) or Hooke's atom. The exact state is an
+instrument control, not a substitute for a trained-state result.
 
-This directory contains the contract and its machine-readable admission inputs.
-It contains no launcher, training code, or science result. The next slice owns
-the executable controls named here.
+This directory is a documentation and admission slice. It contains no
+launcher, training code, science output, or qualification result.
 
-## Comparison with He-v1
+## Evidence boundary
 
-The comparison source records are all at `origin/dev` commit
-`67beab2095cc987eb044abceeecfdb549a5793fb`:
+The comparison source is pinned to `origin/dev` commit
+`67beab2095cc987eb044abceeecfdb549a5793fb`: the He-v1 README, production
+grid, collector, and report. Historical run identity and corrections are
+listed in `contract_inputs.json`. The current `production_grid.yaml` at that
+commit names a 100k/200k/300k plan; it is not the executed historical
+25k/50k plan.
 
-| record | purpose |
-| --- | --- |
-| `experiments/atomistic/he-v1/README.md` | study scope, existing record and evaluation conventions |
-| `experiments/atomistic/he-v1/configs/production_grid.yaml` | declared checkpoint/evaluation design and complete-record requirements |
-| `experiments/atomistic/he-v1/collect.py` | source, checkpoint, trajectory-record, and identity reconciliation |
-| `experiments/atomistic/he-v1/report.py` | report/receipt rendering and aggregate interpretation |
+The historical helium basin is a **5k-block median of within-batch variance
+on a changing training model**, approximately `0.00173 Ha^2`. It is training
+history, not a frozen-checkpoint population estimate. The reported `s10=26570`
+and `s90=44982` values are definition-dependent summaries; the definition is
+only in the unopened Netscratch report, so neither value is the point where a
+basin was first left. The retained fresh evaluations show a finite-range
+25k-to-50k tail contrast, but do not establish a population moment class or a
+common-estimand decrease-then-increase trajectory.
 
-The preserved evidence records were also read, but are not repository source
-at that commit: `/Users/yizhonghu/TPEN/HANDOFF-he-v1-2026-08-31.md` and
-`/Users/yizhonghu/TPEN/HE-V1-SESSION-SYNTHESIS-2026-08-28.md` are untracked,
-read-only handoffs. They identify the corrected collection
-`f4-collect-20260828T0100--0400`, the `train-seed0000` lineage, and the
-`tpen-f4-eval42-78152c40-20260826T194602--0400` run. Those paths are evidence
-provenance, not live inputs for H-v2.
+## Lane proposals pending operator review
 
-What He-v1 establishes is narrower than the motivating shorthand. The handoff
-reports 25,000-update Hill tail estimates of `2.469--6.045` and 50,000-update
-estimates of `0.465--1.063`; later tail-curvature work correctly demotes both
-to finite-range diagnostics rather than population moment theorems. The
-corrected synthesis reports a 25k-to-50k endpoint dispersion contrast and an
-unresolved mean shift. A separate retained training-history analysis shows a
-broad variance minimum around 9,000--15,000 updates and gradual onset in
-training history (`s10=26570`, `s90=44982`), but those checkpoints were not
-retained and freshly evaluated. Thus He-v1 does **not** establish a full
-decrease-then-increase trajectory on one common fresh-evaluation estimand.
-H-v2 must test recurrence; it must not treat the helium endpoint contrast or
-training-history variance as a threshold or as proof of a fresh-evaluation
-trajectory.
+The seven entries in `contract_inputs.json` are deliberately lane proposals,
+not operator decisions. Each has a rationale and alternatives. The live
+contention is visible: percentile `W` versus event probability as the primary
+axis; fixed versus trainable nuclear curvature; three versus five lineages;
+the factor-two/`0.01 Ha` and `0.002` effect margins; and Cannon single-card
+science versus efficiently packed Polaris science.
 
-## Estimand and records
+The proposed science design is 50,000 completed updates, retaining update zero
+and every 1,000 updates (51 retained checkpoints) while fresh-evaluating a
+separate 27-checkpoint set. It proposes three independent lineages with
+initialization seeds `73001..73003` and sampler seeds `83001..83003`, four
+fresh streams per evaluated checkpoint, 4,096 walkers, 256 draws, burn-in
+1,000, and stride 20. Evaluation seeds use the formula recorded in the JSON;
+pilot seeds are `999001` and `999002` and are excluded from science.
 
-For each checkpoint and each fresh evaluation stream, the primary estimand is
-a tail-sensitive dispersion profile of the local-energy random variable
-`E_L = H Psi / Psi` under the checkpoint's learned `|Psi|^2` distribution. It
-contains predeclared high quantiles, exceedance probabilities above fixed
-thresholds, and the local tail-curvature diagnostic. This profile is the
-scientific estimand because a robust center statistic can be blind to a rare
-event-weight defect. The retained finite-sample MAD,
+The proposed primary statistic is
 
-`D = median(|E_L - median(E_L)|)`,
+`W = P99.9(abs(E_L - median(E_L)))`.
 
-computed over **all** complete draw-by-walker records is secondary, useful for
-ranking but not sufficient to accept a bounded null or reject a tail defect.
-Report the median and IQR alongside MAD for auditability. The ordinary sample
-variance and conventional MCSE are descriptive only and must not be promoted
-to a population claim when the tail diagnostic is unresolved.
+The contract also reports high quantiles, separate positive/negative survival
+curves, and fixed-threshold exceedance probabilities at `0.01`, `0.05`,
+`0.1`, `0.5`, and `1 Ha`. MAD, IQR, ordinary variance, and conventional
+MCSE are secondary/descriptive only. The `W` recurrence rule requires a factor
+of two and `0.01 Ha` change with simultaneous uncertainty support; the bounded
+null additionally requires every fixed-threshold exceedance probability to
+exclude a late absolute increase of `0.002`. A flat MAD is not equivalence.
 
-Each checkpoint window is a fresh evaluation of a frozen checkpoint, with a
-new evaluation seed identity and a declared burn-in, stride, walker count,
-draw count, and record schema. The retained checkpoint schedule must be dense
-enough to resolve both a possible early minimum and a later rise; the proposal
-is 2,500-update spacing from 5,000 through 20,000 followed by 5,000-update
-spacing through the horizon, subject to the pending operator decision. A
-window is complete only when every planned
-draw-by-walker record is present exactly once, has finite coordinates and a
-finite local energy, and passes source/checkpoint/config identity checks. No
-clipping, filtering, replacement draw, final-draw shortcut, or pooled partial
-window is allowed. An incomplete window is `unresolved`, not zero or a pass.
+Held-out beta survival-slope curvature and calibrated generalized-Pareto `xi`
+are interpretation diagnostics. Hill is context only. An absent or
+inconclusive admissible tail diagnostic is `unresolved`, never a pass. No
+finite-prefix diagnostic proves an ultimate finite or infinite variance.
 
-Training and evaluation seeds are separate namespaces and must be distinct:
-`training_seed = (lineage, initialization_seed)` and
-`evaluation_seed = (lineage, checkpoint, evaluation_stream_seed)`. Reusing a
-training seed as an evaluation stream seed is rejected. Lineages are distinct
-training identities, not repeated evaluations of one training run.
+## Closed outcomes
 
-### Tail-existence rule
+The only result categories are `recurrence`, `bounded_null`, and
+`unresolved`. Recurrence requires complete records, qualified uncertainty,
+the predeclared basin search, late persistence, and at least two of three
+independent lineages. Bounded null requires all three complete lineages,
+simultaneous inference over the full predeclared search, and both the `W` and
+exceedance safeguards. Missing identities, records, controls, dependence
+qualification, operator decisions, or supported margins produce `unresolved`.
 
-The proposed diagnostic is a held-out threshold trajectory: local log-survival
-slope/curvature (`beta`) plus a generalized-Pareto shape estimate (`xi`) on
-the upper tail of `|E_L - median(E_L)|`, with nested prefixes, threshold
-stability, and minimum exceedance counts chosen by the operator in the pending
-inputs. A tail class is declared only when the selected diagnostic is
-admissible and its stability rule is met. A Hill estimate may be reported as
-context, but it is not by itself a population tail theorem. If the diagnostic
-is not admissible or its class interval is inconclusive, tail status is
-`unresolved`, not absent. MAD/IQR may rank windows, but tail claims and the
-science result must be carried by the tail-sensitive profile; variance and
-conventional MCSE remain descriptive.
+## Two admission scopes
 
-## Predeclared outcome rules
+The non-science one-electron **PIPELINE CHECK** is admitted under the
+operator's 2026-11-05 direction. Parts (a)-(f), including the independent
+analytic oracle, imperfect-state rejection, sampler controls, short learned
+route, fresh restore, and complete-record refusal controls, belong to slice
+`5cfcca3e` on Cannon CPU. Part (g), the excluded-seed GPU route smoke, belongs
+to slice `406194c5` on Polaris. Slice `2f1b2921` reruns the integrated check
+on the exact candidate. This check is not a science result and does not
+authorize the executor or a lineage.
 
-The result category is one of exactly `recurrence`, `bounded_null`, or
-`unresolved`.
+The **SCIENCE LINEAGES** remain prohibited until the operator has reviewed the
+science plan and explicitly approves it. No pipeline pass, scheduler state,
+pilot, or capacity estimate can waive that hold.
 
-* `recurrence`: complete records exist for the declared horizon and checkpoints;
-  the accepted tail diagnostic is either absent or explicitly handled; and at
-  least the declared replication count of independent lineages shows the same
-  early-to-middle decrease and middle-to-late increase in `D`, each exceeding
-  the operator-approved margins and persisting at the required late checkpoints.
-* `bounded_null`: complete records exist for the declared horizon and
-  checkpoints, no lineage satisfies the recurrence rule, and every lineage's
-  `D` remains within the operator-approved bound relative to the operator's
-  helium reference behavior. A null is bounded to this protocol and horizon;
-  it does not explain helium or prove absence at other horizons.
-* `unresolved`: any required record, identity, tail decision, checkpoint, or
-  operator threshold is absent; the tail diagnostic is inconclusive; or the
-  evidence falls between the recurrence and bounded-null rules.
-
-These rules are deliberately closed: no fixed threshold is inherited from
-the superseded one-electron draft, and no helium endpoint ratio is reused.
-
-## Controls specified for the next slice
-
-The implementation must provide: the exact hydrogen energy `-1/2 Ha`; an
-independently coded scalar local-energy oracle; rejection of a known-imperfect
-state; sampler-target and mutation rejection; a strict no-regularization rule
-at radius zero; and source plus resolved-input identity checks. These controls
-qualify the instrument and admission; they do not themselves constitute a
-science result.
-
-## Admission gate
-
-Training admission is prohibited while any required operator decision in
-`contract_inputs.json` is `absent` or `pending`. The six required decisions
-are: helium reference behavior to match; update horizon and checkpoints;
-lineage count; walker and fresh-evaluation budget; acceptable tail diagnostic;
-and science facility/resource ceiling. The file contains clearly labelled
-proposals to make the choices concrete, but proposals are not decisions.
-
+The executable controls must separately enforce the raw `-1/r` potential and
+`-1/2` Laplacian, absence of an electron-electron term, the intended nuclear
+cusp and decay, the odd-electron readout as a readout device rather than a
+second electron, rejection at undefined radius zero without regularization,
+an independently coded scalar hydrogen oracle, sampler-target/mutation
+rejection, and source/resolved-input identity checks.
