@@ -286,11 +286,20 @@ def test_p5c_runtime_write_trap_is_lexical_and_reentrant(tmp_path: Path, monkeyp
         finally:
             active = False
 
-    real_mkdir, real_makedirs, real_open, real_replace, real_unlink, real_mkstemp = os.mkdir, os.makedirs, os.open, os.replace, os.unlink, tempfile.mkstemp
+    real_mkdir, real_makedirs, real_open, real_replace, real_link, real_unlink, real_mkstemp = os.mkdir, os.makedirs, os.open, os.replace, os.link, os.unlink, tempfile.mkstemp
     monkeypatch.setattr(os, "mkdir", lambda path, *args, **kwargs: (guarded(path), real_mkdir(path, *args, **kwargs))[1])
     monkeypatch.setattr(os, "makedirs", lambda path, *args, **kwargs: (guarded(path), real_makedirs(path, *args, **kwargs))[1])
-    monkeypatch.setattr(os, "open", lambda path, *args, **kwargs: (guarded(path), real_open(path, *args, **kwargs))[1])
+    write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+
+    def guarded_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        # Read-only directory opens for fsync are allowed outside root because they persist the root's own link.
+        if flags & write_flags:
+            guarded(path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", guarded_open)
     monkeypatch.setattr(os, "replace", lambda source, destination: (guarded(source), guarded(destination), real_replace(source, destination))[2])
+    monkeypatch.setattr(os, "link", lambda source, destination, *args, **kwargs: (guarded(source), guarded(destination), real_link(source, destination, *args, **kwargs))[2])
     monkeypatch.setattr(os, "unlink", lambda path, *args, **kwargs: (guarded(path), real_unlink(path, *args, **kwargs))[1])
     monkeypatch.setattr(tempfile, "mkstemp", lambda *args, **kwargs: (guarded(kwargs.get("dir", args[1] if len(args) > 1 else ".")), real_mkstemp(*args, **kwargs))[1])
     store = DirectoryStore(root)
