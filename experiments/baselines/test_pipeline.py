@@ -82,6 +82,7 @@ def test_one_plan_dispatches_uniform_one_gpu_rows_and_writes_records(tmp_path: P
     records = (tmp_path / "launch" / "dispatch_records.jsonl").read_text().splitlines()
     assert len(records) == 2
     assert json.loads((tmp_path / "launch" / "verification.json").read_text())["complete"] is True
+    assert json.loads((tmp_path / "launch" / "executor_input.json").read_text())["schema"] == "tpen-executor/ready-group-v1"
 
 
 def test_four_gpu_rows_use_one_parsl_worker_each(tmp_path: Path) -> None:
