@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import string
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
@@ -18,10 +19,20 @@ from typing import Any, Callable, Mapping
 RUN_MANIFEST_V1 = "tpen-executor/run-manifest-v1"
 RUN_MANIFEST_V2 = "tpen-executor/run-manifest-v2"
 ACCEPTED_SEGMENT_SCHEMA = "tpen-executor/accepted-segment-v1"
+OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed"})
+_HEX_DIGITS = frozenset(string.hexdigits.lower())
 
 
 class ManifestRefusal(ValueError):
-    """Typed refusal for an unreadable or scientifically inconsistent manifest."""
+    """Typed refusal for an unreadable or scientifically inconsistent manifest.
+
+    Parameters
+    ----------
+    code : str
+        Stable machine-readable refusal category.
+    reason : str
+        Human-readable explanation of the rejected manifest or evidence.
+    """
 
     def __init__(self, code: str, reason: str) -> None:
         super().__init__(reason)
@@ -34,7 +45,19 @@ ManifestReadError = ManifestRefusal
 
 @dataclass(frozen=True, slots=True)
 class CommittedSegment:
-    """A selected segment projected from one accepted executor record."""
+    """A selected segment projected from one accepted executor record.
+
+    Parameters
+    ----------
+    task_id, attempt_id : str
+        Logical task and executor attempt identities.
+    predecessor_checkpoint : str or None
+        Prior checkpoint in the committed chain, or ``None`` for a fresh start.
+    checkpoint_dir : str
+        Core-published checkpoint directory.
+    next_iteration, completed_updates : int
+        Nonnegative progress coordinates copied from core evidence.
+    """
 
     task_id: str
     attempt_id: str
@@ -46,7 +69,15 @@ class CommittedSegment:
 
 @dataclass(frozen=True, slots=True)
 class CommittedChain:
-    """The exactly-once accepted segment chain for one logical task."""
+    """The exactly-once accepted segment chain for one logical task.
+
+    Parameters
+    ----------
+    task_id : str
+        Logical task identity.
+    segments : tuple of CommittedSegment
+        Ordered, predecessor-linked accepted segments; no attempt is repeated.
+    """
 
     task_id: str
     segments: tuple[CommittedSegment, ...]
@@ -54,7 +85,17 @@ class CommittedChain:
 
 @dataclass(frozen=True, slots=True)
 class PreservedAttempt:
-    """A manifest attempt retained as evidence but excluded from selection."""
+    """A manifest attempt retained as evidence but excluded from selection.
+
+    Parameters
+    ----------
+    task_id, attempt_id, output_dir : str
+        Original executor attempt identity and fenced output directory.
+    outcome : str or None
+        Published operational outcome status, if one exists.
+    reason : str, default="not-selected"
+        Why the attempt is preserved rather than counted in a committed chain.
+    """
 
     task_id: str
     attempt_id: str
@@ -65,7 +106,15 @@ class PreservedAttempt:
 
 @dataclass(frozen=True, slots=True)
 class ResultSet:
-    """Selected chains plus original attempts that were not selected."""
+    """Selected chains plus original attempts that were not selected.
+
+    Parameters
+    ----------
+    chains : tuple of CommittedChain
+        Exactly-once committed coordinate chains grouped by task.
+    preserved_attempts : tuple of PreservedAttempt
+        Original non-selected attempts retained as evidence and never counted.
+    """
 
     chains: tuple[CommittedChain, ...]
     preserved_attempts: tuple[PreservedAttempt, ...]
@@ -134,6 +183,17 @@ def _nonnegative_int(value: Any, name: str) -> int:
     return value
 
 
+def _sha256(value: Any, name: str) -> str:
+    """Validate the lowercase SHA-256 wire representation used by executor."""
+
+    _text(value, name)
+    if len(value) != 64 or any(character not in _HEX_DIGITS for character in value):
+        raise ManifestRefusal("malformed-record", f"{name} must be a lowercase SHA-256 digest")
+    if value != value.lower():
+        raise ManifestRefusal("malformed-record", f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
 def _attempt(value: Any) -> dict[str, Any]:
     record = dict(_fields(value, {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir"}, "manifest attempt"))
     if record["schema"] != "tpen-executor/manifest-attempt-v1":
@@ -143,8 +203,9 @@ def _attempt(value: Any) -> dict[str, Any]:
     start = dict(_fields(record["start_receipt"], {"schema", "task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir"}, "start receipt"))
     if start["schema"] != "tpen-executor/start-receipt-v1":
         raise ManifestRefusal("unknown-schema", "start receipt schema is unsupported")
-    for key in ("task_id", "attempt_id", "allocation_id", "backend_job_id", "group_digest", "started_at_utc", "output_dir"):
+    for key in ("task_id", "attempt_id", "allocation_id", "backend_job_id", "started_at_utc", "output_dir"):
         _text(start[key], f"start.{key}")
+    _sha256(start["group_digest"], "start.group_digest")
     if (start["task_id"], start["attempt_id"], start["output_dir"]) != (record["task_id"], record["attempt_id"], record["output_dir"]):
         raise ManifestRefusal("attempt-receipt-mismatch", "manifest attempt disagrees with its start receipt")
     outcome = record["outcome_receipt"]
@@ -152,11 +213,18 @@ def _attempt(value: Any) -> dict[str, Any]:
         outcome = dict(_fields(outcome, {"schema", "task_id", "attempt_id", "group_digest", "finished_at_utc", "status", "output_dir", "result_digest"}, "outcome receipt"))
         if outcome["schema"] != "tpen-executor/outcome-receipt-v1":
             raise ManifestRefusal("unknown-schema", "outcome receipt schema is unsupported")
-        for key in ("task_id", "attempt_id", "group_digest", "finished_at_utc", "status", "output_dir"):
+        for key in ("task_id", "attempt_id", "finished_at_utc", "status", "output_dir"):
             _text(outcome[key], f"outcome.{key}")
+        _sha256(outcome["group_digest"], "outcome.group_digest")
+        if outcome["status"] not in OUTCOME_STATUSES:
+            raise ManifestRefusal("malformed-record", "outcome.status is not a supported operational status")
         if outcome["result_digest"] is not None:
-            _text(outcome["result_digest"], "outcome.result_digest")
-        if (outcome["task_id"], outcome["attempt_id"], outcome["output_dir"]) != (record["task_id"], record["attempt_id"], record["output_dir"]):
+            _sha256(outcome["result_digest"], "outcome.result_digest")
+        if (
+            outcome["task_id"], outcome["attempt_id"], outcome["group_digest"], outcome["output_dir"]
+        ) != (
+            record["task_id"], record["attempt_id"], start["group_digest"], record["output_dir"]
+        ):
             raise ManifestRefusal("attempt-receipt-mismatch", "manifest attempt disagrees with its outcome receipt")
     record["outcome_receipt"] = outcome
     return record
@@ -190,10 +258,18 @@ def _manifest(path: Path) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], t
     else:
         raise ManifestRefusal("unknown-schema", f"unsupported run manifest schema {schema!r}")
     _text(value["group_id"], "manifest.group_id")
-    _text(value["group_digest"], "manifest.group_digest")
+    _sha256(value["group_digest"], "manifest.group_digest")
     if isinstance(value["attempts"], (str, bytes, bytearray)) or not isinstance(value["attempts"], list):
         raise ManifestRefusal("malformed-record", "manifest attempts must be a sequence")
     attempts = tuple(_attempt(item) for item in value["attempts"])
+    for attempt in attempts:
+        if attempt["start_receipt"]["group_digest"] != value["group_digest"]:
+            raise ManifestRefusal("group-digest-mismatch", "start receipt group_digest differs from manifest")
+        if (
+            attempt["outcome_receipt"] is not None
+            and attempt["outcome_receipt"]["group_digest"] != value["group_digest"]
+        ):
+            raise ManifestRefusal("group-digest-mismatch", "outcome receipt group_digest differs from manifest")
     if len({item["attempt_id"] for item in attempts}) != len(attempts):
         raise ManifestRefusal("duplicate-attempt", "manifest contains duplicate attempt identities")
     return dict(value), attempts, raw_segments
@@ -241,6 +317,11 @@ def _public_evidence(value: Any) -> tuple[str, Mapping[str, Any] | None]:
     expected = {"checkpoint_dir", "schema_version", "next_iteration", "completed_updates"}
     if set(checkpoint) != expected:
         raise ManifestRefusal("core-evidence-mismatch", "core checkpoint evidence has an unexpected shape")
+    _text(checkpoint["checkpoint_dir"], "core.checkpoint_dir")
+    if type(checkpoint["schema_version"]) is not int:
+        raise ManifestRefusal("core-evidence-mismatch", "core.schema_version must be an integer")
+    _nonnegative_int(checkpoint["next_iteration"], "core.next_iteration")
+    _nonnegative_int(checkpoint["completed_updates"], "core.completed_updates")
     return verdict, checkpoint
 
 

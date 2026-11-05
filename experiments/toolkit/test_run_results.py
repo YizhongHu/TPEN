@@ -55,7 +55,7 @@ def test_p8_reader_selects_exactly_once_and_preserves_unselected_attempts(tmp_pa
             "verdict": "completed",
             "checkpoint": {
                 "checkpoint_dir": str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001"),
-                "schema_version": "v1",
+                "schema_version": 1,
                 "next_iteration": 1,
                 "completed_updates": 1,
             },
@@ -72,7 +72,7 @@ def test_p8_reader_selects_exactly_once_and_preserves_unselected_attempts(tmp_pa
 def test_p8_reader_refuses_core_evidence_mismatch(tmp_path: Path) -> None:
     path, _ = _materialized_manifest(tmp_path)
     with pytest.raises(ManifestRefusal, match="disagrees"):
-        read(path, lambda _: {"verdict": "completed", "checkpoint": {"checkpoint_dir": "wrong", "schema_version": "v1", "next_iteration": 1, "completed_updates": 1}})
+        read(path, lambda _: {"verdict": "completed", "checkpoint": {"checkpoint_dir": "wrong", "schema_version": 1, "next_iteration": 1, "completed_updates": 1}})
 
 
 def _write_segment_mutation(tmp_path: Path, mutation: str) -> Path:

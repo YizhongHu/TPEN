@@ -407,6 +407,13 @@ class DirectoryStore:
                 outcome = OutcomeReceipt.decode(Path(outcome_path).read_bytes())
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
                 raise FenceRejected("outcome receipt is unavailable") from error
+            if (
+                outcome.task_id != start.task_id
+                or outcome.attempt_id != start.attempt_id
+                or outcome.group_digest != start.group_digest
+                or outcome.output_dir != start.output_dir
+            ):
+                raise FenceRejected("outcome receipt crosses the attempt fence")
             if outcome.status != "completed":
                 raise FenceRejected("accepted segment requires a completed attempt")
             segment_path = os.path.join(output_dir, "segment.json")
@@ -438,7 +445,14 @@ class DirectoryStore:
 
     @staticmethod
     def _segments_for_task(task_dir: str) -> tuple[AcceptedSegment, ...]:
-        """Read accepted segment receipts in one task directory's order."""
+        """Read accepted segments in predecessor-linked chain order.
+
+        Raises
+        ------
+        FenceRejected
+            If durable segment receipts form a fork, cycle, or disconnected
+            chain instead of one linear history.
+        """
 
         segments: list[AcceptedSegment] = []
         for attempt_id in sorted(os.listdir(task_dir)):
@@ -452,7 +466,39 @@ class DirectoryStore:
                 continue
             _require_regular(segment_path, "accepted segment", ValueError)
             segments.append(AcceptedSegment.decode(Path(segment_path).read_bytes()))
-        return tuple(segments)
+        if not segments:
+            return ()
+        successors: dict[str, list[AcceptedSegment]] = {}
+        roots = []
+        for segment in segments:
+            if segment.predecessor_checkpoint is None:
+                roots.append(segment)
+            else:
+                successors.setdefault(segment.predecessor_checkpoint, []).append(segment)
+        if len(roots) != 1:
+            raise FenceRejected("accepted segments do not have one chain root")
+        ordered: list[AcceptedSegment] = []
+        current = roots[0]
+        seen_attempts: set[object] = set()
+        while True:
+            if current.attempt_id in seen_attempts:
+                raise FenceRejected("accepted segments contain a cycle")
+            seen_attempts.add(current.attempt_id)
+            ordered.append(current)
+            next_segments = successors.get(current.checkpoint_dir, [])
+            if len(next_segments) > 1:
+                raise FenceRejected("accepted segments contain a fork")
+            if not next_segments:
+                break
+            current = next_segments[0]
+        if len(ordered) != len(segments):
+            raise FenceRejected("accepted segments contain a disconnected chain")
+        for previous, segment in zip(ordered, ordered[1:]):
+            previous_coordinate = (previous.next_iteration, previous.completed_updates)
+            coordinate = (segment.next_iteration, segment.completed_updates)
+            if coordinate[0] < previous_coordinate[0] or coordinate[1] < previous_coordinate[1] or coordinate == previous_coordinate:
+                raise FenceRejected("accepted segment progress coordinate is not strictly increasing")
+        return tuple(ordered)
 
     def _validate_fence(self, fence: AttemptFence, task_dir: str) -> StartReceipt:
         """Validate pointer, path, and every start-receipt fence binding."""
