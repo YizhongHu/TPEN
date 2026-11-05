@@ -173,7 +173,7 @@
       "admissibility": "At least 200 held-out exceedances from 50 distinct walkers, finite ordered thresholds, complete identities, and qualified dependence; three adjacent supported intervals at half/full prefixes and common shallower support at quarter prefix.",
       "stability": "Proposed relative beta drift <= 0.20 and absolute xi drift <= 0.10 with compatible whole-walker uncertainty intervals.",
       "hill": "context_only",
-      "absence_or_inconclusive": "unresolved; an absent admissible tail diagnostic is never a pass",
+      "absence_or_inconclusive": "an absent or inconclusive gating diagnostic is never a pass",
       "gating": {
         "statistics": [
           "W_99_9",
@@ -219,28 +219,28 @@
           ]
         },
         "pipeline_gpu_smoke_g": {
-        "training": [
-          999002
-        ],
-        "sampler": [
-          999003
-        ],
-        "evaluation": [
-          999004
-        ]
+          "training": [
+            999002
+          ],
+          "sampler": [
+            999003
+          ],
+          "evaluation": [
+            999004
+          ]
         },
         "capacity_pilot": {
           "training": [
-          999001
+            999001
           ],
           "sampler": [
-          999005
+            999005
           ],
           "evaluation": [
-          999006,
-          999007,
-          999008,
-          999009
+            999006,
+            999007,
+            999008,
+            999009
           ]
         }
       }
@@ -307,7 +307,7 @@
       "unresolved"
     ],
     "recurrence": "Complete records and qualified uncertainty exist. Streams 0/1 select the smallest-mean-W consecutive triple centered at 3000..19000 (earliest tie); streams 2/3 re-measure early, basin and late W, and each confirmation stream independently must show early W exceeds basin W by >=2x and >=0.01 Ha, with at least two of 40000/45000/50000 exceeding it by both margins with simultaneous confidence bounds. At least 2 of 3 lineages pass. If two lineages pass and the third is incomplete, the study-level label is unresolved; report recurrence in the two complete lineages only. Tail exceedance safeguards must not contradict the W result.",
-    "bounded_null": "All 3 lineages are complete and pass instrument/sampling gates; simultaneous inference over every predeclared basin, checkpoint, threshold, and window search excludes the W decrease/rise rule and excludes a late W deterioration of the declared size through 20000. Fixed-threshold exceedance bands use all four streams and the pilot gate; they also exclude an absolute late increase of 0.002 at every threshold. A flat MAD or nonsignificance alone is not equivalence.",
+    "bounded_null": "All 3 lineages are complete and pass instrument/sampling gates; simultaneous inference over every predeclared basin, checkpoint, threshold, and window search excludes the W decrease/rise rule. For every reference checkpoint k in bounded_null_reference_updates, the simultaneous band excludes W at bounded_null_late_count or more late checkpoints reaching max(2 W(k), W(k) + 0.01 Ha). Fixed-threshold exceedance bands use all four streams and the pilot gate; they also exclude an absolute late increase of 0.002 at every threshold. A flat MAD or nonsignificance alone is not equivalence.",
     "unresolved": "Any required record, identity, instrument, dependence/uncertainty qualification, tail safeguard, operator decision, or horizon is absent or inconclusive; a partial lineage result, conflicting streams, unsupported margins, or a tail-only change outside the declared instrument is unresolved.",
     "parameters": {
       "w_factor_margin": 2,
@@ -342,6 +342,30 @@
         50000
       ],
       "late_required_count": 2,
+      "bounded_null_reference_updates": [
+        0,
+        1000,
+        2000,
+        3000,
+        4000,
+        5000,
+        6000,
+        7000,
+        8000,
+        9000,
+        10000,
+        11000,
+        12000,
+        13000,
+        14000,
+        15000,
+        16000,
+        17000,
+        18000,
+        19000,
+        20000
+      ],
+      "bounded_null_late_count": 2,
       "selection_streams": [
         0,
         1
@@ -437,7 +461,7 @@
     {
       "id": "learned_model_optimizer_and_training_sampler",
       "status": "proposed_by_lane_pending_operator_review",
-      "proposal": "Use one layer, 32 channels, hidden width 128, maximum order 2, SiLU embedding/mixing/aggregation/residual stack, trainable equal-initialized readout weights, float64, Adam learning rate 0.005, curved electron-nucleus law c=0.01 and d=1 both trainable, and 4096 training walkers; retain the odd-electron Pfaffian border as a readout device, not a second electron.",
+      "proposal": "Use one layer, 32 channels, hidden width 128, maximum order 2, SiLU embedding/mixing/aggregation/residual stack, trainable equal-initialized readout weights, float64, Adam learning rate 0.005, curved electron-nucleus law c=0.01 and d=1 both trainable, 4096 training walkers, sampler burn-in 100, 10 Metropolis steps per update, and proposal scale 0.5 bohr; retain the odd-electron Pfaffian border as a readout device, not a second electron.",
       "rationale": "A concrete model/optimizer/sampler proposal makes the pipeline and science plan reviewable without silently choosing unreviewed hyperparameters; c=0 is the exact hydrogen answer and c/d drift is a reportable normalizability signal.",
       "alternatives": [
         "fixed linear nuclear factor -r",
@@ -474,10 +498,10 @@
               4,
               8
             ],
-            "ordinary_total_energy_abs_error_hartree": 1e-8,
+            "ordinary_total_energy_abs_error_hartree": 1e-08,
             "stress_radii_bohr": [
-              1e-8,
-              0.000001,
+              1e-08,
+              1e-06,
               0.0001
             ],
             "stress_bound": "max(1e-9, 128*eps64*(abs(K)+abs(V)))",
@@ -513,7 +537,9 @@
             "evaluation_walkers": 1024,
             "draws_per_stream": 64,
             "streams": 2,
-            "burn_in": 1000,
+            "burn_in": 100,
+            "metropolis_steps_per_update": 10,
+            "proposal_scale_bohr": 0.5,
             "stride": 20,
             "energy_abs_error_hartree": 0.02,
             "median_abs_error_improvement": 0.25,

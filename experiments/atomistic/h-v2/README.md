@@ -41,7 +41,9 @@ and every 1,000 updates (51 retained checkpoints) while fresh-evaluating a
 separate 27-checkpoint set. It proposes three independent lineages with
 initialization seeds `73001..73003` and sampler seeds `83001..83003`, four
 fresh streams per evaluated checkpoint, 4,096 walkers, 256 draws, burn-in
-1,000, and stride 20. Evaluation seeds use the formula recorded in the JSON;
+1,000, and stride 20. The training sampler uses burn-in 100, 10 Metropolis
+steps per update, and proposal scale 0.5 bohr. Evaluation seeds use the
+formula recorded in the JSON;
 the non-science pipeline and capacity-pilot seed namespaces are excluded from
 science and are globally disjoint from one another and from the science seeds.
 
@@ -63,7 +65,10 @@ curves, and fixed-threshold exceedance probabilities at `0.01`, `0.05`,
 MCSE are secondary/descriptive only. The `W` recurrence rule requires a factor
 of two and `0.01 Ha` change with simultaneous uncertainty support; the bounded
 null additionally requires every fixed-threshold exceedance probability to
-exclude a late absolute increase of `0.002`. A flat MAD is not equivalence.
+exclude a late absolute increase of `0.002`. Its W clause applies to every
+evaluated reference checkpoint through update 20,000 and excludes the declared
+late count reaching `max(2 W(k), W(k) + 0.01 Ha)`. A flat MAD is not
+equivalence.
 
 The gating instrument is W, the high quantiles, and the exceedance
 probabilities, provided complete records and qualified dependence are present.
@@ -71,8 +76,8 @@ Held-out beta survival-slope curvature and calibrated generalized-Pareto `xi`
 are non-gating interpretation diagnostics; Hill is context only. Their drift
 is measured across the declared held-out ordered draw prefixes and supported
 tail-fraction intervals. An unresolved ultimate tail class does not by itself
-make the trajectory label `unresolved`; an absent or inconclusive direct
-instrument remains `unresolved`, never a pass. No finite-prefix diagnostic
+make the trajectory label `unresolved`; an absent or inconclusive gating
+diagnostic is never a pass. No finite-prefix diagnostic
 proves an ultimate finite or infinite variance.
 
 ## Closed outcomes
@@ -89,8 +94,9 @@ qualification, operator decisions, or supported margins produce `unresolved`.
 
 The non-science one-electron **PIPELINE CHECK** is admitted under the
 operator's 2026-11-05 direction. Parts (a)-(f), including the independent
-analytic oracle, imperfect-state rejection, sampler controls, short learned
-route, fresh restore, and complete-record refusal controls, belong to slice
+analytic oracle, imperfect-state rejection, sampler controls (including burn-in
+100, 10 Metropolis steps per update, and proposal scale 0.5 bohr), short
+learned route, fresh restore, and complete-record refusal controls, belong to slice
 `5cfcca3e` on Cannon CPU. Part (g), the excluded-seed GPU route smoke, belongs
 to slice `406194c5` on Polaris. Slice `2f1b2921` reruns the integrated check
 on the exact candidate. The JSON gives each part's pass criteria and its

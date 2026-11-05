@@ -65,7 +65,7 @@ def test_tail_contract_never_promotes_hill_or_missing_diagnostics() -> None:
     assert tail["hill"] == "context_only"
     assert "never replaced by a Hill" in tail["diagnostic"]
     assert tail["absence_or_inconclusive"] == (
-        "unresolved; an absent admissible tail diagnostic is never a pass"
+        "an absent or inconclusive gating diagnostic is never a pass"
     )
     assert tail["gating"]["statistics"] == [
         "W_99_9",
@@ -124,6 +124,33 @@ def test_retention_and_evaluation_sets_are_distinct() -> None:
     assert measurement["checkpoint_retention"]["updates"].startswith(
         "0 and every 1000"
     )
+
+
+def test_bounded_null_reference_set_and_late_count_are_machine_readable() -> None:
+    inputs = load_inputs()
+    measurement = inputs["measurement"]
+    parameters = inputs["decision_rules"]["parameters"]
+    evaluated = measurement["evaluated_checkpoints"]["updates"]
+    assert parameters["bounded_null_reference_updates"] == [
+        update for update in evaluated if update <= 20000
+    ]
+    assert parameters["bounded_null_late_count"] == parameters["late_required_count"]
+
+
+def test_training_sampler_settings_match_lane_proposal_and_pipeline() -> None:
+    inputs = load_inputs()
+    proposal = inputs["lane_proposals"][7]["proposal"]
+    criteria = next(
+        part["pass_criteria"]
+        for part in inputs["admission"]["pipeline_check"]["parts"]
+        if part["id"] == "e"
+    )
+    assert criteria["burn_in"] == 100
+    assert criteria["metropolis_steps_per_update"] == 10
+    assert criteria["proposal_scale_bohr"] == 0.5
+    assert "burn-in 100" in proposal
+    assert "10 Metropolis steps per update" in proposal
+    assert "proposal scale 0.5 bohr" in proposal
 
 
 def test_normalizability_gate_is_explicit() -> None:
