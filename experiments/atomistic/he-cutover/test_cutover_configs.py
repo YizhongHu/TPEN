@@ -29,12 +29,15 @@ if "_tpen_study_imports" not in _tpen_sys.modules:
 sibling = _tpen_sys.modules["_tpen_study_imports"].sibling
 
 from experiments.toolkit.ast_bindings import sys_module_names  # noqa: E402
+from experiments.toolkit.executor_inputs import canonical_bytes  # noqa: E402
 
 run_train_row = sibling(__file__, 'run_train_row')
+cutover_plan = sibling(__file__, 'cutover_plan')
 
 
 ROOT = Path(__file__).resolve().parents[3]
 HEV1_BARE_MODULES = {"layout", "strata", "plan", "driver", "eval", "collect", "canary", "launch"}
+P9_HE_FIXTURE = ROOT / "executor/tests/fixtures/p9/he_cutover.json"
 
 
 def _differences(before, after, prefix=""):
@@ -99,6 +102,49 @@ def test_profiles_contain_policy_but_no_filesystem_roots() -> None:
                 stack.extend(value)
             elif isinstance(value, str):
                 assert not value.startswith("/")
+
+
+def test_he_cutover_emits_the_executor_golden_without_resolving_config() -> None:
+    grid = cutover_plan.load_grid(Path(__file__).with_name("smoke_grid.yaml"))
+    train, evaluation, _ = cutover_plan.build_plans(
+        grid, facility="polaris", results_root="/p9/he", plan_id="p9-fixture"
+    )
+    emitted, _ = cutover_plan.executor_inputs(train, evaluation)
+    assert canonical_bytes(emitted) == P9_HE_FIXTURE.read_bytes().rstrip(b"\n")
+    assert emitted["members"][0]["program"]["config_ref"]["config"].startswith("experiments/")
+
+
+def test_p9_executor_boundary_is_six_named_producers_without_activation() -> None:
+    producers = {
+        ROOT / "experiments/atomistic/he-cutover/admission.py",
+        ROOT / "experiments/atomistic/he-cutover/cutover_plan.py",
+        ROOT / "experiments/atomistic/he-cutover/pipeline.py",
+        ROOT / "experiments/baselines/pipeline.py",
+        ROOT / "experiments/baselines/plan.py",
+        ROOT / "experiments/baselines/rungs/rung_makeplan.py",
+    }
+    emitter_importers = set()
+    forbidden_imports = []
+    forbidden_activation = []
+    for path in (ROOT / "experiments").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if module == "experiments.toolkit.executor_inputs" and not path.name.startswith("test_"):
+                    emitter_importers.add(path)
+                if "tpen_executor" in module:
+                    forbidden_imports.append(path)
+            elif isinstance(node, ast.Import):
+                if any("tpen_executor" in alias.name for alias in node.names):
+                    forbidden_imports.append(path)
+            elif isinstance(node, (ast.Name, ast.Attribute)):
+                name = node.id if isinstance(node, ast.Name) else node.attr
+                if name in {"LocalDispatcher", "ParslDispatcher", "DirectoryStore"}:
+                    forbidden_activation.append((path, name))
+    assert emitter_importers == producers
+    assert forbidden_imports == []
+    assert forbidden_activation == []
 
 
 # Binding analysis has ONE owner. This rule and the sys.modules rule in
