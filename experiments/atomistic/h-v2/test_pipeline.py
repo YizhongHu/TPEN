@@ -47,13 +47,7 @@ def test_configured_local_energy_sampler_and_model_only_restore(tmp_path: Path) 
     evaluation["evaluator"]["tasks"][0]["generator"]["n_draws"] = 3
     evaluation["evaluator"]["tasks"][0]["generator"]["chunk_size"] = 5
     evaluation["evaluator"]["tasks"][0]["summaries"][0]["max_samples"] = 24
-    result = _run_config(evaluation, command="h-v2 pipeline model-only evaluation")
-    if result != 0:
-        for path in sorted(tmp_path.rglob("occurrences.jsonl")):
-            print(f"evaluation occurrences {path}:\\n{path.read_text(encoding='utf-8')}")
-        for path in sorted(tmp_path.rglob("metrics.jsonl")):
-            print(f"evaluation metrics {path}:\\n{path.read_text(encoding='utf-8')}")
-    assert result == 0
+    assert _run_config(evaluation, command="h-v2 pipeline model-only evaluation") == 0
     eval_dir = tmp_path / "tpen_h_v2" / "atomistic" / "eval" / "trajectory"
     with (eval_dir / "sampled_eval_table.csv").open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
