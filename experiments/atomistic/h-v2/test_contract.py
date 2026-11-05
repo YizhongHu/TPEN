@@ -40,7 +40,9 @@ def test_tail_contract_never_promotes_hill_or_missing_diagnostics() -> None:
 def test_science_hold_and_pipeline_scope_are_separate() -> None:
     admission = load_inputs()["admission"]
     assert admission["pipeline_check"]["status"].startswith("admitted_")
-    assert admission["pipeline_check"]["parts"] == list("abcdefg")
+    assert [part["id"] for part in admission["pipeline_check"]["parts"]] == list(
+        "abcdefg"
+    )
     assert admission["science_lineages"]["status"] == (
         "prohibited_until_operator_reviews_science_plan"
     )
@@ -70,9 +72,9 @@ def test_seed_rosters_are_disjoint_and_result_categories_closed() -> None:
     }
 
 
-def test_all_seven_lane_proposals_are_visible() -> None:
+def test_all_eight_lane_proposals_are_visible() -> None:
     proposals = load_inputs()["lane_proposals"]
-    assert len(proposals) == 7
+    assert len(proposals) == 8
     assert all(item["status"].startswith("proposed_by_lane_") for item in proposals)
     assert all(
         item["proposal"] and item["rationale"] and item["alternatives"]

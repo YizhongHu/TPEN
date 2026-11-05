@@ -28,12 +28,13 @@ common-estimand decrease-then-increase trajectory.
 
 ## Lane proposals pending operator review
 
-The seven entries in `contract_inputs.json` are deliberately lane proposals,
+The eight entries in `contract_inputs.json` are deliberately lane proposals,
 not operator decisions. Each has a rationale and alternatives. The live
 contention is visible: percentile `W` versus event probability as the primary
 axis; fixed versus trainable nuclear curvature; three versus five lineages;
-the factor-two/`0.01 Ha` and `0.002` effect margins; and Cannon single-card
-science versus efficiently packed Polaris science.
+the factor-two/`0.01 Ha` and `0.002` effect margins; the model/optimizer and
+training sampler; and Cannon single-card science versus efficiently packed
+Polaris science.
 
 The proposed science design is 50,000 completed updates, retaining update zero
 and every 1,000 updates (51 retained checkpoints) while fresh-evaluating a
@@ -42,6 +43,14 @@ initialization seeds `73001..73003` and sampler seeds `83001..83003`, four
 fresh streams per evaluated checkpoint, 4,096 walkers, 256 draws, burn-in
 1,000, and stride 20. Evaluation seeds use the formula recorded in the JSON;
 pilot seeds are `999001` and `999002` and are excluded from science.
+
+The fresh-evaluation estimator is machine-readable in `contract_inputs.json`:
+compute each stream's W on its complete 4,096 by 256 grid, use that stream's
+median, and take the `ceil(0.999*N)` sorted deviation with no interpolation.
+Streams 0/1 select only the basin-triple index; streams 2/3 independently
+re-measure early, basin and late W. Bounded-null inference uses all four
+streams. The zero-event safeguard is a one-sided 97.5% Clopper--Pearson upper
+bound on the walker-level any-exceedance indicator.
 
 The proposed primary statistic is
 
@@ -55,10 +64,15 @@ of two and `0.01 Ha` change with simultaneous uncertainty support; the bounded
 null additionally requires every fixed-threshold exceedance probability to
 exclude a late absolute increase of `0.002`. A flat MAD is not equivalence.
 
+The gating instrument is W, the high quantiles, and the exceedance
+probabilities, provided complete records and qualified dependence are present.
 Held-out beta survival-slope curvature and calibrated generalized-Pareto `xi`
-are interpretation diagnostics. Hill is context only. An absent or
-inconclusive admissible tail diagnostic is `unresolved`, never a pass. No
-finite-prefix diagnostic proves an ultimate finite or infinite variance.
+are non-gating interpretation diagnostics; Hill is context only. Their drift
+is measured across the declared held-out ordered draw prefixes and supported
+tail-fraction intervals. An unresolved ultimate tail class does not by itself
+make the trajectory label `unresolved`; an absent or inconclusive direct
+instrument remains `unresolved`, never a pass. No finite-prefix diagnostic
+proves an ultimate finite or infinite variance.
 
 ## Closed outcomes
 
@@ -78,7 +92,8 @@ analytic oracle, imperfect-state rejection, sampler controls, short learned
 route, fresh restore, and complete-record refusal controls, belong to slice
 `5cfcca3e` on Cannon CPU. Part (g), the excluded-seed GPU route smoke, belongs
 to slice `406194c5` on Polaris. Slice `2f1b2921` reruns the integrated check
-on the exact candidate. This check is not a science result and does not
+on the exact candidate. The JSON gives each part's pass criteria and its
+disjoint non-science seed namespace. This check is not a science result and does not
 authorize the executor or a lineage.
 
 The **SCIENCE LINEAGES** remain prohibited until the operator has reviewed the
@@ -91,3 +106,19 @@ cusp and decay, the odd-electron readout as a readout device rather than a
 second electron, rejection at undefined radius zero without regularization,
 an independently coded scalar hydrogen oracle, sampler-target/mutation
 rejection, and source/resolved-input identity checks.
+
+The proposed nuclear law has a normalizability gate at every checkpoint:
+outer slope `-1 + c/d <= -kappa_min`, with `kappa_min = 0.5` proposed for
+operator review. A violation makes that checkpoint `unresolved`; it is never
+filtered out. `c = 0` is the exact hydrogen answer, so upward curvature drift
+is itself a reportable model signal. The independently recomputed analytic
+controls are `alpha=1.2`: mean `-0.48 Ha`, variance `0.0576 Ha^2`, median
+local energy `-0.540498 Ha`, `W=2.339741 Ha`, with exceedance probabilities
+`0.008304` at 1 Ha and `0.926514` at 0.01 Ha; `alpha=1` has constant `-0.5 Ha`
+and zero W/exceedances. The W/bootstrap instrument must reproduce these
+controls on independent Gamma draws.
+
+The early comparison uses updates 0 and 1,000; the contract records that this
+decrease component may have little dynamic range because update zero is
+untrained. A post-transient secondary early point remains an operator
+alternative and does not silently change the rule.
