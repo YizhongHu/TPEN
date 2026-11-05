@@ -132,7 +132,6 @@ evaluator:
         seed: ${runtime.seed}
         reset: true
         verify_model_unchanged: true
-        readout_eps: 1.0e-12
         chunk_size: 4096
       calculators:
         - _target_: tpen.evaluation.LocalEnergyCalculator
