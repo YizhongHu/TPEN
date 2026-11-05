@@ -82,7 +82,7 @@ def validate_rows(rows: list[dict[str, Any]], spec: RecordSpec, manifest: dict[s
         for key, expected in (("source_sha", spec.source_sha), ("checkpoint_sha", spec.checkpoint_sha), ("config_sha", spec.config_sha)):
             _require_identity(row, key, expected)
         if row.get("commit_marker") != "committed":
-            raise RecordIntegrityError("row is not committed")
+            raise RecordIntegrityError("row commit marker is not committed")
         try:
             draw = int(row["draw_index"])
             walker = int(row["walker_index"])

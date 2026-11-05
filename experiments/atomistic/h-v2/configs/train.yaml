@@ -48,7 +48,7 @@ model:
   trace_name: tpen
   embedding:
     _target_: tpen.nn.Embedding
-    max_order: 1
+    max_order: 2
     spatial_dim: ${system.spatial_dim}
     out_channels: 8
     hidden_channels: 32
@@ -58,8 +58,8 @@ model:
     - _target_: tpen.nn.TPENLayer
       mixing:
         _target_: tpen.nn.EquivariantMixing
-        max_order: 1
-        max_virtual_order: 1
+        max_order: 2
+        max_virtual_order: 2
         channels: 8
         implementation: vectorized
         initial_weight: 0.5
@@ -67,8 +67,8 @@ model:
           _target_: torch.nn.SiLU
       path_aggregation:
         _target_: tpen.nn.PathAggregation
-        max_order: 1
-        max_virtual_order: 1
+        max_order: 2
+        max_virtual_order: 2
         channels: 8
         activation:
           _target_: torch.nn.SiLU
