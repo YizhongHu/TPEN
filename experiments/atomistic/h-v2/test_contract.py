@@ -5,6 +5,7 @@ or any scientific result.
 """
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -66,6 +67,16 @@ def test_tail_contract_never_promotes_hill_or_missing_diagnostics() -> None:
     assert tail["absence_or_inconclusive"] == (
         "unresolved; an absent admissible tail diagnostic is never a pass"
     )
+    assert tail["gating"]["statistics"] == [
+        "W_99_9",
+        "high_quantiles",
+        "exceedance_probabilities",
+    ]
+    assert tail["non_gating_interpretation"]["statistics"] == [
+        "beta survival-slope curvature",
+        "generalized-Pareto xi",
+        "Hill",
+    ]
 
 
 def test_science_hold_and_pipeline_scope_are_separate() -> None:
@@ -89,11 +100,11 @@ def test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct() -> Non
     assert len(explicit_seed_values) == len(explicit_seeds)
     assert explicit_seeds.isdisjoint(evaluation_seeds)
     assert len(explicit_seeds | evaluation_seeds) == len(explicit_seeds) + 324
-    assert set(inputs["decision_rules"]["categories"]) == {
+    assert inputs["decision_rules"]["categories"] == [
         "recurrence",
         "bounded_null",
         "unresolved",
-    }
+    ]
 
 
 def test_all_eight_lane_proposals_are_visible() -> None:
@@ -113,3 +124,11 @@ def test_retention_and_evaluation_sets_are_distinct() -> None:
     assert measurement["checkpoint_retention"]["updates"].startswith(
         "0 and every 1000"
     )
+
+
+def test_normalizability_gate_is_explicit() -> None:
+    gate = load_inputs()["measurement"]["normalizability_gate"]
+    assert gate["outer_slope"] == "-1 + c/d"
+    assert gate["kappa_min"] == 0.5
+    assert gate["condition"] == "outer slope <= -kappa_min at every checkpoint"
+    assert gate["violation"] == "checkpoint is unresolved; no records are filtered"
