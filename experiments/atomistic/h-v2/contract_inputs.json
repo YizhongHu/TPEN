@@ -6,7 +6,10 @@
     "electron_count": 1,
     "nuclear_charge": 1,
     "exact_ground_energy_hartree": -0.5,
-    "excluded_systems": ["molecular hydrogen", "Hooke's atom"]
+    "excluded_systems": [
+      "molecular hydrogen",
+      "Hooke's atom"
+    ]
   },
   "source_identity": {
     "comparison_commit": "67beab2095cc987eb044abceeecfdb549a5793fb",
@@ -17,22 +20,96 @@
       "experiments/atomistic/he-v1/report.py"
     ],
     "historical_evidence": [
-      {"path": "/Users/yizhonghu/he-v1-independent-report-20260823/REPORT.md", "kind": "historical training and collection report"},
-      {"path": "/Users/yizhonghu/he-v1-independent-report-20260823/data/block_statistics.csv", "kind": "historical 5k-block training statistics"},
-      {"path": "TO:7e47ec15 corrected He-v1 collection receipt", "kind": "immutable run identity"},
-      {"path": "TO:2421a447 diagnosis-results", "kind": "historical onset summary"},
-      {"path": "TO:fcc7c2c7 authorized-tail-curvature-result-2026-08-31", "kind": "historical fresh-evaluation tail evidence"},
-      {"path": "TO:97f9d143 tail-class-gate-unsettles-the-founding-claim-2026-09-01", "kind": "historical correction"},
-      {"path": "TO:30c6b2cf tail-index-domain-and-fork-addendum-2026-08-31", "kind": "historical correction"}
+      {
+        "path": "/Users/yizhonghu/he-v1-independent-report-20260823/REPORT.md",
+        "kind": "historical training and collection report"
+      },
+      {
+        "path": "/Users/yizhonghu/he-v1-independent-report-20260823/data/block_statistics.csv",
+        "kind": "historical 5k-block training statistics"
+      },
+      {
+        "path": "TO:7e47ec15 corrected He-v1 collection receipt",
+        "kind": "immutable run identity"
+      },
+      {
+        "path": "TO:2421a447 diagnosis-results",
+        "kind": "historical onset summary"
+      },
+      {
+        "path": "TO:fcc7c2c7 authorized-tail-curvature-result-2026-08-31",
+        "kind": "historical fresh-evaluation tail evidence"
+      },
+      {
+        "path": "TO:97f9d143 tail-class-gate-unsettles-the-founding-claim-2026-09-01",
+        "kind": "historical correction"
+      },
+      {
+        "path": "TO:30c6b2cf tail-index-domain-and-fork-addendum-2026-08-31",
+        "kind": "historical correction"
+      }
     ],
-    "current_grid_warning": "The production_grid.yaml at 67beab2095cc987eb044abceeecfdb549a5793fb names a current 100k/200k/300k plan; it is not the executed historical 25k/50k plan."
+    "current_grid_warning": "The production_grid.yaml at 67beab2095cc987eb044abceeecfdb549a5793fb names a current 100k/200k/300k plan; it is not the executed historical 25k/50k plan.",
+    "historical_identifiers": {
+      "training_run": {
+        "value": "train-seed0000",
+        "source": "REPORT.md line 5",
+        "independently_checked": true
+      },
+      "training_slurm_job": {
+        "value": "40907434",
+        "source": "REPORT.md line 5",
+        "independently_checked": true
+      },
+      "training_source_commit": {
+        "value": "418accf153368aab45586dc2a2cc97c18472691c",
+        "source": "REPORT.md line 5",
+        "independently_checked": true
+      },
+      "checkpoint_50k_sha256": {
+        "value": "9a8acc0e6f2ca86c405880ce5a43c322bfddb4352315c692e257aced7b0d07d7",
+        "source": "REPORT.md lines 44,313",
+        "independently_checked": true
+      },
+      "evaluation_run": {
+        "value": "tpen-f4-eval42-78152c40-20260826T194602--0400",
+        "source": "TO:2421a447 diagnosis-results/cannon-execution, mechanically extracted by MCP query_notes",
+        "independently_checked": true
+      },
+      "collection_run": {
+        "value": "f4-collect-20260828T0100--0400",
+        "source": "TO:0e471630 acceptance-contract/implementation-receipt, mechanically extracted by MCP query_notes",
+        "independently_checked": true
+      },
+      "diagnosis_report_sha256": {
+        "value": "4ce7c166f4c9777019c948bed0b3ae22150106c6ea8bb376048f65eec2f5275a",
+        "source": "TO:2421a447 diagnosis-results, mechanically extracted by MCP query_notes",
+        "independently_checked": true
+      }
+    }
   },
   "measurement": {
     "estimand": "tail-sensitive local-energy dispersion profile over complete draw-by-walker records from a fresh evaluation of a frozen checkpoint",
     "primary_statistic": "W = the 99.9th percentile of A = abs(E_L - median(E_L)), computed on the complete retained draw-by-walker grid",
-    "primary_dispersion": ["W_99_9", "high_quantiles", "exceedance_probabilities", "positive_and_negative_survival_curves"],
-    "secondary_dispersion": ["median_absolute_deviation", "median", "IQR", "sample_variance"],
-    "fixed_exceedance_thresholds_hartree": [0.01, 0.05, 0.1, 0.5, 1.0],
+    "primary_dispersion": [
+      "W_99_9",
+      "high_quantiles",
+      "exceedance_probabilities",
+      "positive_and_negative_survival_curves"
+    ],
+    "secondary_dispersion": [
+      "median_absolute_deviation",
+      "median",
+      "IQR",
+      "sample_variance"
+    ],
+    "fixed_exceedance_thresholds_hartree": [
+      0.01,
+      0.05,
+      0.1,
+      0.5,
+      1
+    ],
     "energy_error_profile": "Also report quantiles and exceedance probabilities for abs(E_L + 0.5 Ha) and the signed median energy error.",
     "complete_record_rule": "Every planned draw-by-walker record appears exactly once with finite coordinates and local energy, reconciled source/checkpoint/config/schema identities, and no clipping, filtering, replacement, final-draw shortcut, or pooled partial window.",
     "checkpoint_retention": {
@@ -44,46 +121,457 @@
     },
     "evaluated_checkpoints": {
       "status": "proposed_by_lane_pending_operator_review",
-      "updates": [0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000, 25000, 30000, 35000, 40000, 45000, 50000],
+      "updates": [
+        0,
+        1000,
+        2000,
+        3000,
+        4000,
+        5000,
+        6000,
+        7000,
+        8000,
+        9000,
+        10000,
+        11000,
+        12000,
+        13000,
+        14000,
+        15000,
+        16000,
+        17000,
+        18000,
+        19000,
+        20000,
+        25000,
+        30000,
+        35000,
+        40000,
+        45000,
+        50000
+      ],
       "count_per_lineage": 27,
       "distinction": "The evaluated set is a subset of the retained set; unevaluated retained checkpoints are not post-result primary selections."
     },
     "tail_rule": {
       "status": "proposed_by_lane_pending_operator_review",
       "diagnostic": "Direct W, quantile, and exceedance profiles are primary. Held-out beta survival-slope curvature and calibrated generalized-Pareto xi are interpretation diagnostics, never replaced by a Hill class declaration.",
-      "tail_fractions": [0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001],
-      "prefixes": [0.25, 0.5, 1.0],
+      "tail_fractions": [
+        0.1,
+        0.05,
+        0.02,
+        0.01,
+        0.005,
+        0.002,
+        0.001
+      ],
+      "prefixes": [
+        0.25,
+        0.5,
+        1
+      ],
       "admissibility": "At least 200 held-out exceedances from 50 distinct walkers, finite ordered thresholds, complete identities, and qualified dependence; three adjacent supported intervals at half/full prefixes and common shallower support at quarter prefix.",
       "stability": "Proposed relative beta drift <= 0.20 and absolute xi drift <= 0.10 with compatible whole-walker uncertainty intervals.",
       "hill": "context_only",
-      "absence_or_inconclusive": "unresolved; an absent admissible tail diagnostic is never a pass"
+      "absence_or_inconclusive": "unresolved; an absent admissible tail diagnostic is never a pass",
+      "gating": {
+        "statistics": [
+          "W_99_9",
+          "high_quantiles",
+          "exceedance_probabilities"
+        ],
+        "admissibility": "complete records plus qualified dependence check"
+      },
+      "non_gating_interpretation": {
+        "statistics": [
+          "beta survival-slope curvature",
+          "generalized-Pareto xi",
+          "Hill"
+        ],
+        "drift_axis": "across held-out ordered draw prefixes 0.25, 0.5 and 1.0 and adjacent supported tail-fraction intervals",
+        "status": "interpretation only; an unresolved ultimate tail class does not by itself make the trajectory label unresolved"
+      }
     },
     "seed_roster": {
-      "training_initialization_seeds": [73001, 73002, 73003],
-      "training_sampler_seeds": [83001, 83002, 83003],
+      "training_initialization_seeds": [
+        73001,
+        73002,
+        73003
+      ],
+      "training_sampler_seeds": [
+        83001,
+        83002,
+        83003
+      ],
       "evaluation_stream_seed_formula": "1000000 + 10000*lineage_index + 10*evaluated_checkpoint_ordinal + stream_index, with indices 0..2, 0..26, 0..3",
-      "pilot_seeds": [999001, 999002],
-      "disjointness": "Pilot/check seeds are excluded from science; no training, sampler, evaluation, or pilot seed may be reused across namespaces."
+      "pilot_seeds": [
+        999001,
+        999002
+      ],
+      "disjointness": "Pilot/check seeds are excluded from science; no training, sampler, evaluation, or pilot seed may be reused across namespaces.",
+      "non_science_seed_namespaces": {
+        "pipeline_cpu_learned_e": {
+          "training": [
+            910001
+          ],
+          "sampler": [
+            910002
+          ],
+          "evaluation": [
+            910003,
+            910004
+          ]
+        },
+        "pipeline_gpu_smoke_g": {
+        "training": [
+          999002
+        ],
+        "sampler": [
+          999003
+        ],
+        "evaluation": [
+          999004
+        ]
+        },
+        "capacity_pilot": {
+          "training": [
+          999001
+          ],
+          "sampler": [
+          999005
+          ],
+          "evaluation": [
+          999006,
+          999007,
+          999008,
+          999009
+          ]
+        }
+      }
+    },
+    "fresh_evaluation": {
+      "streams_per_checkpoint": 4,
+      "walkers": 4096,
+      "draws_per_stream": 256,
+      "burn_in": 1000,
+      "stride": 20,
+      "stream_roles": {
+        "selection": [
+          0,
+          1
+        ],
+        "confirmation": [
+          2,
+          3
+        ]
+      },
+      "estimator": {
+        "quantity": "W = P99.9(abs(E_L - per-stream median(E_L)))",
+        "grid": "each stream's full 4096 by 256 draw-by-walker grid",
+        "median": "computed independently per stream",
+        "order_statistic": "index ceil(0.999*N) of sorted deviations, no interpolation"
+      },
+      "uncertainty": {
+        "resampling_unit": "whole walker",
+        "minimum_resamples": 2000,
+        "simultaneous_band_level": 0.95
+      },
+      "zero_event_bound": "one-sided 97.5% Clopper-Pearson upper bound for the walker-level indicator that a walker has at least one exceedance, with n=4096 times the number of streams used"
+    },
+    "normalizability_gate": {
+      "outer_slope": "-1 + c/d",
+      "kappa_min": 0.5,
+      "condition": "outer slope <= -kappa_min at every checkpoint",
+      "violation": "checkpoint is unresolved; no records are filtered",
+      "exact_hydrogen_answer": "c=0"
+    },
+    "analytic_controls": {
+      "source": "independently coded standard-library scalar oracle",
+      "alpha_1_2": {
+        "pointwise_local_energy": "-alpha^2/2 + (alpha-1)/r",
+        "born_mean_hartree": -0.48,
+        "variance_hartree2": 0.0576,
+        "median_local_energy_hartree": -0.540498,
+        "w_p99_9_hartree": 2.339741,
+        "exceedance_probability_abs_deviation_gt_1_hartree": 0.008304,
+        "exceedance_probability_abs_deviation_gt_0_01_hartree": 0.926514
+      },
+      "alpha_1": {
+        "pointwise_local_energy_hartree": -0.5,
+        "w_p99_9_hartree": 0,
+        "all_fixed_threshold_exceedance_probabilities": 0
+      },
+      "instrument_requirement": "independent Gamma draws must reproduce W_exact within its own band; bootstrap must exercise the alpha=1 zero-event bound"
     }
   },
   "decision_rules": {
-    "categories": ["recurrence", "bounded_null", "unresolved"],
-    "recurrence": "Complete records and qualified uncertainty exist. For each passing lineage, streams 0/1 select the smallest-mean-W consecutive triple centered at 3000..19000 (earliest tie); streams 2/3 confirm early W (mean at 0 and 1000) exceeds basin W by >=2x and >=0.01 Ha, and at least two of 40000/45000/50000 exceed it by both margins with simultaneous confidence bounds. At least 2 of 3 lineages pass. Tail exceedance safeguards must not contradict the W result.",
-    "bounded_null": "All 3 lineages are complete and pass instrument/sampling gates; simultaneous inference over every predeclared basin, checkpoint, threshold, and window search excludes the W decrease/rise rule and excludes a late W deterioration of the declared size through 20000. Fixed-threshold exceedance bands also exclude an absolute late increase of 0.002 at every threshold. A flat MAD or nonsignificance alone is not equivalence.",
-    "unresolved": "Any required record, identity, instrument, dependence/uncertainty qualification, tail safeguard, operator decision, or horizon is absent or inconclusive; a partial lineage result, conflicting streams, unsupported margins, or a tail-only change outside the declared instrument is unresolved."
+    "categories": [
+      "recurrence",
+      "bounded_null",
+      "unresolved"
+    ],
+    "recurrence": "Complete records and qualified uncertainty exist. Streams 0/1 select the smallest-mean-W consecutive triple centered at 3000..19000 (earliest tie); streams 2/3 re-measure early, basin and late W, and each confirmation stream independently must show early W exceeds basin W by >=2x and >=0.01 Ha, with at least two of 40000/45000/50000 exceeding it by both margins with simultaneous confidence bounds. At least 2 of 3 lineages pass. If two lineages pass and the third is incomplete, the study-level label is unresolved; report recurrence in the two complete lineages only. Tail exceedance safeguards must not contradict the W result.",
+    "bounded_null": "All 3 lineages are complete and pass instrument/sampling gates; simultaneous inference over every predeclared basin, checkpoint, threshold, and window search excludes the W decrease/rise rule and excludes a late W deterioration of the declared size through 20000. Fixed-threshold exceedance bands use all four streams and the pilot gate; they also exclude an absolute late increase of 0.002 at every threshold. A flat MAD or nonsignificance alone is not equivalence.",
+    "unresolved": "Any required record, identity, instrument, dependence/uncertainty qualification, tail safeguard, operator decision, or horizon is absent or inconclusive; a partial lineage result, conflicting streams, unsupported margins, or a tail-only change outside the declared instrument is unresolved.",
+    "parameters": {
+      "w_factor_margin": 2,
+      "w_absolute_margin_hartree": 0.01,
+      "exceedance_absolute_margin": 0.002,
+      "basin_center_updates": [
+        3000,
+        4000,
+        5000,
+        6000,
+        7000,
+        8000,
+        9000,
+        10000,
+        11000,
+        12000,
+        13000,
+        14000,
+        15000,
+        16000,
+        17000,
+        18000,
+        19000
+      ],
+      "early_updates": [
+        0,
+        1000
+      ],
+      "late_updates": [
+        40000,
+        45000,
+        50000
+      ],
+      "late_required_count": 2,
+      "selection_streams": [
+        0,
+        1
+      ],
+      "confirmation_streams": [
+        2,
+        3
+      ],
+      "lineages_required_for_recurrence": 2,
+      "confirmation_mode": "each confirmation stream passes independently; streams 2 and 3 are not pooled",
+      "bounded_null_streams": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "pilot_gate": "science admission requires pilot simultaneous-band half-width <= half of every exceedance margin",
+      "operator_alternative": "retain absolute 0.002 only at 0.1, 0.5 and 1 Ha and use a relative margin at 0.01 and 0.05 Ha",
+      "zero_event_bound": "one-sided 97.5% Clopper-Pearson upper bound on walker-level any-exceedance indicator"
+    }
   },
   "lane_proposals": [
-    {"id": "helium_reference_model_and_primary_statistic", "status": "proposed_by_lane_pending_operator_review", "proposal": "Use the historical He training basin only as context: 5k-block median of within-batch variance on a changing model, about 0.00173 Ha^2; s10=26570 and s90=44982 are definition-dependent onset summaries whose definition is only in the unopened Netscratch report, not basin-departure points. Use W and fixed exceedance probabilities for H.", "rationale": "W detects rare-event frequency defects that MAD can hide; no fresh He basin checkpoint exists for a common-estimand threshold.", "alternatives": ["make exceedance probability the primary axis instead of percentile W", "use a separately approved recomputed He fresh-evaluation reference"]},
-    {"id": "horizon_and_checkpoints", "status": "proposed_by_lane_pending_operator_review", "proposal": "50,000 updates, retain 0..50000 every 1000, evaluate the explicit 27-checkpoint set", "rationale": "Dense retention prevents loss of an early basin while the smaller evaluated set controls fresh-evaluation cost.", "alternatives": ["evaluate all 51 retained checkpoints", "use a 100,000-update horizon or a sparse 15-point evaluation set"]},
-    {"id": "independent_lineages", "status": "proposed_by_lane_pending_operator_review", "proposal": "Three fresh lineages with seeds 73001..73003 and sampler seeds 83001..83003; require two of three for recurrence", "rationale": "Three is a bounded first recurrence experiment with independent training identities.", "alternatives": ["one exploratory lineage, which cannot support replicated recurrence", "five lineages for more replication at about 67 percent more cost"]},
-    {"id": "walkers_evaluation_and_uncertainty", "status": "proposed_by_lane_pending_operator_review", "proposal": "4096 training walkers; four fresh streams per evaluated checkpoint, 4096 walkers x 256 draws, burn-in 1000 and stride 20; whole-walker resampling with at least 2000 resamples and simultaneous 95 percent bands", "rationale": "Separate stream replication, complete histories, and conservative zero-event bounds protect against dependence and rare-event overclaiming.", "alternatives": ["1024 walkers x 1024 draws", "two streams, accepting weaker basin-selection/confirmation power"]},
-    {"id": "tail_diagnostic_and_margins", "status": "proposed_by_lane_pending_operator_review", "proposal": "Use direct W plus exceedance safeguards; beta/xi are held-out context diagnostics. Use factor-2 and 0.01 Ha W margins and 0.002 absolute exceedance-probability safeguard.", "rationale": "The decision remains distributional without claiming an ultimate tail class or population variance.", "alternatives": ["make event probability primary", "require all three seeds or use a tenfold effect threshold"]},
-    {"id": "science_venue_and_ceiling", "status": "proposed_by_lane_pending_operator_review", "proposal": "FASRC Cannon, one full A100 per lineage, at most 32 GPU-hours per lineage and 96 total; pilot must project the complete unchanged plan. Polaris packed-node science is not assumed.", "rationale": "A single-card Cannon stratum is simpler before multi-GPU placement is qualified.", "alternatives": ["efficiently packed Polaris node after placement and utilization qualification", "a revised lower-cost plan with lost timing or replication power stated"]},
-    {"id": "one_electron_pipeline_check", "status": "proposed_by_lane_admitted_non_science_scope", "proposal": "Admit the bounded non-science check under the operator's 2026-11-05 direction: parts (a)-(f) on Cannon CPU in slice 5cfcca3e; part (g) as an excluded-seed Polaris GPU smoke in slice 406194c5; exact integrated rerun in slice 2f1b2921.", "rationale": "The first one-electron route must prove physics, learning, fresh restore, sampler, and collection wiring before any science lineage.", "alternatives": ["a smaller CPU wiring check and GPU-only learning check, with weaker CPU qualification", "put the complete GPU route check inside the excluded-seed capacity pilot"]}
+    {
+      "id": "helium_reference_model_and_primary_statistic",
+      "status": "proposed_by_lane_pending_operator_review",
+      "proposal": "Use the historical He training basin only as context: 5k-block median of within-batch variance on a changing model, about 0.00173 Ha^2; s10=26570 and s90=44982 are definition-dependent onset summaries whose definition is only in the unopened Netscratch report, not basin-departure points. Use W and fixed exceedance probabilities for H.",
+      "rationale": "W detects rare-event frequency defects that MAD can hide; no fresh He basin checkpoint exists for a common-estimand threshold.",
+      "alternatives": [
+        "make exceedance probability the primary axis instead of percentile W",
+        "use a separately approved recomputed He fresh-evaluation reference"
+      ]
+    },
+    {
+      "id": "horizon_and_checkpoints",
+      "status": "proposed_by_lane_pending_operator_review",
+      "proposal": "50,000 updates, retain 0..50000 every 1000, evaluate the explicit 27-checkpoint set",
+      "rationale": "Dense retention prevents loss of an early basin while the smaller evaluated set controls fresh-evaluation cost.",
+      "alternatives": [
+        "evaluate all 51 retained checkpoints",
+        "use a 100,000-update horizon or a sparse 15-point evaluation set"
+      ]
+    },
+    {
+      "id": "independent_lineages",
+      "status": "proposed_by_lane_pending_operator_review",
+      "proposal": "Three fresh lineages with seeds 73001..73003 and sampler seeds 83001..83003; require two of three for recurrence",
+      "rationale": "Three is a bounded first recurrence experiment with independent training identities.",
+      "alternatives": [
+        "one exploratory lineage, which cannot support replicated recurrence",
+        "five lineages for more replication at about 67 percent more cost"
+      ]
+    },
+    {
+      "id": "walkers_evaluation_and_uncertainty",
+      "status": "proposed_by_lane_pending_operator_review",
+      "proposal": "4096 training walkers; four fresh streams per evaluated checkpoint, 4096 walkers x 256 draws, burn-in 1000 and stride 20; whole-walker resampling with at least 2000 resamples and simultaneous 95 percent bands",
+      "rationale": "Separate stream replication, complete histories, and conservative zero-event bounds protect against dependence and rare-event overclaiming.",
+      "alternatives": [
+        "1024 walkers x 1024 draws",
+        "two streams, accepting weaker basin-selection/confirmation power"
+      ]
+    },
+    {
+      "id": "tail_diagnostic_and_margins",
+      "status": "proposed_by_lane_pending_operator_review",
+      "proposal": "Use direct W plus exceedance safeguards; beta/xi are held-out context diagnostics. Use factor-2 and 0.01 Ha W margins and 0.002 absolute exceedance-probability safeguard.",
+      "rationale": "The decision remains distributional without claiming an ultimate tail class or population variance.",
+      "alternatives": [
+        "make event probability primary",
+        "require all three seeds or use a tenfold effect threshold"
+      ]
+    },
+    {
+      "id": "science_venue_and_ceiling",
+      "status": "proposed_by_lane_pending_operator_review",
+      "proposal": "FASRC Cannon, one full A100 per lineage, at most 32 GPU-hours per lineage and 96 total; pilot must project the complete unchanged plan. Polaris packed-node science is not assumed.",
+      "rationale": "A single-card Cannon stratum is simpler before multi-GPU placement is qualified.",
+      "alternatives": [
+        "efficiently packed Polaris node after placement and utilization qualification",
+        "a revised lower-cost plan with lost timing or replication power stated"
+      ]
+    },
+    {
+      "id": "one_electron_pipeline_check",
+      "status": "proposed_by_lane_admitted_non_science_scope",
+      "proposal": "Admit the bounded non-science check under the operator's 2026-11-05 direction: parts (a)-(f) on Cannon CPU in slice 5cfcca3e; part (g) as an excluded-seed Polaris GPU smoke in slice 406194c5; exact integrated rerun in slice 2f1b2921.",
+      "rationale": "The first one-electron route must prove physics, learning, fresh restore, sampler, and collection wiring before any science lineage.",
+      "alternatives": [
+        "a smaller CPU wiring check and GPU-only learning check, with weaker CPU qualification",
+        "put the complete GPU route check inside the excluded-seed capacity pilot"
+      ]
+    },
+    {
+      "id": "learned_model_optimizer_and_training_sampler",
+      "status": "proposed_by_lane_pending_operator_review",
+      "proposal": "Use one layer, 32 channels, hidden width 128, maximum order 2, SiLU embedding/mixing/aggregation/residual stack, trainable equal-initialized readout weights, float64, Adam learning rate 0.005, curved electron-nucleus law c=0.01 and d=1 both trainable, and 4096 training walkers; retain the odd-electron Pfaffian border as a readout device, not a second electron.",
+      "rationale": "A concrete model/optimizer/sampler proposal makes the pipeline and science plan reviewable without silently choosing unreviewed hyperparameters; c=0 is the exact hydrogen answer and c/d drift is a reportable normalizability signal.",
+      "alternatives": [
+        "fixed linear nuclear factor -r",
+        "constrained decaying nuclear law",
+        "a revised architecture or optimizer with changed recurrence and resource implications stated"
+      ]
+    }
   ],
   "admission": {
-    "pipeline_check": {"scope": "non_science_one_electron_pipeline_check", "status": "admitted_by_operator_direction_2026-11-05", "parts": ["a", "b", "c", "d", "e", "f", "g"], "placements": {"a-f": "slice 5cfcca3e on Cannon CPU", "g": "slice 406194c5 as excluded-seed Polaris GPU smoke", "integrated_rerun": "slice 2f1b2921"}, "science_result": false},
-    "science_lineages": {"scope": "three 50000-update scientific training lineages and their fresh evaluations", "status": "prohibited_until_operator_reviews_science_plan", "required_review": "operator review of all lane_proposals with explicit approval", "current_status": "prohibited"}
+    "pipeline_check": {
+      "scope": "non_science_one_electron_pipeline_check",
+      "status": "admitted_by_operator_direction_2026-11-05",
+      "parts": [
+        {
+          "id": "a",
+          "description": "construct one-electron charge-one H with raw -1/r, -1/2 Laplacian, no electron-electron term/factor, intended cusp, and geometry agreement",
+          "pass_criteria": {
+            "geometry": "model, sampler and Hamiltonian agree",
+            "potential": "raw -1/r",
+            "laplacian": "-1/2"
+          }
+        },
+        {
+          "id": "b",
+          "description": "independent exact-state scalar instrument with component closure and explicit radius-zero refusal",
+          "pass_criteria": {
+            "ordinary_radii_bohr": [
+              0.001,
+              0.01,
+              0.1,
+              0.5,
+              1,
+              2,
+              4,
+              8
+            ],
+            "ordinary_total_energy_abs_error_hartree": 1e-8,
+            "stress_radii_bohr": [
+              1e-8,
+              0.000001,
+              0.0001
+            ],
+            "stress_bound": "max(1e-9, 128*eps64*(abs(K)+abs(V)))",
+            "radius_zero": "reject or invalid; never regularize"
+          }
+        },
+        {
+          "id": "c",
+          "description": "reject exact-energy stubs with imperfect alpha=1.2 state and wrong Hamiltonian mutants",
+          "pass_criteria": {
+            "imperfect_state": "exp(-1.2*r)",
+            "born_mean_hartree": -0.48,
+            "variance_hartree2": 0.0576
+          }
+        },
+        {
+          "id": "d",
+          "description": "independent radial sampler control from three rate-two exponentials and uniform directions",
+          "pass_criteria": {
+            "radial_density": "4*r^2*exp(-2*r)",
+            "compare_starts": "narrow and diffuse",
+            "predeclare": "simultaneous radial distribution and tail bands"
+          }
+        },
+        {
+          "id": "e",
+          "description": "briefly train the learned route, restore model-only into two fresh evaluations, and collect complete records",
+          "pass_criteria": {
+            "channels": 8,
+            "hidden_width": 32,
+            "training_walkers": 256,
+            "updates": 1000,
+            "evaluation_walkers": 1024,
+            "draws_per_stream": 64,
+            "streams": 2,
+            "burn_in": 1000,
+            "stride": 20,
+            "energy_abs_error_hartree": 0.02,
+            "median_abs_error_improvement": 0.25,
+            "dynamic_range_rule": "if initial error <=0.02, report little learning dynamic range and require imperfect learned-state/gradient control"
+          }
+        },
+        {
+          "id": "f",
+          "description": "reconcile complete initial and terminal populations and refuse integrity defects",
+          "pass_criteria": {
+            "refusals": [
+              "missing draw",
+              "duplicate walker record",
+              "altered source/checkpoint/config identity",
+              "missing checkpoint commit marker",
+              "nonfinite data",
+              "uncommitted tail",
+              "training-state restore request"
+            ]
+          }
+        },
+        {
+          "id": "g",
+          "description": "excluded-seed Polaris full-model GPU smoke with complete fresh stream",
+          "pass_criteria": {
+            "walkers": 4096,
+            "updates_max": 1000,
+            "fresh_stream": "4096 walkers by 256 draws",
+            "energy_abs_error_hartree": 0.02,
+            "ceiling": "one node-hour including setup",
+            "record": "actual placement/device/precision and all artifacts"
+          }
+        }
+      ],
+      "placements": {
+        "a-f": "slice 5cfcca3e on Cannon CPU",
+        "g": "slice 406194c5 as excluded-seed Polaris GPU smoke",
+        "integrated_rerun": "slice 2f1b2921"
+      },
+      "science_result": false
+    },
+    "science_lineages": {
+      "scope": "three 50000-update scientific training lineages and their fresh evaluations",
+      "status": "prohibited_until_operator_reviews_science_plan",
+      "required_review": "operator review of all lane_proposals with explicit approval",
+      "current_status": "prohibited"
+    }
   },
-  "controls": ["exact hydrogen energy -1/2 Ha", "independently coded scalar local-energy oracle", "known-imperfect alpha=1.2 state rejection", "sampler target and mutation rejection", "strict no-regularization rule at radius zero", "source and resolved-input identity checks"]
+  "controls": [
+    "exact hydrogen energy -1/2 Ha",
+    "independently coded scalar local-energy oracle",
+    "known-imperfect alpha=1.2 state rejection",
+    "sampler target and mutation rejection",
+    "strict no-regularization rule at radius zero",
+    "source and resolved-input identity checks"
+  ]
 }
