@@ -3,10 +3,14 @@
 from importlib import import_module
 
 from .contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
+from .allocations import ConfiguredAllocation
 from .delivery import PreparedInputBundle
 from .environments import PreparedPythonEnvironment, SourceScript
-from .results import AllocationObservation, ManifestAttempt, OutcomeReceipt, RunManifest, StartReceipt, decode_manifest, encode_manifest
+from .results import AllocationObservation, ManifestAttempt, OutcomeReceipt, OUTCOME_STATUSES, RunManifest, StartReceipt, decode_manifest, encode_manifest
 from .runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
+from .storage import AttemptFence, DirectoryStore, FenceRejected
+from .tasks import ConfiguredRun
+from .lifecycle import AttachedAllocation
 from .workers import ProcessOutcome, SubprocessWorker
 
 __version__ = "0.1.0"
@@ -33,7 +37,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "__version__", "AllocationId", "AllocationObservation", "AllocationProgram",
-    "AttemptId", "BackendJobId", "CoreRunEvidence", "EvidenceUnavailable", "ManifestAttempt", "MaterializedProgram", "OutcomeReceipt", "ProcessOutcome",
+    "AttemptId", "AttachedAllocation", "AttemptFence", "BackendJobId", "ConfiguredAllocation", "ConfiguredRun", "CoreRunEvidence", "DirectoryStore", "EvidenceUnavailable", "FenceRejected", "ManifestAttempt", "MaterializedProgram", "OUTCOME_STATUSES", "OutcomeReceipt", "ProcessOutcome",
     "ProgramSpecRef", "ReadyGroup", "RunManifest", "StagedConfig", "StagedHydra",
     "PreparedInputBundle", "PreparedPythonEnvironment", "SourceScript", "StartReceipt",
     "TaskSpec", "TPENCommand", "TPENEvidence", "SubprocessWorker", "WorkerProgram",
