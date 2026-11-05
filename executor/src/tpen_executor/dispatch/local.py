@@ -175,6 +175,7 @@ class LocalDispatcher:
                         begin_error = error
                     continue
                 result_digest: str | None = None
+                segment_evidence: CoreRunEvidence | None = None
                 status = "launch_failed"
                 try:
                     worker = self.worker.materialize(env)
@@ -211,6 +212,7 @@ class LocalDispatcher:
                         result_digest = None
                     else:
                         result_digest = digest(_evidence_payload(decoded))
+                        segment_evidence = decoded
                 except EvidenceUnavailable:
                     # Evidence absence never changes the process outcome or
                     # fabricates a digest.
@@ -234,6 +236,17 @@ class LocalDispatcher:
                 except Exception as error:
                     if finish_error is None:
                         finish_error = error
+                if (
+                    status == "completed"
+                    and segment_evidence is not None
+                    and segment_evidence.verdict in {"completed", "incomplete"}
+                    and segment_evidence.checkpoint is not None
+                ):
+                    try:
+                        lifecycle.store.accept_segment(fence, segment_evidence, None)
+                    except Exception as error:
+                        if finish_error is None:
+                            finish_error = error
             if begin_error is not None:
                 if finish_error is not None:
                     begin_error.add_note(f"finish error after deferred begin failure: {finish_error!r}")
