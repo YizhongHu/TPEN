@@ -17,7 +17,7 @@ def _fields(verdict):
         "schema": "tpen.run-evidence/v1", "run_dir": "/run", "verdict": verdict,
         "run_status": "completed" if verdict == "completed" else None,
         "checkpoint": {
-            "checkpoint_dir": "/run/checkpoints/c", "schema_version": "v2",
+            "checkpoint_dir": "/run/checkpoints/c", "schema_version": 2,
             "next_iteration": 2, "completed_updates": 1,
         } if verdict == "completed" else None,
         "refusal": {"code": "missing-run-dir", "reason": "absent"} if verdict == "refused" else None,

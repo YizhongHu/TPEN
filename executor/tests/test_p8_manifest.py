@@ -91,7 +91,7 @@ def _evidence(run_dir: str, *, verdict: str = "completed", checkpoint_dir: str |
             "run_status": verdict,
             "checkpoint": {
                 "checkpoint_dir": checkpoint_dir or f"{run_dir}/checkpoint-{step}",
-                "schema_version": "v1",
+                "schema_version": 1,
                 "next_iteration": step,
                 "completed_updates": step,
             },

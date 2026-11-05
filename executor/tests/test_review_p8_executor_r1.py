@@ -23,7 +23,7 @@ def finish(store, group, allocation, step):
     fence = store.begin_attempt(group, "a", allocation, "2026-11-05T00:00:00Z")
     store.finish_attempt(fence, "completed", "2026-11-05T00:01:00Z")
     core = str(Path(fence.output_dir) / "core")
-    evidence = CoreRunEvidence.from_mapping(dict(schema="tpen.run-evidence/v1", run_dir=core, verdict="completed", run_status="completed", refusal=None, checkpoint=dict(checkpoint_dir=core + f"/checkpoints/step_{step:06d}", schema_version="2", next_iteration=step, completed_updates=step)))
+    evidence = CoreRunEvidence.from_mapping(dict(schema="tpen.run-evidence/v1", run_dir=core, verdict="completed", run_status="completed", refusal=None, checkpoint=dict(checkpoint_dir=core + f"/checkpoints/step_{step:06d}", schema_version=2, next_iteration=step, completed_updates=step)))
     return fence, evidence
 
 

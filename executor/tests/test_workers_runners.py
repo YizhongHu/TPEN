@@ -147,7 +147,7 @@ def test_tpen_evidence_decodes_all_verdicts_and_never_reads_run_dir(tmp_path: Pa
     run_dir.mkdir()
     payload = {
         "schema": "tpen.run-evidence/v1", "run_dir": str(run_dir), "verdict": "completed",
-        "run_status": "completed", "checkpoint": {"checkpoint_dir": "/c", "schema_version": "v2", "next_iteration": 2, "completed_updates": 1}, "refusal": None,
+        "run_status": "completed", "checkpoint": {"checkpoint_dir": "/c", "schema_version": 2, "next_iteration": 2, "completed_updates": 1}, "refusal": None,
     }
     environment = PreparedPythonEnvironment(environment.python, environment.setup, {**environment.env, "EVIDENCE": json.dumps(payload)})
     out, err = tmp_path / "evidence.out", tmp_path / "evidence.err"

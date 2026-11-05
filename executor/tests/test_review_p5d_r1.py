@@ -57,7 +57,7 @@ def payload(run_dir, verdict="completed"):
         "schema": "tpen.run-evidence/v1", "run_dir": str(run_dir),
         "verdict": verdict, "run_status": "failed" if verdict == "refused" else verdict,
         "checkpoint": None if verdict == "refused" else {
-            "checkpoint_dir": str(Path(run_dir) / "checkpoint"), "schema_version": "v2",
+            "checkpoint_dir": str(Path(run_dir) / "checkpoint"), "schema_version": 2,
             "next_iteration": 3, "completed_updates": 2,
         },
         "refusal": {"code": "missing-checkpoint", "reason": "review"} if verdict == "refused" else None,
