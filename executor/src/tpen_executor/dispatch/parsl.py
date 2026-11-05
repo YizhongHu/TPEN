@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
 import threading
@@ -56,11 +55,6 @@ class _ChildProcessHandle:
             self._attached.set()
         if kill_requested:
             self._kill_process_group(process)
-
-    def wait_for_process(self, timeout: float) -> bool:
-        """Wait briefly for a child to publish its process-group handle."""
-
-        return self._attached.wait(timeout)
 
     def request_kill(self) -> None:
         """Request group termination, including before the child is attached."""
@@ -222,55 +216,48 @@ class ParslDispatcher(DispatcherContract):
             executors.
         """
 
-        binding = self.binding
-        if binding is None:
-            if not isinstance(lifecycle, AttachedAllocation):
-                raise BindingError("binding is required when lifecycle is not AttachedAllocation")
-            binding = binding_from_allocation(lifecycle.allocation)
-        else:
-            binding = WorkerBinding.from_mapping(binding)
-        config = self.executor_config
-        if config is None:
-            run_dir = str(Path(lifecycle.store.root) / "parsl")
-            config = self._config_type(
-                executors=[self._thread_pool_type(max_threads=1)],
-                run_dir=run_dir,
-                usage_tracking=False,
-            )
-        labels = self._validate_executor_config(config)
-        object.__setattr__(self, "_active_binding", binding)
-        object.__setattr__(self, "_active_executor_labels", labels)
-        dfk = self._dfk_type(config=config)
-        object.__setattr__(self, "_active_dfk", dfk)
+        token = self._begin_dispatch(group, runs, lifecycle, env, timeout)
+        dfk: Any = None
         original: BaseException | None = None
-        cleanup_error: BaseException | None = None
-        result: RunManifest | None = None
         try:
-            # Keep the concrete dispatch path valid on slotted dataclasses;
-            # the injected zero-argument hook exists only for the isolated
-            # contract probe seam.
-            injected_super = globals().get("super")
-            if injected_super is not None:
-                result = injected_super().run(group, runs, lifecycle, env, timeout)
+            binding = self.binding
+            if binding is None:
+                if not isinstance(lifecycle, AttachedAllocation):
+                    raise BindingError("binding is required when lifecycle is not AttachedAllocation")
+                binding = binding_from_allocation(lifecycle.allocation)
             else:
-                result = super(ParslDispatcher, self).run(group, runs, lifecycle, env, timeout)
-        except BaseException as error:
-            original = error
-        finally:
+                binding = WorkerBinding.from_mapping(binding)
+            config = self.executor_config
+            if config is None:
+                run_dir = str(Path(lifecycle.store.root) / "parsl")
+                config = self._config_type(
+                    executors=[self._thread_pool_type(max_threads=1)],
+                    run_dir=run_dir,
+                    usage_tracking=False,
+                )
+            labels = self._validate_executor_config(config)
+            object.__setattr__(self, "_active_binding", binding)
+            object.__setattr__(self, "_active_executor_labels", labels)
+            dfk = self._dfk_type(config=config)
+            object.__setattr__(self, "_active_dfk", dfk)
             try:
-                dfk.cleanup()
-            except BaseException as cleanup_exc:
-                cleanup_error = cleanup_exc
-                if original is not None:
-                    original.add_note(f"Parsl DFK cleanup error: {cleanup_exc!r}")
+                return super().run(group, runs, lifecycle, env, timeout, _admitted=True)
+            except BaseException as error:
+                original = error
+                raise
+        finally:
+            if dfk is not None:
+                try:
+                    dfk.cleanup()
+                except BaseException as cleanup_error:
+                    if original is not None:
+                        original.add_note(f"Parsl DFK cleanup error: {cleanup_error!r}")
+                    else:
+                        raise
             object.__setattr__(self, "_active_dfk", None)
             object.__setattr__(self, "_active_binding", None)
             object.__setattr__(self, "_active_executor_labels", ("threads",))
-        if original is not None:
-            raise original
-        if cleanup_error is not None:
-            raise cleanup_error
-        return result
+            self._end_dispatch(token)
 
     def _validate_executor_config(self, config: Any) -> tuple[str, ...]:
         """Refuse non-ThreadPool Parsl configs before any lifecycle begin."""
@@ -332,47 +319,20 @@ class ParslDispatcher(DispatcherContract):
             "timeout": timeout,
             "process_handle": process_handle,
         }
-        if isinstance(dfk, self._dfk_class):
-            app = self._python_app_factory(
-                data_flow_kernel=dfk,
-                cache=False,
-                executors=list(self._active_executor_labels),
-            )(_run_parsl_child_captured)
-            future = app(*app_args, **app_kwargs)
-        else:
-            # The reviewer seam supplies a lightweight DFK double. Keep its
-            # call in the pinned structured Parsl submission shape without
-            # bypassing python_app for a real DataFlowKernel.
-            future = dfk.submit(
-                _run_parsl_child,
-                app_args=app_args,
-                executors=list(self._active_executor_labels),
-                cache=False,
-                ignore_for_cache=None,
-                app_kwargs=app_kwargs,
-            )
+        app = self._python_app_factory(
+            data_flow_kernel=dfk,
+            cache=False,
+            executors=list(self._active_executor_labels),
+        )(_run_parsl_child_captured)
+        future = app(*app_args, **app_kwargs)
         try:
             result = future.result(None)
-        except FutureTimeoutError:
+        except BaseException as original:
             process_handle.request_kill()
             try:
                 future.result(None)
-            except BaseException:
-                pass
-            return ProcessOutcome(args, None, stdout_path, stderr_path, True)
-        except BaseException as original:
-            process_handle.request_kill()
-            # The real Parsl AppFuture has no supported cancellation path. A
-            # non-Parsl future here is only the isolated legacy probe seam.
-            if not process_handle.wait_for_process(0.1) and not type(future).__module__.startswith("parsl."):
-                cancel = getattr(future, "cancel", None)
-                if callable(cancel):
-                    cancel()
-            elif process_handle.wait_for_process(0):
-                try:
-                    future.result(None)
-                except BaseException as reap_error:
-                    original.add_note(f"Parsl child reap result: {reap_error!r}")
+            except BaseException as reap_error:
+                original.add_note(f"Parsl child reap result: {reap_error!r}")
             raise
         if not isinstance(result, ProcessOutcome):
             if isinstance(result, _ChildFailure):
