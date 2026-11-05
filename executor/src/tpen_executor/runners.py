@@ -214,8 +214,12 @@ class TPENEvidence:
             Prepared environment consumed by the worker.
         run_dir : str or os.PathLike
             Run directory passed to public inspection; it is not read here.
-        cwd, stdout_path, stderr_path, timeout : optional
-            Child working directory, named logs, and timeout in seconds.
+        cwd : str or os.PathLike or None, optional
+            Child working directory.
+        stdout_path, stderr_path : str or os.PathLike
+            Required named logs.
+        timeout : float or None, optional
+            Timeout in seconds.
 
         Returns
         -------
@@ -229,8 +233,9 @@ class TPENEvidence:
 
         Notes
         -----
-        The worker's setup script runs before environment overlay and the
-        timeout covers the worker's complete process group.
+        The worker applies the owner environment, then the descriptor overlay,
+        then the setup script; setup is the last writer. The timeout covers the
+        worker's complete process group.
         """
 
         try:

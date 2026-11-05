@@ -41,9 +41,10 @@ class SubprocessWorker:
 
     Notes
     -----
-    Setup is sourced through positional shell parameters, then the child
-    environment overlay is applied.  Each invocation starts a new POSIX
-    session so timeout cleanup owns the complete process group.
+    The owner environment is copied first, the descriptor overlay is applied
+    second, and the setup script is sourced last. Each invocation starts a
+    new POSIX session so timeout cleanup owns the complete process group.
+    The caller-named stdout and stderr log files are truncated for each run.
     """
 
     def run(
@@ -64,8 +65,10 @@ class SubprocessWorker:
             Prepared interpreter, optional setup, and environment overlay.
         args : sequence of str
             Child arguments; strings are never interpolated into shell text.
-        cwd, stdout_path, stderr_path : str or os.PathLike
-            Child working directory and caller-named binary logs.
+        cwd : str or os.PathLike or None
+            Child working directory.
+        stdout_path, stderr_path : str or os.PathLike
+            Required caller-named binary logs, truncated for this run.
         timeout : float or None, optional
             Positive timeout in seconds for the whole process group.
 
