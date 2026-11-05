@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import os
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, ClassVar, Mapping
 
-from ._codec import canonical_bytes
+from ._codec import canonical_bytes, decode_json
 from .environments import PreparedPythonEnvironment
 from .workers import SubprocessWorker
 
@@ -54,6 +53,10 @@ class CoreRunEvidence:
     VERDICTS: ClassVar[frozenset[str]] = frozenset({"completed", "incomplete", "failed", "refused"})
     REFUSAL_CODES: ClassVar[frozenset[str]] = REFUSAL_CODES
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "checkpoint", self._checkpoint(self.checkpoint))
+        object.__setattr__(self, "refusal", self._refusal(self.refusal))
+
     @classmethod
     def from_mapping(cls, value: Any) -> "CoreRunEvidence":
         """Decode one strict public evidence mapping.
@@ -89,8 +92,8 @@ class CoreRunEvidence:
         run_status = value["run_status"]
         if run_status is not None and type(run_status) is not str:
             raise EvidenceUnavailable("run_status must be a string or null")
-        checkpoint = cls._checkpoint(value["checkpoint"])
-        refusal = cls._refusal(value["refusal"])
+        checkpoint = value["checkpoint"]
+        refusal = value["refusal"]
         if verdict == "refused" and refusal is None:
             raise EvidenceUnavailable("refused evidence requires refusal")
         if verdict == "refused" and checkpoint is not None:
@@ -118,7 +121,7 @@ class CoreRunEvidence:
         if value is None:
             return None
         keys = {"checkpoint_dir", "schema_version", "next_iteration", "completed_updates"}
-        if type(value) is not dict or set(value) != keys:
+        if not isinstance(value, Mapping) or set(value) != keys:
             raise EvidenceUnavailable("checkpoint has invalid keys")
         if type(value["checkpoint_dir"]) is not str or type(value["schema_version"]) is not str:
             raise EvidenceUnavailable("checkpoint text fields have invalid types")
@@ -132,7 +135,7 @@ class CoreRunEvidence:
     def _refusal(cls, value: Any) -> MappingProxyType | None:
         if value is None:
             return None
-        if type(value) is not dict or set(value) != {"code", "reason"}:
+        if not isinstance(value, Mapping) or set(value) != {"code", "reason"}:
             raise EvidenceUnavailable("refusal has invalid keys")
         if type(value["code"]) is not str or value["code"] not in cls.REFUSAL_CODES:
             raise EvidenceUnavailable("unknown refusal code")
@@ -250,21 +253,10 @@ class TPENEvidence:
         if not payload.strip():
             raise EvidenceUnavailable("inspection stdout is empty")
         try:
-            decoded = json.loads(payload, object_pairs_hook=_reject_duplicate_keys)
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            decoded = decode_json(payload)
+        except (TypeError, ValueError) as exc:
             raise EvidenceUnavailable("inspection stdout is not one JSON object") from exc
         return CoreRunEvidence.from_mapping(decoded)
-
-
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """Reject duplicate JSON member names while decoding every object."""
-
-    value: dict[str, Any] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"duplicate JSON key: {key!r}")
-        value[key] = item
-    return value
 
 
 __all__ = ["CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "TPENCommand", "TPENEvidence"]
