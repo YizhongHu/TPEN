@@ -40,3 +40,15 @@ cd executor && uv sync --locked && uv run pytest -q tests
 Operational outcome receipts use the closed vocabulary `completed`, `failed`,
 `timed_out`, and `launch_failed`. These statuses describe execution only;
 scientific validity remains the responsibility of core evidence.
+
+`DirectoryStore` requires a POSIX filesystem with advisory `fcntl.lockf`
+support. It holds one task lock across pointer advancement, fence validation,
+and outcome publication. Receipt publication writes and fsyncs a temporary
+file, links it into the final name without replacement, fsyncs the containing
+directory, and removes the temporary name. Newly created store directories and
+pointer parents are fsynced before `begin_attempt` returns.
+
+Store-owned directories and receipt files must not be pre-existing symlinks;
+the store refuses them before use. The task namespace is deliberately limited
+to reversible `[A-Za-z0-9._-]+` path components. Resistance to a concurrent
+adversary swapping a link after these checks is outside this layer's contract.
