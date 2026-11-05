@@ -14,7 +14,7 @@ from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.results import OUTCOME_STATUSES, OutcomeReceipt, StartReceipt
-from tpen_executor.storage import AttemptFence, DirectoryStore, FenceRejected
+from tpen_executor.storage import AttemptFence, DirectoryStore, FenceRejected, _write_new
 from tpen_executor.tasks import ConfiguredRun
 
 
@@ -123,6 +123,19 @@ def test_p5c_preexisting_attempt_directory_is_refused_and_untouched(tmp_path: Pa
     assert list(existing.iterdir()) == [marker]
 
 
+def test_p5c_write_new_refuses_existing_destination_without_replacement(tmp_path: Path) -> None:
+    """The storage-owned private writer pins its no-overwrite layer directly."""
+    destination = tmp_path / "receipt.json"
+    original = b'{"known":"bytes"}\n'
+    destination.write_bytes(original)
+
+    with pytest.raises((FileExistsError, OSError)):
+        _write_new(str(destination), b'{"replacement":true}\n')
+
+    assert destination.read_bytes() == original
+    assert not list(tmp_path.glob(".tmp-*"))
+
+
 def test_p5c_stale_and_double_finish_are_rejected_without_overwrite(tmp_path: Path) -> None:
     """The current pointer fences completion and receipts are exact-once."""
     store = DirectoryStore(tmp_path)
@@ -134,7 +147,7 @@ def test_p5c_stale_and_double_finish_are_rejected_without_overwrite(tmp_path: Pa
     assert not Path(first.output_dir, "outcome.json").exists()
     store.finish_attempt(second, "failed", "done")
     original = Path(second.output_dir, "outcome.json").read_bytes()
-    with pytest.raises(FenceRejected):
+    with pytest.raises(FenceRejected, match="already finished"):
         store.finish_attempt(second, "completed", "again")
     assert Path(second.output_dir, "outcome.json").read_bytes() == original
 
