@@ -172,7 +172,7 @@ plan = StagePlanV2(study="baselines", stage="baselines", plan_id=PLAN_ID,
                    results_root=ROOT, tasks=tuple(tasks)).validate()
 Path(PLAN_DIR).mkdir(parents=True, exist_ok=True)
 plan.write(PLAN_DIR)
-write_additive_ready_group(Path(PLAN_DIR) / "executor_input.json", plan)
+write_additive_ready_group(Path(PLAN_DIR) / "executor_input.json", plan, script_slot=1)
 # Assert the thing build_plan would have got wrong.
 cmds = {t.command for t in plan.tasks}
 assert len(cmds) == NROWS, f"EXPECTED {NROWS} DISTINCT COMMANDS, got {len(cmds)}"

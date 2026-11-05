@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -78,3 +79,51 @@ def test_non_unrepresentable_error_still_propagates(tmp_path: Path, monkeypatch)
 
 def test_unrepresentable_exception_is_a_value_error() -> None:
     assert issubclass(UnrepresentableInput, ValueError)
+
+
+def test_r3_t1_literal_argv_tokens_keep_exact_plan_identity(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    first = str(root / "not-a-script.py")
+    second = str(root) + "/./not-a-script.py"
+    base = _plan(tmp_path / "results")
+    task = base.tasks[0]
+    left = replace(base, tasks=(replace(task, command=("runner", "--literal", first)),))
+    right = replace(base, tasks=(replace(task, command=("runner", "--literal", second)),))
+
+    assert left.validate() is left
+    assert right.validate() is right
+    assert ready_group(left)["execution_plan_digest"] != ready_group(right)["execution_plan_digest"]
+
+
+def test_r3_t2_single_current_artifact_in_both_publication_orders(tmp_path: Path) -> None:
+    good = _plan(tmp_path / "valid-then-refused" / "results")
+    current = tmp_path / "valid-then-refused" / "executor_input.json"
+    assert write_additive_ready_group(current, good) == current
+    prior = current.read_bytes()
+    bad = replace(good, tasks=(replace(good.tasks[0], params={"steps": Path("100.5")}),))
+    assert bad.validate() is bad
+    assert write_additive_ready_group(current, bad) is None
+    assert not current.exists()
+    assert current.with_name("executor_input_diagnostics.json").exists()
+    history = sorted(current.parent.glob("executor_input.superseded-*.json"))
+    assert len(history) == 1
+    assert history[0].read_bytes() == prior
+
+    refused_first = _plan(tmp_path / "refused-then-valid" / "results")
+    current = tmp_path / "refused-then-valid" / "executor_input.json"
+    refused = replace(
+        refused_first,
+        tasks=(replace(refused_first.tasks[0], params={"steps": Path("100.5")}),),
+    )
+    assert write_additive_ready_group(current, refused) is None
+    diagnostic = current.with_name("executor_input_diagnostics.json")
+    assert diagnostic.exists()
+    prior_diagnostic = diagnostic.read_bytes()
+    assert write_additive_ready_group(current, refused_first) == current
+    assert current.exists()
+    assert not diagnostic.exists()
+    diagnostic_history = sorted(
+        current.parent.glob("executor_input_diagnostics.superseded-*.json")
+    )
+    assert len(diagnostic_history) == 1
+    assert diagnostic_history[0].read_bytes() == prior_diagnostic

@@ -198,15 +198,19 @@ def executor_inputs(train_plan: StagePlanV2, eval_plan: StagePlanV2) -> tuple[di
         Training and evaluation ``ReadyGroup`` wire mappings, respectively.
     """
 
-    return ready_group(train_plan), ready_group(eval_plan)
+    return ready_group(train_plan, script_slot=1), ready_group(eval_plan, script_slot=1)
 
 
 def write_plans(output_dir: str | Path, train_plan: StagePlanV2, eval_plan: StagePlanV2, manifest: Mapping[str, Any]) -> Path:
     output = Path(output_dir)
     train_plan.write(output / "02_train")
     eval_plan.write(output / "03_eval")
-    write_additive_ready_group(output / "02_train" / "executor_input.json", train_plan)
-    write_additive_ready_group(output / "03_eval" / "executor_input.json", eval_plan)
+    write_additive_ready_group(
+        output / "02_train" / "executor_input.json", train_plan, script_slot=1
+    )
+    write_additive_ready_group(
+        output / "03_eval" / "executor_input.json", eval_plan, script_slot=1
+    )
     output.mkdir(parents=True, exist_ok=True)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     with (output / "rows.csv").open("w", encoding="utf-8", newline="") as handle:
