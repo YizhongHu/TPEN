@@ -76,4 +76,4 @@ def executor_input(plan: StagePlanV2) -> dict[str, object]:
         Plain executor ``ReadyGroup`` wire mapping.
     """
 
-    return ready_group(plan)
+    return ready_group(plan, script_slot=1)

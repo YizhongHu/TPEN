@@ -12,8 +12,10 @@ from collections.abc import Mapping, Sequence
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Any
 
 
@@ -121,26 +123,30 @@ def _path_projection(value: Any, field: str, path_roots: tuple[Path, ...]) -> An
     return {"root": "repo", "path": relative.as_posix() or "."}
 
 
-def _command_projection(value: Any, path_roots: tuple[Path, ...]) -> Any:
-    """Project absolute script tokens in an argv field for plan digests."""
+def _command_projection(
+    value: Any, path_roots: tuple[Path, ...], script_slot: int | None
+) -> Any:
+    """Project only the producer-declared script token in an argv field."""
 
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         return value
+    if script_slot is None:
+        return value
     projected = []
-    for token in value:
-        if type(token) is str and token.startswith("/") and Path(token).suffix == ".py":
-            try:
-                Path(token).relative_to(_REPO_ROOT)
-            except ValueError:
-                projected.append(token)
-            else:
-                projected.append(_path_projection(token, "script", path_roots))
-            continue
-        projected.append(token)
+    for index, token in enumerate(value):
+        if index == script_slot:
+            projected.append(_path_projection(token, "script", path_roots))
+        else:
+            projected.append(token)
     return projected
 
 
-def _project_declared_paths(value: Any, path_roots: tuple[Path, ...] = ()) -> Any:
+def _project_declared_paths(
+    value: Any,
+    path_roots: tuple[Path, ...] = (),
+    *,
+    script_slot: int | None = None,
+) -> Any:
     """Project only declared path/reference fields before canonical encoding."""
 
     value = _omega_container(value)
@@ -148,17 +154,17 @@ def _project_declared_paths(value: Any, path_roots: tuple[Path, ...] = ()) -> An
         if type(value) is not dict:
             return value
         return {
-            key: _command_projection(item, path_roots)
+            key: _command_projection(item, path_roots, script_slot)
             if key == "command"
             else _path_projection(item, key, path_roots)
             if key in _PATH_FIELDS
-            else _project_declared_paths(item, path_roots)
+            else _project_declared_paths(item, path_roots, script_slot=script_slot)
             for key, item in value.items()
         }
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         if type(value) not in (list, tuple):
             return value
-        return [_project_declared_paths(item, path_roots) for item in value]
+        return [_project_declared_paths(item, path_roots, script_slot=script_slot) for item in value]
     return value
 
 
@@ -420,7 +426,9 @@ def task_spec(
     }
 
 
-def ready_group(plan: Any, *, group_id: str | None = None) -> dict[str, Any]:
+def ready_group(
+    plan: Any, *, group_id: str | None = None, script_slot: int | None = None
+) -> dict[str, Any]:
     """Build one ordered ``ReadyGroup`` mapping from a stage plan.
 
     Parameters
@@ -430,6 +438,11 @@ def ready_group(plan: Any, *, group_id: str | None = None) -> dict[str, Any]:
     group_id : str, optional
         Stable group identity.  By default the study, stage, and plan id are
         namespaced together.
+    script_slot : int, optional
+        Index of the producer-owned script token in each task command.  Only
+        this explicitly declared token is projected across checkout roots;
+        arbitrary argv values are retained byte-for-byte.  ``None`` disables
+        command projection.
 
     Returns
     -------
@@ -475,7 +488,9 @@ def ready_group(plan: Any, *, group_id: str | None = None) -> dict[str, Any]:
         "group_id": resolved_group_id,
         "members": members,
         "execution_plan_digest": payload_digest(
-            _project_declared_paths(_plan_payload(plan), path_roots)
+            _project_declared_paths(
+                _plan_payload(plan), path_roots, script_slot=script_slot
+            )
         ),
     }
     return group
@@ -531,12 +546,76 @@ def write_ready_group(path: str | Path, plan: Any, *, group_id: str | None = Non
         # diagnostic artifact.  Producer pipelines use the additive helper
         # below so executor_input.json is never a diagnostic envelope.
         payload = _diagnostic_payload(plan, exc, group_id=group_id)
-    target.write_bytes(canonical_bytes(payload))
+    _atomic_write(target, canonical_bytes(payload))
     return target
 
 
+def _history_digest(plan: Any, *, script_slot: int | None) -> str:
+    """Return a stable generation token, including for refused plans."""
+
+    roots = (Path(plan.results_root),)
+    projected = _project_declared_paths(
+        _plan_payload(plan), roots, script_slot=script_slot
+    )
+    try:
+        return payload_digest(projected)
+    except UnrepresentableInput:
+        # A refused plan can contain a value such as Path("100.5") in its
+        # horizon.  It still needs a non-colliding history name even though
+        # that value cannot enter the executor wire document.
+        return hashlib.sha256(
+            json.dumps(
+                projected,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=repr,
+            ).encode("utf-8")
+        ).hexdigest()
+
+
+def _retire_current(path: Path, *, digest: str) -> None:
+    """Move a current artifact to a never-overwritten history name."""
+
+    if not path.exists():
+        return
+    candidate = path.with_name(f"{path.stem}.superseded-{digest}{path.suffix}")
+    serial = 2
+    while candidate.exists():
+        candidate = path.with_name(
+            f"{path.stem}.superseded-{digest}-{serial}{path.suffix}"
+        )
+        serial += 1
+    os.replace(path, candidate)
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Write bytes through a same-directory temporary file and rename."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def write_additive_ready_group(
-    path: str | Path, plan: Any, *, group_id: str | None = None
+    path: str | Path,
+    plan: Any,
+    *,
+    group_id: str | None = None,
+    script_slot: int | None = None,
 ) -> Path | None:
     """Write a valid group or a sibling diagnostic without blocking dispatch.
 
@@ -548,6 +627,9 @@ def write_additive_ready_group(
         Stage-plan object accepted by :func:`ready_group`.
     group_id : str, optional
         Optional stable group identity override.
+    script_slot : int, optional
+        Index of the producer-declared script token, or ``None`` when no
+        command token is a producer-owned script reference.
 
     Returns
     -------
@@ -565,17 +647,18 @@ def write_additive_ready_group(
     """
 
     target = Path(path)
+    diagnostic = target.with_name("executor_input_diagnostics.json")
+    digest = _history_digest(plan, script_slot=script_slot)
     try:
-        payload = ready_group(plan, group_id=group_id)
+        payload = ready_group(plan, group_id=group_id, script_slot=script_slot)
     except UnrepresentableInput as exc:
-        diagnostic = target.with_name("executor_input_diagnostics.json")
-        diagnostic.parent.mkdir(parents=True, exist_ok=True)
-        diagnostic.write_bytes(
-            canonical_bytes(_diagnostic_payload(plan, exc, group_id=group_id))
+        _retire_current(target, digest=digest)
+        _atomic_write(
+            diagnostic, canonical_bytes(_diagnostic_payload(plan, exc, group_id=group_id))
         )
         return None
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(canonical_bytes(payload))
+    _retire_current(diagnostic, digest=payload["execution_plan_digest"])
+    _atomic_write(target, canonical_bytes(payload))
     return target
 
 

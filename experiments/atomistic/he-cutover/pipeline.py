@@ -88,7 +88,7 @@ def executor_inputs(train_plan: StagePlanV2, eval_plan: StagePlanV2) -> tuple[di
         Training and evaluation ``ReadyGroup`` wire mappings, respectively.
     """
 
-    return ready_group(train_plan), ready_group(eval_plan)
+    return ready_group(train_plan, script_slot=1), ready_group(eval_plan, script_slot=1)
 
 
 def run_pipeline(*, train_plan: StagePlanV2, eval_plan: StagePlanV2, facility: str, launch_dir: str | Path, admission_id: str, executor=None, environ: Mapping[str, str] | None = None) -> int:
@@ -96,8 +96,12 @@ def run_pipeline(*, train_plan: StagePlanV2, eval_plan: StagePlanV2, facility: s
 
     launch = Path(launch_dir)
     launch.mkdir(parents=True, exist_ok=True)
-    write_additive_ready_group(launch / "02_train" / "executor_input.json", train_plan)
-    write_additive_ready_group(launch / "03_eval" / "executor_input.json", eval_plan)
+    write_additive_ready_group(
+        launch / "02_train" / "executor_input.json", train_plan, script_slot=1
+    )
+    write_additive_ready_group(
+        launch / "03_eval" / "executor_input.json", eval_plan, script_slot=1
+    )
     context = allocation_context(facility=facility, run_root=launch, environ=environ)
     executor = executor or ParslAttachExecutor()
     records = []
