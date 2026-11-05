@@ -82,10 +82,11 @@ def test_core_profile_reference_rejects_malformed_or_unpinned_output(tmp_path: P
 
 
 def test_profile_check_hash_matches_equality_and_nested_state_is_frozen() -> None:
-    first = ProfileCheck.from_mapping(_payload())
+    first = ProfileCheck.from_mapping(_payload("refused"))
     second = ProfileCheck.from_mapping(dict(reversed(tuple(first.to_dict().items()))))
     assert first == second
     assert hash(first) == hash(second)
+    assert first.refusal is not None
     with pytest.raises(TypeError):
         first.refusal["code"] = "bad"  # type: ignore[index]
 
