@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import math
 import os
@@ -63,6 +63,7 @@ class SubprocessWorker:
         stderr_path: str | os.PathLike[str],
         timeout: float | None = None,
         process_handle: Any = None,
+        pre_spawn_guard: Callable[[], bool] | None = None,
     ) -> ProcessOutcome:
         """Run the prepared interpreter with exact argument boundaries.
 
@@ -82,6 +83,10 @@ class SubprocessWorker:
             Thread-safe owner handle notified of the child process group. The
             handle must provide ``attach(process)`` and ``clear(process)``;
             it may request an owner-side cancellation before attachment.
+        pre_spawn_guard : callable returning bool, optional
+            Optional thread-safe cancellation check made immediately before
+            ``Popen``. When it returns true, no child is spawned and a
+            never-spawned ``ProcessOutcome`` is returned.
 
         Returns
         -------
@@ -100,6 +105,8 @@ class SubprocessWorker:
             raise TypeError("environment must be PreparedPythonEnvironment")
         if isinstance(args, (str, bytes, bytearray)) or any(type(arg) is not str for arg in args):
             raise TypeError("args must be a sequence of strings")
+        if pre_spawn_guard is not None and not callable(pre_spawn_guard):
+            raise TypeError("pre_spawn_guard must be callable or None")
         if timeout is not None and (
             type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0
         ):
@@ -121,6 +128,8 @@ class SubprocessWorker:
         stderr_name = os.fspath(stderr_path)
         timed_out = False
         with Path(stdout_name).open("wb") as stdout, Path(stderr_name).open("wb") as stderr:
+            if pre_spawn_guard is not None and pre_spawn_guard():
+                return ProcessOutcome(logical_argv, None, stdout_name, stderr_name, timed_out)
             process = subprocess.Popen(
                 command,
                 cwd=None if cwd is None else os.fspath(cwd),
