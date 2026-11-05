@@ -130,6 +130,7 @@ class ParslDispatcher(DispatcherContract):
     binding: WorkerBinding | Mapping[str, Any] | None = None
     _config_type: Any = field(init=False, repr=False, compare=False)
     _dfk_type: Any = field(init=False, repr=False, compare=False)
+    _dfk_class: Any = field(init=False, repr=False, compare=False)
     _thread_pool_type: Any = field(init=False, repr=False, compare=False)
     _python_app_factory: Any = field(init=False, repr=False, compare=False)
     _active_binding: WorkerBinding | None = field(init=False, default=None, repr=False, compare=False)
@@ -152,6 +153,7 @@ class ParslDispatcher(DispatcherContract):
             raise
         object.__setattr__(self, "_config_type", Config)
         object.__setattr__(self, "_dfk_type", DataFlowKernel)
+        object.__setattr__(self, "_dfk_class", DataFlowKernel)
         object.__setattr__(self, "_thread_pool_type", ThreadPoolExecutor)
         object.__setattr__(self, "_python_app_factory", python_app)
         if self.binding is not None:
@@ -307,7 +309,7 @@ class ParslDispatcher(DispatcherContract):
             "timeout": timeout,
             "process_handle": process_handle,
         }
-        if isinstance(dfk, self._dfk_type):
+        if isinstance(dfk, self._dfk_class):
             app = self._python_app_factory(
                 data_flow_kernel=dfk,
                 cache=False,
