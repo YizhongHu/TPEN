@@ -123,6 +123,37 @@ def test_p5c_preexisting_attempt_directory_is_refused_and_untouched(tmp_path: Pa
     assert list(existing.iterdir()) == [marker]
 
 
+def test_p5c_competing_attempt_creator_is_refused_by_exclusive_mkdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A directory appearing after lstat is refused without publication."""
+    import tpen_executor.storage as storage_module
+
+    group = _group("a")
+    task_dir = tmp_path / "groups" / group.identity / "a"
+    attempt_dir = task_dir / "fixed-attempt"
+    marker = attempt_dir / "competing-data"
+    real_lstat = storage_module.os.lstat
+    competed = False
+
+    monkeypatch.setattr(storage_module, "uuid4", lambda: type("FixedUUID", (), {"hex": "fixed-attempt"})())
+
+    def competing_lstat(path: str | os.PathLike[str]) -> os.stat_result:
+        nonlocal competed
+        if Path(path) == attempt_dir and not competed:
+            competed = True
+            attempt_dir.mkdir()
+            marker.write_bytes(b"preserve")
+            raise FileNotFoundError(path)
+        return real_lstat(path)
+
+    monkeypatch.setattr(storage_module.os, "lstat", competing_lstat)
+    # This isolates the exclusive mkdir layer from the lstat pre-check.
+    with pytest.raises(FenceRejected):
+        DirectoryStore(tmp_path).begin_attempt(group, "a", _allocation(), "start")
+    assert marker.read_bytes() == b"preserve"
+    assert not (attempt_dir / "start.json").exists()
+    assert not (task_dir / "current-attempt.json").exists()
+
+
 def test_p5c_write_new_refuses_existing_destination_without_replacement(tmp_path: Path) -> None:
     """The storage-owned private writer pins its no-overwrite layer directly."""
     destination = tmp_path / "receipt.json"
