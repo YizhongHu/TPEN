@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 import pytest
 
 from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
+from tpen_executor.dispatch import LocalDispatcher
+from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.results import AcceptedSegment, ManifestAttempt, OutcomeReceipt, RunManifest, StartReceipt
-from tpen_executor.runners import CoreRunEvidence
+from tpen_executor.runners import CoreRunEvidence, EvidenceUnavailable
 from tpen_executor.storage import DirectoryStore, FenceRejected
+from tpen_executor.tasks import ConfiguredRun
+from tpen_executor.workers import ProcessOutcome
 from helpers.p8_manifest_fixture import cross_project_manifest
 
 
@@ -32,10 +37,8 @@ def _segment(task_id: str, attempt_id: str, predecessor: str | None, step: int =
 def test_p8_manifest_v2_round_trips_and_v1_decodes_read_only() -> None:
     manifest = cross_project_manifest()
     assert RunManifest.decode(manifest.encode()) == manifest
-    old = dict(manifest.to_dict())
-    old["schema"] = RunManifest.V1_SCHEMA
-    old.pop("segments")
-    decoded = RunManifest.decode(old)
+    v1_fixture = Path(__file__).parent / "fixtures" / "run-manifest-v1.json"
+    decoded = RunManifest.decode(v1_fixture.read_bytes())
     assert decoded.segments == ()
     assert decoded.encode() == RunManifest("group-1", GROUP_DIGEST, manifest.attempts, ()).encode()
 
@@ -75,6 +78,10 @@ def _group() -> ReadyGroup:
     return ReadyGroup("group-1", (TaskSpec("task-a", "task-a", program, digest("task-a"), 1, "steps"),), digest({"group": 1}))
 
 
+def _allocation() -> ConfiguredAllocation:
+    return ConfiguredAllocation(AllocationId("allocation-1"), BackendJobId("job-1"), {})
+
+
 def _evidence(run_dir: str, *, verdict: str = "completed", checkpoint_dir: str | None = None, step: int = 1) -> CoreRunEvidence:
     return CoreRunEvidence.from_mapping(
         {
@@ -91,6 +98,102 @@ def _evidence(run_dir: str, *, verdict: str = "completed", checkpoint_dir: str |
             "refusal": None,
         }
     )
+
+
+def _evidence_without_checkpoint(run_dir: str) -> CoreRunEvidence:
+    return CoreRunEvidence.from_mapping(
+        {
+            "schema": "tpen.run-evidence/v1",
+            "run_dir": run_dir,
+            "verdict": "incomplete",
+            "run_status": "running",
+            "checkpoint": None,
+            "refusal": None,
+        }
+    )
+
+
+def _dispatcher_worker(
+    evidence_factory,
+    *,
+    returncode: int = 0,
+) -> SimpleNamespace:
+    class Process:
+        def run(self, environment, args, **kwargs):
+            return ProcessOutcome(tuple(args), returncode, kwargs["stdout_path"], kwargs["stderr_path"], False)
+
+    class Evidence:
+        def read(self, *args, **kwargs):
+            return evidence_factory(args[2])
+
+    return SimpleNamespace(
+        materialize=lambda env: {
+            "environment": object(),
+            "process": Process(),
+            "runner": object(),
+            "evidence": Evidence(),
+        }
+    )
+
+
+def _dispatch_once(tmp_path: Path, worker: SimpleNamespace, store: DirectoryStore) -> RunManifest:
+    group = _group()
+    lifecycle = AttachedAllocation(_allocation(), store)
+    return LocalDispatcher(worker).run(
+        group,
+        {"task-a": ConfiguredRun("task-a", str(tmp_path / "task-a.yaml"))},
+        lifecycle,
+    )
+
+
+def test_p8_dispatcher_accepts_one_completed_checkpoint_as_fresh_segment(tmp_path: Path) -> None:
+    store = DirectoryStore(tmp_path / "store")
+    manifest = _dispatch_once(tmp_path, _dispatcher_worker(_evidence), store)
+    assert len(manifest.segments) == 1
+    segment = manifest.segments[0]
+    assert segment.task_id == "task-a"
+    assert segment.predecessor_checkpoint is None
+    assert (segment.next_iteration, segment.completed_updates) == (1, 1)
+
+
+def test_p8_dispatcher_does_not_accept_failed_member(tmp_path: Path) -> None:
+    store = DirectoryStore(tmp_path / "store")
+    manifest = _dispatch_once(tmp_path, _dispatcher_worker(_evidence, returncode=3), store)
+    assert manifest.segments == ()
+
+
+def test_p8_dispatcher_does_not_accept_evidence_without_checkpoint(tmp_path: Path) -> None:
+    store = DirectoryStore(tmp_path / "store")
+    manifest = _dispatch_once(tmp_path, _dispatcher_worker(_evidence_without_checkpoint), store)
+    assert manifest.segments == ()
+
+
+def test_p8_dispatcher_does_not_accept_unavailable_evidence(tmp_path: Path) -> None:
+    class Evidence:
+        def read(self, *args, **kwargs):
+            raise EvidenceUnavailable("no public evidence")
+
+    worker = SimpleNamespace(
+        materialize=lambda env: {
+            "environment": object(),
+            "process": _dispatcher_worker(_evidence).materialize(env)["process"],
+            "runner": object(),
+            "evidence": Evidence(),
+        }
+    )
+    store = DirectoryStore(tmp_path / "store")
+    manifest = _dispatch_once(tmp_path, worker, store)
+    assert manifest.segments == ()
+
+
+def test_p8_dispatcher_does_not_add_second_fresh_segment(tmp_path: Path) -> None:
+    store = DirectoryStore(tmp_path / "store")
+    worker = _dispatcher_worker(_evidence)
+    first = _dispatch_once(tmp_path, worker, store)
+    second = _dispatch_once(tmp_path, worker, store)
+    assert len(first.segments) == 1
+    assert second.segments == first.segments
+    assert len(second.attempts) == 2
 
 
 def test_p8_store_accept_segment_is_durable_fenced_and_one_shot(tmp_path: Path) -> None:

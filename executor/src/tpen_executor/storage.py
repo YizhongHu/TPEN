@@ -342,9 +342,6 @@ class DirectoryStore:
         with _task_lock(lock_path):
             start = self._validate_fence(fence, task_dir)
             output_dir = _lexical(fence.output_dir)
-            expected_core_dir = _lexical(os.path.join(output_dir, "core"))
-            if _lexical(evidence.run_dir) != expected_core_dir:
-                raise FenceRejected("core evidence run_dir crosses the attempt fence")
             outcome_path = os.path.join(output_dir, "outcome.json")
             if os.path.lexists(outcome_path):
                 _require_regular(outcome_path, "outcome receipt")
@@ -401,6 +398,9 @@ class DirectoryStore:
         with _task_lock(lock_path):
             start = self._validate_fence(fence, task_dir)
             output_dir = _lexical(fence.output_dir)
+            expected_core_dir = _lexical(os.path.join(output_dir, "core"))
+            if _lexical(evidence.run_dir) != expected_core_dir:
+                raise FenceRejected("core evidence run_dir crosses the attempt fence")
             outcome_path = os.path.join(output_dir, "outcome.json")
             _require_regular(outcome_path, "outcome receipt")
             try:

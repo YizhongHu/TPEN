@@ -242,11 +242,13 @@ class LocalDispatcher:
                     and segment_evidence.verdict in {"completed", "incomplete"}
                     and segment_evidence.checkpoint is not None
                 ):
-                    try:
-                        lifecycle.store.accept_segment(fence, segment_evidence, None)
-                    except Exception as error:
-                        if finish_error is None:
-                            finish_error = error
+                    existing_segments = lifecycle.store.manifest(group).segments
+                    if not any(segment.task_id == fence.task_id for segment in existing_segments):
+                        try:
+                            lifecycle.store.accept_segment(fence, segment_evidence, None)
+                        except Exception as error:
+                            if finish_error is None:
+                                finish_error = error
             if begin_error is not None:
                 if finish_error is not None:
                     begin_error.add_note(f"finish error after deferred begin failure: {finish_error!r}")
