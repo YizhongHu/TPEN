@@ -137,6 +137,7 @@ evaluator:
         - _target_: tpen.evaluation.LocalEnergyCalculator
           hamiltonian_terms: ${hamiltonian_terms}
           return_terms: true
+        - _target_: tpen.evaluation.WavefunctionCalculator
       summaries:
         - _target_: tpen.evaluation.SampledRecordWriter
           max_samples: 65536
