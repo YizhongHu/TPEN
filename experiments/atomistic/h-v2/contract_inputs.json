@@ -22,17 +22,18 @@
     ]
   },
   "measurement": {
-    "estimand": "MAD of local energy over complete draw-by-walker records from a fresh evaluation of a frozen checkpoint",
-    "primary_dispersion": "median_absolute_deviation",
-    "secondary_dispersion": ["median", "IQR"],
+    "estimand": "tail-sensitive local-energy dispersion profile over complete draw-by-walker records from a fresh evaluation of a frozen checkpoint",
+    "primary_dispersion": ["high_quantiles", "exceedance_survival_curve", "tail_curvature_beta_xi"],
+    "secondary_dispersion": ["median_absolute_deviation", "median", "IQR"],
     "complete_record_rule": "every planned draw-by-walker record exactly once; finite coordinates and local energy; source, checkpoint, config, and schema identities reconcile; no clipping or replacement",
-    "checkpoint_window": "fresh evaluation stream for each frozen checkpoint with declared burn-in, stride, walkers, draws, and evaluation seed",
+    "checkpoint_window": "fresh evaluation stream for each frozen checkpoint with declared burn-in, stride, walkers, draws, and evaluation seed; retained checkpoints must resolve a possible early minimum and later rise",
+    "checkpoint_density": {"status": "pending_operator_decision", "proposal": "every 2500 updates from 5000 through 20000, then every 5000 updates through the horizon"},
     "seed_identity_rule": "training and evaluation seeds use separate namespaces and must be distinct",
     "tail_rule": {
-      "diagnostic": "Hill estimator on upper tail of absolute median-centered local energy",
+      "diagnostic": "held-out threshold trajectory with local log-survival slope/curvature beta and generalized-Pareto shape xi on upper tail of absolute median-centered local energy",
       "status": "pending_operator_decision",
-      "proposal": {"variance_boundary_alpha": 2.0, "tail_fraction": 0.01, "minimum_order_statistics": 1024, "stability_interval": "operator-selected uncertainty interval wholly below alpha=2"},
-      "when_present": "use MAD, IQR, and quantiles as primary dispersion; variance and conventional MCSE descriptive only"
+      "proposal": {"hill_context_only": true, "nested_prefixes": [0.25, 0.5, 1.0], "tail_fraction": "operator-selected ladder", "minimum_exceedances": "operator-selected", "stability_interval": "operator-selected beta/xi stability rule", "held_out_extremes": true},
+      "when_present": "use tail profile as primary; MAD and IQR may rank windows but cannot establish tail absence; variance and conventional MCSE descriptive only"
     }
   },
   "decision_rules": {
