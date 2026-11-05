@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from experiments.toolkit.dispatch import DispatchSpec, LogicalTaskSpec, StagePlanV2, admit_tasks
+from experiments.toolkit.executor_inputs import ready_group
 from experiments.toolkit.jsonio import write_jsonl
 
 
@@ -59,3 +60,9 @@ def write_dispatch_specs(path: str | Path, dispatches: Sequence[DispatchSpec]) -
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     return write_jsonl(path, (dispatch.to_dict() for dispatch in dispatches))
+
+
+def executor_input(plan: StagePlanV2) -> dict[str, object]:
+    """Emit the executor input mapping while retaining the dispatch route."""
+
+    return ready_group(plan)
