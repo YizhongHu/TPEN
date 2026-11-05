@@ -5,8 +5,26 @@ and exact nonrelativistic infinite-nuclear-mass ground-state energy `-0.5 Ha`.
 It is not molecular hydrogen (`H2`) or Hooke's atom. The exact state is an
 instrument control, not a substitute for a trained-state result.
 
-This directory is a documentation and admission slice. It contains no
-launcher, training code, science output, or qualification result.
+This directory contains the non-science CPU pipeline check. It owns frozen
+Hydra configurations, an independent standard-library scalar oracle, strict
+record collection, and tests beside those sources. It does not contain a
+science launcher, science output, or qualification result.
+
+The executable route is the normal TPEN entrypoint (the ``tpen`` console
+script, or ``tpen.run.run_from_config`` from a test). Do not use
+``python -m tpen.run``: that module has no ``__main__`` guard.
+
+The short learned route is deliberately separate from the scalar oracle:
+``configs/train.yaml`` uses 256 training walkers and distinct initialization
+and sampler seeds, while ``configs/eval.yaml`` restores ``model_only`` into
+fresh 1,024-walker, 64-draw streams. Both configs contain exactly one
+electron, one charge-one nucleus, raw ``eps: 0`` Coulomb potential, and no
+electron-electron factor or term.
+
+``collect.py`` admits only a complete committed draw-by-walker grid after
+source, checkpoint, and resolved-config identities reconcile. Missing,
+duplicate, nonfinite, wrong-identity, training-state, and uncommitted records
+are refusals; no clipped or final-draw statistic is produced.
 
 ## Evidence boundary
 
