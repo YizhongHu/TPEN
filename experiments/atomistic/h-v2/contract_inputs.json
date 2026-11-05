@@ -204,10 +204,6 @@
         83003
       ],
       "evaluation_stream_seed_formula": "1000000 + 10000*lineage_index + 10*evaluated_checkpoint_ordinal + stream_index, with indices 0..2, 0..26, 0..3",
-      "pilot_seeds": [
-        999001,
-        999002
-      ],
       "disjointness": "Pilot/check seeds are excluded from science; no training, sampler, evaluation, or pilot seed may be reused across namespaces.",
       "non_science_seed_namespaces": {
         "pipeline_cpu_learned_e": {

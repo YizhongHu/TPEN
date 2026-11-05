@@ -36,12 +36,14 @@ def test_evaluation_seed_formula_is_injective_and_disjoint() -> None:
         for stream in range(4)
     }
     assert len(seeds) == 3 * n_ordinals * 4 == 324
-    for name in (
-        "training_initialization_seeds",
-        "training_sampler_seeds",
-        "pilot_seeds",
-    ):
-        assert seeds.isdisjoint(roster[name])
+    explicit_seeds = {
+        seed
+        for value in roster.values()
+        if isinstance(value, list)
+        for seed in value
+        if isinstance(seed, int)
+    }
+    assert seeds.isdisjoint(explicit_seeds)
     assert 10 * (n_ordinals - 1) + 3 < 10000
     assert 3 < 10
 
