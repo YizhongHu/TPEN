@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import signal
@@ -89,8 +90,10 @@ class SubprocessWorker:
             raise TypeError("environment must be PreparedPythonEnvironment")
         if isinstance(args, (str, bytes, bytearray)) or any(type(arg) is not str for arg in args):
             raise TypeError("args must be a sequence of strings")
-        if timeout is not None and (type(timeout) not in (int, float) or timeout <= 0):
-            raise ValueError("timeout must be positive or None")
+        if timeout is not None and (
+            type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0
+        ):
+            raise ValueError("timeout must be finite and positive or None")
         logical_argv = (environment.python, *tuple(args))
         command = list(logical_argv)
         if environment.setup is not None:
@@ -117,15 +120,28 @@ class SubprocessWorker:
                 start_new_session=True,
             )
             try:
-                returncode = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                # Kill the isolated session so setup/science descendants stop too.
+                try:
+                    returncode = process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    # Kill the isolated session so setup/science descendants stop too.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    returncode = process.wait()
+            except BaseException:
+                # An interrupt while waiting must not orphan the isolated
+                # session. Reap the leader before propagating cancellation.
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                returncode = process.wait()
+                try:
+                    process.wait()
+                except BaseException:
+                    pass
+                raise
         return ProcessOutcome(logical_argv, returncode, stdout_name, stderr_name, timed_out)
 
 
