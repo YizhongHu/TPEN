@@ -45,7 +45,7 @@ def test_configured_local_energy_sampler_and_model_only_restore(tmp_path: Path) 
     evaluation["run"]["run_id"] = "eval"
     evaluation["sampler"].update(n_walkers=8, burn_in=2, n_steps=2)
     evaluation["evaluator"]["tasks"][0]["generator"]["n_draws"] = 3
-    evaluation["evaluator"]["tasks"][0]["generator"]["replay_chunk_size"] = 5
+    evaluation["evaluator"]["tasks"][0]["generator"]["chunk_size"] = 5
     evaluation["evaluator"]["tasks"][0]["summaries"][0]["max_samples"] = 24
     assert _run_config(evaluation, command="h-v2 pipeline model-only evaluation") == 0
     eval_dir = tmp_path / "tpen_h_v2" / "atomistic" / "eval" / "trajectory"
