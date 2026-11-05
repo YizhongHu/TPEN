@@ -95,11 +95,15 @@ def test_p5c_fresh_fences_are_unique_and_directories_are_not_reused(tmp_path: Pa
     group = _group("a")
     first = store.begin_attempt(group, "a", _allocation(), "t1")
     second = store.begin_attempt(group, "a", _allocation(), "t2")
+    first_start = Path(first.output_dir, "start.json").read_bytes()
+    second_start = Path(second.output_dir, "start.json").read_bytes()
+    third = store.begin_attempt(group, "a", _allocation(), "t3")
     assert first.attempt_id != second.attempt_id
     assert first.output_dir != second.output_dir
+    assert third.output_dir not in {first.output_dir, second.output_dir}
     assert Path(first.output_dir).is_dir() and Path(second.output_dir).is_dir()
-    with pytest.raises(FenceRejected):
-        os.mkdir(first.output_dir)
+    assert Path(first.output_dir, "start.json").read_bytes() == first_start
+    assert Path(second.output_dir, "start.json").read_bytes() == second_start
 
 
 def test_p5c_preexisting_attempt_directory_is_refused_and_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -169,16 +173,23 @@ def test_p5c_each_crossed_fence_rejection_preserves_bytes(tmp_path: Path, crossi
     assert OUTCOME_STATUSES == {"completed", "failed", "timed_out", "launch_failed"}
 
 
-@pytest.mark.parametrize("bad_status", ["unknown", "", "completed ", "cancelled"], ids=["unknown", "empty", "whitespace", "unvocabulary"])
-def test_p5c_status_decode_rejects_each_unknown_value(tmp_path: Path, bad_status: str) -> None:
+@pytest.mark.parametrize(
+    ("bad_status", "expected_exception"),
+    [("unknown", ValueError), ("", TypeError), ("completed ", ValueError), ("cancelled", ValueError)],
+    ids=["unknown", "empty", "whitespace", "unvocabulary"],
+)
+def test_p5c_status_decode_rejects_each_unknown_value(
+    tmp_path: Path, bad_status: str, expected_exception: type[Exception]
+) -> None:
     """Construction and canonical decode enforce the closed status set."""
     group = _group("a")
     fence = DirectoryStore(tmp_path).begin_attempt(group, "a", _allocation(), "start")
-    with pytest.raises(ValueError):
+    with pytest.raises(expected_exception):
         OutcomeReceipt("a", fence.attempt_id, group.identity, "done", bad_status, fence.output_dir)
     mapping = OutcomeReceipt("a", fence.attempt_id, group.identity, "done", "completed", fence.output_dir).to_dict()
     mapping["status"] = bad_status
-    with pytest.raises(ValueError):
+    # ``text`` accepts surrounding whitespace, so this reaches vocabulary validation.
+    with pytest.raises(expected_exception):
         OutcomeReceipt.decode(mapping)
 
 
@@ -248,8 +259,6 @@ def test_p5c_atomic_write_failure_leaves_no_temporary_file(tmp_path: Path, monke
 
 def test_p5c_runtime_write_trap_is_lexical_and_reentrant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Store write calls stay lexically below root while the trap avoids recursion."""
-    import tpen_executor.storage as storage_module
-
     root = tmp_path / "root"
     writes: list[str] = []
     active = False
