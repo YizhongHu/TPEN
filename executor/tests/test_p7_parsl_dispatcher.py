@@ -188,7 +188,7 @@ def test_p7_b_exact_argv_payload_and_fresh_output_namespace(tmp_path: Path, disp
             expected_args = expected_args[2:]
         assert observed["argv"][: len(expected_args)] == list(expected_args)
         assert observed["argv"][-3:] == [f"run.root={output_dir}", "run.layout=flat", "run.run_id=core"]
-        assert observed["cwd"] == str(output_dir)
+        assert Path(observed["cwd"]).resolve() == output_dir.resolve()
     assert attempts["one"].start_receipt.output_dir != attempts["two"].start_receipt.output_dir  # type: ignore[union-attr]
 
 
