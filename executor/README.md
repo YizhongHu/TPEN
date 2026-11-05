@@ -36,3 +36,7 @@ tests with:
 ```text
 cd executor && uv sync --locked && uv run pytest -q tests
 ```
+
+Operational outcome receipts use the closed vocabulary `completed`, `failed`,
+`timed_out`, and `launch_failed`. These statuses describe execution only;
+scientific validity remains the responsibility of core evidence.

@@ -8,6 +8,8 @@ from typing import Any, ClassVar
 from ._codec import _freeze, canonical_bytes, decode_json, fields, sequence, sha256_text, text, thaw
 from .contracts import AllocationId, AttemptId, BackendJobId
 
+OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed"})
+
 
 def _identity(value: Any, cls: type, name: str) -> Any:
     if not isinstance(value, cls):
@@ -67,8 +69,8 @@ class StartReceipt:
 class OutcomeReceipt:
     """Durable observation of an attempt's operational outcome.
 
-    ``status`` is free text in the v1 wire schema; P5c owns later outcome
-    classification.
+    ``status`` is a closed operational classification. Scientific validity is
+    supplied by core evidence, not by this receipt.
 
     Parameters
     ----------
@@ -79,7 +81,7 @@ class OutcomeReceipt:
     group_digest : str
         ``ReadyGroup.identity`` for the issuing group.
     finished_at_utc, status, output_dir : str
-        Outcome timestamp, v1 free-text status, and output namespace.
+        Outcome timestamp, operational status, and output namespace.
     result_digest : str or None
         Optional digest of the produced result.
     """
@@ -97,6 +99,8 @@ class OutcomeReceipt:
         object.__setattr__(self, "task_id", text(self.task_id, "task_id")); _identity(self.attempt_id, AttemptId, "attempt_id")
         object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
         object.__setattr__(self, "finished_at_utc", text(self.finished_at_utc, "finished_at_utc")); object.__setattr__(self, "status", text(self.status, "status")); object.__setattr__(self, "output_dir", text(self.output_dir, "output_dir"))
+        if self.status not in OUTCOME_STATUSES:
+            raise ValueError(f"status must be one of {sorted(OUTCOME_STATUSES)!r}")
         if self.result_digest is not None: object.__setattr__(self, "result_digest", sha256_text(self.result_digest, "result_digest"))
 
     def to_dict(self) -> dict[str, Any]:
@@ -255,7 +259,7 @@ class RunManifest:
         return cls.from_mapping(decode_json(data))
 
 
-__all__ = ["AllocationObservation", "ManifestAttempt", "OutcomeReceipt", "RunManifest", "StartReceipt"]
+__all__ = ["AllocationObservation", "ManifestAttempt", "OutcomeReceipt", "OUTCOME_STATUSES", "RunManifest", "StartReceipt"]
 
 
 def encode_manifest(manifest: RunManifest) -> bytes:

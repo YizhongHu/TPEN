@@ -1,5 +1,24 @@
 defaults: []
 
+allocation:
+  _target_: tpen_executor.allocations.ConfiguredAllocation
+  _recursive_: false
+  allocation_id: configured-allocation
+  backend_job_id: configured-backend-job
+  facts: {}
+
+store:
+  _target_: tpen_executor.storage.DirectoryStore
+  _recursive_: false
+  root: /prepared/executor-store
+
+task:
+  _target_: tpen_executor.tasks.ConfiguredRun
+  _recursive_: false
+  id: configured-task
+  config: /prepared/science/config.yaml
+  overrides: []
+
 program:
   # A marker has named concrete payload slots. Nested program markers become
   # process-local handles before all slots are instantiated. Program subtrees
