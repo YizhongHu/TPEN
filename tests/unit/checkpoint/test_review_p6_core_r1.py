@@ -93,6 +93,22 @@ def test_core_t2_constants_facade_and_chain_resume_remain_exact():
     assert facade.UnsupportedMutableStateError is native_profile.UnsupportedMutableStateError
     assert facade.validate_native_recovery_profile is native_profile.validate_native_recovery_profile
     assert chain_resume.NATIVE_PROFILE_VERSION == "tpen.execution.native_profile:SUPPORTED_STATE_OWNERS@e5"
+    assert profiles.SUPPORTED_CALLBACK_TARGETS == frozenset({
+        "tpen.callback.ConfigSnapshot",
+        "tpen.callback.ResolvedConfigSnapshot",
+        "tpen.callback.Metadata",
+        "tpen.callback.RunTiming",
+        "tpen.callback.TrainStepTiming",
+        "tpen.callback.TrainPhaseTiming",
+        "tpen.callback.Status",
+        "tpen.callback.Checkpoint",
+    })
+    assert profiles.SUPPORTED_LOGGER_TARGETS == frozenset({
+        "tpen.logging.CSV", "tpen.logging.JSONL",
+    })
+    assert profiles.SUPPORTED_STATE_OWNERS == frozenset({
+        "model", "optimizer", "trainer_cursor", "sampler_mcmc", "process_rng",
+    })
     assert profiles.NATIVE_PROFILE.callback_state_supported is False
     assert profiles.REFUSAL_CODES == {
         "unknown-profile", "unsupported-callback", "unsupported-logger", "malformed-config",
