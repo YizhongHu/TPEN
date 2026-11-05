@@ -99,7 +99,17 @@ def _ensure_directory(path: str) -> None:
     try:
         info = os.lstat(path)
     except FileNotFoundError:
-        os.mkdir(path)
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            try:
+                info = os.lstat(path)
+            except FileNotFoundError as error:
+                raise FenceRejected(f"store component is missing: {path}") from error
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise FenceRejected(f"store component is not a directory: {path}")
+            _fsync_directory(os.path.dirname(path))
+            return
         _fsync_directory(os.path.dirname(path))
         return
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
