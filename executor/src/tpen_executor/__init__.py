@@ -8,6 +8,7 @@ from .delivery import PreparedInputBundle
 from .environments import PreparedPythonEnvironment, SourceScript
 from .results import AllocationObservation, ManifestAttempt, OutcomeReceipt, OUTCOME_STATUSES, RunManifest, StartReceipt, decode_manifest, encode_manifest
 from .runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
+from .recovery import CoreProfileReference, ProfileCheck, ProfileUnavailable
 from .storage import AttemptFence, DirectoryStore, FenceRejected
 from .tasks import ConfiguredRun
 from .lifecycle import AttachedAllocation
@@ -39,8 +40,8 @@ def __getattr__(name: str):
 __all__ = [
     "__version__", "AllocationId", "AllocationObservation", "AllocationProgram",
     "AttemptId", "AttachedAllocation", "AttemptFence", "BackendJobId", "ConfiguredAllocation", "ConfiguredRun", "CoreRunEvidence", "DirectoryStore", "EvidenceUnavailable", "FenceRejected", "ManifestAttempt", "MaterializedProgram", "OUTCOME_STATUSES", "OutcomeReceipt", "ProcessOutcome",
-    "ProgramSpecRef", "ReadyGroup", "RunManifest", "StagedConfig", "StagedHydra", "LocalDispatcher",
+    "ProgramSpecRef", "ProfileCheck", "ProfileUnavailable", "ReadyGroup", "RunManifest", "StagedConfig", "StagedHydra", "LocalDispatcher",
     "PreparedInputBundle", "PreparedPythonEnvironment", "SourceScript", "StartReceipt",
-    "TaskSpec", "TPENCommand", "TPENEvidence", "SubprocessWorker", "WorkerProgram",
+    "TaskSpec", "TPENCommand", "TPENEvidence", "SubprocessWorker", "WorkerProgram", "CoreProfileReference",
     "decode_manifest", "encode_manifest",
 ]
