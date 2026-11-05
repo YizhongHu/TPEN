@@ -37,3 +37,11 @@ def test_hydrogen_identity_and_comparison_sources_are_pinned() -> None:
     assert inputs["study"]["exact_ground_energy_hartree"] == -0.5
     assert len(inputs["source_identity"]["comparison_paths"]) == 4
     assert len(inputs["source_identity"]["comparison_commit"]) == 40
+
+
+def test_tail_sensitive_profile_is_primary_and_checkpoint_density_is_pending() -> None:
+    inputs = load_inputs()
+    primary = inputs["measurement"]["primary_dispersion"]
+    assert "tail_curvature_beta_xi" in primary
+    assert "median_absolute_deviation" not in primary
+    assert inputs["measurement"]["checkpoint_density"]["status"] == "pending_operator_decision"
