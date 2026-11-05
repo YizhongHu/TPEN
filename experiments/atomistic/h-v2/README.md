@@ -42,7 +42,8 @@ separate 27-checkpoint set. It proposes three independent lineages with
 initialization seeds `73001..73003` and sampler seeds `83001..83003`, four
 fresh streams per evaluated checkpoint, 4,096 walkers, 256 draws, burn-in
 1,000, and stride 20. Evaluation seeds use the formula recorded in the JSON;
-pilot seeds are `999001` and `999002` and are excluded from science.
+the non-science pipeline and capacity-pilot seed namespaces are excluded from
+science and are globally disjoint from one another and from the science seeds.
 
 The fresh-evaluation estimator is machine-readable in `contract_inputs.json`:
 compute each stream's W on its complete 4,096 by 256 grid, use that stream's
