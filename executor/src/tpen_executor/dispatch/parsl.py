@@ -34,7 +34,6 @@ class _ChildProcessHandle:
         self._lock = threading.Lock()
         self._process: Any = None
         self._kill_requested = False
-        self._attached = threading.Event()
 
     @staticmethod
     def _kill_process_group(process: Any) -> None:
@@ -52,9 +51,14 @@ class _ChildProcessHandle:
         with self._lock:
             self._process = process
             kill_requested = self._kill_requested
-            self._attached.set()
         if kill_requested:
             self._kill_process_group(process)
+
+    def pre_spawn_guard(self) -> bool:
+        """Return whether owner cancellation was requested before spawn."""
+
+        with self._lock:
+            return self._kill_requested
 
     def request_kill(self) -> None:
         """Request group termination, including before the child is attached."""
@@ -116,6 +120,7 @@ def _run_parsl_child(
         stderr_path=stderr_path,
         timeout=timeout,
         process_handle=process_handle,
+        pre_spawn_guard=None if process_handle is None else process_handle.pre_spawn_guard,
     )
 
 
@@ -147,7 +152,6 @@ class ParslDispatcher(DispatcherContract):
     binding: WorkerBinding | Mapping[str, Any] | None = None
     _config_type: Any = field(init=False, repr=False, compare=False)
     _dfk_type: Any = field(init=False, repr=False, compare=False)
-    _dfk_class: Any = field(init=False, repr=False, compare=False)
     _thread_pool_type: Any = field(init=False, repr=False, compare=False)
     _python_app_factory: Any = field(init=False, repr=False, compare=False)
     _active_binding: WorkerBinding | None = field(init=False, default=None, repr=False, compare=False)
@@ -170,7 +174,6 @@ class ParslDispatcher(DispatcherContract):
             raise
         object.__setattr__(self, "_config_type", Config)
         object.__setattr__(self, "_dfk_type", DataFlowKernel)
-        object.__setattr__(self, "_dfk_class", DataFlowKernel)
         object.__setattr__(self, "_thread_pool_type", ThreadPoolExecutor)
         object.__setattr__(self, "_python_app_factory", python_app)
         if self.binding is not None:
@@ -241,23 +244,27 @@ class ParslDispatcher(DispatcherContract):
             dfk = self._dfk_type(config=config)
             object.__setattr__(self, "_active_dfk", dfk)
             try:
-                return super().run(group, runs, lifecycle, env, timeout, _admitted=True)
+                return super(ParslDispatcher, self).run(group, runs, lifecycle, env, timeout, _admitted=True)
             except BaseException as error:
                 original = error
                 raise
         finally:
-            if dfk is not None:
-                try:
+            cleanup_error: BaseException | None = None
+            try:
+                if dfk is not None:
                     dfk.cleanup()
-                except BaseException as cleanup_error:
-                    if original is not None:
-                        original.add_note(f"Parsl DFK cleanup error: {cleanup_error!r}")
-                    else:
-                        raise
-            object.__setattr__(self, "_active_dfk", None)
-            object.__setattr__(self, "_active_binding", None)
-            object.__setattr__(self, "_active_executor_labels", ("threads",))
-            self._end_dispatch(token)
+            except BaseException as error:
+                cleanup_error = error
+            finally:
+                object.__setattr__(self, "_active_dfk", None)
+                object.__setattr__(self, "_active_binding", None)
+                object.__setattr__(self, "_active_executor_labels", ("threads",))
+                self._end_dispatch(token)
+            if cleanup_error is not None:
+                if original is not None:
+                    original.add_note(f"Parsl DFK cleanup error: {cleanup_error!r}")
+                else:
+                    raise cleanup_error
 
     def _validate_executor_config(self, config: Any) -> tuple[str, ...]:
         """Refuse non-ThreadPool Parsl configs before any lifecycle begin."""
@@ -329,9 +336,15 @@ class ParslDispatcher(DispatcherContract):
             result = future.result(None)
         except BaseException as original:
             process_handle.request_kill()
-            try:
-                future.result(None)
-            except BaseException as reap_error:
+            reap_errors: list[BaseException] = []
+            while True:
+                try:
+                    future.result(None)
+                except BaseException as reap_error:
+                    reap_errors.append(reap_error)
+                else:
+                    break
+            for reap_error in reap_errors:
                 original.add_note(f"Parsl child reap result: {reap_error!r}")
             raise
         if not isinstance(result, ProcessOutcome):
