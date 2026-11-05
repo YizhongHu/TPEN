@@ -11,6 +11,15 @@ from .contracts import AllocationId, BackendJobId
 from .results import AllocationObservation
 
 
+def _hashable(value: Any) -> Any:
+    """Convert a deeply frozen JSON value to Python's equality/hash shape."""
+    if isinstance(value, Mapping):
+        return tuple(sorted((key, _hashable(item)) for key, item in value.items()))
+    if isinstance(value, tuple):
+        return tuple(_hashable(item) for item in value)
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ConfiguredAllocation:
     """An explicitly configured allocation; no scheduler discovery occurs.
@@ -44,8 +53,14 @@ class ConfiguredAllocation:
         return canonical_bytes(self.to_dict())
 
     def __hash__(self) -> int:
-        """Hash the canonical immutable wire representation."""
-        return hash(self.encode())
+        """Hash the immutable Python equality representation.
+
+        Python numeric equality is intentional here: nested ``1``, ``True``,
+        and ``1.0`` values, as well as ``0.0`` and ``-0.0``, hash alike even
+        though canonical JSON encoding preserves their distinct wire forms.
+        Equal records may therefore encode differently.
+        """
+        return hash((self.allocation_id, self.backend_job_id, _hashable(self.facts)))
 
     @classmethod
     def from_mapping(cls, data: Any) -> "ConfiguredAllocation":
