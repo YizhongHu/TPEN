@@ -116,6 +116,31 @@ def test_hydrogen_alpha_state_closed_form_w_oracle() -> None:
     assert survival_abs_deviation(1.0) == pytest.approx(0.008304, abs=1e-5)
     assert survival_abs_deviation(0.01) == pytest.approx(0.926514, abs=1e-5)
 
+    controls = load_inputs()["measurement"]["analytic_controls"]["alpha_1_2"]
+    assert controls["born_mean_hartree"] == pytest.approx(
+        alpha * alpha / 2 - alpha, abs=1e-12
+    )
+    assert controls["variance_hartree2"] == pytest.approx(
+        alpha * alpha * (alpha - 1) * (alpha - 1), abs=1e-12
+    )
+    assert controls["median_local_energy_hartree"] == pytest.approx(
+        median_energy, abs=1e-6
+    )
+    assert controls["w_p99_9_hartree"] == pytest.approx(
+        w_quantile(0.999), abs=1e-6
+    )
+    assert controls["exceedance_probability_abs_deviation_gt_1_hartree"] == pytest.approx(
+        survival_abs_deviation(1.0), abs=1e-6
+    )
+    assert controls["exceedance_probability_abs_deviation_gt_0_01_hartree"] == pytest.approx(
+        survival_abs_deviation(0.01), abs=1e-6
+    )
+
+    alpha_one = load_inputs()["measurement"]["analytic_controls"]["alpha_1"]
+    assert alpha_one["pointwise_local_energy_hartree"] == -0.5
+    assert alpha_one["w_p99_9_hartree"] == 0
+    assert alpha_one["all_fixed_threshold_exceedance_probabilities"] == 0
+
     rng = random.Random(20261105)
     energies = [
         local_energy(-(math.log(rng.random()) + math.log(rng.random()) + math.log(rng.random())) / (2 * alpha))
