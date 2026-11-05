@@ -60,6 +60,7 @@ class PreservedAttempt:
     attempt_id: str
     output_dir: str
     outcome: str | None
+    reason: str = "not-selected"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +79,12 @@ class ResultSet:
     @property
     def non_selected_attempts(self) -> tuple[PreservedAttempt, ...]:
         """Compatibility name for the preserved-evidence collection."""
+
+        return self.preserved_attempts
+
+    @property
+    def preserved_evidence(self) -> tuple[PreservedAttempt, ...]:
+        """Return original attempts retained as preserved evidence."""
 
         return self.preserved_attempts
 
@@ -315,6 +322,9 @@ def read(
             attempt["attempt_id"],
             attempt["output_dir"],
             None if attempt["outcome_receipt"] is None else attempt["outcome_receipt"]["status"],
+            "uncommitted" if attempt["outcome_receipt"] is None else (
+                "failed-or-incomplete" if attempt["outcome_receipt"]["status"] != "completed" else "not-selected"
+            ),
         )
         for attempt in attempts
         if attempt["attempt_id"] not in selected_ids
