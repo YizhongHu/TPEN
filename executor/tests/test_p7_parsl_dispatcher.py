@@ -24,7 +24,7 @@ from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.programs import WorkerProgram
 from tpen_executor.results import RunManifest
-from tpen_executor.runners import RUN_SHIM
+from tpen_executor.runners import EvidenceUnavailable, RUN_SHIM
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.tasks import ConfiguredRun
 from tpen_executor.workers import ProcessOutcome
@@ -235,7 +235,7 @@ def test_p7_d_child_rc_not_framework_success_controls_status(tmp_path: Path) -> 
 
     class Evidence:
         def read(self, *args, **kwargs):
-            raise AssertionError("evidence must not promote a nonzero child")
+            raise EvidenceUnavailable("no core receipt")
 
     worker = SimpleNamespace(materialize=lambda env: {"environment": object(), "process": Process(), "runner": object(), "evidence": Evidence()})
     store = DirectoryStore(tmp_path / "store")

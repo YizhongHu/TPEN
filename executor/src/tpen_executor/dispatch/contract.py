@@ -121,6 +121,39 @@ class DispatcherContract:
             timeout=timeout,
         )
 
+    def validate(
+        self,
+        group: ReadyGroup,
+        runs: Mapping[str, ConfiguredRun],
+        lifecycle: AttachedAllocation,
+        env: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """Perform common admission without touching backend or store state."""
+
+        self._validate_inputs(group, runs, lifecycle, env, timeout)
+
+    def _begin_dispatch(
+        self,
+        group: ReadyGroup,
+        runs: Mapping[str, ConfiguredRun],
+        lifecycle: AttachedAllocation,
+        env: Mapping[str, Any] | None,
+        timeout: float | None,
+    ) -> Any:
+        """Validate inputs and reserve the process-local dispatch slot."""
+
+        if _ACTIVE_DISPATCH.get():
+            raise RuntimeError("dispatcher.run is not reentrant")
+        self.validate(group, runs, lifecycle, env, timeout)
+        return _ACTIVE_DISPATCH.set(True)
+
+    @staticmethod
+    def _end_dispatch(token: Any) -> None:
+        """Release a dispatch slot acquired by :meth:`_begin_dispatch`."""
+
+        _ACTIVE_DISPATCH.reset(token)
+
     def run(
         self,
         group: ReadyGroup,
@@ -128,6 +161,8 @@ class DispatcherContract:
         lifecycle: AttachedAllocation,
         env: Mapping[str, Any] | None = None,
         timeout: float | None = None,
+        *,
+        _admitted: bool = False,
     ) -> RunManifest:
         """Dispatch every admitted member and return its durable group manifest.
 
@@ -167,107 +202,120 @@ class DispatcherContract:
         member failures are recorded and processing continues to later members.
         """
 
-        if _ACTIVE_DISPATCH.get():
-            raise RuntimeError("dispatcher.run is not reentrant")
-        token = _ACTIVE_DISPATCH.set(True)
+        if _admitted:
+            if not _ACTIVE_DISPATCH.get():
+                raise RuntimeError("admitted dispatch requires an active dispatch slot")
+            return self._run_admitted(group, runs, lifecycle, env, timeout)
+        token = self._begin_dispatch(group, runs, lifecycle, env, timeout)
         try:
-            self._validate_inputs(group, runs, lifecycle, env, timeout)
-            begin_error: Exception | None = None
-            finish_error: Exception | None = None
-            for member in group.members:
-                configured = runs[member.task_id]
-                try:
-                    fence = lifecycle.begin(group, member.task_id, _utc_now())
-                except Exception as error:
-                    if begin_error is None:
-                        begin_error = error
-                    continue
+            return self._run_admitted(group, runs, lifecycle, env, timeout)
+        finally:
+            self._end_dispatch(token)
 
-                result_digest: str | None = None
-                segment_evidence: CoreRunEvidence | None = None
-                status = "launch_failed"
+    def _run_admitted(
+        self,
+        group: ReadyGroup,
+        runs: Mapping[str, ConfiguredRun],
+        lifecycle: AttachedAllocation,
+        env: Mapping[str, Any] | None,
+        timeout: float | None,
+    ) -> RunManifest:
+        """Run the shared lifecycle after admission and guard setup."""
+
+        begin_error: Exception | None = None
+        finish_error: Exception | None = None
+        for member in group.members:
+            configured = runs[member.task_id]
+            try:
+                fence = lifecycle.begin(group, member.task_id, _utc_now())
+            except Exception as error:
+                if begin_error is None:
+                    begin_error = error
+                continue
+
+            result_digest: str | None = None
+            segment_evidence: CoreRunEvidence | None = None
+            status = "launch_failed"
+            try:
+                materialized = self.worker.materialize(env)
+                environment = self._worker_environment(materialized)
+                process = materialized["process"]
+                materialized["runner"]
+                evidence = materialized["evidence"]
+                if not callable(getattr(process, "run", None)):
+                    raise TypeError("materialized worker process lacks run()")
+                if not callable(getattr(evidence, "read", None)):
+                    raise TypeError("materialized worker evidence reader lacks read()")
+                output_dir, core_dir, stdout_path, stderr_path, evidence_stdout, evidence_stderr = _member_paths(fence)
+                args = (*configured.command().args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
+                outcome = self._execute_process(
+                    materialized,
+                    environment,
+                    args,
+                    cwd=output_dir,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    timeout=timeout,
+                )
+                status = _status(outcome)
                 try:
-                    materialized = self.worker.materialize(env)
-                    environment = self._worker_environment(materialized)
-                    process = materialized["process"]
-                    materialized["runner"]
-                    evidence = materialized["evidence"]
-                    if not callable(getattr(process, "run", None)):
-                        raise TypeError("materialized worker process lacks run()")
-                    if not callable(getattr(evidence, "read", None)):
-                        raise TypeError("materialized worker evidence reader lacks read()")
-                    output_dir, core_dir, stdout_path, stderr_path, evidence_stdout, evidence_stderr = _member_paths(fence)
-                    args = (*configured.command().args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
-                    outcome = self._execute_process(
-                        materialized,
+                    decoded = evidence.read(
+                        process,
                         environment,
-                        args,
+                        core_dir,
                         cwd=output_dir,
-                        stdout_path=stdout_path,
-                        stderr_path=stderr_path,
+                        stdout_path=evidence_stdout,
+                        stderr_path=evidence_stderr,
                         timeout=timeout,
                     )
-                    status = _status(outcome)
-                    try:
-                        decoded = evidence.read(
-                            process,
-                            environment,
-                            core_dir,
-                            cwd=output_dir,
-                            stdout_path=evidence_stdout,
-                            stderr_path=evidence_stderr,
-                            timeout=timeout,
-                        )
-                    except EvidenceUnavailable:
-                        result_digest = None
-                    else:
-                        result_digest = digest(_evidence_payload(decoded))
-                        segment_evidence = decoded
-                except Exception:
-                    status = "launch_failed"
+                except EvidenceUnavailable:
                     result_digest = None
-                except BaseException as error:
-                    # A begun fence is terminalized exactly once before any
-                    # cancellation escapes. Preserve a known timeout because it
-                    # is more specific than the later evidence interruption.
-                    if status != "timed_out":
-                        status = "failed"
-                    try:
-                        lifecycle.finish(fence, status, _utc_now(), result_digest)
-                    except BaseException as finish_exc:
-                        try:
-                            error.add_note(f"finish error during cancellation: {finish_exc!r}")
-                        except BaseException:
-                            pass
-                    raise
+                else:
+                    result_digest = digest(_evidence_payload(decoded))
+                    segment_evidence = decoded
+            except Exception:
+                status = "launch_failed"
+                result_digest = None
+            except BaseException as error:
+                # A begun fence is terminalized exactly once before any
+                # cancellation escapes. Preserve a known timeout because it
+                # is more specific than the later evidence interruption.
+                if status != "timed_out":
+                    status = "failed"
                 try:
                     lifecycle.finish(fence, status, _utc_now(), result_digest)
-                except Exception as error:
-                    if finish_error is None:
-                        finish_error = error
-                if (
-                    status == "completed"
-                    and segment_evidence is not None
-                    and segment_evidence.verdict in {"completed", "incomplete"}
-                    and segment_evidence.checkpoint is not None
-                ):
-                    existing_segments = lifecycle.store.manifest(group).segments
-                    if not any(segment.task_id == fence.task_id for segment in existing_segments):
-                        try:
-                            lifecycle.store.accept_segment(fence, segment_evidence, None)
-                        except Exception as error:
-                            if finish_error is None:
-                                finish_error = error
+                except BaseException as finish_exc:
+                    try:
+                        error.add_note(f"finish error during cancellation: {finish_exc!r}")
+                    except BaseException:
+                        pass
+                raise
+            try:
+                lifecycle.finish(fence, status, _utc_now(), result_digest)
+            except Exception as error:
+                if finish_error is None:
+                    finish_error = error
+            if (
+                status == "completed"
+                and segment_evidence is not None
+                and segment_evidence.verdict in {"completed", "incomplete"}
+                and segment_evidence.checkpoint is not None
+            ):
+                existing_segments = lifecycle.store.manifest(group).segments
+                if not any(segment.task_id == fence.task_id for segment in existing_segments):
+                    try:
+                        lifecycle.store.accept_segment(fence, segment_evidence, None)
+                    except Exception as error:
+                        if finish_error is None:
+                            finish_error = error
 
-            if begin_error is not None:
-                if finish_error is not None:
-                    begin_error.add_note(f"finish error after deferred begin failure: {finish_error!r}")
-                raise begin_error
+        if begin_error is not None:
             if finish_error is not None:
-                raise finish_error
-            return lifecycle.store.manifest(group)
-        finally:
-            _ACTIVE_DISPATCH.reset(token)
+                begin_error.add_note(f"finish error after deferred begin failure: {finish_error!r}")
+            raise begin_error
+        if finish_error is not None:
+            raise finish_error
+        return lifecycle.store.manifest(group)
 
     @staticmethod
     def _validate_inputs(
