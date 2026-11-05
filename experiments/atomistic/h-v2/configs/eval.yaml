@@ -1,0 +1,159 @@
+experiment:
+  name: tpen_h_v2
+  sector: atomistic
+  run_name: tpen_h_v2_eval
+
+run:
+  root: experiments/atomistic/h-v2/outputs
+  run_id: h-v2-eval
+  dir: null
+  timezone: UTC
+
+runtime:
+  seed: 910003
+  device: cpu
+  dtype: float64
+
+system:
+  id: atomic_hydrogen
+  n_particles: 1
+  spatial_dim: 3
+  spin:
+    n_up: 1
+    n_down: 0
+  nuclei:
+    positions: [[0.0, 0.0, 0.0]]
+    charges: [1.0]
+  reference_energy: -0.5
+
+atoms:
+  _target_: tpen.data.atomic_configuration.AtomicConfiguration
+  positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+
+load:
+  path: ???
+  mode: model_only
+  strict: true
+  allow_protocol_mismatch: false
+
+runner:
+  _target_: tpen.runner.Evaluate
+  model: ${model}
+  load: ${load}
+  evaluator: ${evaluator}
+
+model:
+  _target_: tpen.nn.TPENWaveFunction
+  trace_name: tpen
+  embedding:
+    _target_: tpen.nn.Embedding
+    max_order: 1
+    spatial_dim: ${system.spatial_dim}
+    out_channels: 8
+    hidden_channels: 32
+    num_hidden_layers: 1
+    include_spins: true
+  layers:
+    - _target_: tpen.nn.TPENLayer
+      mixing:
+        _target_: tpen.nn.EquivariantMixing
+        max_order: 1
+        max_virtual_order: 1
+        channels: 8
+        implementation: vectorized
+        initial_weight: 0.5
+        activation:
+          _target_: torch.nn.SiLU
+      path_aggregation:
+        _target_: tpen.nn.PathAggregation
+        max_order: 1
+        max_virtual_order: 1
+        channels: 8
+        activation:
+          _target_: torch.nn.SiLU
+      update:
+        _target_: tpen.nn.ResidualUpdater
+  factors:
+    - _target_: tpen.nn.ElectronNucleusCusp
+      atoms: ${atoms}
+  readout:
+    _target_: tpen.nn.readout.PfaffianReadout
+    channels: 8
+    trainable: true
+
+hamiltonian_terms:
+  kinetic:
+    _target_: tpen.physics.kinetic.KineticEnergy
+  electron_nucleus:
+    _target_: tpen.physics.potential.ElectronNucleusPotential
+    atoms: ${atoms}
+    eps: 0.0
+
+sampler:
+  _target_: tpen.sampling.metropolis.MetropolisSampler
+  n_walkers: 1024
+  burn_in: 1000
+  n_steps: 20
+  proposal_scale: 0.5
+  seed: ${runtime.seed}
+  n_electrons: ${system.n_particles}
+  spatial_dim: ${system.spatial_dim}
+  n_up: ${system.spin.n_up}
+  n_down: ${system.spin.n_down}
+  nuclear_positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  nuclear_charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+  dtype: ${runtime.dtype}
+
+evaluator:
+  _target_: tpen.evaluation.Evaluator
+  namespace: eval
+  seed: ${runtime.seed}
+  artifact_level: records
+  task_failure_policy: fail_fast
+  tasks:
+    - name: trajectory
+      namespace: trajectory
+      output_dir: ${run.dir}/trajectory
+      generator:
+        _target_: tpen.evaluation.generators.TrajectoryMCMCGenerator
+        sampler: ${sampler}
+        hamiltonian_terms: ${hamiltonian_terms}
+        n_draws: 64
+        discard_draws: 0
+        seed: ${runtime.seed}
+        reset: true
+        verify_model_unchanged: true
+        readout_eps: 1.0e-12
+        replay_chunk_size: 4096
+      calculators:
+        - _target_: tpen.evaluation.LocalEnergyCalculator
+          hamiltonian_terms: ${hamiltonian_terms}
+          return_terms: true
+      summaries:
+        - _target_: tpen.evaluation.SampledRecordWriter
+          max_samples: 65536
+          include_term_energies: true
+        - _target_: tpen.evaluation.SamplerStatsSummary
+
+callbacks:
+  - _target_: tpen.callback.ConfigSnapshot
+    output_path: ${run.dir}/config.yaml
+  - _target_: tpen.callback.ResolvedConfigSnapshot
+    output_path: ${run.dir}/resolved_config.yaml
+  - _target_: tpen.callback.Metadata
+    output_path: ${run.dir}/metadata.json
+  - _target_: tpen.callback.Status
+    output_path: ${run.dir}/status.json
+
+loggers:
+  - _target_: tpen.logging.JSONL
+    path: ${run.dir}/metrics.jsonl
