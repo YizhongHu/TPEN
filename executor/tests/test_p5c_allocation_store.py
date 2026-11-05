@@ -253,17 +253,17 @@ def test_p5c_manifest_rejects_each_receipt_corruption(tmp_path: Path, mutation: 
 
 
 def test_p5c_atomic_write_failure_leaves_no_temporary_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failure between durable temp write and replacement is cleaned up."""
+    """A failure at no-replace publication is cleaned up."""
     store = DirectoryStore(tmp_path)
     group = _group("a")
-    real_replace = os.replace
+    real_link = os.link
 
-    def fail_replace(source: str, destination: str) -> None:
+    def fail_link(source: str, destination: str, *args: object, **kwargs: object) -> None:
         if destination.endswith("start.json"):
-            raise OSError("injected replace failure")
-        real_replace(source, destination)
+            raise OSError("injected link failure")
+        real_link(source, destination, *args, **kwargs)
 
-    monkeypatch.setattr(os, "replace", fail_replace)
+    monkeypatch.setattr(os, "link", fail_link)
     with pytest.raises(OSError):
         store.begin_attempt(group, "a", _allocation(), "start")
     assert not list(tmp_path.rglob(".tmp-*"))
