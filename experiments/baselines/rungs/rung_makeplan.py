@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, "/home/rhu/src/TPEN-l0-dev")
 from experiments.toolkit.dispatch import StagePlanV2, LogicalTaskSpec, CompletionSpec, logical_task_id_from_parts
-from experiments.toolkit.executor_inputs import ready_group, write_ready_group
+from experiments.toolkit.executor_inputs import ready_group, write_additive_ready_group
 from experiments.toolkit.resources import ResourceSpec
 
 
@@ -172,7 +172,7 @@ plan = StagePlanV2(study="baselines", stage="baselines", plan_id=PLAN_ID,
                    results_root=ROOT, tasks=tuple(tasks)).validate()
 Path(PLAN_DIR).mkdir(parents=True, exist_ok=True)
 plan.write(PLAN_DIR)
-write_ready_group(Path(PLAN_DIR) / "executor_input.json", plan)
+write_additive_ready_group(Path(PLAN_DIR) / "executor_input.json", plan)
 # Assert the thing build_plan would have got wrong.
 cmds = {t.command for t in plan.tasks}
 assert len(cmds) == NROWS, f"EXPECTED {NROWS} DISTINCT COMMANDS, got {len(cmds)}"

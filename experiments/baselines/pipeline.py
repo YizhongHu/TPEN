@@ -17,7 +17,7 @@ from experiments.toolkit.dispatch import (
     admit_tasks,
     write_dispatch_records,
 )
-from experiments.toolkit.executor_inputs import ready_group, write_ready_group
+from experiments.toolkit.executor_inputs import ready_group, write_additive_ready_group
 from experiments.toolkit.parsl_attach import ParslAttachExecutor
 
 
@@ -139,7 +139,7 @@ def run_pipeline(
     launch = Path(launch_dir)
     launch.mkdir(parents=True, exist_ok=True)
     plan.validate()
-    write_ready_group(launch / "executor_input.json", plan)
+    write_additive_ready_group(launch / "executor_input.json", plan)
     gpus_per_row = _uniform_gpu_count(plan)
     context = allocation_context(
         facility=facility,

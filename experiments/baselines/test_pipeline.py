@@ -125,9 +125,17 @@ def test_horizon_encoding_keeps_legacy_dispatch_compatible(
         executor=executor,
         environ={"PBS_JOBID": "horizon.server"},
     ) == 0
-    payload = json.loads((tmp_path / "launch" / "executor_input.json").read_text())
-    assert payload["members"][0]["target_horizon"] == expected_horizon
-    assert ("unrepresentable" in payload) is has_unrepresentable
+    input_path = tmp_path / "launch" / "executor_input.json"
+    diagnostic_path = tmp_path / "launch" / "executor_input_diagnostics.json"
+    if has_unrepresentable:
+        assert not input_path.exists()
+        payload = json.loads(diagnostic_path.read_text())
+        assert payload["schema"] == "tpen-experiments/executor-input-diagnostics-v1"
+        assert payload["unrepresentable"][0]["field"] == "steps"
+    else:
+        payload = json.loads(input_path.read_text())
+        assert payload["members"][0]["target_horizon"] == expected_horizon
+        assert not diagnostic_path.exists()
     assert len(executor.dispatches) == 1
 
 

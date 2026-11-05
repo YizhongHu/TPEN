@@ -116,7 +116,10 @@ def test_he_cutover_emits_the_executor_golden_without_resolving_config() -> None
     )
     emitted, _ = cutover_plan.executor_inputs(train, evaluation)
     assert canonical_bytes(emitted) == P9_HE_FIXTURE.read_bytes().rstrip(b"\n")
-    assert emitted["members"][0]["program"]["config_ref"]["config"].startswith("experiments/")
+    assert emitted["members"][0]["program"]["config_ref"]["config"] == {
+        "root": "repo",
+        "path": "experiments/atomistic/he-v1/configs/train.yaml",
+    }
 
 
 def test_he_cutover_emission_is_identical_from_two_checkout_roots(tmp_path: Path) -> None:
