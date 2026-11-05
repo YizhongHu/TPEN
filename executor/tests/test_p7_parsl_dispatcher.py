@@ -370,4 +370,3 @@ def test_p7_g_mutant_shared_output_path_is_fenced(tmp_path: Path) -> None:
     manifest = dispatcher.run(group, _runs(tmp_path, "left", "right"), AttachedAllocation(_allocation(), store))
     output_dirs = [attempt.start_receipt.output_dir for attempt in manifest.attempts]  # type: ignore[union-attr]
     assert len(output_dirs) == len(set(output_dirs)) == 2
-
