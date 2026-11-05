@@ -172,6 +172,7 @@ def test_decision_rule_parameters_are_machine_readable() -> None:
     assert parameters["early_updates"] == [0, 1000]
     assert parameters["late_updates"] == [40000, 45000, 50000]
     assert parameters["late_required_count"] == 2
+    assert parameters["bounded_null_late_count"] == parameters["late_required_count"]
     assert parameters["selection_streams"] == [0, 1]
     assert parameters["confirmation_streams"] == [2, 3]
     assert parameters["lineages_required_for_recurrence"] == 2
