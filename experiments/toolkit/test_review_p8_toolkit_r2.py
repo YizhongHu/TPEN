@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import pytest
 from experiments.toolkit.run_results import read, ManifestRefusal
-from test_review_p8_toolkit_r1 import executor, materialize, write
+from experiments.toolkit.test_review_p8_toolkit_r1 import executor, materialize, write
 
 
 @pytest.mark.parametrize("mutation", ["manifest-uppercase", "start-nonhex", "outcome-short", "result-uppercase", "outcome-group", "start-group"])
