@@ -81,3 +81,12 @@ def test_physics_mutations_are_rejected(mutation, message) -> None:
     mutation(config)
     with pytest.raises(ValueError, match=message):
         protocol.assert_hydrogen_contract(config)
+
+
+def test_sampler_target_is_born_density_not_amplitude() -> None:
+    """Keep the configured route tied to TPEN's |psi|^2 acceptance law."""
+
+    sampler_source = (HERE.parents[2] / "tpen" / "sampling" / "metropolis.py").read_text(
+        encoding="utf-8"
+    )
+    assert "2.0 * (proposed_logabs - current_logabs)" in sampler_source
