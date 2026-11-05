@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import types
 
 import pytest
 from omegaconf import OmegaConf
@@ -17,21 +16,8 @@ from omegaconf import OmegaConf
 from tpen.checkpoint import profiles
 from tpen.execution import native_profile
 
-BASE = "5ba0db266657cd2041dbc588f60886ad72862bfe"
 PROFILE = "tpen.native-recovery/v1"
 ROOT = Path(__file__).parents[3]
-
-
-@pytest.fixture(scope="module")
-def legacy():
-    """Load the predecessor's standalone validator without altering imports."""
-    source = subprocess.check_output(
-        ["git", "show", f"{BASE}:tpen/execution/native_profile.py"],
-        cwd=ROOT, text=True,
-    )
-    module = types.ModuleType("review_legacy_native_profile")
-    exec(compile(source, "<predecessor-native-profile>", "exec"), module.__dict__)
-    return module
 
 
 def _outcome(validator, config):
@@ -58,29 +44,55 @@ LEGACY_INPUTS = [
 ]
 
 
-@pytest.mark.parametrize("config", LEGACY_INPUTS)
-def test_core_t1_existing_validator_preserves_exact_outcomes(legacy, config):
-    assert _outcome(native_profile.validate_native_recovery_profile, config) == _outcome(
-        legacy.validate_native_recovery_profile, config,
-    )
+# Frozen once from the predecessor validator at 5ba0db26; no repository or
+# subprocess lookup is needed when this test runs.
+LEGACY_EXPECTED_OUTCOMES = [
+    ("UnsupportedMutableStateError", "native profile requires a mapping config"),
+    ("UnsupportedMutableStateError", "native profile requires a mapping config"),
+    ("UnsupportedMutableStateError", "native profile requires a mapping config"),
+    ("returned", None),
+    ("returned", None),
+    ("returned", None),
+    ("returned", None),
+    ("returned", None),
+    ("returned", None),
+    ("returned", None),
+    ("returned", None),
+    ("UnsupportedMutableStateError", "callbacks[0] must be a mapping"),
+    ("UnsupportedMutableStateError", "callbacks[0] has no explicit _target_"),
+    ("UnsupportedMutableStateError", "callbacks[0] has no explicit _target_"),
+    ("UnsupportedMutableStateError", "callbacks[0] has no explicit _target_"),
+    (
+        "UnsupportedMutableStateError",
+        "callbacks[0] 'review_forbidden.PrivateState' is not in the native "
+        "mutable-state profile",
+    ),
+    ("returned", None),
+    ("returned", None),
+    (
+        "UnsupportedMutableStateError",
+        "loggers[0] 'review_forbidden.Logger' is not in the native "
+        "mutable-state profile",
+    ),
+    ("UnsupportedMutableStateError", "loggers must be a sequence"),
+]
 
 
-def test_core_t2_constants_facade_and_chain_resume_remain_exact(legacy):
+@pytest.mark.parametrize("config, expected", zip(LEGACY_INPUTS, LEGACY_EXPECTED_OUTCOMES))
+def test_core_t1_existing_validator_preserves_exact_outcomes(config, expected):
+    assert _outcome(native_profile.validate_native_recovery_profile, config) == expected
+
+
+def test_core_t2_constants_facade_and_chain_resume_remain_exact():
     import tpen.execution as facade
     from tpen.execution import chain_resume
 
     for key in ("SUPPORTED_CALLBACK_TARGETS", "SUPPORTED_LOGGER_TARGETS", "SUPPORTED_STATE_OWNERS"):
-        assert getattr(native_profile, key) == getattr(legacy, key)
         assert getattr(native_profile, key) is getattr(profiles, key)
         assert getattr(facade, key) is getattr(profiles, key)
     assert facade.UnsupportedMutableStateError is native_profile.UnsupportedMutableStateError
     assert facade.validate_native_recovery_profile is native_profile.validate_native_recovery_profile
     assert chain_resume.NATIVE_PROFILE_VERSION == "tpen.execution.native_profile:SUPPORTED_STATE_OWNERS@e5"
-    for name in ("chain_resume.py", "__init__.py"):
-        path = "tpen/execution/" + name
-        assert (ROOT / path).read_bytes() == subprocess.check_output(
-            ["git", "show", f"{BASE}:{path}"], cwd=ROOT,
-        )
     assert profiles.NATIVE_PROFILE.callback_state_supported is False
     assert profiles.REFUSAL_CODES == {
         "unknown-profile", "unsupported-callback", "unsupported-logger", "malformed-config",

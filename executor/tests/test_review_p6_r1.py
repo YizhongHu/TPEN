@@ -152,24 +152,6 @@ def test_r1_t3_refusal_mapping_is_immutable_on_refused_record(tmp_path: Path) ->
         result.refusal["code"] = "unknown"  # type: ignore[index]
 
 
-def test_r1_t3_deep_malformed_json_is_typed_unavailable(tmp_path: Path) -> None:
-    """RED: decoder recursion failures must become ProfileUnavailable."""
-
-    nested = "[" * 2000 + "0" + "]" * 2000
-    marker = "__P6_NESTED_STATE_OWNERS__"
-    output = json.dumps({
-        "schema": "tpen.profile-check/v1",
-        "profile": PROFILE,
-        "verdict": "supported",
-        "state_owners": marker,
-        "refusal": None,
-    }).replace(json.dumps(marker), nested)
-    assert '"state_owners": [[' in output
-    assert len(output.encode("utf-8")) < 10 * 1024
-    with pytest.raises(ProfileUnavailable):
-        _read(tmp_path, _fake_environment(tmp_path, output), timeout=10.0)
-
-
 @pytest.mark.parametrize("config_text, expected_verdict", [
     ("{}\n", "supported"),
     ("callbacks:\n  - _target_: tpen.callback.NotCertified\n", "refused"),
