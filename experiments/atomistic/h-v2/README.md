@@ -94,14 +94,16 @@ qualification, operator decisions, or supported margins produce `unresolved`.
 
 The non-science one-electron **PIPELINE CHECK** is admitted under the
 operator's 2026-11-05 direction. Parts (a)-(f), including the independent
-analytic oracle, imperfect-state rejection, sampler controls (including burn-in
-100, 10 Metropolis steps per update, and proposal scale 0.5 bohr), short
-learned route, fresh restore, and complete-record refusal controls, belong to slice
-`5cfcca3e` on Cannon CPU. Part (g), the excluded-seed GPU route smoke, belongs
-to slice `406194c5` on Polaris. Slice `2f1b2921` reruns the integrated check
-on the exact candidate. The JSON gives each part's pass criteria and its
-disjoint non-science seed namespace. This check is not a science result and does not
-authorize the executor or a lineage.
+analytic oracle, imperfect-state rejection, short learned route, fresh restore,
+and complete-record refusal controls, belong to slice `5cfcca3e` on Cannon CPU.
+For part (e), the training sampler is `256` walkers with burn-in `100`, `10`
+Metropolis steps per update, and proposal scale `0.5` bohr; each fresh
+evaluation uses `1,024` walkers, `64` draws, `2` streams, burn-in `1,000`, and
+stride `20`. Part (g), the excluded-seed GPU route smoke, belongs to slice
+`406194c5` on Polaris. Slice `2f1b2921` reruns the integrated check on the exact
+candidate. The JSON gives each part's pass criteria and its disjoint non-science
+seed namespace. This check is not a science result and does not authorize the
+executor or a lineage.
 
 The **SCIENCE LINEAGES** remain prohibited until the operator has reviewed the
 science plan and explicitly approves it. No pipeline pass, scheduler state,

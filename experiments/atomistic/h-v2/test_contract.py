@@ -137,7 +137,7 @@ def test_bounded_null_reference_set_and_late_count_are_machine_readable() -> Non
     assert parameters["bounded_null_late_count"] == parameters["late_required_count"]
 
 
-def test_training_sampler_settings_match_lane_proposal_and_pipeline() -> None:
+def test_training_and_fresh_evaluation_sampler_settings_are_exact() -> None:
     inputs = load_inputs()
     proposal = inputs["lane_proposals"][7]["proposal"]
     criteria = next(
@@ -145,9 +145,20 @@ def test_training_sampler_settings_match_lane_proposal_and_pipeline() -> None:
         for part in inputs["admission"]["pipeline_check"]["parts"]
         if part["id"] == "e"
     )
-    assert criteria["burn_in"] == 100
-    assert criteria["metropolis_steps_per_update"] == 10
-    assert criteria["proposal_scale_bohr"] == 0.5
+    assert criteria["training_sampler"] == {
+        "walkers": 256,
+        "burn_in": 100,
+        "metropolis_steps_per_update": 10,
+        "proposal_scale_bohr": 0.5,
+    }
+    assert criteria["fresh_evaluation"] == {
+        "walkers": 1024,
+        "draws_per_stream": 64,
+        "streams": 2,
+        "burn_in": 1000,
+        "stride": 20,
+    }
+    assert criteria["fresh_evaluation"]["burn_in"] != criteria["training_sampler"]["burn_in"]
     assert "burn-in 100" in proposal
     assert "10 Metropolis steps per update" in proposal
     assert "proposal scale 0.5 bohr" in proposal
