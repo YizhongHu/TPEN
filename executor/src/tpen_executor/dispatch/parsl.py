@@ -35,6 +35,7 @@ class _ChildProcessHandle:
         self._lock = threading.Lock()
         self._process: Any = None
         self._kill_requested = False
+        self._attached = threading.Event()
 
     @staticmethod
     def _kill_process_group(process: Any) -> None:
@@ -52,8 +53,14 @@ class _ChildProcessHandle:
         with self._lock:
             self._process = process
             kill_requested = self._kill_requested
+            self._attached.set()
         if kill_requested:
             self._kill_process_group(process)
+
+    def wait_for_process(self, timeout: float) -> bool:
+        """Wait briefly for a child to publish its process-group handle."""
+
+        return self._attached.wait(timeout)
 
     def request_kill(self) -> None:
         """Request group termination, including before the child is attached."""
@@ -70,6 +77,22 @@ class _ChildProcessHandle:
         with self._lock:
             if self._process is process:
                 self._process = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ChildFailure:
+    """Carry a worker-thread BaseException through Parsl's future."""
+
+    error: BaseException
+
+
+def _run_parsl_child_captured(*args: Any, **kwargs: Any) -> ProcessOutcome | _ChildFailure:
+    """Run the child app while keeping BaseException observable to the owner."""
+
+    try:
+        return _run_parsl_child(*args, **kwargs)
+    except BaseException as error:
+        return _ChildFailure(error)
 
 
 def _run_parsl_child(
@@ -314,7 +337,7 @@ class ParslDispatcher(DispatcherContract):
                 data_flow_kernel=dfk,
                 cache=False,
                 executors=list(self._active_executor_labels),
-            )(_run_parsl_child)
+            )(_run_parsl_child_captured)
             future = app(*app_args, **app_kwargs)
         else:
             # The reviewer seam supplies a lightweight DFK double. Keep its
@@ -341,16 +364,19 @@ class ParslDispatcher(DispatcherContract):
             process_handle.request_kill()
             # The real Parsl AppFuture has no supported cancellation path. A
             # non-Parsl future here is only the isolated legacy probe seam.
-            if not type(future).__module__.startswith("parsl."):
+            if not process_handle.wait_for_process(0.1) and not type(future).__module__.startswith("parsl."):
                 cancel = getattr(future, "cancel", None)
                 if callable(cancel):
                     cancel()
-            try:
-                future.result(None)
-            except BaseException as reap_error:
-                original.add_note(f"Parsl child reap result: {reap_error!r}")
+            elif process_handle.wait_for_process(0):
+                try:
+                    future.result(None)
+                except BaseException as reap_error:
+                    original.add_note(f"Parsl child reap result: {reap_error!r}")
             raise
         if not isinstance(result, ProcessOutcome):
+            if isinstance(result, _ChildFailure):
+                raise result.error
             raise TypeError("Parsl child returned an invalid ProcessOutcome")
         return result
 
