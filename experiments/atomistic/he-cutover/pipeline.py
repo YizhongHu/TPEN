@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from experiments.toolkit.dispatch import AllocationContext, DispatchSpec, StagePlanV2, write_dispatch_records
+from experiments.toolkit.executor_inputs import ready_group, write_ready_group
 from experiments.toolkit.parsl_attach import ParslAttachExecutor
 
 # Siblings are loaded study-scoped, not by bare import: experiments/ has several
@@ -73,11 +74,19 @@ def preflight_dispatch(*, context: AllocationContext, cwd: str | Path, admission
     return DispatchSpec("preflight", admission_id, f"{admission_id}:preflight", "01_preflight", "preflight", (python, "-c", code), str(context.run_root), runtime, str(cwd), completion=CompletionSpec(policy="none"))
 
 
+def executor_inputs(train_plan: StagePlanV2, eval_plan: StagePlanV2) -> tuple[dict[str, object], dict[str, object]]:
+    """Emit both executor input mappings without changing the legacy route."""
+
+    return ready_group(train_plan), ready_group(eval_plan)
+
+
 def run_pipeline(*, train_plan: StagePlanV2, eval_plan: StagePlanV2, facility: str, launch_dir: str | Path, admission_id: str, executor=None, environ: Mapping[str, str] | None = None) -> int:
     """Run probe, training, completion barrier, then evaluation; exit code is truth."""
 
     launch = Path(launch_dir)
     launch.mkdir(parents=True, exist_ok=True)
+    write_ready_group(launch / "02_train" / "executor_input.json", train_plan)
+    write_ready_group(launch / "03_eval" / "executor_input.json", eval_plan)
     context = allocation_context(facility=facility, run_root=launch, environ=environ)
     executor = executor or ParslAttachExecutor()
     records = []
