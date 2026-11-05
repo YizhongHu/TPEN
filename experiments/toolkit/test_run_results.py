@@ -75,6 +75,39 @@ def test_p8_reader_refuses_core_evidence_mismatch(tmp_path: Path) -> None:
         read(path, lambda _: {"verdict": "completed", "checkpoint": {"checkpoint_dir": "wrong", "schema_version": 1, "next_iteration": 1, "completed_updates": 1}})
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("task_id", "other-task", id="task"),
+        pytest.param("attempt_id", "attempt-2", id="attempt"),
+        pytest.param("output_dir", "/runs/group-1/task-a/attempt-2", id="output-dir"),
+    ],
+)
+def test_p8_reader_refuses_outcome_binding_mismatch(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    path, _ = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    # Keep the group digest and all segment/start fields consistent so only
+    # the outcome-to-manifest binding check can refuse this selected attempt.
+    payload["attempts"][0]["outcome_receipt"][field] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ManifestRefusal, match="manifest attempt disagrees with its outcome receipt"):
+        read(
+            path,
+            lambda _: {
+                "verdict": "completed",
+                "checkpoint": {
+                    "checkpoint_dir": str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001"),
+                    "schema_version": 1,
+                    "next_iteration": 1,
+                    "completed_updates": 1,
+                },
+            },
+        )
+
+
 def _write_segment_mutation(tmp_path: Path, mutation: str) -> Path:
     path, _ = _materialized_manifest(tmp_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
