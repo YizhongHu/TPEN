@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import math
 import os
 from typing import Any
 
@@ -150,10 +151,16 @@ class LocalDispatcher:
         token = _ACTIVE_DISPATCH.set(True)
         try:
             self._validate_inputs(group, runs, lifecycle, env, timeout)
+            begin_error: Exception | None = None
             finish_error: Exception | None = None
             for member in group.members:
                 configured = runs[member.task_id]
-                fence = lifecycle.begin(group, member.task_id, _utc_now())
+                try:
+                    fence = lifecycle.begin(group, member.task_id, _utc_now())
+                except Exception as error:
+                    if begin_error is None:
+                        begin_error = error
+                    continue
                 result_digest: str | None = None
                 status = "launch_failed"
                 try:
@@ -191,6 +198,20 @@ class LocalDispatcher:
                         result_digest = None
                     else:
                         result_digest = digest(_evidence_payload(decoded))
+                except EvidenceUnavailable:
+                    # Evidence absence never changes the process outcome or
+                    # fabricates a digest.
+                    result_digest = None
+                except BaseException:
+                    # Cancellation and interpreter exits still receive the
+                    # one finish attempt before propagating to the caller.
+                    status = "failed"
+                    result_digest = None
+                    try:
+                        lifecycle.finish(fence, status, _utc_now(), result_digest)
+                    except BaseException:
+                        pass
+                    raise
                 except Exception:
                     status = "launch_failed"
                     result_digest = None
@@ -201,6 +222,8 @@ class LocalDispatcher:
                         finish_error = error
             if finish_error is not None:
                 raise finish_error
+            if begin_error is not None:
+                raise begin_error
             return lifecycle.store.manifest(group)
         finally:
             _ACTIVE_DISPATCH.reset(token)
@@ -218,15 +241,20 @@ class LocalDispatcher:
         if not isinstance(group, ReadyGroup):
             raise TypeError("group must be ReadyGroup")
         if isinstance(runs, (str, bytes, bytearray)) or not isinstance(runs, Mapping):
-            raise TypeError("runs must be a mapping of task IDs to ConfiguredRun")
+            raise ValueError("runs must be a mapping of task IDs to ConfiguredRun")
         if not callable(getattr(lifecycle, "begin", None)) or not callable(getattr(lifecycle, "finish", None)):
             raise TypeError("lifecycle must provide begin() and finish()")
         if not hasattr(lifecycle, "store") or not callable(getattr(lifecycle.store, "manifest", None)):
             raise TypeError("lifecycle must expose a manifest-capable store")
         if env is not None and (isinstance(env, (str, bytes, bytearray)) or not isinstance(env, Mapping)):
             raise TypeError("env must be a mapping or None")
-        if timeout is not None and (type(timeout) not in (int, float) or timeout <= 0):
-            raise ValueError("timeout must be positive or None")
+        if timeout is not None and (
+            type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0
+        ):
+            raise ValueError("timeout must be finite and positive or None")
+        store_root = getattr(lifecycle.store, "root", None)
+        if isinstance(store_root, (str, os.PathLike)) and "${" in os.fspath(store_root):
+            raise ValueError("store root must not contain OmegaConf interpolation syntax '${'")
         expected = {member.task_id for member in group.members}
         actual = set(runs)
         if actual != expected:
