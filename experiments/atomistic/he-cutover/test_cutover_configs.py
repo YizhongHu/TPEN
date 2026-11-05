@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 
+import pytest
 import yaml
 from omegaconf import OmegaConf
 
@@ -29,6 +33,7 @@ if "_tpen_study_imports" not in _tpen_sys.modules:
 sibling = _tpen_sys.modules["_tpen_study_imports"].sibling
 
 from experiments.toolkit.ast_bindings import sys_module_names  # noqa: E402
+from experiments.toolkit import executor_inputs as emit  # noqa: E402
 from experiments.toolkit.executor_inputs import canonical_bytes  # noqa: E402
 
 run_train_row = sibling(__file__, 'run_train_row')
@@ -114,6 +119,98 @@ def test_he_cutover_emits_the_executor_golden_without_resolving_config() -> None
     assert emitted["members"][0]["program"]["config_ref"]["config"].startswith("experiments/")
 
 
+def test_he_cutover_emission_is_identical_from_two_checkout_roots(tmp_path: Path) -> None:
+    """The real producer must not hash its checkout's absolute ``__file__``."""
+
+    script = """
+from pathlib import Path
+import sys
+from experiments.toolkit.study_imports import load_study_module
+from experiments.toolkit.executor_inputs import canonical_bytes
+
+root = Path.cwd()
+module = load_study_module(root / "experiments/atomistic/he-cutover", "cutover_plan")
+grid = module.load_grid(root / "experiments/atomistic/he-cutover/smoke_grid.yaml")
+train, _, _ = module.build_plans(grid, facility="polaris", results_root="/p9/he", plan_id="p9-fixture")
+Path(sys.argv[1]).write_bytes(canonical_bytes(module.executor_inputs(train, train)[0]))
+"""
+    copies = []
+    outputs = []
+    for index in ("a", "b"):
+        checkout = tmp_path / f"checkout-{index}"
+        shutil.copytree(
+            ROOT,
+            checkout,
+            ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__", ".pytest_cache"),
+        )
+        output = tmp_path / f"emission-{index}.json"
+        subprocess.run(
+            [sys.executable, "-c", script, str(output)],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        copies.append(checkout)
+        outputs.append(output)
+    assert outputs[0].read_bytes() == outputs[1].read_bytes()
+    assert copies[0] != copies[1]
+
+
+def test_t2_he_program_reference_retains_each_row_science_input() -> None:
+    grid = cutover_plan.load_grid(Path(__file__).with_name("production_grid.yaml"))
+    train, evaluation, _ = cutover_plan.build_plans(
+        grid, facility="polaris", results_root="/p9/he", plan_id="p9-production"
+    )
+    train_wire, eval_wire = cutover_plan.executor_inputs(train, evaluation)
+    train_refs = {canonical_bytes(member["program"]["config_ref"]) for member in train_wire["members"]}
+    eval_refs = {canonical_bytes(member["program"]["config_ref"]) for member in eval_wire["members"]}
+    assert len(train_refs) == 3
+    assert len(eval_refs) == 36
+    assert all("seed" in member["program"]["config_ref"]["overrides"] for member in train_wire["members"])
+    assert all("checkpoint" in member["program"]["config_ref"]["overrides"] for member in eval_wire["members"])
+
+
+@pytest.mark.parametrize("kind", ["plain", "omegaconf"])
+def test_t3_program_reference_preserves_unresolved_mapping(kind: str) -> None:
+    raw = {"runtime": {"seed": 7}, "seed": "${runtime.seed}", "label": "λ"}
+    source = raw if kind == "plain" else OmegaConf.create(raw)
+    actual = emit.program_spec_ref(source)
+    assert actual["config_ref"] == raw
+    assert actual["content_digest"] != emit.payload_digest({**raw, "seed": 7})
+
+
+def _imports_executor_inputs(source: str) -> bool:
+    """Classify both supported executor-input import syntaxes in one place."""
+
+    tree = ast.parse(source)
+    return any(
+        (
+            isinstance(node, ast.ImportFrom)
+            and (
+                node.module == "experiments.toolkit.executor_inputs"
+                or (
+                    node.module == "experiments.toolkit"
+                    and any(alias.name == "executor_inputs" for alias in node.names)
+                )
+            )
+        )
+        or (
+            isinstance(node, ast.Import)
+            and any(alias.name == "experiments.toolkit.executor_inputs" for alias in node.names)
+        )
+        for node in ast.walk(tree)
+    )
+
+
+def _emitter_importers(paths: set[Path]) -> set[Path]:
+    return {
+        path
+        for path in paths
+        if _imports_executor_inputs(path.read_text(encoding="utf-8"))
+    }
+
+
 def test_p9_executor_boundary_is_six_named_producers_without_activation() -> None:
     producers = {
         ROOT / "experiments/atomistic/he-cutover/admission.py",
@@ -123,16 +220,16 @@ def test_p9_executor_boundary_is_six_named_producers_without_activation() -> Non
         ROOT / "experiments/baselines/plan.py",
         ROOT / "experiments/baselines/rungs/rung_makeplan.py",
     }
-    emitter_importers = set()
     forbidden_imports = []
     forbidden_activation = []
-    for path in (ROOT / "experiments").rglob("*.py"):
+    experiment_files = {
+        path for path in (ROOT / "experiments").rglob("*.py") if not path.name.startswith("test_")
+    }
+    for path in experiment_files:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 module = node.module or ""
-                if module == "experiments.toolkit.executor_inputs" and not path.name.startswith("test_"):
-                    emitter_importers.add(path)
                 if "tpen_executor" in module:
                     forbidden_imports.append(path)
             elif isinstance(node, ast.Import):
@@ -142,9 +239,31 @@ def test_p9_executor_boundary_is_six_named_producers_without_activation() -> Non
                 name = node.id if isinstance(node, ast.Name) else node.attr
                 if name in {"LocalDispatcher", "ParslDispatcher", "DirectoryStore"}:
                     forbidden_activation.append((path, name))
-    assert emitter_importers == producers
+    assert _emitter_importers(experiment_files) == producers
     assert forbidden_imports == []
     assert forbidden_activation == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import experiments.toolkit.executor_inputs as inputs\n",
+        "from experiments.toolkit import executor_inputs\n",
+    ],
+)
+def test_t10_six_only_guard_refuses_each_seventh_import_form(tmp_path: Path, source: str) -> None:
+    seventh = tmp_path / "seventh.py"
+    seventh.write_text(source, encoding="utf-8")
+    producers = {
+        ROOT / "experiments/atomistic/he-cutover/admission.py",
+        ROOT / "experiments/atomistic/he-cutover/cutover_plan.py",
+        ROOT / "experiments/atomistic/he-cutover/pipeline.py",
+        ROOT / "experiments/baselines/pipeline.py",
+        ROOT / "experiments/baselines/plan.py",
+        ROOT / "experiments/baselines/rungs/rung_makeplan.py",
+    }
+    assert _imports_executor_inputs(source)
+    assert _emitter_importers(producers | {seventh}) != producers
 
 
 # Binding analysis has ONE owner. This rule and the sys.modules rule in

@@ -107,7 +107,18 @@ def _uniform_gpu_count(plan: StagePlanV2) -> int:
 
 
 def executor_input(plan: StagePlanV2) -> dict[str, object]:
-    """Emit the executor input mapping while retaining the legacy route."""
+    """Emit the executor input mapping while retaining the legacy route.
+
+    Parameters
+    ----------
+    plan : StagePlanV2
+        Validated baseline plan to describe.
+
+    Returns
+    -------
+    dict
+        Plain executor ``ReadyGroup`` wire mapping.
+    """
 
     return ready_group(plan)
 
