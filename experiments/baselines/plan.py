@@ -19,6 +19,7 @@ from experiments.toolkit.dispatch import (
     StagePlanV2,
     logical_task_id_from_parts,
 )
+from experiments.toolkit.executor_inputs import ready_group
 from experiments.toolkit.resources import ResourceSpec
 from experiments.toolkit.specs import CompletionSpec
 
@@ -95,6 +96,23 @@ def build_plan(
         results_root=root,
         tasks=tasks,
     ).validate()
+
+
+def executor_input(plan: StagePlanV2) -> dict[str, object]:
+    """Emit the executor input mapping for a built plan.
+
+    Parameters
+    ----------
+    plan : StagePlanV2
+        Validated baseline plan to describe.
+
+    Returns
+    -------
+    dict
+        Plain executor ``ReadyGroup`` wire mapping.
+    """
+
+    return ready_group(plan)
 
 
 def _validate_matrix(matrix: Mapping[str, Sequence[Any]]) -> dict[str, tuple[Any, ...]]:
