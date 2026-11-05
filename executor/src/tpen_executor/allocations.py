@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -30,6 +31,8 @@ class ConfiguredAllocation:
     def __post_init__(self) -> None:
         if not isinstance(self.allocation_id, AllocationId) or not isinstance(self.backend_job_id, BackendJobId):
             raise TypeError("allocation identities have invalid types")
+        if not isinstance(self.facts, Mapping):
+            raise TypeError("facts must be a mapping")
         object.__setattr__(self, "facts", _freeze(self.facts, "facts"))
 
     def to_dict(self) -> dict[str, Any]:

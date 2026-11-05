@@ -2,9 +2,12 @@ defaults: []
 
 allocation:
   _target_: tpen_executor.allocations.ConfiguredAllocation
-  _recursive_: false
-  allocation_id: configured-allocation
-  backend_job_id: configured-backend-job
+  allocation_id:
+    _target_: tpen_executor.contracts.AllocationId
+    value: configured-allocation
+  backend_job_id:
+    _target_: tpen_executor.contracts.BackendJobId
+    value: configured-backend-job
   facts: {}
 
 store:
@@ -18,6 +21,11 @@ task:
   id: configured-task
   config: /prepared/science/config.yaml
   overrides: []
+
+lifecycle:
+  _target_: tpen_executor.lifecycle.AttachedAllocation
+  allocation: ${allocation}
+  store: ${store}
 
 program:
   # A marker has named concrete payload slots. Nested program markers become
