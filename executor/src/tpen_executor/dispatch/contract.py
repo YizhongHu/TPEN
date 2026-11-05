@@ -131,11 +131,40 @@ class DispatcherContract:
     ) -> RunManifest:
         """Dispatch every admitted member and return its durable group manifest.
 
-        Admission is completed before the first lifecycle write.  Every begun
-        fence receives one best-effort finish on cancellation, while ordinary
-        member failures are recorded and processing continues to later members.
+        Parameters
+        ----------
+        group : ReadyGroup
+            Ordered group whose members are launched in order.
+        runs : mapping[str, ConfiguredRun]
+            Exactly one configured run for every group member.
+        lifecycle : AttachedAllocation
+            Attached allocation that owns the fences and receipt store.
+        env : mapping, optional
+            Owner-process materialization environment for the worker handle.
+        timeout : float or None, optional
+            Positive child and evidence timeout in seconds.
+
+        Returns
+        -------
+        RunManifest
+            Manifest rebuilt from the lifecycle store after all members finish.
+
+        Raises
+        ------
+        TypeError, ValueError
+            If the group, run mapping, lifecycle, environment, or timeout is
+            malformed. Admission happens before the first store write.
+        RuntimeError
+            If dispatch is re-entered or a fenced path is not lexically safe.
+
+        Notes
+        -----
+        Every begun fence receives one best-effort finish on cancellation.
         Child return code and timeout determine operational status; backend
         future success is never used as a completion signal.
+
+        Admission is completed before the first lifecycle write. Ordinary
+        member failures are recorded and processing continues to later members.
         """
 
         if _ACTIVE_DISPATCH.get():
@@ -190,11 +219,6 @@ class DispatcherContract:
                             timeout=timeout,
                         )
                     except EvidenceUnavailable:
-                        result_digest = None
-                    except Exception:
-                        # Evidence transport is secondary to the reaped child
-                        # outcome.  It may remove the digest, but it must not
-                        # turn a child rc/timeout into a framework outcome.
                         result_digest = None
                     else:
                         result_digest = digest(_evidence_payload(decoded))
