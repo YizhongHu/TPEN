@@ -532,18 +532,23 @@
           "pass_criteria": {
             "channels": 8,
             "hidden_width": 32,
-            "training_walkers": 256,
             "updates": 1000,
-            "evaluation_walkers": 1024,
-            "draws_per_stream": 64,
-            "streams": 2,
-            "burn_in": 100,
-            "metropolis_steps_per_update": 10,
-            "proposal_scale_bohr": 0.5,
-            "stride": 20,
             "energy_abs_error_hartree": 0.02,
             "median_abs_error_improvement": 0.25,
-            "dynamic_range_rule": "if initial error <=0.02, report little learning dynamic range and require imperfect learned-state/gradient control"
+            "dynamic_range_rule": "if initial error <=0.02, report little learning dynamic range and require imperfect learned-state/gradient control",
+            "training_sampler": {
+              "walkers": 256,
+              "burn_in": 100,
+              "metropolis_steps_per_update": 10,
+              "proposal_scale_bohr": 0.5
+            },
+            "fresh_evaluation": {
+              "walkers": 1024,
+              "draws_per_stream": 64,
+              "streams": 2,
+              "burn_in": 1000,
+              "stride": 20
+            }
           }
         },
         {
