@@ -93,14 +93,14 @@ def test_r1_t2_abrupt_exit_cannot_publish_an_empty_receipt(tmp_path, receipt):
     fence = store.begin_attempt(group, "a", allocation, "start") if receipt == "outcome.json" else None
 
     def writer():
-        real = storage.os.replace
+        real = storage.os.link
 
-        def abrupt(source, destination):
+        def abrupt(source, destination, *args, **kwargs):
             if str(destination).endswith(receipt):
                 os._exit(73)
-            return real(source, destination)
+            return real(source, destination, *args, **kwargs)
 
-        storage.os.replace = abrupt
+        storage.os.link = abrupt
         if fence is None:
             store.begin_attempt(group, "a", allocation, "start")
         else:
