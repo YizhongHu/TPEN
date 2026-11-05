@@ -101,6 +101,12 @@ class LocalDispatcher:
     Parsl, or Balsam behavior. The public core run-directory overrides are
     ``run.root=<attempt output>``, ``run.layout=flat``, and ``run.run_id=core``.
     They keep core's derived run directory below the store-owned attempt fence.
+    A concrete store root containing the literal ``${`` is refused before the
+    first ``begin`` call so unresolved OmegaConf syntax cannot redirect core.
+    A timeout, when supplied, must be finite and positive. Cancellation makes
+    one best-effort ``finish`` publication for the begun member, preserves a
+    known ``timed_out`` status (otherwise using ``failed``), and propagates the
+    original cancellation after worker cleanup.
     """
 
     worker: WorkerProgram
@@ -141,9 +147,16 @@ class LocalDispatcher:
         ------
         TypeError, ValueError
             If the group, run mapping, lifecycle, environment, or timeout is
-            malformed. Admission happens before the first store write.
+            malformed. Admission happens before the first store write. A
+            literal ``${`` in the concrete store root is also rejected before
+            ``begin``; the timeout must be finite and positive when present.
         RuntimeError
             If dispatch is re-entered or a fenced path is not lexically safe.
+        Exception
+            The first member-local ``begin`` exception is deferred until all
+            other members have been visited. If a later ``finish`` exception
+            also occurs, it is attached as a note to that same original begin
+            exception rather than replacing it.
         """
 
         if _ACTIVE_DISPATCH.get():
@@ -208,7 +221,8 @@ class LocalDispatcher:
                 except BaseException:
                     # Cancellation and interpreter exits still receive the
                     # one finish attempt before propagating to the caller.
-                    status = "failed"
+                    if status != "timed_out":
+                        status = "failed"
                     result_digest = None
                     try:
                         lifecycle.finish(fence, status, _utc_now(), result_digest)
@@ -220,10 +234,12 @@ class LocalDispatcher:
                 except Exception as error:
                     if finish_error is None:
                         finish_error = error
+            if begin_error is not None:
+                if finish_error is not None:
+                    begin_error.add_note(f"finish error after deferred begin failure: {finish_error!r}")
+                raise begin_error
             if finish_error is not None:
                 raise finish_error
-            if begin_error is not None:
-                raise begin_error
             return lifecycle.store.manifest(group)
         finally:
             _ACTIVE_DISPATCH.reset(token)

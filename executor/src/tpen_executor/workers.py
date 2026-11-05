@@ -46,6 +46,10 @@ class SubprocessWorker:
     second, and the setup script is sourced last. Each invocation starts a
     new POSIX session so timeout cleanup owns the complete process group.
     The caller-named stdout and stderr log files are truncated for each run.
+    A timeout must be finite and positive. Cancellation sends ``SIGKILL`` to
+    the owned process group, waits until the leader is reaped even if cleanup
+    waits are interrupted again, annotates later interruptions on the original
+    exception, and then propagates that original exception.
     """
 
     def run(
@@ -81,7 +85,7 @@ class SubprocessWorker:
         Raises
         ------
         TypeError, ValueError
-            If inputs have invalid types or timeout is not positive.
+            If inputs have invalid types or timeout is not finite and positive.
         OSError
             If process launch or log creation fails.
         """
@@ -130,17 +134,21 @@ class SubprocessWorker:
                     except ProcessLookupError:
                         pass
                     returncode = process.wait()
-            except BaseException:
+            except BaseException as original:
                 # An interrupt while waiting must not orphan the isolated
                 # session. Reap the leader before propagating cancellation.
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                try:
-                    process.wait()
-                except BaseException:
-                    pass
+                cleanup_errors: list[BaseException] = []
+                while process.returncode is None:
+                    try:
+                        process.wait()
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
+                for cleanup_error in cleanup_errors:
+                    original.add_note(f"cleanup wait interruption: {cleanup_error!r}")
                 raise
         return ProcessOutcome(logical_argv, returncode, stdout_name, stderr_name, timed_out)
 
