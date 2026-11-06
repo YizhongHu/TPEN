@@ -89,6 +89,28 @@ def allocation_context_payload(
 ) -> dict[str, Any]:
     """Snapshot the bounded attached-allocation context without dropping fields.
 
+    Parameters
+    ----------
+    context : object
+        Object exposing every field of the toolkit ``AllocationContext``.
+    allocation_id, backend_job_id : str
+        Stable identities copied into the executor allocation record.
+    observed_environment : mapping[str, str]
+        Environment observed by the caller at attachment time.
+    observed_hostname : str
+        Hostname observed by the caller at attachment time.
+
+    Returns
+    -------
+    dict
+        Versioned JSON-shaped context snapshot.
+
+    Raises
+    ------
+    ActivationRefusal
+        If fields are missing, inconsistent, blank, or describe unsupported
+        multi-slot or multi-node geometry.
+
     This is intentionally a data adapter rather than a placement claim.  The
     P10 route admits only one worker visibility value and one node; physical
     slot identity remains an owner of the placement qualification item.
@@ -108,6 +130,14 @@ def allocation_context_payload(
     missing = [name for name in names if not hasattr(context, name)]
     if missing:
         raise ActivationRefusal("allocation-context", f"allocation context omits fields: {missing}")
+    if type(context.allocation_id) is not str or not context.allocation_id:
+        raise ActivationRefusal("allocation-context", "context allocation_id must be non-empty")
+    if context.allocation_id != allocation_id:
+        raise ActivationRefusal("allocation-context", "context and supplied allocation IDs disagree")
+    if type(context.visibility_variable) is not str or not context.visibility_variable:
+        raise ActivationRefusal("allocation-context", "visibility_variable must be non-empty")
+    if type(context.deadline_guard_min) is not int or context.deadline_guard_min < 0:
+        raise ActivationRefusal("allocation-context", "deadline_guard_min must be a non-negative integer")
     visibility = tuple(context.visibility_values)
     if any(type(item) is not str or not item for item in visibility):
         raise ActivationRefusal("allocation-context", "visibility values must be non-empty strings")
@@ -149,12 +179,90 @@ def allocation_context_payload(
     }
 
 
+def bind_allocation_context(
+    allocation_path: str | Path,
+    output_path: str | Path,
+    context: Any,
+    *,
+    observed_environment: Mapping[str, str],
+    observed_hostname: str,
+) -> Path:
+    """Write the validated full context into the allocation consumed by dispatch.
+
+    Parameters
+    ----------
+    allocation_path : str or pathlib.Path
+        Existing executor allocation JSON record.
+    output_path : str or pathlib.Path
+        Distinct absolute allocation record passed to the executor CLI.
+    context : object
+        Allocation-context object carrying every attach field.
+    observed_environment : mapping[str, str]
+        Environment observed by the caller before dispatch.
+    observed_hostname : str
+        Hostname observed by the caller before dispatch.
+
+    Returns
+    -------
+    pathlib.Path
+        The newly published allocation record used by the route.
+
+    Raises
+    ------
+    ActivationRefusal
+        If the source record, context identity, or output path is invalid.
+    """
+
+    source = Path(allocation_path)
+    output = Path(output_path)
+    if not source.is_absolute() or not output.is_absolute():
+        raise ActivationRefusal("allocation-path", "allocation paths must be absolute")
+    if source.resolve() == output.resolve():
+        raise ActivationRefusal("allocation-path", "bound allocation output must be a distinct path")
+    payload = _strict_json(source.read_text(encoding="utf-8"), "allocation")
+    expected = {"schema", "allocation_id", "backend_job_id", "facts"}
+    if set(payload) != expected or payload["schema"] != "tpen-executor/configured-allocation-v1":
+        raise ActivationRefusal("allocation-shape", "allocation record has an unexpected schema")
+    if type(payload["allocation_id"]) is not str or type(payload["backend_job_id"]) is not str:
+        raise ActivationRefusal("allocation-shape", "allocation identities must be strings")
+    if not isinstance(payload["facts"], Mapping):
+        raise ActivationRefusal("allocation-shape", "allocation facts must be a mapping")
+    snapshot = allocation_context_payload(
+        context,
+        allocation_id=payload["allocation_id"],
+        backend_job_id=payload["backend_job_id"],
+        observed_environment=observed_environment,
+        observed_hostname=observed_hostname,
+    )
+    facts = dict(payload["facts"])
+    facts["attached_context"] = snapshot
+    payload["facts"] = facts
+    _atomic_write(output, canonical_bytes(payload) + b"\n")
+    return output
+
+
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
 def file_sha256(path: str | Path) -> str:
-    """Hash one input file without resolving or rewriting it."""
+    """Hash one input file without resolving or rewriting it.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Existing file to hash.
+
+    Returns
+    -------
+    str
+        Lowercase SHA-256 digest.
+
+    Raises
+    ------
+    OSError
+        If the file cannot be read.
+    """
 
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -217,6 +325,48 @@ def _retire(path: Path, token: str) -> None:
     os.replace(path, candidate)
 
 
+def retire_attached_generation(directory: str | Path, error: BaseException) -> None:
+    """Retire current attached sidecars and publish a failed-generation diagnostic.
+
+    Parameters
+    ----------
+    directory : str or pathlib.Path
+        Absolute directory containing the current attached handoff files.
+    error : BaseException
+        The selected-generation failure to preserve in the diagnostic record.
+
+    Returns
+    -------
+    None
+        Current sidecars are retired and a diagnostic is published.
+
+    Raises
+    ------
+    ActivationRefusal
+        If ``directory`` is not absolute.
+    OSError
+        If evidence cannot be retired or published.
+    """
+
+    root = Path(directory)
+    if not root.is_absolute():
+        raise ActivationRefusal("handoff-path", "attached handoff directory must be absolute")
+    token = hashlib.sha256(repr(error).encode()).hexdigest()
+    _retire(root / "executor_input.json", token)
+    _retire(root / "configured-runs.json", token)
+    _retire(root / "executor_input_diagnostics.json", token)
+    _atomic_write(
+        root / "executor_input_diagnostics.json",
+        canonical_bytes(
+            {
+                "schema": "tpen-experiments/attached-input-diagnostics-v1",
+                "code": getattr(error, "code", "translation-failed"),
+                "reason": str(error),
+            }
+        ),
+    )
+
+
 def _absolute_config(value: Any, name: str) -> str:
     if type(value) is not str or not value.strip():
         raise ActivationRefusal("config-path", f"{name} must be a non-empty path")
@@ -252,6 +402,31 @@ def build_attached_inputs(
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], AttachedHandoff]:
     """Build a complete attached group and its configured-run sidecar.
+
+    Parameters
+    ----------
+    plan : StagePlanV2
+        Validated ordered producer plan.
+    effective_config, source_config : str or pathlib.Path
+        Absolute effective and source YAML paths.
+    profile : str, default=PROFILE_NAME
+        Declared core profile identity.
+    overrides_by_task : mapping[str, sequence[str]], optional
+        Exact per-task override lists to bind into the group.
+    group_id : str, optional
+        Explicit opaque group identity.
+    metadata : mapping, optional
+        Additional provenance carried in the opaque program reference.
+
+    Returns
+    -------
+    tuple of dict, dict, AttachedHandoff
+        Group wire mapping, configured-runs wire mapping, and their identity.
+
+    Raises
+    ------
+    ActivationRefusal
+        If a path, task, override, or group member cannot be represented.
 
     The group is built in the root project and then augmented with the exact
     effective/source config paths and hashes before its order-sensitive group
@@ -335,6 +510,26 @@ def write_attached_handoff(
 ) -> AttachedHandoff:
     """Write both attached input files for a fresh generation.
 
+    Parameters
+    ----------
+    directory : str or pathlib.Path
+        Absolute handoff directory.
+    plan : StagePlanV2
+        Validated ordered producer plan.
+    effective_config, source_config, profile, overrides_by_task, group_id, metadata
+        Inputs forwarded to :func:`build_attached_inputs`.
+
+    Returns
+    -------
+    AttachedHandoff
+        Current sidecar paths and bound identity.
+
+    Raises
+    ------
+    ActivationRefusal
+        If translation fails; current sidecars are retired and a diagnostic is
+        published before the refusal is re-raised.
+
     Existing current files are superseded by digest-named siblings.  A failed
     translation retires stale current inputs and leaves a diagnostic artifact,
     so an earlier representable prefix cannot be dispatched accidentally.
@@ -354,18 +549,7 @@ def write_attached_handoff(
             metadata=metadata,
         )
     except Exception as error:
-        token = hashlib.sha256(repr(error).encode()).hexdigest()
-        _retire(root / "executor_input.json", token)
-        _retire(root / "configured-runs.json", token)
-        _retire(root / "executor_input_diagnostics.json", token)
-        _atomic_write(
-            root / "executor_input_diagnostics.json",
-            canonical_bytes({
-                "schema": "tpen-experiments/attached-input-diagnostics-v1",
-                "code": getattr(error, "code", "translation-failed"),
-                "reason": str(error),
-            }),
-        )
+        retire_attached_generation(root, error)
         raise
     token = handoff.group_digest
     _retire(root / "executor_input.json", token)
@@ -382,7 +566,27 @@ def write_attached_handoff(
 
 
 def parse_profile_verdict(stdout: str, *, expected_profile: str = PROFILE_NAME, returncode: int = 0) -> ProfileVerdict:
-    """Parse a profile JSON verdict; process exit status is not the verdict."""
+    """Parse a profile JSON verdict; process exit status is not the verdict.
+
+    Parameters
+    ----------
+    stdout : str
+        Exactly one profile-check JSON object.
+    expected_profile : str, default=PROFILE_NAME
+        Requested profile identity.
+    returncode : int, default=0
+        Process status recorded for provenance only.
+
+    Returns
+    -------
+    ProfileVerdict
+        Typed profile response.
+
+    Raises
+    ------
+    ActivationRefusal
+        If the JSON schema, profile, verdict, or refusal shape is invalid.
+    """
 
     payload = _strict_json(stdout, "profile stdout")
     expected = {"schema", "profile", "verdict", "state_owners", "refusal"}
@@ -410,7 +614,29 @@ def check_profile(
     profile: str = PROFILE_NAME,
     cwd: str | Path | None = None,
 ) -> ProfileVerdict:
-    """Run the prepared science profile checker and require supported JSON."""
+    """Run the prepared science profile checker and require supported JSON.
+
+    Parameters
+    ----------
+    science_python : str or pathlib.Path
+        Absolute prepared science Python executable.
+    config : str or pathlib.Path
+        Absolute effective config path.
+    profile : str, default=PROFILE_NAME
+        Profile requested from the checker.
+    cwd : str or pathlib.Path, optional
+        Checker working directory.
+
+    Returns
+    -------
+    ProfileVerdict
+        Supported typed profile verdict.
+
+    Raises
+    ------
+    ActivationRefusal
+        If the checker output is malformed, mismatched, or refused.
+    """
 
     python = _absolute_config(str(science_python), "science_python")
     config_path = _absolute_config(str(config), "config")
@@ -430,6 +656,53 @@ def check_profile(
     return verdict
 
 
+def _validate_attached_sidecars(handoff: AttachedHandoff) -> None:
+    """Refuse sidecars whose P10 binding differs from a fresh handoff."""
+
+    try:
+        group = _strict_json(Path(handoff.executor_input).read_text(encoding="utf-8"), "executor input")
+        table = _strict_json(Path(handoff.configured_runs).read_text(encoding="utf-8"), "configured runs")
+    except OSError as error:
+        raise ActivationRefusal("handoff-missing", f"attached sidecar could not be read: {error}") from error
+    if payload_digest(group) != handoff.group_digest:
+        raise ActivationRefusal("handoff-group-mismatch", "executor input no longer matches the bound group digest")
+    if table.get("schema") != CONFIGURED_RUNS_SCHEMA or table.get("group_digest") != handoff.group_digest:
+        raise ActivationRefusal("handoff-runs-mismatch", "configured-runs sidecar is not bound to the fresh group")
+    members = group.get("members")
+    runs = table.get("runs")
+    if not isinstance(members, list) or not isinstance(runs, list) or len(members) != len(runs):
+        raise ActivationRefusal("handoff-shape", "attached sidecars have different member counts")
+    if tuple(str(member.get("task_id")) for member in members) != handoff.task_ids:
+        raise ActivationRefusal("handoff-task-mismatch", "executor input task IDs differ from the fresh handoff")
+    for member, run in zip(members, runs, strict=True):
+        if not isinstance(member, Mapping) or not isinstance(run, Mapping):
+            raise ActivationRefusal("handoff-shape", "attached sidecars contain a non-object member")
+        task_id = member.get("task_id")
+        program = member.get("program")
+        config_ref = program.get("config_ref") if isinstance(program, Mapping) else None
+        binding = config_ref.get("attached_activation") if isinstance(config_ref, Mapping) else None
+        if not isinstance(binding, Mapping):
+            raise ActivationRefusal("handoff-binding-missing", f"task {task_id!r} has no attached P10 binding")
+        expected = {
+            "effective_config": handoff.effective_config,
+            "effective_config_sha256": handoff.effective_config_sha256,
+            "source_config": handoff.source_config,
+            "source_config_sha256": handoff.source_config_sha256,
+            "profile": handoff.profile,
+        }
+        if any(binding.get(key) != value for key, value in expected.items()):
+            raise ActivationRefusal("handoff-binding-mismatch", f"task {task_id!r} binding changed")
+        if run.get("id") != task_id or run.get("config") != handoff.effective_config:
+            raise ActivationRefusal("handoff-run-mismatch", f"task {task_id!r} configured run changed")
+        bound_overrides = binding.get("overrides")
+        if not isinstance(bound_overrides, list) or run.get("overrides") != bound_overrides:
+            raise ActivationRefusal("handoff-overrides-mismatch", f"task {task_id!r} overrides changed")
+    if file_sha256(handoff.effective_config) != handoff.effective_config_sha256:
+        raise ActivationRefusal("effective-config-mismatch", "effective config bytes differ from the fresh handoff")
+    if file_sha256(handoff.source_config) != handoff.source_config_sha256:
+        raise ActivationRefusal("source-config-mismatch", "source config bytes differ from the fresh handoff")
+
+
 def run_executor_cli(
     executor_python: str | Path,
     handoff: AttachedHandoff,
@@ -441,9 +714,36 @@ def run_executor_cli(
     timeout: float | None = None,
     cwd: str | Path | None = None,
 ) -> ExecutorDispatchResult:
-    """Invoke the installed P9c CLI in an absolute executor environment."""
+    """Invoke the installed P9c CLI in an absolute executor environment.
+
+    Parameters
+    ----------
+    executor_python : str or pathlib.Path
+        Absolute Python executable containing the installed executor package.
+    handoff : AttachedHandoff
+        Fresh handoff identity to validate against both sidecars.
+    allocation, worker_config, store : str or pathlib.Path
+        Absolute allocation record, worker YAML, and fresh store paths.
+    dispatcher : {"local", "parsl"}, default="parsl"
+        Executor dispatcher backend.
+    timeout : float, optional
+        Positive child/evidence timeout.
+    cwd : str or pathlib.Path, optional
+        Working directory for the executor subprocess.
+
+    Returns
+    -------
+    ExecutorDispatchResult
+        Captured CLI result and any decoded manifest.
+
+    Raises
+    ------
+    ActivationRefusal
+        If the sidecars no longer match the bound P10 program.
+    """
 
     python = _absolute_config(str(executor_python), "executor_python")
+    _validate_attached_sidecars(handoff)
     command = [
         python,
         "-m",
@@ -483,13 +783,56 @@ def write_activation_receipt(
     inspect_run: Callable[[str | Path], Any] | None = None,
     profile: str = PROFILE_NAME,
 ) -> ResultSet:
-    """Read a committed manifest in the root environment and write its receipt."""
+    """Read completed core evidence and write the P10 activation receipt.
+
+    Parameters
+    ----------
+    manifest_path, receipt_path : str or pathlib.Path
+        Published executor manifest and durable activation receipt paths.
+    expected_task_ids : sequence of str
+        Exact ordered task identities expected from the selected generation.
+    inspect_run : callable, optional
+        Public core inspector or a test double receiving each fenced core path.
+    profile : str, default=PROFILE_NAME
+        Profile identity recorded in the receipt.
+
+    Returns
+    -------
+    ResultSet
+        Reader result after the completed-verdict gate.
+
+    Raises
+    ------
+    ManifestRefusal, OSError, ValueError
+        If the manifest, public evidence, or receipt cannot be accepted.
+    """
 
     manifest = Path(manifest_path)
     receipt = Path(receipt_path)
     expected = tuple(str(item) for item in expected_task_ids)
     try:
-        result = read(manifest, inspect_run=inspect_run)
+        inspector = inspect_run
+        if inspector is None:
+            from .run_results import _default_inspect_run
+
+            inspector = _default_inspect_run
+
+        def completed_inspector(path: str | Path) -> Any:
+            evidence = inspector(path)
+            if isinstance(evidence, Mapping):
+                verdict = evidence.get("verdict")
+                run_status = evidence.get("run_status")
+            else:
+                verdict = getattr(evidence, "verdict", None)
+                run_status = getattr(evidence, "run_status", None)
+            if verdict != "completed" or run_status != "completed":
+                raise ManifestRefusal(
+                    "core-run-incomplete",
+                    "P10 activation requires public core verdict and run_status completed",
+                )
+            return evidence
+
+        result = read(manifest, inspect_run=completed_inspector)
         actual = tuple(chain.task_id for chain in result.chains)
         if actual != expected:
             raise ManifestRefusal("task-set-mismatch", f"reader chains {actual!r} differ from expected {expected!r}")
@@ -544,7 +887,31 @@ def write_activation_failure_receipt(
     profile: str = PROFILE_NAME,
     manifest_path: str | Path | None = None,
 ) -> None:
-    """Preserve a named pre-reader activation failure as durable evidence."""
+    """Preserve a named pre-reader activation failure as durable evidence.
+
+    Parameters
+    ----------
+    receipt_path : str or pathlib.Path
+        Destination for the failed activation receipt.
+    code, reason : str
+        Named refusal code and human-readable reason.
+    expected_task_ids : sequence of str, optional
+        Task identities selected before the failure.
+    profile : str, default=PROFILE_NAME
+        Profile identity recorded in the receipt.
+    manifest_path : str or pathlib.Path, optional
+        Existing manifest whose digest should be retained.
+
+    Returns
+    -------
+    None
+        The failure receipt is atomically published.
+
+    Raises
+    ------
+    OSError
+        If the receipt path cannot be written.
+    """
 
     payload = {
         "schema": ATTACHED_ACTIVATION_SCHEMA,
@@ -562,6 +929,7 @@ def write_activation_failure_receipt(
 
 __all__ = [
     "ATTACHED_ACTIVATION_SCHEMA",
+    "bind_allocation_context",
     "CONFIGURED_RUNS_SCHEMA",
     "ActivationRefusal",
     "allocation_context_payload",
@@ -575,6 +943,7 @@ __all__ = [
     "file_sha256",
     "parse_profile_verdict",
     "run_executor_cli",
+    "retire_attached_generation",
     "write_activation_receipt",
     "write_activation_failure_receipt",
     "write_attached_handoff",
