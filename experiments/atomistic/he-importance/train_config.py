@@ -49,6 +49,21 @@ class ContextResolutionError(TrainConfigResolutionError):
     """A row declares a model context that this resolver does not consume."""
 
 
+_AB_CONTEXT_KEYS = frozenset(
+    {
+        "producer_path",
+        "activation",
+        "channels",
+        "embedding",
+        "update",
+        "producer_initialization",
+        "electron_electron",
+        "electron_nucleus",
+        "readout_initialization",
+    }
+)
+
+
 def _require_checkout_root() -> Path:
     """Require the repository root on ``sys.path`` before loading experiment code.
 
@@ -225,9 +240,18 @@ def _optimizer_entry(manifest: Mapping[str, Any]) -> Any:
     by_method = {entry.method: entry for entry in roster}
     entry = by_method.get(method)
     if entry is None:
+        unavailable_reason = optimizer_cell.get("unavailable_reason")
+        status_is_unavailable = {"available": False, "unavailable": True}.get(status, False)
+        if status_is_unavailable and unavailable_reason:
+            raise UnavailableOptimizerError(
+                f"optimizer method {method!r} is unavailable: {unavailable_reason}"
+            )
         raise UnavailableOptimizerError(f"optimizer method {method!r} is absent from the HI roster")
     if not entry.admitted or status != "available" or not entry.target:
-        reason = optimizer_cell.get("reason") or "not admitted by HI_METHOD_ROSTER"
+        reason = (
+            optimizer_cell.get("reason")
+            or "not admitted by HI_METHOD_ROSTER"
+        )
         raise UnavailableOptimizerError(
             f"optimizer method {method!r} is unavailable: {reason}"
         )
@@ -306,7 +330,24 @@ def _declared_adam_levels(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _consumed_context(manifest: Mapping[str, Any]) -> str:
-    """Validate and return one of the two resolver-consumed context literals."""
+    """Validate and return the resolver-consumed context family.
+
+    A/B rows use the AB-4a literal package vocabulary.  The accepted shape is
+    ``{"axis": "A" or "B", "literal_configuration": {...}}``; the
+    configuration is checked as a closed set here; no control expansion is
+    performed.  O rows retain their pre-existing named ``overrides`` shape so
+    their resolved configuration remains unchanged.
+
+    Returns
+    -------
+    str
+        ``"O-raw"``, ``"O-composite"``, ``"A"``, or ``"B"``.
+
+    Raises
+    ------
+    ContextResolutionError
+        If the context is not one of the closed scientific vocabularies.
+    """
 
     identity = _mapping(manifest.get("scientific_identity"), "scientific_identity")
     context = _mapping(identity.get("context"), "scientific_identity.context")
@@ -329,6 +370,55 @@ def _consumed_context(manifest: Mapping[str, Any]) -> str:
         if dict(context) == literal:
             return name
 
+    context_keys = frozenset(context)
+    if context_keys.intersection({"axis", "literal_configuration"}):
+        if context_keys.symmetric_difference({"axis", "literal_configuration"}):
+            raise ContextResolutionError(
+                "scientific_identity.context A/B shape must have exactly the keys "
+                "['axis', 'literal_configuration']; "
+                f"declared keys={sorted(context_keys)!r}"
+            )
+        axis = context.get("axis")
+        literal = context.get("literal_configuration")
+        axis_name = {"A": "A", "B": "B"}.get(axis) if type(axis) is str else None
+        if axis_name is None:
+            raise ContextResolutionError(
+                f"scientific_identity.context A/B shape has unknown axis {axis!r}"
+            )
+        if not isinstance(literal, Mapping):
+            raise ContextResolutionError(
+                "scientific_identity.context A/B shape requires "
+                f"literal_configuration to be a mapping, got {type(literal).__name__}"
+            )
+        labels = dict(literal)
+        expected_keys = set(_AB_CONTEXT_KEYS)
+        if {"A": False, "B": True}.get(axis_name, False):
+            expected_keys.add("package")
+        label_keys = frozenset(labels)
+        key_differences = label_keys.symmetric_difference(expected_keys)
+        if key_differences:
+            missing = sorted(expected_keys - label_keys)
+            extra = sorted(label_keys - expected_keys)
+            details = []
+            if missing:
+                details.append(f"missing coordinate(s) {missing!r}")
+            if extra:
+                details.append(f"extra coordinate(s) {extra!r}")
+            raise ContextResolutionError(
+                f"scientific_identity.context.literal_configuration for {axis} must be closed: "
+                + "; ".join(details)
+            )
+        invalid_coordinate = next(
+            (coordinate for coordinate, value in labels.items() if type(value) is not str),
+            None,
+        )
+        if invalid_coordinate is not None:
+            raise ContextResolutionError(
+                "scientific_identity.context.literal_configuration coordinate "
+                f"{invalid_coordinate!r} must be an exact str label"
+            )
+        return axis_name
+
     if dict(context) not in expected.values():
         differences = []
         declared_name = context.get("name")
@@ -346,6 +436,28 @@ def _consumed_context(manifest: Mapping[str, Any]) -> str:
         )
 
     raise AssertionError("unreachable context validation branch")
+
+
+def _ab_context_labels(manifest: Mapping[str, Any], axis: str) -> dict[str, str]:
+    """Return complete AB-4a labels after closed-schema context validation.
+
+    Parameters
+    ----------
+    manifest
+        Frozen materialized training manifest.
+    axis
+        The already validated ``"A"`` or ``"B"`` context family.
+
+    Returns
+    -------
+    dict[str, str]
+        Complete labels accepted by
+        :func:`context_mapping.compose_architecture_package`.
+    """
+
+    context = _mapping(manifest["scientific_identity"].get("context"), "scientific_identity.context")
+    literal = _mapping(context.get("literal_configuration"), "scientific_identity.context.literal_configuration")
+    return dict(literal)
 
 
 def resolve_train_config(source: Any) -> DictConfig:
@@ -451,6 +563,27 @@ def resolve_train_config(source: Any) -> DictConfig:
                 seed=model_seed,
             )
         )
+    elif {"A": True, "B": True}.get(context_name, False):
+        context_mapping = _context_mapping_api()
+        labels = _ab_context_labels(manifest, context_name)
+        package = labels.pop("package", None)
+        # AB-3 owns architecture composition.  Assign the returned model at
+        # the full Hydra root so its relative interpolations resolve against
+        # ``cfg`` rather than against a detached model fragment.
+        try:
+            cfg.model = context_mapping.compose_architecture_package(
+                cfg.model,
+                package=package,
+                seed=model_seed,
+                **labels,
+            )
+        except Exception as error:
+            if isinstance(error, context_mapping.UnknownContextLabel):
+                raise ContextResolutionError(
+                    "scientific_identity.context contains an unknown A/B coordinate label: "
+                    f"{error}"
+                ) from error
+            raise
     scheduler_paths = _scheduler_paths(OmegaConf.to_container(cfg, resolve=False))
     if scheduler_paths:
         raise OptimizerLevelResolutionError(

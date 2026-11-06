@@ -12,7 +12,9 @@ import random
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+import subprocess
 import sys
+import types
 
 import pytest
 import torch
@@ -55,6 +57,15 @@ assert _CONTEXT_SPEC is not None and _CONTEXT_SPEC.loader is not None
 context_mapping = importlib.util.module_from_spec(_CONTEXT_SPEC)
 sys.modules[_CONTEXT_SPEC.name] = context_mapping
 _CONTEXT_SPEC.loader.exec_module(context_mapping)
+
+_AB_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_ab_universe_for_train_config",
+    Path(__file__).with_name("ab_universe.py"),
+)
+assert _AB_SPEC is not None and _AB_SPEC.loader is not None
+ab_universe = importlib.util.module_from_spec(_AB_SPEC)
+sys.modules[_AB_SPEC.name] = ab_universe
+_AB_SPEC.loader.exec_module(ab_universe)
 
 
 def _walker_refusal_pattern(stage: str, value: object, declared: object) -> str:
@@ -131,6 +142,87 @@ def _he_batch() -> object:
 
 def _context_cell(tmp_path: Path, name: str = "O-composite") -> object:
     return next(cell for cell in _q_adam_cells(tmp_path, name) if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005)
+
+
+def _ab_cell(tmp_path: Path, package: Mapping[str, object], axis: str) -> object:
+    """Materialize one AB-4a package in the resolver's closed context shape."""
+
+    adam = next(slot for slot in package["optimizer_slots"] if slot["method"] == "adam")
+    return stage_coordinate.materialize_stage(
+        axis,
+        [
+            {
+                "scientific_identity": {
+                    "context": {
+                        "axis": axis,
+                        "literal_configuration": package["literal_configuration"],
+                    },
+                    "optimizer": {
+                        "method": adam["method"],
+                        "levels": dict(adam["levels"]),
+                    },
+                },
+                "payload": {"updates": stage_coordinate.stage_definition(axis).updates},
+                "topology": {},
+            }
+        ],
+        stage_coordinate.OptimizerCell(adam["method"], adam["status"]),
+        tmp_path,
+    )[0]
+
+
+def _load_prechange_resolver() -> types.ModuleType:
+    """Load the pre-change resolver source for byte comparison."""
+
+    # Pre-change resolver source, blob 7ede61e8, identical to the PR base's train_config.py.
+    # Generating command, mechanically: git show 040a5b8e87befc59bb21a9c64f8ec1782c8fa283:
+    # experiments/atomistic/he-importance/train_config.py
+    source = subprocess.run(
+        [
+            "git",
+            "show",
+            "040a5b8e87befc59bb21a9c64f8ec1782c8fa283:"
+            "experiments/atomistic/he-importance/train_config.py",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    module = types.ModuleType("he_importance_train_config_prechange")
+    module.__file__ = train_config.__file__
+    exec(compile(source, module.__file__, "exec"), module.__dict__)
+    return module
+
+
+def _canonical_resolved_config(config: object) -> str:
+    """Serialize one resolved config with a stable, sorted-key encoding."""
+
+    return json.dumps(
+        OmegaConf.to_container(config, resolve=True),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _assert_matches_prechange(
+    cells: Sequence[object], resolver: object, prechange: types.ModuleType
+) -> None:
+    """Compare current output or refusal with the mechanically loaded oracle."""
+
+    for cell in cells:
+        try:
+            expected = prechange.resolve_train_config(cell)
+        except Exception as expected_error:  # noqa: BLE001 - refusal is part of the oracle
+            try:
+                resolver(cell)
+            except Exception as observed_error:  # noqa: BLE001 - compare oracle refusals
+                assert type(observed_error).__name__ == type(expected_error).__name__
+                assert str(observed_error) == str(expected_error)
+            else:
+                raise AssertionError("current resolver accepted a prechange-refused cell")
+        else:
+            observed = resolver(cell)
+            assert _canonical_resolved_config(observed) == _canonical_resolved_config(expected)
 
 
 def _independent_initializer_paths(value: object, path: str = "") -> set[str]:
@@ -629,6 +721,139 @@ def test_o_composite_instantiates_finitely_and_trains_added_parameters(tmp_path:
     for order, columns in ((1, [4]), (2, [4, 9, 10, 11, 12])):
         weight = model.embedding.order_mlps[str(order)].layers[0].weight
         assert torch.any(weight.grad[:, columns] != 0)
+
+
+@pytest.mark.parametrize("axis", ("A", "B"))
+def test_every_ab4a_fixed_adam_package_resolves_and_instantiates(
+    tmp_path: Path, axis: str
+) -> None:
+    """Every AB-4a package uses the AB-3 composition entry point."""
+
+    packages = ab_universe.render_ab_universe()[axis]
+    for index, package in enumerate(packages):
+        cell = _ab_cell(tmp_path / axis / str(index), package, axis)
+        resolved = train_config.resolve_train_config(cell)
+        model = instantiate(resolved.model).to(dtype=torch.float64)
+        assert model is not None
+
+
+def test_q_and_o1_outputs_match_mechanical_prechange_oracle(tmp_path: Path) -> None:
+    """Every existing Q/O1 row remains byte-identical to the pinned resolver."""
+
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "materialized",
+        availability=optimizer_grid.roster_availability(),
+        stages=("Q", "O1"),
+    )
+    prechange = _load_prechange_resolver()
+    _assert_matches_prechange(cells, train_config.resolve_train_config, prechange)
+
+
+def test_changed_o_raw_resolution_fails_mechanical_prechange_oracle(tmp_path: Path) -> None:
+    """The oracle control must detect a deliberately changed O-raw result."""
+
+    cell = _q_adam_cells(tmp_path, "O-raw")[0]
+    prechange = _load_prechange_resolver()
+
+    def mutant(source: object) -> DictConfig:
+        resolved = train_config.resolve_train_config(source)
+        resolved.model.trace_name = "deliberate-o-raw-mutant"
+        return resolved
+
+    with pytest.raises(AssertionError):
+        _assert_matches_prechange((cell,), mutant, prechange)
+
+
+def test_ab_o_star_refusal_names_pending_reason_and_control_resolves(tmp_path: Path) -> None:
+    """An AB O* slot is refused; the fixed-Adam slot is the control."""
+
+    package = ab_universe.render_a_packages()[0]
+    o_star = next(slot for slot in package["optimizer_slots"] if slot["method"] == "O*")
+    fixed = _ab_cell(tmp_path / "fixed", package, "A")
+    resolved = train_config.resolve_train_config(fixed)
+    assert resolved.optimizer._target_ == "torch.optim.Adam"
+
+    pending = stage_coordinate.materialize_stage(
+        "A",
+        [
+            {
+                "scientific_identity": {
+                    "context": fixed.manifest["scientific_identity"]["context"],
+                    "optimizer": {"method": o_star["method"], "levels": None},
+                },
+                "payload": {"updates": stage_coordinate.stage_definition("A").updates},
+                "topology": {},
+            }
+        ],
+        stage_coordinate.OptimizerCell(
+            o_star["method"], o_star["status"], o_star["unavailable_reason"]
+        ),
+        tmp_path / "pending",
+    )[0]
+    with pytest.raises(
+        train_config.UnavailableOptimizerError,
+        match=re.escape(o_star["unavailable_reason"]),
+    ):
+        train_config.resolve_train_config(pending)
+
+
+@pytest.mark.parametrize(
+    "contamination",
+    (stage_coordinate._REFERENCE_ENERGY, {"nested": stage_coordinate._REFERENCE_ENERGY}),
+)
+def test_ab_reference_packet_is_rejected_before_model_construction(
+    tmp_path: Path, contamination: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AB reference-bearing packets fail before the model composer is called."""
+
+    package = ab_universe.render_a_packages()[0]
+    clean = _ab_cell(tmp_path / "clean", package, "A")
+    assert train_config.resolve_train_config(clean).model is not None
+
+    manifest = stage_coordinate._thaw(clean.manifest)
+    if isinstance(contamination, Mapping):
+        manifest["payload"]["configuration"]["nested"] = contamination
+    else:
+        manifest["scientific_identity"]["reference_energy"] = contamination
+    contaminated = replace(
+        clean,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=stage_coordinate.content_hash(manifest),
+        output_path=clean.output_path.parent / stage_coordinate.content_hash(manifest),
+    )
+    monkeypatch.setattr(
+        train_config,
+        "_compose_base_config",
+        lambda: pytest.fail("reference-bearing packet reached model construction"),
+    )
+    with pytest.raises(Exception, match="reference|evaluation reference"):
+        train_config.resolve_train_config(contaminated)
+
+
+@pytest.mark.parametrize("mutation", ("extra", "near_miss", "axis"))
+def test_ab_context_is_closed_and_rejects_mutant_coordinates(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Unconsumed, near-miss, and misspelled AB coordinates fail closed."""
+
+    package = ab_universe.render_a_packages()[0]
+    cell = _ab_cell(tmp_path, package, "A")
+    manifest = stage_coordinate._thaw(cell.manifest)
+    context = manifest["scientific_identity"]["context"]
+    if mutation == "extra":
+        context["unconsumed_coordinate"] = "unexpected"
+    elif mutation == "near_miss":
+        context["literal_configuration"]["activation"] = "SiLU,SiLU "
+    else:
+        context["axis"] = "a"
+    rebuilt = replace(
+        cell,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=stage_coordinate.content_hash(manifest),
+        output_path=cell.output_path.parent / stage_coordinate.content_hash(manifest),
+    )
+    with pytest.raises(train_config.ContextResolutionError):
+        train_config.resolve_train_config(rebuilt)
 
 
 @pytest.mark.parametrize("field", ("name", "producer_policy", "aggregation_activation", "input_features", "feature_update"))
