@@ -70,7 +70,7 @@ def _inside(root: str, path: str) -> bool:
     return path == root or path.startswith(root + os.sep)
 
 
-_SAFE_TASK_ID = re.compile(r"[A-Za-z0-9._-]+\Z")
+_SAFE_TASK_ID = re.compile(r"[A-Za-z0-9._:-]+\Z")
 _TASK_LOCK = ".task.lock"
 
 
@@ -216,7 +216,7 @@ class DirectoryStore:
         """Validate the reversible task directory namespace."""
         text(task_id, "task_id")
         if task_id in {".", ".."} or _SAFE_TASK_ID.fullmatch(task_id) is None:
-            raise ValueError("task_id must match [A-Za-z0-9._-]+")
+            raise ValueError("task_id must match [A-Za-z0-9._:-]+ and must not be a traversal component")
 
     def _prepare_task_dir(self, group: ReadyGroup, task_id: str) -> str:
         """Create and durably link the store ancestry for one task."""
