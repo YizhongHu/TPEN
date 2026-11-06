@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 import os
 from pathlib import Path
 from types import MappingProxyType
@@ -11,6 +10,7 @@ from typing import Any, ClassVar
 
 from ._codec import canonical_bytes, decode_json, fields, sequence
 from .environments import PreparedPythonEnvironment
+from ._records import frozen_record
 from .workers import SubprocessWorker
 
 PROFILE_CHECK_SCHEMA = "tpen.profile-check/v1"
@@ -24,7 +24,7 @@ class ProfileUnavailable(RuntimeError):
     """Raised when core cannot provide a trustworthy profile capability."""
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class ProfileCheck:
     """Strict immutable executor mirror of core's profile-check record."""
 
@@ -99,7 +99,7 @@ class ProfileCheck:
         return hash(canonical_bytes(self.to_dict()))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class CoreProfileReference:
     """Reference to a core config and declared recovery profile.
 

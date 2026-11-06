@@ -91,6 +91,8 @@ class DispatcherContract:
     that Local and Parsl dispatchers publish identical records.
     """
 
+    __slots__ = ()
+
     worker: Any
 
     def _worker_environment(self, materialized: Any) -> Any:

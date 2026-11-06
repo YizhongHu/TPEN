@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 from typing import ClassVar, Sequence
 
 from .runners import TPENCommand
+from ._records import frozen_record
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class ConfiguredRun:
     """Hydra-constructible command configuration for one logical task.
 

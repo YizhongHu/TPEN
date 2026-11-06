@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from ..allocations import ConfiguredAllocation
 from ..contracts import ReadyGroup
 from ..results import AllocationObservation, OutcomeReceipt
 from ..storage import AttemptFence, DirectoryStore, FenceRejected
+from .._records import frozen_record
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class AttachedAllocation:
     """Delegate lifecycle to one configured allocation and receipt store.
 
