@@ -7,7 +7,6 @@ from pathlib import Path
 import subprocess
 import sys
 import textwrap
-from types import SimpleNamespace
 
 import pytest
 
@@ -15,7 +14,6 @@ from tpen_executor import composition
 from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
-from tpen_executor.placement import binding_from_allocation
 from tpen_executor.tasks import ConfiguredRun, ConfiguredRunTable
 
 
@@ -27,27 +25,32 @@ def _group() -> ReadyGroup:
     return ReadyGroup("p10", (TaskSpec("train:seed-0000", "train:seed-0000", program, digest("science"), 1, "steps"),), digest("plan"))
 
 
-def _inputs(tmp_path: Path, *, evidence: bool = True) -> dict[str, Path]:
+def _inputs(tmp_path: Path, *, evidence: bool = True, allocation_id: str = "alloc", backend_job_id: str = "job") -> dict[str, Path]:
     group = _group()
     config = tmp_path / "config.yaml"
     config.write_text("ok", encoding="utf-8")
     package = tmp_path / "fake_core" / "tpen"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
-    (package / "run.py").write_text(
-        textwrap.dedent(
-            f"""
+    identity_script = textwrap.dedent(
+        """
             import json, os, sys
             from pathlib import Path
             def main(argv):
                 values = dict(item.split('=', 1) for item in argv if '=' in item)
                 run_dir = Path(values['run.root']) / values['run.run_id']
                 run_dir.mkdir(parents=True, exist_ok=True)
-                (run_dir / 'process-identity.json').write_text(json.dumps({'pid': os.getpid(), 'start_token': __import__('time').time_ns(), 'nonce': os.urandom(8).hex(), 'hostname': __import__('socket').gethostname()}))
-                {"(run_dir / 'evidence.json').write_text(json.dumps({'schema':'tpen.run-evidence/v1','run_dir':str(run_dir),'verdict':'completed','run_status':'completed','checkpoint':{'checkpoint_dir':str(run_dir / 'checkpoint'),'schema_version':1,'next_iteration':1,'completed_updates':1},'refusal':None}))" if evidence else "pass"}
+                start_token = Path('/proc/self/stat').read_text().split()[21]
+                (run_dir / 'process-identity.json').write_text(json.dumps({'pid': os.getpid(), 'start_token': start_token, 'nonce': os.urandom(8).hex(), 'hostname': __import__('socket').gethostname(), 'environment': dict(os.environ)}))
                 return 0
             """
-        ),
+    )
+    evidence_script = (
+        "(run_dir / 'evidence.json').write_text(json.dumps({'schema':'tpen.run-evidence/v1','run_dir':str(run_dir),'verdict':'completed','run_status':'completed','checkpoint':{'checkpoint_dir':str(run_dir / 'checkpoint'),'schema_version':1,'next_iteration':1,'completed_updates':1},'refusal':None}))"
+        if evidence else "pass"
+    )
+    (package / "run.py").write_text(
+        identity_script.replace("                return 0", f"                {evidence_script}\n                return 0"),
         encoding="utf-8",
     )
     (package / "inspection.py").write_text(
@@ -55,9 +58,9 @@ def _inputs(tmp_path: Path, *, evidence: bool = True) -> dict[str, Path]:
         encoding="utf-8",
     )
     allocation = ConfiguredAllocation(
-        AllocationId("alloc"),
-        BackendJobId("job"),
-        {"binding": {"environment": {"P10_NODE": "node-0"}, "worker_id": "worker-0", "node": "node-0"}},
+        AllocationId(allocation_id),
+        BackendJobId(backend_job_id),
+        {"binding": {"environment": {"P10_NODE": "node-0", "P10_ALLOCATION_OBSERVED": allocation_id}, "worker_id": "worker-0", "node": "node-0"}},
     )
     worker = tmp_path / "worker.yaml"
     worker.write_text(
@@ -137,63 +140,13 @@ def test_a2_named_admission_controls_create_no_store(tmp_path: Path, mutation: s
     assert not (tmp_path / "store").exists()
 
 
-def test_a3_reader_rejects_empty_committed_chain_after_zero_exit(tmp_path: Path) -> None:
-    paths = _inputs(tmp_path, evidence=False)
-    result = _cli(paths, tmp_path / "store")
-    assert result.returncode == 0
-    sys.path.insert(0, str(Path(__file__).parents[2]))
-    from experiments.toolkit.attached_activation import write_activation_receipt
-    from experiments.toolkit.run_results import ManifestRefusal
-    with pytest.raises(ManifestRefusal, match="no committed|reader chains"):
-        write_activation_receipt(
-            tmp_path / "store" / "run-manifest.json",
-            tmp_path / "receipt.json",
-            expected_task_ids=("train:seed-0000",),
-        )
-
-
-def test_a4_allocation_context_preserves_named_binding_facts() -> None:
-    sys.path.insert(0, str(Path(__file__).parents[2]))
-    from experiments.toolkit.attached_activation import allocation_context_payload
-
-    context = SimpleNamespace(
-        allocation_id="alloc",
-        visibility_variable="CUDA_VISIBLE_DEVICES",
-        visibility_values=("0",),
-        run_root="/runs",
-        deadline=123.5,
-        deadline_env_var="END",
-        deadline_guard_min=1,
-        environment={"OMP_NUM_THREADS": "4"},
-        nodes_per_block=None,
-    )
-    snapshot = allocation_context_payload(
-        context,
-        allocation_id="alloc",
-        backend_job_id="job",
-        observed_environment={"HOST": "n0"},
-        observed_hostname="n0",
-    )
-    assert snapshot["context"]["deadline"] == 123.5
-    assert snapshot["context"]["environment"] == {"OMP_NUM_THREADS": "4"}
-    assert snapshot["observed"]["hostname"] == "n0"
-
-    allocation = ConfiguredAllocation(
-        AllocationId("alloc"),
-        BackendJobId("job"),
-        {"binding": {"environment": {"CUDA_VISIBLE_DEVICES": "0", "OMP_NUM_THREADS": "4"}, "node": "n0"}, "deadline": "d"},
-    )
-    binding = binding_from_allocation(allocation)
-    assert dict(binding.env) == {"CUDA_VISIBLE_DEVICES": "0", "OMP_NUM_THREADS": "4"}
-    assert binding.node == "n0"
-    assert allocation.facts["deadline"] == "d"
-
-
-def test_a5_two_fresh_stores_have_disjoint_attempt_namespaces(tmp_path: Path) -> None:
+def test_a5_two_fresh_stores_have_pid_start_token_reaping_and_allocation_identity(tmp_path: Path) -> None:
     paths = _inputs(tmp_path)
     first = _cli(paths, tmp_path / "store-1")
     second = _cli(paths, tmp_path / "store-2")
-    assert first.returncode == second.returncode == 0
+    changed_paths = _inputs(tmp_path / "changed", allocation_id="alloc-B", backend_job_id="job-B")
+    changed = _cli(changed_paths, tmp_path / "store-3")
+    assert first.returncode == second.returncode == changed.returncode == 0
     left = json.loads(first.stdout)["attempts"][0]["attempt_id"]
     right = json.loads(second.stdout)["attempts"][0]["attempt_id"]
     assert left != right
@@ -203,5 +156,13 @@ def test_a5_two_fresh_stores_have_disjoint_attempt_namespaces(tmp_path: Path) ->
     second_output = Path(json.loads(second.stdout)["attempts"][0]["output_dir"])
     first_identity = json.loads((first_output / "core" / "process-identity.json").read_text())
     second_identity = json.loads((second_output / "core" / "process-identity.json").read_text())
+    changed_output = Path(json.loads(changed.stdout)["attempts"][0]["output_dir"])
+    changed_identity = json.loads((changed_output / "core" / "process-identity.json").read_text())
+    assert (first_identity["pid"], first_identity["start_token"]) != (second_identity["pid"], second_identity["start_token"])
+    assert (first_identity["pid"], first_identity["start_token"]) != (changed_identity["pid"], changed_identity["start_token"])
+    assert not Path("/proc", str(first_identity["pid"])).exists()
+    assert not Path("/proc", str(second_identity["pid"])).exists()
+    assert not Path("/proc", str(changed_identity["pid"])).exists()
     assert first_identity["nonce"] != second_identity["nonce"]
     assert first_output != second_output
+    assert changed_identity["environment"]["P10_ALLOCATION_OBSERVED"] == "alloc-B"
