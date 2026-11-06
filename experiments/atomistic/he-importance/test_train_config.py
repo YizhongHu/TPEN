@@ -344,6 +344,31 @@ def test_resolve_binds_output_path_to_run_root_and_dir(tmp_path: Path) -> None:
     assert resolved.run.dir == str(cell.output_path)
 
 
+def test_resolve_applies_operational_overrides_before_resolution(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    root = tmp_path / "override-root"
+    run_dir = root / "run"
+    resolved = train_config.resolve_train_config(
+        cell,
+        overrides={
+            "trainer.max_steps": 7,
+            "run.root": str(root),
+            "run.dir": str(run_dir),
+        },
+    )
+
+    assert resolved.trainer.max_steps == 7
+    assert resolved.runner.trainer.max_steps == 7
+    assert resolved.run.root == str(root)
+    assert resolved.run.dir == str(run_dir)
+    assert resolved.checkpoint.output_dir == str(run_dir / "checkpoints")
+    assert resolved.loggers[0].path == str(run_dir / "metrics.csv")
+    assert resolved.loggers[1].path == str(run_dir / "metrics.jsonl")
+    assert resolved.callbacks[-2].output_dir == str(run_dir / "checkpoints")
+    assert resolved.runner.sampler.seed == resolved.sampler.seed
+    assert resolved.runner.model.embedding.spatial_dim == resolved.model.embedding.spatial_dim
+
+
 def test_resolve_refuses_output_path_not_bound_to_identity_digest(tmp_path: Path) -> None:
     committed = _cell(tmp_path, stage="Q")
     mechanics = stage_coordinate.with_q_mechanics_walkers(committed)

@@ -348,7 +348,9 @@ def _consumed_context(manifest: Mapping[str, Any]) -> str:
     raise AssertionError("unreachable context validation branch")
 
 
-def resolve_train_config(source: Any) -> DictConfig:
+def resolve_train_config(
+    source: Any, *, overrides: Mapping[str, Any] | None = None
+) -> DictConfig:
     """Resolve one materialized cell or training packet into a Hydra config.
 
     Parameters
@@ -358,6 +360,11 @@ def resolve_train_config(source: Any) -> DictConfig:
         structural boundary is intentional so a packet imported through the
         checkout's real ``tpen.hi.train.v1`` namespace is accepted without
         duplicating the stage-coordinate classes here.
+    overrides
+        The declared operational overlays ``trainer.max_steps``, ``run.root``,
+        and ``run.dir``. They are applied to the composed tree before any
+        interpolation is resolved, so copied runner and sink consumers read
+        the same values.
 
     Returns
     -------
@@ -413,6 +420,15 @@ def resolve_train_config(source: Any) -> DictConfig:
     model_seed = _integer_seed(streams, "model_initialization")
 
     cfg = _compose_base_config()
+    if overrides is not None:
+        if not isinstance(overrides, Mapping):
+            raise TrainConfigResolutionError("overrides must be a mapping")
+        allowed_overrides = {"trainer.max_steps", "run.root", "run.dir"}
+        unknown = set(overrides).difference(allowed_overrides)
+        if unknown:
+            raise TrainConfigResolutionError(
+                "unsupported train-config overrides: " + ", ".join(sorted(unknown))
+            )
     committed_walkers = stage_api.COMMITTED_WALKERS
     composed_walkers = OmegaConf.select(cfg, "sampler.n_walkers", default=None)
     # Exact-int plus int.__eq__ keeps this decision structural, not caller-overridable.
@@ -428,6 +444,8 @@ def resolve_train_config(source: Any) -> DictConfig:
     OmegaConf.update(cfg, "run.layout", "flat", merge=False, force_add=True)
     OmegaConf.update(cfg, "run.dir", str(output_path), merge=False)
     OmegaConf.update(cfg, "runtime.seed", model_seed, merge=False)
+    for path, value in (overrides or {}).items():
+        OmegaConf.update(cfg, path, value, merge=False)
     OmegaConf.update(cfg, "optimizer._target_", optimizer_entry.target, merge=False)
     # Every Adam coordinate is explicit in the resolved config; no torch
     # constructor default is allowed to stand in for a declared level.

@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 
 def _batch():
     from tpen.execution import ExecutionConfig, ReadyBatch, ReadyItem
@@ -147,8 +149,8 @@ def test_r6_e3_direct_configured_overlay_is_a_green_control(monkeypatch, tmp_pat
     assert observed_start[0]["declared_overlays"] == {"trainer.max_steps": 1}
 
 
-def test_r6_post_resolution_overlays_recompose_runner_and_artifact_consumers(tmp_path):
-    """Read back copied consumers, not only the top-level overlay leaves."""
+def test_r6_unresolved_overlay_constructs_consumers_and_reads_back(tmp_path):
+    """Unresolved source shape carries overlays into constructed consumers."""
 
     from omegaconf import OmegaConf
     from tpen.execution import capture_science_intent
@@ -162,7 +164,10 @@ def test_r6_post_resolution_overlays_recompose_runner_and_artifact_consumers(tmp
         "runtime": {"seed": 17},
         "model": {"spatial_dim": "${system.spatial_dim}", "seed": "${runtime.seed}"},
         "sampler": {"spatial_dim": "${system.spatial_dim}", "seed": "${runtime.seed}"},
-        "trainer": {"max_steps": 20},
+        "trainer": {
+            "_target_": "tpen.training.trainer.VMCTrainer",
+            "max_steps": 20,
+        },
         "runner": {
             "model": "${model}",
             "sampler": "${sampler}",
@@ -171,24 +176,82 @@ def test_r6_post_resolution_overlays_recompose_runner_and_artifact_consumers(tmp
         "run": {"root": "${run.base}", "base": str(tmp_path / "old")},
         "checkpoint": {"output_dir": "${run.root}/checkpoints"},
         "metrics": {"path": "${run.root}/metrics.jsonl"},
+        "loggers": [{"_target_": "tpen.logging.JSONL", "path": "${run.root}/metrics.jsonl"}],
     }
     intent = capture_science_intent(
         {"system": "probe"}, target_iterations=20, source_config=source
     )
-    resolved = OmegaConf.create(source)
-    OmegaConf.resolve(resolved)
     decision = select_recovery(intent, phase=RecoveryPhase.INITIAL)
+    output_root = tmp_path / "new-root"
 
     worker = _materialize_configured_worker_config(
-        resolved,
+        OmegaConf.create(source),
         intent=intent,
         decision=decision,
-        output_path=tmp_path / "new-output",
-        declared_overlays={"trainer.max_steps": 7, "run.root": str(tmp_path / "new-root")},
+        output_path=output_root,
+        declared_overlays={"trainer.max_steps": 7, "run.root": str(output_root)},
     )
 
-    assert worker.runner.trainer.max_steps == 7
-    assert worker.runner.model.spatial_dim == 3
-    assert worker.runner.sampler.seed == 17
-    assert worker.checkpoint.output_dir == str(tmp_path / "new-output" / "checkpoints")
-    assert worker.metrics.path == str(tmp_path / "new-output" / "metrics.jsonl")
+    _assert_constructed_overlay_readback(worker, output_root)
+
+
+def _assert_constructed_overlay_readback(worker, output_root):
+    from hydra.utils import instantiate
+
+    trainer = instantiate(worker.trainer)
+    logger = instantiate(worker.loggers[0])
+    assert trainer.max_steps == 7
+    assert worker.runner.trainer.max_steps == trainer.max_steps
+    assert worker.runner.model.spatial_dim == worker.model.spatial_dim == 3
+    assert worker.runner.sampler.seed == worker.sampler.seed == 17
+    assert worker.checkpoint.output_dir == str(output_root / "checkpoints")
+    assert worker.metrics.path == str(output_root / "metrics.jsonl")
+    assert logger.path == output_root / "metrics.jsonl"
+
+
+def test_r6_resolved_descendant_supply_is_fail_closed(tmp_path):
+    """A resolved descendant cannot masquerade as the captured section."""
+
+    from omegaconf import OmegaConf
+    from tpen.execution import ReceiptBindingError, RecoveryPhase, capture_science_intent, select_recovery
+    from tpen.execution.invocation import _materialize_configured_worker_config
+
+    source = {
+        "trainer": {"max_steps": 20},
+        "runner": {"trainer": "${trainer}"},
+        "run": {"root": "${run.base}", "base": str(tmp_path / "old")},
+    }
+    intent = capture_science_intent({"system": "probe"}, target_iterations=20, source_config=source)
+    supplied = OmegaConf.create({
+        "trainer": {"max_steps": 20},
+        "runner": {"trainer": {"max_steps": 20}},
+        "run": {"root": str(tmp_path / "old")},
+    })
+    with pytest.raises(ReceiptBindingError, match="omits captured source leaves"):
+        _materialize_configured_worker_config(
+            supplied,
+            intent=intent,
+            decision=select_recovery(intent, phase=RecoveryPhase.INITIAL),
+            output_path=tmp_path / "new",
+            declared_overlays={"trainer.max_steps": 7},
+        )
+
+
+def test_r6_overlay_application_mutant_is_red(tmp_path):
+    """The readback pin fails for the mutant that drops declared overlays."""
+
+    from omegaconf import OmegaConf
+    from tpen.execution import RecoveryPhase, capture_science_intent, select_recovery
+    from tpen.execution.invocation import _materialize_configured_worker_config
+
+    source = {"trainer": {"max_steps": 20}, "run": {"root": "${run.base}", "base": str(tmp_path / "old")}}
+    intent = capture_science_intent({"system": "probe"}, target_iterations=20, source_config=source)
+    worker = _materialize_configured_worker_config(
+        OmegaConf.create(source),
+        intent=intent,
+        decision=select_recovery(intent, phase=RecoveryPhase.INITIAL),
+        output_path=tmp_path / "new",
+        declared_overlays={},
+    )
+    with pytest.raises(AssertionError):
+        _assert_constructed_overlay_readback(worker, tmp_path / "new")
