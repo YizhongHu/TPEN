@@ -76,6 +76,47 @@ with ``trainable=False``. So no frozen config can make the model's
 embedding/readout contribute an exact, input-independent constant. No core
 slice is pending for this protocol-only slice.
 
+## Exact-hydrogen evaluation canary
+
+`test_hydrogen_exact_canary.py` pushes a fixed exact one-electron hydrogen
+wavefunction (`tpen.physics.hydrogen.HydrogenExact`, `psi = exp(-alpha r)`,
+mirroring `tpen/physics/hooke.py`) through the real evaluation route:
+`tpen.run.run_from_config`, the real `Evaluate` runner, a genuine model-only
+checkpoint restore, `TrajectoryMCMCGenerator`, the local-energy and
+wavefunction calculators, the trajectory record writer and
+`LocalEnergySummary`, and finally this directory's own collector
+(`collect.py`). Neither `test_oracle_vs_tpen.py` nor
+`test_stub_oracle_contract.py` exercises that route: both feed a stub
+wavefunction directly to the Hamiltonian terms and sampler, never through
+`run_from_config`, the record writer, the summaries, or the collector. An
+evaluation-path defect -- a wrong aggregation, a dropped or duplicated
+record, a term mis-assigned between kinetic and potential, or a summary
+computed on a subset -- cannot be told apart from ordinary model behavior on
+a learned model, whose true local energy is unknown; on the exact ground
+state (`alpha=1`) every local energy must equal exactly -0.5 Ha, so such a
+defect is directly visible. For `alpha=1.2` the canary checks the same
+known-imperfect closed-form control already in `contract_inputs.json`
+(`analytic_controls`): mean -0.48 Ha, variance 0.0576 Ha^2, `W=2.339741` Ha.
+
+**Restore scope, stated honestly.** `HydrogenExact` carries no trainable
+state: it is constructed from a fixed `AtomicConfiguration` and a fixed
+`alpha`, with no `nn.Parameter`. There is therefore no optimizer, trainer,
+sampler, or RNG state that a training-resume checkpoint would add, and the
+`Train` runner cannot even build an optimizer over zero parameters
+(`torch.optim.Adam([])` raises `ValueError: optimizer got an empty parameter
+list`). The canary does not go through the `Train` runner the way a learned
+checkpoint does. What it does instead -- and what the collector requires
+regardless, since `collect.py`'s `validate_checkpoint_identity` and
+`validate_restore_mode` are unconditional -- is build a genuine model-only
+checkpoint directly with `tpen.checkpoint.save.save_checkpoint`: the same
+function, directory layout, and manifest a learned run's checkpoint uses.
+That checkpoint is then restored through the same `load:` config block and
+the real `Evaluate` runner (`tpen.checkpoint.restore.restore_checkpoint`),
+exercising the real model-only restore path honestly. It does not exercise
+optimizer/trainer/sampler/RNG restore, because this module has none of that
+state to restore; that part of the restore surface remains covered only by
+a learned-model run (the short learned route in parts (e)/(f) above).
+
 ## Evidence boundary
 
 The comparison source is pinned to `origin/dev` commit
