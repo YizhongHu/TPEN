@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 #: Schema and row-semantics constants mirrored from
 #: ``tpen.evaluation.trajectory_records`` so this module never imports tpen
 #: (see ``experiments/README.md``).
@@ -138,6 +140,9 @@ def validate_rows(rows: list[dict[str, Any]], spec: RecordSpec) -> list[dict[str
             walker = int(row["walker_index"])
             energy = float(row["local_energy"])
             logabs = float(row["logabs"])
+            coordinates = [
+                float(row[f"position/electron_0/axis_{axis}"]) for axis in range(3)
+            ]
         except (KeyError, TypeError, ValueError) as exc:
             raise RecordIntegrityError("malformed complete record") from exc
         if not 0 <= draw < spec.draws or not 0 <= walker < spec.walkers:
@@ -146,7 +151,16 @@ def validate_rows(rows: list[dict[str, Any]], spec: RecordSpec) -> list[dict[str
         if key in seen:
             raise RecordIntegrityError("duplicate walker record")
         seen.add(key)
-        if row.get("finite") != "True" or not math.isfinite(energy) or not math.isfinite(logabs):
+        # TPEN's own ``finite`` column covers only ``local_energy``
+        # (tpen/evaluation/generators/trajectory.py); the contract's
+        # complete-record rule also requires finite coordinates, so they are
+        # checked explicitly here.
+        if (
+            row.get("finite") != "True"
+            or not math.isfinite(energy)
+            or not math.isfinite(logabs)
+            or not all(math.isfinite(coordinate) for coordinate in coordinates)
+        ):
             raise RecordIntegrityError("nonfinite record")
         ordered[draw * spec.walkers + walker] = row
     if any(row is None for row in ordered):
@@ -164,8 +178,6 @@ def collect_records(
     spec: RecordSpec,
 ) -> dict[str, Any]:
     """Read and validate one complete real evaluation stream, returning a receipt."""
-
-    import yaml
 
     validate_checkpoint_identity(checkpoint_dir, spec)
     run_metadata = json.loads(run_metadata_path.read_text(encoding="utf-8"))

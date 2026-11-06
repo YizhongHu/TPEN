@@ -9,20 +9,19 @@ in this module -- not to ``tpen.physics`` itself and not to a grep over
 and nuclear-potential-sign mutation controls, and the grep-only sampler-target
 control, found by the r1 verification receipt.
 
-Scope note: a genuine closed-form-oracle comparison -- TPEN's wavefunction
-pinned, via config alone, to the exact ``psi = exp(-alpha r)`` analytic
-hydrogen state used by ``analytic_oracle.py`` -- is out of scope here. No
-config-only route exists to make a Hydra-constructed `tpen.nn.TPENWaveFunction`
-contribute an exact, input-independent constant from its embedding/readout:
-`tpen.nn.embedding.Embedding` only ever builds `tpen.nn.mlp.MLP`/
-`tpen.nn.initialization.SeededLinear` layers, whose only initializers
-(`TorchInitializer.uniform_`/`normal_`/`xavier_uniform_`/
+Scope: this module covers contract parts (b), (c) and (d) through TPEN's real
+kinetic, potential and sampler code, against the closed-form oracle on an
+exact ``psi = exp(-alpha r)`` amplitude stub. What is not done, and is not
+required by the contract, is pinning a Hydra-constructed
+`tpen.nn.TPENWaveFunction` to that exact state: no config-only route exists to
+make it contribute an exact, input-independent constant from its
+embedding/readout. `tpen.nn.embedding.Embedding` only ever builds
+`tpen.nn.mlp.MLP`/`tpen.nn.initialization.SeededLinear` layers, whose only
+initializers (`TorchInitializer.uniform_`/`normal_`/`xavier_uniform_`/
 `linear_kaiming_uniform_`) are random, with no zero/constant scheme; and
 `tpen.nn.readout.pfaffian.PfaffianReadout` always folds a learned order-1
-feature into the odd-electron border, even with ``trainable=False``. Pinning
-the amplitude to a known closed form would need a new core capability (a
-null/fixed-amplitude readout, or a zero-initialization scheme) that is out of
-scope for this slice; see the H-v2 README.
+feature into the odd-electron border, even with ``trainable=False``. No core
+slice is pending for this protocol-only slice; see the H-v2 README.
 """
 
 from __future__ import annotations
@@ -252,7 +251,7 @@ def test_kinetic_finite_difference_richardson_headroom(seed: int, record_propert
     print(f"seed={seed} richardson_discrepancy={discrepancy}")
     # Fixed tolerance, not derived from this run's own discrepancy (finding 9):
     # measured on Cannon across seeds 1-3, Richardson extrapolation of h=1e-3
-    # and h=5e-4 brought the discrepancy to the TOLERANCE_MARGIN docstring
-    # below. Kept at a documented measured level rather than the un-extrapolated
-    # probe's untightened 1e-5.
+    # and h=5e-4 brought the discrepancy to the level recorded in the
+    # RICHARDSON_TOLERANCE comment above. Kept at a documented measured level
+    # rather than the un-extrapolated probe's untightened 1e-5.
     assert discrepancy <= RICHARDSON_TOLERANCE

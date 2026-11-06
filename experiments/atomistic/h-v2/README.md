@@ -58,23 +58,23 @@ Without ``--run-h-v2-pipeline``, the standard
 ``pytest -q experiments/atomistic/h-v2 experiments/atomistic/he-v1`` run skips
 it (measured: part (e) alone adds several minutes on top of the rest of the
 suite, inside the contract's 2h/4-core CPU budget, which is why verifiers only
-pay that cost once per head).
+pay that cost once per head). The opt-in flag only works with this documented
+invocation naming ``test_pipeline.py`` directly; a broader invocation (e.g.
+rooted at ``experiments/atomistic``) can only skip the test, not run it.
 
-**Known gap, not closed by this slice.** A closed-form-oracle comparison --
-pinning a Hydra-constructed ``TPENWaveFunction`` to the exact
-``psi = exp(-alpha r)`` state ``analytic_oracle.py`` already checks against
-itself -- has no config-only route. `tpen.nn.embedding.Embedding` only ever
-builds `tpen.nn.mlp.MLP`/`tpen.nn.initialization.SeededLinear` layers, and
+**Scope, not a gap.** ``test_stub_oracle_contract.py`` already compares TPEN's
+real kinetic, potential, and sampler code against the closed-form oracle on an
+exact ``psi = exp(-alpha r)`` amplitude stub, covering contract parts (b), (c)
+and (d) through the real operators. What is not done, and is not required by
+the contract, is pinning a Hydra-constructed ``TPENWaveFunction`` to that exact
+state: `tpen.nn.embedding.Embedding` only ever builds
+`tpen.nn.mlp.MLP`/`tpen.nn.initialization.SeededLinear` layers, and
 `TorchInitializer` only exposes random (Kaiming/Xavier/normal) initializers
 with no zero/constant scheme; `tpen.nn.readout.pfaffian.PfaffianReadout`
 always folds a learned order-1 feature into the odd-electron border, even
 with ``trainable=False``. So no frozen config can make the model's
-embedding/readout contribute an exact, input-independent constant, and
-neither TPEN's local energy nor its sampler's walker-radius distribution can
-be compared to the Gamma(3, 2) closed form on the exact analytic state
-through the real route. Closing this needs a new core capability (a
-null/fixed-amplitude readout, or a zero-initialization scheme for
-`Embedding`) that is out of scope for a protocol-only slice.
+embedding/readout contribute an exact, input-independent constant. No core
+slice is pending for this protocol-only slice.
 
 ## Evidence boundary
 
