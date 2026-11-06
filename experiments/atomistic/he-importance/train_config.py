@@ -208,29 +208,6 @@ def _set_optional_execution_seeds(cfg: DictConfig, streams: Mapping[str, Any]) -
                     )
 
 
-def _apply_runtime_seed_override(cfg: DictConfig, value: Any) -> None:
-    """Keep every consumer of the shared runtime seed on an explicit override."""
-
-    OmegaConf.update(cfg, "sampler.seed", value, merge=False)
-    for path in _initializer_paths(cfg.model, "model"):
-        OmegaConf.update(cfg, f"{path}.seed", value, merge=False)
-    callbacks = OmegaConf.select(cfg, "callbacks", default=[])
-    for index, callback in enumerate(callbacks):
-        if not isinstance(callback, Mapping):
-            continue
-        checkers = callback.get("checkers")
-        if not isinstance(checkers, Sequence) or isinstance(checkers, (str, bytes, bytearray)):
-            continue
-        for checker_index, checker in enumerate(checkers):
-            if isinstance(checker, Mapping) and "seed" in checker:
-                OmegaConf.update(
-                    cfg,
-                    f"callbacks.{index}.checkers.{checker_index}.seed",
-                    value,
-                    merge=False,
-                )
-
-
 def _optimizer_entry(manifest: Mapping[str, Any]) -> Any:
     """Resolve the cell's optimizer through the live build-time roster."""
 
@@ -517,10 +494,6 @@ def resolve_train_config(
         )
     _set_named_initializer_seeds(cfg, model_seed)
     _set_optional_execution_seeds(cfg, streams)
-    runtime_overrides = dict(override_items)
-    if "runtime.seed" in runtime_overrides:
-        runtime_seed_override = runtime_overrides["runtime.seed"]
-        _apply_runtime_seed_override(cfg, runtime_seed_override)
     OmegaConf.resolve(cfg)
 
     schema = import_module("tpen.hi_schema")
