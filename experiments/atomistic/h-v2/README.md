@@ -26,6 +26,34 @@ source, checkpoint, and resolved-config identities reconcile. Missing,
 duplicate, nonfinite, wrong-identity, training-state, and uncommitted records
 are refusals; no clipped or final-draw statistic is produced.
 
+``test_oracle_vs_tpen.py`` checks TPEN's real kinetic, electron-nucleus, and
+sampler accept-ratio code against independently-coded references (central
+finite differences, a raw ``-Z/r`` formula, and an independent rederivation
+of the |psi|^2 accept exponent) computed in that module, not against
+``tpen.physics`` or a grep. Part (e)'s ``0.02`` Ha and ``0.25`` improvement
+criteria are evaluated at contract scale by
+``test_pipeline.test_part_e_contract_scale_training_and_evaluation_energy_criteria``,
+gated behind the ``h2v2_pipeline`` marker (run with
+``uv run pytest -q -m h2v2_pipeline experiments/atomistic/h-v2/test_pipeline.py``)
+since it runs two full 1000-update trainer passes and four fresh-evaluation
+streams at contract scale.
+
+**Known gap, not closed by this slice.** A closed-form-oracle comparison --
+pinning a Hydra-constructed ``TPENWaveFunction`` to the exact
+``psi = exp(-alpha r)`` state ``analytic_oracle.py`` already checks against
+itself -- has no config-only route. `tpen.nn.embedding.Embedding` only ever
+builds `tpen.nn.mlp.MLP`/`tpen.nn.initialization.SeededLinear` layers, and
+`TorchInitializer` only exposes random (Kaiming/Xavier/normal) initializers
+with no zero/constant scheme; `tpen.nn.readout.pfaffian.PfaffianReadout`
+always folds a learned order-1 feature into the odd-electron border, even
+with ``trainable=False``. So no frozen config can make the model's
+embedding/readout contribute an exact, input-independent constant, and
+neither TPEN's local energy nor its sampler's walker-radius distribution can
+be compared to the Gamma(3, 2) closed form on the exact analytic state
+through the real route. Closing this needs a new core capability (a
+null/fixed-amplitude readout, or a zero-initialization scheme for
+`Embedding`) that is out of scope for a protocol-only slice.
+
 ## Evidence boundary
 
 The comparison source is pinned to `origin/dev` commit
