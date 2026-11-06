@@ -40,14 +40,20 @@ explicitly "its final retained draw" (see that generator's own docstring),
 so the JSONL `local_energy_mean`/`local_energy_variance` metrics that
 `LocalEnergySummary` publishes from that batch are a final-draw snapshot,
 not a full-grid aggregate -- a real, documented distinction, not a defect.
-Both tests below therefore check the manifest's own aggregates (the
-full-grid quantity) against an independent recomputation from every row in
-`sampled_eval_table.csv`, to tight float64 tolerance, separately from the
-Monte Carlo bands on the JSONL snapshot metric. A summary genuinely
-aggregated on a subset of the records (e.g. one draw instead of all 64)
-would not pass this check even though it can still fall inside the alpha=1.2
-Monte Carlo bands, which are wide enough (serially correlated 1024-walker
-MCMC, not IID) to absorb a single draw's snapshot mean.
+Both tests below check the manifest's own aggregates against an independent
+recomputation from every row in `sampled_eval_table.csv`, to tight float64
+tolerance, separately from the Monte Carlo bands on the JSONL snapshot
+metric. They also check the JSONL metric itself against a recomputation
+from only the rows of its own final draw (`_final_draw_energies`) -- the
+same population it claims to summarize, so this must agree to tight
+tolerance too. A summary silently aggregated over a further subset of that
+same draw (e.g. half its walkers) moves this second recomputation
+measurably at alpha=1.2, where the local energy is position-dependent, even
+when the raw metric still falls inside the predeclared Monte Carlo band. At
+alpha=1 every value is the same constant, so subsetting a constant signal
+cannot change its mean by construction -- a mathematical limit on this
+family of check, not a gap specific to this canary, and the alpha=1.2 test
+is what actually exercises it.
 
 **Record-path precision.** `HydrogenExact`'s local energy is the closed
 form `-alpha^2/2 + (alpha-1)/r` exactly at every walker, independent of
@@ -99,6 +105,9 @@ pytestmark = pytest.mark.integration
 ALPHA_1_2_MEAN = -0.48
 ALPHA_1_2_VARIANCE = 0.0576
 ALPHA_1_2_W = 2.339741
+
+N_WALKERS = 1024
+N_DRAWS = 64
 
 
 def _load_config() -> dict[str, Any]:
@@ -208,6 +217,28 @@ def _full_grid_mean_and_variance(energies: list[float]) -> tuple[float, float]:
     return mean, variance
 
 
+def _final_draw_energies(rows: list[dict[str, str]], *, n_draws: int) -> list[float]:
+    """Return `local_energy` for the rows `LocalEnergySummary`'s JSONL metric
+    actually summarizes.
+
+    `TrajectoryMCMCGenerator.generate` exposes the evaluation batch as "its
+    final retained draw" (see that module's docstring); every calculator and
+    summary in the task, including `LocalEnergySummary`, runs on that batch
+    alone. So the JSONL `local_energy_mean`/`local_energy_variance` metrics
+    are a snapshot over this one draw's records, not the full draw-by-walker
+    grid -- a real, documented distinction, not a defect. Recomputing from
+    exactly this same row subset (not the full grid) gives a tight,
+    noise-free check: unlike the full grid vs. a single draw, this is the
+    same population the metric claims to summarize, so it must agree to
+    float64 tolerance, and a mutant that further subsets what
+    `LocalEnergySummary` sees changes this recomputation even though it may
+    hide inside the Monte Carlo band on the raw metric value.
+    """
+
+    final_draw_index = n_draws - 1
+    return [float(row["local_energy"]) for row in rows if int(row["draw_index"]) == final_draw_index]
+
+
 def _read_metric(run_dir: Path, *, namespace: str, key: str) -> float:
     lines = (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
     records = [json.loads(line) for line in lines]
@@ -265,6 +296,20 @@ def test_exact_ground_state_every_record_is_minus_half_hartree(tmp_path: Path) -
     assert variance == pytest.approx(0.0, abs=1e-8)
     assert _w_statistic(energies) == pytest.approx(0.0, abs=1e-6)
 
+    # Exact bookkeeping against the exact same population the JSONL metric
+    # claims to summarize (the final retained draw only, see
+    # `_final_draw_energies`). At alpha=1 every value is the same constant,
+    # so this specific check cannot by itself distinguish a subset of this
+    # draw from the whole of it -- that is a mathematical fact about a
+    # constant signal, not a gap in the check -- but it still catches any
+    # other aggregation defect (wrong draw selected, wrong row count, wrong
+    # formula), and the alpha=1.2 test below closes the subset gap.
+    final_draw_energies = _final_draw_energies(rows, n_draws=N_DRAWS)
+    assert len(final_draw_energies) == N_WALKERS
+    final_draw_mean, final_draw_variance = _full_grid_mean_and_variance(final_draw_energies)
+    assert mean == pytest.approx(final_draw_mean, rel=1e-10, abs=1e-12)
+    assert variance == pytest.approx(final_draw_variance, rel=1e-10, abs=1e-12)
+
     # Exact bookkeeping, not a Monte Carlo band: the trajectory manifest's own
     # mean/variance/row_count/finite_count are accumulated across every draw
     # as the grid streams, so they must equal an independent recomputation
@@ -299,6 +344,20 @@ def test_imperfect_state_matches_closed_form_analytic_controls(tmp_path: Path) -
     assert mean == pytest.approx(ALPHA_1_2_MEAN, abs=0.02)
     assert variance == pytest.approx(ALPHA_1_2_VARIANCE, rel=0.15)
     assert _w_statistic(energies) == pytest.approx(ALPHA_1_2_W, rel=0.3)
+
+    # Exact bookkeeping against the exact same population the JSONL metric
+    # summarizes (the final retained draw, see `_final_draw_energies`). Here
+    # alpha=1.2 makes the local energy position-dependent, so unlike the
+    # alpha=1 case this recomputation IS sensitive to a summary silently
+    # aggregated over a further subset of that draw (e.g. half its walkers):
+    # such a mutant can still fall inside the Monte Carlo band on the raw
+    # metric above, but changes this recomputed value measurably, well
+    # outside float64 rounding.
+    final_draw_energies = _final_draw_energies(rows, n_draws=N_DRAWS)
+    assert len(final_draw_energies) == N_WALKERS
+    final_draw_mean, final_draw_variance = _full_grid_mean_and_variance(final_draw_energies)
+    assert mean == pytest.approx(final_draw_mean, rel=1e-10, abs=1e-12)
+    assert variance == pytest.approx(final_draw_variance, rel=1e-10, abs=1e-12)
 
     # Exact bookkeeping, separate from the Monte Carlo band above: the
     # summary mean/variance must equal the mean/variance of the recorded
