@@ -144,7 +144,13 @@ def test_part_e_contract_scale_training_and_evaluation_energy_criteria(tmp_path:
             errors.extend(stream_errors)
             energies_all.extend(energies)
             stream_mean = sum(energies) / len(energies)
-            stream_median = sorted(stream_errors)[len(stream_errors) // 2]
+            sorted_stream_errors = sorted(stream_errors)
+            stream_midpoint = len(sorted_stream_errors) // 2
+            stream_median = (
+                sorted_stream_errors[stream_midpoint]
+                if len(sorted_stream_errors) % 2
+                else (sorted_stream_errors[stream_midpoint - 1] + sorted_stream_errors[stream_midpoint]) / 2.0
+            )
             record_property(f"{run_id}_stream{stream}_mean_local_energy", stream_mean)
             record_property(f"{run_id}_stream{stream}_median_abs_error", stream_median)
             print(f"{run_id} stream {stream}: mean={stream_mean} median_abs_error={stream_median}")
