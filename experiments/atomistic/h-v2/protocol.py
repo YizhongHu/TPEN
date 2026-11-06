@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -45,13 +44,6 @@ def evaluation_config(checkpoint: Path, *, stream: int = 0, root: Path | None = 
     return config
 
 
-def config_sha256(config: dict[str, Any]) -> str:
-    """Hash a normalized config mapping for record identity."""
-
-    payload = yaml.safe_dump(config, sort_keys=True).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
 def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False) -> None:
     """Refuse configs that drift from one-electron, charge-one hydrogen."""
 
@@ -89,7 +81,6 @@ __all__ = [
     "SAMPLER_SEED",
     "TRAINING_SEED",
     "assert_hydrogen_contract",
-    "config_sha256",
     "evaluation_config",
     "load_yaml",
     "training_config",
