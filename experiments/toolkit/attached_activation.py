@@ -235,6 +235,15 @@ def bind_allocation_context(
         observed_hostname=observed_hostname,
     )
     facts = dict(payload["facts"])
+    binding = dict(facts.get("binding", {}))
+    operational_environment = dict(snapshot["context"]["environment"])
+    if snapshot["context"]["visibility_values"]:
+        operational_environment[snapshot["context"]["visibility_variable"]] = ",".join(
+            snapshot["context"]["visibility_values"]
+        )
+    binding["environment"] = operational_environment
+    binding["visibility"] = list(snapshot["context"]["visibility_values"])
+    facts["binding"] = binding
     facts["attached_context"] = snapshot
     payload["facts"] = facts
     _atomic_write(output, canonical_bytes(payload) + b"\n")
@@ -612,6 +621,7 @@ def check_profile(
     config: str | Path,
     *,
     profile: str = PROFILE_NAME,
+    overrides: Sequence[str] = (),
     cwd: str | Path | None = None,
 ) -> ProfileVerdict:
     """Run the prepared science profile checker and require supported JSON.
@@ -624,6 +634,9 @@ def check_profile(
         Absolute effective config path.
     profile : str, default=PROFILE_NAME
         Profile requested from the checker.
+    overrides : sequence of str, optional
+        Unresolved dot-list overrides to merge with ``config`` in the science
+        environment before the public profile checker is invoked.
     cwd : str or pathlib.Path, optional
         Checker working directory.
 
@@ -640,13 +653,49 @@ def check_profile(
 
     python = _absolute_config(str(science_python), "science_python")
     config_path = _absolute_config(str(config), "config")
-    result = subprocess.run(
-        [python, "-m", "tpen.checkpoint.profiles", config_path, "--profile", profile],
-        cwd=None if cwd is None else str(cwd),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    command = [python, "-m", "tpen.checkpoint.profiles", config_path, "--profile", profile]
+    if overrides:
+        compose_script = """
+import json
+import subprocess
+import sys
+from omegaconf import OmegaConf
+
+base = OmegaConf.load(sys.argv[1])
+merged = OmegaConf.merge(base, OmegaConf.from_dotlist(json.loads(sys.argv[4])))
+OmegaConf.save(config=merged, f=sys.argv[2], resolve=False)
+result = subprocess.run(
+    [sys.executable, "-m", "tpen.checkpoint.profiles", sys.argv[2], "--profile", sys.argv[3]],
+    capture_output=True,
+    text=True,
+    check=False,
+)
+sys.stdout.write(result.stdout)
+sys.stderr.write(result.stderr)
+raise SystemExit(result.returncode)
+"""
+        with tempfile.TemporaryDirectory(
+            prefix=".tpen-profile-",
+            dir=None if cwd is None else str(cwd),
+        ) as temporary:
+            merged_path = Path(temporary) / "merged.yaml"
+            script_path = Path(temporary) / "compose_and_check.py"
+            script_path.write_text(compose_script, encoding="utf-8")
+            result = subprocess.run(
+                [python, str(script_path), config_path, str(merged_path), profile, json.dumps(list(overrides))],
+                cwd=None if cwd is None else str(cwd),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+    else:
+        result = subprocess.run(
+            command,
+            cwd=None if cwd is None else str(cwd),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     verdict = parse_profile_verdict(result.stdout, expected_profile=profile, returncode=result.returncode)
     if verdict.verdict != "supported":
         reason = "profile refused"

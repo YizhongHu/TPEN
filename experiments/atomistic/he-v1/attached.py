@@ -211,7 +211,7 @@ def generate_reduced_callback_config(
             tofile=str(output),
         )
     )
-    source_hash = _sha256_bytes(source_bytes)
+    source_hash = hashlib.sha256(source_bytes).hexdigest()
     _atomic_text(output, effective_text)
     diff_path = output.with_suffix(output.suffix + ".diff")
     hash_path = output.with_suffix(output.suffix + ".sha256")
@@ -611,7 +611,21 @@ def activate_he_train(
             )
             raise
     try:
-        profile = check_profile(science_python, prepared.effective_config, cwd=cwd)
+        table = json.loads(Path(prepared.handoff.configured_runs).read_text(encoding="utf-8"))
+        runs = table.get("runs")
+        if not isinstance(runs, list) or not runs:
+            raise ActivationRefusal("handoff-shape", "attached handoff has no configured runs")
+        profile: ProfileVerdict | None = None
+        for run in runs:
+            if not isinstance(run, Mapping) or not isinstance(run.get("overrides"), list):
+                raise ActivationRefusal("handoff-shape", "attached configured run has no override list")
+            profile = check_profile(
+                science_python,
+                prepared.effective_config,
+                overrides=tuple(run["overrides"]),
+                cwd=cwd,
+            )
+        assert profile is not None
     except ActivationRefusal as error:
         write_activation_failure_receipt(
             receipt_path,
