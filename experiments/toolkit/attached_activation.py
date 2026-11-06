@@ -846,13 +846,14 @@ def validate_child_context_observation(
     Raises
     ------
     ActivationRefusal
-        If the bound snapshot, child identity evidence, or observed values
+        If the bound snapshot, child observation evidence, or observed values
         cannot be trusted.  The named refusal preserves the completed child
         evidence while preventing a success activation receipt.
 
-    The identity file is child-owned evidence written after any supported
-    ``SourceScript`` setup.  Therefore this comparison is intentionally made
-    after executor dispatch and before the root reader can publish success.
+    The observation file is child-owned evidence written by the executor
+    runner after any supported ``SourceScript`` setup. Therefore this
+    comparison is intentionally made after executor dispatch and before the
+    root reader can publish success.
     """
 
     try:
@@ -886,15 +887,47 @@ def validate_child_context_observation(
             output_dir = attempt.get("output_dir") if isinstance(attempt, Mapping) else None
             if type(output_dir) is not str or not output_dir:
                 raise ValueError("executor manifest attempt has no output directory")
-            identity = _strict_json(
-                (Path(output_dir) / "core" / "identity.json").read_text(encoding="utf-8"),
-                "child identity",
+            observation = _strict_json(
+                (Path(output_dir) / "executor-child-observation.json").read_text(encoding="utf-8"),
+                "child observation",
             )
-            observed = identity.get("environment")
+            if set(observation) != {
+                "schema",
+                "cuda_visible_devices",
+                "environment",
+                "thread_settings",
+                "hostname",
+                "pid",
+            } or observation["schema"] != "tpen-executor/child-observation-v1":
+                raise ValueError("child observation has an unexpected schema")
+            observed = observation["environment"]
             if not isinstance(observed, Mapping) or any(
                 type(key) is not str or type(value) is not str for key, value in observed.items()
             ):
-                raise ValueError("child identity has no string-valued environment")
+                raise ValueError("child observation has no string-valued environment")
+            thread_settings = observation["thread_settings"]
+            if not isinstance(thread_settings, Mapping) or set(thread_settings) != {
+                "OMP_NUM_THREADS", "MKL_NUM_THREADS"
+            } or any(value is not None and type(value) is not str for value in thread_settings.values()):
+                raise ValueError("child observation has invalid thread settings")
+            if observation["cuda_visible_devices"] is not None and type(observation["cuda_visible_devices"]) is not str:
+                raise ValueError("child observation has invalid CUDA visibility")
+            if type(observation["hostname"]) is not str or not observation["hostname"]:
+                raise ValueError("child observation has invalid hostname")
+            if type(observation["pid"]) is not int or isinstance(observation["pid"], bool) or observation["pid"] <= 0:
+                raise ValueError("child observation has invalid PID")
+            attached = facts.get("attached_context") if isinstance(facts, Mapping) else None
+            observed_snapshot = attached.get("observed") if isinstance(attached, Mapping) else None
+            if not isinstance(observed_snapshot, Mapping):
+                raise ValueError("bound allocation has no observed context snapshot")
+            expected_hostname = observed_snapshot.get("hostname")
+            if type(expected_hostname) is not str or not expected_hostname:
+                raise ValueError("bound allocation has no observed hostname")
+            if observation["hostname"] != expected_hostname:
+                raise ActivationRefusal(
+                    "child-context-mismatch",
+                    f"child hostname differs from validated allocation: expected {expected_hostname!r}, observed {observation['hostname']!r}",
+                )
             mismatches = {
                 key: {"expected": value, "observed": observed.get(key)}
                 for key, value in expected.items()
