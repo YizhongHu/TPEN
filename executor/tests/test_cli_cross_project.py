@@ -50,7 +50,7 @@ stub.mkdir(parents=True)
 import json
 import sys
 from pathlib import Path
-import tpen
+import tpen.run as tpen_run
 def main(argv):
     config = Path(argv[argv.index('--config') + 1])
     values = dict(item.split('=', 1) for item in argv if '=' in item)
@@ -58,7 +58,11 @@ def main(argv):
     if config.read_text() == 'fail':
         return 9
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / 'selected-tpen-module.txt').write_text(str(Path(tpen.__file__).resolve()))
+    stub_root = Path(__file__).resolve().parent
+    selected_module = Path(tpen_run.__file__).resolve()
+    assert selected_module.is_relative_to(stub_root)
+    assert selected_module != (stub_root / '__init__.py').resolve()
+    (run_dir / 'selected-tpen-module.txt').write_text(str(selected_module))
     (run_dir / 'evidence.json').write_text(json.dumps({'schema':'tpen.run-evidence/v1','run_dir':str(run_dir),'verdict':'completed','run_status':'completed','checkpoint':{'checkpoint_dir':str(run_dir / 'checkpoint'),'schema_version':1,'next_iteration':1,'completed_updates':1},'refusal':None}))
     return 0
 """)
@@ -101,6 +105,10 @@ def inspect_run(path):
 result = read(manifest_path, inspect_run=inspect_run)
 expected_stub_module = manifest_path.parent.parent / "stub/tpen/run.py"
 selected_module = Path(result.chains[0].segments[0].checkpoint_dir).parent / "selected-tpen-module.txt"
+stub_root = (manifest_path.parent.parent / "stub/tpen").resolve()
+selected_module_path = Path(selected_module.read_text()).resolve()
+assert selected_module_path.is_relative_to(stub_root)
+assert selected_module_path != (stub_root / "__init__.py").resolve()
 payload = {
     "chains": len(result.chains),
     "coordinates": [[segment.next_iteration, segment.completed_updates] for segment in result.chains[0].segments],
@@ -108,7 +116,7 @@ payload = {
         {"task_id": attempt.task_id, "outcome": attempt.outcome, "reason": attempt.reason}
         for attempt in result.preserved_attempts
     ],
-    "stub_module_path": selected_module.read_text(),
+    "stub_module_path": str(selected_module_path),
     "expected_stub_module_path": str(expected_stub_module.resolve()),
 }
 tampered = manifest_path.with_name("tampered-manifest.json")
