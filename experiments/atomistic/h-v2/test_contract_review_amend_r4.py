@@ -31,12 +31,24 @@ only at the exact keyword-matched leaf. Paths left out, and why:
 - ``source_identity.*``: historical provenance pointers, no keyword match.
 - ``measurement.{estimand,primary_statistic,primary_dispersion,
   secondary_dispersion,energy_error_profile,complete_record_rule,
-  seed_roster,fresh_evaluation}``: no keyword match; the statistic/seed
-  content is already pinned exactly by
-  ``test_primary_statistic_drives_rules_and_mad_is_secondary``,
-  ``test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct``,
-  ``test_sampler_tail_qualification_seed_namespace_is_disjoint``, and
-  ``test_training_and_fresh_evaluation_sampler_settings_are_exact``.
+  seed_roster,fresh_evaluation}``: no keyword match. The seed content is
+  pinned (for distinctness, not exact value) by
+  ``test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct`` and
+  ``test_sampler_tail_qualification_seed_namespace_is_disjoint``;
+  ``primary_statistic`` has only the substring check in
+  ``test_primary_statistic_drives_rules_and_mad_is_secondary``. Round-4
+  previously cited ``test_training_and_fresh_evaluation_sampler_settings_are_exact``
+  as pinning ``measurement.fresh_evaluation`` exactly -- that was a citation
+  error: that test asserts ``lane_proposals[7].proposal`` and
+  ``admission.pipeline_check.parts[e].pass_criteria``, a different JSON
+  subtree. Only 4 of ``fresh_evaluation``'s leaves (``burn_in``, ``stride``,
+  ``walkers``, ``draws_per_stream``) are cross-checked, by
+  ``test_green_tail_qualification_reuses_the_contract_thresholds_and_shape``
+  in ``test_contract_review_amend_r1.py``. The remaining leaves under
+  ``measurement`` listed above, plus ``controls`` below, had zero coverage
+  until round 5's frozen full-leaf snapshot test
+  (``test_contract_review_amend_r5.py``) closed the gap structurally instead
+  of field by field.
 - ``controls``: a general control list, no keyword match.
 
 ``decision_rules.{recurrence,bounded_null,unresolved}`` have no keyword match
