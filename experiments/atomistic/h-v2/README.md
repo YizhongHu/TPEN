@@ -21,28 +21,44 @@ fresh 1,024-walker, 64-draw streams. Both configs contain exactly one
 electron, one charge-one nucleus, raw ``eps: 0`` Coulomb potential, and no
 electron-electron factor or term.
 
-``collect.py`` admits only a complete committed draw-by-walker grid after
-source, checkpoint, and resolved-config identities reconcile. Missing,
-duplicate, nonfinite, wrong-identity, training-state, and uncommitted records
-are refusals; no clipped or final-draw statistic is produced.
+``collect.py`` consumes TPEN's real per-run artifacts directly: the
+``sampled_eval_table.csv``/``.metadata.json`` trajectory envelope, the run's
+own ``resolved_config.yaml`` and ``metadata.json``, and the restored
+checkpoint directory. It admits only a complete draw-by-walker grid after
+source, checkpoint, and resolved-config identities reconcile at that
+envelope. Missing draws, duplicate walker records, nonfinite data, altered
+source/checkpoint/config identity, a missing checkpoint commit marker, an
+uncommitted tail, and a training-state restore request are all refusals; no
+clipped or final-draw statistic is produced.
 
 ``test_oracle_vs_tpen.py`` checks TPEN's real kinetic, electron-nucleus, and
-sampler accept-ratio code against independently-coded references (central
-finite differences, a raw ``-Z/r`` formula, and an independent rederivation
-of the |psi|^2 accept exponent) computed in that module, not against
-``tpen.physics`` or a grep. Measured on Cannon (job 58147449, head
-``a74bc22c``): a kinetic-prefactor mutant and a sign-flipped nuclear
-potential, both previously uncaught, are now KILLED by these checks; a
-sampler |psi|-vs-|psi|^2 mutant is KILLED by both the new behavioral check
-and the pre-existing grep. Part (e)'s ``0.02`` Ha and ``0.25`` improvement
-criteria are evaluated at contract scale by
+sampler accept-ratio/accept-decision code against independently-coded
+references (central finite differences with a Richardson-extrapolated
+tolerance, a raw ``-Z/r`` formula, and an independent rederivation of both the
+|psi|^2 accept exponent and the resulting accept/reject decision) computed in
+that module, not against ``tpen.physics`` or a grep. Measured on Cannon (job
+58147449, head ``a74bc22c``): a kinetic-prefactor mutant and a sign-flipped
+nuclear potential, both previously uncaught, are now KILLED by these checks; a
+sampler |psi|-vs-|psi|^2 mutant is KILLED by both the new behavioral check and
+the pre-existing grep. ``test_stub_oracle_contract.py`` runs TPEN's real
+kinetic, potential, and sampler operators against the closed-form oracle on an
+exact ``psi = exp(-alpha r)`` amplitude stub, covering contract parts (b), (c)
+and (d) behaviorally (see "Known gap" below for what this does not close).
+Part (e)'s ``0.02`` Ha energy-error (the pooled mean local energy, not a
+median) and ``0.25`` median-absolute-error-improvement criteria are evaluated
+at contract scale, with the complete draw-by-walker grid asserted, by
 ``test_pipeline.test_part_e_contract_scale_training_and_evaluation_energy_criteria``,
-marked ``h2v2_pipeline``. That marker is for selecting the test in isolation
-(``uv run pytest -q -m h2v2_pipeline experiments/atomistic/h-v2/test_pipeline.py``),
-not for excluding it: this repo's markers do not filter the standard
-``pytest -q experiments/atomistic/h-v2 experiments/atomistic/he-v1`` run, so
-part (e) already runs as part of it (measured: ~5-6 extra minutes on top of
-the rest of the suite, inside the contract's 2h/4-core CPU budget).
+marked ``h_v2_pipeline``. That test is skipped by default by
+``experiments/atomistic/h-v2/conftest.py`` -- a verifier must pass an explicit
+option to run it, once per head rather than once per mutant::
+
+    uv run pytest -q --run-h-v2-pipeline -m h_v2_pipeline experiments/atomistic/h-v2/test_pipeline.py
+
+Without ``--run-h-v2-pipeline``, the standard
+``pytest -q experiments/atomistic/h-v2 experiments/atomistic/he-v1`` run skips
+it (measured: part (e) alone adds several minutes on top of the rest of the
+suite, inside the contract's 2h/4-core CPU budget, which is why verifiers only
+pay that cost once per head).
 
 **Known gap, not closed by this slice.** A closed-form-oracle comparison --
 pinning a Hydra-constructed ``TPENWaveFunction`` to the exact

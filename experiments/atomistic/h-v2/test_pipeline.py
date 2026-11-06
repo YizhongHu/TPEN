@@ -31,6 +31,7 @@ def _run_config(config: dict, *, command: str) -> int:
 
 def test_configured_local_energy_sampler_and_model_only_restore(tmp_path: Path) -> None:
     train = protocol.training_config()
+    protocol.assert_hydrogen_contract(train)
     train["run"]["root"] = str(tmp_path)
     train["run"]["run_id"] = "train"
     train["trainer"]["max_steps"] = 1
@@ -42,6 +43,7 @@ def test_configured_local_energy_sampler_and_model_only_restore(tmp_path: Path) 
     assert (checkpoint / "COMPLETE").is_file()
 
     evaluation = protocol.evaluation_config(checkpoint, stream=0, root=tmp_path)
+    protocol.assert_hydrogen_contract(evaluation, evaluation=True)
     evaluation["run"]["run_id"] = "eval"
     evaluation["sampler"].update(n_walkers=8, burn_in=2, n_steps=2)
     evaluation["evaluator"]["tasks"][0]["generator"]["n_draws"] = 3
@@ -69,34 +71,61 @@ def test_training_state_restore_is_rejected_by_evaluation_config(tmp_path: Path)
         protocol.assert_hydrogen_contract(evaluation, evaluation=True)
 
 
-@pytest.mark.h2v2_pipeline
-def test_part_e_contract_scale_training_and_evaluation_energy_criteria(tmp_path: Path) -> None:
+def test_training_state_restore_is_refused_by_the_real_evaluate_runner(tmp_path: Path) -> None:
+    train = protocol.training_config()
+    train["run"]["root"] = str(tmp_path)
+    train["run"]["run_id"] = "runner-train"
+    train["trainer"]["max_steps"] = 1
+    train["sampler"].update(n_walkers=8, burn_in=2, n_steps=2)
+    train["callbacks"][-1]["schedule"]["every_n"] = 1
+    assert _run_config(train, command="h-v2 runner refusal train") == 0
+    checkpoint = tmp_path / "tpen_h_v2" / "atomistic" / "runner-train" / "checkpoints" / "step_000001"
+    evaluation = protocol.evaluation_config(checkpoint, root=tmp_path)
+    evaluation["run"]["run_id"] = "runner-refusal"
+    evaluation["sampler"].update(n_walkers=8, burn_in=2, n_steps=2)
+    evaluation["load"]["mode"] = "train_resume"
+    with pytest.raises(ValueError, match="train_resume"):
+        _run_config(evaluation, command="h-v2 runner refusal evaluation")
+
+
+@pytest.mark.h_v2_pipeline
+def test_part_e_contract_scale_training_and_evaluation_energy_criteria(tmp_path: Path, record_property) -> None:
     """Run the h-v2 short learned route at full contract scale (part e).
 
     Contract (``contract_inputs.json`` ``admission.pipeline_check`` part e):
     8 channels, 32 hidden, 1000 updates; training sampler 256 walkers,
     burn-in 100, 10 Metropolis steps/update, proposal scale 0.5 bohr; fresh
     evaluation 1024 walkers x 64 draws x 2 streams, burn-in 1000, stride 20.
-    Computes the ``0.02`` Ha energy-error criterion and the ``0.25`` median-
-    absolute-error improvement rule, with the little-dynamic-range branch
-    when the untrained (update-zero) model is already within ``0.02`` Ha --
-    in which case the contract requires only the imperfect learned-state/
-    gradient control, which `test_protocol.test_exact_and_imperfect_analytic_controls`
-    (``alpha=1.2``) already provides.
+    Computes the ``0.02`` Ha energy-error criterion (the absolute value of the
+    pooled mean local energy plus ``0.5`` Ha, not a median) and the ``0.25``
+    median-absolute-error improvement rule as a separate criterion, with the
+    little-dynamic-range branch reported explicitly (via the
+    ``*_improvement_rule_evaluated`` junit property) when the untrained
+    (update-zero) model is already within ``0.02`` Ha. In that branch the
+    contract requires only the imperfect learned-state/gradient control.
+    `test_stub_oracle_contract.test_stub_imperfect_state_is_not_reported_exact`
+    (``alpha=1.2``) is an oracle self-consistency control, not a learned-state
+    control: it proves the independent analytic instrument rejects an
+    imperfect exact-form stub, not that this pipeline's trained model is
+    imperfect. The imperfect learned-state/gradient control for this branch,
+    when it applies, is this test's own measured numbers (recorded below), not
+    that oracle check.
 
-    Marked ``h2v2_pipeline`` for selection, not exclusion: this repo's pytest
+    Marked ``h_v2_pipeline`` for selection, not exclusion: this repo's pytest
     markers (see also ``integration``) are categorical only -- nothing here
     filters them out of the standard ``pytest -q experiments/atomistic/h-v2
-    experiments/atomistic/he-v1`` invocation, and this test does run as part
-    of it (measured on Cannon: ~5-6 extra minutes on top of the rest of the
-    suite, well inside the contract's 2h/4-core CPU budget). Use the marker to
-    run ONLY this test in isolation::
+    experiments/atomistic/he-v1`` invocation. This test is instead skipped by
+    default via `conftest.py` unless ``--run-h-v2-pipeline`` is passed, because
+    at contract scale it alone adds several minutes on top of the rest of the
+    suite (well inside the contract's 2h/4-core CPU budget, but expensive to
+    pay once per mutant during verification). Run it explicitly with::
 
-        uv run pytest -q -m h2v2_pipeline experiments/atomistic/h-v2/test_pipeline.py
+        uv run pytest -q --run-h-v2-pipeline -m h_v2_pipeline experiments/atomistic/h-v2/test_pipeline.py
     """
 
-    def _median_abs_error(checkpoint: Path, run_id: str) -> float:
+    def _median_abs_error(checkpoint: Path, run_id: str) -> tuple[float, float]:
         errors: list[float] = []
+        energies_all: list[float] = []
         for stream in (0, 1):
             evaluation = protocol.evaluation_config(checkpoint, stream=stream, root=tmp_path)
             evaluation["run"]["run_id"] = f"{run_id}-stream{stream}"
@@ -105,13 +134,30 @@ def test_part_e_contract_scale_training_and_evaluation_energy_criteria(tmp_path:
             with (eval_dir / "sampled_eval_table.csv").open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
             assert rows
+            assert len(rows) == 1024 * 64
+            assert {(int(row["draw_index"]), int(row["walker_index"])) for row in rows} == {
+                (draw, walker) for draw in range(64) for walker in range(1024)
+            }
             assert all(row["finite"] == "True" for row in rows)
-            errors.extend(abs(float(row["local_energy"]) + 0.5) for row in rows)
+            energies = [float(row["local_energy"]) for row in rows]
+            stream_errors = [abs(value + 0.5) for value in energies]
+            errors.extend(stream_errors)
+            energies_all.extend(energies)
+            stream_mean = sum(energies) / len(energies)
+            stream_median = sorted(stream_errors)[len(stream_errors) // 2]
+            record_property(f"{run_id}_stream{stream}_mean_local_energy", stream_mean)
+            record_property(f"{run_id}_stream{stream}_median_abs_error", stream_median)
+            print(f"{run_id} stream {stream}: mean={stream_mean} median_abs_error={stream_median}")
         errors.sort()
         midpoint = len(errors) // 2
-        if len(errors) % 2:
-            return errors[midpoint]
-        return (errors[midpoint - 1] + errors[midpoint]) / 2.0
+        median = errors[midpoint] if len(errors) % 2 else (errors[midpoint - 1] + errors[midpoint]) / 2.0
+        pooled_mean = sum(energies_all) / len(energies_all)
+        energy_abs_error = abs(pooled_mean + 0.5)
+        record_property(f"{run_id}_pooled_mean_local_energy", pooled_mean)
+        record_property(f"{run_id}_pooled_median_abs_error", median)
+        record_property(f"{run_id}_pooled_energy_abs_error", energy_abs_error)
+        print(f"{run_id} pooled: mean={pooled_mean} median_abs_error={median} energy_abs_error={energy_abs_error}")
+        return median, energy_abs_error
 
     # Control: the untrained model at update zero, via a terminal max_steps=0 run.
     initial_train = protocol.training_config()
@@ -130,9 +176,26 @@ def test_part_e_contract_scale_training_and_evaluation_energy_criteria(tmp_path:
     final_checkpoint = tmp_path / "tpen_h_v2" / "atomistic" / "train-final" / "checkpoints" / "step_001000"
     assert (final_checkpoint / "COMPLETE").is_file()
 
-    initial_median_abs_error = _median_abs_error(initial_checkpoint, "eval-initial")
-    final_median_abs_error = _median_abs_error(final_checkpoint, "eval-final")
+    initial_median_abs_error, initial_energy_abs_error = _median_abs_error(initial_checkpoint, "eval-initial")
+    final_median_abs_error, energy_abs_error_final = _median_abs_error(final_checkpoint, "eval-final")
+    improvement_rule_evaluated = initial_median_abs_error > 0.02
+    improvement_ratio = final_median_abs_error / initial_median_abs_error
+    for key, value in {
+        "initial_median_abs_error": initial_median_abs_error,
+        "final_median_abs_error": final_median_abs_error,
+        "initial_energy_abs_error": initial_energy_abs_error,
+        "energy_abs_error_final": energy_abs_error_final,
+        "improvement_rule_evaluated": improvement_rule_evaluated,
+        "improvement_ratio": improvement_ratio,
+    }.items():
+        record_property(key, value)
+        print(f"{key}={value}")
 
-    assert final_median_abs_error <= 0.02
-    if initial_median_abs_error > 0.02:
+    # Contract criterion (a): the final energy error, |mean(E_L) + 0.5|, not a
+    # median (finding 1 of the round-1 review).
+    assert energy_abs_error_final <= 0.02
+    # Contract criterion (b), kept separate from (a): the median-absolute-error
+    # improvement rule, evaluated only when the untrained control's error
+    # exceeds the 0.02 Ha threshold (the little-dynamic-range branch above).
+    if improvement_rule_evaluated:
         assert final_median_abs_error <= 0.75 * initial_median_abs_error
