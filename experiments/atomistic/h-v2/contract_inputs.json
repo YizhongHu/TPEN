@@ -312,18 +312,35 @@
       "instrument_requirement": "independent Gamma draws must reproduce W_exact within its own band; bootstrap must exercise the alpha=1 zero-event bound"
     },
     "amplitude_risk": {
-      "status": "definition_decided_threshold_pending_spike",
+      "status": "definition_and_thresholds_decided",
       "definition": "the fraction of walkers whose logabs falls below (batch-median logabs minus a threshold), plus the nonfinite-logabs count and the sign count",
       "naming_rule": "never called a Pfaffian floor or a readout floor unless the pre-floor readout amplitude is itself deliberately measured",
       "interpretation": "descriptive only; introduces no alarm and no science gate",
       "decided_by": [
         "operator-decision-amplitude-risk-threshold-20261106",
-        "amplitude-risk-decision-20261106"
+        "amplitude-risk-decision-20261106",
+        "amplitude-risk-call-20261106"
       ],
-      "threshold": "pending the bounded Cannon CPU spike authorised 2026-11-06; candidates -3, -4, -5, -7, -10 are not frozen until the spike receipt exists",
-      "must_fix_before_science": "the threshold must still be fixed before science, with its evidence recorded",
-      "blocks": "layer fa3c35a8 (amplitude-risk fraction module and threshold); qualification and science both wait on the frozen threshold, not on the operator",
-      "source": "operator-decision-amplitude-risk-threshold-20261106: 'Tell the orchestrator to make a call that makes sense from previous runs of exact models and trained models. If it needs to spike something so be it.'; amplitude-risk-decision-20261106: the orchestrator's accepted definition"
+      "thresholds": {
+        "frozen_tau": [-3, -4, -5, -7, -10],
+        "primary": -5,
+        "labels": {
+          "-3": "resolved sensitivity",
+          "-4": "resolved sensitivity",
+          "-5": "primary descriptive scale",
+          "-7": "marginal resolution at the evaluation scale (4096 x 64)",
+          "-10": "rare or unresolved; a zero is not a healthy zero"
+        }
+      },
+      "evidence": {
+        "spike_receipt": "amplitude-risk-spike-receipt on fa3c35a8",
+        "spike_branch": "agent/h-v2-amplitude-spike",
+        "spike_sha": "39135fda1388ef319c2325c8ad934de3b3c513db",
+        "cannon_jobs": [58383577, 58388053, 58388109]
+      },
+      "must_fix_before_science": "no gate: thresholds are frozen descriptive labels, not a science admission criterion; independent verification happens when slice fa3c35a8 is implemented and verified",
+      "blocks": "layer fa3c35a8 (amplitude-risk fraction module); the definition and frozen thresholds are decided, implementation and independent verification remain",
+      "source": "operator-decision-amplitude-risk-threshold-20261106: 'Tell the orchestrator to make a call that makes sense from previous runs of exact models and trained models. If it needs to spike something so be it.'; amplitude-risk-decision-20261106: the orchestrator's accepted definition; amplitude-risk-call-20261106: the frozen threshold list"
     }
   },
   "decision_rules": {

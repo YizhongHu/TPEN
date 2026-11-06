@@ -193,18 +193,27 @@ def test_checkpoint_retention_and_evaluation_counts_are_decided() -> None:
     assert "operator" in evaluated["decided_by"].lower()
 
 
-def test_amplitude_risk_definition_decided_threshold_pending_spike() -> None:
+def test_amplitude_risk_definition_and_thresholds_are_decided() -> None:
     inputs = load_inputs()
     amplitude_risk = inputs["measurement"]["amplitude_risk"]
-    assert amplitude_risk["status"] == "definition_decided_threshold_pending_spike"
+    assert amplitude_risk["status"] == "definition_and_thresholds_decided"
     assert "held for the operator" not in amplitude_risk["blocks"]
-    assert "pending" in amplitude_risk["threshold"]
-    assert "not frozen" in amplitude_risk["threshold"]
     assert "descriptive only" in amplitude_risk["interpretation"]
-    assert "fixed before science" in amplitude_risk["must_fix_before_science"]
     assert "fraction" in amplitude_risk["definition"]
     assert "Pfaffian" in amplitude_risk["naming_rule"]
-    # The amplitude-risk hold does not relax the standing science prohibition.
+    thresholds = amplitude_risk["thresholds"]
+    assert thresholds["frozen_tau"] == [-3, -4, -5, -7, -10]
+    assert thresholds["primary"] == -5
+    assert thresholds["labels"]["-5"] == "primary descriptive scale"
+    assert "marginal resolution" in thresholds["labels"]["-7"]
+    assert "not a healthy zero" in thresholds["labels"]["-10"]
+    assert set(str(tau) for tau in thresholds["frozen_tau"]) == set(thresholds["labels"])
+    assert amplitude_risk["evidence"]["spike_sha"] == (
+        "39135fda1388ef319c2325c8ad934de3b3c513db"
+    )
+    assert amplitude_risk["evidence"]["cannon_jobs"] == [58383577, 58388053, 58388109]
+    # The amplitude-risk thresholds are descriptive only; no gate on science.
+    assert "no gate" in amplitude_risk["must_fix_before_science"]
     assert inputs["admission"]["science_lineages"]["status"] == (
         "prohibited_until_operator_reviews_science_plan"
     )

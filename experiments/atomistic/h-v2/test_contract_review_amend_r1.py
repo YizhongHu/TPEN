@@ -160,3 +160,23 @@ def test_red_finding_1_amplitude_risk_is_not_held_for_the_operator() -> None:
     assert "held for the operator" not in risk["blocks"]
     held = [m for m in inputs["logging"]["modules"] if m["name"] == "amplitude_risk_fraction"]
     assert held[0]["status"] != "held_for_operator"
+
+
+def test_green_amplitude_risk_thresholds_are_frozen_labeled_and_ungated() -> None:
+    """The 2026-11-06 ~22:15Z call freezes tau, labels every entry, and gates nothing."""
+    risk = load_inputs()["measurement"]["amplitude_risk"]
+    thresholds = risk["thresholds"]
+    frozen = thresholds["frozen_tau"]
+    assert frozen == [-3, -4, -5, -7, -10]
+    # Every frozen threshold carries a label; dropping one (mutant: shorten the
+    # list) or leaving one unlabeled (mutant: omit -10's label) must fail here.
+    labels = thresholds["labels"]
+    assert set(str(tau) for tau in frozen) == set(labels)
+    assert all(labels[str(tau)] for tau in frozen)
+    assert thresholds["primary"] == -5
+    assert labels["-5"] == "primary descriptive scale"
+    assert "marginal resolution" in labels["-7"]
+    assert "not a healthy zero" in labels["-10"]
+    # Descriptive only: no gate (mutant: adding a gate clause must fail this).
+    assert risk["interpretation"] == "descriptive only; introduces no alarm and no science gate"
+    assert "no gate" in risk["must_fix_before_science"]

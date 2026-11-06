@@ -266,17 +266,24 @@ code from `python -m tpen.run` proves nothing.
 
 ## Still open
 
-The amplitude-risk **definition** is decided, and the operator (2026-11-06,
-"Tell the orchestrator to make a call that makes sense from previous runs of
-exact models and trained models. If it needs to spike something so be it.")
-handed the call to the lane; it is no longer held for the operator. The
-accepted definition is the fraction of walkers whose `logabs` falls below the
-batch-median `logabs` minus a threshold, plus nonfinite-`logabs` and sign
-counts, never called a Pfaffian or readout floor unless the pre-floor readout
-amplitude is itself measured. It is descriptive only: no alarm and no science
-gate. The **threshold** is pending a bounded Cannon CPU spike authorized
-2026-11-06; candidate offsets `-3, -4, -5, -7, -10` are not frozen until the
-spike receipt exists, and the threshold must still be fixed before science,
-with its evidence recorded. The horizon of 50,000 updates, the science venue
-and resource ceiling, and every other `lane_proposals` entry remain pending
-operator review. Science lineages remain prohibited.
+The amplitude-risk **definition and thresholds are both decided**. The
+operator (2026-11-06, "Tell the orchestrator to make a call that makes sense
+from previous runs of exact models and trained models. If it needs to spike
+something so be it.") handed the call to the lane; it is no longer held for
+the operator. The accepted definition is the fraction of walkers whose
+`logabs` falls below the batch-median `logabs` minus a threshold, plus
+nonfinite-`logabs` and sign counts, never called a Pfaffian or readout floor
+unless the pre-floor readout amplitude is itself measured. A bounded Cannon
+CPU spike (branch `agent/h-v2-amplitude-spike` at
+`39135fda1388ef319c2325c8ad934de3b3c513db`, Cannon jobs `58383577`,
+`58388053`, `58388109`) froze the study threshold list `tau in {-3, -4, -5,
+-7, -10}`: `-5` is the primary descriptive scale, `-3`/`-4` are resolved
+sensitivities, `-7` is "marginal resolution at the evaluation scale (4096 x
+64)", and `-10` is "rare or unresolved; a zero is not a healthy zero". The
+spike found the exact, imperfect, untrained and trained states all fall in
+the same narrow band, confirming the module cannot classify state quality.
+It remains descriptive only: no alarm and no science gate. Implementation
+(layer `fa3c35a8`) and independent verification against the frozen list
+still remain. The horizon of 50,000 updates, the science venue and resource
+ceiling, and every other `lane_proposals` entry remain pending operator
+review. Science lineages remain prohibited.
