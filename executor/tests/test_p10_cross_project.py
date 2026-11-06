@@ -32,7 +32,14 @@ task = LogicalTaskSpec(
     run_id="train:seed-0000",
     command=("tpen", "train"),
     result_dir=str(out / "result"),
-    params={"kind": "train", "config": str(source), "executor_overrides": ("runtime.seed=0",)},
+    params={
+        "kind": "train",
+        "config": str(source),
+        "seed": 0,
+        "n_walkers": 16,
+        "max_steps": 25,
+        "executor_overrides": ("runtime.seed=0",),
+    },
 )
 plan = StagePlanV2("he", "train", "golden", str(out), (task,)).validate()
 group, table, _ = build_attached_inputs(plan, effective_config=source, source_config=source)
