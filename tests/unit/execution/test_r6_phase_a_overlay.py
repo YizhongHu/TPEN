@@ -145,3 +145,50 @@ def test_r6_e3_direct_configured_overlay_is_a_green_control(monkeypatch, tmp_pat
     )
     assert seen == [1]
     assert observed_start[0]["declared_overlays"] == {"trainer.max_steps": 1}
+
+
+def test_r6_post_resolution_overlays_recompose_runner_and_artifact_consumers(tmp_path):
+    """Read back copied consumers, not only the top-level overlay leaves."""
+
+    from omegaconf import OmegaConf
+    from tpen.execution import capture_science_intent
+    from tpen.execution.invocation import (
+        _materialize_configured_worker_config,
+    )
+    from tpen.execution import RecoveryPhase, select_recovery
+
+    source = {
+        "system": {"spatial_dim": 3},
+        "runtime": {"seed": 17},
+        "model": {"spatial_dim": "${system.spatial_dim}", "seed": "${runtime.seed}"},
+        "sampler": {"spatial_dim": "${system.spatial_dim}", "seed": "${runtime.seed}"},
+        "trainer": {"max_steps": 20},
+        "runner": {
+            "model": "${model}",
+            "sampler": "${sampler}",
+            "trainer": "${trainer}",
+        },
+        "run": {"root": "${run.base}", "base": str(tmp_path / "old")},
+        "checkpoint": {"output_dir": "${run.root}/checkpoints"},
+        "metrics": {"path": "${run.root}/metrics.jsonl"},
+    }
+    intent = capture_science_intent(
+        {"system": "probe"}, target_iterations=20, source_config=source
+    )
+    resolved = OmegaConf.create(source)
+    OmegaConf.resolve(resolved)
+    decision = select_recovery(intent, phase=RecoveryPhase.INITIAL)
+
+    worker = _materialize_configured_worker_config(
+        resolved,
+        intent=intent,
+        decision=decision,
+        output_path=tmp_path / "new-output",
+        declared_overlays={"trainer.max_steps": 7, "run.root": str(tmp_path / "new-root")},
+    )
+
+    assert worker.runner.trainer.max_steps == 7
+    assert worker.runner.model.spatial_dim == 3
+    assert worker.runner.sampler.seed == 17
+    assert worker.checkpoint.output_dir == str(tmp_path / "new-output" / "checkpoints")
+    assert worker.metrics.path == str(tmp_path / "new-output" / "metrics.jsonl")
