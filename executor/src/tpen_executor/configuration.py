@@ -23,7 +23,6 @@ by P5a.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 import re
 from typing import Any
 
@@ -33,6 +32,7 @@ from omegaconf.grammar_parser import parse as parse_interpolation
 
 from ._codec import digest
 from .contracts import ProgramSpecRef
+from ._records import frozen_record
 from .programs import AllocationProgram, WorkerProgram, payload_entries, validate_marker_shape
 
 
@@ -199,7 +199,7 @@ def _stage(config: DictConfig) -> StagedConfig:
     return StagedConfig(config=config, programs=found)
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class StagedConfig:
     """Composed configuration plus opaque future-process program handles."""
 

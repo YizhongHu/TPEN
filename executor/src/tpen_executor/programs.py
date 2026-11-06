@@ -14,7 +14,6 @@ errors; pass owner-process values through the materialize environment instead.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from operator import itemgetter
 import re
 from types import MappingProxyType
@@ -26,6 +25,7 @@ from omegaconf.nodes import AnyNode
 
 from ._codec import digest, thaw
 from .contracts import ProgramSpecRef
+from ._records import frozen_record
 
 
 _PROGRAM_TARGETS = {
@@ -255,7 +255,7 @@ def _materialize(ref: ProgramSpecRef, path: str, env: Mapping[str, Any] | None) 
     )
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class MaterializedProgram:
     """Frozen named slots produced by one owner-process materialization.
 
@@ -304,7 +304,7 @@ class MaterializedProgram:
         return len(self.slots)
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class WorkerProgram:
     """Thin holder for an unresolved worker-process program specification."""
 
@@ -317,7 +317,7 @@ class WorkerProgram:
         return _materialize(self.spec, self.path, env)
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class AllocationProgram:
     """Thin holder for an unresolved allocation-process program specification."""
 

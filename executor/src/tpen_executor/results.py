@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ._codec import _freeze, canonical_bytes, decode_json, fields, sequence, sha256_text, text, thaw
 from .contracts import AllocationId, AttemptId, BackendJobId
+from ._records import frozen_record
 
 OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed"})
 
@@ -18,7 +18,7 @@ def _identity(value: Any, cls: type, name: str) -> Any:
     return value
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class StartReceipt:
     """Durable observation that an attempt was started.
 
@@ -66,7 +66,7 @@ class StartReceipt:
         return cls.from_mapping(decode_json(data))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class OutcomeReceipt:
     """Durable observation of an attempt's operational outcome.
 
@@ -121,7 +121,7 @@ class OutcomeReceipt:
         return cls.from_mapping(decode_json(data))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class AllocationObservation:
     """Backend-neutral observation of an allocation.
 
@@ -163,7 +163,7 @@ class AllocationObservation:
         return cls.from_mapping(decode_json(data))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class ManifestAttempt:
     """One group member's attempt and receipt references.
 
@@ -213,7 +213,7 @@ class ManifestAttempt:
         return cls.from_mapping(decode_json(data))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class AcceptedSegment:
     """One core-validated segment selected for scientific continuation.
 
@@ -299,7 +299,7 @@ class AcceptedSegment:
         return cls.from_mapping(decode_json(data))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class RunManifest:
     """Versioned group manifest that points at operational receipts.
 

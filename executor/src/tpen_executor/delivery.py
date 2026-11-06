@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 from typing import Any, ClassVar
 
 from ._codec import canonical_bytes, decode_json, fields, sha256_text
+from ._records import frozen_record
 
 
 def _absolute_path(value: Any) -> str:
@@ -19,7 +19,7 @@ def _absolute_path(value: Any) -> str:
     return value
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class PreparedInputBundle:
     """Description of immutable inputs prepared for an owner process.
 

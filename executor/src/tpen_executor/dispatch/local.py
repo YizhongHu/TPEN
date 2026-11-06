@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from ..programs import WorkerProgram
+from .._records import frozen_record
 from .contract import DispatcherContract
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class LocalDispatcher(DispatcherContract):
     """Run independent group members sequentially in one attached allocation.
 
