@@ -33,7 +33,7 @@ class HydrogenExact(nn.Module):
     exact_alpha: float = 1.0
     exact_energy: float = -0.5
 
-    def __init__(self, atoms: AtomicConfiguration, alpha: float = 1.0) -> None:
+    def __init__(self, atoms: object, alpha: float = 1.0) -> None:
         super().__init__()
         if not isinstance(atoms, AtomicConfiguration):
             raise TypeError(f"{type(self).__name__} requires an AtomicConfiguration, got {type(atoms).__name__}")
