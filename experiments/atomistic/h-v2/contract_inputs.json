@@ -312,12 +312,18 @@
       "instrument_requirement": "independent Gamma draws must reproduce W_exact within its own band; bootstrap must exercise the alpha=1 zero-event bound"
     },
     "amplitude_risk": {
-      "status": "open",
+      "status": "definition_decided_threshold_pending_spike",
       "definition": "the fraction of walkers whose logabs falls below (batch-median logabs minus a threshold), plus the nonfinite-logabs count and the sign count",
       "naming_rule": "never called a Pfaffian floor or a readout floor unless the pre-floor readout amplitude is itself deliberately measured",
-      "threshold": "open",
-      "blocks": "layer fa3c35a8 (amplitude-risk fraction module and threshold), held for the operator; qualification and science both wait on it",
-      "source": "operator-decisions-logging-module-checkpoints-20261106d: 'still open: the amplitude-risk threshold'"
+      "interpretation": "descriptive only; introduces no alarm and no science gate",
+      "decided_by": [
+        "operator-decision-amplitude-risk-threshold-20261106",
+        "amplitude-risk-decision-20261106"
+      ],
+      "threshold": "pending the bounded Cannon CPU spike authorised 2026-11-06; candidates -3, -4, -5, -7, -10 are not frozen until the spike receipt exists",
+      "must_fix_before_science": "the threshold must still be fixed before science, with its evidence recorded",
+      "blocks": "layer fa3c35a8 (amplitude-risk fraction module and threshold); qualification and science both wait on the frozen threshold, not on the operator",
+      "source": "operator-decision-amplitude-risk-threshold-20261106: 'Tell the orchestrator to make a call that makes sense from previous runs of exact models and trained models. If it needs to spike something so be it.'; amplitude-risk-decision-20261106: the orchestrator's accepted definition"
     }
   },
   "decision_rules": {
@@ -420,11 +426,10 @@
     },
     {
       "id": "horizon_and_checkpoints",
-      "status": "proposed_by_lane_pending_operator_review",
+      "status": "checkpoint counts decided 2026-11-06 (operator-decisions-logging-module-checkpoints-20261106d); horizon of 50,000 updates still proposed_by_lane_pending_operator_review",
       "proposal": "50,000 updates, retain 0..50000 every 1000, evaluate the explicit 27-checkpoint set",
       "rationale": "Dense retention prevents loss of an early basin while the smaller evaluated set controls fresh-evaluation cost.",
       "alternatives": [
-        "evaluate all 51 retained checkpoints",
         "use a 100,000-update horizon or a sparse 15-point evaluation set"
       ]
     },
@@ -623,19 +628,21 @@
     "design_rule": "every new measurement is an optional module that a run's configuration adds, following the existing callback/logger pattern (a callback class listed under callbacks: with an every_n_steps cadence, writing through context.log to the configured loggers:); core does not compute or log any of them unconditionally",
     "design_rule_source": "operator-decisions-logging-module-checkpoints-20261106d: 'remember it is added as a module not a core metric that always gets logged. This is an old, established design.'",
     "modules": [
-      {"name": "module_parameter_gradient_norm_callback", "layer": "6c29fe1d"},
-      {"name": "optimizer_state_summary_callback", "layer": "5d61a6c9"},
-      {"name": "training_batch_radius_quantile_callback", "layer": "8476456e"},
-      {"name": "raw_training_batch_recorder", "layer": "7f884e4d"},
-      {"name": "initial_checkpoint_callback", "layer": "5cfad8d2"},
-      {"name": "parameter_activity_callback", "layer": "52ead353"},
-      {"name": "readout_trajectory_generator", "layer": "c8fedd84"},
-      {"name": "amplitude_risk_fraction", "layer": "fa3c35a8", "status": "held_for_operator"}
+      {"name": "module_parameter_gradient_norm_callback", "layer": "6c29fe1d", "kind": "training_callback"},
+      {"name": "optimizer_state_summary_callback", "layer": "5d61a6c9", "kind": "training_callback"},
+      {"name": "training_batch_radius_quantile_callback", "layer": "8476456e", "kind": "training_callback"},
+      {"name": "raw_training_batch_recorder", "layer": "7f884e4d", "kind": "training_callback"},
+      {"name": "initial_checkpoint_callback", "layer": "5cfad8d2", "kind": "one_shot_callback"},
+      {"name": "parameter_activity_callback", "layer": "52ead353", "kind": "training_callback"},
+      {"name": "readout_trajectory_generator", "layer": "c8fedd84", "kind": "evaluation_generator"},
+      {"name": "amplitude_risk_fraction", "layer": "fa3c35a8", "status": "threshold_pending_spike", "kind": "training_callback"}
     ],
     "cadence": {
       "scalar_diagnostics": "every completed update",
       "raw_training_batches": {
-        "every_n_updates": 50,
+        "capture_coordinate": "iteration_step",
+        "every_n_steps": 50,
+        "includes_step_zero": true,
         "partition_size_updates": 1000,
         "format": "numpy_column_bundle_with_json_integrity_sidecar",
         "cadence_source": "operator-decisions-logging-storage-cadence-20261106b: '50 makes more sense here.'",
@@ -648,6 +655,7 @@
     },
     "capture_semantics": {
       "sample": "pre-update",
+      "coordinate": "iteration_step, the same coordinate as the raw-batch cadence and partition ranges",
       "row_fields": [
         "iteration_step",
         "completed_updates_after",
@@ -655,6 +663,8 @@
       ],
       "skipped_updates": "recorded, not dropped"
     },
+    "design_rule_scope": "the callback/every_n_steps/context.log sentence describes training_callback modules; evaluation_generator modules run during fresh evaluation and one_shot_callback modules fire once, not on a cadence",
+    "core_logs_unconditionally": false,
     "checkpoints": {
       "retained_per_lineage": 51,
       "evaluated_per_lineage": 27,
@@ -664,7 +674,9 @@
       "working_location": "Cannon netscratch, not scratch",
       "purge_window_days": 90,
       "holystore_set": "chosen retroactively after the analysis; about 26 to 28 GiB is acceptable for now",
-      "lifecycle_source": "operator-decisions-logging-storage-cadence-20261106b: \"'leading up to the conclusion' is usually retroactive after all the analysis is done. 26G is acceptable for now. netscratch; not scratch.\"",
+      "holystore_excludes": "the checkpoints themselves",
+      "hpss_scope": "the whole run, checkpoints included, compressed",
+      "lifecycle_source": "operator-decisions-logging-storage-cadence-20261106b: \"'leading up to the conclusion' is usually retroactive after all the analysis is done. 26G is acceptable for now. netscratch; not scratch.\"; operator-decisions-logging-and-560-20261106: 'archive everything leading up to the conclusion except the checkpoints themselves into holystore, archived ... The whole thing gets compressed and archived the HPSS.'",
       "procedures": ["archive-experiment skill", "backup-experiment-cannon skill"],
       "related_items": ["10d766be", "6bb4f4ea", "8433b0be", "b0ff32b6", "c3c8a012"],
       "removal_rule": "nothing on netscratch is removed without a Task Orchestrator lifecycle disposition naming the exact paths and a passed recovery verification of the archive"
@@ -674,12 +686,17 @@
       "fresh_evaluation": {
         "formula": "3 lineages x 27 evaluated checkpoints x 4 streams x 4096 walkers x 256 draws",
         "rows": 339738624,
-        "compact_gib": 28.1
+        "compact_gib": 28.1,
+        "bytes_per_row_compact": 89,
+        "bytes_per_row_source": "training-batch-storage-proposal: 89 bytes, the conservative envelope"
       },
       "raw_training_batches": {
-        "formula": "3 lineages x 1000 retained batches x 4096 walkers",
-        "rows": 12288000,
-        "compact_gib": 0.93
+        "formula": "3 lineages x 1001 captured batches (every_n_steps=50, iteration step 0 through 50000 inclusive) x 4096 walkers",
+        "batches_per_lineage": 1001,
+        "rows": 12300288,
+        "compact_gib": 0.928,
+        "bytes_per_row_compact": 81,
+        "bytes_per_row_source": "training-batch-storage-proposal: 81 primitive bytes"
       },
       "compression_ratio": "unmeasured; a pilot block must measure it before a Holystore budget promises it"
     }
@@ -707,6 +724,10 @@
         }
       },
       "superseded_stub": "the prior stub check compared the CDF only up to r=3 (about the 94th percentile of the outer radius) and never examined the inner tail that drives W",
+      "superseded_stub_fields": {
+        "max_radius_checked": 3.0,
+        "band": 0.02
+      },
       "radial_levels": [0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001],
       "radial_sides": ["lower_tail_cdf", "upper_tail_survival"],
       "radial_applies_to": ["alpha_1", "alpha_1_2"],
@@ -726,13 +747,15 @@
       },
       "band": {
         "statistic": "z = (log(S_hat) - log(S_exact)) / se",
-        "se_method": "whole-walker bootstrap standard error of log(S_hat), at least 2000 resamples",
+        "centering": "per-stream sample median of E_L, as in measurement.fresh_evaluation.estimator",
+        "se_method": "whole-walker bootstrap standard error of log(S_hat), at least 2000 resamples; the median is recomputed inside every whole-walker resample",
+        "exact_value_centering_note": "S_exact at the fixed thresholds is the oracle value centred on the exact median -0.540498, not the per-stream sample median",
         "zero_count_rule": "a zero count at a gated level fails",
         "family_wise_false_fail_rate": 0.001,
-        "k_definition": "the number of gated comparisons implied by radial_levels x radial_sides x 2 alphas, plus alpha_1_2_only.fixed_exceedance_thresholds_hartree, plus alpha_1_2_only.exceedance_levels",
-        "k_value": 61,
+        "k_definition": "the number of gated comparisons implied by radial_levels x radial_sides x 2 alphas, plus alpha_1_2_only.fixed_exceedance_thresholds_hartree, plus alpha_1_2_only.exceedance_levels, multiplied by shape_and_seeds.fresh_evaluation_sampler.streams",
+        "k_value": 122,
         "c_formula": "inverse_normal_cdf(1 - family_wise_false_fail_rate / (2*K))",
-        "c_value": 4.309080861982394,
+        "c_value": 4.45998023125495,
         "pass_rule": "qualification passes only if max(|z|) over every gated comparison in both streams is at most c"
       },
       "shape_and_seeds": {
@@ -745,6 +768,10 @@
     "status": "decided",
     "decided_by": "operator-decisions-560-logging-20261106c: 'the others look good to incorporate'",
     "preserved_tip": "0da2b23d628a15b18ac2031ff5f72dff0c010280",
+    "preserved_tip_locations": [
+      "refs/preserved/codex-one-electron-variance-20261028-0da2b23d (local ref only, in the main checkout)",
+      "refs/pull/560/head (GitHub)"
+    ],
     "findings": [
       {"finding": 1, "description": "tail-calibrated sampler bands", "layer": "028867dc"},
       {"finding": 2, "description": "science-collector integrity checks carried from analysis.py", "layer": "372ef393"},
@@ -765,7 +792,12 @@
     "status": "decided",
     "rule": "experiments reach core only through configuration, tpen.run.run_from_config, or the installed tpen command; an integration test that needs core internals for fixtures or mutation hooks lives in the core tests/ tree",
     "rule_source": "root note operator-decisions-20261106-imports-mirflow-readonly, rows 1 and 2",
-    "run_module_trap": "python -m tpen.run exits 0 and does nothing: tpen/run.py has no if __name__ == '__main__' guard, and operator policy 2026-11-06 will not add one; use the installed tpen entrypoint or call tpen.run.run_from_config/tpen.run.main explicitly"
+    "allowed_core_surfaces": [
+      "configuration",
+      "tpen.run.run_from_config",
+      "the installed tpen command"
+    ],
+    "run_module_trap": "python -m tpen.run exits 0 and does nothing: tpen/run.py has no if __name__ == '__main__' guard, and operator policy 2026-11-06 will not add one; experiment code must use the installed tpen entrypoint or call tpen.run.run_from_config explicitly"
   },
   "controls": [
     "exact hydrogen energy -1/2 Ha",

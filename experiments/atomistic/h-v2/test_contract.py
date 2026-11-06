@@ -113,7 +113,13 @@ def test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct() -> Non
 def test_all_eight_lane_proposals_are_visible() -> None:
     proposals = load_inputs()["lane_proposals"]
     assert len(proposals) == 8
-    assert all(item["status"].startswith("proposed_by_lane_") for item in proposals)
+    still_pending = [p for p in proposals if p["id"] != "horizon_and_checkpoints"]
+    assert all(item["status"].startswith("proposed_by_lane_") for item in still_pending)
+    horizon = next(p for p in proposals if p["id"] == "horizon_and_checkpoints")
+    assert horizon["status"].startswith("checkpoint counts decided")
+    assert "horizon of 50,000 updates" in horizon["status"]
+    assert "proposed_by_lane_pending_operator_review" in horizon["status"]
+    assert not any("51" in alternative for alternative in horizon["alternatives"])
     assert all(
         item["proposal"] and item["rationale"] and item["alternatives"]
         for item in proposals
@@ -187,11 +193,15 @@ def test_checkpoint_retention_and_evaluation_counts_are_decided() -> None:
     assert "operator" in evaluated["decided_by"].lower()
 
 
-def test_amplitude_risk_stays_explicitly_open_and_science_still_prohibited() -> None:
+def test_amplitude_risk_definition_decided_threshold_pending_spike() -> None:
     inputs = load_inputs()
     amplitude_risk = inputs["measurement"]["amplitude_risk"]
-    assert amplitude_risk["status"] == "open"
-    assert amplitude_risk["threshold"] == "open"
+    assert amplitude_risk["status"] == "definition_decided_threshold_pending_spike"
+    assert "held for the operator" not in amplitude_risk["blocks"]
+    assert "pending" in amplitude_risk["threshold"]
+    assert "not frozen" in amplitude_risk["threshold"]
+    assert "descriptive only" in amplitude_risk["interpretation"]
+    assert "fixed before science" in amplitude_risk["must_fix_before_science"]
     assert "fraction" in amplitude_risk["definition"]
     assert "Pfaffian" in amplitude_risk["naming_rule"]
     # The amplitude-risk hold does not relax the standing science prohibition.
@@ -205,16 +215,21 @@ def test_logging_is_an_optional_module_not_an_always_on_core_metric() -> None:
     assert logging_block["status"] == "decided"
     assert "optional module" in logging_block["design_rule"]
     assert "does not compute or log" in logging_block["design_rule"]
+    assert logging_block["core_logs_unconditionally"] is False
     module_names = {module["name"] for module in logging_block["modules"]}
     assert "amplitude_risk_fraction" in module_names
     assert "raw_training_batch_recorder" in module_names
     held = [m for m in logging_block["modules"] if m["name"] == "amplitude_risk_fraction"]
-    assert held[0]["status"] == "held_for_operator"
+    assert held[0]["status"] == "threshold_pending_spike"
+    kinds = {"training_callback", "evaluation_generator", "one_shot_callback"}
+    assert all(module["kind"] in kinds for module in logging_block["modules"])
 
 
 def test_raw_training_batch_cadence_and_format_are_decided() -> None:
     cadence = load_inputs()["logging"]["cadence"]["raw_training_batches"]
-    assert cadence["every_n_updates"] == 50
+    assert cadence["capture_coordinate"] == "iteration_step"
+    assert cadence["every_n_steps"] == 50
+    assert cadence["includes_step_zero"] is True
     assert cadence["partition_size_updates"] == 1000
     assert cadence["format"] == "numpy_column_bundle_with_json_integrity_sidecar"
     assert len(cadence["out_of_memory_checks"]) == 2
@@ -226,9 +241,14 @@ def test_storage_row_counts_match_their_declared_formulas() -> None:
     fresh = figures["fresh_evaluation"]
     raw = figures["raw_training_batches"]
     assert fresh["rows"] == 3 * 27 * 4 * scale["training_walkers"] * 256
-    assert raw["rows"] == scale["lineages"] * 1000 * scale["training_walkers"]
-    assert fresh["compact_gib"] == pytest.approx(fresh["rows"] * 89 / 2**30, rel=0.01)
-    assert raw["compact_gib"] == pytest.approx(raw["rows"] * 81 / 2**30, rel=0.01)
+    assert raw["batches_per_lineage"] == 1001
+    assert raw["rows"] == scale["lineages"] * raw["batches_per_lineage"] * scale["training_walkers"]
+    assert fresh["compact_gib"] == pytest.approx(
+        fresh["rows"] * fresh["bytes_per_row_compact"] / 2**30, rel=0.01
+    )
+    assert raw["compact_gib"] == pytest.approx(
+        raw["rows"] * raw["bytes_per_row_compact"] / 2**30, rel=0.01
+    )
     assert figures["compression_ratio"] == (
         "unmeasured; a pilot block must measure it before a Holystore budget promises it"
     )
@@ -279,16 +299,20 @@ def test_sampler_tail_qualification_k_and_c_match_the_formula() -> None:
     tail = load_inputs()["tail_characterization"]["sampler_tail_qualification"]
     band = tail["band"]
     alpha_only = tail["alpha_1_2_only"]
-    k_computed = (
+    streams = tail["shape_and_seeds"]["fresh_evaluation_sampler"]["streams"]
+    per_stream = (
         len(tail["radial_levels"]) * len(tail["radial_sides"]) * 2
         + len(alpha_only["fixed_exceedance_thresholds_hartree"])
         + len(alpha_only["exceedance_levels"])
     )
+    k_computed = per_stream * streams
     assert k_computed == band["k_value"]
     c_computed = statistics.NormalDist().inv_cdf(
         1 - band["family_wise_false_fail_rate"] / (2 * band["k_value"])
     )
     assert c_computed == pytest.approx(band["c_value"], abs=1e-12)
+    assert band["centering"].startswith("per-stream sample median")
+    assert "recomputed inside every whole-walker resample" in band["se_method"]
 
 
 def test_sampler_tail_qualification_seed_namespace_is_disjoint() -> None:
@@ -322,5 +346,11 @@ def test_experiment_boundary_rule_and_run_module_trap_are_stated() -> None:
     assert "run_from_config" in boundary["rule"]
     assert "tpen command" in boundary["rule"]
     assert "core tests/" in boundary["rule"]
+    assert boundary["allowed_core_surfaces"] == [
+        "configuration",
+        "tpen.run.run_from_config",
+        "the installed tpen command",
+    ]
     assert "python -m tpen.run" in boundary["run_module_trap"]
     assert "exits 0 and does nothing" in boundary["run_module_trap"]
+    assert "tpen.run.main" not in boundary["run_module_trap"]

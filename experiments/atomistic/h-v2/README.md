@@ -41,8 +41,8 @@ and every 1,000 updates (51 retained checkpoints) while fresh-evaluating a
 separate 27-checkpoint set. The checkpoint counts themselves are **decided**,
 2026-11-06: the operator confirmed "27 makes sense. especially if evaluation
 is expensive". All 51 retained checkpoints are kept; fresh evaluation stays at
-27. The rest of the science plan (lineage count, walker budget, venue) remains
-a lane proposal pending operator review. It proposes three independent
+27. The rest of the science plan (horizon, lineage count, walker budget,
+venue) remains a lane proposal pending operator review. It proposes three independent
 lineages with
 initialization seeds `73001..73003` and sampler seeds `83001..83003`, four
 fresh streams per evaluated checkpoint, 4,096 walkers, 256 draws, burn-in
@@ -145,24 +145,31 @@ checkpoint is the primary evidence.
 
 Every new measurement beyond what already exists is an **optional module**
 that a run's configuration adds, following the established callback and
-logger pattern: a callback class listed under `callbacks:` with an
-`every_n_steps` cadence, writing its metrics through `context.log` to the
-configured `loggers:`. Core does not compute or log any of them
+logger pattern: for training callbacks, a callback class listed under
+`callbacks:` with an `every_n_steps` cadence, writing its metrics through
+`context.log` to the configured `loggers:`. The one-shot `initial_checkpoint`
+callback fires once rather than on a cadence, and
+`readout_trajectory_generator` is an evaluation-side generator, not a
+training callback; each module carries a `kind` field
+(`training_callback`/`evaluation_generator`/`one_shot_callback`) in
+`contract_inputs.json`. Core does not compute or log any of them
 unconditionally (operator, 2026-11-06: "remember it is added as a module not
 a core metric that always gets logged. This is an old, established design.").
 The modules, and the stack layer that provides each one, are listed
 machine-readably in `contract_inputs.json` under `logging.modules`.
 
 Cadence: scalar diagnostics log every completed update. Raw training batches
-are captured every 50th update (operator: "50 makes more sense here"), in
-partitions of 1,000 updates per lineage, written as NumPy column bundles with
-a JSON integrity sidecar (operator: "numpy seems to make more sense as long
-as it does not cause OOM events"). The out-of-memory condition is checked
-twice: a bounded-memory test in the training-batch recorder layer, and a
-logging-on measurement in the full-card pilot. A recorded training batch is
-the pre-update sample; each row carries the iteration step, the
-completed-update count after the iteration, and whether the update was
-applied. Skipped updates are recorded, not dropped.
+are captured on the iteration-step coordinate, every 50th step including step
+0 (operator: "50 makes more sense here"), in partitions of 1,000 updates per
+lineage, written as NumPy column bundles with a JSON integrity sidecar
+(operator: "numpy seems to make more sense as long as it does not cause OOM
+events"). The out-of-memory condition is checked twice: a bounded-memory test
+in the training-batch recorder layer, and a logging-on measurement in the
+full-card pilot. A recorded training batch is the pre-update sample; each row
+carries the iteration step (the same coordinate used for the capture cadence
+and the partition ranges), the completed-update count after the iteration,
+and whether the update was applied. Skipped updates are recorded, not
+dropped.
 
 All 51 checkpoints per lineage are retained (update 0 and every 1,000 through
 50,000). Fresh evaluation stays at the predeclared 27 per lineage (operator,
@@ -172,17 +179,23 @@ counts are now **decided**, not proposed.
 Storage lifecycle: the working location is Cannon netscratch, not scratch,
 which is purged after 90 days, so the HPSS archive must be made inside that
 window. The Holystore set is chosen retroactively, after the analysis; about
-26 to 28 GiB is acceptable for now. The procedures are the `archive-experiment`
+26 to 28 GiB is acceptable for now, and excludes the checkpoints themselves
+(operator: "archive everything leading up to the conclusion except the
+checkpoints themselves into holystore"). The HPSS scope is the whole run,
+checkpoints included, compressed. The procedures are the `archive-experiment`
 and `backup-experiment-cannon` skills. Nothing on netscratch is removed
 without a Task Orchestrator lifecycle disposition naming the exact paths and
 a passed recovery verification of the archive.
 
 Storage figures, recomputed at the science scale of 4,096 training walkers:
 fresh evaluation is `3 x 27 x 4 x 4,096 x 256 = 339,738,624` rows, about 28.1
-GiB compact; raw training batches every 50th update is `3 x 1,000 x 4,096 =
-12,288,000` rows, about 0.93 GiB compact before container and compression.
-Compression ratios are unmeasured and are labelled so in
-`contract_inputs.json`.
+GiB compact at 89 bytes per row (the conservative envelope); raw training
+batches, captured every 50th iteration step including step 0 through 50,000
+(1,001 batches per lineage), is `3 x 1,001 x 4,096 = 12,300,288` rows, about
+0.928 GiB compact at 81 primitive bytes per row, before container and
+compression. Both byte-per-row figures and their source are recorded in
+`contract_inputs.json`. Compression ratios are unmeasured and are labelled so
+in `contract_inputs.json`.
 
 ## Tail characterization
 
@@ -203,8 +216,12 @@ the local-energy deviation for `alpha=1.2`. A level gates only if its
 expected count is at least 100 per stream at the contract's fresh-evaluation
 shape; deeper levels are reported but never gated. Each gated level is
 checked with a whole-walker bootstrap z-score against a Bonferroni-corrected
-critical value computed from the declared grid (`K` comparisons, false-fail
-rate 0.001).
+critical value computed from the declared grid, counted once per stream
+(`K = 122` comparisons across both streams, false-fail rate 0.001, giving
+`c = 4.45998023125495`). The comparison centers `A` on the per-stream sample
+median of `E_L`, as the science estimator does; the median is recomputed
+inside every whole-walker resample, and the exact survival value at the fixed
+thresholds is the oracle value centered on the exact median `-0.540498`.
 
 Second, the primary science evidence for the tail is the **full** positive
 and negative survival and exceedance curves computed from the retained raw
@@ -215,7 +232,9 @@ rows; this is the lane's scientific response to the operator's concern.
 ## Pull request 560 incorporation
 
 Pull request 560 (`origin/codex/one-electron-variance-20261028`, tip
-preserved at `0da2b23d628a15b18ac2031ff5f72dff0c010280`) is superseded by
+`0da2b23d628a15b18ac2031ff5f72dff0c010280`, preserved at the local-only ref
+`refs/preserved/codex-one-electron-variance-20261028-0da2b23d` in the main
+checkout and at `refs/pull/560/head` on GitHub) is superseded by
 H-v2 for the hydrogen physics controls, but several of its capabilities are
 worth carrying forward (operator: "the others look good to incorporate").
 The mapping from each finding to its destination layer is machine-readable
@@ -240,16 +259,24 @@ the core. otherwise the interface is only through the config").
 
 **Trap:** `python -m tpen.run ...` exits 0 and does nothing. `tpen/run.py`
 has a `main` function but no `if __name__ == "__main__":` guard, and the
-operator has decided no guard will be added (2026-11-06). Use the installed
-`tpen` entrypoint, or call `tpen.run.run_from_config`/`tpen.run.main`
-explicitly. A green exit code from `python -m tpen.run` proves nothing.
+operator has decided no guard will be added (2026-11-06). Experiment code
+must use the installed `tpen` entrypoint or call `tpen.run.run_from_config`
+explicitly; `tpen.run.main` is not an experiment-facing surface. A green exit
+code from `python -m tpen.run` proves nothing.
 
 ## Still open
 
-The amplitude-risk definition and threshold remain explicitly **open**: the
-lane's proposal is the fraction of walkers whose `logabs` falls below the
+The amplitude-risk **definition** is decided, and the operator (2026-11-06,
+"Tell the orchestrator to make a call that makes sense from previous runs of
+exact models and trained models. If it needs to spike something so be it.")
+handed the call to the lane; it is no longer held for the operator. The
+accepted definition is the fraction of walkers whose `logabs` falls below the
 batch-median `logabs` minus a threshold, plus nonfinite-`logabs` and sign
 counts, never called a Pfaffian or readout floor unless the pre-floor readout
-amplitude is itself measured. The science venue and resource ceiling, and
-every other `lane_proposals` entry, remain pending operator review. Science
-lineages remain prohibited.
+amplitude is itself measured. It is descriptive only: no alarm and no science
+gate. The **threshold** is pending a bounded Cannon CPU spike authorized
+2026-11-06; candidate offsets `-3, -4, -5, -7, -10` are not frozen until the
+spike receipt exists, and the threshold must still be fixed before science,
+with its evidence recorded. The horizon of 50,000 updates, the science venue
+and resource ceiling, and every other `lane_proposals` entry remain pending
+operator review. Science lineages remain prohibited.
