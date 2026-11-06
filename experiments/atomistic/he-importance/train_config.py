@@ -348,8 +348,34 @@ def _consumed_context(manifest: Mapping[str, Any]) -> str:
     raise AssertionError("unreachable context validation branch")
 
 
+def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple[str, Any], ...]:
+    """Flatten mapping or Hydra dotlist overrides into explicit leaf updates."""
+
+    if isinstance(overrides, Mapping):
+        raw = OmegaConf.to_container(OmegaConf.create(overrides), resolve=False)
+    elif isinstance(overrides, Sequence) and not isinstance(overrides, (str, bytes, bytearray)):
+        try:
+            raw = OmegaConf.to_container(OmegaConf.from_dotlist(list(overrides)), resolve=False)
+        except Exception as exc:
+            raise TrainConfigResolutionError("overrides must be a valid Hydra dotlist") from exc
+    else:
+        raise TrainConfigResolutionError("overrides must be a mapping or Hydra dotlist")
+
+    items: list[tuple[str, Any]] = []
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                visit(child, f"{path}.{key}" if path else str(key))
+        else:
+            items.append((path, value))
+
+    visit(raw, "")
+    return tuple(items)
+
+
 def resolve_train_config(
-    source: Any, *, overrides: Mapping[str, Any] | None = None
+    source: Any, *, overrides: Mapping[str, Any] | Sequence[str] | None = None
 ) -> DictConfig:
     """Resolve one materialized cell or training packet into a Hydra config.
 
@@ -361,10 +387,9 @@ def resolve_train_config(
         checkout's real ``tpen.hi.train.v1`` namespace is accepted without
         duplicating the stage-coordinate classes here.
     overrides
-        The declared operational overlays ``trainer.max_steps``, ``run.root``,
-        and ``run.dir``. They are applied to the composed tree before any
-        interpolation is resolved, so copied runner and sink consumers read
-        the same values.
+        Optional mapping or Hydra dotlist of operational overlays. They are
+        applied to the composed tree before any interpolation is resolved, so
+        copied runner, shared-leaf, and sink consumers read the same values.
 
     Returns
     -------
@@ -420,15 +445,7 @@ def resolve_train_config(
     model_seed = _integer_seed(streams, "model_initialization")
 
     cfg = _compose_base_config()
-    if overrides is not None:
-        if not isinstance(overrides, Mapping):
-            raise TrainConfigResolutionError("overrides must be a mapping")
-        allowed_overrides = {"trainer.max_steps", "run.root", "run.dir"}
-        unknown = set(overrides).difference(allowed_overrides)
-        if unknown:
-            raise TrainConfigResolutionError(
-                "unsupported train-config overrides: " + ", ".join(sorted(unknown))
-            )
+    override_items = _override_items(overrides) if overrides is not None else ()
     committed_walkers = stage_api.COMMITTED_WALKERS
     composed_walkers = OmegaConf.select(cfg, "sampler.n_walkers", default=None)
     # Exact-int plus int.__eq__ keeps this decision structural, not caller-overridable.
@@ -444,7 +461,7 @@ def resolve_train_config(
     OmegaConf.update(cfg, "run.layout", "flat", merge=False, force_add=True)
     OmegaConf.update(cfg, "run.dir", str(output_path), merge=False)
     OmegaConf.update(cfg, "runtime.seed", model_seed, merge=False)
-    for path, value in (overrides or {}).items():
+    for path, value in override_items:
         OmegaConf.update(cfg, path, value, merge=False)
     OmegaConf.update(cfg, "optimizer._target_", optimizer_entry.target, merge=False)
     # Every Adam coordinate is explicit in the resolved config; no torch

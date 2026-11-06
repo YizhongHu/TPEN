@@ -350,11 +350,12 @@ def test_resolve_applies_operational_overrides_before_resolution(tmp_path: Path)
     run_dir = root / "run"
     resolved = train_config.resolve_train_config(
         cell,
-        overrides={
-            "trainer.max_steps": 7,
-            "run.root": str(root),
-            "run.dir": str(run_dir),
-        },
+        overrides=[
+            "trainer.max_steps=7",
+            f"run.root={root}",
+            f"run.dir={run_dir}",
+            "runtime.seed=123",
+        ],
     )
 
     assert resolved.trainer.max_steps == 7
@@ -365,8 +366,26 @@ def test_resolve_applies_operational_overrides_before_resolution(tmp_path: Path)
     assert resolved.loggers[0].path == str(run_dir / "metrics.csv")
     assert resolved.loggers[1].path == str(run_dir / "metrics.jsonl")
     assert resolved.callbacks[-2].output_dir == str(run_dir / "checkpoints")
-    assert resolved.runner.sampler.seed == resolved.sampler.seed
-    assert resolved.runner.model.embedding.spatial_dim == resolved.model.embedding.spatial_dim
+    assert resolved.callbacks[0].output_path == str(run_dir / "config.yaml")
+    assert resolved.callbacks[1].output_path == str(run_dir / "resolved_config.yaml")
+    assert resolved.callbacks[2].output_path == str(run_dir / "metadata.json")
+    assert resolved.callbacks[3].output_path == str(run_dir / "status.json")
+    assert resolved.callbacks[8].artifact_dir == str(run_dir / "checks/equivariance")
+    assert resolved.loggers[0].path == str(run_dir / "metrics.csv")
+    assert resolved.loggers[1].path == str(run_dir / "metrics.jsonl")
+    assert resolved.runtime.seed == 123
+    assert resolved.sampler.seed == resolved.runner.sampler.seed == 123
+    assert resolved.model.embedding.initializer.seed == 123
+    assert resolved.runner.model.embedding.initializer.seed == 123
+    assert all(checker.seed == 123 for checker in _callback_checkers(resolved))
+
+
+def test_resolve_overlay_mutant_after_resolution_is_red(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    resolved = train_config.resolve_train_config(cell)
+    OmegaConf.update(resolved, "runtime.seed", 123, merge=False)
+    assert resolved.runner.sampler.seed != 123
+    assert resolved.model.embedding.initializer.seed != 123
 
 
 def test_resolve_refuses_output_path_not_bound_to_identity_digest(tmp_path: Path) -> None:
