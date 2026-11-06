@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import ast
+import hashlib
 import importlib.util
 from pathlib import Path
 import sys
@@ -58,6 +59,7 @@ def test_reduced_config_is_explicit_and_preserves_science(tmp_path: Path) -> Non
     source = tmp_path / "source.yaml"
     output = tmp_path / "effective.yaml"
     _source_config(source)
+    source_bytes = source.read_bytes()
     reduced = attached.generate_reduced_callback_config(
         source,
         output,
@@ -78,6 +80,8 @@ def test_reduced_config_is_explicit_and_preserves_science(tmp_path: Path) -> Non
     assert [entry["_target_"] for entry in raw["loggers"]] == ["tpen.logging.CSV"]
     assert Path(reduced.diff_path).is_file()
     assert Path(reduced.hash_path).read_text().startswith(reduced.effective_sha256)
+    assert reduced.effective_path != reduced.source_path
+    assert reduced.source_sha256 == hashlib.sha256(source_bytes).hexdigest()
 
 
 def test_attached_handoff_binds_group_identity_and_order(tmp_path: Path) -> None:
@@ -109,6 +113,63 @@ def test_attached_route_requires_opt_in(tmp_path: Path) -> None:
             results_root=tmp_path / "results",
             source_config=source,
         )
+
+
+def test_reduced_route_reaches_executor_dispatch_with_doubles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "train.yaml"
+    _source_config(source)
+    calls: dict[str, object] = {}
+
+    def fake_profile(science_python: str, config: str, *, overrides: tuple[str, ...], cwd: str | None = None):
+        calls["profile"] = (science_python, config, overrides, cwd)
+        return attached.ProfileVerdict(attached.PROFILE_NAME, "supported", ("model",), None, 0)
+
+    def fake_dispatch(executor_python: str, handoff: object, **kwargs: object):
+        calls["dispatch"] = (executor_python, handoff, kwargs)
+        store = Path(str(kwargs["store"]))
+        store.mkdir(parents=True)
+        (store / "run-manifest.json").write_text("{}", encoding="utf-8")
+        return attached.ExecutorDispatchResult(0, {}, "", "")
+
+    monkeypatch.setattr(attached, "check_profile", fake_profile)
+    monkeypatch.setattr(attached, "run_executor_cli", fake_dispatch)
+    monkeypatch.setattr(attached, "write_activation_receipt", lambda *args, **kwargs: None)
+    activation = attached.activate_he_train(
+        {
+            "plan_id": "plan",
+            "rows": [
+                {
+                    "logical_task_id": "logical",
+                    "run_id": "run",
+                    "row_id": "seed-000",
+                    "kind": "train",
+                    "stage": "02_train",
+                    "runtime": "tpen-cu126",
+                    "config": str(source),
+                    "seed": 0,
+                    "max_steps": 25,
+                    "n_walkers": 16,
+                }
+            ],
+        },
+        output_dir=tmp_path / "generation",
+        repo_root=tmp_path,
+        results_root=tmp_path / "results",
+        source_config=source,
+        science_python=tmp_path / "science-python",
+        executor_python=tmp_path / "executor-python",
+        allocation=tmp_path / "allocation.json",
+        worker_config=tmp_path / "worker.yaml",
+        store=tmp_path / "store",
+        receipt_path=tmp_path / "activation.json",
+        enable_attached=True,
+        enable_reduced_callbacks=True,
+    )
+    assert activation.profile.verdict == "supported"
+    assert "profile" in calls and "dispatch" in calls
+    profile_config = str(calls["profile"][1])  # type: ignore[index]
+    assert profile_config != str(source)
+    assert calls["dispatch"][1].effective_config == profile_config  # type: ignore[index]
 
 
 def test_approved_smoke_row_translates_declared_scale_as_separate_fields(tmp_path: Path) -> None:
@@ -168,7 +229,7 @@ def test_train_translation_named_rejections(tmp_path: Path, row: dict[str, objec
     source = tmp_path / "train.yaml"
     _source_config(source)
     row = {"kind": "train", "config": str(source), **row}
-    with pytest.raises(ActivationRefusal, match="runtime|conflicts"):
+    with pytest.raises(ActivationRefusal, match="declares .*overrides|runtime"):
         attached.build_he_train_plan(
             {"plan_id": "p", "rows": [row]},
             repo_root=tmp_path,

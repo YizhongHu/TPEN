@@ -26,6 +26,7 @@ def _group() -> ReadyGroup:
 
 
 def _inputs(tmp_path: Path, *, evidence: bool = True, allocation_id: str = "alloc", backend_job_id: str = "job") -> dict[str, Path]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     group = _group()
     config = tmp_path / "config.yaml"
     config.write_text("ok", encoding="utf-8")
@@ -50,7 +51,7 @@ def _inputs(tmp_path: Path, *, evidence: bool = True, allocation_id: str = "allo
         if evidence else "pass"
     )
     (package / "run.py").write_text(
-        identity_script.replace("                return 0", f"                {evidence_script}\n                return 0"),
+        identity_script.replace("    return 0", f"    {evidence_script}\n    return 0"),
         encoding="utf-8",
     )
     (package / "inspection.py").write_text(
