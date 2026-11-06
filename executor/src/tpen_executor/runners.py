@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 from pathlib import Path
 from types import MappingProxyType
@@ -10,6 +9,7 @@ from typing import Any, ClassVar, Mapping
 
 from ._codec import canonical_bytes, decode_json
 from .environments import PreparedPythonEnvironment
+from ._records import frozen_record
 from .workers import SubprocessWorker
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
@@ -28,7 +28,7 @@ class EvidenceUnavailable(RuntimeError):
     """Raised when a child cannot provide trustworthy public evidence."""
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class CoreRunEvidence:
     """Strict, immutable executor-owned mirror of core run evidence.
 
@@ -146,7 +146,7 @@ class CoreRunEvidence:
         return MappingProxyType({"code": value["code"], "reason": value["reason"]})
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class TPENCommand:
     """Command specification for the public configured-run entrypoint.
 
@@ -184,7 +184,7 @@ class TPENCommand:
         return ("-c", RUN_SHIM, "--config", self.config, *self.overrides)
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class TPENEvidence:
     """Read public run evidence through a child inspection process.
 

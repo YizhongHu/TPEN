@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
@@ -11,10 +10,11 @@ import signal
 import subprocess
 from typing import Any
 
+from ._records import frozen_record
 from .environments import PreparedPythonEnvironment
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class ProcessOutcome:
     """Immutable outcome of one subprocess invocation.
 
@@ -37,7 +37,7 @@ class ProcessOutcome:
     timed_out: bool
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class SubprocessWorker:
     """Launch one prepared Python child without shell-interpolated arguments.
 

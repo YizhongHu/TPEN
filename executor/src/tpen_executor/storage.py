@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
 import fcntl
 import json
 import os
@@ -19,13 +18,14 @@ from .allocations import ConfiguredAllocation
 from .contracts import AttemptId, ReadyGroup
 from .results import AcceptedSegment, ManifestAttempt, OutcomeReceipt, RunManifest, StartReceipt
 from .runners import CoreRunEvidence
+from ._records import frozen_record
 
 
 class FenceRejected(RuntimeError):
     """Raised when an attempt fence is stale, crossed, or already finished."""
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class AttemptFence:
     """Opaque identity binding for one store-owned attempt.
 
@@ -187,7 +187,7 @@ def _write_new(path: str, payload: bytes) -> None:
                 pass
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class DirectoryStore:
     """The sole durable receipt writer beneath one lexical root.
 
