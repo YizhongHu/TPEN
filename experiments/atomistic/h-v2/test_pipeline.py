@@ -67,3 +67,68 @@ def test_training_state_restore_is_rejected_by_evaluation_config(tmp_path: Path)
     evaluation["load"]["mode"] = "train_resume"
     with pytest.raises(ValueError, match="model-only"):
         protocol.assert_hydrogen_contract(evaluation, evaluation=True)
+
+
+@pytest.mark.h2v2_pipeline
+def test_part_e_contract_scale_training_and_evaluation_energy_criteria(tmp_path: Path) -> None:
+    """Run the h-v2 short learned route at full contract scale (part e).
+
+    Contract (``contract_inputs.json`` ``admission.pipeline_check`` part e):
+    8 channels, 32 hidden, 1000 updates; training sampler 256 walkers,
+    burn-in 100, 10 Metropolis steps/update, proposal scale 0.5 bohr; fresh
+    evaluation 1024 walkers x 64 draws x 2 streams, burn-in 1000, stride 20.
+    Computes the ``0.02`` Ha energy-error criterion and the ``0.25`` median-
+    absolute-error improvement rule, with the little-dynamic-range branch
+    when the untrained (update-zero) model is already within ``0.02`` Ha --
+    in which case the contract requires only the imperfect learned-state/
+    gradient control, which `test_protocol.test_exact_and_imperfect_analytic_controls`
+    (``alpha=1.2``) already provides.
+
+    Excluded from the fast/default suite (``train.yaml``/``eval.yaml`` are
+    used unmodified: two full trainer runs plus four fresh-evaluation
+    streams). Run explicitly with::
+
+        uv run pytest -q -m h2v2_pipeline experiments/atomistic/h-v2/test_pipeline.py
+    """
+
+    def _median_abs_error(checkpoint: Path, run_id: str) -> float:
+        errors: list[float] = []
+        for stream in (0, 1):
+            evaluation = protocol.evaluation_config(checkpoint, stream=stream, root=tmp_path)
+            evaluation["run"]["run_id"] = f"{run_id}-stream{stream}"
+            assert _run_config(evaluation, command=f"h-v2 pipeline part-e {run_id} stream {stream}") == 0
+            eval_dir = tmp_path / "tpen_h_v2" / "atomistic" / f"{run_id}-stream{stream}" / "trajectory"
+            with (eval_dir / "sampled_eval_table.csv").open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            assert rows
+            assert all(row["finite"] == "True" for row in rows)
+            errors.extend(abs(float(row["local_energy"]) + 0.5) for row in rows)
+        errors.sort()
+        midpoint = len(errors) // 2
+        if len(errors) % 2:
+            return errors[midpoint]
+        return (errors[midpoint - 1] + errors[midpoint]) / 2.0
+
+    # Control: the untrained model at update zero, via a terminal max_steps=0 run.
+    initial_train = protocol.training_config()
+    initial_train["run"]["root"] = str(tmp_path)
+    initial_train["run"]["run_id"] = "train-initial"
+    initial_train["trainer"]["max_steps"] = 0
+    assert _run_config(initial_train, command="h-v2 pipeline part-e initial checkpoint") == 0
+    initial_checkpoint = tmp_path / "tpen_h_v2" / "atomistic" / "train-initial" / "checkpoints" / "step_000000"
+    assert (initial_checkpoint / "COMPLETE").is_file()
+
+    # Treatment: the full 1000-update contract-scale training run.
+    trained = protocol.training_config()
+    trained["run"]["root"] = str(tmp_path)
+    trained["run"]["run_id"] = "train-final"
+    assert _run_config(trained, command="h-v2 pipeline part-e full training") == 0
+    final_checkpoint = tmp_path / "tpen_h_v2" / "atomistic" / "train-final" / "checkpoints" / "step_001000"
+    assert (final_checkpoint / "COMPLETE").is_file()
+
+    initial_median_abs_error = _median_abs_error(initial_checkpoint, "eval-initial")
+    final_median_abs_error = _median_abs_error(final_checkpoint, "eval-final")
+
+    assert final_median_abs_error <= 0.02
+    if initial_median_abs_error > 0.02:
+        assert final_median_abs_error <= 0.75 * initial_median_abs_error
