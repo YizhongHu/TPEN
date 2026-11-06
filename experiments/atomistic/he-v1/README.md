@@ -107,3 +107,15 @@ is false still fails.
 one `tpen` symbol `experiments/README.md` permits here. Tests live beside the
 code and run from the directory form, e.g. `python -m pytest -v
 experiments/atomistic/he-v1`.
+
+## Explicit attached TRAIN route
+
+`attached.py` supplies a separate, opt-in He TRAIN route for a bounded
+generation. It writes `executor_input.json` and `configured-runs.json` through
+the shared toolkit handoff, records the source/effective config hashes, checks
+the JSON `tpen.native-recovery/v1` verdict, invokes the installed executor CLI
+with an absolute executor Python, and lets the root reader write the activation
+receipt. The legacy launcher and all evaluation/baseline rows remain
+unchanged. A reduced callback config may only be generated with
+`enable_reduced_callbacks=True`; it is a smoke artifact, not a replacement for
+this production config.
