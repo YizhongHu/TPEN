@@ -244,12 +244,23 @@ def test_wrong_kinetic_prefactor_mutant_breaks_the_canary(tmp_path: Path, monkey
 
     def _wrong_prefactor_local_energy(self, wavefunction, batch):
         result = real_local_energy(self, wavefunction, batch)
-        # Wrong kinetic prefactor: -1.0 instead of the real -0.5.
+        # Wrong kinetic prefactor: -1.0 instead of the real -0.5. Preserve
+        # `wavefunction_output`/`per_electron_kinetic`: the trajectory
+        # generator requires exactly one term to supply the signed-log
+        # output (it differentiates the model once and reuses the byproduct
+        # rather than re-evaluating it), so dropping it here would fail the
+        # generator itself rather than exercising the intended mutation.
         mutated = 2.0 * result.total
-        return LocalEnergyResult(total=mutated, terms={self.name: mutated})
+        return LocalEnergyResult(
+            total=mutated,
+            terms={self.name: mutated},
+            wavefunction_output=result.wavefunction_output,
+            per_electron_kinetic=result.per_electron_kinetic,
+        )
 
     monkeypatch.setattr(KineticEnergy, "local_energy", _wrong_prefactor_local_energy)
     result = _run_canary(tmp_path, alpha=1.0, run_id="mutant-kinetic-prefactor")
+    assert result["status"] == 0
     mean = _read_metric(result["run_dir"], namespace="trajectory", key="local_energy_mean")
     assert mean != pytest.approx(-0.5, abs=1e-6)
     assert abs(mean - (-0.5)) > 0.1
@@ -267,6 +278,7 @@ def test_sign_flipped_potential_mutant_breaks_the_canary(tmp_path: Path, monkeyp
 
     monkeypatch.setattr(ElectronNucleusPotential, "local_energy", _flipped_sign_local_energy)
     result = _run_canary(tmp_path, alpha=1.0, run_id="mutant-potential-sign")
+    assert result["status"] == 0
     mean = _read_metric(result["run_dir"], namespace="trajectory", key="local_energy_mean")
     assert mean != pytest.approx(-0.5, abs=1e-6)
     assert abs(mean - (-0.5)) > 0.1
