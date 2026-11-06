@@ -30,6 +30,33 @@ through the same `load:` block and the real `Evaluate` runner
 (`tpen.checkpoint.restore.restore_checkpoint`). This exercises the real
 model-only restore path honestly; it does not exercise optimizer/trainer/
 sampler/RNG restore, because this module has none of that state to restore.
+
+**Full-record-set bookkeeping.** The streamed trajectory manifest
+(`sampled_eval_table.metadata.json`, written by
+`tpen.evaluation.trajectory_records`) accumulates `mean`/`variance`/
+`row_count`/`finite_count` across every retained draw, not just the final
+one. `TrajectoryMCMCGenerator`'s evaluation batch, by contrast, is
+explicitly "its final retained draw" (see that generator's own docstring),
+so the JSONL `local_energy_mean`/`local_energy_variance` metrics that
+`LocalEnergySummary` publishes from that batch are a final-draw snapshot,
+not a full-grid aggregate -- a real, documented distinction, not a defect.
+Both tests below therefore check the manifest's own aggregates (the
+full-grid quantity) against an independent recomputation from every row in
+`sampled_eval_table.csv`, to tight float64 tolerance, separately from the
+Monte Carlo bands on the JSONL snapshot metric. A summary genuinely
+aggregated on a subset of the records (e.g. one draw instead of all 64)
+would not pass this check even though it can still fall inside the alpha=1.2
+Monte Carlo bands, which are wide enough (serially correlated 1024-walker
+MCMC, not IID) to absorb a single draw's snapshot mean.
+
+**Record-path precision.** `HydrogenExact`'s local energy is the closed
+form `-alpha^2/2 + (alpha-1)/r` exactly at every walker, independent of
+position. At alpha=1.2 the imperfect-state test recomputes this pointwise
+from each record's own recorded position and requires float64-level
+agreement (`rel=1e-10`), which a float32 downcast anywhere in the record
+path (~1e-7 relative error) would fail. The trajectory manifest exposes no
+separate dtype/column-precision field to assert directly; this pointwise
+check is the precision gate.
 """
 
 from __future__ import annotations
@@ -37,6 +64,7 @@ from __future__ import annotations
 import csv
 import importlib.util
 import json
+import math
 import subprocess
 import sys
 from datetime import UTC
@@ -154,6 +182,32 @@ def _read_rows(run_dir: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _read_trajectory_manifest(run_dir: Path) -> dict[str, Any]:
+    """Read the streamed trajectory's own manifest (`_write_metadata` in
+    `tpen.evaluation.trajectory_records`), which the collector also validates.
+
+    Its ``mean``/``variance``/``row_count``/``finite_count`` are accumulated
+    across every draw as the trajectory streams (`ObservableTrajectoryAccumulator`),
+    not just the final-draw snapshot the JSONL `local_energy_mean`/`variance`
+    metrics carry (`TrajectoryMCMCGenerator`'s evaluation batch is explicitly
+    "its final retained draw" -- see that module's docstring), so this is the
+    full-record-set aggregate to check bookkeeping against.
+    """
+
+    path = run_dir / "trajectory" / "sampled_eval_table.metadata.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _full_grid_mean_and_variance(energies: list[float]) -> tuple[float, float]:
+    """Population mean/variance over every record, matching
+    `ObservableTrajectoryAccumulator`'s `total/n` and `total_square/n - mean**2`."""
+
+    n = len(energies)
+    mean = sum(energies) / n
+    variance = sum((value - mean) ** 2 for value in energies) / n
+    return mean, variance
+
+
 def _read_metric(run_dir: Path, *, namespace: str, key: str) -> float:
     lines = (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
     records = [json.loads(line) for line in lines]
@@ -211,13 +265,27 @@ def test_exact_ground_state_every_record_is_minus_half_hartree(tmp_path: Path) -
     assert variance == pytest.approx(0.0, abs=1e-8)
     assert _w_statistic(energies) == pytest.approx(0.0, abs=1e-6)
 
+    # Exact bookkeeping, not a Monte Carlo band: the trajectory manifest's own
+    # mean/variance/row_count/finite_count are accumulated across every draw
+    # as the grid streams, so they must equal an independent recomputation
+    # from the full set of recorded rows to tight float64 tolerance. A
+    # summary aggregated on a subset of the records (e.g. one draw instead of
+    # all 64) would not match this.
+    manifest = _read_trajectory_manifest(result["run_dir"])
+    assert manifest["row_count"] == 1024 * 64
+    assert manifest["finite_count"] == 1024 * 64
+    full_mean, full_variance = _full_grid_mean_and_variance(energies)
+    assert manifest["mean"] == pytest.approx(full_mean, rel=1e-10, abs=1e-12)
+    assert manifest["variance"] == pytest.approx(full_variance, rel=1e-10, abs=1e-12)
+
     receipt = _collect(tmp_path, result)
     assert receipt["status"] == "complete"
     assert receipt["row_count"] == 1024 * 64
 
 
 def test_imperfect_state_matches_closed_form_analytic_controls(tmp_path: Path) -> None:
-    result = _run_canary(tmp_path, alpha=1.2, run_id="exact-alpha-1-2")
+    alpha = 1.2
+    result = _run_canary(tmp_path, alpha=alpha, run_id="exact-alpha-1-2")
     assert result["status"] == 0
     rows = _read_rows(result["run_dir"])
     energies = [float(row["local_energy"]) for row in rows]
@@ -231,6 +299,29 @@ def test_imperfect_state_matches_closed_form_analytic_controls(tmp_path: Path) -
     assert mean == pytest.approx(ALPHA_1_2_MEAN, abs=0.02)
     assert variance == pytest.approx(ALPHA_1_2_VARIANCE, rel=0.15)
     assert _w_statistic(energies) == pytest.approx(ALPHA_1_2_W, rel=0.3)
+
+    # Exact bookkeeping, separate from the Monte Carlo band above: the
+    # summary mean/variance must equal the mean/variance of the recorded
+    # rows, recomputed independently from the full record set.
+    manifest = _read_trajectory_manifest(result["run_dir"])
+    assert manifest["row_count"] == 1024 * 64
+    assert manifest["finite_count"] == 1024 * 64
+    full_mean, full_variance = _full_grid_mean_and_variance(energies)
+    assert manifest["mean"] == pytest.approx(full_mean, rel=1e-10, abs=1e-12)
+    assert manifest["variance"] == pytest.approx(full_variance, rel=1e-10, abs=1e-12)
+
+    # Precision: recompute the oracle local energy pointwise from each
+    # record's own recorded position (`-alpha^2/2 + (alpha-1)/r`) and require
+    # float64-level agreement. `HydrogenExact`'s local energy is this closed
+    # form exactly at every walker, independent of position, so any
+    # deviation beyond float64 rounding -- e.g. a float32 downcast of
+    # `local_energy` anywhere in the record path, which would show up as a
+    # ~1e-7 relative discrepancy -- must fail this check.
+    for row in rows:
+        coordinates = [float(row[f"position/electron_0/axis_{axis}"]) for axis in range(3)]
+        radius = math.sqrt(sum(coordinate**2 for coordinate in coordinates))
+        oracle_energy = -(alpha**2) / 2.0 + (alpha - 1.0) / radius
+        assert float(row["local_energy"]) == pytest.approx(oracle_energy, rel=1e-10, abs=1e-10)
 
     receipt = _collect(tmp_path, result)
     assert receipt["status"] == "complete"
