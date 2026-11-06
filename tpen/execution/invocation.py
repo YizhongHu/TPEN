@@ -892,6 +892,12 @@ def _is_config_path(path: str, prefixes: frozenset[str]) -> bool:
     return any(path == prefix or path.startswith(f"{prefix}.") for prefix in prefixes)
 
 
+def _has_config_path_or_descendant(values: Mapping[str, Any], path: str) -> bool:
+    """Return whether a leaf or an interpolated copied section is present."""
+
+    return path in values or any(key.startswith(f"{path}.") for key in values)
+
+
 def _has_concrete_config_path(config: Mapping[str, Any], path: str) -> bool:
     """Distinguish effective no-load values from concrete INITIAL loads."""
 
@@ -956,7 +962,7 @@ def _materialize_configured_worker_config(
         path
         for path in source_values
         if not _is_config_path(path, _RECOVERY_CONFIG_PATHS)
-        and path not in supplied_values
+        and not _has_config_path_or_descendant(supplied_values, path)
     ]
     if missing_captured:
         raise ReceiptBindingError(
@@ -993,15 +999,16 @@ def _materialize_configured_worker_config(
     # subset), so retain those already-validated opaque leaves in the supplied
     # mapping.  No supplied leaf can replace a captured value, and no target
     # is resolved while making this copy.
-    worker_cfg = OmegaConf.create(supplied)
-    for path, value in source_values.items():
-        if _is_config_path(path, _RECOVERY_CONFIG_PATHS):
-            continue
-        if path in supplied_values:
-            OmegaConf.update(worker_cfg, path, value, merge=False, force_add=True)
+    # Recompose from the captured syntax so overlays are applied before the
+    # source's section and sink interpolations are materialized.  The supplied
+    # config remains the fallback for legacy opaque leaves not in the capture;
+    # source-derived values win when both views provide a path.
+    recomposed = OmegaConf.create(source)
     for path, value in overlays.items():
-        OmegaConf.update(worker_cfg, path, value, merge=False, force_add=True)
-    OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
+        OmegaConf.update(recomposed, path, value, merge=False, force_add=True)
+    OmegaConf.update(recomposed, "run.root", str(output_path), merge=False, force_add=True)
+    OmegaConf.resolve(recomposed)
+    worker_cfg = OmegaConf.merge(OmegaConf.create(supplied), recomposed)
     return worker_cfg
 
 
