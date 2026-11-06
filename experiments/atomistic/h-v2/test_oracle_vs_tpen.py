@@ -41,13 +41,13 @@ from tpen.data.batch import ElectronBatch, Walkers
 HERE = Path(__file__).parent
 
 #: Richardson-extrapolation tolerance for
-#: `test_kinetic_finite_difference_richardson_headroom`. Placeholder pending
-#: the round-3 Cannon measurement; updated to the measured discrepancy with
-#: margin once that job's junit properties are read back (round-1 review
-#: finding 9: measured plain-probe discrepancy was 1.74e-3 at h=1e-3 and
-#: 4.35e-4 at h=5e-4, exact h^2 scaling, so extrapolation should land near
-#: 1e-6).
-RICHARDSON_TOLERANCE = 1e-5
+#: `test_kinetic_finite_difference_richardson_headroom` (round-1 review
+#: finding 9). The un-extrapolated probe's plain discrepancy was 1.74e-3 at
+#: h=1e-3 and 4.35e-4 at h=5e-4 (exact h^2 scaling); Richardson-extrapolating
+#: those same two step sizes measured on Cannon (job 58183718, seeds 1-3):
+#: 2.04e-8, 1.68e-8, 1.12e-7 -- about four orders tighter than the
+#: un-extrapolated 1e-5 probe. Set with headroom over the measured max.
+RICHARDSON_TOLERANCE = 1e-6
 _spec = importlib.util.spec_from_file_location("h_v2_protocol_oracle", HERE / "protocol.py")
 assert _spec is not None and _spec.loader is not None
 protocol = importlib.util.module_from_spec(_spec)
