@@ -142,11 +142,12 @@ def test_a2_named_admission_controls_create_no_store(tmp_path: Path, mutation: s
 
 
 def test_a5_two_fresh_stores_have_pid_start_token_reaping_and_allocation_identity(tmp_path: Path) -> None:
+    pytest.importorskip("parsl", reason="requires the approved executor parsl extra")
     paths = _inputs(tmp_path)
-    first = _cli(paths, tmp_path / "store-1")
-    second = _cli(paths, tmp_path / "store-2")
+    first = _cli(paths, tmp_path / "store-1", "--dispatcher", "parsl")
+    second = _cli(paths, tmp_path / "store-2", "--dispatcher", "parsl")
     changed_paths = _inputs(tmp_path / "changed", allocation_id="alloc-B", backend_job_id="job-B")
-    changed = _cli(changed_paths, tmp_path / "store-3")
+    changed = _cli(changed_paths, tmp_path / "store-3", "--dispatcher", "parsl")
     assert first.returncode == second.returncode == changed.returncode == 0
     left = json.loads(first.stdout)["attempts"][0]["attempt_id"]
     right = json.loads(second.stdout)["attempts"][0]["attempt_id"]
