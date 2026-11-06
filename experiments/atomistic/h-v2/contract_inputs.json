@@ -113,14 +113,16 @@
     "energy_error_profile": "Also report quantiles and exceedance probabilities for abs(E_L + 0.5 Ha) and the signed median energy error.",
     "complete_record_rule": "Every planned draw-by-walker record appears exactly once with finite coordinates and local energy, reconciled source/checkpoint/config/schema identities, and no clipping, filtering, replacement, final-draw shortcut, or pooled partial window.",
     "checkpoint_retention": {
-      "status": "proposed_by_lane_pending_operator_review",
+      "status": "decided",
+      "decided_by": "operator-decisions-logging-module-checkpoints-20261106d, 2026-11-06, quoted '27 makes sense. especially if evaluation is expensive' (confirming the 51-retained/27-evaluated split)",
       "updates": "0 and every 1000 completed optimizer updates through 50000 inclusive",
       "count_per_lineage": 51,
       "payload": "full available resume payload and committed publication identity; retention does not authorize resume, retry, or reselection",
       "historical_basis": "TO:bfb2247e operator-recommendations-accepted-and-horizon-2026-09-04 is evidence for the 1000-update target, not a fresh operator quote"
     },
     "evaluated_checkpoints": {
-      "status": "proposed_by_lane_pending_operator_review",
+      "status": "decided",
+      "decided_by": "operator-decisions-logging-module-checkpoints-20261106d, 2026-11-06, quoted '27 makes sense. especially if evaluation is expensive'",
       "updates": [
         0,
         1000,
@@ -242,6 +244,16 @@
             999008,
             999009
           ]
+        },
+        "sampler_tail_qualification": {
+          "sampler": [
+            920001,
+            920002
+          ],
+          "evaluation": [
+            920003,
+            920004
+          ]
         }
       }
     },
@@ -298,6 +310,14 @@
         "all_fixed_threshold_exceedance_probabilities": 0
       },
       "instrument_requirement": "independent Gamma draws must reproduce W_exact within its own band; bootstrap must exercise the alpha=1 zero-event bound"
+    },
+    "amplitude_risk": {
+      "status": "open",
+      "definition": "the fraction of walkers whose logabs falls below (batch-median logabs minus a threshold), plus the nonfinite-logabs count and the sign count",
+      "naming_rule": "never called a Pfaffian floor or a readout floor unless the pre-floor readout amplitude is itself deliberately measured",
+      "threshold": "open",
+      "blocks": "layer fa3c35a8 (amplitude-risk fraction module and threshold), held for the operator; qualification and science both wait on it",
+      "source": "operator-decisions-logging-module-checkpoints-20261106d: 'still open: the amplitude-risk threshold'"
     }
   },
   "decision_rules": {
@@ -592,6 +612,160 @@
       "required_review": "operator review of all lane_proposals with explicit approval",
       "current_status": "prohibited"
     }
+  },
+  "logging": {
+    "status": "decided",
+    "decided_by": "operator-decisions-logging-and-560-20261106, -storage-cadence-20261106b, -560-logging-20261106c, -logging-module-checkpoints-20261106d, 2026-11-06",
+    "observation_classes": {
+      "training_history": "diagnostic only, drawn from a changing model; never pooled with fresh evaluation",
+      "fresh_evaluation": "the primary evidence surface, a new model-only sampler run from one frozen checkpoint"
+    },
+    "design_rule": "every new measurement is an optional module that a run's configuration adds, following the existing callback/logger pattern (a callback class listed under callbacks: with an every_n_steps cadence, writing through context.log to the configured loggers:); core does not compute or log any of them unconditionally",
+    "design_rule_source": "operator-decisions-logging-module-checkpoints-20261106d: 'remember it is added as a module not a core metric that always gets logged. This is an old, established design.'",
+    "modules": [
+      {"name": "module_parameter_gradient_norm_callback", "layer": "6c29fe1d"},
+      {"name": "optimizer_state_summary_callback", "layer": "5d61a6c9"},
+      {"name": "training_batch_radius_quantile_callback", "layer": "8476456e"},
+      {"name": "raw_training_batch_recorder", "layer": "7f884e4d"},
+      {"name": "initial_checkpoint_callback", "layer": "5cfad8d2"},
+      {"name": "parameter_activity_callback", "layer": "52ead353"},
+      {"name": "readout_trajectory_generator", "layer": "c8fedd84"},
+      {"name": "amplitude_risk_fraction", "layer": "fa3c35a8", "status": "held_for_operator"}
+    ],
+    "cadence": {
+      "scalar_diagnostics": "every completed update",
+      "raw_training_batches": {
+        "every_n_updates": 50,
+        "partition_size_updates": 1000,
+        "format": "numpy_column_bundle_with_json_integrity_sidecar",
+        "cadence_source": "operator-decisions-logging-storage-cadence-20261106b: '50 makes more sense here.'",
+        "out_of_memory_checks": [
+          "bounded-memory test in the training-batch recorder layer (7f884e4d)",
+          "logging-on measurement in the full-card pilot 406194c5"
+        ],
+        "format_source": "operator-decisions-560-logging-20261106c: 'numpy seems to make more sense as long as it does not cause OOM events.'"
+      }
+    },
+    "capture_semantics": {
+      "sample": "pre-update",
+      "row_fields": [
+        "iteration_step",
+        "completed_updates_after",
+        "update_applied"
+      ],
+      "skipped_updates": "recorded, not dropped"
+    },
+    "checkpoints": {
+      "retained_per_lineage": 51,
+      "evaluated_per_lineage": 27,
+      "status": "decided"
+    },
+    "storage_lifecycle": {
+      "working_location": "Cannon netscratch, not scratch",
+      "purge_window_days": 90,
+      "holystore_set": "chosen retroactively after the analysis; about 26 to 28 GiB is acceptable for now",
+      "lifecycle_source": "operator-decisions-logging-storage-cadence-20261106b: \"'leading up to the conclusion' is usually retroactive after all the analysis is done. 26G is acceptable for now. netscratch; not scratch.\"",
+      "procedures": ["archive-experiment skill", "backup-experiment-cannon skill"],
+      "related_items": ["10d766be", "6bb4f4ea", "8433b0be", "b0ff32b6", "c3c8a012"],
+      "removal_rule": "nothing on netscratch is removed without a Task Orchestrator lifecycle disposition naming the exact paths and a passed recovery verification of the archive"
+    },
+    "storage_figures": {
+      "scale": {"lineages": 3, "training_walkers": 4096},
+      "fresh_evaluation": {
+        "formula": "3 lineages x 27 evaluated checkpoints x 4 streams x 4096 walkers x 256 draws",
+        "rows": 339738624,
+        "compact_gib": 28.1
+      },
+      "raw_training_batches": {
+        "formula": "3 lineages x 1000 retained batches x 4096 walkers",
+        "rows": 12288000,
+        "compact_gib": 0.93
+      },
+      "compression_ratio": "unmeasured; a pilot block must measure it before a Holystore budget promises it"
+    }
+  },
+  "tail_characterization": {
+    "status": "decided",
+    "decided_by": "lane scientific call responding to operator-decisions-560-logging-20261106c: \"only a few percentile values may not be enough was my point about logging\"",
+    "science_measurement": {
+      "primary_evidence": "the full positive and negative survival and exceedance curves computed from the retained raw rows, on the same level grid as sampler_tail_qualification down to its supported depth",
+      "never_substitutes": "no reported percentile, W, variance, MAD, IQR, or fitted tail index replaces the raw rows"
+    },
+    "sampler_tail_qualification": {
+      "layer": "028867dc (H-v2: qualify the sampler over full radial and local-energy survival curves)",
+      "targets": {
+        "alpha_1": {
+          "description": "exact state alpha=1",
+          "radius_distribution": "Gamma(shape=3, rate=2)",
+          "local_energy_hartree": -0.5
+        },
+        "alpha_1_2": {
+          "description": "imperfect state alpha=1.2 sampled from its own |psi|^2",
+          "radius_distribution": "Gamma(shape=3, rate=2.4)",
+          "local_energy_hartree": "-0.72 + 0.2/r",
+          "tail_origin": "the large positive local-energy tail comes from the inner radial tail (small r), not the outer radial tail"
+        }
+      },
+      "superseded_stub": "the prior stub check compared the CDF only up to r=3 (about the 94th percentile of the outer radius) and never examined the inner tail that drives W",
+      "radial_levels": [0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001],
+      "radial_sides": ["lower_tail_cdf", "upper_tail_survival"],
+      "radial_applies_to": ["alpha_1", "alpha_1_2"],
+      "median_reported_not_gated": true,
+      "alpha_1_2_only": {
+        "fixed_exceedance_thresholds_hartree": [0.01, 0.05, 0.1, 0.5, 1],
+        "exceedance_levels": [0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001],
+        "w_level": 0.001
+      },
+      "support_rule": {
+        "minimum_expected_count_per_stream": 100,
+        "fresh_evaluation_rows_per_stream": 1048576,
+        "fresh_evaluation_rows_per_stream_formula": "4096 walkers x 256 retained draws",
+        "deepest_gated_level": 0.0001,
+        "deepest_gated_level_expected_count": 105,
+        "note": "deeper levels are reported, never gated"
+      },
+      "band": {
+        "statistic": "z = (log(S_hat) - log(S_exact)) / se",
+        "se_method": "whole-walker bootstrap standard error of log(S_hat), at least 2000 resamples",
+        "zero_count_rule": "a zero count at a gated level fails",
+        "family_wise_false_fail_rate": 0.001,
+        "k_definition": "the number of gated comparisons implied by radial_levels x radial_sides x 2 alphas, plus alpha_1_2_only.fixed_exceedance_thresholds_hartree, plus alpha_1_2_only.exceedance_levels",
+        "k_value": 61,
+        "c_formula": "inverse_normal_cdf(1 - family_wise_false_fail_rate / (2*K))",
+        "c_value": 4.309080861982394,
+        "pass_rule": "qualification passes only if max(|z|) over every gated comparison in both streams is at most c"
+      },
+      "shape_and_seeds": {
+        "fresh_evaluation_sampler": {"burn_in": 1000, "stride": 20, "walkers": 4096, "draws_per_stream": 256, "streams": 2},
+        "seed_namespace": "sampler_tail_qualification"
+      }
+    }
+  },
+  "pr_560_incorporation": {
+    "status": "decided",
+    "decided_by": "operator-decisions-560-logging-20261106c: 'the others look good to incorporate'",
+    "preserved_tip": "0da2b23d628a15b18ac2031ff5f72dff0c010280",
+    "findings": [
+      {"finding": 1, "description": "tail-calibrated sampler bands", "layer": "028867dc"},
+      {"finding": 2, "description": "science-collector integrity checks carried from analysis.py", "layer": "372ef393"},
+      {"finding": 3, "description": "InitialCheckpoint callback for the update-zero checkpoint", "layer": "5cfad8d2"},
+      {"finding": 4, "description": "ParameterActivity callback recording first-update gradient state", "layer": "52ead353"},
+      {"finding": 5, "description": "ReadoutTrajectoryMCMCGenerator for the pre-floor readout channel sum", "layer": "c8fedd84"},
+      {"finding": 6, "description": "stricter trajectory-record metadata validation", "layer": "bef1fe2c"},
+      {"finding": 7, "description": "moment-band calibration of the imperfect state and the CUDA exact canary", "layer": "f5068c1a"}
+    ],
+    "hooke_only_handed_to_manager": [
+      "nucleus-free trajectory_records v2 and allow_nucleus_free_records",
+      "OneElectronGaussian",
+      "Hooke one-electron facts (omega 0.5, E 0.75, imperfect alpha 0.6 formulas)",
+      "GaussianConfinement.scalar_diagnostics"
+    ]
+  },
+  "experiment_boundary": {
+    "status": "decided",
+    "rule": "experiments reach core only through configuration, tpen.run.run_from_config, or the installed tpen command; an integration test that needs core internals for fixtures or mutation hooks lives in the core tests/ tree",
+    "rule_source": "root note operator-decisions-20261106-imports-mirflow-readonly, rows 1 and 2",
+    "run_module_trap": "python -m tpen.run exits 0 and does nothing: tpen/run.py has no if __name__ == '__main__' guard, and operator policy 2026-11-06 will not add one; use the installed tpen entrypoint or call tpen.run.run_from_config/tpen.run.main explicitly"
   },
   "controls": [
     "exact hydrogen energy -1/2 Ha",
