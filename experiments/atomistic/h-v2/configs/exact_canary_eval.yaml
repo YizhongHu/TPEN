@@ -1,0 +1,156 @@
+# =============================================================================
+# H-v2 exact-hydrogen evaluation canary
+# =============================================================================
+#
+# Pushes the fixed exact one-electron hydrogen wavefunction
+# (`tpen.physics.hydrogen.HydrogenExact`) through the real evaluation route:
+# `tpen.run.run_from_config` -> the real `Evaluate` runner -> model-only
+# checkpoint restore -> `TrajectoryMCMCGenerator` -> `LocalEnergyCalculator` /
+# `WavefunctionCalculator` -> `SampledRecordWriter` / `LocalEnergySummary` ->
+# the H-v2 collector (`collect.py`).
+#
+# `model.alpha` selects the control: 1.0 is the exact ground state (every
+# local energy equals -0.5 Ha exactly); 1.2 is the known-imperfect control
+# (mean -0.48 Ha, variance 0.0576 Ha^2, per `contract_inputs.json`
+# `analytic_controls`). The colocated test overrides `model.alpha` and
+# `load.path` per run; see `test_hydrogen_exact_canary.py`.
+#
+# `load.path` is a placeholder here (`???`): the canary carries no trainable
+# state, so there is nothing a *training* checkpoint would add, but the real
+# collector (`collect.py`) requires a reconciled restored-checkpoint identity.
+# The test builds a genuine model-only checkpoint of this exact, parameterless
+# module directly with `tpen.checkpoint.save.save_checkpoint` -- the same
+# function and directory format a learned run produces -- and restores it
+# through this same `load:` block and the real `Evaluate` runner. See the
+# H-v2 README for why this route, not a Train-runner checkpoint, is honest
+# here.
+# =============================================================================
+
+experiment:
+  name: tpen_h_v2_exact_canary
+  sector: atomistic
+  run_name: tpen_h_v2_exact_canary_eval
+
+run:
+  root: experiments/atomistic/h-v2/outputs
+  run_id: h-v2-exact-canary-eval
+  dir: null
+  timezone: UTC
+
+runtime:
+  seed: 910003
+  device: cpu
+  dtype: float64
+
+system:
+  id: atomic_hydrogen
+  n_particles: 1
+  spatial_dim: 3
+  spin:
+    n_up: 1
+    n_down: 0
+  nuclei:
+    positions: [[0.0, 0.0, 0.0]]
+    charges: [1.0]
+  reference_energy: -0.5
+
+atoms:
+  _target_: tpen.data.atomic_configuration.AtomicConfiguration
+  positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+
+load:
+  path: ???
+  mode: model_only
+  strict: true
+  allow_protocol_mismatch: false
+
+runner:
+  _target_: tpen.runner.Evaluate
+  model: ${model}
+  load: ${load}
+  evaluator: ${evaluator}
+
+model:
+  _target_: tpen.physics.hydrogen.HydrogenExact
+  atoms: ${atoms}
+  alpha: 1.0
+
+hamiltonian_terms:
+  kinetic:
+    _target_: tpen.physics.kinetic.KineticEnergy
+  electron_nucleus:
+    _target_: tpen.physics.potential.ElectronNucleusPotential
+    atoms: ${atoms}
+    eps: 0.0
+
+sampler:
+  _target_: tpen.sampling.metropolis.MetropolisSampler
+  n_walkers: 1024
+  burn_in: 1000
+  n_steps: 20
+  proposal_scale: 0.5
+  seed: ${runtime.seed}
+  n_electrons: ${system.n_particles}
+  spatial_dim: ${system.spatial_dim}
+  n_up: ${system.spin.n_up}
+  n_down: ${system.spin.n_down}
+  nuclear_positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  nuclear_charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+  dtype: ${runtime.dtype}
+
+evaluator:
+  _target_: tpen.evaluation.Evaluator
+  namespace: eval
+  seed: ${runtime.seed}
+  artifact_level: records
+  task_failure_policy: fail_fast
+  tasks:
+    - name: trajectory
+      namespace: trajectory
+      output_dir: ${run.dir}/trajectory
+      generator:
+        _target_: tpen.evaluation.generators.TrajectoryMCMCGenerator
+        sampler: ${sampler}
+        hamiltonian_terms: ${hamiltonian_terms}
+        n_draws: 64
+        discard_draws: 0
+        seed: ${runtime.seed}
+        reset: true
+        verify_model_unchanged: true
+        chunk_size: 4096
+      calculators:
+        - _target_: tpen.evaluation.LocalEnergyCalculator
+          hamiltonian_terms: ${hamiltonian_terms}
+          return_terms: true
+        - _target_: tpen.evaluation.WavefunctionCalculator
+      summaries:
+        - _target_: tpen.evaluation.SampledRecordWriter
+          max_samples: 65536
+          include_term_energies: true
+        - _target_: tpen.evaluation.SamplerStatsSummary
+        - _target_: tpen.evaluation.LocalEnergySummary
+        - _target_: tpen.evaluation.ReferenceEnergySummary
+          reference_energy: ${system.reference_energy}
+
+callbacks:
+  - _target_: tpen.callback.ConfigSnapshot
+    output_path: ${run.dir}/config.yaml
+  - _target_: tpen.callback.ResolvedConfigSnapshot
+    output_path: ${run.dir}/resolved_config.yaml
+  - _target_: tpen.callback.Metadata
+    output_path: ${run.dir}/metadata.json
+  - _target_: tpen.callback.Status
+    output_path: ${run.dir}/status.json
+
+loggers:
+  - _target_: tpen.logging.JSONL
+    path: ${run.dir}/metrics.jsonl
