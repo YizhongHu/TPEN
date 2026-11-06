@@ -13,7 +13,25 @@ from ._records import frozen_record
 from .workers import SubprocessWorker
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
-RUN_SHIM = "import sys; from tpen.run import main; raise SystemExit(main(sys.argv[1:]))"
+RUN_SHIM = (
+    "import json, os, socket, sys\n"
+    "from pathlib import Path\n"
+    "run_roots = [arg.split('=', 1)[1] for arg in sys.argv[1:] if arg.startswith('run.root=')]\n"
+    "if run_roots:\n"
+    "    observation = {\n"
+    "        'schema': 'tpen-executor/child-observation-v1',\n"
+    "        'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),\n"
+    "        'environment': dict(os.environ),\n"
+    "        'thread_settings': {name: os.environ.get(name) for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS')},\n"
+    "        'hostname': socket.gethostname(),\n"
+    "        'pid': os.getpid(),\n"
+    "    }\n"
+    "    Path(run_roots[-1], 'executor-child-observation.json').write_text(\n"
+    "        json.dumps(observation, sort_keys=True) + '\\n', encoding='utf-8'\n"
+    "    )\n"
+    "from tpen.run import main\n"
+    "raise SystemExit(main(sys.argv[1:]))"
+)
 REFUSAL_CODES = frozenset(
     {
         "missing-run-dir", "missing-status", "multiple-status", "malformed-status",
