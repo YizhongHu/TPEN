@@ -30,6 +30,7 @@ from experiments.toolkit.attached_activation import (
     file_sha256,
     retire_attached_generation,
     run_executor_cli,
+    validate_child_context_observation,
     write_activation_failure_receipt,
     write_activation_receipt,
     write_attached_handoff,
@@ -656,6 +657,19 @@ def activate_he_train(
             manifest_path=manifest_path,
         )
         raise ActivationRefusal("executor-failed", f"executor CLI returned {dispatch.returncode}")
+    try:
+        if allocation_context is not None:
+            validate_child_context_observation(allocation_for_dispatch, dispatch.manifest)
+    except ActivationRefusal as error:
+        write_activation_failure_receipt(
+            receipt_path,
+            code=error.code,
+            reason=error.reason,
+            expected_task_ids=expected,
+            profile=profile.profile,
+            manifest_path=manifest_path,
+        )
+        raise
     try:
         write_activation_receipt(
             manifest_path,

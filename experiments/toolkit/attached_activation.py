@@ -824,6 +824,93 @@ def run_executor_cli(
     return ExecutorDispatchResult(result.returncode, manifest, result.stdout, result.stderr)
 
 
+def validate_child_context_observation(
+    allocation_path: str | Path,
+    manifest: Mapping[str, Any],
+) -> None:
+    """Compare child-owned context observations with the validated binding.
+
+    Parameters
+    ----------
+    allocation_path : str or pathlib.Path
+        Bound allocation record containing the attached context snapshot.
+    manifest : mapping
+        Published executor manifest containing the completed attempt outputs.
+
+    Returns
+    -------
+    None
+        The function returns only when every child reports the validated
+        visibility and explicit context-environment values.
+
+    Raises
+    ------
+    ActivationRefusal
+        If the bound snapshot, child identity evidence, or observed values
+        cannot be trusted.  The named refusal preserves the completed child
+        evidence while preventing a success activation receipt.
+
+    The identity file is child-owned evidence written after any supported
+    ``SourceScript`` setup.  Therefore this comparison is intentionally made
+    after executor dispatch and before the root reader can publish success.
+    """
+
+    try:
+        allocation = _strict_json(Path(allocation_path).read_text(encoding="utf-8"), "allocation")
+        facts = allocation.get("facts")
+        snapshot = facts.get("attached_context") if isinstance(facts, Mapping) else None
+        context = snapshot.get("context") if isinstance(snapshot, Mapping) else None
+        if not isinstance(context, Mapping):
+            raise ValueError("bound allocation has no attached context snapshot")
+        visibility_variable = context.get("visibility_variable")
+        visibility_values = context.get("visibility_values")
+        environment = context.get("environment")
+        if (
+            type(visibility_variable) is not str
+            or not visibility_variable
+            or not isinstance(visibility_values, list)
+            or not isinstance(environment, Mapping)
+            or any(type(key) is not str or type(value) is not str for key, value in environment.items())
+        ):
+            raise ValueError("attached context snapshot has an invalid environment shape")
+        expected = dict(environment)
+        if visibility_values:
+            if any(type(value) is not str or not value for value in visibility_values):
+                raise ValueError("attached context snapshot has invalid visibility values")
+            expected[visibility_variable] = ",".join(visibility_values)
+
+        attempts = manifest.get("attempts")
+        if not isinstance(attempts, list) or not attempts:
+            raise ValueError("executor manifest has no attempts to observe")
+        for attempt in attempts:
+            output_dir = attempt.get("output_dir") if isinstance(attempt, Mapping) else None
+            if type(output_dir) is not str or not output_dir:
+                raise ValueError("executor manifest attempt has no output directory")
+            identity = _strict_json(
+                (Path(output_dir) / "core" / "identity.json").read_text(encoding="utf-8"),
+                "child identity",
+            )
+            observed = identity.get("environment")
+            if not isinstance(observed, Mapping) or any(
+                type(key) is not str or type(value) is not str for key, value in observed.items()
+            ):
+                raise ValueError("child identity has no string-valued environment")
+            mismatches = {
+                key: {"expected": value, "observed": observed.get(key)}
+                for key, value in expected.items()
+                if observed.get(key) != value
+            }
+            if mismatches:
+                raise ActivationRefusal(
+                    "child-context-mismatch",
+                    f"child context differs from validated allocation: {mismatches}",
+                )
+    except ActivationRefusal:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise ActivationRefusal("child-context-observation", str(error)) from error
+
+
 def write_activation_receipt(
     manifest_path: str | Path,
     receipt_path: str | Path,
@@ -992,6 +1079,7 @@ __all__ = [
     "file_sha256",
     "parse_profile_verdict",
     "run_executor_cli",
+    "validate_child_context_observation",
     "retire_attached_generation",
     "write_activation_receipt",
     "write_activation_failure_receipt",
