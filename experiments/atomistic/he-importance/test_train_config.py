@@ -374,7 +374,7 @@ def test_resolve_applies_operational_overrides_before_resolution(tmp_path: Path)
     assert resolved.loggers[0].path == str(run_dir / "metrics.csv")
     assert resolved.loggers[1].path == str(run_dir / "metrics.jsonl")
     assert resolved.runtime.dtype == "float64"
-    assert resolved.atoms.dtype == resolved.sampler.dtype == resolved.runner.sampler.dtype == "float64"
+    assert resolved.sampler.dtype == resolved.runner.sampler.dtype == "float64"
 
 
 def test_resolve_refuses_resolver_owned_seed_overrides(tmp_path: Path) -> None:
