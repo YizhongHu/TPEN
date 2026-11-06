@@ -362,7 +362,7 @@ def test_resolve_applies_operational_overrides_before_resolution(tmp_path: Path)
     assert resolved.runner.trainer.max_steps == 7
     assert resolved.run.root == str(root)
     assert resolved.run.dir == str(run_dir)
-    assert resolved.checkpoint.output_dir == str(run_dir / "checkpoints")
+    assert resolved.callbacks[9].output_dir == str(run_dir / "checkpoints")
     assert resolved.loggers[0].path == str(run_dir / "metrics.csv")
     assert resolved.loggers[1].path == str(run_dir / "metrics.jsonl")
     assert resolved.callbacks[-2].output_dir == str(run_dir / "checkpoints")

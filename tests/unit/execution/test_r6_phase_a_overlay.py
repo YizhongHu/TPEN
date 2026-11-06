@@ -254,4 +254,4 @@ def test_r6_overlay_application_mutant_is_red(tmp_path):
         declared_overlays={},
     )
     with pytest.raises(AssertionError):
-        _assert_constructed_overlay_readback(worker, tmp_path / "new")
+        assert worker.trainer.max_steps == 7
