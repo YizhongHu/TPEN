@@ -237,6 +237,9 @@
     "operator_alternative": "retain absolute 0.002 only at 0.1, 0.5 and 1 Ha and use a relative margin at 0.01 and 0.05 Ha",
     "zero_event_bound": "one-sided 97.5% Clopper-Pearson upper bound on walker-level any-exceedance indicator"
   },
+  "decision_rules.recurrence": "Complete records and qualified uncertainty exist. Streams 0/1 select the smallest-mean-W consecutive triple centered at 3000..19000 (earliest tie); streams 2/3 re-measure early, basin and late W, and each confirmation stream independently must show early W exceeds basin W by >=2x and >=0.01 Ha, with at least two of 40000/45000/50000 exceeding it by both margins with simultaneous confidence bounds. At least 2 of 3 lineages pass. If two lineages pass and the third is incomplete, the study-level label is unresolved; report recurrence in the two complete lineages only. Tail exceedance safeguards must not contradict the W result.",
+  "decision_rules.bounded_null": "All 3 lineages are complete and pass instrument/sampling gates; simultaneous inference over every predeclared basin, checkpoint, threshold, and window search excludes the W decrease/rise rule. For every reference checkpoint k in bounded_null_reference_updates, the simultaneous band excludes W at bounded_null_late_count or more late checkpoints reaching max(2 W(k), W(k) + 0.01 Ha). Fixed-threshold exceedance bands use all four streams and the pilot gate; they also exclude an absolute late increase of 0.002 at every threshold. A flat MAD or nonsignificance alone is not equivalence.",
+  "decision_rules.unresolved": "Any required record, identity, instrument, dependence/uncertainty qualification, tail safeguard, operator decision, or horizon is absent or inconclusive; a partial lineage result, conflicting streams, unsupported margins, or a tail-only change outside the declared instrument is unresolved.",
   "lane_proposals": [
     {
       "id": "helium_reference_model_and_primary_statistic",

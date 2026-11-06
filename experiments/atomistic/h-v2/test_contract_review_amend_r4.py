@@ -37,12 +37,14 @@ only at the exact keyword-matched leaf. Paths left out, and why:
   ``test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct``,
   ``test_sampler_tail_qualification_seed_namespace_is_disjoint``, and
   ``test_training_and_fresh_evaluation_sampler_settings_are_exact``.
-- ``decision_rules.{recurrence,bounded_null,unresolved}``: prose decision
-  text, no keyword match in the key names; already pinned by
-  ``test_primary_statistic_drives_rules_and_mad_is_secondary`` (W-vs-MAD
-  invariant) and ``test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct``
-  (categories list).
 - ``controls``: a general control list, no keyword match.
+
+``decision_rules.{recurrence,bounded_null,unresolved}`` have no keyword match
+either, but the Cannon leaf sweep below found ``decision_rules.unresolved``
+had zero test coverage (``recurrence``/``bounded_null`` only had the partial
+substring checks in ``test_primary_statistic_drives_rules_and_mad_is_secondary``).
+All three are declared here with exact-string equality rather than justified
+away, closing that leftover instead of documenting it.
 """
 
 import json
@@ -64,6 +66,9 @@ DECLARED_PATHS = [
     "measurement.amplitude_risk",
     "decision_rules.categories",
     "decision_rules.parameters",
+    "decision_rules.recurrence",
+    "decision_rules.bounded_null",
+    "decision_rules.unresolved",
     "lane_proposals",
     "admission",
     "logging",
