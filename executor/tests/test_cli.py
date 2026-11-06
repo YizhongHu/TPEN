@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import textwrap
 
 import pytest
 
+from tpen_executor import composition
 from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
@@ -199,3 +201,72 @@ def test_a7_existing_and_symlink_stores_refuse_without_reuse(tmp_path: Path) -> 
     paths["store"] = symlink
     third = _run_cli(paths)
     assert third.returncode == 2
+
+
+def test_f1_wrong_worker_environment_refuses_before_store_reservation(tmp_path: Path) -> None:
+    """A malformed prepared-environment slot is an admission refusal."""
+    paths = _inputs(tmp_path)
+    worker = Path(paths["worker"])
+    worker.write_text(
+        worker.read_text(encoding="utf-8").replace(
+            "tpen_executor.environments.PreparedPythonEnvironment",
+            "tpen_executor.programs.DummyWorker",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(composition.CLIRefusal, match="PreparedPythonEnvironment"):
+        composition.admit(paths["input"], paths["store"], paths["allocation"], worker, paths["runs"])
+    assert not Path(paths["store"]).exists()
+
+
+def test_f1_interpolated_store_refuses_before_store_reservation(tmp_path: Path) -> None:
+    """A literal unresolved store interpolation is rejected before mkdir."""
+    paths = _inputs(tmp_path)
+    store = tmp_path / "${unresolved}"
+    with pytest.raises(composition.CLIRefusal, match="interpolation"):
+        composition.admit(paths["input"], store, paths["allocation"], paths["worker"], paths["runs"])
+    assert not store.exists()
+
+
+def test_f2_failed_manifest_write_never_exposes_final_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A write fault leaves no partial bytes at the published manifest name."""
+    target = tmp_path / "run-manifest.json"
+    real_fdopen = os.fdopen
+
+    class FaultWriter:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def write(self, payload):
+            self.stream.write(payload[:1])
+            self.stream.flush()
+            raise OSError("committed control write failure")
+
+    monkeypatch.setattr(os, "fdopen", lambda fd, mode: FaultWriter(real_fdopen(fd, mode)))
+    with pytest.raises(OSError, match="committed control"):
+        composition._publish_new(target, b'{"complete":true}\n')
+    assert not target.exists()
+
+
+def test_f8_deep_known_program_field_is_typed_admission_refusal(tmp_path: Path) -> None:
+    """Known program payload depth cannot escape record admission as recursion."""
+    paths = _inputs(tmp_path)
+    raw = Path(paths["input"]).read_text(encoding="utf-8")
+    nested = "[" * 1500 + "0" + "]" * 1500
+    old_digest = hashlib.sha256(b"{}").hexdigest()
+    new_digest = hashlib.sha256(nested.encode()).hexdigest()
+    raw = raw.replace('"config_ref":{}', '"config_ref":' + nested, 1)
+    raw = raw.replace('"content_digest":"' + old_digest + '"', '"content_digest":"' + new_digest + '"', 1)
+    Path(paths["input"]).write_text(raw, encoding="utf-8")
+    with pytest.raises(composition.CLIRefusal) as refused:
+        composition.admit(paths["input"], paths["store"], paths["allocation"], paths["worker"], paths["runs"])
+    assert refused.value.code in {"invalid-json", "invalid-ready-group", "admission-depth"}
+    assert not Path(paths["store"]).exists()

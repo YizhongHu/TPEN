@@ -50,6 +50,7 @@ stub.mkdir(parents=True)
 import json
 import sys
 from pathlib import Path
+import tpen
 def main(argv):
     config = Path(argv[argv.index('--config') + 1])
     values = dict(item.split('=', 1) for item in argv if '=' in item)
@@ -57,6 +58,7 @@ def main(argv):
     if config.read_text() == 'fail':
         return 9
     run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / 'selected-tpen-module.txt').write_text(str(Path(tpen.__file__).resolve()))
     (run_dir / 'evidence.json').write_text(json.dumps({'schema':'tpen.run-evidence/v1','run_dir':str(run_dir),'verdict':'completed','run_status':'completed','checkpoint':{'checkpoint_dir':str(run_dir / 'checkpoint'),'schema_version':1,'next_iteration':1,'completed_updates':1},'refusal':None}))
     return 0
 """)
@@ -69,7 +71,7 @@ worker = f"""worker:
     _recursive_: false
     python: {json.dumps(os.environ["P9C_ROOT_PYTHON"])}
     env:
-      PYTHONPATH: {json.dumps(str(stub.parent.parent.resolve()))}
+      PYTHONPATH: {json.dumps(str(stub.parent.resolve()))}
   process:
     _target_: tpen_executor.workers.SubprocessWorker
     _recursive_: false
@@ -97,7 +99,18 @@ manifest_path = Path(sys.argv[1])
 def inspect_run(path):
     return json.loads(Path(path, "evidence.json").read_text())
 result = read(manifest_path, inspect_run=inspect_run)
-payload = {"chains": len(result.chains), "preserved": len(result.preserved)}
+expected_stub_module = manifest_path.parent.parent / "stub/tpen/run.py"
+selected_module = Path(result.chains[0].segments[0].checkpoint_dir).parent / "selected-tpen-module.txt"
+payload = {
+    "chains": len(result.chains),
+    "coordinates": [[segment.next_iteration, segment.completed_updates] for segment in result.chains[0].segments],
+    "preserved_attempts": [
+        {"task_id": attempt.task_id, "outcome": attempt.outcome, "reason": attempt.reason}
+        for attempt in result.preserved_attempts
+    ],
+    "stub_module_path": selected_module.read_text(),
+    "expected_stub_module_path": str(expected_stub_module.resolve()),
+}
 tampered = manifest_path.with_name("tampered-manifest.json")
 document = json.loads(manifest_path.read_text())
 document["segments"][0]["checkpoint_dir"] = "tampered-checkpoint"
@@ -144,5 +157,9 @@ def test_a8_root_producer_executor_cli_and_root_reader_are_separate(tmp_path: Pa
     assert reader.returncode == 0, reader.stderr
     observed = json.loads(reader.stdout)
     assert observed["chains"] == 1
-    assert observed["preserved"] == 1
+    assert observed["coordinates"] == [[1, 1]]
+    assert len(observed["preserved_attempts"]) == 1
+    assert observed["preserved_attempts"][0]["outcome"] == "failed"
+    assert observed["preserved_attempts"][0]["reason"] == "failed-or-incomplete"
+    assert observed["stub_module_path"] == observed["expected_stub_module_path"]
     assert observed["tamper_refused"] == "core-evidence-mismatch"
