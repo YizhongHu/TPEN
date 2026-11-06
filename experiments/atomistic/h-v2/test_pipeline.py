@@ -84,9 +84,13 @@ def test_part_e_contract_scale_training_and_evaluation_energy_criteria(tmp_path:
     gradient control, which `test_protocol.test_exact_and_imperfect_analytic_controls`
     (``alpha=1.2``) already provides.
 
-    Excluded from the fast/default suite (``train.yaml``/``eval.yaml`` are
-    used unmodified: two full trainer runs plus four fresh-evaluation
-    streams). Run explicitly with::
+    Marked ``h2v2_pipeline`` for selection, not exclusion: this repo's pytest
+    markers (see also ``integration``) are categorical only -- nothing here
+    filters them out of the standard ``pytest -q experiments/atomistic/h-v2
+    experiments/atomistic/he-v1`` invocation, and this test does run as part
+    of it (measured on Cannon: ~5-6 extra minutes on top of the rest of the
+    suite, well inside the contract's 2h/4-core CPU budget). Use the marker to
+    run ONLY this test in isolation::
 
         uv run pytest -q -m h2v2_pipeline experiments/atomistic/h-v2/test_pipeline.py
     """

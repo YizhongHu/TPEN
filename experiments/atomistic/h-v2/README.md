@@ -30,13 +30,19 @@ are refusals; no clipped or final-draw statistic is produced.
 sampler accept-ratio code against independently-coded references (central
 finite differences, a raw ``-Z/r`` formula, and an independent rederivation
 of the |psi|^2 accept exponent) computed in that module, not against
-``tpen.physics`` or a grep. Part (e)'s ``0.02`` Ha and ``0.25`` improvement
+``tpen.physics`` or a grep. Measured on Cannon (job 58147449, head
+``a74bc22c``): a kinetic-prefactor mutant and a sign-flipped nuclear
+potential, both previously uncaught, are now KILLED by these checks; a
+sampler |psi|-vs-|psi|^2 mutant is KILLED by both the new behavioral check
+and the pre-existing grep. Part (e)'s ``0.02`` Ha and ``0.25`` improvement
 criteria are evaluated at contract scale by
 ``test_pipeline.test_part_e_contract_scale_training_and_evaluation_energy_criteria``,
-gated behind the ``h2v2_pipeline`` marker (run with
-``uv run pytest -q -m h2v2_pipeline experiments/atomistic/h-v2/test_pipeline.py``)
-since it runs two full 1000-update trainer passes and four fresh-evaluation
-streams at contract scale.
+marked ``h2v2_pipeline``. That marker is for selecting the test in isolation
+(``uv run pytest -q -m h2v2_pipeline experiments/atomistic/h-v2/test_pipeline.py``),
+not for excluding it: this repo's markers do not filter the standard
+``pytest -q experiments/atomistic/h-v2 experiments/atomistic/he-v1`` run, so
+part (e) already runs as part of it (measured: ~5-6 extra minutes on top of
+the rest of the suite, inside the contract's 2h/4-core CPU budget).
 
 **Known gap, not closed by this slice.** A closed-form-oracle comparison --
 pinning a Hydra-constructed ``TPENWaveFunction`` to the exact
