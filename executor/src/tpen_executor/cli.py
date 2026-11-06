@@ -53,7 +53,25 @@ def _operational_exit(manifest) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the executor CLI and return its documented process exit code."""
+    """Run the executor CLI and return its documented process exit code.
+
+    Parameters
+    ----------
+    argv : sequence of str or None, optional
+        Arguments after the executable name. ``None`` reads ``sys.argv``.
+
+    Returns
+    -------
+    int
+        ``0`` for completed operational dispatch, ``2`` for admission or
+        usage refusal, ``3`` for an operationally incomplete dispatch, ``4``
+        for an unexpected dispatch error, and ``130`` for cancellation.
+
+    Raises
+    ------
+    CLIRefusal
+        Converted to the typed stderr envelope and exit code ``2``.
+    """
 
     parser = build_parser()
     try:

@@ -9,18 +9,17 @@ from pathlib import Path
 import stat
 from typing import Any
 
-from omegaconf import DictConfig, OmegaConf
-
 from ._codec import decode_json
 from .allocations import ConfiguredAllocation
 from .configuration import StagedHydra
 from .contracts import ReadyGroup
 from .dispatch import LocalDispatcher, ParslDispatcher, ParslUnavailableError
+from .environments import PreparedPythonEnvironment
 from .lifecycle import AttachedAllocation
 from .placement import BindingError, binding_from_allocation
 from .programs import WorkerProgram
 from .results import RunManifest
-from .storage import DirectoryStore
+from .storage import DirectoryStore, _write_new
 from .tasks import ConfiguredRunTable
 from ._records import frozen_record
 
@@ -76,7 +75,7 @@ def _decode(path: Path, name: str) -> Mapping[str, Any]:
         return decode_json(_read_regular(path, name))
     except CLIRefusal:
         raise
-    except (TypeError, ValueError, UnicodeError) as error:
+    except (RecursionError, TypeError, ValueError, UnicodeError) as error:
         raise CLIRefusal("invalid-json", f"{name} is not one strict JSON object: {error}") from error
 
 
@@ -92,6 +91,8 @@ def _validate_worker(worker: WorkerProgram) -> None:
     required = {"environment", "process", "runner", "evidence"}
     if set(materialized.slots) != required:
         raise CLIRefusal("worker-shape", f"worker slots must be exactly {sorted(required)!r}")
+    if not isinstance(materialized.environment, PreparedPythonEnvironment):
+        raise CLIRefusal("worker-shape", "worker environment must be PreparedPythonEnvironment")
     if not callable(getattr(materialized.process, "run", None)):
         raise CLIRefusal("worker-shape", "worker process must provide run()")
     if not callable(getattr(materialized.evidence, "read", None)):
@@ -99,18 +100,28 @@ def _validate_worker(worker: WorkerProgram) -> None:
 
 
 def load_worker(path: str | os.PathLike[str]) -> WorkerProgram:
-    """Load an unresolved worker marker from a YAML config file."""
+    """Load an unresolved worker marker from a YAML config file.
+
+    Parameters
+    ----------
+    path : str or os.PathLike
+        YAML file containing the executor worker marker.
+
+    Returns
+    -------
+    WorkerProgram
+        Unresolved worker handle whose concrete slots are admitted once.
+
+    Raises
+    ------
+    CLIRefusal
+        If the file is unreadable, malformed, or has the wrong worker shape.
+    """
 
     config_path = _path(path, "worker-config")
     try:
         source = _read_regular(config_path, "worker-config").decode("utf-8")
-        loaded = OmegaConf.create(source)
-        if not isinstance(loaded, DictConfig):
-            raise TypeError("worker-config must be a YAML mapping")
-        raw = OmegaConf.to_container(loaded, resolve=False, enum_to_str=True)
-        if isinstance(raw, Mapping) and isinstance(raw.get("_target_"), str):
-            loaded = OmegaConf.create({"worker": raw})
-        staged = StagedHydra.stage(loaded)
+        staged = StagedHydra.stage_source(source)
     except CLIRefusal:
         raise
     except Exception as error:
@@ -156,7 +167,35 @@ def _reserve_store(path: str | os.PathLike[str]) -> DirectoryStore:
 
 @frozen_record
 class DispatchPlan:
-    """Fully admitted executor inputs, with all writes still pending."""
+    """Fully admitted executor inputs, with all writes still pending.
+
+    Parameters
+    ----------
+    group : ReadyGroup
+        Ordered group admitted for dispatch.
+    table : ConfiguredRunTable
+        Sidecar commands bound to the group's ordered members.
+    allocation : ConfiguredAllocation
+        Backend allocation identity owning the store.
+    worker : WorkerProgram
+        Unresolved worker handle with validated concrete slots.
+    dispatcher : object
+        Local or optional-Parsl dispatcher selected by admission.
+    lifecycle : AttachedAllocation
+        Store-owning lifecycle used for fenced receipts.
+    timeout : float or None
+        Positive child/evidence timeout, if supplied.
+
+    Returns
+    -------
+    DispatchPlan
+        Frozen record carrying the admitted dispatch inputs.
+
+    Raises
+    ------
+    TypeError, ValueError
+        If a field does not satisfy the frozen dispatch-plan contract.
+    """
 
     group: ReadyGroup
     table: ConfiguredRunTable
@@ -177,7 +216,29 @@ def admit(
     dispatcher_name: str = "local",
     timeout: float | None = None,
 ) -> DispatchPlan:
-    """Decode and preflight a dispatch without beginning an attempt."""
+    """Decode and preflight a dispatch without beginning an attempt.
+
+    Parameters
+    ----------
+    input_path, store_path, allocation_path, worker_config_path, runs_path : str or os.PathLike
+        Input records, fresh store root, allocation record, worker YAML, and
+        configured-runs sidecar.
+    dispatcher_name : {"local", "parsl"}, default="local"
+        Attached dispatcher backend.
+    timeout : float or None, optional
+        Positive timeout passed to child and evidence operations.
+
+    Returns
+    -------
+    DispatchPlan
+        Fully admitted inputs with a reserved, empty store.
+
+    Raises
+    ------
+    CLIRefusal
+        If any input fails decoding, validation, worker-shape, or reservation
+        admission before a dispatch attempt begins.
+    """
 
     if dispatcher_name not in {"local", "parsl"}:
         raise CLIRefusal("invalid-dispatcher", f"unknown dispatcher {dispatcher_name!r}")
@@ -193,7 +254,7 @@ def admit(
     raw_group = _decode(input_file, "input")
     try:
         group = ReadyGroup.from_mapping(raw_group)
-    except (TypeError, ValueError) as error:
+    except (RecursionError, TypeError, ValueError) as error:
         raise CLIRefusal("invalid-ready-group", f"input is not a valid ReadyGroup: {error}") from error
     if not group.members:
         raise CLIRefusal("missing-ready-group", "input must contain a non-empty ReadyGroup")
@@ -201,14 +262,17 @@ def admit(
     raw_allocation = _decode(_path(allocation_path, "allocation"), "allocation")
     try:
         allocation = ConfiguredAllocation.from_mapping(raw_allocation)
-    except (TypeError, ValueError) as error:
+    except (RecursionError, TypeError, ValueError) as error:
         raise CLIRefusal("invalid-allocation", f"allocation is invalid: {error}") from error
     raw_table = _decode(_path(runs_path, "runs"), "runs")
     try:
         table = ConfiguredRunTable.from_mapping(raw_table)
-    except (TypeError, ValueError) as error:
+    except (RecursionError, TypeError, ValueError) as error:
         raise CLIRefusal("invalid-runs", f"run-table is invalid: {error}") from error
-    _validate_group_and_runs(group, table)
+    try:
+        _validate_group_and_runs(group, table)
+    except RecursionError as error:
+        raise CLIRefusal("admission-depth", "record validation exceeded the supported nesting depth") from error
     worker = load_worker(worker_config_path)
 
     try:
@@ -222,29 +286,40 @@ def admit(
     except (BindingError, TypeError, ValueError) as error:
         raise CLIRefusal("dispatcher-admission", str(error)) from error
 
-    store = _reserve_store(store_path)
+    store_file = _path(store_path, "store")
+    if "${" in os.fspath(store_file):
+        raise CLIRefusal("store-path", "store path must not contain OmegaConf interpolation syntax '${'")
+    store = _reserve_store(store_file)
     lifecycle = AttachedAllocation(allocation, store)
     return DispatchPlan(group, table, allocation, worker, dispatcher, lifecycle, timeout)
 
 
-def _publish_new(path: Path, payload: bytes) -> None:
-    """Publish a complete manifest at a previously absent path."""
-
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            fd = -1
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-    finally:
-        if fd != -1:
-            os.close(fd)
+_publish_new = _write_new
 
 
 def dispatch(plan: DispatchPlan, manifest_name: str = "run-manifest.json") -> RunManifest:
-    """Run an admitted plan and publish its manifest exactly once."""
+    """Run an admitted plan and publish its manifest exactly once.
+
+    Parameters
+    ----------
+    plan : DispatchPlan
+        Inputs returned by :func:`admit`.
+    manifest_name : str, default="run-manifest.json"
+        Fresh manifest name below the reserved store root.
+
+    Returns
+    -------
+    RunManifest
+        Manifest returned by the dispatcher and durably published.
+
+    Raises
+    ------
+    TypeError
+        If ``plan`` is not a :class:`DispatchPlan`.
+    BaseException
+        The primary dispatch or publication failure, with secondary failures
+        attached as notes when both operations fail.
+    """
 
     if not isinstance(plan, DispatchPlan):
         raise TypeError("plan must be DispatchPlan")

@@ -1,5 +1,6 @@
 """P7 r3 behavior probes through real DFK/python_app and child processes."""
 import json
+import importlib.util
 from pathlib import Path
 import sys
 import threading
@@ -15,6 +16,12 @@ from tpen_executor.storage import DirectoryStore
 from test_p7_parsl_dispatcher import _allocation, _group, _runs, _make_stub_package, _worker_spec
 
 
+PARSL_REQUIRED = pytest.mark.skipif(
+    importlib.util.find_spec("parsl") is None,
+    reason="requires the approved executor parsl extra",
+)
+
+
 def dispatcher_for(tmp_path):
     package = _make_stub_package(tmp_path)
     worker = _worker_spec(PreparedPythonEnvironment(sys.executable, env={"PYTHONPATH": str(package)}))
@@ -26,6 +33,7 @@ def lifecycle_for(tmp_path, name="store"):
 
 
 @pytest.mark.parametrize("repeat_interrupt", [False, True], ids=["one-interrupt", "repeated-interrupt"])
+@PARSL_REQUIRED
 def test_r3_t1_cancel_before_spawn_refuses_child_and_waits_for_app(tmp_path, monkeypatch, repeat_interrupt):
     """Cancellation requested before worker launch must prevent a new child.
 
@@ -123,6 +131,7 @@ def test_r3_t1_cancel_before_spawn_refuses_child_and_waits_for_app(tmp_path, mon
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt], ids=["ordinary", "base-exception"])
+@PARSL_REQUIRED
 def test_r3_t2_cleanup_error_releases_active_state_and_dispatch_guard(tmp_path, monkeypatch, error_type):
     """A real DFK cleanup failure must not poison later dispatch admission."""
     dispatcher = dispatcher_for(tmp_path)
@@ -166,12 +175,14 @@ def test_r3_t2_cleanup_error_releases_active_state_and_dispatch_guard(tmp_path, 
         _ACTIVE_DISPATCH.reset(saved)
 
 
+@PARSL_REQUIRED
 def test_r3_t3_public_dispatch_on_supported_python(tmp_path):
     """Valid public dispatch works under every declared supported interpreter."""
     manifest = dispatcher_for(tmp_path).run(_group("a"), _runs(tmp_path, "a"), lifecycle_for(tmp_path))
     assert manifest.attempts[0].outcome_receipt.status == "completed"
 
 
+@PARSL_REQUIRED
 def test_r3_t4_guard_covers_backend_initialization_without_nested_artifacts(tmp_path):
     """GREEN: reentry during real backend initialization is refused early."""
     dispatcher = dispatcher_for(tmp_path)
