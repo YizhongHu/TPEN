@@ -374,6 +374,22 @@ def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple
     return tuple(items)
 
 
+def _reject_resolver_owned_seed_overrides(items: Sequence[tuple[str, Any]]) -> None:
+    """Refuse seed paths whose values are owned by manifest seed streams."""
+
+    owned = {
+        path
+        for path, _ in items
+        if path in {"runtime.seed", "sampler.seed"}
+        or path.endswith(".initializer.seed")
+        or (path.startswith("callbacks.") and ".checkers." in path and path.endswith(".seed"))
+    }
+    if owned:
+        raise TrainConfigResolutionError(
+            "resolver-owned seed overrides are not permitted: " + ", ".join(sorted(owned))
+        )
+
+
 def resolve_train_config(
     source: Any, *, overrides: Mapping[str, Any] | Sequence[str] | None = None
 ) -> DictConfig:
@@ -446,6 +462,7 @@ def resolve_train_config(
 
     cfg = _compose_base_config()
     override_items = _override_items(overrides) if overrides is not None else ()
+    _reject_resolver_owned_seed_overrides(override_items)
     committed_walkers = stage_api.COMMITTED_WALKERS
     composed_walkers = OmegaConf.select(cfg, "sampler.n_walkers", default=None)
     # Exact-int plus int.__eq__ keeps this decision structural, not caller-overridable.

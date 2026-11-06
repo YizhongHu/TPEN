@@ -354,7 +354,7 @@ def test_resolve_applies_operational_overrides_before_resolution(tmp_path: Path)
             "trainer.max_steps=7",
             f"run.root={root}",
             f"run.dir={run_dir}",
-            "runtime.seed=123",
+            "runtime.dtype=float64",
         ],
     )
 
@@ -373,19 +373,21 @@ def test_resolve_applies_operational_overrides_before_resolution(tmp_path: Path)
     assert resolved.callbacks[8].artifact_dir == str(run_dir / "checks/equivariance")
     assert resolved.loggers[0].path == str(run_dir / "metrics.csv")
     assert resolved.loggers[1].path == str(run_dir / "metrics.jsonl")
-    assert resolved.runtime.seed == 123
-    assert resolved.sampler.seed == resolved.runner.sampler.seed == 123
-    assert resolved.model.embedding.initializer.seed == 123
-    assert resolved.runner.model.embedding.initializer.seed == 123
-    assert all(checker.seed == 123 for checker in _callback_checkers(resolved))
+    assert resolved.runtime.dtype == "float64"
+    assert resolved.atoms.dtype == resolved.sampler.dtype == resolved.runner.sampler.dtype == "float64"
+
+
+def test_resolve_refuses_resolver_owned_seed_overrides(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    for path in ("runtime.seed", "sampler.seed", "model.embedding.initializer.seed"):
+        with pytest.raises(train_config.TrainConfigResolutionError, match="resolver-owned seed"):
+            train_config.resolve_train_config(cell, overrides={path: 123})
 
 
 def test_resolve_overlay_mutant_after_resolution_is_red(tmp_path: Path) -> None:
-    cell = _cell(tmp_path)
-    resolved = train_config.resolve_train_config(cell)
-    OmegaConf.update(resolved, "runtime.seed", 123, merge=False)
-    assert resolved.runner.sampler.seed != 123
-    assert resolved.model.embedding.initializer.seed != 123
+    resolved = train_config.resolve_train_config(_cell(tmp_path))
+    OmegaConf.update(resolved, "runtime.dtype", "float32", merge=False)
+    assert resolved.sampler.dtype != "float32"
 
 
 def test_resolve_refuses_output_path_not_bound_to_identity_digest(tmp_path: Path) -> None:
