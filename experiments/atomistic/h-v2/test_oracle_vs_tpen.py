@@ -51,7 +51,11 @@ def _hydrogen_model_and_terms(seed: int):
 
     torch.manual_seed(seed)
     full = OmegaConf.create(protocol.training_config())
-    model = instantiate(full.model)
+    # Generated MLP/readout weights default to float32; the runner normally
+    # casts the model to ``runtime.dtype`` (see PfaffianReadout's docstring).
+    # Reproduce that cast here so float64 positions do not hit a dtype
+    # mismatch in the embedding's Linear layers.
+    model = instantiate(full.model).to(dtype=torch.float64)
     kinetic = instantiate(full.hamiltonian_terms.kinetic)
     potential = instantiate(full.hamiltonian_terms.electron_nucleus)
     return model, kinetic, potential
