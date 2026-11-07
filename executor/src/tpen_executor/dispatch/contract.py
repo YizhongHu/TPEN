@@ -353,6 +353,67 @@ class DispatcherContract:
             raise finish_error
         return lifecycle.store.manifest(group)
 
+    def _complete_member(
+        self,
+        group: ReadyGroup,
+        member: Any,
+        configured: ConfiguredRun,
+        lifecycle: AttachedAllocation,
+        fence: Any,
+        materialized: Any,
+        environment: Any,
+        outcome: Any,
+        timeout: float | None,
+    ) -> Exception | None:
+        """Inspect and publish one quiescent child from the controller.
+
+        Backend workers return only a plain process outcome.  This method is
+        deliberately called by the owner/controller thread after the backend
+        future and child process have both quiesced; it is the only shared
+        completion path that writes finish and accepted-segment receipts.
+        """
+
+        del configured, group
+        status = _status(outcome)
+        result_digest: str | None = None
+        segment_evidence: CoreRunEvidence | None = None
+        try:
+            evidence = materialized["evidence"]
+            process = materialized["process"]
+            output_dir, core_dir, _stdout, _stderr, evidence_stdout, evidence_stderr = _member_paths(fence)
+            if not callable(getattr(evidence, "read", None)):
+                raise TypeError("materialized worker evidence reader lacks read()")
+            decoded = evidence.read(
+                process,
+                environment,
+                core_dir,
+                cwd=output_dir,
+                stdout_path=evidence_stdout,
+                stderr_path=evidence_stderr,
+                timeout=timeout,
+            )
+            result_digest = digest(_evidence_payload(decoded))
+            segment_evidence = decoded
+        except EvidenceUnavailable:
+            pass
+        except Exception:
+            status = "failed"
+        try:
+            lifecycle.finish(fence, status, _utc_now(), result_digest)
+        except Exception as error:
+            return error
+        if (
+            status == "completed"
+            and segment_evidence is not None
+            and segment_evidence.verdict in {"completed", "incomplete"}
+            and segment_evidence.checkpoint is not None
+        ):
+            try:
+                lifecycle.store.accept_segment(fence, segment_evidence, None)
+            except Exception as error:
+                return error
+        return None
+
     @staticmethod
     def _validate_inputs(
         group: ReadyGroup,

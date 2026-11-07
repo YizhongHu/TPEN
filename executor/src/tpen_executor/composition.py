@@ -16,7 +16,7 @@ from .contracts import ReadyGroup
 from .dispatch import LocalDispatcher, ParslDispatcher, ParslUnavailableError
 from .environments import PreparedPythonEnvironment
 from .lifecycle import AttachedAllocation
-from .placement import BindingError, binding_from_allocation
+from .placement import BindingError
 from .programs import WorkerProgram
 from .results import RunManifest
 from .storage import DirectoryStore, _write_new
@@ -279,8 +279,10 @@ def admit(
         if dispatcher_name == "local":
             dispatcher = LocalDispatcher(worker)
         else:
-            binding = binding_from_allocation(allocation)
-            dispatcher = ParslDispatcher(worker, binding=binding)
+            # Parsl resolves the allocation's slot pool at dispatch admission;
+            # resolving one legacy binding here would make multi-slot facts
+            # impossible to reach the controller.
+            dispatcher = ParslDispatcher(worker)
     except ParslUnavailableError as error:
         raise CLIRefusal("parsl-unavailable", str(error)) from error
     except (BindingError, TypeError, ValueError) as error:
