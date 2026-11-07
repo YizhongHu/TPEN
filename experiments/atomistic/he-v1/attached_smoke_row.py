@@ -38,7 +38,7 @@ def prepare_smoke_row(
     results_root: str | Path,
     source_config: str | Path,
     row_id: str,
-) -> object:
+) -> _attached.PreparedHeTrain:
     """Prepare exactly one explicitly selected He TRAIN row.
 
     Parameters
@@ -51,8 +51,15 @@ def prepare_smoke_row(
 
     Returns
     -------
-    object
+    _attached.PreparedHeTrain
         The value returned by :func:`prepare_he_train`.
+
+    Raises
+    ------
+    ValueError
+        If a launch-packet path is not absolute.
+    FileNotFoundError
+        If the manifest path does not identify a readable file.
     """
 
     manifest_file = _absolute(manifest_path, "manifest_path")
@@ -83,12 +90,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repo-root", required=True)
     parser.add_argument("--results-root", required=True)
     parser.add_argument("--source-config", required=True)
-    parser.add_argument("--science-python", required=True)
-    parser.add_argument("--executor-python", required=True)
-    parser.add_argument("--allocation", required=True)
-    parser.add_argument("--worker-config", required=True)
-    parser.add_argument("--store", required=True)
-    parser.add_argument("--receipt", required=True)
     parser.add_argument("--row-id", required=True)
     return parser.parse_args(argv)
 
@@ -97,23 +98,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Prepare the selected row from an explicit launch packet."""
 
     args = _parse_args(argv)
-    manifest = _absolute(args.manifest, "manifest")
-    output_dir = _absolute(args.output_dir, "output_dir")
-    repo_root = _absolute(args.repo_root, "repo_root")
-    results_root = _absolute(args.results_root, "results_root")
-    source_config = _absolute(args.source_config, "source_config")
-    _absolute(args.science_python, "science_python")
-    _absolute(args.executor_python, "executor_python")
-    _absolute(args.allocation, "allocation")
-    _absolute(args.worker_config, "worker_config")
-    _absolute(args.store, "store")
-    _absolute(args.receipt, "receipt")
     prepare_smoke_row(
-        manifest,
-        output_dir=output_dir,
-        repo_root=repo_root,
-        results_root=results_root,
-        source_config=source_config,
+        args.manifest,
+        output_dir=args.output_dir,
+        repo_root=args.repo_root,
+        results_root=args.results_root,
+        source_config=args.source_config,
         row_id=args.row_id,
     )
     return 0
