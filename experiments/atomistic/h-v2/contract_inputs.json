@@ -239,11 +239,29 @@
           "sampler": [
             999005
           ],
+          "evaluation_formula": "996000 + 10*pilot_checkpoint_ordinal + stream_index, with pilot_checkpoint_ordinal 0..20 (the 21 contract-evaluated checkpoints at or below 20,000 updates, measurement.evaluated_checkpoints.updates filtered <=20000) and stream_index 0..3 (measurement.fresh_evaluation.streams_per_checkpoint); disjoint from every other namespace and from the science evaluation_stream_seed_formula. Decided 2026-11-07, round-3 pre-review finding H2, accepted 2026-11-07, so the capacity_pilot.evaluation roster can seed every checkpoint x stream pair the pilot fresh-evaluates up to 20,000 updates (admission.pilot.length_updates_target), not only one basin triple.",
           "evaluation": [
-            999006,
-            999007,
-            999008,
-            999009
+            996000, 996001, 996002, 996003,
+            996010, 996011, 996012, 996013,
+            996020, 996021, 996022, 996023,
+            996030, 996031, 996032, 996033,
+            996040, 996041, 996042, 996043,
+            996050, 996051, 996052, 996053,
+            996060, 996061, 996062, 996063,
+            996070, 996071, 996072, 996073,
+            996080, 996081, 996082, 996083,
+            996090, 996091, 996092, 996093,
+            996100, 996101, 996102, 996103,
+            996110, 996111, 996112, 996113,
+            996120, 996121, 996122, 996123,
+            996130, 996131, 996132, 996133,
+            996140, 996141, 996142, 996143,
+            996150, 996151, 996152, 996153,
+            996160, 996161, 996162, 996163,
+            996170, 996171, 996172, 996173,
+            996180, 996181, 996182, 996183,
+            996190, 996191, 996192, 996193,
+            996200, 996201, 996202, 996203
           ]
         },
         "sampler_tail_qualification": {
@@ -693,26 +711,40 @@
       ],
       "placements": {
         "a-f": "slice 5cfcca3e on Cannon CPU",
-        "g": "slice 406194c5 as excluded-seed Polaris GPU smoke",
+        "g": "part (g), excluded-seed Polaris GPU route smoke, at its current caps (1,000 updates, one node-hour including setup); runs first, following the 2026-10-30 facility split (Polaris for smokes)",
+        "406194c5_cannon_pilot": "slice 406194c5's Cannon capacity-and-freeze pilot (admission.pilot, a separate part from (g)): one A100 (--constraint=a100), runs after part (g) and after qualification; own ceiling of 16 GPU-hours including setup, checkpoint writes and fresh evaluation, flagged as the lane's proposal for operator review of this pull request, separate from and not counted against the 96 GPU-hour science ceiling; if exceeded the pilot stops and reports, the ceiling is not extended",
         "integrated_rerun": "slice 2f1b2921"
       },
+      "placements_note": "Slice 406194c5 has two parts with separate placements, facilities and ceilings; see placements.g and placements.406194c5_cannon_pilot above and admission.pilot below. Decided 2026-11-07, round-3 pre-review finding H1, accepted 2026-11-07.",
       "nuclear_law_note": "The pipeline check (parts a-g, including the integrated rerun 2f1b2921) runs the science model's nuclear law, CurvatureElectronNucleusCuspLaw(curvature_coefficient=0.01, curvature_range=1.0, trainable=true), with scale-only overrides, following He-v1's 'the smoke is this same file with scale-only overrides' rule; PR 590's configs are adapted to this at its rebase onto this amendment. Decided 2026-11-07, round-1 pre-review finding F8.",
       "science_result": false
     },
     "pilot": {
       "status": "decided_2026-11-07",
-      "decided_by": "round-2 pre-review of operator-review-contract-proposals-20261107, finding G3, accepted 2026-11-07",
+      "decided_by": "round-2 pre-review of operator-review-contract-proposals-20261107, finding G3, accepted 2026-11-07; split into its own placement and ceiling, separate from pipeline_check part (g), by round-3 pre-review finding H1, accepted 2026-11-07; length extended to 20,000 updates and freeze basin selection clarified by round-3 pre-review finding H3, accepted 2026-11-07",
       "facility": "FASRC Cannon",
+      "constraint": "--constraint=a100",
+      "gpu_count": 1,
+      "order": "runs after admission.pipeline_check.parts[g] (the Polaris GPU route smoke) and after qualification; part (g) runs first",
       "seeds": "the excluded non_science_seed_namespaces.capacity_pilot seeds, never a science seed",
       "shape": "the science model (lane_proposals.learned_model_optimizer_and_training_sampler) and the science training sampler, run at the contract's fresh-evaluation shape (measurement.fresh_evaluation)",
       "length_updates_min": 4000,
-      "length_rationale": "at least 4,000 updates so a basin window (decision_rules.parameters.basin_center_updates, 3000..19000) exists to measure",
-      "evaluation": "a fresh evaluation at the contract shape, reaching the basin window",
+      "length_updates_target": 20000,
+      "length_rationale": "runs through 20,000 updates, within the 16 GPU-hour ceiling, so the pilot's own basin search covers the same centers (decision_rules.parameters.basin_center_updates, 3000..19000) that the science recurrence rule searches; the 4,000-update hard minimum remains so at least one basin-window triple exists even if the ceiling stops the pilot early, in which case the shortfall against the 20,000-update target is reported",
+      "evaluation": "fresh-evaluates the contract's evaluated checkpoints (measurement.evaluated_checkpoints.updates) up to the updates actually reached, at most 20,000, at the contract shape (measurement.fresh_evaluation); seeded from non_science_seed_namespaces.capacity_pilot.evaluation (evaluation_formula)",
+      "freeze_basin_selection": "the freeze uses the pilot's own smallest-mean-W consecutive triple over the centers it reached, chosen by the recurrence rule's selection (decision_rules.parameters.basin_center_updates); this is the same search the science recurrence rule performs, not necessarily the earliest triple. Decided 2026-11-07, round-3 pre-review finding H3, accepted 2026-11-07.",
+      "gpu_hour_ceiling": {
+        "value_gpu_hours": 16,
+        "includes": "setup, checkpoint writes, fresh evaluation",
+        "status": "lane_proposal_flagged_for_operator_review",
+        "separate_from": "the 96 GPU-hour science ceiling (lane_proposals science venue, item 7); does not count against it",
+        "on_exceed": "stop and report; the ceiling is not extended"
+      },
       "outputs": [
         "the frozen measurement.hydrogen_equivalent_tail_threshold (freeze_rule)",
         "the pilot_gate simultaneous-band half-widths at all six exceedance margins in decision_rules.parameters.exceedance_margins_hartree"
       ],
-      "implemented_by": "slice 406194c5, extended as needed; the contract defines the run, the slice implements it",
+      "implemented_by": "slice 406194c5, the Cannon capacity-and-freeze pilot part (separate from part (g), the Polaris route smoke); the contract defines the run, the slice implements it",
       "on_failure": "if the pilot gate fails at the hydrogen-equivalent threshold, the F5 stop rule applies (measurement.hydrogen_equivalent_tail_threshold); see decision_rules.parameters.zero_event_bound_pooling and the G5 no-retune rule below"
     },
     "science_lineages": {
