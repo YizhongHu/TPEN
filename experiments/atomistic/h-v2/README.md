@@ -69,8 +69,10 @@ now states the tail-safeguard contradiction DIRECTIONALLY, and restricts it
 to the TAIL thresholds only -- `0.5 Ha`, `1 Ha`, and a third, pilot-frozen
 `hydrogen_equivalent_tail_threshold`, quantile-matched before science so the
 pilot's basin-window exceedance there is about `0.003`, matching He-v1's
-`p(>0.5 Ha)` at its own basin, and never retuned once frozen (round-1
-pre-review finding F4, option (B), accepted 2026-11-07): a bulk-threshold
+`p(>0.5 Ha) = 0.003` at its `25k` fresh evaluation, its earliest
+fresh-evaluated checkpoint, and never retuned once frozen (round-1
+pre-review finding F4, option (B), accepted 2026-11-07; wording corrected
+round-2, finding G4): a bulk-threshold
 decrease that accompanies a `W` rise is expected, not a contradiction, and a
 bulk-threshold exceedance that fails to confirm a `W` rise is reported as a
 qualification, never a contradiction. Option (A), making the rule an active
@@ -90,19 +92,25 @@ half-width-at-most-half-the-margin gate at `0.002 Ha`; no H pilot has run).
 This is the `operator_alternative` extended to all three bulk thresholds, not
 adopted verbatim. An "increase of at least its margin", for both the tail and
 bulk clauses, means the simultaneous LOWER confidence bound of the increase
-reaches the margin (round-1 pre-review finding F5(a)). The recurrence
-confirmation streams (2 and 3) are pooled, `n=8192` walkers; the bounded-null
-check pools all four streams, `n=16384` walkers (finding F5(b)). The
+reaches the margin (round-1 pre-review finding F5(a)). Each confirmation
+stream (2 and 3) passes the `W` clause independently; for the exceedance
+safeguard, the recurrence confirmation streams (2 and 3) are pooled,
+`n=8192` walkers, and the bounded-null check pools all four streams,
+`n=16384` walkers (finding F5(b); wording corrected round-2, finding G1). The
 zero-event safeguard's half-width is the one-sided 97.5% Clopper-Pearson
 upper bound `U`, computed with the pooled `n` of the rule that uses it and
 family-adjusted by that rule's own explicit comparison count, not the
 evaluated-checkpoint count (round-2 correction to finding F5(c)): the
 recurrence family is the three tail thresholds times the three late-checkpoint
 comparisons made against the basin (`family_k_recurrence=9`), and the
-bounded-null family is every fixed exceedance threshold times every
-reference-checkpoint/late-checkpoint comparison (`family_k_bounded_null=315`).
-Recomputed mechanically by script: `U=0.000718` at `n=8192` and `U=0.000576`
-at `n=16384`, both still inside half the tightest margin (`0.001`), so the
+bounded-null family is the six fixed exceedance thresholds -- the five in
+`fixed_exceedance_thresholds_hartree` plus the pilot-frozen
+hydrogen-equivalent threshold, which the bounded-null exceedance sentence now
+names explicitly -- times every reference-checkpoint (the 21 evaluated
+checkpoints at or below `20,000` updates) by late-checkpoint comparison
+(`family_k_bounded_null=378`, round-2 correction, finding G2). Recomputed
+mechanically by script: `U=0.000718` at `n=8192` and `U=0.000587` at
+`n=16384`, both still inside half the tightest margin (`0.001`), so the
 pilot gate passes without loosening.
 
 ### Nuclear curvature and model/optimizer/sampler (items 3 and 5)
@@ -424,7 +432,19 @@ still remain.
 Every `lane_proposals` entry is now decided (2026-11-07 operator review; see
 "Lane proposals: operator-reviewed 2026-11-07" above). That does not lift the
 science hold: **science lineages remain prohibited** pending this amendment's
-own Cannon verification and the human merge of this pull request, and pending
+own Cannon verification and the human merge of this pull request, pending
 the remaining pipeline-check (`5cfcca3e`), excluded-seed Polaris smoke
 (`406194c5`), and integrated-rerun (`2f1b2921`) gates already described above,
-none of which this amendment closes.
+and pending a third admission gate added round-2 (finding G3):
+`admission.pilot`, a FASRC Cannon run using the excluded `capacity_pilot`
+seeds, at the science model/sampler shape, for at least `4,000` updates so a
+basin window exists, with a fresh evaluation at the contract shape. It
+freezes `measurement.hydrogen_equivalent_tail_threshold` and measures the
+pilot-gate simultaneous-band half-widths at all six exceedance margins;
+`admission.pilot` is the contract definition of the run, implemented by
+slice `406194c5`, extended as needed. None of these gates is closed by this
+amendment. If the pilot gate fails at the hydrogen-equivalent threshold, the
+F5 stop rule applies and the decision returns to the lane and the operator
+with the measured value as evidence; a failure is never grounds to retune the
+threshold, its margin, or its quantile after the number is seen (finding
+G5).

@@ -135,7 +135,9 @@ def test_zero_event_bound_family_k_and_u_match_the_contract_fields() -> None:
     expected_k_recurrence = n_tail_thresholds * n_late
     assert pooling["family_k_recurrence"] == expected_k_recurrence
 
+    bounded_null_text = inputs["decision_rules"]["bounded_null"]
     n_fixed_thresholds = len(measurement["fixed_exceedance_thresholds_hartree"])
+    n_fixed_thresholds += int("hydrogen-equivalent" in bounded_null_text)
     n_bn_reference = len(parameters["bounded_null_reference_updates"])
     expected_k_bounded_null = n_fixed_thresholds * n_bn_reference * n_late
     assert pooling["family_k_bounded_null"] == expected_k_bounded_null
