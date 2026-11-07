@@ -276,9 +276,11 @@ class DispatcherContract:
                 environment = _with_child_context_keys(environment, lifecycle.allocation)
                 process = materialized["process"]
                 materialized["runner"]
-                materialized["evidence"]
+                evidence = materialized["evidence"]
                 if not callable(getattr(process, "run", None)):
                     raise TypeError("materialized worker process lacks run()")
+                if not callable(getattr(evidence, "read", None)):
+                    raise TypeError("materialized worker evidence reader lacks read()")
                 output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = _member_paths(fence)
                 args = (*configured.command().args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
                 outcome = self._execute_process(
@@ -359,8 +361,13 @@ class DispatcherContract:
         """
 
         del configured
+        invalid_outcome = False
         if error is None:
-            status = _status(outcome)
+            try:
+                status = _status(outcome)
+            except Exception:
+                status = "launch_failed"
+                invalid_outcome = True
         else:
             # Ordinary launch/worker errors are durable launch failures; a
             # BaseException is a cancellation and remains an operational
@@ -369,7 +376,7 @@ class DispatcherContract:
         result_digest: str | None = None
         segment_evidence: CoreRunEvidence | None = None
         inspection_error: BaseException | None = None
-        if error is None:
+        if error is None and not invalid_outcome:
             try:
                 evidence = materialized["evidence"]
                 process = materialized["process"]
