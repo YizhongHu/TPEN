@@ -95,10 +95,15 @@ confirmation streams (2 and 3) are pooled, `n=8192` walkers; the bounded-null
 check pools all four streams, `n=16384` walkers (finding F5(b)). The
 zero-event safeguard's half-width is the one-sided 97.5% Clopper-Pearson
 upper bound `U`, computed with the pooled `n` of the rule that uses it and
-family-adjusted by the same `K=27` as the evaluated-checkpoint `W` family
-(finding F5(c)): `U=0.000852` at `n=8192` and `U=0.000426` at `n=16384`
-(recomputed mechanically by script), both well inside half the tightest
-margin (`0.001`), so the pilot gate passes without loosening.
+family-adjusted by that rule's own explicit comparison count, not the
+evaluated-checkpoint count (round-2 correction to finding F5(c)): the
+recurrence family is the three tail thresholds times the three late-checkpoint
+comparisons made against the basin (`family_k_recurrence=9`), and the
+bounded-null family is every fixed exceedance threshold times every
+reference-checkpoint/late-checkpoint comparison (`family_k_bounded_null=315`).
+Recomputed mechanically by script: `U=0.000718` at `n=8192` and `U=0.000576`
+at `n=16384`, both still inside half the tightest margin (`0.001`), so the
+pilot gate passes without loosening.
 
 ### Nuclear curvature and model/optimizer/sampler (items 3 and 5)
 

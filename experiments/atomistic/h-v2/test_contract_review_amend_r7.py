@@ -14,6 +14,8 @@ intentionally changed).
 import json
 from pathlib import Path
 
+import pytest
+
 INPUTS = Path(__file__).with_name("contract_inputs.json")
 
 
@@ -114,6 +116,48 @@ def test_four_stream_design_kept_with_fallback_condition_recorded() -> None:
     assert "too difficult" in decision["fallback"]
     assert "confirmed with the operator through the manager" in decision["fallback"]
     assert "5 streams" in decision["fallback"]
+
+
+def test_zero_event_bound_family_k_and_u_match_the_contract_fields() -> None:
+    """Round-2 correction: family_k is an explicit comparison count, not 27.
+
+    Guards against a future edit desynchronising family_k_recurrence /
+    family_k_bounded_null or their recorded U values from the contract
+    fields they are derived from.
+    """
+    inputs = load_inputs()
+    measurement = inputs["measurement"]
+    parameters = inputs["decision_rules"]["parameters"]
+    pooling = parameters["zero_event_bound_pooling"]
+
+    n_tail_thresholds = 3  # 0.5 Ha, 1 Ha, hydrogen_equivalent_tail_threshold
+    n_late = len(parameters["late_updates"])
+    expected_k_recurrence = n_tail_thresholds * n_late
+    assert pooling["family_k_recurrence"] == expected_k_recurrence
+
+    n_fixed_thresholds = len(measurement["fixed_exceedance_thresholds_hartree"])
+    n_bn_reference = len(parameters["bounded_null_reference_updates"])
+    expected_k_bounded_null = n_fixed_thresholds * n_bn_reference * n_late
+    assert pooling["family_k_bounded_null"] == expected_k_bounded_null
+
+    alpha = 0.025
+    tightest_half_margin = min(parameters["exceedance_margins_hartree"].values()) / 2.0
+
+    u_recurrence = 1 - (alpha / pooling["family_k_recurrence"]) ** (
+        1.0 / pooling["recurrence_confirmation_pooled_n"]
+    )
+    u_bounded_null = 1 - (alpha / pooling["family_k_bounded_null"]) ** (
+        1.0 / pooling["bounded_null_pooled_n"]
+    )
+    computed = pooling["computed_U"]
+    assert u_recurrence == pytest.approx(
+        computed["recurrence_confirmation_n_8192"], rel=1e-9
+    )
+    assert u_bounded_null == pytest.approx(
+        computed["bounded_null_n_16384"], rel=1e-9
+    )
+    assert u_recurrence <= tightest_half_margin
+    assert u_bounded_null <= tightest_half_margin
 
 
 def test_science_lineages_stay_prohibited_pending_remaining_gates() -> None:

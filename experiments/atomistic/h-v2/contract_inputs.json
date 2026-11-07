@@ -469,17 +469,19 @@
       "pilot_gate": "science admission requires pilot simultaneous-band half-width <= half of every exceedance margin",
       "zero_event_bound_pooling": {
         "status": "decided_2026-11-07",
-        "decided_by": "round-1 pre-review of operator-review-contract-proposals-20261107, finding F5(b)/(c), accepted 2026-11-07",
+        "decided_by": "round-1 pre-review of operator-review-contract-proposals-20261107, finding F5(b)/(c), accepted 2026-11-07; family_k correction accepted 2026-11-07 (round-2 correction: K is the explicit count of exceedance-safeguard comparisons each rule evaluates, not the evaluated-checkpoint count)",
         "recurrence_confirmation_pooled_n": 8192,
         "recurrence_confirmation_streams": [2, 3],
         "bounded_null_pooled_n": 16384,
         "bounded_null_streams": [0, 1, 2, 3],
-        "family_k": 27,
-        "family_k_source": "same K as the evaluated_checkpoints.count_per_lineage W family",
+        "family_k_recurrence": 9,
+        "family_k_recurrence_formula": "len(tail thresholds {0.5 Ha, 1 Ha, hydrogen_equivalent_tail_threshold}) * len(decision_rules.parameters.late_updates) = 3 * 3, the tail thresholds times the late-checkpoint comparisons the recurrence rule makes against the basin",
+        "family_k_bounded_null": 315,
+        "family_k_bounded_null_formula": "len(measurement.fixed_exceedance_thresholds_hartree) * len(decision_rules.parameters.bounded_null_reference_updates) * len(decision_rules.parameters.late_updates) = 5 * 21 * 3, every fixed exceedance threshold times every reference-checkpoint/late-checkpoint comparison the bounded-null rule makes, mirroring the W clause's own reference-checkpoint x late-checkpoint structure",
         "computed_U": {
-          "recurrence_confirmation_n_8192": 0.0008522631212269927,
-          "bounded_null_n_16384": 0.00042622239337786194,
-          "formula": "U = 1 - (0.025 / family_k) ** (1 / n), the one-sided 97.5% Clopper-Pearson upper bound family-adjusted by family_k, computed mechanically by script, not copied",
+          "recurrence_confirmation_n_8192": 0.0007182604858808617,
+          "bounded_null_n_16384": 0.000576094497524493,
+          "formula": "U = 1 - (0.025 / family_k) ** (1 / n), the one-sided 97.5% Clopper-Pearson upper bound family-adjusted by the rule's own family_k (family_k_recurrence or family_k_bounded_null), computed mechanically by script, not copied",
           "pilot_gate_result": "both U values are <= 0.001, half of the tightest exceedance margin (0.002 Ha at the tail thresholds); PASS, not loosened"
         }
       },
