@@ -1265,3 +1265,35 @@ def test_resolver_requires_repo_root_on_sys_path(tmp_path: Path, monkeypatch: py
 
     with pytest.raises(train_config.CheckoutPreconditionError, match="checkout root"):
         train_config.resolve_train_config(cell)
+
+
+# Pre-change pin guard ---------------------------------------------------------
+def test_prechange_pin_guard_names_pin_and_both_blobs_on_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pin whose train_config.py blob is not the recorded one fails before any oracle load."""
+
+    recorded_blob = _PRECHANGE_BLOB
+    wrong_blob = "0" * 40
+    monkeypatch.setitem(globals(), "_PRECHANGE_BLOB", wrong_blob)
+
+    with pytest.raises(AssertionError) as info:
+        _load_prechange_resolver()
+
+    message = str(info.value)
+    assert _PRECHANGE_PIN in message
+    assert recorded_blob in message
+    assert wrong_blob in message
+
+
+def test_prechange_pin_guard_fails_loudly_when_the_pin_object_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable pin is a CalledProcessError from rev-parse, never a quiet oracle mismatch."""
+
+    monkeypatch.setitem(globals(), "_PRECHANGE_PIN", "0" * 40)
+
+    with pytest.raises(subprocess.CalledProcessError) as info:
+        _load_prechange_resolver()
+
+    assert info.value.returncode != 0
