@@ -281,7 +281,7 @@ class ParslDispatcher(DispatcherContract):
     ) -> None:
         """Perform common admission plus strict attached-slot admission."""
 
-        super().validate(group, runs, lifecycle, env, timeout)
+        super(ParslDispatcher, self).validate(group, runs, lifecycle, env, timeout)
         self._resolve_bindings(lifecycle)
 
     def _resolve_bindings(self, lifecycle: AttachedAllocation) -> tuple[WorkerBinding, ...]:
