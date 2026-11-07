@@ -64,7 +64,7 @@ EXPECTED_PRODUCTION_INVENTORY = {
     ("train_config.py", 238, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 638, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 662, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("run_stage_q.py", 128, "tpen.hi_schema"): InventoryEntry(
@@ -1210,6 +1210,14 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             ("keys are detached composed-config names and the set contains resolver-owned literals", 1),
         ("train_config.py", "_set_optional_execution_seeds", '"seed" in checker'):
             ("checker is a validated mapping from the composed config and the key is a module literal", 1),
+        ("train_config.py", "_is_resolver_owned_seed_path", "path in _RESOLVER_OWNED_SEED_PATHS"):
+            ("path is a detached override key and the frozen set is module-owned", 1),
+        ("train_config.py", "_is_resolver_owned_seed_path", "path[: len(prefix)] == prefix"):
+            ("path is a detached override key and prefix is module-owned frozen data", 1),
+        ("train_config.py", "_is_resolver_owned_seed_path", "marker in path"):
+            ("path is a detached override key and marker is module-owned frozen data", 1),
+        ("train_config.py", "_is_resolver_owned_seed_path", "path[len(path) - len(suffix) :] == suffix"):
+            ("path is a detached override key and suffix is module-owned frozen data", 2),
         ("train_config.py", "_optimizer_entry", 'status not in {"available", "unavailable"}'):
             ("status is read from the validated scientific-identity mapping and compared with module literals", 1),
         ("train_config.py", "_optimizer_entry", 'status != "available"'):
