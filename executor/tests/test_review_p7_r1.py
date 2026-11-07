@@ -1,6 +1,7 @@
 """Independent P7 backend probes; no implementation or mutant edits."""
 from concurrent.futures import TimeoutError
 import json
+import importlib.util
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -16,6 +17,12 @@ from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.storage import DirectoryStore
 
 
+PARSL_REQUIRED = pytest.mark.skipif(
+    importlib.util.find_spec("parsl") is None,
+    reason="requires the approved executor parsl extra",
+)
+
+
 def _dispatcher():
     return ParslDispatcher(SimpleNamespace(materialize=lambda env: {}),
                            binding={"environment": {"CUDA_VISIBLE_DEVICES": "0"}})
@@ -28,6 +35,7 @@ def _execute(dispatcher, tmp_path, timeout=None):
         timeout=timeout)
 
 
+@PARSL_REQUIRED
 def test_t1_native_dfk_submit_accepts_prepared_payload(tmp_path):
     """RED: exercise the actual pinned DFK API without the run/super blocker."""
     dispatcher = _dispatcher()
@@ -72,6 +80,7 @@ def test_t8_explicit_binding_refuses_ambiguous_nodes(nodes):
         WorkerBinding.from_mapping({"environment": {"CUDA_VISIBLE_DEVICES": "0"}, "nodes": nodes})
 
 
+@PARSL_REQUIRED
 def test_t9_binding_overlay_preserves_prepared_environment(tmp_path):
     """GREEN: binding overrides visibility while retaining setup and other env."""
     dispatcher = _dispatcher()

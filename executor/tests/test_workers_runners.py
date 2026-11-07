@@ -14,7 +14,7 @@ import pytest
 
 from tpen_executor.configuration import StagedHydra
 from tpen_executor.environments import PreparedPythonEnvironment, SourceScript
-from tpen_executor.runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
+from tpen_executor.runners import CoreRunEvidence, EvidenceUnavailable, RUN_SHIM, TPENCommand, TPENEvidence
 from tpen_executor.workers import ProcessOutcome, SubprocessWorker
 
 
@@ -29,9 +29,7 @@ def _science(tmp_path: Path) -> tuple[PreparedPythonEnvironment, Path]:
         "    print('ARGS=' + repr(list(argv)))\n"
         "    print('MODE=' + os.environ.get('MODE',''))\n"
         "    print('SETUP=' + os.environ.get('SETUP_WAS_SOURCED',''))\n"
-        "    return int(os.environ.get('EXIT_CODE','0'))\n"
-        "if __name__ == '__main__':\n"
-        "    raise SystemExit(main(sys.argv[1:]))\n",
+        "    return int(os.environ.get('EXIT_CODE','0'))\n",
         encoding="utf-8",
     )
     (package / "inspection.py").write_text(
@@ -54,12 +52,12 @@ def test_subprocess_worker_preserves_setup_env_and_argument_boundaries(tmp_path:
     out, err = tmp_path / "out", tmp_path / "err"
     outcome = SubprocessWorker().run(
         environment,
-        ("-m", "tpen.run", "--value", "space ' quote $ value"),
+        ("-c", RUN_SHIM, "--value", "space ' quote $ value"),
         cwd=tmp_path,
         stdout_path=out,
         stderr_path=err,
     )
-    assert outcome.argv == (sys.executable, "-m", "tpen.run", "--value", "space ' quote $ value")
+    assert outcome.argv == (sys.executable, "-c", RUN_SHIM, "--value", "space ' quote $ value")
     assert outcome.returncode == 0 and not outcome.timed_out
     assert "ARGS=['--value', \"space ' quote $ value\"]" in out.read_text()
     assert "MODE=overlay" in out.read_text()
@@ -89,7 +87,7 @@ def test_subprocess_worker_real_timeout_records_returncode_and_logs(tmp_path: Pa
     environment, _ = _science(tmp_path)
     environment = PreparedPythonEnvironment(environment.python, environment.setup, {**environment.env, "SLEEP": "5"})
     out, err = tmp_path / "timeout.out", tmp_path / "timeout.err"
-    outcome = SubprocessWorker().run(environment, ("-m", "tpen.run"), cwd=tmp_path, stdout_path=out, stderr_path=err, timeout=0.5)
+    outcome = SubprocessWorker().run(environment, ("-c", RUN_SHIM), cwd=tmp_path, stdout_path=out, stderr_path=err, timeout=0.5)
     assert outcome.timed_out is True
     assert outcome.returncode is not None
     assert out.is_file() and err.is_file()
@@ -99,7 +97,7 @@ def test_subprocess_worker_real_nonzero_returncode_is_recorded(tmp_path: Path) -
     environment, _ = _science(tmp_path)
     environment = PreparedPythonEnvironment(environment.python, environment.setup, {**environment.env, "EXIT_CODE": "3"})
     out, err = tmp_path / "nonzero.out", tmp_path / "nonzero.err"
-    outcome = SubprocessWorker().run(environment, ("-m", "tpen.run"), cwd=tmp_path, stdout_path=out, stderr_path=err)
+    outcome = SubprocessWorker().run(environment, ("-c", RUN_SHIM), cwd=tmp_path, stdout_path=out, stderr_path=err)
     assert outcome.timed_out is False and outcome.returncode == 3
     assert out.is_file() and err.is_file()
 
@@ -108,7 +106,7 @@ def test_subprocess_worker_only_writes_named_logs(tmp_path: Path) -> None:
     environment, _ = _science(tmp_path)
     out, err = tmp_path / "named.out", tmp_path / "named.err"
     before = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
-    SubprocessWorker().run(environment, ("-m", "tpen.run"), cwd=tmp_path, stdout_path=out, stderr_path=err)
+    SubprocessWorker().run(environment, ("-c", RUN_SHIM), cwd=tmp_path, stdout_path=out, stderr_path=err)
     after = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
     assert after - before == {Path("named.out"), Path("named.err")}
 
@@ -119,9 +117,7 @@ def test_tpen_command_launches_stub_with_exact_args(tmp_path: Path) -> None:
         "import json\n"
         "def main(argv):\n"
         "    print(json.dumps(list(argv)))\n"
-        "    return 0\n"
-        "if __name__ == '__main__':\n"
-        "    raise SystemExit(main(__import__('sys').argv[1:]))\n",
+        "    return 0\n",
         encoding="utf-8",
     )
     config = str(tmp_path / "config.yaml")
