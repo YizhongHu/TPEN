@@ -293,7 +293,24 @@ def _int_tuple(value: Any, name: str) -> tuple[int, ...]:
 
 
 def slots_from_allocation(allocation: ConfiguredAllocation) -> tuple[AllocationSlot, ...]:
-    """Decode and strictly validate the optional versioned slot record."""
+    """Decode and strictly validate the optional versioned slot record.
+
+    Parameters
+    ----------
+    allocation : ConfiguredAllocation
+        Allocation facts containing the optional versioned ``slots`` record.
+
+    Returns
+    -------
+    tuple of AllocationSlot
+        Immutable, disjoint slot entitlements in declared order.
+
+    Raises
+    ------
+    BindingError
+        If the record is absent, malformed, overlapping, or names unsupported
+        multi-node geometry.
+    """
 
     if not isinstance(allocation, ConfiguredAllocation):
         raise BindingError("slot resolution requires ConfiguredAllocation")
@@ -318,20 +335,34 @@ def slots_from_allocation(allocation: ConfiguredAllocation) -> tuple[AllocationS
     nodes = [slot.node for slot in decoded]
     if any(type(node) is not str or not node.strip() for node in nodes):
         raise BindingError("allocation slots must identify unambiguous nodes")
+    if len(set(nodes)) != 1:
+        raise BindingError("allocation slots must identify exactly one attached worker node")
     return decoded
 
 
 def bindings_from_allocation(allocation: ConfiguredAllocation) -> tuple[WorkerBinding, ...]:
-    """Return per-slot bindings, or the legacy one-binding fallback."""
+    """Return per-slot bindings, or the legacy one-binding fallback.
+
+    Parameters
+    ----------
+    allocation : ConfiguredAllocation
+        Allocation facts to resolve.
+
+    Returns
+    -------
+    tuple of WorkerBinding
+        One immutable worker binding per declared slot, or one legacy binding.
+
+    Raises
+    ------
+    BindingError
+        If the slot record or legacy binding is not admissible.
+    """
 
     slots = slots_from_allocation(allocation)
     if slots:
         return tuple(slot.binding() for slot in slots)
     return (binding_from_allocation(allocation),)
-
-
-SlotRecord = AllocationSlot
-allocation_slots = slots_from_allocation
 
 
 def binding_from_allocation(allocation: ConfiguredAllocation) -> WorkerBinding:
@@ -360,11 +391,9 @@ def binding_from_allocation(allocation: ConfiguredAllocation) -> WorkerBinding:
 
 __all__ = [
     "AllocationSlot",
-    "SlotRecord",
     "BindingError",
     "WorkerBinding",
     "binding_from_allocation",
     "bindings_from_allocation",
-    "allocation_slots",
     "slots_from_allocation",
 ]
