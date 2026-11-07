@@ -75,9 +75,9 @@ def test_t1b_ab_model_override_is_preserved_or_refused(tmp_path: Path) -> None:
     package = ab_universe.render_a_packages()[0]
     with pytest.raises(train_config.TrainConfigResolutionError, match="override"):
         resolved = train_config.resolve_train_config(
-            _ab_cell(tmp_path, package, "A"), overrides=["model.embedding.out_channels.1=999"]
+            _ab_cell(tmp_path, package, "A"), overrides=["model.embedding.hidden_channels=999"]
         )
-        assert resolved.model.embedding.out_channels[1] == 999
+        assert resolved.model.embedding.hidden_channels == 999
 
 
 def test_t2_run_root_override_moves_all_sinks_or_is_refused(tmp_path: Path) -> None:
