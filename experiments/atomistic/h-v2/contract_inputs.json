@@ -292,6 +292,13 @@
           3
         ]
       },
+      "stream_design_decision": {
+        "status": "decided_2026-11-07",
+        "decided_by": "operator-review-contract-proposals-20261107 item 8 on fffc313a",
+        "decision": "Keep the four-stream select/confirm design above (streams 0/1 select the basin, streams 2/3 confirm it). The operator, quoted: '1 if it is not too difficult. it is ok to be a little scrappy since we are likely only doing this once. 2 otherwise. in that case I would do 5 streams for better data.'",
+        "fallback": "A two-stream pick-and-confirm design is permitted ONLY if the four-stream design proves too difficult to implement. If the fallback is used, the operator added 'I would do 5 streams for better data'; its exact layout must be confirmed with the operator through the manager before use, and is not predecided by this contract.",
+        "contract_text_unaffected": "This decision records the choice; it does not change streams_per_checkpoint, stream_roles, or any other numeric field above."
+      },
       "estimator": {
         "quantity": "W = P99.9(abs(E_L - per-stream median(E_L)))",
         "grid": "each stream's full 4096 by 256 draw-by-walker grid",
@@ -368,13 +375,19 @@
       "bounded_null",
       "unresolved"
     ],
-    "recurrence": "Complete records and qualified uncertainty exist. Streams 0/1 select the smallest-mean-W consecutive triple centered at 3000..19000 (earliest tie); streams 2/3 re-measure early, basin and late W, and each confirmation stream independently must show early W exceeds basin W by >=2x and >=0.01 Ha, with at least two of 40000/45000/50000 exceeding it by both margins with simultaneous confidence bounds. At least 2 of 3 lineages pass. If two lineages pass and the third is incomplete, the study-level label is unresolved; report recurrence in the two complete lineages only. Tail exceedance safeguards must not contradict the W result.",
-    "bounded_null": "All 3 lineages are complete and pass instrument/sampling gates; simultaneous inference over every predeclared basin, checkpoint, threshold, and window search excludes the W decrease/rise rule. For every reference checkpoint k in bounded_null_reference_updates, the simultaneous band excludes W at bounded_null_late_count or more late checkpoints reaching max(2 W(k), W(k) + 0.01 Ha). Fixed-threshold exceedance bands use all four streams and the pilot gate; they also exclude an absolute late increase of 0.002 at every threshold. A flat MAD or nonsignificance alone is not equivalence.",
+    "recurrence": "Complete records and qualified uncertainty exist. Streams 0/1 select the smallest-mean-W consecutive triple centered at 3000..19000 (earliest tie); streams 2/3 re-measure early, basin and late W, and each confirmation stream independently must show early W exceeds basin W by >=2x and >=0.01 Ha, with at least two of 40000/45000/50000 exceeding it by both margins with simultaneous confidence bounds. At least 2 of 3 lineages pass. If two lineages pass and the third is incomplete, the study-level label is unresolved; report recurrence in the two complete lineages only. Tail exceedance safeguards must not contradict the W result: a contradiction is (i) W meets the rise rule while no fixed exceedance threshold shows an increase of at least its own margin in decision_rules.parameters.exceedance_margins_hartree, or (ii) W fails the rise rule, or the bounded-null band excludes it, while some fixed exceedance threshold shows an increase of at least its own margin. A bulk-threshold (0.01/0.05/0.1 Ha) decrease that accompanies a W rise is expected, as He-v1's own 25k-to-50k contrast shows, and is not a contradiction. Directional wording and evidence: operator-review-contract-proposals-20261107 items 1-2 on fffc313a, decided in primary-measure-and-margins-decision-20261107 on 8a67671f from analysis primary-measure-and-margins-analysis-20261107 (FASRC Cannon job 58568904).",
+    "bounded_null": "All 3 lineages are complete and pass instrument/sampling gates; simultaneous inference over every predeclared basin, checkpoint, threshold, and window search excludes the W decrease/rise rule. For every reference checkpoint k in bounded_null_reference_updates, the simultaneous band excludes W at bounded_null_late_count or more late checkpoints reaching max(2 W(k), W(k) + 0.01 Ha). Fixed-threshold exceedance bands use all four streams and the pilot gate; they also exclude an absolute late increase at every threshold of at least that threshold's own margin in decision_rules.parameters.exceedance_margins_hartree (0.002 Ha at the tail thresholds 0.5 and 1 Ha; 0.01 Ha at the bulk thresholds 0.01, 0.05 and 0.1 Ha, where the pilot gate's half-width <= half-margin requirement is otherwise unreachable). A flat MAD or nonsignificance alone is not equivalence.",
     "unresolved": "Any required record, identity, instrument, dependence/uncertainty qualification, tail safeguard, operator decision, or horizon is absent or inconclusive; a partial lineage result, conflicting streams, unsupported margins, or a tail-only change outside the declared instrument is unresolved.",
     "parameters": {
       "w_factor_margin": 2,
       "w_absolute_margin_hartree": 0.01,
-      "exceedance_absolute_margin": 0.002,
+      "exceedance_margins_hartree": {
+        "0.01": 0.01,
+        "0.05": 0.01,
+        "0.1": 0.01,
+        "0.5": 0.002,
+        "1": 0.002
+      },
       "basin_center_updates": [
         3000,
         4000,
@@ -446,15 +459,17 @@
       ],
       "pilot_gate": "science admission requires pilot simultaneous-band half-width <= half of every exceedance margin",
       "operator_alternative": "retain absolute 0.002 only at 0.1, 0.5 and 1 Ha and use a relative margin at 0.01 and 0.05 Ha",
+      "operator_alternative_disposition": "decided 2026-11-07 in an extended form, not the original alternative verbatim: exceedance_margins_hartree uses absolute 0.01 Ha at 0.01, 0.05 AND 0.1 Ha (the alternative's 0.1 Ha stayed at 0.002, which analysis found fails the pilot gate whenever p(0.1 Ha) is in the bulk) and absolute 0.002 Ha at 0.5 and 1 Ha; no relative-margin form was adopted. Source: operator-review-contract-proposals-20261107 item 2 ('same as above', delegated), decided in primary-measure-and-margins-decision-20261107, evidence primary-measure-and-margins-analysis-20261107 (Cannon job 58568904, pilot half-widths 0.0010-0.0022 Ha at the bulk thresholds against the previous 0.001 requirement).",
       "zero_event_bound": "one-sided 97.5% Clopper-Pearson upper bound on walker-level any-exceedance indicator"
     }
   },
   "lane_proposals": [
     {
       "id": "helium_reference_model_and_primary_statistic",
-      "status": "proposed_by_lane_pending_operator_review",
-      "proposal": "Use the historical He training basin only as context: 5k-block median of within-batch variance on a changing model, about 0.00173 Ha^2; s10=26570 and s90=44982 are definition-dependent onset summaries whose definition is only in the unopened Netscratch report, not basin-departure points. Use W and fixed exceedance probabilities for H.",
-      "rationale": "W detects rare-event frequency defects that MAD can hide; no fresh He basin checkpoint exists for a common-estimand threshold.",
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 item 1 on fffc313a ('how much does it matter? decide based on He-v1 analysis', delegated to the lane), lane decision primary-measure-and-margins-decision-20261107 on 8a67671f",
+      "proposal": "Use the historical He training basin only as context: 5k-block median of within-batch variance on a changing model, about 0.00173 Ha^2; s10=26570 and s90=44982 are definition-dependent onset summaries whose definition is only in the unopened Netscratch report, not basin-departure points. Use W, the 99.9th percentile of the absolute deviation from the median, as the primary statistic for H, with fixed exceedance probabilities as safeguards (see decision_rules for the directional-contradiction rule and decision_rules.parameters.exceedance_margins_hartree for the per-threshold margins).",
+      "rationale": "W detects rare-event frequency defects that MAD can hide; no fresh He basin checkpoint exists for a common-estimand threshold. Evidence (primary-measure-and-margins-analysis-20261107, Cannon job 58568904): He-v1's own 25k-to-50k fresh-evaluation contrast is a 22-25x W rise, detected identically by W and by the tail exceedance thresholds (0.5, 1 Ha), while the bulk exceedance thresholds (0.01, 0.05, 0.1 Ha) FALL at the same transition -- an exceedance-primary rule on the bulk thresholds would have called He-v1's broken checkpoint an improvement. For an He-v1-sized effect the choice of primary statistic does not change the outcome; for moderate tail-onset versus uniform-broadening effects it does, which is why the primary stays a ratio statistic (W) rather than a threshold in hartree.",
       "alternatives": [
         "make exceedance probability the primary axis instead of percentile W",
         "use a separately approved recomputed He fresh-evaluation reference"
@@ -462,7 +477,8 @@
     },
     {
       "id": "horizon_and_checkpoints",
-      "status": "checkpoint counts decided 2026-11-06 (operator-decisions-logging-module-checkpoints-20261106d); horizon of 50,000 updates still proposed_by_lane_pending_operator_review",
+      "status": "decided_2026-11-07",
+      "decided_by": "checkpoint counts decided 2026-11-06 (operator-decisions-logging-module-checkpoints-20261106d, '27 makes sense. especially if evaluation is expensive'); horizon decided 2026-11-07 (operator-review-contract-proposals-20261107 item 6, 'you already decided')",
       "proposal": "50,000 updates, retain 0..50000 every 1000, evaluate the explicit 27-checkpoint set",
       "rationale": "Dense retention prevents loss of an early basin while the smaller evaluated set controls fresh-evaluation cost.",
       "alternatives": [
@@ -471,7 +487,8 @@
     },
     {
       "id": "independent_lineages",
-      "status": "proposed_by_lane_pending_operator_review",
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 item 4 on fffc313a, quoted '3'",
       "proposal": "Three fresh lineages with seeds 73001..73003 and sampler seeds 83001..83003; require two of three for recurrence",
       "rationale": "Three is a bounded first recurrence experiment with independent training identities.",
       "alternatives": [
@@ -481,7 +498,8 @@
     },
     {
       "id": "walkers_evaluation_and_uncertainty",
-      "status": "proposed_by_lane_pending_operator_review",
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 item 6 on fffc313a, quoted 'you already decided', consistent with the 2026-11-06 logging and storage decisions",
       "proposal": "4096 training walkers; four fresh streams per evaluated checkpoint, 4096 walkers x 256 draws, burn-in 1000 and stride 20; whole-walker resampling with at least 2000 resamples and simultaneous 95 percent bands",
       "rationale": "Separate stream replication, complete histories, and conservative zero-event bounds protect against dependence and rare-event overclaiming.",
       "alternatives": [
@@ -491,19 +509,23 @@
     },
     {
       "id": "tail_diagnostic_and_margins",
-      "status": "proposed_by_lane_pending_operator_review",
-      "proposal": "Use direct W plus exceedance safeguards; beta/xi are held-out context diagnostics. Use factor-2 and 0.01 Ha W margins and 0.002 absolute exceedance-probability safeguard.",
-      "rationale": "The decision remains distributional without claiming an ultimate tail class or population variance.",
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 item 2 on fffc313a ('same as above', delegated), lane decision primary-measure-and-margins-decision-20261107 on 8a67671f",
+      "proposal": "Use direct W plus exceedance safeguards; beta/xi are held-out context diagnostics. Use factor-2 and 0.01 Ha W margins (unchanged). Use the per-threshold exceedance margins in decision_rules.parameters.exceedance_margins_hartree: 0.002 Ha absolute at the tail thresholds 0.5 and 1 Ha, and 0.01 Ha absolute at the bulk thresholds 0.01, 0.05 and 0.1 Ha, together with the directional-contradiction wording in decision_rules.recurrence.",
+      "rationale": "The decision remains distributional without claiming an ultimate tail class or population variance. Evidence (primary-measure-and-margins-analysis-20261107, Cannon job 58568904): the W margins of factor 2 and 0.01 Ha are never approached by the measured noise ceiling (worst null-pair ratio 1.04-1.15) and are unchanged. The original single 0.002 Ha exceedance margin fails the contract's own pilot gate (band half-width <= half the margin) at the bulk thresholds, where measured pilot half-widths are 0.0010-0.0022 Ha; 0.01 Ha passes it there with margin, while 0.002 Ha remains correct and achievable at the tail thresholds.",
       "alternatives": [
         "make event probability primary",
-        "require all three seeds or use a tenfold effect threshold"
+        "require all three seeds or use a tenfold effect threshold",
+        "exceedance primary at one pre-chosen tail threshold (0.05 or 0.1 Ha) with a 0.002 Ha margin",
+        "a noise-scaled exceedance margin delta(t) = max(0.002, 0.02*sqrt(p_ref*(1-p_ref)))"
       ]
     },
     {
       "id": "science_venue_and_ceiling",
-      "status": "proposed_by_lane_pending_operator_review",
-      "proposal": "FASRC Cannon, one full A100 per lineage, at most 32 GPU-hours per lineage and 96 total; pilot must project the complete unchanged plan. Polaris packed-node science is not assumed.",
-      "rationale": "A single-card Cannon stratum is simpler before multi-GPU placement is qualified.",
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 item 7 on fffc313a, quoted 'cannon with long jobs'",
+      "proposal": "FASRC Cannon, one full A100 per lineage (--constraint=a100), at most 32 GPU-hours per lineage and 96 total; pilot must project the complete unchanged plan. Submit to both FASRC Cannon production GPU partitions in one job, kozinsky_gpu (wall limit 7-00:00:00, gpu:nvidia_a100-sxm4-80gb:4) and seas_gpu (wall limit 2-00:00:00, mixed gpu:nvidia_h200:4 and gpu:nvidia_a100-sxm4-80gb:4), per the cluster-access partition-naming policy (naming fewer needs a stated reason; 32 GPU-hours per lineage fits well inside even the 2-day seas_gpu ceiling). Polaris is not used for H-v2 science; the one-electron pipeline check's excluded-seed Polaris GPU smoke (slice 406194c5) is a non-science route check, not a science venue.",
+      "rationale": "A single-card Cannon stratum is simpler before multi-GPU placement is qualified. Facts cited from the Cannon GPU hardware note (gpu-hardware-strata-and-constraint-rule-2026-08-15 on item 3541fe33): kozinsky_gpu is 2 nodes of 4x A100-SXM4-80GB at a 7-day wall limit; seas_gpu mixes A100-SXM4-80GB and H200 nodes at a 2-day wall limit and requires --constraint pinning for a comparable stratum across lineages.",
       "alternatives": [
         "efficiently packed Polaris node after placement and utilization qualification",
         "a revised lower-cost plan with lost timing or replication power stated"
@@ -521,9 +543,10 @@
     },
     {
       "id": "learned_model_optimizer_and_training_sampler",
-      "status": "proposed_by_lane_pending_operator_review",
-      "proposal": "Use one layer, 32 channels, hidden width 128, maximum order 2, SiLU embedding/mixing/aggregation/residual stack, trainable equal-initialized readout weights, float64, Adam learning rate 0.005, curved electron-nucleus law c=0.01 and d=1 both trainable, 4096 training walkers, sampler burn-in 100, 10 Metropolis steps per update, and proposal scale 0.5 bohr; retain the odd-electron Pfaffian border as a readout device, not a second electron.",
-      "rationale": "A concrete model/optimizer/sampler proposal makes the pipeline and science plan reviewable without silently choosing unreviewed hyperparameters; c=0 is the exact hydrogen answer and c/d drift is a reportable normalizability signal.",
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 items 3 and 5 on fffc313a, quoted 'whatever He-v1 did we do in Hydrogen experiment' (item 3, correcting an earlier 'trainable' answer) and 'whatever He-v1 did' (item 5)",
+      "proposal": "Match He-v1 exactly, adapted only where the one-electron system forces a deviation. Primary source: experiments/atomistic/he-v1/configs/train.yaml at the executed He-v1 training source commit 418accf153368aab45586dc2a2cc97c18472691c (REPORT.md line 5 names this as the commit of record for train-seed0000/Cannon job 40907434). As resolved there: one TPENLayer, Embedding max_order=2/out_channels=32/hidden_channels=128/num_hidden_layers=1 (lines 110-116), EquivariantMixing and PathAggregation both max_order=2/max_virtual_order=2/channels=32/SiLU (lines 118-135), ResidualUpdater (line 137); post-readout factors are ElectronElectronCusp(trainable_range=true) plus ElectronNucleusCusp with CurvatureElectronNucleusCuspLaw(curvature_coefficient=0.01, curvature_range=1.0, trainable=true) (lines 188-197); PfaffianReadout(channels=32, trainable=true) (lines 198-227); optimizer torch.optim.Adam(lr=0.005) (lines 277-280); training sampler MetropolisSampler(n_walkers=4096, burn_in=100, n_steps=10, proposal_scale=0.5) (lines 249-260): burn-in 100, 10 Metropolis steps per update, proposal scale 0.5 bohr. The resolved config of run train-seed0000 itself was not separately available to this amendment; the source commit's train.yaml is the primary evidence used. Nuclear curvature law: c (curvature_coefficient) = 0.01, d (curvature_range) = 1.0, both trainable -- this already matches the contract's normalizability_gate notation (outer slope -1 + c/d, exact_hydrogen_answer c=0) and required no numeric change. One-electron-forced deviations from He-v1, recorded because H has one electron where He has two: (1) ElectronElectronCusp has no effect for a single electron (no electron pair exists to carry same-spin or opposite-spin range gradient; the factor's channel is structurally inert, not frozen by training as He's same-spin channel is for a singlet) -- it is retained as a declared factor for parsed-config agreement with He-v1's pattern, not because it changes the H-v2 wavefunction; (2) spin configuration is n_up=1, n_down=0 (He-v1: n_up=1, n_down=1); (3) nuclear_charge is 1 (He-v1: 2), per study.nuclear_charge; (4) the PfaffianReadout's odd-electron border is retained as a readout device rather than a second electron, as already documented in README.md.",
+      "rationale": "A concrete model/optimizer/sampler proposal makes the pipeline and science plan reviewable without silently choosing unreviewed hyperparameters; c=0 is the exact hydrogen answer and c/d drift is a reportable normalizability signal. Matching He-v1 exactly (rather than re-deriving hyperparameters) is now an operator decision, not a lane proposal, so comparability between the He-v1 and H-v2 wavefunction families is by construction wherever the one-electron system does not force a difference.",
       "alternatives": [
         "fixed linear nuclear factor -r",
         "constrained decaying nuclear law",
@@ -651,7 +674,8 @@
       "scope": "three 50000-update scientific training lineages and their fresh evaluations",
       "status": "prohibited_until_operator_reviews_science_plan",
       "required_review": "operator review of all lane_proposals with explicit approval",
-      "current_status": "prohibited"
+      "current_status": "prohibited",
+      "operator_review_20261107_disposition": "operator-review-contract-proposals-20261107 settled items 1, 2 and 8 on fffc313a (the primary measure/margins and the four-stream design), and all other lane_proposals are now decided; this amendment records that settlement. current_status stays 'prohibited': admission still awaits (a) this amendment's own Cannon verification and human merge of this pull request, and (b) the remaining pipeline-check (slice 5cfcca3e), Polaris smoke (slice 406194c5) and integrated-rerun (slice 2f1b2921) gates already named in this admission block, none of which this amendment closes."
     }
   },
   "logging": {

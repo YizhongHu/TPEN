@@ -26,31 +26,106 @@ basin was first left. The retained fresh evaluations show a finite-range
 25k-to-50k tail contrast, but do not establish a population moment class or a
 common-estimand decrease-then-increase trajectory.
 
-## Lane proposals pending operator review
+## Lane proposals: operator-reviewed 2026-11-07
 
-The eight entries in `contract_inputs.json` are deliberately lane proposals,
-not operator decisions. Each has a rationale and alternatives. The live
-contention is visible: percentile `W` versus event probability as the primary
-axis; fixed versus trainable nuclear curvature; three versus five lineages;
-the factor-two/`0.01 Ha` and `0.002` effect margins; the model/optimizer and
-training sampler; and Cannon single-card science versus efficiently packed
-Polaris science.
+All eight entries in `contract_inputs.json` are now **decided** (see
+`decided_by` on each, except `one_electron_pipeline_check`, which was already
+`admitted_by_operator_direction_2026-11-05`). The operator reviewed them in
+TO note `operator-review-contract-proposals-20261107` on item `fffc313a`,
+with an item-3 correction and an item-8 answer appended the same day. Items 1
+and 2 (percentile `W` versus event probability as the primary axis, and the
+recurrence-rule margins) were delegated to the lane, quoted "decide based on
+He-v1 analysis"/"same as above", and resolved from a read-only He-v1
+fresh-evaluation analysis (FASRC Cannon job `58568904`; note
+`primary-measure-and-margins-analysis-20261107` on item `8a67671f`). Items 3
+to 7 (nuclear curvature, lineage count, model/optimizer/sampler, horizon and
+walker budget, science venue) were decided directly by the operator. Item 8
+(the four-stream design) was decided after one round of clarification.
 
-The proposed science design is 50,000 completed updates, retaining update zero
-and every 1,000 updates (51 retained checkpoints) while fresh-evaluating a
-separate 27-checkpoint set. The checkpoint counts themselves are **decided**,
-2026-11-06: the operator confirmed "27 makes sense. especially if evaluation
-is expensive". All 51 retained checkpoints are kept; fresh evaluation stays at
-27. The rest of the science plan (horizon, lineage count, walker budget,
-venue) remains a lane proposal pending operator review. It proposes three independent
-lineages with
-initialization seeds `73001..73003` and sampler seeds `83001..83003`, four
-fresh streams per evaluated checkpoint, 4,096 walkers, 256 draws, burn-in
-1,000, and stride 20. The training sampler uses burn-in 100, 10 Metropolis
+The science design is 50,000 completed updates, retaining update zero and
+every 1,000 updates (51 retained checkpoints) while fresh-evaluating a
+separate 27-checkpoint set; both the checkpoint counts (2026-11-06, "27 makes
+sense. especially if evaluation is expensive") and the horizon itself
+(2026-11-07, "you already decided") are decided. It uses three independent
+lineages (operator, quoted "3") with initialization seeds `73001..73003` and
+sampler seeds `83001..83003`, four fresh streams per evaluated checkpoint,
+4,096 walkers, 256 draws, burn-in 1,000, and stride 20 (operator, "you
+already decided"). The training sampler uses burn-in 100, 10 Metropolis
 steps per update, and proposal scale 0.5 bohr. Evaluation seeds use the
 formula recorded in the JSON;
 the non-science pipeline and capacity-pilot seed namespaces are excluded from
 science and are globally disjoint from one another and from the science seeds.
+
+### Primary measure and margins (items 1-2)
+
+`W` stays primary; exceedance probabilities stay safeguards. The analysis
+found that, for an He-v1-sized effect, `W` and the TAIL exceedance thresholds
+(`0.5`, `1 Ha`) agree -- He-v1's own 25k-to-50k fresh-evaluation contrast is a
+22-25x `W` rise, with both tail thresholds rising too. The BULK exceedance
+thresholds (`0.01`, `0.05`, `0.1 Ha`) FALL over the same contrast (`-0.07`,
+`-0.24`, `-0.15`); an exceedance-primary rule on those thresholds would have
+read He-v1's broken checkpoint as an improvement. This is why `decision_rules`
+now states the tail-safeguard contradiction DIRECTIONALLY: a bulk-threshold
+decrease that accompanies a `W` rise is expected, not a contradiction. The `W`
+margins (factor `2` and `0.01 Ha`) are unchanged; the measured noise ceiling
+between null stream pairs never exceeds a ratio of about `1.15`. The
+exceedance margin is now per-threshold in `exceedance_margins_hartree`:
+`0.002 Ha` at the tail thresholds `0.5` and `1 Ha` (unchanged, and achievable
+under the pilot gate there), and `0.01 Ha` at the bulk thresholds `0.01`,
+`0.05` and `0.1 Ha` (widened from `0.002 Ha`, because the measured pilot
+simultaneous-band half-widths there, `0.0010`-`0.0022 Ha`, fail the
+contract's own half-width-at-most-half-the-margin gate at `0.002 Ha`). This
+is the `operator_alternative` extended to all three bulk thresholds, not
+adopted verbatim.
+
+### Nuclear curvature and model/optimizer/sampler (items 3 and 5)
+
+Nuclear curvature is **whatever He-v1 did**, not an independently chosen
+value (the operator corrected an initial "trainable" answer to "whatever
+He-v1 did we do in Hydrogen experiment"). The primary source is He-v1's
+training config at the executed source commit
+`418accf153368aab45586dc2a2cc97c18472691c`
+(`experiments/atomistic/he-v1/configs/train.yaml`): a
+`CurvatureElectronNucleusCuspLaw` with `curvature_coefficient=0.01`
+(`c`), `curvature_range=1.0` (`d`), `trainable=true` -- this already matched
+what the lane had proposed, so no numeric value changed; only the citation
+and the "matches He-v1" framing are new. The same source fixes model,
+optimizer and training sampler (item 5): one `TPENLayer`, `Embedding`
+`out_channels=32`/`hidden_channels=128`, `EquivariantMixing`/
+`PathAggregation` `channels=32`/SiLU, `PfaffianReadout(channels=32,
+trainable=true)`, `torch.optim.Adam(lr=0.005)`, and the training
+`MetropolisSampler(n_walkers=4096, burn_in=100, n_steps=10,
+proposal_scale=0.5)`. One-electron-forced deviations from He-v1 are recorded
+in `contract_inputs.json`: the `ElectronElectronCusp` factor has no effect
+for a single electron (no electron pair exists to carry gradient; it is kept
+only for parsed-config agreement with He-v1's pattern); the spin
+configuration is `n_up=1, n_down=0` against He-v1's `n_up=1, n_down=1`; the
+nuclear charge is `1` against He-v1's `2`; and the `PfaffianReadout`'s
+odd-electron border stays a readout device, not a second electron.
+
+### Science venue (item 7)
+
+Cannon, using long jobs, not packed Polaris (operator, "cannon with long
+jobs"). Science submits to both FASRC Cannon production GPU partitions in one
+job: `kozinsky_gpu` (wall limit `7-00:00:00`, `gpu:nvidia_a100-sxm4-80gb:4`)
+and `seas_gpu` (wall limit `2-00:00:00`, mixed `gpu:nvidia_h200:4` and
+`gpu:nvidia_a100-sxm4-80gb:4`), pinned with `--constraint=a100` for a
+comparable stratum, per the Cannon partition-naming policy. At most 32
+GPU-hours per lineage fits comfortably inside even the tighter `seas_gpu`
+ceiling. Polaris is not used for H-v2 science; its only role stays the
+pipeline check's excluded-seed GPU smoke (slice `406194c5`), which is not a
+science venue.
+
+### Four-stream design (item 8)
+
+The four-stream select/confirm design (streams 0/1 select the basin, streams
+2/3 confirm it) is kept, unchanged in the machine-readable fields below. The
+operator: "1 if it is not too difficult. it is ok to be a little scrappy
+since we are likely only doing this once. 2 otherwise. in that case I would
+do 5 streams for better data." A two-stream fallback is permitted only if the
+four-stream design proves too difficult to implement, and its exact layout
+(the operator suggested five streams for better data) must be confirmed with
+the operator through the manager before use -- it is not predecided here.
 
 The fresh-evaluation estimator is machine-readable in `contract_inputs.json`:
 compute each stream's W on its complete 4,096 by 256 grid, use that stream's
@@ -60,7 +135,8 @@ re-measure early, basin and late W. Bounded-null inference uses all four
 streams. The zero-event safeguard is a one-sided 97.5% Clopper--Pearson upper
 bound on the walker-level any-exceedance indicator.
 
-The proposed primary statistic is
+The primary statistic, decided 2026-11-07 (see "Primary measure and margins"
+above), is
 
 `W = P99.9(abs(E_L - median(E_L)))`.
 
@@ -70,7 +146,9 @@ curves, and fixed-threshold exceedance probabilities at `0.01`, `0.05`,
 MCSE are secondary/descriptive only. The `W` recurrence rule requires a factor
 of two and `0.01 Ha` change with simultaneous uncertainty support; the bounded
 null additionally requires every fixed-threshold exceedance probability to
-exclude a late absolute increase of `0.002`. Its W clause applies to every
+exclude a late absolute increase of at least its own margin in
+`exceedance_margins_hartree`: `0.002 Ha` at `0.5` and `1 Ha`, `0.01 Ha` at
+`0.01`, `0.05` and `0.1 Ha`. Its W clause applies to every
 evaluated reference checkpoint through update 20,000 and excludes the declared
 late count reaching `max(2 W(k), W(k) + 0.01 Ha)`. A flat MAD is not
 equivalence.
@@ -121,9 +199,10 @@ second electron, rejection at undefined radius zero without regularization,
 an independently coded scalar hydrogen oracle, sampler-target/mutation
 rejection, and source/resolved-input identity checks.
 
-The proposed nuclear law has a normalizability gate at every checkpoint:
-outer slope `-1 + c/d <= -kappa_min`, with `kappa_min = 0.5` proposed for
-operator review. A violation makes that checkpoint `unresolved`; it is never
+The nuclear law (decided 2026-11-07 to match He-v1; see "Nuclear curvature and
+model/optimizer/sampler" above) has a normalizability gate at every
+checkpoint: outer slope `-1 + c/d <= -kappa_min`, with `kappa_min = 0.5`. A
+violation makes that checkpoint `unresolved`; it is never
 filtered out. `c = 0` is the exact hydrogen answer, so upward curvature drift
 is itself a reportable model signal. The independently recomputed analytic
 controls are `alpha=1.2`: mean `-0.48 Ha`, variance `0.0576 Ha^2`, median
@@ -292,6 +371,12 @@ spike found the exact, imperfect, untrained and trained states all fall in
 the same narrow band, confirming the module cannot classify state quality.
 It remains descriptive only: no alarm and no science gate. Implementation
 (layer `fa3c35a8`) and independent verification against the frozen list
-still remain. The horizon of 50,000 updates, the science venue and resource
-ceiling, and every other `lane_proposals` entry remain pending operator
-review. Science lineages remain prohibited.
+still remain.
+
+Every `lane_proposals` entry is now decided (2026-11-07 operator review; see
+"Lane proposals: operator-reviewed 2026-11-07" above). That does not lift the
+science hold: **science lineages remain prohibited** pending this amendment's
+own Cannon verification and the human merge of this pull request, and pending
+the remaining pipeline-check (`5cfcca3e`), excluded-seed Polaris smoke
+(`406194c5`), and integrated-rerun (`2f1b2921`) gates already described above,
+none of which this amendment closes.

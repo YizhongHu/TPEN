@@ -167,7 +167,13 @@ def test_decision_rule_parameters_are_machine_readable() -> None:
     parameters = rules["parameters"]
     assert parameters["w_factor_margin"] == 2
     assert parameters["w_absolute_margin_hartree"] == 0.01
-    assert parameters["exceedance_absolute_margin"] == 0.002
+    assert parameters["exceedance_margins_hartree"] == {
+        "0.01": 0.01,
+        "0.05": 0.01,
+        "0.1": 0.01,
+        "0.5": 0.002,
+        "1": 0.002,
+    }
     assert parameters["basin_center_updates"] == list(range(3000, 19001, 1000))
     assert parameters["early_updates"] == [0, 1000]
     assert parameters["late_updates"] == [40000, 45000, 50000]

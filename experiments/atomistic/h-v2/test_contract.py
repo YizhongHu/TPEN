@@ -118,12 +118,18 @@ def test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct() -> Non
 def test_all_eight_lane_proposals_are_visible() -> None:
     proposals = load_inputs()["lane_proposals"]
     assert len(proposals) == 8
-    still_pending = [p for p in proposals if p["id"] != "horizon_and_checkpoints"]
-    assert all(item["status"].startswith("proposed_by_lane_") for item in still_pending)
+    pipeline_check = next(p for p in proposals if p["id"] == "one_electron_pipeline_check")
+    assert pipeline_check["status"] == "proposed_by_lane_admitted_non_science_scope"
+    decided = [p for p in proposals if p["id"] != "one_electron_pipeline_check"]
+    # Operator review 2026-11-07 (operator-review-contract-proposals-20261107) settled
+    # every remaining lane proposal; none is still pending operator review.
+    assert all(item["status"] == "decided_2026-11-07" for item in decided)
+    assert all("decided_by" in item and item["decided_by"] for item in decided)
+    assert not any(
+        item["status"].startswith("proposed_by_lane_pending_operator_review")
+        for item in proposals
+    )
     horizon = next(p for p in proposals if p["id"] == "horizon_and_checkpoints")
-    assert horizon["status"].startswith("checkpoint counts decided")
-    assert "horizon of 50,000 updates" in horizon["status"]
-    assert "proposed_by_lane_pending_operator_review" in horizon["status"]
     assert not any("51" in alternative for alternative in horizon["alternatives"])
     assert all(
         item["proposal"] and item["rationale"] and item["alternatives"]
