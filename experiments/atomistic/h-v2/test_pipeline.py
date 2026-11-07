@@ -103,7 +103,7 @@ def test_part_e_contract_scale_training_and_evaluation_energy_criteria(tmp_path:
     ``*_improvement_rule_evaluated`` junit property) when the untrained
     (update-zero) model is already within ``0.02`` Ha. In that branch the
     contract requires only the imperfect learned-state/gradient control.
-    `test_stub_oracle_contract.test_stub_imperfect_state_is_not_reported_exact`
+    ``tests/unit/physics/test_hydrogen_oracle_controls.test_stub_imperfect_state_is_not_reported_exact``
     (``alpha=1.2``) is an oracle self-consistency control, not a learned-state
     control: it proves the independent analytic instrument rejects an
     imperfect exact-form stub, not that this pipeline's trained model is

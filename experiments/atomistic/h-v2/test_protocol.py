@@ -66,6 +66,25 @@ def test_frozen_configs_are_hydrogen_and_model_only_eval() -> None:
     assert evaluation["load"]["mode"] == "model_only"
 
 
+def test_frozen_training_config_selects_the_contract_sampler_literals() -> None:
+    """Pin the frozen sampler binding the moved core tests rely on as literals.
+
+    ``tests/unit/sampling/test_hydrogen_sampler_controls.py`` builds
+    ``MetropolisSampler`` directly from these same numeric literals (not from
+    this configuration) because the experiment boundary forbids that core
+    test from importing ``tpen`` or reading this file. This test is what
+    keeps the two in sync: a drift in the frozen sampler settings fails here.
+    """
+
+    sampler = protocol.training_config()["sampler"]
+    assert sampler["_target_"] == "tpen.sampling.metropolis.MetropolisSampler"
+    assert sampler["n_walkers"] == 256
+    assert sampler["burn_in"] == 100
+    assert sampler["n_steps"] == 10
+    assert sampler["proposal_scale"] == 0.5
+    assert sampler["seed"] == 910002
+
+
 @pytest.mark.parametrize(
     "mutation, message",
     [
@@ -73,6 +92,7 @@ def test_frozen_configs_are_hydrogen_and_model_only_eval() -> None:
         (lambda cfg: cfg["hamiltonian_terms"].update(electron_electron={}), "only kinetic"),
         (lambda cfg: cfg["hamiltonian_terms"]["kinetic"].update(_target_="wrong.Kinetic"), "-1/2"),
         (lambda cfg: cfg["hamiltonian_terms"]["electron_nucleus"].update(eps=0.1), "raw"),
+        (lambda cfg: cfg["sampler"].update(_target_="wrong.Sampler"), "Metropolis sampler"),
         (lambda cfg: cfg["model"]["factors"].append({"_target_": "tpen.nn.ElectronElectronCusp"}), "only the nuclear"),
     ],
 )

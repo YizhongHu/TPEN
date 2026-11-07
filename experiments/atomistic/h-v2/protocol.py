@@ -62,6 +62,9 @@ def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False
         raise ValueError("H-v2 requires the raw electron-nucleus potential")
     if terms["electron_nucleus"].get("eps") != 0.0:
         raise ValueError("H-v2 Coulomb potential must be raw -1/r")
+    sampler = config.get("sampler", {})
+    if sampler.get("_target_") != "tpen.sampling.metropolis.MetropolisSampler":
+        raise ValueError("H-v2 requires the Metropolis sampler")
     factors = config.get("model", {}).get("factors", [])
     targets = [factor.get("_target_") for factor in factors]
     if targets != ["tpen.nn.ElectronNucleusCusp"]:

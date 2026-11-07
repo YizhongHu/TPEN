@@ -31,19 +31,28 @@ source/checkpoint/config identity, a missing checkpoint commit marker, an
 uncommitted tail, and a training-state restore request are all refusals; no
 clipped or final-draw statistic is produced.
 
-``test_oracle_vs_tpen.py`` checks TPEN's real kinetic, electron-nucleus, and
-sampler accept-ratio/accept-decision code against independently-coded
-references (central finite differences with a Richardson-extrapolated
-tolerance, a raw ``-Z/r`` formula, and an independent rederivation of both the
-|psi|^2 accept exponent and the resulting accept/reject decision) computed in
-that module, not against ``tpen.physics`` or a grep. Measured on Cannon (job
-58147449, head ``a74bc22c``): a kinetic-prefactor mutant and a sign-flipped
-nuclear potential, both previously uncaught, are now KILLED by these checks; a
-sampler |psi|-vs-|psi|^2 mutant is KILLED by both the new behavioral check and
-the pre-existing grep. ``test_stub_oracle_contract.py`` runs TPEN's real
-kinetic, potential, and sampler operators against the closed-form oracle on an
-exact ``psi = exp(-alpha r)`` amplitude stub, covering contract parts (b), (c)
-and (d) behaviorally (see "Known gap" below for what this does not close).
+TPEN's real kinetic, electron-nucleus, and sampler accept-ratio/accept-decision
+code is checked against independently-coded references (central finite
+differences with a Richardson-extrapolated tolerance, a raw ``-Z/r`` formula,
+an independent rederivation of both the |psi|^2 accept exponent and the
+resulting accept/reject decision, and the closed-form oracle on an exact
+``psi = exp(-alpha r)`` amplitude stub) by
+``tests/unit/physics/test_hydrogen_oracle_controls.py`` and
+``tests/unit/sampling/test_hydrogen_sampler_controls.py`` in the core tests
+tree, not under this directory: the experiment boundary (see "Experiment
+boundary" below) restricts files here to configuration,
+``tpen.run.run_from_config``, or the ``tpen`` command, and these checks reach
+``tpen.physics``/``tpen.sampling`` internals directly. The charge-one hydrogen
+setup those core tests use is built from literals in
+``tests/helpers/hydrogen_contract.py``, duplicated from (and pinned against,
+by ``test_protocol.test_frozen_training_config_selects_the_contract_sampler_literals``)
+this directory's frozen ``configs/train.yaml``, not read from it. Measured on
+Cannon (job 58147449, head ``a74bc22c``, pre-move): a kinetic-prefactor mutant
+and a sign-flipped nuclear potential, both previously uncaught, are now KILLED
+by these checks; a sampler |psi|-vs-|psi|^2 mutant is KILLED by both the
+behavioral check and the pre-existing grep. The oracle checks cover contract
+parts (b), (c) and (d) behaviorally (see "Known gap" below for what this does
+not close).
 Part (e)'s ``0.02`` Ha energy-error (the pooled mean local energy, not a
 median) and ``0.25`` median-absolute-error-improvement criteria are evaluated
 at contract scale, with the complete draw-by-walker grid asserted, by
@@ -62,9 +71,10 @@ pay that cost once per head). The opt-in flag only works with this documented
 invocation naming ``test_pipeline.py`` directly; a broader invocation (e.g.
 rooted at ``experiments/atomistic``) can only skip the test, not run it.
 
-**Scope, not a gap.** ``test_stub_oracle_contract.py`` already compares TPEN's
-real kinetic, potential, and sampler code against the closed-form oracle on an
-exact ``psi = exp(-alpha r)`` amplitude stub, covering contract parts (b), (c)
+**Scope, not a gap.** ``tests/unit/physics/test_hydrogen_oracle_controls.py``
+already compares TPEN's real kinetic, potential, and sampler code against the
+closed-form oracle on an exact ``psi = exp(-alpha r)`` amplitude stub,
+covering contract parts (b), (c)
 and (d) through the real operators. What is not done, and is not required by
 the contract, is pinning a Hydra-constructed ``TPENWaveFunction`` to that exact
 state: `tpen.nn.embedding.Embedding` only ever builds
