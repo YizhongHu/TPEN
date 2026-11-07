@@ -16,7 +16,6 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from importlib import import_module
 import json
-import operator
 from pathlib import Path
 import sys
 from typing import Any
@@ -468,11 +467,32 @@ def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple
     return tuple(items)
 
 
+def _config_leaves(value: Any, path: str = "") -> tuple[tuple[str, Any], ...]:
+    """Flatten an unresolved OmegaConf container into leaf paths and values."""
+
+    if isinstance(value, Mapping):
+        leaves: list[tuple[str, Any]] = []
+        for key, nested in value.items():
+            child = f"{path}.{key}" if path else str(key)
+            leaves.extend(_config_leaves(nested, child))
+        return tuple(leaves)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        leaves = []
+        for index, nested in enumerate(value):
+            child = f"{path}.{index}" if path else str(index)
+            leaves.extend(_config_leaves(nested, child))
+        return tuple(leaves)
+    return ((path, value),)
+
+
 _RESOLVER_OWNED_SEED_PATHS = frozenset({"runtime.seed", "sampler.seed"})
 _RESOLVER_OWNED_SEED_SUFFIXES = (".initializer.seed",)
 _RESOLVER_OWNED_CHECKER_PREFIX = "callbacks."
 _RESOLVER_OWNED_CHECKER_MARKER = ".checkers."
 _RESOLVER_OWNED_SEED_SUFFIX = ".seed"
+_RESOLVER_OWNED_OVERRIDE_PATHS = frozenset(
+    {"run.root", "run.dir", "run.run_id", "run.layout", "sampler.n_walkers"}
+)
 _OVERRIDE_MISSING = object()
 
 
@@ -513,7 +533,7 @@ def _reject_resolver_owned_overrides(items: Sequence[tuple[str, Any]]) -> None:
     """Refuse paths whose values are written by this resolver after overlays."""
 
     for path, _ in items:
-        if str.__eq__(path, "run.root") is True or str.__eq__(path, "run.dir") is True:
+        if path in _RESOLVER_OWNED_OVERRIDE_PATHS:
             raise TrainConfigResolutionError(
                 f"resolver-owned override path is not permitted: {path}"
             )
@@ -691,13 +711,18 @@ def resolve_train_config(
         )
     _set_named_initializer_seeds(cfg, model_seed)
     _set_optional_execution_seeds(cfg, streams)
+    unresolved = OmegaConf.to_container(cfg, resolve=False)
+    unresolved_leaves = dict(_config_leaves(unresolved))
     for path, expected in override_items:
-        actual = OmegaConf.select(cfg, path, default=_OVERRIDE_MISSING)
-        if not operator.eq(actual, expected):
+        actual = unresolved_leaves.get(path, _OVERRIDE_MISSING)
+        if actual != expected:
             raise TrainConfigResolutionError(
                 f"override path {path!r} was not preserved before resolution"
             )
-    OmegaConf.resolve(cfg)
+    try:
+        OmegaConf.resolve(cfg)
+    except Exception as exc:
+        raise TrainConfigResolutionError("configuration interpolation could not be resolved") from exc
 
     schema = import_module("tpen.hi_schema")
     schema.validate_hi_train_config(cfg)
