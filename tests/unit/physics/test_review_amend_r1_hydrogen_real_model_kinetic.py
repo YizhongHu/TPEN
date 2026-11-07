@@ -38,7 +38,7 @@ def _model() -> TPENWaveFunction:
     ).to(dtype=torch.float64)
 
 
-def test_real_architecture_kinetic_matches_independent_difference(seed: int, record_property) -> None:
+def _check_real_architecture_kinetic(seed: int, record_property) -> None:
     """Differentiate the real architecture and compare two finite differences."""
 
     torch.manual_seed(seed)
@@ -59,4 +59,4 @@ def test_real_architecture_kinetic_matches_independent_difference(seed: int, rec
 def test_real_architecture_kinetic_for_seed(seed: int, record_property) -> None:
     """Run the real-architecture oracle for each requested initialization."""
 
-    test_real_architecture_kinetic_matches_independent_difference(seed, record_property)
+    _check_real_architecture_kinetic(seed, record_property)
