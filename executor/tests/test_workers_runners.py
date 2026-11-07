@@ -13,6 +13,7 @@ import sys
 import pytest
 
 from tpen_executor.configuration import StagedHydra
+from tpen_executor.dispatch.contract import _child_context_keys
 from tpen_executor.environments import PreparedPythonEnvironment, SourceScript
 from tpen_executor.runners import (
     CHILD_CONTEXT_KEYS_ENV,
@@ -22,7 +23,6 @@ from tpen_executor.runners import (
     RUN_SHIM,
     TPENCommand,
     TPENEvidence,
-    _child_context_keys,
 )
 from tpen_executor.workers import ProcessOutcome, SubprocessWorker
 
