@@ -522,7 +522,7 @@ def test_t7_repeated_cancel_interrupts_still_reap_every_active_future(tmp_path: 
     """M1 kills cancellation cleanup that exits after its second interrupt."""
 
     dispatcher = _dispatcher(tmp_path, _stub_package(tmp_path))
-    lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(1)), DirectoryStore(tmp_path / "store"))
+    lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(2)), DirectoryStore(tmp_path / "store"))
     state = {"polls": 0}
 
     class Future:
