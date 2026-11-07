@@ -148,19 +148,51 @@ def test_a2_local_dispatch_publishes_v2_manifest_and_preserves_colon_id(tmp_path
     assert (Path(paths["store"]) / "run-manifest.json").exists()
 
 
-@pytest.mark.parametrize("mutation", ["diagnostic", "duplicate-json", "wrong-runs"])
+@pytest.mark.parametrize("mutation", ["diagnostic", "duplicate-json"])
 def test_a3_named_admission_refusals_do_not_create_store(tmp_path: Path, mutation: str) -> None:
     paths = _inputs(tmp_path)
     if mutation == "diagnostic":
         Path(paths["input"]).with_name("executor_input_diagnostics.json").write_text("{}", encoding="utf-8")
-    elif mutation == "duplicate-json":
-        Path(paths["input"]).write_text('{"schema":"x","schema":"y"}', encoding="utf-8")
     else:
-        Path(paths["runs"]).write_text('{"schema":"tpen-executor/configured-runs-v1","group_digest":"' + "0" * 64 + '","runs":[]}', encoding="utf-8")
+        Path(paths["input"]).write_text('{"schema":"x","schema":"y"}', encoding="utf-8")
     result = _run_cli(paths)
     assert result.returncode == 2
     assert result.stdout == ""
-    assert json.loads(result.stderr)["schema"] == "tpen-executor/cli-error-v1"
+    error = json.loads(result.stderr)
+    assert error["schema"] == "tpen-executor/cli-error-v1"
+    if mutation == "diagnostic":
+        assert error["code"] == "diagnostic-present"
+    assert not Path(paths["store"]).exists()
+
+
+def test_a3_empty_runs_refuses_before_store(tmp_path: Path) -> None:
+    paths = _inputs(tmp_path)
+    runs = json.loads(Path(paths["runs"]).read_text(encoding="utf-8"))
+    runs["runs"] = []
+    Path(paths["runs"]).write_text(json.dumps(runs), encoding="utf-8")
+    result = _run_cli(paths)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    error = json.loads(result.stderr)
+    assert error["schema"] == "tpen-executor/cli-error-v1"
+    assert error["code"] == "invalid-runs"
+    assert not Path(paths["store"]).exists()
+
+
+def test_a3_wrong_group_digest_refuses_before_store(tmp_path: Path) -> None:
+    paths = _inputs(tmp_path, ("task:first", "task:last"))
+    runs = json.loads(Path(paths["runs"]).read_text(encoding="utf-8"))
+    wrong_digest = "0" * 64
+    if runs["group_digest"] == wrong_digest:
+        wrong_digest = "1" * 64
+    runs["group_digest"] = wrong_digest
+    Path(paths["runs"]).write_text(json.dumps(runs), encoding="utf-8")
+    result = _run_cli(paths)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    error = json.loads(result.stderr)
+    assert error["schema"] == "tpen-executor/cli-error-v1"
+    assert error["code"] == "group-digest-mismatch"
     assert not Path(paths["store"]).exists()
 
 
