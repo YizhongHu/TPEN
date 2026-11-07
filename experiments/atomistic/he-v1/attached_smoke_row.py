@@ -95,7 +95,32 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Prepare the selected row from an explicit launch packet."""
+    """Prepare the selected row from an explicit launch packet.
+
+    Parameters
+    ----------
+    argv : sequence of str, optional
+        Command-line arguments.  If omitted, arguments are read from
+        ``sys.argv``.
+
+    Returns
+    -------
+    int
+        Zero after the selected row is prepared.
+
+    Raises
+    ------
+    SystemExit
+        If the launch packet is incomplete or contains invalid arguments.
+    ActivationRefusal
+        Propagated unchanged if the attached route refuses activation.
+    ValueError
+        If a launch-packet path is not absolute.
+    FileNotFoundError
+        If the manifest path does not identify a readable file.
+    json.JSONDecodeError
+        If the manifest is not valid JSON.
+    """
 
     args = _parse_args(argv)
     prepare_smoke_row(

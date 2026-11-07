@@ -121,11 +121,26 @@ def test_t1b_main_forwards_distinct_launch_values_and_required_row(
     }
 
 
-def test_t3_relative_paths_are_refused_before_prepare(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("argument_name", "error_name"),
+    [
+        ("manifest_path", "manifest_path"),
+        ("output_dir", "output_dir"),
+        ("repo_root", "repo_root"),
+        ("results_root", "results_root"),
+        ("source_config", "source_config"),
+    ],
+)
+def test_t3_relative_paths_are_refused_before_prepare(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    argument_name: str,
+    error_name: str,
+) -> None:
     """T3 kills the mutant that silently resolves a relative launch path."""
 
     arguments = _arguments(tmp_path)
-    arguments["manifest_path"] = "manifest.json"
+    arguments[argument_name] = "relative-input"
     called = False
 
     def record(*args: object, **kwargs: object) -> object:
@@ -134,7 +149,7 @@ def test_t3_relative_paths_are_refused_before_prepare(monkeypatch: pytest.Monkey
         return SimpleNamespace()
 
     monkeypatch.setattr(smoke, "prepare_he_train", record)
-    with pytest.raises(ValueError, match="manifest_path must be absolute"):
+    with pytest.raises(ValueError, match=f"{error_name} must be absolute"):
         smoke.prepare_smoke_row(**arguments)
     assert not called
 
@@ -165,4 +180,44 @@ def test_t5_missing_manifest_propagates_without_prepare_call(
     monkeypatch.setattr(smoke, "prepare_he_train", record)
     with pytest.raises(FileNotFoundError):
         smoke.prepare_smoke_row(**arguments)
+    assert not called
+
+
+@pytest.mark.parametrize(
+    "omitted_flag",
+    ["manifest", "output-dir", "repo-root", "results-root", "source-config", "row-id"],
+)
+def test_t6_all_launch_flags_are_required(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    omitted_flag: str,
+) -> None:
+    """T6 kills defaults that substitute for any missing launch input."""
+
+    arguments = _arguments(tmp_path)
+    called = False
+
+    def record(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called = True
+        return SimpleNamespace()
+
+    monkeypatch.setattr(smoke, "prepare_he_train", record)
+    argv = [
+        item
+        for key, value in {
+            "manifest": arguments["manifest_path"],
+            "output-dir": arguments["output_dir"],
+            "repo-root": arguments["repo_root"],
+            "results-root": arguments["results_root"],
+            "source-config": arguments["source_config"],
+            "row-id": arguments["row_id"],
+        }.items()
+        if key != omitted_flag
+        for item in (f"--{key}", str(value))
+    ]
+
+    with pytest.raises(SystemExit) as raised:
+        smoke.main(argv)
+    assert raised.value.code == 2
     assert not called
