@@ -72,9 +72,10 @@ invocation naming ``test_pipeline.py`` directly; a broader invocation (e.g.
 rooted at ``experiments/atomistic``) can only skip the test, not run it.
 
 **Scope, not a gap.** ``tests/unit/physics/test_hydrogen_oracle_controls.py``
-already compares TPEN's real kinetic, potential, and sampler code against the
-closed-form oracle on an exact ``psi = exp(-alpha r)`` amplitude stub,
-covering contract parts (b), (c)
+already compares TPEN's real kinetic and potential code, and
+``tests/unit/sampling/test_hydrogen_sampler_controls.py`` the real sampler
+code, against the closed-form oracle on an exact ``psi = exp(-alpha r)``
+amplitude stub, covering contract parts (b), (c)
 and (d) through the real operators. What is not done, and is not required by
 the contract, is pinning a Hydra-constructed ``TPENWaveFunction`` to that exact
 state: `tpen.nn.embedding.Embedding` only ever builds

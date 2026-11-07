@@ -36,13 +36,15 @@ from tests.helpers.hydrogen_contract import (
 )
 
 #: Richardson-extrapolation tolerance for
-#: `test_kinetic_finite_difference_richardson_headroom`. Not independently
-#: Cannon-calibrated for `RandomSmoothWaveFunction` (it was calibrated to
-#: 1e-6 for the trained H-v2 architecture in the superseded study test); kept
-#: generous relative to the plain, un-extrapolated probe's 2e-3 tolerance
-#: below. The extrapolated discrepancy is recorded via `record_property` so a
-#: future tightening is a measured change, not a guess.
-RICHARDSON_TOLERANCE = 1e-5
+#: `test_kinetic_finite_difference_richardson_headroom`. Measured on Cannon
+#: (job 58571622) for `RandomSmoothWaveFunction` at seeds 1-3:
+#: 2.0584259644018665e-09, 3.3302093530723775e-09, 3.81966344664697e-09 --
+#: about 260x headroom here. The real-architecture arm
+#: (`tests/unit/physics/test_review_amend_r1_hydrogen_real_model_kinetic.py`)
+#: measured 6.6e-8 to 8.0e-8 at the same bound, about 12x headroom, so one
+#: constant serves both. The extrapolated discrepancy is recorded via
+#: `record_property` so a future tightening is a measured change, not a guess.
+RICHARDSON_TOLERANCE = 1e-6
 
 
 @pytest.mark.parametrize("seed", [1, 2, 3])

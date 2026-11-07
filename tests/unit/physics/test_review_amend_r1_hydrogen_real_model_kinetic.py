@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import torch
 import pytest
+import torch
 
 from tpen.nn import (
     ElectronNucleusCusp,
@@ -38,7 +38,8 @@ def _model() -> TPENWaveFunction:
     ).to(dtype=torch.float64)
 
 
-def _check_real_architecture_kinetic(seed: int, record_property) -> None:
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_real_architecture_kinetic_for_seed(seed: int, record_property) -> None:
     """Differentiate the real architecture and compare two finite differences."""
 
     torch.manual_seed(seed)
@@ -53,10 +54,3 @@ def _check_real_architecture_kinetic(seed: int, record_property) -> None:
     record_property(f"seed_{seed}_richardson_discrepancy", discrepancy)
     print(f"seed={seed} richardson_discrepancy={discrepancy}")
     assert torch.allclose(actual, expected, atol=2e-3, rtol=2e-3)
-
-
-@pytest.mark.parametrize("seed", [1, 2, 3])
-def test_real_architecture_kinetic_for_seed(seed: int, record_property) -> None:
-    """Run the real-architecture oracle for each requested initialization."""
-
-    _check_real_architecture_kinetic(seed, record_property)
