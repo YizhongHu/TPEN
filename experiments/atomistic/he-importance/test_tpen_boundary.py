@@ -61,10 +61,10 @@ EXPECTED_PRODUCTION_INVENTORY = {
     ("optimizer_grid.py", 367, "tpen.hi_schema"): InventoryEntry(
         "remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 239, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 238, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 702, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 727, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("run_stage_q.py", 128, "tpen.hi_schema"): InventoryEntry(
@@ -1220,6 +1220,8 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             ("path is a detached override key and suffix is module-owned frozen data", 2),
         ("train_config.py", "resolve_train_config", "actual != expected"):
             ("expected from OmegaConf.to_container, actual from resolver-owned config; no caller object reaches it", 1),
+        ("train_config.py", "_reject_resolver_owned_overrides", "path in _RESOLVER_OWNED_OVERRIDE_PATHS"):
+            ("path is a detached override key and the frozen resolver-owned path set is module-owned", 1),
         ("train_config.py", "_optimizer_entry", 'status not in {"available", "unavailable"}'):
             ("status is read from the validated scientific-identity mapping and compared with module literals", 1),
         ("train_config.py", "_optimizer_entry", 'status != "available"'):
