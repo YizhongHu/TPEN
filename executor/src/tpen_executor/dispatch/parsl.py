@@ -333,9 +333,11 @@ class ParslDispatcher(DispatcherContract):
                 environment = _with_child_context_keys(environment, lifecycle.allocation)
                 process = materialized["process"]
                 materialized["runner"]
-                materialized["evidence"]
+                evidence = materialized["evidence"]
                 if not callable(getattr(process, "run", None)):
                     raise TypeError("materialized worker process lacks run()")
+                if not callable(getattr(evidence, "read", None)):
+                    raise TypeError("materialized worker evidence reader lacks read()")
                 output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = _member_paths(fence)
                 args = (*configured.command().args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
                 future, handle = self._submit_process(
@@ -471,12 +473,14 @@ class ParslDispatcher(DispatcherContract):
             record["handle"].request_kill()
         for future, record in active.items():
             reap_errors: list[BaseException] = []
+            while True:
+                try:
+                    if future.done():
+                        break
+                    _poll_sleep(0.01)
+                except BaseException as error:
+                    reap_errors.append(error)
             try:
-                while not future.done():
-                    try:
-                        _poll_sleep(0.01)
-                    except BaseException as error:
-                        reap_errors.append(error)
                 try:
                     future.result(None)
                 except BaseException as error:

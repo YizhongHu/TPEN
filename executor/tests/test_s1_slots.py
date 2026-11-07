@@ -22,6 +22,7 @@ from tpen_executor import composition
 from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
+from tpen_executor.dispatch import LocalDispatcher
 from tpen_executor.dispatch.parsl import ParslDispatcher, _ChildProcessHandle
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
@@ -558,6 +559,100 @@ def test_t7_repeated_cancel_interrupts_still_reap_every_active_future(tmp_path: 
 
 
 @PARSL_REQUIRED
+def test_t7_cancel_retries_when_done_is_interrupted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """T7 kills cancellation cleanup that exits when future.done() is interrupted."""
+
+    dispatcher = _dispatcher(tmp_path, _stub_package(tmp_path))
+    lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(2)), DirectoryStore(tmp_path / "store"))
+    state = {"done_calls": 0, "polls": 0}
+
+    class Future:
+        reaped = False
+
+        def done(self) -> bool:
+            state["done_calls"] += 1
+            if state["done_calls"] == 1:
+                return False
+            if state["done_calls"] == 2:
+                raise KeyboardInterrupt("S1 cancellation 2")
+            self.reaped = True
+            return True
+
+        def result(self, timeout: float | None = None) -> ProcessOutcome:
+            del timeout
+            assert self.reaped
+            return ProcessOutcome((sys.executable,), 137, "", "", False)
+
+    future = Future()
+
+    def submit(self, materialized, environment, args, **kwargs):
+        del self, materialized, environment, args, kwargs
+        return future, SimpleNamespace(request_kill=lambda: None)
+
+    def interrupting_sleep(seconds: float) -> None:
+        del seconds
+        state["polls"] += 1
+        if state["polls"] == 1:
+            raise KeyboardInterrupt("S1 cancellation 1")
+
+    monkeypatch.setattr(ParslDispatcher, "_submit_process", submit)
+    monkeypatch.setattr("tpen_executor.dispatch.parsl._poll_sleep", interrupting_sleep)
+    with pytest.raises(KeyboardInterrupt, match="S1 cancellation 1"):
+        dispatcher.run(_group("active"), _runs(tmp_path, "active"), lifecycle)
+    assert future.reaped, "cancellation finished the fence without reaping the child-group future"
+
+
+def test_n1_malformed_shared_process_outcome_is_recorded_and_dispatch_continues(tmp_path: Path) -> None:
+    """N1 kills an uncaught _status error that skips finish and later members."""
+
+    class Process:
+        def run(self, environment, args, **kwargs):
+            del environment, args, kwargs
+            return object()
+
+    worker = SimpleNamespace(
+        materialize=lambda env: {
+            "environment": object(),
+            "process": Process(),
+            "runner": object(),
+            "evidence": SimpleNamespace(read=lambda *args, **kwargs: None),
+        }
+    )
+    group = _group("a", "b")
+    store = DirectoryStore(tmp_path / "store")
+    manifest = LocalDispatcher(worker).run(group, _runs(tmp_path, "a", "b"), AttachedAllocation(_allocation(tmp_path), store))
+    assert [attempt.outcome_receipt.status for attempt in manifest.attempts] == ["launch_failed", "launch_failed"]  # type: ignore[union-attr]
+    for attempt in manifest.attempts:
+        assert Path(attempt.start_receipt.output_dir, "outcome.json").is_file()  # type: ignore[union-attr]
+
+
+def test_n1_unusable_shared_evidence_reader_refuses_before_child_launch(tmp_path: Path) -> None:
+    """N1 kills a late evidence-reader check that launches an unusable child."""
+
+    launched: list[tuple[str, ...]] = []
+
+    class Process:
+        def run(self, environment, args, **kwargs):
+            del environment
+            launched.append(tuple(args))
+            return ProcessOutcome(tuple(args), 0, kwargs["stdout_path"], kwargs["stderr_path"], False)
+
+    worker = SimpleNamespace(
+        materialize=lambda env: {
+            "environment": object(),
+            "process": Process(),
+            "runner": object(),
+            "evidence": object(),
+        }
+    )
+    group = _group("a")
+    store = DirectoryStore(tmp_path / "store")
+    manifest = LocalDispatcher(worker).run(group, _runs(tmp_path, "a"), AttachedAllocation(_allocation(tmp_path), store))
+    assert manifest.attempts[0].outcome_receipt.status == "launch_failed"  # type: ignore[union-attr]
+    assert launched == [], "child was launched although the evidence reader is unusable"
+
+
+@PARSL_REQUIRED
 def test_t7_cancel_before_spawn_finishes_only_the_begun_fence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """T7 kills post-cancel refill and dropped terminal-fence mutants."""
 
@@ -577,6 +672,30 @@ def test_t7_cancel_before_spawn_finishes_only_the_begun_fence(tmp_path: Path, mo
     assert manifest.attempts[0].outcome_receipt.status == "failed"  # type: ignore[union-attr]
 
 
+@PARSL_REQUIRED
+def test_t7_pool_cancel_before_spawn_finishes_begun_fence_and_starts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T7 kills a pool pre-spawn cancellation path that drops the begun fence."""
+
+    dispatcher = _dispatcher(tmp_path, _stub_package(tmp_path))
+    group = _group("first", "queued")
+    lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(2)), DirectoryStore(tmp_path / "store"))
+
+    def interrupted_submit(self, *args, **kwargs):
+        del self, args, kwargs
+        raise KeyboardInterrupt("cancel before pool child spawn")
+
+    monkeypatch.setattr(ParslDispatcher, "_submit_process", interrupted_submit)
+    with pytest.raises(KeyboardInterrupt, match="cancel before pool child spawn"):
+        dispatcher.run(group, _runs(tmp_path, "first", "queued"), lifecycle)
+    manifest = lifecycle.store.manifest(group)
+    assert [attempt.task_id for attempt in manifest.attempts] == ["first"]
+    assert manifest.attempts[0].outcome_receipt is not None  # type: ignore[union-attr]
+    assert manifest.attempts[0].outcome_receipt.status == "failed"  # type: ignore[union-attr]
+    assert not (tmp_path / "store" / "groups" / group.identity / "queued").exists()
+
+
 def test_t7_cancel_during_spawn_kills_a_late_attached_child(monkeypatch: pytest.MonkeyPatch) -> None:
     """T7 kills a pre-spawn cancellation race in the child-group handle."""
 
@@ -590,12 +709,20 @@ def test_t7_cancel_during_spawn_kills_a_late_attached_child(monkeypatch: pytest.
 
 
 @PARSL_REQUIRED
-def test_t8_one_explicit_slot_remains_serial_and_preserves_binding_refusal(tmp_path: Path) -> None:
+def test_t8_one_explicit_slot_remains_serial_and_preserves_binding_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """T8 kills changed-default and missing-binding mutants."""
 
     package = _stub_package(tmp_path)
     group = _group("one", "two")
     lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(1)), DirectoryStore(tmp_path / "store"))
+
+    def pool_is_not_allowed(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("one-slot dispatch must retain the serial contract path")
+
+    monkeypatch.setattr(ParslDispatcher, "_run_slot_pool", pool_is_not_allowed)
     manifest = _dispatcher(tmp_path, package).run(group, _runs(tmp_path, "one", "two"), lifecycle)
     observed = _observations(manifest)
     assert observed["one"]["end"] <= observed["two"]["start"]
