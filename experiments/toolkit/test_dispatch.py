@@ -686,7 +686,30 @@ def test_allocation_context_rejects_undeclared_environment_key() -> None:
 def test_toolkit_and_executor_context_key_patterns_match() -> None:
     """The decoupled toolkit and executor must enforce the same namespace."""
 
-    from tpen_executor.runners import CONTEXT_ENV_KEY_PATTERN as executor_pattern
+    import os
+    import subprocess
+
+    executor_python = os.environ.get("P9C_EXECUTOR_PYTHON")
+    if not executor_python:
+        pytest.skip("named skip: P9C_EXECUTOR_PYTHON is unset")
+
+    root = Path(__file__).resolve().parents[2]
+    executor_env = os.environ.copy()
+    executor_env["PYTHONPATH"] = str(root / "executor" / "src")
+    result = subprocess.run(
+        [
+            executor_python,
+            "-c",
+            "from tpen_executor.runners import CONTEXT_ENV_KEY_PATTERN; print(CONTEXT_ENV_KEY_PATTERN)",
+        ],
+        cwd=root,
+        env=executor_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    executor_pattern = result.stdout.strip()
 
     assert CONTEXT_ENV_KEY_PATTERN == executor_pattern
 
