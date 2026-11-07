@@ -61,10 +61,10 @@ EXPECTED_PRODUCTION_INVENTORY = {
     ("optimizer_grid.py", 367, "tpen.hi_schema"): InventoryEntry(
         "remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 238, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 239, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 701, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 702, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("run_stage_q.py", 128, "tpen.hi_schema"): InventoryEntry(
