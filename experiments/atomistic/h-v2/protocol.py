@@ -80,6 +80,8 @@ def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False
     if "law" not in factors[0]:
         raise ValueError("H-v2 nuclear cusp factor must declare a law")
     law = factors[0]["law"]
+    if not isinstance(law, dict):
+        raise ValueError("H-v2 nuclear cusp law must be a mapping")
     if law.get("_target_") != CONTRACT_NUCLEAR_LAW["_target_"]:
         raise ValueError("H-v2 nuclear cusp law must be the contract curvature law")
     if law.get("curvature_coefficient") != CONTRACT_NUCLEAR_LAW["curvature_coefficient"]:
@@ -88,6 +90,8 @@ def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False
         raise ValueError("H-v2 nuclear cusp law range must be 1.0")
     if law.get("trainable") is not CONTRACT_NUCLEAR_LAW["trainable"]:
         raise ValueError("H-v2 nuclear cusp law must be trainable")
+    if law != CONTRACT_NUCLEAR_LAW:
+        raise ValueError("H-v2 nuclear cusp law carries unexpected keys")
     if not evaluation and config.get("sampler", {}).get("seed") == config.get("runtime", {}).get("seed"):
         raise ValueError("training and sampler seeds must be distinct")
     if evaluation:

@@ -113,6 +113,8 @@ def test_frozen_evaluation_model_block_equals_training_model_block() -> None:
         (lambda cfg: cfg["model"]["factors"][0]["law"].update(curvature_coefficient=0.02), "coefficient must be 0.01"),
         (lambda cfg: cfg["model"]["factors"][0]["law"].update(curvature_range=2.0), "range must be 1.0"),
         (lambda cfg: cfg["model"]["factors"][0]["law"].update(trainable=False), "must be trainable"),
+        (lambda cfg: cfg["model"]["factors"][0]["law"].update(eps=0.5), "unexpected keys"),
+        (lambda cfg: cfg["model"]["factors"][0].update(law=None), "must be a mapping"),
     ],
 )
 def test_physics_mutations_are_rejected(mutation, message) -> None:
