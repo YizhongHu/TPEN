@@ -96,7 +96,12 @@ def test_science_hold_and_pipeline_scope_are_separate() -> None:
 def test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct() -> None:
     inputs = load_inputs()
     roster = inputs["measurement"]["seed_roster"]
-    explicit_seed_values = _integer_seeds(roster)
+    # consumed_outside_roster records blocks the spike used outside this
+    # roster (including a deliberate replay of pipeline_cpu_learned_e's own
+    # seeds); it is not itself an assignment made by the roster, so it is
+    # excluded from the roster's own-seed distinctness sweep.
+    own_assignments = {k: v for k, v in roster.items() if k != "consumed_outside_roster"}
+    explicit_seed_values = _integer_seeds(own_assignments)
     explicit_seeds = set(explicit_seed_values)
     evaluation_seeds = _evaluation_seeds(inputs)
     assert len(evaluation_seeds) == 324
@@ -229,9 +234,17 @@ def test_logging_is_an_optional_module_not_an_always_on_core_metric() -> None:
     assert "amplitude_risk_fraction" in module_names
     assert "raw_training_batch_recorder" in module_names
     held = [m for m in logging_block["modules"] if m["name"] == "amplitude_risk_fraction"]
-    assert held[0]["status"] == "threshold_pending_spike"
+    assert held[0]["status"] == "thresholds_frozen_implementation_pending"
     kinds = {"training_callback", "evaluation_generator", "one_shot_callback"}
     assert all(module["kind"] in kinds for module in logging_block["modules"])
+
+
+def test_module_status_agrees_with_the_amplitude_risk_decision() -> None:
+    inputs = load_inputs()
+    risk_status = inputs["measurement"]["amplitude_risk"]["status"]
+    module = next(m for m in inputs["logging"]["modules"] if m["name"] == "amplitude_risk_fraction")
+    assert risk_status == "definition_and_thresholds_decided"
+    assert "pending_spike" not in module.get("status", "")
 
 
 def test_raw_training_batch_cadence_and_format_are_decided() -> None:
@@ -239,7 +252,7 @@ def test_raw_training_batch_cadence_and_format_are_decided() -> None:
     assert cadence["capture_coordinate"] == "iteration_step"
     assert cadence["every_n_steps"] == 50
     assert cadence["includes_step_zero"] is True
-    assert cadence["partition_size_updates"] == 1000
+    assert cadence["partition_size_steps"] == 1000
     assert cadence["format"] == "numpy_column_bundle_with_json_integrity_sidecar"
     assert len(cadence["out_of_memory_checks"]) == 2
 
@@ -258,6 +271,12 @@ def test_storage_row_counts_match_their_declared_formulas() -> None:
     assert raw["compact_gib"] == pytest.approx(
         raw["rows"] * raw["bytes_per_row_compact"] / 2**30, rel=0.01
     )
+    cadence = load_inputs()["logging"]["cadence"]["raw_training_batches"]
+    full_partitions, remainder = divmod(raw["batches_per_lineage"], 20)
+    assert raw["partitions_per_lineage"] == full_partitions + (1 if remainder else 0)
+    assert raw["data_objects_total"] == scale["lineages"] * raw["partitions_per_lineage"]
+    assert raw["data_objects_total"] == 153
+    assert cadence["partition_size_steps"] == 1000
     assert figures["compression_ratio"] == (
         "unmeasured; a pilot block must measure it before a Holystore budget promises it"
     )
@@ -339,6 +358,24 @@ def test_sampler_tail_qualification_seed_namespace_is_disjoint() -> None:
             other_seeds |= set(_integer_seeds(value))
     other_seeds |= _evaluation_seeds(inputs)
     assert namespace_seeds.isdisjoint(other_seeds)
+
+
+def test_roster_seeds_avoid_blocks_consumed_outside_the_roster() -> None:
+    inputs = load_inputs()
+    roster = inputs["measurement"]["seed_roster"]
+    consumed: set[int] = set()
+    for block in roster["consumed_outside_roster"]:
+        lo, hi = block["range"]
+        consumed |= set(range(lo, hi + 1))
+    assert {910001, 910002, 920001} <= consumed  # the spike's known collisions are recorded
+    roster_seeds = set(_integer_seeds(roster["training_initialization_seeds"]))
+    roster_seeds |= set(_integer_seeds(roster["training_sampler_seeds"]))
+    for name, namespace in roster["non_science_seed_namespaces"].items():
+        if name == "pipeline_cpu_learned_e":
+            continue  # deliberate part (e) replay by the spike, recorded as such
+        roster_seeds |= set(_integer_seeds(namespace))
+    roster_seeds |= _evaluation_seeds(inputs)
+    assert roster_seeds.isdisjoint(consumed)
 
 
 def test_pr_560_incorporation_maps_every_finding_to_a_layer() -> None:

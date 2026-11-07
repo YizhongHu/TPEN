@@ -139,7 +139,7 @@ def _iter_diffs(live: object, frozen: object, path: tuple, excluded_prefixes: li
             frozen_item = frozen[index] if index < len(frozen) else _MISSING
             yield from _iter_diffs(live_item, frozen_item, child_path, excluded_prefixes)
     else:
-        if live != frozen:
+        if live != frozen or type(live) is not type(frozen):
             yield path, live, frozen
 
 
@@ -158,6 +158,11 @@ def test_excluded_paths_resolve_in_the_live_contract() -> None:
             else:
                 assert part in cur, f"excluded path {_path_str(prefix)!r} does not resolve"
                 cur = cur[part]
+
+
+def test_frozen_comparison_is_type_strict() -> None:
+    diffs = list(_iter_diffs({"flag": 1}, {"flag": True}, (), []))
+    assert diffs == [(("flag",), 1, True)]
 
 
 def test_frozen_snapshot_matches_live_contract_except_excluded_paths() -> None:

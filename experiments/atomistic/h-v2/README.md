@@ -160,8 +160,10 @@ machine-readably in `contract_inputs.json` under `logging.modules`.
 
 Cadence: scalar diagnostics log every completed update. Raw training batches
 are captured on the iteration-step coordinate, every 50th step including step
-0 (operator: "50 makes more sense here"), in partitions of 1,000 updates per
-lineage, written as NumPy column bundles with a JSON integrity sidecar
+0 (operator: "50 makes more sense here"), in partitions of 1,000 iteration
+steps per lineage (the field is named `partition_size_steps`, matching the
+iteration-step capture coordinate rather than the completed-update count),
+written as NumPy column bundles with a JSON integrity sidecar
 (operator: "numpy seems to make more sense as long as it does not cause OOM
 events"). The out-of-memory condition is checked twice: a bounded-memory test
 in the training-batch recorder layer, and a logging-on measurement in the
@@ -193,9 +195,12 @@ GiB compact at 89 bytes per row (the conservative envelope); raw training
 batches, captured every 50th iteration step including step 0 through 50,000
 (1,001 batches per lineage), is `3 x 1,001 x 4,096 = 12,300,288` rows, about
 0.928 GiB compact at 81 primitive bytes per row, before container and
-compression. Both byte-per-row figures and their source are recorded in
-`contract_inputs.json`. Compression ratios are unmeasured and are labelled so
-in `contract_inputs.json`.
+compression. At 20 batches per 1,000-step partition, 1,001 batches per
+lineage gives 50 full partitions plus one single-batch partition (holding
+only step 50,000), 51 partitions per lineage, `3 x 51 = 153` data objects
+total, not the 150 the storage proposal costed. Both byte-per-row figures and
+their source are recorded in `contract_inputs.json`. Compression ratios are
+unmeasured and are labelled so in `contract_inputs.json`.
 
 ## Tail characterization
 
@@ -270,16 +275,19 @@ The amplitude-risk **definition and thresholds are both decided**. The
 operator (2026-11-06, "Tell the orchestrator to make a call that makes sense
 from previous runs of exact models and trained models. If it needs to spike
 something so be it.") handed the call to the lane; it is no longer held for
-the operator. The accepted definition is the fraction of walkers whose
-`logabs` falls below the batch-median `logabs` minus a threshold, plus
-nonfinite-`logabs` and sign counts, never called a Pfaffian or readout floor
-unless the pre-floor readout amplitude is itself measured. A bounded Cannon
-CPU spike (branch `agent/h-v2-amplitude-spike` at
-`39135fda1388ef319c2325c8ad934de3b3c513db`, Cannon jobs `58383577`,
-`58388053`, `58388109`) froze the study threshold list `tau in {-3, -4, -5,
--7, -10}`: `-5` is the primary descriptive scale, `-3`/`-4` are resolved
-sensitivities, `-7` is "marginal resolution at the evaluation scale (4096 x
-64)", and `-10` is "rare or unresolved; a zero is not a healthy zero". The
+the operator. The accepted definition is the fraction of samples whose
+`logabs` falls below the median of the finite `logabs` values minus a
+threshold, computed per training batch and per fresh-evaluation draw
+separately, plus the nonfinite-`logabs` count and the invalid-sign count,
+never called a Pfaffian or readout floor unless the pre-floor readout
+amplitude is itself measured. A bounded Cannon CPU spike (branch
+`agent/h-v2-amplitude-spike` at `39135fda1388ef319c2325c8ad934de3b3c513db`,
+Cannon jobs `58383577`, `58388053`, `58388109`) froze the study threshold list
+`tau in {-3, -4, -5, -7, -10}`: `-5` is the primary descriptive scale, `-3`/
+`-4` are resolved sensitivities, `-7` is "marginal resolution at the spike's
+evaluation scale (4096 x 64 rows per stream, 17 of 20 streams resolved);
+unmeasured at the contract's 4096 x 256", and `-10` is "rare or unresolved; a
+zero is not a healthy zero". The
 spike found the exact, imperfect, untrained and trained states all fall in
 the same narrow band, confirming the module cannot classify state quality.
 It remains descriptive only: no alarm and no science gate. Implementation

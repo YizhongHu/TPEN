@@ -247,15 +247,34 @@
         },
         "sampler_tail_qualification": {
           "sampler": [
-            920001,
-            920002
+            940001,
+            940002
           ],
           "evaluation": [
-            920003,
-            920004
+            940003,
+            940004
           ]
         }
-      }
+      },
+      "consumed_outside_roster": [
+        {
+          "range": [910001, 910002],
+          "source": "amplitude-risk-spike-receipt on fa3c35a8",
+          "note": "deliberate replay of non_science_seed_namespaces.pipeline_cpu_learned_e, part (e) of the pipeline check; not a fresh collision"
+        },
+        {
+          "range": [910101, 910102],
+          "source": "amplitude-risk-spike-receipt on fa3c35a8"
+        },
+        {
+          "range": [920000, 920031],
+          "source": "amplitude-risk-spike-receipt on fa3c35a8"
+        },
+        {
+          "range": [930000, 930131],
+          "source": "amplitude-risk-spike-receipt on fa3c35a8"
+        }
+      ]
     },
     "fresh_evaluation": {
       "streams_per_checkpoint": 4,
@@ -313,7 +332,7 @@
     },
     "amplitude_risk": {
       "status": "definition_and_thresholds_decided",
-      "definition": "the fraction of walkers whose logabs falls below (batch-median logabs minus a threshold), plus the nonfinite-logabs count and the sign count",
+      "definition": "the fraction of samples whose logabs falls below the median of the finite logabs values minus a threshold, computed per training batch and per fresh-evaluation draw separately, plus the nonfinite-logabs count and the invalid-sign count",
       "naming_rule": "never called a Pfaffian floor or a readout floor unless the pre-floor readout amplitude is itself deliberately measured",
       "interpretation": "descriptive only; introduces no alarm and no science gate",
       "decided_by": [
@@ -328,7 +347,7 @@
           "-3": "resolved sensitivity",
           "-4": "resolved sensitivity",
           "-5": "primary descriptive scale",
-          "-7": "marginal resolution at the evaluation scale (4096 x 64)",
+          "-7": "marginal resolution at the spike's evaluation scale (4096 x 64 rows per stream, 17 of 20 streams resolved); unmeasured at the contract's 4096 x 256",
           "-10": "rare or unresolved; a zero is not a healthy zero"
         }
       },
@@ -652,7 +671,7 @@
       {"name": "initial_checkpoint_callback", "layer": "5cfad8d2", "kind": "one_shot_callback"},
       {"name": "parameter_activity_callback", "layer": "52ead353", "kind": "training_callback"},
       {"name": "readout_trajectory_generator", "layer": "c8fedd84", "kind": "evaluation_generator"},
-      {"name": "amplitude_risk_fraction", "layer": "fa3c35a8", "status": "threshold_pending_spike", "kind": "training_callback"}
+      {"name": "amplitude_risk_fraction", "layer": "fa3c35a8", "status": "thresholds_frozen_implementation_pending", "kind": "training_callback"}
     ],
     "cadence": {
       "scalar_diagnostics": "every completed update",
@@ -660,7 +679,7 @@
         "capture_coordinate": "iteration_step",
         "every_n_steps": 50,
         "includes_step_zero": true,
-        "partition_size_updates": 1000,
+        "partition_size_steps": 1000,
         "format": "numpy_column_bundle_with_json_integrity_sidecar",
         "cadence_source": "operator-decisions-logging-storage-cadence-20261106b: '50 makes more sense here.'",
         "out_of_memory_checks": [
@@ -713,7 +732,10 @@
         "rows": 12300288,
         "compact_gib": 0.928,
         "bytes_per_row_compact": 81,
-        "bytes_per_row_source": "training-batch-storage-proposal: 81 primitive bytes"
+        "bytes_per_row_source": "training-batch-storage-proposal: 81 primitive bytes",
+        "partitions_per_lineage": 51,
+        "data_objects_total": 153,
+        "partition_note": "20 batches per 1000-step partition gives 50 full partitions plus one single-batch partition (step 50000) per lineage; 3 lineages x 51 partitions = 153 data objects, not the 150 the storage proposal costed"
       },
       "compression_ratio": "unmeasured; a pilot block must measure it before a Holystore budget promises it"
     }
