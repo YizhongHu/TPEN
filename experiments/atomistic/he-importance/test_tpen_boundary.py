@@ -94,10 +94,10 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 1109, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_train_config.py", 280, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 300, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: test-only schema validation for the independent HI grid oracle."
     ),
-    ("test_train_config.py", 343, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 363, "tpen.hi_schema"): InventoryEntry(
         "item 1c0b06fd: executed A9 schema measurement for the HI train-resume load shape."
     ),
     ("test_train_config.py", 581, "tpen.hi_schema"): InventoryEntry(

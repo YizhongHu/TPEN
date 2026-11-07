@@ -37,7 +37,10 @@ optimizer_grid = _load("he_importance_optimizer_grid_for_ab4b_review_r1", "optim
 train_config = _load("he_importance_train_config_for_ab4b_review_r1", "train_config.py")
 ab_universe = _load("he_importance_ab_universe_for_ab4b_review_r1", "ab_universe.py")
 
-_PRECHANGE_PIN = "040a5b8e87befc59bb21a9c64f8ec1782c8fa283"
+# Pre-change resolver: dev commit 1ae776c9, state before #573, blob 7ede61e8.
+# The former pre-change pin was orphaned by the squash merge.
+_PRECHANGE_PIN = "1ae776c98c661a02aaa53e7f76d8aacf91b1a15d"
+_PRECHANGE_BLOB = "7ede61e86383c68db55eb4ea13214857fdebdd28"
 _A_COORDINATES = tuple(sorted(ab_universe.render_a_packages()[0]["literal_configuration"]))
 
 
@@ -271,8 +274,25 @@ def test_fixed_adam_slot_from_the_rendered_package_resolves_with_its_levels(tmp_
 
 # T7 ------------------------------------------------------------------------
 def _load_prechange_resolver() -> tuple[types.ModuleType, str]:
+    test_dir = Path(__file__).resolve().parent
+    actual_blob = subprocess.run(
+        [
+            "git",
+            "rev-parse",
+            f"{_PRECHANGE_PIN}:experiments/atomistic/he-importance/train_config.py",
+        ],
+        cwd=test_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert actual_blob == _PRECHANGE_BLOB, (
+        f"pre-change pin {_PRECHANGE_PIN} resolves to blob {actual_blob}; "
+        f"expected {_PRECHANGE_BLOB}"
+    )
     source = subprocess.run(
         ["git", "show", f"{_PRECHANGE_PIN}:experiments/atomistic/he-importance/train_config.py"],
+        cwd=test_dir,
         check=True, capture_output=True, text=True,
     ).stdout
     module = types.ModuleType("he_importance_train_config_prechange_for_ab4b_review_r1")

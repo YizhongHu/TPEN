@@ -22,6 +22,12 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
 
+# Pre-change resolver: dev commit 1ae776c9, state before #573, blob 7ede61e8.
+# The former pre-change pin was orphaned by the squash merge.
+_PRECHANGE_PIN = "1ae776c98c661a02aaa53e7f76d8aacf91b1a15d"
+_PRECHANGE_BLOB = "7ede61e86383c68db55eb4ea13214857fdebdd28"
+
+
 _STAGE_SPEC = importlib.util.spec_from_file_location(
     "he_importance_stage_coordinate_for_train_config",
     Path(__file__).with_name("stage_coordinate.py"),
@@ -174,16 +180,30 @@ def _ab_cell(tmp_path: Path, package: Mapping[str, object], axis: str) -> object
 def _load_prechange_resolver() -> types.ModuleType:
     """Load the pre-change resolver source for byte comparison."""
 
-    # Pre-change resolver source, blob 7ede61e8, identical to the PR base's train_config.py.
-    # Generating command, mechanically: git show 040a5b8e87befc59bb21a9c64f8ec1782c8fa283:
-    # experiments/atomistic/he-importance/train_config.py
+    test_dir = Path(__file__).resolve().parent
+    actual_blob = subprocess.run(
+        [
+            "git",
+            "rev-parse",
+            f"{_PRECHANGE_PIN}:experiments/atomistic/he-importance/train_config.py",
+        ],
+        cwd=test_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert actual_blob == _PRECHANGE_BLOB, (
+        f"pre-change pin {_PRECHANGE_PIN} resolves to blob {actual_blob}; "
+        f"expected {_PRECHANGE_BLOB}"
+    )
     source = subprocess.run(
         [
             "git",
             "show",
-            "040a5b8e87befc59bb21a9c64f8ec1782c8fa283:"
+            f"{_PRECHANGE_PIN}:"
             "experiments/atomistic/he-importance/train_config.py",
         ],
+        cwd=test_dir,
         check=True,
         capture_output=True,
         text=True,
