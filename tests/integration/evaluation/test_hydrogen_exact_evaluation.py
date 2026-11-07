@@ -73,7 +73,7 @@ from tpen.physics.potential import ElectronNucleusPotential
 from tpen.run import run_from_config
 
 HERE = Path(__file__).parent
-FIXTURES = HERE.resolve().parents[1] / "artifacts" / "hydrogen"
+FIXTURES = HERE.resolve().parent / "artifacts" / "hydrogen"
 CONFIG_PATH = FIXTURES / "exact_eval.yaml"
 
 # Analytic controls for the `alpha=1.2` imperfect state:
