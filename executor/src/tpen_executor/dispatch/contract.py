@@ -5,15 +5,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 from contextvars import ContextVar
 from datetime import datetime, timezone
+import json
 import math
 import os
 from typing import Any
 
 from .._codec import digest
 from ..contracts import ReadyGroup
+from ..environments import PreparedPythonEnvironment
 from ..lifecycle.attached import AttachedAllocation
 from ..results import RunManifest
-from ..runners import CoreRunEvidence, EvidenceUnavailable
+from ..runners import CHILD_CONTEXT_KEYS_ENV, CoreRunEvidence, EvidenceUnavailable
 from ..tasks import ConfiguredRun
 
 
@@ -81,6 +83,32 @@ def _status(process_outcome: Any) -> str:
     return "timed_out" if process_outcome.timed_out else (
         "completed" if process_outcome.returncode == 0 else "failed"
     )
+
+
+def _child_context_keys(allocation: Any) -> tuple[str, ...]:
+    """Return only validated-context environment names for child observation."""
+
+    keys = {"CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_THREADS"}
+    facts = getattr(allocation, "facts", {})
+    attached = facts.get("attached_context") if isinstance(facts, Mapping) else None
+    context = attached.get("context") if isinstance(attached, Mapping) else None
+    declared = context.get("environment") if isinstance(context, Mapping) else None
+    if isinstance(declared, Mapping):
+        keys.update(key for key in declared if type(key) is str and key)
+    visibility = context.get("visibility_variable") if isinstance(context, Mapping) else None
+    if type(visibility) is str and visibility:
+        keys.add(visibility)
+    return tuple(sorted(keys))
+
+
+def _with_child_context_keys(environment: Any, allocation: Any) -> Any:
+    """Pass the observation allowlist to a prepared science environment."""
+
+    if not isinstance(environment, PreparedPythonEnvironment):
+        return environment
+    overlay = dict(environment.env)
+    overlay[CHILD_CONTEXT_KEYS_ENV] = json.dumps(_child_context_keys(allocation), separators=(",", ":"))
+    return PreparedPythonEnvironment(environment.python, environment.setup, overlay)
 
 
 class DispatcherContract:
@@ -241,6 +269,7 @@ class DispatcherContract:
             try:
                 materialized = self.worker.materialize(env)
                 environment = self._worker_environment(materialized)
+                environment = _with_child_context_keys(environment, lifecycle.allocation)
                 process = materialized["process"]
                 materialized["runner"]
                 evidence = materialized["evidence"]
