@@ -5,8 +5,87 @@ and exact nonrelativistic infinite-nuclear-mass ground-state energy `-0.5 Ha`.
 It is not molecular hydrogen (`H2`) or Hooke's atom. The exact state is an
 instrument control, not a substitute for a trained-state result.
 
-This directory is a documentation and admission slice. It contains no
-launcher, training code, science output, or qualification result.
+This directory contains the non-science CPU pipeline check. It owns frozen
+Hydra configurations, an independent standard-library scalar oracle, strict
+record collection, and tests beside those sources. It does not contain a
+science launcher, science output, or qualification result.
+
+The executable route is the normal TPEN entrypoint (the ``tpen`` console
+script, or ``tpen.run.run_from_config`` from a test). Do not use
+``python -m tpen.run``: that module has no ``__main__`` guard.
+
+The short learned route is deliberately separate from the scalar oracle:
+``configs/train.yaml`` uses 256 training walkers and distinct initialization
+and sampler seeds, while ``configs/eval.yaml`` restores ``model_only`` into
+fresh 1,024-walker, 64-draw streams. Both configs contain exactly one
+electron, one charge-one nucleus, raw ``eps: 0`` Coulomb potential, and no
+electron-electron factor or term.
+
+``collect.py`` consumes TPEN's real per-run artifacts directly: the
+``sampled_eval_table.csv``/``.metadata.json`` trajectory envelope, the run's
+own ``resolved_config.yaml`` and ``metadata.json``, and the restored
+checkpoint directory. It admits only a complete draw-by-walker grid after
+source, checkpoint, and resolved-config identities reconcile at that
+envelope. Missing draws, duplicate walker records, nonfinite data, altered
+source/checkpoint/config identity, a missing checkpoint commit marker, an
+uncommitted tail, and a training-state restore request are all refusals; no
+clipped or final-draw statistic is produced.
+
+TPEN's real kinetic, electron-nucleus, and sampler accept-ratio/accept-decision
+code is checked against independently-coded references (central finite
+differences with a Richardson-extrapolated tolerance, a raw ``-Z/r`` formula,
+an independent rederivation of both the |psi|^2 accept exponent and the
+resulting accept/reject decision, and the closed-form oracle on an exact
+``psi = exp(-alpha r)`` amplitude stub) by
+``tests/unit/physics/test_hydrogen_oracle_controls.py`` and
+``tests/unit/sampling/test_hydrogen_sampler_controls.py`` in the core tests
+tree, not under this directory: the experiment boundary (see "Experiment
+boundary" below) restricts files here to configuration,
+``tpen.run.run_from_config``, or the ``tpen`` command, and these checks reach
+``tpen.physics``/``tpen.sampling`` internals directly. The charge-one hydrogen
+setup those core tests use is built from literals in
+``tests/helpers/hydrogen_contract.py``, duplicated from (and pinned against,
+by ``test_protocol.test_frozen_training_config_selects_the_contract_sampler_literals``)
+this directory's frozen ``configs/train.yaml``, not read from it. Measured on
+Cannon (job 58147449, head ``a74bc22c``, pre-move): a kinetic-prefactor mutant
+and a sign-flipped nuclear potential, both previously uncaught, are now KILLED
+by these checks; a sampler |psi|-vs-|psi|^2 mutant is KILLED by both the
+behavioral check and the pre-existing grep. The oracle checks cover contract
+parts (b), (c) and (d) behaviorally (see "Known gap" below for what this does
+not close).
+Part (e)'s ``0.02`` Ha energy-error (the pooled mean local energy, not a
+median) and ``0.25`` median-absolute-error-improvement criteria are evaluated
+at contract scale, with the complete draw-by-walker grid asserted, by
+``test_pipeline.test_part_e_contract_scale_training_and_evaluation_energy_criteria``,
+marked ``h_v2_pipeline``. That test is skipped by default by
+``experiments/atomistic/h-v2/conftest.py`` -- a verifier must pass an explicit
+option to run it, once per head rather than once per mutant::
+
+    uv run pytest -q --run-h-v2-pipeline -m h_v2_pipeline experiments/atomistic/h-v2/test_pipeline.py
+
+Without ``--run-h-v2-pipeline``, the standard
+``pytest -q experiments/atomistic/h-v2 experiments/atomistic/he-v1`` run skips
+it (measured: part (e) alone adds several minutes on top of the rest of the
+suite, inside the contract's 2h/4-core CPU budget, which is why verifiers only
+pay that cost once per head). The opt-in flag only works with this documented
+invocation naming ``test_pipeline.py`` directly; a broader invocation (e.g.
+rooted at ``experiments/atomistic``) can only skip the test, not run it.
+
+**Scope, not a gap.** ``tests/unit/physics/test_hydrogen_oracle_controls.py``
+already compares TPEN's real kinetic and potential code, and
+``tests/unit/sampling/test_hydrogen_sampler_controls.py`` the real sampler
+code, against the closed-form oracle on an exact ``psi = exp(-alpha r)``
+amplitude stub, covering contract parts (b), (c)
+and (d) through the real operators. What is not done, and is not required by
+the contract, is pinning a Hydra-constructed ``TPENWaveFunction`` to that exact
+state: `tpen.nn.embedding.Embedding` only ever builds
+`tpen.nn.mlp.MLP`/`tpen.nn.initialization.SeededLinear` layers, and
+`TorchInitializer` only exposes random (Kaiming/Xavier/normal) initializers
+with no zero/constant scheme; `tpen.nn.readout.pfaffian.PfaffianReadout`
+always folds a learned order-1 feature into the odd-electron border, even
+with ``trainable=False``. So no frozen config can make the model's
+embedding/readout contribute an exact, input-independent constant. No core
+slice is pending for this protocol-only slice.
 
 ## Evidence boundary
 

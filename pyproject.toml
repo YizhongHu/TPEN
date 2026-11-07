@@ -148,6 +148,7 @@ pythonpath = ["."]
 consider_namespace_packages = true
 markers = [
   "integration: end-to-end tests that exercise entrypoints, configs, or generated artifacts",
+  "h_v2_pipeline: contract-scale H-v2 pipeline-check run (part e); skipped by default via experiments/atomistic/h-v2/conftest.py unless --run-h-v2-pipeline is passed",
 ]
 addopts = "--typeguard-packages=tpen"
 norecursedirs = [
