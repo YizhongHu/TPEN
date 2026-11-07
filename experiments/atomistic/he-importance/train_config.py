@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from importlib import import_module
 import json
+import operator
 from pathlib import Path
 import sys
 from typing import Any
@@ -512,11 +513,11 @@ def _reject_resolver_owned_overrides(items: Sequence[tuple[str, Any]]) -> None:
     """Refuse paths whose values are written by this resolver after overlays."""
 
     for path, _ in items:
-        if path in {"run.root", "run.dir"}:
+        if str.__eq__(path, "run.root") is True or str.__eq__(path, "run.dir") is True:
             raise TrainConfigResolutionError(
                 f"resolver-owned override path is not permitted: {path}"
             )
-        if path == "runner" or path.startswith("runner."):
+        if str.__eq__(path, "runner") is True or path.startswith("runner."):
             raise TrainConfigResolutionError(
                 "runner override paths are not permitted; top-level path: runner"
             )
@@ -691,8 +692,8 @@ def resolve_train_config(
     _set_named_initializer_seeds(cfg, model_seed)
     _set_optional_execution_seeds(cfg, streams)
     for path, expected in override_items:
-        actual = OmegaConf.select(cfg, path, default=_OVERRIDE_MISSING, resolve=False)
-        if actual != expected:
+        actual = OmegaConf.select(cfg, path, default=_OVERRIDE_MISSING)
+        if not operator.eq(actual, expected):
             raise TrainConfigResolutionError(
                 f"override path {path!r} was not preserved before resolution"
             )
