@@ -164,8 +164,10 @@ the 2026-08-15 hardware note; they drift -- re-measure with `sinfo` rather
 than citing this date). At most 32
 GPU-hours per lineage fits comfortably inside even the tighter `seas_gpu`
 ceiling. Polaris is not used for H-v2 science; its only role stays the
-pipeline check's excluded-seed GPU smoke (slice `406194c5`), which is not a
-science venue.
+pipeline check's excluded-seed GPU smoke, part (g) of slice `406194c5`,
+which is not a science venue. Slice `406194c5`'s other part, the Cannon
+capacity-and-freeze pilot (`admission.pilot`), runs on Cannon, not Polaris --
+see "Two admission scopes" below.
 
 ### Four-stream design (item 8)
 
@@ -436,15 +438,38 @@ own Cannon verification and the human merge of this pull request, pending
 the remaining pipeline-check (`5cfcca3e`), excluded-seed Polaris smoke
 (`406194c5`), and integrated-rerun (`2f1b2921`) gates already described above,
 and pending a third admission gate added round-2 (finding G3):
-`admission.pilot`, a FASRC Cannon run using the excluded `capacity_pilot`
-seeds, at the science model/sampler shape, for at least `4,000` updates so a
-basin window exists, with a fresh evaluation at the contract shape. It
-freezes `measurement.hydrogen_equivalent_tail_threshold` and measures the
-pilot-gate simultaneous-band half-widths at all six exceedance margins;
-`admission.pilot` is the contract definition of the run, implemented by
-slice `406194c5`, extended as needed. None of these gates is closed by this
-amendment. If the pilot gate fails at the hydrogen-equivalent threshold, the
-F5 stop rule applies and the decision returns to the lane and the operator
-with the measured value as evidence; a failure is never grounds to retune the
+`admission.pilot`.
+
+Slice `406194c5` has two parts with separate placements and ceilings (round-3
+pre-review finding H1, accepted 2026-11-07): part (g), the excluded-seed
+Polaris GPU route smoke, keeps its current caps (1,000 updates, one
+node-hour including setup) and runs first; then, after part (g) and
+qualification, the Cannon capacity-and-freeze pilot runs on one A100
+(`--constraint=a100`) with its own ceiling of **16 GPU-hours** including
+setup, checkpoint writes and fresh evaluation -- flagged in the contract as
+the lane's proposal for this pull request's operator review, separate from
+and not counted against the 96 GPU-hour science ceiling. If the pilot
+exceeds its ceiling it stops and reports; the ceiling is not extended.
+
+`admission.pilot` is the contract definition of the Cannon pilot run: the
+science model/sampler shape at the excluded `capacity_pilot` seeds, run
+through a **20,000-update target** (4,000-update hard minimum, round-3
+pre-review finding H3, accepted 2026-11-07) so its own basin search covers
+the same centers (`3000..19000`) the science recurrence rule searches. It
+fresh-evaluates the contract's evaluated checkpoints it reaches, at most
+20,000, seeded by a dedicated `capacity_pilot.evaluation_formula`
+(`996000 + 10*pilot_checkpoint_ordinal + stream_index`, 21 checkpoints x 4
+streams = 84 seeds, disjoint from every other namespace; round-3 pre-review
+finding H2, accepted 2026-11-07). If the ceiling stops the pilot before
+20,000 updates, the shortfall is reported. The freeze uses the pilot's own
+smallest-mean-W consecutive triple over the centers it reached, by the
+recurrence rule's selection, not necessarily the earliest triple. It freezes
+`measurement.hydrogen_equivalent_tail_threshold` and measures the pilot-gate
+simultaneous-band half-widths at all six exceedance margins; `admission.pilot`
+is the contract definition of the run, implemented by slice `406194c5`'s
+Cannon pilot part. None of these gates is closed by this amendment. If the
+pilot gate fails at the hydrogen-equivalent threshold, the F5 stop rule
+applies and the decision returns to the lane and the operator with the
+measured value as evidence; a failure is never grounds to retune the
 threshold, its margin, or its quantile after the number is seen (finding
 G5).
