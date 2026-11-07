@@ -46,6 +46,7 @@ slice may not edit legacy files to widen them.
 
 from __future__ import annotations
 
+import re
 import shlex
 import uuid
 from dataclasses import dataclass, field
@@ -68,6 +69,12 @@ DISPATCH_RECORDS_JSONL = "dispatch_records.jsonl"
 #: name". Admission omits the runtime segment of ``attempt_id`` in that case; see
 #: :func:`admit_tasks`.
 DEFAULT_RUNTIME = "default"
+
+# Context environment names are deliberately narrower than the process
+# environment.  The executor owns the same literal independently so the
+# experiment toolkit remains decoupled from the executor package.
+CONTEXT_ENV_KEY_PATTERN = r"^(CUDA_VISIBLE_DEVICES|TPEN_CTX_[A-Z0-9_]{1,64})$"
+_CONTEXT_ENV_KEY_RE = re.compile(CONTEXT_ENV_KEY_PATTERN)
 
 
 @dataclass(frozen=True)
@@ -641,8 +648,29 @@ class AllocationContext:
         """
 
         _require_non_empty("allocation_id", self.allocation_id)
-        _require_non_empty("visibility_variable", self.visibility_variable)
+        if type(self.visibility_variable) is not str or not _CONTEXT_ENV_KEY_RE.fullmatch(
+            self.visibility_variable
+        ):
+            raise ValueError(
+                "context-environment-key: allocation context visibility_variable must match "
+                f"{CONTEXT_ENV_KEY_PATTERN!r}"
+            )
         _require_non_empty_sequence("visibility_values", self.visibility_values)
+        if not isinstance(self.environment, Mapping):
+            raise ValueError("context-environment-key: allocation context environment must be a mapping")
+        invalid_keys = sorted(
+            key
+            for key in self.environment
+            if type(key) is not str or _CONTEXT_ENV_KEY_RE.fullmatch(key) is None
+        )
+        invalid_keys.sort(key=repr)
+        if invalid_keys:
+            raise ValueError(
+                "context-environment-key: allocation context declares unsupported keys "
+                f"{invalid_keys!r}"
+            )
+        if any(type(value) is not str for value in self.environment.values()):
+            raise ValueError("context-environment-key: allocation context values must be strings")
         if self.deadline_guard_min < 0:
             raise ValueError("allocation context deadline_guard_min must be non-negative")
         if self.nodes_per_block is not None and self.nodes_per_block <= 0:

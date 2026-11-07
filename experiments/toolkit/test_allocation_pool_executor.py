@@ -164,7 +164,7 @@ def _single_worker_executor(tmp_path: Path, pass_id: str) -> AllocationPoolExecu
     return AllocationPoolExecutor(
         pass_id=pass_id,
         n_workers=1,
-        visibility_variable="TEST_VISIBLE_DEVICE",
+        visibility_variable="TPEN_CTX_VISIBLE_DEVICE",
         visibility_values=("worker-0",),
         run_root=tmp_path / "pool",
         deadline_guard_min=0,
@@ -367,7 +367,7 @@ def test_fatal_worker_error_wins_over_completion_failure(
     executor = AllocationPoolExecutor(
         pass_id="fatal-priority-pass",
         n_workers=2,
-        visibility_variable="TEST_VISIBLE_DEVICE",
+        visibility_variable="TPEN_CTX_VISIBLE_DEVICE",
         visibility_values=("worker-0", "worker-1"),
         run_root=tmp_path / "pool",
         deadline_guard_min=0,
@@ -439,7 +439,7 @@ def _run_pool_process(
     AllocationPoolExecutor(
         pass_id="process-race",
         n_workers=1,
-        visibility_variable="TEST_VISIBLE_DEVICE",
+        visibility_variable="TPEN_CTX_VISIBLE_DEVICE",
         visibility_values=("worker-0",),
         run_root=run_root,
         deadline_guard_min=0,
@@ -515,7 +515,7 @@ def test_pool_refills_workers_and_retries_only_failed_rows(tmp_path: Path) -> No
     first = AllocationPoolExecutor(
         pass_id="pass-a",
         n_workers=2,
-        visibility_variable="TEST_VISIBLE_DEVICE",
+        visibility_variable="TPEN_CTX_VISIBLE_DEVICE",
         visibility_values=("worker-0", "worker-1"),
         run_root=run_root,
         deadline_guard_min=0,
@@ -554,7 +554,7 @@ def test_pool_refills_workers_and_retries_only_failed_rows(tmp_path: Path) -> No
     second = AllocationPoolExecutor(
         pass_id="pass-b",
         n_workers=2,
-        visibility_variable="TEST_VISIBLE_DEVICE",
+        visibility_variable="TPEN_CTX_VISIBLE_DEVICE",
         visibility_values=("worker-0", "worker-1"),
         run_root=run_root,
         deadline_guard_min=0,
@@ -633,7 +633,7 @@ def test_deadline_stops_new_claims_without_killing_running_tasks(tmp_path: Path)
     records = AllocationPoolExecutor(
         pass_id="deadline-pass",
         n_workers=2,
-        visibility_variable="TEST_VISIBLE_DEVICE",
+        visibility_variable="TPEN_CTX_VISIBLE_DEVICE",
         visibility_values=("worker-0", "worker-1"),
         run_root=run_root,
         deadline=time.time() + 64.0,
@@ -659,7 +659,7 @@ def test_pool_runs_task_command_verbatim_as_argv(tmp_path: Path) -> None:
     records = AllocationPoolExecutor(
         pass_id="verbatim-pass",
         n_workers=1,
-        visibility_variable="TEST_VISIBLE_DEVICE",
+        visibility_variable="TPEN_CTX_VISIBLE_DEVICE",
         visibility_values=("worker-0",),
         run_root=tmp_path / "pool",
         deadline_guard_min=0,
@@ -677,7 +677,7 @@ def test_pool_does_not_execute_a_row_already_claimed_in_the_pass(tmp_path: Path)
     records = AllocationPoolExecutor(
         pass_id="shared-pass",
         n_workers=1,
-        visibility_variable="TEST_VISIBLE_DEVICE",
+        visibility_variable="TPEN_CTX_VISIBLE_DEVICE",
         visibility_values=("worker-0",),
         run_root=run_root,
         deadline_guard_min=0,
@@ -707,7 +707,7 @@ def test_pool_rejects_invalid_worker_configuration(
     executor = AllocationPoolExecutor(
         pass_id="invalid-pass",
         n_workers=n_workers,
-        visibility_variable="TEST_VISIBLE_DEVICE",
+        visibility_variable="TPEN_CTX_VISIBLE_DEVICE",
         visibility_values=visibility_values,
         run_root=tmp_path / "pool",
         deadline_guard_min=deadline_guard_min,

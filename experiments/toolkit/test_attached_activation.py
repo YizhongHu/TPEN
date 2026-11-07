@@ -293,7 +293,7 @@ def test_allocation_context_rejects_inconsistent_fields(field: str, value: objec
         deadline=123.5,
         deadline_env_var="END",
         deadline_guard_min=1,
-        environment={"OMP_NUM_THREADS": "4"},
+        environment={"TPEN_CTX_THREAD_SETTING": "4"},
         nodes_per_block=None,
     )
     setattr(context, field, value)
@@ -317,6 +317,7 @@ def _child_observation_control(tmp_path: Path, *, cuda: str = "7", omp: str = "4
             "CUDA_VISIBLE_DEVICES": cuda,
             "MKL_NUM_THREADS": None,
             "OMP_NUM_THREADS": omp,
+            "TPEN_CTX_THREAD_SETTING": omp,
         },
         "thread_settings": {"MKL_NUM_THREADS": None, "OMP_NUM_THREADS": omp},
         "hostname": socket.gethostname(),
@@ -333,7 +334,7 @@ def _child_observation_control(tmp_path: Path, *, cuda: str = "7", omp: str = "4
                         "context": {
                             "visibility_variable": "CUDA_VISIBLE_DEVICES",
                             "visibility_values": ["7"],
-                            "environment": {"OMP_NUM_THREADS": "4"},
+                            "environment": {"TPEN_CTX_THREAD_SETTING": "4"},
                         },
                         "observed": {"hostname": socket.gethostname()},
                     }
@@ -387,6 +388,31 @@ def test_missing_child_observation_refuses_named_observation(tmp_path: Path) -> 
     with pytest.raises(ActivationRefusal) as raised:
         validate_child_context_observation(allocation, manifest)
     assert raised.value.code == "child-context-observation"
+
+
+def test_allocation_context_payload_refuses_undeclared_environment_key() -> None:
+    """The study-side validator names unsupported context declarations."""
+
+    context = SimpleNamespace(
+        allocation_id="alloc",
+        visibility_variable="CUDA_VISIBLE_DEVICES",
+        visibility_values=(),
+        run_root="/runs",
+        deadline=None,
+        deadline_env_var=None,
+        deadline_guard_min=1,
+        environment={"P10_CONTEXT_VALUE": "unsafe"},
+        nodes_per_block=None,
+    )
+    with pytest.raises(ActivationRefusal) as raised:
+        allocation_context_payload(
+            context,
+            allocation_id="alloc",
+            backend_job_id="job",
+            observed_environment={},
+            observed_hostname="n0",
+        )
+    assert raised.value.code == "context-environment-key"
 
 
 def test_reader_rejects_empty_committed_chain_after_zero_exit(tmp_path: Path) -> None:

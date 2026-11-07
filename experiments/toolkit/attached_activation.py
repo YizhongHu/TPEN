@@ -14,11 +14,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
-from .dispatch import StagePlanV2
+from .dispatch import CONTEXT_ENV_KEY_PATTERN, StagePlanV2
 from .executor_inputs import canonical_bytes, payload_digest, ready_group
 from .run_results import ManifestRefusal, ResultSet, read
 
@@ -136,6 +137,11 @@ def allocation_context_payload(
         raise ActivationRefusal("allocation-context", "context and supplied allocation IDs disagree")
     if type(context.visibility_variable) is not str or not context.visibility_variable:
         raise ActivationRefusal("allocation-context", "visibility_variable must be non-empty")
+    if not re.fullmatch(CONTEXT_ENV_KEY_PATTERN, context.visibility_variable):
+        raise ActivationRefusal(
+            "context-environment-key",
+            f"visibility_variable {context.visibility_variable!r} is outside the allowed context namespace",
+        )
     if type(context.deadline_guard_min) is not int or context.deadline_guard_min < 0:
         raise ActivationRefusal("allocation-context", "deadline_guard_min must be a non-negative integer")
     visibility = tuple(context.visibility_values)
@@ -151,6 +157,17 @@ def allocation_context_payload(
         raise ActivationRefusal("allocation-observation", "observed hostname must be non-empty")
     if not isinstance(context.environment, Mapping):
         raise ActivationRefusal("allocation-context", "context environment must be a mapping")
+    invalid_keys = [
+        key
+        for key in context.environment
+        if type(key) is not str or re.fullmatch(CONTEXT_ENV_KEY_PATTERN, key) is None
+    ]
+    invalid_keys.sort(key=repr)
+    if invalid_keys:
+        raise ActivationRefusal(
+            "context-environment-key",
+            f"context environment declares unsupported keys: {invalid_keys!r}",
+        )
     if any(type(key) is not str or type(value) is not str for key, value in context.environment.items()):
         raise ActivationRefusal("allocation-context", "context environment must be string-valued")
     if not isinstance(observed_environment, Mapping) or any(
@@ -874,6 +891,10 @@ def validate_child_context_observation(
             or any(type(key) is not str or type(value) is not str for key, value in environment.items())
         ):
             raise ValueError("attached context snapshot has an invalid environment shape")
+        if re.fullmatch(CONTEXT_ENV_KEY_PATTERN, visibility_variable) is None:
+            raise ValueError("attached context snapshot has an unsupported visibility variable")
+        if any(re.fullmatch(CONTEXT_ENV_KEY_PATTERN, key) is None for key in environment):
+            raise ValueError("attached context snapshot has an unsupported environment key")
         expected = dict(environment)
         if visibility_values:
             if any(type(value) is not str or not value for value in visibility_values):

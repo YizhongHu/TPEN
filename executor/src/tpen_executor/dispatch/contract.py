@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import json
 import math
 import os
+import re
 from typing import Any
 
 from .._codec import digest
@@ -15,7 +16,7 @@ from ..contracts import ReadyGroup
 from ..environments import PreparedPythonEnvironment
 from ..lifecycle.attached import AttachedAllocation
 from ..results import RunManifest
-from ..runners import CHILD_CONTEXT_KEYS_ENV, CoreRunEvidence, EvidenceUnavailable
+from ..runners import CONTEXT_ENV_KEY_PATTERN, CHILD_CONTEXT_KEYS_ENV, CoreRunEvidence, EvidenceUnavailable
 from ..tasks import ConfiguredRun
 
 
@@ -94,9 +95,13 @@ def _child_context_keys(allocation: Any) -> tuple[str, ...]:
     context = attached.get("context") if isinstance(attached, Mapping) else None
     declared = context.get("environment") if isinstance(context, Mapping) else None
     if isinstance(declared, Mapping):
-        keys.update(key for key in declared if type(key) is str and key)
+        keys.update(
+            key
+            for key in declared
+            if type(key) is str and re.fullmatch(CONTEXT_ENV_KEY_PATTERN, key) is not None
+        )
     visibility = context.get("visibility_variable") if isinstance(context, Mapping) else None
-    if type(visibility) is str and visibility:
+    if type(visibility) is str and re.fullmatch(CONTEXT_ENV_KEY_PATTERN, visibility) is not None:
         keys.add(visibility)
     return tuple(sorted(keys))
 
