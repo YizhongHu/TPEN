@@ -30,44 +30,38 @@ command::
 and review the resulting diff of ``contract_frozen_snapshot.json`` in the
 same commit -- that diff is the visible record of the decision changing.
 
-``EXCLUDED_PATHS`` re-examines (not copies) the round-4 verifier's 55
-"justified" survivors from its exhaustive 599-leaf sweep. Anything that could
-change a scientific or admission decision was kept IN (covered by this
-test); only true free prose/provenance/metadata, or fields already protected
-by an exact-value test elsewhere, is excluded:
+``EXCLUDED_PATHS`` was re-examined again by the round-5 independent verifier
+(see TO note ``tip-verification-6a0a6a53``), who found that 3 of the 7
+round-5 exclusions (``study.*``, ``source_identity.*``, and the three
+``measurement.seed_roster`` seed-array leaves) were themselves
+decision-bearing and should not have been excluded: physical constants that
+scientific controls are defined in terms of (``nuclear_charge``,
+``exact_ground_energy_hartree``), checksums and commit identifiers that are
+the evidentiary record for the He-v1 comparison (``source_identity.*``), and
+pre-registered seeds whose whole point is to be fixed *before* results are
+seen, not just mutually distinct (the seed arrays). Per the binding
+round-6 decision (``contract-test-coverage-decision-20261106`` amendment on
+item ``fffc313a``), only one exclusion survives this round:
 
-- ``schema``: a format-version tag, not a decision.
-- ``study.{name,system,nuclear_charge,exact_ground_energy_hartree,
-  excluded_systems}``: physical constants and labels fixed by the choice of
-  system (H-v2 is atomic hydrogen, Z=1, exact ground energy -0.5 Ha by
-  definition), not an operator decision. ``study.electron_count`` is left
-  OUT of this exclusion (it stays covered) because the round-4 contract
-  already treats it as decision-bearing.
-- ``source_identity.*``: historical provenance pointers (commit hashes,
-  comparison paths, prior-run identifiers). Nothing computational reads
-  this subtree; confirmed by grep across every ``test_contract*.py`` file.
-- ``measurement.seed_roster.training_initialization_seeds``,
-  ``.training_sampler_seeds``, ``.non_science_seed_namespaces``: the actual
-  contract for these is mutual distinctness and disjointness from every
-  other seed namespace, enforced by
-  ``test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct`` and
-  ``test_sampler_tail_qualification_seed_namespace_is_disjoint`` in
-  ``test_contract.py``. Any mutually-distinct set of integers is equally
-  valid scientifically, so pinning the exact integers here would freeze an
-  arbitrary choice, not a decision. ``measurement.seed_roster
-  .evaluation_stream_seed_formula`` and ``.disjointness`` are deliberately
-  left OUT of this exclusion (they stay covered by the frozen-snapshot
-  comparison below): the formula's numeric pattern is checked by
-  ``_evaluation_seeds`` via a regex, but only the matched prefix -- the
-  round-4 verifier found its own append-only mutation to the trailing
-  descriptive text survived, since that text isn't pinned anywhere. Covering
-  the full string here closes that gap at zero cost.
+- ``schema``: a format-version tag, not a decision -- no study parameter,
+  control, provenance identifier, or seed value is ever read from it.
 
-Everything else that the round-4 verifier's sweep found uncovered --
-``measurement.{estimand,primary_dispersion,secondary_dispersion,
+Every other path -- all of ``study.*`` (including ``name``, ``system``,
+``excluded_systems``, ``nuclear_charge``, ``exact_ground_energy_hartree``),
+the whole ``source_identity`` subtree, and the seed-roster arrays
+(``training_initialization_seeds``, ``training_sampler_seeds``,
+``non_science_seed_namespaces``) -- is now frozen exactly by
+``test_frozen_snapshot_matches_live_contract_except_excluded_paths`` below,
+alongside everything round 5 already covered
+(``measurement.{estimand,primary_dispersion,secondary_dispersion,
 energy_error_profile,complete_record_rule,fresh_evaluation}`` and
-``controls`` -- is *not* excluded, and is therefore now caught by
-``test_frozen_snapshot_matches_live_contract_except_excluded_paths`` below.
+``controls``). The seed-array distinctness/disjointness tests in
+``test_contract.py`` (``test_all_seed_namespaces_and_evaluation_seeds_are_
+globally_distinct``, ``test_sampler_tail_qualification_seed_namespace_is_
+disjoint``) are unaffected and still run: freezing the exact integers and
+checking their distinctness are complementary, not substitutes -- the
+frozen-snapshot comparison catches a silent re-roll to a different (still
+distinct) set, which the distinctness tests alone cannot.
 """
 
 import json
@@ -85,34 +79,6 @@ _MISSING = object()
 # prefixes. See the module docstring for the full reasoning per entry.
 EXCLUDED_PATHS: list[tuple[tuple, str]] = [
     (("schema",), "format-version tag, not a decision"),
-    (("study", "name"), "physical label of the fixed system, not a decision"),
-    (("study", "system"), "physical label of the fixed system, not a decision"),
-    (("study", "nuclear_charge"), "fixed by the choice of system (Z=1 for atomic hydrogen)"),
-    (
-        ("study", "exact_ground_energy_hartree"),
-        "fixed physical constant for atomic hydrogen, not an operator decision",
-    ),
-    (("study", "excluded_systems"), "labels of systems explicitly out of scope, not a decision"),
-    (
-        ("source_identity",),
-        "historical provenance pointers; nothing computational reads this subtree",
-    ),
-    (
-        ("measurement", "seed_roster", "training_initialization_seeds"),
-        "contract is mutual distinctness/disjointness, not the exact integers; "
-        "enforced by test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct",
-    ),
-    (
-        ("measurement", "seed_roster", "training_sampler_seeds"),
-        "contract is mutual distinctness/disjointness, not the exact integers; "
-        "enforced by test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct",
-    ),
-    (
-        ("measurement", "seed_roster", "non_science_seed_namespaces"),
-        "contract is mutual distinctness/disjointness, not the exact integers; "
-        "enforced by test_all_seed_namespaces_and_evaluation_seeds_are_globally_distinct "
-        "and test_sampler_tail_qualification_seed_namespace_is_disjoint",
-    ),
 ]
 
 
