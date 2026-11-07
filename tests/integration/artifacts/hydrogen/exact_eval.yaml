@@ -19,7 +19,15 @@
 # test builds a genuine model-only checkpoint directly with
 # `tpen.checkpoint.save.save_checkpoint` -- the same function and directory
 # format a learned run produces -- and restores it through this same `load:`
-# block and the real `Evaluate` runner, mirroring `hooke_exact_evaluation.yaml`.
+# block and the real `Evaluate` runner. `hooke_exact_evaluation.yaml` has no
+# `load:` block and covers the evaluator stack, not restore; it is not a
+# precedent for this fixture's restore path.
+#
+# `runtime.seed: 910003` deliberately reuses
+# `non_science_seed_namespaces.pipeline_cpu_learned_e.evaluation[0]`
+# (`contract_inputs.json`): this canary is an instrument control of that
+# same pipeline check, not an independent science run, so the shared seed
+# is intentional rather than an undeclared namespace collision.
 # =============================================================================
 
 experiment:

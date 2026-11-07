@@ -124,3 +124,24 @@ def test_forward_sign_is_always_positive() -> None:
 def test_has_no_trainable_parameters() -> None:
     wf = HydrogenExact(atoms=_origin_atoms(), alpha=1.0)
     assert list(wf.parameters()) == []
+
+
+def test_displaced_nucleus_local_energy_is_constant_at_minus_half() -> None:
+    """Every fixture above puts the nucleus at the origin, so a wavefunction
+    that ignored `AtomicConfiguration.positions` would still pass them. Place
+    the nucleus away from the origin and require the same exact-ground-state
+    result, directly exercising the `atoms.positions` convention."""
+
+    nucleus = torch.tensor([[0.3, -0.2, 0.5]], dtype=DTYPE)
+    atoms = AtomicConfiguration(positions=nucleus, charges=torch.ones(1, dtype=DTYPE))
+    wf = HydrogenExact(atoms=atoms, alpha=1.0)
+    generator = torch.Generator().manual_seed(0)
+    relative = torch.empty(BATCH_SIZE, 1, 3, dtype=DTYPE).normal_(generator=generator) * 0.8
+    positions = relative + nucleus
+    batch = ElectronBatch(positions=positions)
+    terms = _hydrogen_terms(atoms)
+
+    eloc = local_energy(terms, wf, batch)
+    assert torch.allclose(eloc, torch.full_like(eloc, -0.5), atol=ENERGY_ATOL)
+    output = wf(batch)
+    assert torch.allclose(output.logabs, -relative[:, 0, :].norm(dim=-1), atol=1e-12, rtol=0.0)

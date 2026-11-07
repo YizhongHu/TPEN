@@ -26,6 +26,17 @@ through configuration, `run_from_config`, or the `tpen` command, and no
 configured route can produce a checkpoint for a zero-parameter model (see that
 file's own probe test for the exact error).
 
+Because `HydrogenExact.state_dict()` is empty, a genuine checkpoint's
+`model.pt` is also an empty mapping, so `strict=True` loading of an empty
+mapping is indistinguishable from never loading at all. The test that proves
+the restore actually reaches the live model is
+`test_model_only_restore_applies_the_checkpoint_state_dict_to_the_live_model`
+below: it points the `load:` block at a checkpoint saved from a *different*
+module (`torch.nn.Linear`) with a non-empty, foreign state dict, so a real
+`load_state_dict(..., strict=True)` call must raise. A no-op restore would
+let this evaluation run proceed and the test would fail to see the expected
+error.
+
 Core integration tests may import tpen internals freely (unlike the
 experiment code under `experiments/`), so this file is not subject to the
 H-v2 experiment import boundary. It imports no file under `experiments/` and
@@ -62,6 +73,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
@@ -77,10 +89,28 @@ FIXTURES = HERE.resolve().parent / "artifacts" / "hydrogen"
 CONFIG_PATH = FIXTURES / "exact_eval.yaml"
 
 # Analytic controls for the `alpha=1.2` imperfect state:
-# E_L = -alpha^2/2 + (alpha-1)/r, with r ~ the exact-ground-state radial
-# distribution. Mirrors the H-v2 contract's `analytic_controls`.
+# E_L = -alpha^2/2 + (alpha-1)/r, with r ~ Gamma(3, 2.4) under |psi|^2 (the
+# exact-ground-state radial distribution). Mirrors the H-v2 contract's
+# `analytic_controls`. `E[1/r] = alpha`, `Var[1/r] = alpha^2`, giving
+# mean = -0.48 Ha and variance = 0.0576 Ha^2 exactly.
+#
+# These bands apply to the full-grid manifest aggregates (all 65536 rows),
+# not the final-draw JSONL metric. `E[r^-4]` diverges under this
+# distribution, so the *sample* variance of E_L has infinite variance and is
+# dominated by whichever walker lands closest to the nucleus; a
+# seed-to-seed sweep (ten seeds, PR 592 review round 1, Cannon job
+# 58746188) measured the final-draw variance ranging 0.0395 to 0.0717
+# (-31% to +24% of 0.0576) and the full-grid variance ranging 0.0498 to
+# 0.0649 (-14% to +13%) -- both too wide for a tight band on 1024 or even
+# 65536 samples drawn from this tail. The full-grid mean (-0.4783 to
+# -0.4812) and median (-0.5393 to -0.5412, against the analytic
+# -0.540498) are robust across the same sweep, so those are the
+# statistics this test pins; the final-draw JSONL metric below is kept
+# only as an exact recomputation from its own rows, not compared to the
+# analytic target.
 ALPHA_1_2_MEAN = -0.48
 ALPHA_1_2_VARIANCE = 0.0576
+ALPHA_1_2_MEDIAN = -0.540498
 
 N_WALKERS = 1024
 N_DRAWS = 64
@@ -90,6 +120,60 @@ def _build_model_only_checkpoint(tmp_path: Path, cfg: Any) -> Path:
     """Save a genuine model-only checkpoint of the exact, parameterless module."""
 
     model = instantiate(cfg.model)
+    artifact_manager = ArtifactManager(
+        tmp_path / "checkpoint-source",
+        experiment="hydrogen_exact",
+        sector="atomistic",
+        run_id="checkpoint-source",
+        layout="flat",
+    )
+    artifact_manager.make_dirs()
+    metadata = RunMetadata(
+        run_id="checkpoint-source",
+        run_name="checkpoint-source",
+        timestamp="2026-11-07T00:00:00+00:00",
+        timezone="UTC",
+        git_commit="checkpoint-source",
+        git_branch="agent/h-v2-exact-canary",
+        dirty_worktree=False,
+        command="pytest",
+        config_path=str(CONFIG_PATH),
+        resolved_config_path=str(artifact_manager.path("resolved_config.yaml")),
+        run_dir=str(artifact_manager.run_dir),
+        device="cpu",
+        dtype="float64",
+    )
+    context = RunContext(
+        cfg=cfg,
+        source_cfg=cfg,
+        artifact_manager=artifact_manager,
+        metadata=metadata,
+        clock=RunClock(timezone="UTC", tzinfo=UTC),
+    )
+    return save_checkpoint(
+        output_dir=tmp_path / "checkpoint-source" / "checkpoints",
+        next_iteration=0,
+        completed_updates=0,
+        model=model,
+        context=context,
+        save_optimizer=False,
+        save_trainer=False,
+        save_sampler=False,
+        save_rng=False,
+    )
+
+
+def _build_foreign_model_checkpoint(tmp_path: Path, cfg: Any) -> Path:
+    """Build a model-only checkpoint whose payload has foreign state keys.
+
+    Unlike `_build_model_only_checkpoint`, this saves a `torch.nn.Linear`
+    module, so `model.pt` carries real, non-empty state-dict keys that
+    `HydrogenExact` does not have. Restoring this checkpoint into a
+    `HydrogenExact` run must raise under `strict=True` loading -- a no-op
+    restore would let the run proceed.
+    """
+
+    model = torch.nn.Linear(1, 1).double()
     artifact_manager = ArtifactManager(
         tmp_path / "checkpoint-source",
         experiment="hydrogen_exact",
@@ -175,6 +259,15 @@ def _full_grid_mean_and_variance(energies: list[float]) -> tuple[float, float]:
     return mean, variance
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    midpoint = n // 2
+    if n % 2 == 1:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+
+
 def _final_draw_energies(rows: list[dict[str, str]], *, n_draws: int) -> list[float]:
     final_draw_index = n_draws - 1
     return [float(row["local_energy"]) for row in rows if int(row["draw_index"]) == final_draw_index]
@@ -225,10 +318,13 @@ def test_imperfect_state_matches_closed_form_analytic_controls(tmp_path: Path) -
     energies = [float(row["local_energy"]) for row in rows]
     assert all(row["finite"] == "True" for row in rows)
 
+    # The JSONL trajectory metric is a final-draw snapshot (see module
+    # docstring). `E[r^-4]` diverges under this distribution, so its sample
+    # variance has no reliable predeclared band (seed sweep, PR 592 review
+    # round 1, Cannon job 58746188); keep it only as an exact recomputation
+    # from its own rows, never compared to the analytic target directly.
     mean = _read_metric(result["run_dir"], namespace="trajectory", key="local_energy_mean")
     variance = _read_metric(result["run_dir"], namespace="trajectory", key="local_energy_variance")
-    assert mean == pytest.approx(ALPHA_1_2_MEAN, abs=0.02)
-    assert variance == pytest.approx(ALPHA_1_2_VARIANCE, rel=0.15)
 
     final_draw_energies = _final_draw_energies(rows, n_draws=N_DRAWS)
     assert len(final_draw_energies) == N_WALKERS
@@ -236,12 +332,20 @@ def test_imperfect_state_matches_closed_form_analytic_controls(tmp_path: Path) -
     assert mean == pytest.approx(final_draw_mean, rel=1e-10, abs=1e-12)
     assert variance == pytest.approx(final_draw_variance, rel=1e-10, abs=1e-12)
 
+    # The full-grid manifest aggregates (all 65536 rows) are the robust
+    # statistics the seed sweep supports: mean within 0.01 and variance
+    # within 25% relative of the analytic closed form, plus the median,
+    # which tracks the analytic target even more tightly (<=0.2% in the
+    # sweep).
     manifest = _read_trajectory_manifest(result["run_dir"])
     assert manifest["row_count"] == N_WALKERS * N_DRAWS
     assert manifest["finite_count"] == N_WALKERS * N_DRAWS
     full_mean, full_variance = _full_grid_mean_and_variance(energies)
     assert manifest["mean"] == pytest.approx(full_mean, rel=1e-10, abs=1e-12)
     assert manifest["variance"] == pytest.approx(full_variance, rel=1e-10, abs=1e-12)
+    assert full_mean == pytest.approx(ALPHA_1_2_MEAN, abs=0.01)
+    assert full_variance == pytest.approx(ALPHA_1_2_VARIANCE, rel=0.25)
+    assert _median(energies) == pytest.approx(ALPHA_1_2_MEDIAN, abs=0.005)
 
     # Precision: recompute the oracle local energy pointwise from each
     # record's own recorded position and require float64-level agreement. A
@@ -252,6 +356,60 @@ def test_imperfect_state_matches_closed_form_analytic_controls(tmp_path: Path) -
         radius = math.sqrt(sum(coordinate**2 for coordinate in coordinates))
         oracle_energy = -(alpha**2) / 2.0 + (alpha - 1.0) / radius
         assert float(row["local_energy"]) == pytest.approx(oracle_energy, rel=1e-10, abs=1e-10)
+
+
+def test_model_only_restore_applies_the_checkpoint_state_dict_to_the_live_model(
+    tmp_path: Path,
+) -> None:
+    """Require strict model-state loading on the evaluation restore route."""
+
+    config = _load_config()
+    config["run"]["root"] = str(tmp_path)
+    config["run"]["run_id"] = "foreign-state"
+    cfg = OmegaConf.create(config)
+    checkpoint_dir = _build_foreign_model_checkpoint(tmp_path, cfg)
+    config["load"]["path"] = str(checkpoint_dir)
+
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        run_from_config(OmegaConf.create(config), command="restore foreign-state", raise_exceptions=True)
+
+
+def test_model_only_restore_refuses_a_model_config_mismatch(tmp_path: Path) -> None:
+    """Reject a checkpoint whose model configuration differs from the run."""
+
+    source = _load_config()
+    source["model"]["alpha"] = 1.0
+    source["run"]["root"] = str(tmp_path)
+    source["run"]["run_id"] = "source"
+    checkpoint_dir = _build_model_only_checkpoint(tmp_path, OmegaConf.create(source))
+
+    current = _load_config()
+    current["model"]["alpha"] = 1.2
+    current["run"]["root"] = str(tmp_path)
+    current["run"]["run_id"] = "mismatch"
+    current["load"]["path"] = str(checkpoint_dir)
+    with pytest.raises(ValueError, match="model_config mismatch"):
+        run_from_config(OmegaConf.create(current), command="restore mismatch", raise_exceptions=True)
+
+
+def test_model_only_restore_is_recorded_in_occurrences(tmp_path: Path) -> None:
+    """Persist the model-only restore report in the durable occurrences log."""
+
+    result = _run(tmp_path, alpha=1.0, run_id="restore-occurrence")
+    occurrences = result["run_dir"] / "occurrences.jsonl"
+    records = [
+        json.loads(line)
+        for line in occurrences.read_text(encoding="utf-8").splitlines()
+        if "CheckpointRestored" in line
+    ]
+    assert len(records) == 1
+    report = records[0]["fields"]["report"]
+    assert report["mode"] == "model_only"
+    assert report["loaded_model"] is True
+    assert report["loaded_optimizer"] is False
+    assert report["loaded_trainer"] is False
+    assert report["loaded_sampler"] is False
+    assert report["loaded_rng"] is False
 
 
 def test_wrong_kinetic_prefactor_mutant_breaks_the_evaluation(

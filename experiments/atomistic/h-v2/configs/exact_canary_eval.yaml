@@ -27,6 +27,12 @@
 # test_hydrogen_exact_evaluation.py` covers that honestly with a genuine
 # checkpoint built directly with `tpen.checkpoint.save.save_checkpoint`,
 # which core test code may do freely.
+#
+# `runtime.seed: 910003` deliberately reuses
+# `non_science_seed_namespaces.pipeline_cpu_learned_e.evaluation[0]`
+# (`contract_inputs.json`): this canary is an instrument control of that
+# same pipeline check, not an independent science run, so the shared seed
+# is intentional rather than an undeclared namespace collision.
 # =============================================================================
 
 experiment:

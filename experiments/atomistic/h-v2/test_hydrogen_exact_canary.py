@@ -122,8 +122,24 @@ _collect_spec.loader.exec_module(collect)
 pytestmark = pytest.mark.integration
 
 # Contract analytic controls (`contract_inputs.json` `analytic_controls`).
+# These bands apply to the full-grid manifest aggregates (all 65536 rows),
+# not the final-draw JSONL metric: `E[r^-4]` diverges under the exact
+# ground-state radial distribution (r ~ Gamma(3, 2.4) under |psi|^2), so the
+# *sample* variance of E_L has infinite variance and is dominated by
+# whichever walker lands closest to the nucleus. A ten-seed sweep (PR 592
+# review round 1, Cannon job 58746188) measured the final-draw variance
+# ranging 0.0395 to 0.0717 (-31% to +24% of 0.0576) and the full-grid
+# variance ranging 0.0498 to 0.0649 (-14% to +13%) -- both too wide for a
+# tight band. The full-grid mean (-0.4783 to -0.4812) and median (-0.5393
+# to -0.5412, against the analytic ALPHA_1_2_MEDIAN) were robust across the
+# same sweep, so those are the statistics pinned below; the final-draw
+# JSONL metric is kept only as an exact recomputation from its own rows
+# (see `test_imperfect_state_matches_closed_form_analytic_controls`), never
+# compared to the analytic target directly. The W statistic (rel=0.3) was
+# also robust (2.25 to 2.47) and is unaffected by this change.
 ALPHA_1_2_MEAN = -0.48
 ALPHA_1_2_VARIANCE = 0.0576
+ALPHA_1_2_MEDIAN = -0.540498
 ALPHA_1_2_W = 2.339741
 
 N_WALKERS = 1024
@@ -179,6 +195,15 @@ def _full_grid_mean_and_variance(energies: list[float]) -> tuple[float, float]:
     mean = sum(energies) / n
     variance = sum((value - mean) ** 2 for value in energies) / n
     return mean, variance
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    midpoint = n // 2
+    if n % 2 == 1:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
 
 
 def _final_draw_energies(rows: list[dict[str, str]], *, n_draws: int) -> list[float]:
@@ -358,13 +383,13 @@ def test_imperfect_state_matches_closed_form_analytic_controls(tmp_path: Path) -
     energies = [float(row["local_energy"]) for row in rows]
     assert all(row["finite"] == "True" for row in rows)
 
+    # The JSONL trajectory metric is a final-draw snapshot (see module
+    # docstring). Its sample variance has no reliable predeclared band at
+    # this alpha (see the comment above `ALPHA_1_2_MEAN`); keep it only as
+    # an exact recomputation from its own rows below, never compared to the
+    # analytic target directly.
     mean = _read_metric(result["run_dir"], namespace="trajectory", key="local_energy_mean")
     variance = _read_metric(result["run_dir"], namespace="trajectory", key="local_energy_variance")
-    # Predeclared Monte Carlo bands: generous relative to the serially
-    # correlated 1024-walker x 64-draw MCMC sample (not IID), looser than the
-    # IID-sample tolerances in `test_stub_oracle_contract.py`.
-    assert mean == pytest.approx(ALPHA_1_2_MEAN, abs=0.02)
-    assert variance == pytest.approx(ALPHA_1_2_VARIANCE, rel=0.15)
     assert _w_statistic(energies) == pytest.approx(ALPHA_1_2_W, rel=0.3)
 
     # Exact bookkeeping against the exact same population the JSONL metric
@@ -372,24 +397,29 @@ def test_imperfect_state_matches_closed_form_analytic_controls(tmp_path: Path) -
     # alpha=1.2 makes the local energy position-dependent, so unlike the
     # alpha=1 case this recomputation IS sensitive to a summary silently
     # aggregated over a further subset of that draw (e.g. half its walkers):
-    # such a mutant can still fall inside the Monte Carlo band on the raw
-    # metric above, but changes this recomputed value measurably, well
-    # outside float64 rounding.
+    # such a mutant can still fall inside a Monte Carlo band on the raw
+    # metric, but changes this recomputed value measurably, well outside
+    # float64 rounding.
     final_draw_energies = _final_draw_energies(rows, n_draws=N_DRAWS)
     assert len(final_draw_energies) == N_WALKERS
     final_draw_mean, final_draw_variance = _full_grid_mean_and_variance(final_draw_energies)
     assert mean == pytest.approx(final_draw_mean, rel=1e-10, abs=1e-12)
     assert variance == pytest.approx(final_draw_variance, rel=1e-10, abs=1e-12)
 
-    # Exact bookkeeping, separate from the Monte Carlo band above: the
+    # Exact bookkeeping, separate from the Monte Carlo bands: the
     # summary mean/variance must equal the mean/variance of the recorded
-    # rows, recomputed independently from the full record set.
+    # rows, recomputed independently from the full record set. The analytic
+    # bands below apply here, to the full-grid aggregate, which the seed
+    # sweep showed to be robust (see the comment above `ALPHA_1_2_MEAN`).
     manifest = _read_trajectory_manifest(result["run_dir"])
     assert manifest["row_count"] == 1024 * 64
     assert manifest["finite_count"] == 1024 * 64
     full_mean, full_variance = _full_grid_mean_and_variance(energies)
     assert manifest["mean"] == pytest.approx(full_mean, rel=1e-10, abs=1e-12)
     assert manifest["variance"] == pytest.approx(full_variance, rel=1e-10, abs=1e-12)
+    assert full_mean == pytest.approx(ALPHA_1_2_MEAN, abs=0.01)
+    assert full_variance == pytest.approx(ALPHA_1_2_VARIANCE, rel=0.25)
+    assert _median(energies) == pytest.approx(ALPHA_1_2_MEDIAN, abs=0.005)
 
     # Precision: recompute the oracle local energy pointwise from each
     # record's own recorded position (`-alpha^2/2 + (alpha-1)/r`) and require
@@ -409,9 +439,23 @@ def test_imperfect_state_matches_closed_form_analytic_controls(tmp_path: Path) -
     assert receipt["row_count"] == 1024 * 64
 
 
-def test_dropped_record_mutant_is_refused_by_the_collector(tmp_path: Path) -> None:
-    result = _run_canary(tmp_path, alpha=1.0, run_id="mutant-dropped-record")
-    rows = _read_rows(result["run_dir"])
+@pytest.fixture(scope="module")
+def _alpha_one_rows(tmp_path_factory: pytest.TempPathFactory) -> list[dict[str, str]]:
+    """One alpha=1 canary run, shared by the collector-mutant tests below.
+
+    Both tests hand-edit a copy of these rows with identities the collector
+    rejects regardless of the underlying local-energy values, so the
+    assertions do not depend on a fresh evaluation per test; a single
+    module-scoped run suffices (F9).
+    """
+
+    tmp_path = tmp_path_factory.mktemp("alpha-one-collector-source")
+    result = _run_canary(tmp_path, alpha=1.0, run_id="mutant-source")
+    return _read_rows(result["run_dir"])
+
+
+def test_dropped_record_mutant_is_refused_by_the_collector(_alpha_one_rows: list[dict[str, str]]) -> None:
+    rows = [dict(row) for row in _alpha_one_rows]
     rows.pop()
     with pytest.raises(collect.RecordIntegrityError, match="missing draw"):
         collect.validate_rows(
@@ -426,9 +470,8 @@ def test_dropped_record_mutant_is_refused_by_the_collector(tmp_path: Path) -> No
         )
 
 
-def test_duplicated_record_mutant_is_refused_by_the_collector(tmp_path: Path) -> None:
-    result = _run_canary(tmp_path, alpha=1.0, run_id="mutant-duplicated-record")
-    rows = _read_rows(result["run_dir"])
+def test_duplicated_record_mutant_is_refused_by_the_collector(_alpha_one_rows: list[dict[str, str]]) -> None:
+    rows = [dict(row) for row in _alpha_one_rows]
     rows[1] = dict(rows[0])
     with pytest.raises(collect.RecordIntegrityError, match="duplicate"):
         collect.validate_rows(

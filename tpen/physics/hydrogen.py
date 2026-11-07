@@ -30,7 +30,6 @@ class HydrogenExact(nn.Module):
         Fixed radial decay rate. Default 1.0 (the exact ground state).
     """
 
-    exact_alpha: float = 1.0
     exact_energy: float = -0.5
 
     def __init__(self, atoms: object, alpha: float = 1.0) -> None:
