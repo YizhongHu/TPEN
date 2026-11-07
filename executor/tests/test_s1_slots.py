@@ -47,7 +47,7 @@ def _slots(count: int = 2) -> list[dict[str, object]]:
     return [
         AllocationSlot(
             f"slot-{index}",
-            f"node-{index}",
+            "node-0",
             (str(index),),
             (index,),
             (("OMP_NUM_THREADS", index + 1),),
@@ -569,7 +569,7 @@ def test_t7_cancel_before_spawn_finishes_only_the_begun_fence(tmp_path: Path, mo
         del self, args, kwargs
         raise KeyboardInterrupt("cancel before child spawn")
 
-    monkeypatch.setattr(ParslDispatcher, "_submit_process", interrupted_submit)
+    monkeypatch.setattr(ParslDispatcher, "_execute_process", interrupted_submit)
     with pytest.raises(KeyboardInterrupt, match="cancel before child spawn"):
         dispatcher.run(group, _runs(tmp_path, "first", "queued"), lifecycle)
     manifest = lifecycle.store.manifest(group)

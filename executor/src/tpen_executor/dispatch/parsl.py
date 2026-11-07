@@ -612,7 +612,13 @@ class ParslDispatcher(DispatcherContract):
             cache=False,
             executors=list(self._active_executor_labels),
         )(_run_parsl_child_captured)
-        future = app(*app_args, **app_kwargs)
+        try:
+            future = app(*app_args, **app_kwargs)
+        except BaseException:
+            # The app may be interrupted before it returns its future.  Mark
+            # the handle first so a racing worker spawn is killed on attach.
+            process_handle.request_kill()
+            raise
         try:
             result = future.result(None)
         except BaseException as original:
