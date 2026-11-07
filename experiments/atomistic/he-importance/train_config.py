@@ -464,16 +464,40 @@ def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple
     return tuple(items)
 
 
+_RESOLVER_OWNED_SEED_PATHS = frozenset({"runtime.seed", "sampler.seed"})
+_RESOLVER_OWNED_SEED_SUFFIXES = (".initializer.seed",)
+_RESOLVER_OWNED_CHECKER_PREFIX = "callbacks."
+_RESOLVER_OWNED_CHECKER_MARKER = ".checkers."
+_RESOLVER_OWNED_SEED_SUFFIX = ".seed"
+
+
+def _is_resolver_owned_seed_path(path: str) -> bool:
+    """Return whether *path* belongs to a resolver-owned seed stream."""
+
+    if path in _RESOLVER_OWNED_SEED_PATHS:
+        return True
+    if any(
+        path[len(path) - len(suffix) :] == suffix
+        for suffix in _RESOLVER_OWNED_SEED_SUFFIXES
+        if len(path) >= len(suffix)
+    ):
+        return True
+    prefix = _RESOLVER_OWNED_CHECKER_PREFIX
+    marker = _RESOLVER_OWNED_CHECKER_MARKER
+    suffix = _RESOLVER_OWNED_SEED_SUFFIX
+    return (
+        len(path) >= len(prefix)
+        and path[: len(prefix)] == prefix
+        and marker in path
+        and len(path) >= len(suffix)
+        and path[len(path) - len(suffix) :] == suffix
+    )
+
+
 def _reject_resolver_owned_seed_overrides(items: Sequence[tuple[str, Any]]) -> None:
     """Refuse seed paths whose values are owned by manifest seed streams."""
 
-    owned = {
-        path
-        for path, _ in items
-        if path in {"runtime.seed", "sampler.seed"}
-        or path.endswith(".initializer.seed")
-        or (path.startswith("callbacks.") and ".checkers." in path and path.endswith(".seed"))
-    }
+    owned = {path for path, _ in items if _is_resolver_owned_seed_path(path)}
     if owned:
         raise TrainConfigResolutionError(
             "resolver-owned seed overrides are not permitted: " + ", ".join(sorted(owned))
