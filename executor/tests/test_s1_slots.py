@@ -18,17 +18,18 @@ from types import SimpleNamespace
 
 import pytest
 
+from tpen_executor import composition
 from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
-from tpen_executor.dispatch.parsl import ParslDispatcher
+from tpen_executor.dispatch.parsl import ParslDispatcher, _ChildProcessHandle
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
-from tpen_executor.placement import AllocationSlot, BindingError, slots_from_allocation
+from tpen_executor.placement import AllocationSlot, BindingError
 from tpen_executor.results import RunManifest
 from tpen_executor.runners import EvidenceUnavailable, TPENEvidence
 from tpen_executor.storage import DirectoryStore
-from tpen_executor.tasks import ConfiguredRun
+from tpen_executor.tasks import ConfiguredRun, ConfiguredRunTable
 from tpen_executor.workers import ProcessOutcome, SubprocessWorker
 
 
@@ -94,10 +95,23 @@ def _stub_package(tmp_path: Path) -> Path:
                 values = dict(item.split('=', 1) for item in argv if '=' in item)
                 core = Path(values['run.root']) / values['run.run_id']
                 start = time.time()
+                def wait_for(path_value):
+                    if not path_value:
+                        return
+                    deadline = time.monotonic() + 10.0
+                    path = Path(path_value)
+                    while not path.exists():
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError(f'event gate timed out: {path}')
+                        time.sleep(0.01)
+
                 if mode == 'slow':
-                    time.sleep(0.60)
+                    Path(os.environ['S1_T2_SLOW_STARTED']).touch()
+                    wait_for(os.environ['S1_T2_THIRD_STARTED'])
                 elif mode == 'fast':
-                    time.sleep(0.12)
+                    wait_for(os.environ['S1_T2_SLOW_STARTED'])
+                elif mode == 'third':
+                    Path(os.environ['S1_T2_THIRD_STARTED']).touch()
                 elif mode == 'timeout':
                     time.sleep(4.0)
                 if mode == 'fail':
@@ -138,8 +152,11 @@ def _stub_package(tmp_path: Path) -> Path:
     return package.parent
 
 
-def _worker(tmp_path: Path, package: Path) -> SimpleNamespace:
-    environment = PreparedPythonEnvironment(sys.executable, env={"PYTHONPATH": str(package)})
+def _worker(tmp_path: Path, package: Path, *, extra_env: dict[str, str] | None = None) -> SimpleNamespace:
+    environment = PreparedPythonEnvironment(
+        sys.executable,
+        env={"PYTHONPATH": str(package), **({} if extra_env is None else extra_env)},
+    )
     return SimpleNamespace(
         materialize=lambda env: {
             "environment": environment,
@@ -158,16 +175,100 @@ def _observations(manifest: RunManifest) -> dict[str, dict[str, object]]:
     }
 
 
-def _dispatcher(tmp_path: Path, package: Path) -> ParslDispatcher:
-    return ParslDispatcher(_worker(tmp_path, package))
+def _dispatcher(tmp_path: Path, package: Path, *, extra_env: dict[str, str] | None = None) -> ParslDispatcher:
+    return ParslDispatcher(_worker(tmp_path, package, extra_env=extra_env))
+
+
+def _composition_inputs(tmp_path: Path, facts: dict[str, object]) -> dict[str, Path]:
+    """Build public-admission records for the pre-store binding gate."""
+
+    group = _group("t:0")
+    config = tmp_path / "config.yaml"
+    config.write_text("ok", encoding="utf-8")
+    worker = tmp_path / "worker.yaml"
+    worker.write_text(
+        textwrap.dedent(
+            f"""
+            worker:
+              _target_: tpen_executor.programs.WorkerProgram
+              _recursive_: false
+              environment:
+                _target_: tpen_executor.environments.PreparedPythonEnvironment
+                _recursive_: false
+                python: {json.dumps(sys.executable)}
+              process:
+                _target_: tpen_executor.workers.SubprocessWorker
+                _recursive_: false
+              runner:
+                _target_: tpen_executor.runners.TPENCommand
+                _recursive_: false
+                config: {json.dumps(str(config))}
+              evidence:
+                _target_: tpen_executor.runners.TPENEvidence
+                _recursive_: false
+            """
+        ),
+        encoding="utf-8",
+    )
+    paths = {
+        "input": tmp_path / "executor_input.json",
+        "runs": tmp_path / "configured-runs.json",
+        "allocation": tmp_path / "allocation.json",
+        "worker": worker,
+        "store": tmp_path / "store",
+    }
+    paths["input"].write_bytes(group.encode())
+    paths["runs"].write_bytes(ConfiguredRunTable(group.identity, (ConfiguredRun("t:0", str(config)),)).encode())
+    paths["allocation"].write_bytes(
+        _allocation(tmp_path, slots=facts.get("slots") if "slots" in facts else None).encode()
+        if "slots" in facts
+        else _allocation(tmp_path).encode()
+    )
+    return paths
+
+
+@PARSL_REQUIRED
+@pytest.mark.parametrize(
+    "facts",
+    [
+        {},
+        {"slots": []},
+    ],
+    ids=["missing-binding", "empty-slots"],
+)
+def test_h1_parsl_binding_refusal_precedes_store_reservation(tmp_path: Path, facts: dict[str, object]) -> None:
+    """H1 kills late-admission-after-store reservation."""
+
+    paths = _composition_inputs(tmp_path, facts)
+    with pytest.raises(composition.CLIRefusal) as observed:
+        composition.admit(
+            paths["input"],
+            paths["store"],
+            paths["allocation"],
+            paths["worker"],
+            paths["runs"],
+            dispatcher_name="parsl",
+        )
+    assert observed.value.code == "dispatcher-admission"
+    assert not paths["store"].exists()
 
 
 @pytest.mark.parametrize(
     "mutation",
-    ["duplicate-slot-id", "duplicate-device", "overlap-cpu", "bad-thread", "bad-env", "ambiguous-node", "empty-slots"],
+    [
+        "duplicate-slot-id",
+        "duplicate-device",
+        "overlap-cpu",
+        "bad-thread",
+        "bad-env",
+        "ambiguous-node",
+        "multi-node-geometry",
+        "empty-slots",
+    ],
 )
+@PARSL_REQUIRED
 def test_t1_strict_slot_admission_rejects_before_begin(tmp_path: Path, mutation: str) -> None:
-    """T1 kills duplicate-slot, overlap-allowed, and late-admission mutants."""
+    """T1 kills malformed, overlapping, multi-node, and late-admission mutants."""
 
     slots = _slots(2)
     if mutation == "duplicate-slot-id":
@@ -182,12 +283,18 @@ def test_t1_strict_slot_admission_rejects_before_begin(tmp_path: Path, mutation:
         slots[0]["environment"] = {"OMP_NUM_THREADS": "not-an-int"}
     elif mutation == "ambiguous-node":
         slots[0]["node"] = ""
+    elif mutation == "multi-node-geometry":
+        slots[1]["node"] = "node-1"
     else:
         slots = []
     allocation = _allocation(tmp_path, slots=slots)
     with pytest.raises(BindingError):
-        slots_from_allocation(allocation)
-    assert not (tmp_path / "store" / "groups").exists()
+        _dispatcher(tmp_path, _stub_package(tmp_path)).run(
+            _group("malformed"),
+            _runs(tmp_path, "malformed"),
+            AttachedAllocation(allocation, DirectoryStore(tmp_path / "store")),
+        )
+    assert not list((tmp_path / "store" / "groups").glob("**/start.json"))
 
 
 @PARSL_REQUIRED
@@ -195,15 +302,25 @@ def test_t2_completion_order_refills_a_quiescent_slot(tmp_path: Path) -> None:
     """T2 kills serial-wait and submission-order-refill mutants."""
 
     package = _stub_package(tmp_path)
-    group = _group("fast", "slow", "third")
+    group = _group("slow", "fast", "third")
+    slow_started = tmp_path / "slow.started"
+    third_started = tmp_path / "third.started"
     lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(2)), DirectoryStore(tmp_path / "store"))
-    manifest = _dispatcher(tmp_path, package).run(
+    manifest = _dispatcher(
+        tmp_path,
+        package,
+        extra_env={
+            "S1_T2_SLOW_STARTED": str(slow_started),
+            "S1_T2_THIRD_STARTED": str(third_started),
+        },
+    ).run(
         group,
-        _runs(tmp_path, "fast", "slow", "third", modes={"fast": "fast", "slow": "slow"}),
+        _runs(tmp_path, "slow", "fast", "third", modes={"slow": "slow", "fast": "fast", "third": "third"}),
         lifecycle,
     )
     observed = _observations(manifest)
-    assert observed["fast"]["start"] < observed["slow"]["end"]
+    assert slow_started.is_file() and third_started.is_file()
+    assert observed["slow"]["start"] < observed["fast"]["end"]
     assert observed["third"]["start"] >= observed["fast"]["end"]
     assert observed["third"]["start"] < observed["slow"]["end"]
 
@@ -217,7 +334,7 @@ def test_t3_future_completion_does_not_release_before_child_quiescence(tmp_path:
     lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(2)), DirectoryStore(tmp_path / "store"))
     release = threading.Event()
     submitted_event = threading.Event()
-    submitted: list[str] = []
+    submitted: list[tuple[str, bool]] = []
 
     class Future:
         def __init__(self, task_id: str) -> None:
@@ -235,7 +352,7 @@ def test_t3_future_completion_does_not_release_before_child_quiescence(tmp_path:
     def submit(materialized, environment, args, **kwargs):
         del materialized, environment, kwargs
         task_id = args[-4].split("=", 1)[-1]
-        submitted.append(task_id)
+        submitted.append((task_id, release.is_set()))
         if len(submitted) == 2:
             submitted_event.set()
         return Future(task_id), SimpleNamespace(request_kill=lambda: None)
@@ -250,10 +367,10 @@ def test_t3_future_completion_does_not_release_before_child_quiescence(tmp_path:
     )
     runner.start()
     assert submitted_event.wait(2)
-    assert submitted == ["one", "two"]
+    assert submitted == [("one", False), ("two", False)]
     release.set()
     runner.join(2)
-    assert submitted == ["one", "two", "three"]
+    assert submitted == [("one", False), ("two", False), ("three", True)]
 
 
 @PARSL_REQUIRED
@@ -261,22 +378,45 @@ def test_t4_each_child_gets_only_its_slot_overlay_and_root(tmp_path: Path) -> No
     """T4 kills shared/wrong environment, shared output, and process affinity mutants."""
 
     package = _stub_package(tmp_path)
-    original = os.environ.get("S1_SLOT_MARKER")
+    parent_keys = ("TPEN_SLOT_ID", "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "S1_SLOT_MARKER")
+    original = {key: os.environ.get(key) for key in parent_keys}
     manifest = _dispatcher(tmp_path, package).run(
         _group("left", "right"),
         _runs(tmp_path, "left", "right"),
         AttachedAllocation(_allocation(tmp_path, slots=_slots(2)), DirectoryStore(tmp_path / "store")),
     )
-    if original is None:
-        assert "S1_SLOT_MARKER" not in os.environ
-    else:
-        assert os.environ["S1_SLOT_MARKER"] == original
+    assert {key: os.environ.get(key) for key in parent_keys} == original
     observed = _observations(manifest)
     assert observed["left"]["env"]["TPEN_SLOT_ID"] == "slot-0"  # type: ignore[index]
     assert observed["right"]["env"]["TPEN_SLOT_ID"] == "slot-1"  # type: ignore[index]
+    assert observed["left"]["env"]["CUDA_VISIBLE_DEVICES"] == "0"  # type: ignore[index]
+    assert observed["right"]["env"]["CUDA_VISIBLE_DEVICES"] == "1"  # type: ignore[index]
+    assert observed["left"]["env"]["OMP_NUM_THREADS"] == "1"  # type: ignore[index]
+    assert observed["right"]["env"]["OMP_NUM_THREADS"] == "2"  # type: ignore[index]
+    assert observed["left"]["env"]["S1_SLOT_MARKER"] == "slot-0"  # type: ignore[index]
+    assert observed["right"]["env"]["S1_SLOT_MARKER"] == "slot-1"  # type: ignore[index]
     assert observed["left"]["env"]["TPEN_SLOT_CPUS"] != observed["right"]["env"]["TPEN_SLOT_CPUS"]  # type: ignore[index]
     roots = [attempt.start_receipt.output_dir for attempt in manifest.attempts]  # type: ignore[union-attr]
     assert len(roots) == len(set(roots)) == 2
+
+
+class _RecordingStore(DirectoryStore):
+    """Record lifecycle writer identities for the controller-only gate."""
+
+    __slots__ = ()
+    writers: list[tuple[str, int]] = []
+
+    def begin_attempt(self, *args, **kwargs):
+        type(self).writers.append(("begin", threading.get_ident()))
+        return super().begin_attempt(*args, **kwargs)
+
+    def finish_attempt(self, *args, **kwargs):
+        type(self).writers.append(("finish", threading.get_ident()))
+        return super().finish_attempt(*args, **kwargs)
+
+    def accept_segment(self, *args, **kwargs):
+        type(self).writers.append(("accept", threading.get_ident()))
+        return super().accept_segment(*args, **kwargs)
 
 
 @PARSL_REQUIRED
@@ -285,7 +425,8 @@ def test_t5_controller_is_the_only_lifecycle_writer_and_accepts_once(tmp_path: P
 
     package = _stub_package(tmp_path)
     group = _group("ok", "fail", "refuse")
-    store = DirectoryStore(tmp_path / "store")
+    _RecordingStore.writers.clear()
+    store = _RecordingStore(tmp_path / "store")
     lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(2)), store)
     manifest = _dispatcher(tmp_path, package).run(
         group,
@@ -298,6 +439,10 @@ def test_t5_controller_is_the_only_lifecycle_writer_and_accepts_once(tmp_path: P
     for attempt in attempts.values():
         assert Path(attempt.start_receipt.output_dir, "start.json").is_file()  # type: ignore[union-attr]
         assert Path(attempt.start_receipt.output_dir, "outcome.json").is_file()  # type: ignore[union-attr]
+    controller = threading.get_ident()
+    kinds = [kind for kind, _ in _RecordingStore.writers]
+    assert kinds.count("begin") == 3 and kinds.count("finish") == 3 and kinds.count("accept") == 1
+    assert {ident for _, ident in _RecordingStore.writers} == {controller}
 
 
 @PARSL_REQUIRED
@@ -311,7 +456,7 @@ def test_t6_fail_timeout_and_evidence_refusal_free_only_quiescent_slots(tmp_path
         group,
         _runs(tmp_path, "fail", "timeout", "refuse", "ok", modes={"fail": "fail", "timeout": "timeout", "refuse": "refuse"}),
         AttachedAllocation(_allocation(tmp_path, slots=_slots(2)), store),
-        timeout=0.15,
+        timeout=2.0,
     )
     attempts = {attempt.task_id: attempt for attempt in manifest.attempts}
     assert attempts["fail"].outcome_receipt.status == "failed"  # type: ignore[union-attr]
@@ -370,6 +515,78 @@ def test_t7_cancel_closes_admission_kills_active_and_never_starts_queued(tmp_pat
     manifest = lifecycle.store.manifest(group)
     assert len(manifest.attempts) == 2
     assert all(attempt.outcome_receipt.status == "failed" for attempt in manifest.attempts)  # type: ignore[union-attr]
+
+
+@PARSL_REQUIRED
+def test_t7_repeated_cancel_interrupts_still_reap_every_active_future(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """M1 kills cancellation cleanup that exits after its second interrupt."""
+
+    dispatcher = _dispatcher(tmp_path, _stub_package(tmp_path))
+    lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(1)), DirectoryStore(tmp_path / "store"))
+    state = {"polls": 0}
+
+    class Future:
+        reaped = False
+
+        def done(self) -> bool:
+            return self.reaped
+
+        def result(self, timeout: float | None = None) -> ProcessOutcome:
+            del timeout
+            assert self.reaped
+            return ProcessOutcome((sys.executable,), 137, "", "", False)
+
+    future = Future()
+
+    def submit(self, materialized, environment, args, **kwargs):
+        del self
+        del materialized, environment, args, kwargs
+        return future, SimpleNamespace(request_kill=lambda: None)
+
+    def interrupting_sleep(seconds: float) -> None:
+        del seconds
+        state["polls"] += 1
+        if state["polls"] <= 2:
+            raise KeyboardInterrupt(f"S1 cancellation {state['polls']}")
+        future.reaped = True
+
+    monkeypatch.setattr(ParslDispatcher, "_submit_process", submit)
+    monkeypatch.setattr("tpen_executor.dispatch.parsl._poll_sleep", interrupting_sleep)
+    with pytest.raises(KeyboardInterrupt, match="S1 cancellation 1"):
+        dispatcher.run(_group("active"), _runs(tmp_path, "active"), lifecycle)
+    assert future.reaped
+
+
+@PARSL_REQUIRED
+def test_t7_cancel_before_spawn_finishes_only_the_begun_fence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """T7 kills post-cancel refill and dropped terminal-fence mutants."""
+
+    dispatcher = _dispatcher(tmp_path, _stub_package(tmp_path))
+    group = _group("first", "queued")
+    lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(1)), DirectoryStore(tmp_path / "store"))
+
+    def interrupted_submit(self, *args, **kwargs):
+        del self, args, kwargs
+        raise KeyboardInterrupt("cancel before child spawn")
+
+    monkeypatch.setattr(ParslDispatcher, "_submit_process", interrupted_submit)
+    with pytest.raises(KeyboardInterrupt, match="cancel before child spawn"):
+        dispatcher.run(group, _runs(tmp_path, "first", "queued"), lifecycle)
+    manifest = lifecycle.store.manifest(group)
+    assert [attempt.task_id for attempt in manifest.attempts] == ["first"]
+    assert manifest.attempts[0].outcome_receipt.status == "failed"  # type: ignore[union-attr]
+
+
+def test_t7_cancel_during_spawn_kills_a_late_attached_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    """T7 kills a pre-spawn cancellation race in the child-group handle."""
+
+    killed: list[object] = []
+    monkeypatch.setattr(_ChildProcessHandle, "_kill_process_group", staticmethod(killed.append))
+    handle = _ChildProcessHandle()
+    process = SimpleNamespace(pid=123)
+    handle.request_kill()
+    handle.attach(process)
+    assert killed == [process]
 
 
 @PARSL_REQUIRED

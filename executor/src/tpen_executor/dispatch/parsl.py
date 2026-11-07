@@ -240,7 +240,7 @@ class ParslDispatcher(DispatcherContract):
                     run_dir=run_dir,
                     usage_tracking=False,
                 )
-            labels = self._validate_executor_config(config)
+            labels = self._validate_executor_config(config, len(bindings))
             if len(bindings) == 1:
                 object.__setattr__(self, "_active_binding", bindings[0])
             object.__setattr__(self, "_active_executor_labels", labels)
@@ -293,6 +293,8 @@ class ParslDispatcher(DispatcherContract):
             return (WorkerBinding.from_mapping(self.binding),)
         slots = slots_from_allocation(lifecycle.allocation)
         if slots:
+            if self.binding is not None:
+                raise BindingError("explicit binding is ambiguous when allocation slots are declared")
             return tuple(slot.binding() for slot in slots)
         if self.binding is not None:
             return (WorkerBinding.from_mapping(self.binding),)
@@ -381,12 +383,14 @@ class ParslDispatcher(DispatcherContract):
                     continue
                 record = active.pop(completed)
                 binding = record["binding"]
+                completion_started = False
                 try:
                     result = completed.result(None)
                     if isinstance(result, _ChildFailure):
                         raise result.error
                     if not isinstance(result, ProcessOutcome):
                         raise TypeError("Parsl child returned an invalid ProcessOutcome")
+                    completion_started = True
                     completion_error = self._complete_member(
                         group,
                         record["member"],
@@ -401,21 +405,43 @@ class ParslDispatcher(DispatcherContract):
                     if completion_error is not None and finish_error is None:
                         finish_error = completion_error
                 except Exception as error:
-                    try:
-                        lifecycle.finish(record["fence"], "failed", self._utc_now(), None)
-                    except Exception as finish_exc:
+                    if completion_started:
                         if finish_error is None:
-                            finish_error = finish_exc
-                    if finish_error is None and isinstance(error, (ValueError, TypeError)):
-                        finish_error = error
+                            finish_error = error
+                    else:
+                        completion_error = self._complete_member(
+                            group,
+                            record["member"],
+                            record["configured"],
+                            lifecycle,
+                            record["fence"],
+                            record["materialized"],
+                            record["environment"],
+                            None,
+                            timeout,
+                            error=error,
+                        )
+                        if completion_error is not None and finish_error is None:
+                            finish_error = completion_error
                 except BaseException as cancellation:
-                    try:
-                        lifecycle.finish(record["fence"], "failed", self._utc_now(), None)
-                    except BaseException as finish_exc:
-                        try:
-                            cancellation.add_note(f"slot {record['member'].task_id} finish unresolved: {finish_exc!r}")
-                        except BaseException:
-                            pass
+                    if not completion_started:
+                        completion_error = self._complete_member(
+                            group,
+                            record["member"],
+                            record["configured"],
+                            lifecycle,
+                            record["fence"],
+                            record["materialized"],
+                            record["environment"],
+                            None,
+                            timeout,
+                            error=cancellation,
+                        )
+                        if completion_error is not None:
+                            try:
+                                cancellation.add_note(f"slot {record['member'].task_id} finish unresolved: {completion_error!r}")
+                            except BaseException:
+                                pass
                     raise
                 available.append(binding)
                 fill()
@@ -444,11 +470,20 @@ class ParslDispatcher(DispatcherContract):
         for record in active.values():
             record["handle"].request_kill()
         for future, record in active.items():
+            reap_errors: list[BaseException] = []
             try:
                 while not future.done():
-                    _poll_sleep(0.01)
-                future.result(None)
+                    try:
+                        _poll_sleep(0.01)
+                    except BaseException as error:
+                        reap_errors.append(error)
+                try:
+                    future.result(None)
+                except BaseException as error:
+                    reap_errors.append(error)
             except BaseException as error:
+                reap_errors.append(error)
+            for error in reap_errors:
                 try:
                     cancellation.add_note(f"slot {record['member'].task_id} reap result: {error!r}")
                 except BaseException:
@@ -461,7 +496,7 @@ class ParslDispatcher(DispatcherContract):
                 except BaseException:
                     pass
 
-    def _validate_executor_config(self, config: Any) -> tuple[str, ...]:
+    def _validate_executor_config(self, config: Any, required_threads: int | None = None) -> tuple[str, ...]:
         """Refuse non-ThreadPool Parsl configs before any lifecycle begin."""
 
         executors = getattr(config, "executors", None)
@@ -474,6 +509,16 @@ class ParslDispatcher(DispatcherContract):
         labels = tuple(executor.label for executor in executors)
         if any(type(label) is not str or not label or label == "_parsl_internal" for label in labels):
             raise UnsupportedParslExecutorError("Parsl ThreadPool executors must have usable labels")
+        if required_threads is not None:
+            capacity = sum(
+                threads
+                for executor in executors
+                if type(threads := getattr(executor, "max_threads", None)) is int and threads > 0
+            )
+            if capacity < required_threads:
+                raise UnsupportedParslExecutorError(
+                    "Parsl ThreadPool executor capacity is smaller than the admitted slot pool"
+                )
         return labels
 
     def _worker_environment(self, materialized: Any, binding: WorkerBinding | None = None) -> PreparedPythonEnvironment:
@@ -513,17 +558,23 @@ class ParslDispatcher(DispatcherContract):
             cache=False,
             executors=list(self._active_executor_labels),
         )(_run_parsl_child_captured)
-        future = app(
-            environment.python,
-            None if environment.setup is None else environment.setup.path,
-            dict(environment.env),
-            args,
-            cwd=cwd,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            timeout=timeout,
-            process_handle=process_handle,
-        )
+        try:
+            future = app(
+                environment.python,
+                None if environment.setup is None else environment.setup.path,
+                dict(environment.env),
+                args,
+                cwd=cwd,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout=timeout,
+                process_handle=process_handle,
+            )
+        except BaseException:
+            # The app may be interrupted before it returns its future.  Mark
+            # the handle first so a racing worker spawn is killed on attach.
+            process_handle.request_kill()
+            raise
         return future, process_handle
 
     def _execute_process(

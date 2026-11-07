@@ -268,21 +268,18 @@ class DispatcherContract:
                     begin_error = error
                 continue
 
-            result_digest: str | None = None
-            segment_evidence: CoreRunEvidence | None = None
-            status = "launch_failed"
+            materialized: Any = None
+            environment: Any = None
             try:
                 materialized = self.worker.materialize(env)
                 environment = self._worker_environment(materialized)
                 environment = _with_child_context_keys(environment, lifecycle.allocation)
                 process = materialized["process"]
                 materialized["runner"]
-                evidence = materialized["evidence"]
+                materialized["evidence"]
                 if not callable(getattr(process, "run", None)):
                     raise TypeError("materialized worker process lacks run()")
-                if not callable(getattr(evidence, "read", None)):
-                    raise TypeError("materialized worker evidence reader lacks read()")
-                output_dir, core_dir, stdout_path, stderr_path, evidence_stdout, evidence_stderr = _member_paths(fence)
+                output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = _member_paths(fence)
                 args = (*configured.command().args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
                 outcome = self._execute_process(
                     materialized,
@@ -293,57 +290,43 @@ class DispatcherContract:
                     stderr_path=stderr_path,
                     timeout=timeout,
                 )
-                status = _status(outcome)
-                try:
-                    decoded = evidence.read(
-                        process,
-                        environment,
-                        core_dir,
-                        cwd=output_dir,
-                        stdout_path=evidence_stdout,
-                        stderr_path=evidence_stderr,
-                        timeout=timeout,
-                    )
-                except EvidenceUnavailable:
-                    result_digest = None
-                else:
-                    result_digest = digest(_evidence_payload(decoded))
-                    segment_evidence = decoded
-            except Exception:
-                status = "launch_failed"
-                result_digest = None
             except BaseException as error:
-                # A begun fence is terminalized exactly once before any
-                # cancellation escapes. Preserve a known timeout because it
-                # is more specific than the later evidence interruption.
-                if status != "timed_out":
-                    status = "failed"
-                try:
-                    lifecycle.finish(fence, status, _utc_now(), result_digest)
-                except BaseException as finish_exc:
-                    try:
-                        error.add_note(f"finish error during cancellation: {finish_exc!r}")
-                    except BaseException:
-                        pass
-                raise
-            try:
-                lifecycle.finish(fence, status, _utc_now(), result_digest)
-            except Exception as error:
-                if finish_error is None:
-                    finish_error = error
-            if (
-                status == "completed"
-                and segment_evidence is not None
-                and segment_evidence.verdict in {"completed", "incomplete"}
-                and segment_evidence.checkpoint is not None
-            ):
-                existing_segments = lifecycle.store.manifest(group).segments
-                if not any(segment.task_id == fence.task_id for segment in existing_segments):
-                    try:
-                        lifecycle.store.accept_segment(fence, segment_evidence, None)
-                    except Exception as error:
-                        if finish_error is None:
-                            finish_error = error
+                completion_error = self._complete_member(
+                    group,
+                    member,
+                    configured,
+                    lifecycle,
+                    fence,
+                    materialized,
+                    environment,
+                    None,
+                    timeout,
+                    error=error,
+                )
+                if completion_error is not None:
+                    if isinstance(error, Exception) and finish_error is None:
+                        finish_error = completion_error
+                    else:
+                        try:
+                            error.add_note(f"finish error during dispatch: {completion_error!r}")
+                        except BaseException:
+                            pass
+                if not isinstance(error, Exception):
+                    raise
+                continue
+            completion_error = self._complete_member(
+                group,
+                member,
+                configured,
+                lifecycle,
+                fence,
+                materialized,
+                environment,
+                outcome,
+                timeout,
+            )
+            if completion_error is not None and finish_error is None:
+                finish_error = completion_error
 
         if begin_error is not None:
             if finish_error is not None:
@@ -364,6 +347,8 @@ class DispatcherContract:
         environment: Any,
         outcome: Any,
         timeout: float | None,
+        *,
+        error: BaseException | None = None,
     ) -> Exception | None:
         """Inspect and publish one quiescent child from the controller.
 
@@ -373,45 +358,68 @@ class DispatcherContract:
         completion path that writes finish and accepted-segment receipts.
         """
 
-        del configured, group
-        status = _status(outcome)
+        del configured
+        if error is None:
+            status = _status(outcome)
+        else:
+            # Ordinary launch/worker errors are durable launch failures; a
+            # BaseException is a cancellation and remains an operational
+            # failure while its original exception propagates.
+            status = "launch_failed" if isinstance(error, Exception) else "failed"
         result_digest: str | None = None
         segment_evidence: CoreRunEvidence | None = None
-        try:
-            evidence = materialized["evidence"]
-            process = materialized["process"]
-            output_dir, core_dir, _stdout, _stderr, evidence_stdout, evidence_stderr = _member_paths(fence)
-            if not callable(getattr(evidence, "read", None)):
-                raise TypeError("materialized worker evidence reader lacks read()")
-            decoded = evidence.read(
-                process,
-                environment,
-                core_dir,
-                cwd=output_dir,
-                stdout_path=evidence_stdout,
-                stderr_path=evidence_stderr,
-                timeout=timeout,
-            )
-            result_digest = digest(_evidence_payload(decoded))
-            segment_evidence = decoded
-        except EvidenceUnavailable:
-            pass
-        except Exception:
-            status = "failed"
+        inspection_error: BaseException | None = None
+        if error is None:
+            try:
+                evidence = materialized["evidence"]
+                process = materialized["process"]
+                output_dir, core_dir, _stdout, _stderr, evidence_stdout, evidence_stderr = _member_paths(fence)
+                if not callable(getattr(evidence, "read", None)):
+                    raise TypeError("materialized worker evidence reader lacks read()")
+                decoded = evidence.read(
+                    process,
+                    environment,
+                    core_dir,
+                    cwd=output_dir,
+                    stdout_path=evidence_stdout,
+                    stderr_path=evidence_stderr,
+                    timeout=timeout,
+                )
+                result_digest = digest(_evidence_payload(decoded))
+                segment_evidence = decoded
+            except EvidenceUnavailable:
+                pass
+            except Exception:
+                status = "launch_failed"
+            except BaseException as caught:
+                # Preserve a known process timeout while still terminalizing
+                # the begun fence before propagating owner cancellation.
+                if status != "timed_out":
+                    status = "failed"
+                inspection_error = caught
         try:
             lifecycle.finish(fence, status, _utc_now(), result_digest)
-        except Exception as error:
-            return error
+        except Exception as finish_error:
+            if inspection_error is None:
+                return finish_error
+            try:
+                inspection_error.add_note(f"finish error during inspection cancellation: {finish_error!r}")
+            except BaseException:
+                pass
+        if inspection_error is not None:
+            raise inspection_error
         if (
             status == "completed"
             and segment_evidence is not None
             and segment_evidence.verdict in {"completed", "incomplete"}
             and segment_evidence.checkpoint is not None
         ):
-            try:
-                lifecycle.store.accept_segment(fence, segment_evidence, None)
-            except Exception as error:
-                return error
+            existing_segments = lifecycle.store.manifest(group).segments
+            if not any(segment.task_id == fence.task_id for segment in existing_segments):
+                try:
+                    lifecycle.store.accept_segment(fence, segment_evidence, None)
+                except Exception as error:
+                    return error
         return None
 
     @staticmethod
