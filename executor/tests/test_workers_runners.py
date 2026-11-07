@@ -22,6 +22,7 @@ from tpen_executor.runners import (
     RUN_SHIM,
     TPENCommand,
     TPENEvidence,
+    _child_context_keys,
 )
 from tpen_executor.workers import ProcessOutcome, SubprocessWorker
 
@@ -155,6 +156,25 @@ def test_context_key_pattern_is_the_executor_shim_pattern() -> None:
     """The source constant is available for the cross-project contract test."""
 
     assert CONTEXT_ENV_KEY_PATTERN == r"^(CUDA_VISIBLE_DEVICES|TPEN_CTX_[A-Z0-9_]{1,64})$"
+
+
+def test_child_context_keys_preserve_default_and_declared_context_names() -> None:
+    allocation = SimpleNamespace(
+        facts={
+            "attached_context": {
+                "context": {
+                    "environment": {"TPEN_CTX_THREAD_SETTING": "4"},
+                    "visibility_variable": "CUDA_VISIBLE_DEVICES",
+                }
+            }
+        }
+    )
+    assert _child_context_keys(allocation) == (
+        "CUDA_VISIBLE_DEVICES",
+        "MKL_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "TPEN_CTX_THREAD_SETTING",
+    )
 
 
 def test_tpen_command_launches_stub_with_exact_args(tmp_path: Path) -> None:
