@@ -14,6 +14,8 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import experiments.toolkit.attached_activation as attached_activation
+
 _ATTACHED_PATH = Path(__file__).resolve().parents[1] / "atomistic" / "he-v1" / "attached.py"
 _ATTACHED_SPEC = importlib.util.spec_from_file_location("he_v1_attached_p10", _ATTACHED_PATH)
 assert _ATTACHED_SPEC is not None and _ATTACHED_SPEC.loader is not None
@@ -22,6 +24,7 @@ sys.modules[_ATTACHED_SPEC.name] = attached
 _ATTACHED_SPEC.loader.exec_module(attached)
 from experiments.toolkit.attached_activation import (
     ActivationRefusal,
+    _validate_attached_sidecars,
     allocation_context_payload,
     build_attached_inputs,
     parse_profile_verdict,
@@ -104,6 +107,34 @@ def test_attached_handoff_binds_group_identity_and_order(tmp_path: Path) -> None
     ]
 
 
+def test_attached_handoff_preserves_opaque_logical_identity(tmp_path: Path) -> None:
+    source = tmp_path / "source.yaml"
+    _source_config(source)
+    plan, _ = attached.build_he_train_plan(
+        {
+            "plan_id": "opaque-plan",
+            "rows": [{
+                "logical_task_id": "logical-opaque",
+                "run_id": "run-opaque",
+                "row_id": "row-000",
+                "stage": "02_train",
+                "kind": "train",
+                "runtime": "tpen-cu126",
+                "config": str(source),
+                "seed": 0,
+                "max_steps": 7,
+                "n_walkers": 12,
+            }],
+        },
+        repo_root=tmp_path,
+        results_root=tmp_path / "results",
+        source_config=source,
+        checkpoint_every_n=25,
+    )
+    assert plan.tasks[0].logical_task_id == "logical-opaque"
+    assert plan.tasks[0].run_id == "run-opaque"
+
+
 def test_attached_route_requires_opt_in(tmp_path: Path) -> None:
     source = tmp_path / "source.yaml"
     _source_config(source)
@@ -169,6 +200,7 @@ def test_reduced_route_reaches_executor_dispatch_with_doubles(tmp_path: Path, mo
     )
     assert activation.profile.verdict == "supported"
     assert "profile" in calls and "dispatch" in calls
+    assert calls["dispatch"][2]["dispatcher"] == "parsl"  # type: ignore[index]
     profile_config = str(calls["profile"][1])  # type: ignore[index]
     assert profile_config != str(source)
     assert calls["dispatch"][1].effective_config == profile_config  # type: ignore[index]
@@ -207,6 +239,85 @@ def test_approved_smoke_row_translates_declared_scale_as_separate_fields(tmp_pat
     assert "sampler.n_walkers=16" not in overrides
 
 
+def test_activation_rechecks_child_context_after_dispatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "train.yaml"
+    _source_config(source)
+    allocation = tmp_path / "allocation.json"
+    allocation.write_text(
+        json.dumps({
+            "schema": "tpen-executor/configured-allocation-v1",
+            "allocation_id": "alloc",
+            "backend_job_id": "job",
+            "facts": {},
+        }),
+        encoding="utf-8",
+    )
+    context = SimpleNamespace(
+        allocation_id="alloc",
+        visibility_variable="CUDA_VISIBLE_DEVICES",
+        visibility_values=("0",),
+        run_root="/runs",
+        deadline=None,
+        deadline_env_var=None,
+        deadline_guard_min=1,
+        environment={},
+        nodes_per_block=None,
+    )
+
+    monkeypatch.setattr(attached, "check_profile", lambda *args, **kwargs: attached.ProfileVerdict(
+        attached.PROFILE_NAME, "supported", ("model",), None, 0
+    ))
+
+    def fake_dispatch(_executor_python: str, _handoff: object, **kwargs: object):
+        store = Path(str(kwargs["store"]))
+        store.mkdir(parents=True)
+        (store / "run-manifest.json").write_text("{}", encoding="utf-8")
+        return attached.ExecutorDispatchResult(0, {}, "{}", "")
+
+    monkeypatch.setattr(attached, "run_executor_cli", fake_dispatch)
+    monkeypatch.setattr(
+        attached,
+        "validate_child_context_observation",
+        lambda *args: (_ for _ in ()).throw(
+            ActivationRefusal("child-context-mismatch", "child context drifted")
+        ),
+    )
+    monkeypatch.setattr(attached, "write_activation_failure_receipt", lambda *args, **kwargs: None)
+    with pytest.raises(ActivationRefusal, match="child context drifted"):
+        attached.activate_he_train(
+            {
+                "plan_id": "plan",
+                "rows": [{
+                    "logical_task_id": "logical",
+                    "run_id": "run",
+                    "row_id": "seed-000",
+                    "kind": "train",
+                    "stage": "02_train",
+                    "runtime": "tpen-cu126",
+                    "config": str(source),
+                    "seed": 0,
+                    "max_steps": 25,
+                    "n_walkers": 16,
+                }],
+            },
+            output_dir=tmp_path / "generation",
+            repo_root=tmp_path,
+            results_root=tmp_path / "results",
+            source_config=source,
+            science_python=tmp_path / "science-python",
+            executor_python=tmp_path / "executor-python",
+            allocation=allocation,
+            worker_config=tmp_path / "worker.yaml",
+            store=tmp_path / "store",
+            receipt_path=tmp_path / "activation.json",
+            enable_attached=True,
+            enable_reduced_callbacks=True,
+            allocation_context=context,
+            observed_environment={},
+            observed_hostname="n0",
+        )
+
+
 @pytest.mark.parametrize(
     "row",
     [
@@ -241,6 +352,22 @@ def test_train_translation_named_rejections(tmp_path: Path, row: dict[str, objec
             source_config=source,
             checkpoint_every_n=25,
         )
+
+
+def test_attached_sidecars_refuse_a_tampered_group_run_pair(tmp_path: Path) -> None:
+    source = tmp_path / "source.yaml"
+    _source_config(source)
+    handoff = attached_activation.write_attached_handoff(
+        tmp_path / "handoff",
+        _plan(tmp_path),
+        effective_config=source,
+        source_config=source,
+    )
+    table = json.loads(Path(handoff.configured_runs).read_text(encoding="utf-8"))
+    table["group_digest"] = "f" * 64
+    Path(handoff.configured_runs).write_text(json.dumps(table), encoding="utf-8")
+    with pytest.raises(ActivationRefusal, match="configured-runs sidecar"):
+        _validate_attached_sidecars(handoff)
 
 
 def test_failed_generation_retires_current_sidecars(tmp_path: Path) -> None:
@@ -417,6 +544,29 @@ def test_allocation_context_payload_refuses_undeclared_environment_key() -> None
     assert raised.value.code == "context-environment-key"
 
 
+def test_allocation_context_payload_refuses_secret_like_visibility_name() -> None:
+    context = SimpleNamespace(
+        allocation_id="alloc",
+        visibility_variable="P10_TEST_SECRET",
+        visibility_values=("0",),
+        run_root="/runs",
+        deadline=None,
+        deadline_env_var=None,
+        deadline_guard_min=1,
+        environment={},
+        nodes_per_block=None,
+    )
+    with pytest.raises(ActivationRefusal) as raised:
+        allocation_context_payload(
+            context,
+            allocation_id="alloc",
+            backend_job_id="job",
+            observed_environment={},
+            observed_hostname="n0",
+        )
+    assert raised.value.code == "context-environment-key"
+
+
 def test_reader_rejects_empty_committed_chain_after_zero_exit(tmp_path: Path) -> None:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
@@ -439,6 +589,25 @@ def test_reader_rejects_empty_committed_chain_after_zero_exit(tmp_path: Path) ->
             inspect_run=lambda _: {"verdict": "completed", "run_status": "completed"},
         )
     assert json.loads((tmp_path / "receipt.json").read_text())["status"] == "failed"
+
+
+def test_reader_rechecks_completed_core_verdict_after_nonempty_dispatch(tmp_path: Path) -> None:
+    attempt = tmp_path / "attempt"
+    (attempt / "core" / "checkpoint" / "step_000001").mkdir(parents=True)
+    manifest = tmp_path / "manifest.json"
+    fixture = (Path(__file__).parent / "fixtures" / "run-manifest-v2.json").read_text(encoding="utf-8")
+    manifest.write_text(fixture.replace("/runs/group-1/task-a/attempt-1", str(attempt)), encoding="utf-8")
+    with pytest.raises(Exception, match="public core verdict"):
+        write_activation_receipt(
+            manifest,
+            tmp_path / "receipt.json",
+            expected_task_ids=("task-a",),
+            inspect_run=lambda _: {
+                "verdict": "incomplete",
+                "run_status": "incomplete",
+                "checkpoint": None,
+            },
+        )
 
 
 def test_profile_verdict_is_json_not_exit_status() -> None:
