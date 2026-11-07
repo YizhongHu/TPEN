@@ -77,6 +77,11 @@ model:
   factors:
     - _target_: tpen.nn.ElectronNucleusCusp
       atoms: ${atoms}
+      law:
+        _target_: tpen.nn.CurvatureElectronNucleusCuspLaw
+        curvature_coefficient: 0.01
+        curvature_range: 1.0
+        trainable: true
   readout:
     _target_: tpen.nn.readout.PfaffianReadout
     channels: 8
