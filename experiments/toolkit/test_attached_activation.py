@@ -370,6 +370,23 @@ def test_attached_sidecars_refuse_a_tampered_group_run_pair(tmp_path: Path) -> N
         _validate_attached_sidecars(handoff)
 
 
+def test_attached_sidecars_refuse_a_tampered_executor_member(tmp_path: Path) -> None:
+    source = tmp_path / "source.yaml"
+    _source_config(source)
+    handoff = attached_activation.write_attached_handoff(
+        tmp_path / "handoff",
+        _plan(tmp_path),
+        effective_config=source,
+        source_config=source,
+    )
+    group = json.loads(Path(handoff.executor_input).read_text(encoding="utf-8"))
+    group["members"][0]["command"] = ["tpen", "tampered"]
+    Path(handoff.executor_input).write_text(json.dumps(group), encoding="utf-8")
+    with pytest.raises(ActivationRefusal) as refusal:
+        _validate_attached_sidecars(handoff)
+    assert refusal.value.code == "handoff-group-mismatch"
+
+
 def test_failed_generation_retires_current_sidecars(tmp_path: Path) -> None:
     source = tmp_path / "train.yaml"
     _source_config(source)
