@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import tpen_executor.workers as workers_module
 from tpen_executor.configuration import StagedHydra
 from tpen_executor.dispatch.contract import _child_context_keys
 from tpen_executor.environments import PreparedPythonEnvironment, SourceScript
@@ -151,6 +152,31 @@ def test_run_shim_observation_excludes_unallowlisted_environment(tmp_path: Path)
         "TPEN_CTX_CONTEXT_VALUE": "declared",
     }
     assert "P10_TEST_SECRET" not in observation["environment"]
+
+
+def test_run_shim_observation_records_spawned_child_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    environment, _ = _science(tmp_path)
+    spawned_pids: list[int] = []
+    real_popen = workers_module.subprocess.Popen
+
+    def recording_popen(*args: object, **kwargs: object) -> object:
+        process = real_popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    monkeypatch.setattr(workers_module.subprocess, "Popen", recording_popen)
+    outcome = SubprocessWorker().run(
+        environment,
+        ("-c", RUN_SHIM, f"run.root={tmp_path}"),
+        cwd=tmp_path,
+        stdout_path=tmp_path / "observation.out",
+        stderr_path=tmp_path / "observation.err",
+    )
+
+    assert outcome.returncode == 0
+    assert len(spawned_pids) == 1
+    observation = json.loads((tmp_path / "executor-child-observation.json").read_text(encoding="utf-8"))
+    assert observation["pid"] == spawned_pids[0]
 
 
 def test_context_key_pattern_is_the_executor_shim_pattern() -> None:
