@@ -189,8 +189,8 @@ def test_approved_smoke_row_translates_declared_scale_as_separate_fields(tmp_pat
                     "runtime": "tpen-cu126",
                     "config": str(source),
                     "seed": 0,
-                    "max_steps": 25,
-                    "n_walkers": 16,
+                    "max_steps": 7,
+                    "n_walkers": 12,
                 }
             ],
         },
@@ -201,8 +201,10 @@ def test_approved_smoke_row_translates_declared_scale_as_separate_fields(tmp_pat
     )
     assert plan.plan_id == "approved-plan"
     overrides = translated["seed-000"]
-    assert "trainer.max_steps=25" in overrides
-    assert "sampler.n_walkers=16" in overrides
+    assert "trainer.max_steps=7" in overrides
+    assert "sampler.n_walkers=12" in overrides
+    assert "trainer.max_steps=25" not in overrides
+    assert "sampler.n_walkers=16" not in overrides
 
 
 @pytest.mark.parametrize(
