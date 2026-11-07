@@ -92,41 +92,64 @@ slice is pending for this protocol-only slice.
 `test_hydrogen_exact_canary.py` pushes a fixed exact one-electron hydrogen
 wavefunction (`tpen.physics.hydrogen.HydrogenExact`, `psi = exp(-alpha r)`,
 mirroring `tpen/physics/hooke.py`) through the real evaluation route:
-`tpen.run.run_from_config`, the real `Evaluate` runner, a genuine model-only
-checkpoint restore, `TrajectoryMCMCGenerator`, the local-energy and
-wavefunction calculators, the trajectory record writer and
-`LocalEnergySummary`, and finally this directory's own collector
-(`collect.py`). Neither `test_oracle_vs_tpen.py` nor
-`test_stub_oracle_contract.py` exercises that route: both feed a stub
+`tpen.run.run_from_config`, the real `Evaluate` runner,
+`TrajectoryMCMCGenerator`, the local-energy and wavefunction calculators, the
+trajectory record writer and `LocalEnergySummary`, and finally this
+directory's own collector (`collect.py`). Neither `test_oracle_vs_tpen.py`
+nor `test_stub_oracle_contract.py` exercises that route: both feed a stub
 wavefunction directly to the Hamiltonian terms and sampler, never through
 `run_from_config`, the record writer, the summaries, or the collector. An
-evaluation-path defect -- a wrong aggregation, a dropped or duplicated
-record, a term mis-assigned between kinetic and potential, or a summary
-computed on a subset -- cannot be told apart from ordinary model behavior on
-a learned model, whose true local energy is unknown; on the exact ground
-state (`alpha=1`) every local energy must equal exactly -0.5 Ha, so such a
-defect is directly visible. For `alpha=1.2` the canary checks the same
+evaluation-path defect -- a wrong aggregation or a dropped or duplicated
+record -- cannot be told apart from ordinary model behavior on a learned
+model, whose true local energy is unknown; on the exact ground state
+(`alpha=1`) every local energy must equal exactly -0.5 Ha, so such a defect
+is directly visible. For `alpha=1.2` the canary checks the same
 known-imperfect closed-form control already in `contract_inputs.json`
 (`analytic_controls`): mean -0.48 Ha, variance 0.0576 Ha^2, `W=2.339741` Ha.
+
+**Test placement.** Per the operator ruling that experiment code and tests
+reach core only through configuration, `run_from_config`, or the `tpen`
+command (root note `operator-decisions-20261106-imports-mirflow-readonly`),
+the wrong-kinetic-prefactor and flipped-potential-sign mutants, which need a
+direct monkeypatch of `tpen.physics.kinetic.KineticEnergy`/
+`tpen.physics.potential.ElectronNucleusPotential`, moved to the core
+integration test `tests/integration/evaluation/
+test_hydrogen_exact_evaluation.py`, which is not subject to this boundary.
+`test_import_boundary.py` enforces the boundary for this directory,
+including this file.
 
 **Restore scope, stated honestly.** `HydrogenExact` carries no trainable
 state: it is constructed from a fixed `AtomicConfiguration` and a fixed
 `alpha`, with no `nn.Parameter`. There is therefore no optimizer, trainer,
 sampler, or RNG state that a training-resume checkpoint would add, and the
-`Train` runner cannot even build an optimizer over zero parameters
-(`torch.optim.Adam([])` raises `ValueError: optimizer got an empty parameter
-list`). The canary does not go through the `Train` runner the way a learned
-checkpoint does. What it does instead -- and what the collector requires
-regardless, since `collect.py`'s `validate_checkpoint_identity` and
-`validate_restore_mode` are unconditional -- is build a genuine model-only
-checkpoint directly with `tpen.checkpoint.save.save_checkpoint`: the same
-function, directory layout, and manifest a learned run's checkpoint uses.
-That checkpoint is then restored through the same `load:` config block and
-the real `Evaluate` runner (`tpen.checkpoint.restore.restore_checkpoint`),
-exercising the real model-only restore path honestly. It does not exercise
-optimizer/trainer/sampler/RNG restore, because this module has none of that
-state to restore; that part of the restore surface remains covered only by
-a learned-model run (the short learned route in parts (e)/(f) above).
+only configured route that writes a checkpoint, the `Train` runner,
+unconditionally builds a real optimizer over `model.parameters()` before
+touching the trainer, sampler, or `load` mode -- so it cannot even build an
+optimizer over zero parameters (`torch.optim.SGD([])` raises `ValueError:
+optimizer got an empty parameter list`). `test_hydrogen_exact_canary.py`'s
+own `test_no_configured_checkpoint_route_exists_for_the_parameterless_model`
+drives exactly this `Train` config through `run_from_config` and asserts
+that error directly, rather than assuming it: there is no configured route --
+`run_from_config` or the `tpen` command -- that can produce a checkpoint for
+this module, so this experiment-side canary cannot build one honestly
+(building one directly with `tpen.checkpoint.save.save_checkpoint`, as an
+earlier revision did, is a direct `tpen` import this file may no longer
+make). The canary therefore uses no checkpoint and does not exercise
+`collect.py`'s checkpoint-identity/restore-mode admission
+(`validate_checkpoint_identity`/`validate_restore_mode`); those are
+exercised instead by `test_collect.py`'s own unit tests against synthetic
+checkpoint artifacts. Every other collector check that does not need a
+checkpoint -- `validate_run_identity`, `validate_manifest`,
+`validate_rows` -- is still exercised directly against the real collector
+code. Restore itself (the real `Evaluate` runner's model-only
+`tpen.checkpoint.restore.restore_checkpoint` path) is instead covered
+honestly by the core integration test, which builds a genuine checkpoint
+directly with `tpen.checkpoint.save.save_checkpoint` -- core test code may do
+that freely -- and restores it through the same `load:` config block. It
+does not exercise optimizer/trainer/sampler/RNG restore, because this module
+has none of that state to restore; that part of the restore surface remains
+covered only by a learned-model run (the short learned route in parts (e)/(f)
+above).
 
 ## Evidence boundary
 

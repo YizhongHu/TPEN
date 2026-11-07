@@ -1,35 +1,63 @@
 """End-to-end evaluation-route canary for the exact one-electron hydrogen state.
 
 Drives `tpen.physics.hydrogen.HydrogenExact` through the real evaluation
-route: `tpen.run.run_from_config` into the real `Evaluate` runner, a genuine
-model-only checkpoint restore, `TrajectoryMCMCGenerator`,
-`LocalEnergyCalculator`/`WavefunctionCalculator`, `SampledRecordWriter` and
-`LocalEnergySummary`, and finally the real H-v2 collector (`collect.py`).
+route: `tpen.run.run_from_config` into the real `Evaluate` runner,
+`TrajectoryMCMCGenerator`, `LocalEnergyCalculator`/`WavefunctionCalculator`,
+`SampledRecordWriter`/`LocalEnergySummary`, and finally the real H-v2
+collector (`collect.py`).
 
 Neither `test_oracle_vs_tpen.py` nor `test_stub_oracle_contract.py` touches
 this route: both feed a stub wavefunction straight to the Hamiltonian terms
 and sampler, never through `run_from_config`, the trajectory record writer,
 the summaries, or the collector (see container note
 ``canary-overlap-assessment-20261106``). An evaluation-path defect -- a
-wrong aggregation, a dropped or duplicated record, a term mis-assigned
-between kinetic and potential, or a summary computed on a subset -- cannot be
-told apart from model behavior on a learned model, whose true local energy is
-unknown. On the exact hydrogen ground state (alpha=1) every local energy must
-equal -0.5 Ha exactly, so any such defect is directly visible.
+wrong aggregation, a dropped or duplicated record, or a summary computed on
+a subset -- cannot be told apart from model behavior on a learned model,
+whose true local energy is unknown. On the exact hydrogen ground state
+(alpha=1) every local energy must equal -0.5 Ha exactly, so any such defect
+is directly visible.
 
-**Restore scope.** `HydrogenExact` carries no trainable state, so there is no
-optimizer/trainer/sampler state a *training*-resume checkpoint would add (an
-``nn.Module`` with zero parameters cannot even build an optimizer --
-``torch.optim.Adam([])`` raises). The canary therefore cannot go through the
-`Train` runner the way a learned checkpoint does. What it does instead, and
-what the real collector (`collect.py`) requires regardless, is build a
-genuine model-only checkpoint directly with
-`tpen.checkpoint.save.save_checkpoint` -- the same function, directory
-format, and manifest a learned run's checkpoint uses -- and restore it
-through the same `load:` block and the real `Evaluate` runner
-(`tpen.checkpoint.restore.restore_checkpoint`). This exercises the real
-model-only restore path honestly; it does not exercise optimizer/trainer/
-sampler/RNG restore, because this module has none of that state to restore.
+**Experiment boundary.** Per the operator ruling (root note
+``operator-decisions-20261106-imports-mirflow-readonly``, amended by
+``acceptance-contract-amendment-20261106``), this file reaches core only
+through configuration, `tpen.run.run_from_config`, or the installed `tpen`
+command -- never a direct `tpen.*` import. The wrong-kinetic-prefactor and
+flipped-potential-sign mutants, which need a direct monkeypatch of
+`tpen.physics.kinetic.KineticEnergy`/`tpen.physics.potential.
+ElectronNucleusPotential`, therefore moved to the core integration test
+(`tests/integration/evaluation/test_hydrogen_exact_evaluation.py`), which is
+not subject to this boundary. `experiments/atomistic/h-v2/
+test_import_boundary.py` enforces this boundary for every file in this
+directory, including this one.
+
+**Restore scope.** `HydrogenExact` carries no trainable state, so there is
+no optimizer/trainer/sampler state a *training*-resume checkpoint would add
+(an `nn.Module` with zero parameters cannot even build an optimizer --
+`torch.optim.SGD([])` raises "optimizer got an empty parameter list"). The
+only configured route that writes a checkpoint is `tpen.runner.Train`, and
+`Train.run` unconditionally builds a real optimizer over `model.parameters()`
+before touching the trainer, sampler, or `load` mode
+(`tpen/runner/train.py`), so there is no configured route -- `run_from_config`
+or the `tpen` command -- that can produce a checkpoint for this module.
+`test_no_configured_checkpoint_route_exists_for_the_parameterless_model`
+below exercises this directly rather than assuming it, per the amendment's
+requirement to report the exact error (see `implementation-receipt`). This
+canary therefore uses no checkpoint and does not cover restore; the core
+integration test covers that honestly instead, with a genuine checkpoint
+built directly via `tpen.checkpoint.save.save_checkpoint` (core test code may
+do that freely; this file may not).
+
+Because there is no checkpoint, this canary cannot call the collector's
+composite `collect_records` (it requires a restored checkpoint directory and
+a `model_only` resolved restore mode). It instead calls the real collector
+functions that do not depend on a checkpoint directly --
+`collect.validate_run_identity`, `collect.validate_manifest`, and
+`collect.validate_rows` -- so source-commit identity, resolved-config
+identity, manifest completeness, and full per-row validation are still
+genuinely exercised against the real collector code. This is a disclosed
+gap, not a silently dropped one: `collect.validate_checkpoint_identity` and
+`collect.validate_restore_mode` are exercised by `test_collect.py`'s own
+unit tests against synthetic checkpoint artifacts instead.
 
 **Full-record-set bookkeeping.** The streamed trajectory manifest
 (`sampled_eval_table.metadata.json`, written by
@@ -73,21 +101,13 @@ import json
 import math
 import subprocess
 import sys
-from datetime import UTC
 from pathlib import Path
 from typing import Any
 
 import pytest
-import torch
 import yaml
-from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
-from tpen.artifacts import ArtifactManager, RunClock, RunContext, RunMetadata
-from tpen.checkpoint.save import save_checkpoint
-from tpen.physics.hamiltonian import LocalEnergyResult
-from tpen.physics.kinetic import KineticEnergy
-from tpen.physics.potential import ElectronNucleusPotential
 from tpen.run import run_from_config
 
 HERE = Path(__file__).parent
@@ -116,74 +136,18 @@ def _load_config() -> dict[str, Any]:
     return value
 
 
-def _build_model_only_checkpoint(tmp_path: Path, cfg: Any) -> Path:
-    """Save a genuine model-only checkpoint of the exact, parameterless module."""
-
-    model = instantiate(cfg.model)
-    artifact_manager = ArtifactManager(
-        tmp_path / "checkpoint-source",
-        experiment="h_v2_exact_canary",
-        sector="atomistic",
-        run_id="checkpoint-source",
-        layout="flat",
-    )
-    artifact_manager.make_dirs()
-    metadata = RunMetadata(
-        run_id="checkpoint-source",
-        run_name="checkpoint-source",
-        timestamp="2026-11-06T00:00:00+00:00",
-        timezone="UTC",
-        git_commit="checkpoint-source",
-        git_branch="agent/h-v2-exact-canary",
-        dirty_worktree=False,
-        command="pytest",
-        config_path=str(CONFIG_PATH),
-        resolved_config_path=str(artifact_manager.path("resolved_config.yaml")),
-        run_dir=str(artifact_manager.run_dir),
-        device="cpu",
-        dtype="float64",
-    )
-    context = RunContext(
-        cfg=cfg,
-        source_cfg=cfg,
-        artifact_manager=artifact_manager,
-        metadata=metadata,
-        clock=RunClock(timezone="UTC", tzinfo=UTC),
-    )
-    return save_checkpoint(
-        output_dir=tmp_path / "checkpoint-source" / "checkpoints",
-        next_iteration=0,
-        completed_updates=0,
-        model=model,
-        context=context,
-        save_optimizer=False,
-        save_trainer=False,
-        save_sampler=False,
-        save_rng=False,
-    )
-
-
 def _run_canary(tmp_path: Path, *, alpha: float, run_id: str) -> dict[str, Any]:
     config = _load_config()
     config["model"]["alpha"] = alpha
     config["run"]["root"] = str(tmp_path)
     config["run"]["run_id"] = run_id
 
-    cfg = OmegaConf.create(config)
-    checkpoint_dir = _build_model_only_checkpoint(tmp_path, cfg)
-    config["load"]["path"] = str(checkpoint_dir)
-
     status = run_from_config(
         OmegaConf.create(config), command=f"h-v2 exact canary {run_id}", raise_exceptions=True
     )
 
     run_dir = Path(config["run"]["root"]) / config["experiment"]["name"] / config["experiment"]["sector"] / run_id
-    return {
-        "status": status,
-        "run_dir": run_dir,
-        "checkpoint_dir": checkpoint_dir,
-        "config": config,
-    }
+    return {"status": status, "run_dir": run_dir, "config": config}
 
 
 def _read_rows(run_dir: Path) -> list[dict[str, str]]:
@@ -260,24 +224,82 @@ def _w_statistic(energies: list[float]) -> float:
     return deviations[index]
 
 
-def _collect(tmp_path: Path, result: dict[str, Any]) -> dict[str, Any]:
+def _collect_without_checkpoint(result: dict[str, Any]) -> dict[str, Any]:
+    """Exercise the real collector's checkpoint-independent envelope checks.
+
+    This canary carries no checkpoint (see module docstring and
+    `test_no_configured_checkpoint_route_exists_for_the_parameterless_model`),
+    so the composite `collect.collect_records` -- which requires a restored
+    checkpoint directory and a `model_only` resolved restore mode -- cannot
+    be called honestly here. Instead this calls the real, unmodified
+    `collect.validate_run_identity`, `collect.validate_manifest`, and
+    `collect.validate_rows` directly: source-commit identity, resolved-config
+    identity, manifest completeness, and full per-row validation are all
+    still genuinely exercised against the production collector code.
+    `collect.validate_checkpoint_identity`/`collect.validate_restore_mode`
+    are NOT exercised by this call -- a disclosed gap, covered instead by
+    `test_collect.py`'s own unit tests against synthetic checkpoint
+    artifacts.
+    """
+
     run_dir = result["run_dir"]
     source_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, cwd=HERE).strip()
+    resolved_config_path = run_dir / "resolved_config.yaml"
     spec = collect.RecordSpec(
         source_sha=source_sha,
-        checkpoint_model_sha256=collect.file_sha256(result["checkpoint_dir"] / "model.pt"),
-        resolved_config_sha256=collect.file_sha256(run_dir / "resolved_config.yaml"),
-        walkers=1024,
-        draws=64,
+        checkpoint_model_sha256="not-applicable-no-configured-checkpoint-route",
+        resolved_config_sha256=collect.file_sha256(resolved_config_path),
+        walkers=N_WALKERS,
+        draws=N_DRAWS,
     )
-    return collect.collect_records(
-        csv_path=run_dir / "trajectory" / "sampled_eval_table.csv",
-        metadata_path=run_dir / "trajectory" / "sampled_eval_table.metadata.json",
-        resolved_config_path=run_dir / "resolved_config.yaml",
-        run_metadata_path=run_dir / "metadata.json",
-        checkpoint_dir=result["checkpoint_dir"],
-        spec=spec,
-    )
+    run_metadata = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
+    collect.validate_run_identity(run_metadata, resolved_config_path, spec)
+
+    csv_path = run_dir / "trajectory" / "sampled_eval_table.csv"
+    manifest = _read_trajectory_manifest(result["run_dir"])
+    collect.validate_manifest(manifest, csv_path, spec)
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    ordered = collect.validate_rows(rows, spec)
+    return {"status": "complete_without_checkpoint_admission", "row_count": len(ordered)}
+
+
+def test_no_configured_checkpoint_route_exists_for_the_parameterless_model(tmp_path: Path) -> None:
+    """Confirm, by executing it, that no configured route can checkpoint
+    `HydrogenExact`.
+
+    The only configured route that writes a checkpoint is `tpen.runner.Train`.
+    This builds a real `Train` config -- the same model, sampler, and
+    Hamiltonian terms as the canary's own evaluation config, with a trivial
+    partial `torch.optim.SGD` factory -- and drives it through
+    `run_from_config`. `Train.run` unconditionally builds a real optimizer
+    over `model.parameters()` before touching the trainer, sampler, or `load`
+    mode (`tpen/runner/train.py`), and `HydrogenExact` has zero trainable
+    parameters, so every standard `torch.optim` optimizer refuses on an empty
+    parameter list, independent of `max_steps` or any other training
+    configuration. This is the "exact error" the acceptance-contract
+    amendment requires reporting rather than assuming (see
+    `implementation-receipt`): there is no configured route -- `run_from_config`
+    or the `tpen` command -- that can produce a checkpoint for this module.
+    """
+
+    config = _load_config()
+    config["run"]["root"] = str(tmp_path)
+    config["run"]["run_id"] = "configured-route-probe"
+    config.pop("evaluator", None)
+    config["runner"] = {
+        "_target_": "tpen.runner.Train",
+        "model": "${model}",
+        "sampler": "${sampler}",
+        "hamiltonian_terms": "${hamiltonian_terms}",
+        "optimizer": {"_target_": "torch.optim.SGD", "_partial_": True, "lr": 0.01},
+        "trainer": None,
+    }
+
+    cfg = OmegaConf.create(config)
+    with pytest.raises(ValueError, match="empty parameter list"):
+        run_from_config(cfg, command="h-v2 exact canary configured-route probe", raise_exceptions=True)
 
 
 def test_exact_ground_state_every_record_is_minus_half_hartree(tmp_path: Path) -> None:
@@ -323,8 +345,8 @@ def test_exact_ground_state_every_record_is_minus_half_hartree(tmp_path: Path) -
     assert manifest["mean"] == pytest.approx(full_mean, rel=1e-10, abs=1e-12)
     assert manifest["variance"] == pytest.approx(full_variance, rel=1e-10, abs=1e-12)
 
-    receipt = _collect(tmp_path, result)
-    assert receipt["status"] == "complete"
+    receipt = _collect_without_checkpoint(result)
+    assert receipt["status"] == "complete_without_checkpoint_admission"
     assert receipt["row_count"] == 1024 * 64
 
 
@@ -382,56 +404,9 @@ def test_imperfect_state_matches_closed_form_analytic_controls(tmp_path: Path) -
         oracle_energy = -(alpha**2) / 2.0 + (alpha - 1.0) / radius
         assert float(row["local_energy"]) == pytest.approx(oracle_energy, rel=1e-10, abs=1e-10)
 
-    receipt = _collect(tmp_path, result)
-    assert receipt["status"] == "complete"
+    receipt = _collect_without_checkpoint(result)
+    assert receipt["status"] == "complete_without_checkpoint_admission"
     assert receipt["row_count"] == 1024 * 64
-
-
-def test_wrong_kinetic_prefactor_mutant_breaks_the_canary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A wrong kinetic prefactor must be visible on the exact ground state."""
-
-    real_local_energy = KineticEnergy.local_energy
-
-    def _wrong_prefactor_local_energy(self, wavefunction, batch):
-        result = real_local_energy(self, wavefunction, batch)
-        # Wrong kinetic prefactor: -1.0 instead of the real -0.5. Preserve
-        # `wavefunction_output`/`per_electron_kinetic`: the trajectory
-        # generator requires exactly one term to supply the signed-log
-        # output (it differentiates the model once and reuses the byproduct
-        # rather than re-evaluating it), so dropping it here would fail the
-        # generator itself rather than exercising the intended mutation.
-        mutated = 2.0 * result.total
-        return LocalEnergyResult(
-            total=mutated,
-            terms={self.name: mutated},
-            wavefunction_output=result.wavefunction_output,
-            per_electron_kinetic=result.per_electron_kinetic,
-        )
-
-    monkeypatch.setattr(KineticEnergy, "local_energy", _wrong_prefactor_local_energy)
-    result = _run_canary(tmp_path, alpha=1.0, run_id="mutant-kinetic-prefactor")
-    assert result["status"] == 0
-    mean = _read_metric(result["run_dir"], namespace="trajectory", key="local_energy_mean")
-    assert mean != pytest.approx(-0.5, abs=1e-6)
-    assert abs(mean - (-0.5)) > 0.1
-
-
-def test_sign_flipped_potential_mutant_breaks_the_canary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A sign-flipped nuclear potential must be visible on the exact ground state."""
-
-    real_local_energy = ElectronNucleusPotential.local_energy
-
-    def _flipped_sign_local_energy(self, wavefunction, batch):
-        result = real_local_energy(self, wavefunction, batch)
-        mutated = -result.total
-        return LocalEnergyResult(total=mutated, terms={self.name: mutated})
-
-    monkeypatch.setattr(ElectronNucleusPotential, "local_energy", _flipped_sign_local_energy)
-    result = _run_canary(tmp_path, alpha=1.0, run_id="mutant-potential-sign")
-    assert result["status"] == 0
-    mean = _read_metric(result["run_dir"], namespace="trajectory", key="local_energy_mean")
-    assert mean != pytest.approx(-0.5, abs=1e-6)
-    assert abs(mean - (-0.5)) > 0.1
 
 
 def test_dropped_record_mutant_is_refused_by_the_collector(tmp_path: Path) -> None:

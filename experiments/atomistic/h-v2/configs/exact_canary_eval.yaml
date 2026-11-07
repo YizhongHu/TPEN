@@ -1,29 +1,32 @@
 # =============================================================================
-# H-v2 exact-hydrogen evaluation canary
+# H-v2 exact-hydrogen evaluation canary (study-side, config/run_from_config only)
 # =============================================================================
 #
 # Pushes the fixed exact one-electron hydrogen wavefunction
 # (`tpen.physics.hydrogen.HydrogenExact`) through the real evaluation route:
-# `tpen.run.run_from_config` -> the real `Evaluate` runner -> model-only
-# checkpoint restore -> `TrajectoryMCMCGenerator` -> `LocalEnergyCalculator` /
-# `WavefunctionCalculator` -> `SampledRecordWriter` / `LocalEnergySummary` ->
-# the H-v2 collector (`collect.py`).
+# `tpen.run.run_from_config` -> the real `Evaluate` runner ->
+# `TrajectoryMCMCGenerator` -> `LocalEnergyCalculator` / `WavefunctionCalculator`
+# -> `SampledRecordWriter` / `LocalEnergySummary` -> the H-v2 collector
+# (`collect.py`).
 #
 # `model.alpha` selects the control: 1.0 is the exact ground state (every
 # local energy equals -0.5 Ha exactly); 1.2 is the known-imperfect control
 # (mean -0.48 Ha, variance 0.0576 Ha^2, per `contract_inputs.json`
-# `analytic_controls`). The colocated test overrides `model.alpha` and
-# `load.path` per run; see `test_hydrogen_exact_canary.py`.
+# `analytic_controls`). The colocated test overrides `model.alpha` per run;
+# see `test_hydrogen_exact_canary.py`.
 #
-# `load.path` is a placeholder here (`???`): the canary carries no trainable
-# state, so there is nothing a *training* checkpoint would add, but the real
-# collector (`collect.py`) requires a reconciled restored-checkpoint identity.
-# The test builds a genuine model-only checkpoint of this exact, parameterless
-# module directly with `tpen.checkpoint.save.save_checkpoint` -- the same
-# function and directory format a learned run produces -- and restores it
-# through this same `load:` block and the real `Evaluate` runner. See the
-# H-v2 README for why this route, not a Train-runner checkpoint, is honest
-# here.
+# No `load:` block: `HydrogenExact` carries no trainable parameters, and the
+# only configured route that writes a checkpoint (`tpen.runner.Train`)
+# unconditionally builds a real optimizer over `model.parameters()` before
+# anything else, which every standard `torch.optim` optimizer refuses on an
+# empty parameter list. There is therefore no configured route (this
+# experiment code may reach core only through configuration or
+# `run_from_config`) that can produce a checkpoint for this module; see the
+# colocated test's own probe for the exact error. This canary does not cover
+# model-only restore -- `tests/integration/evaluation/
+# test_hydrogen_exact_evaluation.py` covers that honestly with a genuine
+# checkpoint built directly with `tpen.checkpoint.save.save_checkpoint`,
+# which core test code may do freely.
 # =============================================================================
 
 experiment:
@@ -63,16 +66,9 @@ atoms:
     _target_: torch.tensor
     data: ${system.nuclei.charges}
 
-load:
-  path: ???
-  mode: model_only
-  strict: true
-  allow_protocol_mismatch: false
-
 runner:
   _target_: tpen.runner.Evaluate
   model: ${model}
-  load: ${load}
   evaluator: ${evaluator}
 
 model:
