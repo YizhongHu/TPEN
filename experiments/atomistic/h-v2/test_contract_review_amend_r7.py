@@ -83,7 +83,7 @@ def test_one_electron_forced_deviations_from_he_v1_are_recorded() -> None:
         if p["id"] == "learned_model_optimizer_and_training_sampler"
     )
     for phrase in (
-        "ElectronElectronCusp has no effect for a single electron",
+        "ElectronElectronCusp is omitted from the H-v2 model configuration",
         "n_up=1, n_down=0",
         "nuclear_charge is 1",
         "readout device rather than a second electron",

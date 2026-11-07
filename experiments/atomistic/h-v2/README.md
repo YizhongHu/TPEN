@@ -65,43 +65,79 @@ found that, for an He-v1-sized effect, `W` and the TAIL exceedance thresholds
 thresholds (`0.01`, `0.05`, `0.1 Ha`) FALL over the same contrast (`-0.07`,
 `-0.24`, `-0.15`); an exceedance-primary rule on those thresholds would have
 read He-v1's broken checkpoint as an improvement. This is why `decision_rules`
-now states the tail-safeguard contradiction DIRECTIONALLY: a bulk-threshold
-decrease that accompanies a `W` rise is expected, not a contradiction. The `W`
+now states the tail-safeguard contradiction DIRECTIONALLY, and restricts it
+to the TAIL thresholds only -- `0.5 Ha`, `1 Ha`, and a third, pilot-frozen
+`hydrogen_equivalent_tail_threshold`, quantile-matched before science so the
+pilot's basin-window exceedance there is about `0.003`, matching He-v1's
+`p(>0.5 Ha)` at its own basin, and never retuned once frozen (round-1
+pre-review finding F4, option (B), accepted 2026-11-07): a bulk-threshold
+decrease that accompanies a `W` rise is expected, not a contradiction, and a
+bulk-threshold exceedance that fails to confirm a `W` rise is reported as a
+qualification, never a contradiction. Option (A), making the rule an active
+contradiction only, was considered and not chosen: He-v1's own bulk
+exceedances fell while its `W` rose, so option (A) would make He-v1 itself
+`unresolved`, the exact failure the directional rule was meant to fix. The `W`
 margins (factor `2` and `0.01 Ha`) are unchanged; the measured noise ceiling
 between null stream pairs never exceeds a ratio of about `1.15`. The
 exceedance margin is now per-threshold in `exceedance_margins_hartree`:
-`0.002 Ha` at the tail thresholds `0.5` and `1 Ha` (unchanged, and achievable
-under the pilot gate there), and `0.01 Ha` at the bulk thresholds `0.01`,
-`0.05` and `0.1 Ha` (widened from `0.002 Ha`, because the measured pilot
-simultaneous-band half-widths there, `0.0010`-`0.0022 Ha`, fail the
-contract's own half-width-at-most-half-the-margin gate at `0.002 Ha`). This
-is the `operator_alternative` extended to all three bulk thresholds, not
-adopted verbatim.
+`0.002 Ha` at the tail thresholds `0.5`, `1 Ha` and the hydrogen-equivalent
+threshold (unchanged at the first two, and achievable under the pilot gate
+there), and `0.01 Ha` at the bulk thresholds `0.01`, `0.05` and `0.1 Ha`
+(widened from `0.002 Ha`, because the He-v1 analysis half-widths there,
+`0.0010`-`0.0022 Ha` under a 6-member Bonferroni family -- narrower than this
+contract's family, about `1.4x` -- fail the contract's own
+half-width-at-most-half-the-margin gate at `0.002 Ha`; no H pilot has run).
+This is the `operator_alternative` extended to all three bulk thresholds, not
+adopted verbatim. An "increase of at least its margin", for both the tail and
+bulk clauses, means the simultaneous LOWER confidence bound of the increase
+reaches the margin (round-1 pre-review finding F5(a)). The recurrence
+confirmation streams (2 and 3) are pooled, `n=8192` walkers; the bounded-null
+check pools all four streams, `n=16384` walkers (finding F5(b)). The
+zero-event safeguard's half-width is the one-sided 97.5% Clopper-Pearson
+upper bound `U`, computed with the pooled `n` of the rule that uses it and
+family-adjusted by the same `K=27` as the evaluated-checkpoint `W` family
+(finding F5(c)): `U=0.000852` at `n=8192` and `U=0.000426` at `n=16384`
+(recomputed mechanically by script), both well inside half the tightest
+margin (`0.001`), so the pilot gate passes without loosening.
 
 ### Nuclear curvature and model/optimizer/sampler (items 3 and 5)
 
 Nuclear curvature is **whatever He-v1 did**, not an independently chosen
 value (the operator corrected an initial "trainable" answer to "whatever
-He-v1 did we do in Hydrogen experiment"). The primary source is He-v1's
-training config at the executed source commit
-`418accf153368aab45586dc2a2cc97c18472691c`
-(`experiments/atomistic/he-v1/configs/train.yaml`): a
+He-v1 did we do in Hydrogen experiment"). The primary source is the He-v1
+**resolved config of the executed run `train-seed0000` itself**
+(`/Users/yizhonghu/he-v1-independent-report-20260823/receipts/resolved_config.yaml`,
+sha256 `b9234c469ceadb36291833a2f8ef8a02f29feeba73cdd330949eebbd90d2e8c1`,
+listed in `BUNDLE_MANIFEST.json`; round-1 pre-review finding F2, accepted
+2026-11-07). It agrees with He-v1's training config at the executed source
+commit `418accf153368aab45586dc2a2cc97c18472691c`
+(`experiments/atomistic/he-v1/configs/train.yaml`) for the model, optimizer
+and sampler blocks, and records an executed horizon of **50,000 updates**,
+which differs from the `300000` in `train.yaml` and from the
+`production_grid.yaml` plan. The nuclear law is a
 `CurvatureElectronNucleusCuspLaw` with `curvature_coefficient=0.01`
 (`c`), `curvature_range=1.0` (`d`), `trainable=true` -- this already matched
 what the lane had proposed, so no numeric value changed; only the citation
 and the "matches He-v1" framing are new. The same source fixes model,
 optimizer and training sampler (item 5): one `TPENLayer`, `Embedding`
-`out_channels=32`/`hidden_channels=128`, `EquivariantMixing`/
-`PathAggregation` `channels=32`/SiLU, `PfaffianReadout(channels=32,
-trainable=true)`, `torch.optim.Adam(lr=0.005)`, and the training
-`MetropolisSampler(n_walkers=4096, burn_in=100, n_steps=10,
-proposal_scale=0.5)`. One-electron-forced deviations from He-v1 are recorded
-in `contract_inputs.json`: the `ElectronElectronCusp` factor has no effect
-for a single electron (no electron pair exists to carry gradient; it is kept
-only for parsed-config agreement with He-v1's pattern); the spin
-configuration is `n_up=1, n_down=0` against He-v1's `n_up=1, n_down=1`; the
-nuclear charge is `1` against He-v1's `2`; and the `PfaffianReadout`'s
-odd-electron border stays a readout device, not a second electron.
+`out_channels=32`/`hidden_channels=128`/`include_spins=true`,
+`EquivariantMixing`/`PathAggregation` `channels=32`/`initial_weight=0.5`/
+`implementation=vectorized`/SiLU, `PfaffianReadout(channels=32,
+trainable=true)`, `torch.optim.Adam(lr=0.005)`, training runtime `dtype=
+float64`, and the training `MetropolisSampler(n_walkers=4096, burn_in=100,
+n_steps=10, proposal_scale=0.5)` (the four non-default fields above were
+missing from the prior enumeration; round-1 pre-review finding F3). The full
+model/optimizer/sampler/runtime blocks of the resolved config govern, apart
+from the recorded one-electron-forced deviations; the enumeration is
+illustrative, not exhaustive. One-electron-forced deviations from He-v1 are
+recorded in `contract_inputs.json`: the `ElectronElectronCusp` factor is
+**omitted** from the H-v2 model configuration -- no electron pair exists to
+carry a range gradient, so the one-electron system forces its omission (not
+retained for parsed-config agreement; round-1 pre-review finding F1,
+accepted 2026-11-07); the spin configuration is `n_up=1, n_down=0` against
+He-v1's `n_up=1, n_down=1`; the nuclear charge is `1` against He-v1's `2`;
+and the `PfaffianReadout`'s odd-electron border stays a readout device, not a
+second electron.
 
 ### Science venue (item 7)
 
@@ -110,7 +146,9 @@ jobs"). Science submits to both FASRC Cannon production GPU partitions in one
 job: `kozinsky_gpu` (wall limit `7-00:00:00`, `gpu:nvidia_a100-sxm4-80gb:4`)
 and `seas_gpu` (wall limit `2-00:00:00`, mixed `gpu:nvidia_h200:4` and
 `gpu:nvidia_a100-sxm4-80gb:4`), pinned with `--constraint=a100` for a
-comparable stratum, per the Cannon partition-naming policy. At most 32
+comparable stratum, per the Cannon partition-naming policy (node counts as of
+the 2026-08-15 hardware note; they drift -- re-measure with `sinfo` rather
+than citing this date). At most 32
 GPU-hours per lineage fits comfortably inside even the tighter `seas_gpu`
 ceiling. Polaris is not used for H-v2 science; its only role stays the
 pipeline check's excluded-seed GPU smoke (slice `406194c5`), which is not a
@@ -186,7 +224,12 @@ stride `20`. Part (g), the excluded-seed GPU route smoke, belongs to slice
 `406194c5` on Polaris. Slice `2f1b2921` reruns the integrated check on the exact
 candidate. The JSON gives each part's pass criteria and its disjoint non-science
 seed namespace. This check is not a science result and does not authorize the
-executor or a lineage.
+executor or a lineage. The pipeline check (parts a-g, including the
+integrated rerun) runs the science model's nuclear law,
+`CurvatureElectronNucleusCuspLaw(0.01, 1.0, trainable)`, with scale-only
+overrides, following He-v1's "same file with scale-only overrides" rule; PR
+590's configs are adapted to this at its rebase onto this amendment (round-1
+pre-review finding F8, accepted 2026-11-07).
 
 The **SCIENCE LINEAGES** remain prohibited until the operator has reviewed the
 science plan and explicitly approves it. No pipeline pass, scheduler state,
