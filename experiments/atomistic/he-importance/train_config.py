@@ -476,12 +476,6 @@ def _config_leaves(value: Any, path: str = "") -> tuple[tuple[str, Any], ...]:
             child = f"{path}.{key}" if path else str(key)
             leaves.extend(_config_leaves(nested, child))
         return tuple(leaves)
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        leaves = []
-        for index, nested in enumerate(value):
-            child = f"{path}.{index}" if path else str(index)
-            leaves.extend(_config_leaves(nested, child))
-        return tuple(leaves)
     return ((path, value),)
 
 

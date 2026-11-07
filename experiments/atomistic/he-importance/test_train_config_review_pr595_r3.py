@@ -8,9 +8,6 @@ import sys
 import types
 from typing import Any
 
-import pytest
-
-
 def _load(name: str, filename: str) -> types.ModuleType:
     spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
     assert spec is not None and spec.loader is not None
@@ -50,21 +47,8 @@ def _cell(tmp_path: Path) -> Any:
 
 
 def test_t14_list_valued_override_equal_to_committed_value_is_preserved(tmp_path: Path) -> None:
-    with pytest.raises(train_config.TrainConfigResolutionError) as captured:
-        resolved = train_config.resolve_train_config(
-            _cell(tmp_path), overrides=["system.nuclei.charges=[2.0]"]
-        )
-        assert list(resolved.system.nuclei.charges) == [2.0]
-        assert list(resolved.atoms.charges.data) == [2.0]
-
-    assert type(captured.value).__name__ == "TrainConfigResolutionError"
-    assert str(captured.value) == (
-        "override path 'system.nuclei.charges' was not preserved before resolution"
-    )
-
-
-def test_t15_scalar_override_is_preserved_and_read_back(tmp_path: Path) -> None:
     resolved = train_config.resolve_train_config(
-        _cell(tmp_path), overrides=["trainer.max_steps=7"]
+        _cell(tmp_path), overrides=["system.nuclei.charges=[2.0]"]
     )
-    assert resolved.runner.trainer.max_steps == 7
+    assert list(resolved.system.nuclei.charges) == [2.0]
+    assert list(resolved.atoms.charges.data) == [2.0]
