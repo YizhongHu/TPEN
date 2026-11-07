@@ -328,50 +328,119 @@ def test_t2_completion_order_refills_a_quiescent_slot(tmp_path: Path) -> None:
 
 @PARSL_REQUIRED
 def test_t3_future_completion_does_not_release_before_child_quiescence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """T3 kills cap+1 and release-before-reap mutants."""
+    """T3 keeps refill behind controller handling and bounds live slot use."""
 
     package = _stub_package(tmp_path)
     dispatcher = _dispatcher(tmp_path, package)
     lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(2)), DirectoryStore(tmp_path / "store"))
-    release = threading.Event()
-    submitted_event = threading.Event()
-    submitted: list[tuple[str, bool]] = []
+    handling_started = threading.Event()
+    release_handling = threading.Event()
+    handling_finished = threading.Event()
+    submitted: list[tuple[str, str]] = []
+    premature_refill: list[str] = []
+    active_children: dict[str, str] = {}
+    duplicate_active_slots: list[tuple[str, tuple[str, ...]]] = []
+    over_capacity: list[tuple[str, int]] = []
+    futures: list["Future"] = []
+    future_by_task: dict[str, "Future"] = {}
 
     class Future:
         def __init__(self, task_id: str) -> None:
             self.task_id = task_id
-            self.released = False
+            self.ready = task_id in {"one", "two"}
 
         def done(self) -> bool:
+            if not self.ready:
+                return False
+            # A completed future has quiesced its child even if the controller
+            # is still inside the completion/evidence handling gate.
+            for future in futures:
+                if future.ready:
+                    active_children.pop(future.task_id, None)
             return True
 
         def result(self, timeout: float | None = None) -> ProcessOutcome:
             del timeout
-            assert release.wait(2), "controller released a slot before child quiescence"
+            if self.task_id == "two":
+                future_by_task["three"].ready = True
+            elif self.task_id == "three":
+                future_by_task["four"].ready = True
+            elif self.task_id == "four":
+                future_by_task["five"].ready = True
             return ProcessOutcome((sys.executable,), 0, "", "", False)
 
     def submit(materialized, environment, args, **kwargs):
-        del materialized, environment, kwargs
+        del materialized, kwargs
         task_id = args[-4].split("=", 1)[-1]
-        submitted.append((task_id, release.is_set()))
-        if len(submitted) == 2:
-            submitted_event.set()
-        return Future(task_id), SimpleNamespace(request_kill=lambda: None)
+        slot_id = environment.env["TPEN_SLOT_ID"]
+        submitted.append((task_id, slot_id))
+        if task_id not in {"one", "two"} and not handling_finished.is_set():
+            premature_refill.append(task_id)
+        active_children[task_id] = slot_id
+        current_slots = tuple(active_children.values())
+        if len(current_slots) > 2:
+            over_capacity.append((task_id, len(current_slots)))
+        if len(current_slots) != len(set(current_slots)):
+            duplicate_active_slots.append((task_id, current_slots))
+        future = Future(task_id)
+        futures.append(future)
+        future_by_task[task_id] = future
+        return future, SimpleNamespace(request_kill=lambda: None)
 
     monkeypatch.setattr(ParslDispatcher, "_submit_process", lambda self, materialized, environment, args, **kwargs: submit(materialized, environment, args, **kwargs))
     evidence = SimpleNamespace(read=lambda *args, **kwargs: (_ for _ in ()).throw(EvidenceUnavailable("gated")))
     object.__setattr__(dispatcher, "worker", SimpleNamespace(materialize=lambda env: {"environment": PreparedPythonEnvironment(sys.executable), "process": SubprocessWorker(), "runner": object(), "evidence": evidence}))
+    original_complete = dispatcher._complete_member
+
+    def gated_complete(self, group, member, configured, lifecycle, fence, materialized, environment, outcome, timeout, *, error=None):
+        if member.task_id == "one":
+            handling_started.set()
+            assert release_handling.wait(2), "test did not release the controller handling gate"
+        result = original_complete(
+            group,
+            member,
+            configured,
+            lifecycle,
+            fence,
+            materialized,
+            environment,
+            outcome,
+            timeout,
+            error=error,
+        )
+        if member.task_id == "one":
+            handling_finished.set()
+        return result
+
+    monkeypatch.setattr(ParslDispatcher, "_complete_member", gated_complete)
+    runner_error: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            dispatcher.run(
+                _group("one", "two", "three", "four", "five"),
+                _runs(tmp_path, "one", "two", "three", "four", "five"),
+                lifecycle,
+            )
+        except BaseException as error:
+            runner_error.append(error)
+
     runner = threading.Thread(
-        target=dispatcher.run,
-        args=(group := _group("one", "two", "three"), _runs(tmp_path, "one", "two", "three"), lifecycle),
+        target=run,
         daemon=True,
     )
     runner.start()
-    assert submitted_event.wait(2)
-    assert submitted == [("one", False), ("two", False)]
-    release.set()
+    assert handling_started.wait(2)
+    assert submitted[:2] == [("one", "slot-0"), ("two", "slot-1")]
+    release_handling.set()
     runner.join(2)
-    assert submitted == [("one", False), ("two", False), ("three", True)]
+    assert handling_finished.is_set()
+    assert not runner.is_alive()
+    assert not runner_error
+    assert [task_id for task_id, _slot_id in submitted] == ["one", "two", "three", "four", "five"]
+    assert not premature_refill
+    assert not duplicate_active_slots
+    assert not over_capacity
 
 
 @PARSL_REQUIRED
