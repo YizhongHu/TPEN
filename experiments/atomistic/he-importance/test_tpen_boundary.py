@@ -61,10 +61,10 @@ EXPECTED_PRODUCTION_INVENTORY = {
     ("optimizer_grid.py", 367, "tpen.hi_schema"): InventoryEntry(
         "remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 238, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 239, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("train_config.py", 597, "tpen.hi_schema"): InventoryEntry(
+    ("train_config.py", 702, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("run_stage_q.py", 128, "tpen.hi_schema"): InventoryEntry(
@@ -100,13 +100,13 @@ EXPECTED_TEST_INVENTORY = {
     ("test_train_config.py", 343, "tpen.hi_schema"): InventoryEntry(
         "item 1c0b06fd: executed A9 schema measurement for the HI train-resume load shape."
     ),
-    ("test_train_config.py", 552, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 581, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 989, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 1018, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
-    ("test_train_config.py", 1082, "tpen.hi_schema"): InventoryEntry(
+    ("test_train_config.py", 1111, "tpen.hi_schema"): InventoryEntry(
         "item df8f8b31: remedy blocked on pending HI authority ruling 99591859."
     ),
     ("test_run_stage_q.py", 775, "tpen.hi_schema"): InventoryEntry(
@@ -1210,6 +1210,16 @@ def test_topology_validators_have_no_object_overridable_decision_sites() -> None
             ("keys are detached composed-config names and the set contains resolver-owned literals", 1),
         ("train_config.py", "_set_optional_execution_seeds", '"seed" in checker'):
             ("checker is a validated mapping from the composed config and the key is a module literal", 1),
+        ("train_config.py", "_is_resolver_owned_seed_path", "path in _RESOLVER_OWNED_SEED_PATHS"):
+            ("path is a detached override key and the frozen set is module-owned", 1),
+        ("train_config.py", "_is_resolver_owned_seed_path", "path[: len(prefix)] == prefix"):
+            ("path is a detached override key and prefix is module-owned frozen data", 1),
+        ("train_config.py", "_is_resolver_owned_seed_path", "marker in path"):
+            ("path is a detached override key and marker is module-owned frozen data", 1),
+        ("train_config.py", "_is_resolver_owned_seed_path", "path[len(path) - len(suffix) :] == suffix"):
+            ("path is a detached override key and suffix is module-owned frozen data", 2),
+        ("train_config.py", "resolve_train_config", "actual != expected"):
+            ("expected from OmegaConf.to_container, actual from resolver-owned config; no caller object reaches it", 1),
         ("train_config.py", "_optimizer_entry", 'status not in {"available", "unavailable"}'):
             ("status is read from the validated scientific-identity mapping and compared with module literals", 1),
         ("train_config.py", "_optimizer_entry", 'status != "available"'):

@@ -436,6 +436,35 @@ def test_resolve_binds_output_path_to_run_root_and_dir(tmp_path: Path) -> None:
     assert resolved.run.dir == str(cell.output_path)
 
 
+def test_resolve_applies_operational_overrides_before_resolution(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    resolved = train_config.resolve_train_config(
+        cell,
+        overrides=[
+            "trainer.max_steps=7",
+            "runtime.device=cpu",
+        ],
+    )
+
+    assert resolved.trainer.max_steps == 7
+    assert resolved.runner.trainer.max_steps == 7
+    assert resolved.runtime.device == "cpu"
+    assert resolved.callbacks[10].allocator_probe.device == "cpu"
+
+
+def test_resolve_refuses_resolver_owned_seed_overrides(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    for path in ("runtime.seed", "sampler.seed", "model.embedding.initializer.seed"):
+        with pytest.raises(train_config.TrainConfigResolutionError, match="resolver-owned seed"):
+            train_config.resolve_train_config(cell, overrides={path: 123})
+
+
+def test_resolve_overlay_mechanism_pin_after_resolution(tmp_path: Path) -> None:
+    resolved = train_config.resolve_train_config(_cell(tmp_path))
+    OmegaConf.update(resolved, "runtime.dtype", "float32", merge=False)
+    assert resolved.sampler.dtype != "float32"
+
+
 def test_resolve_refuses_output_path_not_bound_to_identity_digest(tmp_path: Path) -> None:
     committed = _cell(tmp_path, stage="Q")
     mechanics = stage_coordinate.with_q_mechanics_walkers(committed)
