@@ -85,6 +85,20 @@ def test_frozen_training_config_selects_the_contract_sampler_literals() -> None:
     assert sampler["seed"] == 910002
 
 
+def test_frozen_evaluation_model_block_equals_training_model_block() -> None:
+    """Pin that training and fresh evaluation select the identical model block.
+
+    The pipeline check does not re-derive the evaluation model from training;
+    both configs are frozen independently. This keeps them from drifting apart
+    (for example the nuclear cusp law) without either config-identity check
+    above catching the mismatch.
+    """
+
+    train_model = protocol.training_config()["model"]
+    evaluation_model = protocol.evaluation_config(Path("/tmp/checkpoint"), stream=0)["model"]
+    assert train_model == evaluation_model
+
+
 @pytest.mark.parametrize(
     "mutation, message",
     [
@@ -94,6 +108,11 @@ def test_frozen_training_config_selects_the_contract_sampler_literals() -> None:
         (lambda cfg: cfg["hamiltonian_terms"]["electron_nucleus"].update(eps=0.1), "raw"),
         (lambda cfg: cfg["sampler"].update(_target_="wrong.Sampler"), "Metropolis sampler"),
         (lambda cfg: cfg["model"]["factors"].append({"_target_": "tpen.nn.ElectronElectronCusp"}), "only the nuclear"),
+        (lambda cfg: cfg["model"]["factors"][0].pop("law"), "must declare a law"),
+        (lambda cfg: cfg["model"]["factors"][0]["law"].update(_target_="wrong.Law"), "contract curvature law"),
+        (lambda cfg: cfg["model"]["factors"][0]["law"].update(curvature_coefficient=0.02), "coefficient must be 0.01"),
+        (lambda cfg: cfg["model"]["factors"][0]["law"].update(curvature_range=2.0), "range must be 1.0"),
+        (lambda cfg: cfg["model"]["factors"][0]["law"].update(trainable=False), "must be trainable"),
     ],
 )
 def test_physics_mutations_are_rejected(mutation, message) -> None:

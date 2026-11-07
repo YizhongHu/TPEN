@@ -14,6 +14,14 @@ TRAINING_SEED = 910001
 SAMPLER_SEED = 910002
 EVALUATION_SEEDS = (910003, 910004)
 
+#: Contract-frozen nuclear cusp law literals (``admission.pipeline_check.nuclear_law_note``).
+CONTRACT_NUCLEAR_LAW = {
+    "_target_": "tpen.nn.CurvatureElectronNucleusCuspLaw",
+    "curvature_coefficient": 0.01,
+    "curvature_range": 1.0,
+    "trainable": True,
+}
+
 
 def load_yaml(path: Path) -> dict[str, Any]:
     """Load one frozen configuration without resolving Hydra interpolations."""
@@ -69,6 +77,17 @@ def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False
     targets = [factor.get("_target_") for factor in factors]
     if targets != ["tpen.nn.ElectronNucleusCusp"]:
         raise ValueError("H-v2 model must have only the nuclear cusp factor")
+    if "law" not in factors[0]:
+        raise ValueError("H-v2 nuclear cusp factor must declare a law")
+    law = factors[0]["law"]
+    if law.get("_target_") != CONTRACT_NUCLEAR_LAW["_target_"]:
+        raise ValueError("H-v2 nuclear cusp law must be the contract curvature law")
+    if law.get("curvature_coefficient") != CONTRACT_NUCLEAR_LAW["curvature_coefficient"]:
+        raise ValueError("H-v2 nuclear cusp law coefficient must be 0.01")
+    if law.get("curvature_range") != CONTRACT_NUCLEAR_LAW["curvature_range"]:
+        raise ValueError("H-v2 nuclear cusp law range must be 1.0")
+    if law.get("trainable") is not CONTRACT_NUCLEAR_LAW["trainable"]:
+        raise ValueError("H-v2 nuclear cusp law must be trainable")
     if not evaluation and config.get("sampler", {}).get("seed") == config.get("runtime", {}).get("seed"):
         raise ValueError("training and sampler seeds must be distinct")
     if evaluation:
@@ -79,6 +98,7 @@ def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False
 
 
 __all__ = [
+    "CONTRACT_NUCLEAR_LAW",
     "EVALUATION_SEEDS",
     "ROOT",
     "SAMPLER_SEED",

@@ -51,6 +51,7 @@ def _violations(path: Path) -> list[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     importlib_names = {"importlib"}
     import_module_names: set[str] = set()
+    spec_from_file_location_names: set[str] = set()
     pytest_names = {"pytest"}
     found: list[str] = []
     for node in ast.walk(tree):
@@ -71,6 +72,10 @@ def _violations(path: Path) -> list[str]:
                 bound = alias.asname or alias.name
                 if module == "importlib" and alias.name == "import_module":
                     import_module_names.add(bound)
+                if module == "importlib" and alias.name == "util":
+                    importlib_names.add(bound)
+                if module == "importlib.util" and alias.name == "spec_from_file_location":
+                    spec_from_file_location_names.add(bound)
                 if module == "hydra" or module.startswith("hydra."):
                     found.append(f"{path.name}: from {module} import {alias.name}")
                 if module == "tpen" or module.startswith("tpen."):
@@ -86,6 +91,7 @@ def _violations(path: Path) -> list[str]:
                 or (function and function.endswith(".__import__"))
                 or (function and function.endswith(".importorskip") and function.split(".")[0] in pytest_names)
                 or (function and function.endswith(".spec_from_file_location") and function.split(".")[0] in importlib_names)
+                or (function in spec_from_file_location_names)
             )
             if dynamic:
                 for arg in node.args:
