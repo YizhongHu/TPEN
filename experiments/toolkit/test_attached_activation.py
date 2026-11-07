@@ -412,6 +412,30 @@ def test_failed_generation_retires_current_sidecars(tmp_path: Path) -> None:
     assert (handoff / "executor_input_diagnostics.json").is_file()
 
 
+def test_write_handoff_failure_retires_stale_current_sidecars(tmp_path: Path) -> None:
+    source = tmp_path / "train.yaml"
+    _source_config(source)
+    handoff = tmp_path / "handoff"
+    handoff.mkdir()
+    (handoff / "executor_input.json").write_text("stale", encoding="utf-8")
+    (handoff / "configured-runs.json").write_text("stale", encoding="utf-8")
+
+    with pytest.raises(ActivationRefusal) as refusal:
+        attached_activation.write_attached_handoff(
+            handoff,
+            _plan(tmp_path),
+            effective_config=source,
+            source_config=source,
+            overrides_by_task={"train-seed0000": ("",)},
+        )
+
+    assert refusal.value.code == "empty-override"
+    assert not (handoff / "executor_input.json").exists()
+    assert not (handoff / "configured-runs.json").exists()
+    assert list(handoff.glob("*.superseded-*.json"))
+    assert (handoff / "executor_input_diagnostics.json").is_file()
+
+
 def test_source_output_alias_is_refused_before_reduction(tmp_path: Path) -> None:
     source = tmp_path / "train.yaml"
     _source_config(source)
