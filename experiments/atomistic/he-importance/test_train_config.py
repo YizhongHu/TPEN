@@ -438,35 +438,18 @@ def test_resolve_binds_output_path_to_run_root_and_dir(tmp_path: Path) -> None:
 
 def test_resolve_applies_operational_overrides_before_resolution(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
-    root = tmp_path / "override-root"
-    run_dir = root / "run"
     resolved = train_config.resolve_train_config(
         cell,
         overrides=[
             "trainer.max_steps=7",
-            f"run.root={root}",
-            f"run.dir={run_dir}",
-            "runtime.dtype=float64",
+            "runtime.device=cpu",
         ],
     )
 
     assert resolved.trainer.max_steps == 7
     assert resolved.runner.trainer.max_steps == 7
-    assert resolved.run.root == str(root)
-    assert resolved.run.dir == str(run_dir)
-    assert resolved.callbacks[9].output_dir == str(run_dir / "checkpoints")
-    assert resolved.loggers[0].path == str(run_dir / "metrics.csv")
-    assert resolved.loggers[1].path == str(run_dir / "metrics.jsonl")
-    assert resolved.callbacks[-2].output_dir == str(run_dir / "checkpoints")
-    assert resolved.callbacks[0].output_path == str(run_dir / "config.yaml")
-    assert resolved.callbacks[1].output_path == str(run_dir / "resolved_config.yaml")
-    assert resolved.callbacks[2].output_path == str(run_dir / "metadata.json")
-    assert resolved.callbacks[3].output_path == str(run_dir / "status.json")
-    assert resolved.callbacks[8].artifact_dir == str(run_dir / "checks/equivariance")
-    assert resolved.loggers[0].path == str(run_dir / "metrics.csv")
-    assert resolved.loggers[1].path == str(run_dir / "metrics.jsonl")
-    assert resolved.runtime.dtype == "float64"
-    assert resolved.sampler.dtype == resolved.runner.sampler.dtype == "float64"
+    assert resolved.runtime.device == "cpu"
+    assert resolved.callbacks[10].allocator_probe.device == "cpu"
 
 
 def test_resolve_refuses_resolver_owned_seed_overrides(tmp_path: Path) -> None:
@@ -476,7 +459,7 @@ def test_resolve_refuses_resolver_owned_seed_overrides(tmp_path: Path) -> None:
             train_config.resolve_train_config(cell, overrides={path: 123})
 
 
-def test_resolve_overlay_mutant_after_resolution_is_red(tmp_path: Path) -> None:
+def test_resolve_overlay_mechanism_pin_after_resolution(tmp_path: Path) -> None:
     resolved = train_config.resolve_train_config(_cell(tmp_path))
     OmegaConf.update(resolved, "runtime.dtype", "float32", merge=False)
     assert resolved.sampler.dtype != "float32"

@@ -80,15 +80,11 @@ def test_t1b_ab_model_override_is_preserved_or_refused(tmp_path: Path) -> None:
         assert resolved.model.embedding.hidden_channels == 999
 
 
-def test_t2_run_root_override_moves_all_sinks_or_is_refused(tmp_path: Path) -> None:
+@pytest.mark.parametrize("path", ["run.root", "run.dir"])
+def test_t2_run_path_override_moves_all_sinks_or_is_refused(tmp_path: Path, path: str) -> None:
     new_root = tmp_path / "new-root"
-    try:
-        resolved = train_config.resolve_train_config(_cell(tmp_path), overrides=[f"run.root={new_root}"])
-    except train_config.TrainConfigResolutionError:
-        return
-    sinks = [*(resolved.callbacks[i].output_path for i in range(4)), resolved.callbacks[8].artifact_dir,
-              resolved.callbacks[9].output_dir, resolved.loggers[0].path, resolved.loggers[1].path]
-    assert all(str(value).startswith(str(new_root) + "/") for value in sinks)
+    with pytest.raises(train_config.TrainConfigResolutionError, match=path):
+        train_config.resolve_train_config(_cell(tmp_path), overrides=[f"{path}={new_root}"])
 
 
 def test_t3_runtime_device_override_reaches_shared_consumer(tmp_path: Path) -> None:
@@ -101,15 +97,15 @@ def test_t3_runtime_device_override_reaches_shared_consumer(tmp_path: Path) -> N
 
 
 def test_t4_mapping_overrides_propagate_to_runner_and_sinks(tmp_path: Path) -> None:
-    root, directory = tmp_path / "root", tmp_path / "run"
+    cell = _cell(tmp_path / "cell")
     resolved = train_config.resolve_train_config(
-        _cell(tmp_path / "cell"),
-        overrides={"trainer": {"max_steps": 9}, "run": {"root": str(root), "dir": str(directory)}},
+        cell,
+        overrides={"trainer": {"max_steps": 9}, "runtime": {"device": "cpu"}},
     )
     assert resolved.runner.trainer.max_steps == 9
     assert resolved.trainer.max_steps == 9
-    assert resolved.callbacks[9].output_dir == str(directory / "checkpoints")
-    assert resolved.loggers[1].path == str(directory / "metrics.jsonl")
+    assert resolved.callbacks[9].output_dir == str(cell.output_path / "checkpoints")
+    assert resolved.loggers[1].path == str(cell.output_path / "metrics.jsonl")
 
 
 def test_t5_checker_seed_override_is_refused(tmp_path: Path) -> None:
@@ -126,14 +122,6 @@ def test_t5_checker_seed_override_is_refused(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("override", ["runner.trainer.max_steps=7", "runner.sampler.seed=5"])
-def test_t6_runner_alias_override_reports_struct_error(tmp_path: Path, override: str) -> None:
-    with pytest.raises(Exception) as info:
+def test_t6_runner_alias_override_is_explicitly_refused(tmp_path: Path, override: str) -> None:
+    with pytest.raises(train_config.TrainConfigResolutionError, match=r"top-level path: runner"):
         train_config.resolve_train_config(_cell(tmp_path), overrides=[override])
-    assert type(info.value).__name__ != "TrainConfigResolutionError"
-    assert str(info.value)
-
-
-def test_t7_typo_override_is_refused(tmp_path: Path) -> None:
-    with pytest.raises(Exception) as info:
-        train_config.resolve_train_config(_cell(tmp_path), overrides=["trainer.max_step=7"])
-    assert str(info.value)

@@ -237,8 +237,8 @@ def test_r6_resolved_descendant_supply_is_fail_closed(tmp_path):
         )
 
 
-def test_r6_overlay_application_mutant_is_red(tmp_path):
-    """The readback pin fails for the mutant that drops declared overlays."""
+def test_r6_overlay_application_mechanism_pin(tmp_path):
+    """The readback pin documents the configured-overlay mechanism."""
 
     from omegaconf import OmegaConf
     from tpen.execution import RecoveryPhase, capture_science_intent, select_recovery

@@ -442,7 +442,10 @@ def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple
     """Flatten mapping or Hydra dotlist overrides into explicit leaf updates."""
 
     if isinstance(overrides, Mapping):
-        raw = OmegaConf.to_container(OmegaConf.create(overrides), resolve=False)
+        try:
+            raw = OmegaConf.to_container(OmegaConf.create(overrides), resolve=False)
+        except Exception as exc:
+            raise TrainConfigResolutionError("overrides must be a valid mapping") from exc
     elif isinstance(overrides, Sequence) and not isinstance(overrides, (str, bytes, bytearray)):
         try:
             raw = OmegaConf.to_container(OmegaConf.from_dotlist(list(overrides)), resolve=False)
@@ -469,6 +472,7 @@ _RESOLVER_OWNED_SEED_SUFFIXES = (".initializer.seed",)
 _RESOLVER_OWNED_CHECKER_PREFIX = "callbacks."
 _RESOLVER_OWNED_CHECKER_MARKER = ".checkers."
 _RESOLVER_OWNED_SEED_SUFFIX = ".seed"
+_OVERRIDE_MISSING = object()
 
 
 def _is_resolver_owned_seed_path(path: str) -> bool:
@@ -504,8 +508,36 @@ def _reject_resolver_owned_seed_overrides(items: Sequence[tuple[str, Any]]) -> N
         )
 
 
+def _reject_resolver_owned_overrides(items: Sequence[tuple[str, Any]]) -> None:
+    """Refuse paths whose values are written by this resolver after overlays."""
+
+    for path, _ in items:
+        if path in {"run.root", "run.dir"}:
+            raise TrainConfigResolutionError(
+                f"resolver-owned override path is not permitted: {path}"
+            )
+        if path == "runner" or path.startswith("runner."):
+            raise TrainConfigResolutionError(
+                "runner override paths are not permitted; top-level path: runner"
+            )
+
+
 def _ab_context_labels(manifest: Mapping[str, Any], axis: str) -> dict[str, str]:
-    """Return complete AB-4a labels after closed-schema context validation."""
+    """Return complete AB-4a labels after closed-schema context validation.
+
+    Parameters
+    ----------
+    manifest
+        Frozen materialized training manifest.
+    axis
+        The already validated ``"A"`` or ``"B"`` context family.
+
+    Returns
+    -------
+    dict[str, str]
+        Complete labels accepted by
+        :func:`context_mapping.compose_architecture_package`.
+    """
 
     context = _mapping(manifest["scientific_identity"].get("context"), "scientific_identity.context")
     literal = _mapping(
@@ -588,6 +620,7 @@ def resolve_train_config(
     cfg = _compose_base_config()
     override_items = _override_items(overrides) if overrides is not None else ()
     _reject_resolver_owned_seed_overrides(override_items)
+    _reject_resolver_owned_overrides(override_items)
     committed_walkers = stage_api.COMMITTED_WALKERS
     composed_walkers = OmegaConf.select(cfg, "sampler.n_walkers", default=None)
     # Exact-int plus int.__eq__ keeps this decision structural, not caller-overridable.
@@ -657,6 +690,12 @@ def resolve_train_config(
         )
     _set_named_initializer_seeds(cfg, model_seed)
     _set_optional_execution_seeds(cfg, streams)
+    for path, expected in override_items:
+        actual = OmegaConf.select(cfg, path, default=_OVERRIDE_MISSING, resolve=False)
+        if actual != expected:
+            raise TrainConfigResolutionError(
+                f"override path {path!r} was not preserved before resolution"
+            )
     OmegaConf.resolve(cfg)
 
     schema = import_module("tpen.hi_schema")
