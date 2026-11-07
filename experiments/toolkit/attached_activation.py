@@ -902,9 +902,15 @@ def validate_child_context_observation(
                 raise ValueError("child observation has an unexpected schema")
             observed = observation["environment"]
             if not isinstance(observed, Mapping) or any(
-                type(key) is not str or type(value) is not str for key, value in observed.items()
+                type(key) is not str or (value is not None and type(value) is not str)
+                for key, value in observed.items()
             ):
-                raise ValueError("child observation has no string-valued environment")
+                raise ValueError("child observation has invalid environment values")
+            allowed_environment = set(expected) | {
+                "CUDA_VISIBLE_DEVICES", "OMP_NUM_THREADS", "MKL_NUM_THREADS"
+            }
+            if set(observed) != allowed_environment:
+                raise ValueError("child observation environment is outside the validated allowlist")
             thread_settings = observation["thread_settings"]
             if not isinstance(thread_settings, Mapping) or set(thread_settings) != {
                 "OMP_NUM_THREADS", "MKL_NUM_THREADS"
@@ -912,6 +918,13 @@ def validate_child_context_observation(
                 raise ValueError("child observation has invalid thread settings")
             if observation["cuda_visible_devices"] is not None and type(observation["cuda_visible_devices"]) is not str:
                 raise ValueError("child observation has invalid CUDA visibility")
+            if observation["cuda_visible_devices"] != observed.get("CUDA_VISIBLE_DEVICES"):
+                raise ValueError("child observation CUDA visibility is inconsistent")
+            if any(
+                thread_settings[name] != observed.get(name)
+                for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS")
+            ):
+                raise ValueError("child observation thread settings are inconsistent")
             if type(observation["hostname"]) is not str or not observation["hostname"]:
                 raise ValueError("child observation has invalid hostname")
             if type(observation["pid"]) is not int or isinstance(observation["pid"], bool) or observation["pid"] <= 0:

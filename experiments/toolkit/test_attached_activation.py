@@ -7,6 +7,7 @@ import ast
 import hashlib
 import importlib.util
 from pathlib import Path
+import socket
 import sys
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from experiments.toolkit.attached_activation import (
     allocation_context_payload,
     build_attached_inputs,
     parse_profile_verdict,
+    validate_child_context_observation,
     write_activation_receipt,
 )
 from experiments.toolkit.dispatch import LogicalTaskSpec, StagePlanV2
@@ -303,6 +305,88 @@ def test_allocation_context_rejects_inconsistent_fields(field: str, value: objec
             observed_environment={"HOST": "n0"},
             observed_hostname="n0",
         )
+
+
+def _child_observation_control(tmp_path: Path, *, cuda: str = "7", omp: str = "4", write_artifact: bool = True):
+    attempt = tmp_path / "attempt"
+    (attempt / "core").mkdir(parents=True)
+    observation = {
+        "schema": "tpen-executor/child-observation-v1",
+        "cuda_visible_devices": cuda,
+        "environment": {
+            "CUDA_VISIBLE_DEVICES": cuda,
+            "MKL_NUM_THREADS": None,
+            "OMP_NUM_THREADS": omp,
+        },
+        "thread_settings": {"MKL_NUM_THREADS": None, "OMP_NUM_THREADS": omp},
+        "hostname": socket.gethostname(),
+        "pid": 123,
+    }
+    if write_artifact:
+        (attempt / "executor-child-observation.json").write_text(json.dumps(observation), encoding="utf-8")
+    allocation = tmp_path / "allocation.json"
+    allocation.write_text(
+        json.dumps(
+            {
+                "facts": {
+                    "attached_context": {
+                        "context": {
+                            "visibility_variable": "CUDA_VISIBLE_DEVICES",
+                            "visibility_values": ["7"],
+                            "environment": {"OMP_NUM_THREADS": "4"},
+                        },
+                        "observed": {"hostname": socket.gethostname()},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return allocation, {"attempts": [{"output_dir": str(attempt)}]}
+
+
+def test_matching_child_observation_allows_completed_activation_context(tmp_path: Path) -> None:
+    allocation, manifest = _child_observation_control(tmp_path)
+    validate_child_context_observation(allocation, manifest)
+    receipt = tmp_path / "activation.json"
+    manifest_path = tmp_path / "manifest.json"
+    fixture = (Path(__file__).parent / "fixtures" / "run-manifest-v2.json").read_text(encoding="utf-8")
+    manifest_path.write_text(fixture.replace("/runs/group-1/task-a/attempt-1", str(tmp_path / "attempt")), encoding="utf-8")
+    result = write_activation_receipt(
+        manifest_path,
+        receipt,
+        expected_task_ids=("task-a",),
+        inspect_run=lambda _: {
+            "verdict": "completed",
+            "run_status": "completed",
+            "checkpoint": {
+                "checkpoint_dir": str(tmp_path / "attempt" / "core" / "checkpoint" / "step_000001"),
+                "schema_version": 1,
+                "next_iteration": 1,
+                "completed_updates": 1,
+            },
+        },
+    )
+    assert result.chains and json.loads(receipt.read_text())["status"] == "activated"
+
+
+@pytest.mark.parametrize(
+    ("cuda", "omp"),
+    [("8", "5")],
+    ids=["drift-8-5"],
+)
+def test_child_observation_drift_refuses_named_context_mismatch(tmp_path: Path, cuda: str, omp: str) -> None:
+    allocation, manifest = _child_observation_control(tmp_path, cuda=cuda, omp=omp)
+    with pytest.raises(ActivationRefusal) as raised:
+        validate_child_context_observation(allocation, manifest)
+    assert raised.value.code == "child-context-mismatch"
+
+
+def test_missing_child_observation_refuses_named_observation(tmp_path: Path) -> None:
+    allocation, manifest = _child_observation_control(tmp_path, write_artifact=False)
+    with pytest.raises(ActivationRefusal) as raised:
+        validate_child_context_observation(allocation, manifest)
+    assert raised.value.code == "child-context-observation"
 
 
 def test_reader_rejects_empty_committed_chain_after_zero_exit(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import MappingProxyType
@@ -13,16 +14,25 @@ from ._records import frozen_record
 from .workers import SubprocessWorker
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
+CHILD_CONTEXT_KEYS_ENV = "TPEN_EXECUTOR_CONTEXT_ENV_KEYS"
 RUN_SHIM = (
     "import json, os, socket, sys\n"
     "from pathlib import Path\n"
+    "try:\n"
+    f"    context_keys = json.loads(os.environ.get('{CHILD_CONTEXT_KEYS_ENV}', '[]'))\n"
+    "except (TypeError, ValueError):\n"
+    "    context_keys = []\n"
+    "if not isinstance(context_keys, list) or any(type(key) is not str or not key for key in context_keys):\n"
+    "    context_keys = []\n"
+    "observation_keys = sorted(set(context_keys) | {'CUDA_VISIBLE_DEVICES', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS'})\n"
+    "observed_environment = {key: os.environ.get(key) for key in observation_keys}\n"
     "run_roots = [arg.split('=', 1)[1] for arg in sys.argv[1:] if arg.startswith('run.root=')]\n"
     "if run_roots:\n"
     "    observation = {\n"
     "        'schema': 'tpen-executor/child-observation-v1',\n"
-    "        'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),\n"
-    "        'environment': dict(os.environ),\n"
-    "        'thread_settings': {name: os.environ.get(name) for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS')},\n"
+    "        'cuda_visible_devices': observed_environment['CUDA_VISIBLE_DEVICES'],\n"
+    "        'environment': observed_environment,\n"
+    "        'thread_settings': {name: observed_environment[name] for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS')},\n"
     "        'hostname': socket.gethostname(),\n"
     "        'pid': os.getpid(),\n"
     "    }\n"
@@ -284,4 +294,4 @@ class TPENEvidence:
         return CoreRunEvidence.from_mapping(decoded)
 
 
-__all__ = ["CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "TPENCommand", "TPENEvidence"]
+__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "TPENCommand", "TPENEvidence"]

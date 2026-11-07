@@ -14,7 +14,14 @@ import pytest
 
 from tpen_executor.configuration import StagedHydra
 from tpen_executor.environments import PreparedPythonEnvironment, SourceScript
-from tpen_executor.runners import CoreRunEvidence, EvidenceUnavailable, RUN_SHIM, TPENCommand, TPENEvidence
+from tpen_executor.runners import (
+    CHILD_CONTEXT_KEYS_ENV,
+    CoreRunEvidence,
+    EvidenceUnavailable,
+    RUN_SHIM,
+    TPENCommand,
+    TPENEvidence,
+)
 from tpen_executor.workers import ProcessOutcome, SubprocessWorker
 
 
@@ -109,6 +116,38 @@ def test_subprocess_worker_only_writes_named_logs(tmp_path: Path) -> None:
     SubprocessWorker().run(environment, ("-c", RUN_SHIM), cwd=tmp_path, stdout_path=out, stderr_path=err)
     after = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
     assert after - before == {Path("named.out"), Path("named.err")}
+
+
+def test_run_shim_observation_excludes_unallowlisted_environment(tmp_path: Path) -> None:
+    environment, _ = _science(tmp_path)
+    environment = PreparedPythonEnvironment(
+        environment.python,
+        environment.setup,
+        {
+            **environment.env,
+            "CUDA_VISIBLE_DEVICES": "7",
+            "OMP_NUM_THREADS": "4",
+            "P10_CONTEXT_VALUE": "declared",
+            "P10_TEST_SECRET": "xyz",
+            CHILD_CONTEXT_KEYS_ENV: json.dumps(["P10_CONTEXT_VALUE"]),
+        },
+    )
+    outcome = SubprocessWorker().run(
+        environment,
+        ("-c", RUN_SHIM, f"run.root={tmp_path}"),
+        cwd=tmp_path,
+        stdout_path=tmp_path / "observation.out",
+        stderr_path=tmp_path / "observation.err",
+    )
+    assert outcome.returncode == 0
+    observation = json.loads((tmp_path / "executor-child-observation.json").read_text(encoding="utf-8"))
+    assert observation["environment"] == {
+        "CUDA_VISIBLE_DEVICES": "7",
+        "MKL_NUM_THREADS": None,
+        "OMP_NUM_THREADS": "4",
+        "P10_CONTEXT_VALUE": "declared",
+    }
+    assert "P10_TEST_SECRET" not in observation["environment"]
 
 
 def test_tpen_command_launches_stub_with_exact_args(tmp_path: Path) -> None:
