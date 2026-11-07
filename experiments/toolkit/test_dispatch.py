@@ -16,6 +16,7 @@ from typing import Sequence
 import pytest
 
 from experiments.toolkit.dispatch import (
+    CONTEXT_ENV_KEY_PATTERN,
     DEFAULT_RUNTIME,
     SCHEMA_VERSION_V2,
     AllocationContext,
@@ -668,6 +669,26 @@ def test_allocation_context_rejects_blank_visibility_entry() -> None:
             visibility_variable="CUDA_VISIBLE_DEVICES",
             visibility_values=("0", " "),
         ).validate()
+
+
+def test_allocation_context_rejects_undeclared_environment_key() -> None:
+    """Context declarations cannot widen the executor observation namespace."""
+
+    with pytest.raises(ValueError, match="context-environment-key"):
+        AllocationContext(
+            allocation_id="alloc-1",
+            visibility_variable="CUDA_VISIBLE_DEVICES",
+            visibility_values=(),
+            environment={"P10_CONTEXT_VALUE": "unsafe"},
+        ).validate()
+
+
+def test_toolkit_and_executor_context_key_patterns_match() -> None:
+    """The decoupled toolkit and executor must enforce the same namespace."""
+
+    from tpen_executor.runners import CONTEXT_ENV_KEY_PATTERN as executor_pattern
+
+    assert CONTEXT_ENV_KEY_PATTERN == executor_pattern
 
 
 @pytest.mark.parametrize(

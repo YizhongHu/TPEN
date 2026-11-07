@@ -16,6 +16,7 @@ from tpen_executor.configuration import StagedHydra
 from tpen_executor.environments import PreparedPythonEnvironment, SourceScript
 from tpen_executor.runners import (
     CHILD_CONTEXT_KEYS_ENV,
+    CONTEXT_ENV_KEY_PATTERN,
     CoreRunEvidence,
     EvidenceUnavailable,
     RUN_SHIM,
@@ -127,9 +128,9 @@ def test_run_shim_observation_excludes_unallowlisted_environment(tmp_path: Path)
             **environment.env,
             "CUDA_VISIBLE_DEVICES": "7",
             "OMP_NUM_THREADS": "4",
-            "P10_CONTEXT_VALUE": "declared",
+            "TPEN_CTX_CONTEXT_VALUE": "declared",
             "P10_TEST_SECRET": "xyz",
-            CHILD_CONTEXT_KEYS_ENV: json.dumps(["P10_CONTEXT_VALUE"]),
+            CHILD_CONTEXT_KEYS_ENV: json.dumps(["TPEN_CTX_CONTEXT_VALUE", "P10_TEST_SECRET"]),
         },
     )
     outcome = SubprocessWorker().run(
@@ -143,11 +144,17 @@ def test_run_shim_observation_excludes_unallowlisted_environment(tmp_path: Path)
     observation = json.loads((tmp_path / "executor-child-observation.json").read_text(encoding="utf-8"))
     assert observation["environment"] == {
         "CUDA_VISIBLE_DEVICES": "7",
-        "MKL_NUM_THREADS": None,
+        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS"),
         "OMP_NUM_THREADS": "4",
-        "P10_CONTEXT_VALUE": "declared",
+        "TPEN_CTX_CONTEXT_VALUE": "declared",
     }
     assert "P10_TEST_SECRET" not in observation["environment"]
+
+
+def test_context_key_pattern_is_the_executor_shim_pattern() -> None:
+    """The source constant is available for the cross-project contract test."""
+
+    assert CONTEXT_ENV_KEY_PATTERN == r"^(CUDA_VISIBLE_DEVICES|TPEN_CTX_[A-Z0-9_]{1,64})$"
 
 
 def test_tpen_command_launches_stub_with_exact_args(tmp_path: Path) -> None:

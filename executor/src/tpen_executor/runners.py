@@ -15,15 +15,15 @@ from .workers import SubprocessWorker
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
 CHILD_CONTEXT_KEYS_ENV = "TPEN_EXECUTOR_CONTEXT_ENV_KEYS"
+CONTEXT_ENV_KEY_PATTERN = r"^(CUDA_VISIBLE_DEVICES|TPEN_CTX_[A-Z0-9_]{1,64})$"
 RUN_SHIM = (
-    "import json, os, socket, sys\n"
+    "import json, os, re, socket, sys\n"
     "from pathlib import Path\n"
     "try:\n"
     f"    context_keys = json.loads(os.environ.get('{CHILD_CONTEXT_KEYS_ENV}', '[]'))\n"
     "except (TypeError, ValueError):\n"
     "    context_keys = []\n"
-    "if not isinstance(context_keys, list) or any(type(key) is not str or not key for key in context_keys):\n"
-    "    context_keys = []\n"
+    f"context_keys = [key for key in context_keys if type(key) is str and re.fullmatch({CONTEXT_ENV_KEY_PATTERN!r}, key)] if isinstance(context_keys, list) else []\n"
     "observation_keys = sorted(set(context_keys) | {'CUDA_VISIBLE_DEVICES', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS'})\n"
     "observed_environment = {key: os.environ.get(key) for key in observation_keys}\n"
     "run_roots = [arg.split('=', 1)[1] for arg in sys.argv[1:] if arg.startswith('run.root=')]\n"
@@ -294,4 +294,4 @@ class TPENEvidence:
         return CoreRunEvidence.from_mapping(decoded)
 
 
-__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "TPENCommand", "TPENEvidence"]
+__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CONTEXT_ENV_KEY_PATTERN", "CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "TPENCommand", "TPENEvidence"]
