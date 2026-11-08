@@ -18,10 +18,14 @@ needed to inspect the child-side contract.
 | F7 | M7: read thread settings only from the legacy observation allowlist | all declared thread settings are recorded truthfully |
 | F8 | M8: hide child placement refusal | an affinity refusal is visible before core import |
 | F9 | M9: accept arbitrary comparison labels | placement comparisons use a closed vocabulary |
+| C1 | drop refusal receipt construction | missing sidecars remain typed and readable |
+| C2 | treat empty devices as absent | CPU-only children retain explicit placement input |
+| M1 | compare raw host strings only | short/FQDN host forms still match canonically |
 | N1 | drop the CUDA visibility fallback | Local and Parsl preset device declarations agree |
 | H1 | delete the controller affinity subset check | dispatcher refuses an out-of-affinity slot before launch |
 | H2 | delete invalid-receipt exception handling | dispatcher stores a typed construction refusal |
-| F12 | emit PID zero for a refused receipt | refused receipts retain the positive compatibility sentinel |
+| F12 | omit NumpyDoc contract details | placement helpers document inputs, outputs, and refusals |
+| L1 | emit PID zero for a refused receipt | refused receipts retain the positive compatibility sentinel |
 """
 
 from __future__ import annotations
@@ -425,6 +429,34 @@ def test_n1_local_and_parsl_preset_device_declarations_agree(tmp_path: Path) -> 
     )
     assert local.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == "0"
     assert preset.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == local.env["TPEN_PLACEMENT_DECLARED_DEVICES"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux sched affinity")
+@pytest.mark.parametrize("devices", [("0",), ()], ids=["device-control", "cpu-only"])
+def test_prepared_visibility_does_not_change_slot_entitlement(
+    tmp_path: Path, devices: tuple[str, ...],
+) -> None:
+    """D1 kills deriving declared devices from merged CUDA visibility."""
+
+    slot = AllocationSlot(
+        "slot-a", socket.gethostname(), devices,
+        (min(os.sched_getaffinity(0)),), (), (),
+    )
+    allocation = _slot_allocation(slot)
+    group = _group()
+    member = group.members[0]
+    configured = _configured(tmp_path)
+    fence = SimpleNamespace(attempt_id=AttemptId("attempt-a"), output_dir=str(tmp_path / "output"))
+    prepared = PreparedPythonEnvironment(sys.executable, env={"CUDA_VISIBLE_DEVICES": "7"})
+
+    local = _with_child_placement(prepared, allocation, fence, group, member, configured)
+    preset = ParslDispatcher._worker_environment(
+        SimpleNamespace(), {"environment": prepared}, binding=slot.binding(),
+    )
+    parsl = _with_child_placement(preset, allocation, fence, group, member, configured)
+
+    assert local.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == ",".join(devices)
+    assert parsl.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == local.env["TPEN_PLACEMENT_DECLARED_DEVICES"]
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux sched affinity")

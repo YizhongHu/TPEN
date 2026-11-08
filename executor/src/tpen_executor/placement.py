@@ -215,7 +215,23 @@ class ChildPlacementObservation:
 
 
 def read_child_placement(path: str | os.PathLike[str]) -> ChildPlacementObservation:
-    """Read one non-symlink child placement sidecar."""
+    """Read one non-symlink child placement sidecar.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Candidate sidecar path.
+
+    Returns
+    -------
+    ChildPlacementObservation
+        Strictly decoded child placement evidence.
+
+    Raises
+    ------
+    PlacementRefusal
+        If the path is missing, a symlink, or malformed.
+    """
 
     candidate = Path(path)
     try:
@@ -231,7 +247,25 @@ def read_child_placement(path: str | os.PathLike[str]) -> ChildPlacementObservat
 
 
 def placement_environment(base: Mapping[str, str], **values: str) -> dict[str, str]:
-    """Overlay executor placement facts without modifying controller state."""
+    """Overlay executor placement facts without modifying controller state.
+
+    Parameters
+    ----------
+    base : mapping[str, str]
+        Existing prepared child environment.
+    **values : str
+        Placement fields to overlay; only declared devices may be empty.
+
+    Returns
+    -------
+    dict[str, str]
+        A copied environment containing the placement fields.
+
+    Raises
+    ------
+    PlacementRefusal
+        If a placement field is not valid text.
+    """
 
     result = dict(base)
     for key, value in values.items():
@@ -293,6 +327,8 @@ class WorkerBinding:
             key, value = item
             if type(key) is not str or not key or type(value) is not str:
                 raise BindingError("worker binding environment keys and values must be strings")
+            if not value and key != "TPEN_PLACEMENT_DECLARED_DEVICES":
+                raise BindingError("worker binding environment values must be non-empty strings")
             if key in seen:
                 raise BindingError(f"worker binding contains duplicate environment key {key!r}")
             seen.add(key)
@@ -333,7 +369,7 @@ class WorkerBinding:
                 raise BindingError("worker binding environment keys must be strings")
             if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)):
                 item = ",".join(str(part) for part in item)
-            if type(item) is not str or not item:
+            if type(item) is not str or (not item and key != "TPEN_PLACEMENT_DECLARED_DEVICES"):
                 raise BindingError("worker binding environment values must be non-empty strings")
             normalized[key] = item
         visibility = value.get("visibility", value.get("accelerator_visibility"))
@@ -456,6 +492,7 @@ class AllocationSlot:
 
         values = dict(self.environment)
         values.update({"TPEN_SLOT_ID": self.slot_id, "TPEN_SLOT_NODE": self.node, "TPEN_SLOT_CPUS": ",".join(str(cpu) for cpu in self.cpus)})
+        values["TPEN_PLACEMENT_DECLARED_DEVICES"] = ",".join(self.devices)
         if self.devices:
             values["CUDA_VISIBLE_DEVICES"] = ",".join(self.devices)
         values.update({key: str(value) for key, value in self.threads})

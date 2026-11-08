@@ -1,9 +1,11 @@
 """Shared lifecycle contract for attached executor dispatchers.
 
 Placement mutant controls include N1 (preserve declared devices for preset
-device slots), H1 (refuse controller CPU-outside-affinity placements), H2
-(turn invalid receipt construction into typed refusal evidence), and F12
-(refused receipts use a positive sentinel rather than emitting PID zero).
+device slots), C1/C2 (retain explicit refusal and CPU-only placement evidence),
+M1 (canonical host matching), H1 (refuse controller CPU-outside-affinity
+placements), H2 (turn invalid receipt construction into typed refusal
+evidence), and L1 (refused receipts use a positive sentinel rather than
+emitting PID zero).
 """
 
 from __future__ import annotations
@@ -161,10 +163,6 @@ def _with_child_placement(
     host = values.get("TPEN_SLOT_NODE")
     cpus = values.get("TPEN_SLOT_CPUS")
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
-    if not devices:
-        # Parsl preset bindings carry the entitlement as CUDA visibility;
-        # recover it without turning CPU-only slots into device slots.
-        devices = values.get("CUDA_VISIBLE_DEVICES", "")
     if not (slot_id and host and cpus):
         slots = slots_from_allocation(allocation)
         if len(slots) != 1:
@@ -238,7 +236,27 @@ def _placement_receipt(
     environment: Any,
     process_outcome: Any = None,
 ) -> SciencePlacementReceipt:
-    """Validate a quiescent child sidecar and convert it to a receipt."""
+    """Validate a quiescent child sidecar and convert it to a receipt.
+
+    Parameters
+    ----------
+    observation : ChildPlacementObservation
+        Child-side placement record read after process quiescence.
+    allocation, fence, group, member, configured, environment
+        Controller-owned identities and prepared child environment.
+    process_outcome : ProcessOutcome, optional
+        Controller-observed process identity for generation validation.
+
+    Returns
+    -------
+    SciencePlacementReceipt
+        Strict placement evidence bound to the attempt fence.
+
+    Raises
+    ------
+    PlacementRefusal
+        If identity, affinity, or entitlement validation fails.
+    """
 
     if not isinstance(environment, PreparedPythonEnvironment):
         raise PlacementRefusal("placement-environment", "child environment is not a prepared Python environment")
@@ -328,7 +346,20 @@ def _placement_refusal_receipt(
     environment: Any,
     process_outcome: Any,
 ) -> SciencePlacementReceipt:
-    """Encode a missing or malformed child sidecar as explicit refusal evidence."""
+    """Encode a missing or malformed child sidecar as explicit refusal evidence.
+
+    Parameters
+    ----------
+    observation_error : PlacementRefusal
+        Typed reason the child-side record could not qualify.
+    allocation, fence, group, member, configured, environment, process_outcome
+        Controller context used to preserve identity and refusal provenance.
+
+    Returns
+    -------
+    SciencePlacementReceipt
+        Placement evidence whose comparison is explicitly refused.
+    """
 
     if not isinstance(environment, PreparedPythonEnvironment):
         raise PlacementRefusal("placement-environment", "child environment is not a prepared Python environment")
