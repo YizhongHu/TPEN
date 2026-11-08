@@ -411,7 +411,9 @@ def test_tiled_visibility_override_is_rejected_before_runner(
     assert calls == 0
 
 
-def test_worker_binding_is_measured_not_selected_by_dispatch_index(tmp_path: Path) -> None:
+def test_worker_binding_is_measured_not_selected_by_dispatch_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A worker assignment differing from submission order must be preserved."""
 
     observed: list[str] = []
@@ -421,11 +423,12 @@ def test_worker_binding_is_measured_not_selected_by_dispatch_index(tmp_path: Pat
 
     def fake_runner(**kwargs: Any) -> dict[str, Any]:
         worker_binding = next(worker_bindings)
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", worker_binding)
         output = Path(kwargs["output_directory"])
         payload = _run_dispatch_payload(
             kwargs["argv"],
             kwargs["cwd"],
-            {**kwargs["environment"], "CUDA_VISIBLE_DEVICES": worker_binding},
+            kwargs["environment"],
             str(output),
             kwargs["attempt_id"],
             kwargs["visibility_variable"],
