@@ -698,20 +698,20 @@
         },
         {
           "id": "g",
-          "description": "excluded-seed Polaris full-model GPU smoke with complete fresh stream",
+          "description": "excluded-seed FASRC Cannon gpu_test full-model GPU smoke with complete fresh stream",
           "pass_criteria": {
             "walkers": 4096,
             "updates_max": 1000,
             "fresh_stream": "4096 walkers by 256 draws",
             "energy_abs_error_hartree": 0.02,
-            "ceiling": "one node-hour including setup",
+            "ceiling": "one GPU-hour on the allocated device, setup included",
             "record": "actual placement/device/precision and all artifacts"
           }
         }
       ],
       "placements": {
         "a-f": "slice 5cfcca3e on Cannon CPU",
-        "g": "part (g), excluded-seed Polaris GPU route smoke, at its current caps (1,000 updates, one node-hour including setup); runs first, following the 2026-10-30 facility split (Polaris for smokes)",
+        "g": "part (g), excluded-seed GPU route smoke, at its current update cap (1,000 updates), capped at one GPU-hour on the allocated device, setup included; runs first. Facility restated 2026-11-07 (D5/D6, operator-decisions-pilot-geometry-design-target-20261107 and operator-answers-design-target-d1-d6-20261107 on fffc313a, superseding the 2026-10-30 Polaris-for-smokes split for this part): D5, operator quoted, 'Gpu test goes on cannon' -- runs on FASRC Cannon's gpu_test partition (a MIG slice). D6, operator quoted: 'the contract text for part (g) is restated at the next PR 587 touch: Cannon, with a cap of one GPU-hour on the allocated device, setup included.'",
         "406194c5_cannon_pilot": "slice 406194c5's Cannon capacity-and-freeze pilot (admission.pilot, a separate part from (g)): one A100 (--constraint=a100), runs after part (g) and after qualification; own ceiling of 16 GPU-hours including setup, checkpoint writes and fresh evaluation, flagged as the lane's proposal for operator review of this pull request, separate from and not counted against the 96 GPU-hour science ceiling; if exceeded the pilot stops and reports, the ceiling is not extended",
         "integrated_rerun": "slice 2f1b2921"
       },
@@ -725,7 +725,7 @@
       "facility": "FASRC Cannon",
       "constraint": "--constraint=a100",
       "gpu_count": 1,
-      "order": "runs after admission.pipeline_check.parts[g] (the Polaris GPU route smoke) and after qualification; part (g) runs first",
+      "order": "runs after admission.pipeline_check.parts[g] (the Cannon gpu_test GPU route smoke, D5/D6) and after qualification; part (g) runs first",
       "seeds": "the excluded non_science_seed_namespaces.capacity_pilot seeds, never a science seed",
       "shape": "the science model (lane_proposals.learned_model_optimizer_and_training_sampler) and the science training sampler, run at the contract's fresh-evaluation shape (measurement.fresh_evaluation)",
       "length_updates_min": 4000,
@@ -744,7 +744,7 @@
         "the frozen measurement.hydrogen_equivalent_tail_threshold (freeze_rule)",
         "the pilot_gate simultaneous-band half-widths at all six exceedance margins in decision_rules.parameters.exceedance_margins_hartree"
       ],
-      "implemented_by": "slice 406194c5, the Cannon capacity-and-freeze pilot part (separate from part (g), the Polaris route smoke); the contract defines the run, the slice implements it",
+      "implemented_by": "slice 406194c5, the Cannon capacity-and-freeze pilot part (separate from part (g), the Cannon gpu_test route smoke, D5/D6); the contract defines the run, the slice implements it",
       "on_failure": "if the pilot gate fails at the hydrogen-equivalent threshold, the F5 stop rule applies (measurement.hydrogen_equivalent_tail_threshold); see decision_rules.parameters.zero_event_bound_pooling and the G5 no-retune rule below"
     },
     "science_lineages": {
@@ -752,7 +752,7 @@
       "status": "prohibited_until_operator_reviews_science_plan",
       "required_review": "operator review of all lane_proposals with explicit approval",
       "current_status": "prohibited",
-      "operator_review_20261107_disposition": "operator-review-contract-proposals-20261107 settled items 1, 2 and 8 on fffc313a (the primary measure/margins and the four-stream design), and all other lane_proposals are now decided; this amendment records that settlement. current_status stays 'prohibited': admission still awaits (a) this amendment's own Cannon verification and human merge of this pull request, (b) the remaining pipeline-check (slice 5cfcca3e), Polaris smoke (slice 406194c5) and integrated-rerun (slice 2f1b2921) gates already named in this admission block, and (c) the hydrogen-equivalent threshold frozen and the pilot gate passed at all six margins (admission.pilot), none of which this amendment closes."
+      "operator_review_20261107_disposition": "operator-review-contract-proposals-20261107 settled items 1, 2 and 8 on fffc313a (the primary measure/margins and the four-stream design), and all other lane_proposals are now decided; this amendment records that settlement. current_status stays 'prohibited': admission still awaits (a) this amendment's own Cannon verification and human merge of this pull request, (b) the remaining pipeline-check (slice 5cfcca3e), excluded-seed Cannon gpu_test smoke (slice 406194c5, D5/D6) and integrated-rerun (slice 2f1b2921) gates already named in this admission block, and (c) the hydrogen-equivalent threshold frozen and the pilot gate passed at all six margins (admission.pilot), none of which this amendment closes."
     }
   },
   "logging": {
