@@ -24,7 +24,6 @@ system:
   nuclei:
     positions: [[0.0, 0.0, 0.0]]
     charges: [1.0]
-  reference_energy: -0.5
 
 atoms:
   _target_: tpen.data.atomic_configuration.AtomicConfiguration
