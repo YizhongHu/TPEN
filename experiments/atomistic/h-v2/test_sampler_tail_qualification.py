@@ -104,8 +104,6 @@ def _module(name: str):
 
 oracle = _module("analytic_oracle")
 
-pytestmark = pytest.mark.h_v2_sampler_tail_qualification
-
 _CONTRACT = json.loads(INPUTS_PATH.read_text(encoding="utf-8"))
 _TAIL = _CONTRACT["tail_characterization"]["sampler_tail_qualification"]
 _SHAPE = _TAIL["shape_and_seeds"]["fresh_evaluation_sampler"]
@@ -227,6 +225,10 @@ def _energy_exceedance_resample_counts(
         weight_sorted = multiplicity[walkers_sorted]
         cumulative = np.cumsum(weight_sorted)
         total = cumulative[-1]
+        # Lower weighted median (first order statistic reaching half the total
+        # weight), not the two-middle-values average `S_hat`'s np.median uses;
+        # at N=1,048,576 the two conventions differ by one order-statistic
+        # spacing, immaterial for se (round-2 review, finding G4).
         median_index = int(np.searchsorted(cumulative, total / 2.0, side="left"))
         median_index = min(median_index, e_sorted.size - 1)
         median_b = e_sorted[median_index]
@@ -276,6 +278,7 @@ def test_energy_exceedance_resample_counts_recomputes_the_median_per_resample() 
     assert counts[:, 0].tolist() != fixed_counts_per_resample
 
 
+@pytest.mark.h_v2_sampler_tail_qualification
 def test_sampler_reproduces_exact_radial_and_local_energy_tail_curves(tmp_path_factory: pytest.TempPathFactory) -> None:
     start = time.monotonic()
     rng = np.random.default_rng(_BOOTSTRAP_SEED)
