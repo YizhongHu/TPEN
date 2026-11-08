@@ -46,6 +46,7 @@ from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.dispatch import contract as contract_module
 from tpen_executor.dispatch.contract import _placement_receipt, _placement_refusal_receipt, _with_child_placement
 from tpen_executor.dispatch.local import LocalDispatcher
+from tpen_executor.dispatch.parsl import ParslDispatcher
 from tpen_executor.placement import ChildPlacementObservation, PlacementRefusal, parse_proc_start_ticks, read_child_placement
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
