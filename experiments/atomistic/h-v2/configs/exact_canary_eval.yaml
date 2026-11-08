@@ -28,11 +28,13 @@
 # checkpoint built directly with `tpen.checkpoint.save.save_checkpoint`,
 # which core test code may do freely.
 #
-# `runtime.seed: 910003` deliberately reuses
+# `runtime.seed: 950001` is this canary's own disjoint seed
+# (`non_science_seed_namespaces.exact_canary.evaluation[0]` in
+# `contract_inputs.json`). F6, operator-added scope on PR 600 2026-11-07:
+# this canary previously reused
 # `non_science_seed_namespaces.pipeline_cpu_learned_e.evaluation[0]`
-# (`contract_inputs.json`): this canary is an instrument control of that
-# same pipeline check, not an independent science run, so the shared seed
-# is intentional rather than an undeclared namespace collision.
+# (910003) as a deliberate instrument-control replay; it now has its own
+# namespace instead.
 # =============================================================================
 
 experiment:
@@ -47,7 +49,7 @@ run:
   timezone: America/New_York
 
 runtime:
-  seed: 910003
+  seed: 950001
   device: cpu
   dtype: float64
 

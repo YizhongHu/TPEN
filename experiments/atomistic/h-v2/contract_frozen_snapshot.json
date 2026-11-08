@@ -273,6 +273,12 @@
             940003,
             940004
           ]
+        },
+        "exact_canary": {
+          "evaluation": [
+            950001
+          ],
+          "note": "F6, operator-added scope on PR 600 2026-11-07: the exact-hydrogen evaluation canary (experiments/atomistic/h-v2/test_hydrogen_exact_canary.py and tests/integration/evaluation/test_hydrogen_exact_evaluation.py, configs exact_canary_eval.yaml and tests/integration/artifacts/hydrogen/exact_eval.yaml) previously reused non_science_seed_namespaces.pipeline_cpu_learned_e.evaluation[0] (910003) as a deliberate instrument-control replay. F6 gives it its own disjoint evaluation seed instead."
         }
       },
       "consumed_outside_roster": [
