@@ -445,7 +445,7 @@ def test_h1_dispatcher_refuses_cpu_outside_controller_affinity(tmp_path: Path) -
             "environment": PreparedPythonEnvironment(sys.executable),
             "process": Process(),
             "runner": object(),
-            "evidence": TPNEvidence(),
+            "evidence": TPENEvidence(),
         }
     )
     lifecycle = AttachedAllocation(_slot_allocation(slot), DirectoryStore(tmp_path / "store"))
