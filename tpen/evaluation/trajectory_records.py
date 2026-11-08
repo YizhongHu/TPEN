@@ -27,6 +27,31 @@ TRAJECTORY_RECORD_FILENAME = "sampled_eval_table.csv"
 TRAJECTORY_RECORD_SCHEMA = "trajectory_records/v1"
 """Versioned serialized trajectory-record schema."""
 
+TRAJECTORY_RECORD_METADATA_KEYS: tuple[str, ...] = (
+    "schema",
+    "row_semantics",
+    "csv_filename",
+    "observable",
+    "draw_count",
+    "walker_count",
+    "draw_stride",
+    "burn_in_draws",
+    "n_electrons",
+    "spatial_dim",
+    "term_names",
+    "row_count",
+    "finite_count",
+    "nonfinite_count",
+    "mean",
+    "variance",
+    "observable_values_content_id",
+    "csv_sha256",
+    "byte_count",
+    "atomic_configuration_id",
+    "atomic_configuration",
+)
+"""Every key `_write_metadata` emits in the trajectory-record metadata sidecar."""
+
 
 @dataclass(frozen=True)
 class TrajectoryRecordBatch:
@@ -324,8 +349,11 @@ class TrajectoryRecordArtifact:
                 "charges": atoms.charges.detach().to(torch.float64).cpu().tolist(),
             },
         }
+        for key in TRAJECTORY_RECORD_METADATA_KEYS:
+            if key not in metadata:
+                raise ValueError(f"trajectory record metadata is missing required key {key!r}")
         for key, expected in expected_scalars.items():
-            if key not in metadata or metadata[key] != expected:
+            if metadata[key] != expected:
                 raise ValueError(f"trajectory record metadata {key!r} disagrees with typed manifest")
 
 
@@ -627,6 +655,7 @@ def _same_reconciliation(
 
 __all__ = [
     "TRAJECTORY_RECORD_FILENAME",
+    "TRAJECTORY_RECORD_METADATA_KEYS",
     "TRAJECTORY_RECORD_SCHEMA",
     "TrajectoryRecordArtifact",
     "TrajectoryRecordBatch",

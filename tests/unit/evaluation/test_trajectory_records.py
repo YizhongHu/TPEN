@@ -10,35 +10,12 @@ import torch
 
 from tpen.data.atomic_configuration import AtomicConfiguration
 from tpen.evaluation.trajectory_records import (
+    TRAJECTORY_RECORD_METADATA_KEYS,
     TrajectoryRecordArtifact,
     TrajectoryRecordBatch,
     TrajectoryRecordStreamWriter,
 )
 from tpen.statistics.trajectory import ObservableTrajectory
-
-_EMITTED_METADATA_KEYS = (
-    "schema",
-    "row_semantics",
-    "csv_filename",
-    "observable",
-    "draw_count",
-    "walker_count",
-    "draw_stride",
-    "burn_in_draws",
-    "n_electrons",
-    "spatial_dim",
-    "term_names",
-    "row_count",
-    "finite_count",
-    "nonfinite_count",
-    "mean",
-    "variance",
-    "observable_values_content_id",
-    "csv_sha256",
-    "byte_count",
-    "atomic_configuration_id",
-    "atomic_configuration",
-)
 
 
 def _artifact(tmp_path: Path, values: torch.Tensor, *, name: str = "trajectory.csv") -> TrajectoryRecordArtifact:
@@ -100,7 +77,7 @@ def test_nonfinite_mean_and_variance_round_trip(tmp_path: Path) -> None:
     artifact.validate()
 
 
-@pytest.mark.parametrize("key", _EMITTED_METADATA_KEYS)
+@pytest.mark.parametrize("key", TRAJECTORY_RECORD_METADATA_KEYS)
 def test_altered_metadata_value_is_refused(tmp_path: Path, key: str) -> None:
     artifact = _artifact(tmp_path, torch.tensor([[1.0, 2.0], [3.0, 4.0]]), name=f"altered-{key}.csv")
     metadata = json.loads(artifact.metadata_path.read_text(encoding="utf-8"))
@@ -118,15 +95,15 @@ def test_altered_metadata_value_is_refused(tmp_path: Path, key: str) -> None:
     else:
         raise AssertionError(f"unexpected metadata type for {key!r}: {type(original)!r}")
     _rewrite_metadata(artifact, metadata)
-    with pytest.raises(ValueError, match=key):
+    with pytest.raises(ValueError, match=f"{key!r} disagrees with typed manifest"):
         artifact.validate()
 
 
-@pytest.mark.parametrize("key", _EMITTED_METADATA_KEYS)
+@pytest.mark.parametrize("key", TRAJECTORY_RECORD_METADATA_KEYS)
 def test_missing_metadata_key_is_refused(tmp_path: Path, key: str) -> None:
     artifact = _artifact(tmp_path, torch.tensor([[1.0, 2.0], [3.0, 4.0]]), name=f"missing-{key}.csv")
     metadata = json.loads(artifact.metadata_path.read_text(encoding="utf-8"))
     del metadata[key]
     _rewrite_metadata(artifact, metadata)
-    with pytest.raises(ValueError, match=key):
+    with pytest.raises(ValueError, match=f"missing required key {key!r}"):
         artifact.validate()
