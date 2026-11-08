@@ -1,0 +1,20 @@
+defaults: []
+
+program:
+  # A marker has exactly one concrete payload. Nested program markers become
+  # process-local handles before the payload is instantiated; multi-payload
+  # layouts are introduced by P5a.
+  _target_: tpen_executor.programs.AllocationProgram
+  _recursive_: false
+  process:
+    _target_: tpen_executor.programs.DummyAllocation
+    _recursive_: false
+    worker:
+      _target_: tpen_executor.programs.WorkerProgram
+      _recursive_: false
+      runner:
+        _target_: tpen_executor.programs.DummyWorker
+        _recursive_: false
+        # remote_only is owner-process input and is intentionally absent here;
+        # submitter-known keys outside this program subtree are rejected.
+        command: "${remote_only.value}"

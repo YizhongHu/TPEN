@@ -1,13 +1,35 @@
 """Public immutable records for the independent TPEN executor project."""
 
+from importlib import import_module
+
 from .contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
 from .results import AllocationObservation, ManifestAttempt, OutcomeReceipt, RunManifest, StartReceipt, decode_manifest, encode_manifest
 
 __version__ = "0.1.0"
 
+_LAZY_EXPORTS = {
+    "AllocationProgram": (".programs", "AllocationProgram"),
+    "StagedConfig": (".configuration", "StagedConfig"),
+    "StagedHydra": (".configuration", "StagedHydra"),
+    "WorkerProgram": (".programs", "WorkerProgram"),
+}
+
+
+def __getattr__(name: str):
+    """Load Hydra-dependent exports only when a caller requests them."""
+
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute = target
+    value = getattr(import_module(module_name, __name__), attribute)
+    globals()[name] = value
+    return value
+
 __all__ = [
-    "__version__", "AllocationId", "AllocationObservation", "AttemptId",
-    "BackendJobId", "ManifestAttempt", "OutcomeReceipt", "ProgramSpecRef",
-    "ReadyGroup", "RunManifest", "StartReceipt", "TaskSpec",
+    "__version__", "AllocationId", "AllocationObservation", "AllocationProgram",
+    "AttemptId", "BackendJobId", "ManifestAttempt", "OutcomeReceipt",
+    "ProgramSpecRef", "ReadyGroup", "RunManifest", "StagedConfig", "StagedHydra",
+    "StartReceipt", "TaskSpec", "WorkerProgram",
     "decode_manifest", "encode_manifest",
 ]
