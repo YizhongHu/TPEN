@@ -483,8 +483,13 @@ class DirectoryStore:
                 outcome = OutcomeReceipt.decode(Path(outcome_path).read_bytes())
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
                 raise FenceRejected("outcome receipt is unavailable") from error
-            if outcome.status not in {"completed", "failed", "timed_out", "launch_failed"}:
-                raise FenceRejected("outcome receipt has an invalid status")
+            if (
+                outcome.task_id != start.task_id
+                or outcome.attempt_id != start.attempt_id
+                or outcome.group_digest != start.group_digest
+                or outcome.output_dir != output_dir
+            ):
+                raise FenceRejected("outcome receipt crosses the attempt fence")
             if (
                 receipt.task_id != start.task_id
                 or receipt.attempt_id != start.attempt_id

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 
 from ._codec import _freeze, canonical_bytes, decode_json, fields, sequence, sha256_text, text, thaw
@@ -206,11 +206,64 @@ class SciencePlacementReceipt:
         _identity(self.attempt_id, AttemptId, "attempt_id")
         object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
         object.__setattr__(self, "payload_digest", sha256_text(self.payload_digest, "payload_digest"))
+        expected_sections = {
+            "child": {"host", "pid", "proc_start_ticks", "affinity", "thread_settings", "cuda_visible_devices", "observed_at_utc"},
+            "declared": {"host", "cpus", "devices"},
+            "gpu": {"status", "reason", "method", "started_at_utc", "finished_at_utc", "samples", "active_uuids", "active_pci"},
+            "comparison": {"host", "affinity", "device"},
+        }
         for name in ("child", "declared", "gpu", "comparison"):
             value = getattr(self, name)
             if not isinstance(value, Mapping):
                 raise TypeError(f"{name} must be a mapping")
-            object.__setattr__(self, name, _freeze(value, name))
+            if set(value) != expected_sections[name]:
+                raise ValueError(f"{name} has invalid keys")
+        child = self.child
+        if type(child["host"]) is not str or not child["host"] or type(child["pid"]) is not int or child["pid"] <= 0:
+            raise TypeError("child host and pid are invalid")
+        if type(child["proc_start_ticks"]) is not int or child["proc_start_ticks"] < 0:
+            raise TypeError("child proc_start_ticks must be a nonnegative integer")
+        if isinstance(child["affinity"], (str, bytes, bytearray)) or not isinstance(child["affinity"], Sequence):
+            raise TypeError("child affinity must be a sequence")
+        if any(type(cpu) is not int or cpu < 0 for cpu in child["affinity"]):
+            raise TypeError("child affinity must contain nonnegative integers")
+        if not child["affinity"] and self.refusal is None:
+            raise ValueError("child affinity cannot be empty without refusal")
+        if not isinstance(child["thread_settings"], Mapping) or any(
+            type(key) is not str or (type(value) is not str and value is not None)
+            for key, value in child["thread_settings"].items()
+        ):
+            raise TypeError("child thread_settings is invalid")
+        if child["cuda_visible_devices"] is not None and type(child["cuda_visible_devices"]) is not str:
+            raise TypeError("child cuda_visible_devices must be text or null")
+        for key in ("observed_at_utc",):
+            text(child[key], f"child.{key}")
+        declared = self.declared
+        if type(declared["host"]) is not str or not declared["host"]:
+            raise TypeError("declared host must be non-empty text")
+        if isinstance(declared["cpus"], (str, bytes, bytearray)) or not isinstance(declared["cpus"], Sequence) or not declared["cpus"]:
+            raise TypeError("declared cpus must be a non-empty sequence")
+        if any(type(cpu) is not int or cpu < 0 for cpu in declared["cpus"]):
+            raise TypeError("declared cpus must contain nonnegative integers")
+        if isinstance(declared["devices"], (str, bytes, bytearray)) or not isinstance(declared["devices"], Sequence) or any(type(device) is not str or not device for device in declared["devices"]):
+            raise TypeError("declared devices must be a sequence of strings")
+        gpu = self.gpu
+        for key in ("status", "reason", "method", "started_at_utc", "finished_at_utc"):
+            text(gpu[key], f"gpu.{key}")
+        if gpu["status"] not in {"unavailable", "qualified"}:
+            raise ValueError("gpu.status is invalid")
+        for key in ("samples", "active_uuids", "active_pci"):
+            if isinstance(gpu[key], (str, bytes, bytearray)) or not isinstance(gpu[key], Sequence):
+                raise TypeError(f"gpu.{key} must be a sequence")
+        if any(type(value) is not str or not value for value in tuple(gpu["active_uuids"]) + tuple(gpu["active_pci"])):
+            raise TypeError("gpu active device values must be non-empty strings")
+        comparison = self.comparison
+        if any(type(comparison[key]) is not str or not comparison[key] for key in ("host", "affinity", "device")):
+            raise TypeError("placement comparison values must be non-empty strings")
+        object.__setattr__(self, "child", _freeze(child, "child"))
+        object.__setattr__(self, "declared", _freeze(declared, "declared"))
+        object.__setattr__(self, "gpu", _freeze(gpu, "gpu"))
+        object.__setattr__(self, "comparison", _freeze(comparison, "comparison"))
         if self.refusal is not None:
             if not isinstance(self.refusal, Mapping) or set(self.refusal) != {"code", "reason"}:
                 raise TypeError("refusal must contain code and reason")
