@@ -1,0 +1,161 @@
+experiment:
+  name: tpen_h_v2
+  sector: atomistic
+  run_name: tpen_h_v2_train
+
+run:
+  root: experiments/atomistic/h-v2/outputs
+  run_id: h-v2-train
+  dir: null
+  timezone: America/New_York
+
+runtime:
+  seed: 910001
+  device: cpu
+  dtype: float64
+
+system:
+  id: atomic_hydrogen
+  n_particles: 1
+  spatial_dim: 3
+  spin:
+    n_up: 1
+    n_down: 0
+  nuclei:
+    positions: [[0.0, 0.0, 0.0]]
+    charges: [1.0]
+  reference_energy: -0.5
+
+atoms:
+  _target_: tpen.data.atomic_configuration.AtomicConfiguration
+  positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+
+runner:
+  _target_: tpen.runner.Train
+  model: ${model}
+  sampler: ${sampler}
+  hamiltonian_terms: ${hamiltonian_terms}
+  optimizer: ${optimizer}
+  trainer: ${trainer}
+
+model:
+  _target_: tpen.nn.TPENWaveFunction
+  trace_name: tpen
+  embedding:
+    _target_: tpen.nn.Embedding
+    max_order: 2
+    spatial_dim: ${system.spatial_dim}
+    out_channels: 8
+    hidden_channels: 32
+    num_hidden_layers: 1
+    include_spins: true
+  layers:
+    - _target_: tpen.nn.TPENLayer
+      mixing:
+        _target_: tpen.nn.EquivariantMixing
+        max_order: 2
+        max_virtual_order: 2
+        channels: 8
+        implementation: vectorized
+        initial_weight: 0.5
+        activation:
+          _target_: torch.nn.SiLU
+      path_aggregation:
+        _target_: tpen.nn.PathAggregation
+        max_order: 2
+        max_virtual_order: 2
+        channels: 8
+        activation:
+          _target_: torch.nn.SiLU
+      update:
+        _target_: tpen.nn.ResidualUpdater
+  factors:
+    - _target_: tpen.nn.ElectronNucleusCusp
+      atoms: ${atoms}
+      law:
+        _target_: tpen.nn.CurvatureElectronNucleusCuspLaw
+        curvature_coefficient: 0.01
+        curvature_range: 1.0
+        trainable: true
+  readout:
+    _target_: tpen.nn.readout.PfaffianReadout
+    channels: 8
+    trainable: true
+
+hamiltonian_terms:
+  kinetic:
+    _target_: tpen.physics.kinetic.KineticEnergy
+  electron_nucleus:
+    _target_: tpen.physics.potential.ElectronNucleusPotential
+    atoms: ${atoms}
+    eps: 0.0
+
+sampler:
+  _target_: tpen.sampling.metropolis.MetropolisSampler
+  n_walkers: 256
+  burn_in: 100
+  n_steps: 10
+  proposal_scale: 0.5
+  seed: 910002
+  n_electrons: ${system.n_particles}
+  spatial_dim: ${system.spatial_dim}
+  n_up: ${system.spin.n_up}
+  n_down: ${system.spin.n_down}
+  nuclear_positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  nuclear_charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+  dtype: ${runtime.dtype}
+
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.005
+
+trainer:
+  _target_: tpen.training.trainer.VMCTrainer
+  max_steps: 1000
+  log_every_n_steps: 100
+  return_terms: true
+
+callbacks:
+  - _target_: tpen.callback.ConfigSnapshot
+    output_path: ${run.dir}/config.yaml
+  - _target_: tpen.callback.ResolvedConfigSnapshot
+    output_path: ${run.dir}/resolved_config.yaml
+  - _target_: tpen.callback.Metadata
+    output_path: ${run.dir}/metadata.json
+  - _target_: tpen.callback.Status
+    output_path: ${run.dir}/status.json
+  - _target_: tpen.callback.DataIntegrity
+    every_n_steps: 100
+    fail_fast: true
+    max_nonfinite_energy_fraction: 0.0
+    max_nonfinite_logabs_fraction: 0.0
+    check_loss: true
+    check_wavefunction_output: true
+    check_batch: true
+    strict_sign_values: true
+  - _target_: tpen.callback.GradientStats
+    every_n_steps: 100
+    fail_fast: true
+    check_finite: true
+  - _target_: tpen.callback.Checkpoint
+    terminal: true
+    schedule:
+      _target_: tpen.checkpoint.EveryNUpdates
+      every_n: 1000
+    payload:
+      _target_: tpen.checkpoint.TrainResume
+    output_dir: ${run.dir}/checkpoints
+
+loggers:
+  - _target_: tpen.logging.JSONL
+    path: ${run.dir}/metrics.jsonl
