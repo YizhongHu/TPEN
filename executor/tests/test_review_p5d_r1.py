@@ -53,6 +53,7 @@ class RecordingLifecycle(AttachedAllocation):
 
 
 def payload(run_dir, verdict="completed"):
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
     return {
         "schema": "tpen.run-evidence/v1", "run_dir": str(run_dir),
         "verdict": verdict, "run_status": "failed" if verdict == "refused" else verdict,

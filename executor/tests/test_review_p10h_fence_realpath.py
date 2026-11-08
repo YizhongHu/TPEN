@@ -5,12 +5,14 @@
 | T1 (`executor/tests/test_review_p10h_fence_realpath.py:58`) | M1 | A symlinked store root must compare by resolved identity, not spelling. |
 | T2 (`executor/tests/test_review_p10h_fence_realpath.py:75`) | M2 | An evidence symlink escaping the attempt must not pass loose containment. |
 | T3 (`executor/tests/test_review_p10h_fence_realpath.py:86`) | M3 | A sibling attempt's core directory must fail exact equality. |
-| T4 (`executor/tests/test_review_p10h_fence_realpath.py:95`) | M4 | A missing evidence directory must fail strict resolution. |
+| T4 (`executor/tests/test_review_p10h_fence_realpath.py:95`) | M4 | A missing evidence directory must use strict resolution, not only a later directory check. |
+| T5 (`executor/tests/test_review_p10h_fence_realpath.py:109`) | M5 | A store-side core symlink must be rejected before canonical comparison. |
 """
 
 from pathlib import Path
 
 import pytest
+import tpen_executor.storage as storage
 
 from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
@@ -92,9 +94,34 @@ def test_t3_sibling_attempt_core_is_rejected_and_kills_m3(tmp_path: Path) -> Non
         store.accept_segment(fence, _evidence(str(sibling_core)))
 
 
-def test_t4_missing_evidence_run_dir_is_rejected_and_kills_m4(tmp_path: Path) -> None:
+def test_t4_missing_evidence_run_dir_is_rejected_and_kills_m4(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store, fence = _finished_attempt(tmp_path)
     missing = Path(fence.output_dir) / "missing-core"
+    calls: list[bool | None] = []
+    original_realpath = storage.os.path.realpath
+
+    def strict_realpath(path, *args, **kwargs):
+        calls.append(kwargs.get("strict"))
+        return original_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage.os.path, "realpath", strict_realpath)
 
     with pytest.raises(FenceRejected, match="core evidence run_dir crosses the attempt fence"):
         store.accept_segment(fence, _evidence(str(missing)))
+    assert calls and all(strict is True for strict in calls)
+
+
+@pytest.mark.parametrize("target_kind", ["outside", "sibling"], ids=["outside", "another-attempt"])
+def test_t5_store_side_core_symlink_is_rejected(tmp_path: Path, target_kind: str) -> None:
+    store, fence = _finished_attempt(tmp_path)
+    if target_kind == "outside":
+        target = tmp_path / "outside" / "core"
+    else:
+        target = Path(fence.output_dir).parent / "another-attempt" / "core"
+    target.mkdir(parents=True)
+    store_core = Path(fence.output_dir) / "core"
+    store_core.rmdir()
+    store_core.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(FenceRejected, match="core evidence run_dir crosses the attempt fence"):
+        store.accept_segment(fence, _evidence(str(target)))

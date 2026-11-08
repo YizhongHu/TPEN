@@ -83,6 +83,7 @@ def _allocation() -> ConfiguredAllocation:
 
 
 def _evidence(run_dir: str, *, verdict: str = "completed", checkpoint_dir: str | None = None, step: int = 1) -> CoreRunEvidence:
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
     return CoreRunEvidence.from_mapping(
         {
             "schema": "tpen.run-evidence/v1",

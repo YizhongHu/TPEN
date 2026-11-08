@@ -74,7 +74,23 @@ _CORE_EVIDENCE_FENCE_REASON = "core evidence run_dir crosses the attempt fence"
 
 
 def _strict_real_directory(path: str | os.PathLike[str]) -> str:
-    """Return an existing directory's canonical path or reject the fence."""
+    """Return an existing directory's canonical path or reject the fence.
+
+    Parameters
+    ----------
+    path : str or os.PathLike
+        Directory path whose target must exist before resolution.
+
+    Returns
+    -------
+    str
+        The canonical path of the existing directory.
+
+    Raises
+    ------
+    FenceRejected
+        If ``path`` is missing, cannot be resolved, or is not a directory.
+    """
     try:
         resolved = os.path.realpath(os.fspath(path), strict=True)
     except (OSError, ValueError) as error:
@@ -397,9 +413,18 @@ class DirectoryStore:
         ------
         FenceRejected
             If the fence is foreign/stale, the attempt is not completed, the
-            evidence lacks a checkpoint, or this attempt was already accepted.
+            evidence lacks a checkpoint, the evidence run directory is not
+            exactly the canonical ``<attempt>/core`` directory, or this
+            attempt was already accepted.
         ValueError, TypeError
             If the predecessor or evidence shape is malformed.
+
+        Notes
+        -----
+        The store-side attempt directory is resolved strictly and its
+        ``core`` child must be an existing non-symlink directory.  The
+        evidence run directory is also resolved strictly, then compared by
+        exact canonical identity with that store-side core directory.
         """
 
         if not isinstance(evidence, CoreRunEvidence):
@@ -412,7 +437,13 @@ class DirectoryStore:
         with _task_lock(lock_path):
             start = self._validate_fence(fence, task_dir)
             output_dir = _lexical(fence.output_dir)
-            expected_core_dir = _strict_real_directory(os.path.join(output_dir, "core"))
+            attempt_dir = _strict_real_directory(output_dir)
+            core_path = os.path.join(attempt_dir, "core")
+            try:
+                _require_directory(core_path, "core evidence directory")
+            except FenceRejected as error:
+                raise FenceRejected(_CORE_EVIDENCE_FENCE_REASON) from error
+            expected_core_dir = _strict_real_directory(core_path)
             evidence_core_dir = _strict_real_directory(evidence.run_dir)
             if evidence_core_dir != expected_core_dir:
                 raise FenceRejected(_CORE_EVIDENCE_FENCE_REASON)
