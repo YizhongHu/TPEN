@@ -60,8 +60,42 @@ def _artifact(tmp_path: Path, values: torch.Tensor, *, name: str = "trajectory.c
     )
 
 
-def _rewrite_metadata(artifact: TrajectoryRecordArtifact, metadata: dict) -> None:
+def _rewrite_metadata(artifact: TrajectoryRecordArtifact, metadata: object) -> None:
     artifact.metadata_path.write_text(json.dumps(metadata, sort_keys=True, indent=2), encoding="utf-8")
+
+
+def _read_metadata(artifact: TrajectoryRecordArtifact) -> dict:
+    return json.loads(artifact.metadata_path.read_text(encoding="utf-8"))
+
+
+FINITE = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+# Literal, independent of TRAJECTORY_RECORD_METADATA_KEYS: a key dropped from the
+# production constant must still appear here, so its altered-value/missing-key
+# tests keep running and can catch the drift (PR 609 pre-review round 1, finding 1).
+EXPECTED_METADATA_KEYS = (
+    "schema",
+    "row_semantics",
+    "csv_filename",
+    "observable",
+    "draw_count",
+    "walker_count",
+    "draw_stride",
+    "burn_in_draws",
+    "n_electrons",
+    "spatial_dim",
+    "term_names",
+    "row_count",
+    "finite_count",
+    "nonfinite_count",
+    "mean",
+    "variance",
+    "observable_values_content_id",
+    "csv_sha256",
+    "byte_count",
+    "atomic_configuration_id",
+    "atomic_configuration",
+)
 
 
 def test_freshly_written_artifact_validates(tmp_path: Path) -> None:
@@ -77,7 +111,21 @@ def test_nonfinite_mean_and_variance_round_trip(tmp_path: Path) -> None:
     artifact.validate()
 
 
-@pytest.mark.parametrize("key", TRAJECTORY_RECORD_METADATA_KEYS)
+def test_sidecar_key_set_equals_declared_constant(tmp_path: Path) -> None:
+    """The writer emits exactly the declared key set, with no duplicates.
+
+    Guards against drift between ``TRAJECTORY_RECORD_METADATA_KEYS`` and the
+    sidecar the writer actually produces, independent of the literal key list
+    the parametrized tests below use.
+    """
+
+    artifact = _artifact(tmp_path, FINITE)
+    assert len(set(TRAJECTORY_RECORD_METADATA_KEYS)) == len(TRAJECTORY_RECORD_METADATA_KEYS)
+    assert set(_read_metadata(artifact)) == set(TRAJECTORY_RECORD_METADATA_KEYS)
+    assert set(TRAJECTORY_RECORD_METADATA_KEYS) == set(EXPECTED_METADATA_KEYS)
+
+
+@pytest.mark.parametrize("key", EXPECTED_METADATA_KEYS)
 def test_altered_metadata_value_is_refused(tmp_path: Path, key: str) -> None:
     artifact = _artifact(tmp_path, torch.tensor([[1.0, 2.0], [3.0, 4.0]]), name=f"altered-{key}.csv")
     metadata = json.loads(artifact.metadata_path.read_text(encoding="utf-8"))
@@ -99,11 +147,89 @@ def test_altered_metadata_value_is_refused(tmp_path: Path, key: str) -> None:
         artifact.validate()
 
 
-@pytest.mark.parametrize("key", TRAJECTORY_RECORD_METADATA_KEYS)
+@pytest.mark.parametrize("key", EXPECTED_METADATA_KEYS)
 def test_missing_metadata_key_is_refused(tmp_path: Path, key: str) -> None:
     artifact = _artifact(tmp_path, torch.tensor([[1.0, 2.0], [3.0, 4.0]]), name=f"missing-{key}.csv")
     metadata = json.loads(artifact.metadata_path.read_text(encoding="utf-8"))
     del metadata[key]
     _rewrite_metadata(artifact, metadata)
     with pytest.raises(ValueError, match=f"missing required key {key!r}"):
+        artifact.validate()
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_mean", "expected_variance"),
+    [
+        ([[float("inf"), 1.0], [1.0, 2.0]], "inf", "nan"),
+        ([[float("-inf"), 1.0], [1.0, 2.0]], "-inf", "nan"),
+        ([[float("inf"), float("-inf")], [1.0, 2.0]], "nan", "nan"),
+    ],
+    ids=["mean-inf", "mean-neg-inf", "mean-nan"],
+)
+def test_nonfinite_sentinels_are_exact_and_validate(
+    tmp_path: Path, values: list[list[float]], expected_mean: str, expected_variance: str
+) -> None:
+    """Each `_json_float` sentinel is asserted exactly, then `validate()` accepts it."""
+
+    artifact = _artifact(tmp_path, torch.tensor(values), name="nonfinite.csv")
+    metadata = _read_metadata(artifact)
+    assert metadata["mean"] == expected_mean
+    assert metadata["variance"] == expected_variance
+    artifact.validate()
+
+
+def test_tampered_nonfinite_sentinel_is_refused(tmp_path: Path) -> None:
+    """Swapping one sentinel string for another is a value mismatch."""
+
+    artifact = _artifact(tmp_path, torch.tensor([[float("inf"), float("-inf")], [1.0, 2.0]]), name="nonfinite.csv")
+    metadata = _read_metadata(artifact)
+    assert metadata["mean"] == "nan"
+    metadata["mean"] = "inf"
+    _rewrite_metadata(artifact, metadata)
+    with pytest.raises(ValueError, match="'mean' disagrees with typed manifest"):
+        artifact.validate()
+
+
+@pytest.mark.parametrize("field", ["positions", "charges"])
+def test_altered_atomic_configuration_entry_is_refused(tmp_path: Path, field: str) -> None:
+    """A numeric change inside the nested payload, not only an added key, is refused."""
+
+    artifact = _artifact(tmp_path, FINITE, name=f"atoms-{field}.csv")
+    metadata = _read_metadata(artifact)
+    if field == "positions":
+        metadata["atomic_configuration"]["positions"][0][0] += 1e-12
+    else:
+        metadata["atomic_configuration"]["charges"][0] += 1.0
+    _rewrite_metadata(artifact, metadata)
+    with pytest.raises(ValueError, match="'atomic_configuration' disagrees with typed manifest"):
+        artifact.validate()
+
+
+def test_undeclared_extra_key_is_refused(tmp_path: Path) -> None:
+    """Strict key-set equality (PR 609 pre-review round 1, finding 3, decided strict).
+
+    The schema is versioned (``trajectory_records/v1``) and the writer emits
+    exactly the declared keys, so an undeclared key signals a writer/schema
+    mismatch and must be refused, naming the offending key.
+    """
+
+    artifact = _artifact(tmp_path, FINITE, name="extra.csv")
+    metadata = _read_metadata(artifact)
+    metadata["__undeclared__"] = 1
+    _rewrite_metadata(artifact, metadata)
+    with pytest.raises(ValueError, match="__undeclared__"):
+        artifact.validate()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["null", "5", json.dumps(" ".join(TRAJECTORY_RECORD_METADATA_KEYS)), "[]"],
+    ids=["null", "int", "str-containing-every-key", "list"],
+)
+def test_non_object_sidecar_is_refused_with_value_error(tmp_path: Path, payload: str) -> None:
+    """A sidecar that is valid JSON but not an object is refused with `ValueError`."""
+
+    artifact = _artifact(tmp_path, FINITE, name="malformed.csv")
+    artifact.metadata_path.write_text(payload + "\n", encoding="utf-8")
+    with pytest.raises(ValueError):
         artifact.validate()
