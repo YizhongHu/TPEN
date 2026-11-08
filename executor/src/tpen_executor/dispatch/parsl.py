@@ -21,9 +21,9 @@ from ..workers import ProcessOutcome, SubprocessWorker
 from .contract import (
     DispatcherContract,
     _member_paths,
+    _prepare_child_placement,
     _placement_refusal_from_environment,
     _with_child_context_keys,
-    _with_child_placement,
 )
 
 
@@ -337,7 +337,7 @@ class ParslDispatcher(DispatcherContract):
                 materialized = self.worker.materialize(env)
                 environment = self._worker_environment(materialized, binding)
                 environment = _with_child_context_keys(environment, lifecycle.allocation)
-                environment = _with_child_placement(
+                environment = _prepare_child_placement(
                     environment,
                     lifecycle.allocation,
                     fence,
