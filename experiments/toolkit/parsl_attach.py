@@ -150,6 +150,14 @@ def _run_dispatch_payload(
 ) -> dict[str, Any]:
     """Run one immutable argv and write only stdlib worker evidence.
 
+    When ``visibility_variable`` is supplied, an explicit
+    ``visibility_value`` takes precedence over the worker's ambient value;
+    otherwise the worker's ambient value takes precedence over the serialized
+    environment map, and the key is removed when the worker has no ambient
+    value.  With no visibility variable (the INHERIT path), the serialized
+    environment is merged normally and only the placement receipt can report
+    its visible value.
+
     This function is intentionally self-contained: Parsl serializes it by
     value, and a worker must never import this package to execute a row.
     """
@@ -305,7 +313,8 @@ class ParslAttachExecutor:
                 if visibility_variable in dispatch.environment:
                     raise ValueError(
                         "TILED visibility override from dispatch.environment is not allowed for "
-                        f"key {visibility_variable!r}"
+                        f"key {visibility_variable!r} for dispatch attempt "
+                        f"{dispatch.attempt_id!r}"
                     )
         runner = self.app_runner or self._real_runner(context, launch_attempt_dir)
         submitted: list[tuple[DispatchSpec, Any]] = []

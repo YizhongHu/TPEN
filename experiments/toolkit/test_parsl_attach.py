@@ -298,6 +298,7 @@ def test_inherit_visibility_keeps_scheduler_binding(tmp_path: Path, monkeypatch:
     context = _context(tmp_path, visibility_values=())
     assert context.validate() is context
     ParslAttachExecutor(app_runner=fake_runner).dispatch((spec,), context=context)
+    assert calls[0]["environment"]["CUDA_VISIBLE_DEVICES"] == "scheduler-mig"
     assert "visibility_variable" not in calls[0]
     assert "visibility_value" not in calls[0]
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "scheduler-mig"
@@ -306,17 +307,16 @@ def test_inherit_visibility_keeps_scheduler_binding(tmp_path: Path, monkeypatch:
     payload = _run_dispatch_payload(
         (sys.executable, "-c", "import os; print(os.environ['CUDA_VISIBLE_DEVICES'])"),
         str(tmp_path),
-        {},
+        calls[0]["environment"],
         str(output),
-        "inherit-attempt",
-        "CUDA_VISIBLE_DEVICES",
+        calls[0]["attempt_id"],
     )
     assert payload["returncode"] == 0
     assert (output / "stdout.log").read_text() == "scheduler-mig\n"
     status = json.loads((output / "attempt_status.json").read_text())
-    assert payload["inherited_visibility_value"] == "scheduler-mig"
+    assert payload["inherited_visibility_value"] is None
     assert payload["placement"]["cuda_visible_devices"] == "scheduler-mig"
-    assert status["inherited_visibility_value"] == "scheduler-mig"
+    assert status["inherited_visibility_value"] is None
     assert status["placement"]["cuda_visible_devices"] == "scheduler-mig"
 
     parsl = pytest.importorskip("parsl")
@@ -369,6 +369,8 @@ def test_tiled_visibility_protects_worker_binding_end_to_end(
 def test_payload_protects_worker_binding_from_serialized_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A serialized visibility override cannot replace the worker binding."""
+
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "worker-mig")
     output = tmp_path / "payload"
     payload = _run_dispatch_payload(
@@ -389,6 +391,8 @@ def test_payload_protects_worker_binding_from_serialized_override(
 def test_tiled_visibility_override_is_rejected_before_runner(
     source: str, tmp_path: Path
 ) -> None:
+    """Reject ambiguous tiled visibility overrides before submitting work."""
+
     calls = 0
 
     def fake_runner(**kwargs: Any) -> dict[str, Any]:
@@ -408,6 +412,8 @@ def test_tiled_visibility_override_is_rejected_before_runner(
         ParslAttachExecutor(app_runner=fake_runner).dispatch((spec,), context=context)
 
     assert "CUDA_VISIBLE_DEVICES" in str(raised.value)
+    if source == "dispatch":
+        assert spec.attempt_id in str(raised.value)
     assert calls == 0
 
 
