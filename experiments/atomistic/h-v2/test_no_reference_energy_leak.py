@@ -11,8 +11,9 @@ logs it, plus the derived `energy_error`, straight into `metrics.jsonl`.
 
 This test recursively scans every YAML config under this directory's
 `configs/` folder -- not just the ones named in the triggering review
-comment -- for a `reference_energy` mapping key at any nesting depth, and
-for any string value (a Hydra interpolation) that mentions it.
+comment, and not just `*.yaml` -- for a `reference_energy` mapping key at
+any nesting depth, and for any string value (a Hydra interpolation) that
+mentions it.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ def _find_reference_energy_paths(node: Any, path: tuple[str, ...] = ()) -> list[
 
 
 def test_no_h_v2_config_names_a_reference_energy() -> None:
-    configs = sorted(CONFIGS_DIR.glob("*.yaml"))
+    configs = sorted(set(CONFIGS_DIR.rglob("*.yaml")) | set(CONFIGS_DIR.rglob("*.yml")))
     assert configs, f"no configs found under {CONFIGS_DIR} -- swept corpus looks wrong"
     violations: dict[str, list[tuple[str, ...]]] = {}
     for path in configs:
