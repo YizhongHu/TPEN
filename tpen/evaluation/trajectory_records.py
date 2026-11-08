@@ -352,10 +352,14 @@ class TrajectoryRecordArtifact:
             "atomic_configuration_id": atoms.content_id(),
             "atomic_configuration": _atomic_geometry_payload(atoms),
         }
-        assert expected_scalars.keys() == set(TRAJECTORY_RECORD_METADATA_KEYS), (
-            "trajectory_records.py: expected_scalars and TRAJECTORY_RECORD_METADATA_KEYS "
-            "have diverged; update both together"
-        )
+        declared_keys = set(TRAJECTORY_RECORD_METADATA_KEYS)
+        if expected_scalars.keys() != declared_keys:
+            missing = sorted(declared_keys - expected_scalars.keys())
+            extra = sorted(expected_scalars.keys() - declared_keys)
+            raise RuntimeError(
+                "trajectory_records.py: expected_scalars and TRAJECTORY_RECORD_METADATA_KEYS "
+                f"have diverged; update both together (missing={missing}, extra={extra})"
+            )
         extra_keys = set(metadata) - expected_scalars.keys()
         if extra_keys:
             raise ValueError(

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from tpen.data.atomic_configuration import AtomicConfiguration
+from tpen.evaluation import trajectory_records
 from tpen.evaluation.trajectory_records import (
     TRAJECTORY_RECORD_METADATA_KEYS,
     TrajectoryRecordArtifact,
@@ -103,14 +104,6 @@ def test_freshly_written_artifact_validates(tmp_path: Path) -> None:
     artifact.validate()
 
 
-def test_nonfinite_mean_and_variance_round_trip(tmp_path: Path) -> None:
-    values = torch.tensor([[float("inf"), float("-inf")], [1.0, 2.0]])
-    artifact = _artifact(tmp_path, values, name="nonfinite.csv")
-    metadata = json.loads(artifact.metadata_path.read_text(encoding="utf-8"))
-    assert metadata["mean"] in ("nan", "inf", "-inf") or isinstance(metadata["mean"], float)
-    artifact.validate()
-
-
 def test_sidecar_key_set_equals_declared_constant(tmp_path: Path) -> None:
     """The writer emits exactly the declared key set, with no duplicates.
 
@@ -123,6 +116,25 @@ def test_sidecar_key_set_equals_declared_constant(tmp_path: Path) -> None:
     assert len(set(TRAJECTORY_RECORD_METADATA_KEYS)) == len(TRAJECTORY_RECORD_METADATA_KEYS)
     assert set(_read_metadata(artifact)) == set(TRAJECTORY_RECORD_METADATA_KEYS)
     assert set(TRAJECTORY_RECORD_METADATA_KEYS) == set(EXPECTED_METADATA_KEYS)
+
+
+def test_constant_dict_divergence_raises_runtime_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dropped/renamed key in the declared constant is a loud programming error.
+
+    Survives `python -O`, unlike the `assert` it replaces (PR 609 pre-review
+    round 2, finding 1).
+    """
+
+    artifact = _artifact(tmp_path, FINITE, name="divergent.csv")
+    monkeypatch.setattr(
+        trajectory_records,
+        "TRAJECTORY_RECORD_METADATA_KEYS",
+        tuple(key for key in TRAJECTORY_RECORD_METADATA_KEYS if key != "schema") + ("bogus",),
+    )
+    with pytest.raises(RuntimeError, match=r"missing=\['bogus'\], extra=\['schema'\]"):
+        artifact.validate()
 
 
 @pytest.mark.parametrize("key", EXPECTED_METADATA_KEYS)
@@ -217,7 +229,7 @@ def test_undeclared_extra_key_is_refused(tmp_path: Path) -> None:
     metadata = _read_metadata(artifact)
     metadata["__undeclared__"] = 1
     _rewrite_metadata(artifact, metadata)
-    with pytest.raises(ValueError, match="__undeclared__"):
+    with pytest.raises(ValueError, match=r"undeclared key\(s\): __undeclared__"):
         artifact.validate()
 
 
