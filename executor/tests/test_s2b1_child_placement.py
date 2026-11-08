@@ -21,9 +21,12 @@ needed to inspect the child-side contract.
 | C1 | drop refusal receipt construction | missing sidecars remain typed and readable |
 | C2 | treat empty devices as absent | CPU-only children retain explicit placement input |
 | M1 | compare raw host strings only | short/FQDN host forms still match canonically |
-| N1 | drop the CUDA visibility fallback | Local and Parsl preset device declarations agree |
+| N1 | derive entitlement from merged CUDA visibility | Local and Parsl explicit slot declarations agree |
 | H1 | delete the controller affinity subset check | dispatcher refuses an out-of-affinity slot before launch |
 | H2 | delete invalid-receipt exception handling | dispatcher stores a typed construction refusal |
+| D1 | derive declared devices from CUDA visibility | prepared visibility cannot alter slot entitlement |
+| D2 | delete missing-device-key refusal | preset slots fail closed when entitlement is absent |
+| D3 | restore direct empty-value rejection | direct WorkerBinding construction remains backward-compatible |
 | F12 | omit NumpyDoc contract details | placement helpers document inputs, outputs, and refusals |
 | L1 | emit PID zero for a refused receipt | refused receipts retain the positive compatibility sentinel |
 """
@@ -458,6 +461,43 @@ def test_prepared_visibility_does_not_change_slot_entitlement(
 
     assert local.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == ",".join(devices)
     assert parsl.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == local.env["TPEN_PLACEMENT_DECLARED_DEVICES"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux sched affinity")
+@pytest.mark.parametrize("devices", [("0",), ()], ids=["device", "cpu-only"])
+@pytest.mark.parametrize("explicit", [False, True], ids=["missing-declaration", "explicit-declaration"])
+def test_local_preset_slot_triple_preserves_entitlement(
+    tmp_path: Path, devices: tuple[str, ...], explicit: bool,
+) -> None:
+    """D2 refuses absent entitlement but accepts an explicit empty CPU value."""
+
+    slot = AllocationSlot("slot-a", socket.gethostname(), devices, (min(os.sched_getaffinity(0)),), (), ())
+    allocation = _slot_allocation(slot)
+    values = {
+        "TPEN_SLOT_ID": slot.slot_id,
+        "TPEN_SLOT_NODE": slot.node,
+        "TPEN_SLOT_CPUS": str(slot.cpus[0]),
+        "CUDA_VISIBLE_DEVICES": ",".join(devices),
+    }
+    if explicit:
+        values["TPEN_PLACEMENT_DECLARED_DEVICES"] = ",".join(devices)
+    prepared = PreparedPythonEnvironment(sys.executable, env=values)
+    group = _group()
+    configured = _configured(tmp_path)
+    fence = SimpleNamespace(attempt_id=AttemptId("attempt-a"), output_dir=str(tmp_path / "output"))
+    if not explicit:
+        with pytest.raises(PlacementRefusal, match="declared device entitlement"):
+            _with_child_placement(prepared, allocation, fence, group, group.members[0], configured)
+        return
+    result = _with_child_placement(prepared, allocation, fence, group, group.members[0], configured)
+    assert result.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == ",".join(devices)
+
+
+def test_direct_worker_binding_retains_empty_cuda_visibility() -> None:
+    """D3 preserves direct-constructor compatibility for empty visibility."""
+
+    binding = WorkerBinding({"CUDA_VISIBLE_DEVICES": ""})
+    assert WorkerBinding.from_mapping(binding).env["CUDA_VISIBLE_DEVICES"] == ""
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux sched affinity")

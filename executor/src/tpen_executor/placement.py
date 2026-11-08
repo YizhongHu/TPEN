@@ -327,8 +327,6 @@ class WorkerBinding:
             key, value = item
             if type(key) is not str or not key or type(value) is not str:
                 raise BindingError("worker binding environment keys and values must be strings")
-            if not value and key != "TPEN_PLACEMENT_DECLARED_DEVICES":
-                raise BindingError("worker binding environment values must be non-empty strings")
             if key in seen:
                 raise BindingError(f"worker binding contains duplicate environment key {key!r}")
             seen.add(key)

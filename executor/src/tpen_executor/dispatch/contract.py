@@ -162,6 +162,11 @@ def _with_child_placement(
     slot_id = values.get("TPEN_SLOT_ID")
     host = values.get("TPEN_SLOT_NODE")
     cpus = values.get("TPEN_SLOT_CPUS")
+    if slot_id and host and cpus and "TPEN_PLACEMENT_DECLARED_DEVICES" not in values:
+        raise PlacementRefusal(
+            "placement-declared-devices-missing",
+            "preset slot environment is missing declared device entitlement",
+        )
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
     if not (slot_id and host and cpus):
         slots = slots_from_allocation(allocation)
@@ -420,7 +425,31 @@ def _ensure_placement_refusal_environment(
     configured: ConfiguredRun,
     refusal: PlacementRefusal,
 ) -> Any:
-    """Add a publication target when placement setup failed before overlay."""
+    """Add a publication target when placement setup failed before overlay.
+
+    Parameters
+    ----------
+    environment : PreparedPythonEnvironment or Any
+        Prepared child environment to augment. Non-prepared values are returned
+        unchanged because they cannot carry a child placement sidecar.
+    allocation, fence, group, member, configured
+        Controller-owned allocation, attempt fence, group/member identity, and
+        configured run used to bind the refusal receipt.
+    refusal : PlacementRefusal
+        Typed pre-launch placement refusal to publish through the child-side
+        placement receipt path.
+
+    Returns
+    -------
+    Any
+        The prepared environment with a sidecar target and refusal envelope,
+        or the original value when it is not a prepared environment.
+
+    Raises
+    ------
+    PlacementRefusal
+        If the placement environment cannot encode one of the required facts.
+    """
 
     if not isinstance(environment, PreparedPythonEnvironment):
         return environment
