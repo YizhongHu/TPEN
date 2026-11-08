@@ -467,18 +467,6 @@ def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple
     return tuple(items)
 
 
-def _config_leaves(value: Any, path: str = "") -> tuple[tuple[str, Any], ...]:
-    """Flatten an unresolved OmegaConf container into leaf paths and values."""
-
-    if isinstance(value, Mapping):
-        leaves: list[tuple[str, Any]] = []
-        for key, nested in value.items():
-            child = f"{path}.{key}" if path else str(key)
-            leaves.extend(_config_leaves(nested, child))
-        return tuple(leaves)
-    return ((path, value),)
-
-
 _RESOLVER_OWNED_SEED_PATHS = frozenset({"runtime.seed", "sampler.seed"})
 _RESOLVER_OWNED_SEED_SUFFIXES = (".initializer.seed",)
 _RESOLVER_OWNED_CHECKER_PREFIX = "callbacks."
@@ -706,9 +694,20 @@ def resolve_train_config(
     _set_named_initializer_seeds(cfg, model_seed)
     _set_optional_execution_seeds(cfg, streams)
     unresolved = OmegaConf.to_container(cfg, resolve=False)
-    unresolved_leaves = dict(_config_leaves(unresolved))
     for path, expected in override_items:
-        actual = unresolved_leaves.get(path, _OVERRIDE_MISSING)
+        actual: Any = unresolved
+        for segment in path.split("."):
+            if isinstance(actual, Mapping):
+                actual = actual.get(segment, _OVERRIDE_MISSING)
+            elif isinstance(actual, Sequence) and not isinstance(actual, (str, bytes, bytearray)):
+                if not segment.isdigit() or int(segment) >= len(actual):
+                    actual = _OVERRIDE_MISSING
+                else:
+                    actual = actual[int(segment)]
+            else:
+                actual = _OVERRIDE_MISSING
+            if actual is _OVERRIDE_MISSING:
+                break
         if actual != expected:
             raise TrainConfigResolutionError(
                 f"override path {path!r} was not preserved before resolution"
