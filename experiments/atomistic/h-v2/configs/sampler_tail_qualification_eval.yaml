@@ -28,7 +28,9 @@ run:
   root: experiments/atomistic/h-v2/outputs
   run_id: h-v2-sampler-tail-qualification
   dir: null
-  timezone: America/New_York
+  # Consumed only by pytest; CLAUDE.md's America/New_York convention is for
+  # experiment run configs, not test-only configs like this one (review r1 F7).
+  timezone: UTC
 
 runtime:
   seed: 940001
