@@ -432,30 +432,6 @@ def _ensure_placement_refusal_environment(
     return PreparedPythonEnvironment(environment.python, environment.setup, values)
 
 
-def _prepare_child_placement(
-    environment: Any,
-    allocation: Any,
-    fence: Any,
-    group: ReadyGroup,
-    member: Any,
-    configured: ConfiguredRun,
-) -> Any:
-    """Prepare placement and preserve a refusal before backend launch.
-
-    A controller-side refusal can be raised while constructing the overlay,
-    before the overlay containing its publication path is returned.  Normalize
-    that exception at the refusal point so Local and Parsl share the same
-    durable receipt path.
-    """
-
-    try:
-        return _with_child_placement(environment, allocation, fence, group, member, configured)
-    except PlacementRefusal as refusal:
-        return _ensure_placement_refusal_environment(
-            environment, allocation, fence, group, member, configured, refusal
-        )
-
-
 class DispatcherContract:
     """Implement admission, fencing, outcome, evidence, and segment semantics.
 
@@ -614,7 +590,7 @@ class DispatcherContract:
                 materialized = self.worker.materialize(env)
                 environment = self._worker_environment(materialized)
                 environment = _with_child_context_keys(environment, lifecycle.allocation)
-                environment = _prepare_child_placement(
+                environment = _with_child_placement(
                     environment,
                     lifecycle.allocation,
                     fence,
@@ -763,6 +739,16 @@ class DispatcherContract:
                 inspection_error.add_note(f"finish error during inspection cancellation: {finish_error!r}")
             except BaseException:
                 pass
+        if isinstance(error, PlacementRefusal):
+            environment = _ensure_placement_refusal_environment(
+                environment,
+                lifecycle.allocation,
+                fence,
+                group,
+                member,
+                configured,
+                error,
+            )
         placement_path = None
         if isinstance(environment, PreparedPythonEnvironment):
             placement_path = environment.env.get("TPEN_PLACEMENT_OUTPUT")
