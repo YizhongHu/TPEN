@@ -6,6 +6,8 @@ from .contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, Re
 from .delivery import PreparedInputBundle
 from .environments import PreparedPythonEnvironment, SourceScript
 from .results import AllocationObservation, ManifestAttempt, OutcomeReceipt, RunManifest, StartReceipt, decode_manifest, encode_manifest
+from .runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
+from .workers import ProcessOutcome, SubprocessWorker
 
 __version__ = "0.1.0"
 
@@ -31,9 +33,9 @@ def __getattr__(name: str):
 
 __all__ = [
     "__version__", "AllocationId", "AllocationObservation", "AllocationProgram",
-    "AttemptId", "BackendJobId", "ManifestAttempt", "MaterializedProgram", "OutcomeReceipt",
+    "AttemptId", "BackendJobId", "CoreRunEvidence", "EvidenceUnavailable", "ManifestAttempt", "MaterializedProgram", "OutcomeReceipt", "ProcessOutcome",
     "ProgramSpecRef", "ReadyGroup", "RunManifest", "StagedConfig", "StagedHydra",
     "PreparedInputBundle", "PreparedPythonEnvironment", "SourceScript", "StartReceipt",
-    "TaskSpec", "WorkerProgram",
+    "TaskSpec", "TPENCommand", "TPENEvidence", "SubprocessWorker", "WorkerProgram",
     "decode_manifest", "encode_manifest",
 ]
