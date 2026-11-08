@@ -766,11 +766,9 @@ class DispatcherContract:
         placement_path = None
         if isinstance(environment, PreparedPythonEnvironment):
             placement_path = environment.env.get("TPEN_PLACEMENT_OUTPUT")
-        requested_refusal = _placement_refusal_from_environment(environment)
-        if requested_refusal is None and isinstance(error, PlacementRefusal):
-            requested_refusal = error
-        if placement_path is not None or requested_refusal is not None:
+        if placement_path is not None:
             try:
+                requested_refusal = _placement_refusal_from_environment(environment)
                 if requested_refusal is not None:
                     raise requested_refusal
                 observation = read_child_placement(placement_path)
