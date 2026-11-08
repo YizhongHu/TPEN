@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import socket
 import sys
 import textwrap
 import threading
@@ -45,12 +46,15 @@ def _group(*task_ids: str) -> ReadyGroup:
 
 
 def _slots(count: int = 2) -> list[dict[str, object]]:
+    allowed = sorted(os.sched_getaffinity(0))
+    if len(allowed) < count:
+        raise RuntimeError("S1 slot fixture requires one permitted CPU per slot")
     return [
         AllocationSlot(
             f"slot-{index}",
-            "node-0",
+            socket.gethostname(),
             (str(index),),
-            (index,),
+            (allowed[index],),
             (("OMP_NUM_THREADS", index + 1),),
             (("S1_SLOT_MARKER", f"slot-{index}"),),
         ).to_dict()

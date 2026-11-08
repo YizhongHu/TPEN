@@ -27,6 +27,7 @@ import os
 from pathlib import Path
 import socket
 import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -34,12 +35,15 @@ import pytest
 from tpen_executor._codec import digest
 from tpen_executor.contracts import AllocationId, BackendJobId, AttemptId, ProgramSpecRef, ReadyGroup, TaskSpec
 from tpen_executor.allocations import ConfiguredAllocation
-from tpen_executor.dispatch.contract import _placement_receipt
+from tpen_executor.dispatch.contract import _placement_receipt, _placement_refusal_receipt, _with_child_placement
+from tpen_executor.dispatch.local import LocalDispatcher
 from tpen_executor.placement import ChildPlacementObservation, PlacementRefusal, parse_proc_start_ticks, read_child_placement
 from tpen_executor.environments import PreparedPythonEnvironment
+from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.results import ManifestAttempt, OutcomeReceipt, SciencePlacementReceipt, StartReceipt
-from tpen_executor.runners import RUN_SHIM
+from tpen_executor.runners import EvidenceUnavailable, RUN_SHIM, TPENEvidence
 from tpen_executor.storage import DirectoryStore
+from tpen_executor.placement import AllocationSlot
 from tpen_executor.workers import ProcessOutcome, SubprocessWorker
 
 
@@ -118,14 +122,26 @@ def test_t2_shim_affinity_is_before_core_import() -> None:
     assert "os.sched_getaffinity(0)" in RUN_SHIM
 
 
-def test_t3_receipt_rejects_cross_attempt_identity(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("field", "value"), [
+    ("task_id", "other-task"),
+    ("attempt_id", "other-attempt"),
+    ("group_digest", digest({"other": True})),
+    ("allocation_id", "other-allocation"),
+    ("backend_job_id", "other-job"),
+    ("slot_id", "other-slot"),
+    ("payload_digest", digest({"other": True})),
+    ("output_dir", "/elsewhere"),
+    ("host", "other-node"),
+    ("affinity", (3,)),
+])
+def test_t3_receipt_rejects_every_cross_binding_identity(tmp_path: Path, field: str, value: object) -> None:
     """T3 kills M3: accepting task-index, worker-PID, or another attempt."""
 
     group, configured, allocation, fence, environment = _receipt_inputs(tmp_path)
-    observation = _observation(tmp_path, attempt_id="other-attempt")
+    observation = _observation(tmp_path, **{field: value})
     receipt = _placement_receipt(observation, allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((sys.executable,), 0, "", "", False, 1234, 55))
     assert receipt.refusal is not None
-    assert receipt.refusal["code"] == "placement-identity-mismatch"
+    assert receipt.refusal["code"] in {"placement-identity-mismatch", "placement-affinity-mismatch"}
 
 
 def test_t5_cpu_path_is_explicitly_unavailable_for_gpu(tmp_path: Path) -> None:
@@ -297,6 +313,39 @@ def test_f8_shim_exposes_affinity_refusal(tmp_path: Path) -> None:
     assert b"child-placement-refused" in (tmp_path / "err.log").read_bytes()
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux /proc and sched affinity")
+def test_f8_real_shim_applies_a_strict_permitted_cpu_subset(tmp_path: Path) -> None:
+    """F8/M8: the science child, not the controller, applies a permitted subset."""
+
+    allowed = sorted(os.sched_getaffinity(0))
+    if len(allowed) < 2:
+        pytest.skip("needs at least two permitted CPUs")
+    package = tmp_path / "pkg" / "tpen"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "run.py").write_text("def main(argv):\n    return 0\n", encoding="utf-8")
+    sidecar = tmp_path / "child-placement.json"
+    environment = PreparedPythonEnvironment(sys.executable, None, {
+        "PYTHONPATH": str(package.parent),
+        "TPEN_PLACEMENT_OUTPUT": str(sidecar),
+        "TPEN_PLACEMENT_DECLARED_CPUS": str(allowed[0]),
+        "TPEN_PLACEMENT_DECLARED_HOST": socket.gethostname(),
+    })
+    outcome = SubprocessWorker().run(
+        environment,
+        ("-c", RUN_SHIM, f"run.root={tmp_path}", "run.run_id=core"),
+        cwd=tmp_path,
+        stdout_path=tmp_path / "out.log",
+        stderr_path=tmp_path / "err.log",
+    )
+    assert outcome.returncode == 0
+    observed = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert observed["refusal"] is None
+    assert observed["affinity"] == [allowed[0]]
+    assert observed["pid"] == outcome.pid
+    assert observed["proc_start_ticks"] == outcome.proc_start_ticks
+
+
 def test_f9_receipt_rejects_unknown_comparison_state() -> None:
     """F9 kills M9: comparison fields cannot carry an unreviewed state."""
 
@@ -309,3 +358,189 @@ def test_f9_receipt_rejects_unknown_comparison_state() -> None:
             {"status": "unavailable", "reason": "cpu", "method": "test", "started_at_utc": "now", "finished_at_utc": "now", "samples": [], "active_uuids": [], "active_pci": []},
             {"host": "matched", "affinity": "matched", "device": "not-a-state"},
         )
+
+
+def _stub_package(tmp_path: Path) -> Path:
+    """Create a minimal child-only ``tpen`` package for RUN_SHIM tests."""
+
+    package = tmp_path / "stub" / "tpen"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "run.py").write_text(
+        textwrap.dedent(
+            """
+            import json
+            from pathlib import Path
+
+            def main(argv):
+                values = dict(item.split('=', 1) for item in argv if '=' in item)
+                core = Path(values['run.root']) / values['run.run_id']
+                core.mkdir(parents=True, exist_ok=True)
+                (core / 'evidence.json').write_text(json.dumps({
+                    'schema': 'tpen.run-evidence/v1',
+                    'run_dir': str(core),
+                    'verdict': 'completed',
+                    'run_status': 'completed',
+                    'checkpoint': None,
+                    'refusal': None,
+                }), encoding='utf-8')
+                return 0
+            """
+        ),
+        encoding="utf-8",
+    )
+    return package.parent
+
+
+def _slot_allocation(slot: AllocationSlot) -> ConfiguredAllocation:
+    return ConfiguredAllocation(
+        AllocationId("allocation-a"),
+        BackendJobId("job-a"),
+        {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot.to_dict()]}},
+    )
+
+
+def test_c1a_refusal_receipt_is_constructible(tmp_path: Path) -> None:
+    """C1/M1a: a missing sidecar is a valid refused placement receipt."""
+
+    group, configured, allocation, fence, environment = _receipt_inputs(tmp_path)
+    receipt = _placement_refusal_receipt(
+        PlacementRefusal("placement-missing", "child placement sidecar is unavailable"),
+        allocation,
+        fence,
+        group,
+        group.members[0],
+        configured,
+        environment,
+        ProcessOutcome((sys.executable,), 1, "", "", False, None, None),
+    )
+    assert receipt.refusal == {"code": "placement-missing", "reason": "child placement sidecar is unavailable"}
+    assert dict(receipt.comparison) == {"host": "refused", "affinity": "refused", "device": "unavailable"}
+
+
+def test_c1b_local_missing_sidecar_records_refusal_and_continues(tmp_path: Path) -> None:
+    """C1/M1b: one missing sidecar does not abort later members."""
+
+    cpu = min(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else 0
+    slot = AllocationSlot("slot-a", socket.gethostname(), (), (cpu,), (), ())
+
+    class Process:
+        def run(self, environment, args, **kwargs):
+            del environment, args
+            return ProcessOutcome((sys.executable,), 0, kwargs["stdout_path"], kwargs["stderr_path"], False)
+
+    evidence = SimpleNamespace(read=lambda *args, **kwargs: (_ for _ in ()).throw(EvidenceUnavailable("none")))
+    worker = SimpleNamespace(
+        materialize=lambda env: {
+            "environment": PreparedPythonEnvironment(sys.executable),
+            "process": Process(),
+            "runner": object(),
+            "evidence": evidence,
+        }
+    )
+    group = ReadyGroup(
+        "s2b1-two",
+        tuple(TaskSpec(task, task, ProgramSpecRef({}, digest({})), digest(task), 1, "steps") for task in ("a", "b")),
+        digest({"group": "s2b1-two"}),
+    )
+    runs = {}
+    for task in ("a", "b"):
+        config = tmp_path / f"{task}.yaml"
+        config.write_text("ok\n", encoding="utf-8")
+        from tpen_executor.tasks import ConfiguredRun
+        runs[task] = ConfiguredRun(task, str(config), (f"payload.task={task}",))
+    lifecycle = AttachedAllocation(_slot_allocation(slot), DirectoryStore(tmp_path / "store"))
+    manifest = LocalDispatcher(worker).run(group, runs, lifecycle)
+    assert [attempt.outcome_receipt.status for attempt in manifest.attempts] == ["completed", "completed"]
+    assert all(attempt.placement_receipt is not None for attempt in manifest.attempts)
+    assert all(attempt.placement_receipt.refusal["code"] == "placement-missing" for attempt in manifest.attempts)
+
+
+def test_c1c_cancellation_is_preserved_with_refusal_receipt(tmp_path: Path) -> None:
+    """C1/M1c: receipt construction cannot replace owner cancellation."""
+
+    cpu = min(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else 0
+    slot = AllocationSlot("slot-a", socket.gethostname(), (), (cpu,), (), ())
+
+    class Process:
+        def run(self, environment, args, **kwargs):
+            del environment, args, kwargs
+            raise KeyboardInterrupt("cancel before child spawn")
+
+    worker = SimpleNamespace(
+        materialize=lambda env: {
+            "environment": PreparedPythonEnvironment(sys.executable),
+            "process": Process(),
+            "runner": object(),
+            "evidence": TPENEvidence(),
+        }
+    )
+    group = _group()
+    lifecycle = AttachedAllocation(_slot_allocation(slot), DirectoryStore(tmp_path / "store"))
+    with pytest.raises(KeyboardInterrupt, match="cancel before child spawn"):
+        LocalDispatcher(worker).run(group, {"task-a": _configured(tmp_path)}, lifecycle)
+    manifest = lifecycle.store.manifest(group)
+    assert manifest.attempts[0].outcome_receipt.status == "failed"
+    assert manifest.attempts[0].placement_receipt.refusal["code"] == "placement-missing"
+
+
+def test_c2a_cpu_only_slot_gets_a_valid_overlay(tmp_path: Path) -> None:
+    """C2/M2a: an empty device entitlement is valid CPU placement input."""
+
+    group = _group()
+    configured = _configured(tmp_path)
+    fence = SimpleNamespace(attempt_id=AttemptId("attempt-a"), output_dir=str(tmp_path / "output"))
+    cpu = min(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else 0
+    allocation = _slot_allocation(AllocationSlot("slot-a", socket.gethostname(), (), (cpu,), (), ()))
+    environment = _with_child_placement(
+        PreparedPythonEnvironment(sys.executable, None, {}), allocation, fence, group, group.members[0], configured
+    )
+    assert environment.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == ""
+    assert environment.env["TPEN_PLACEMENT_DECLARED_CPUS"] == str(cpu)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux /proc and sched affinity")
+def test_c2b_cpu_only_real_child_publishes_matched_receipt(tmp_path: Path) -> None:
+    """C2/M2b: the real CPU-only child reaches core and publishes placement."""
+
+    cpu = min(os.sched_getaffinity(0))
+    package = _stub_package(tmp_path)
+    environment = PreparedPythonEnvironment(sys.executable, env={"PYTHONPATH": str(package)})
+    worker = SimpleNamespace(
+        materialize=lambda env: {
+            "environment": environment,
+            "process": SubprocessWorker(),
+            "runner": object(),
+            "evidence": TPENEvidence(),
+        }
+    )
+    group = _group()
+    lifecycle = AttachedAllocation(
+        _slot_allocation(AllocationSlot("slot-a", socket.gethostname(), (), (cpu,), (), ())),
+        DirectoryStore(tmp_path / "store"),
+    )
+    manifest = LocalDispatcher(worker).run(group, {"task-a": _configured(tmp_path)}, lifecycle)
+    attempt = manifest.attempts[0]
+    assert attempt.outcome_receipt.status == "completed"
+    assert attempt.placement_receipt is not None
+    assert attempt.placement_receipt.refusal is None
+    assert dict(attempt.placement_receipt.comparison) == {"host": "matched", "affinity": "matched", "device": "unavailable"}
+
+
+def test_m1_short_and_fqdn_hosts_compare_canonically(tmp_path: Path) -> None:
+    """M1: raw host labels are retained while short/FQDN comparison matches."""
+
+    group, configured, allocation, fence, environment = _receipt_inputs(tmp_path)
+    receipt = _placement_receipt(
+        _observation(tmp_path, group_digest=group.identity, host="node-a.example.org"),
+        allocation,
+        fence,
+        group,
+        group.members[0],
+        configured,
+        environment,
+        ProcessOutcome((sys.executable,), 0, "", "", False, 1234, 55),
+    )
+    assert receipt.refusal is None
+    assert receipt.child["host"] == "node-a.example.org"
+    assert receipt.declared["host"] == "node-a"

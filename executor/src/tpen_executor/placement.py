@@ -40,6 +40,20 @@ class PlacementRefusal(ValueError):
 
 CHILD_PLACEMENT_SCHEMA = "tpen-executor/child-placement-v1"
 PLACEMENT_OUTPUT_ENV = "TPEN_PLACEMENT_OUTPUT"
+PLACEMENT_REFUSAL_ENV = "TPEN_PLACEMENT_REFUSAL"
+
+
+def canonical_host(value: str) -> str:
+    """Return the stable short-host key used for placement comparisons.
+
+    Raw host values remain in the sidecar and receipt. The comparison key
+    removes case, a trailing dot, and an optional DNS suffix so a scheduler's
+    short node label can match the child's FQDN without hiding the originals.
+    """
+
+    if type(value) is not str or not value.strip():
+        raise PlacementRefusal("invalid-host", "placement host must be non-empty text")
+    return value.strip().lower().rstrip(".").split(".", 1)[0]
 
 
 def parse_proc_start_ticks(pid: int, stat_text: str | None = None) -> int:
@@ -221,7 +235,7 @@ def placement_environment(base: Mapping[str, str], **values: str) -> dict[str, s
 
     result = dict(base)
     for key, value in values.items():
-        if type(value) is not str or not value:
+        if type(value) is not str or (not value and key != "TPEN_PLACEMENT_DECLARED_DEVICES"):
             raise PlacementRefusal("invalid-placement-fact", f"placement fact {key!r} must be non-empty text")
         result[key] = value
     return result

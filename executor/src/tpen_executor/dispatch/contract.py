@@ -18,7 +18,10 @@ from ..lifecycle.attached import AttachedAllocation
 from ..results import RunManifest, SciencePlacementReceipt
 from ..placement import (
     PLACEMENT_OUTPUT_ENV,
+    PLACEMENT_REFUSAL_ENV,
     PlacementRefusal,
+    canonical_host,
+    parse_cpu_set,
     placement_environment,
     read_child_placement,
     slots_from_allocation,
@@ -150,8 +153,6 @@ def _with_child_placement(
     host = values.get("TPEN_SLOT_NODE")
     cpus = values.get("TPEN_SLOT_CPUS")
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
-    if slot_id and host and cpus and not devices:
-        devices = values.get("CUDA_VISIBLE_DEVICES", "")
     if not (slot_id and host and cpus):
         slots = slots_from_allocation(allocation)
         if len(slots) != 1:
@@ -162,25 +163,57 @@ def _with_child_placement(
         slot_id, host, cpus = slot.slot_id, slot.node, ",".join(str(cpu) for cpu in slot.cpus)
         devices = ",".join(slot.devices)
         values.update(slot.env)
+    declared_cpus = parse_cpu_set(cpus)
+    controller_refusal: dict[str, str] | None = None
+    try:
+        permitted_cpus = set(os.sched_getaffinity(0))
+    except (AttributeError, OSError) as error:
+        controller_refusal = {
+            "code": "placement-controller-affinity-unavailable",
+            "reason": f"controller CPU affinity is unavailable: {error}",
+        }
+    else:
+        if not set(declared_cpus).issubset(permitted_cpus):
+            controller_refusal = {
+                "code": "placement-cpu-outside-controller-affinity",
+                "reason": "declared slot CPUs are not all permitted to this controller",
+            }
     payload_digest = digest({"config": configured.config, "overrides": list(configured.overrides)})
-    values = placement_environment(
-        values,
-        **{
-            PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
-            "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
-            "TPEN_PLACEMENT_TASK_ID": member.task_id,
-            "TPEN_PLACEMENT_ATTEMPT_ID": fence.attempt_id.value,
-            "TPEN_PLACEMENT_GROUP_DIGEST": group.identity,
-            "TPEN_PLACEMENT_ALLOCATION_ID": allocation.allocation_id.value,
-            "TPEN_PLACEMENT_BACKEND_JOB_ID": allocation.backend_job_id.value,
-            "TPEN_PLACEMENT_SLOT_ID": slot_id,
-            "TPEN_PLACEMENT_DECLARED_HOST": host,
-            "TPEN_PLACEMENT_DECLARED_CPUS": cpus,
-            "TPEN_PLACEMENT_DECLARED_DEVICES": devices,
-            "TPEN_PLACEMENT_PAYLOAD_DIGEST": payload_digest,
-        },
-    )
+    placement_values = {
+        PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
+        "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
+        "TPEN_PLACEMENT_TASK_ID": member.task_id,
+        "TPEN_PLACEMENT_ATTEMPT_ID": fence.attempt_id.value,
+        "TPEN_PLACEMENT_GROUP_DIGEST": group.identity,
+        "TPEN_PLACEMENT_ALLOCATION_ID": allocation.allocation_id.value,
+        "TPEN_PLACEMENT_BACKEND_JOB_ID": allocation.backend_job_id.value,
+        "TPEN_PLACEMENT_SLOT_ID": slot_id,
+        "TPEN_PLACEMENT_DECLARED_HOST": host,
+        "TPEN_PLACEMENT_DECLARED_CPUS": ",".join(str(cpu) for cpu in declared_cpus),
+        "TPEN_PLACEMENT_DECLARED_DEVICES": devices,
+        "TPEN_PLACEMENT_PAYLOAD_DIGEST": payload_digest,
+    }
+    if controller_refusal is not None:
+        placement_values[PLACEMENT_REFUSAL_ENV] = json.dumps(controller_refusal, sort_keys=True)
+    values = placement_environment(values, **placement_values)
     return PreparedPythonEnvironment(environment.python, environment.setup, values)
+
+
+def _placement_refusal_from_environment(environment: Any) -> PlacementRefusal | None:
+    """Decode a controller-side placement refusal carried to completion."""
+
+    if not isinstance(environment, PreparedPythonEnvironment):
+        return None
+    encoded = environment.env.get(PLACEMENT_REFUSAL_ENV)
+    if encoded is None:
+        return None
+    try:
+        refusal = json.loads(encoded)
+        if type(refusal) is not dict or set(refusal) != {"code", "reason"}:
+            raise ValueError("placement refusal has invalid keys")
+        return PlacementRefusal(refusal["code"], refusal["reason"])
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        return PlacementRefusal("placement-refusal-malformed", str(error))
 
 
 def _placement_receipt(
@@ -223,8 +256,8 @@ def _placement_receipt(
             "reason": "child sidecar PID/start token does not match the spawned live process",
         }
     expected_host = values.get("TPEN_SLOT_NODE")
-    expected_cpus = tuple(sorted(int(item) for item in values.get("TPEN_SLOT_CPUS", "").split(",") if item))
-    host_match = expected_host is not None and observation.host == expected_host
+    expected_cpus = parse_cpu_set(values.get("TPEN_SLOT_CPUS", ""))
+    host_match = expected_host is not None and canonical_host(observation.host) == canonical_host(expected_host)
     affinity_match = expected_cpus == observation.affinity
     if not host_match or not affinity_match:
         refusal = refusal or {
@@ -501,6 +534,9 @@ class DispatcherContract:
                     member,
                     configured,
                 )
+                placement_refusal = _placement_refusal_from_environment(environment)
+                if placement_refusal is not None:
+                    raise placement_refusal
                 process = materialized["process"]
                 materialized["runner"]
                 evidence = materialized["evidence"]
@@ -644,6 +680,9 @@ class DispatcherContract:
             placement_path = environment.env.get("TPEN_PLACEMENT_OUTPUT")
         if placement_path is not None:
             try:
+                requested_refusal = _placement_refusal_from_environment(environment)
+                if requested_refusal is not None:
+                    raise requested_refusal
                 observation = read_child_placement(placement_path)
                 receipt = _placement_receipt(
                     observation,
@@ -658,6 +697,17 @@ class DispatcherContract:
             except PlacementRefusal as placement_error:
                 receipt = _placement_refusal_receipt(
                     placement_error,
+                    lifecycle.allocation,
+                    fence,
+                    group,
+                    member,
+                    configured,
+                    environment,
+                    outcome,
+                )
+            except (TypeError, ValueError) as placement_error:
+                receipt = _placement_refusal_receipt(
+                    PlacementRefusal("placement-receipt-invalid", str(placement_error)),
                     lifecycle.allocation,
                     fence,
                     group,

@@ -10,7 +10,7 @@ from .contracts import AllocationId, AttemptId, BackendJobId
 from ._records import frozen_record
 
 OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed"})
-PLACEMENT_COMPARISON_STATES = frozenset({"matched", "mismatch", "unavailable"})
+PLACEMENT_COMPARISON_STATES = frozenset({"matched", "mismatch", "unavailable", "refused"})
 
 
 def _identity(value: Any, cls: type, name: str) -> Any:
@@ -220,8 +220,10 @@ class SciencePlacementReceipt:
             if set(value) != expected_sections[name]:
                 raise ValueError(f"{name} has invalid keys")
         child = self.child
-        if type(child["host"]) is not str or not child["host"] or type(child["pid"]) is not int or child["pid"] <= 0:
+        if type(child["host"]) is not str or not child["host"] or type(child["pid"]) is not int or child["pid"] < 0:
             raise TypeError("child host and pid are invalid")
+        if child["pid"] == 0 and self.refusal is None:
+            raise TypeError("child pid must be positive unless placement was refused")
         if type(child["proc_start_ticks"]) is not int or child["proc_start_ticks"] < 0:
             raise TypeError("child proc_start_ticks must be a nonnegative integer")
         if isinstance(child["affinity"], (str, bytes, bytearray)) or not isinstance(child["affinity"], Sequence):

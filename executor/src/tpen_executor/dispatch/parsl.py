@@ -18,7 +18,13 @@ from ..contracts import ReadyGroup
 from ..lifecycle.attached import AttachedAllocation
 from ..tasks import ConfiguredRun
 from ..workers import ProcessOutcome, SubprocessWorker
-from .contract import DispatcherContract, _member_paths, _with_child_context_keys, _with_child_placement
+from .contract import (
+    DispatcherContract,
+    _member_paths,
+    _placement_refusal_from_environment,
+    _with_child_context_keys,
+    _with_child_placement,
+)
 
 
 class ParslUnavailableError(RuntimeError):
@@ -339,6 +345,24 @@ class ParslDispatcher(DispatcherContract):
                     member,
                     configured,
                 )
+                placement_refusal = _placement_refusal_from_environment(environment)
+                if placement_refusal is not None:
+                    completion_error = self._complete_member(
+                        group,
+                        member,
+                        configured,
+                        lifecycle,
+                        fence,
+                        materialized,
+                        environment,
+                        None,
+                        timeout,
+                        error=placement_refusal,
+                    )
+                    if completion_error is not None and finish_error is None:
+                        finish_error = completion_error
+                    available.append(binding)
+                    return
                 process = materialized["process"]
                 materialized["runner"]
                 evidence = materialized["evidence"]
