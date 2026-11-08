@@ -297,22 +297,35 @@ class TrajectoryRecordArtifact:
 
     def _validate_serialized_metadata(self) -> None:
         metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        atoms = self.atomic_configuration
         expected_scalars = {
             "schema": TRAJECTORY_RECORD_SCHEMA,
+            "row_semantics": "complete_draw_walker_grid",
             "csv_filename": self.path.name,
             "observable": self.observable,
             "draw_count": self.n_draws,
             "walker_count": self.n_walkers,
+            "draw_stride": self.draw_stride,
+            "burn_in_draws": self.burn_in_draws,
+            "n_electrons": self.n_electrons,
+            "spatial_dim": self.spatial_dim,
+            "term_names": list(self.term_names),
             "row_count": self.row_count,
             "finite_count": self.finite_count,
             "nonfinite_count": self.nonfinite_count,
+            "mean": _json_float(self.mean),
+            "variance": _json_float(self.variance),
             "observable_values_content_id": self.observable_values_content_id,
             "csv_sha256": self.csv_sha256,
             "byte_count": self.byte_count,
-            "atomic_configuration_id": self.atomic_configuration.content_id(),
+            "atomic_configuration_id": atoms.content_id(),
+            "atomic_configuration": {
+                "positions": atoms.positions.detach().to(torch.float64).cpu().tolist(),
+                "charges": atoms.charges.detach().to(torch.float64).cpu().tolist(),
+            },
         }
         for key, expected in expected_scalars.items():
-            if metadata.get(key) != expected:
+            if key not in metadata or metadata[key] != expected:
                 raise ValueError(f"trajectory record metadata {key!r} disagrees with typed manifest")
 
 
