@@ -145,8 +145,14 @@ code. Restore itself (the real `Evaluate` runner's model-only
 `tpen.checkpoint.restore.restore_checkpoint` path) is instead covered
 honestly by the core integration test, which builds a genuine checkpoint
 directly with `tpen.checkpoint.save.save_checkpoint` -- core test code may do
-that freely -- and restores it through the same `load:` config block. It
-does not exercise optimizer/trainer/sampler/RNG restore, because this module
+that freely -- and restores it through the same `load:` config block. The
+foreign-state-dict test,
+`test_model_only_restore_applies_the_checkpoint_state_dict_to_the_live_model`
+in `tests/integration/evaluation/test_hydrogen_exact_evaluation.py`, is the
+one that proves the load reaches the live model: it restores a checkpoint
+saved from an unrelated `torch.nn.Linear` module and asserts strict loading
+rejects the foreign state dict, which could not happen if the restore were a
+no-op. It does not exercise optimizer/trainer/sampler/RNG restore, because this module
 has none of that state to restore; that part of the restore surface remains
 covered only by a learned-model run (the short learned route in parts (e)/(f)
 above).

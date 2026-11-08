@@ -108,6 +108,11 @@ CONFIG_PATH = FIXTURES / "exact_eval.yaml"
 # statistics this test pins; the final-draw JSONL metric below is kept
 # only as an exact recomputation from its own rows, not compared to the
 # analytic target.
+#
+# Exposure: these bands were chosen after the ten-seed sweep in review job
+# 58746188, which also certifies them, while the analytic targets were
+# known before measuring -- the bands are post hoc with respect to that
+# sweep.
 ALPHA_1_2_MEAN = -0.48
 ALPHA_1_2_VARIANCE = 0.0576
 ALPHA_1_2_MEDIAN = -0.540498
@@ -116,64 +121,20 @@ N_WALKERS = 1024
 N_DRAWS = 64
 
 
-def _build_model_only_checkpoint(tmp_path: Path, cfg: Any) -> Path:
-    """Save a genuine model-only checkpoint of the exact, parameterless module."""
+def _build_model_only_checkpoint(tmp_path: Path, cfg: Any, model: Any = None) -> Path:
+    """Save a model-only checkpoint.
 
-    model = instantiate(cfg.model)
-    artifact_manager = ArtifactManager(
-        tmp_path / "checkpoint-source",
-        experiment="hydrogen_exact",
-        sector="atomistic",
-        run_id="checkpoint-source",
-        layout="flat",
-    )
-    artifact_manager.make_dirs()
-    metadata = RunMetadata(
-        run_id="checkpoint-source",
-        run_name="checkpoint-source",
-        timestamp="2026-11-07T00:00:00+00:00",
-        timezone="UTC",
-        git_commit="checkpoint-source",
-        git_branch="agent/h-v2-exact-canary",
-        dirty_worktree=False,
-        command="pytest",
-        config_path=str(CONFIG_PATH),
-        resolved_config_path=str(artifact_manager.path("resolved_config.yaml")),
-        run_dir=str(artifact_manager.run_dir),
-        device="cpu",
-        dtype="float64",
-    )
-    context = RunContext(
-        cfg=cfg,
-        source_cfg=cfg,
-        artifact_manager=artifact_manager,
-        metadata=metadata,
-        clock=RunClock(timezone="UTC", tzinfo=UTC),
-    )
-    return save_checkpoint(
-        output_dir=tmp_path / "checkpoint-source" / "checkpoints",
-        next_iteration=0,
-        completed_updates=0,
-        model=model,
-        context=context,
-        save_optimizer=False,
-        save_trainer=False,
-        save_sampler=False,
-        save_rng=False,
-    )
-
-
-def _build_foreign_model_checkpoint(tmp_path: Path, cfg: Any) -> Path:
-    """Build a model-only checkpoint whose payload has foreign state keys.
-
-    Unlike `_build_model_only_checkpoint`, this saves a `torch.nn.Linear`
-    module, so `model.pt` carries real, non-empty state-dict keys that
-    `HydrogenExact` does not have. Restoring this checkpoint into a
+    By default this saves a genuine checkpoint of the exact, parameterless
+    `HydrogenExact` module. Passing `model` overrides the saved module -- used
+    to build a checkpoint with foreign state-dict keys, e.g. a
+    `torch.nn.Linear`, so `model.pt` carries real, non-empty state-dict keys
+    that `HydrogenExact` does not have. Restoring such a checkpoint into a
     `HydrogenExact` run must raise under `strict=True` loading -- a no-op
     restore would let the run proceed.
     """
 
-    model = torch.nn.Linear(1, 1).double()
+    if model is None:
+        model = instantiate(cfg.model)
     artifact_manager = ArtifactManager(
         tmp_path / "checkpoint-source",
         experiment="hydrogen_exact",
@@ -367,7 +328,9 @@ def test_model_only_restore_applies_the_checkpoint_state_dict_to_the_live_model(
     config["run"]["root"] = str(tmp_path)
     config["run"]["run_id"] = "foreign-state"
     cfg = OmegaConf.create(config)
-    checkpoint_dir = _build_foreign_model_checkpoint(tmp_path, cfg)
+    checkpoint_dir = _build_model_only_checkpoint(
+        tmp_path, cfg, model=torch.nn.Linear(1, 1).double()
+    )
     config["load"]["path"] = str(checkpoint_dir)
 
     with pytest.raises(RuntimeError, match="Unexpected key"):

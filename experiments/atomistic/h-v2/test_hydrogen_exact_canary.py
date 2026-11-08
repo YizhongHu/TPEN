@@ -137,6 +137,11 @@ pytestmark = pytest.mark.integration
 # (see `test_imperfect_state_matches_closed_form_analytic_controls`), never
 # compared to the analytic target directly. The W statistic (rel=0.3) was
 # also robust (2.25 to 2.47) and is unaffected by this change.
+#
+# Exposure: these bands were chosen after the ten-seed sweep in review job
+# 58746188, which also certifies them, while the analytic targets were
+# known before measuring -- the bands are post hoc with respect to that
+# sweep.
 ALPHA_1_2_MEAN = -0.48
 ALPHA_1_2_VARIANCE = 0.0576
 ALPHA_1_2_MEDIAN = -0.540498
