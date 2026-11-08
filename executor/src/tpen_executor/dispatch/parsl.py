@@ -337,6 +337,7 @@ class ParslDispatcher(DispatcherContract):
                 materialized = self.worker.materialize(env)
                 environment = self._worker_environment(materialized, binding)
                 environment = _with_child_context_keys(environment, lifecycle.allocation)
+                # _with_child_placement is normalized by the shared wrapper.
                 environment = _prepare_child_placement(
                     environment,
                     lifecycle.allocation,
