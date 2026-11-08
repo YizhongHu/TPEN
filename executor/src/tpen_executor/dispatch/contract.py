@@ -155,7 +155,7 @@ def _with_child_placement(
     payload_digest = digest({"config": configured.config, "overrides": list(configured.overrides)})
     values.update(
         {
-            "TPEN_PLACEMENT_OUTPUT": os.path.join(fence.output_dir, "placement.json"),
+            "TPEN_PLACEMENT_OUTPUT": os.path.join(fence.output_dir, "child-placement.json"),
             "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
             "TPEN_PLACEMENT_TASK_ID": member.task_id,
             "TPEN_PLACEMENT_ATTEMPT_ID": fence.attempt_id.value,
@@ -180,6 +180,7 @@ def _placement_receipt(
     member: Any,
     configured: ConfiguredRun,
     environment: Any,
+    process_outcome: Any = None,
 ) -> SciencePlacementReceipt:
     """Validate a quiescent child sidecar and convert it to a receipt."""
 
@@ -203,6 +204,13 @@ def _placement_receipt(
         refusal = {"code": "placement-identity-mismatch", "reason": f"child sidecar identity mismatch: {failed}"}
     if observation.proc_start_ticks <= 0:
         refusal = refusal or {"code": "placement-start-token-missing", "reason": "child start ticks are missing"}
+    expected_pid = getattr(process_outcome, "pid", None)
+    expected_ticks = getattr(process_outcome, "proc_start_ticks", None)
+    if observation.pid != expected_pid or observation.proc_start_ticks != expected_ticks:
+        refusal = refusal or {
+            "code": "placement-generation-mismatch",
+            "reason": "child sidecar PID/start token does not match the spawned live process",
+        }
     expected_host = values.get("TPEN_SLOT_NODE")
     expected_cpus = tuple(sorted(int(item) for item in values.get("TPEN_SLOT_CPUS", "").split(",") if item))
     host_match = expected_host is not None and observation.host == expected_host
@@ -251,6 +259,68 @@ def _placement_receipt(
             "device": "unavailable",
         },
         refusal,
+    )
+
+
+def _placement_refusal_receipt(
+    observation_error: PlacementRefusal,
+    allocation: Any,
+    fence: Any,
+    group: ReadyGroup,
+    member: Any,
+    configured: ConfiguredRun,
+    environment: Any,
+    process_outcome: Any,
+) -> SciencePlacementReceipt:
+    """Encode a missing or malformed child sidecar as explicit refusal evidence."""
+
+    if not isinstance(environment, PreparedPythonEnvironment):
+        raise PlacementRefusal("placement-environment", "child environment is not a prepared Python environment")
+    values = environment.env
+    try:
+        declared_cpus = [int(item) for item in values.get("TPEN_SLOT_CPUS", "").split(",") if item]
+    except ValueError:
+        declared_cpus = []
+    if not declared_cpus:
+        declared_cpus = [0]
+    declared_devices = [item for item in values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "").split(",") if item]
+    pid = getattr(process_outcome, "pid", None)
+    ticks = getattr(process_outcome, "proc_start_ticks", None)
+    return SciencePlacementReceipt(
+        member.task_id,
+        fence.attempt_id,
+        group.identity,
+        allocation.allocation_id.value,
+        allocation.backend_job_id.value,
+        values.get("TPEN_SLOT_ID", "unavailable"),
+        digest({"config": configured.config, "overrides": list(configured.overrides)}),
+        fence.output_dir,
+        {
+            "host": values.get("TPEN_SLOT_NODE", "unknown"),
+            "pid": pid if type(pid) is int and pid > 0 else 1,
+            "proc_start_ticks": ticks if type(ticks) is int and ticks >= 0 else 0,
+            "affinity": [],
+            "thread_settings": {name: values.get(name) for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS")},
+            "cuda_visible_devices": values.get("CUDA_VISIBLE_DEVICES"),
+            "observed_at_utc": _utc_now(),
+        },
+        {
+            "host": values.get("TPEN_SLOT_NODE", "unknown"),
+            "cpus": declared_cpus,
+            "devices": declared_devices,
+        },
+        {
+            "status": "unavailable",
+            "reason": "active GPU sampler is owned by S2b-2",
+            "method": "s2b-1-child-generation-no-sampler",
+            "started_at_utc": _utc_now(),
+            "finished_at_utc": _utc_now(),
+            "samples": [],
+            "active_uuids": [],
+            "active_pci": [],
+        },
+        {"host": "refused", "affinity": "refused", "device": "unavailable"},
+        observation_error.to_dict(),
     )
 
 
@@ -564,14 +634,31 @@ class DispatcherContract:
         if placement_path is not None:
             try:
                 observation = read_child_placement(placement_path)
-                receipt = _placement_receipt(observation, lifecycle.allocation, fence, group, member, configured, environment)
+                receipt = _placement_receipt(
+                    observation,
+                    lifecycle.allocation,
+                    fence,
+                    group,
+                    member,
+                    configured,
+                    environment,
+                    outcome,
+                )
+            except PlacementRefusal as placement_error:
+                receipt = _placement_refusal_receipt(
+                    placement_error,
+                    lifecycle.allocation,
+                    fence,
+                    group,
+                    member,
+                    configured,
+                    environment,
+                    outcome,
+                )
+            try:
                 lifecycle.store.publish_placement(fence, receipt)
-            except PlacementRefusal:
-                # Operational completion remains separate from placement
-                # qualification; absence or mismatch is visible as no receipt.
-                pass
-            except Exception:
-                pass
+            except Exception as placement_error:
+                return placement_error
         if inspection_error is not None:
             raise inspection_error
         if (

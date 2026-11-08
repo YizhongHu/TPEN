@@ -18,7 +18,7 @@ from ..contracts import ReadyGroup
 from ..lifecycle.attached import AttachedAllocation
 from ..tasks import ConfiguredRun
 from ..workers import ProcessOutcome, SubprocessWorker
-from .contract import DispatcherContract, _member_paths, _with_child_context_keys
+from .contract import DispatcherContract, _member_paths, _with_child_context_keys, _with_child_placement
 
 
 class ParslUnavailableError(RuntimeError):
@@ -331,6 +331,14 @@ class ParslDispatcher(DispatcherContract):
                 materialized = self.worker.materialize(env)
                 environment = self._worker_environment(materialized, binding)
                 environment = _with_child_context_keys(environment, lifecycle.allocation)
+                environment = _with_child_placement(
+                    environment,
+                    lifecycle.allocation,
+                    fence,
+                    group,
+                    member,
+                    configured,
+                )
                 process = materialized["process"]
                 materialized["runner"]
                 evidence = materialized["evidence"]

@@ -14,6 +14,26 @@ from ._records import frozen_record
 from .environments import PreparedPythonEnvironment
 
 
+def _proc_start_ticks(pid: int) -> int | None:
+    """Read a live child's Linux process-generation start token."""
+
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    close = stat_text.rfind(")")
+    if close < 0:
+        return None
+    fields_after_comm = stat_text[close + 1 :].strip().split()
+    if len(fields_after_comm) <= 19:
+        return None
+    try:
+        ticks = int(fields_after_comm[19])
+    except ValueError:
+        return None
+    return ticks if ticks >= 0 else None
+
+
 @frozen_record
 class ProcessOutcome:
     """Immutable outcome of one subprocess invocation.
@@ -28,6 +48,11 @@ class ProcessOutcome:
         The two caller-named log paths.
     timed_out : bool
         Whether the process-group timeout path was taken.
+    pid : int or None
+        Spawned child PID, or ``None`` when no child was spawned.
+    proc_start_ticks : int or None
+        Linux ``/proc/<pid>/stat`` start token captured while the child was
+        live, or ``None`` when it could not be observed.
     """
 
     argv: tuple[str, ...]
@@ -35,6 +60,8 @@ class ProcessOutcome:
     stdout_path: str
     stderr_path: str
     timed_out: bool
+    pid: int | None = None
+    proc_start_ticks: int | None = None
 
 
 @frozen_record
@@ -138,6 +165,8 @@ class SubprocessWorker:
                 stderr=stderr,
                 start_new_session=True,
             )
+            spawned_pid = process.pid
+            spawned_ticks = _proc_start_ticks(spawned_pid)
             try:
                 if process_handle is not None:
                     process_handle.attach(process)
@@ -170,7 +199,7 @@ class SubprocessWorker:
             finally:
                 if process_handle is not None:
                     process_handle.clear(process)
-        return ProcessOutcome(logical_argv, returncode, stdout_name, stderr_name, timed_out)
+        return ProcessOutcome(logical_argv, returncode, stdout_name, stderr_name, timed_out, spawned_pid, spawned_ticks)
 
 
 __all__ = ["ProcessOutcome", "SubprocessWorker"]
