@@ -380,6 +380,58 @@ def _placement_refusal_receipt(
     )
 
 
+def _ensure_placement_refusal_environment(
+    environment: Any,
+    allocation: Any,
+    fence: Any,
+    group: ReadyGroup,
+    member: Any,
+    configured: ConfiguredRun,
+    refusal: PlacementRefusal,
+) -> Any:
+    """Add a publication target when placement setup failed before overlay."""
+
+    if not isinstance(environment, PreparedPythonEnvironment):
+        return environment
+    if PLACEMENT_OUTPUT_ENV in environment.env:
+        return environment
+    values = dict(environment.env)
+    slot_id = values.get("TPEN_SLOT_ID", "unavailable")
+    host = values.get("TPEN_SLOT_NODE", "unknown")
+    cpus = values.get("TPEN_SLOT_CPUS", "0")
+    try:
+        slots = slots_from_allocation(allocation)
+    except (TypeError, ValueError):
+        slots = ()
+    if len(slots) == 1:
+        slot = slots[0]
+        slot_id = slot.slot_id
+        host = slot.node
+        cpus = ",".join(str(cpu) for cpu in slot.cpus)
+        values.update(slot.env)
+    try:
+        declared_cpus = parse_cpu_set(cpus)
+    except PlacementRefusal:
+        declared_cpus = (0,)
+    placement_values = {
+        PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
+        "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
+        "TPEN_PLACEMENT_TASK_ID": member.task_id,
+        "TPEN_PLACEMENT_ATTEMPT_ID": fence.attempt_id.value,
+        "TPEN_PLACEMENT_GROUP_DIGEST": group.identity,
+        "TPEN_PLACEMENT_ALLOCATION_ID": allocation.allocation_id.value,
+        "TPEN_PLACEMENT_BACKEND_JOB_ID": allocation.backend_job_id.value,
+        "TPEN_PLACEMENT_SLOT_ID": slot_id,
+        "TPEN_PLACEMENT_DECLARED_HOST": host,
+        "TPEN_PLACEMENT_DECLARED_CPUS": ",".join(str(cpu) for cpu in declared_cpus),
+        "TPEN_PLACEMENT_DECLARED_DEVICES": values.get("TPEN_PLACEMENT_DECLARED_DEVICES", ""),
+        "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest({"config": configured.config, "overrides": list(configured.overrides)}),
+        PLACEMENT_REFUSAL_ENV: json.dumps(refusal.to_dict(), sort_keys=True),
+    }
+    values = placement_environment(values, **placement_values)
+    return PreparedPythonEnvironment(environment.python, environment.setup, values)
+
+
 class DispatcherContract:
     """Implement admission, fencing, outcome, evidence, and segment semantics.
 
@@ -687,6 +739,16 @@ class DispatcherContract:
                 inspection_error.add_note(f"finish error during inspection cancellation: {finish_error!r}")
             except BaseException:
                 pass
+        if isinstance(error, PlacementRefusal):
+            environment = _ensure_placement_refusal_environment(
+                environment,
+                lifecycle.allocation,
+                fence,
+                group,
+                member,
+                configured,
+                error,
+            )
         placement_path = None
         if isinstance(environment, PreparedPythonEnvironment):
             placement_path = environment.env.get("TPEN_PLACEMENT_OUTPUT")
