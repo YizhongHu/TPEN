@@ -28,7 +28,7 @@ run:
   root: experiments/atomistic/h-v2/outputs
   run_id: h-v2-sampler-tail-qualification
   dir: null
-  timezone: UTC
+  timezone: America/New_York
 
 runtime:
   seed: 940001
