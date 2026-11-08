@@ -20,7 +20,8 @@ from omegaconf import OmegaConf
 from tpen.artifacts import ArtifactManager, RunClock, RunContext, RunMetadata
 from tpen.callback import Checkpoint
 from tpen.callback.initial_checkpoint import InitialCheckpoint
-from tpen.checkpoint import checkpoint_step_dir_name, save_checkpoint
+from tpen.checkpoint import CheckpointRestored, checkpoint_step_dir_name, save_checkpoint
+from tpen.checkpoint.restore import RestoreReport
 from tpen.events import Occurrence, Started
 from tpen.training.events import TrainingIteration, UpdateCompleted, TrainingIterationCompleted
 from tpen.training.state import TrainerState
@@ -203,6 +204,67 @@ def test_refuses_nonzero_completed_updates_even_at_step_zero(tmp_path: Path) -> 
     assert not output_dir.exists()
 
 
+def _checkpoint_restored() -> Occurrence[CheckpointRestored]:
+    report = RestoreReport(
+        mode="train_resume",
+        checkpoint_dir="/tmp/source",
+        next_iteration=0,
+        completed_updates=0,
+        loaded_model=True,
+        loaded_optimizer=True,
+        loaded_trainer=True,
+        loaded_sampler=True,
+        loaded_rng=True,
+    )
+    return Occurrence(event=CheckpointRestored(report=report), count=1)
+
+
+def test_refuses_a_restored_lineage_even_with_zero_counters(tmp_path: Path) -> None:
+    """A `CheckpointRestored` report, not just the counters, must gate the write.
+
+    A lineage resumed from a checkpoint that was itself written at the zero
+    boundary reads `next_iteration == completed_updates == 0` and its first
+    `Started(TrainingIteration)` has `step == 0` -- exactly the state a fresh
+    lineage has. Nothing in the counters distinguishes the two cases; only
+    having actually observed a restore does. `InitialCheckpoint` subscribes to
+    `tpen.checkpoint.CheckpointRestored` (emitted by the runner strictly
+    before `TrainingIteration` can start) through a second, stateless,
+    class-owned group for exactly this reason.
+    """
+
+    context = _InitialCheckpointContext(tmp_path)
+    output_dir = tmp_path / "checkpoints"
+    callback = InitialCheckpoint(output_dir)
+    context.callbacks = [callback]
+    state = _fresh_state()
+
+    callback.handle_occurrence(_checkpoint_restored(), context, None)
+
+    with pytest.raises(ValueError, match="fresh zero-update lineage"):
+        callback.handle_occurrence(_started_iteration(0, count=1), context, state)
+
+    assert not output_dir.exists()
+
+
+def test_accepts_a_fresh_lineage_with_no_restore_report(tmp_path: Path) -> None:
+    """Positive control: with no `CheckpointRestored` ever delivered, the write proceeds.
+
+    Same wiring as the refusal test above, minus the restore occurrence, so
+    the two tests isolate exactly the restore-report signal.
+    """
+
+    context = _InitialCheckpointContext(tmp_path)
+    output_dir = tmp_path / "checkpoints"
+    callback = InitialCheckpoint(output_dir)
+    context.callbacks = [callback]
+    state = _fresh_state()
+
+    callback.handle_occurrence(_started_iteration(0, count=1), context, state)
+
+    final_dir = output_dir / checkpoint_step_dir_name(0)
+    assert (final_dir / "COMPLETE").is_file()
+
+
 def test_refuses_an_existing_checkpoint_rather_than_overwriting(tmp_path: Path) -> None:
     """An existing checkpoint at step_000000 is refused, never overwritten."""
 
@@ -256,16 +318,23 @@ def test_ignores_non_training_iteration_started_events(tmp_path: Path) -> None:
     assert not callback._written
 
 
-def test_coexists_idempotently_with_a_periodic_checkpoint_at_update_zero(tmp_path: Path) -> None:
-    """The default periodic Checkpoint callback's step-0 write is a no-op republication.
+def test_coexists_idempotently_with_a_periodic_checkpoint_at_update_zero_synthetic_counters(
+    tmp_path: Path,
+) -> None:
+    """Same-path reconciliation when a periodic write lands at update zero.
 
-    `Checkpoint._save` checks `is_complete_checkpoint_dir` before writing, and
-    with matching default (all-component) payloads an already-complete
-    directory is reconciled rather than re-written. `InitialCheckpoint` always
-    runs first (it fires on the TrainingIteration Started boundary, strictly
-    before the TrainingIterationCompleted boundary the periodic callback's
-    write is gated on), so this pins "no double write, no collision" for the
-    common default-configuration case.
+    This drives the trainer double's `UpdateCompleted`/`TrainingIterationCompleted`
+    occurrences directly while its counters still read zero -- a state a real
+    VMC run cannot reach, since the trainer advances its cursor to 1 before the
+    first `TrainingIterationCompleted` is emitted (a real run's first-update
+    checkpoint is `step_000001`, not a republication of `step_000000`; see
+    `test_initial_checkpoint_and_periodic_checkpoint_coexist_across_an_update`
+    in `tests/integration/training/test_initial_checkpoint_real_runner.py` for
+    the real-runner path). What this synthetic drive DOES pin is
+    `Checkpoint._save`'s existing `is_complete_checkpoint_dir` reconciliation
+    logic: with matching default (all-component) payloads, an already-complete
+    directory at the same path is reconciled rather than re-written, so two
+    callbacks that land on the identical step never double-write or collide.
     """
 
     output_dir = tmp_path / "checkpoints"
@@ -280,9 +349,9 @@ def test_coexists_idempotently_with_a_periodic_checkpoint_at_update_zero(tmp_pat
     final_dir = output_dir / checkpoint_step_dir_name(0)
     written_bytes = (final_dir / "model.pt").read_bytes()
 
-    # The periodic callback is armed by UpdateCompleted and writes at
-    # TrainingIterationCompleted for the same step, as it would in a real run
-    # whose first iteration actually applied an optimizer update.
+    # Synthetic: delivered directly with the trainer double's counters still
+    # at zero, which a real run's cursor has already left behind by this
+    # point. This exercises the reconciliation path, not real-run timing.
     periodic.handle_occurrence(
         Occurrence(event=UpdateCompleted(iteration=TrainingIteration(step=0)), count=1),
         context,
@@ -302,15 +371,19 @@ def test_coexists_idempotently_with_a_periodic_checkpoint_at_update_zero(tmp_pat
     assert (final_dir / "model.pt").read_bytes() == written_bytes
 
 
-def test_collides_with_a_differently_configured_periodic_checkpoint_at_update_zero(
+def test_collides_with_a_differently_configured_periodic_checkpoint_at_update_zero_synthetic_counters(
     tmp_path: Path,
 ) -> None:
-    """A periodic Checkpoint configured for a DIFFERENT payload collides loudly.
+    """Same-path collision when a differently-shaped periodic write lands at update zero.
 
-    `Checkpoint._validate_existing_publication` compares the existing
-    component set against the configured one and raises on mismatch -- this is
-    the defined collision behaviour, inherited unchanged from the periodic
-    callback, not new coupling introduced by `InitialCheckpoint`.
+    As with the reconciliation test above, this delivers the periodic
+    callback's occurrences directly while the trainer double's counters still
+    read zero -- a state a real run's cursor has already left by the time its
+    first `TrainingIterationCompleted` arrives. It pins the existing
+    `Checkpoint._validate_existing_publication` collision behaviour (raises on
+    a component-set mismatch against the existing publication), inherited
+    unchanged from the periodic callback, not new coupling introduced by
+    `InitialCheckpoint`.
     """
 
     output_dir = tmp_path / "checkpoints"
