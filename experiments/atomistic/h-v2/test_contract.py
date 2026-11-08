@@ -378,7 +378,11 @@ def test_roster_seeds_avoid_blocks_consumed_outside_the_roster() -> None:
     roster_seeds |= set(_integer_seeds(roster["training_sampler_seeds"]))
     for name, namespace in roster["non_science_seed_namespaces"].items():
         if name == "pipeline_cpu_learned_e":
-            continue  # deliberate part (e) replay by the spike, recorded as such
+            # Only training and sampler were replayed by the spike (recorded
+            # above); the evaluation seeds must still be disjoint from every
+            # consumed block.
+            roster_seeds |= set(_integer_seeds(namespace["evaluation"]))
+            continue
         roster_seeds |= set(_integer_seeds(namespace))
     roster_seeds |= _evaluation_seeds(inputs)
     assert roster_seeds.isdisjoint(consumed)
@@ -391,6 +395,27 @@ def test_pr_560_incorporation_maps_every_finding_to_a_layer() -> None:
     assert all(item["layer"] for item in findings)
     assert incorporation["preserved_tip"] == "0da2b23d628a15b18ac2031ff5f72dff0c010280"
     assert len(incorporation["hooke_only_handed_to_manager"]) == 4
+
+
+def test_green_tail_qualification_targets_follow_from_alpha() -> None:
+    """R ~ Gamma(3, 2*alpha) and E_L = -alpha^2/2 + (alpha-1)/r for psi = exp(-alpha r)."""
+
+    targets = load_inputs()["tail_characterization"]["sampler_tail_qualification"]["targets"]
+    for key, alpha in (("alpha_1", 1.0), ("alpha_1_2", 1.2)):
+        target = targets[key]
+        match = re.fullmatch(r"Gamma\(shape=(\d+), rate=([\d.]+)\)", target["radius_distribution"])
+        assert match is not None, key
+        assert int(match.group(1)) == 3
+        assert float(match.group(2)) == pytest.approx(2 * alpha, abs=1e-12)
+        energy = target["local_energy_hartree"]
+        if isinstance(energy, (int, float)):
+            assert alpha == 1.0
+            assert energy == pytest.approx(-alpha * alpha / 2, abs=1e-12)
+        else:
+            match = re.fullmatch(r"(-?[\d.]+) \+ ([\d.]+)/r", energy)
+            assert match is not None, key
+            assert float(match.group(1)) == pytest.approx(-alpha * alpha / 2, abs=1e-12)
+            assert float(match.group(2)) == pytest.approx(alpha - 1, abs=1e-12)
 
 
 def test_experiment_boundary_rule_and_run_module_trap_are_stated() -> None:

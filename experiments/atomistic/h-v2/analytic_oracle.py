@@ -121,6 +121,42 @@ def zero_event_upper_bound(n: int, confidence: float = 0.975) -> float:
     return 1.0 - (1.0 - confidence) ** (1.0 / n)
 
 
+def radial_survival(radius: float, alpha: float = 1.0) -> float:
+    """Return ``P(R > radius)`` for ``R ~ Gamma(shape=3, rate=2*alpha)``."""
+
+    return 1.0 - gamma3_cdf(radius, alpha)
+
+
+def radial_lower_tail_quantile(level: float, alpha: float = 1.0) -> float:
+    """Return the radius ``r`` such that ``P(R <= r) == level`` exactly.
+
+    Used by the sampler tail qualification: the gated lower-tail level IS the
+    exact survival value at this threshold, by construction.
+    """
+
+    return gamma3_quantile(level, alpha)
+
+
+def radial_upper_tail_quantile(level: float, alpha: float = 1.0) -> float:
+    """Return the radius ``r`` such that ``P(R > r) == level`` exactly."""
+
+    return gamma3_quantile(1.0 - level, alpha)
+
+
+def energy_exceedance_threshold(level: float, alpha: float = 1.2) -> float:
+    """Return the ``threshold`` such that ``exceedance_probability(threshold, alpha) == level`` exactly.
+
+    Inverse of :func:`exceedance_probability`, built on the same closed-form
+    bisection as :func:`closed_form_w` (``closed_form_w(alpha, probability)``
+    is the ``probability``-th quantile of ``A = abs(E_L - median(E_L))``, so
+    the ``level``-exceedance threshold is the ``1 - level`` quantile).
+    """
+
+    if not 0.0 < level < 1.0:
+        raise ValueError("level must be strictly between zero and one")
+    return closed_form_w(alpha, 1.0 - level)
+
+
 def analytic_control(alpha: float) -> dict[str, float | int | str]:
     """Return reproducible exact-state controls for one selected ``alpha``."""
 
@@ -145,10 +181,14 @@ def analytic_control(alpha: float) -> dict[str, float | int | str]:
 __all__ = [
     "analytic_control",
     "closed_form_w",
+    "energy_exceedance_threshold",
     "exceedance_probability",
     "gamma3_cdf",
     "gamma3_quantile",
     "local_energy",
+    "radial_lower_tail_quantile",
+    "radial_survival",
+    "radial_upper_tail_quantile",
     "sample_born_radii",
     "zero_event_upper_bound",
 ]
