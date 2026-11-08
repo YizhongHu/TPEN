@@ -131,7 +131,7 @@ def test_t5_cpu_path_is_explicitly_unavailable_for_gpu(tmp_path: Path) -> None:
     """T5-CPU kills M5: empty-success or fabricated GPU status is forbidden."""
 
     group, configured, allocation, fence, environment = _receipt_inputs(tmp_path)
-    receipt = _placement_receipt(_observation(tmp_path), allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((sys.executable,), 0, "", "", False, 1234, 55))
+    receipt = _placement_receipt(_observation(tmp_path, group_digest=group.identity), allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((sys.executable,), 0, "", "", False, 1234, 55))
     assert receipt.gpu["status"] == "unavailable"
     assert receipt.gpu["reason"]
     assert receipt.gpu["method"]
@@ -144,9 +144,9 @@ def test_t6_receipt_and_manifest_reference_round_trip_backward_readable(tmp_path
     """T6 kills M6: dropping start token/comparison or breaking old manifests."""
 
     group, configured, allocation, fence, environment = _receipt_inputs(tmp_path)
-    placement = _placement_receipt(_observation(tmp_path), allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((sys.executable,), 0, "", "", False, 1234, 55))
-    start = StartReceipt("task-a", fence.attempt_id, allocation.allocation_id, allocation.backend_job_id, GROUP_DIGEST, "start", fence.output_dir)
-    outcome = OutcomeReceipt("task-a", fence.attempt_id, GROUP_DIGEST, "finish", "completed", fence.output_dir)
+    placement = _placement_receipt(_observation(tmp_path, group_digest=group.identity), allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((sys.executable,), 0, "", "", False, 1234, 55))
+    start = StartReceipt("task-a", fence.attempt_id, allocation.allocation_id, allocation.backend_job_id, group.identity, "start", fence.output_dir)
+    outcome = OutcomeReceipt("task-a", fence.attempt_id, group.identity, "finish", "completed", fence.output_dir)
     manifest_attempt = ManifestAttempt("task-a", fence.attempt_id, start, outcome, fence.output_dir, placement)
     decoded = ManifestAttempt.from_mapping(manifest_attempt.to_dict())
     assert decoded.placement_receipt == placement
@@ -176,7 +176,7 @@ def test_f1_child_sidecar_and_controller_receipt_are_distinct(tmp_path: Path) ->
         "TPEN_SLOT_CPUS": "3,5",
         "TPEN_PLACEMENT_DECLARED_DEVICES": "",
     })
-    sidecar = _observation(tmp_path, output_dir=fence.output_dir)
+    sidecar = _observation(tmp_path, group_digest=group.identity, output_dir=fence.output_dir)
     sidecar_path = Path(fence.output_dir, "child-placement.json")
     sidecar_path.write_text(json.dumps(sidecar.to_dict()) + "\n", encoding="utf-8")
     store.finish_attempt(fence, "completed", "finish")
@@ -231,7 +231,7 @@ def test_f4_unbound_generation_token_is_refused(tmp_path: Path) -> None:
     """F4 kills M4: sidecar PID/start ticks must come from the spawned child."""
 
     group, configured, allocation, fence, environment = _receipt_inputs(tmp_path)
-    forged = _observation(tmp_path, pid=1, proc_start_ticks=1)
+    forged = _observation(tmp_path, group_digest=group.identity, pid=1, proc_start_ticks=1)
     receipt = _placement_receipt(forged, allocation, fence, group, group.members[0], configured, environment)
     assert receipt.refusal is not None
     assert receipt.refusal["code"] == "placement-generation-mismatch"
