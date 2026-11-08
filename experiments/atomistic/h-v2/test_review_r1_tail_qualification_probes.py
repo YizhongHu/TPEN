@@ -4,12 +4,12 @@ independent-integration checks of the radial and local-energy tail oracle
 functions in the exact gated regime, computed without calling the oracle's
 own CDF/survival machinery.
 
-**Experiment boundary.** No `tpen` import anywhere in this file's own source
-(not even transitively at module scope): `test_sampler_tail_qualification.py`
-is loaded by path, exactly as it loads `analytic_oracle`, so its `from
-tpen.run import run_from_config` does execute when that module is loaded --
-`run_from_config` is the one import the experiment boundary allows -- and its
-`pytestmark` only marks its own collected tests.
+**Experiment boundary.** No `tpen` import anywhere in this file's own source:
+`test_sampler_tail_qualification.py` is loaded by path, exactly as it loads
+`analytic_oracle`, so its `from tpen.run import run_from_config` does execute
+when that module is loaded -- `run_from_config` is the one import the
+experiment boundary allows -- and its own markers only mark its own
+collected tests.
 """
 
 from __future__ import annotations
