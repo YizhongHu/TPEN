@@ -87,14 +87,20 @@ def _context(tmp_path: Path, tag: str, *, callbacks=None) -> RunContext:
     )
 
 
-def test_checkpoint_model_matches_a_separately_constructed_model_same_seed(
+def test_checkpoint_written_before_first_sample_matches_fresh_construction(
     tmp_path: Path,
 ) -> None:
-    """The written model state equals a model built fresh with the same seed.
+    """The written model AND sampler state match fresh, never-run constructions.
 
-    Not merely "equals the running model's state after fit()": a separate
-    process constructing a model with the same seed, never touched by this
-    run, must see the identical bytes.
+    The model check alone would not catch a callback that fires after sampling
+    but before the optimizer update: `collect_samples` reads the model without
+    mutating its parameters, so the model state is unchanged either way. The
+    sampler check is what actually pins "before the first sample is drawn":
+    `MetropolisSampler.collect_samples` advances the sampler's own
+    `torch.Generator` and its burn-in bookkeeping, so a checkpoint written
+    AFTER sampling would carry an already-advanced generator state that a
+    freshly constructed (never-run) sampler, seeded the same way from config,
+    would not match.
     """
 
     output_dir = tmp_path / "checkpoints"
@@ -124,6 +130,14 @@ def test_checkpoint_model_matches_a_separately_constructed_model_same_seed(
     assert set(written_state) == set(expected_state)
     for name, expected_tensor in expected_state.items():
         assert torch.equal(written_state[name], expected_tensor), name
+
+    fresh_sampler = build_tiny_sampler()
+    written_sampler_state = torch.load(final_dir / "sampler.pt", weights_only=False)
+    expected_sampler_state = fresh_sampler.mcmc_state_dict()
+    assert written_sampler_state["has_burned_in"] == expected_sampler_state["has_burned_in"]
+    assert torch.equal(
+        written_sampler_state["generator_state"], expected_sampler_state["generator_state"]
+    )
 
 
 def test_resuming_from_it_reproduces_the_first_update_bitwise(tmp_path: Path) -> None:
@@ -165,6 +179,13 @@ def test_resuming_from_it_reproduces_the_first_update_bitwise(tmp_path: Path) ->
     sampler_b = build_tiny_sampler()
     sampler_b.load_mcmc_state_dict(torch.load(final_dir / "sampler.pt", weights_only=False))
     trainer_b = VMCTrainer(max_steps=1, log_every_n_steps=1)
+    # The update method must be bound -- which resolves `_resolved_model` --
+    # before `load_state_dict`, exactly as a real runner-driven resume does
+    # (`resolve_update_state` runs before checkpoint restore; see
+    # `tpen.training.trainer.VMCTrainer.resolve_update_state`). Loading the
+    # trainer's progress state first would hit its own
+    # "update-state resolution before restore" guard.
+    trainer_b.resolve_update_state(model=model_b, optimizer=optimizer_b)
     trainer_b.load_state_dict(
         json.loads((final_dir / "trainer.json").read_text(encoding="utf-8"))
     )
