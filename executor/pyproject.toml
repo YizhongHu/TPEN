@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tpen-executor"
+version = "0.1.0"
+description = "Independent execution boundary for TPEN workflows."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest==9.0.3",
+]
+
+[tool.uv]
+constraint-dependencies = [
+  "colorama==0.4.6",
+  "iniconfig==2.3.0",
+  "packaging==26.2",
+  "pluggy==1.6.0",
+  "pygments==2.20.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tpen_executor*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

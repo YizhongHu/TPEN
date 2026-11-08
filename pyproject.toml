@@ -157,4 +157,5 @@ norecursedirs = [
   ".agent-worktrees",
   "experiments/hooke/pair_validation",
   "experiments/hooke/pair_stability_small",
+  "executor",
 ]
