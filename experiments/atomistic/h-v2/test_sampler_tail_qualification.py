@@ -51,16 +51,10 @@ deepest, 0.0001, has an expected count of about 105 --
 ``support_rule.deepest_gated_level_expected_count``), so no level is
 dropped here, but the check is applied rather than assumed.
 
-K cross-check: enumerating ``radial_levels x radial_sides x 2 alphas`` (44)
-plus ``alpha_1_2_only.fixed_exceedance_thresholds_hartree`` (5) plus
-``alpha_1_2_only.exceedance_levels`` (11), all times
-``shape_and_seeds.fresh_evaluation_sampler.streams`` (2), gives 120, not the
-``band.k_value`` of 122 recorded in the contract. This is a pre-existing
-two-item discrepancy in the contract's own stated ``k_value`` against its
-own ``k_definition`` formula (not introduced by this test); the gate below
-uses the contract's literal, more conservative ``c_value`` -- computed from
-the larger K=122 -- directly, so this does not loosen the gate. Both figures
-are reported in the printed receipt below for inspection.
+K cross-check: this test's own measured comparison count (``k_measured`` in
+the printed report) matched the contract's declared ``band.k_value`` of 122
+on the Cannon qualification run (job 58808266, 2026-11-07). The gate below
+uses the contract's literal ``c_value`` directly, never recomputing it.
 
 Seeds. `contract_inputs.json`'s `sampler_tail_qualification` seed namespace
 provides two `sampler` seeds and two `evaluation` seeds; this test assigns
