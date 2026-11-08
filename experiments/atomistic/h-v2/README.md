@@ -71,6 +71,18 @@ pay that cost once per head). The opt-in flag only works with this documented
 invocation naming ``test_pipeline.py`` directly; a broader invocation (e.g.
 rooted at ``experiments/atomistic``) can only skip the test, not run it.
 
+The sampler tail qualification (``test_sampler_tail_qualification.py``,
+marked ``h_v2_sampler_tail_qualification``) follows the same opt-in pattern:
+four full 4,096-walker x 256-draw fresh evaluations (two alphas x two
+streams), gating the real sampler's radial and local-energy survival curves
+against the independent analytic oracle over both tails. Run it once per
+head with::
+
+    uv run pytest -q --run-h-v2-sampler-tail-qualification -m h_v2_sampler_tail_qualification experiments/atomistic/h-v2/test_sampler_tail_qualification.py
+
+The same caveat applies: the opt-in flag only works when the test file is
+named directly; a broader invocation only skips it.
+
 **Scope, not a gap.** ``tests/unit/physics/test_hydrogen_oracle_controls.py``
 already compares TPEN's real kinetic and potential code, and
 ``tests/unit/sampling/test_hydrogen_sampler_controls.py`` the real sampler
@@ -318,9 +330,10 @@ decisions, `operator-decisions-pilot-geometry-design-target-20261107` and
 the operator, quoted, "Gpu test goes on cannon" -- the pipeline check's
 excluded-seed GPU route smoke, part (g) of slice `406194c5`, moved from
 Polaris to FASRC Cannon's `gpu_test` partition (a MIG slice), and is not a
-science venue either way. D6, quoted: "the contract text for part (g) is
-restated at the next PR 587 touch: Cannon, with a cap of one GPU-hour on
-the allocated device, setup included." Slice `406194c5`'s other part, the
+science venue either way. D6, the manager's restatement, to which the
+operator answered "Yes" (quoted as typed: "6. Yes"): "the contract text for
+part (g) is restated at the next PR 587 touch: Cannon, with a cap of one
+GPU-hour on the allocated device, setup included." Slice `406194c5`'s other part, the
 Cannon capacity-and-freeze pilot (`admission.pilot`), also runs on Cannon --
 see "Two admission scopes" below.
 
