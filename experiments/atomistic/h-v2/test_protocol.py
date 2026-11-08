@@ -122,3 +122,78 @@ def test_physics_mutations_are_rejected(mutation, message) -> None:
     mutation(config)
     with pytest.raises(ValueError, match=message):
         protocol.assert_hydrogen_contract(config)
+
+
+# -----------------------------------------------------------------------------
+# Independent numeric-integration controls for the sampler tail qualification
+# (028867dc) oracle extensions: `radial_survival`, `radial_lower_tail_quantile`,
+# `radial_upper_tail_quantile`, `energy_exceedance_threshold`.  Each check below
+# recomputes the target quantity from the Gamma(shape=3, rate=2*alpha) density
+# by composite Simpson's rule, never by calling the closed-form functions
+# under test, so an error in the closed form (not just a typo in a literal)
+# would be caught here.
+# -----------------------------------------------------------------------------
+
+
+def _simpson(f, low: float, high: float, n: int) -> float:
+    """Composite Simpson's rule with ``n`` (even) subintervals."""
+
+    assert n % 2 == 0
+    h = (high - low) / n
+    total = f(low) + f(high)
+    for i in range(1, n):
+        total += f(low + i * h) * (4.0 if i % 2 else 2.0)
+    return total * h / 3.0
+
+
+def _gamma3_pdf(radius: float, alpha: float) -> float:
+    rate = 2.0 * alpha
+    return (rate**3) * radius * radius * math.exp(-rate * radius) / 2.0
+
+
+def _numeric_gamma3_cdf(radius: float, alpha: float) -> float:
+    if radius <= 0.0:
+        return 0.0
+    return _simpson(lambda r: _gamma3_pdf(r, alpha), 0.0, radius, 20000)
+
+
+def _numeric_exceedance_probability(threshold: float, alpha: float) -> float:
+    median_radius = oracle.gamma3_quantile(0.5, alpha)
+    median_energy = oracle.local_energy(median_radius, alpha)
+
+    def integrand(radius: float) -> float:
+        if radius <= 0.0:
+            return 0.0
+        energy = -(alpha**2) / 2.0 + (alpha - 1.0) / radius
+        if abs(energy - median_energy) <= threshold:
+            return 0.0
+        return _gamma3_pdf(radius, alpha)
+
+    return _simpson(integrand, 1e-9, 60.0 / alpha, 500000)
+
+
+@pytest.mark.parametrize("radius,alpha", [(0.1, 1.0), (1.0, 1.0), (3.0, 1.0), (0.2, 1.2), (2.5, 1.2)])
+def test_gamma3_cdf_matches_independent_numeric_integration(radius, alpha) -> None:
+    assert oracle.gamma3_cdf(radius, alpha) == pytest.approx(_numeric_gamma3_cdf(radius, alpha), abs=1e-6)
+
+
+@pytest.mark.parametrize("level,alpha", [(0.2, 1.0), (0.01, 1.0), (0.001, 1.2), (0.1, 1.2)])
+def test_radial_quantiles_invert_the_survival_functions(level, alpha) -> None:
+    lower = oracle.radial_lower_tail_quantile(level, alpha)
+    assert oracle.gamma3_cdf(lower, alpha) == pytest.approx(level, abs=1e-8)
+    upper = oracle.radial_upper_tail_quantile(level, alpha)
+    assert oracle.radial_survival(upper, alpha) == pytest.approx(level, abs=1e-8)
+    assert oracle.radial_survival(lower, alpha) == pytest.approx(1.0 - level, abs=1e-8)
+
+
+@pytest.mark.parametrize("threshold", [0.01, 1.0])
+def test_exceedance_probability_matches_independent_numeric_integration(threshold) -> None:
+    assert oracle.exceedance_probability(threshold, 1.2) == pytest.approx(
+        _numeric_exceedance_probability(threshold, 1.2), abs=2e-3
+    )
+
+
+@pytest.mark.parametrize("level", [0.5, 0.1, 0.001])
+def test_energy_exceedance_threshold_inverts_exceedance_probability(level) -> None:
+    threshold = oracle.energy_exceedance_threshold(level, 1.2)
+    assert oracle.exceedance_probability(threshold, 1.2) == pytest.approx(level, abs=1e-8)
