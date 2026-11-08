@@ -164,6 +164,119 @@ class AllocationObservation:
 
 
 @frozen_record
+class SciencePlacementReceipt:
+    """Immutable child-generation and placement evidence for one attempt.
+
+    This record intentionally keeps GPU evidence separate from operational and
+    scientific verdicts.  S2b-1 publishes ``gpu.status == "unavailable"``;
+    the active-PID sampler is owned by S2b-2.
+
+    Parameters
+    ----------
+    task_id, group_digest, allocation_id, backend_job_id, slot_id : str
+        Identities that bind the child to its fenced allocation slot.
+    attempt_id : AttemptId
+        Store-owned attempt identity.
+    payload_digest, output_dir : str
+        Digest of the configured child payload and its fenced output root.
+    child, declared, gpu, comparison : mapping
+        Strict JSON-shaped evidence sections.  They are deeply frozen.
+    refusal : mapping or None
+        Typed child/controller refusal, when placement could not be proven.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/science-placement-receipt-v1"
+    task_id: str
+    attempt_id: AttemptId
+    group_digest: str
+    allocation_id: str
+    backend_job_id: str
+    slot_id: str
+    payload_digest: str
+    output_dir: str
+    child: dict[str, Any]
+    declared: dict[str, Any]
+    gpu: dict[str, Any]
+    comparison: dict[str, Any]
+    refusal: dict[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("task_id", "allocation_id", "backend_job_id", "slot_id", "output_dir"):
+            object.__setattr__(self, name, text(getattr(self, name), name))
+        _identity(self.attempt_id, AttemptId, "attempt_id")
+        object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
+        object.__setattr__(self, "payload_digest", sha256_text(self.payload_digest, "payload_digest"))
+        for name in ("child", "declared", "gpu", "comparison"):
+            value = getattr(self, name)
+            if not isinstance(value, Mapping):
+                raise TypeError(f"{name} must be a mapping")
+            object.__setattr__(self, name, _freeze(value, name))
+        if self.refusal is not None:
+            if not isinstance(self.refusal, Mapping) or set(self.refusal) != {"code", "reason"}:
+                raise TypeError("refusal must contain code and reason")
+            if any(type(self.refusal[key]) is not str or not self.refusal[key] for key in ("code", "reason")):
+                raise TypeError("refusal code and reason must be non-empty strings")
+            object.__setattr__(self, "refusal", _freeze(dict(self.refusal), "refusal"))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the canonical JSON-shaped receipt."""
+
+        return {
+            "schema": self.schema,
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id.value,
+            "group_digest": self.group_digest,
+            "allocation_id": self.allocation_id,
+            "backend_job_id": self.backend_job_id,
+            "slot_id": self.slot_id,
+            "payload_digest": self.payload_digest,
+            "output_dir": self.output_dir,
+            "child": thaw(self.child),
+            "declared": thaw(self.declared),
+            "gpu": thaw(self.gpu),
+            "comparison": thaw(self.comparison),
+            "refusal": None if self.refusal is None else thaw(self.refusal),
+        }
+
+    def encode(self) -> bytes:
+        """Encode this receipt as canonical JSON bytes."""
+
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "SciencePlacementReceipt":
+        """Decode and strictly validate one placement receipt."""
+
+        expected = {
+            "schema", "task_id", "attempt_id", "group_digest", "allocation_id",
+            "backend_job_id", "slot_id", "payload_digest", "output_dir", "child",
+            "declared", "gpu", "comparison", "refusal",
+        }
+        fields(data, expected, cls.schema, "SciencePlacementReceipt")
+        if any(type(data[key]) is not str for key in (
+            "task_id", "attempt_id", "group_digest", "allocation_id", "backend_job_id",
+            "slot_id", "payload_digest", "output_dir",
+        )):
+            raise TypeError("SciencePlacementReceipt identity fields must be strings")
+        if any(not isinstance(data[key], Mapping) for key in ("child", "declared", "gpu", "comparison")):
+            raise TypeError("SciencePlacementReceipt evidence sections must be mappings")
+        if data["refusal"] is not None and not isinstance(data["refusal"], Mapping):
+            raise TypeError("SciencePlacementReceipt refusal must be a mapping or null")
+        return cls(
+            data["task_id"], AttemptId(data["attempt_id"]), data["group_digest"],
+            data["allocation_id"], data["backend_job_id"], data["slot_id"],
+            data["payload_digest"], data["output_dir"], data["child"], data["declared"],
+            data["gpu"], data["comparison"], data["refusal"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "SciencePlacementReceipt":
+        """Decode canonical JSON or an already-decoded mapping."""
+
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
 class ManifestAttempt:
     """One group member's attempt and receipt references.
 
@@ -185,6 +298,7 @@ class ManifestAttempt:
     start_receipt: StartReceipt
     outcome_receipt: OutcomeReceipt | None
     output_dir: str
+    placement_receipt: SciencePlacementReceipt | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", text(self.task_id, "task_id")); _identity(self.attempt_id, AttemptId, "attempt_id"); _identity(self.start_receipt, StartReceipt, "start_receipt"); _identity(self.start_receipt.attempt_id, AttemptId, "start_receipt.attempt_id")
@@ -193,20 +307,40 @@ class ManifestAttempt:
         if self.outcome_receipt is not None and not isinstance(self.outcome_receipt, OutcomeReceipt): raise TypeError("outcome_receipt must be OutcomeReceipt or None")
         if self.outcome_receipt is not None and (self.task_id != self.outcome_receipt.task_id or self.attempt_id != self.outcome_receipt.attempt_id or self.output_dir != self.outcome_receipt.output_dir or self.start_receipt.group_digest != self.outcome_receipt.group_digest):
             raise ValueError("manifest attempt disagrees with outcome receipt")
+        if self.placement_receipt is not None:
+            if not isinstance(self.placement_receipt, SciencePlacementReceipt):
+                raise TypeError("placement_receipt must be SciencePlacementReceipt or None")
+            if (
+                self.task_id != self.placement_receipt.task_id
+                or self.attempt_id != self.placement_receipt.attempt_id
+                or self.output_dir != self.placement_receipt.output_dir
+                or self.start_receipt.group_digest != self.placement_receipt.group_digest
+                or self.start_receipt.allocation_id.value != self.placement_receipt.allocation_id
+                or self.start_receipt.backend_job_id.value != self.placement_receipt.backend_job_id
+            ):
+                raise ValueError("manifest attempt disagrees with placement receipt")
         object.__setattr__(self, "output_dir", text(self.output_dir, "output_dir"))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schema": self.schema, "task_id": self.task_id, "attempt_id": self.attempt_id.value, "start_receipt": self.start_receipt.to_dict(), "outcome_receipt": None if self.outcome_receipt is None else self.outcome_receipt.to_dict(), "output_dir": self.output_dir}
+        result = {"schema": self.schema, "task_id": self.task_id, "attempt_id": self.attempt_id.value, "start_receipt": self.start_receipt.to_dict(), "outcome_receipt": None if self.outcome_receipt is None else self.outcome_receipt.to_dict(), "output_dir": self.output_dir}
+        if self.placement_receipt is not None:
+            result["placement_receipt"] = self.placement_receipt.to_dict()
+        return result
 
     def encode(self) -> bytes:
         return canonical_bytes(self.to_dict())
 
     @classmethod
     def from_mapping(cls, data: Any) -> "ManifestAttempt":
-        fields(data, {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir"}, cls.schema, "ManifestAttempt")
+        legacy = {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir"}
+        current = legacy | {"placement_receipt"}
+        if not isinstance(data, Mapping) or set(data) not in (legacy, current):
+            raise ValueError("ManifestAttempt keys differ")
+        fields(data, set(data), cls.schema, "ManifestAttempt")
         if any(type(data[key]) is not str for key in ("task_id", "attempt_id", "output_dir")): raise TypeError("ManifestAttempt has an invalid scalar field")
         outcome = None if data["outcome_receipt"] is None else OutcomeReceipt.from_mapping(data["outcome_receipt"])
-        return cls(data["task_id"], AttemptId(data["attempt_id"]), StartReceipt.from_mapping(data["start_receipt"]), outcome, data["output_dir"])
+        placement = None if data.get("placement_receipt") is None else SciencePlacementReceipt.from_mapping(data["placement_receipt"])
+        return cls(data["task_id"], AttemptId(data["attempt_id"]), StartReceipt.from_mapping(data["start_receipt"]), outcome, data["output_dir"], placement)
 
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "ManifestAttempt":
@@ -393,7 +527,7 @@ class RunManifest:
         return cls.from_mapping(decode_json(data))
 
 
-__all__ = ["AcceptedSegment", "AllocationObservation", "ManifestAttempt", "OutcomeReceipt", "OUTCOME_STATUSES", "RunManifest", "StartReceipt"]
+__all__ = ["AcceptedSegment", "AllocationObservation", "ManifestAttempt", "OutcomeReceipt", "OUTCOME_STATUSES", "RunManifest", "SciencePlacementReceipt", "StartReceipt"]
 
 
 def encode_manifest(manifest: RunManifest) -> bytes:

@@ -16,7 +16,7 @@ from uuid import uuid4
 from ._codec import canonical_bytes, decode_json, fields, text
 from .allocations import ConfiguredAllocation
 from .contracts import AttemptId, ReadyGroup
-from .results import AcceptedSegment, ManifestAttempt, OutcomeReceipt, RunManifest, StartReceipt
+from .results import AcceptedSegment, ManifestAttempt, OutcomeReceipt, RunManifest, SciencePlacementReceipt, StartReceipt
 from .runners import CoreRunEvidence
 from ._records import frozen_record
 
@@ -443,6 +443,64 @@ class DirectoryStore:
             _write_new(segment_path, segment.encode())
             return segment
 
+    def publish_placement(self, fence: AttemptFence, receipt: SciencePlacementReceipt) -> SciencePlacementReceipt:
+        """Publish one validated placement receipt after child quiescence.
+
+        The receipt is written beneath the same attempt fence as the start and
+        outcome records.  Requiring the terminal outcome first prevents a
+        controller from presenting an in-flight child as placement evidence.
+
+        Parameters
+        ----------
+        fence : AttemptFence
+            Store-owned attempt fence returned by :meth:`begin_attempt`.
+        receipt : SciencePlacementReceipt
+            Controller-validated child-generation record.
+
+        Returns
+        -------
+        SciencePlacementReceipt
+            The immutable receipt that was durably published.
+
+        Raises
+        ------
+        FenceRejected
+            If the attempt is foreign, unfinished, already has a placement
+            receipt, or the receipt crosses any fence identity.
+        """
+
+        if not isinstance(receipt, SciencePlacementReceipt):
+            raise TypeError("receipt must be SciencePlacementReceipt")
+        task_dir = self._task_dir_for_fence(fence)
+        lock_path = os.path.join(task_dir, _TASK_LOCK)
+        _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
+        with _task_lock(lock_path):
+            start = self._validate_fence(fence, task_dir)
+            output_dir = _lexical(fence.output_dir)
+            outcome_path = os.path.join(output_dir, "outcome.json")
+            _require_regular(outcome_path, "outcome receipt")
+            try:
+                outcome = OutcomeReceipt.decode(Path(outcome_path).read_bytes())
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise FenceRejected("outcome receipt is unavailable") from error
+            if outcome.status not in {"completed", "failed", "timed_out", "launch_failed"}:
+                raise FenceRejected("outcome receipt has an invalid status")
+            if (
+                receipt.task_id != start.task_id
+                or receipt.attempt_id != start.attempt_id
+                or receipt.group_digest != start.group_digest
+                or receipt.allocation_id != start.allocation_id.value
+                or receipt.backend_job_id != start.backend_job_id.value
+                or receipt.output_dir != output_dir
+            ):
+                raise FenceRejected("placement receipt crosses the attempt fence")
+            placement_path = os.path.join(output_dir, "placement.json")
+            if os.path.lexists(placement_path):
+                _require_regular(placement_path, "placement receipt")
+                raise FenceRejected("attempt already has a placement receipt")
+            _write_new(placement_path, receipt.encode())
+            return receipt
+
     @staticmethod
     def _segments_for_task(task_dir: str) -> tuple[AcceptedSegment, ...]:
         """Read accepted segments in predecessor-linked chain order.
@@ -613,6 +671,21 @@ class DirectoryStore:
                         raise ValueError("foreign outcome receipt in group store")
                 else:
                     outcome = None
+                placement_path = os.path.join(output_dir, "placement.json")
+                if os.path.lexists(placement_path):
+                    _require_regular(placement_path, "placement receipt", ValueError)
+                    placement = SciencePlacementReceipt.decode(Path(placement_path).read_bytes())
+                    if (
+                        placement.task_id != task_id
+                        or placement.attempt_id.value != attempt_id
+                        or placement.group_digest != group.identity
+                        or placement.output_dir != output_dir
+                        or placement.allocation_id != start.allocation_id.value
+                        or placement.backend_job_id != start.backend_job_id.value
+                    ):
+                        raise ValueError("foreign placement receipt in group store")
+                else:
+                    placement = None
                 segment_path = os.path.join(output_dir, "segment.json")
                 if os.path.lexists(segment_path):
                     _require_regular(segment_path, "accepted segment", ValueError)
@@ -620,7 +693,7 @@ class DirectoryStore:
                     if segment.task_id != task_id or segment.attempt_id.value != attempt_id:
                         raise ValueError("foreign accepted segment in group store")
                     segments.append(segment)
-                attempts.append(ManifestAttempt(task_id, start.attempt_id, start, outcome, start.output_dir))
+                attempts.append(ManifestAttempt(task_id, start.attempt_id, start, outcome, start.output_dir, placement))
         segments.sort(key=lambda item: (item.task_id, item.next_iteration, item.completed_updates))
         return RunManifest(group.group_id, group.identity, tuple(attempts), tuple(segments))
 

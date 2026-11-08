@@ -15,7 +15,8 @@ from .._codec import digest
 from ..contracts import ReadyGroup
 from ..environments import PreparedPythonEnvironment
 from ..lifecycle.attached import AttachedAllocation
-from ..results import RunManifest
+from ..results import RunManifest, SciencePlacementReceipt
+from ..placement import PlacementRefusal, read_child_placement, slots_from_allocation
 from ..runners import CONTEXT_ENV_KEY_PATTERN, CHILD_CONTEXT_KEYS_ENV, CoreRunEvidence, EvidenceUnavailable
 from ..tasks import ConfiguredRun
 
@@ -114,6 +115,143 @@ def _with_child_context_keys(environment: Any, allocation: Any) -> Any:
     overlay = dict(environment.env)
     overlay[CHILD_CONTEXT_KEYS_ENV] = json.dumps(_child_context_keys(allocation), separators=(",", ":"))
     return PreparedPythonEnvironment(environment.python, environment.setup, overlay)
+
+
+def _with_child_placement(
+    environment: Any,
+    allocation: Any,
+    fence: Any,
+    group: ReadyGroup,
+    member: Any,
+    configured: ConfiguredRun,
+) -> Any:
+    """Overlay the one concrete slot and fenced identities for the child.
+
+    Legacy workers without a declared slot retain their existing behavior.
+    Once a slot is present, all placement fields are explicit and immutable
+    from the controller's point of view; only the science child applies CPU
+    affinity in :data:`RUN_SHIM` before importing core.
+    """
+
+    if not isinstance(environment, PreparedPythonEnvironment):
+        return environment
+    values = dict(environment.env)
+    slot_id = values.get("TPEN_SLOT_ID")
+    host = values.get("TPEN_SLOT_NODE")
+    cpus = values.get("TPEN_SLOT_CPUS")
+    devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
+    if slot_id and host and cpus and not devices:
+        devices = values.get("CUDA_VISIBLE_DEVICES", "")
+    if not (slot_id and host and cpus):
+        slots = slots_from_allocation(allocation)
+        if len(slots) != 1:
+            # A local worker with no slot is a legacy path; a multi-slot
+            # allocation must be resolved by the backend worker (Parsl).
+            return environment
+        slot = slots[0]
+        slot_id, host, cpus = slot.slot_id, slot.node, ",".join(str(cpu) for cpu in slot.cpus)
+        devices = ",".join(slot.devices)
+        values.update(slot.env)
+    payload_digest = digest({"config": configured.config, "overrides": list(configured.overrides)})
+    values.update(
+        {
+            "TPEN_PLACEMENT_OUTPUT": os.path.join(fence.output_dir, "placement.json"),
+            "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
+            "TPEN_PLACEMENT_TASK_ID": member.task_id,
+            "TPEN_PLACEMENT_ATTEMPT_ID": fence.attempt_id.value,
+            "TPEN_PLACEMENT_GROUP_DIGEST": group.identity,
+            "TPEN_PLACEMENT_ALLOCATION_ID": allocation.allocation_id.value,
+            "TPEN_PLACEMENT_BACKEND_JOB_ID": allocation.backend_job_id.value,
+            "TPEN_PLACEMENT_SLOT_ID": slot_id,
+            "TPEN_PLACEMENT_DECLARED_HOST": host,
+            "TPEN_PLACEMENT_DECLARED_CPUS": cpus,
+            "TPEN_PLACEMENT_DECLARED_DEVICES": devices,
+            "TPEN_PLACEMENT_PAYLOAD_DIGEST": payload_digest,
+        }
+    )
+    return PreparedPythonEnvironment(environment.python, environment.setup, values)
+
+
+def _placement_receipt(
+    observation: Any,
+    allocation: Any,
+    fence: Any,
+    group: ReadyGroup,
+    member: Any,
+    configured: ConfiguredRun,
+    environment: Any,
+) -> SciencePlacementReceipt:
+    """Validate a quiescent child sidecar and convert it to a receipt."""
+
+    if not isinstance(environment, PreparedPythonEnvironment):
+        raise PlacementRefusal("placement-environment", "child environment is not a prepared Python environment")
+    values = environment.env
+    expected_payload = digest({"config": configured.config, "overrides": list(configured.overrides)})
+    checks = {
+        "task": observation.task_id == member.task_id,
+        "attempt": observation.attempt_id == fence.attempt_id.value,
+        "group": observation.group_digest == group.identity,
+        "allocation": observation.allocation_id == allocation.allocation_id.value,
+        "backend": observation.backend_job_id == allocation.backend_job_id.value,
+        "slot": observation.slot_id == values.get("TPEN_SLOT_ID"),
+        "payload": observation.payload_digest == expected_payload,
+        "output": observation.output_dir == fence.output_dir,
+    }
+    refusal = observation.refusal
+    if not all(checks.values()):
+        failed = ",".join(name for name, passed in checks.items() if not passed)
+        refusal = {"code": "placement-identity-mismatch", "reason": f"child sidecar identity mismatch: {failed}"}
+    if observation.proc_start_ticks <= 0:
+        refusal = refusal or {"code": "placement-start-token-missing", "reason": "child start ticks are missing"}
+    expected_host = values.get("TPEN_SLOT_NODE")
+    expected_cpus = tuple(sorted(int(item) for item in values.get("TPEN_SLOT_CPUS", "").split(",") if item))
+    host_match = expected_host is not None and observation.host == expected_host
+    affinity_match = expected_cpus == observation.affinity
+    if not host_match or not affinity_match:
+        refusal = refusal or {
+            "code": "placement-affinity-mismatch",
+            "reason": f"child host/affinity differs from declared slot ({observation.host!r}, {observation.affinity!r})",
+        }
+    return SciencePlacementReceipt(
+        member.task_id,
+        fence.attempt_id,
+        group.identity,
+        allocation.allocation_id.value,
+        allocation.backend_job_id.value,
+        values.get("TPEN_SLOT_ID", observation.slot_id),
+        expected_payload,
+        fence.output_dir,
+        {
+            "host": observation.host,
+            "pid": observation.pid,
+            "proc_start_ticks": observation.proc_start_ticks,
+            "affinity": list(observation.affinity),
+            "thread_settings": observation.thread_settings,
+            "cuda_visible_devices": observation.cuda_visible_devices,
+            "observed_at_utc": observation.observed_at_utc,
+        },
+        {
+            "host": expected_host,
+            "cpus": list(expected_cpus),
+            "devices": [item for item in values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "").split(",") if item],
+        },
+        {
+            "status": "unavailable",
+            "reason": "active GPU sampler is owned by S2b-2",
+            "method": "s2b-1-child-generation-no-sampler",
+            "started_at_utc": observation.observed_at_utc,
+            "finished_at_utc": _utc_now(),
+            "samples": [],
+            "active_uuids": [],
+            "active_pci": [],
+        },
+        {
+            "host": "matched" if host_match else "mismatch",
+            "affinity": "matched" if affinity_match else "mismatch",
+            "device": "unavailable",
+        },
+        refusal,
+    )
 
 
 class DispatcherContract:
@@ -274,6 +412,14 @@ class DispatcherContract:
                 materialized = self.worker.materialize(env)
                 environment = self._worker_environment(materialized)
                 environment = _with_child_context_keys(environment, lifecycle.allocation)
+                environment = _with_child_placement(
+                    environment,
+                    lifecycle.allocation,
+                    fence,
+                    group,
+                    member,
+                    configured,
+                )
                 process = materialized["process"]
                 materialized["runner"]
                 evidence = materialized["evidence"]
@@ -360,7 +506,6 @@ class DispatcherContract:
         completion path that writes finish and accepted-segment receipts.
         """
 
-        del configured
         invalid_outcome = False
         if error is None:
             try:
@@ -412,6 +557,20 @@ class DispatcherContract:
             try:
                 inspection_error.add_note(f"finish error during inspection cancellation: {finish_error!r}")
             except BaseException:
+                pass
+        placement_path = None
+        if isinstance(environment, PreparedPythonEnvironment):
+            placement_path = environment.env.get("TPEN_PLACEMENT_OUTPUT")
+        if placement_path is not None:
+            try:
+                observation = read_child_placement(placement_path)
+                receipt = _placement_receipt(observation, lifecycle.allocation, fence, group, member, configured, environment)
+                lifecycle.store.publish_placement(fence, receipt)
+            except PlacementRefusal:
+                # Operational completion remains separate from placement
+                # qualification; absence or mismatch is visible as no receipt.
+                pass
+            except Exception:
                 pass
         if inspection_error is not None:
             raise inspection_error
