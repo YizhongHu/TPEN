@@ -17,6 +17,7 @@ needed to inspect the child-side contract.
 | F4 | M4: trust child-reported PID/start ticks | controller binding requires the spawned generation token |
 | F7 | M7: read thread settings only from the legacy observation allowlist | all declared thread settings are recorded truthfully |
 | F8 | M8: hide child placement refusal | an affinity refusal is visible before core import |
+| F9 | M9: accept arbitrary comparison labels | placement comparisons use a closed vocabulary |
 """
 
 from __future__ import annotations
@@ -294,3 +295,17 @@ def test_f8_shim_exposes_affinity_refusal(tmp_path: Path) -> None:
     observed = json.loads(sidecar.read_text(encoding="utf-8"))
     assert observed["refusal"]["code"] == "child-placement-refused"
     assert b"child-placement-refused" in (tmp_path / "err.log").read_bytes()
+
+
+def test_f9_receipt_rejects_unknown_comparison_state() -> None:
+    """F9 kills M9: comparison fields cannot carry an unreviewed state."""
+
+    with pytest.raises(ValueError, match="unknown state"):
+        SciencePlacementReceipt(
+            "task-a", AttemptId("attempt-a"), GROUP_DIGEST, "allocation-a", "job-a", "slot-a",
+            digest("payload"), "/tmp/output",
+            {"host": "node-a", "pid": 1, "proc_start_ticks": 2, "affinity": [0], "thread_settings": {}, "cuda_visible_devices": None, "observed_at_utc": "now"},
+            {"host": "node-a", "cpus": [0], "devices": []},
+            {"status": "unavailable", "reason": "cpu", "method": "test", "started_at_utc": "now", "finished_at_utc": "now", "samples": [], "active_uuids": [], "active_pci": []},
+            {"host": "matched", "affinity": "matched", "device": "not-a-state"},
+        )

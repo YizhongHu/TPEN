@@ -16,7 +16,13 @@ from ..contracts import ReadyGroup
 from ..environments import PreparedPythonEnvironment
 from ..lifecycle.attached import AttachedAllocation
 from ..results import RunManifest, SciencePlacementReceipt
-from ..placement import PlacementRefusal, read_child_placement, slots_from_allocation
+from ..placement import (
+    PLACEMENT_OUTPUT_ENV,
+    PlacementRefusal,
+    placement_environment,
+    read_child_placement,
+    slots_from_allocation,
+)
 from ..runners import CONTEXT_ENV_KEY_PATTERN, CHILD_CONTEXT_KEYS_ENV, CoreRunEvidence, EvidenceUnavailable
 from ..tasks import ConfiguredRun
 
@@ -131,6 +137,10 @@ def _with_child_placement(
     Once a slot is present, all placement fields are explicit and immutable
     from the controller's point of view; only the science child applies CPU
     affinity in :data:`RUN_SHIM` before importing core.
+
+    The slot environment is merged into the prepared child environment so
+    legacy S1 logical labels remain visible to the child; placement-specific
+    enforcement is enabled only by the explicit sidecar output path.
     """
 
     if not isinstance(environment, PreparedPythonEnvironment):
@@ -153,9 +163,10 @@ def _with_child_placement(
         devices = ",".join(slot.devices)
         values.update(slot.env)
     payload_digest = digest({"config": configured.config, "overrides": list(configured.overrides)})
-    values.update(
-        {
-            "TPEN_PLACEMENT_OUTPUT": os.path.join(fence.output_dir, "child-placement.json"),
+    values = placement_environment(
+        values,
+        **{
+            PLACEMENT_OUTPUT_ENV: os.path.join(fence.output_dir, "child-placement.json"),
             "TPEN_PLACEMENT_OUTPUT_DIR": fence.output_dir,
             "TPEN_PLACEMENT_TASK_ID": member.task_id,
             "TPEN_PLACEMENT_ATTEMPT_ID": fence.attempt_id.value,
@@ -167,7 +178,7 @@ def _with_child_placement(
             "TPEN_PLACEMENT_DECLARED_CPUS": cpus,
             "TPEN_PLACEMENT_DECLARED_DEVICES": devices,
             "TPEN_PLACEMENT_PAYLOAD_DIGEST": payload_digest,
-        }
+        },
     )
     return PreparedPythonEnvironment(environment.python, environment.setup, values)
 

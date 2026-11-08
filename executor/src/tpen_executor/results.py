@@ -10,6 +10,7 @@ from .contracts import AllocationId, AttemptId, BackendJobId
 from ._records import frozen_record
 
 OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed"})
+PLACEMENT_COMPARISON_STATES = frozenset({"matched", "mismatch", "unavailable"})
 
 
 def _identity(value: Any, cls: type, name: str) -> Any:
@@ -260,6 +261,8 @@ class SciencePlacementReceipt:
         comparison = self.comparison
         if any(type(comparison[key]) is not str or not comparison[key] for key in ("host", "affinity", "device")):
             raise TypeError("placement comparison values must be non-empty strings")
+        if any(comparison[key] not in PLACEMENT_COMPARISON_STATES for key in ("host", "affinity", "device")):
+            raise ValueError("placement comparison values use an unknown state")
         object.__setattr__(self, "child", _freeze(child, "child"))
         object.__setattr__(self, "declared", _freeze(declared, "declared"))
         object.__setattr__(self, "gpu", _freeze(gpu, "gpu"))
