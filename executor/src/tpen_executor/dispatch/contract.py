@@ -208,10 +208,7 @@ def _with_child_placement(
     if controller_refusal is not None:
         placement_values[PLACEMENT_REFUSAL_ENV] = json.dumps(controller_refusal, sort_keys=True)
     values = placement_environment(values, **placement_values)
-    prepared = PreparedPythonEnvironment(environment.python, environment.setup, values)
-    if controller_refusal is not None:
-        raise PlacementRefusal(controller_refusal["code"], controller_refusal["reason"])
-    return prepared
+    return PreparedPythonEnvironment(environment.python, environment.setup, values)
 
 
 def _placement_refusal_from_environment(environment: Any) -> PlacementRefusal | None:
