@@ -123,7 +123,7 @@ FIXED_THRESHOLDS = _TAIL["alpha_1_2_only"]["fixed_exceedance_thresholds_hartree"
 EXCEEDANCE_LEVELS = _TAIL["alpha_1_2_only"]["exceedance_levels"]
 K_CONTRACT = _BAND["k_value"]
 C_VALUE = _BAND["c_value"]
-MIN_RESAMPLES = 2000
+MIN_RESAMPLES = _CONTRACT["measurement"]["fresh_evaluation"]["uncertainty"]["minimum_resamples"]
 
 #: `sampler` namespace seeds drive the alpha=1 instrument-control streams;
 #: `evaluation` namespace seeds drive the alpha=1.2 qualification target.
@@ -150,6 +150,12 @@ def _run_stream(tmp_path: Path, *, alpha: float, stream: int) -> dict[str, np.nd
     run_id = f"tail-qual-alpha{alpha}-stream{stream}"
     config["run"]["root"] = str(tmp_path)
     config["run"]["run_id"] = run_id
+
+    assert config["sampler"]["n_walkers"] == _SHAPE["walkers"]
+    assert config["sampler"]["burn_in"] == _SHAPE["burn_in"]
+    assert config["sampler"]["n_steps"] == _SHAPE["stride"]
+    generator_config = config["evaluator"]["tasks"][0]["generator"]
+    assert generator_config["n_draws"] == _SHAPE["draws_per_stream"]
 
     status = run_from_config(
         OmegaConf.create(config), command=f"h-v2 sampler tail qualification {run_id}", raise_exceptions=True
@@ -198,6 +204,78 @@ def _gated_z(indicator: np.ndarray, walkers: np.ndarray, exact_level: float, *, 
     return z, hat_count
 
 
+def _energy_exceedance_resample_counts(
+    energies: np.ndarray, walkers: np.ndarray, resample_indices: np.ndarray, thresholds: list[float]
+) -> np.ndarray:
+    """Weighted-exceedance counts per whole-walker resample, median recomputed each time.
+
+    `band.se_method` (``contract_inputs.json``) requires the median to be
+    recomputed inside every whole-walker resample, not fixed once on the
+    full-sample median (see PR 600 review round 1, finding F1). Returns an
+    ``(R, len(thresholds))`` matrix so one shared resample matrix, built once
+    per stream, can be reused by every energy comparison at that stream.
+    """
+
+    order = np.argsort(energies, kind="stable")
+    e_sorted = energies[order]
+    walkers_sorted = walkers[order]
+    thresholds_arr = np.asarray(thresholds, dtype=np.float64)
+    r = resample_indices.shape[0]
+    counts = np.empty((r, thresholds_arr.size), dtype=np.float64)
+    for b in range(r):
+        multiplicity = np.bincount(resample_indices[b], minlength=N_WALKERS).astype(np.float64)
+        weight_sorted = multiplicity[walkers_sorted]
+        cumulative = np.cumsum(weight_sorted)
+        total = cumulative[-1]
+        median_index = int(np.searchsorted(cumulative, total / 2.0, side="left"))
+        median_index = min(median_index, e_sorted.size - 1)
+        median_b = e_sorted[median_index]
+        deviation_sorted = np.abs(e_sorted - median_b)
+        mask = deviation_sorted[:, None] > thresholds_arr[None, :]
+        counts[b] = weight_sorted @ mask
+    return counts
+
+
+def _se_from_resample_counts(counts_column: np.ndarray, n: int) -> float:
+    valid = counts_column > 0
+    if int(valid.sum()) < 2:
+        return math.inf
+    log_boot = np.log(counts_column[valid] / n)
+    se = float(np.std(log_boot, ddof=1))
+    return se if se > 0.0 else math.inf
+
+
+def test_energy_exceedance_resample_counts_recomputes_the_median_per_resample() -> None:
+    """Hand-computed check that the median is recomputed inside each resample.
+
+    Two walkers, one draw each: energies 0.0 and 10.0. Three resamples pick
+    different walker multiplicities, so the weighted median swings between
+    0.0 and 10.0 depending on the resample -- exactly what ``band.se_method``
+    requires and what the fixed-median indicator (the reverted mutant this
+    test must catch) cannot reproduce, since a *single* full-sample median
+    (``np.median([0.0, 10.0]) == 5.0``) puts every deviation at the gated
+    threshold of 5.0 and reports a count of 0 in every resample.
+    """
+
+    energies = np.array([0.0, 10.0])
+    walkers = np.array([0, 1])
+    resample_indices = np.array([[0, 1], [0, 0], [1, 1]])
+    thresholds = [5.0]
+
+    counts = _energy_exceedance_resample_counts(energies, walkers, resample_indices, thresholds)
+
+    assert counts[:, 0].tolist() == [1.0, 0.0, 0.0]
+
+    sample_median = float(np.median(energies))
+    fixed_indicator = np.abs(energies - sample_median) > thresholds[0]
+    fixed_counts_per_resample = [
+        float(np.bincount(resample_indices[b], weights=fixed_indicator.astype(np.int64), minlength=2).sum())
+        for b in range(resample_indices.shape[0])
+    ]
+    assert fixed_counts_per_resample == [0.0, 0.0, 0.0]
+    assert counts[:, 0].tolist() != fixed_counts_per_resample
+
+
 def test_sampler_reproduces_exact_radial_and_local_energy_tail_curves(tmp_path_factory: pytest.TempPathFactory) -> None:
     start = time.monotonic()
     rng = np.random.default_rng(_BOOTSTRAP_SEED)
@@ -237,20 +315,17 @@ def test_sampler_reproduces_exact_radial_and_local_energy_tail_curves(tmp_path_f
             medians.append({"alpha": alpha, "stream": stream, "energy_median": sample_median_energy})
             deviation = np.abs(energies - sample_median_energy)
 
+            gated_specs: list[dict[str, Any]] = []
             for threshold in FIXED_THRESHOLDS:
                 exact_level = oracle.exceedance_probability(threshold, alpha)
                 if exact_level * n < MIN_COUNT:
                     continue
-                z, count = _gated_z(deviation > threshold, walkers, exact_level, rng=rng)
-                comparisons.append(
+                gated_specs.append(
                     {
-                        "alpha": alpha,
-                        "stream": stream,
                         "side": "fixed_exceedance_threshold_hartree",
                         "threshold_hartree": threshold,
                         "exact_level": exact_level,
-                        "count": count,
-                        "z": z,
+                        "extra": {"threshold_hartree": threshold, "exact_level": exact_level},
                     }
                 )
 
@@ -258,10 +333,32 @@ def test_sampler_reproduces_exact_radial_and_local_energy_tail_curves(tmp_path_f
                 if level * n < MIN_COUNT:
                     continue
                 threshold = oracle.energy_exceedance_threshold(level, alpha)
-                z, count = _gated_z(deviation > threshold, walkers, level, rng=rng)
-                comparisons.append(
-                    {"alpha": alpha, "stream": stream, "side": "exceedance_level", "level": level, "count": count, "z": z}
+                gated_specs.append(
+                    {
+                        "side": "exceedance_level",
+                        "threshold_hartree": threshold,
+                        "exact_level": level,
+                        "extra": {"level": level},
+                    }
                 )
+
+            # One shared whole-walker resample matrix per stream: band.se_method
+            # requires the median recomputed inside every resample, so all
+            # energy comparisons at this stream reuse the same resample draw
+            # (finding F1).
+            resample_indices = rng.integers(0, N_WALKERS, size=(MIN_RESAMPLES, N_WALKERS))
+            resample_counts = _energy_exceedance_resample_counts(
+                energies, walkers, resample_indices, [spec["threshold_hartree"] for spec in gated_specs]
+            )
+            for column, spec in enumerate(gated_specs):
+                indicator = deviation > spec["threshold_hartree"]
+                count = int(indicator.sum())
+                if count == 0:
+                    z = math.inf
+                else:
+                    se = _se_from_resample_counts(resample_counts[:, column], n)
+                    z = math.inf if not math.isfinite(se) else (math.log(count / n) - math.log(spec["exact_level"])) / se
+                comparisons.append({"alpha": alpha, "stream": stream, "side": spec["side"], "count": count, "z": z, **spec["extra"]})
 
     wall_time_seconds = time.monotonic() - start
     max_abs_z = max(abs(entry["z"]) for entry in comparisons)
@@ -278,6 +375,9 @@ def test_sampler_reproduces_exact_radial_and_local_energy_tail_curves(tmp_path_f
     }
     print(json.dumps(report, indent=2, default=str))
 
+    assert len(comparisons) == K_CONTRACT, (
+        f"measured K={len(comparisons)} != contract band.k_value={K_CONTRACT}; c_value is only valid for the contract's K"
+    )
     assert not failing, (
         f"{len(failing)} of {len(comparisons)} gated comparison(s) exceeded c={C_VALUE} "
         f"or had a zero count: {failing}"
