@@ -18,6 +18,10 @@ needed to inspect the child-side contract.
 | F7 | M7: read thread settings only from the legacy observation allowlist | all declared thread settings are recorded truthfully |
 | F8 | M8: hide child placement refusal | an affinity refusal is visible before core import |
 | F9 | M9: accept arbitrary comparison labels | placement comparisons use a closed vocabulary |
+| N1 | drop the CUDA visibility fallback | Local and Parsl preset device declarations agree |
+| H1 | delete the controller affinity subset check | dispatcher refuses an out-of-affinity slot before launch |
+| H2 | delete invalid-receipt exception handling | dispatcher stores a typed construction refusal |
+| F12 | emit PID zero for a refused receipt | refused receipts retain the positive compatibility sentinel |
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ import pytest
 from tpen_executor._codec import digest
 from tpen_executor.contracts import AllocationId, BackendJobId, AttemptId, ProgramSpecRef, ReadyGroup, TaskSpec
 from tpen_executor.allocations import ConfiguredAllocation
+from tpen_executor.dispatch import contract as contract_module
 from tpen_executor.dispatch.contract import _placement_receipt, _placement_refusal_receipt, _with_child_placement
 from tpen_executor.dispatch.local import LocalDispatcher
 from tpen_executor.placement import ChildPlacementObservation, PlacementRefusal, parse_proc_start_ticks, read_child_placement
@@ -400,6 +405,90 @@ def _slot_allocation(slot: AllocationSlot) -> ConfiguredAllocation:
     )
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux sched affinity")
+def test_n1_local_and_parsl_preset_device_declarations_agree(tmp_path: Path) -> None:
+    """N1 kills a dropped CUDA visibility fallback for preset device slots."""
+
+    cpu = min(os.sched_getaffinity(0))
+    group = _group()
+    configured = _configured(tmp_path)
+    fence = SimpleNamespace(attempt_id=AttemptId("attempt-a"), output_dir=str(tmp_path / "output"))
+    slot = AllocationSlot("slot-a", socket.gethostname(), ("0",), (cpu,), (), ())
+    local = _with_child_placement(
+        PreparedPythonEnvironment(sys.executable, None, {}),
+        _slot_allocation(slot), fence, group, group.members[0], configured,
+    )
+    preset = _with_child_placement(
+        PreparedPythonEnvironment(sys.executable, None, dict(slot.env)),
+        ConfiguredAllocation(AllocationId("allocation-a"), BackendJobId("job-a"), {}),
+        fence, group, group.members[0], configured,
+    )
+    assert local.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == "0"
+    assert preset.env["TPEN_PLACEMENT_DECLARED_DEVICES"] == local.env["TPEN_PLACEMENT_DECLARED_DEVICES"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux sched affinity")
+def test_h1_dispatcher_refuses_cpu_outside_controller_affinity(tmp_path: Path) -> None:
+    """H1 kills deletion of the controller CPU-affinity subset check."""
+
+    outside = max(os.sched_getaffinity(0)) + 1
+    slot = AllocationSlot("slot-a", socket.gethostname(), (), (outside,), (), ())
+    launched: list[object] = []
+
+    class Process:
+        def run(self, environment, args, **kwargs):
+            launched.append(args)
+            return ProcessOutcome((sys.executable,), 0, kwargs["stdout_path"], kwargs["stderr_path"], False)
+
+    worker = SimpleNamespace(
+        materialize=lambda env: {
+            "environment": PreparedPythonEnvironment(sys.executable),
+            "process": Process(),
+            "runner": object(),
+            "evidence": TPNEvidence(),
+        }
+    )
+    lifecycle = AttachedAllocation(_slot_allocation(slot), DirectoryStore(tmp_path / "store"))
+    manifest = LocalDispatcher(worker).run(_group(), {"task-a": _configured(tmp_path)}, lifecycle)
+    assert launched == []
+    attempt = manifest.attempts[0]
+    assert attempt.outcome_receipt.status == "launch_failed"
+    assert attempt.placement_receipt.refusal["code"] == "placement-cpu-outside-controller-affinity"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux process execution")
+def test_h2_invalid_receipt_construction_becomes_typed_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H2 kills removal of the invalid receipt-construction handler."""
+
+    cpu = min(os.sched_getaffinity(0))
+    package = _stub_package(tmp_path)
+    environment = PreparedPythonEnvironment(sys.executable, env={"PYTHONPATH": str(package)})
+    worker = SimpleNamespace(
+        materialize=lambda env: {
+            "environment": environment,
+            "process": SubprocessWorker(),
+            "runner": object(),
+            "evidence": TPENEvidence(),
+        }
+    )
+
+    def broken_receipt(*args, **kwargs):
+        raise TypeError("declared host must be non-empty text")
+
+    monkeypatch.setattr(contract_module, "_placement_receipt", broken_receipt)
+    lifecycle = AttachedAllocation(
+        _slot_allocation(AllocationSlot("slot-a", socket.gethostname(), (), (cpu,), (), ())),
+        DirectoryStore(tmp_path / "store"),
+    )
+    manifest = LocalDispatcher(worker).run(_group(), {"task-a": _configured(tmp_path)}, lifecycle)
+    attempt = manifest.attempts[0]
+    assert attempt.outcome_receipt.status == "completed"
+    assert attempt.placement_receipt.refusal["code"] == "placement-receipt-invalid"
+    assert "declared host" in attempt.placement_receipt.refusal["reason"]
+
+
 def test_c1a_refusal_receipt_is_constructible(tmp_path: Path) -> None:
     """C1/M1a: a missing sidecar is a valid refused placement receipt."""
 
@@ -415,6 +504,7 @@ def test_c1a_refusal_receipt_is_constructible(tmp_path: Path) -> None:
         ProcessOutcome((sys.executable,), 1, "", "", False, None, None),
     )
     assert receipt.refusal == {"code": "placement-missing", "reason": "child placement sidecar is unavailable"}
+    assert receipt.child["pid"] == 1
     assert dict(receipt.comparison) == {"host": "refused", "affinity": "refused", "device": "unavailable"}
 
 

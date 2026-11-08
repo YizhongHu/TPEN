@@ -1,4 +1,10 @@
-"""Shared lifecycle contract for attached executor dispatchers."""
+"""Shared lifecycle contract for attached executor dispatchers.
+
+Placement mutant controls include N1 (preserve declared devices for preset
+device slots), H1 (refuse controller CPU-outside-affinity placements), H2
+(turn invalid receipt construction into typed refusal evidence), and F12
+(refused receipts use a positive sentinel rather than emitting PID zero).
+"""
 
 from __future__ import annotations
 
@@ -144,6 +150,8 @@ def _with_child_placement(
     The slot environment is merged into the prepared child environment so
     legacy S1 logical labels remain visible to the child; placement-specific
     enforcement is enabled only by the explicit sidecar output path.
+
+    CPU-only slots intentionally retain an empty declared-device field.
     """
 
     if not isinstance(environment, PreparedPythonEnvironment):
@@ -153,6 +161,10 @@ def _with_child_placement(
     host = values.get("TPEN_SLOT_NODE")
     cpus = values.get("TPEN_SLOT_CPUS")
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
+    if not devices:
+        # Parsl preset bindings carry the entitlement as CUDA visibility;
+        # recover it without turning CPU-only slots into device slots.
+        devices = values.get("CUDA_VISIBLE_DEVICES", "")
     if not (slot_id and host and cpus):
         slots = slots_from_allocation(allocation)
         if len(slots) != 1:
