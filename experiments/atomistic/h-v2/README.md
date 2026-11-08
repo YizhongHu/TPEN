@@ -329,8 +329,10 @@ decisions, `operator-decisions-pilot-geometry-design-target-20261107` and
 `operator-answers-design-target-d1-d6-20261107` on `fffc313a`, 2026-11-07):
 the operator, quoted, "Gpu test goes on cannon" -- the pipeline check's
 excluded-seed GPU route smoke, part (g) of slice `406194c5`, moved from
-Polaris to FASRC Cannon's `gpu_test` partition (a MIG slice), and is not a
-science venue either way. D6, the manager's restatement, to which the
+Polaris to FASRC Cannon's `gpu_test` partition (a MIG slice) -- the
+partition and "a MIG slice" are the manager's D5 restatement, to which the
+operator answered "Yes" (quoted as typed: "5. Yes") -- and is not a science
+venue either way. D6, the manager's restatement, to which the
 operator answered "Yes" (quoted as typed: "6. Yes"): "the contract text for
 part (g) is restated at the next PR 587 touch: Cannon, with a cap of one
 GPU-hour on the allocated device, setup included." Slice `406194c5`'s other part, the
