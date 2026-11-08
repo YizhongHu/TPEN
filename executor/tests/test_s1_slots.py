@@ -281,7 +281,7 @@ def test_t1_strict_slot_admission_rejects_before_begin(tmp_path: Path, mutation:
     elif mutation == "duplicate-device":
         slots[1]["devices"] = ["0"]
     elif mutation == "overlap-cpu":
-        slots[1]["cpus"] = [0]
+            slots[1]["cpus"] = list(slots[0]["cpus"])
     elif mutation == "bad-thread":
         slots[0]["threads"] = {"OMP_NUM_THREADS": 0}
     elif mutation == "bad-env":
