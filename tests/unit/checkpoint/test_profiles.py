@@ -244,34 +244,6 @@ def test_dropping_each_new_target_refuses_the_h_v2_callback_set(
     assert target in result.refusal["reason"]
 
 
-def test_electron_nucleus_distance_callback_is_profile_admitted() -> None:
-    config = _config(
-        callbacks=[
-            {"_target_": "tpen.callback.ElectronNucleusDistanceQuantiles", "quantiles": [0.5]},
-        ]
-    )
-    result = check_profile(OmegaConf.create(config), NATIVE_RECOVERY_PROFILE)
-    assert result.verdict == "supported"
-    assert result.refusal is None
-
-
-def test_observational_distance_callback_allows_max_calls() -> None:
-    config = _config(
-        callbacks=[
-            {
-                "_target_": "tpen.callback.ElectronNucleusDistanceQuantiles",
-                "quantiles": [0.5],
-                "max_calls": 2,
-            }
-        ]
-    )
-
-    result = check_profile(OmegaConf.create(config), NATIVE_RECOVERY_PROFILE)
-
-    assert result.verdict == "supported"
-    assert result.refusal is None
-
-
 @pytest.mark.parametrize(
     ("owner", "target", "code"),
     [

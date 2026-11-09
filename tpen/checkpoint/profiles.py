@@ -96,7 +96,6 @@ OBSERVATIONAL_CALLBACK_TARGETS = frozenset(
         "tpen.callback.TrainStepTiming",
         "tpen.callback.TrainPhaseTiming",
         "tpen.callback.Status",
-        "tpen.callback.ElectronNucleusDistanceQuantiles",
     }
 )
 # These callbacks are admitted explicitly because their resume behavior is
