@@ -69,9 +69,9 @@ def payload(run_dir, verdict="completed", *, identity=True):
     return value
 
 
-def test_r1_t8_legacy_evidence_digest_omits_absent_identity() -> None:
+def test_r1_t8_legacy_evidence_digest_omits_absent_identity(tmp_path: Path) -> None:
     """Legacy v1 evidence keeps its pre-identity canonical bytes and digest."""
-    legacy = payload(Path("/runs/legacy/core"), identity=False)
+    legacy = payload(tmp_path / "legacy" / "core", identity=False)
     evidence = CoreRunEvidence.from_mapping(legacy)
     assert _evidence_payload(evidence) == legacy
     assert digest(_evidence_payload(evidence)) == "366743525e63dace38629a282b6836bd49538e8fa3e669daa5af631b0c2c8c19"

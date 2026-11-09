@@ -202,12 +202,12 @@ def test_p8_dispatcher_publishes_v2_identity_on_accepted_segment(tmp_path: Path)
     assert decoded.segments[0].resolved_config_identity == identity
 
 
-def test_p8_decoders_refuse_explicit_null_identity_but_allow_absence() -> None:
+def test_p8_decoders_refuse_explicit_null_identity_but_allow_absence(tmp_path: Path) -> None:
     legacy = _segment("task-a", "attempt-1", None).to_dict()
     assert AcceptedSegment.from_mapping(legacy).resolved_config_identity is None
     with pytest.raises(TypeError, match="must not be null"):
         AcceptedSegment.from_mapping({**legacy, "resolved_config_identity": None})
-    evidence = _evidence("/runs/group-1/task-a/attempt-1/core")
+    evidence = _evidence(str(tmp_path / "group-1" / "task-a" / "attempt-1" / "core"))
     with pytest.raises(EvidenceUnavailable, match="non-null"):
         CoreRunEvidence.from_mapping({
             "schema": "tpen.run-evidence/v2",
