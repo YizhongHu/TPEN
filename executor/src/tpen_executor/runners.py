@@ -16,6 +16,7 @@ from .workers import SubprocessWorker
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
 RUN_EVIDENCE_SCHEMA_V2 = "tpen.run-evidence/v2"
 CHILD_CONTEXT_KEYS_ENV = "TPEN_EXECUTOR_CONTEXT_ENV_KEYS"
+CHILD_OBSERVATION_FILENAME = "executor-child-observation.json"
 CONTEXT_ENV_KEY_PATTERN = r"^(CUDA_VISIBLE_DEVICES|TPEN_CTX_[A-Z0-9_]{1,64})$"
 RUN_SHIM = (
     "import json, os, re, socket, sys\n"
@@ -87,7 +88,7 @@ RUN_SHIM = (
     "    except OSError as error:\n"
     "        print(f\"child-placement-refused: could not write sidecar: {error}\", file=sys.stderr)\n"
     "        raise SystemExit(2)\n"
-    "Path(run_roots[-1], 'executor-child-observation.json').write_text(json.dumps({'schema': 'tpen-executor/child-observation-v1', 'cuda_visible_devices': observed_environment.get('CUDA_VISIBLE_DEVICES'), 'environment': observed_environment, 'thread_settings': {name: observed_environment.get(name) for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS')}, 'hostname': placement_host, 'pid': placement_pid}, sort_keys=True) + '\\n', encoding='utf-8') if run_roots else None\n"
+    f"Path(run_roots[-1], {CHILD_OBSERVATION_FILENAME!r}).write_text(json.dumps({{'schema': 'tpen-executor/child-observation-v1', 'cuda_visible_devices': observed_environment.get('CUDA_VISIBLE_DEVICES'), 'environment': observed_environment, 'thread_settings': {{name: observed_environment.get(name) for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS')}}, 'hostname': placement_host, 'pid': placement_pid}}, sort_keys=True) + '\\n', encoding='utf-8') if run_roots else None\n"
     "if placement_abort:\n"
     "    raise SystemExit(2)\n"
     "from tpen.run import main\n"
@@ -372,4 +373,4 @@ class TPENEvidence:
         return CoreRunEvidence.from_mapping(decoded)
 
 
-__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CONTEXT_ENV_KEY_PATTERN", "CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "RUN_EVIDENCE_SCHEMA_V2", "TPENCommand", "TPENEvidence"]
+__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CHILD_OBSERVATION_FILENAME", "CONTEXT_ENV_KEY_PATTERN", "CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "RUN_EVIDENCE_SCHEMA_V2", "TPENCommand", "TPENEvidence"]
