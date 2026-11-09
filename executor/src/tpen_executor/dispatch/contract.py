@@ -71,6 +71,7 @@ def _evidence_payload(evidence: CoreRunEvidence) -> dict[str, Any]:
         "run_status": evidence.run_status,
         "checkpoint": evidence.checkpoint,
         "refusal": evidence.refusal,
+        "resolved_config_identity": evidence.resolved_config_identity,
     }
 
 

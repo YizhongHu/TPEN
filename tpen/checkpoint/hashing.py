@@ -17,6 +17,23 @@ RESOLVED_CONFIG_HASH_EXCLUSIONS = (
     ("run", "dir"),
 )
 
+RESOLVED_CONFIG_IDENTITY_SCHEMA = "tpen-config-identity-v1"
+RESOLVED_CONFIG_IDENTITY_EXCLUSIONS = (
+    ("run", "root"),
+    ("run", "run_id"),
+    ("run", "dir"),
+    ("run", "layout"),
+    ("run", "timezone"),
+    ("run", "timestamp"),
+    ("run", "start_time_unix"),
+    ("callbacks", "*", "output_path"),
+    ("callbacks", "*", "output_dir"),
+    ("loggers", "*", "path"),
+    ("loggers", "*", "output_path"),
+    ("loggers", "*", "output_dir"),
+    ("evaluator", "tasks", "*", "output_dir"),
+)
+
 
 _FILE_HASH_CHUNK_BYTES = 1 << 20
 
@@ -82,6 +99,33 @@ def resolved_config_hash(config: Any) -> str:
     return stable_config_hash(plain)
 
 
+def canonical_resolved_config_bytes(config: Any) -> bytes:
+    """Return canonical bytes for the public resolved-config identity.
+
+    The identity is deliberately separate from checkpoint manifest hashes:
+    checkpoint compatibility retains its historical exclusions, while this
+    public contract has a closed, documented run-artifact exclusion list.
+    """
+
+    plain = to_plain_container(config)
+    if not isinstance(plain, Mapping):
+        raise TypeError("resolved configuration identity requires a mapping")
+    normalized = copy.deepcopy(plain)
+    for path in RESOLVED_CONFIG_IDENTITY_EXCLUSIONS:
+        _delete_pattern(normalized, path)
+    safe = _json_safe(normalized)
+    return json.dumps(safe, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def resolved_config_identity(config: Any) -> dict[str, str]:
+    """Return the versioned public identity for one resolved configuration."""
+
+    return {
+        "schema": RESOLVED_CONFIG_IDENTITY_SCHEMA,
+        "sha256": hashlib.sha256(canonical_resolved_config_bytes(config)).hexdigest(),
+    }
+
+
 def component_config_hash(config: Any, section: str) -> str | None:
     """Hash one top-level config section, returning ``None`` when absent."""
 
@@ -141,3 +185,25 @@ def _delete_path(container: dict[str, Any], path: tuple[str, ...]) -> None:
         current = current[key]
     if isinstance(current, dict):
         current.pop(path[-1], None)
+
+
+def _delete_pattern(container: dict[str, Any], path: tuple[str, ...]) -> None:
+    """Delete one explicitly declared path, allowing list-index wildcards."""
+
+    if not path:
+        return
+    key = path[0]
+    if key == "*":
+        if isinstance(container, list):
+            for item in container:
+                if isinstance(item, (dict, list)):
+                    _delete_pattern(item, path[1:])
+        return
+    if not isinstance(container, dict) or key not in container:
+        return
+    if len(path) == 1:
+        container.pop(key, None)
+        return
+    child = container[key]
+    if isinstance(child, (dict, list)):
+        _delete_pattern(child, path[1:])

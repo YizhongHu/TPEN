@@ -431,6 +431,8 @@ class DirectoryStore:
             raise TypeError("evidence must be CoreRunEvidence")
         if evidence.verdict not in {"completed", "incomplete"} or evidence.checkpoint is None:
             raise FenceRejected("accepted segment requires core evidence with a checkpoint")
+        if evidence.schema == "tpen.run-evidence/v2" and evidence.resolved_config_identity is None:
+            raise FenceRejected("accepted segment requires resolved-config identity")
         task_dir = self._task_dir_for_fence(fence)
         lock_path = os.path.join(task_dir, _TASK_LOCK)
         _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
@@ -474,6 +476,7 @@ class DirectoryStore:
                 str(checkpoint["checkpoint_dir"]),
                 checkpoint["next_iteration"],
                 checkpoint["completed_updates"],
+                evidence.resolved_config_identity,
             )
             prior_segments = self._segments_for_task(task_dir)
             if prior_segments:

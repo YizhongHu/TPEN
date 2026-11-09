@@ -72,6 +72,7 @@ class CommittedSegment:
     next_iteration: int
     completed_updates: int
     placement_receipt: Mapping[str, Any] | None = None
+    resolved_config_identity: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,8 +316,22 @@ def _placement_receipt(value: Any, attempt: Mapping[str, Any], start: Mapping[st
     return record
 
 
+def _config_identity(value: Any) -> Mapping[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"schema", "sha256"}:
+        raise ManifestRefusal("malformed-record", "segment.resolved_config_identity has invalid keys")
+    if value["schema"] != "tpen-config-identity-v1":
+        raise ManifestRefusal("unknown-schema", "resolved-config identity schema is unsupported")
+    digest = _sha256(value["sha256"], "segment.resolved_config_identity.sha256")
+    return MappingProxyType({"schema": value["schema"], "sha256": digest})
+
+
 def _attempt(value: Any, group_digest: str) -> dict[str, Any]:
-    record = dict(_fields(value, {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir", "placement_receipt"} if isinstance(value, dict) and "placement_receipt" in value else {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir"}, "manifest attempt"))
+    expected = {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir"}
+    if isinstance(value, dict) and "placement_receipt" in value:
+        expected.add("placement_receipt")
+    record = dict(_fields(value, expected, "manifest attempt"))
     if record["schema"] != "tpen-executor/manifest-attempt-v1":
         raise ManifestRefusal("unknown-schema", "manifest attempt schema is unsupported")
     for key in ("task_id", "attempt_id", "output_dir"):
@@ -354,7 +369,10 @@ def _attempt(value: Any, group_digest: str) -> dict[str, Any]:
 
 
 def _segment(value: Any) -> dict[str, Any]:
-    record = dict(_fields(value, {"schema", "task_id", "attempt_id", "predecessor_checkpoint", "checkpoint_dir", "next_iteration", "completed_updates"}, "accepted segment"))
+    base = {"schema", "task_id", "attempt_id", "predecessor_checkpoint", "checkpoint_dir", "next_iteration", "completed_updates"}
+    if not isinstance(value, dict) or set(value) not in {base, base | {"resolved_config_identity"}}:
+        raise ManifestRefusal("malformed-record", "accepted segment keys differ")
+    record = dict(value)
     if record["schema"] != ACCEPTED_SEGMENT_SCHEMA:
         raise ManifestRefusal("unknown-schema", "accepted segment schema is unsupported")
     _text(record["task_id"], "segment.task_id")
@@ -364,6 +382,7 @@ def _segment(value: Any) -> dict[str, Any]:
     _text(record["checkpoint_dir"], "segment.checkpoint_dir")
     _nonnegative_int(record["next_iteration"], "segment.next_iteration")
     _nonnegative_int(record["completed_updates"], "segment.completed_updates")
+    record["resolved_config_identity"] = _config_identity(record.get("resolved_config_identity"))
     return record
 
 
@@ -426,7 +445,7 @@ def _check_segments(attempts: tuple[dict[str, Any], ...], segments: tuple[dict[s
         previous[segment["task_id"]] = segment
 
 
-def _public_evidence(value: Any) -> tuple[str, Mapping[str, Any] | None]:
+def _public_evidence(value: Any) -> tuple[str, Mapping[str, Any] | None, dict[str, str] | None]:
     if isinstance(value, Mapping):
         verdict = value.get("verdict")
         checkpoint = value.get("checkpoint")
@@ -445,7 +464,8 @@ def _public_evidence(value: Any) -> tuple[str, Mapping[str, Any] | None]:
         raise ManifestRefusal("core-evidence-mismatch", "core.schema_version must be an integer")
     _nonnegative_int(checkpoint["next_iteration"], "core.next_iteration")
     _nonnegative_int(checkpoint["completed_updates"], "core.completed_updates")
-    return verdict, checkpoint
+    raw_identity = value.get("resolved_config_identity") if isinstance(value, Mapping) else getattr(value, "resolved_config_identity", None)
+    return verdict, checkpoint, _config_identity(raw_identity)
 
 
 def _default_inspect_run(path: str | Path) -> Any:
@@ -501,7 +521,7 @@ def read(
             raise
         except Exception as error:
             raise ManifestRefusal("core-evidence-unavailable", f"core inspection failed for {run_dir}: {error}") from error
-        _, checkpoint = _public_evidence(evidence)
+        _, checkpoint, evidence_identity = _public_evidence(evidence)
         if dict(checkpoint) != {
             "checkpoint_dir": segment["checkpoint_dir"],
             "schema_version": checkpoint["schema_version"],
@@ -509,6 +529,8 @@ def read(
             "completed_updates": segment["completed_updates"],
         }:
             raise ManifestRefusal("core-evidence-mismatch", f"core evidence disagrees with accepted segment {segment['attempt_id']!r}")
+        if segment.get("resolved_config_identity") is not None and segment["resolved_config_identity"] != evidence_identity:
+            raise ManifestRefusal("core-evidence-mismatch", f"core identity disagrees with accepted segment {segment['attempt_id']!r}")
         projected = CommittedSegment(
             segment["task_id"],
             segment["attempt_id"],
@@ -517,6 +539,7 @@ def read(
             segment["next_iteration"],
             segment["completed_updates"],
             _freeze_json(attempt["placement_receipt"]),
+            segment.get("resolved_config_identity"),
         )
         by_task.setdefault(projected.task_id, []).append(projected)
     for task_id, task_segments in by_task.items():

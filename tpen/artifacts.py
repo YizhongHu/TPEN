@@ -28,6 +28,7 @@ from omegaconf import DictConfig, OmegaConf
 from tpen.events import DomainState, Ended, Event as TypedEvent, Occurrence, Operation, Started
 from tpen.distributed import ExecutionTopology, ProfileRecord, RankLocalJSONLWriter
 from tpen.durable_append import append_record
+from tpen.checkpoint.hashing import resolved_config_identity
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_RUN_DIRS = ("checkpoints", "checks", "diagnostics")
@@ -885,6 +886,7 @@ def write_run_start_artifact(context: RunContext) -> None:
     if not isinstance(study, Mapping):
         study = {}
     data = {
+        "resolved_config_identity": resolved_config_identity(cfg),
         "run_id": context.metadata.run_id,
         "run_dir": context.metadata.run_dir,
         "study": {

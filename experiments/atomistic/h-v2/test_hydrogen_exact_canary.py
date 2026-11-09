@@ -278,7 +278,7 @@ def _collect_without_checkpoint(result: dict[str, Any]) -> dict[str, Any]:
     spec = collect.RecordSpec(
         source_sha=source_sha,
         checkpoint_model_sha256="not-applicable-no-configured-checkpoint-route",
-        resolved_config_sha256=collect.file_sha256(resolved_config_path),
+        resolved_config_sha256=collect.expected_resolved_config_identity_from_path(resolved_config_path)["sha256"],
         walkers=N_WALKERS,
         draws=N_DRAWS,
     )

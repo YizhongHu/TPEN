@@ -11,12 +11,31 @@ from ._records import frozen_record
 
 OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed"})
 PLACEMENT_COMPARISON_STATES = frozenset({"matched", "mismatch", "unavailable", "refused"})
+_SEGMENT_FIELDS = {
+    "schema", "task_id", "attempt_id", "predecessor_checkpoint", "checkpoint_dir",
+    "next_iteration", "completed_updates",
+}
 
 
 def _identity(value: Any, cls: type, name: str) -> Any:
     if not isinstance(value, cls):
         raise TypeError(f"{name} must be {cls.__name__}")
     return value
+
+
+def _config_identity(value: Any) -> Mapping[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"schema", "sha256"}:
+        raise TypeError("resolved_config_identity has invalid keys")
+    if value["schema"] != "tpen-config-identity-v1":
+        raise ValueError("unknown resolved_config_identity schema")
+    digest = value["sha256"]
+    if type(digest) is not str or len(digest) != 64 or digest != digest.lower() or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError("resolved_config_identity sha256 is invalid")
+    return _freeze({"schema": value["schema"], "sha256": digest})
 
 
 @frozen_record
@@ -431,6 +450,7 @@ class AcceptedSegment:
     checkpoint_dir: str
     next_iteration: int
     completed_updates: int
+    resolved_config_identity: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
@@ -442,9 +462,10 @@ class AcceptedSegment:
             raise TypeError("next_iteration must be a nonnegative integer")
         if type(self.completed_updates) is not int or self.completed_updates < 0:
             raise TypeError("completed_updates must be a nonnegative integer")
+        object.__setattr__(self, "resolved_config_identity", _config_identity(self.resolved_config_identity))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "schema": self.schema,
             "task_id": self.task_id,
             "attempt_id": self.attempt_id.value,
@@ -453,26 +474,19 @@ class AcceptedSegment:
             "next_iteration": self.next_iteration,
             "completed_updates": self.completed_updates,
         }
+        if self.resolved_config_identity is not None:
+            data["resolved_config_identity"] = thaw(self.resolved_config_identity)
+        return data
 
     def encode(self) -> bytes:
         return canonical_bytes(self.to_dict())
 
     @classmethod
     def from_mapping(cls, data: Any) -> "AcceptedSegment":
-        fields(
-            data,
-            {
-                "schema",
-                "task_id",
-                "attempt_id",
-                "predecessor_checkpoint",
-                "checkpoint_dir",
-                "next_iteration",
-                "completed_updates",
-            },
-            cls.schema,
-            "AcceptedSegment",
-        )
+        if not isinstance(data, Mapping) or set(data) not in {_SEGMENT_FIELDS, _SEGMENT_FIELDS | {"resolved_config_identity"}}:
+            raise TypeError("AcceptedSegment has an invalid key set")
+        if data.get("schema") != cls.schema:
+            raise ValueError(f"AcceptedSegment schema must be {cls.schema!r}")
         if any(type(data[key]) is not str for key in ("task_id", "attempt_id", "checkpoint_dir")):
             raise TypeError("AcceptedSegment text fields have invalid types")
         if data["predecessor_checkpoint"] is not None and type(data["predecessor_checkpoint"]) is not str:
@@ -484,6 +498,7 @@ class AcceptedSegment:
             data["checkpoint_dir"],
             data["next_iteration"],
             data["completed_updates"],
+            data.get("resolved_config_identity"),
         )
 
     @classmethod

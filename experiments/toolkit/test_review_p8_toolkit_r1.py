@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import pytest
 from experiments.toolkit.run_results import ManifestRefusal, read, RUN_MANIFEST_V1, RUN_MANIFEST_V2
+from experiments.toolkit.config_identity import expected_resolved_config_identity
 from tpen.checkpoint.manifest import CheckpointManifest
 from tpen.inspection import inspect_run
 
@@ -113,17 +114,33 @@ else:
     assert start.returncode == 0, start.stderr
     core = Path(start.stdout.strip()) / "core"
     core_checkpoint(core)
+    intended_config = {"science": {"charge": 1}}
+    identity = expected_resolved_config_identity(intended_config)
+    (core / "run_start.json").write_text(json.dumps({"resolved_config_identity": identity}))
     evidence = inspect_run(core)
     assert evidence.verdict == "completed", evidence.to_dict()
+    assert evidence.resolved_config_identity == identity
     (tmp_path / "evidence.json").write_text(json.dumps(evidence.to_dict()))
     accept = executor(code, tmp_path, "accept")
     assert accept.returncode == 0, accept.stderr
     result = read(tmp_path / "manifest.json")
     assert len(result.chains[0].segments) == 1
+    assert result.chains[0].segments[0].resolved_config_identity == identity
 
 
-def test_t10_real_executor_store_manifest_with_placement_receipt_reads_in_toolkit(tmp_path):
-    """A real executor store manifest with S2b-1 placement crosses the boundary."""
+def test_t10_reader_refuses_a_segment_identity_mismatch(tmp_path):
+    p, out = materialize(tmp_path)
+    identity = expected_resolved_config_identity({"science": {"charge": 1}})
+    (out / "core" / "run_start.json").write_text(json.dumps({"resolved_config_identity": identity}))
+    p["segments"][0]["resolved_config_identity"] = identity
+    p["segments"][0]["resolved_config_identity"]["sha256"] = "b" * 64
+    path = write(tmp_path, p)
+    with pytest.raises(ManifestRefusal, match="identity"):
+        read(path)
+
+
+def test_t10_real_executor_store_manifest_with_placement_and_identity_reads_in_toolkit(tmp_path):
+    """One real P8 manifest carries both S2b-1 placement and core identity."""
 
     code = '''import json, sys
 from pathlib import Path
@@ -161,8 +178,11 @@ else:
     assert start.returncode == 0, start.stderr
     core = Path(start.stdout.strip()) / "core"
     checkpoint = core_checkpoint(core)
+    identity = expected_resolved_config_identity({"science": {"charge": 1}})
+    (core / "run_start.json").write_text(json.dumps({"resolved_config_identity": identity}))
     evidence = inspect_run(core)
     assert evidence.verdict == "completed", evidence.to_dict()
+    assert evidence.resolved_config_identity == identity
     (tmp_path / "evidence.json").write_text(json.dumps(evidence.to_dict()))
     finish = executor(code, tmp_path, "accept")
     assert finish.returncode == 0, finish.stderr
@@ -175,6 +195,7 @@ else:
     assert placement["child"]["proc_start_ticks"] == 55
     assert placement["gpu"]["status"] == "unavailable"
     assert result.chains[0].segments[0].checkpoint_dir == str(checkpoint)
+    assert result.chains[0].segments[0].resolved_config_identity == identity
 
 
 def test_t8_wire_fixtures_and_experiment_boundary():

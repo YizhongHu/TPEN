@@ -82,23 +82,31 @@ def _allocation() -> ConfiguredAllocation:
     return ConfiguredAllocation(AllocationId("allocation-1"), BackendJobId("job-1"), {})
 
 
-def _evidence(run_dir: str, *, verdict: str = "completed", checkpoint_dir: str | None = None, step: int = 1) -> CoreRunEvidence:
+def _evidence(
+    run_dir: str,
+    *,
+    verdict: str = "completed",
+    checkpoint_dir: str | None = None,
+    step: int = 1,
+    identity: dict[str, str] | None = None,
+) -> CoreRunEvidence:
     Path(run_dir).mkdir(parents=True, exist_ok=True)
-    return CoreRunEvidence.from_mapping(
-        {
-            "schema": "tpen.run-evidence/v1",
-            "run_dir": run_dir,
-            "verdict": verdict,
-            "run_status": verdict,
-            "checkpoint": {
-                "checkpoint_dir": checkpoint_dir or f"{run_dir}/checkpoint-{step}",
-                "schema_version": 1,
-                "next_iteration": step,
-                "completed_updates": step,
-            },
-            "refusal": None,
-        }
-    )
+    data = {
+        "schema": "tpen.run-evidence/v2" if identity is not None else "tpen.run-evidence/v1",
+        "run_dir": run_dir,
+        "verdict": verdict,
+        "run_status": verdict,
+        "checkpoint": {
+            "checkpoint_dir": checkpoint_dir or f"{run_dir}/checkpoint-{step}",
+            "schema_version": 1,
+            "next_iteration": step,
+            "completed_updates": step,
+        },
+        "refusal": None,
+    }
+    if identity is not None:
+        data["resolved_config_identity"] = identity
+    return CoreRunEvidence.from_mapping(data)
 
 
 def _evidence_without_checkpoint(run_dir: str) -> CoreRunEvidence:
@@ -155,6 +163,16 @@ def test_p8_dispatcher_accepts_one_completed_checkpoint_as_fresh_segment(tmp_pat
     assert segment.task_id == "task-a"
     assert segment.predecessor_checkpoint is None
     assert (segment.next_iteration, segment.completed_updates) == (1, 1)
+
+
+def test_p8_dispatcher_publishes_v2_identity_on_accepted_segment(tmp_path: Path) -> None:
+    identity = {"schema": "tpen-config-identity-v1", "sha256": "a" * 64}
+    store = DirectoryStore(tmp_path / "store")
+    manifest = _dispatch_once(tmp_path, _dispatcher_worker(lambda run_dir: _evidence(run_dir, identity=identity)), store)
+
+    assert manifest.segments[0].resolved_config_identity == identity
+    decoded = RunManifest.decode(manifest.encode())
+    assert decoded.segments[0].resolved_config_identity == identity
 
 
 def test_p8_dispatcher_does_not_accept_failed_member(tmp_path: Path) -> None:
