@@ -102,7 +102,6 @@ def test_core_t2_constants_facade_and_chain_resume_remain_exact():
         "tpen.callback.TrainPhaseTiming",
         "tpen.callback.Status",
         "tpen.callback.Checkpoint",
-        "tpen.callback.InitialCheckpoint",
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
     })

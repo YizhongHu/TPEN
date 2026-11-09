@@ -42,7 +42,6 @@ NEW_CALLBACK_TARGETS = frozenset(
     {
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
-        "tpen.callback.InitialCheckpoint",
     }
 )
 

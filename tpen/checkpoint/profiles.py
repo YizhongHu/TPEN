@@ -99,7 +99,6 @@ OBSERVATIONAL_CALLBACK_TARGETS = frozenset(
 RESUME_SENSITIVE_CALLBACK_TARGETS = frozenset(
     {
         "tpen.callback.Checkpoint",
-        "tpen.callback.InitialCheckpoint",
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
     }
