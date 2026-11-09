@@ -159,6 +159,19 @@ def test_round_trip_publishes_only_the_selected_compressed_bundle(tmp_path: Path
     np.testing.assert_array_equal(rows["term/kinetic"], [1.0, 2.0, 1.0, 2.0])
 
 
+def test_reader_refuses_physical_bundle_hash_mismatch(tmp_path: Path) -> None:
+    _publish_valid(tmp_path)
+
+    # Keep the archive readable and logically identical while changing its
+    # physical representation, leaving the published sidecar hash stale.
+    bundle = tmp_path / "partition-00000.npz"
+    arrays = dict(np.load(bundle, allow_pickle=False))
+    np.savez(bundle, **arrays)
+
+    with pytest.raises(ValueError, match="physical hash"):
+        TrainingBatchReader(tmp_path).validate()
+
+
 def test_partition_provenance_is_written_and_exposed_by_reader(tmp_path: Path) -> None:
     """Keep run, source, sampler, and partition acceptance provenance typed."""
 
