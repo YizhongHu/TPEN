@@ -7,7 +7,8 @@ integration test that needs core internals lives in the core ``tests/`` tree
 instead (item 2). This test parses every ``.py`` file under this directory
 (recursively) with ``ast`` and fails on any ``tpen`` import other than
 ``tpen.run.run_from_config``, on any import of ``hydra`` (direct or via
-``hydra.utils``), and on reaching either module through a literal-string
+``hydra.utils``), on any import of ``tpen_executor`` (direct or via a
+submodule), and on reaching any of those modules through a literal-string
 dynamic import (``importlib.import_module``, ``__import__``,
 ``pytest.importorskip``, ``importlib.util.spec_from_file_location``).
 
@@ -17,6 +18,13 @@ scanner missed a nested file and `spec_from_file_location`'s path argument
 inspects every string-constant argument of a candidate dynamic-import call,
 and self-checks that the swept corpus is real so a mis-resolved ``HERE`` (or
 an accidentally empty directory) fails loudly instead of certifying nothing.
+
+Acceptance-contract-amendment-20261109-reorder (item 9d3aa0a3): the study
+talks to the executor only through its CLI as a subprocess plus the shared
+toolkit helpers, never by importing ``tpen_executor`` itself, even from the
+new ``attached.py`` activation route. ``tpen_executor`` is therefore added to
+the same forbidden-import and forbidden-dynamic-import checks as ``tpen`` and
+``hydra`` below.
 """
 
 from __future__ import annotations
@@ -66,6 +74,8 @@ def _violations(path: Path) -> list[str]:
                     found.append(f"{path.name}: import {alias.name}")
                 if alias.name == "tpen" or alias.name.startswith("tpen."):
                     found.append(f"{path.name}: import {alias.name}")
+                if alias.name == "tpen_executor" or alias.name.startswith("tpen_executor."):
+                    found.append(f"{path.name}: import {alias.name}")
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             for alias in node.names:
@@ -81,6 +91,8 @@ def _violations(path: Path) -> list[str]:
                 if module == "tpen" or module.startswith("tpen."):
                     if module == ALLOWED_TPEN_IMPORT[0] and alias.name == ALLOWED_TPEN_IMPORT[1]:
                         continue
+                    found.append(f"{path.name}: from {module} import {alias.name}")
+                if module == "tpen_executor" or module.startswith("tpen_executor."):
                     found.append(f"{path.name}: from {module} import {alias.name}")
         elif isinstance(node, ast.Call) and node.args:
             function = _chain(node.func)
@@ -111,7 +123,7 @@ def _swept() -> tuple[Path, ...]:
 def test_experiment_files_only_reach_core_through_run_from_config() -> None:
     paths = _swept()
     names = {path.name for path in paths}
-    required = {"protocol.py", "collect.py", "test_pipeline.py", "test_collect.py", "conftest.py"}
+    required = {"protocol.py", "collect.py", "test_pipeline.py", "test_collect.py", "conftest.py", "attached.py"}
     assert required <= names, f"swept corpus looks wrong, found only: {sorted(names)}"
     violations = [hit for path in paths for hit in _violations(path)]
     assert not violations, "experiment boundary violated:\n" + "\n".join(violations)
