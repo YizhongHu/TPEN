@@ -24,16 +24,18 @@ class GroupedModel(nn.Module):
         self.readout.trace_name = "final_readout"
 
 
-class LoggerContext:
+class LoggerContext(RecordingContext):
     """Forward callback records through the production logger interfaces."""
 
     def __init__(self, *loggers) -> None:
+        super().__init__()
         self.loggers = loggers
 
     def log(self, metrics, *, step=None, namespace="run") -> None:
         record = LogRecord(step=step, namespace=namespace, metrics=dict(metrics))
         for logger in self.loggers:
             logger.log(record)
+        super().log(metrics, step=step, namespace=namespace)
 
 
 def test_resolver_uses_module_paths_and_explicit_trace_names() -> None:
