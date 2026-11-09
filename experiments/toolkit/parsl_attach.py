@@ -150,6 +150,14 @@ def _run_dispatch_payload(
 ) -> dict[str, Any]:
     """Run one immutable argv and write only stdlib worker evidence.
 
+    When ``visibility_variable`` is supplied, an explicit
+    ``visibility_value`` takes precedence over the worker's ambient value;
+    otherwise the worker's ambient value takes precedence over the serialized
+    environment map, and the key is removed when the worker has no ambient
+    value.  With no visibility variable (the INHERIT path), the serialized
+    environment is merged normally and only the placement receipt can report
+    its visible value.
+
     This function is intentionally self-contained: Parsl serializes it by
     value, and a worker must never import this package to execute a row.
     """
@@ -159,9 +167,19 @@ def _run_dispatch_payload(
     stdout_path = output_path / "stdout.log"
     stderr_path = output_path / "stderr.log"
     status_path = output_path / "attempt_status.json"
+    worker_visibility_value = (
+        os.environ.get(visibility_variable) if visibility_variable is not None else None
+    )
     worker_environment = os.environ | {str(key): str(value) for key, value in environment.items()}
-    if visibility_variable is not None and visibility_value is not None:
-        worker_environment[visibility_variable] = visibility_value
+    if visibility_variable is not None:
+        if visibility_value is not None:
+            worker_environment[visibility_variable] = visibility_value
+        elif worker_visibility_value is None:
+            worker_environment.pop(visibility_variable, None)
+        else:
+            # A tiled worker owns this value. Do not let the serialized
+            # dispatcher environment replace it during payload execution.
+            worker_environment[visibility_variable] = worker_visibility_value
     started_at = time.time()
     # Keep this worker payload stdlib-only. Parsl serializes it by value, and
     # importing the toolkit here would make worker deserialization depend on
@@ -283,21 +301,39 @@ class ParslAttachExecutor:
             raise ValueError("ParslAttachExecutor requires context.run_root as the launch attempt directory")
 
         launch_attempt_dir = Path(context.run_root)
+        tiled = bool(context.visibility_values) or context.nodes_per_block is not None
+        if tiled:
+            visibility_variable = context.visibility_variable
+            if visibility_variable in context.environment:
+                raise ValueError(
+                    "TILED visibility override from context.environment is not allowed for "
+                    f"key {visibility_variable!r}"
+                )
+            for dispatch in ready_dispatches:
+                if visibility_variable in dispatch.environment:
+                    raise ValueError(
+                        "TILED visibility override from dispatch.environment is not allowed for "
+                        f"key {visibility_variable!r} for dispatch attempt "
+                        f"{dispatch.attempt_id!r}"
+                    )
         runner = self.app_runner or self._real_runner(context, launch_attempt_dir)
         submitted: list[tuple[DispatchSpec, Any]] = []
         for dispatch in ready_dispatches:
             output_directory = launch_attempt_dir / "dispatch" / dispatch.attempt_id
+            environment = os.environ | {**context.environment, **dispatch.environment}
+            if tiled:
+                # available_accelerators binds each HTEX worker. The task must
+                # inherit that worker-owned environment; dispatcher visibility
+                # is not a resource identity.
+                environment.pop(context.visibility_variable, None)
             runner_kwargs: dict[str, Any] = {
                 "argv": dispatch.argv,
                 "cwd": dispatch.cwd,
-                "environment": os.environ | {**context.environment, **dispatch.environment},
+                "environment": environment,
                 "output_directory": str(output_directory),
                 "attempt_id": dispatch.attempt_id,
             }
-            # ``available_accelerators`` binds each HTEX worker.  The task must
-            # inherit that worker-owned environment; dispatch order is not a
-            # resource identity and must never select a GPU.
-            if context.visibility_values or context.nodes_per_block is not None:
+            if tiled:
                 runner_kwargs["visibility_variable"] = context.visibility_variable
             submitted.append(
                 (

@@ -298,6 +298,7 @@ def test_inherit_visibility_keeps_scheduler_binding(tmp_path: Path, monkeypatch:
     context = _context(tmp_path, visibility_values=())
     assert context.validate() is context
     ParslAttachExecutor(app_runner=fake_runner).dispatch((spec,), context=context)
+    assert calls[0]["environment"]["CUDA_VISIBLE_DEVICES"] == "scheduler-mig"
     assert "visibility_variable" not in calls[0]
     assert "visibility_value" not in calls[0]
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "scheduler-mig"
@@ -306,12 +307,17 @@ def test_inherit_visibility_keeps_scheduler_binding(tmp_path: Path, monkeypatch:
     payload = _run_dispatch_payload(
         (sys.executable, "-c", "import os; print(os.environ['CUDA_VISIBLE_DEVICES'])"),
         str(tmp_path),
-        {},
+        calls[0]["environment"],
         str(output),
-        "inherit-attempt",
+        calls[0]["attempt_id"],
     )
     assert payload["returncode"] == 0
     assert (output / "stdout.log").read_text() == "scheduler-mig\n"
+    status = json.loads((output / "attempt_status.json").read_text())
+    assert payload["inherited_visibility_value"] is None
+    assert payload["placement"]["cuda_visible_devices"] == "scheduler-mig"
+    assert status["inherited_visibility_value"] is None
+    assert status["placement"]["cuda_visible_devices"] == "scheduler-mig"
 
     parsl = pytest.importorskip("parsl")
     captured: dict[str, Any] = {}
@@ -324,7 +330,96 @@ def test_inherit_visibility_keeps_scheduler_binding(tmp_path: Path, monkeypatch:
     assert captured["config"].executors[0].max_workers_per_node == 1
 
 
-def test_worker_binding_is_measured_not_selected_by_dispatch_index(tmp_path: Path) -> None:
+def test_tiled_visibility_protects_worker_binding_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worker's binding survives dispatch and a real child process."""
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "dispatcher-mig")
+    calls: list[dict[str, Any]] = []
+    payloads: list[dict[str, Any]] = []
+
+    def fake_runner(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "worker-mig")
+        payload = _run_dispatch_payload(
+            (sys.executable, "-c", "import os; print(os.environ['CUDA_VISIBLE_DEVICES'])"),
+            kwargs["cwd"],
+            kwargs["environment"],
+            kwargs["output_directory"],
+            kwargs["attempt_id"],
+            kwargs["visibility_variable"],
+            kwargs.get("visibility_value"),
+        )
+        payloads.append(payload)
+        return payload
+
+    ParslAttachExecutor(app_runner=fake_runner).dispatch(
+        (_dispatch(tmp_path),), context=_context(tmp_path)
+    )
+
+    assert "CUDA_VISIBLE_DEVICES" not in calls[0]["environment"]
+    assert (tmp_path / "launch" / "dispatch" / "attempt-1" / "stdout.log").read_text() == (
+        "worker-mig\n"
+    )
+    assert payloads[0]["inherited_visibility_value"] == "worker-mig"
+    assert payloads[0]["placement"]["cuda_visible_devices"] == "worker-mig"
+
+
+def test_payload_protects_worker_binding_from_serialized_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A serialized visibility override cannot replace the worker binding."""
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "worker-mig")
+    output = tmp_path / "payload"
+    payload = _run_dispatch_payload(
+        (sys.executable, "-c", "import os; print(os.environ['CUDA_VISIBLE_DEVICES'])"),
+        str(tmp_path),
+        {"CUDA_VISIBLE_DEVICES": "dispatcher-mig"},
+        str(output),
+        "attempt-1",
+        "CUDA_VISIBLE_DEVICES",
+    )
+
+    assert (output / "stdout.log").read_text() == "worker-mig\n"
+    assert payload["inherited_visibility_value"] == "worker-mig"
+    assert payload["placement"]["cuda_visible_devices"] == "worker-mig"
+
+
+@pytest.mark.parametrize("source", ["context", "dispatch"])
+def test_tiled_visibility_override_is_rejected_before_runner(
+    source: str, tmp_path: Path
+) -> None:
+    """Reject ambiguous tiled visibility overrides before submitting work."""
+
+    calls = 0
+
+    def fake_runner(**kwargs: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {"returncode": 0}
+
+    spec = _dispatch(tmp_path)
+    context = _context(
+        tmp_path,
+        environment={"CUDA_VISIBLE_DEVICES": "context-mig"} if source == "context" else {},
+    )
+    if source == "dispatch":
+        spec = replace(spec, environment={**spec.environment, "CUDA_VISIBLE_DEVICES": "task-mig"})
+
+    with pytest.raises(ValueError, match=rf"TILED visibility override from {source}") as raised:
+        ParslAttachExecutor(app_runner=fake_runner).dispatch((spec,), context=context)
+
+    assert "CUDA_VISIBLE_DEVICES" in str(raised.value)
+    if source == "dispatch":
+        assert spec.attempt_id in str(raised.value)
+    assert calls == 0
+
+
+def test_worker_binding_is_measured_not_selected_by_dispatch_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A worker assignment differing from submission order must be preserved."""
 
     observed: list[str] = []
@@ -334,11 +429,12 @@ def test_worker_binding_is_measured_not_selected_by_dispatch_index(tmp_path: Pat
 
     def fake_runner(**kwargs: Any) -> dict[str, Any]:
         worker_binding = next(worker_bindings)
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", worker_binding)
         output = Path(kwargs["output_directory"])
         payload = _run_dispatch_payload(
             kwargs["argv"],
             kwargs["cwd"],
-            {**kwargs["environment"], "CUDA_VISIBLE_DEVICES": worker_binding},
+            kwargs["environment"],
             str(output),
             kwargs["attempt_id"],
             kwargs["visibility_variable"],
