@@ -51,9 +51,10 @@ class _DriftingReadout(_FixedReadout):
     def __init__(self) -> None:
         super().__init__(raw_value=5.0e-6)
         self.drift = nn.Parameter(torch.zeros(()))
+        self.replay = False
 
     def forward(self, batch: ElectronBatch) -> WavefunctionOutput:
-        if not torch.is_grad_enabled():
+        if self.replay and not torch.is_grad_enabled():
             with torch.no_grad():
                 self.drift.add_(1.0)
         return super().forward(batch)
@@ -140,7 +141,9 @@ def test_ordinary_model_raw_sum_agrees_with_logabs_sign_and_has_no_floor_hits(tm
     )
     directory = tmp_path / "ordinary"
     directory.mkdir()
-    _generator(_FixedTrajectorySampler(positions), chunk_size=2).generate(
+    ReadoutTrajectoryMCMCGenerator(
+        **_kwargs(), readout_eps=1.0e-12, replay_chunk_size=2
+    ).generate(
         model=_FixedReadout(raw_value=5.0e-6).eval(), context=_context(directory)
     )
     rows = list(csv.DictReader((directory / "raw_readout.csv").open(newline="")))
@@ -164,7 +167,9 @@ def test_forced_floor_raw_sums_and_flags_match_independent_oracle(tmp_path):
     )
     directory = tmp_path / "floor"
     directory.mkdir()
-    _generator(_FixedTrajectorySampler(positions), chunk_size=2).generate(
+    ReadoutTrajectoryMCMCGenerator(
+        **_kwargs(), readout_eps=1.0e-12, replay_chunk_size=2
+    ).generate(
         model=_FixedReadout().eval(), context=_context(directory)
     )
     rows = list(csv.DictReader((directory / "raw_readout.csv").open(newline="")))
@@ -197,7 +202,15 @@ def test_replay_refuses_training_mode(tmp_path):
         )
 
 
-def test_replay_refuses_parameter_fingerprint_change(tmp_path):
+def test_replay_refuses_parameter_fingerprint_change(monkeypatch, tmp_path):
+    original_generate = TrajectoryMCMCGenerator.generate
+
+    def collect_then_enable_replay(self, *, model, context):
+        generated = original_generate(self, model=model, context=context)
+        model.replay = True
+        return generated
+
+    monkeypatch.setattr(TrajectoryMCMCGenerator, "generate", collect_then_enable_replay)
     with pytest.raises(ValueError, match="changed"):
         ReadoutTrajectoryMCMCGenerator(**_kwargs(), readout_eps=1.0e-12).generate(
             model=_DriftingReadout().eval(), context=_context(tmp_path)

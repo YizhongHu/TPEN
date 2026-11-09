@@ -236,6 +236,7 @@ def test_collector_admits_the_real_smoke_evaluation_output(tmp_path: Path, recor
     train = protocol.training_config()
     train["run"]["root"] = str(tmp_path)
     train["run"]["run_id"] = "collector-train"
+    train["model"]["readout"]["eps"] = 1.0e-12
     train["trainer"]["max_steps"] = 1
     train["sampler"].update(n_walkers=8, burn_in=2, n_steps=1)
     train["callbacks"][-1]["schedule"]["every_n"] = 1
