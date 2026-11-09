@@ -28,7 +28,7 @@ def _study_module(name):
         spec = importlib.util.spec_from_file_location(key, HERE / f"{name}.py")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        sys.modules[key] = module
+        sys.modules[spec.name] = module  # spec.name == key; matches this dir's own loader idiom
         spec.loader.exec_module(module)
     return sys.modules[key]
 
