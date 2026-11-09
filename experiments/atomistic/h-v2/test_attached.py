@@ -175,8 +175,10 @@ def test_build_h_v2_train_plan_requires_absolute_paths(tmp_path: Path) -> None:
 
 
 def test_build_h_v2_train_plan_rejects_a_drifted_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    original_training_config = protocol.training_config
+
     def _bad_config() -> dict[str, Any]:
-        config = protocol.training_config()
+        config = original_training_config()
         config["system"]["n_particles"] = 2
         return config
 
@@ -508,7 +510,7 @@ def test_activate_h_v2_run_propagates_admission_refusal(tmp_path: Path, monkeypa
             h_v2_receipt_path=tmp_path / "h-v2-receipt.json",
             expected_source_commit="a" * 40,
         )
-    assert excinfo.value.code == "executor-exit-2"
+    assert excinfo.value.code == "executor-failed"
     failure_payload = json.loads(activation_receipt_path.read_text(encoding="utf-8"))
     assert failure_payload["status"] == "failed"
     assert failure_payload["refusal"]["code"] == "executor-exit-2"
