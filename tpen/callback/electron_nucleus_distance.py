@@ -151,6 +151,12 @@ def _validate_quantiles(values: Sequence[float]) -> tuple[float, ...]:
         raise ValueError(f"quantiles must lie in [0, 1], got {levels}")
     if len(set(levels)) != len(levels):
         raise ValueError(f"quantiles must not contain duplicates, got {levels}")
+    labels = tuple(_quantile_label(level) for level in levels)
+    if len(set(labels)) != len(labels):
+        raise ValueError(
+            "quantiles must have unique serialized labels, "
+            f"got {dict(zip(levels, labels, strict=True))}"
+        )
     return levels
 
 
