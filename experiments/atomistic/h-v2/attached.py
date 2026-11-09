@@ -28,8 +28,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import yaml
+from omegaconf import OmegaConf
 
 from experiments.toolkit.attached_activation import (
+    PROFILE_NAME,
     ActivationRefusal,
     AttachedHandoff,
     ExecutorDispatchResult,
@@ -66,27 +68,47 @@ def _h_v2_module(name: str) -> Any:
     spec = importlib.util.spec_from_file_location(key, HERE / f"{name}.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules[key] = module
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
 
 protocol = _h_v2_module("protocol")
-collect = _h_v2_module("collect")
 
 
 ROUTE_NAME = "h-v2-attached"
 TRAIN_STAGE = "train"
 EVAL_STAGE = "eval"
 H_V2_ACCEPTED_RECEIPT_SCHEMA = "tpen-experiments/h-v2-accepted-receipt-v1"
+#: F1: EVAL cannot yet produce accepted checkpoint-based evidence.  EVAL's
+#: model-only restore writes no training checkpoint, so
+#: ``tpen/inspection.py``'s ``inspect_run`` returns ``missing-checkpoint``
+#: even for a run that completed correctly, and the executor's own contract
+#: (``executor/src/tpen_executor/dispatch/contract.py``) publishes no
+#: accepted segment without checkpoint evidence.  This is an inter-lane
+#: core/executor contract decision (see TO item 9d3aa0a3, note
+#: ``blocker-recovery-profile-callback-whitelist-20261109``), not something
+#: this study-side module can resolve by inventing a training checkpoint.
+EVAL_ROUTE_UNSUPPORTED_CODE = "h-v2-eval-route-unsupported"
+EVAL_ROUTE_UNSUPPORTED_REASON = (
+    "H-v2 EVAL cannot yet produce accepted checkpoint-based evidence: a model-only "
+    "restore writes no training checkpoint, so tpen/inspection.py's inspect_run "
+    "returns 'missing-checkpoint' for a run that completed correctly, and the "
+    "executor's dispatch contract publishes no accepted segment without one. "
+    "Blocked on an inter-lane core/executor contract decision for completed-EVAL "
+    "evidence; see TO item 9d3aa0a3-0f59-43e6-b52b-dcf39a39785d."
+)
 #: Artifacts present in every segment's core run directory (both callback
 #: configs declare ``ResolvedConfigSnapshot``/``Metadata`` unconditionally).
 _BASE_ARTIFACTS = {"resolved_config": "resolved_config.yaml", "metadata": "metadata.json"}
-#: Additional artifacts present only for a committed segment that ran an
-#: evaluation trajectory (``SampledRecordWriter``'s envelope).
+#: Trajectory artifacts, required for every EVAL segment and never declared
+#: for TRAIN (``SampledRecordWriter``'s envelope, written under the real
+#: frozen ``configs/eval.yaml:129`` evaluator task output directory,
+#: ``${run.dir}/trajectory``, i.e. ``trajectory/`` relative to the fenced
+#: core run directory).
 _TRAJECTORY_ARTIFACTS = {
-    "trajectory_csv": "sampled_eval_table.csv",
-    "trajectory_metadata": "sampled_eval_table.metadata.json",
+    "trajectory_csv": "trajectory/sampled_eval_table.csv",
+    "trajectory_metadata": "trajectory/sampled_eval_table.metadata.json",
 }
 
 
@@ -119,6 +141,8 @@ class PreparedHV2Run:
     handoff: AttachedHandoff
     task_id: str
     effective_config: str
+    config: Mapping[str, Any]
+    overrides: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,9 +357,25 @@ def build_h_v2_eval_plan(
     return plan, {task_id: overrides}, config
 
 
+def _compose_config_with_overrides(effective_config: str | Path, overrides: Sequence[str]) -> dict[str, Any]:
+    """Compose the exact config that will launch: the effective file plus overrides.
+
+    Mirrors ``experiments.toolkit.attached_activation.check_profile``'s own
+    composition (``OmegaConf.merge(base, OmegaConf.from_dotlist(overrides))``)
+    so the contract check and the profile check see the same bound config.
+    """
+
+    base = OmegaConf.load(effective_config)
+    merged = OmegaConf.merge(base, OmegaConf.from_dotlist(list(overrides)))
+    composed = OmegaConf.to_container(merged, resolve=False)
+    assert isinstance(composed, dict)
+    return composed
+
+
 def prepare_h_v2_run(
     plan: StagePlanV2,
     overrides_by_task: Mapping[str, Sequence[str]],
+    config: Mapping[str, Any],
     *,
     output_dir: str | Path,
 ) -> PreparedHV2Run:
@@ -348,6 +388,10 @@ def prepare_h_v2_run(
         :func:`build_h_v2_eval_plan`.
     overrides_by_task : mapping[str, sequence[str]]
         Exact per-task override tuple returned alongside ``plan``.
+    config : mapping
+        The exact resolved config dict returned alongside ``plan``, used
+        later to bind stage-specific artifact declarations to the prepared
+        config (see :func:`activate_h_v2_run`).
     output_dir : str or pathlib.Path
         Absolute handoff directory.
 
@@ -358,6 +402,16 @@ def prepare_h_v2_run(
 
     Raises
     ------
+    HV2ReceiptRefusal
+        If the plan does not carry exactly one task.
+    ValueError
+        If the exact bound config -- the effective config file composed with
+        its own overrides, the same composition that will actually launch --
+        fails :func:`protocol.assert_hydrogen_contract`.  Carried requirement
+        1 is checked here, on the COMPOSED config, not only on the builder's
+        unresolved dict: an override supplied after the builder ran (for
+        example a tampered ``system.n_particles=2``) is caught here, before
+        any dispatch.
     ActivationRefusal
         If handoff translation fails; current sidecars are retired and a
         diagnostic is preserved (see ``write_attached_handoff``).
@@ -367,6 +421,9 @@ def prepare_h_v2_run(
         raise HV2ReceiptRefusal("multi-task-plan", "the H-v2 attached route dispatches exactly one task")
     task = plan.tasks[0]
     effective_config = task.params["config"]
+    overrides = tuple(str(item) for item in overrides_by_task[task.logical_task_id])
+    composed = _compose_config_with_overrides(effective_config, overrides)
+    protocol.assert_hydrogen_contract(composed, evaluation=(task.stage == EVAL_STAGE))
     handoff = write_attached_handoff(
         output_dir,
         plan,
@@ -375,7 +432,7 @@ def prepare_h_v2_run(
         overrides_by_task=overrides_by_task,
         metadata={"route": ROUTE_NAME, "stage": task.stage},
     )
-    return PreparedHV2Run(plan, handoff, task.logical_task_id, str(effective_config))
+    return PreparedHV2Run(plan, handoff, task.logical_task_id, str(effective_config), dict(config), overrides)
 
 
 def activate_h_v2_run(
@@ -442,16 +499,28 @@ def activate_h_v2_run(
     """
 
     expected = prepared.handoff.task_ids
+    manifest_path = Path(store) / "run-manifest.json"
+    stage = prepared.plan.tasks[0].stage
+
+    def _fail(code: str, reason: str, *, profile: str | None = None) -> None:
+        for path in (activation_receipt_path, h_v2_receipt_path):
+            write_activation_failure_receipt(
+                path,
+                code=code,
+                reason=reason,
+                expected_task_ids=expected,
+                profile=profile if profile is not None else PROFILE_NAME,
+                manifest_path=manifest_path,
+            )
+
+    if stage == EVAL_STAGE:
+        _fail(EVAL_ROUTE_UNSUPPORTED_CODE, EVAL_ROUTE_UNSUPPORTED_REASON)
+        raise ActivationRefusal(EVAL_ROUTE_UNSUPPORTED_CODE, EVAL_ROUTE_UNSUPPORTED_REASON)
+
     try:
-        profile = check_profile(science_python, prepared.effective_config, cwd=cwd)
+        profile = check_profile(science_python, prepared.effective_config, overrides=prepared.overrides, cwd=cwd)
     except ActivationRefusal as error:
-        write_activation_failure_receipt(
-            activation_receipt_path,
-            code=error.code,
-            reason=error.reason,
-            expected_task_ids=expected,
-            manifest_path=Path(store) / "run-manifest.json",
-        )
+        _fail(error.code, error.reason)
         raise
     dispatch = run_executor_cli(
         executor_python,
@@ -463,16 +532,10 @@ def activate_h_v2_run(
         timeout=timeout,
         cwd=cwd,
     )
-    manifest_path = Path(store) / "run-manifest.json"
     if dispatch.manifest is None or not manifest_path.is_file():
-        write_activation_failure_receipt(
-            activation_receipt_path,
-            code=f"executor-exit-{dispatch.returncode}",
-            reason=dispatch.stderr.strip() or "executor did not publish a manifest",
-            expected_task_ids=expected,
-            profile=profile.profile,
-            manifest_path=manifest_path,
-        )
+        code = f"executor-exit-{dispatch.returncode}"
+        reason = dispatch.stderr.strip() or "executor did not publish a manifest"
+        _fail(code, reason, profile=profile.profile)
         raise ActivationRefusal("executor-failed", f"executor CLI returned {dispatch.returncode}")
     try:
         write_activation_receipt(
@@ -483,6 +546,14 @@ def activate_h_v2_run(
             profile=profile.profile,
         )
     except Exception as error:
+        write_activation_failure_receipt(
+            h_v2_receipt_path,
+            code="reader-failed",
+            reason=str(error),
+            expected_task_ids=expected,
+            profile=profile.profile,
+            manifest_path=manifest_path,
+        )
         raise ActivationRefusal("reader-failed", str(error)) from error
     try:
         write_h_v2_accepted_receipt(
@@ -490,14 +561,25 @@ def activate_h_v2_run(
             h_v2_receipt_path,
             expected_task_ids=expected,
             expected_source_commit=expected_source_commit,
+            stage=stage,
             inspect_run=inspect_run,
             artifact_declarations=artifact_declarations,
         )
-    except Exception:
+    except (HV2ReceiptRefusal, ManifestRefusal) as error:
         write_activation_failure_receipt(
             h_v2_receipt_path,
-            code="h-v2-receipt-refused",
-            reason="see h_v2_receipt_path for the refusal detail",
+            code=error.code,
+            reason=error.reason,
+            expected_task_ids=expected,
+            profile=profile.profile,
+            manifest_path=manifest_path,
+        )
+        raise
+    except Exception as error:
+        write_activation_failure_receipt(
+            h_v2_receipt_path,
+            code="h-v2-receipt-build-failed",
+            reason=str(error),
             expected_task_ids=expected,
             profile=profile.profile,
             manifest_path=manifest_path,
@@ -511,6 +593,7 @@ def build_h_v2_accepted_receipt(
     *,
     expected_task_ids: Sequence[str],
     expected_source_commit: str,
+    stage: str = TRAIN_STAGE,
     inspect_run: Any = None,
     artifact_declarations: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -525,14 +608,23 @@ def build_h_v2_accepted_receipt(
         Exact ordered task identities expected from this generation.
     expected_source_commit : str
         The exact commit this job checked out.
+    stage : {"train", "eval"}, default="train"
+        Segment stage, bound to the prepared config by the caller (see
+        :func:`activate_h_v2_run`).  EVAL segments additionally and
+        unconditionally declare the trajectory pair, written under the real
+        frozen ``configs/eval.yaml:129`` evaluator task output directory
+        (``trajectory/`` relative to the fenced core run directory).  TRAIN
+        segments never produce a trajectory and never declare one, so
+        ``trajectory_csv_sha256`` stays ``None`` for them.
     inspect_run : callable, optional
         Public core inspector, or a test double receiving each fenced core
         run directory.
     artifact_declarations : mapping[str, str], optional
         Additional ``{name: relative_path}`` entries every accepted segment
-        must carry, beyond the base (``resolved_config``, ``metadata``)
-        artifacts this function always declares.  Later logging layers
-        extend this without redefining the receipt schema.
+        must carry, beyond the base (``resolved_config``, ``metadata``) and,
+        for EVAL, the trajectory artifacts this function already declares.
+        Later logging layers extend this without redefining the receipt
+        schema.
 
     Returns
     -------
@@ -546,17 +638,46 @@ def build_h_v2_accepted_receipt(
         If the manifest, chain, or public core evidence is inconsistent
         (propagated unchanged from ``read()``), the task-set does not match
         ``expected_task_ids``, or the recorded trajectory has an
-        uncommitted tail (propagated from ``collect.validate_manifest``).
+        uncommitted tail.
     HV2ReceiptRefusal
         If a segment's source commit disagrees with ``expected_source_commit``,
         a chain's segments disagree on their resolved-config hash (a wrong
         resolved-config identity drifting mid-chain), or a declared artifact
-        is missing.
+        -- including both trajectory entries for an EVAL segment -- is
+        missing.
+
+    Notes
+    -----
+    This function does not carry a trusted, independently-computed expected
+    ``resolved_config_sha256`` per segment (amendment item 3's
+    ``collect.validate_run_identity`` reconciliation).  ``resolved_config.yaml``
+    is written by ``tpen.callback.ResolvedConfigSnapshot`` via
+    ``OmegaConf.save(context.cfg, path, resolve=True)``, where ``context.cfg``
+    additionally carries ``run.root``/``run.run_id``/``run.layout`` values the
+    ATTACHED EXECUTOR forces onto every dispatched command
+    (``executor/src/tpen_executor/dispatch/contract.py``,
+    ``dispatch/parsl.py``), overriding this module's own ``run.root``/
+    ``run.run_id`` overrides.  That forcing is executor-private behavior, not
+    part of any publicly documented toolkit contract (the only public
+    contract is ``experiments/toolkit/run_results.py``'s ``"/core"`` fencing
+    suffix); reproducing it here to compute an independent expected hash
+    would couple this study module to undocumented executor internals rather
+    than to a supported boundary, and risk silent, wrong refusals the moment
+    that internal forcing changes.  Per orchestrator decision F4, this is
+    reported rather than worked around: the cross-segment resolved-config
+    equality check below is retained as defense-in-depth for a multi-segment
+    chain, but a single-segment run (the normal case for this route) has no
+    independent identity check.  See TO item
+    9d3aa0a3-0f59-43e6-b52b-dcf39a39785d.
     """
 
+    if stage not in (TRAIN_STAGE, EVAL_STAGE):
+        raise ValueError(f"stage must be {TRAIN_STAGE!r} or {EVAL_STAGE!r}, got {stage!r}")
     manifest_path = Path(manifest_path)
     expected = tuple(str(item) for item in expected_task_ids)
     declared = dict(_BASE_ARTIFACTS)
+    if stage == EVAL_STAGE:
+        declared.update(_TRAJECTORY_ARTIFACTS)
     if artifact_declarations:
         declared.update(artifact_declarations)
 
@@ -592,12 +713,18 @@ def build_h_v2_accepted_receipt(
 
     segments_payload: list[dict[str, Any]] = []
     for (task_id, segment), core_dir in zip(flat_segments, recorded_run_dirs, strict=True):
-        resolved_config_path = core_dir / declared["resolved_config"]
+        # Every declared artifact -- base, trajectory (EVAL only), and any
+        # caller-supplied additions -- is required unconditionally: a
+        # declared file that is missing refuses the whole segment rather
+        # than being silently skipped.
+        artifacts: dict[str, dict[str, str]] = {}
+        for name, relative in declared.items():
+            artifact_path = core_dir / relative
+            if not artifact_path.is_file():
+                raise HV2ReceiptRefusal("missing-artifact", f"{task_id!r} is missing declared artifact {name!r}")
+            artifacts[name] = {"path": str(artifact_path), "sha256": file_sha256(artifact_path)}
+
         metadata_path = core_dir / declared["metadata"]
-        if not resolved_config_path.is_file():
-            raise HV2ReceiptRefusal("missing-artifact", f"{task_id!r} is missing {declared['resolved_config']!r}")
-        if not metadata_path.is_file():
-            raise HV2ReceiptRefusal("missing-artifact", f"{task_id!r} is missing {declared['metadata']!r}")
         run_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         actual_commit = run_metadata.get("git_commit")
         if actual_commit != expected_source_commit:
@@ -606,39 +733,17 @@ def build_h_v2_accepted_receipt(
                 f"{task_id!r} segment {segment.attempt_id!r} ran commit {actual_commit!r}, "
                 f"expected {expected_source_commit!r}",
             )
-        resolved_config_sha256 = file_sha256(resolved_config_path)
+        resolved_config_sha256 = artifacts["resolved_config"]["sha256"]
 
         trajectory_csv_sha256: str | None = None
-        trajectory_name = declared.get("trajectory_csv", _TRAJECTORY_ARTIFACTS["trajectory_csv"])
-        trajectory_metadata_name = declared.get(
-            "trajectory_metadata", _TRAJECTORY_ARTIFACTS["trajectory_metadata"]
-        )
-        trajectory_csv_path = core_dir / trajectory_name
-        trajectory_metadata_path = core_dir / trajectory_metadata_name
-        if trajectory_csv_path.is_file() or trajectory_metadata_path.is_file():
+        if "trajectory_csv" in declared:
+            trajectory_metadata_path = core_dir / declared["trajectory_metadata"]
             trajectory_manifest = json.loads(trajectory_metadata_path.read_text(encoding="utf-8"))
             trajectory_csv_sha256 = trajectory_manifest.get("csv_sha256")
-            if trajectory_csv_sha256 != collect.file_sha256(trajectory_csv_path):
+            if trajectory_csv_sha256 != artifacts["trajectory_csv"]["sha256"]:
                 raise ManifestRefusal(
                     "uncommitted-tail", f"{task_id!r} segment {segment.attempt_id!r} trajectory csv is stale"
                 )
-
-        artifacts: dict[str, dict[str, str]] = {}
-        for name, relative in declared.items():
-            if name in ("resolved_config", "metadata") or name in ("trajectory_csv", "trajectory_metadata"):
-                continue
-            artifact_path = core_dir / relative
-            if not artifact_path.is_file():
-                raise HV2ReceiptRefusal("missing-artifact", f"{task_id!r} is missing declared artifact {name!r}")
-            artifacts[name] = {"path": str(artifact_path), "sha256": file_sha256(artifact_path)}
-        artifacts["resolved_config"] = {"path": str(resolved_config_path), "sha256": resolved_config_sha256}
-        artifacts["metadata"] = {"path": str(metadata_path), "sha256": file_sha256(metadata_path)}
-        if trajectory_csv_sha256 is not None:
-            artifacts["trajectory_csv"] = {"path": str(trajectory_csv_path), "sha256": trajectory_csv_sha256}
-            artifacts["trajectory_metadata"] = {
-                "path": str(trajectory_metadata_path),
-                "sha256": file_sha256(trajectory_metadata_path),
-            }
 
         segments_payload.append(
             {
@@ -705,11 +810,15 @@ def write_h_v2_accepted_receipt(
 
 
 __all__ = [
+    "EVAL_ROUTE_UNSUPPORTED_CODE",
+    "EVAL_ROUTE_UNSUPPORTED_REASON",
+    "EVAL_STAGE",
     "H_V2_ACCEPTED_RECEIPT_SCHEMA",
     "HV2Activation",
     "HV2ReceiptRefusal",
     "PreparedHV2Run",
     "ROUTE_NAME",
+    "TRAIN_STAGE",
     "activate_h_v2_run",
     "build_h_v2_accepted_receipt",
     "build_h_v2_eval_plan",
