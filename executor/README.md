@@ -50,8 +50,33 @@ pointer parents are fsynced before `begin_attempt` returns.
 
 Store-owned directories and receipt files must not be pre-existing symlinks;
 the store refuses them before use. The task namespace is deliberately limited
-to reversible `[A-Za-z0-9._-]+` path components. Resistance to a concurrent
+to reversible `[A-Za-z0-9._:-]+` path components. Resistance to a concurrent
 adversary swapping a link after these checks is outside this layer's contract.
+
+## CLI usage and exit codes
+
+Dispatch one producer input with a fresh store and its allocation, worker, and
+configured-runs records:
+
+```text
+python -m tpen_executor dispatch \
+  --input <executor_input.json> \
+  --store <fresh-store-directory> \
+  --allocation <allocation.json> \
+  --worker-config <worker.yaml> \
+  --runs <configured-runs.json> \
+  [--dispatcher local|parsl] [--timeout SECONDS]
+```
+
+The command writes a JSON manifest to stdout on dispatch and a typed
+`tpen-executor/cli-error-v1` envelope to stderr on refusal or failure. Exit
+codes are:
+
+* `0`: all admitted members completed operationally;
+* `2`: usage or admission refusal; no store is reserved;
+* `3`: dispatch completed with a failed, timed-out, or launch-failed member;
+* `4`: unexpected dispatch or publication failure after admission;
+* `130`: cancellation after an attempt began.
 
 ## Local dispatch
 

@@ -241,6 +241,34 @@ class StagedHydra:
 
         return _stage(config)
 
+    @staticmethod
+    def stage_source(source: str) -> StagedConfig:
+        """Parse and stage a YAML source without resolving program markers.
+
+        Parameters
+        ----------
+        source : str
+            YAML document containing a mapping or one top-level program marker.
+
+        Returns
+        -------
+        StagedConfig
+            Parsed configuration and unresolved program handles.
+
+        Raises
+        ------
+        TypeError, ValueError
+            If the source is not a mapping or cannot be staged.
+        """
+
+        loaded = OmegaConf.create(source)
+        if not isinstance(loaded, DictConfig):
+            raise TypeError("configuration source must be a YAML mapping")
+        raw = _raw(loaded)
+        if isinstance(raw, Mapping) and isinstance(raw.get("_target_"), str):
+            loaded = OmegaConf.create({"worker": raw})
+        return _stage(loaded)
+
     @classmethod
     def compose(cls, config_name: str = "executor", overrides: Sequence[str] = (), *, config_module: str = "tpen_executor.conf", config_dir: str | None = None) -> StagedConfig:
         """Convenience class API for composing a staged configuration."""
