@@ -176,13 +176,22 @@ def test_callback_captures_pre_update_forward_and_records_skipped_update(tmp_pat
     # Simulate later mutation of the in-process state after the callback's capture point.
     state.wavefunction_output = WavefunctionOutput(torch.tensor([40.0, 50.0]), torch.ones(2))
     state.local_energy = torch.tensor([20.0, 30.0])
+    state.optimizer_step = True
+    state.wavefunction_output = WavefunctionOutput(torch.tensor([6.0, 7.0]), torch.ones(2))
+    state.local_energy = torch.tensor([6.0, 7.0])
+    callback.handle_occurrence(
+        Occurrence(TrainingIterationCompleted(TrainingIteration(1)), 1), context, state
+    )
+    # A post-update capture would observe this later state instead of the forward above.
+    state.wavefunction_output = WavefunctionOutput(torch.tensor([60.0, 70.0]), torch.ones(2))
+    state.local_energy = torch.tensor([60.0, 70.0])
     callback.handle_occurrence(Occurrence(TrainingCompleted(), 1), context, state)
 
     rows = TrainingBatchReader(tmp_path).read()
-    np.testing.assert_array_equal(rows["logabs"], [4.0, 5.0])
-    np.testing.assert_array_equal(rows["local_energy"], [2.0, 3.0])
-    np.testing.assert_array_equal(rows["update_applied"], [False, False])
-    np.testing.assert_array_equal(rows["completed_updates"], [0, 0])
+    np.testing.assert_array_equal(rows["logabs"], [4.0, 5.0, 6.0, 7.0])
+    np.testing.assert_array_equal(rows["local_energy"], [2.0, 3.0, 6.0, 7.0])
+    np.testing.assert_array_equal(rows["update_applied"], [False, False, True, True])
+    np.testing.assert_array_equal(rows["completed_updates"], [0, 0, 1, 1])
 
 
 @pytest.mark.parametrize("defect", ["missing", "duplicate", "grid", "nonfinite", "digest", "manifest"])
