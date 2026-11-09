@@ -48,10 +48,23 @@ JOB_SCRIPT_RELATIVE = "experiments/atomistic/h-v2/run_job.py"
 #: Per-lineage wall-time cap (D1): T_wall + E_wall <= this, each <= 2 days.
 MAX_LINEAGE_WALL_SECONDS = 32 * 60 * 60
 
+#: Per-job wall-time ceiling (section C2/C3): the `seas_gpu` partition limit,
+#: and the per-job cap independent of the combined lineage cap above.
+MAX_JOB_WALL_SECONDS = 2 * 24 * 60 * 60
+
+#: The one GPU stratum every TRAIN/EVAL job must verify it was delivered
+#: (section B3/C2): ``--constraint=a100`` selects this card family, but a
+#: requeue can silently change it (policy
+#: ``gpu-hardware-strata-and-constraint-rule-2026-08-15``), so the delivered
+#: device is checked inside every job, not merely requested at submission.
+APPROVED_GPU_STRATUM = "NVIDIA A100-SXM4-80GB"
+
 __all__ = [
+    "APPROVED_GPU_STRATUM",
     "JOB_SCRIPT_RELATIVE",
     "JobResources",
     "LINEAGES",
+    "MAX_JOB_WALL_SECONDS",
     "MAX_LINEAGE_WALL_SECONDS",
     "RESOURCES",
 ]

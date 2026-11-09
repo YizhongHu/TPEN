@@ -73,12 +73,14 @@ def test_one_lineage_issues_exactly_two_sbatch_commands_with_chained_afterok(tmp
 
 
 def test_every_lineage_gets_its_own_chained_pair(tmp_path: Path) -> None:
+    # In-budget pair (F4: submit_all validates T_WALL + E_WALL <= 32h before
+    # any submission); 08:00:00 + 23:00:00 = 31h.
     runner = _StubRunner(job_ids=["1", "2", "3", "4", "5", "6"])
     results = launch.submit_all(
         run_root=tmp_path,
         checkout_root=tmp_path / "checkout",
-        t_wall="08:30:00",
-        e_wall="25:24:00",
+        t_wall="08:00:00",
+        e_wall="23:00:00",
         runner=runner,
     )
     assert len(runner.calls) == 2 * len(launch_config.LINEAGES)
@@ -146,13 +148,14 @@ def test_a_missing_job_id_from_the_first_sbatch_aborts_before_the_second(tmp_pat
 
 
 def test_a_failed_lineage_aborts_before_any_later_lineage(tmp_path: Path) -> None:
+    # In-budget pair; see test_every_lineage_gets_its_own_chained_pair.
     runner = _StubRunner(job_ids=["111"], fail_on=1)
     with pytest.raises(launch.LaunchError):
         launch.submit_all(
             run_root=tmp_path,
             checkout_root=tmp_path / "checkout",
-            t_wall="08:30:00",
-            e_wall="25:24:00",
+            t_wall="08:00:00",
+            e_wall="23:00:00",
             runner=runner,
         )
     # Only L1's train sbatch was attempted; L2/L3 never ran.

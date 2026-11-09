@@ -109,19 +109,29 @@ def test_f2_later_lineage_cannot_replace_live_earlier_handoff(job_env, monkeypat
 
     Pause L1 before dispatch, prepare L2, then read the files L1 still owns.
     Real prepare_h_v2_run/write_attached_handoff perform every file write.
+
+    ADAPTED for the F3 fix: TRAIN now refuses before dispatch unless
+    ``pipeline_check`` is set (no approved per-lineage science config
+    interface exists yet), so both calls pass it explicitly to reach
+    dispatch at all; this finding (handoff isolation) is independent of
+    which payload is dispatched. Task ids correspondingly carry the
+    pipeline-check label the fix gives that payload.
     """
     seen = []
 
     def activate(prepared, **kwargs):
         seen.append(prepared)
-        if prepared.task_id == "h-v2-train-L1":
+        if prepared.task_id == "h-v2-train-pipeline-check-L1":
             before = _sidecar_bytes(prepared)
-            job.run("train", "L2")
+            job.run("train", "L2", pipeline_check=True)
             assert _sidecar_bytes(prepared) == before, "L2 replaced L1's bound sidecars"
 
     monkeypatch.setattr(job.attached, "activate_h_v2_run", activate)
-    job.run("train", "L1")
-    assert {p.task_id for p in seen} == {"h-v2-train-L1", "h-v2-train-L2"}
+    job.run("train", "L1", pipeline_check=True)
+    assert {p.task_id for p in seen} == {
+        "h-v2-train-pipeline-check-L1",
+        "h-v2-train-pipeline-check-L2",
+    }
 
 
 def test_f3_science_lineages_do_not_silently_dispatch_pipeline_defaults(job_env, monkeypatch):
@@ -252,7 +262,16 @@ def test_f6_delivered_card_must_match_approved_stratum(tmp_path, monkeypatch, de
 
 @pytest.mark.parametrize("refuses", [False, True])
 def test_c_receipt_refusal_controls_job_exit(job_env, monkeypatch, capsys, refuses):
-    """Catch main returning 0 after the attached route's receipt refusal."""
+    """Catch main returning 0 after the attached route's receipt refusal.
+
+    ADAPTED for the F3 fix: TRAIN now refuses before dispatch unless
+    ``--pipeline-check`` is passed (see test_f2's note); this control's own
+    concern -- that a downstream receipt refusal still makes ``main``
+    return non-zero -- is independent of that gate, so it opts in to reach
+    dispatch. Also the control for the verifier's mutant (d) addition
+    (run_job.py's main() swallowing an exception/refusal and exiting 0):
+    the ``refuses=True`` arm must observe ``rc != 0``.
+    """
     calls = []
 
     def activate(prepared, **kwargs):
@@ -261,14 +280,14 @@ def test_c_receipt_refusal_controls_job_exit(job_env, monkeypatch, capsys, refus
             raise job.attached.HV2ReceiptRefusal("wrong-source-commit", "review sentinel refusal")
 
     monkeypatch.setattr(job.attached, "activate_h_v2_run", activate)
-    rc = job.main(["train", "L1"])
-    assert calls == ["h-v2-train-L1"]
+    rc = job.main(["train", "L1", "--pipeline-check"])
+    assert calls == ["h-v2-train-pipeline-check-L1"]
     captured = capsys.readouterr()
     if refuses:
         assert rc != 0 and "review sentinel refusal" in captured.err
         assert ": accepted" not in captured.out
     else:
-        assert rc == 0 and "h-v2-train-L1: accepted" in captured.out
+        assert rc == 0 and "h-v2-train-pipeline-check-L1: accepted" in captured.out
 
 
 @pytest.mark.parametrize("stdout,rc,expected_calls", [

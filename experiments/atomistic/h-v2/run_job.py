@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """H-v2 in-job attached route (design target sections A4/B3, item 9d3aa0a3).
 
-Invoked directly by Slurm as the launch script's job program (``launch.py``,
-item 67f2eb57): ``sbatch ... run_job.py train L1`` or
-``... run_job.py eval L1``. Runs entirely inside its own allocation; the
-launch script only submits it.
+Invoked by the launch script's generated wrapper (``launch.py``, item
+67f2eb57, F1): ``"$SCIENCE_PYTHON" <checkout>/.../run_job.py train L1`` or
+``... run_job.py eval L1``, always with an absolute path to this file inside
+the explicit checkout (never the Slurm-spooled copy of this file alone,
+which has no siblings to import). Runs entirely inside its own allocation;
+the launch script only submits it.
 
 Required environment (inherited from the submitting shell, per section B3):
 
@@ -67,6 +69,19 @@ def _h_v2_module(name: str):
 
 
 attached = _h_v2_module("attached")
+launch_config = _h_v2_module("launch_config")
+
+#: F3: no approved per-lineage science configuration interface exists yet
+#: (design target section A1; the follow-up is tracked on item 3c13ba74).
+#: TRAIN refuses with this code rather than silently submitting
+#: ``protocol.training_config()``'s CPU pipeline-check defaults relabeled
+#: with a science lineage name.
+SCIENCE_CONFIG_UNAVAILABLE_CODE = "h-v2-science-config-unavailable"
+
+#: F3: the label an explicitly-selected non-science dispatch carries in its
+#: task id, so its job name/logs/receipts say plainly that it is not a
+#: science run.
+PIPELINE_CHECK_LABEL = "pipeline-check"
 
 
 class JobError(RuntimeError):
@@ -111,7 +126,19 @@ def check_identity(run_root: Path, expected_commit: str, science_python: str) ->
     )
     if torch_check.returncode != 0:
         raise JobError(f"CUDA torch check failed: {torch_check.stderr.strip()}")
-    print(f"[h-v2] {torch_check.stdout.strip()}")
+    device_name = torch_check.stdout.strip()
+    # F6: the delivered card is checked here, not merely requested at
+    # submission (section B3: "must print NVIDIA A100-SXM4-80GB; anything
+    # else fails the job loudly"). seas_gpu mixes A100-80GB and H200, and a
+    # requeue can change which one a job lands on (policy
+    # gpu-hardware-strata-and-constraint-rule-2026-08-15).
+    if device_name != launch_config.APPROVED_GPU_STRATUM:
+        raise JobError(
+            f"delivered GPU {device_name!r} does not match the approved stratum "
+            f"{launch_config.APPROVED_GPU_STRATUM!r} (design target section B3/C2); "
+            "failing loudly rather than running on an unapproved card"
+        )
+    print(f"[h-v2] {device_name}")
 
 
 def write_local_allocation_and_worker(
@@ -185,8 +212,31 @@ def checkpoint_dir_for_eval(run_root: Path, lineage: str) -> Path:
     return Path(segments[0]["checkpoint_dir"])
 
 
-def run(stage: str, lineage: str) -> None:
-    """Build, prepare, and activate one H-v2 attached generation."""
+def run(stage: str, lineage: str, *, pipeline_check: bool = False) -> None:
+    """Build, prepare, and activate one H-v2 attached generation.
+
+    Parameters
+    ----------
+    stage : {"train", "eval"}
+        Job stage.
+    lineage : str
+        Opaque lineage identity (for example ``"L1"``).
+    pipeline_check : bool, default=False
+        F3: TRAIN refuses before dispatch unless this is explicitly set,
+        because no approved per-lineage science configuration interface
+        exists yet (design target section A1) and the only config this
+        route can otherwise build is ``protocol.training_config()``'s CPU
+        pipeline-check payload -- not a science run. Setting this
+        explicitly selects that non-science payload (its task id, job
+        name and logs say so); production launch (``launch.py``) never
+        sets it.
+
+    Raises
+    ------
+    JobError
+        Code :data:`SCIENCE_CONFIG_UNAVAILABLE_CODE`, if ``stage`` is
+        ``"train"`` and ``pipeline_check`` is not set.
+    """
 
     run_root = Path(_require_env("RUN")).resolve()
     expected_commit = _require_env("SHA")
@@ -196,13 +246,29 @@ def run(stage: str, lineage: str) -> None:
     check_identity(run_root, expected_commit, science_python)
 
     if stage == "train":
-        task_id = f"h-v2-train-{lineage}"
+        if not pipeline_check:
+            raise JobError(
+                f"{SCIENCE_CONFIG_UNAVAILABLE_CODE}: no approved per-lineage science "
+                "configuration interface exists yet (design target section A1; "
+                "follow-up tracked on item 3c13ba74). Refusing before dispatch "
+                "rather than silently submitting protocol.training_config()'s CPU "
+                f"pipeline-check defaults for lineage {lineage!r}. Pass "
+                "pipeline_check=True (CLI: --pipeline-check) to explicitly select "
+                "the non-science pipeline-check payload."
+            )
+        build_lineage = f"{PIPELINE_CHECK_LABEL}-{lineage}"
+        task_id = f"h-v2-train-{build_lineage}"
     elif stage == "eval":
+        build_lineage = lineage
         task_id = f"h-v2-eval-{lineage}-stream0"
     else:
         raise JobError(f"stage must be 'train' or 'eval', got {stage!r}")
 
-    handoff_dir = run_root / "attached" / "handoff"
+    # F2: namespaced by task id so a concurrent sibling lineage/stage cannot
+    # retire or overwrite the handoff sidecars this task is still bound to
+    # (the fixed names executor_input.json/configured-runs.json were
+    # previously shared by every lineage and stage under one directory).
+    handoff_dir = run_root / "attached" / "handoff" / task_id
     results_root = run_root / "attached" / "results"
     store = run_root / "attached" / "store" / task_id
     receipts_dir = run_root / "attached" / "receipts"
@@ -210,7 +276,7 @@ def run(stage: str, lineage: str) -> None:
 
     if stage == "train":
         plan, overrides, config = attached.build_h_v2_train_plan(
-            output_dir=handoff_dir, results_root=results_root, lineage=lineage
+            output_dir=handoff_dir, results_root=results_root, lineage=build_lineage
         )
     else:
         checkpoint_dir = checkpoint_dir_for_eval(run_root, lineage)
@@ -247,13 +313,17 @@ def run(stage: str, lineage: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
+    argv = list(sys.argv[1:] if argv is None else argv)
+    pipeline_check = False
+    if argv and argv[-1] == "--pipeline-check":
+        pipeline_check = True
+        argv = argv[:-1]
     if len(argv) != 2:
-        print("usage: run_job.py {train|eval} <lineage>", file=sys.stderr)
+        print("usage: run_job.py {train|eval} <lineage> [--pipeline-check]", file=sys.stderr)
         return 2
     stage, lineage = argv
     try:
-        run(stage, lineage)
+        run(stage, lineage, pipeline_check=pipeline_check)
     except Exception as error:  # noqa: BLE001 - this is the job's own top-level boundary
         # afterok sees only this exit code: any refusal here must be non-zero,
         # never a bare 0 (executor CLI exit 0 alone is not science complete).
