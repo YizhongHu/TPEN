@@ -430,7 +430,8 @@ def test_verified_no_op_on_resumed_lineage_with_prior_inventory(tmp_path: Path) 
     mtime_before = output_path.stat().st_mtime_ns
 
     # A fresh callback instance, as a resumed run would construct, observing
-    # the resumed lineage's own first applied update at a nonzero step.
+    # the resumed lineage's own first applied update at a nonzero step. The
+    # restore report is delivered first, the same order the runner emits it.
     resumed_model = _ThreeParamModel()
     resumed_optimizer = torch.optim.SGD(resumed_model.parameters(), lr=0.1)
     resumed_model.loss().backward()
@@ -438,17 +439,22 @@ def test_verified_no_op_on_resumed_lineage_with_prior_inventory(tmp_path: Path) 
         model=resumed_model, optimizer=resumed_optimizer, trainer=_Trainer(completed_updates=4)
     )
     resumed_callback = ParameterActivity(output_path)
+    resumed_context = _make_context(tmp_path, run_id="resumed")
     resumed_callback.handle_occurrence(
-        _update_completed(step=3), _make_context(tmp_path, run_id="resumed"), resumed_state
+        _checkpoint_restored(next_iteration=3, completed_updates=3), resumed_context, None
+    )
+    resumed_callback.handle_occurrence(
+        _update_completed(step=3), resumed_context, resumed_state
     )
 
     assert resumed_callback._written
     assert output_path.read_text(encoding="utf-8") == before
     assert output_path.stat().st_mtime_ns == mtime_before
 
-    # A redelivery is still a no-op, guarded by `_written`.
+    # A redelivery (same context identity) is still a no-op, guarded by
+    # `_written`.
     resumed_callback.handle_occurrence(
-        _update_completed(step=3, count=2), _make_context(tmp_path, run_id="resumed"), resumed_state
+        _update_completed(step=3, count=2), resumed_context, resumed_state
     )
     assert output_path.stat().st_mtime_ns == mtime_before
 
@@ -469,8 +475,10 @@ def test_refuses_resumed_lineage_with_no_prior_inventory(tmp_path: Path) -> None
 
     for output_path in (tmp_path / "parameter_activity.json", tmp_path / "parameter_activity_fresh_attempt.json"):
         callback = ParameterActivity(output_path)
+        context = _make_context(tmp_path)
+        callback.handle_occurrence(_checkpoint_restored(next_iteration=3, completed_updates=3), context, None)
         with pytest.raises(ValueError, match="fresh first-applied-update lineage"):
-            callback.handle_occurrence(_update_completed(step=3), _make_context(tmp_path), state)
+            callback.handle_occurrence(_update_completed(step=3), context, state)
         assert not output_path.exists()
 
 
@@ -489,9 +497,11 @@ def test_refuses_resumed_lineage_with_a_malformed_prior_inventory(tmp_path: Path
     output_path = tmp_path / "parameter_activity.json"
     output_path.write_text("not even json", encoding="utf-8")
     callback = ParameterActivity(output_path)
+    context = _make_context(tmp_path)
+    callback.handle_occurrence(_checkpoint_restored(next_iteration=3, completed_updates=3), context, None)
 
     with pytest.raises(ValueError, match="fresh first-applied-update lineage"):
-        callback.handle_occurrence(_update_completed(step=3), _make_context(tmp_path), state)
+        callback.handle_occurrence(_update_completed(step=3), context, state)
 
     assert output_path.read_text(encoding="utf-8") == "not even json"
 

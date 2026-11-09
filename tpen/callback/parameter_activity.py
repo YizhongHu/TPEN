@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -19,6 +20,7 @@ from .cadence import SubscriptionGroup
 _INVENTORY_INTERPRETATION = "observed_on_first_applied_update_not_structural_proof"
 _INVENTORY_KEYS = {"completed_updates", "interpretation", "parameters"}
 _PARAMETER_ROW_KEYS = {"name", "shape", "requires_grad", "gradient", "gradient_norm"}
+_GRADIENT_STATUSES = {"absent", "zero", "nonzero"}
 
 
 class ParameterActivity(StatefulCallback[TrainerState]):
@@ -105,14 +107,19 @@ class ParameterActivity(StatefulCallback[TrainerState]):
         event = occurrence.event
         if not isinstance(event, UpdateCompleted):
             return
-        fresh = event.iteration.step == 0
-        if fresh and not self._restored:
+        if not self._restored:
+            # Origin comes from the `CheckpointRestored` report alone, never
+            # from the step of this first applied update: a fresh lineage can
+            # skip iteration 0 entirely (no update applies there) and first
+            # apply an update at a nonzero step, which must still record as
+            # the lineage's first inventory.
             self._write_fresh_inventory(state)
             self._written = True
             return
-        if fresh:
-            # `self._restored`: a zero-step first update, but a
-            # `CheckpointRestored` report proves this lineage is not fresh.
+        if event.iteration.step == 0:
+            # Restored lineage whose first applied update still reads step
+            # zero: indistinguishable from fresh by step alone, so the
+            # `CheckpointRestored` report is what refuses it.
             raise ValueError("ParameterActivity requires a fresh first-applied-update lineage")
         # Resumed lineage (nonzero step): never record a later update's
         # gradients as though they were the first. Only a VERIFIED prior
@@ -160,12 +167,14 @@ class ParameterActivity(StatefulCallback[TrainerState]):
 def _is_verified_inventory(path: Path) -> bool:
     """Return whether `path` holds a complete, well-formed parameter inventory.
 
-    Structural verification only: the expected top-level keys, the expected
-    interpretation string, and a nonempty list of per-parameter rows each
-    carrying the expected row keys. This never recomputes or compares
-    gradient values -- they legitimately differ update to update, so a
-    resumed lineage's "verified" artifact is one that parses and has the
-    right shape, not one whose numbers match anything current.
+    Structural and value verification: the expected top-level keys, the
+    expected interpretation string, a nonempty list of per-parameter rows
+    each carrying the expected row keys with well-typed values, a finite or
+    null gradient norm, a recognized gradient status, and a valid counter.
+    This never recomputes or compares gradient VALUES -- they legitimately
+    differ update to update, so a resumed lineage's "verified" artifact is
+    one that parses and has the right shape and types, not one whose
+    numbers match anything current.
     """
 
     if not path.is_file():
@@ -178,12 +187,47 @@ def _is_verified_inventory(path: Path) -> bool:
         return False
     if payload["interpretation"] != _INVENTORY_INTERPRETATION:
         return False
+    if not _is_valid_counter(payload["completed_updates"]):
+        return False
     rows = payload["parameters"]
     if not isinstance(rows, list) or not rows:
         return False
-    return all(
-        isinstance(row, dict) and set(row) == _PARAMETER_ROW_KEYS for row in rows
-    )
+    return all(_is_verified_row(row) for row in rows)
+
+
+def _is_valid_counter(value: Any) -> bool:
+    """Return whether `value` is a valid counter: null, or a non-negative int."""
+
+    if value is None:
+        return True
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_verified_row(row: Any) -> bool:
+    """Return whether one parameter row has the expected keys and well-typed values."""
+
+    if not isinstance(row, dict) or set(row) != _PARAMETER_ROW_KEYS:
+        return False
+    shape = row["shape"]
+    if not isinstance(shape, list) or not all(
+        isinstance(dim, int) and not isinstance(dim, bool) and dim >= 0 for dim in shape
+    ):
+        return False
+    if not isinstance(row["requires_grad"], bool):
+        return False
+    if row["gradient"] not in _GRADIENT_STATUSES:
+        return False
+    return _is_finite_or_null(row["gradient_norm"])
+
+
+def _is_finite_or_null(value: Any) -> bool:
+    """Return whether `value` is `None`, or a finite (non-bool) real number."""
+
+    if value is None:
+        return True
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
 
 
 def _tracked_parameter_ids(optimizer: Any) -> set[int]:

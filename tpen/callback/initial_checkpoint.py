@@ -48,6 +48,19 @@ class InitialCheckpoint(StatefulCallback[TrainerState]):
     ``tpen.training.trainer.Trainer.fit``). So the write this callback performs
     always precedes the first sample of a fresh run.
 
+    AUDITED for the same step-derived-origin coupling R1-1 fixed in
+    ``ParameterActivity``: there, a fresh lineage's first applied update
+    could read a nonzero step after a skipped iteration, so origin had to
+    come from the restore report alone, never from step. That coupling does
+    not reach here. ``Started(TrainingIteration)`` is never skipped -- unlike
+    an optimizer update, the trainer always emits exactly one per iteration
+    -- and a lineage's counters can only be nonzero at its very first
+    iteration if a checkpoint restored them; a never-restored lineage's
+    first ``TrainingIteration`` is therefore always ``step == 0`` in
+    practice. ``test_refuses_resumed_lineage_nonzero_step`` pins the
+    defensive (synthetic, not reachable in production) refusal for a
+    never-restored call with a nonzero step or nonzero counters anyway.
+
     The durable counters alone do not distinguish a fresh lineage from one
     restored from a checkpoint whose own counters happen to be zero (the
     exact lineage this callback itself produces, resumed into a new output

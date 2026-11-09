@@ -158,7 +158,18 @@ def test_writes_full_train_resume_payload_once(tmp_path: Path) -> None:
 
 
 def test_refuses_resumed_lineage_nonzero_step(tmp_path: Path) -> None:
-    """A resumed run's first iteration (nonzero step) is refused, not written."""
+    """A resumed run's first iteration (nonzero step) is refused, not written.
+
+    Also stands as the R1-1 coupling audit for this callback: no
+    `CheckpointRestored` is ever delivered here, so this exercises a
+    never-restored call whose first `Started(TrainingIteration)` reads a
+    nonzero step -- the same input shape R1-1 showed was reachable in
+    production for `ParameterActivity`. For `InitialCheckpoint` it is not
+    reachable (a never-restored lineage's first iteration is always step 0,
+    since `Started(TrainingIteration)` is never skipped the way an
+    optimizer update can be), so this pins the refusal as defensive rather
+    than load-bearing.
+    """
 
     context = _InitialCheckpointContext(tmp_path)
     output_dir = tmp_path / "checkpoints"
