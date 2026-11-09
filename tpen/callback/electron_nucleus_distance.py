@@ -118,6 +118,8 @@ def summarize_electron_nucleus_distances(
         nuclear_positions = None if configuration is None else configuration.positions
     if nuclear_positions is None or int(nuclear_positions.shape[-2]) == 0:
         raise ValueError("electron-nucleus distance diagnostics require at least one nucleus")
+    if nuclear_positions.ndim > 2:
+        nuclear_positions = batch.flatten_samples().nuclear_positions
 
     distances = electron_nuclear_distances(batch, nuclear_positions=nuclear_positions)
     nearest = distances.min(dim=-1).values
