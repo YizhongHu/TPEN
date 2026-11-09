@@ -8,6 +8,8 @@ import pytest
 
 from tpen.checkpoint.hashing import (
     RESOLVED_CONFIG_IDENTITY_SCHEMA,
+    _delete_known_operational_slots,
+    _identity_resolved_container,
     canonical_resolved_config_bytes,
     resolved_config_identity,
 )
@@ -99,6 +101,8 @@ def test_identity_resolves_run_derived_evaluator_copies_before_scrubbing() -> No
     }
     actual = copy.deepcopy(intended)
     actual["run"] = {"dir": "/different/run", "run_id": "different"}
+    prepared = _identity_resolved_container(intended)
+    assert prepared["runner"]["evaluator"]["tasks"][0]["output_dir"] == "__tpen_run_field__/trajectory"
     assert resolved_config_identity(intended) == resolved_config_identity(actual)
 
 
@@ -113,6 +117,11 @@ def test_identity_handles_tuple_operational_slots_like_lists() -> None:
     tupled = copy.deepcopy(listed)
     tupled["callbacks"] = tuple(tupled["callbacks"])  # type: ignore[assignment]
     tupled["loggers"] = tuple(tupled["loggers"])  # type: ignore[assignment]
+    listed_scrubbed = copy.deepcopy(listed)
+    tupled_scrubbed = copy.deepcopy(tupled)
+    _delete_known_operational_slots(listed_scrubbed)
+    _delete_known_operational_slots(tupled_scrubbed)
+    assert tupled_scrubbed == listed_scrubbed
     assert resolved_config_identity(tupled) == resolved_config_identity(listed)
 
 
