@@ -37,7 +37,7 @@ _IDENTITY_RUN_DEFAULTS = {
 }
 _IDENTITY_RUN_FIELDS = ("root", "run_id", "dir", "layout", "timezone")
 _RUN_INTERPOLATION = re.compile(r"\$\{run(?:\.[^{}]+)?\}")
-_RUN_SENTINEL = "__tpen_run_field__"
+_RUN_SENTINEL_MARKER = "__tpen_identity_run_sentinel_7b1e4c93f0a64b9d__"
 
 # Operational slots are schema-bound to the built-in producers.  A user
 # callback/logger with an arbitrary ``output_path`` or ``path`` is not silently
@@ -58,6 +58,10 @@ _EVALUATOR_TARGET = "tpen.evaluation.Evaluator"
 
 
 _FILE_HASH_CHUNK_BYTES = 1 << 20
+
+
+class ResolvedConfigIdentityError(ValueError):
+    """Raised when a run-derived value would enter the public config identity."""
 
 
 def file_sha256(path: Path | str) -> str:
@@ -121,7 +125,9 @@ def resolved_config_hash(config: Any) -> str:
     return stable_config_hash(plain)
 
 
-def canonical_resolved_config_bytes(config: Any) -> bytes:
+def canonical_resolved_config_bytes(
+    config: Any, *, run_values: Mapping[str, Any] | None = None
+) -> bytes:
     """Return canonical bytes for the public resolved-config identity.
 
     The identity is deliberately separate from checkpoint manifest hashes:
@@ -129,7 +135,7 @@ def canonical_resolved_config_bytes(config: Any) -> bytes:
     public contract has a closed, documented run-artifact exclusion list.
     """
 
-    normalized = _identity_resolved_container(config)
+    normalized = _identity_resolved_container(config, run_values=run_values)
     if not isinstance(normalized, Mapping):
         raise TypeError("resolved configuration identity requires a mapping")
     for path in RESOLVED_CONFIG_IDENTITY_EXCLUSIONS:
@@ -139,12 +145,22 @@ def canonical_resolved_config_bytes(config: Any) -> bytes:
     return json.dumps(safe, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
-def resolved_config_identity(config: Any) -> dict[str, str]:
-    """Return the versioned public identity for one resolved configuration."""
+def resolved_config_identity(
+    config: Any, *, run_values: Mapping[str, Any] | None = None
+) -> dict[str, str]:
+    """Return the versioned public identity for one intended configuration.
+
+    ``config`` remains unresolved until run-derived fields have been replaced
+    by field-specific sentinels.  The core launch path supplies actual run
+    values separately while the study side normally omits them, so both sides
+    use the same unresolved composition and refusal boundary.
+    """
 
     return {
         "schema": RESOLVED_CONFIG_IDENTITY_SCHEMA,
-        "sha256": hashlib.sha256(canonical_resolved_config_bytes(config)).hexdigest(),
+        "sha256": hashlib.sha256(
+            canonical_resolved_config_bytes(config, run_values=run_values)
+        ).hexdigest(),
     }
 
 
@@ -198,9 +214,10 @@ def populate_resolved_config_defaults(config: Any, *, timezone: str | None = Non
     if not isinstance(experiment, dict) or not isinstance(run, dict):
         raise TypeError("experiment and run config sections must be mappings")
     name = experiment.get("name")
-    run_name = experiment.get("run_name")
-    if run_name is None or not str(run_name).strip():
-        experiment["run_name"] = str(name).strip() if name is not None and str(name).strip() else "tpen_run"
+    run_name = _normalized_text(experiment.get("run_name"))
+    if run_name is None:
+        run_name = _normalized_text(name) or "tpen_run"
+    experiment["run_name"] = run_name
     for key, default in _IDENTITY_RUN_DEFAULTS.items():
         if key == "timezone" and run.get(key) is None:
             run[key] = timezone if timezone is not None else default
@@ -217,12 +234,21 @@ def to_unresolved_container(config: Any) -> Any:
     return config
 
 
-def _identity_resolved_container(config: Any) -> Any:
+def _identity_resolved_container(
+    config: Any, *, run_values: Mapping[str, Any] | None = None
+) -> Any:
     prepared = populate_resolved_config_defaults(config)
     prepared.setdefault("run", {})
     run = prepared["run"]
     if not isinstance(run, dict):
         raise TypeError("run config section must be a mapping")
+    if run_values is not None:
+        if not isinstance(run_values, Mapping):
+            raise TypeError("run_values must be a mapping")
+        for key, value in run_values.items():
+            if key not in _IDENTITY_RUN_FIELDS:
+                raise TypeError(f"unsupported run identity value {key!r}")
+            run[key] = copy.deepcopy(value)
     # The launch populates these at ``tpen/run.py:180-192``.  Add the same
     # slots on the study side, then replace every value before OmegaConf can
     # resolve an interpolation that copied it into another subtree.
@@ -230,9 +256,49 @@ def _identity_resolved_container(config: Any) -> Any:
     run.setdefault("dir", None)
     _reject_science_run_interpolations(prepared)
     for field in _IDENTITY_RUN_FIELDS:
-        run[field] = _RUN_SENTINEL
+        run[field] = _run_sentinel(field)
     resolved = OmegaConf.to_container(OmegaConf.create(prepared), resolve=True)
-    return copy.deepcopy(resolved)
+    normalized = copy.deepcopy(resolved)
+    if not isinstance(normalized, Mapping):
+        raise TypeError("resolved configuration identity requires a mapping")
+    # Remove explicit exclusions before scanning. Operational consumers may
+    # receive run paths; retained science leaves may not, including strings
+    # nested in lists or reached through indirect aliases.
+    scan_target = copy.deepcopy(normalized)
+    for path in RESOLVED_CONFIG_IDENTITY_EXCLUSIONS:
+        _delete_pattern(scan_target, path)
+    _delete_known_operational_slots(scan_target)
+    _reject_run_sentinels(scan_target)
+    return normalized
+
+
+def _normalized_text(value: Any) -> str | None:
+    """Match the core run-boundary normalization for durable text fields."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _run_sentinel(field: str) -> str:
+    return f"{_RUN_SENTINEL_MARKER}:{field}__"
+
+
+def _reject_run_sentinels(container: Any, path: tuple[object, ...] = ()) -> None:
+    """Refuse any retained leaf contaminated by a run-field sentinel."""
+
+    if isinstance(container, Mapping):
+        for key, value in container.items():
+            _reject_run_sentinels(value, path + (key,))
+    elif isinstance(container, (list, tuple)):
+        for index, value in enumerate(container):
+            _reject_run_sentinels(value, path + (index,))
+    elif isinstance(container, str) and _RUN_SENTINEL_MARKER in container:
+        dotted = ".".join(str(part) for part in path)
+        raise ResolvedConfigIdentityError(
+            f"run-derived sentinel retained at {dotted}; run values cannot feed science"
+        )
 
 
 def _reject_science_run_interpolations(container: Any, path: tuple[object, ...] = (), ancestors: tuple[str, ...] = ()) -> None:
@@ -243,7 +309,10 @@ def _reject_science_run_interpolations(container: Any, path: tuple[object, ...] 
             child_path = path + (key,)
             if isinstance(value, str) and _RUN_INTERPOLATION.search(value) and not _is_operational_slot(child_path, container, key, next_ancestors):
                 dotted = ".".join(str(part) for part in child_path)
-                raise ValueError(f"run-populated interpolation at {dotted} would feed science; bind it to an operational slot")
+                raise ResolvedConfigIdentityError(
+                    f"run-populated interpolation at {dotted} would feed science; "
+                    "bind it to an operational slot"
+                )
             _reject_science_run_interpolations(value, child_path, next_ancestors)
     elif isinstance(container, (list, tuple)):
         for index, value in enumerate(container):

@@ -5,9 +5,11 @@ from __future__ import annotations
 import copy
 
 import pytest
+from experiments.toolkit.config_identity import expected_resolved_config_identity
 
 from tpen.checkpoint.hashing import (
     RESOLVED_CONFIG_IDENTITY_SCHEMA,
+    ResolvedConfigIdentityError,
     _delete_known_operational_slots,
     _identity_resolved_container,
     canonical_resolved_config_bytes,
@@ -102,7 +104,9 @@ def test_identity_resolves_run_derived_evaluator_copies_before_scrubbing() -> No
     actual = copy.deepcopy(intended)
     actual["run"] = {"dir": "/different/run", "run_id": "different"}
     prepared = _identity_resolved_container(intended)
-    assert prepared["runner"]["evaluator"]["tasks"][0]["output_dir"] == "__tpen_run_field__/trajectory"
+    assert prepared["runner"]["evaluator"]["tasks"][0]["output_dir"] == (
+        "__tpen_identity_run_sentinel_7b1e4c93f0a64b9d__:dir__/trajectory"
+    )
     assert resolved_config_identity(intended) == resolved_config_identity(actual)
 
 
@@ -121,13 +125,60 @@ def test_identity_handles_tuple_operational_slots_like_lists() -> None:
     tupled_scrubbed = copy.deepcopy(tupled)
     _delete_known_operational_slots(listed_scrubbed)
     _delete_known_operational_slots(tupled_scrubbed)
-    assert tupled_scrubbed == listed_scrubbed
+    assert list(tupled_scrubbed["callbacks"]) == listed_scrubbed["callbacks"]
+    assert list(tupled_scrubbed["loggers"]) == listed_scrubbed["loggers"]
     assert resolved_config_identity(tupled) == resolved_config_identity(listed)
 
 
-def test_identity_rejects_run_field_interpolation_into_science() -> None:
-    with pytest.raises(ValueError, match="would feed science"):
-        resolved_config_identity({"science": {"seed": "${run.run_id}"}})
+@pytest.mark.parametrize(
+    "identity_function",
+    [resolved_config_identity, expected_resolved_config_identity],
+    ids=["core", "study"],
+)
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"science": {"seed": "${run.run_id}"}},
+        {"science": {"inputs": ["${run.dir}/potential.dat"]}},
+        {
+            "callbacks": [
+                {
+                    "_target_": "tpen.callback.ConfigSnapshot",
+                    "output_path": "${run.dir}/config.yaml",
+                }
+            ],
+            "science": {"input": "${callbacks.0.output_path}"},
+        },
+    ],
+    ids=["direct", "list-element", "indirect-chain"],
+)
+def test_identity_rejects_run_field_interpolation_into_science(
+    identity_function, config: dict[str, object]
+) -> None:
+    with pytest.raises(ResolvedConfigIdentityError):
+        identity_function(config)
+
+
+def test_run_derived_science_collision_configs_are_refused() -> None:
+    configs = [
+        {"science": {"value": "${run.dir}/a"}},
+        {"science": {"value": "${run.dir}/b"}},
+    ]
+    for config in configs:
+        with pytest.raises(ResolvedConfigIdentityError):
+            resolved_config_identity(config)
+        with pytest.raises(ResolvedConfigIdentityError):
+            expected_resolved_config_identity(config)
+
+
+@pytest.mark.parametrize(
+    ("intended", "run_side"),
+    [("  padded-run  ", "padded-run"), (12345, "12345")],
+)
+def test_identity_matches_core_run_name_normalization(intended: object, run_side: str) -> None:
+    base = {"experiment": {"name": "eval", "run_name": intended}, "science": {"charge": 1}}
+    normalized = {"experiment": {"name": "eval", "run_name": run_side}, "science": {"charge": 1}}
+    assert resolved_config_identity(base) == resolved_config_identity(normalized)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])

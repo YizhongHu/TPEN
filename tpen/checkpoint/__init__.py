@@ -25,6 +25,7 @@ from .events import CheckpointRestored, LoadFailed, LoadStarted, LoadSucceeded
 from .hashing import (
     RESOLVED_CONFIG_IDENTITY_EXCLUSIONS,
     RESOLVED_CONFIG_IDENTITY_SCHEMA,
+    ResolvedConfigIdentityError,
     canonical_resolved_config_bytes,
     checkpoint_hashes,
     component_config_hash,
@@ -153,6 +154,7 @@ __all__ = [
     "populate_resolved_config_defaults",
     "RESOLVED_CONFIG_IDENTITY_EXCLUSIONS",
     "RESOLVED_CONFIG_IDENTITY_SCHEMA",
+    "ResolvedConfigIdentityError",
     "coerce_checkpoint_replay_semantics",
     "deserialize_checkpoint_ref",
     "has_publication_receipt",

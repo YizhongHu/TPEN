@@ -92,13 +92,7 @@ def test_t7_real_core_executor_and_study_identity_agree(tmp_path):
     config = tmp_path / "native_recovery.yaml"
     source = ROOT / "tests/integration/artifacts/execution/native_recovery.yaml"
     config.write_text(
-        source.read_text()
-        + "\n# EVAL-style run-derived operational path retained in the intended composition.\n"
-        + "evaluator:\n"
-        + "  _target_: tpen.evaluation.Evaluator\n"
-        + "  tasks:\n"
-        + "    - name: trajectory\n"
-        + "      output_dir: ${run.dir}/trajectory\n",
+        source.read_text(),
         encoding="utf-8",
     )
     overrides = ("trainer.max_steps=1", "sampler.n_walkers=2", "sampler.burn_in=0", "system.omega=0.75")
@@ -146,6 +140,58 @@ Path(sys.argv[2]).write_bytes(result.encode())
     mismatched = copy.deepcopy(intended)
     mismatched["system"]["omega"] = 0.5
     assert expected_resolved_config_identity(mismatched) != actual_identity
+
+    # Exercise the exact H-v2 EVAL composition shape at the identity boundary:
+    # ``runner.evaluator: ${evaluator}`` and the evaluator task's operational
+    # ``output_dir: ${run.dir}/...``.  A full EVAL child would require a
+    # model-only checkpoint and the heavy evaluation runtime, so this probe is
+    # intentionally limited to the real study helper versus a separate core
+    # process running the same public identity function.
+    eval_config = {
+        "experiment": {"name": "h-v2", "run_name": "  h-v2-eval  "},
+        "run": {"root": "outputs", "run_id": None, "dir": None, "timezone": "UTC"},
+        "runtime": {"seed": 910003},
+        "evaluation": {"namespace": "eval", "seed": "${runtime.seed}"},
+        "runner": {"_target_": "tpen.runner.Evaluate", "evaluator": "${evaluator}"},
+        "evaluator": {
+            "_target_": "tpen.evaluation.Evaluator",
+            "namespace": "${evaluation.namespace}",
+            "seed": "${evaluation.seed}",
+            "tasks": [
+                {
+                    "name": "trajectory",
+                    "output_dir": "${run.dir}/trajectory",
+                    "generator": {"seed": "${evaluation.seed}"},
+                }
+            ],
+        },
+        "science": {"charge": 1},
+    }
+    eval_path = tmp_path / "h_v2_eval_shape.json"
+    eval_path.write_text(json.dumps(eval_config), encoding="utf-8")
+    eval_run_values = {
+        "root": "outputs",
+        "run_id": "h-v2-eval",
+        "dir": str(tmp_path / "outputs" / "h-v2-eval"),
+        "layout": "nested",
+        "timezone": "UTC",
+    }
+    expected_eval = expected_resolved_config_identity(eval_config, run_values=eval_run_values)
+    eval_code = """import json, sys
+from pathlib import Path
+from tpen.checkpoint.hashing import resolved_config_identity
+config = json.loads(Path(sys.argv[1]).read_text())
+run_values = json.loads(sys.argv[2])
+print(json.dumps(resolved_config_identity(config, run_values=run_values)))
+"""
+    eval_run = executor(
+        eval_code,
+        eval_path,
+        json.dumps(eval_run_values),
+        python=sys.executable,
+    )
+    assert eval_run.returncode == 0, (eval_run.stdout, eval_run.stderr)
+    assert json.loads(eval_run.stdout) == expected_eval
 
 
 def test_t7_reader_refuses_explicit_null_segment_identity(tmp_path):
