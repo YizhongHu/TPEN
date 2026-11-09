@@ -28,17 +28,30 @@ from tpen.training.trainer import VMCTrainer
 from tests.helpers.hooke_models import build_tiny_hamiltonian_terms, build_tiny_sampler, build_tiny_spenn
 
 
-class _Context:
-    metadata = {}
-
-    def __init__(self) -> None:
-        self.logged: list[dict[str, object]] = []
-
-    def now_iso(self) -> str:
-        return "2026-01-01T00:00:00+00:00"
-
-    def log(self, metrics: dict[str, object], *, namespace: str) -> None:
-        self.logged.append({"metrics": metrics, "namespace": namespace})
+def _run_context(tmp_path: Path) -> RunContext:
+    manager = ArtifactManager(tmp_path / "artifacts", "callback", "unit", "run", layout="flat")
+    manager.make_dirs()
+    return RunContext(
+        cfg=OmegaConf.create({}),
+        source_cfg=OmegaConf.create({}),
+        artifact_manager=manager,
+        metadata=RunMetadata(
+            run_id="run",
+            run_name="run",
+            timestamp="2026-01-01T00:00:00+00:00",
+            timezone="UTC",
+            git_commit="test-sha",
+            git_branch="test",
+            dirty_worktree=False,
+            command="pytest",
+            config_path="test.yaml",
+            resolved_config_path=str(manager.path("resolved_config.yaml")),
+            run_dir=str(manager.run_dir),
+            device="cpu",
+            dtype="float64",
+        ),
+        clock=RunClock(timezone="UTC", tzinfo=UTC),
+    )
 
 
 def _record(step: int, *, applied: bool = True) -> TrainingBatchRecord:
@@ -148,7 +161,7 @@ def test_round_trip_publishes_only_the_selected_compressed_bundle(tmp_path: Path
 
 def test_callback_captures_pre_update_forward_and_records_skipped_update(tmp_path: Path) -> None:
     callback = RawTrainingBatchRecorder(tmp_path, partition_size_steps=10, every_n_steps=1)
-    context = _Context()
+    context = _run_context(tmp_path)
     state = TrainerState(
         trainer=SimpleNamespace(completed_updates=0),
         batch=ElectronBatch(torch.tensor([[[0.0, 1.0, 2.0]], [[3.0, 4.0, 5.0]]])),
