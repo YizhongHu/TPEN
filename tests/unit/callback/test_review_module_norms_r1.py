@@ -6,11 +6,9 @@ import math
 
 import pytest
 import torch
-from omegaconf import OmegaConf
 from torch import nn
 
 from tpen.callback import GradientStats, ModuleNorms
-from tpen.checkpoint.profiles import NATIVE_RECOVERY_PROFILE, check_profile
 from tpen.parameter_groups import resolve_parameter_groups
 from tests.unit.callback.support import RecordingContext, deliver_completed_iteration, training_state
 
@@ -164,39 +162,15 @@ def test_reconstruction_preserves_durable_step_cadence() -> None:
     ]
 
 
-def test_profile_admits_but_reconstruction_resets_max_calls_gate() -> None:
-    config = OmegaConf.create({
-        "callbacks": [{
-            "_target_": "tpen.callback.ModuleNorms",
-            "groups": {"branch": ["branch"]},
-            "every_n_steps": 1,
-            "max_calls": 2,
-        }],
-        "loggers": [],
-    })
-    profile = check_profile(config, NATIVE_RECOVERY_PROFILE)
-    assert profile.verdict == "supported"
-    assert profile.refusal is None
+@pytest.mark.parametrize(
+    "cadence_option",
+    [
+        {"max_calls": 2},
+        {"probability": 0.5},
+    ],
+)
+def test_stateful_cadence_options_are_refused(cadence_option: dict[str, object]) -> None:
+    """Resume-unsafe callback-owned cadence state is rejected at construction."""
 
-    model = UntiedNested()
-    context = RecordingContext()
-    uninterrupted = ModuleNorms({"branch": ["branch"]}, every_n_steps=1, max_calls=2)
-    for step in range(6):
-        deliver_completed_iteration(uninterrupted, context, training_state(model=model), step=step)
-    uninterrupted_steps = [
-        record["step"] for record in context.by_namespace("train/module_norms/branch")
-    ]
-    assert uninterrupted_steps == [0, 1]
-
-    context = RecordingContext()
-    first = ModuleNorms({"branch": ["branch"]}, every_n_steps=1, max_calls=2)
-    for step in range(3):
-        deliver_completed_iteration(first, context, training_state(model=model), step=step)
-    reconstructed = ModuleNorms({"branch": ["branch"]}, every_n_steps=1, max_calls=2)
-    for step in range(3, 6):
-        deliver_completed_iteration(reconstructed, context, training_state(model=model), step=step)
-
-    # The declared profile admits this callback while callback-owned state is unsupported.
-    # This assertion intentionally stays RED on the current source: reconstruction resets
-    # the mutable max_calls gate and emits additional [3, 4] steps.
-    assert [record["step"] for record in context.by_namespace("train/module_norms/branch")] == [0, 1]
+    with pytest.raises(ValueError, match=next(iter(cadence_option))):
+        ModuleNorms({"branch": ["branch"]}, every_n_steps=1, **cadence_option)
