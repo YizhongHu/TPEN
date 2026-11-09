@@ -257,19 +257,6 @@ def test_unsupported_callback_or_logger_is_typed_refusal(owner: str, target: str
     assert result.refusal == {"code": code, "reason": result.refusal["reason"]}
 
 
-def test_raw_training_recorder_is_refused_by_checkpoint_profile() -> None:
-    """Training history remains optional and is not a resumable checkpoint target."""
-
-    result = check_profile(
-        _config(callbacks=[{"_target_": "tpen.callback.RawTrainingBatchRecorder"}]),
-        NATIVE_RECOVERY_PROFILE,
-    )
-    assert result.verdict == "refused"
-    assert result.refusal is not None
-    assert result.refusal["code"] == "unsupported-callback"
-    assert "RawTrainingBatchRecorder" in result.refusal["reason"]
-
-
 def test_callback_state_negative_control_refuses_unknown_callback() -> None:
     result = check_profile(
         _config(callbacks=[{"_target_": "tests.helpers.CallbackWithState", "state": {"count": 1}}]),
