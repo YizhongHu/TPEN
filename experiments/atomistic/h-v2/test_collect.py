@@ -236,6 +236,7 @@ def test_collector_admits_the_real_smoke_evaluation_output(tmp_path: Path, recor
     train = protocol.training_config()
     train["run"]["root"] = str(tmp_path)
     train["run"]["run_id"] = "collector-train"
+    train["model"]["readout"]["eps"] = 1.0e-12
     train["trainer"]["max_steps"] = 1
     train["sampler"].update(n_walkers=8, burn_in=2, n_steps=1)
     train["callbacks"][-1]["schedule"]["every_n"] = 1
@@ -245,7 +246,11 @@ def test_collector_admits_the_real_smoke_evaluation_output(tmp_path: Path, recor
     evaluation = protocol.evaluation_config(checkpoint_dir, root=tmp_path)
     evaluation["run"]["run_id"] = "collector-eval"
     evaluation["sampler"].update(n_walkers=8, burn_in=2, n_steps=1)
-    evaluation["evaluator"]["tasks"][0]["generator"]["n_draws"] = 3
+    generator = evaluation["evaluator"]["tasks"][0]["generator"]
+    generator["_target_"] = "tpen.evaluation.generators.ReadoutTrajectoryMCMCGenerator"
+    generator["n_draws"] = 3
+    generator["readout_eps"] = 1.0e-12
+    evaluation["model"]["readout"]["eps"] = 1.0e-12
     evaluation["evaluator"]["tasks"][0]["generator"]["chunk_size"] = 5
     evaluation["evaluator"]["tasks"][0]["summaries"][0]["max_samples"] = 24
     assert run_from_config(OmegaConf.create(evaluation), command="h-v2 collector eval", raise_exceptions=True) == 0
@@ -254,6 +259,10 @@ def test_collector_admits_the_real_smoke_evaluation_output(tmp_path: Path, recor
     trajectory_dir = eval_run_dir / "trajectory"
     csv_path = trajectory_dir / "sampled_eval_table.csv"
     metadata_path = trajectory_dir / "sampled_eval_table.metadata.json"
+    raw_readout_path = trajectory_dir / "raw_readout.csv"
+    raw_readout_metadata_path = trajectory_dir / "raw_readout.json"
+    assert raw_readout_path.is_file()
+    assert raw_readout_metadata_path.is_file()
     with csv_path.open(newline="", encoding="utf-8") as handle:
         header = csv.DictReader(handle).fieldnames
     real_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -282,3 +291,9 @@ def test_collector_admits_the_real_smoke_evaluation_output(tmp_path: Path, recor
     )
     assert receipt["status"] == "complete"
     assert receipt["row_count"] == 24
+    assert receipt["csv_sha256"] == real_metadata["csv_sha256"]
+    raw_fields = csv.DictReader(raw_readout_path.open(newline="")).fieldnames
+    assert raw_fields is not None
+    assert not set(raw_fields).intersection(
+        {"local_energy", "term/kinetic", "logabs", "sign"}
+    )

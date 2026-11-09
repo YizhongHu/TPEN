@@ -28,6 +28,7 @@ from tpen.evaluation.generators.trajectory import (
     TRAJECTORY_METADATA_KEY,
     TrajectoryMCMCGenerator,
 )
+from tpen.evaluation.generators.readout_trajectory import ReadoutTrajectoryMCMCGenerator
 
 __all__ = [
     "SAMPLER_TRAJECTORY_DIAGNOSTICS_KEY",
@@ -44,6 +45,7 @@ __all__ = [
     "MCMCGenerator",
     "PermutationOrbitGenerator",
     "ReequilibratedFactorGenerator",
+    "ReadoutTrajectoryMCMCGenerator",
     "RotationOrbitGenerator",
     "StratifiedGeometryGenerator",
     "TailGridGenerator",
