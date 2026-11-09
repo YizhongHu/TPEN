@@ -29,7 +29,11 @@ def resolve_parameter_groups(
     -------
     dict
         Group names mapped to ordered ``(parameter_name, parameter)`` pairs.
-        The ungrouped bucket is included only when it is non-empty.
+        Ownership is by parameter identity, not by the spelling of a name:
+        tied aliases therefore belong to every selected module that exposes
+        the tensor, and an identity claimed by two groups is refused. The
+        returned pairs use the first model-level name for each identity, and
+        the ungrouped bucket is included only when it is non-empty.
 
     Raises
     ------
@@ -71,37 +75,54 @@ def resolve_parameter_groups(
         normalized[group] = specs
 
     named_modules = tuple(model.named_modules())
+    # ``remove_duplicate=False`` is essential here.  PyTorch's default
+    # ``named_parameters`` traversal keeps only the first spelling of a tied
+    # parameter, which would make a later alias appear ungrouped and would
+    # hide an overlap between two explicitly selected modules.
+    named_parameters = tuple(model.named_parameters(remove_duplicate=False))
+    canonical_parameters: dict[int, tuple[str, Any]] = {}
+    for parameter_name, parameter in named_parameters:
+        canonical_parameters.setdefault(id(parameter), (parameter_name, parameter))
+    selected_by_group: dict[str, set[int]] = {group: set() for group in normalized}
+    for group, specifications in normalized.items():
+        for path, module in named_modules:
+            if any(
+                _module_matches_specification(path, module, specification)
+                for specification in specifications
+            ):
+                selected_by_group[group].update(
+                    id(parameter)
+                    for _, parameter in module.named_parameters(
+                        prefix=path, recurse=True, remove_duplicate=False
+                    )
+                )
+
+    ownership: dict[int, str] = {}
+    for group, identities in selected_by_group.items():
+        for identity in identities:
+            previous = ownership.setdefault(identity, group)
+            if previous != group:
+                parameter_name = canonical_parameters[identity][0]
+                raise ValueError(
+                    f"parameter {parameter_name!r} is covered by overlapping groups "
+                    f"[{previous!r}, {group!r}]"
+                )
+
     assignments: dict[str, list[tuple[str, Any]]] = {
         group: [] for group in normalized
     }
     assignments[ungrouped] = []
-    for parameter_name, parameter in model.named_parameters():
-        matching: list[str] = []
-        for group, specifications in normalized.items():
-            if any(
-                _parameter_is_under_module(parameter_name, path, module, spec)
-                for path, module in named_modules
-                for spec in specifications
-            ):
-                matching.append(group)
-        if len(matching) > 1:
-            raise ValueError(
-                f"parameter {parameter_name!r} is covered by overlapping groups {matching}"
-            )
-        assignments[matching[0] if matching else ungrouped].append((parameter_name, parameter))
+    for identity, (parameter_name, parameter) in canonical_parameters.items():
+        assignments[ownership.get(identity, ungrouped)].append((parameter_name, parameter))
 
     return {group: tuple(values) for group, values in assignments.items() if values}
 
 
-def _parameter_is_under_module(
-    parameter_name: str, path: str, module: Any, specification: str
-) -> bool:
-    """Return whether a named parameter belongs to one specified module."""
+def _module_matches_specification(path: str, module: Any, specification: str) -> bool:
+    """Return whether a module is addressed by one configured specification."""
 
     trace_name = getattr(module, "trace_name", None)
-    if specification != path and specification != trace_name:
-        return False
-    return not path or parameter_name == path or parameter_name.startswith(path + ".")
+    return specification == path or specification == trace_name
 
 
 __all__ = ["resolve_parameter_groups"]
