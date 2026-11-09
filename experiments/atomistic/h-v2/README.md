@@ -71,6 +71,18 @@ pay that cost once per head). The opt-in flag only works with this documented
 invocation naming ``test_pipeline.py`` directly; a broader invocation (e.g.
 rooted at ``experiments/atomistic``) can only skip the test, not run it.
 
+The sampler tail qualification (``test_sampler_tail_qualification.py``,
+marked ``h_v2_sampler_tail_qualification``) follows the same opt-in pattern:
+four full 4,096-walker x 256-draw fresh evaluations (two alphas x two
+streams), gating the real sampler's radial and local-energy survival curves
+against the independent analytic oracle over both tails. Run it once per
+head with::
+
+    uv run pytest -q --run-h-v2-sampler-tail-qualification -m h_v2_sampler_tail_qualification experiments/atomistic/h-v2/test_sampler_tail_qualification.py
+
+The same caveat applies: the opt-in flag only works when the test file is
+named directly; a broader invocation only skips it.
+
 **Scope, not a gap.** ``tests/unit/physics/test_hydrogen_oracle_controls.py``
 already compares TPEN's real kinetic and potential code, and
 ``tests/unit/sampling/test_hydrogen_sampler_controls.py`` the real sampler
@@ -312,10 +324,19 @@ comparable stratum, per the Cannon partition-naming policy (node counts as of
 the 2026-08-15 hardware note; they drift -- re-measure with `sinfo` rather
 than citing this date). At most 32
 GPU-hours per lineage fits comfortably inside even the tighter `seas_gpu`
-ceiling. Polaris is not used for H-v2 science; its only role stays the
-pipeline check's excluded-seed GPU smoke, part (g) of slice `406194c5`,
-which is not a science venue. Slice `406194c5`'s other part, the Cannon
-capacity-and-freeze pilot (`admission.pilot`), runs on Cannon, not Polaris --
+ceiling. Polaris is not used for H-v2 science. D6/D5 restatement (operator
+decisions, `operator-decisions-pilot-geometry-design-target-20261107` and
+`operator-answers-design-target-d1-d6-20261107` on `fffc313a`, 2026-11-07):
+the operator, quoted, "Gpu test goes on cannon" -- the pipeline check's
+excluded-seed GPU route smoke, part (g) of slice `406194c5`, moved from
+Polaris to FASRC Cannon's `gpu_test` partition (a MIG slice) -- the
+partition and "a MIG slice" are the manager's D5 restatement, to which the
+operator answered "Yes" (quoted as typed: "5. Yes") -- and is not a science
+venue either way. D6, the manager's restatement, to which the
+operator answered "Yes" (quoted as typed: "6. Yes"): "the contract text for
+part (g) is restated at the next PR 587 touch: Cannon, with a cap of one
+GPU-hour on the allocated device, setup included." Slice `406194c5`'s other part, the
+Cannon capacity-and-freeze pilot (`admission.pilot`), also runs on Cannon --
 see "Two admission scopes" below.
 
 ### Four-stream design (item 8)
@@ -385,7 +406,9 @@ For part (e), the training sampler is `256` walkers with burn-in `100`, `10`
 Metropolis steps per update, and proposal scale `0.5` bohr; each fresh
 evaluation uses `1,024` walkers, `64` draws, `2` streams, burn-in `1,000`, and
 stride `20`. Part (g), the excluded-seed GPU route smoke, belongs to slice
-`406194c5` on Polaris. Slice `2f1b2921` reruns the integrated check on the exact
+`406194c5` on FASRC Cannon's `gpu_test` partition (a MIG slice), capped at
+one GPU-hour on the allocated device, setup included (D5/D6, operator
+decisions on `fffc313a`, 2026-11-07). Slice `2f1b2921` reruns the integrated check on the exact
 candidate. The JSON gives each part's pass criteria and its disjoint non-science
 seed namespace. This check is not a science result and does not authorize the
 executor or a lineage. The pipeline check (parts a-g, including the
@@ -584,15 +607,17 @@ Every `lane_proposals` entry is now decided (2026-11-07 operator review; see
 "Lane proposals: operator-reviewed 2026-11-07" above). That does not lift the
 science hold: **science lineages remain prohibited** pending this amendment's
 own Cannon verification and the human merge of this pull request, pending
-the remaining pipeline-check (`5cfcca3e`), excluded-seed Polaris smoke
-(`406194c5`), and integrated-rerun (`2f1b2921`) gates already described above,
-and pending a third admission gate added round-2 (finding G3):
+the remaining pipeline-check (`5cfcca3e`), excluded-seed Cannon `gpu_test`
+smoke (`406194c5`), and integrated-rerun (`2f1b2921`) gates already described
+above, and pending a third admission gate added round-2 (finding G3):
 `admission.pilot`.
 
 Slice `406194c5` has two parts with separate placements and ceilings (round-3
-pre-review finding H1, accepted 2026-11-07): part (g), the excluded-seed
-Polaris GPU route smoke, keeps its current caps (1,000 updates, one
-node-hour including setup) and runs first; then, after part (g) and
+pre-review finding H1, accepted 2026-11-07, facility updated by D5/D6
+2026-11-07): part (g), the excluded-seed GPU route smoke, runs on FASRC
+Cannon's `gpu_test` partition (a MIG slice), keeps its current update cap
+(1,000 updates), is capped at one GPU-hour on the allocated device, setup
+included, and runs first; then, after part (g) and
 qualification, the Cannon capacity-and-freeze pilot runs on one A100
 (`--constraint=a100`) with its own ceiling of **16 GPU-hours** including
 setup, checkpoint writes and fresh evaluation -- flagged in the contract as

@@ -7,7 +7,7 @@ run:
   root: experiments/atomistic/h-v2/outputs
   run_id: h-v2-eval
   dir: null
-  timezone: UTC
+  timezone: America/New_York
 
 runtime:
   seed: 910003
@@ -24,7 +24,6 @@ system:
   nuclei:
     positions: [[0.0, 0.0, 0.0]]
     charges: [1.0]
-  reference_energy: -0.5
 
 atoms:
   _target_: tpen.data.atomic_configuration.AtomicConfiguration

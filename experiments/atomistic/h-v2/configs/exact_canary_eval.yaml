@@ -28,11 +28,13 @@
 # checkpoint built directly with `tpen.checkpoint.save.save_checkpoint`,
 # which core test code may do freely.
 #
-# `runtime.seed: 910003` deliberately reuses
+# `runtime.seed: 950001` is this canary's own disjoint seed
+# (`non_science_seed_namespaces.exact_canary.evaluation[0]` in
+# `contract_inputs.json`). F6, operator-added scope on PR 600 2026-11-07:
+# this canary previously reused
 # `non_science_seed_namespaces.pipeline_cpu_learned_e.evaluation[0]`
-# (`contract_inputs.json`): this canary is an instrument control of that
-# same pipeline check, not an independent science run, so the shared seed
-# is intentional rather than an undeclared namespace collision.
+# (910003) as a deliberate instrument-control replay; it now has its own
+# namespace instead.
 # =============================================================================
 
 experiment:
@@ -44,10 +46,12 @@ run:
   root: experiments/atomistic/h-v2/outputs
   run_id: h-v2-exact-canary-eval
   dir: null
+  # Consumed only by pytest; CLAUDE.md's America/New_York convention is for
+  # experiment run configs, not test-only configs like this one (review r1 F7).
   timezone: UTC
 
 runtime:
-  seed: 910003
+  seed: 950001
   device: cpu
   dtype: float64
 
@@ -61,7 +65,6 @@ system:
   nuclei:
     positions: [[0.0, 0.0, 0.0]]
     charges: [1.0]
-  reference_energy: -0.5
 
 atoms:
   _target_: tpen.data.atomic_configuration.AtomicConfiguration
@@ -140,8 +143,6 @@ evaluator:
           include_term_energies: true
         - _target_: tpen.evaluation.SamplerStatsSummary
         - _target_: tpen.evaluation.LocalEnergySummary
-        - _target_: tpen.evaluation.ReferenceEnergySummary
-          reference_energy: ${system.reference_energy}
 
 callbacks:
   - _target_: tpen.callback.ConfigSnapshot
