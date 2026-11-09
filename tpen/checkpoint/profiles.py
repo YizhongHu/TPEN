@@ -81,7 +81,7 @@ class Profile:
         }
 
 
-SUPPORTED_CALLBACK_TARGETS = frozenset(
+OBSERVATIONAL_CALLBACK_TARGETS = frozenset(
     {
         "tpen.callback.ConfigSnapshot",
         "tpen.callback.ResolvedConfigSnapshot",
@@ -90,8 +90,26 @@ SUPPORTED_CALLBACK_TARGETS = frozenset(
         "tpen.callback.TrainStepTiming",
         "tpen.callback.TrainPhaseTiming",
         "tpen.callback.Status",
-        "tpen.callback.Checkpoint",
+        "tpen.callback.ParameterActivity",
+        "tpen.callback.RawTrainingBatchRecorder",
+        "tpen.callback.ElectronNucleusDistanceQuantiles",
+        "tpen.callback.ModuleNorms",
     }
+)
+# These callbacks are admitted explicitly because their resume behavior is
+# part of the callback's contract.  This is deliberately not inferred from
+# ``StatefulCallback``: that generic describes the domain state a callback
+# observes, not callback-owned state restored by ``train_resume``.
+RESUME_SENSITIVE_CALLBACK_TARGETS = frozenset(
+    {
+        "tpen.callback.Checkpoint",
+        "tpen.callback.InitialCheckpoint",
+        "tpen.callback.DataIntegrity",
+        "tpen.callback.GradientStats",
+    }
+)
+SUPPORTED_CALLBACK_TARGETS = (
+    OBSERVATIONAL_CALLBACK_TARGETS | RESUME_SENSITIVE_CALLBACK_TARGETS
 )
 SUPPORTED_LOGGER_TARGETS = frozenset({"tpen.logging.CSV", "tpen.logging.JSONL"})
 SUPPORTED_STATE_OWNERS = frozenset(

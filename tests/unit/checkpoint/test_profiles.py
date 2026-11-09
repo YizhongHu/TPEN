@@ -11,12 +11,14 @@ from omegaconf import OmegaConf
 from tpen.checkpoint.profiles import (
     NATIVE_PROFILE,
     NATIVE_RECOVERY_PROFILE,
+    Profile,
     PROFILE_CHECK_SCHEMA,
     REFUSAL_CODES,
     SUPPORTED_STATE_OWNERS,
     ProfileCheck,
     check_profile,
 )
+from tpen.checkpoint import profiles
 from tpen.execution import NATIVE_PROFILE_VERSION
 from tpen.execution.native_profile import (
     SUPPORTED_CALLBACK_TARGETS,
@@ -34,12 +36,77 @@ def _config(**overrides: object) -> dict[str, object]:
     return value
 
 
+ROOT = Path(__file__).parents[3]
+H_V2_TRAIN_CONFIG = ROOT / "experiments" / "atomistic" / "h-v2" / "configs" / "train.yaml"
+NEW_CALLBACK_TARGETS = frozenset(
+    {
+        "tpen.callback.DataIntegrity",
+        "tpen.callback.GradientStats",
+        "tpen.callback.InitialCheckpoint",
+        "tpen.callback.ParameterActivity",
+        "tpen.callback.RawTrainingBatchRecorder",
+        "tpen.callback.ElectronNucleusDistanceQuantiles",
+        "tpen.callback.ModuleNorms",
+    }
+)
+
+
 def test_supported_profile_reports_declared_state_owners() -> None:
     result = check_profile(OmegaConf.create(_config()), NATIVE_RECOVERY_PROFILE)
     assert result.schema == PROFILE_CHECK_SCHEMA
     assert result.verdict == "supported"
     assert result.state_owners == SUPPORTED_STATE_OWNERS
     assert result.refusal is None
+
+
+def test_h_v2_real_train_config_is_admitted_through_profile_loader() -> None:
+    """The executor's profile subprocess path accepts the real H-v2 config."""
+
+    result = check_profile(OmegaConf.load(H_V2_TRAIN_CONFIG), NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "supported"
+    assert result.refusal is None
+
+
+def test_unknown_callback_target_remains_refused() -> None:
+    result = check_profile(
+        OmegaConf.create(
+            {
+                "callbacks": [{"_target_": "tpen.callback.NotARealCallback"}],
+                "loggers": [],
+            }
+        ),
+        NATIVE_RECOVERY_PROFILE,
+    )
+
+    assert result.verdict == "refused"
+    assert result.refusal["code"] == "unsupported-callback"
+
+
+@pytest.mark.parametrize("target", sorted(NEW_CALLBACK_TARGETS))
+def test_dropping_each_new_target_refuses_the_h_v2_callback_set(
+    target: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each newly admitted target is independently covered by the gate."""
+
+    config = OmegaConf.to_container(OmegaConf.load(H_V2_TRAIN_CONFIG), resolve=False)
+    callbacks = config["callbacks"]
+    if target not in {entry["_target_"] for entry in callbacks}:
+        callbacks.append({"_target_": target})
+    mutant = Profile(
+        name=NATIVE_PROFILE.name,
+        state_owners=NATIVE_PROFILE.state_owners,
+        callbacks=NATIVE_PROFILE.callbacks - {target},
+        loggers=NATIVE_PROFILE.loggers,
+        callback_state_supported=NATIVE_PROFILE.callback_state_supported,
+    )
+    monkeypatch.setattr(profiles, "PROFILES", {NATIVE_RECOVERY_PROFILE: mutant})
+
+    result = check_profile(config, NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "refused"
+    assert result.refusal["code"] == "unsupported-callback"
+    assert target in result.refusal["reason"]
 
 
 @pytest.mark.parametrize(
