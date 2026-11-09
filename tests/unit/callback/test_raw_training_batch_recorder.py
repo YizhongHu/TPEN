@@ -159,6 +159,34 @@ def test_round_trip_publishes_only_the_selected_compressed_bundle(tmp_path: Path
     np.testing.assert_array_equal(rows["term/kinetic"], [1.0, 2.0, 1.0, 2.0])
 
 
+def test_partition_provenance_is_written_and_exposed_by_reader(tmp_path: Path) -> None:
+    """Keep run, source, sampler, and partition acceptance provenance typed."""
+
+    provenance = {
+        "run_id": "run-1",
+        "config_hash": "config-sha",
+        "source_revision": "source-sha",
+        "sampler_settings": {"n_walkers": 2, "burn_in": 3, "n_steps": 4},
+    }
+    writer = TrainingBatchPartitionWriter(
+        tmp_path, partition_index=0, planned_steps=[0], provenance=provenance
+    )
+    writer.append(
+        _record(0),
+        sampler_stats={"iteration_acceptance_rate": 0.75, "proposal_scale": 0.05},
+    )
+    writer.publish()
+
+    sidecar = json.loads((tmp_path / "partition-00000.json").read_text())
+    assert sidecar["provenance"]["run_id"] == "run-1"
+    assert sidecar["provenance"]["acceptance_proposal_stats"] == [
+        {"iteration_acceptance_rate": 0.75, "proposal_scale": 0.05}
+    ]
+    reader = TrainingBatchReader(tmp_path)
+    reader.validate()
+    assert reader.provenance[0]["source_revision"] == "source-sha"
+
+
 def test_callback_captures_pre_update_forward_and_records_skipped_update(tmp_path: Path) -> None:
     callback = RawTrainingBatchRecorder(tmp_path, partition_size_steps=10, every_n_steps=1)
     context = _run_context(tmp_path)

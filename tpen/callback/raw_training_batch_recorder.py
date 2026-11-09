@@ -1,8 +1,8 @@
 """Optional, integrity-checked raw training-history recording.
 
 Training history describes a changing model and is therefore deliberately kept
-separate from frozen evaluation records.  This module owns the complete
-``training_history/v1`` format: typed row batches, one-partition-at-a-time
+separate from frozen evaluation records. This module owns the versioned
+``training_history`` format: typed row batches, one-partition-at-a-time
 writing, and manifest-selected reading/validation.
 """
 
@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Mapping
 
 import numpy as np
+from omegaconf import OmegaConf
 
 from tpen.artifacts import RunContext
 from tpen.events import DomainState
@@ -28,7 +29,8 @@ from tpen.training.state import TrainerState
 from .base import StatefulCallback
 from .cadence import StepCadenceGate, SubscriptionGroup, pop_step_cadence
 
-SCHEMA = "training_history/v1"
+LEGACY_SCHEMA = "training_history/v1"
+SCHEMA = "training_history/v2"
 MANIFEST_FILENAME = "manifest.json"
 
 
@@ -153,12 +155,21 @@ def _sha256(path: Path) -> str:
 class TrainingBatchPartitionWriter:
     """Collect and publish exactly one immutable NumPy partition."""
 
-    def __init__(self, root: str | Path, *, partition_index: int, planned_steps: list[int]) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        partition_index: int,
+        planned_steps: list[int],
+        provenance: Mapping[str, Any] | None = None,
+    ) -> None:
         self.root = Path(root)
         self.partition_index = int(partition_index)
         self.planned_steps = [int(step) for step in planned_steps]
         self._records: list[TrainingBatchRecord] = []
         self._seen: set[int] = set()
+        self._provenance = dict(provenance or _empty_provenance())
+        self._sampler_stats: list[dict[str, Any]] = []
         self.root.mkdir(parents=True, exist_ok=True)
 
     @property
@@ -167,7 +178,7 @@ class TrainingBatchPartitionWriter:
 
         return sum(int(value.nbytes) for record in self._records for value in _record_arrays(record))
 
-    def append(self, record: TrainingBatchRecord) -> None:
+    def append(self, record: TrainingBatchRecord, *, sampler_stats: Mapping[str, Any] | None = None) -> None:
         """Append one complete retained update to this partition."""
 
         if record.iteration_step in self._seen:
@@ -180,6 +191,8 @@ class TrainingBatchPartitionWriter:
             raise ValueError("Hamiltonian terms changed within a training partition")
         self._records.append(record)
         self._seen.add(record.iteration_step)
+        if sampler_stats is not None:
+            self._sampler_stats.append(dict(sampler_stats))
 
     def publish(self) -> dict[str, Any]:
         """Write one compressed bundle, its sidecar, and manifest entry."""
@@ -233,6 +246,10 @@ class TrainingBatchPartitionWriter:
             "selected_filename": compressed_path.name,
             "selection_reason": "compressed bundle selected to reduce retained training-history bytes; the uncompressed arm is measured then removed",
             "write_time_sec": time.perf_counter() - started,
+            "provenance": {
+                **self._provenance,
+                "acceptance_proposal_stats": self._sampler_stats,
+            },
         }
         _write_json_exclusive(sidecar_path, sidecar)
         manifest_path = self.root / MANIFEST_FILENAME
@@ -242,7 +259,52 @@ class TrainingBatchPartitionWriter:
         _atomic_json(manifest_path, manifest)
         self._records.clear()
         self._seen.clear()
+        self._sampler_stats.clear()
         return sidecar
+
+
+def _empty_provenance() -> dict[str, Any]:
+    """Return the typed provenance envelope used by direct writer callers."""
+
+    return {
+        "run_id": None,
+        "config_hash": None,
+        "source_revision": None,
+        "sampler_settings": {},
+        "acceptance_proposal_stats": [],
+    }
+
+
+def _context_provenance(context: RunContext, sampler_stats: Any) -> dict[str, Any]:
+    """Build small JSON-safe provenance from the run and sampler domains."""
+
+    config = OmegaConf.to_container(context.cfg, resolve=True)
+    config_hash = hashlib.sha256(
+        json.dumps(config, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+    settings: dict[str, Any] = {}
+    if sampler_stats is not None:
+        for name in ("n_walkers", "burn_in", "n_steps", "proposal_scale", "seed"):
+            value = getattr(sampler_stats, name)
+            settings[name] = value
+        settings["geometry"] = dict(sampler_stats.geometry)
+    return {
+        "run_id": context.metadata.run_id,
+        "config_hash": config_hash,
+        "source_revision": context.metadata.git_commit,
+        "sampler_settings": settings,
+    }
+
+
+def _sampler_provenance(sampler_stats: Any) -> dict[str, Any]:
+    """Return the per-step acceptance/proposal subset of typed sampler stats."""
+
+    if sampler_stats is None:
+        return {}
+    return {
+        "iteration_acceptance_rate": float(sampler_stats.acceptance_rate),
+        "proposal_scale": float(sampler_stats.proposal_scale),
+    }
 
 
 def _record_arrays(record: TrainingBatchRecord) -> list[np.ndarray]:
@@ -307,26 +369,38 @@ class TrainingBatchReader:
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
+        self.provenance: dict[int, Mapping[str, Any]] = {}
 
     def read(self, *, start_step: int | None = None, end_step: int | None = None) -> dict[str, np.ndarray]:
         """Return rows in the requested iteration range after full validation."""
 
         manifest_path = self.root / MANIFEST_FILENAME
         manifest = json.loads(manifest_path.read_text())
-        if manifest.get("schema") != SCHEMA:
+        if manifest.get("schema") not in {LEGACY_SCHEMA, SCHEMA}:
             raise ValueError("training history manifest has the wrong schema")
         selected: list[dict[str, np.ndarray]] = []
+        self.provenance = {}
+        identities: set[tuple[int, int]] = set()
         for partition_number, entry in enumerate(manifest.get("partitions", [])):
             parent_hash = entry.get("parent_manifest_sha256")
-            if (partition_number == 0 and parent_hash is not None) or (
-                partition_number > 0 and not isinstance(parent_hash, str)
-            ):
+            expected_parent = None
+            if partition_number > 0:
+                predecessor = {"schema": manifest["schema"], "partitions": manifest["partitions"][:partition_number]}
+                expected_parent = _canonical_hash(predecessor)
+            if parent_hash != expected_parent:
                 raise ValueError("training manifest partition lineage is broken")
             sidecar_path = self.root / entry["sidecar"]
             sidecar = json.loads(sidecar_path.read_text())
             _validate_sidecar(self.root, sidecar, entry=entry)
+            if sidecar["schema"] == SCHEMA:
+                self.provenance[partition_number] = dict(sidecar["provenance"])
             arrays = dict(np.load(self.root / sidecar["compressed_filename"], allow_pickle=False))
             _validate_bundle(arrays, sidecar)
+            for step, walker in zip(arrays["iteration_step"], arrays["walker_index"]):
+                identity = (int(step), int(walker))
+                if identity in identities:
+                    raise ValueError("duplicate (iteration, walker) identity across training partitions")
+                identities.add(identity)
             mask = np.ones(len(arrays["iteration_step"]), dtype=bool)
             if start_step is not None:
                 mask &= arrays["iteration_step"] >= int(start_step)
@@ -350,8 +424,10 @@ def _validate_sidecar(root: Path, sidecar: Mapping[str, Any], *, entry: Mapping[
     missing = required - set(sidecar)
     if missing:
         raise ValueError(f"training sidecar is missing keys: {sorted(missing)}")
-    if sidecar["schema"] != SCHEMA or sidecar["observed_updates"] != sorted(sidecar["observed_updates"]):
+    if sidecar["schema"] not in {LEGACY_SCHEMA, SCHEMA} or sidecar["observed_updates"] != sorted(sidecar["observed_updates"]):
         raise ValueError("training sidecar schema or update ordering is invalid")
+    if sidecar["schema"] == SCHEMA and not isinstance(sidecar.get("provenance"), Mapping):
+        raise ValueError("training sidecar is missing typed provenance")
     if entry.get("sidecar") != Path(str(sidecar.get("compressed_filename", ""))).with_suffix(".json").name:
         raise ValueError("training manifest and sidecar disagree about the partition")
     if sidecar.get("selected_filename") != sidecar["compressed_filename"]:
@@ -396,6 +472,13 @@ def _validate_bundle(arrays: Mapping[str, np.ndarray], sidecar: Mapping[str, Any
         digest.update(value.tobytes())
     if digest.hexdigest() != sidecar["logical_sha256"]:
         raise ValueError("training partition logical digest does not match its sidecar")
+
+
+def _canonical_hash(value: Mapping[str, Any]) -> str:
+    """Hash a manifest prefix using the writer's canonical JSON encoding."""
+
+    encoded = json.dumps(value, sort_keys=True, indent=2, allow_nan=False).encode()
+    return hashlib.sha256(encoded + b"\n").hexdigest()
 
 
 class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
@@ -458,10 +541,19 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         if self._partition is None or self._partition.partition_index != index:
             if self._partition is not None:
                 self._publish(context)
-            start = index * self.partition_size_steps
-            planned = list(range(max(start, self._steps.cadence.start), start + self.partition_size_steps, self._steps.cadence.every_n))
-            self._partition = TrainingBatchPartitionWriter(self.path, partition_index=index, planned_steps=planned)
-        self._partition.append(record)
+            lower = index * self.partition_size_steps
+            upper = lower + self.partition_size_steps
+            cadence_start = self._steps.cadence.start
+            every = self._steps.cadence.every_n
+            first = cadence_start + max(0, (lower - cadence_start + every - 1) // every) * every
+            planned = list(range(first, upper, every)) if first < upper else []
+            self._partition = TrainingBatchPartitionWriter(
+                self.path,
+                partition_index=index,
+                planned_steps=planned,
+                provenance=_context_provenance(context, state.sampler_stats),
+            )
+        self._partition.append(record, sampler_stats=_sampler_provenance(state.sampler_stats))
         if self._partition.planned_steps and record.iteration_step == self._partition.planned_steps[-1]:
             self._publish(context)
 
