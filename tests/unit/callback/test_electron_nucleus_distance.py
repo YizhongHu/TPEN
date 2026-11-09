@@ -87,6 +87,41 @@ def test_quantile_levels_are_required_and_validated(quantiles) -> None:
         ElectronNucleusDistanceQuantiles(quantiles=quantiles)
 
 
+@pytest.mark.parametrize("options", [{"max_calls": 1}, {"probability": 0.5}])
+def test_checkpoint_admitted_callback_refuses_non_durable_cadence(options) -> None:
+    with pytest.raises(ValueError):
+        ElectronNucleusDistanceQuantiles(quantiles=(0.5,), **options)
+
+
+def test_rebuilding_callback_at_checkpoint_preserves_durable_step_schedule() -> None:
+    batch = _batch([[[1.0, 0.0, 0.0]]], [[0.0, 0.0, 0.0]])
+    state = training_state(batch=batch)
+    steps = range(1, 10)
+
+    uninterrupted_context = RecordingContext()
+    uninterrupted = ElectronNucleusDistanceQuantiles(
+        quantiles=(0.5,), every_n_steps=3, start_step=2
+    )
+    for step in steps:
+        deliver_completed_iteration(uninterrupted, uninterrupted_context, state, step=step)
+
+    resumed_context = RecordingContext()
+    resumed = ElectronNucleusDistanceQuantiles(
+        quantiles=(0.5,), every_n_steps=3, start_step=2
+    )
+    for step in range(1, 5):
+        deliver_completed_iteration(resumed, resumed_context, state, step=step)
+    resumed = ElectronNucleusDistanceQuantiles(
+        quantiles=(0.5,), every_n_steps=3, start_step=2
+    )
+    for step in range(5, 10):
+        deliver_completed_iteration(resumed, resumed_context, state, step=step)
+
+    assert resumed_context.by_namespace("train/electron_nucleus_distance") == (
+        uninterrupted_context.by_namespace("train/electron_nucleus_distance")
+    )
+
+
 def test_zero_nuclei_are_refused() -> None:
     batch = _batch([[[1.0, 0.0, 0.0]]], [])
     with pytest.raises(ValueError, match="at least one nucleus"):
