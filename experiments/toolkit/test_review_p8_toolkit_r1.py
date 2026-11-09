@@ -146,7 +146,7 @@ else:
     fence = AttemptFence(**d)
     store.finish_attempt(fence, 'completed', '2026-11-05T00:01:00Z')
     placement = SciencePlacementReceipt(
-        'a', fence.attempt_id, digest('group'), 'alloc', 'job', 'slot-a', digest({'payload': 'a'}), fence.output_dir,
+        'a', fence.attempt_id, fence.group_digest, 'alloc', 'job', 'slot-a', digest({'payload': 'a'}), fence.output_dir,
         {'host': 'node-a', 'pid': 1234, 'proc_start_ticks': 55, 'affinity': [0], 'thread_settings': {'OMP_NUM_THREADS': '1'}, 'cuda_visible_devices': None, 'observed_at_utc': '2026-11-05T00:00:01Z'},
         {'host': 'node-a', 'cpus': [0], 'devices': []},
         {'status': 'unavailable', 'reason': 'CPU-only test', 'method': 's2b-1-child-generation-no-sampler', 'started_at_utc': '2026-11-05T00:00:01Z', 'finished_at_utc': '2026-11-05T00:01:00Z', 'samples': [], 'active_uuids': [], 'active_pci': []},

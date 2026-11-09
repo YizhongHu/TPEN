@@ -22,7 +22,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "run-manifest-v2.json"
 FIXTURE_V1 = Path(__file__).parent / "fixtures" / "run-manifest-v1.json"
 
 
-def _placement_receipt() -> dict[str, object]:
+def _placement_receipt(output_dir: str = "/runs/group-1/task-a/attempt-1") -> dict[str, object]:
     """Return a valid S2b-1 CPU placement receipt for the checked-in fixture."""
 
     return {
@@ -34,7 +34,7 @@ def _placement_receipt() -> dict[str, object]:
         "backend_job_id": "job-1",
         "slot_id": "slot-a",
         "payload_digest": "18b9e78cf2fe0d58544c12e59fda8cf04b18230222d1f7fa98fd79f11f698102",
-        "output_dir": "/runs/group-1/task-a/attempt-1",
+        "output_dir": output_dir,
         "child": {
             "host": "node-a",
             "pid": 1234,
@@ -116,7 +116,7 @@ def test_p8_reader_refuses_core_evidence_mismatch(tmp_path: Path) -> None:
 def test_p8_reader_accepts_optional_placement_receipt_and_surfaces_it(tmp_path: Path) -> None:
     path, _ = _materialized_manifest(tmp_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["attempts"][0]["placement_receipt"] = _placement_receipt()
+    payload["attempts"][0]["placement_receipt"] = _placement_receipt(payload["attempts"][0]["output_dir"])
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     result = read(
@@ -143,7 +143,7 @@ def test_p8_reader_accepts_optional_placement_receipt_and_surfaces_it(tmp_path: 
 def test_p8_reader_refuses_malformed_placement_receipt(tmp_path: Path, mutation: str) -> None:
     path, _ = _materialized_manifest(tmp_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    placement = _placement_receipt()
+    placement = _placement_receipt(payload["attempts"][0]["output_dir"])
     if mutation == "extra-key":
         placement["unexpected"] = True
     elif mutation == "bad-child-pid":
