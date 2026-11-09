@@ -14,7 +14,20 @@ set -euo pipefail
 : "${TPEN_ENV_ROOT:?environment root is required}"
 : "${TPEN_EXPECTED_LOCK_SHA:?expected executor lock SHA is required}"
 
-ROOT="$TPEN_RUN_ROOT"
+APPROVED_RUNS_ROOT="/eagle/HetRxnEnergy/rhu/runs"
+ROOT_CANONICAL=$(realpath -e -- "$TPEN_RUN_ROOT")
+APPROVED_RUNS_ROOT_CANONICAL=$(realpath -e -- "$APPROVED_RUNS_ROOT")
+case "$TPEN_RUN_ROOT" in
+  /*) ;;
+  *) echo "TPEN_RUN_ROOT must be absolute" >&2; exit 2 ;;
+esac
+test "$TPEN_RUN_ROOT" = "$ROOT_CANONICAL"
+case "$ROOT_CANONICAL" in
+  "$APPROVED_RUNS_ROOT_CANONICAL"/*) ;;
+  *) echo "TPEN_RUN_ROOT must be a strict descendant of $APPROVED_RUNS_ROOT_CANONICAL" >&2; exit 2 ;;
+esac
+
+ROOT="$ROOT_CANONICAL"
 CHECKOUT="$ROOT/checkout"
 ENV_ROOT="$TPEN_ENV_ROOT"
 SCI_PY="$ENV_ROOT/tpen-polaris-alcf-2025-09-25/bin/python"
@@ -134,52 +147,8 @@ PY
 
 # Ask the installed executor package for its single product-owned filename.
 CHILD_OBSERVATION_FILENAME=$(env -u PYTHONPATH "$EXEC_PY" -c 'from tpen_executor.runners import CHILD_OBSERVATION_FILENAME; print(CHILD_OBSERVATION_FILENAME)')
-env PYTHONPATH="$CHECKOUT" "$SCI_PY" - "$STORE/run-manifest.json" "$ROOT/terminal-summary.json" "$CHILD_OBSERVATION_FILENAME" <<'PY'
-import json
-import os
-import sys
-from pathlib import Path
-import yaml
-
-manifest_path, summary_path, child_observation_filename = map(Path, sys.argv[1:])
-manifest = json.loads(manifest_path.read_text())
-assert manifest["schema"] == "tpen-executor/run-manifest-v2", manifest
-assert len(manifest["attempts"]) == 1, manifest
-assert len(manifest["segments"]) == 1, manifest
-attempt = manifest["attempts"][0]
-receipt = attempt["placement_receipt"]
-attempt_root = Path(attempt["output_dir"])
-observation = json.loads((attempt_root / child_observation_filename).read_text())
-resolved = yaml.safe_load((attempt_root / "resolved_config.yaml").read_text())
-segment = manifest["segments"][0]
-checkpoint = Path(segment["checkpoint_dir"])
-assert (checkpoint / "COMPLETE").is_file(), checkpoint
-assert resolved["trainer"]["max_steps"] == 25, resolved
-assert resolved["sampler"]["n_walkers"] == 16, resolved
-assert observation["cuda_visible_devices"] == "0", observation
-assert observation["environment"]["OMP_NUM_THREADS"] == "4", observation
-eagle_checkpoint = str(checkpoint)
-lus_checkpoint = eagle_checkpoint.replace("/eagle/", "/lus/eagle/", 1)
-fence_pass = os.path.realpath(eagle_checkpoint) == os.path.realpath(lus_checkpoint)
-assert fence_pass, (eagle_checkpoint, lus_checkpoint, os.path.realpath(eagle_checkpoint), os.path.realpath(lus_checkpoint))
-summary = {
-    "manifest": str(manifest_path),
-    "manifest_schema": manifest["schema"],
-    "accepted_segment": {"task_id": segment["task_id"], "completed_updates": segment["completed_updates"], "next_iteration": segment["next_iteration"], "checkpoint_dir": segment["checkpoint_dir"]},
-    "attempt_status": attempt["outcome_receipt"]["status"],
-    "checkpoint_complete": str(checkpoint / "COMPLETE"),
-    "child_observation": str(attempt_root / child_observation_filename),
-    "child_hostname": observation["hostname"],
-    "child_cuda_visible_devices": observation["cuda_visible_devices"],
-    "child_omp_num_threads": observation["environment"]["OMP_NUM_THREADS"],
-    "resolved_trainer_max_steps": resolved["trainer"]["max_steps"],
-    "resolved_sampler_n_walkers": resolved["sampler"]["n_walkers"],
-    "placement_receipt": {"comparison": receipt["comparison"], "declared": receipt["declared"], "observed": {"host": receipt["child"]["host"], "cuda_visible_devices": receipt["child"]["cuda_visible_devices"], "affinity": receipt["child"]["affinity"]}, "refusal": receipt.get("refusal"), "gpu_status": receipt["gpu"]["status"]},
-    "fence": {"outcome": "PASS", "eagle_path": eagle_checkpoint, "lus_path": lus_checkpoint, "eagle_realpath": os.path.realpath(eagle_checkpoint), "lus_realpath": os.path.realpath(lus_checkpoint)},
-    "home": os.environ["HOME"],
-}
-summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-print(json.dumps(summary, sort_keys=True))
+env PYTHONPATH="$CHECKOUT" "$SCI_PY" "$CHECKOUT/experiments/atomistic/he-v1/p10_summary.py" \
+  "$STORE/run-manifest.json" "$ROOT/terminal-summary.json" "$CHILD_OBSERVATION_FILENAME"
 PY
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$ROOT/job-finish-utc.txt"
