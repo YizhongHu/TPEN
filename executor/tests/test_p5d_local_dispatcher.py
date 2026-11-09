@@ -66,6 +66,7 @@ def _worker_spec(environment: PreparedPythonEnvironment) -> WorkerProgram:
 
 
 def _evidence(run_dir: str) -> CoreRunEvidence:
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
     return CoreRunEvidence.from_mapping(
         {
             "schema": "tpen.run-evidence/v1",
