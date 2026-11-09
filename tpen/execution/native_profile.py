@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from tpen.checkpoint.profiles import (
+    check_resume_sensitive_callback_cadence,
     SUPPORTED_CALLBACK_TARGETS,
     SUPPORTED_LOGGER_TARGETS,
     SUPPORTED_STATE_OWNERS,
@@ -77,6 +78,10 @@ def validate_native_recovery_profile(config: Any) -> None:
                 raise UnsupportedMutableStateError(
                     f"{owner}[{index}] {target!r} is not in the native mutable-state profile"
                 )
+    cadence_refusal = check_resume_sensitive_callback_cadence(config)
+    if cadence_refusal is not None:
+        code, reason = cadence_refusal
+        raise UnsupportedMutableStateError(f"{code}: {reason}")
 
 
 __all__ = [

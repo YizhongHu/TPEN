@@ -102,6 +102,8 @@ def test_core_t2_constants_facade_and_chain_resume_remain_exact():
         "tpen.callback.TrainPhaseTiming",
         "tpen.callback.Status",
         "tpen.callback.Checkpoint",
+        "tpen.callback.DataIntegrity",
+        "tpen.callback.GradientStats",
     })
     assert profiles.SUPPORTED_LOGGER_TARGETS == frozenset({
         "tpen.logging.CSV", "tpen.logging.JSONL",
@@ -111,7 +113,8 @@ def test_core_t2_constants_facade_and_chain_resume_remain_exact():
     })
     assert profiles.NATIVE_PROFILE.callback_state_supported is False
     assert profiles.REFUSAL_CODES == {
-        "unknown-profile", "unsupported-callback", "unsupported-logger", "malformed-config",
+        "unknown-profile", "unsupported-callback", "unsupported-callback-cadence",
+        "unsupported-logger", "malformed-config",
     }
     assert not [n for n in ast.walk(ast.parse((ROOT / "tpen/checkpoint/profiles.py").read_text()))
                 if isinstance(n, ast.Constant) and type(n.value) is float]

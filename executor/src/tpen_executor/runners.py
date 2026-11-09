@@ -98,6 +98,7 @@ REFUSAL_CODES = frozenset(
         "status-io-error", "incomplete-checkpoint", "corrupt-checkpoint",
         "checkpoint-io-error", "corrupt-publication-catalog", "torn-publication-catalog",
         "missing-checkpoint", "no-train-resume-checkpoint",
+        "unsupported-callback-cadence",
     }
 )
 

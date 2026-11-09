@@ -19,7 +19,13 @@ PROFILE_CHECK_SCHEMA = "tpen.profile-check/v1"
 NATIVE_RECOVERY_PROFILE = "tpen.native-recovery/v1"
 NATIVE_PROFILE_NAME = NATIVE_RECOVERY_PROFILE
 REFUSAL_CODES = frozenset(
-    {"unknown-profile", "unsupported-callback", "unsupported-logger", "malformed-config"}
+    {
+        "unknown-profile",
+        "unsupported-callback",
+        "unsupported-callback-cadence",
+        "unsupported-logger",
+        "malformed-config",
+    }
 )
 
 
@@ -81,7 +87,7 @@ class Profile:
         }
 
 
-SUPPORTED_CALLBACK_TARGETS = frozenset(
+OBSERVATIONAL_CALLBACK_TARGETS = frozenset(
     {
         "tpen.callback.ConfigSnapshot",
         "tpen.callback.ResolvedConfigSnapshot",
@@ -90,8 +96,56 @@ SUPPORTED_CALLBACK_TARGETS = frozenset(
         "tpen.callback.TrainStepTiming",
         "tpen.callback.TrainPhaseTiming",
         "tpen.callback.Status",
-        "tpen.callback.Checkpoint",
     }
+)
+# These callbacks are admitted explicitly because their resume behavior is
+# part of the callback's contract.  This is deliberately not inferred from
+# ``StatefulCallback``: that generic describes the domain state a callback
+# observes, not callback-owned state restored by ``train_resume``.
+RESUME_SENSITIVE_CALLBACK_TARGETS = frozenset(
+    {
+        "tpen.callback.Checkpoint",
+        "tpen.callback.DataIntegrity",
+        "tpen.callback.GradientStats",
+    }
+)
+# ``pop_step_cadence`` consumes five fields from these callbacks:
+# ``every_n_steps``, ``start_step``, ``max_calls``, ``probability``, and
+# ``seed``. The first two are immutable step-window values. ``seed`` only
+# initializes the local RNG, which is never consumed when probability is one.
+# ``max_calls`` and a probability below one are different: they advance the
+# callback-local call counter or RNG, neither of which train_resume restores.
+# Checkpoint consumes these fields at ``tpen/callback/checkpoint.py:162`` and
+# uses the resulting gate for periodic publication at line 208, so its
+# published-checkpoint set is recovery-sensitive. Status consumes the same
+# fields at ``tpen/callback/status.py:127``, but gates only its optional
+# training-line logging (lines 133-140). TrainStepTiming consumes them at
+# ``tpen/callback/timing/train_step_timing.py:41-57`` and TrainPhaseTiming at
+# ``tpen/callback/timing/train_phase_timing.py:64-83``; both gate only
+# observational ``train/perf`` logging. Those three observational callbacks
+# therefore remain admitted.
+CALLBACK_CADENCE_REFUSAL_CODE = "unsupported-callback-cadence"
+CADENCE_SENSITIVE_CALLBACK_TARGETS = frozenset(
+    {
+        "tpen.callback.Checkpoint",
+        "tpen.callback.DataIntegrity",
+        "tpen.callback.GradientStats",
+    }
+)
+# These schedules make decisions only from the durable completed-update
+# coordinate.  A CheckpointSchedule is a protocol, so an arbitrary Hydra
+# target is not evidence that its private counters or RNG are reconstructed by
+# train_resume.  Keep the admission boundary explicit until such a schedule
+# supplies its own recovery contract.
+AUDITED_CHECKPOINT_SCHEDULE_TARGETS = frozenset(
+    {
+        "tpen.checkpoint.TerminalOnly",
+        "tpen.checkpoint.EveryNUpdates",
+        "tpen.checkpoint.ExplicitUpdates",
+    }
+)
+SUPPORTED_CALLBACK_TARGETS = (
+    OBSERVATIONAL_CALLBACK_TARGETS | RESUME_SENSITIVE_CALLBACK_TARGETS
 )
 SUPPORTED_LOGGER_TARGETS = frozenset({"tpen.logging.CSV", "tpen.logging.JSONL"})
 SUPPORTED_STATE_OWNERS = frozenset(
@@ -189,6 +243,129 @@ def _plain_config(config: Any) -> Any:
     return config
 
 
+def check_resume_sensitive_callback_cadence(
+    config: Any,
+) -> tuple[str, str] | None:
+    """Find cadence options whose callback-local state is not restored.
+
+    Parameters
+    ----------
+    config : mapping
+        Unresolved OmegaConf-compatible configuration. Only callback target
+        names and cadence option values are inspected.
+
+    Returns
+    -------
+    tuple[str, str] or None
+        A typed refusal code and reason, or ``None`` when every configured
+        resume-sensitive callback uses reconstructible cadence options.
+
+    Notes
+    -----
+    ``max_calls`` is safe only when omitted or explicitly ``None``. A
+    ``probability`` is safe only when omitted or numerically equal to one;
+    accepting any lower value would admit a callback-local ``random.Random``
+    stream whose position is not part of the checkpoint.
+    """
+
+    plain = _plain_config(config)
+    if not isinstance(plain, Mapping):
+        return None
+    callbacks = plain.get("callbacks", ())
+    if callbacks is None or isinstance(callbacks, (str, bytes, bytearray)):
+        return None
+    if not isinstance(callbacks, Sequence):
+        return None
+    for index, entry in enumerate(callbacks):
+        if not isinstance(entry, Mapping):
+            continue
+        target = entry.get("_target_")
+        if target not in CADENCE_SENSITIVE_CALLBACK_TARGETS:
+            continue
+        if "max_calls" in entry and entry["max_calls"] is not None:
+            return (
+                CALLBACK_CADENCE_REFUSAL_CODE,
+                f"callbacks[{index}] {target!r} sets cadence field 'max_calls'; "
+                "the callback-local call count is not restored",
+            )
+        probability = entry.get("probability", 1)
+        if type(probability) not in (int, float) or probability != 1:
+            return (
+                CALLBACK_CADENCE_REFUSAL_CODE,
+                f"callbacks[{index}] {target!r} sets cadence field 'probability' "
+                "to a value other than 1.0; the callback-local RNG state is not restored",
+            )
+        if target == "tpen.callback.Checkpoint" and "schedule" in entry:
+            schedule_refusal = _checkpoint_schedule_cadence_refusal(
+                entry["schedule"], f"callbacks[{index}].schedule"
+            )
+            if schedule_refusal is not None:
+                return schedule_refusal
+    return None
+
+
+def _checkpoint_schedule_cadence_refusal(
+    schedule: Any, path: str
+) -> tuple[str, str] | None:
+    """Refuse unaudited or locally stateful nested checkpoint schedules.
+
+    Hydra may construct a ``StepCadenceGate`` below ``Checkpoint.schedule``.
+    Its call counter and RNG are callback-local state, just like the scalar
+    cadence fields handled above, and train_resume does not restore either.
+    The in-tree schedule implementations are immutable functions of durable
+    ``completed_updates`` and are therefore the only admitted schedule forms.
+    """
+
+    if schedule is None:
+        return None
+    if not isinstance(schedule, Mapping):
+        return (
+            CALLBACK_CADENCE_REFUSAL_CODE,
+            f"{path} is not an audited durable-coordinate CheckpointSchedule; "
+            "nested callback-local state cannot be certified",
+        )
+    target = schedule.get("_target_")
+    nested_refusal = _nested_cadence_refusal(schedule, path)
+    if nested_refusal is not None:
+        return nested_refusal
+    if target not in AUDITED_CHECKPOINT_SCHEDULE_TARGETS:
+        return (
+            CALLBACK_CADENCE_REFUSAL_CODE,
+            f"{path} target {target!r} is not an audited durable-coordinate "
+            "CheckpointSchedule; nested callback-local state is not restored",
+        )
+    return None
+
+
+def _nested_cadence_refusal(value: Any, path: str) -> tuple[str, str] | None:
+    """Find unsafe cadence fields in a recursively instantiated mapping."""
+
+    if isinstance(value, Mapping):
+        if "max_calls" in value and value["max_calls"] is not None:
+            return (
+                CALLBACK_CADENCE_REFUSAL_CODE,
+                f"{path}.max_calls is callback-local state; its call count is not restored",
+            )
+        if "probability" in value:
+            probability = value["probability"]
+            if type(probability) not in (int, float) or probability != 1:
+                return (
+                    CALLBACK_CADENCE_REFUSAL_CODE,
+                    f"{path}.probability is callback-local state; its RNG state is not restored",
+                )
+        for key, child in value.items():
+            if key != "_target_":
+                refusal = _nested_cadence_refusal(child, f"{path}.{key}")
+                if refusal is not None:
+                    return refusal
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, child in enumerate(value):
+            refusal = _nested_cadence_refusal(child, f"{path}[{index}]")
+            if refusal is not None:
+                return refusal
+    return None
+
+
 def _syntax_refusal(config: Any, profile: Profile) -> tuple[str, str] | None:
     """Find malformed syntax or the first disallowed mutable target."""
 
@@ -215,18 +392,13 @@ def _syntax_refusal(config: Any, profile: Profile) -> tuple[str, str] | None:
 
 
 def _check_refusal(config: Any, profile: Profile) -> tuple[str, str] | None:
-    """Validate with the existing native-profile logic and classify refusal."""
+    """Validate syntax and callback-owned cadence state for this profile."""
 
-    from tpen.execution.native_profile import validate_native_recovery_profile
-
-    try:
-        validate_native_recovery_profile(config)
-    except Exception:
-        return _syntax_refusal(_plain_config(config), profile) or (
-            "malformed-config",
-            "profile config failed native profile validation",
-        )
-    return _syntax_refusal(_plain_config(config), profile)
+    plain = _plain_config(config)
+    syntax_refusal = _syntax_refusal(plain, profile)
+    if syntax_refusal is not None:
+        return syntax_refusal
+    return check_resume_sensitive_callback_cadence(plain)
 
 
 def check_profile(config: Any, profile_name: str) -> ProfileCheck:
@@ -310,6 +482,10 @@ __all__ = [
     "ProfileCheck",
     "REFUSAL_CODES",
     "PROFILE_REFUSAL_CODES",
+    "CALLBACK_CADENCE_REFUSAL_CODE",
+    "AUDITED_CHECKPOINT_SCHEDULE_TARGETS",
+    "CADENCE_SENSITIVE_CALLBACK_TARGETS",
+    "check_resume_sensitive_callback_cadence",
     "SUPPORTED_CALLBACK_TARGETS",
     "SUPPORTED_LOGGER_TARGETS",
     "SUPPORTED_STATE_OWNERS",
