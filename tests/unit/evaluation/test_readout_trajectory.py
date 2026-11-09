@@ -158,7 +158,8 @@ def test_ordinary_model_raw_sum_agrees_with_logabs_sign_and_has_no_floor_hits(tm
         )
         assert float(row["raw_channel_sum"]) == pytest.approx(5.0e-6)
         assert float(trajectory_row["logabs"]) == pytest.approx(
-            torch.log(torch.tensor(5.0e-6)).item() - 0.25 * radius_squared,
+            torch.log(torch.tensor(5.0e-6, dtype=torch.float64)).item()
+            - 0.25 * radius_squared,
             rel=1.0e-12,
             abs=1.0e-12,
         )
