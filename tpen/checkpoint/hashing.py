@@ -187,7 +187,7 @@ def _delete_path(container: dict[str, Any], path: tuple[str, ...]) -> None:
         current.pop(path[-1], None)
 
 
-def _delete_pattern(container: dict[str, Any] | list[Any], path: tuple[str, ...]) -> None:
+def _delete_pattern(container: dict[Any, Any] | list[Any], path: tuple[str, ...]) -> None:
     """Delete one explicitly declared path, allowing list-index wildcards."""
 
     if not path:

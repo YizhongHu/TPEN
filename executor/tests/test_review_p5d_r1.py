@@ -14,6 +14,7 @@ from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
 from tpen_executor.dispatch import LocalDispatcher
+from tpen_executor.dispatch.contract import _evidence_payload
 from tpen_executor.environments import PreparedPythonEnvironment
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.programs import AllocationProgram, WorkerProgram
@@ -63,6 +64,14 @@ def payload(run_dir, verdict="completed"):
         },
         "refusal": {"code": "missing-checkpoint", "reason": "review"} if verdict == "refused" else None,
     }
+
+
+def test_r1_t8_legacy_evidence_digest_omits_absent_identity() -> None:
+    """Legacy v1 evidence keeps its pre-identity canonical bytes and digest."""
+    legacy = payload(Path("/runs/legacy/core"))
+    evidence = CoreRunEvidence.from_mapping(legacy)
+    assert _evidence_payload(evidence) == legacy
+    assert digest(_evidence_payload(evidence)) == "366743525e63dace38629a282b6836bd49538e8fa3e669daa5af631b0c2c8c19"
 
 
 class ReviewAbort(BaseException):

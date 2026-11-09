@@ -64,15 +64,17 @@ def _evidence_payload(evidence: CoreRunEvidence) -> dict[str, Any]:
 
     if not isinstance(evidence, CoreRunEvidence):
         raise TypeError("evidence reader must return CoreRunEvidence")
-    return {
+    payload = {
         "schema": evidence.schema,
         "run_dir": evidence.run_dir,
         "verdict": evidence.verdict,
         "run_status": evidence.run_status,
         "checkpoint": evidence.checkpoint,
         "refusal": evidence.refusal,
-        "resolved_config_identity": evidence.resolved_config_identity,
     }
+    if evidence.resolved_config_identity is not None:
+        payload["resolved_config_identity"] = evidence.resolved_config_identity
+    return payload
 
 
 def _member_paths(fence: Any) -> tuple[str, str, str, str, str, str]:
