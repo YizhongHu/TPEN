@@ -17,7 +17,7 @@ from tpen.training.events import TrainingIterationCompleted
 from tpen.training.state import TrainerState
 
 from .base import StatefulCallback
-from .cadence import StepCadenceGate, SubscriptionGroup, pop_durable_step_cadence
+from .cadence import StepCadenceGate, SubscriptionGroup, pop_step_cadence
 
 
 class ElectronNucleusDistanceQuantiles(StatefulCallback[TrainerState]):
@@ -29,6 +29,12 @@ class ElectronNucleusDistanceQuantiles(StatefulCallback[TrainerState]):
     each electron, distances are first minimized over nuclei and then
     summarized across all configurations in the batch.
 
+    This is an observational callback. Its ``every_n_steps`` and ``start_step``
+    cadence is based on the durable training step and therefore reconstructs
+    the same scheduled steps after resume. Callback-local ``max_calls`` and
+    ``probability`` state restarts on resume, changing only which observational
+    steps are logged, as with ``TrainStepTiming``.
+
     Parameters
     ----------
     quantiles : sequence of float
@@ -37,13 +43,13 @@ class ElectronNucleusDistanceQuantiles(StatefulCallback[TrainerState]):
         ``linear`` interpolation method, matching the naming convention used
         by :mod:`tpen.diagnostics.energy`.
     every_n_steps : int, optional
-        Durable training-step cadence.
+        Training-step cadence.
     start_step : int, optional
         First durable training step at which to emit a metric.
     max_calls, probability, seed
-        Not supported. The callback is admitted to checkpoint recovery, so its
-        cadence must be a deterministic function of the durable step rather
-        than mutable callback state or a probability stream.
+        Optional callback-local cadence controls. On resume, their counters
+        and random stream restart, changing only which observational steps are
+        logged, as with :class:`tpen.callback.TrainStepTiming`.
 
     Raises
     ------
@@ -59,7 +65,7 @@ class ElectronNucleusDistanceQuantiles(StatefulCallback[TrainerState]):
         if quantiles is None:
             raise ValueError("quantiles must be provided by the run configuration")
         self.quantiles = _validate_quantiles(quantiles)
-        cadence = pop_durable_step_cadence(kwargs)
+        cadence = pop_step_cadence(kwargs)
         super().__init__(
             typed_groups=(
                 SubscriptionGroup(selectors=(Subscription.of(TrainingIterationCompleted),)),

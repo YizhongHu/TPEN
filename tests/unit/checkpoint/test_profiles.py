@@ -255,6 +255,23 @@ def test_electron_nucleus_distance_callback_is_profile_admitted() -> None:
     assert result.refusal is None
 
 
+def test_observational_distance_callback_allows_max_calls() -> None:
+    config = _config(
+        callbacks=[
+            {
+                "_target_": "tpen.callback.ElectronNucleusDistanceQuantiles",
+                "quantiles": [0.5],
+                "max_calls": 2,
+            }
+        ]
+    )
+
+    result = check_profile(OmegaConf.create(config), NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "supported"
+    assert result.refusal is None
+
+
 @pytest.mark.parametrize(
     ("owner", "target", "code"),
     [

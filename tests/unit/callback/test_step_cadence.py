@@ -23,7 +23,7 @@ import random
 import pytest
 
 from tpen.callback import StepCadence, StepCadenceGate
-from tpen.callback.cadence import pop_durable_step_cadence, pop_step_cadence
+from tpen.callback.cadence import pop_step_cadence
 
 
 class _LegacySchedule:
@@ -166,29 +166,6 @@ def test_pop_step_cadence_consumes_exactly_the_five_scheduling_scalars() -> None
     assert cadence == StepCadence(every_n=5, start=1, max_calls=3, probability=0.5, seed=9)
     # Everything else reaches the callback's own constructor untouched.
     assert kwargs == {"fail_fast": True, "check_finite": False}
-
-
-def test_pop_durable_step_cadence_accepts_only_the_deterministic_window() -> None:
-    kwargs = {"every_n_steps": 5, "start_step": 2, "seed": 9, "other": True}
-
-    cadence = pop_durable_step_cadence(kwargs)
-
-    assert cadence == StepCadence(every_n=5, start=2)
-    assert kwargs == {"other": True}
-
-
-@pytest.mark.parametrize(
-    "options, message",
-    [
-        ({"max_calls": 2}, "max_calls"),
-        ({"probability": 0.5}, "probability"),
-    ],
-)
-def test_pop_durable_step_cadence_refuses_stateful_admission(
-    options: dict[str, object], message: str
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        pop_durable_step_cadence(options)
 
 
 def test_start_step_stays_inert_without_an_every_n_steps() -> None:

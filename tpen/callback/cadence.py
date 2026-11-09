@@ -260,41 +260,6 @@ def pop_step_cadence(kwargs: MutableMapping[str, Any]) -> StepCadence:
     )
 
 
-def pop_durable_step_cadence(kwargs: MutableMapping[str, Any]) -> StepCadence:
-    """Consume cadence keywords that are safe across callback restoration.
-
-    This variant keeps the existing cadence option names while limiting the
-    schedule to a deterministic window of the emitting domain's durable step.
-    ``max_calls`` and probabilistic admission depend on mutable callback state
-    or an RNG stream, neither of which is restored by the callback profile.
-
-    Parameters
-    ----------
-    kwargs : MutableMapping
-        Constructor keywords, mutated in place. The same five cadence keys as
-        :func:`pop_step_cadence` are consumed.
-
-    Returns
-    -------
-    StepCadence
-        A deterministic durable-step window with no call limit or probability
-        gate.
-
-    Raises
-    ------
-    ValueError
-        If ``max_calls`` is configured or ``probability`` is not exactly
-        ``1.0``.
-    """
-
-    cadence = pop_step_cadence(kwargs)
-    if cadence.max_calls is not None:
-        raise ValueError("durable-step cadence does not support max_calls")
-    if cadence.probability != 1.0:
-        raise ValueError("durable-step cadence does not support probability != 1.0")
-    return StepCadence(every_n=cadence.every_n, start=cadence.start)
-
-
 @dataclass(frozen=True)
 class SubscriptionGroup:
     """Selectors sharing one optional occurrence cadence decision.
@@ -389,7 +354,6 @@ __all__ = [
     "StepCadence",
     "StepCadenceGate",
     "SubscriptionGroup",
-    "pop_durable_step_cadence",
     "pop_step_cadence",
     "validate_subscription_groups",
 ]
