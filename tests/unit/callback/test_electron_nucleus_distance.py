@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import csv
+import json
+
 import numpy as np
 import pytest
 import torch
@@ -9,8 +12,11 @@ import torch
 from tpen.callback import ElectronNucleusDistanceQuantiles
 from tpen.callback.electron_nucleus_distance import summarize_electron_nucleus_distances
 from tpen.data.batch import ElectronBatch
+from tpen.logging import CSV, JSONL
+from tpen.training.events import TrainingIteration, TrainingIterationCompleted
 
 from .support import RecordingContext, deliver_completed_iteration, training_state
+from tests.helpers.run_context import make_run_context
 
 
 def _batch(positions: list[list[list[float]]], nuclei: list[list[float]]) -> ElectronBatch:
@@ -85,4 +91,51 @@ def test_zero_nuclei_are_refused() -> None:
     batch = _batch([[[1.0, 0.0, 0.0]]], [])
     with pytest.raises(ValueError, match="at least one nucleus"):
         summarize_electron_nucleus_distances(batch, quantiles=(0.5,))
+
+
+def test_real_csv_and_jsonl_loggers_preserve_cadence_and_existing_metrics(tmp_path) -> None:
+    csv_path = tmp_path / "metrics.csv"
+    jsonl_path = tmp_path / "metrics.jsonl"
+    callback = ElectronNucleusDistanceQuantiles(quantiles=(0.5,), every_n_steps=2)
+    context = make_run_context(
+        tmp_path,
+        callbacks=[callback],
+        loggers=[CSV(csv_path), JSONL(jsonl_path)],
+    )
+    state = training_state(batch=_batch([[[1.0, 0.0, 0.0]]], [[0.0, 0.0, 0.0]]))
+
+    for step in range(1, 6):
+        context.log({"existing_metric": float(step)}, step=step, namespace="train")
+        context.emit(
+            TrainingIterationCompleted(iteration=TrainingIteration(step=step)),
+            state=state,
+        )
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [int(row["step"]) for row in rows if row["key"] == "existing_metric"] == [1, 2, 3, 4, 5]
+    assert [int(row["step"]) for row in rows if row["key"] == "electron_0_nucleus_distance_q50"] == [2, 4]
+    assert {row["key"] for row in rows} == {"existing_metric", "electron_0_nucleus_distance_min", "electron_0_nucleus_distance_q50"}
+
+    records = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["step"] for record in records if "existing_metric" in record["metrics"]] == [1, 2, 3, 4, 5]
+    assert [record["step"] for record in records if "electron_0_nucleus_distance_q50" in record["metrics"]] == [2, 4]
+
+
+def test_distance_metric_is_absent_when_callback_is_not_configured(tmp_path) -> None:
+    csv_path = tmp_path / "metrics.csv"
+    jsonl_path = tmp_path / "metrics.jsonl"
+    context = make_run_context(tmp_path, loggers=[CSV(csv_path), JSONL(jsonl_path)])
+    state = training_state(batch=_batch([[[1.0, 0.0, 0.0]]], [[0.0, 0.0, 0.0]]))
+
+    for step in range(1, 4):
+        context.log({"existing_metric": float(step)}, step=step, namespace="train")
+        context.emit(
+            TrainingIterationCompleted(iteration=TrainingIteration(step=step)),
+            state=state,
+        )
+
+    assert "electron_nucleus_distance" not in csv_path.read_text(encoding="utf-8")
+    records = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+    assert all(not any(key.startswith("electron_") for key in record["metrics"]) for record in records)
 
