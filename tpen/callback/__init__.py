@@ -32,6 +32,10 @@ def __getattr__(name: str) -> object:
         from .initial_checkpoint import InitialCheckpoint
 
         return InitialCheckpoint
+    if name == "ModuleNorms":
+        from .module_norms import ModuleNorms
+
+        return ModuleNorms
     if name == "ParameterActivity":
         from .parameter_activity import ParameterActivity
 
@@ -110,6 +114,7 @@ __all__ = [
     "GradientStats",
     "InitialCheckpoint",
     "Metadata",
+    "ModuleNorms",
     "ParameterActivity",
     "ResolvedConfigSnapshot",
     "ResourceUsage",

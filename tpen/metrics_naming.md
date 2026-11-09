@@ -529,6 +529,13 @@ binds these together.
 
 ## CSV logging
 
+`ModuleNorms` (an optional callback, not an always-on trainer metric) writes
+one namespace per configured group under `train/module_norms/<group>`. Its
+`parameter_*` values are post-update model values; its `gradient_*` values are
+the clipped gradients consumed by that update. `n_no_gradient_parameters` is
+separate from zero gradients, and `gradient_nonfinite_count` is excluded from
+the finite gradient norm reconciliation.
+
 CSV uses long-form scalar records:
 
 ```csv
