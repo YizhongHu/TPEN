@@ -14,30 +14,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from tpen.checkpoint.profiles import (
+    SUPPORTED_CALLBACK_TARGETS,
+    SUPPORTED_LOGGER_TARGETS,
+    SUPPORTED_STATE_OWNERS,
+)
+
 
 class UnsupportedMutableStateError(ValueError):
     """Raised when a configured state owner is outside the native profile."""
 
 
-# These callbacks either write durable observations or derive their state from
-# the restored trainer cursor.  They do not carry scientifically active private
-# state across a resume in this qualification.
-SUPPORTED_CALLBACK_TARGETS = frozenset(
-    {
-        "tpen.callback.ConfigSnapshot",
-        "tpen.callback.ResolvedConfigSnapshot",
-        "tpen.callback.Metadata",
-        "tpen.callback.RunTiming",
-        "tpen.callback.TrainStepTiming",
-        "tpen.callback.TrainPhaseTiming",
-        "tpen.callback.Status",
-        "tpen.callback.Checkpoint",
-    }
-)
-SUPPORTED_LOGGER_TARGETS = frozenset({"tpen.logging.CSV", "tpen.logging.JSONL"})
-SUPPORTED_STATE_OWNERS = frozenset(
-    {"model", "optimizer", "trainer_cursor", "sampler_mcmc", "process_rng"}
-)
 # This allowlist defines the train_resume owners; callback/logger validation
 # below only covers additional user-configured mutable state.
 

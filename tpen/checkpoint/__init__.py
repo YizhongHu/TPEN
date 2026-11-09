@@ -71,6 +71,16 @@ from .reference import (
 )
 from .save import save_checkpoint
 from .schedule import CheckpointSchedule, EveryNUpdates, ExplicitUpdates, TerminalOnly
+from .profiles import (
+    NATIVE_PROFILE,
+    NATIVE_RECOVERY_PROFILE,
+    PROFILE_CHECK_SCHEMA,
+    PROFILE_REGISTRY,
+    Profile,
+    ProfileCheck,
+    REFUSAL_CODES,
+    check_profile,
+)
 
 __all__ = [
     "CHECKPOINT_KIND",
@@ -105,6 +115,14 @@ __all__ = [
     "EveryNUpdates",
     "ExplicitUpdates",
     "TerminalOnly",
+    "NATIVE_PROFILE",
+    "NATIVE_RECOVERY_PROFILE",
+    "PROFILE_CHECK_SCHEMA",
+    "PROFILE_REGISTRY",
+    "Profile",
+    "ProfileCheck",
+    "REFUSAL_CODES",
+    "check_profile",
     "ModelOnly",
     "TrainResume",
     "MODEL_ONLY_PAYLOAD",
