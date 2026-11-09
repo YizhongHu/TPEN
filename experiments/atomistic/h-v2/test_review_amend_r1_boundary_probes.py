@@ -37,18 +37,17 @@ def test_current_scanner_rejects_dynamic_forms(number: int, source: str, tmp_pat
     assert boundary._violations(path), f"probe {number} was missed"
 
 
-def test_current_scanner_rejects_subdirectory_probe() -> None:
-    """The current non-recursive sweep must not certify a nested violation."""
+def test_current_scanner_rejects_subdirectory_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The scanner must still catch a nested violation when the sweep is recursive."""
 
-    probe = HERE / "_probe_sub" / "x.py"
+    for name in ("protocol.py", "collect.py", "test_pipeline.py", "test_collect.py", "conftest.py"):
+        (tmp_path / name).write_text("", encoding="utf-8")
+    probe = tmp_path / "_probe_sub" / "x.py"
     probe.parent.mkdir()
     probe.write_text("import tpen\n", encoding="utf-8")
-    try:
-        with pytest.raises(AssertionError):
-            boundary.test_experiment_files_only_reach_core_through_run_from_config()
-    finally:
-        probe.unlink()
-        probe.parent.rmdir()
+    monkeypatch.setattr(boundary, "HERE", tmp_path)
+    with pytest.raises(AssertionError):
+        boundary.test_experiment_files_only_reach_core_through_run_from_config()
 
 
 def test_current_scanner_rejects_empty_sweep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -59,16 +58,12 @@ def test_current_scanner_rejects_empty_sweep(tmp_path: Path, monkeypatch: pytest
         boundary.test_experiment_files_only_reach_core_through_run_from_config()
 
 
-def test_current_scanner_controls() -> None:
+def test_current_scanner_controls(tmp_path: Path) -> None:
     """The intended direct-import control pair remains meaningful."""
 
-    flagged = HERE / "_control_flagged.py"
-    allowed = HERE / "_control_allowed.py"
+    flagged = tmp_path / "_control_flagged.py"
+    allowed = tmp_path / "_control_allowed.py"
     flagged.write_text("from tpen.data.batch import ElectronBatch\n", encoding="utf-8")
     allowed.write_text("from tpen.run import run_from_config\n", encoding="utf-8")
-    try:
-        assert boundary._violations(flagged)
-        assert not boundary._violations(allowed)
-    finally:
-        flagged.unlink()
-        allowed.unlink()
+    assert boundary._violations(flagged)
+    assert not boundary._violations(allowed)
