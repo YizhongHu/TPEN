@@ -13,6 +13,7 @@ from .storage import AttemptFence, DirectoryStore, FenceRejected
 from .tasks import ConfiguredRun
 from .lifecycle import AttachedAllocation
 from .workers import ProcessOutcome, SubprocessWorker
+from .placement import BindingError, WorkerBinding, binding_from_allocation
 
 __version__ = "0.1.0"
 
@@ -23,6 +24,8 @@ _LAZY_EXPORTS = {
     "StagedHydra": (".configuration", "StagedHydra"),
     "WorkerProgram": (".programs", "WorkerProgram"),
     "LocalDispatcher": (".dispatch", "LocalDispatcher"),
+    "ParslDispatcher": (".dispatch", "ParslDispatcher"),
+    "ParslUnavailableError": (".dispatch", "ParslUnavailableError"),
 }
 
 
@@ -40,8 +43,9 @@ def __getattr__(name: str):
 __all__ = [
     "__version__", "AcceptedSegment", "AllocationId", "AllocationObservation", "AllocationProgram",
     "AttemptId", "AttachedAllocation", "AttemptFence", "BackendJobId", "ConfiguredAllocation", "ConfiguredRun", "CoreRunEvidence", "DirectoryStore", "EvidenceUnavailable", "FenceRejected", "ManifestAttempt", "MaterializedProgram", "OUTCOME_STATUSES", "OutcomeReceipt", "ProcessOutcome",
-    "ProgramSpecRef", "ProfileCheck", "ProfileUnavailable", "ReadyGroup", "RunManifest", "StagedConfig", "StagedHydra", "LocalDispatcher",
+    "ProgramSpecRef", "ProfileCheck", "ProfileUnavailable", "ReadyGroup", "RunManifest", "StagedConfig", "StagedHydra", "LocalDispatcher", "ParslDispatcher", "ParslUnavailableError",
     "PreparedInputBundle", "PreparedPythonEnvironment", "SourceScript", "StartReceipt",
     "TaskSpec", "TPENCommand", "TPENEvidence", "SubprocessWorker", "WorkerProgram", "CoreProfileReference",
+    "BindingError", "WorkerBinding", "binding_from_allocation",
     "decode_manifest", "encode_manifest",
 ]

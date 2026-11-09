@@ -24,6 +24,8 @@ def test_executor_lock_matches_root_versions() -> None:
         root_lock = tomllib.load(root_file)
     with (ROOT / "executor" / "uv.lock").open("rb") as executor_file:
         executor_lock = tomllib.load(executor_file)
+    with (ROOT / "executor" / "pyproject.toml").open("rb") as project_file:
+        executor_project = tomllib.load(project_file)
 
     root_packages = _packages(root_lock)
     executor_packages = _packages(executor_lock)
@@ -33,6 +35,10 @@ def test_executor_lock_matches_root_versions() -> None:
         if root_version is not None and executor_version != root_version:
             mismatches.append(f"{name}: executor {executor_version} vs root {root_version}")
 
+    executor_only = sorted(set(executor_packages) - set(root_packages))
+    if executor_only != ["tpen-executor"]:
+        mismatches.append(f"unexpected executor-only packages: {executor_only!r}")
+
     for constraint in executor_lock["manifest"]["constraints"]:
         name = constraint["name"]
         specifier = constraint["specifier"]
@@ -40,5 +46,20 @@ def test_executor_lock_matches_root_versions() -> None:
         root_version = root_packages.get(name)
         if root_version != expected:
             mismatches.append(f"{name}: executor {expected} vs root {root_version}")
+
+    parsl_extra = executor_project["project"]["optional-dependencies"]["parsl"]
+    if parsl_extra != ["parsl==2026.8.10"]:
+        mismatches.append(f"parsl extra is not the approved pin: {parsl_extra!r}")
+    for requirement in parsl_extra:
+        name, separator, expected = requirement.partition("==")
+        if not separator or not name or not expected:
+            mismatches.append(f"invalid parsl extra requirement: {requirement!r}")
+            continue
+        executor_version = executor_packages.get(name)
+        root_version = root_packages.get(name)
+        if executor_version != expected:
+            mismatches.append(f"{name}: executor lock {executor_version} vs extra {expected}")
+        if root_version != expected:
+            mismatches.append(f"{name}: root {root_version} vs extra {expected}")
 
     assert not mismatches, "executor/root lock mismatches: " + ", ".join(mismatches)
