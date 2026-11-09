@@ -74,7 +74,7 @@ def _evidence(run_dir: str) -> CoreRunEvidence:
             "run_status": "completed",
             "checkpoint": {
                 "checkpoint_dir": f"{run_dir}/checkpoint",
-                "schema_version": "v1",
+                "schema_version": 1,
                 "next_iteration": 1,
                 "completed_updates": 1,
             },
@@ -110,7 +110,7 @@ def _make_stub_package(tmp_path: Path) -> Path:
                     "run_dir": str(run_dir),
                     "verdict": "completed",
                     "run_status": "completed",
-                    "checkpoint": {"checkpoint_dir": str(run_dir / "checkpoint"), "schema_version": "v1", "next_iteration": 1, "completed_updates": 1},
+                    "checkpoint": {"checkpoint_dir": str(run_dir / "checkpoint"), "schema_version": 1, "next_iteration": 1, "completed_updates": 1},
                     "refusal": None,
                 }), encoding="utf-8")
                 return 0

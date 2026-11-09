@@ -17,7 +17,8 @@ from uuid import uuid4
 from ._codec import canonical_bytes, decode_json, fields, text
 from .allocations import ConfiguredAllocation
 from .contracts import AttemptId, ReadyGroup
-from .results import ManifestAttempt, OutcomeReceipt, RunManifest, StartReceipt
+from .results import AcceptedSegment, ManifestAttempt, OutcomeReceipt, RunManifest, StartReceipt
+from .runners import CoreRunEvidence
 
 
 class FenceRejected(RuntimeError):
@@ -354,6 +355,151 @@ class DirectoryStore:
                 raise FenceRejected("outcome could not be written") from error
             return outcome
 
+    def accept_segment(
+        self,
+        fence: AttemptFence,
+        evidence: CoreRunEvidence,
+        predecessor_checkpoint: str | None = None,
+    ) -> AcceptedSegment:
+        """Durably accept one checkpoint from a completed attempt.
+
+        Parameters
+        ----------
+        fence : AttemptFence
+            Store-owned fence for the attempt being accepted.
+        evidence : CoreRunEvidence
+            Public core evidence for the fenced run.  Only completed or
+            incomplete evidence carrying a checkpoint may be accepted.
+        predecessor_checkpoint : str or None, optional
+            Checkpoint from which this segment continued.  P8 only publishes
+            fresh-start segments, so callers normally leave this as ``None``.
+
+        Returns
+        -------
+        AcceptedSegment
+            The immutable receipt published beneath the attempt directory.
+
+        Raises
+        ------
+        FenceRejected
+            If the fence is foreign/stale, the attempt is not completed, the
+            evidence lacks a checkpoint, or this attempt was already accepted.
+        ValueError, TypeError
+            If the predecessor or evidence shape is malformed.
+        """
+
+        if not isinstance(evidence, CoreRunEvidence):
+            raise TypeError("evidence must be CoreRunEvidence")
+        if evidence.verdict not in {"completed", "incomplete"} or evidence.checkpoint is None:
+            raise FenceRejected("accepted segment requires core evidence with a checkpoint")
+        task_dir = self._task_dir_for_fence(fence)
+        lock_path = os.path.join(task_dir, _TASK_LOCK)
+        _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
+        with _task_lock(lock_path):
+            start = self._validate_fence(fence, task_dir)
+            output_dir = _lexical(fence.output_dir)
+            expected_core_dir = _lexical(os.path.join(output_dir, "core"))
+            if _lexical(evidence.run_dir) != expected_core_dir:
+                raise FenceRejected("core evidence run_dir crosses the attempt fence")
+            outcome_path = os.path.join(output_dir, "outcome.json")
+            _require_regular(outcome_path, "outcome receipt")
+            try:
+                outcome = OutcomeReceipt.decode(Path(outcome_path).read_bytes())
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+                raise FenceRejected("outcome receipt is unavailable") from error
+            if (
+                outcome.task_id != start.task_id
+                or outcome.attempt_id != start.attempt_id
+                or outcome.group_digest != start.group_digest
+                or outcome.output_dir != start.output_dir
+            ):
+                raise FenceRejected("outcome receipt crosses the attempt fence")
+            if outcome.status != "completed":
+                raise FenceRejected("accepted segment requires a completed attempt")
+            segment_path = os.path.join(output_dir, "segment.json")
+            if os.path.lexists(segment_path):
+                _require_regular(segment_path, "accepted segment")
+                raise FenceRejected("attempt already has an accepted segment")
+            checkpoint = evidence.checkpoint
+            segment = AcceptedSegment(
+                fence.task_id,
+                fence.attempt_id,
+                predecessor_checkpoint,
+                str(checkpoint["checkpoint_dir"]),
+                checkpoint["next_iteration"],
+                checkpoint["completed_updates"],
+            )
+            prior_segments = self._segments_for_task(task_dir)
+            if prior_segments:
+                previous = prior_segments[-1]
+                if segment.predecessor_checkpoint != previous.checkpoint_dir:
+                    raise FenceRejected("accepted segment predecessor disagrees with prior checkpoint")
+                previous_coordinate = (previous.next_iteration, previous.completed_updates)
+                coordinate = (segment.next_iteration, segment.completed_updates)
+                if coordinate[0] < previous_coordinate[0] or coordinate[1] < previous_coordinate[1] or coordinate == previous_coordinate:
+                    raise FenceRejected("accepted segment progress coordinate is not strictly increasing")
+            elif segment.predecessor_checkpoint is not None:
+                raise FenceRejected("first accepted segment must have no predecessor")
+            _write_new(segment_path, segment.encode())
+            return segment
+
+    @staticmethod
+    def _segments_for_task(task_dir: str) -> tuple[AcceptedSegment, ...]:
+        """Read accepted segments in predecessor-linked chain order.
+
+        Raises
+        ------
+        FenceRejected
+            If durable segment receipts form a fork, cycle, or disconnected
+            chain instead of one linear history.
+        """
+
+        segments: list[AcceptedSegment] = []
+        for attempt_id in sorted(os.listdir(task_dir)):
+            if attempt_id in {_TASK_LOCK, "current-attempt.json"}:
+                continue
+            output_dir = _lexical(os.path.join(task_dir, attempt_id))
+            if not os.path.isdir(output_dir):
+                continue
+            segment_path = os.path.join(output_dir, "segment.json")
+            if not os.path.lexists(segment_path):
+                continue
+            _require_regular(segment_path, "accepted segment", ValueError)
+            segments.append(AcceptedSegment.decode(Path(segment_path).read_bytes()))
+        if not segments:
+            return ()
+        successors: dict[str, list[AcceptedSegment]] = {}
+        roots = []
+        for segment in segments:
+            if segment.predecessor_checkpoint is None:
+                roots.append(segment)
+            else:
+                successors.setdefault(segment.predecessor_checkpoint, []).append(segment)
+        if len(roots) != 1:
+            raise FenceRejected("accepted segments do not have one chain root")
+        ordered: list[AcceptedSegment] = []
+        current = roots[0]
+        seen_attempts: set[object] = set()
+        while True:
+            if current.attempt_id in seen_attempts:
+                raise FenceRejected("accepted segments contain a cycle")
+            seen_attempts.add(current.attempt_id)
+            ordered.append(current)
+            next_segments = successors.get(current.checkpoint_dir, [])
+            if len(next_segments) > 1:
+                raise FenceRejected("accepted segments contain a fork")
+            if not next_segments:
+                break
+            current = next_segments[0]
+        if len(ordered) != len(segments):
+            raise FenceRejected("accepted segments contain a disconnected chain")
+        for previous, segment in zip(ordered, ordered[1:]):
+            previous_coordinate = (previous.next_iteration, previous.completed_updates)
+            coordinate = (segment.next_iteration, segment.completed_updates)
+            if coordinate[0] < previous_coordinate[0] or coordinate[1] < previous_coordinate[1] or coordinate == previous_coordinate:
+                raise FenceRejected("accepted segment progress coordinate is not strictly increasing")
+        return tuple(ordered)
+
     def _validate_fence(self, fence: AttemptFence, task_dir: str) -> StartReceipt:
         """Validate pointer, path, and every start-receipt fence binding."""
         pointer = os.path.join(task_dir, "current-attempt.json")
@@ -418,6 +564,7 @@ class DirectoryStore:
             raise TypeError("group must be ReadyGroup")
         group_dir = self._group_dir(group)
         attempts: list[ManifestAttempt] = []
+        segments: list[AcceptedSegment] = []
         members = {member.task_id for member in group.members}
         if not os.path.lexists(self.root):
             return RunManifest(group.group_id, group.identity, ())
@@ -466,8 +613,16 @@ class DirectoryStore:
                         raise ValueError("foreign outcome receipt in group store")
                 else:
                     outcome = None
+                segment_path = os.path.join(output_dir, "segment.json")
+                if os.path.lexists(segment_path):
+                    _require_regular(segment_path, "accepted segment", ValueError)
+                    segment = AcceptedSegment.decode(Path(segment_path).read_bytes())
+                    if segment.task_id != task_id or segment.attempt_id.value != attempt_id:
+                        raise ValueError("foreign accepted segment in group store")
+                    segments.append(segment)
                 attempts.append(ManifestAttempt(task_id, start.attempt_id, start, outcome, start.output_dir))
-        return RunManifest(group.group_id, group.identity, tuple(attempts))
+        segments.sort(key=lambda item: (item.task_id, item.next_iteration, item.completed_updates))
+        return RunManifest(group.group_id, group.identity, tuple(attempts), tuple(segments))
 
 
 def _write_pointer(path: str, attempt_id: str) -> None:

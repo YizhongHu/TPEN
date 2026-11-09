@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -213,6 +214,92 @@ class ManifestAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class AcceptedSegment:
+    """One core-validated segment selected for scientific continuation.
+
+    Parameters
+    ----------
+    task_id : str
+        Logical task whose attempt published the checkpoint.
+    attempt_id : AttemptId
+        Attempt that produced the checkpoint.
+    predecessor_checkpoint : str or None
+        Checkpoint directory from which this segment continued, or ``None``
+        for a fresh-start segment.
+    checkpoint_dir : str
+        Core-published checkpoint directory for this segment.
+    next_iteration, completed_updates : int
+        Independent progress coordinates copied from core public evidence.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/accepted-segment-v1"
+    task_id: str
+    attempt_id: AttemptId
+    predecessor_checkpoint: str | None
+    checkpoint_dir: str
+    next_iteration: int
+    completed_updates: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "task_id", text(self.task_id, "task_id"))
+        _identity(self.attempt_id, AttemptId, "attempt_id")
+        if self.predecessor_checkpoint is not None:
+            object.__setattr__(self, "predecessor_checkpoint", text(self.predecessor_checkpoint, "predecessor_checkpoint"))
+        object.__setattr__(self, "checkpoint_dir", text(self.checkpoint_dir, "checkpoint_dir"))
+        if type(self.next_iteration) is not int or self.next_iteration < 0:
+            raise TypeError("next_iteration must be a nonnegative integer")
+        if type(self.completed_updates) is not int or self.completed_updates < 0:
+            raise TypeError("completed_updates must be a nonnegative integer")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id.value,
+            "predecessor_checkpoint": self.predecessor_checkpoint,
+            "checkpoint_dir": self.checkpoint_dir,
+            "next_iteration": self.next_iteration,
+            "completed_updates": self.completed_updates,
+        }
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "AcceptedSegment":
+        fields(
+            data,
+            {
+                "schema",
+                "task_id",
+                "attempt_id",
+                "predecessor_checkpoint",
+                "checkpoint_dir",
+                "next_iteration",
+                "completed_updates",
+            },
+            cls.schema,
+            "AcceptedSegment",
+        )
+        if any(type(data[key]) is not str for key in ("task_id", "attempt_id", "checkpoint_dir")):
+            raise TypeError("AcceptedSegment text fields have invalid types")
+        if data["predecessor_checkpoint"] is not None and type(data["predecessor_checkpoint"]) is not str:
+            raise TypeError("predecessor_checkpoint must be a string or null")
+        return cls(
+            data["task_id"],
+            AttemptId(data["attempt_id"]),
+            data["predecessor_checkpoint"],
+            data["checkpoint_dir"],
+            data["next_iteration"],
+            data["completed_updates"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "AcceptedSegment":
+        return cls.from_mapping(decode_json(data))
+
+
+@dataclass(frozen=True, slots=True)
 class RunManifest:
     """Versioned group manifest that points at operational receipts.
 
@@ -227,12 +314,17 @@ class RunManifest:
         Order-sensitive ``ReadyGroup.identity``.
     attempts : sequence of ManifestAttempt
         Attempt records, with unique attempt identities.
+    segments : sequence of AcceptedSegment, optional
+        Accepted scientific segments, ordered independently for each task.
     """
 
-    schema: ClassVar[str] = "tpen-executor/run-manifest-v1"
+    schema: ClassVar[str] = "tpen-executor/run-manifest-v2"
+    V1_SCHEMA: ClassVar[str] = "tpen-executor/run-manifest-v1"
+    V2_SCHEMA: ClassVar[str] = schema
     group_id: str
     group_digest: str
     attempts: tuple[ManifestAttempt, ...]
+    segments: tuple[AcceptedSegment, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "group_id", text(self.group_id, "group_id")); object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
@@ -242,24 +334,66 @@ class RunManifest:
         if any(attempt.start_receipt.group_digest != self.group_digest or (attempt.outcome_receipt is not None and attempt.outcome_receipt.group_digest != self.group_digest) for attempt in attempts):
             raise ValueError("receipt group_digest does not match manifest group_digest")
         object.__setattr__(self, "attempts", attempts)
+        segments = sequence(self.segments, "segments")
+        if any(not isinstance(segment, AcceptedSegment) for segment in segments):
+            raise TypeError("segments must contain AcceptedSegment records")
+        attempts_by_id = {attempt.attempt_id: attempt for attempt in attempts}
+        if len({segment.attempt_id for segment in segments}) != len(segments):
+            raise ValueError("duplicate attempt_id in accepted segments")
+        previous_by_task: dict[str, AcceptedSegment] = {}
+        for segment in segments:
+            attempt = attempts_by_id.get(segment.attempt_id)
+            if attempt is None:
+                raise ValueError("accepted segment references an unknown attempt")
+            if attempt.task_id != segment.task_id:
+                raise ValueError("accepted segment task_id disagrees with attempt")
+            if attempt.outcome_receipt is None or attempt.outcome_receipt.status != "completed":
+                raise ValueError("accepted segment requires a completed attempt")
+            previous = previous_by_task.get(segment.task_id)
+            if previous is None:
+                if segment.predecessor_checkpoint is not None:
+                    raise ValueError("first accepted segment must have no predecessor")
+            else:
+                if segment.predecessor_checkpoint != previous.checkpoint_dir:
+                    raise ValueError("accepted segment predecessor disagrees with prior checkpoint")
+                previous_coordinate = (previous.next_iteration, previous.completed_updates)
+                coordinate = (segment.next_iteration, segment.completed_updates)
+                if coordinate[0] < previous_coordinate[0] or coordinate[1] < previous_coordinate[1] or coordinate == previous_coordinate:
+                    raise ValueError("accepted segment progress coordinate is not strictly increasing")
+            previous_by_task[segment.task_id] = segment
+        object.__setattr__(self, "segments", segments)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schema": self.schema, "group_id": self.group_id, "group_digest": self.group_digest, "attempts": [attempt.to_dict() for attempt in self.attempts]}
+        return {
+            "schema": self.schema,
+            "group_id": self.group_id,
+            "group_digest": self.group_digest,
+            "attempts": [attempt.to_dict() for attempt in self.attempts],
+            "segments": [segment.to_dict() for segment in self.segments],
+        }
 
     def encode(self) -> bytes: return canonical_bytes(self.to_dict())
 
     @classmethod
     def from_mapping(cls, data: Any) -> "RunManifest":
-        fields(data, {"schema", "group_id", "group_digest", "attempts"}, cls.schema, "RunManifest")
+        if not isinstance(data, Mapping):
+            raise TypeError("RunManifest must be a mapping")
+        schema = data.get("schema")
+        if schema == cls.V1_SCHEMA:
+            fields(data, {"schema", "group_id", "group_digest", "attempts"}, cls.V1_SCHEMA, "RunManifest")
+            segments: tuple[AcceptedSegment, ...] = ()
+        else:
+            fields(data, {"schema", "group_id", "group_digest", "attempts", "segments"}, cls.schema, "RunManifest")
+            segments = tuple(AcceptedSegment.from_mapping(item) for item in sequence(data["segments"], "segments"))
         if type(data["group_id"]) is not str or type(data["group_digest"]) is not str: raise TypeError("RunManifest scalar fields have invalid types")
-        return cls(data["group_id"], data["group_digest"], tuple(ManifestAttempt.from_mapping(item) for item in sequence(data["attempts"], "attempts")))
+        return cls(data["group_id"], data["group_digest"], tuple(ManifestAttempt.from_mapping(item) for item in sequence(data["attempts"], "attempts")), segments)
 
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "RunManifest":
         return cls.from_mapping(decode_json(data))
 
 
-__all__ = ["AllocationObservation", "ManifestAttempt", "OutcomeReceipt", "OUTCOME_STATUSES", "RunManifest", "StartReceipt"]
+__all__ = ["AcceptedSegment", "AllocationObservation", "ManifestAttempt", "OutcomeReceipt", "OUTCOME_STATUSES", "RunManifest", "StartReceipt"]
 
 
 def encode_manifest(manifest: RunManifest) -> bytes:
