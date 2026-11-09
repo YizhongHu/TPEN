@@ -154,6 +154,8 @@ def test_pipeline_orders_probe_train_barrier_eval_and_verification_matches_exit(
     assert (code, verification["exit_code"], verification["complete"]) == (0, 0, True)
     assert (tmp_path / "launch/02_train/dispatch_specs.jsonl").is_file()
     assert (tmp_path / "launch/03_eval/dispatch_specs.jsonl").is_file()
+    assert json.loads((tmp_path / "launch/02_train/executor_input.json").read_text())["schema"] == "tpen-executor/ready-group-v1"
+    assert json.loads((tmp_path / "launch/03_eval/executor_input.json").read_text())["schema"] == "tpen-executor/ready-group-v1"
 
 
 def test_preflight_failure_prevents_all_science_and_is_truthful(tmp_path: Path) -> None:

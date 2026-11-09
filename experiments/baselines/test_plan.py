@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from experiments.baselines.plan import build_plan
+from experiments.baselines.plan import build_plan, executor_input
+from experiments.toolkit.executor_inputs import canonical_bytes
 from experiments.toolkit.specs import CompletionSpec
 
 
@@ -19,6 +20,7 @@ MATRIX = {
     "steps": (100,),
     "batch_size": (32,),
 }
+P9_BASELINES_FIXTURE = Path(__file__).parents[2] / "executor/tests/fixtures/p9/baselines.json"
 
 
 def test_matrix_cartesian_product_and_injected_argv(tmp_path: Path) -> None:
@@ -32,6 +34,24 @@ def test_matrix_cartesian_product_and_injected_argv(tmp_path: Path) -> None:
     assert plan.n_tasks == 8
     assert all(task.command == ("python", "-m", "baseline_runner", "--literal", "line\\ntext") for task in plan.tasks)
     assert all(task.resources.gpus == 1 and task.resources.device == "cuda" for task in plan.tasks)
+
+
+def test_baselines_emits_the_executor_golden() -> None:
+    matrix = {
+        "code": ("ferminet",),
+        "ansatz": ("default",),
+        "system": ("he",),
+        "seed": (0, 7),
+        "steps": (100,),
+        "batch_size": (32,),
+    }
+    plan = build_plan(
+        matrix,
+        command=("python", "-m", "baseline_runner"),
+        results_root="/p9/baselines",
+        plan_id="p9-fixture",
+    )
+    assert canonical_bytes(executor_input(plan)) == P9_BASELINES_FIXTURE.read_bytes().rstrip(b"\n")
 
 
 def test_ids_are_deterministic_and_result_dirs_pairwise_distinct(tmp_path: Path) -> None:
