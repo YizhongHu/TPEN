@@ -370,7 +370,8 @@ def _attempt(value: Any, group_digest: str) -> dict[str, Any]:
 
 def _segment(value: Any) -> dict[str, Any]:
     base = {"schema", "task_id", "attempt_id", "predecessor_checkpoint", "checkpoint_dir", "next_iteration", "completed_updates"}
-    if not isinstance(value, dict) or set(value) not in {base, base | {"resolved_config_identity"}}:
+    actual_fields = set(value) if isinstance(value, dict) else None
+    if actual_fields not in (base, base | {"resolved_config_identity"}):
         raise ManifestRefusal("malformed-record", "accepted segment keys differ")
     record = dict(value)
     if record["schema"] != ACCEPTED_SEGMENT_SCHEMA:

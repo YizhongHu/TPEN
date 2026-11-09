@@ -28,7 +28,6 @@ from omegaconf import DictConfig, OmegaConf
 from tpen.events import DomainState, Ended, Event as TypedEvent, Occurrence, Operation, Started
 from tpen.distributed import ExecutionTopology, ProfileRecord, RankLocalJSONLWriter
 from tpen.durable_append import append_record
-from tpen.checkpoint.hashing import resolved_config_identity
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_RUN_DIRS = ("checkpoints", "checks", "diagnostics")
@@ -878,6 +877,10 @@ def write_error_artifact(
 
 def write_run_start_artifact(context: RunContext) -> None:
     """Write the early run-start breadcrumb before long-running work begins."""
+
+    # Import lazily: importing ``tpen.checkpoint`` initializes its directory
+    # artifact helpers, which import this module for ``write_json``.
+    from tpen.checkpoint.hashing import resolved_config_identity
 
     cfg = context.cfg
     study = OmegaConf.select(cfg, "study", default={}) or {}

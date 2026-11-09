@@ -52,6 +52,26 @@ def test_p8_records_are_frozen_hashable_and_reject_scalar_sequences() -> None:
         RunManifest("group-1", GROUP_DIGEST, "not-a-sequence")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("identity", [None, {"schema": "tpen-config-identity-v1", "sha256": "a" * 64}])
+def test_p8_accepted_segment_from_mapping_decodes_legacy_and_identity_records(identity: dict[str, str] | None) -> None:
+    segment = _segment("task-a", "attempt-1", None)
+    mapping = segment.to_dict()
+    if identity is not None:
+        mapping["resolved_config_identity"] = identity
+
+    decoded = AcceptedSegment.from_mapping(mapping)
+
+    assert decoded == AcceptedSegment(
+        "task-a",
+        AttemptId("attempt-1"),
+        None,
+        segment.checkpoint_dir,
+        1,
+        1,
+        identity,
+    )
+
+
 @pytest.mark.parametrize(
     "segments, message",
     [

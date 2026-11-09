@@ -483,7 +483,8 @@ class AcceptedSegment:
 
     @classmethod
     def from_mapping(cls, data: Any) -> "AcceptedSegment":
-        if not isinstance(data, Mapping) or set(data) not in {_SEGMENT_FIELDS, _SEGMENT_FIELDS | {"resolved_config_identity"}}:
+        actual_fields = set(data) if isinstance(data, Mapping) else None
+        if actual_fields not in (_SEGMENT_FIELDS, _SEGMENT_FIELDS | {"resolved_config_identity"}):
             raise TypeError("AcceptedSegment has an invalid key set")
         if data.get("schema") != cls.schema:
             raise ValueError(f"AcceptedSegment schema must be {cls.schema!r}")
