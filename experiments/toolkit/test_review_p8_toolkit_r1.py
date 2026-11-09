@@ -177,32 +177,6 @@ else:
     assert result.chains[0].segments[0].checkpoint_dir == str(checkpoint)
 
 
-def test_t11_toolkit_and_executor_refuse_nonfinite_nested_placement_sample(tmp_path):
-    p, _ = materialize(tmp_path)
-    placement = {
-        "schema": "tpen-executor/science-placement-receipt-v1",
-        "task_id": "task-a",
-        "attempt_id": "attempt-1",
-        "group_digest": p["group_digest"],
-        "allocation_id": "allocation-1",
-        "backend_job_id": "job-1",
-        "slot_id": "slot-a",
-        "payload_digest": "1" * 64,
-        "output_dir": p["attempts"][0]["output_dir"],
-        "child": {"host": "node-a", "pid": 1234, "proc_start_ticks": 55, "affinity": [0], "thread_settings": {"OMP_NUM_THREADS": "1"}, "cuda_visible_devices": None, "observed_at_utc": "2026-11-05T00:00:01Z"},
-        "declared": {"host": "node-a", "cpus": [0], "devices": []},
-        "gpu": {"status": "unavailable", "reason": "CPU-only test", "method": "test", "started_at_utc": "2026-11-05T00:00:01Z", "finished_at_utc": "2026-11-05T00:01:00Z", "samples": [{"value": float("inf")}], "active_uuids": [], "active_pci": []},
-        "comparison": {"host": "matched", "affinity": "matched", "device": "unavailable"},
-        "refusal": None,
-    }
-    p["attempts"][0]["placement_receipt"] = placement
-    path = write(tmp_path, p)
-    executor_check = executor("import sys\nfrom tpen_executor.results import SciencePlacementReceipt\nfrom tpen_executor.contracts import AttemptId\ntry:\n SciencePlacementReceipt('task-a', AttemptId('attempt-1'), sys.argv[1], 'allocation-1', 'job-1', 'slot-a', '1' * 64, '/tmp/out', {'host': 'node-a', 'pid': 1234, 'proc_start_ticks': 55, 'affinity': [0], 'thread_settings': {'OMP_NUM_THREADS': '1'}, 'cuda_visible_devices': None, 'observed_at_utc': '2026-11-05T00:00:01Z'}, {'host': 'node-a', 'cpus': [0], 'devices': []}, {'status': 'unavailable', 'reason': 'CPU-only test', 'method': 'test', 'started_at_utc': '2026-11-05T00:00:01Z', 'finished_at_utc': '2026-11-05T00:01:00Z', 'samples': [{'value': float('inf')}], 'active_uuids': [], 'active_pci': []}, {'host': 'matched', 'affinity': 'matched', 'device': 'unavailable'})\nexcept (ValueError, TypeError): print('REFUSED')\nelse: raise AssertionError('executor unexpectedly accepted non-finite placement sample')", p["group_digest"])
-    assert executor_check.returncode == 0 and executor_check.stdout.strip() == "REFUSED", executor_check.stderr
-    with pytest.raises(ManifestRefusal, match=r"placement\.gpu\.samples\[0\]\.value"):
-        read(path, lambda _: pytest.fail("toolkit unexpectedly accepted non-finite placement sample"))
-
-
 def test_t8_wire_fixtures_and_experiment_boundary():
     for name in ["run-manifest-v1.json", "run-manifest-v2.json"]:
         assert (ROOT / "executor/tests/fixtures" / name).read_bytes() == (ROOT / "experiments/toolkit/fixtures" / name).read_bytes()

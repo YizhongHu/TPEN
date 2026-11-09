@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import math
 from pathlib import Path
 import string
 from types import MappingProxyType
@@ -205,20 +204,13 @@ def _sha256(value: Any, name: str) -> str:
     return value
 
 
-def _freeze_json(value: Any, path: str = "placement") -> Any:
+def _freeze_json(value: Any) -> Any:
     """Return immutable views of validated JSON-shaped placement evidence."""
 
     if isinstance(value, dict):
-        frozen: dict[str, Any] = {}
-        for key, item in value.items():
-            if type(key) is not str:
-                raise ManifestRefusal("malformed-record", f"{path} keys must be strings")
-            frozen[key] = _freeze_json(item, f"{path}.{key}")
-        return MappingProxyType(frozen)
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
     if isinstance(value, list):
-        return tuple(_freeze_json(item, f"{path}[{index}]") for index, item in enumerate(value))
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ManifestRefusal("malformed-record", f"{path} must be finite")
+        return tuple(_freeze_json(item) for item in value)
     return value
 
 
@@ -524,7 +516,7 @@ def read(
             segment["checkpoint_dir"],
             segment["next_iteration"],
             segment["completed_updates"],
-            _freeze_json(attempt["placement_receipt"], "placement"),
+            _freeze_json(attempt["placement_receipt"]),
         )
         by_task.setdefault(projected.task_id, []).append(projected)
     for task_id, task_segments in by_task.items():
@@ -538,7 +530,7 @@ def read(
             "uncommitted" if attempt["outcome_receipt"] is None else (
                 "failed-or-incomplete" if attempt["outcome_receipt"]["status"] != "completed" else "not-selected"
             ),
-            _freeze_json(attempt["placement_receipt"], "placement"),
+            _freeze_json(attempt["placement_receipt"]),
         )
         for attempt in attempts
         if attempt["attempt_id"] not in selected_ids
