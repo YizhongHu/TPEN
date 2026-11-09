@@ -11,8 +11,12 @@ from torch import nn
 
 from tpen.callback import GradientStats, ModuleNorms
 from tpen.logging import CSV, JSONL, LogRecord
+from tpen.physics.kinetic import KineticEnergy
+from tpen.physics.potential import ElectronElectronInteraction, HarmonicTrap
 from tpen.parameter_groups import resolve_parameter_groups
+from tpen.training.trainer import VMCTrainer
 from tests.unit.callback.support import RecordingContext, deliver_completed_iteration, training_state
+from tests.helpers.hooke_models import build_tiny_sampler, build_tiny_spenn
 
 
 class GroupedModel(nn.Module):
@@ -36,6 +40,56 @@ class LoggerContext(RecordingContext):
         for logger in self.loggers:
             logger.log(record)
         super().log(metrics, step=step, namespace=namespace)
+
+
+class DispatchingContext(RecordingContext):
+    """Minimal context that sends real trainer occurrences to callbacks."""
+
+    def __init__(self, callbacks) -> None:
+        super().__init__()
+        self.callbacks = list(callbacks)
+
+    def _dispatch_occurrence(self, occurrence, *, state=None) -> None:
+        for callback in self.callbacks:
+            callback.handle_occurrence(occurrence, self, state)
+
+
+class NormRecordingAdam(torch.optim.Adam):
+    """Record grouped parameter norms immediately around each real update."""
+
+    def __init__(self, model: torch.nn.Module, **kwargs) -> None:
+        super().__init__(model.parameters(), **kwargs)
+        self.model = model
+        self.before: list[float] = []
+        self.after: list[float] = []
+
+    def step(self, closure=None):
+        self.before.append(
+            float(
+                torch.cat(
+                    [
+                        parameter.detach().reshape(-1)
+                        for parameter in self.model.embedding.parameters()
+                    ]
+                )
+                .norm()
+                .item()
+            )
+        )
+        result = super().step(closure)
+        self.after.append(
+            float(
+                torch.cat(
+                    [
+                        parameter.detach().reshape(-1)
+                        for parameter in self.model.embedding.parameters()
+                    ]
+                )
+                .norm()
+                .item()
+            )
+        )
+        return result
 
 
 def test_resolver_uses_module_paths_and_explicit_trace_names() -> None:
@@ -108,6 +162,41 @@ def test_callback_reads_post_update_parameters() -> None:
     logged = context.latest("train/module_norms/embed")
     assert logged["parameter_l2"] == pytest.approx(float(after_update.norm().item()))
     assert logged["parameter_l2"] != pytest.approx(float(before_update.norm().item()))
+
+
+def test_real_trainer_dispatch_logs_post_update_parameters() -> None:
+    """The real completion boundary observes each optimizer-updated model."""
+
+    model = build_tiny_spenn()
+    optimizer = NormRecordingAdam(model, lr=0.01)
+    context = DispatchingContext(
+        [ModuleNorms({"embed": ["embedding"]}, every_n_steps=1)]
+    )
+    trainer = VMCTrainer(max_steps=2, log_every_n_steps=1)
+    trainer.fit(
+        model=model,
+        sampler=build_tiny_sampler(),
+        hamiltonian_terms=[
+            KineticEnergy(),
+            HarmonicTrap(omega=0.5),
+            ElectronElectronInteraction(),
+        ],
+        optimizer=optimizer,
+        context=context,
+        emit=lambda *args, **kwargs: None,
+    )
+
+    records = context.by_namespace("train/module_norms/embed")
+    assert len(records) == 2
+    assert len(optimizer.before) == len(optimizer.after) == 2
+    assert any(
+        before != pytest.approx(after)
+        for before, after in zip(optimizer.before, optimizer.after)
+    )
+    for record, before, after in zip(records, optimizer.before, optimizer.after):
+        assert record["step"] in (0, 1)
+        assert record["metrics"]["parameter_l2"] == pytest.approx(after)
+        assert record["metrics"]["parameter_l2"] != pytest.approx(before)
 
 
 def test_callback_is_optional_and_cadenced() -> None:
