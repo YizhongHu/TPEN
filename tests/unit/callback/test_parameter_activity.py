@@ -23,6 +23,15 @@ from tpen.training.state import TrainerState
 from tpen.events import Occurrence
 
 
+class _Context:
+    """Minimal stand-in satisfying the runtime-checked `CallbackContext` protocol."""
+
+    metadata = None
+
+    def now_iso(self) -> str:
+        return "2026-01-01T00:00:00+00:00"
+
+
 class _Trainer:
     """Trainer double exposing only the `completed_updates` counter this callback reads."""
 
@@ -79,7 +88,7 @@ def test_classifies_absent_zero_and_nonzero_gradients(tmp_path: Path) -> None:
     output_path = tmp_path / "parameter_activity.json"
     callback = ParameterActivity(output_path)
 
-    callback.handle_occurrence(_update_completed(), object(), state)
+    callback.handle_occurrence(_update_completed(), _Context(), state)
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     rows = _rows_by_name(payload)
@@ -113,7 +122,7 @@ def test_optimizer_without_live_model_parameters_reports_every_parameter_absent(
     output_path = tmp_path / "parameter_activity.json"
     callback = ParameterActivity(output_path)
 
-    callback.handle_occurrence(_update_completed(), object(), state)
+    callback.handle_occurrence(_update_completed(), _Context(), state)
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     rows = _rows_by_name(payload)
@@ -130,8 +139,9 @@ def test_no_write_on_update_skipped_or_unrelated_event(tmp_path: Path) -> None:
     output_path = tmp_path / "parameter_activity.json"
     callback = ParameterActivity(output_path)
 
-    callback.handle_occurrence(_update_skipped(), object(), state)
-    callback.handle_occurrence(_iteration_completed(), object(), state)
+    context = _Context()
+    callback.handle_occurrence(_update_skipped(), context, state)
+    callback.handle_occurrence(_iteration_completed(), context, state)
 
     assert not output_path.exists()
 
@@ -144,14 +154,15 @@ def test_writes_exactly_once_on_first_applied_update(tmp_path: Path) -> None:
     output_path = tmp_path / "parameter_activity.json"
     callback = ParameterActivity(output_path)
 
-    callback.handle_occurrence(_update_completed(count=1), object(), state)
+    context = _Context()
+    callback.handle_occurrence(_update_completed(count=1), context, state)
     mtime_before = output_path.stat().st_mtime_ns
 
     # A second applied update must not attempt a second write at all -- the
     # `_written` guard short-circuits before the file is ever reopened, so
     # even an attempted (and would-be-refused) second write cannot happen.
     state.trainer.completed_updates = 2
-    callback.handle_occurrence(_update_completed(count=2), object(), state)
+    callback.handle_occurrence(_update_completed(count=2), context, state)
 
     assert output_path.stat().st_mtime_ns == mtime_before
 
@@ -168,6 +179,6 @@ def test_refuses_to_silently_overwrite_an_existing_inventory(tmp_path: Path) -> 
     callback = ParameterActivity(output_path)
 
     with pytest.raises(FileExistsError):
-        callback.handle_occurrence(_update_completed(), object(), state)
+        callback.handle_occurrence(_update_completed(), _Context(), state)
 
     assert output_path.read_text(encoding="utf-8") == "stale-from-a-prior-attempt"
