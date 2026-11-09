@@ -149,6 +149,5 @@ PY
 CHILD_OBSERVATION_FILENAME=$(env -u PYTHONPATH "$EXEC_PY" -c 'from tpen_executor.runners import CHILD_OBSERVATION_FILENAME; print(CHILD_OBSERVATION_FILENAME)')
 env PYTHONPATH="$CHECKOUT" "$SCI_PY" "$CHECKOUT/experiments/atomistic/he-v1/p10_summary.py" \
   "$STORE/run-manifest.json" "$ROOT/terminal-summary.json" "$CHILD_OBSERVATION_FILENAME"
-PY
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$ROOT/job-finish-utc.txt"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -14,6 +15,25 @@ import pytest
 HERE = Path(__file__).parent
 TEMPLATE = HERE / "templates" / "p10-smoke.pbs"
 SUMMARY = HERE / "p10_summary.py"
+
+
+def _heredoc_issues(text: str) -> list[str]:
+    """Return orphaned, duplicated, or unclosed shell heredoc delimiters."""
+
+    pending: list[str] = []
+    issues: list[str] = []
+    opener = re.compile(r"<<-?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))")
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        match = opener.search(line)
+        if match:
+            pending.append(next(value for value in match.groups() if value is not None))
+        stripped = line.strip()
+        if stripped in pending:
+            pending.remove(stripped)
+        elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", stripped) and stripped in {"PY", "EOF", "END"}:
+            issues.append(f"orphan terminator {stripped!r} at line {line_number}")
+    issues.extend(f"unclosed heredoc {tag!r}" for tag in pending)
+    return issues
 
 
 def _load_summary():
@@ -89,3 +109,9 @@ def test_run_root_guard_precedes_all_writes_and_keeps_temp_under_root() -> None:
     assert 'case "$ROOT_CANONICAL" in' in text
     assert '"$APPROVED_RUNS_ROOT_CANONICAL"/*)' in text
     assert 'export TMPDIR="$ROOT/tmp"' in text
+
+
+def test_template_heredocs_have_exactly_one_terminator() -> None:
+    """Catch orphan terminators that bash -n accepts as commands."""
+
+    assert _heredoc_issues(TEMPLATE.read_text(encoding="utf-8")) == []
