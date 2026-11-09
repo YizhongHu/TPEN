@@ -14,7 +14,7 @@ from tpen.training.events import TrainingIterationCompleted
 from tpen.training.state import TrainerState
 
 from .base import StatefulCallback
-from .cadence import StepCadenceGate, SubscriptionGroup, pop_step_cadence
+from .cadence import StepCadenceGate, SubscriptionGroup, pop_durable_step_cadence
 
 
 class ModuleNorms(StatefulCallback[TrainerState]):
@@ -27,7 +27,8 @@ class ModuleNorms(StatefulCallback[TrainerState]):
         ``trace_name`` values. Parameters not selected by a group are reported
         under the explicit ``ungrouped`` bucket.
     every_n_steps : int, optional
-        Durable-step cadence consumed by ``pop_step_cadence``.
+        Durable-step cadence consumed by ``pop_durable_step_cadence``. The
+        resume-safe module refuses ``max_calls`` and probabilistic admission.
 
     Notes
     -----
@@ -41,7 +42,7 @@ class ModuleNorms(StatefulCallback[TrainerState]):
     state_type: ClassVar[type[DomainState]] = TrainerState
 
     def __init__(self, groups: Mapping[str, Any], **kwargs: Any) -> None:
-        cadence = pop_step_cadence(kwargs)
+        cadence = pop_durable_step_cadence(kwargs)
         super().__init__(
             typed_groups=(
                 SubscriptionGroup(selectors=(Subscription.of(TrainingIterationCompleted),)),
