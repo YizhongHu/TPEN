@@ -48,6 +48,7 @@ class DispatchingContext(RecordingContext):
     def __init__(self, callbacks) -> None:
         super().__init__()
         self.callbacks = list(callbacks)
+        self._occurrence_counts = {}
 
     def _dispatch_occurrence(self, occurrence, *, state=None) -> None:
         for callback in self.callbacks:
