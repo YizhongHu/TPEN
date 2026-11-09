@@ -152,12 +152,26 @@ def test_r1_t3_refusal_mapping_is_immutable_on_refused_record(tmp_path: Path) ->
         result.refusal["code"] = "unknown"  # type: ignore[index]
 
 
-@pytest.mark.parametrize("config_text, expected_verdict", [
-    ("{}\n", "supported"),
-    ("callbacks:\n  - _target_: tpen.callback.NotCertified\n", "refused"),
+@pytest.mark.parametrize("config_text, expected_verdict, expected_refusal_code", [
+    ("{}\n", "supported", None),
+    ("callbacks:\n  - _target_: tpen.callback.NotCertified\n", "refused", "unsupported-callback"),
+    (
+        "callbacks:\n"
+        "  - _target_: tpen.callback.Checkpoint\n"
+        "    schedule:\n"
+        "      _target_: tpen.callback.cadence.StepCadenceGate\n"
+        "      cadence:\n"
+        "        _target_: tpen.callback.cadence.StepCadence\n"
+        "        max_calls: 1\n",
+        "refused",
+        "unsupported-callback-cadence",
+    ),
 ])
 def test_r1_t4_real_core_profile_cli_and_refusal_codes(
-    tmp_path: Path, config_text: str, expected_verdict: str,
+    tmp_path: Path,
+    config_text: str,
+    expected_verdict: str,
+    expected_refusal_code: str | None,
 ) -> None:
     """GREEN: the pinned core CLI emits the executor-consumed capability record."""
 
@@ -196,4 +210,5 @@ def test_r1_t4_real_core_profile_cli_and_refusal_codes(
     if expected_verdict == "refused":
         assert result.refusal is not None
         assert result.refusal["code"] in REFUSAL_CODES
+        assert result.refusal["code"] == expected_refusal_code
 

@@ -132,6 +132,18 @@ CADENCE_SENSITIVE_CALLBACK_TARGETS = frozenset(
         "tpen.callback.GradientStats",
     }
 )
+# These schedules make decisions only from the durable completed-update
+# coordinate.  A CheckpointSchedule is a protocol, so an arbitrary Hydra
+# target is not evidence that its private counters or RNG are reconstructed by
+# train_resume.  Keep the admission boundary explicit until such a schedule
+# supplies its own recovery contract.
+AUDITED_CHECKPOINT_SCHEDULE_TARGETS = frozenset(
+    {
+        "tpen.checkpoint.TerminalOnly",
+        "tpen.checkpoint.EveryNUpdates",
+        "tpen.checkpoint.ExplicitUpdates",
+    }
+)
 SUPPORTED_CALLBACK_TARGETS = (
     OBSERVATIONAL_CALLBACK_TARGETS | RESUME_SENSITIVE_CALLBACK_TARGETS
 )
@@ -283,6 +295,74 @@ def check_resume_sensitive_callback_cadence(
                 f"callbacks[{index}] {target!r} sets cadence field 'probability' "
                 "to a value other than 1.0; the callback-local RNG state is not restored",
             )
+        if target == "tpen.callback.Checkpoint" and "schedule" in entry:
+            schedule_refusal = _checkpoint_schedule_cadence_refusal(
+                entry["schedule"], f"callbacks[{index}].schedule"
+            )
+            if schedule_refusal is not None:
+                return schedule_refusal
+    return None
+
+
+def _checkpoint_schedule_cadence_refusal(
+    schedule: Any, path: str
+) -> tuple[str, str] | None:
+    """Refuse unaudited or locally stateful nested checkpoint schedules.
+
+    Hydra may construct a ``StepCadenceGate`` below ``Checkpoint.schedule``.
+    Its call counter and RNG are callback-local state, just like the scalar
+    cadence fields handled above, and train_resume does not restore either.
+    The in-tree schedule implementations are immutable functions of durable
+    ``completed_updates`` and are therefore the only admitted schedule forms.
+    """
+
+    if schedule is None:
+        return None
+    if not isinstance(schedule, Mapping):
+        return (
+            CALLBACK_CADENCE_REFUSAL_CODE,
+            f"{path} is not an audited durable-coordinate CheckpointSchedule; "
+            "nested callback-local state cannot be certified",
+        )
+    target = schedule.get("_target_")
+    nested_refusal = _nested_cadence_refusal(schedule, path)
+    if nested_refusal is not None:
+        return nested_refusal
+    if target not in AUDITED_CHECKPOINT_SCHEDULE_TARGETS:
+        return (
+            CALLBACK_CADENCE_REFUSAL_CODE,
+            f"{path} target {target!r} is not an audited durable-coordinate "
+            "CheckpointSchedule; nested callback-local state is not restored",
+        )
+    return None
+
+
+def _nested_cadence_refusal(value: Any, path: str) -> tuple[str, str] | None:
+    """Find unsafe cadence fields in a recursively instantiated mapping."""
+
+    if isinstance(value, Mapping):
+        if "max_calls" in value and value["max_calls"] is not None:
+            return (
+                CALLBACK_CADENCE_REFUSAL_CODE,
+                f"{path}.max_calls is callback-local state; its call count is not restored",
+            )
+        if "probability" in value:
+            probability = value["probability"]
+            if type(probability) not in (int, float) or probability != 1:
+                return (
+                    CALLBACK_CADENCE_REFUSAL_CODE,
+                    f"{path}.probability is callback-local state; its RNG state is not restored",
+                )
+        for key, child in value.items():
+            if key != "_target_":
+                refusal = _nested_cadence_refusal(child, f"{path}.{key}")
+                if refusal is not None:
+                    return refusal
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, child in enumerate(value):
+            refusal = _nested_cadence_refusal(child, f"{path}[{index}]")
+            if refusal is not None:
+                return refusal
     return None
 
 
@@ -403,6 +483,7 @@ __all__ = [
     "REFUSAL_CODES",
     "PROFILE_REFUSAL_CODES",
     "CALLBACK_CADENCE_REFUSAL_CODE",
+    "AUDITED_CHECKPOINT_SCHEDULE_TARGETS",
     "CADENCE_SENSITIVE_CALLBACK_TARGETS",
     "check_resume_sensitive_callback_cadence",
     "SUPPORTED_CALLBACK_TARGETS",

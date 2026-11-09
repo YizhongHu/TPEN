@@ -172,6 +172,52 @@ def test_checkpoint_cadence_is_resume_sensitive() -> None:
         )
 
 
+def test_checkpoint_nested_schedule_cadence_is_resume_sensitive() -> None:
+    config = _config(
+        callbacks=[
+            {
+                "_target_": "tpen.callback.Checkpoint",
+                "schedule": {
+                    "_target_": "tpen.callback.cadence.StepCadenceGate",
+                    "cadence": {
+                        "_target_": "tpen.callback.cadence.StepCadence",
+                        "max_calls": 1,
+                    },
+                },
+            }
+        ]
+    )
+
+    result = check_profile(config, NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "refused"
+    assert result.refusal is not None
+    assert result.refusal["code"] == CALLBACK_CADENCE_REFUSAL_CODE
+    assert "schedule" in result.refusal["reason"]
+    with pytest.raises(UnsupportedMutableStateError, match="schedule"):
+        validate_native_recovery_profile(config)
+
+
+def test_checkpoint_plain_schedule_is_admitted_by_both_validators() -> None:
+    config = _config(
+        callbacks=[
+            {
+                "_target_": "tpen.callback.Checkpoint",
+                "schedule": {
+                    "_target_": "tpen.checkpoint.EveryNUpdates",
+                    "every_n": 5,
+                },
+            }
+        ]
+    )
+
+    result = check_profile(config, NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "supported"
+    assert result.refusal is None
+    validate_native_recovery_profile(config)
+
+
 @pytest.mark.parametrize("target", sorted(NEW_CALLBACK_TARGETS))
 def test_dropping_each_new_target_refuses_the_h_v2_callback_set(
     target: str, monkeypatch: pytest.MonkeyPatch

@@ -15,7 +15,13 @@ from .workers import SubprocessWorker
 
 PROFILE_CHECK_SCHEMA = "tpen.profile-check/v1"
 REFUSAL_CODES = frozenset(
-    {"unknown-profile", "unsupported-callback", "unsupported-logger", "malformed-config"}
+    {
+        "unknown-profile",
+        "unsupported-callback",
+        "unsupported-callback-cadence",
+        "unsupported-logger",
+        "malformed-config",
+    }
 )
 PROFILE_REFUSAL_CODES = REFUSAL_CODES
 
