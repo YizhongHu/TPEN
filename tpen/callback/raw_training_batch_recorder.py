@@ -307,7 +307,12 @@ class TrainingBatchReader:
         if manifest.get("schema") != SCHEMA:
             raise ValueError("training history manifest has the wrong schema")
         selected: list[dict[str, np.ndarray]] = []
-        for entry in manifest.get("partitions", []):
+        for partition_number, entry in enumerate(manifest.get("partitions", [])):
+            parent_hash = entry.get("parent_manifest_sha256")
+            if (partition_number == 0 and parent_hash is not None) or (
+                partition_number > 0 and not isinstance(parent_hash, str)
+            ):
+                raise ValueError("training manifest partition lineage is broken")
             sidecar_path = self.root / entry["sidecar"]
             sidecar = json.loads(sidecar_path.read_text())
             _validate_sidecar(self.root, sidecar, entry=entry)
@@ -322,6 +327,11 @@ class TrainingBatchReader:
         if not selected:
             return {}
         return {name: np.concatenate([part[name] for part in selected]) for name in selected[0]}
+
+    def validate(self) -> None:
+        """Validate every manifest-selected partition without returning rows."""
+
+        self.read()
 
 
 def _validate_sidecar(root: Path, sidecar: Mapping[str, Any], *, entry: Mapping[str, Any]) -> None:
@@ -406,6 +416,8 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
             return
         if state.batch is None or state.local_energy is None or state.wavefunction_output is None:
             raise ValueError("raw training recorder requires batch, local energy, and wavefunction output")
+        if state.local_energy_terms is None:
+            raise ValueError("raw training recorder requires trainer return_terms=True")
         batch = state.batch
         positions = batch.positions.detach().cpu().numpy().reshape(-1, batch.n_electrons, batch.spatial_dim)
         local_energy = state.local_energy.detach().cpu().numpy().reshape(-1)
@@ -417,7 +429,7 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
             walker_index=np.arange(len(local_energy), dtype=np.int64),
             positions=positions,
             local_energy=local_energy,
-            term_energies={} if state.local_energy_terms is None else {name: value.detach().cpu().numpy().reshape(-1) for name, value in state.local_energy_terms.items()},
+            term_energies={name: value.detach().cpu().numpy().reshape(-1) for name, value in state.local_energy_terms.items()},
             logabs=output.logabs.detach().cpu().numpy().reshape(-1),
             sign=output.sign.detach().cpu().numpy().reshape(-1),
             finite=(
@@ -457,5 +469,6 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
 
 TrainingBatchRecorder = RawTrainingBatchRecorder
 TrainingHistoryReader = TrainingBatchReader
+TrainingBatchValidator = TrainingBatchReader
 
-__all__ = ["RawTrainingBatchRecorder", "TrainingBatchRecorder", "TrainingBatchPartitionWriter", "TrainingBatchReader", "TrainingHistoryReader", "TrainingBatchRecord", "SCHEMA"]
+__all__ = ["RawTrainingBatchRecorder", "TrainingBatchRecorder", "TrainingBatchPartitionWriter", "TrainingBatchReader", "TrainingHistoryReader", "TrainingBatchValidator", "TrainingBatchRecord", "SCHEMA"]
