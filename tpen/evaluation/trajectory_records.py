@@ -27,6 +27,34 @@ TRAJECTORY_RECORD_FILENAME = "sampled_eval_table.csv"
 TRAJECTORY_RECORD_SCHEMA = "trajectory_records/v1"
 """Versioned serialized trajectory-record schema."""
 
+TRAJECTORY_RECORD_METADATA_KEYS: tuple[str, ...] = (
+    "schema",
+    "row_semantics",
+    "csv_filename",
+    "observable",
+    "draw_count",
+    "walker_count",
+    "draw_stride",
+    "burn_in_draws",
+    "n_electrons",
+    "spatial_dim",
+    "term_names",
+    "row_count",
+    "finite_count",
+    "nonfinite_count",
+    "mean",
+    "variance",
+    "observable_values_content_id",
+    "csv_sha256",
+    "byte_count",
+    "atomic_configuration_id",
+    "atomic_configuration",
+)
+"""Every key `_write_metadata` emits in the trajectory-record metadata sidecar."""
+
+TRAJECTORY_RECORD_ROW_SEMANTICS = "complete_draw_walker_grid"
+"""Row-ordering convention shared by the writer and the metadata validator."""
+
 
 @dataclass(frozen=True)
 class TrajectoryRecordBatch:
@@ -296,23 +324,53 @@ class TrajectoryRecordArtifact:
         return n_rows
 
     def _validate_serialized_metadata(self) -> None:
-        metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        raw = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("trajectory record metadata sidecar must be a JSON object")
+        metadata: dict[str, Any] = raw
+        atoms = self.atomic_configuration
         expected_scalars = {
             "schema": TRAJECTORY_RECORD_SCHEMA,
+            "row_semantics": TRAJECTORY_RECORD_ROW_SEMANTICS,
             "csv_filename": self.path.name,
             "observable": self.observable,
             "draw_count": self.n_draws,
             "walker_count": self.n_walkers,
+            "draw_stride": self.draw_stride,
+            "burn_in_draws": self.burn_in_draws,
+            "n_electrons": self.n_electrons,
+            "spatial_dim": self.spatial_dim,
+            "term_names": list(self.term_names),
             "row_count": self.row_count,
             "finite_count": self.finite_count,
             "nonfinite_count": self.nonfinite_count,
+            "mean": _json_float(self.mean),
+            "variance": _json_float(self.variance),
             "observable_values_content_id": self.observable_values_content_id,
             "csv_sha256": self.csv_sha256,
             "byte_count": self.byte_count,
-            "atomic_configuration_id": self.atomic_configuration.content_id(),
+            "atomic_configuration_id": atoms.content_id(),
+            "atomic_configuration": _atomic_geometry_payload(atoms),
         }
+        declared_keys = set(TRAJECTORY_RECORD_METADATA_KEYS)
+        if expected_scalars.keys() != declared_keys:
+            missing = sorted(declared_keys - expected_scalars.keys())
+            extra = sorted(expected_scalars.keys() - declared_keys)
+            raise RuntimeError(
+                "trajectory_records.py: expected_scalars and TRAJECTORY_RECORD_METADATA_KEYS "
+                f"have diverged; update both together (missing={missing}, extra={extra})"
+            )
+        extra_keys = set(metadata) - expected_scalars.keys()
+        if extra_keys:
+            raise ValueError(
+                "trajectory record metadata has undeclared key(s): "
+                + ", ".join(sorted(extra_keys))
+            )
+        for key in TRAJECTORY_RECORD_METADATA_KEYS:
+            if key not in metadata:
+                raise ValueError(f"trajectory record metadata is missing required key {key!r}")
         for key, expected in expected_scalars.items():
-            if metadata.get(key) != expected:
+            if metadata[key] != expected:
                 raise ValueError(f"trajectory record metadata {key!r} disagrees with typed manifest")
 
 
@@ -522,7 +580,7 @@ def _write_metadata(artifact: TrajectoryRecordArtifact) -> None:
     atoms = artifact.atomic_configuration
     metadata = {
         "schema": TRAJECTORY_RECORD_SCHEMA,
-        "row_semantics": "complete_draw_walker_grid",
+        "row_semantics": TRAJECTORY_RECORD_ROW_SEMANTICS,
         "csv_filename": artifact.path.name,
         "observable": artifact.observable,
         "draw_count": artifact.n_draws,
@@ -541,14 +599,20 @@ def _write_metadata(artifact: TrajectoryRecordArtifact) -> None:
         "csv_sha256": artifact.csv_sha256,
         "byte_count": artifact.byte_count,
         "atomic_configuration_id": atoms.content_id(),
-        "atomic_configuration": {
-            "positions": atoms.positions.detach().to(torch.float64).cpu().tolist(),
-            "charges": atoms.charges.detach().to(torch.float64).cpu().tolist(),
-        },
+        "atomic_configuration": _atomic_geometry_payload(atoms),
     }
     with artifact.metadata_path.open("x", encoding="utf-8") as handle:
         json.dump(metadata, handle, sort_keys=True, indent=2, allow_nan=False)
         handle.write("\n")
+
+
+def _atomic_geometry_payload(atoms: AtomicConfiguration) -> dict[str, list]:
+    """Return the JSON-serializable nuclear geometry payload for a sidecar."""
+
+    return {
+        "positions": atoms.positions.detach().to(torch.float64).cpu().tolist(),
+        "charges": atoms.charges.detach().to(torch.float64).cpu().tolist(),
+    }
 
 
 def _owned_cpu(value: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
@@ -614,6 +678,8 @@ def _same_reconciliation(
 
 __all__ = [
     "TRAJECTORY_RECORD_FILENAME",
+    "TRAJECTORY_RECORD_METADATA_KEYS",
+    "TRAJECTORY_RECORD_ROW_SEMANTICS",
     "TRAJECTORY_RECORD_SCHEMA",
     "TrajectoryRecordArtifact",
     "TrajectoryRecordBatch",

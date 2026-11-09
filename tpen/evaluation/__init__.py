@@ -86,6 +86,8 @@ from tpen.evaluation.summaries import (
 from tpen.evaluation.task import EvaluationTask
 from tpen.evaluation.trajectory_records import (
     TRAJECTORY_RECORD_FILENAME,
+    TRAJECTORY_RECORD_METADATA_KEYS,
+    TRAJECTORY_RECORD_ROW_SEMANTICS,
     TRAJECTORY_RECORD_SCHEMA,
     TrajectoryRecordArtifact,
     TrajectoryRecordBatch,
@@ -111,6 +113,8 @@ __all__ = [
     "EvaluationRunState",
     "EvaluationTask",
     "TRAJECTORY_RECORD_FILENAME",
+    "TRAJECTORY_RECORD_METADATA_KEYS",
+    "TRAJECTORY_RECORD_ROW_SEMANTICS",
     "TRAJECTORY_RECORD_SCHEMA",
     "TrajectoryRecordArtifact",
     "TrajectoryRecordBatch",
