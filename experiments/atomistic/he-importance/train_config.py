@@ -438,6 +438,93 @@ def _consumed_context(manifest: Mapping[str, Any]) -> str:
     raise AssertionError("unreachable context validation branch")
 
 
+def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple[str, Any], ...]:
+    """Flatten mapping or Hydra dotlist overrides into explicit leaf updates."""
+
+    if isinstance(overrides, Mapping):
+        try:
+            raw = OmegaConf.to_container(OmegaConf.create(overrides), resolve=False)
+        except Exception as exc:
+            raise TrainConfigResolutionError("overrides must be a valid mapping") from exc
+    elif isinstance(overrides, Sequence) and not isinstance(overrides, (str, bytes, bytearray)):
+        try:
+            raw = OmegaConf.to_container(OmegaConf.from_dotlist(list(overrides)), resolve=False)
+        except Exception as exc:
+            raise TrainConfigResolutionError("overrides must be a valid Hydra dotlist") from exc
+    else:
+        raise TrainConfigResolutionError("overrides must be a mapping or Hydra dotlist")
+
+    items: list[tuple[str, Any]] = []
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                visit(child, f"{path}.{key}" if path else str(key))
+        else:
+            items.append((path, value))
+
+    visit(raw, "")
+    return tuple(items)
+
+
+_RESOLVER_OWNED_SEED_PATHS = frozenset({"runtime.seed", "sampler.seed"})
+_RESOLVER_OWNED_SEED_SUFFIXES = (".initializer.seed",)
+_RESOLVER_OWNED_CHECKER_PREFIX = "callbacks."
+_RESOLVER_OWNED_CHECKER_MARKER = ".checkers."
+_RESOLVER_OWNED_SEED_SUFFIX = ".seed"
+_RESOLVER_OWNED_OVERRIDE_PATHS = frozenset(
+    {"run.root", "run.dir", "run.run_id", "run.layout", "sampler.n_walkers"}
+)
+_OVERRIDE_MISSING = object()
+
+
+def _is_resolver_owned_seed_path(path: str) -> bool:
+    """Return whether *path* belongs to a resolver-owned seed stream."""
+
+    if path in _RESOLVER_OWNED_SEED_PATHS:
+        return True
+    if any(
+        path[len(path) - len(suffix) :] == suffix
+        for suffix in _RESOLVER_OWNED_SEED_SUFFIXES
+        if len(path) >= len(suffix)
+    ):
+        return True
+    prefix = _RESOLVER_OWNED_CHECKER_PREFIX
+    marker = _RESOLVER_OWNED_CHECKER_MARKER
+    suffix = _RESOLVER_OWNED_SEED_SUFFIX
+    return (
+        len(path) >= len(prefix)
+        and path[: len(prefix)] == prefix
+        and marker in path
+        and len(path) >= len(suffix)
+        and path[len(path) - len(suffix) :] == suffix
+    )
+
+
+def _reject_resolver_owned_seed_overrides(items: Sequence[tuple[str, Any]]) -> None:
+    """Refuse seed paths whose values are owned by manifest seed streams."""
+
+    owned = {path for path, _ in items if _is_resolver_owned_seed_path(path)}
+    if owned:
+        raise TrainConfigResolutionError(
+            "resolver-owned seed overrides are not permitted: " + ", ".join(sorted(owned))
+        )
+
+
+def _reject_resolver_owned_overrides(items: Sequence[tuple[str, Any]]) -> None:
+    """Refuse paths whose values are written by this resolver after overlays."""
+
+    for path, _ in items:
+        if path in _RESOLVER_OWNED_OVERRIDE_PATHS:
+            raise TrainConfigResolutionError(
+                f"resolver-owned override path is not permitted: {path}"
+            )
+        if str.__eq__(path, "runner") is True or path.startswith("runner."):
+            raise TrainConfigResolutionError(
+                "runner override paths are not permitted; top-level path: runner"
+            )
+
+
 def _ab_context_labels(manifest: Mapping[str, Any], axis: str) -> dict[str, str]:
     """Return complete AB-4a labels after closed-schema context validation.
 
@@ -456,11 +543,16 @@ def _ab_context_labels(manifest: Mapping[str, Any], axis: str) -> dict[str, str]
     """
 
     context = _mapping(manifest["scientific_identity"].get("context"), "scientific_identity.context")
-    literal = _mapping(context.get("literal_configuration"), "scientific_identity.context.literal_configuration")
+    literal = _mapping(
+        context.get("literal_configuration"),
+        "scientific_identity.context.literal_configuration",
+    )
     return dict(literal)
 
 
-def resolve_train_config(source: Any) -> DictConfig:
+def resolve_train_config(
+    source: Any, *, overrides: Mapping[str, Any] | Sequence[str] | None = None
+) -> DictConfig:
     """Resolve one materialized cell or training packet into a Hydra config.
 
     Parameters
@@ -470,6 +562,10 @@ def resolve_train_config(source: Any) -> DictConfig:
         structural boundary is intentional so a packet imported through the
         checkout's real ``tpen.hi.train.v1`` namespace is accepted without
         duplicating the stage-coordinate classes here.
+    overrides
+        Optional mapping or Hydra dotlist of operational overlays. They are
+        applied to the composed tree before any interpolation is resolved, so
+        copied runner, shared-leaf, and sink consumers read the same values.
 
     Returns
     -------
@@ -525,6 +621,9 @@ def resolve_train_config(source: Any) -> DictConfig:
     model_seed = _integer_seed(streams, "model_initialization")
 
     cfg = _compose_base_config()
+    override_items = _override_items(overrides) if overrides is not None else ()
+    _reject_resolver_owned_seed_overrides(override_items)
+    _reject_resolver_owned_overrides(override_items)
     committed_walkers = stage_api.COMMITTED_WALKERS
     composed_walkers = OmegaConf.select(cfg, "sampler.n_walkers", default=None)
     # Exact-int plus int.__eq__ keeps this decision structural, not caller-overridable.
@@ -540,6 +639,8 @@ def resolve_train_config(source: Any) -> DictConfig:
     OmegaConf.update(cfg, "run.layout", "flat", merge=False, force_add=True)
     OmegaConf.update(cfg, "run.dir", str(output_path), merge=False)
     OmegaConf.update(cfg, "runtime.seed", model_seed, merge=False)
+    for path, value in override_items:
+        OmegaConf.update(cfg, path, value, merge=False)
     OmegaConf.update(cfg, "optimizer._target_", optimizer_entry.target, merge=False)
     # Every Adam coordinate is explicit in the resolved config; no torch
     # constructor default is allowed to stand in for a declared level.
@@ -592,7 +693,29 @@ def resolve_train_config(source: Any) -> DictConfig:
         )
     _set_named_initializer_seeds(cfg, model_seed)
     _set_optional_execution_seeds(cfg, streams)
-    OmegaConf.resolve(cfg)
+    unresolved = OmegaConf.to_container(cfg, resolve=False)
+    for path, expected in override_items:
+        actual: Any = unresolved
+        for segment in path.split("."):
+            if isinstance(actual, Mapping):
+                actual = actual.get(segment, _OVERRIDE_MISSING)
+            elif isinstance(actual, Sequence) and not isinstance(actual, (str, bytes, bytearray)):
+                if not segment.isdigit() or int(segment) >= len(actual):
+                    actual = _OVERRIDE_MISSING
+                else:
+                    actual = actual[int(segment)]
+            else:
+                actual = _OVERRIDE_MISSING
+            if actual is _OVERRIDE_MISSING:
+                break
+        if actual != expected:
+            raise TrainConfigResolutionError(
+                f"override path {path!r} was not preserved before resolution"
+            )
+    try:
+        OmegaConf.resolve(cfg)
+    except Exception as exc:
+        raise TrainConfigResolutionError("configuration interpolation could not be resolved") from exc
 
     schema = import_module("tpen.hi_schema")
     schema.validate_hi_train_config(cfg)
