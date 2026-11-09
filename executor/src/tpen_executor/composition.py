@@ -16,7 +16,7 @@ from .contracts import ReadyGroup
 from .dispatch import LocalDispatcher, ParslDispatcher, ParslUnavailableError
 from .environments import PreparedPythonEnvironment
 from .lifecycle import AttachedAllocation
-from .placement import BindingError, binding_from_allocation
+from .placement import BindingError, bindings_from_allocation
 from .programs import WorkerProgram
 from .results import RunManifest
 from .storage import DirectoryStore, _write_new
@@ -279,8 +279,10 @@ def admit(
         if dispatcher_name == "local":
             dispatcher = LocalDispatcher(worker)
         else:
-            binding = binding_from_allocation(allocation)
-            dispatcher = ParslDispatcher(worker, binding=binding)
+            # Resolve every slot before reserving the store.  Parsl repeats
+            # this immutable admission at run time, after its DFK exists.
+            bindings_from_allocation(allocation)
+            dispatcher = ParslDispatcher(worker)
     except ParslUnavailableError as error:
         raise CLIRefusal("parsl-unavailable", str(error)) from error
     except (BindingError, TypeError, ValueError) as error:

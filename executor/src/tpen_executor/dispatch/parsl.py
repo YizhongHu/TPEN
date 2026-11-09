@@ -6,10 +6,11 @@ from collections.abc import Mapping
 from dataclasses import field
 from pathlib import Path
 import threading
+import time
 from typing import Any
 
 from ..environments import PreparedPythonEnvironment, SourceScript
-from ..placement import BindingError, WorkerBinding, binding_from_allocation
+from ..placement import BindingError, WorkerBinding, bindings_from_allocation, slots_from_allocation
 from ..programs import WorkerProgram
 from .._records import frozen_record
 from ..results import RunManifest
@@ -17,7 +18,7 @@ from ..contracts import ReadyGroup
 from ..lifecycle.attached import AttachedAllocation
 from ..tasks import ConfiguredRun
 from ..workers import ProcessOutcome, SubprocessWorker
-from .contract import DispatcherContract
+from .contract import DispatcherContract, _member_paths, _with_child_context_keys
 
 
 class ParslUnavailableError(RuntimeError):
@@ -26,6 +27,12 @@ class ParslUnavailableError(RuntimeError):
 
 class UnsupportedParslExecutorError(RuntimeError):
     """Raised when a supplied Parsl config is not ThreadPool-only."""
+
+
+def _poll_sleep(seconds: float) -> None:
+    """Yield between controller future polls."""
+
+    time.sleep(seconds)
 
 
 class _ChildProcessHandle:
@@ -224,28 +231,25 @@ class ParslDispatcher(DispatcherContract):
         dfk: Any = None
         original: BaseException | None = None
         try:
-            binding = self.binding
-            if binding is None:
-                if not isinstance(lifecycle, AttachedAllocation):
-                    raise BindingError("binding is required when lifecycle is not AttachedAllocation")
-                binding = binding_from_allocation(lifecycle.allocation)
-            else:
-                binding = WorkerBinding.from_mapping(binding)
+            bindings = self._resolve_bindings(lifecycle)
             config = self.executor_config
             if config is None:
                 run_dir = str(Path(lifecycle.store.root) / "parsl")
                 config = self._config_type(
-                    executors=[self._thread_pool_type(max_threads=1)],
+                    executors=[self._thread_pool_type(max_threads=len(bindings))],
                     run_dir=run_dir,
                     usage_tracking=False,
                 )
-            labels = self._validate_executor_config(config)
-            object.__setattr__(self, "_active_binding", binding)
+            labels = self._validate_executor_config(config, len(bindings))
+            if len(bindings) == 1:
+                object.__setattr__(self, "_active_binding", bindings[0])
             object.__setattr__(self, "_active_executor_labels", labels)
             dfk = self._dfk_type(config=config)
             object.__setattr__(self, "_active_dfk", dfk)
             try:
-                return super(ParslDispatcher, self).run(group, runs, lifecycle, env, timeout, _admitted=True)
+                if len(bindings) == 1:
+                    return super(ParslDispatcher, self).run(group, runs, lifecycle, env, timeout, _admitted=True)
+                return self._run_slot_pool(group, runs, lifecycle, env, timeout, bindings)
             except BaseException as error:
                 original = error
                 raise
@@ -267,7 +271,236 @@ class ParslDispatcher(DispatcherContract):
                 else:
                     raise cleanup_error
 
-    def _validate_executor_config(self, config: Any) -> tuple[str, ...]:
+    def validate(
+        self,
+        group: ReadyGroup,
+        runs: Mapping[str, ConfiguredRun],
+        lifecycle: AttachedAllocation,
+        env: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """Perform common admission plus strict attached-slot admission."""
+
+        super(ParslDispatcher, self).validate(group, runs, lifecycle, env, timeout)
+        self._resolve_bindings(lifecycle)
+
+    def _resolve_bindings(self, lifecycle: AttachedAllocation) -> tuple[WorkerBinding, ...]:
+        """Resolve immutable per-slot bindings before any lifecycle write."""
+
+        if not isinstance(lifecycle, AttachedAllocation):
+            if self.binding is None:
+                raise BindingError("binding is required when lifecycle is not AttachedAllocation")
+            return (WorkerBinding.from_mapping(self.binding),)
+        slots = slots_from_allocation(lifecycle.allocation)
+        if slots:
+            if self.binding is not None:
+                raise BindingError("explicit binding is ambiguous when allocation slots are declared")
+            return tuple(slot.binding() for slot in slots)
+        if self.binding is not None:
+            return (WorkerBinding.from_mapping(self.binding),)
+        return bindings_from_allocation(lifecycle.allocation)
+
+    def _run_slot_pool(
+        self,
+        group: ReadyGroup,
+        runs: Mapping[str, ConfiguredRun],
+        lifecycle: AttachedAllocation,
+        env: Mapping[str, Any] | None,
+        timeout: float | None,
+        bindings: tuple[WorkerBinding, ...],
+    ) -> RunManifest:
+        """Run members through a bounded controller-owned slot pool."""
+
+        queued = iter(group.members)
+        available = list(bindings)
+        active: dict[Any, dict[str, Any]] = {}
+        begin_error: Exception | None = None
+        finish_error: Exception | None = None
+
+        def launch(member: Any, binding: WorkerBinding) -> None:
+            nonlocal begin_error, finish_error
+            configured = runs[member.task_id]
+            try:
+                fence = lifecycle.begin(group, member.task_id, self._utc_now())
+            except Exception as error:
+                if begin_error is None:
+                    begin_error = error
+                available.append(binding)
+                return
+            try:
+                materialized = self.worker.materialize(env)
+                environment = self._worker_environment(materialized, binding)
+                environment = _with_child_context_keys(environment, lifecycle.allocation)
+                process = materialized["process"]
+                materialized["runner"]
+                evidence = materialized["evidence"]
+                if not callable(getattr(process, "run", None)):
+                    raise TypeError("materialized worker process lacks run()")
+                if not callable(getattr(evidence, "read", None)):
+                    raise TypeError("materialized worker evidence reader lacks read()")
+                output_dir, _core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = _member_paths(fence)
+                args = (*configured.command().args, f"run.root={output_dir}", "run.layout=flat", "run.run_id=core")
+                future, handle = self._submit_process(
+                    materialized,
+                    environment,
+                    args,
+                    cwd=output_dir,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    timeout=timeout,
+                )
+            except Exception:
+                try:
+                    lifecycle.finish(fence, "launch_failed", self._utc_now(), None)
+                except BaseException as error:
+                    if finish_error is None and isinstance(error, Exception):
+                        finish_error = error
+                available.append(binding)
+                return
+            except BaseException:
+                try:
+                    lifecycle.finish(fence, "failed", self._utc_now(), None)
+                except BaseException as error:
+                    if finish_error is None and isinstance(error, Exception):
+                        finish_error = error
+                available.append(binding)
+                raise
+            active[future] = {"member": member, "configured": configured, "fence": fence, "materialized": materialized, "environment": environment, "binding": binding, "handle": handle}
+
+        def fill() -> None:
+            while available:
+                try:
+                    member = next(queued)
+                except StopIteration:
+                    return
+                binding = available.pop(0)
+                launch(member, binding)
+
+        try:
+            fill()
+            while active:
+                completed = next((future for future in active if future.done()), None)
+                if completed is None:
+                    _poll_sleep(0.01)
+                    continue
+                record = active.pop(completed)
+                binding = record["binding"]
+                completion_started = False
+                try:
+                    result = completed.result(None)
+                    if isinstance(result, _ChildFailure):
+                        raise result.error
+                    if not isinstance(result, ProcessOutcome):
+                        raise TypeError("Parsl child returned an invalid ProcessOutcome")
+                    completion_started = True
+                    completion_error = self._complete_member(
+                        group,
+                        record["member"],
+                        record["configured"],
+                        lifecycle,
+                        record["fence"],
+                        record["materialized"],
+                        record["environment"],
+                        result,
+                        timeout,
+                    )
+                    if completion_error is not None and finish_error is None:
+                        finish_error = completion_error
+                except Exception as error:
+                    if completion_started:
+                        if finish_error is None:
+                            finish_error = error
+                    else:
+                        completion_error = self._complete_member(
+                            group,
+                            record["member"],
+                            record["configured"],
+                            lifecycle,
+                            record["fence"],
+                            record["materialized"],
+                            record["environment"],
+                            None,
+                            timeout,
+                            error=error,
+                        )
+                        if completion_error is not None and finish_error is None:
+                            finish_error = completion_error
+                except BaseException as cancellation:
+                    if not completion_started:
+                        completion_error = self._complete_member(
+                            group,
+                            record["member"],
+                            record["configured"],
+                            lifecycle,
+                            record["fence"],
+                            record["materialized"],
+                            record["environment"],
+                            None,
+                            timeout,
+                            error=cancellation,
+                        )
+                        if completion_error is not None:
+                            try:
+                                cancellation.add_note(f"slot {record['member'].task_id} finish unresolved: {completion_error!r}")
+                            except BaseException:
+                                pass
+                    raise
+                available.append(binding)
+                fill()
+        except BaseException as cancellation:
+            self._cancel_slot_pool(active, lifecycle, cancellation)
+            raise
+        if begin_error is not None:
+            if finish_error is not None:
+                begin_error.add_note(f"finish error after deferred begin failure: {finish_error!r}")
+            raise begin_error
+        if finish_error is not None:
+            raise finish_error
+        return lifecycle.store.manifest(group)
+
+    @staticmethod
+    def _utc_now() -> str:
+        """Return a UTC timestamp without coupling slot control to storage."""
+
+        from datetime import datetime, timezone
+
+        return datetime.now(timezone.utc).isoformat()
+
+    def _cancel_slot_pool(self, active: Mapping[Any, Mapping[str, Any]], lifecycle: AttachedAllocation, cancellation: BaseException) -> None:
+        """Kill and reap every started child before failed cancellation finishes."""
+
+        for record in active.values():
+            record["handle"].request_kill()
+        for future, record in active.items():
+            reap_errors: list[BaseException] = []
+            while True:
+                try:
+                    if future.done():
+                        break
+                    _poll_sleep(0.01)
+                except BaseException as error:
+                    reap_errors.append(error)
+            try:
+                try:
+                    future.result(None)
+                except BaseException as error:
+                    reap_errors.append(error)
+            except BaseException as error:
+                reap_errors.append(error)
+            for error in reap_errors:
+                try:
+                    cancellation.add_note(f"slot {record['member'].task_id} reap result: {error!r}")
+                except BaseException:
+                    pass
+            try:
+                lifecycle.finish(record["fence"], "failed", self._utc_now(), None)
+            except BaseException as error:
+                try:
+                    cancellation.add_note(f"slot {record['member'].task_id} finish unresolved: {error!r}")
+                except BaseException:
+                    pass
+
+    def _validate_executor_config(self, config: Any, required_threads: int | None = None) -> tuple[str, ...]:
         """Refuse non-ThreadPool Parsl configs before any lifecycle begin."""
 
         executors = getattr(config, "executors", None)
@@ -280,15 +513,25 @@ class ParslDispatcher(DispatcherContract):
         labels = tuple(executor.label for executor in executors)
         if any(type(label) is not str or not label or label == "_parsl_internal" for label in labels):
             raise UnsupportedParslExecutorError("Parsl ThreadPool executors must have usable labels")
+        if required_threads is not None:
+            capacity = sum(
+                threads
+                for executor in executors
+                if type(threads := getattr(executor, "max_threads", None)) is int and threads > 0
+            )
+            if capacity < required_threads:
+                raise UnsupportedParslExecutorError(
+                    "Parsl ThreadPool executor capacity is smaller than the admitted slot pool"
+                )
         return labels
 
-    def _worker_environment(self, materialized: Any) -> PreparedPythonEnvironment:
+    def _worker_environment(self, materialized: Any, binding: WorkerBinding | None = None) -> PreparedPythonEnvironment:
         """Overlay the explicit worker binding on the prepared environment."""
 
         environment = materialized["environment"]
         if not isinstance(environment, PreparedPythonEnvironment):
             raise TypeError("Parsl worker environment must be PreparedPythonEnvironment")
-        binding = self._active_binding
+        binding = self._active_binding if binding is None else binding
         if binding is None:
             raise BindingError("Parsl worker binding was not resolved before dispatch")
         return PreparedPythonEnvironment(
@@ -296,6 +539,47 @@ class ParslDispatcher(DispatcherContract):
             environment.setup,
             {**environment.env, **binding.env},
         )
+
+    def _submit_process(
+        self,
+        materialized: Any,
+        environment: PreparedPythonEnvironment,
+        args: tuple[str, ...],
+        *,
+        cwd: str,
+        stdout_path: str,
+        stderr_path: str,
+        timeout: float | None,
+    ) -> tuple[Any, _ChildProcessHandle]:
+        """Submit one child app without waiting for its future."""
+
+        dfk = self._active_dfk
+        if dfk is None:
+            raise RuntimeError("Parsl DFK is not active")
+        process_handle = _ChildProcessHandle()
+        app = self._python_app_factory(
+            data_flow_kernel=dfk,
+            cache=False,
+            executors=list(self._active_executor_labels),
+        )(_run_parsl_child_captured)
+        try:
+            future = app(
+                environment.python,
+                None if environment.setup is None else environment.setup.path,
+                dict(environment.env),
+                args,
+                cwd=cwd,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout=timeout,
+                process_handle=process_handle,
+            )
+        except BaseException:
+            # The app may be interrupted before it returns its future.  Mark
+            # the handle first so a racing worker spawn is killed on attach.
+            process_handle.request_kill()
+            raise
+        return future, process_handle
 
     def _execute_process(
         self,
@@ -332,7 +616,13 @@ class ParslDispatcher(DispatcherContract):
             cache=False,
             executors=list(self._active_executor_labels),
         )(_run_parsl_child_captured)
-        future = app(*app_args, **app_kwargs)
+        try:
+            future = app(*app_args, **app_kwargs)
+        except BaseException:
+            # The app may be interrupted before it returns its future.  Mark
+            # the handle first so a racing worker spawn is killed on attach.
+            process_handle.request_kill()
+            raise
         try:
             result = future.result(None)
         except BaseException as original:

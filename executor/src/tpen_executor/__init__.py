@@ -13,7 +13,7 @@ from .storage import AttemptFence, DirectoryStore, FenceRejected
 from .tasks import ConfiguredRun
 from .lifecycle import AttachedAllocation
 from .workers import ProcessOutcome, SubprocessWorker
-from .placement import BindingError, WorkerBinding, binding_from_allocation
+from .placement import AllocationSlot, BindingError, WorkerBinding, binding_from_allocation, bindings_from_allocation, slots_from_allocation
 
 __version__ = "0.1.0"
 
@@ -46,6 +46,6 @@ __all__ = [
     "ProgramSpecRef", "ProfileCheck", "ProfileUnavailable", "ReadyGroup", "RunManifest", "StagedConfig", "StagedHydra", "LocalDispatcher", "ParslDispatcher", "ParslUnavailableError",
     "PreparedInputBundle", "PreparedPythonEnvironment", "SourceScript", "StartReceipt",
     "TaskSpec", "TPENCommand", "TPENEvidence", "SubprocessWorker", "WorkerProgram", "CoreProfileReference",
-    "BindingError", "WorkerBinding", "binding_from_allocation",
+    "AllocationSlot", "BindingError", "WorkerBinding", "binding_from_allocation", "bindings_from_allocation", "slots_from_allocation",
     "decode_manifest", "encode_manifest",
 ]
