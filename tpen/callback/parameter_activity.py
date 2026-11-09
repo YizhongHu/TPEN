@@ -89,16 +89,21 @@ class ParameterActivity(StatefulCallback[TrainerState]):
         ]
         trainer = state.trainer
         completed_updates = None if trainer is None else trainer.completed_updates
+        # Serialize the whole payload before touching the destination: a
+        # non-finite gradient norm makes `allow_nan=False` raise, and doing
+        # this before the exclusive-create open means a rejected payload
+        # never leaves a truncated, unparseable file claiming the path.
+        payload = json.dumps(
+            {
+                "completed_updates": completed_updates,
+                "interpretation": "observed_on_first_applied_update_not_structural_proof",
+                "parameters": rows,
+            },
+            indent=2, allow_nan=False,
+        )
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         with self.output_path.open("x", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "completed_updates": completed_updates,
-                    "interpretation": "observed_on_first_applied_update_not_structural_proof",
-                    "parameters": rows,
-                },
-                handle, indent=2, allow_nan=False,
-            )
+            handle.write(payload)
             handle.write("\n")
         self._written = True
 

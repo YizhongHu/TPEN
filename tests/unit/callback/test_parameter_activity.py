@@ -26,22 +26,22 @@ from tpen.training.state import TrainerState
 from tpen.events import Occurrence
 
 
-def _make_context(tmp_path: Path) -> RunContext:
+def _make_context(tmp_path: Path, *, run_id: str = "parameter-activity-unit") -> RunContext:
     """Build a minimal real `RunContext`: `handle_occurrence_impl` is type-checked
     against the concrete `RunContext` class, so a duck-typed stand-in fails that
     check before any assertion runs. This callback never reads from `context`."""
 
     artifact_manager = ArtifactManager(
-        tmp_path / "run-artifacts",
+        tmp_path / "run-artifacts" / run_id,
         experiment="parameter-activity",
         sector="unit",
-        run_id="parameter-activity-unit",
+        run_id=run_id,
         layout="flat",
     )
     artifact_manager.make_dirs()
     metadata = RunMetadata(
-        run_id="parameter-activity-unit",
-        run_name="parameter-activity-unit",
+        run_id=run_id,
+        run_name=run_id,
         timestamp="2026-11-08T12:00:00+00:00",
         timezone="UTC",
         git_commit="test-sha",
@@ -196,6 +196,199 @@ def test_writes_exactly_once_on_first_applied_update(tmp_path: Path) -> None:
     callback.handle_occurrence(_update_completed(count=2), context, state)
 
     assert output_path.stat().st_mtime_ns == mtime_before
+
+
+class _NonfiniteGradModel(torch.nn.Module):
+    """Parameters carrying genuine NaN/Inf/signed-zero/absent gradients.
+
+    No gradient here comes from a hand-constructed tensor stand-in: every
+    populated ``.grad`` is autograd's own output for a loss built with real
+    nonfinite intermediates, the same way `LegacyAutogradUpdate` would hand
+    an optimizer a nonfinite gradient it still applies.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.nan_param = torch.nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.float64))
+        self.inf_param = torch.nn.Parameter(torch.tensor([3.0], dtype=torch.float64))
+        self.signed_zero_param = torch.nn.Parameter(
+            torch.tensor([0.0, -5.0], dtype=torch.float64)
+        )
+        self.unused_param = torch.nn.Parameter(torch.tensor([7.0], dtype=torch.float64))
+
+    def loss(self) -> torch.Tensor:
+        # Multiplying by a scalar NaN/Inf makes autograd's own backward pass
+        # produce a nonfinite gradient (the constant multiplier itself),
+        # rather than a hand-constructed nonfinite tensor assigned to `.grad`.
+        nan_term = (self.nan_param * float("nan")).sum()
+        inf_term = (self.inf_param * float("inf")).sum()
+        # `signed_zero_param` multiplied by an exact negative zero keeps its
+        # gradient exactly zero (signed) rather than NaN, isolating the
+        # signed-zero preservation question from the nonfinite one.
+        zero_term = (self.signed_zero_param * torch.tensor([-0.0, 0.0], dtype=torch.float64)).sum()
+        return nan_term + inf_term + zero_term
+
+
+class _FiniteTwoGroupModel(torch.nn.Module):
+    """Two parameters split across two distinct optimizer param groups."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.group_a = torch.nn.Parameter(torch.tensor([1.0, -2.0], dtype=torch.float64))
+        self.group_b = torch.nn.Parameter(torch.tensor([3.0], dtype=torch.float64))
+
+    def loss(self) -> torch.Tensor:
+        return (self.group_a ** 2).sum() + (self.group_b ** 2).sum()
+
+
+def test_nonfinite_gradient_does_not_leave_an_unparseable_inventory(tmp_path: Path) -> None:
+    """Regression: a NaN/Inf gradient must not strand a malformed artifact.
+
+    `json.dumps(..., allow_nan=False)` raises on the offending float. This
+    probe does not assert that the callback catches or re-raises any
+    particular way -- only that whatever is left behind at `output_path`,
+    if anything, is either absent or a complete, parseable JSON document.
+    """
+
+    model = _NonfiniteGradModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    model.loss().backward()
+    assert model.nan_param.grad is not None and bool(torch.isnan(model.nan_param.grad).any())
+    assert model.inf_param.grad is not None and bool(torch.isinf(model.inf_param.grad).any())
+
+    state = TrainerState(model=model, optimizer=optimizer, trainer=_Trainer(completed_updates=1))
+    output_path = tmp_path / "parameter_activity.json"
+    callback = ParameterActivity(output_path)
+
+    with pytest.raises(ValueError):
+        callback.handle_occurrence(_update_completed(), _make_context(tmp_path), state)
+
+    if output_path.exists():
+        # Must be a complete, parseable document -- never a truncated prefix.
+        json.loads(output_path.read_text(encoding="utf-8"))
+
+
+def test_retry_after_nonfinite_failure_does_not_wrongly_refuse_a_fresh_attempt(
+    tmp_path: Path,
+) -> None:
+    """A resumed/retried run must be able to attempt the write again.
+
+    `FileExistsError` is documented as reserved for a genuine prior
+    inventory at the same path. A failed first attempt that nonetheless
+    claimed the path with a partial artifact would make this retry raise
+    `FileExistsError` instead of re-attempting (and again failing on) the
+    nonfinite encode -- conflating "a real inventory is already here" with
+    "a doomed write touched this path once".
+    """
+
+    model = _NonfiniteGradModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    model.loss().backward()
+
+    state = TrainerState(model=model, optimizer=optimizer, trainer=_Trainer(completed_updates=1))
+    output_path = tmp_path / "parameter_activity.json"
+    callback = ParameterActivity(output_path)
+
+    with pytest.raises(ValueError):
+        callback.handle_occurrence(_update_completed(), _make_context(tmp_path), state)
+
+    # Retry via a fresh context identity, the same way `_written` would be
+    # cleared across a resumed run's new `RunContext`.
+    second_exc: Exception | None = None
+    try:
+        callback.handle_occurrence(_update_completed(), _make_context(tmp_path), state)
+    except ValueError:
+        pass
+    except FileExistsError as exc:
+        second_exc = exc
+
+    assert second_exc is None, (
+        "retry after a failed nonfinite write must not be refused as though a "
+        "legitimate prior inventory already existed at this path"
+    )
+
+
+def test_two_optimizer_param_groups_both_track_their_parameters(tmp_path: Path) -> None:
+    model = _FiniteTwoGroupModel()
+    optimizer = torch.optim.SGD(
+        [
+            {"params": [model.group_a], "lr": 0.1},
+            {"params": [model.group_b], "lr": 0.2},
+        ]
+    )
+    model.loss().backward()
+    grad_a_before = model.group_a.grad.detach().clone()
+    grad_b_before = model.group_b.grad.detach().clone()
+
+    state = TrainerState(model=model, optimizer=optimizer, trainer=_Trainer(completed_updates=1))
+    output_path = tmp_path / "parameter_activity.json"
+    callback = ParameterActivity(output_path)
+    callback.handle_occurrence(_update_completed(), _make_context(tmp_path), state)
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    rows = _rows_by_name(payload)
+    assert rows["group_a"]["gradient"] == "nonzero"
+    assert rows["group_b"]["gradient"] == "nonzero"
+    # Bitwise-unchanged: the two-group membership check never mutates a
+    # gradient from either group.
+    assert torch.equal(model.group_a.grad, grad_a_before)
+    assert torch.equal(model.group_b.grad, grad_b_before)
+
+
+def test_absent_and_signed_zero_gradients_are_preserved_bitwise(tmp_path: Path) -> None:
+    model = _NonfiniteGradModel()
+    optimizer = torch.optim.SGD(
+        [model.nan_param, model.inf_param, model.signed_zero_param], lr=0.1
+    )
+    model.loss().backward()
+    assert model.unused_param.grad is None
+    zero_grad_before = model.signed_zero_param.grad.detach().clone()
+    assert torch.equal(
+        torch.signbit(zero_grad_before), torch.tensor([True, False])
+    ), "fixture must produce a genuinely signed-zero gradient to be meaningful"
+
+    state = TrainerState(model=model, optimizer=optimizer, trainer=_Trainer(completed_updates=1))
+    output_path = tmp_path / "parameter_activity.json"
+    callback = ParameterActivity(output_path)
+
+    with pytest.raises(ValueError):
+        callback.handle_occurrence(_update_completed(), _make_context(tmp_path), state)
+
+    # The nonfinite encode must not have mutated any gradient along the way,
+    # including the ones that were never implicated in the failure.
+    assert model.unused_param.grad is None
+    assert torch.equal(model.signed_zero_param.grad, zero_grad_before)
+    assert torch.equal(
+        torch.signbit(model.signed_zero_param.grad), torch.tensor([True, False])
+    )
+
+
+def test_reused_callback_refuses_a_second_context_once_a_write_already_landed(
+    tmp_path: Path,
+) -> None:
+    """A callback reused across two `RunContext` identities resets `_written`.
+
+    The second context's attempt reopens the same `output_path` exclusive-
+    create, which must raise `FileExistsError` against the first context's
+    completed (finite, parseable) inventory -- the documented resumed-run
+    refusal, exercised here against a *successful* first write rather than
+    a crashed one.
+    """
+
+    model = _FiniteTwoGroupModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    model.loss().backward()
+    state = TrainerState(model=model, optimizer=optimizer, trainer=_Trainer(completed_updates=1))
+    output_path = tmp_path / "parameter_activity.json"
+    callback = ParameterActivity(output_path)
+
+    first_context = _make_context(tmp_path, run_id="first-context")
+    callback.handle_occurrence(_update_completed(), first_context, state)
+    assert output_path.exists()
+
+    second_context = _make_context(tmp_path, run_id="second-context")
+    with pytest.raises(FileExistsError):
+        callback.handle_occurrence(_update_completed(), second_context, state)
 
 
 def test_refuses_to_silently_overwrite_an_existing_inventory(tmp_path: Path) -> None:
