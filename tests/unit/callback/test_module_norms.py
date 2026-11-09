@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import csv
+import json
+
 import pytest
 import torch
 from torch import nn
 
 from tpen.callback import GradientStats, ModuleNorms
+from tpen.logging import CSV, JSONL, LogRecord
 from tpen.parameter_groups import resolve_parameter_groups
 from tests.unit.callback.support import RecordingContext, deliver_completed_iteration, training_state
 
@@ -18,6 +22,18 @@ class GroupedModel(nn.Module):
         self.readout = nn.Linear(2, 1, bias=False)
         self.extra = nn.Parameter(torch.ones(1, dtype=torch.float64))
         self.readout.trace_name = "final_readout"
+
+
+class LoggerContext:
+    """Forward callback records through the production logger interfaces."""
+
+    def __init__(self, *loggers) -> None:
+        self.loggers = loggers
+
+    def log(self, metrics, *, step=None, namespace="run") -> None:
+        record = LogRecord(step=step, namespace=namespace, metrics=dict(metrics))
+        for logger in self.loggers:
+            logger.log(record)
 
 
 def test_resolver_uses_module_paths_and_explicit_trace_names() -> None:
@@ -105,3 +121,38 @@ def test_group_gradient_norms_reconcile_with_gradient_stats() -> None:
     )
     global_norm = gradient_context.latest("checks/gradient")["global_grad_norm"]
     assert squared_groups == pytest.approx(global_norm**2)
+
+
+def test_logger_consumers_read_cadenced_module_norm_records(tmp_path) -> None:
+    model = GroupedModel().double()
+    model.embedding.weight.grad = torch.ones_like(model.embedding.weight)
+    model.readout.weight.grad = torch.ones_like(model.readout.weight)
+    model.extra.grad = torch.ones_like(model.extra)
+    csv_path = tmp_path / "metrics.csv"
+    jsonl_path = tmp_path / "metrics.jsonl"
+    context = LoggerContext(CSV(csv_path), JSONL(jsonl_path))
+    callback = ModuleNorms(
+        {"embed": ["embedding"], "readout": ["final_readout"]},
+        every_n_steps=2,
+    )
+    state = training_state(model=model)
+    for step in (1, 2, 3, 4):
+        deliver_completed_iteration(callback, context, state, step=step)
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        csv_rows = list(csv.DictReader(handle))
+    json_rows = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+    assert {row["step"] for row in csv_rows} == {"2", "4"}
+    assert {row["step"] for row in json_rows} == {2, 4}
+    assert {row["namespace"] for row in csv_rows} == {
+        "train/module_norms/embed",
+        "train/module_norms/readout",
+        "train/module_norms/ungrouped",
+    }
+    assert {row["namespace"] for row in json_rows} == {
+        "train/module_norms/embed",
+        "train/module_norms/readout",
+        "train/module_norms/ungrouped",
+    }
+    assert {"step", "namespace", "key", "value"} == set(csv_rows[0])
+    assert "gradient_l2" in json_rows[0]["metrics"]
