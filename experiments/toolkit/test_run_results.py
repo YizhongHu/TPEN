@@ -22,6 +22,44 @@ FIXTURE = Path(__file__).parent / "fixtures" / "run-manifest-v2.json"
 FIXTURE_V1 = Path(__file__).parent / "fixtures" / "run-manifest-v1.json"
 
 
+def _placement_receipt() -> dict[str, object]:
+    """Return a valid S2b-1 CPU placement receipt for the checked-in fixture."""
+
+    return {
+        "schema": "tpen-executor/science-placement-receipt-v1",
+        "task_id": "task-a",
+        "attempt_id": "attempt-1",
+        "group_digest": "76a21ab64e2533a35421b67a8c16c832967fcc6cadf730c9fdfd505840389ebf",
+        "allocation_id": "allocation-1",
+        "backend_job_id": "job-1",
+        "slot_id": "slot-a",
+        "payload_digest": "18b9e78cf2fe0d58544c12e59fda8cf04b18230222d1f7fa98fd79f11f698102",
+        "output_dir": "/runs/group-1/task-a/attempt-1",
+        "child": {
+            "host": "node-a",
+            "pid": 1234,
+            "proc_start_ticks": 55,
+            "affinity": [0],
+            "thread_settings": {"OMP_NUM_THREADS": "1"},
+            "cuda_visible_devices": None,
+            "observed_at_utc": "2026-11-04T00:00:01Z",
+        },
+        "declared": {"host": "node-a", "cpus": [0], "devices": []},
+        "gpu": {
+            "status": "unavailable",
+            "reason": "CPU-only test",
+            "method": "s2b-1-child-generation-no-sampler",
+            "started_at_utc": "2026-11-04T00:00:01Z",
+            "finished_at_utc": "2026-11-04T00:01:00Z",
+            "samples": [],
+            "active_uuids": [],
+            "active_pci": [],
+        },
+        "comparison": {"host": "matched", "affinity": "matched", "device": "unavailable"},
+        "refusal": None,
+    }
+
+
 def _materialized_manifest(tmp_path: Path, *, extra_attempt: bool = False) -> tuple[Path, str]:
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     output_dir = tmp_path / "attempt-1"
@@ -73,6 +111,50 @@ def test_p8_reader_refuses_core_evidence_mismatch(tmp_path: Path) -> None:
     path, _ = _materialized_manifest(tmp_path)
     with pytest.raises(ManifestRefusal, match="disagrees"):
         read(path, lambda _: {"verdict": "completed", "checkpoint": {"checkpoint_dir": "wrong", "schema_version": 1, "next_iteration": 1, "completed_updates": 1}})
+
+
+def test_p8_reader_accepts_optional_placement_receipt_and_surfaces_it(tmp_path: Path) -> None:
+    path, _ = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["attempts"][0]["placement_receipt"] = _placement_receipt()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = read(
+        path,
+        lambda _: {
+            "verdict": "completed",
+            "checkpoint": {
+                "checkpoint_dir": str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001"),
+                "schema_version": 1,
+                "next_iteration": 1,
+                "completed_updates": 1,
+            },
+        },
+    )
+    placement = result.chains[0].segments[0].placement_receipt
+    assert placement is not None
+    assert placement["schema"] == "tpen-executor/science-placement-receipt-v1"
+    assert placement["attempt_id"] == "attempt-1"
+    assert placement["child"]["proc_start_ticks"] == 55
+    assert placement["comparison"] == {"host": "matched", "affinity": "matched", "device": "unavailable"}
+
+
+@pytest.mark.parametrize("mutation", ["extra-key", "bad-child-pid", "bad-gpu-sequence"])
+def test_p8_reader_refuses_malformed_placement_receipt(tmp_path: Path, mutation: str) -> None:
+    path, _ = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    placement = _placement_receipt()
+    if mutation == "extra-key":
+        placement["unexpected"] = True
+    elif mutation == "bad-child-pid":
+        placement["child"]["pid"] = "1234"
+    else:
+        placement["gpu"]["samples"] = "not-a-sequence"
+    payload["attempts"][0]["placement_receipt"] = placement
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ManifestRefusal, match="placement"):
+        read(path, lambda _: pytest.fail("malformed placement must be rejected before inspection"))
 
 
 @pytest.mark.parametrize(
