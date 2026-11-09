@@ -486,6 +486,8 @@ class AcceptedSegment:
         actual_fields = set(data) if isinstance(data, Mapping) else None
         if actual_fields not in (_SEGMENT_FIELDS, _SEGMENT_FIELDS | {"resolved_config_identity"}):
             raise TypeError("AcceptedSegment has an invalid key set")
+        if "resolved_config_identity" in data and data["resolved_config_identity"] is None:
+            raise TypeError("resolved_config_identity must not be null on an accepted segment")
         if data.get("schema") != cls.schema:
             raise ValueError(f"AcceptedSegment schema must be {cls.schema!r}")
         if any(type(data[key]) is not str for key in ("task_id", "attempt_id", "checkpoint_dir")):

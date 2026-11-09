@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import pytest
+from omegaconf import OmegaConf
 from experiments.toolkit.run_results import ManifestRefusal, read, RUN_MANIFEST_V1, RUN_MANIFEST_V2
 from experiments.toolkit.config_identity import expected_resolved_config_identity
 from tpen.checkpoint.manifest import CheckpointManifest
@@ -85,47 +86,68 @@ def test_t6_default_reader_uses_real_core_and_refuses_changed_bytes(tmp_path):
         read(path)
 
 
-def test_t7_real_core_evidence_can_cross_store_to_default_toolkit(tmp_path):
-    code = '''import json, sys
+def test_t7_real_core_executor_and_study_identity_agree(tmp_path):
+    config = tmp_path / "native_recovery.yaml"
+    source = ROOT / "tests/integration/artifacts/execution/native_recovery.yaml"
+    config.write_text(
+        source.read_text()
+        + "\n# EVAL-style run-derived operational path retained in the intended composition.\n"
+        + "evaluator:\n"
+        + "  _target_: tpen.evaluation.Evaluator\n"
+        + "  tasks:\n"
+        + "    - name: trajectory\n"
+        + "      output_dir: ${run.dir}/trajectory\n",
+        encoding="utf-8",
+    )
+    overrides = ("trainer.max_steps=1", "sampler.n_walkers=2", "sampler.burn_in=0", "system.omega=0.75")
+    manifest = tmp_path / "manifest.json"
+    code = '''import os, sys
 from pathlib import Path
+from types import SimpleNamespace
 from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
-from tpen_executor.runners import CoreRunEvidence
+from tpen_executor.dispatch import LocalDispatcher
+from tpen_executor.environments import PreparedPythonEnvironment
+from tpen_executor.lifecycle import AttachedAllocation
+from tpen_executor.runners import TPENCommand, TPENEvidence
 from tpen_executor.storage import DirectoryStore
-store = DirectoryStore(Path(sys.argv[1]) / 'store')
+from tpen_executor.tasks import ConfiguredRun
+from tpen_executor.workers import SubprocessWorker
+root = Path(sys.argv[3]).resolve()
+config = Path(sys.argv[1]).resolve()
+env = PreparedPythonEnvironment(sys.executable, env={"PYTHONPATH": os.pathsep.join((str(root), str(root / "executor" / "src")))})
+worker = SimpleNamespace(materialize=lambda _: {"environment": env, "process": SubprocessWorker(), "runner": TPENCommand(str(config)), "evidence": TPENEvidence()})
 program = ProgramSpecRef({}, digest({}))
-group = ReadyGroup('g', (TaskSpec('a', 'a', program, digest('a'), 1, 'steps'),), digest('group'))
-if sys.argv[2] == 'begin':
-    f = store.begin_attempt(group, 'a', ConfiguredAllocation(AllocationId('alloc'), BackendJobId('job'), {}), '2026-11-05T00:00:00Z')
-    Path(sys.argv[1], 'fence.json').write_text(json.dumps(dict(root=f.root, group_digest=f.group_digest, task_id=f.task_id, allocation_id=f.allocation_id, attempt_id=f.attempt_id.value, output_dir=f.output_dir)))
-    print(f.output_dir)
-else:
-    from tpen_executor.storage import AttemptFence
-    from tpen_executor.contracts import AttemptId
-    d = json.loads(Path(sys.argv[1], 'fence.json').read_text()); d['attempt_id'] = AttemptId(d['attempt_id'])
-    f = AttemptFence(**d)
-    store.finish_attempt(f, 'completed', '2026-11-05T00:01:00Z')
-    evidence = CoreRunEvidence.from_mapping(json.loads(Path(sys.argv[1], 'evidence.json').read_text()))
-    store.accept_segment(f, evidence)
-    Path(sys.argv[1], 'manifest.json').write_bytes(store.manifest(group).encode())
+group = ReadyGroup("g", (TaskSpec("run", "run", program, digest("run"), 1, "steps"),), digest("group"))
+allocation = ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {})
+store = DirectoryStore(Path(sys.argv[2]).with_suffix(".store"))
+configured = ConfiguredRun("run", str(config), tuple(sys.argv[4:]))
+result = LocalDispatcher(worker).run(group, {"run": configured}, AttachedAllocation(allocation, store), timeout=120)
+Path(sys.argv[2]).write_bytes(result.encode())
 '''
-    start = executor(code, tmp_path, "begin")
-    assert start.returncode == 0, start.stderr
-    core = Path(start.stdout.strip()) / "core"
-    core_checkpoint(core)
-    intended_config = {"science": {"charge": 1}}
-    identity = expected_resolved_config_identity(intended_config)
-    (core / "run_start.json").write_text(json.dumps({"resolved_config_identity": identity}))
-    evidence = inspect_run(core)
-    assert evidence.verdict == "completed", evidence.to_dict()
-    assert evidence.resolved_config_identity == identity
-    (tmp_path / "evidence.json").write_text(json.dumps(evidence.to_dict()))
-    accept = executor(code, tmp_path, "accept")
-    assert accept.returncode == 0, accept.stderr
-    result = read(tmp_path / "manifest.json")
-    assert len(result.chains[0].segments) == 1
-    assert result.chains[0].segments[0].resolved_config_identity == identity
+    run = executor(code, config, manifest, ROOT, *overrides)
+    assert run.returncode == 0, (run.stdout, run.stderr)
+    result = read(manifest)
+    assert len(result.chains) == 1 and len(result.chains[0].segments) == 1
+    actual_identity = result.chains[0].segments[0].resolved_config_identity
+    intended = OmegaConf.to_container(
+        OmegaConf.merge(OmegaConf.load(config), OmegaConf.from_dotlist(list(overrides))),
+        resolve=False,
+    )
+    expected = expected_resolved_config_identity(intended)
+    assert actual_identity == expected
+    mismatched = copy.deepcopy(intended)
+    mismatched["system"]["omega"] = 0.5
+    assert expected_resolved_config_identity(mismatched) != actual_identity
+
+
+def test_t7_reader_refuses_explicit_null_segment_identity(tmp_path):
+    payload, _ = materialize(tmp_path)
+    payload["segments"][0]["resolved_config_identity"] = None
+    path = write(tmp_path, payload)
+    with pytest.raises(ManifestRefusal, match="must not be null"):
+        read(path, lambda _: pytest.fail("must refuse before inspection"))
 
 
 def test_t10_reader_refuses_a_segment_identity_mismatch(tmp_path):

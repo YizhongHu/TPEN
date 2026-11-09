@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -24,15 +25,36 @@ RESOLVED_CONFIG_IDENTITY_EXCLUSIONS = (
     ("run", "dir"),
     ("run", "layout"),
     ("run", "timezone"),
-    ("run", "timestamp"),
-    ("run", "start_time_unix"),
-    ("callbacks", "*", "output_path"),
-    ("callbacks", "*", "output_dir"),
-    ("loggers", "*", "path"),
-    ("loggers", "*", "output_path"),
-    ("loggers", "*", "output_dir"),
-    ("evaluator", "tasks", "*", "output_dir"),
 )
+
+# These fields are populated or consumed by the core run boundary in
+# ``tpen/run.py:147-192``.  They are deliberately exact: ``run.timestamp`` and
+# ``run.start_time_unix`` are artifact JSON fields, not config producers.
+_IDENTITY_RUN_DEFAULTS = {
+    "root": "outputs",
+    "layout": "nested",
+    "timezone": "UTC",
+}
+_IDENTITY_RUN_FIELDS = ("root", "run_id", "dir", "layout", "timezone")
+_RUN_INTERPOLATION = re.compile(r"\$\{run(?:\.[^{}]+)?\}")
+_RUN_SENTINEL = "__tpen_run_field__"
+
+# Operational slots are schema-bound to the built-in producers.  A user
+# callback/logger with an arbitrary ``output_path`` or ``path`` is not silently
+# removed from a science identity.
+_CALLBACK_OUTPUT_FIELDS = {
+    "tpen.callback.ConfigSnapshot": {"output_path"},
+    "tpen.callback.ResolvedConfigSnapshot": {"output_path"},
+    "tpen.callback.Metadata": {"output_path"},
+    "tpen.callback.Status": {"output_path"},
+    "tpen.callback.Checkpoint": {"output_dir"},
+    "tpen.callback.InitialCheckpoint": {"output_dir"},
+}
+_LOGGER_PATH_FIELDS = {
+    "tpen.logging.CSV": {"path"},
+    "tpen.logging.JSONL": {"path"},
+}
+_EVALUATOR_TARGET = "tpen.evaluation.Evaluator"
 
 
 _FILE_HASH_CHUNK_BYTES = 1 << 20
@@ -107,12 +129,12 @@ def canonical_resolved_config_bytes(config: Any) -> bytes:
     public contract has a closed, documented run-artifact exclusion list.
     """
 
-    plain = to_plain_container(config)
-    if not isinstance(plain, Mapping):
+    normalized = _identity_resolved_container(config)
+    if not isinstance(normalized, Mapping):
         raise TypeError("resolved configuration identity requires a mapping")
-    normalized = copy.deepcopy(plain)
     for path in RESOLVED_CONFIG_IDENTITY_EXCLUSIONS:
         _delete_pattern(normalized, path)
+    _delete_known_operational_slots(normalized)
     safe = _json_safe(normalized)
     return json.dumps(safe, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
@@ -156,6 +178,113 @@ def to_plain_container(config: Any) -> Any:
     return config
 
 
+def populate_resolved_config_defaults(config: Any, *, timezone: str | None = None) -> dict[str, Any]:
+    """Apply the core run-boundary defaults to an unresolved config copy.
+
+    This is the one shared preparation step used by the core launch path and
+    the study-side identity helper.  It intentionally does not manufacture a
+    run id or run directory; those are populated by the launch and replaced by
+    the identity sentinel before interpolation resolution.
+    """
+
+    plain = to_unresolved_container(config)
+    if not isinstance(plain, Mapping):
+        raise TypeError("resolved configuration identity requires a mapping")
+    prepared = copy.deepcopy(dict(plain))
+    experiment = prepared.setdefault("experiment", {})
+    run = prepared.setdefault("run", {})
+    if not isinstance(experiment, dict) or not isinstance(run, dict):
+        raise TypeError("experiment and run config sections must be mappings")
+    name = experiment.get("name")
+    run_name = experiment.get("run_name")
+    if run_name is None or not str(run_name).strip():
+        experiment["run_name"] = str(name).strip() if name is not None and str(name).strip() else "tpen_run"
+    for key, default in _IDENTITY_RUN_DEFAULTS.items():
+        if key == "timezone" and run.get(key) is None:
+            run[key] = timezone if timezone is not None else default
+        else:
+            run.setdefault(key, default)
+    return prepared
+
+
+def to_unresolved_container(config: Any) -> Any:
+    """Return plain containers without resolving OmegaConf interpolations."""
+
+    if OmegaConf.is_config(config):
+        return OmegaConf.to_container(config, resolve=False)
+    return config
+
+
+def _identity_resolved_container(config: Any) -> Any:
+    prepared = populate_resolved_config_defaults(config)
+    prepared.setdefault("run", {})
+    run = prepared["run"]
+    if not isinstance(run, dict):
+        raise TypeError("run config section must be a mapping")
+    # The launch populates these at ``tpen/run.py:180-192``.  Add the same
+    # slots on the study side, then replace every value before OmegaConf can
+    # resolve an interpolation that copied it into another subtree.
+    run.setdefault("run_id", None)
+    run.setdefault("dir", None)
+    _reject_science_run_interpolations(prepared)
+    for field in _IDENTITY_RUN_FIELDS:
+        run[field] = _RUN_SENTINEL
+    resolved = OmegaConf.to_container(OmegaConf.create(prepared), resolve=True)
+    return copy.deepcopy(resolved)
+
+
+def _reject_science_run_interpolations(container: Any, path: tuple[object, ...] = (), ancestors: tuple[str, ...] = ()) -> None:
+    if isinstance(container, Mapping):
+        target = container.get("_target_")
+        next_ancestors = ancestors + ((target,) if isinstance(target, str) else ())
+        for key, value in container.items():
+            child_path = path + (key,)
+            if isinstance(value, str) and _RUN_INTERPOLATION.search(value) and not _is_operational_slot(child_path, container, key, next_ancestors):
+                dotted = ".".join(str(part) for part in child_path)
+                raise ValueError(f"run-populated interpolation at {dotted} would feed science; bind it to an operational slot")
+            _reject_science_run_interpolations(value, child_path, next_ancestors)
+    elif isinstance(container, (list, tuple)):
+        for index, value in enumerate(container):
+            _reject_science_run_interpolations(value, path + (index,), ancestors)
+
+
+def _is_operational_slot(path: tuple[object, ...], owner: Mapping[str, Any], key: object, ancestors: tuple[str, ...]) -> bool:
+    if path and path[0] == "run":
+        return True
+    target = owner.get("_target_")
+    if isinstance(target, str) and key in _CALLBACK_OUTPUT_FIELDS.get(target, set()):
+        return True
+    if isinstance(target, str) and key in _LOGGER_PATH_FIELDS.get(target, set()):
+        return True
+    return (
+        key == "output_dir"
+        and len(path) == 4
+        and path[:2] == ("evaluator", "tasks")
+        and isinstance(path[2], int)
+        and _EVALUATOR_TARGET in ancestors
+    )
+
+
+def _delete_known_operational_slots(container: Any) -> None:
+    if isinstance(container, Mapping):
+        target = container.get("_target_")
+        if isinstance(container, dict):
+            if isinstance(target, str):
+                for key in _CALLBACK_OUTPUT_FIELDS.get(target, set()) | _LOGGER_PATH_FIELDS.get(target, set()):
+                    container.pop(key, None)
+                if target == _EVALUATOR_TARGET:
+                    tasks = container.get("tasks")
+                    if isinstance(tasks, (list, tuple)):
+                        for task in tasks:
+                            if isinstance(task, dict):
+                                task.pop("output_dir", None)
+            for value in tuple(container.values()):
+                _delete_known_operational_slots(value)
+    elif isinstance(container, (list, tuple)):
+        for item in container:
+            _delete_known_operational_slots(item)
+
+
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, bool, int)):
         return value
@@ -187,16 +316,16 @@ def _delete_path(container: dict[str, Any], path: tuple[str, ...]) -> None:
         current.pop(path[-1], None)
 
 
-def _delete_pattern(container: dict[Any, Any] | list[Any], path: tuple[str, ...]) -> None:
+def _delete_pattern(container: dict[Any, Any] | list[Any] | tuple[Any, ...], path: tuple[str, ...]) -> None:
     """Delete one explicitly declared path, allowing list-index wildcards."""
 
     if not path:
         return
     key = path[0]
     if key == "*":
-        if isinstance(container, list):
+        if isinstance(container, (list, tuple)):
             for item in container:
-                if isinstance(item, (dict, list)):
+                if isinstance(item, (dict, list, tuple)):
                     _delete_pattern(item, path[1:])
         return
     if not isinstance(container, dict) or key not in container:
@@ -205,5 +334,5 @@ def _delete_pattern(container: dict[Any, Any] | list[Any], path: tuple[str, ...]
         container.pop(key, None)
         return
     child = container[key]
-    if isinstance(child, (dict, list)):
+    if isinstance(child, (dict, list, tuple)):
         _delete_pattern(child, path[1:])

@@ -113,6 +113,8 @@ class RunEvidence:
             missing = sorted(expected - set(data))
             extra = sorted(set(data) - expected)
             raise ValueError(f"run evidence keys differ: missing={missing}, extra={extra}")
+        if schema == RUN_EVIDENCE_SCHEMA_V2 and data.get("resolved_config_identity") is None:
+            raise ValueError("v2 run evidence requires a non-null resolved_config_identity")
         checkpoint = data["checkpoint"]
         if checkpoint is not None:
             if not isinstance(checkpoint, Mapping) or set(checkpoint) != _CHECKPOINT_KEYS:

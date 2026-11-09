@@ -53,10 +53,10 @@ class RecordingLifecycle(AttachedAllocation):
         return super().finish(fence, status, finished_at_utc, result_digest)
 
 
-def payload(run_dir, verdict="completed"):
+def payload(run_dir, verdict="completed", *, identity=True):
     Path(run_dir).mkdir(parents=True, exist_ok=True)
-    return {
-        "schema": "tpen.run-evidence/v1", "run_dir": str(run_dir),
+    value = {
+        "schema": "tpen.run-evidence/v2" if identity else "tpen.run-evidence/v1", "run_dir": str(run_dir),
         "verdict": verdict, "run_status": "failed" if verdict == "refused" else verdict,
         "checkpoint": None if verdict == "refused" else {
             "checkpoint_dir": str(Path(run_dir) / "checkpoint"), "schema_version": 2,
@@ -64,11 +64,14 @@ def payload(run_dir, verdict="completed"):
         },
         "refusal": {"code": "missing-checkpoint", "reason": "review"} if verdict == "refused" else None,
     }
+    if identity:
+        value["resolved_config_identity"] = {"schema": "tpen-config-identity-v1", "sha256": "a" * 64}
+    return value
 
 
 def test_r1_t8_legacy_evidence_digest_omits_absent_identity() -> None:
     """Legacy v1 evidence keeps its pre-identity canonical bytes and digest."""
-    legacy = payload(Path("/runs/legacy/core"))
+    legacy = payload(Path("/runs/legacy/core"), identity=False)
     evidence = CoreRunEvidence.from_mapping(legacy)
     assert _evidence_payload(evidence) == legacy
     assert digest(_evidence_payload(evidence)) == "366743525e63dace38629a282b6836bd49538e8fa3e669daa5af631b0c2c8c19"
@@ -178,7 +181,7 @@ def normal_worker(verdict="completed", code=0, timed_out=False, unavailable=Fals
         def read(self, *args, **kw):
             if unavailable:
                 raise EvidenceUnavailable("review unavailable")
-            return CoreRunEvidence.from_mapping(payload(args[2], verdict))
+            return CoreRunEvidence.from_mapping(payload(args[2], verdict, identity=verdict != "refused"))
 
     return SimpleNamespace(materialize=lambda env: {"environment": object(), "process": Process(), "runner": object(), "evidence": Evidence()})
 
@@ -197,7 +200,7 @@ def test_r1_t4_operational_status_is_independent_and_digest_is_exact(tmp_path, c
     manifest = LocalDispatcher(normal_worker(verdict, code, timed_out, unavailable)).run(group("a"), runs(tmp_path, "a"), lifecycle)
     record = manifest.attempts[0]
     assert record.outcome_receipt.status == status
-    expected = None if unavailable else digest(payload(Path(record.start_receipt.output_dir) / "core", verdict))
+    expected = None if unavailable else digest(payload(Path(record.start_receipt.output_dir) / "core", verdict, identity=verdict != "refused"))
     assert record.outcome_receipt.result_digest == expected
     assert len(lifecycle.finished) == 1
 

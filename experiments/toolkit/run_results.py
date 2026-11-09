@@ -373,6 +373,8 @@ def _segment(value: Any) -> dict[str, Any]:
     actual_fields = set(value) if isinstance(value, dict) else None
     if actual_fields not in (base, base | {"resolved_config_identity"}):
         raise ManifestRefusal("malformed-record", "accepted segment keys differ")
+    if "resolved_config_identity" in value and value["resolved_config_identity"] is None:
+        raise ManifestRefusal("malformed-record", "segment.resolved_config_identity must not be null")
     record = dict(value)
     if record["schema"] != ACCEPTED_SEGMENT_SCHEMA:
         raise ManifestRefusal("unknown-schema", "accepted segment schema is unsupported")

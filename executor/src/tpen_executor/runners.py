@@ -167,6 +167,8 @@ class CoreRunEvidence:
             expected.add("resolved_config_identity")
         if schema not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2} or set(value) != expected:
             raise EvidenceUnavailable("evidence has unexpected keys")
+        if schema == RUN_EVIDENCE_SCHEMA_V2 and value.get("resolved_config_identity") is None:
+            raise EvidenceUnavailable("v2 evidence requires a non-null resolved_config_identity")
         if value["schema"] not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2}:
             raise EvidenceUnavailable("unknown evidence schema")
         if type(value["run_dir"]) is not str or not value["run_dir"]:

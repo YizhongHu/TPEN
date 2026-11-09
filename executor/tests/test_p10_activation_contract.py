@@ -47,7 +47,7 @@ def _inputs(tmp_path: Path, *, evidence: bool = True, allocation_id: str = "allo
             """
     )
     evidence_script = (
-        "(run_dir / 'evidence.json').write_text(json.dumps({'schema':'tpen.run-evidence/v1','run_dir':str(run_dir),'verdict':'completed','run_status':'completed','checkpoint':{'checkpoint_dir':str(run_dir / 'checkpoint'),'schema_version':1,'next_iteration':1,'completed_updates':1},'refusal':None}))"
+        "(run_dir / 'evidence.json').write_text(json.dumps({'schema':'tpen.run-evidence/v2','run_dir':str(run_dir),'verdict':'completed','run_status':'completed','checkpoint':{'checkpoint_dir':str(run_dir / 'checkpoint'),'schema_version':1,'next_iteration':1,'completed_updates':1},'refusal':None,'resolved_config_identity':{'schema':'tpen-config-identity-v1','sha256':'a'*64}}))"
         if evidence else "pass"
     )
     (package / "run.py").write_text(
