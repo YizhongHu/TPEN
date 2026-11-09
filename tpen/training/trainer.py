@@ -988,6 +988,11 @@ class VMCTrainer:
                 state.samples = walkers
                 state.batch = batch
                 state.local_energy = total_local_energy.detach()
+                state.local_energy_terms = (
+                    None
+                    if term_energies is None
+                    else {name: value.detach() for name, value in term_energies.items()}
+                )
                 state.loss = loss.detach()
                 state.wavefunction_output = output
                 state.sampler_stats = sampler_stats
