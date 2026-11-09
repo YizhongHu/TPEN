@@ -122,6 +122,61 @@ else:
     assert len(result.chains[0].segments) == 1
 
 
+def test_t10_real_executor_store_manifest_with_placement_receipt_reads_in_toolkit(tmp_path):
+    """A real executor store manifest with S2b-1 placement crosses the boundary."""
+
+    code = '''import json, sys
+from pathlib import Path
+from tpen_executor._codec import digest
+from tpen_executor.allocations import ConfiguredAllocation
+from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
+from tpen_executor.results import SciencePlacementReceipt
+from tpen_executor.runners import CoreRunEvidence
+from tpen_executor.storage import AttemptFence, DirectoryStore
+store = DirectoryStore(Path(sys.argv[1]) / 'store')
+program = ProgramSpecRef({}, digest({}))
+group = ReadyGroup('g', (TaskSpec('a', 'a', program, digest('a'), 1, 'steps'),), digest('group'))
+if sys.argv[2] == 'begin':
+    fence = store.begin_attempt(group, 'a', ConfiguredAllocation(AllocationId('alloc'), BackendJobId('job'), {}), '2026-11-05T00:00:00Z')
+    Path(sys.argv[1], 'fence.json').write_text(json.dumps(dict(root=fence.root, group_digest=fence.group_digest, task_id=fence.task_id, allocation_id=fence.allocation_id, attempt_id=fence.attempt_id.value, output_dir=fence.output_dir)))
+    print(fence.output_dir)
+else:
+    d = json.loads(Path(sys.argv[1], 'fence.json').read_text())
+    d['attempt_id'] = AttemptId(d['attempt_id'])
+    fence = AttemptFence(**d)
+    store.finish_attempt(fence, 'completed', '2026-11-05T00:01:00Z')
+    placement = SciencePlacementReceipt(
+        'a', fence.attempt_id, fence.group_digest, 'alloc', 'job', 'slot-a', digest({'payload': 'a'}), fence.output_dir,
+        {'host': 'node-a', 'pid': 1234, 'proc_start_ticks': 55, 'affinity': [0], 'thread_settings': {'OMP_NUM_THREADS': '1'}, 'cuda_visible_devices': None, 'observed_at_utc': '2026-11-05T00:00:01Z'},
+        {'host': 'node-a', 'cpus': [0], 'devices': []},
+        {'status': 'unavailable', 'reason': 'CPU-only test', 'method': 's2b-1-child-generation-no-sampler', 'started_at_utc': '2026-11-05T00:00:01Z', 'finished_at_utc': '2026-11-05T00:01:00Z', 'samples': [], 'active_uuids': [], 'active_pci': []},
+        {'host': 'matched', 'affinity': 'matched', 'device': 'unavailable'},
+    )
+    store.publish_placement(fence, placement)
+    evidence = CoreRunEvidence.from_mapping(json.loads(Path(sys.argv[1], 'evidence.json').read_text()))
+    store.accept_segment(fence, evidence)
+    Path(sys.argv[1], 'manifest.json').write_bytes(store.manifest(group).encode())
+'''
+    start = executor(code, tmp_path, "begin")
+    assert start.returncode == 0, start.stderr
+    core = Path(start.stdout.strip()) / "core"
+    checkpoint = core_checkpoint(core)
+    evidence = inspect_run(core)
+    assert evidence.verdict == "completed", evidence.to_dict()
+    (tmp_path / "evidence.json").write_text(json.dumps(evidence.to_dict()))
+    finish = executor(code, tmp_path, "accept")
+    assert finish.returncode == 0, finish.stderr
+
+    result = read(tmp_path / "manifest.json")
+    placement = result.chains[0].segments[0].placement_receipt
+    assert placement is not None
+    assert placement["schema"] == "tpen-executor/science-placement-receipt-v1"
+    assert placement["slot_id"] == "slot-a"
+    assert placement["child"]["proc_start_ticks"] == 55
+    assert placement["gpu"]["status"] == "unavailable"
+    assert result.chains[0].segments[0].checkpoint_dir == str(checkpoint)
+
+
 def test_t8_wire_fixtures_and_experiment_boundary():
     for name in ["run-manifest-v1.json", "run-manifest-v2.json"]:
         assert (ROOT / "executor/tests/fixtures" / name).read_bytes() == (ROOT / "experiments/toolkit/fixtures" / name).read_bytes()

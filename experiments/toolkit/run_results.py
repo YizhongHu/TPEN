@@ -19,7 +19,9 @@ from typing import Any, Callable, Mapping
 RUN_MANIFEST_V1 = "tpen-executor/run-manifest-v1"
 RUN_MANIFEST_V2 = "tpen-executor/run-manifest-v2"
 ACCEPTED_SEGMENT_SCHEMA = "tpen-executor/accepted-segment-v1"
+SCIENCE_PLACEMENT_RECEIPT_SCHEMA = "tpen-executor/science-placement-receipt-v1"
 OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed"})
+PLACEMENT_COMPARISON_STATES = frozenset({"matched", "mismatch", "unavailable", "refused"})
 _HEX_DIGITS = frozenset(string.hexdigits.lower())
 
 
@@ -57,6 +59,10 @@ class CommittedSegment:
         Core-published checkpoint directory.
     next_iteration, completed_updates : int
         Nonnegative progress coordinates copied from core evidence.
+    placement_receipt : mapping or None
+        Independently validated operational placement evidence for the attempt,
+        when the executor published it.  This does not change scientific
+        segment selection or constitute a placement qualification verdict.
     """
 
     task_id: str
@@ -65,6 +71,7 @@ class CommittedSegment:
     checkpoint_dir: str
     next_iteration: int
     completed_updates: int
+    placement_receipt: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +102,8 @@ class PreservedAttempt:
         Published operational outcome status, if one exists.
     reason : str, default="not-selected"
         Why the attempt is preserved rather than counted in a committed chain.
+    placement_receipt : mapping or None
+        Independently validated operational placement evidence for the attempt.
     """
 
     task_id: str
@@ -102,6 +111,7 @@ class PreservedAttempt:
     output_dir: str
     outcome: str | None
     reason: str = "not-selected"
+    placement_receipt: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,8 +204,119 @@ def _sha256(value: Any, name: str) -> str:
     return value
 
 
-def _attempt(value: Any) -> dict[str, Any]:
-    record = dict(_fields(value, {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir"}, "manifest attempt"))
+def _freeze_json(value: Any) -> Any:
+    """Return immutable views of validated JSON-shaped placement evidence."""
+
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _placement_receipt(value: Any, attempt: Mapping[str, Any], start: Mapping[str, Any], group_digest: str) -> dict[str, Any]:
+    """Decode the optional v2 placement receipt with closed nested schemas."""
+
+    record = dict(_fields(
+        value,
+        {
+            "schema", "task_id", "attempt_id", "group_digest", "allocation_id",
+            "backend_job_id", "slot_id", "payload_digest", "output_dir", "child",
+            "declared", "gpu", "comparison", "refusal",
+        },
+        "placement receipt",
+    ))
+    if record["schema"] != SCIENCE_PLACEMENT_RECEIPT_SCHEMA:
+        raise ManifestRefusal("unknown-schema", "placement receipt schema is unsupported")
+    for key in ("task_id", "attempt_id", "allocation_id", "backend_job_id", "slot_id", "output_dir"):
+        _text(record[key], f"placement.{key}")
+    _sha256(record["group_digest"], "placement.group_digest")
+    _sha256(record["payload_digest"], "placement.payload_digest")
+
+    child = dict(_fields(
+        record["child"],
+        {"host", "pid", "proc_start_ticks", "affinity", "thread_settings", "cuda_visible_devices", "observed_at_utc"},
+        "placement child",
+    ))
+    _text(child["host"], "placement.child.host")
+    _nonnegative_int(child["pid"], "placement.child.pid")
+    _nonnegative_int(child["proc_start_ticks"], "placement.child.proc_start_ticks")
+    affinity = child["affinity"]
+    if isinstance(affinity, (str, bytes, bytearray)) or not isinstance(affinity, list):
+        raise ManifestRefusal("malformed-record", "placement.child.affinity must be a sequence")
+    if any(type(cpu) is not int or cpu < 0 for cpu in affinity):
+        raise ManifestRefusal("malformed-record", "placement.child.affinity must contain nonnegative integers")
+    thread_settings = child["thread_settings"]
+    if not isinstance(thread_settings, dict) or any(
+        type(key) is not str or (type(item) is not str and item is not None)
+        for key, item in thread_settings.items()
+    ):
+        raise ManifestRefusal("malformed-record", "placement.child.thread_settings is invalid")
+    if child["cuda_visible_devices"] is not None and type(child["cuda_visible_devices"]) is not str:
+        raise ManifestRefusal("malformed-record", "placement.child.cuda_visible_devices must be text or null")
+    _text(child["observed_at_utc"], "placement.child.observed_at_utc")
+
+    declared = dict(_fields(record["declared"], {"host", "cpus", "devices"}, "placement declared"))
+    _text(declared["host"], "placement.declared.host")
+    cpus = declared["cpus"]
+    if isinstance(cpus, (str, bytes, bytearray)) or not isinstance(cpus, list) or not cpus:
+        raise ManifestRefusal("malformed-record", "placement.declared.cpus must be a non-empty sequence")
+    if any(type(cpu) is not int or cpu < 0 for cpu in cpus):
+        raise ManifestRefusal("malformed-record", "placement.declared.cpus must contain nonnegative integers")
+    devices = declared["devices"]
+    if isinstance(devices, (str, bytes, bytearray)) or not isinstance(devices, list):
+        raise ManifestRefusal("malformed-record", "placement.declared.devices must be a sequence")
+    if any(type(device) is not str or not device for device in devices):
+        raise ManifestRefusal("malformed-record", "placement.declared.devices must contain non-empty strings")
+
+    gpu = dict(_fields(
+        record["gpu"],
+        {"status", "reason", "method", "started_at_utc", "finished_at_utc", "samples", "active_uuids", "active_pci"},
+        "placement gpu",
+    ))
+    for key in ("status", "reason", "method", "started_at_utc", "finished_at_utc"):
+        _text(gpu[key], f"placement.gpu.{key}")
+    if gpu["status"] not in {"unavailable", "qualified"}:
+        raise ManifestRefusal("malformed-record", "placement.gpu.status is invalid")
+    if any(isinstance(gpu[key], (str, bytes, bytearray)) or not isinstance(gpu[key], list) for key in ("samples", "active_uuids", "active_pci")):
+        raise ManifestRefusal("malformed-record", "placement.gpu sequences are invalid")
+    if any(type(item) is not str or not item for key in ("active_uuids", "active_pci") for item in gpu[key]):
+        raise ManifestRefusal("malformed-record", "placement.gpu active device values must be non-empty strings")
+
+    comparison = dict(_fields(record["comparison"], {"host", "affinity", "device"}, "placement comparison"))
+    for key in ("host", "affinity", "device"):
+        _text(comparison[key], f"placement.comparison.{key}")
+        if comparison[key] not in PLACEMENT_COMPARISON_STATES:
+            raise ManifestRefusal("malformed-record", "placement comparison values use an unknown state")
+
+    refusal = record["refusal"]
+    if refusal is not None:
+        refusal = dict(_fields(refusal, {"code", "reason"}, "placement refusal"))
+        _text(refusal["code"], "placement.refusal.code")
+        _text(refusal["reason"], "placement.refusal.reason")
+    if child["pid"] == 0 and refusal is None:
+        raise ManifestRefusal("malformed-record", "placement.child.pid must be positive unless placement was refused")
+    if not affinity and refusal is None:
+        raise ManifestRefusal("malformed-record", "placement.child.affinity cannot be empty without refusal")
+
+    if (
+        record["task_id"], record["attempt_id"], record["group_digest"], record["allocation_id"],
+        record["backend_job_id"], record["output_dir"],
+    ) != (
+        attempt["task_id"], attempt["attempt_id"], group_digest, start["allocation_id"],
+        start["backend_job_id"], attempt["output_dir"],
+    ):
+        raise ManifestRefusal("attempt-receipt-mismatch", "manifest attempt disagrees with its placement receipt")
+    record["child"] = child
+    record["declared"] = declared
+    record["gpu"] = gpu
+    record["comparison"] = comparison
+    record["refusal"] = refusal
+    return record
+
+
+def _attempt(value: Any, group_digest: str) -> dict[str, Any]:
+    record = dict(_fields(value, {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir", "placement_receipt"} if isinstance(value, dict) and "placement_receipt" in value else {"schema", "task_id", "attempt_id", "start_receipt", "outcome_receipt", "output_dir"}, "manifest attempt"))
     if record["schema"] != "tpen-executor/manifest-attempt-v1":
         raise ManifestRefusal("unknown-schema", "manifest attempt schema is unsupported")
     for key in ("task_id", "attempt_id", "output_dir"):
@@ -227,6 +348,8 @@ def _attempt(value: Any) -> dict[str, Any]:
         ):
             raise ManifestRefusal("attempt-receipt-mismatch", "manifest attempt disagrees with its outcome receipt")
     record["outcome_receipt"] = outcome
+    placement = None if "placement_receipt" not in record or record["placement_receipt"] is None else _placement_receipt(record["placement_receipt"], record, start, group_digest)
+    record["placement_receipt"] = placement
     return record
 
 
@@ -261,7 +384,7 @@ def _manifest(path: Path) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], t
     _sha256(value["group_digest"], "manifest.group_digest")
     if isinstance(value["attempts"], (str, bytes, bytearray)) or not isinstance(value["attempts"], list):
         raise ManifestRefusal("malformed-record", "manifest attempts must be a sequence")
-    attempts = tuple(_attempt(item) for item in value["attempts"])
+    attempts = tuple(_attempt(item, value["group_digest"]) for item in value["attempts"])
     for attempt in attempts:
         if attempt["start_receipt"]["group_digest"] != value["group_digest"]:
             raise ManifestRefusal("group-digest-mismatch", "start receipt group_digest differs from manifest")
@@ -393,6 +516,7 @@ def read(
             segment["checkpoint_dir"],
             segment["next_iteration"],
             segment["completed_updates"],
+            _freeze_json(attempt["placement_receipt"]),
         )
         by_task.setdefault(projected.task_id, []).append(projected)
     for task_id, task_segments in by_task.items():
@@ -406,6 +530,7 @@ def read(
             "uncommitted" if attempt["outcome_receipt"] is None else (
                 "failed-or-incomplete" if attempt["outcome_receipt"]["status"] != "completed" else "not-selected"
             ),
+            _freeze_json(attempt["placement_receipt"]),
         )
         for attempt in attempts
         if attempt["attempt_id"] not in selected_ids
@@ -422,6 +547,7 @@ __all__ = [
     "PreservedAttempt",
     "RUN_MANIFEST_V1",
     "RUN_MANIFEST_V2",
+    "SCIENCE_PLACEMENT_RECEIPT_SCHEMA",
     "ResultSet",
     "read",
 ]
