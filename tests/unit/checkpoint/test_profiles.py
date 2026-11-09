@@ -43,6 +43,7 @@ ROOT = Path(__file__).parents[3]
 H_V2_TRAIN_CONFIG = ROOT / "experiments" / "atomistic" / "h-v2" / "configs" / "train.yaml"
 NEW_CALLBACK_TARGETS = frozenset(
     {
+        "tpen.callback.Checkpoint",
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
     }
@@ -147,6 +148,30 @@ def test_resume_sensitive_cadence_helper_audits_pop_step_cadence_fields() -> Non
     ) is None
 
 
+def test_checkpoint_cadence_is_resume_sensitive() -> None:
+    result = check_profile(
+        _config(
+            callbacks=[
+                {"_target_": "tpen.callback.Checkpoint", "max_calls": 1}
+            ]
+        ),
+        NATIVE_RECOVERY_PROFILE,
+    )
+
+    assert result.verdict == "refused"
+    assert result.refusal is not None
+    assert result.refusal["code"] == CALLBACK_CADENCE_REFUSAL_CODE
+    assert "max_calls" in result.refusal["reason"]
+    with pytest.raises(UnsupportedMutableStateError, match="max_calls"):
+        validate_native_recovery_profile(
+            _config(
+                callbacks=[
+                    {"_target_": "tpen.callback.Checkpoint", "max_calls": 1}
+                ]
+            )
+        )
+
+
 @pytest.mark.parametrize("target", sorted(NEW_CALLBACK_TARGETS))
 def test_dropping_each_new_target_refuses_the_h_v2_callback_set(
     target: str, monkeypatch: pytest.MonkeyPatch
@@ -241,4 +266,10 @@ def test_cli_output_is_one_json_object(tmp_path: Path, capsys: pytest.CaptureFix
     assert payload["state_owners"] == sorted(SUPPORTED_STATE_OWNERS)
 
 
-assert REFUSAL_CODES == {"unknown-profile", "unsupported-callback", "unsupported-logger", "malformed-config"}
+assert REFUSAL_CODES == {
+    "unknown-profile",
+    "unsupported-callback",
+    "unsupported-callback-cadence",
+    "unsupported-logger",
+    "malformed-config",
+}

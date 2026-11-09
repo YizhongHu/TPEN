@@ -115,9 +115,19 @@ RESUME_SENSITIVE_CALLBACK_TARGETS = frozenset(
 # initializes the local RNG, which is never consumed when probability is one.
 # ``max_calls`` and a probability below one are different: they advance the
 # callback-local call counter or RNG, neither of which train_resume restores.
+# Checkpoint consumes these fields at ``tpen/callback/checkpoint.py:162`` and
+# uses the resulting gate for periodic publication at line 208, so its
+# published-checkpoint set is recovery-sensitive. Status consumes the same
+# fields at ``tpen/callback/status.py:127``, but gates only its optional
+# training-line logging (lines 133-140). TrainStepTiming consumes them at
+# ``tpen/callback/timing/train_step_timing.py:41-57`` and TrainPhaseTiming at
+# ``tpen/callback/timing/train_phase_timing.py:64-83``; both gate only
+# observational ``train/perf`` logging. Those three observational callbacks
+# therefore remain admitted.
 CALLBACK_CADENCE_REFUSAL_CODE = "unsupported-callback-cadence"
 CADENCE_SENSITIVE_CALLBACK_TARGETS = frozenset(
     {
+        "tpen.callback.Checkpoint",
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
     }
