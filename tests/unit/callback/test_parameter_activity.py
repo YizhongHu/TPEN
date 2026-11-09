@@ -21,6 +21,8 @@ from omegaconf import OmegaConf
 
 from tpen.artifacts import ArtifactManager, RunClock, RunContext, RunMetadata
 from tpen.callback.parameter_activity import ParameterActivity
+from tpen.checkpoint import CheckpointRestored
+from tpen.checkpoint.restore import RestoreReport
 from tpen.training.events import TrainingIteration, TrainingIterationCompleted, UpdateCompleted, UpdateSkipped
 from tpen.training.state import TrainerState
 from tpen.events import Occurrence
@@ -76,8 +78,23 @@ def _independent_l2_norm(tensor: torch.Tensor) -> float:
     return math.sqrt(float((tensor.detach() ** 2).sum().item()))
 
 
-def _update_completed(*, count: int = 1) -> Occurrence[UpdateCompleted]:
-    return Occurrence(event=UpdateCompleted(iteration=TrainingIteration(step=0)), count=count)
+def _update_completed(*, count: int = 1, step: int = 0) -> Occurrence[UpdateCompleted]:
+    return Occurrence(event=UpdateCompleted(iteration=TrainingIteration(step=step)), count=count)
+
+
+def _checkpoint_restored() -> Occurrence[CheckpointRestored]:
+    report = RestoreReport(
+        mode="train_resume",
+        checkpoint_dir="/tmp/source",
+        next_iteration=0,
+        completed_updates=0,
+        loaded_model=True,
+        loaded_optimizer=True,
+        loaded_trainer=True,
+        loaded_sampler=True,
+        loaded_rng=True,
+    )
+    return Occurrence(event=CheckpointRestored(report=report), count=1)
 
 
 def _update_skipped(*, count: int = 1) -> Occurrence[UpdateSkipped]:
@@ -391,15 +408,99 @@ def test_reused_callback_refuses_a_second_context_once_a_write_already_landed(
         callback.handle_occurrence(_update_completed(), second_context, state)
 
 
-def test_a_resumed_run_with_a_reused_output_path_is_refused_not_overwritten(
-    tmp_path: Path,
-) -> None:
-    """Resume-safety contract: a fresh `ParameterActivity` instance, as a
-    resumed run would construct, never overwrites a prior attempt's
-    inventory at the same `output_path` -- it refuses, matching
-    `InitialCheckpoint`'s policy of never silently clobbering prior state on
-    resume, even though the mechanism differs (refusal, not a verified
-    no-op; see the callback's docstring for why).
+def test_verified_no_op_on_resumed_lineage_with_prior_inventory(tmp_path: Path) -> None:
+    """A resumed lineage (nonzero step) with a verified prior inventory writes nothing.
+
+    Never records a later update's gradients as though they were the
+    lineage's first -- the resume-safety contract this callback now shares
+    with `InitialCheckpoint`.
+    """
+
+    model = _ThreeParamModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    model.loss().backward()
+    output_path = tmp_path / "parameter_activity.json"
+
+    source_state = TrainerState(model=model, optimizer=optimizer, trainer=_Trainer(completed_updates=1))
+    source_callback = ParameterActivity(output_path)
+    source_callback.handle_occurrence(_update_completed(step=0), _make_context(tmp_path), source_state)
+    before = output_path.read_text(encoding="utf-8")
+    mtime_before = output_path.stat().st_mtime_ns
+
+    # A fresh callback instance, as a resumed run would construct, observing
+    # the resumed lineage's own first applied update at a nonzero step.
+    resumed_model = _ThreeParamModel()
+    resumed_optimizer = torch.optim.SGD(resumed_model.parameters(), lr=0.1)
+    resumed_model.loss().backward()
+    resumed_state = TrainerState(
+        model=resumed_model, optimizer=resumed_optimizer, trainer=_Trainer(completed_updates=4)
+    )
+    resumed_callback = ParameterActivity(output_path)
+    resumed_callback.handle_occurrence(
+        _update_completed(step=3), _make_context(tmp_path, run_id="resumed"), resumed_state
+    )
+
+    assert resumed_callback._written
+    assert output_path.read_text(encoding="utf-8") == before
+    assert output_path.stat().st_mtime_ns == mtime_before
+
+    # A redelivery is still a no-op, guarded by `_written`.
+    resumed_callback.handle_occurrence(
+        _update_completed(step=3, count=2), _make_context(tmp_path, run_id="resumed"), resumed_state
+    )
+    assert output_path.stat().st_mtime_ns == mtime_before
+
+
+def test_refuses_resumed_lineage_with_no_prior_inventory(tmp_path: Path) -> None:
+    """A resumed lineage with nothing at `output_path` is refused, never written.
+
+    Pins both halves of the contract in one probe: a missing path is
+    refused, and so is a distinct per-attempt path configured for the
+    resumed arm -- recording at the next update would mislabel update N+1's
+    gradients as the lineage's first, which is worse than a refusal.
+    """
+
+    model = _ThreeParamModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    model.loss().backward()
+    state = TrainerState(model=model, optimizer=optimizer, trainer=_Trainer(completed_updates=4))
+
+    for output_path in (tmp_path / "parameter_activity.json", tmp_path / "parameter_activity_fresh_attempt.json"):
+        callback = ParameterActivity(output_path)
+        with pytest.raises(ValueError, match="fresh first-applied-update lineage"):
+            callback.handle_occurrence(_update_completed(step=3), _make_context(tmp_path), state)
+        assert not output_path.exists()
+
+
+def test_refuses_resumed_lineage_with_a_malformed_prior_inventory(tmp_path: Path) -> None:
+    """A resumed lineage whose prior inventory does not verify is refused.
+
+    Pins that the no-op path actually verifies structure (expected keys,
+    interpretation string, row shape), rather than treating any existing
+    file as proof.
+    """
+
+    model = _ThreeParamModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    model.loss().backward()
+    state = TrainerState(model=model, optimizer=optimizer, trainer=_Trainer(completed_updates=4))
+    output_path = tmp_path / "parameter_activity.json"
+    output_path.write_text("not even json", encoding="utf-8")
+    callback = ParameterActivity(output_path)
+
+    with pytest.raises(ValueError, match="fresh first-applied-update lineage"):
+        callback.handle_occurrence(_update_completed(step=3), _make_context(tmp_path), state)
+
+    assert output_path.read_text(encoding="utf-8") == "not even json"
+
+
+def test_refuses_a_restored_lineage_even_with_a_zero_step_first_update(tmp_path: Path) -> None:
+    """A `CheckpointRestored` report, not just the step, must gate the write.
+
+    Mirrors `InitialCheckpoint`'s equivalent probe: a lineage resumed from a
+    checkpoint written at the zero boundary can have its first applied
+    update still read step zero, indistinguishable from a fresh lineage by
+    step alone.
     """
 
     model = _ThreeParamModel()
@@ -407,18 +508,14 @@ def test_a_resumed_run_with_a_reused_output_path_is_refused_not_overwritten(
     model.loss().backward()
     state = TrainerState(model=model, optimizer=optimizer, trainer=_Trainer(completed_updates=1))
     output_path = tmp_path / "parameter_activity.json"
+    callback = ParameterActivity(output_path)
 
-    source_callback = ParameterActivity(output_path)
-    source_callback.handle_occurrence(_update_completed(), _make_context(tmp_path), state)
-    before = output_path.read_text(encoding="utf-8")
+    callback.handle_occurrence(_checkpoint_restored(), _make_context(tmp_path), None)
 
-    resumed_callback = ParameterActivity(output_path)
-    with pytest.raises(FileExistsError):
-        resumed_callback.handle_occurrence(
-            _update_completed(), _make_context(tmp_path, run_id="resumed"), state
-        )
+    with pytest.raises(ValueError, match="fresh first-applied-update lineage"):
+        callback.handle_occurrence(_update_completed(step=0), _make_context(tmp_path), state)
 
-    assert output_path.read_text(encoding="utf-8") == before
+    assert not output_path.exists()
 
 
 def test_refuses_to_silently_overwrite_an_existing_inventory(tmp_path: Path) -> None:

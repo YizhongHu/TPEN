@@ -7,13 +7,18 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from tpen.artifacts import RunContext
+from tpen.checkpoint import CheckpointRestored
 from tpen.events import DomainState, Occurrence, Subscription
 from tpen.events import Event as TypedEvent
 from tpen.training.events import UpdateCompleted
 from tpen.training.state import TrainerState
 
-from .base import StatefulCallback
+from .base import CallbackContext, StatefulCallback
 from .cadence import SubscriptionGroup
+
+_INVENTORY_INTERPRETATION = "observed_on_first_applied_update_not_structural_proof"
+_INVENTORY_KEYS = {"completed_updates", "interpretation", "parameters"}
+_PARAMETER_ROW_KEYS = {"name", "shape", "requires_grad", "gradient", "gradient_norm"}
 
 
 class ParameterActivity(StatefulCallback[TrainerState]):
@@ -54,16 +59,21 @@ class ParameterActivity(StatefulCallback[TrainerState]):
     inventory is written exactly once, on the first `UpdateCompleted` this
     callback observes.
 
-    Because ``output_path`` is opened with exclusive create, a resumed run
-    whose output directory already carries a prior inventory at the same
-    path raises ``FileExistsError`` rather than silently overwriting it; a
-    resumed run that wants its own inventory must be configured with a
-    distinct per-attempt path. This is a deliberate choice, not a side
-    effect left unaudited: unlike ``InitialCheckpoint``'s update-zero
-    checkpoint, this inventory observes exactly one arbitrary batch and
-    carries no durable, reconstructible reference value a resumed run could
-    verify against, so refusing the collision -- never attempting an
-    unverifiable no-op -- is this callback's resume-safety contract.
+    A restored lineage whose first applied update still reads step zero is
+    refused, exactly as ``InitialCheckpoint`` refuses the same case: this
+    callback's own first-update write happens on a fresh lineage only. A
+    resumed lineage whose first applied update reads a nonzero step instead
+    becomes a VERIFIED no-op: it checks that ``output_path`` already holds a
+    complete, well-formed inventory (the expected top-level keys, the
+    expected interpretation string, and a nonempty list of per-parameter rows
+    each carrying the expected row keys), and records nothing -- never a
+    later update's gradients mislabeled as the first one. A resumed lineage
+    with no such inventory present, at this path or a distinct per-attempt
+    one, is refused, never written late. 'Verified' means artifact
+    integrity, the same standard ``InitialCheckpoint`` holds with its
+    ``COMPLETE`` marker and manifest, not recomputed gradient values: this
+    callback never recomputes or compares against the live model's current
+    gradients, which legitimately differ update to update.
     """
 
     state_type: ClassVar[type[DomainState]] = TrainerState
@@ -71,19 +81,50 @@ class ParameterActivity(StatefulCallback[TrainerState]):
     def __init__(self, output_path: str | Path) -> None:
         super().__init__(typed_groups=(
             SubscriptionGroup(selectors=(Subscription.of(UpdateCompleted),)),
+            SubscriptionGroup(selectors=(Subscription.of(CheckpointRestored),), stateless=True),
         ))
         self.output_path = Path(output_path)
         self._written = False
+        self._restored = False
+
+    def handle_stateless_occurrence_impl(
+        self, occurrence: Occurrence[TypedEvent], context: CallbackContext
+    ) -> None:
+        """Record that this run's lineage was restored, not fresh."""
+        del context
+        if isinstance(occurrence.event, CheckpointRestored):
+            self._restored = True
 
     def handle_occurrence_impl(
         self, occurrence: Occurrence[TypedEvent], context: RunContext, state: TrainerState
     ) -> None:
-        """Write the first-applied-update gradient inventory, once."""
+        """Write the first-applied-update gradient inventory, or verify it on resume."""
         del context
         if self._written:
             return
-        if not isinstance(occurrence.event, UpdateCompleted):
+        event = occurrence.event
+        if not isinstance(event, UpdateCompleted):
             return
+        fresh = event.iteration.step == 0
+        if fresh and not self._restored:
+            self._write_fresh_inventory(state)
+            self._written = True
+            return
+        if fresh:
+            # `self._restored`: a zero-step first update, but a
+            # `CheckpointRestored` report proves this lineage is not fresh.
+            raise ValueError("ParameterActivity requires a fresh first-applied-update lineage")
+        # Resumed lineage (nonzero step): never record a later update's
+        # gradients as though they were the first. Only a VERIFIED prior
+        # inventory at `output_path` makes this a no-op.
+        if not _is_verified_inventory(self.output_path):
+            raise ValueError(
+                "ParameterActivity requires a fresh first-applied-update lineage or a "
+                f"verified prior inventory at {self.output_path}; found neither"
+            )
+        self._written = True
+
+    def _write_fresh_inventory(self, state: TrainerState) -> None:
         model = state.model
         if model is None:
             raise ValueError("ParameterActivity requires state.model")
@@ -101,7 +142,7 @@ class ParameterActivity(StatefulCallback[TrainerState]):
         payload = json.dumps(
             {
                 "completed_updates": completed_updates,
-                "interpretation": "observed_on_first_applied_update_not_structural_proof",
+                "interpretation": _INVENTORY_INTERPRETATION,
                 "parameters": rows,
             },
             indent=2, allow_nan=False,
@@ -110,10 +151,39 @@ class ParameterActivity(StatefulCallback[TrainerState]):
         with self.output_path.open("x", encoding="utf-8") as handle:
             handle.write(payload)
             handle.write("\n")
-        self._written = True
 
     def _reset_typed_state(self) -> None:
         self._written = False
+        self._restored = False
+
+
+def _is_verified_inventory(path: Path) -> bool:
+    """Return whether `path` holds a complete, well-formed parameter inventory.
+
+    Structural verification only: the expected top-level keys, the expected
+    interpretation string, and a nonempty list of per-parameter rows each
+    carrying the expected row keys. This never recomputes or compares
+    gradient values -- they legitimately differ update to update, so a
+    resumed lineage's "verified" artifact is one that parses and has the
+    right shape, not one whose numbers match anything current.
+    """
+
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict) or set(payload) != _INVENTORY_KEYS:
+        return False
+    if payload["interpretation"] != _INVENTORY_INTERPRETATION:
+        return False
+    rows = payload["parameters"]
+    if not isinstance(rows, list) or not rows:
+        return False
+    return all(
+        isinstance(row, dict) and set(row) == _PARAMETER_ROW_KEYS for row in rows
+    )
 
 
 def _tracked_parameter_ids(optimizer: Any) -> set[int]:

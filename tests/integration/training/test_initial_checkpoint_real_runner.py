@@ -440,14 +440,15 @@ def test_initial_checkpoint_and_periodic_checkpoint_coexist_across_an_update(
 
 # --------------------------------------------------------------------------
 # Probe 5: a requeue-style resume into the SAME keep-all directory completes,
-# with InitialCheckpoint a verified no-op and ParameterActivity refusing a
-# reused output path while succeeding at a distinct per-attempt one.
+# with BOTH InitialCheckpoint and ParameterActivity a verified no-op against
+# the SAME reused paths -- never a late write, never a mislabeled record.
 # --------------------------------------------------------------------------
 
 
-def _requeue_cfg(
-    *, max_steps: int, run_id: str, parameter_activity_name: str, load: dict[str, str] | None = None
-) -> DictConfig:
+_PARAMETER_ACTIVITY_NAME = "parameter_activity.json"
+
+
+def _requeue_cfg(*, max_steps: int, run_id: str, load: dict[str, str] | None = None) -> DictConfig:
     """A fixed-`run_id` config, so two invocations share one keep-all directory."""
 
     cfg = OmegaConf.load(FIXTURE)
@@ -458,7 +459,7 @@ def _requeue_cfg(
         OmegaConf.create(
             {
                 "_target_": "tpen.callback.ParameterActivity",
-                "output_path": "${run.dir}/" + parameter_activity_name,
+                "output_path": "${run.dir}/" + _PARAMETER_ACTIVITY_NAME,
             }
         )
     )
@@ -471,37 +472,36 @@ def test_requeue_into_the_same_directory_completes_with_a_verified_no_op(tmp_pat
     """A step > 0 resume into the SAME output directory completes end to end.
 
     Arm A is a fresh, ``max_steps=1`` run, fixed to a known ``run.run_id`` so
-    its ``run.dir`` (and therefore ``InitialCheckpoint``'s shared
-    ``checkpoints`` directory) is reused, not a fresh per-attempt directory,
-    by arm B below -- the requeue shape this follow-up targets, not the
-    independent-directory restore the probes above pin.
+    its ``run.dir`` (and therefore both callbacks' shared output paths) is
+    reused, not a fresh per-attempt directory, by arm B below -- the requeue
+    shape this follow-up targets, not the independent-directory restore the
+    probes above pin.
 
     Arm B resumes from arm A's terminal (``step_000001``) checkpoint, reusing
     arm A's exact ``run.run_id`` (and so its ``run.dir``), so its restored
     trainer counters (asserted below via ``CheckpointRestored``) are nonzero
-    and its first `Started(TrainingIteration)` reads a nonzero step --
-    `InitialCheckpoint` must become a VERIFIED no-op (``step_000000`` already
-    exists and is complete in the shared directory) rather than refusing or
-    writing late. `ParameterActivity` is configured with a distinct
-    per-attempt `output_path` for arm B, exactly as its docstring recommends
-    for a resumed run reusing the same directory; its refusal on a genuinely
-    reused path is pinned at the unit level
-    (`tests/unit/callback/test_parameter_activity.py`), not duplicated here.
+    and its first iteration/applied-update both read a nonzero step.
+    `InitialCheckpoint` and `ParameterActivity` must each become a VERIFIED
+    no-op against their SAME, reused output paths -- neither refuses, and
+    neither writes anything new; `ParameterActivity` in particular must never
+    record arm B's own later-update gradients as though they were the
+    lineage's first.
     """
 
     run_id = "requeue-same-directory"
-    source_dir = _run(tmp_path, _requeue_cfg(max_steps=1, run_id=run_id, parameter_activity_name="parameter_activity.json"))
+    source_dir = _run(tmp_path, _requeue_cfg(max_steps=1, run_id=run_id))
     zero_dir = _checkpoint_dir(source_dir, 0)
     one_dir = _checkpoint_dir(source_dir, 1)
     assert (zero_dir / "COMPLETE").is_file()
     assert (one_dir / "COMPLETE").is_file()
     zero_model_before = (zero_dir / "model.pt").read_bytes()
+    inventory_path = source_dir / _PARAMETER_ACTIVITY_NAME
+    assert inventory_path.is_file()
+    inventory_before = inventory_path.read_bytes()
+    inventory_mtime_before = inventory_path.stat().st_mtime_ns
 
     resumed_cfg = _requeue_cfg(
-        max_steps=2,
-        run_id=run_id,
-        parameter_activity_name="parameter_activity_requeue.json",
-        load={"mode": "train_resume", "path": str(one_dir)},
+        max_steps=2, run_id=run_id, load={"mode": "train_resume", "path": str(one_dir)}
     )
     resumed_dir = _run(tmp_path, resumed_cfg)
     assert resumed_dir == source_dir
@@ -515,7 +515,7 @@ def test_requeue_into_the_same_directory_completes_with_a_verified_no_op(tmp_pat
     # InitialCheckpoint's verified no-op: the shared `step_000000` checkpoint
     # is untouched by the resumed arm.
     assert (zero_dir / "model.pt").read_bytes() == zero_model_before
-    # The resumed arm's own distinct-path inventory was written successfully.
-    assert (resumed_dir / "parameter_activity_requeue.json").is_file()
-    # Arm A's inventory at its own path is untouched by the resumed arm.
-    assert (source_dir / "parameter_activity.json").is_file()
+    # ParameterActivity's verified no-op: the shared inventory is untouched,
+    # never overwritten with arm B's own (later) first-applied-update record.
+    assert inventory_path.read_bytes() == inventory_before
+    assert inventory_path.stat().st_mtime_ns == inventory_mtime_before
