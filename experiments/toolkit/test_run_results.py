@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from experiments.toolkit.run_results import ManifestRefusal, read
+from experiments.toolkit.run_results import ManifestRefusal, _freeze_json, read
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "run-manifest-v2.json"
@@ -155,6 +155,44 @@ def test_p8_reader_refuses_malformed_placement_receipt(tmp_path: Path, mutation:
 
     with pytest.raises(ManifestRefusal, match="placement"):
         read(path, lambda _: pytest.fail("malformed placement must be rejected before inspection"))
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_p8_reader_refuses_nonfinite_nested_gpu_samples(tmp_path: Path, value: float) -> None:
+    path, _ = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    placement = _placement_receipt(payload["attempts"][0]["output_dir"])
+    placement["gpu"]["samples"] = [{"value": value}]
+    payload["attempts"][0]["placement_receipt"] = placement
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ManifestRefusal, match=r"placement\.gpu\.samples\[0\]\.value"):
+        read(path, lambda _: pytest.fail("non-finite placement evidence must be rejected before inspection"))
+
+
+def test_p8_reader_accepts_finite_nested_gpu_samples(tmp_path: Path) -> None:
+    path, _ = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    placement = _placement_receipt(payload["attempts"][0]["output_dir"])
+    placement["gpu"]["samples"] = [{"value": 1.25, "nested": [2.5]}]
+    payload["attempts"][0]["placement_receipt"] = placement
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = read(path, lambda _: {
+        "verdict": "completed",
+        "checkpoint": {
+            "checkpoint_dir": str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001"),
+            "schema_version": 1,
+            "next_iteration": 1,
+            "completed_updates": 1,
+        },
+    })
+    assert result.chains[0].segments[0].placement_receipt["gpu"]["samples"][0]["value"] == 1.25
+
+
+def test_p8_freezing_refuses_non_string_nested_mapping_keys() -> None:
+    with pytest.raises(ManifestRefusal, match=r"placement\.gpu\.samples\[0\] keys must be strings"):
+        _freeze_json({"gpu": {"samples": [{1: "invalid"}]}}, "placement")
 
 
 @pytest.mark.parametrize(
