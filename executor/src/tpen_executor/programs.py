@@ -325,9 +325,20 @@ class AllocationProgram:
     path: str = "program"
 
     def materialize(self, env: Mapping[str, Any] | None = None) -> MaterializedProgram:
-        """Resolve and construct the allocation program in its owning process."""
+        """Resolve and construct the allocation program in its owning process.
 
-        return _materialize(self.spec, self.path, env)
+        Raises
+        ------
+        TypeError
+            If the allocation marker omits its dispatcher or the materialized
+            dispatcher does not provide ``run()``.
+        """
+        result = _materialize(self.spec, self.path, env)
+        if "environment" in result and "dispatcher" not in result:
+            raise TypeError("allocation program requires a dispatcher slot")
+        if "dispatcher" in result and not callable(getattr(result.dispatcher, "run", None)):
+            raise TypeError("allocation dispatcher must provide run()")
+        return result
 
 
 class DummyAllocation:

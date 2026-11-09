@@ -18,6 +18,17 @@ from tpen_executor.contracts import ProgramSpecRef
 from tpen_executor.programs import AllocationProgram, WorkerProgram
 
 
+class RunCapableDispatcher:
+    """Test-only positive target for the retained shape/interpolation fixture."""
+
+    def __init__(self, worker=None, **kwargs):
+        self.worker = worker
+        self.options = kwargs
+
+    def run(self, *args, **kwargs):
+        raise NotImplementedError
+
+
 def _compose(tmp_path: Path, text: str, name: str = "executor") -> StagedConfig:
     """Write one YAML config into ``tmp_path`` and compose it through StagedHydra."""
 
@@ -93,7 +104,8 @@ def test_p5a_r2_t3_plan_shapes_survive_the_compose_time_shape_rule(tmp_path: Pat
     still retained and interpolable, and a nested marker inside a grouping mapping *within* a
     concrete slot's interior is still captured and handed back as a handle."""
 
-    staged = _compose(tmp_path, _LEGITIMATE)
+    text = _LEGITIMATE.replace("tpen_executor.programs.DummyDispatcher", f"{__name__}.RunCapableDispatcher")
+    staged = _compose(tmp_path, text)
     assert set(staged.programs) == {"program", "program.dispatcher.pools.a"}
     assert staged.program is not None
     result = staged.program.materialize({})

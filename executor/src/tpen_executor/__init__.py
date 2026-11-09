@@ -21,6 +21,7 @@ _LAZY_EXPORTS = {
     "StagedConfig": (".configuration", "StagedConfig"),
     "StagedHydra": (".configuration", "StagedHydra"),
     "WorkerProgram": (".programs", "WorkerProgram"),
+    "LocalDispatcher": (".dispatch", "LocalDispatcher"),
 }
 
 
@@ -38,7 +39,7 @@ def __getattr__(name: str):
 __all__ = [
     "__version__", "AllocationId", "AllocationObservation", "AllocationProgram",
     "AttemptId", "AttachedAllocation", "AttemptFence", "BackendJobId", "ConfiguredAllocation", "ConfiguredRun", "CoreRunEvidence", "DirectoryStore", "EvidenceUnavailable", "FenceRejected", "ManifestAttempt", "MaterializedProgram", "OUTCOME_STATUSES", "OutcomeReceipt", "ProcessOutcome",
-    "ProgramSpecRef", "ReadyGroup", "RunManifest", "StagedConfig", "StagedHydra",
+    "ProgramSpecRef", "ReadyGroup", "RunManifest", "StagedConfig", "StagedHydra", "LocalDispatcher",
     "PreparedInputBundle", "PreparedPythonEnvironment", "SourceScript", "StartReceipt",
     "TaskSpec", "TPENCommand", "TPENEvidence", "SubprocessWorker", "WorkerProgram",
     "decode_manifest", "encode_manifest",
