@@ -9,10 +9,11 @@ for the evaluation job, and nothing else -- no retry, no polling, no
 fallback. Each job runs ``run_job.py`` (the executor's attached route from
 item 9d3aa0a3) inside its own allocation.
 
-Never ``scancel``. Never invoke the ``tpen.run`` module directly as a script
-entrypoint (no ``__main__`` guard, operator policy 2026-11-06); use the
-installed ``tpen`` console command instead. This module imports no ``tpen``,
-no ``tpen_executor``, and no ``hydra`` (``experiments/README.md``).
+This script never cancels a scheduler job, and never invokes the ``tpen.run``
+module directly as a script entrypoint (no ``__main__`` guard, operator
+policy 2026-11-06); use the installed ``tpen`` console command instead. It
+imports no ``tpen``, no ``tpen_executor``, and no ``hydra``
+(``experiments/README.md``).
 """
 
 from __future__ import annotations
