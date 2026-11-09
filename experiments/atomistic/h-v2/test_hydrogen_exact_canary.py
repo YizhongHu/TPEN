@@ -213,6 +213,18 @@ def _read_rows(run_dir: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _assert_resolved_device(result: dict[str, Any], device: str) -> None:
+    """Require the parametrized device to reach the real configured runner.
+
+    A passing [cuda] id alone cannot detect a dropped device override: the
+    YAML default is CPU, where all the same numerical assertions also pass.
+    This checks the configuration artifact, not the location of every tensor.
+    """
+
+    resolved = yaml.safe_load((result["run_dir"] / "resolved_config.yaml").read_text(encoding="utf-8"))
+    assert resolved["runtime"]["device"] == device
+
+
 def _read_trajectory_manifest(run_dir: Path) -> dict[str, Any]:
     """Read the streamed trajectory's own manifest (`_write_metadata` in
     `tpen.evaluation.trajectory_records`), which the collector also validates.
@@ -373,6 +385,7 @@ def test_no_configured_checkpoint_route_exists_for_the_parameterless_model(tmp_p
 def test_exact_ground_state_every_record_is_minus_half_hartree(tmp_path: Path, device: str) -> None:
     result = _run_canary(tmp_path, alpha=1.0, run_id=f"exact-alpha-1-{device}", device=device)
     assert result["status"] == 0
+    _assert_resolved_device(result, device)
     rows = _read_rows(result["run_dir"])
     assert len(rows) == 1024 * 64
     energies = [float(row["local_energy"]) for row in rows]
@@ -436,6 +449,7 @@ def test_imperfect_state_matches_closed_form_analytic_controls(
     alpha = 1.2
     result = _run_canary(tmp_path, alpha=alpha, run_id=f"exact-alpha-1-2-{device}", device=device)
     assert result["status"] == 0
+    _assert_resolved_device(result, device)
     rows = _read_rows(result["run_dir"])
     energies = [float(row["local_energy"]) for row in rows]
     assert all(row["finite"] == "True" for row in rows)
