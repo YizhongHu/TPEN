@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import pytest
+from omegaconf import OmegaConf
 
 HERE = Path(__file__).parent
 REPO_ROOT = HERE.resolve().parents[2]
@@ -45,6 +46,36 @@ protocol = _module("protocol")
 
 import experiments.toolkit.attached_activation as attached_activation  # noqa: E402
 from experiments.toolkit.run_results import ManifestRefusal, read as read_manifest  # noqa: E402
+
+
+def test_review_real_profile_consumer_accepts_both_resume_callbacks(tmp_path: Path) -> None:
+    """R1 green control: H-v2's real subprocess checker admits both callbacks.
+
+    Rejects either removed profile entry through the same checker imported by
+    activate_h_v2_run, without mocking it or starting an executor/science run.
+    """
+
+    config = OmegaConf.load(HERE / "configs" / "train.yaml")
+    config.callbacks.extend([
+        {
+            "_target_": "tpen.callback.InitialCheckpoint",
+            "output_dir": "${run.dir}/checkpoints",
+        },
+        {
+            "_target_": "tpen.callback.ParameterActivity",
+            "output_path": "${run.dir}/parameter_activity.json",
+        },
+    ])
+    effective_config = tmp_path / "train-with-resume-callbacks.yaml"
+    OmegaConf.save(config=config, f=effective_config, resolve=False)
+
+    verdict = attached.check_profile(
+        Path(sys.executable), effective_config, cwd=REPO_ROOT
+    )
+
+    assert verdict.verdict == "supported"
+    assert verdict.refusal is None
+    assert verdict.returncode == 0
 
 
 def _sha(data: bytes = b"x") -> str:
