@@ -52,6 +52,14 @@ class _StubRunner:
         return subprocess.CompletedProcess(command, returncode=0, stdout=f"{job_id};cluster\n", stderr="")
 
 
+def _payload_kwargs() -> dict[str, str]:
+    return {
+        "payload": "pipeline-check",
+        "science_python": sys.executable,
+        "executor_python": sys.executable,
+    }
+
+
 def test_one_lineage_issues_exactly_two_sbatch_commands_with_chained_afterok(tmp_path: Path) -> None:
     runner = _StubRunner(job_ids=["111", "222"])
     train_id, eval_id = launch.submit_lineage(
@@ -61,13 +69,14 @@ def test_one_lineage_issues_exactly_two_sbatch_commands_with_chained_afterok(tmp
         t_wall="08:30:00",
         e_wall="25:24:00",
         runner=runner,
+        **_payload_kwargs(),
     )
     assert len(runner.calls) == 2
     assert train_id == "111"
     assert eval_id == "222"
     train_command, eval_command = runner.calls
-    assert "--job-name=h-v2-sci-L1-train" in train_command
-    assert "--job-name=h-v2-sci-L1-eval" in eval_command
+    assert "--job-name=h-v2-pipeline-check-L1-train" in train_command
+    assert "--job-name=h-v2-pipeline-check-L1-eval" in eval_command
     assert not any(flag.startswith("--dependency=") for flag in train_command)
     assert "--dependency=afterok:111" in eval_command
 
@@ -82,6 +91,7 @@ def test_every_lineage_gets_its_own_chained_pair(tmp_path: Path) -> None:
         t_wall="08:00:00",
         e_wall="23:00:00",
         runner=runner,
+        **_payload_kwargs(),
     )
     assert len(runner.calls) == 2 * len(launch_config.LINEAGES)
     assert set(results) == set(launch_config.LINEAGES)
@@ -99,6 +109,7 @@ def test_flags_equal_the_section_c_config_values(tmp_path: Path) -> None:
         t_wall="08:30:00",
         e_wall="25:24:00",
         runner=runner,
+        **_payload_kwargs(),
     )
     resources = launch_config.RESOURCES
     for command in runner.calls:
@@ -124,6 +135,7 @@ def test_a_failed_first_submission_aborts_before_the_second_sbatch(tmp_path: Pat
             t_wall="08:30:00",
             e_wall="25:24:00",
             runner=runner,
+            **_payload_kwargs(),
         )
     assert len(runner.calls) == 1
 
@@ -143,6 +155,7 @@ def test_a_missing_job_id_from_the_first_sbatch_aborts_before_the_second(tmp_pat
             t_wall="08:30:00",
             e_wall="25:24:00",
             runner=runner,
+            **_payload_kwargs(),
         )
     assert len(calls) == 1
 
@@ -157,6 +170,7 @@ def test_a_failed_lineage_aborts_before_any_later_lineage(tmp_path: Path) -> Non
             t_wall="08:00:00",
             e_wall="23:00:00",
             runner=runner,
+            **_payload_kwargs(),
         )
     # Only L1's train sbatch was attempted; L2/L3 never ran.
     assert len(runner.calls) == 1
@@ -172,6 +186,7 @@ def test_dry_run_prints_commands_and_calls_no_runner(tmp_path: Path, capsys: pyt
         e_wall="25:24:00",
         runner=calls.append,  # type: ignore[arg-type]
         dry_run=True,
+        **_payload_kwargs(),
     )
     assert calls == []
     assert train_id is None and eval_id is None
@@ -193,4 +208,10 @@ def test_main_requires_t_wall_and_e_wall_when_not_a_dry_run(
     monkeypatch.delenv("T_WALL", raising=False)
     monkeypatch.delenv("E_WALL", raising=False)
     with pytest.raises(launch.LaunchError):
-        launch.main(["--run-root", str(tmp_path), "--commit", "deadbeef"])
+        launch.main([
+            "--run-root", str(tmp_path),
+            "--commit", "deadbeef",
+            "--payload", "pipeline-check",
+            "--science-python", sys.executable,
+            "--executor-python", sys.executable,
+        ])

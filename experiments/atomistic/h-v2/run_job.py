@@ -2,13 +2,15 @@
 """H-v2 in-job attached route (design target sections A4/B3, item 9d3aa0a3).
 
 Invoked by the launch script's generated wrapper (``launch.py``, item
-67f2eb57, F1): ``"$SCIENCE_PYTHON" <checkout>/.../run_job.py train L1`` or
-``... run_job.py eval L1``, always with an absolute path to this file inside
-the explicit checkout (never the Slurm-spooled copy of this file alone,
-which has no siblings to import). Runs entirely inside its own allocation;
-the launch script only submits it.
+67f2eb57, F1/G2): the exact, validated ``--science-python`` interpreter runs
+``<checkout>/.../run_job.py train L1`` or ``... run_job.py eval L1``, always
+with an absolute path to this file inside the explicit checkout (never the
+Slurm-spooled copy of this file alone, which has no siblings to import).
+Runs entirely inside its own allocation; the launch script only submits it.
 
-Required environment (inherited from the submitting shell, per section B3):
+Required environment (G2: set explicitly by the wrapper from the same
+literal, validated interpreter paths the launch script was given --
+never left to whatever the submitting shell happened to export):
 
 ``RUN``
     Durable run root; ``$RUN/checkout`` is the checkout this job runs from.

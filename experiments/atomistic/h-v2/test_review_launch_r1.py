@@ -49,6 +49,20 @@ def job_env(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _payload_kwargs():
+    """G1/G2 (round 2): every submission-reaching call must now choose a
+    payload and supply explicit interpreter paths. ``pipeline-check`` is the
+    only payload these mechanics probes dispatch; ``test_f3`` (and
+    ``run_job.py`` directly) still cover the ``science`` refusal itself.
+    """
+
+    return {
+        "payload": "pipeline-check",
+        "science_python": sys.executable,
+        "executor_python": sys.executable,
+    }
+
+
 def _sidecar_bytes(prepared):
     return tuple(Path(path).read_bytes() for path in (
         prepared.handoff.executor_input, prepared.handoff.configured_runs,
@@ -77,7 +91,7 @@ def test_f1_submitted_script_finds_checkout_siblings_after_spooling(tmp_path):
     )
     command = launch.build_sbatch_command(
         "train", "L1", run_root=root, checkout_root=checkout,
-        time_value="08:00:00", dependency=None,
+        time_value="08:00:00", dependency=None, **_payload_kwargs(),
     )
     spool = tmp_path / "spool" / "job1234"
     spool.mkdir(parents=True)
@@ -171,7 +185,7 @@ def test_f4_over_budget_pair_refuses_before_any_submission(tmp_path, t_wall, e_w
 
     with pytest.raises(launch.LaunchError):
         launch.submit_all(run_root=tmp_path, checkout_root=tmp_path / "checkout",
-                          t_wall=t_wall, e_wall=e_wall, runner=runner)
+                          t_wall=t_wall, e_wall=e_wall, runner=runner, **_payload_kwargs())
     assert calls == []
 
 
@@ -184,7 +198,8 @@ def test_c4_exact_budget_boundary_still_submits(tmp_path):
         return subprocess.CompletedProcess(command, 0, f"{len(calls)}\n", "")
 
     result = launch.submit_all(run_root=tmp_path, checkout_root=tmp_path / "checkout",
-                               t_wall="08:00:00", e_wall="1-00:00:00", runner=runner)
+                               t_wall="08:00:00", e_wall="1-00:00:00", runner=runner,
+                               **_payload_kwargs())
     assert len(calls) == 6 and len(result) == 3
 
 
@@ -217,7 +232,12 @@ def test_f5_cli_identity_cannot_be_replaced_by_stale_environment(tmp_path, monke
 
     monkeypatch.setattr(launch.subprocess, "run", submit)
     try:
-        launch.main(["--run-root", str(requested), "--commit", SHA])
+        launch.main([
+            "--run-root", str(requested), "--commit", SHA,
+            "--payload", "pipeline-check",
+            "--science-python", sys.executable,
+            "--executor-python", sys.executable,
+        ])
     except launch.LaunchError:
         assert observed == [], "identity refusal must precede submission"
         return
@@ -303,7 +323,7 @@ def test_c_job_id_parsing_and_failed_first_submit(tmp_path, stdout, rc, expected
         return subprocess.CompletedProcess(command, rc, stdout, "submission refused" if rc else "")
 
     args = dict(run_root=tmp_path, checkout_root=tmp_path / "checkout",
-                t_wall="08:00:00", e_wall="24:00:00", runner=runner)
+                t_wall="08:00:00", e_wall="24:00:00", runner=runner, **_payload_kwargs())
     if expected_calls == 1:
         with pytest.raises(launch.LaunchError):
             launch.submit_lineage("L1", **args)
@@ -317,7 +337,7 @@ def test_c_dry_run_shell_words_match_real_commands(tmp_path, capsys):
     """Catch omitted quoting/argv joining and accidental dry-run submission."""
     root = tmp_path / "spaces ' ; $(touch BAD)"
     args = dict(run_root=root, checkout_root=root / "checkout",
-                t_wall="08:00:00", e_wall="24:00:00")
+                t_wall="08:00:00", e_wall="24:00:00", **_payload_kwargs())
 
     def forbidden_runner(command):
         pytest.fail("dry run called its runner")
@@ -347,7 +367,7 @@ def test_c_resource_flags_follow_nondefault_config(tmp_path):
                         cpus_per_task=7, mem="41G", no_requeue=False)
     command = launch.build_sbatch_command(
         "train", "L1", run_root=tmp_path, checkout_root=tmp_path / "checkout",
-        time_value="01:00:00", dependency=None, resources=resources,
+        time_value="01:00:00", dependency=None, resources=resources, **_payload_kwargs(),
     )
     expected = {"--partition=review_partition", "--constraint=review_card", "--gres=gpu:2",
                 "--nodes=2", "--ntasks=3", "--cpus-per-task=7", "--mem=41G"}

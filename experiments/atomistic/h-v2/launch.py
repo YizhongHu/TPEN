@@ -9,6 +9,16 @@ for the evaluation job, and nothing else -- no retry, no polling, no
 fallback. Each job runs ``run_job.py`` (the executor's attached route from
 item 9d3aa0a3) inside its own allocation.
 
+Round 2 (PR 619 decisions F1/F3): ``--payload`` is required, with no
+default. ``science`` always refuses before any ``sbatch`` call (no approved
+per-lineage science configuration interface exists yet); ``pipeline-check``
+explicitly selects the non-science payload, labelled as such in job names
+and in-job argv. ``--science-python``/``--executor-python`` are also
+required, absolute, existing-file paths, embedded literally into the job
+wrapper rather than left to whatever the submitting shell happened to
+export. ``run_job.py``'s own in-job gate for the same refusal is kept as
+defence in depth.
+
 This script never cancels a scheduler job, and never invokes the ``tpen.run``
 module directly as a script entrypoint (no ``__main__`` guard, operator
 policy 2026-11-06); use the installed ``tpen`` console command instead. It
@@ -54,6 +64,17 @@ def _h_v2_module(name: str):
 launch_config = _h_v2_module("launch_config")
 
 
+def _run_job_module():
+    """Lazily load ``run_job.py`` (G1: reuse its constants, not a duplicate literal).
+
+    Loaded on demand rather than at module import time, so a plain
+    ``--dry-run`` or argument-parsing failure never pays for (or depends on)
+    ``run_job.py``'s own module-level load of ``attached.py``.
+    """
+
+    return _h_v2_module("run_job")
+
+
 class LaunchError(RuntimeError):
     """A lineage's submission aborted before completing its two jobs."""
 
@@ -65,7 +86,68 @@ def _default_runner(command: Sequence[str]) -> subprocess.CompletedProcess:
     return subprocess.run(list(command), check=False, capture_output=True, text=True)
 
 
-def _wrap_command(stage: str, lineage: str, *, checkout_root: Path) -> str:
+def _validate_payload(payload: str) -> None:
+    """G1 (decision F3): refuse a ``science`` payload before any dispatch.
+
+    No approved per-lineage science configuration interface exists yet
+    (design target section A1; follow-up tracked on item 3c13ba74), so this
+    script must not silently submit ``protocol.training_config()``'s CPU
+    pipeline-check defaults relabeled as a science run. The refusal reuses
+    ``run_job.py``'s own refusal code (:data:`run_job.SCIENCE_CONFIG_UNAVAILABLE_CODE`)
+    so the two refusal sites -- here, before any ``sbatch`` call, and
+    ``run_job.py``'s in-job gate, kept as defence in depth -- never drift
+    apart into two different codes for the same condition.
+
+    Raises
+    ------
+    LaunchError
+        Always, for ``payload == "science"``; also for any other value that
+        is not ``"pipeline-check"``.
+    """
+
+    if payload == "science":
+        code = _run_job_module().SCIENCE_CONFIG_UNAVAILABLE_CODE
+        raise LaunchError(
+            f"{code}: no approved per-lineage science configuration interface "
+            "exists yet (design target section A1; follow-up tracked on item "
+            "3c13ba74). Refusing before any sbatch submission rather than "
+            "dispatching the non-science pipeline-check payload under a "
+            "science label. Pass --payload pipeline-check to explicitly "
+            "select the non-science payload instead."
+        )
+    if payload != "pipeline-check":
+        raise LaunchError(f"--payload must be 'science' or 'pipeline-check', got {payload!r}")
+
+
+def _validate_interpreter(path_value: str, *, label: str) -> str:
+    """G2 (decision F1): require an absolute, existing interpreter path.
+
+    Symlinks are deliberately left unresolved: a venv's ``bin/python`` is
+    commonly a symlink, and resolving it would embed a path outside the
+    venv it was selected for.
+
+    Raises
+    ------
+    LaunchError
+        If ``path_value`` is not absolute, or does not exist as a file.
+    """
+
+    if not os.path.isabs(path_value):
+        raise LaunchError(f"{label} must be an absolute path, got {path_value!r}")
+    if not Path(path_value).is_file():
+        raise LaunchError(f"{label} does not exist: {path_value!r}")
+    return path_value
+
+
+def _wrap_command(
+    stage: str,
+    lineage: str,
+    *,
+    checkout_root: Path,
+    science_python: str,
+    executor_python: str,
+    payload: str,
+) -> str:
     """Return the ``sh`` body for a self-contained, location-independent wrapper.
 
     F1: a ``sbatch`` submission only spools the SUBMITTED script's own bytes;
@@ -75,17 +157,34 @@ def _wrap_command(stage: str, lineage: str, *, checkout_root: Path) -> str:
     it carries no sibling dependency of its own (every path is embedded as a
     literal, ``shlex``-quoted argument), ``cd``s into the explicit checkout,
     and ``exec``s the explicit science interpreter on the checkout's own
-    ``run_job.py``. The interpreter comes from the ``$SCIENCE_PYTHON``
-    environment variable rather than ``/usr/bin/env python3``, so the job
-    runs in the prepared science environment, not whatever ``python3``
-    happens to resolve to on the allocated node.
+    ``run_job.py``.
+
+    G2: the interpreter is the caller's explicit, validated
+    ``--science-python``/``--executor-python`` value, embedded here as a
+    literal ``shlex``-quoted argument -- never ``$SCIENCE_PYTHON`` read back
+    from whatever the submitting shell happened to export (``sbatch``
+    forwards the submitter's environment via ``--export=ALL``, which is not
+    the same guarantee as an explicit, validated path). ``SCIENCE_PYTHON``
+    and ``EXECUTOR_PY`` are still set in the job's own environment, from the
+    same literal values, because ``run_job.py``'s in-job route reads them by
+    name; setting them here from a literal rather than inheriting them
+    closes the same gap for both.
+
+    G1: when ``payload == "pipeline-check"``, ``--pipeline-check`` is
+    appended to the in-job argv, selecting the explicit non-science payload
+    in ``run_job.py``. ``payload == "science"`` never reaches this function
+    (:func:`_validate_payload` refuses first), so no flag is ever added for
+    it.
     """
 
     job_script = checkout_root / launch_config.JOB_SCRIPT_RELATIVE
+    extra_arg = f" {shlex.quote('--pipeline-check')}" if payload == "pipeline-check" else ""
     return (
         f"cd {shlex.quote(str(checkout_root))} && "
-        f'exec "$SCIENCE_PYTHON" {shlex.quote(str(job_script))} '
-        f"{shlex.quote(stage)} {shlex.quote(lineage)}"
+        f"SCIENCE_PYTHON={shlex.quote(science_python)} "
+        f"EXECUTOR_PY={shlex.quote(executor_python)} "
+        f"exec {shlex.quote(science_python)} {shlex.quote(str(job_script))} "
+        f"{shlex.quote(stage)} {shlex.quote(lineage)}{extra_arg}"
     )
 
 
@@ -93,6 +192,9 @@ def build_sbatch_command(
     stage: str,
     lineage: str,
     *,
+    payload: str,
+    science_python: str,
+    executor_python: str,
     run_root: Path,
     checkout_root: Path,
     time_value: str,
@@ -108,6 +210,14 @@ def build_sbatch_command(
         Job stage.
     lineage : str
         Opaque lineage identity (for example ``"L1"``).
+    payload : {"science", "pipeline-check"}
+        G1: which payload this job dispatches. ``"science"`` is refused by
+        :func:`_validate_payload` before this function is ever reached;
+        ``"pipeline-check"`` labels the job name and appends
+        ``--pipeline-check`` to the in-job argv (:func:`_wrap_command`).
+    science_python, executor_python : str
+        G2: explicit, pre-validated absolute interpreter paths, embedded
+        literally into the wrapper (:func:`_wrap_command`).
     run_root, checkout_root : pathlib.Path
         Durable run root (logs live under ``run_root/logs``) and the
         checkout the job script is read from.
@@ -136,9 +246,11 @@ def build_sbatch_command(
 
     if stage not in ("train", "eval"):
         raise LaunchError(f"stage must be 'train' or 'eval', got {stage!r}")
+    _validate_payload(payload)
     run_root = Path(run_root)
     checkout_root = Path(checkout_root)
-    job_name = f"h-v2-sci-{lineage}-{stage}"
+    label = _run_job_module().PIPELINE_CHECK_LABEL
+    job_name = f"h-v2-{label}-{lineage}-{stage}"
     command = [
         "sbatch",
         "--parsable",
@@ -154,10 +266,13 @@ def build_sbatch_command(
     ]
     if resources.no_requeue:
         command.append("--no-requeue")
-    # F5: RUN and (when known) SHA are bound explicitly here, from this
+    # F5/G2: RUN and (when known) SHA are bound explicitly here, from this
     # script's own parsed arguments, rather than left to whatever the
-    # submitting shell happened to have exported. ALL still forwards the
-    # rest of the submitting environment (SCIENCE_PYTHON, EXECUTOR_PY; sbatch
+    # submitting shell happened to have exported. SCIENCE_PYTHON and
+    # EXECUTOR_PY no longer rely on ALL forwarding the submitting shell's
+    # environment either -- the wrapper (_wrap_command) sets them itself
+    # from the same literal, validated paths used to exec the interpreter.
+    # ALL is kept for anything else the environment may still need (sbatch
     # does not export by default -- facility note
     # sbatch-env-var-not-exported-by-default-20261104).
     export_parts = ["ALL", f"RUN={run_root}"]
@@ -170,7 +285,9 @@ def build_sbatch_command(
     ]
     if dependency:
         command.append(f"--dependency={dependency}")
-    command.append(f"--wrap={_wrap_command(stage, lineage, checkout_root=checkout_root)}")
+    command.append(
+        f"--wrap={_wrap_command(stage, lineage, checkout_root=checkout_root, science_python=science_python, executor_python=executor_python, payload=payload)}"
+    )
     return command
 
 
@@ -263,6 +380,9 @@ def _validate_wall_budget(t_wall: str, e_wall: str) -> None:
 def submit_lineage(
     lineage: str,
     *,
+    payload: str,
+    science_python: str,
+    executor_python: str,
     run_root: Path,
     checkout_root: Path,
     t_wall: str,
@@ -285,13 +405,19 @@ def submit_lineage(
     Raises
     ------
     LaunchError
-        If the train submission fails or yields no job id; the eval job is
+        G1: if ``payload == "science"`` (or any value other than
+        ``"pipeline-check"``), before any submission, dry-run included. If
+        the train submission fails or yields no job id, the eval job is
         never submitted in that case.
     """
 
+    _validate_payload(payload)
     train_command = build_sbatch_command(
         "train",
         lineage,
+        payload=payload,
+        science_python=science_python,
+        executor_python=executor_python,
         run_root=run_root,
         checkout_root=checkout_root,
         time_value=t_wall,
@@ -303,6 +429,9 @@ def submit_lineage(
         placeholder_eval = build_sbatch_command(
             "eval",
             lineage,
+            payload=payload,
+            science_python=science_python,
+            executor_python=executor_python,
             run_root=run_root,
             checkout_root=checkout_root,
             time_value=e_wall,
@@ -316,6 +445,9 @@ def submit_lineage(
     eval_command = build_sbatch_command(
         "eval",
         lineage,
+        payload=payload,
+        science_python=science_python,
+        executor_python=executor_python,
         run_root=run_root,
         checkout_root=checkout_root,
         time_value=e_wall,
@@ -328,6 +460,9 @@ def submit_lineage(
 
 def submit_all(
     *,
+    payload: str,
+    science_python: str,
+    executor_python: str,
     run_root: Path,
     checkout_root: Path,
     t_wall: str,
@@ -339,18 +474,25 @@ def submit_all(
 ) -> dict[str, tuple[str | None, str | None]]:
     """Submit every lineage's two jobs in order; abort on the first failure.
 
-    Validates the T_WALL/E_WALL budget (F4) before any lineage is attempted.
+    G1: validates ``payload`` first, before anything else, so a ``science``
+    payload (or any unrecognized value) raises before the T_WALL/E_WALL
+    budget is even checked, with zero runner calls, dry-run included. Then
+    validates the T_WALL/E_WALL budget (F4) before any lineage is attempted.
     A lineage whose train submission fails raises before any later lineage
     is attempted: this function does no partial-progress bookkeeping beyond
     what each already-successful ``submit_lineage`` call returned to the
     caller before the failure.
     """
 
+    _validate_payload(payload)
     _validate_wall_budget(t_wall, e_wall)
     results: dict[str, tuple[str | None, str | None]] = {}
     for lineage in lineages:
         results[lineage] = submit_lineage(
             lineage,
+            payload=payload,
+            science_python=science_python,
+            executor_python=executor_python,
             run_root=run_root,
             checkout_root=checkout_root,
             t_wall=t_wall,
@@ -367,6 +509,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", required=True, help="Durable run root (logs, checkout live under it).")
+    parser.add_argument(
+        "--payload",
+        required=True,
+        choices=("science", "pipeline-check"),
+        help=(
+            "Which payload every lineage dispatches (G1/decision F3). 'science' always "
+            "refuses before any sbatch submission (no approved per-lineage science "
+            "configuration interface exists yet). 'pipeline-check' explicitly selects "
+            "the non-science pipeline-check payload, labelled as such in job names and "
+            "in-job argv. No default: the caller must choose."
+        ),
+    )
+    parser.add_argument(
+        "--science-python",
+        required=True,
+        help=(
+            "Absolute path to the science environment's python, embedded literally "
+            "into the job wrapper. Not resolved: a venv bin/python symlink is kept "
+            "as-is, since resolving it would escape the venv."
+        ),
+    )
+    parser.add_argument(
+        "--executor-python",
+        required=True,
+        help="Absolute path to the executor environment's python; validated the same way.",
+    )
     parser.add_argument(
         "--commit",
         required=True,
@@ -393,6 +561,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     # override here would submit a job whose wrapper and whose own identity
     # check disagree about where the checkout lives.
     checkout_root = run_root / "checkout"
+    science_python = _validate_interpreter(args.science_python, label="--science-python")
+    executor_python = _validate_interpreter(args.executor_python, label="--executor-python")
     t_wall = os.environ.get("T_WALL")
     e_wall = os.environ.get("E_WALL")
     if not args.dry_run and (not t_wall or not e_wall):
@@ -400,6 +570,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     t_wall = t_wall or "<T_WALL>"
     e_wall = e_wall or "<E_WALL>"
     results = submit_all(
+        payload=args.payload,
+        science_python=science_python,
+        executor_python=executor_python,
         run_root=run_root,
         checkout_root=checkout_root,
         t_wall=t_wall,
