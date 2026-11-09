@@ -509,11 +509,15 @@ def test_refuses_a_restored_lineage_even_with_a_zero_step_first_update(tmp_path:
     state = TrainerState(model=model, optimizer=optimizer, trainer=_Trainer(completed_updates=1))
     output_path = tmp_path / "parameter_activity.json"
     callback = ParameterActivity(output_path)
+    # Same context identity for both deliveries: a new `RunContext` instance
+    # resets `_restored` (see `_reset_typed_state`), which would otherwise
+    # silently defeat this exact probe.
+    context = _make_context(tmp_path)
 
-    callback.handle_occurrence(_checkpoint_restored(), _make_context(tmp_path), None)
+    callback.handle_occurrence(_checkpoint_restored(), context, None)
 
     with pytest.raises(ValueError, match="fresh first-applied-update lineage"):
-        callback.handle_occurrence(_update_completed(step=0), _make_context(tmp_path), state)
+        callback.handle_occurrence(_update_completed(step=0), context, state)
 
     assert not output_path.exists()
 
