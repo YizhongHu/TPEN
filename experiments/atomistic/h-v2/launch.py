@@ -19,6 +19,30 @@ wrapper rather than left to whatever the submitting shell happened to
 export. ``run_job.py``'s own in-job gate for the same refusal is kept as
 defence in depth.
 
+Round 3 (K4). Invocation: run this file with the SCIENCE environment's
+interpreter (the one later passed as ``--science-python``), not a bare
+system Python -- even ``--dry-run`` and a bad ``--payload`` eagerly load
+``run_job.py`` (and therefore ``attached.py``: ``yaml``, ``omegaconf``,
+``experiments/toolkit``) to read shared constants, so those packages must
+already be importable::
+
+    "$TPEN_UV" run --project "$TPEN_CHECKOUT" --locked --extra cpu python \\
+        "$TPEN_CHECKOUT/experiments/atomistic/h-v2/launch.py" \\
+        --run-root "$RUN_ROOT" --commit "$SHA" --payload pipeline-check \\
+        --science-python "$SCIENCE_PYTHON" --executor-python "$EXECUTOR_PY" \\
+        --dry-run
+
+No ``PYTHONPATH`` setup is required for that invocation: this module puts
+its own checkout root on ``sys.path`` (K1; the same convention as
+``experiments/hooke/pair_stability_v3/launch.py``'s own ``REPO_ROOT``
+insertion), since ``experiments`` is a namespace package with no
+``__init__.py`` and resolves only when the repository root is on
+``sys.path`` (``pyproject.toml``'s ``[tool.pytest.ini_options]`` comment).
+The in-job wrapper this script generates sets its own ``PYTHONPATH`` the
+same way, for the same reason, in its own child process (:func:`_wrap_command`).
+``T_WALL``/``E_WALL`` environment variables are required for every
+invocation, dry-run included (K3): there is no placeholder fallback.
+
 This script never cancels a scheduler job, and never invokes the ``tpen.run``
 module directly as a script entrypoint (no ``__main__`` guard, operator
 policy 2026-11-06); use the installed ``tpen`` console command instead. It
@@ -38,6 +62,18 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 HERE = Path(__file__).resolve().parent
+
+# K1: ``experiments`` is a namespace package with no ``__init__.py`` and
+# resolves only when the repository root is on ``sys.path`` (pytest supplies
+# this for free via ``pythonpath = ["."]``; a plain script invocation does
+# not). ``run_job.py``'s module-level load of ``attached.py`` needs it the
+# moment ``_run_job_module()`` is first called below, including under
+# ``--dry-run`` and even for an invalid ``--payload``. Mirrors
+# ``experiments/hooke/pair_stability_v3/launch.py``'s own ``REPO_ROOT``
+# insertion.
+REPO_ROOT = HERE.parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def _h_v2_module(name: str):
@@ -175,12 +211,31 @@ def _wrap_command(
     in ``run_job.py``. ``payload == "science"`` never reaches this function
     (:func:`_validate_payload` refuses first), so no flag is ever added for
     it.
+
+    K1: Slurm spools only the submitted ``--wrap`` body itself, as its own
+    fresh process -- ``sys.path`` there starts at the checkout's
+    ``experiments/atomistic/h-v2`` directory (``run_job.py``'s own
+    directory), never the repository root, and nothing sets ``PYTHONPATH``
+    for it. ``run_job.py``'s module-level load of ``attached.py`` (``from
+    experiments.toolkit.attached_activation import ...``) then fails with
+    ``ModuleNotFoundError: No module named 'experiments'`` before any
+    payload runs, every time, for every stage. The wrapper sets
+    ``PYTHONPATH`` to the explicit checkout root itself, via a real shell
+    variable rather than inline string interpolation (so a run root
+    containing shell metacharacters, as :func:`shlex.quote` already handles
+    for every other embedded path here, can never be reinterpreted),
+    appending any already-inherited ``PYTHONPATH`` rather than replacing it
+    -- the same convention as ``experiments/atomistic/he-cutover``'s sbatch
+    templates.
     """
 
     job_script = checkout_root / launch_config.JOB_SCRIPT_RELATIVE
     extra_arg = f" {shlex.quote('--pipeline-check')}" if payload == "pipeline-check" else ""
+    checkout_quoted = shlex.quote(str(checkout_root))
     return (
-        f"cd {shlex.quote(str(checkout_root))} && "
+        f"cd {checkout_quoted} && "
+        f"CHECKOUT={checkout_quoted} && "
+        'PYTHONPATH="$CHECKOUT${PYTHONPATH:+:$PYTHONPATH}" '
         f"SCIENCE_PYTHON={shlex.quote(science_python)} "
         f"EXECUTOR_PY={shlex.quote(executor_python)} "
         f"exec {shlex.quote(science_python)} {shlex.quote(str(job_script))} "
@@ -563,12 +618,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     checkout_root = run_root / "checkout"
     science_python = _validate_interpreter(args.science_python, label="--science-python")
     executor_python = _validate_interpreter(args.executor_python, label="--executor-python")
+    # K3: required unconditionally, dry-run included -- _validate_wall_budget
+    # cannot parse the prior placeholder values ("<T_WALL>"/"<E_WALL>"), so a
+    # dry run without both set always raised "malformed wall-time value"
+    # anyway; that dead placeholder path is removed rather than fixed.
     t_wall = os.environ.get("T_WALL")
     e_wall = os.environ.get("E_WALL")
-    if not args.dry_run and (not t_wall or not e_wall):
-        raise LaunchError("T_WALL and E_WALL environment variables are required to submit")
-    t_wall = t_wall or "<T_WALL>"
-    e_wall = e_wall or "<E_WALL>"
+    if not t_wall or not e_wall:
+        raise LaunchError("T_WALL and E_WALL environment variables are required")
     results = submit_all(
         payload=args.payload,
         science_python=science_python,

@@ -194,8 +194,31 @@ def write_local_allocation_and_worker(
     return allocation_path, worker_path
 
 
-def checkpoint_dir_for_eval(run_root: Path, lineage: str) -> Path:
+def _train_task_id(lineage: str, *, pipeline_check: bool) -> str:
+    """Return TRAIN's task id for *lineage* (K2/H1).
+
+    :func:`run` uses this to build TRAIN's own task id, and
+    :func:`checkpoint_dir_for_eval` uses it to locate TRAIN's accepted
+    receipt from EVAL -- one function, so the two can never drift apart into
+    two different names for the same lineage again (TRAIN wrote
+    ``h-v2-train-pipeline-check-<lineage>`` under ``pipeline_check`` while
+    EVAL read the unlabelled ``h-v2-train-<lineage>``, so EVAL always failed
+    with "no TRAIN accepted receipt" before reaching its own documented
+    ``h-v2-eval-route-unsupported`` refusal).
+    """
+
+    build_lineage = f"{PIPELINE_CHECK_LABEL}-{lineage}" if pipeline_check else lineage
+    return f"h-v2-train-{build_lineage}"
+
+
+def checkpoint_dir_for_eval(run_root: Path, lineage: str, *, pipeline_check: bool = False) -> Path:
     """Read the lineage's TRAIN checkpoint dir from its accepted receipt.
+
+    Parameters
+    ----------
+    pipeline_check : bool, default=False
+        Must match the ``pipeline_check`` TRAIN actually ran under for this
+        lineage (K2/H1): the receipt name is namespaced the same way.
 
     Raises
     ------
@@ -204,7 +227,8 @@ def checkpoint_dir_for_eval(run_root: Path, lineage: str) -> Path:
         this never invents a checkpoint path.
     """
 
-    receipt_path = run_root / "attached" / "receipts" / f"h-v2-train-{lineage}.h-v2.json"
+    task_id = _train_task_id(lineage, pipeline_check=pipeline_check)
+    receipt_path = run_root / "attached" / "receipts" / f"{task_id}.h-v2.json"
     if not receipt_path.is_file():
         raise JobError(f"no TRAIN accepted receipt at {receipt_path}; TRAIN must complete before EVAL")
     payload = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -259,10 +283,13 @@ def run(stage: str, lineage: str, *, pipeline_check: bool = False) -> None:
                 "the non-science pipeline-check payload."
             )
         build_lineage = f"{PIPELINE_CHECK_LABEL}-{lineage}"
-        task_id = f"h-v2-train-{build_lineage}"
+        task_id = _train_task_id(lineage, pipeline_check=pipeline_check)
     elif stage == "eval":
         build_lineage = lineage
-        task_id = f"h-v2-eval-{lineage}-stream0"
+        # K2/H1: labelled the same way TRAIN is, so EVAL's own task
+        # id/logs/receipts say plainly which TRAIN receipt it read.
+        label = f"{PIPELINE_CHECK_LABEL}-" if pipeline_check else ""
+        task_id = f"h-v2-eval-{label}{lineage}-stream0"
     else:
         raise JobError(f"stage must be 'train' or 'eval', got {stage!r}")
 
@@ -281,7 +308,7 @@ def run(stage: str, lineage: str, *, pipeline_check: bool = False) -> None:
             output_dir=handoff_dir, results_root=results_root, lineage=build_lineage
         )
     else:
-        checkpoint_dir = checkpoint_dir_for_eval(run_root, lineage)
+        checkpoint_dir = checkpoint_dir_for_eval(run_root, lineage, pipeline_check=pipeline_check)
         plan, overrides, config = attached.build_h_v2_eval_plan(
             output_dir=handoff_dir,
             results_root=results_root,
