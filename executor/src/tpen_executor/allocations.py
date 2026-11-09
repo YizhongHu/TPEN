@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ._codec import _freeze, canonical_bytes, decode_json, fields, thaw, text
 from .contracts import AllocationId, BackendJobId
+from ._records import frozen_record
 from .results import AllocationObservation
 
 
@@ -20,7 +20,7 @@ def _hashable(value: Any) -> Any:
     return value
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class ConfiguredAllocation:
     """An explicitly configured allocation; no scheduler discovery occurs.
 

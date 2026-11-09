@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ._codec import _freeze, canonical_bytes, decode_json, digest, fields, sequence, sha256_text, text, thaw
+from ._records import frozen_record
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class _Identity:
     """Base for deliberately non-interchangeable opaque identities."""
 
@@ -43,28 +43,28 @@ class _Identity:
         return cls.from_mapping(decode_json(data))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class AttemptId(_Identity):
     """Identity of one fresh execution attempt."""
 
     schema: ClassVar[str] = "tpen-executor/attempt-id-v1"
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class AllocationId(_Identity):
     """Identity of one backend allocation."""
 
     schema: ClassVar[str] = "tpen-executor/allocation-id-v1"
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class BackendJobId(_Identity):
     """Identity assigned by a backend to one submitted job."""
 
     schema: ClassVar[str] = "tpen-executor/backend-job-id-v1"
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class ProgramSpecRef:
     """Opaque unresolved program configuration and its content digest.
 
@@ -112,7 +112,7 @@ class ProgramSpecRef:
         return cls.from_mapping(decode_json(data))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class TaskSpec:
     """One logical task admitted to an executor group.
 
@@ -163,7 +163,7 @@ class TaskSpec:
         return cls.from_mapping(decode_json(data))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class ReadyGroup:
     """Ordered, heterogeneous group of tasks ready for one allocation plan.
 

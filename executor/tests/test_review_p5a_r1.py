@@ -99,8 +99,8 @@ def test_p5a_r1_t2a_descriptors_never_touch_the_filesystem() -> None:
     assert calls == [], f"descriptor reached the filesystem via {sorted(set(calls))}"
 
 
-_DESCRIPTOR_MODULES = ("environments.py", "delivery.py")
-_ALLOWED_IMPORTS = {"__future__", "os", "collections.abc", "dataclasses", "types", "typing", "tpen_executor._codec"}
+_DESCRIPTOR_MODULES = ("environments.py", "delivery.py", "_records.py")
+_ALLOWED_IMPORTS = {"__future__", "os", "collections.abc", "dataclasses", "types", "typing", "tpen_executor._codec", "tpen_executor._records"}
 _BANNED_NAME_CALLS = {"open", "exec", "eval", "compile", "__import__"}
 _ALLOWED_OS_ATTRIBUTES = {"os.path", "os.path.isabs"}
 

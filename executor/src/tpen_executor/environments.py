@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import field
 from types import MappingProxyType
 from typing import Any, ClassVar
 
 from ._codec import canonical_bytes, decode_json, fields, thaw
+from ._records import frozen_record
 
 
 def _absolute_path(value: Any, name: str) -> str:
@@ -41,7 +42,7 @@ def _string_mapping(value: Any, name: str) -> MappingProxyType:
     return MappingProxyType(frozen)
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class SourceScript:
     """Description of a setup script owned by the target process.
 
@@ -82,7 +83,7 @@ class SourceScript:
         return cls.from_mapping(decode_json(data))
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class PreparedPythonEnvironment:
     """Description of a prepared Python environment.
 

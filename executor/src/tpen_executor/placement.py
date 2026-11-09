@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
 from .allocations import ConfiguredAllocation
+from ._records import frozen_record
 
 
 class BindingError(ValueError):
@@ -32,7 +32,7 @@ def _normalize_nodes(value: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class WorkerBinding:
     """Immutable environment binding for one Parsl worker.
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import field
 from pathlib import Path
 import threading
 from typing import Any
@@ -11,6 +11,7 @@ from typing import Any
 from ..environments import PreparedPythonEnvironment, SourceScript
 from ..placement import BindingError, WorkerBinding, binding_from_allocation
 from ..programs import WorkerProgram
+from .._records import frozen_record
 from ..results import RunManifest
 from ..contracts import ReadyGroup
 from ..lifecycle.attached import AttachedAllocation
@@ -77,7 +78,7 @@ class _ChildProcessHandle:
                 self._process = None
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class _ChildFailure:
     """Carry a worker-thread BaseException through Parsl's future."""
 
@@ -124,7 +125,7 @@ def _run_parsl_child(
     )
 
 
-@dataclass(frozen=True, slots=True)
+@frozen_record
 class ParslDispatcher(DispatcherContract):
     """Dispatch members as Parsl applications inside an existing allocation.
 
