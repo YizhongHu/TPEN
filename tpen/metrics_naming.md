@@ -343,6 +343,22 @@ loss_has_grad                           |
 optimizer_step                          |
 ```
 
+`train/electron_nucleus_distance` — optional `ElectronNucleusDistanceQuantiles`
+callback, one record per configured cadence:
+
+```text
+electron_<index>_nucleus_distance_min
+electron_<index>_nucleus_distance_q<level>
+```
+
+The callback reads the `ElectronBatch` used by the completed iteration. For
+each electron, it first takes the minimum distance over nuclei for every
+configuration, then summarizes those distances across the whole training
+batch. Quantile levels are supplied by the run configuration; core supplies no
+default levels. Quantiles use PyTorch's `linear` interpolation, and labels use
+the energy-diagnostic convention (`q001`, `q01`, `q50`, `q99`, `q999`, or a
+percent label such as `q25`).
+
 `train/sampler` — `SamplerStats.as_metrics`:
 
 ```text
