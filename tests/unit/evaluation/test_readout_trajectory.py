@@ -147,18 +147,22 @@ def test_ordinary_model_raw_sum_agrees_with_logabs_sign_and_has_no_floor_hits(tm
         model=_FixedReadout(raw_value=5.0e-6).eval(), context=_context(directory)
     )
     rows = list(csv.DictReader((directory / "raw_readout.csv").open(newline="")))
+    trajectory_rows = list(
+        csv.DictReader((directory / "sampled_eval_table.csv").open(newline=""))
+    )
     assert all(row["floor_active"] == "False" for row in rows)
-    for row in rows:
+    assert len(rows) == len(trajectory_rows)
+    for row, trajectory_row in zip(rows, trajectory_rows, strict=True):
         radius_squared = sum(
-            float(row[f"position/electron_0/axis_{axis}"]) ** 2 for axis in range(3)
+            float(trajectory_row[f"position/electron_0/axis_{axis}"]) ** 2 for axis in range(3)
         )
         assert float(row["raw_channel_sum"]) == pytest.approx(5.0e-6)
-        assert float(row["logabs"]) == pytest.approx(
+        assert float(trajectory_row["logabs"]) == pytest.approx(
             torch.log(torch.tensor(5.0e-6)).item() - 0.25 * radius_squared,
             rel=1.0e-12,
             abs=1.0e-12,
         )
-        assert float(row["sign"]) == 1.0
+        assert float(trajectory_row["sign"]) == 1.0
 
 
 def test_forced_floor_raw_sums_and_flags_match_independent_oracle(tmp_path):
