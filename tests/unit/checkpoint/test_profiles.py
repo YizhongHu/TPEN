@@ -84,6 +84,17 @@ def test_unknown_callback_target_remains_refused() -> None:
 
 
 @pytest.mark.parametrize("target", sorted(NEW_CALLBACK_TARGETS))
+def test_each_new_callback_target_is_admitted(target: str) -> None:
+    config = OmegaConf.to_container(OmegaConf.load(H_V2_TRAIN_CONFIG), resolve=False)
+    config["callbacks"].append({"_target_": target})
+
+    result = check_profile(config, NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "supported"
+    assert result.refusal is None
+
+
+@pytest.mark.parametrize("target", sorted(NEW_CALLBACK_TARGETS))
 def test_dropping_each_new_target_refuses_the_h_v2_callback_set(
     target: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
