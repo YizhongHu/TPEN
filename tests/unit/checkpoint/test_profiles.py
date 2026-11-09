@@ -9,6 +9,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from tpen.checkpoint.profiles import (
+    CALLBACK_CADENCE_REFUSAL_CODE,
     NATIVE_PROFILE,
     NATIVE_RECOVERY_PROFILE,
     Profile,
@@ -16,6 +17,7 @@ from tpen.checkpoint.profiles import (
     REFUSAL_CODES,
     SUPPORTED_STATE_OWNERS,
     ProfileCheck,
+    check_resume_sensitive_callback_cadence,
     check_profile,
 )
 from tpen.checkpoint import profiles
@@ -23,6 +25,7 @@ from tpen.execution import NATIVE_PROFILE_VERSION
 from tpen.execution.native_profile import (
     SUPPORTED_CALLBACK_TARGETS,
     SUPPORTED_LOGGER_TARGETS,
+    UnsupportedMutableStateError,
     validate_native_recovery_profile,
 )
 
@@ -87,6 +90,61 @@ def test_each_new_callback_target_is_admitted(target: str) -> None:
 
     assert result.verdict == "supported"
     assert result.refusal is None
+
+
+@pytest.mark.parametrize("target", sorted(NEW_CALLBACK_TARGETS))
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("max_calls", 1), ("probability", 0.5)],
+)
+def test_resume_sensitive_cadence_is_refused_by_both_validators(
+    target: str, field: str, value: object
+) -> None:
+    config = _config(callbacks=[{"_target_": target, field: value}])
+
+    result = check_profile(config, NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "refused"
+    assert result.refusal is not None
+    assert result.refusal["code"] == CALLBACK_CADENCE_REFUSAL_CODE
+    assert field in result.refusal["reason"]
+    with pytest.raises(UnsupportedMutableStateError, match=field):
+        validate_native_recovery_profile(config)
+
+
+@pytest.mark.parametrize("target", sorted(NEW_CALLBACK_TARGETS))
+def test_reconstructible_cadence_is_admitted_by_both_validators(target: str) -> None:
+    config = _config(
+        callbacks=[
+            {
+                "_target_": target,
+                "every_n_steps": 100,
+                "max_calls": None,
+                "probability": 1.0,
+            }
+        ]
+    )
+
+    result = check_profile(config, NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "supported"
+    assert result.refusal is None
+    validate_native_recovery_profile(config)
+
+
+def test_resume_sensitive_cadence_helper_audits_pop_step_cadence_fields() -> None:
+    assert check_resume_sensitive_callback_cadence(
+        _config(
+            callbacks=[
+                {
+                    "_target_": "tpen.callback.DataIntegrity",
+                    "every_n_steps": 5,
+                    "start_step": 2,
+                    "seed": 9,
+                }
+            ]
+        )
+    ) is None
 
 
 @pytest.mark.parametrize("target", sorted(NEW_CALLBACK_TARGETS))
