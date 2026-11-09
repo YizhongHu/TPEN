@@ -9,12 +9,23 @@ import json
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
+import tpen_executor.workers as workers_module
 from tpen_executor.configuration import StagedHydra
+from tpen_executor.dispatch.contract import _child_context_keys
 from tpen_executor.environments import PreparedPythonEnvironment, SourceScript
-from tpen_executor.runners import CoreRunEvidence, EvidenceUnavailable, RUN_SHIM, TPENCommand, TPENEvidence
+from tpen_executor.runners import (
+    CHILD_CONTEXT_KEYS_ENV,
+    CONTEXT_ENV_KEY_PATTERN,
+    CoreRunEvidence,
+    EvidenceUnavailable,
+    RUN_SHIM,
+    TPENCommand,
+    TPENEvidence,
+)
 from tpen_executor.workers import ProcessOutcome, SubprocessWorker
 
 
@@ -109,6 +120,88 @@ def test_subprocess_worker_only_writes_named_logs(tmp_path: Path) -> None:
     SubprocessWorker().run(environment, ("-c", RUN_SHIM), cwd=tmp_path, stdout_path=out, stderr_path=err)
     after = {path.relative_to(tmp_path) for path in tmp_path.rglob("*")}
     assert after - before == {Path("named.out"), Path("named.err")}
+
+
+def test_run_shim_observation_excludes_unallowlisted_environment(tmp_path: Path) -> None:
+    environment, _ = _science(tmp_path)
+    environment = PreparedPythonEnvironment(
+        environment.python,
+        environment.setup,
+        {
+            **environment.env,
+            "CUDA_VISIBLE_DEVICES": "7",
+            "OMP_NUM_THREADS": "4",
+            "TPEN_CTX_CONTEXT_VALUE": "declared",
+            "P10_TEST_SECRET": "xyz",
+            CHILD_CONTEXT_KEYS_ENV: json.dumps(["TPEN_CTX_CONTEXT_VALUE", "P10_TEST_SECRET"]),
+        },
+    )
+    outcome = SubprocessWorker().run(
+        environment,
+        ("-c", RUN_SHIM, f"run.root={tmp_path}"),
+        cwd=tmp_path,
+        stdout_path=tmp_path / "observation.out",
+        stderr_path=tmp_path / "observation.err",
+    )
+    assert outcome.returncode == 0
+    observation = json.loads((tmp_path / "executor-child-observation.json").read_text(encoding="utf-8"))
+    assert observation["environment"] == {
+        "CUDA_VISIBLE_DEVICES": "7",
+        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS"),
+        "OMP_NUM_THREADS": "4",
+        "TPEN_CTX_CONTEXT_VALUE": "declared",
+    }
+    assert "P10_TEST_SECRET" not in observation["environment"]
+
+
+def test_run_shim_observation_records_spawned_child_pid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    environment, _ = _science(tmp_path)
+    spawned_pids: list[int] = []
+    real_popen = workers_module.subprocess.Popen
+
+    def recording_popen(*args: object, **kwargs: object) -> object:
+        process = real_popen(*args, **kwargs)
+        spawned_pids.append(process.pid)
+        return process
+
+    monkeypatch.setattr(workers_module.subprocess, "Popen", recording_popen)
+    outcome = SubprocessWorker().run(
+        environment,
+        ("-c", RUN_SHIM, f"run.root={tmp_path}"),
+        cwd=tmp_path,
+        stdout_path=tmp_path / "observation.out",
+        stderr_path=tmp_path / "observation.err",
+    )
+
+    assert outcome.returncode == 0
+    assert len(spawned_pids) == 1
+    observation = json.loads((tmp_path / "executor-child-observation.json").read_text(encoding="utf-8"))
+    assert observation["pid"] == spawned_pids[0]
+
+
+def test_context_key_pattern_is_the_executor_shim_pattern() -> None:
+    """The source constant is available for the cross-project contract test."""
+
+    assert CONTEXT_ENV_KEY_PATTERN == r"^(CUDA_VISIBLE_DEVICES|TPEN_CTX_[A-Z0-9_]{1,64})$"
+
+
+def test_child_context_keys_preserve_default_and_declared_context_names() -> None:
+    allocation = SimpleNamespace(
+        facts={
+            "attached_context": {
+                "context": {
+                    "environment": {"TPEN_CTX_THREAD_SETTING": "4"},
+                    "visibility_variable": "CUDA_VISIBLE_DEVICES",
+                }
+            }
+        }
+    )
+    assert _child_context_keys(allocation) == (
+        "CUDA_VISIBLE_DEVICES",
+        "MKL_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "TPEN_CTX_THREAD_SETTING",
+    )
 
 
 def test_tpen_command_launches_stub_with_exact_args(tmp_path: Path) -> None:

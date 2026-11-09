@@ -166,6 +166,7 @@ def build_plans(grid: Mapping[str, Any], *, facility: str, results_root: str | P
 
     rows = expand_rows(grid, facility=facility, results_root=results_root)
     tasks: list[LogicalTaskSpec] = []
+    manifest_rows: list[dict[str, Any]] = []
     for row in rows:
         result = Path(row["result_dir"])
         status = result / "status.json"
@@ -174,13 +175,14 @@ def build_plans(grid: Mapping[str, Any], *, facility: str, results_root: str | P
         script = "run_train_row.py" if row["kind"] == "train" else "run_eval_row.py"
         command = ("{python}", str(Path(__file__).resolve().parent / script), "--row-json", json.dumps(row, sort_keys=True), "--plan-attempt-id", plan_id)
         logical_id = logical_task_id_from_parts(stage=row["stage"], run_id=row["row_id"], plan_id=plan_id)
+        manifest_rows.append({**row, "logical_task_id": logical_id})
         train_run_id = row["row_id"] if row["kind"] == "train" else f"seed-{int(row['row_id'].split('-')[1]):03d}"
         dependencies = () if row["kind"] == "train" else (logical_task_id_from_parts(stage="02_train", run_id=train_run_id, plan_id=plan_id),)
         resources = row["resources"]
         tasks.append(LogicalTaskSpec(logical_task_id=logical_id, stage=row["stage"], run_id=row["row_id"], command=command, result_dir=str(result), logs=(str(status),), params=dict(row), resources=ResourceSpec(profile="cuda", device="cuda", partition=resources["partition"], threads=resources["cpus"], mem_gb=resources["mem_gb"], gpus=resources["gpus"], timeout_min=resources["timeout_min"], metadata={"stratum": resources["stratum"]}), dependencies=dependencies, completion=completion, metadata={"facility": facility, "runtime": row["runtime"]}))
     train_plan = StagePlanV2(STUDY, "02_train", plan_id, str(results_root), tuple(task for task in tasks if task.stage == "02_train")).validate()
     eval_plan = StagePlanV2(STUDY, "03_eval", plan_id, str(results_root), tuple(task for task in tasks if task.stage == "03_eval")).validate()
-    manifest = {"schema": "he-cutover-plan/v1", "study": STUDY, "facility": facility, "plan_id": plan_id, "results_root": str(Path(results_root).resolve()), "rows": list(rows), "stages": {"02_train": "02_train", "03_eval": "03_eval"}}
+    manifest = {"schema": "he-cutover-plan/v1", "study": STUDY, "facility": facility, "plan_id": plan_id, "results_root": str(Path(results_root).resolve()), "rows": manifest_rows, "stages": {"02_train": "02_train", "03_eval": "03_eval"}}
     return train_plan, eval_plan, manifest
 
 

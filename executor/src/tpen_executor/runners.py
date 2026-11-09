@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import MappingProxyType
@@ -13,7 +14,34 @@ from ._records import frozen_record
 from .workers import SubprocessWorker
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
-RUN_SHIM = "import sys; from tpen.run import main; raise SystemExit(main(sys.argv[1:]))"
+CHILD_CONTEXT_KEYS_ENV = "TPEN_EXECUTOR_CONTEXT_ENV_KEYS"
+CONTEXT_ENV_KEY_PATTERN = r"^(CUDA_VISIBLE_DEVICES|TPEN_CTX_[A-Z0-9_]{1,64})$"
+RUN_SHIM = (
+    "import json, os, re, socket, sys\n"
+    "from pathlib import Path\n"
+    "try:\n"
+    f"    context_keys = json.loads(os.environ.get('{CHILD_CONTEXT_KEYS_ENV}', '[]'))\n"
+    "except (TypeError, ValueError):\n"
+    "    context_keys = []\n"
+    f"context_keys = [key for key in context_keys if type(key) is str and re.fullmatch({CONTEXT_ENV_KEY_PATTERN!r}, key)] if isinstance(context_keys, list) else []\n"
+    "observation_keys = sorted(set(context_keys) | {'CUDA_VISIBLE_DEVICES', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS'})\n"
+    "observed_environment = {key: os.environ.get(key) for key in observation_keys}\n"
+    "run_roots = [arg.split('=', 1)[1] for arg in sys.argv[1:] if arg.startswith('run.root=')]\n"
+    "if run_roots:\n"
+    "    observation = {\n"
+    "        'schema': 'tpen-executor/child-observation-v1',\n"
+    "        'cuda_visible_devices': observed_environment['CUDA_VISIBLE_DEVICES'],\n"
+    "        'environment': observed_environment,\n"
+    "        'thread_settings': {name: observed_environment[name] for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS')},\n"
+    "        'hostname': socket.gethostname(),\n"
+    "        'pid': os.getpid(),\n"
+    "    }\n"
+    "    Path(run_roots[-1], 'executor-child-observation.json').write_text(\n"
+    "        json.dumps(observation, sort_keys=True) + '\\n', encoding='utf-8'\n"
+    "    )\n"
+    "from tpen.run import main\n"
+    "raise SystemExit(main(sys.argv[1:]))"
+)
 REFUSAL_CODES = frozenset(
     {
         "missing-run-dir", "missing-status", "multiple-status", "malformed-status",
@@ -266,4 +294,4 @@ class TPENEvidence:
         return CoreRunEvidence.from_mapping(decoded)
 
 
-__all__ = ["CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "TPENCommand", "TPENEvidence"]
+__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CONTEXT_ENV_KEY_PATTERN", "CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "TPENCommand", "TPENEvidence"]

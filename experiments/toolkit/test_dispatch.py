@@ -16,6 +16,7 @@ from typing import Sequence
 import pytest
 
 from experiments.toolkit.dispatch import (
+    CONTEXT_ENV_KEY_PATTERN,
     DEFAULT_RUNTIME,
     SCHEMA_VERSION_V2,
     AllocationContext,
@@ -668,6 +669,49 @@ def test_allocation_context_rejects_blank_visibility_entry() -> None:
             visibility_variable="CUDA_VISIBLE_DEVICES",
             visibility_values=("0", " "),
         ).validate()
+
+
+def test_allocation_context_rejects_undeclared_environment_key() -> None:
+    """Context declarations cannot widen the executor observation namespace."""
+
+    with pytest.raises(ValueError, match="context-environment-key"):
+        AllocationContext(
+            allocation_id="alloc-1",
+            visibility_variable="CUDA_VISIBLE_DEVICES",
+            visibility_values=(),
+            environment={"P10_CONTEXT_VALUE": "unsafe"},
+        ).validate()
+
+
+def test_toolkit_and_executor_context_key_patterns_match() -> None:
+    """The decoupled toolkit and executor must enforce the same namespace."""
+
+    import os
+    import subprocess
+
+    executor_python = os.environ.get("P9C_EXECUTOR_PYTHON")
+    if not executor_python:
+        pytest.skip("named skip: P9C_EXECUTOR_PYTHON is unset")
+
+    root = Path(__file__).resolve().parents[2]
+    executor_env = os.environ.copy()
+    executor_env["PYTHONPATH"] = str(root / "executor" / "src")
+    result = subprocess.run(
+        [
+            executor_python,
+            "-c",
+            "from tpen_executor.runners import CONTEXT_ENV_KEY_PATTERN; print(CONTEXT_ENV_KEY_PATTERN)",
+        ],
+        cwd=root,
+        env=executor_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    executor_pattern = result.stdout.strip()
+
+    assert CONTEXT_ENV_KEY_PATTERN == executor_pattern
 
 
 @pytest.mark.parametrize(
