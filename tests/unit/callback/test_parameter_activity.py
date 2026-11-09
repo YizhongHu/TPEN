@@ -12,24 +12,55 @@ from __future__ import annotations
 
 import json
 import math
+from datetime import UTC
 from pathlib import Path
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
+from tpen.artifacts import ArtifactManager, RunClock, RunContext, RunMetadata
 from tpen.callback.parameter_activity import ParameterActivity
 from tpen.training.events import TrainingIteration, TrainingIterationCompleted, UpdateCompleted, UpdateSkipped
 from tpen.training.state import TrainerState
 from tpen.events import Occurrence
 
 
-class _Context:
-    """Minimal stand-in satisfying the runtime-checked `CallbackContext` protocol."""
+def _make_context(tmp_path: Path) -> RunContext:
+    """Build a minimal real `RunContext`: `handle_occurrence_impl` is type-checked
+    against the concrete `RunContext` class, so a duck-typed stand-in fails that
+    check before any assertion runs. This callback never reads from `context`."""
 
-    metadata = None
-
-    def now_iso(self) -> str:
-        return "2026-01-01T00:00:00+00:00"
+    artifact_manager = ArtifactManager(
+        tmp_path / "run-artifacts",
+        experiment="parameter-activity",
+        sector="unit",
+        run_id="parameter-activity-unit",
+        layout="flat",
+    )
+    artifact_manager.make_dirs()
+    metadata = RunMetadata(
+        run_id="parameter-activity-unit",
+        run_name="parameter-activity-unit",
+        timestamp="2026-11-08T12:00:00+00:00",
+        timezone="UTC",
+        git_commit="test-sha",
+        git_branch="test-branch",
+        dirty_worktree=False,
+        command="pytest",
+        config_path="test.yaml",
+        resolved_config_path=str(artifact_manager.path("resolved_config.yaml")),
+        run_dir=str(artifact_manager.run_dir),
+        device="cpu",
+        dtype="float64",
+    )
+    return RunContext(
+        cfg=OmegaConf.create({}),
+        source_cfg=OmegaConf.create({}),
+        artifact_manager=artifact_manager,
+        metadata=metadata,
+        clock=RunClock(timezone="UTC", tzinfo=UTC),
+    )
 
 
 class _Trainer:
@@ -88,7 +119,7 @@ def test_classifies_absent_zero_and_nonzero_gradients(tmp_path: Path) -> None:
     output_path = tmp_path / "parameter_activity.json"
     callback = ParameterActivity(output_path)
 
-    callback.handle_occurrence(_update_completed(), _Context(), state)
+    callback.handle_occurrence(_update_completed(), _make_context(tmp_path), state)
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     rows = _rows_by_name(payload)
@@ -122,7 +153,7 @@ def test_optimizer_without_live_model_parameters_reports_every_parameter_absent(
     output_path = tmp_path / "parameter_activity.json"
     callback = ParameterActivity(output_path)
 
-    callback.handle_occurrence(_update_completed(), _Context(), state)
+    callback.handle_occurrence(_update_completed(), _make_context(tmp_path), state)
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     rows = _rows_by_name(payload)
@@ -139,7 +170,7 @@ def test_no_write_on_update_skipped_or_unrelated_event(tmp_path: Path) -> None:
     output_path = tmp_path / "parameter_activity.json"
     callback = ParameterActivity(output_path)
 
-    context = _Context()
+    context = _make_context(tmp_path)
     callback.handle_occurrence(_update_skipped(), context, state)
     callback.handle_occurrence(_iteration_completed(), context, state)
 
@@ -154,7 +185,7 @@ def test_writes_exactly_once_on_first_applied_update(tmp_path: Path) -> None:
     output_path = tmp_path / "parameter_activity.json"
     callback = ParameterActivity(output_path)
 
-    context = _Context()
+    context = _make_context(tmp_path)
     callback.handle_occurrence(_update_completed(count=1), context, state)
     mtime_before = output_path.stat().st_mtime_ns
 
@@ -179,6 +210,6 @@ def test_refuses_to_silently_overwrite_an_existing_inventory(tmp_path: Path) -> 
     callback = ParameterActivity(output_path)
 
     with pytest.raises(FileExistsError):
-        callback.handle_occurrence(_update_completed(), _Context(), state)
+        callback.handle_occurrence(_update_completed(), _make_context(tmp_path), state)
 
     assert output_path.read_text(encoding="utf-8") == "stale-from-a-prior-attempt"
