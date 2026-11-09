@@ -22,6 +22,12 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
 
+# Pre-change resolver: dev commit 1ae776c9, state before #573, blob 7ede61e8.
+# The former pre-change pin was orphaned by the squash merge.
+_PRECHANGE_PIN = "1ae776c98c661a02aaa53e7f76d8aacf91b1a15d"
+_PRECHANGE_BLOB = "7ede61e86383c68db55eb4ea13214857fdebdd28"
+
+
 _STAGE_SPEC = importlib.util.spec_from_file_location(
     "he_importance_stage_coordinate_for_train_config",
     Path(__file__).with_name("stage_coordinate.py"),
@@ -174,16 +180,30 @@ def _ab_cell(tmp_path: Path, package: Mapping[str, object], axis: str) -> object
 def _load_prechange_resolver() -> types.ModuleType:
     """Load the pre-change resolver source for byte comparison."""
 
-    # Pre-change resolver source, blob 7ede61e8, identical to the PR base's train_config.py.
-    # Generating command, mechanically: git show 040a5b8e87befc59bb21a9c64f8ec1782c8fa283:
-    # experiments/atomistic/he-importance/train_config.py
+    test_dir = Path(__file__).resolve().parent
+    actual_blob = subprocess.run(
+        [
+            "git",
+            "rev-parse",
+            f"{_PRECHANGE_PIN}:experiments/atomistic/he-importance/train_config.py",
+        ],
+        cwd=test_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert actual_blob == _PRECHANGE_BLOB, (
+        f"pre-change pin {_PRECHANGE_PIN} resolves to blob {actual_blob}; "
+        f"expected {_PRECHANGE_BLOB}"
+    )
     source = subprocess.run(
         [
             "git",
             "show",
-            "040a5b8e87befc59bb21a9c64f8ec1782c8fa283:"
+            f"{_PRECHANGE_PIN}:"
             "experiments/atomistic/he-importance/train_config.py",
         ],
+        cwd=test_dir,
         check=True,
         capture_output=True,
         text=True,
@@ -1245,3 +1265,35 @@ def test_resolver_requires_repo_root_on_sys_path(tmp_path: Path, monkeypatch: py
 
     with pytest.raises(train_config.CheckoutPreconditionError, match="checkout root"):
         train_config.resolve_train_config(cell)
+
+
+# Pre-change pin guard ---------------------------------------------------------
+def test_prechange_pin_guard_names_pin_and_both_blobs_on_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pin whose train_config.py blob is not the recorded one fails before any oracle load."""
+
+    recorded_blob = _PRECHANGE_BLOB
+    wrong_blob = "0" * 40
+    monkeypatch.setitem(globals(), "_PRECHANGE_BLOB", wrong_blob)
+
+    with pytest.raises(AssertionError) as info:
+        _load_prechange_resolver()
+
+    message = str(info.value)
+    assert _PRECHANGE_PIN in message
+    assert recorded_blob in message
+    assert wrong_blob in message
+
+
+def test_prechange_pin_guard_fails_loudly_when_the_pin_object_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable pin is a CalledProcessError from rev-parse, never a quiet oracle mismatch."""
+
+    monkeypatch.setitem(globals(), "_PRECHANGE_PIN", "0" * 40)
+
+    with pytest.raises(subprocess.CalledProcessError) as info:
+        _load_prechange_resolver()
+
+    assert info.value.returncode != 0
