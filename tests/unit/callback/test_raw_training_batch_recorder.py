@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
+from tpen.artifacts import ArtifactManager, RunClock, RunContext, RunMetadata
 from tpen.callback.raw_training_batch_recorder import (
     RawTrainingBatchRecorder,
     TrainingBatchPartitionWriter,
@@ -21,6 +24,8 @@ from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.events import Occurrence
 from tpen.training.events import TrainingCompleted, TrainingIteration, TrainingIterationCompleted
 from tpen.training.state import TrainerState
+from tpen.training.trainer import VMCTrainer
+from tests.helpers.hooke_models import build_tiny_hamiltonian_terms, build_tiny_sampler, build_tiny_spenn
 
 
 class _Context:
@@ -55,6 +60,58 @@ def _publish_valid(root: Path) -> None:
     writer = TrainingBatchPartitionWriter(root, partition_index=0, planned_steps=[0])
     writer.append(_record(0))
     writer.publish()
+
+
+def test_reader_consumes_real_training_loop_output(tmp_path: Path) -> None:
+    """Validate partitions emitted by the real trainer, not hand-built rows."""
+
+    history_root = tmp_path / "training-history"
+    callback = RawTrainingBatchRecorder(history_root, partition_size_steps=1, every_n_steps=1)
+    manager = ArtifactManager(tmp_path / "artifacts", "compat", "unit", "run", layout="flat")
+    manager.make_dirs()
+    context = RunContext(
+        cfg=OmegaConf.create({"trainer": {"max_steps": 1}}),
+        source_cfg=OmegaConf.create({}),
+        artifact_manager=manager,
+        metadata=RunMetadata(
+            run_id="run",
+            run_name="run",
+            timestamp="2026-01-01T00:00:00+00:00",
+            timezone="UTC",
+            git_commit="test-sha",
+            git_branch="test",
+            dirty_worktree=False,
+            command="pytest",
+            config_path="test.yaml",
+            resolved_config_path=str(manager.path("resolved_config.yaml")),
+            run_dir=str(manager.run_dir),
+            device="cpu",
+            dtype="float64",
+        ),
+        clock=RunClock(timezone="UTC", tzinfo=UTC),
+        callbacks=[callback],
+    )
+    torch.manual_seed(20261109)
+    model = build_tiny_spenn()
+    sampler = build_tiny_sampler()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    trainer = VMCTrainer(max_steps=1, log_every_n_steps=1, return_terms=True)
+    trainer.fit(
+        model=model,
+        sampler=sampler,
+        hamiltonian_terms=build_tiny_hamiltonian_terms(),
+        optimizer=optimizer,
+        context=context,
+        emit=lambda *args, **kwargs: None,
+    )
+
+    manifest = json.loads((history_root / "manifest.json").read_text())
+    assert len(manifest["partitions"]) == 1
+    assert (history_root / manifest["partitions"][0]["sidecar"]).is_file()
+    rows = TrainingBatchReader(history_root).read()
+    assert rows["iteration_step"].size == rows["walker_index"].size
+    assert set(rows["iteration_step"]) == {0}
+    TrainingBatchReader(history_root).validate()
 
 
 def _rewrite_bundle(root: Path, mutate) -> None:
