@@ -29,6 +29,7 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 from omegaconf import OmegaConf
+from omegaconf.errors import UnsupportedInterpolationType
 
 from experiments.toolkit.attached_activation import (
     PROFILE_NAME,
@@ -110,6 +111,13 @@ _TRAJECTORY_ARTIFACTS = {
     "trajectory_csv": "trajectory/sampled_eval_table.csv",
     "trajectory_metadata": "trajectory/sampled_eval_table.metadata.json",
 }
+#: D3: the unresolved ``${run.dir}/...`` prefix every per-run artifact path in
+#: these frozen configs is written under; stripping it from a callback's own
+#: unresolved config value gives the artifact's path relative to the fenced
+#: core run directory, without resolving ``run.dir`` itself (which is not yet
+#: known at prepare time -- the attached executor assigns it, see
+#: ``build_h_v2_accepted_receipt``'s docstring).
+_RUN_DIR_PREFIX = "${run.dir}/"
 
 
 class HV2ReceiptRefusal(ValueError):
@@ -143,6 +151,7 @@ class PreparedHV2Run:
     effective_config: str
     config: Mapping[str, Any]
     overrides: tuple[str, ...]
+    artifact_declarations: Mapping[str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,8 +366,8 @@ def build_h_v2_eval_plan(
     return plan, {task_id: overrides}, config
 
 
-def _compose_config_with_overrides(effective_config: str | Path, overrides: Sequence[str]) -> dict[str, Any]:
-    """Compose the exact config that will launch: the effective file plus overrides.
+def _merge_config_with_overrides(effective_config: str | Path, overrides: Sequence[str]) -> Any:
+    """Merge the effective config file with its exact overrides, unresolved.
 
     Mirrors ``experiments.toolkit.attached_activation.check_profile``'s own
     composition (``OmegaConf.merge(base, OmegaConf.from_dotlist(overrides))``)
@@ -366,10 +375,153 @@ def _compose_config_with_overrides(effective_config: str | Path, overrides: Sequ
     """
 
     base = OmegaConf.load(effective_config)
-    merged = OmegaConf.merge(base, OmegaConf.from_dotlist(list(overrides)))
-    composed = OmegaConf.to_container(merged, resolve=False)
+    return OmegaConf.merge(base, OmegaConf.from_dotlist(list(overrides)))
+
+
+def _resolve_bound_config(merged: Any) -> dict[str, Any]:
+    """Return the FULLY RESOLVED composition, for checking actual values.
+
+    Raises
+    ------
+    HV2ReceiptRefusal
+        Code ``custom-resolver-required``, if resolving needs an OmegaConf
+        resolver this module does not register (it never imports
+        ``tpen.config``, which is where H-v2's custom resolvers, if any were
+        ever added, would be registered).  H-v2's real configs use only plain
+        ``${a.b.c}`` interpolations today, so this is a defensive STOP for a
+        future config change, not a path exercised by the current configs.
+    """
+
+    try:
+        composed = OmegaConf.to_container(merged, resolve=True)
+    except UnsupportedInterpolationType as error:
+        raise HV2ReceiptRefusal(
+            "custom-resolver-required",
+            f"resolving the bound composition needs an OmegaConf resolver this module does "
+            f"not register ({error}); this module never imports tpen.config and must stop "
+            f"rather than guess at one",
+        ) from error
     assert isinstance(composed, dict)
     return composed
+
+
+def _unresolved_bound_config(merged: Any) -> dict[str, Any]:
+    """Return the bound composition with interpolations left as literal text.
+
+    Used only to recover an artifact path's ``${run.dir}``-relative portion
+    (see :func:`_run_dir_relative`): ``run.dir`` is not yet known at prepare
+    time, so resolving it here would produce the wrong (or a placeholder)
+    value, not a usable relative path.
+    """
+
+    unresolved = OmegaConf.to_container(merged, resolve=False)
+    assert isinstance(unresolved, dict)
+    return unresolved
+
+
+def _run_dir_relative(value: Any, *, name: str) -> str:
+    """Strip the unresolved ``${run.dir}/`` prefix from a configured path.
+
+    Raises
+    ------
+    HV2ReceiptRefusal
+        Code ``unbound-artifact-path``, if ``value`` is not an unresolved
+        string of exactly this shape -- a config that points an artifact
+        somewhere not under the run directory is not something this module
+        can safely declare a relative requirement for.
+    """
+
+    if not isinstance(value, str) or not value.startswith(_RUN_DIR_PREFIX):
+        raise HV2ReceiptRefusal(
+            "unbound-artifact-path", f"{name} must be an unresolved {_RUN_DIR_PREFIX!r}-relative path, got {value!r}"
+        )
+    return value[len(_RUN_DIR_PREFIX):]
+
+
+def _derive_artifact_declarations(unresolved: Mapping[str, Any], *, stage: str) -> dict[str, str]:
+    """Derive required artifact declarations from the bound, unresolved config.
+
+    D3: a configured ``tpen.callback.InitialCheckpoint`` or
+    ``tpen.callback.ParameterActivity`` makes its own output mandatory, and an
+    EVAL config's trajectory records are required at their OWN configured
+    path rather than a hardcoded guess.
+
+    Parameters
+    ----------
+    unresolved : mapping
+        The exact bound composition (effective config plus overrides),
+        BEFORE interpolation resolution (see :func:`_unresolved_bound_config`).
+    stage : {"train", "eval"}
+        Segment stage.
+
+    Returns
+    -------
+    dict
+        ``{name: relative_path}`` entries to require, beyond the base
+        (``resolved_config``, ``metadata``) artifacts every segment already
+        declares unconditionally.
+
+    Raises
+    ------
+    HV2ReceiptRefusal
+        Code ``unbound-artifact-path`` (see :func:`_run_dir_relative`), or
+        code ``missing-evaluator-task`` if an EVAL config declares no
+        ``"trajectory"`` evaluator task -- silently requiring nothing here
+        would reintroduce the exact silently-accepted-missing-trajectory
+        defect this module's trajectory check exists to refuse.
+    """
+
+    declared: dict[str, str] = {}
+    for callback in unresolved.get("callbacks") or ():
+        if not isinstance(callback, Mapping):
+            continue
+        target = callback.get("_target_")
+        if target == "tpen.callback.InitialCheckpoint":
+            declared["initial_checkpoint"] = _run_dir_relative(
+                callback.get("output_dir"), name="InitialCheckpoint.output_dir"
+            )
+        elif target == "tpen.callback.ParameterActivity":
+            declared["parameter_activity"] = _run_dir_relative(
+                callback.get("output_path"), name="ParameterActivity.output_path"
+            )
+    if stage == EVAL_STAGE:
+        tasks = ((unresolved.get("evaluator") or {}).get("tasks")) or ()
+        trajectory_task = next(
+            (entry for entry in tasks if isinstance(entry, Mapping) and entry.get("name") == "trajectory"), None
+        )
+        if trajectory_task is None:
+            raise HV2ReceiptRefusal(
+                "missing-evaluator-task", "EVAL config declares no 'trajectory' evaluator task"
+            )
+        relative = _run_dir_relative(trajectory_task.get("output_dir"), name="evaluator.tasks[trajectory].output_dir")
+        declared["trajectory_csv"] = f"{relative}/sampled_eval_table.csv"
+        declared["trajectory_metadata"] = f"{relative}/sampled_eval_table.metadata.json"
+    return declared
+
+
+def _reconcile_artifact_declarations(
+    derived: Mapping[str, str], supplied: Mapping[str, str] | None
+) -> dict[str, str]:
+    """Merge a caller-supplied declaration map into the derived one, refusing a conflict.
+
+    Raises
+    ------
+    HV2ReceiptRefusal
+        Code ``artifact-declaration-mismatch``, if ``supplied`` restates a
+        name the bound composition already derives, with a different path.
+    """
+
+    declared = dict(derived)
+    if supplied:
+        for name, relative in supplied.items():
+            if name in declared and declared[name] != relative:
+                raise HV2ReceiptRefusal(
+                    "artifact-declaration-mismatch",
+                    f"caller-supplied declaration for {name!r} ({relative!r}) disagrees with the "
+                    f"bound composition's own ({declared[name]!r})",
+                )
+            declared[name] = relative
+    return declared
 
 
 def prepare_h_v2_run(
@@ -403,15 +555,19 @@ def prepare_h_v2_run(
     Raises
     ------
     HV2ReceiptRefusal
-        If the plan does not carry exactly one task.
+        If the plan does not carry exactly one task; code
+        ``custom-resolver-required``, ``unbound-artifact-path``, or
+        ``missing-evaluator-task`` from resolving and deriving artifact
+        declarations (see :func:`_resolve_bound_config`,
+        :func:`_derive_artifact_declarations`).
     ValueError
         If the exact bound config -- the effective config file composed with
-        its own overrides, the same composition that will actually launch --
-        fails :func:`protocol.assert_hydrogen_contract`.  Carried requirement
-        1 is checked here, on the COMPOSED config, not only on the builder's
-        unresolved dict: an override supplied after the builder ran (for
-        example a tampered ``system.n_particles=2``) is caught here, before
-        any dispatch.
+        its own overrides and FULLY RESOLVED, the same values that will
+        actually launch -- fails :func:`protocol.assert_hydrogen_contract`.
+        Carried requirement 1 is checked here, on the RESOLVED composition,
+        not the unresolved dict: an override supplied after the builder ran
+        (for example a tampered ``system.n_particles=2``, or one expressed
+        through an interpolation) is caught here, before any dispatch.
     ActivationRefusal
         If handoff translation fails; current sidecars are retired and a
         diagnostic is preserved (see ``write_attached_handoff``).
@@ -422,8 +578,11 @@ def prepare_h_v2_run(
     task = plan.tasks[0]
     effective_config = task.params["config"]
     overrides = tuple(str(item) for item in overrides_by_task[task.logical_task_id])
-    composed = _compose_config_with_overrides(effective_config, overrides)
-    protocol.assert_hydrogen_contract(composed, evaluation=(task.stage == EVAL_STAGE))
+    merged = _merge_config_with_overrides(effective_config, overrides)
+    resolved = _resolve_bound_config(merged)
+    protocol.assert_hydrogen_contract(resolved, evaluation=(task.stage == EVAL_STAGE))
+    unresolved = _unresolved_bound_config(merged)
+    artifact_declarations = _derive_artifact_declarations(unresolved, stage=task.stage)
     handoff = write_attached_handoff(
         output_dir,
         plan,
@@ -432,7 +591,9 @@ def prepare_h_v2_run(
         overrides_by_task=overrides_by_task,
         metadata={"route": ROUTE_NAME, "stage": task.stage},
     )
-    return PreparedHV2Run(plan, handoff, task.logical_task_id, str(effective_config), dict(config), overrides)
+    return PreparedHV2Run(
+        plan, handoff, task.logical_task_id, str(effective_config), dict(config), overrides, artifact_declarations
+    )
 
 
 def activate_h_v2_run(
@@ -478,9 +639,14 @@ def activate_h_v2_run(
     inspect_run : callable, optional
         Root public-reader inspector, or a test double.
     artifact_declarations : mapping[str, str], optional
-        Additional ``{name: relative_path}`` entries, beyond the base and
-        trajectory artifacts this function already declares, that every
-        accepted segment must carry.  Later logging layers extend this
+        Additional ``{name: relative_path}`` entries, beyond the base
+        artifacts and whatever D3 already derives from ``prepared``'s own
+        bound composition (a configured ``InitialCheckpoint``/
+        ``ParameterActivity`` output, and -- for EVAL -- the trajectory pair
+        at its configured path).  Reconciled against that derived map (see
+        :func:`_reconcile_artifact_declarations`): a name this function
+        already derives must agree on its path, or the run refuses with
+        ``artifact-declaration-mismatch``.  Later logging layers extend this
         without redefining the receipt schema.
 
     Returns
@@ -491,11 +657,15 @@ def activate_h_v2_run(
     Raises
     ------
     ActivationRefusal
-        If the profile check or executor dispatch is refused.
+        If the profile check or the executor dispatch -- including its own
+        sidecar preflight, before any subprocess is spawned -- is refused.
     HV2ReceiptRefusal, ManifestRefusal
         If the H-v2 accepted receipt refuses the run (see
-        :func:`build_h_v2_accepted_receipt`).  Both the generic and the
-        H-v2 failure receipts are written before the exception propagates.
+        :func:`build_h_v2_accepted_receipt`), or the caller-supplied
+        ``artifact_declarations`` disagrees with the derived ones.  Both the
+        generic and the H-v2 failure receipts are written before the
+        exception propagates, each carrying the ORIGINAL named code and
+        reason.
     """
 
     expected = prepared.handoff.task_ids
@@ -522,16 +692,24 @@ def activate_h_v2_run(
     except ActivationRefusal as error:
         _fail(error.code, error.reason)
         raise
-    dispatch = run_executor_cli(
-        executor_python,
-        prepared.handoff,
-        allocation=allocation,
-        worker_config=worker_config,
-        store=store,
-        dispatcher=dispatcher,
-        timeout=timeout,
-        cwd=cwd,
-    )
+    try:
+        dispatch = run_executor_cli(
+            executor_python,
+            prepared.handoff,
+            allocation=allocation,
+            worker_config=worker_config,
+            store=store,
+            dispatcher=dispatcher,
+            timeout=timeout,
+            cwd=cwd,
+        )
+    except ActivationRefusal as error:
+        # D2: run_executor_cli's own sidecar preflight (_validate_attached_sidecars)
+        # can refuse before any subprocess is spawned; that refusal must retire
+        # both receipts exactly like the profile-check refusal above, not reach
+        # the caller with stale receipt bytes left in place.
+        _fail(error.code, error.reason, profile=profile.profile)
+        raise
     if dispatch.manifest is None or not manifest_path.is_file():
         code = f"executor-exit-{dispatch.returncode}"
         reason = dispatch.stderr.strip() or "executor did not publish a manifest"
@@ -545,6 +723,21 @@ def activate_h_v2_run(
             inspect_run=inspect_run,
             profile=profile.profile,
         )
+    except ManifestRefusal as error:
+        # D2: write_activation_receipt already preserves error.code/reason on
+        # the operational receipt itself; preserve the SAME named code/reason
+        # on the H-v2 receipt too, and re-raise the original ManifestRefusal
+        # unchanged (it already carries .code/.reason) instead of substituting
+        # a generic "reader-failed" placeholder that erases them.
+        write_activation_failure_receipt(
+            h_v2_receipt_path,
+            code=error.code,
+            reason=error.reason,
+            expected_task_ids=expected,
+            profile=profile.profile,
+            manifest_path=manifest_path,
+        )
+        raise
     except Exception as error:
         write_activation_failure_receipt(
             h_v2_receipt_path,
@@ -556,6 +749,9 @@ def activate_h_v2_run(
         )
         raise ActivationRefusal("reader-failed", str(error)) from error
     try:
+        reconciled_artifact_declarations = _reconcile_artifact_declarations(
+            prepared.artifact_declarations, artifact_declarations
+        )
         write_h_v2_accepted_receipt(
             manifest_path,
             h_v2_receipt_path,
@@ -563,7 +759,7 @@ def activate_h_v2_run(
             expected_source_commit=expected_source_commit,
             stage=stage,
             inspect_run=inspect_run,
-            artifact_declarations=artifact_declarations,
+            artifact_declarations=reconciled_artifact_declarations,
         )
     except (HV2ReceiptRefusal, ManifestRefusal) as error:
         write_activation_failure_receipt(
