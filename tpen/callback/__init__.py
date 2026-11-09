@@ -28,6 +28,10 @@ def __getattr__(name: str) -> object:
         from .checkpoint import Checkpoint
 
         return Checkpoint
+    if name == "InitialCheckpoint":
+        from .initial_checkpoint import InitialCheckpoint
+
+        return InitialCheckpoint
     if name == "Status":
         from .status import Status
 
@@ -100,6 +104,7 @@ __all__ = [
     "FailureLog",
     "FactorScalars",
     "GradientStats",
+    "InitialCheckpoint",
     "Metadata",
     "ResolvedConfigSnapshot",
     "ResourceUsage",

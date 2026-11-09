@@ -17,10 +17,14 @@ class CheckpointRestored(Event):
     because both `tpen.runner.Train` and `tpen.runner.Evaluate` reach the same
     moment, and `RestoreReport` is defined here.
 
-    Unusually for this program, it has no callback subscriber and is not
-    expected to grow one: the legacy ``checkpoint_restored`` string has two
-    emitters and zero handlers repo-wide. It is typed anyway because its
-    consumer is the durable record. The human's D3 ruling put restored
+    Historically this had no callback subscriber: the legacy
+    ``checkpoint_restored`` string has two emitters and zero handlers
+    repo-wide. ``tpen.callback.InitialCheckpoint`` is the first typed
+    subscriber, through a stateless, class-owned group -- it needs to know a
+    run was restored at all, independent of what the restored counters say,
+    to refuse a resumed lineage whose counters happen to read zero. It was
+    typed in the first place because its consumer is the durable record. The
+    human's D3 ruling put restored
     checkpoint identity on the typed evaluation lifecycle rather than smuggling
     it into a metric key or a `tpen.logging.LogRecord` field, and that identity
     reaches ``occurrences.jsonl`` only through this event. Field-wise
