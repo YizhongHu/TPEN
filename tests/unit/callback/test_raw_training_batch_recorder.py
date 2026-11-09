@@ -177,6 +177,7 @@ def test_callback_captures_pre_update_forward_and_records_skipped_update(tmp_pat
     state.wavefunction_output = WavefunctionOutput(torch.tensor([40.0, 50.0]), torch.ones(2))
     state.local_energy = torch.tensor([20.0, 30.0])
     state.optimizer_step = True
+    state.trainer.completed_updates = 1
     state.wavefunction_output = WavefunctionOutput(torch.tensor([6.0, 7.0]), torch.ones(2))
     state.local_energy = torch.tensor([6.0, 7.0])
     callback.handle_occurrence(
