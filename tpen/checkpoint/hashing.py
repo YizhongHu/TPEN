@@ -190,6 +190,8 @@ def populate_resolved_config_defaults(config: Any, *, timezone: str | None = Non
     plain = to_unresolved_container(config)
     if not isinstance(plain, Mapping):
         raise TypeError("resolved configuration identity requires a mapping")
+    if any(type(key) is not str for key in plain):
+        raise TypeError("resolved configuration mapping keys must be strings")
     prepared = copy.deepcopy(dict(plain))
     experiment = prepared.setdefault("experiment", {})
     run = prepared.setdefault("run", {})

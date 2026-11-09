@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import pytest
 from omegaconf import OmegaConf
 from experiments.toolkit.run_results import ManifestRefusal, read, RUN_MANIFEST_V1, RUN_MANIFEST_V2
@@ -48,9 +49,10 @@ def write(tmp_path, p):
     return path
 
 
-def executor(code, *args):
+def executor(code, *args, python=None):
     env = dict(os.environ, PYTHONPATH=str(ROOT / "executor/src"))
-    return subprocess.run([os.environ["P8_EXECUTOR_PYTHON"], "-c", code, *map(str, args)], cwd=ROOT / "executor", env=env, text=True, capture_output=True, timeout=60)
+    executable = python or os.environ["P8_EXECUTOR_PYTHON"]
+    return subprocess.run([executable, "-c", code, *map(str, args)], cwd=ROOT / "executor", env=env, text=True, capture_output=True, timeout=60)
 
 
 @pytest.mark.parametrize("bad", ["foreign-group", "receipt-group-mismatch", "short-digest", "bad-result-digest", "unknown-outcome"])
@@ -126,7 +128,11 @@ configured = ConfiguredRun("run", str(config), tuple(sys.argv[4:]))
 result = LocalDispatcher(worker).run(group, {"run": configured}, AttachedAllocation(allocation, store), timeout=120)
 Path(sys.argv[2]).write_bytes(result.encode())
 '''
-    run = executor(code, config, manifest, ROOT, *overrides)
+    # The executor process itself is the real dispatcher path, while the
+    # launched core child must use the Torch-enabled root environment.  The
+    # arm-specific P8 interpreter is intentionally dependency-light and cannot
+    # stand in for the core runtime here.
+    run = executor(code, config, manifest, ROOT, *overrides, python=sys.executable)
     assert run.returncode == 0, (run.stdout, run.stderr)
     result = read(manifest)
     assert len(result.chains) == 1 and len(result.chains[0].segments) == 1
