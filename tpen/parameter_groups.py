@@ -60,7 +60,7 @@ def resolve_parameter_groups(
             raise TypeError("group names must be non-empty strings")
         if group == ungrouped:
             raise ValueError(f"group name {group!r} is reserved for ungrouped parameters")
-        specs = tuple(specifications)
+        specs = (specifications,) if isinstance(specifications, str) else tuple(specifications)
         if not specs:
             raise ValueError(f"group {group!r} has no module specifications")
         if any(not isinstance(spec, str) or not spec for spec in specs):
