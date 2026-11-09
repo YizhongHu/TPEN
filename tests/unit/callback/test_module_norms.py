@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from tpen.callback import ModuleNorms
+from tpen.callback import GradientStats, ModuleNorms
 from tpen.parameter_groups import resolve_parameter_groups
 from tests.unit.callback.support import RecordingContext, deliver_completed_iteration, training_state
 
@@ -76,3 +76,32 @@ def test_callback_is_optional_and_cadenced() -> None:
     deliver_completed_iteration(callback, context, state, step=1)
     deliver_completed_iteration(callback, context, state, step=2)
     assert len(context.by_namespace("train/module_norms/embed")) == 1
+
+
+def test_group_gradient_norms_reconcile_with_gradient_stats() -> None:
+    model = GroupedModel().double()
+    model.embedding.weight.grad = torch.arange(4.0, dtype=torch.float64).reshape(2, 2)
+    model.readout.weight.grad = torch.tensor([[3.0, 4.0]], dtype=torch.float64)
+    model.extra.grad = torch.tensor([5.0], dtype=torch.float64)
+    state = training_state(model=model)
+
+    module_context = RecordingContext()
+    deliver_completed_iteration(
+        ModuleNorms({"embed": ["embedding"], "readout": ["final_readout"]}),
+        module_context,
+        state,
+        step=4,
+    )
+    gradient_context = RecordingContext()
+    deliver_completed_iteration(GradientStats(), gradient_context, state, step=4)
+
+    squared_groups = sum(
+        module_context.latest(namespace)["gradient_l2"] ** 2
+        for namespace in (
+            "train/module_norms/embed",
+            "train/module_norms/readout",
+            "train/module_norms/ungrouped",
+        )
+    )
+    global_norm = gradient_context.latest("checks/gradient")["global_grad_norm"]
+    assert squared_groups == pytest.approx(global_norm**2)
