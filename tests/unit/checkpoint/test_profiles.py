@@ -43,10 +43,6 @@ NEW_CALLBACK_TARGETS = frozenset(
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
         "tpen.callback.InitialCheckpoint",
-        "tpen.callback.ParameterActivity",
-        "tpen.callback.RawTrainingBatchRecorder",
-        "tpen.callback.ElectronNucleusDistanceQuantiles",
-        "tpen.callback.ModuleNorms",
     }
 )
 
