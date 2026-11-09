@@ -58,7 +58,12 @@ class ParameterActivity(StatefulCallback[TrainerState]):
     whose output directory already carries a prior inventory at the same
     path raises ``FileExistsError`` rather than silently overwriting it; a
     resumed run that wants its own inventory must be configured with a
-    distinct per-attempt path.
+    distinct per-attempt path. This is a deliberate choice, not a side
+    effect left unaudited: unlike ``InitialCheckpoint``'s update-zero
+    checkpoint, this inventory observes exactly one arbitrary batch and
+    carries no durable, reconstructible reference value a resumed run could
+    verify against, so refusing the collision -- never attempting an
+    unverifiable no-op -- is this callback's resume-safety contract.
     """
 
     state_type: ClassVar[type[DomainState]] = TrainerState

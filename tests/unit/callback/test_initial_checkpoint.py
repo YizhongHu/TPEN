@@ -371,6 +371,71 @@ def test_coexists_idempotently_with_a_periodic_checkpoint_at_update_zero_synthet
     assert (final_dir / "model.pt").read_bytes() == written_bytes
 
 
+def test_verified_no_op_on_resumed_lineage_with_prior_checkpoint(tmp_path: Path) -> None:
+    """A resumed lineage (step > 0) with a verified prior checkpoint writes nothing."""
+
+    output_dir = tmp_path / "checkpoints"
+    context = _InitialCheckpointContext(tmp_path)
+    source_callback = InitialCheckpoint(output_dir)
+    context.callbacks = [source_callback]
+    source_callback.handle_occurrence(_started_iteration(0, count=1), context, _fresh_state())
+
+    final_dir = output_dir / checkpoint_step_dir_name(0)
+    before = (final_dir / "model.pt").read_bytes()
+    mtime_before = (final_dir / "COMPLETE").stat().st_mtime_ns
+
+    # A fresh callback instance, as a resumed run would construct, observing
+    # the resumed lineage's own first iteration at a nonzero step.
+    resumed_callback = InitialCheckpoint(output_dir)
+    resumed_state = TrainerState(
+        step=2,
+        model=torch.nn.Linear(3, 2).double(),
+        optimizer=torch.optim.Adam(torch.nn.Linear(3, 2).double().parameters(), lr=0.01),
+        trainer=_Trainer(next_iteration=3, completed_updates=3),
+        sampler=_Sampler(),
+    )
+    resumed_callback.handle_occurrence(_started_iteration(3, count=1), context, resumed_state)
+
+    assert resumed_callback._written
+    assert list(output_dir.glob("step_*")) == [final_dir]
+    assert (final_dir / "model.pt").read_bytes() == before
+    assert (final_dir / "COMPLETE").stat().st_mtime_ns == mtime_before
+
+    # A redelivery is still a no-op, guarded by `_written` like the fresh path.
+    resumed_callback.handle_occurrence(_started_iteration(3, count=2), context, resumed_state)
+    assert (final_dir / "COMPLETE").stat().st_mtime_ns == mtime_before
+
+
+def test_refuses_resumed_lineage_with_an_incomplete_prior_checkpoint(tmp_path: Path) -> None:
+    """A resumed lineage whose prior checkpoint is missing its COMPLETE marker is refused.
+
+    Pins that the no-op path actually verifies (manifest and COMPLETE marker
+    both present), rather than treating any existing directory as proof.
+    """
+
+    output_dir = tmp_path / "checkpoints"
+    final_dir = output_dir / checkpoint_step_dir_name(0)
+    final_dir.mkdir(parents=True)
+    (final_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    # No COMPLETE marker written -- an interrupted or partial publication.
+
+    context = _InitialCheckpointContext(tmp_path)
+    callback = InitialCheckpoint(output_dir)
+    context.callbacks = [callback]
+    state = TrainerState(
+        step=2,
+        model=torch.nn.Linear(3, 2).double(),
+        optimizer=torch.optim.Adam(torch.nn.Linear(3, 2).double().parameters(), lr=0.01),
+        trainer=_Trainer(next_iteration=3, completed_updates=3),
+        sampler=_Sampler(),
+    )
+
+    with pytest.raises(ValueError, match="fresh zero-update lineage"):
+        callback.handle_occurrence(_started_iteration(3, count=1), context, state)
+
+    assert not callback._written
+
+
 def test_collides_with_a_differently_configured_periodic_checkpoint_at_update_zero_synthetic_counters(
     tmp_path: Path,
 ) -> None:

@@ -391,6 +391,36 @@ def test_reused_callback_refuses_a_second_context_once_a_write_already_landed(
         callback.handle_occurrence(_update_completed(), second_context, state)
 
 
+def test_a_resumed_run_with_a_reused_output_path_is_refused_not_overwritten(
+    tmp_path: Path,
+) -> None:
+    """Resume-safety contract: a fresh `ParameterActivity` instance, as a
+    resumed run would construct, never overwrites a prior attempt's
+    inventory at the same `output_path` -- it refuses, matching
+    `InitialCheckpoint`'s policy of never silently clobbering prior state on
+    resume, even though the mechanism differs (refusal, not a verified
+    no-op; see the callback's docstring for why).
+    """
+
+    model = _ThreeParamModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    model.loss().backward()
+    state = TrainerState(model=model, optimizer=optimizer, trainer=_Trainer(completed_updates=1))
+    output_path = tmp_path / "parameter_activity.json"
+
+    source_callback = ParameterActivity(output_path)
+    source_callback.handle_occurrence(_update_completed(), _make_context(tmp_path), state)
+    before = output_path.read_text(encoding="utf-8")
+
+    resumed_callback = ParameterActivity(output_path)
+    with pytest.raises(FileExistsError):
+        resumed_callback.handle_occurrence(
+            _update_completed(), _make_context(tmp_path, run_id="resumed"), state
+        )
+
+    assert output_path.read_text(encoding="utf-8") == before
+
+
 def test_refuses_to_silently_overwrite_an_existing_inventory(tmp_path: Path) -> None:
     """Resumed-run behavior: refuse rather than silently overwrite."""
 
