@@ -86,6 +86,30 @@ def test_callback_logs_group_norms_and_missing_gradients() -> None:
     assert ungrouped["gradient_l2"] == pytest.approx(2.0)
 
 
+def test_callback_reads_post_update_parameters() -> None:
+    model = GroupedModel().double()
+    with torch.no_grad():
+        model.embedding.weight.fill_(1.0)
+    model.embedding.weight.grad = torch.ones_like(model.embedding.weight)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.25)
+    before_update = model.embedding.weight.detach().clone()
+    optimizer.step()
+    after_update = model.embedding.weight.detach().clone()
+    assert not torch.equal(before_update, after_update)
+
+    context = RecordingContext()
+    deliver_completed_iteration(
+        ModuleNorms({"embed": ["embedding"]}),
+        context,
+        training_state(model=model),
+        step=4,
+    )
+
+    logged = context.latest("train/module_norms/embed")
+    assert logged["parameter_l2"] == pytest.approx(float(after_update.norm().item()))
+    assert logged["parameter_l2"] != pytest.approx(float(before_update.norm().item()))
+
+
 def test_callback_is_optional_and_cadenced() -> None:
     model = GroupedModel()
     context = RecordingContext()
