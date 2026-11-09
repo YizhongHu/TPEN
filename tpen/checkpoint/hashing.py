@@ -49,6 +49,10 @@ _CALLBACK_OUTPUT_FIELDS = {
     "tpen.callback.Status": {"output_path"},
     "tpen.callback.Checkpoint": {"output_dir"},
     "tpen.callback.InitialCheckpoint": {"output_dir"},
+    # Producer: ``tpen.callback.RuntimeEquivariance`` writes its diagnostics
+    # below this directory; consumer: ``RuntimeEquivariance.__init__`` and its
+    # artifact writer.  This is an operational destination, not model input.
+    "tpen.callback.RuntimeEquivariance": {"artifact_dir"},
 }
 _LOGGER_PATH_FIELDS = {
     "tpen.logging.CSV": {"path"},
@@ -327,6 +331,17 @@ def _is_operational_slot(path: tuple[object, ...], owner: Mapping[str, Any], key
         return True
     if isinstance(target, str) and key in _LOGGER_PATH_FIELDS.get(target, set()):
         return True
+    # Producer: evaluation config fragments are composed into
+    # ``evaluator.tasks`` by Hydra/OmegaConf; consumer: ``Evaluator`` resolves
+    # each task's output directory before running the generator.  The fragment
+    # exists at this path before composition, so it needs its own closed slot.
+    if (
+        key == "output_dir"
+        and len(path) == 3
+        and path[0] == "evaluation_tasks"
+        and isinstance(path[1], str)
+    ):
+        return True
     return (
         key == "output_dir"
         and len(path) == 4
@@ -349,6 +364,11 @@ def _delete_known_operational_slots(container: Any) -> None:
                         for task in tasks:
                             if isinstance(task, dict):
                                 task.pop("output_dir", None)
+            evaluation_tasks = container.get("evaluation_tasks")
+            if isinstance(evaluation_tasks, dict):
+                for task in evaluation_tasks.values():
+                    if isinstance(task, dict):
+                        task.pop("output_dir", None)
             for value in tuple(container.values()):
                 _delete_known_operational_slots(value)
     elif isinstance(container, (list, tuple)):

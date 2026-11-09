@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 
 import pytest
 from experiments.toolkit.config_identity import expected_resolved_config_identity
+from omegaconf import OmegaConf
 
 from tpen.checkpoint.hashing import (
     RESOLVED_CONFIG_IDENTITY_SCHEMA,
@@ -15,6 +17,22 @@ from tpen.checkpoint.hashing import (
     canonical_resolved_config_bytes,
     resolved_config_identity,
 )
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _identity_config_paths() -> tuple[Path, ...]:
+    """Return every checked-in config tree covered by the identity boundary."""
+
+    roots = (
+        _REPO_ROOT / "tests" / "integration" / "artifacts",
+        _REPO_ROOT / "configs",
+    )
+    paths = {path for root in roots if root.is_dir() for path in root.rglob("*.yaml")}
+    paths.update(_REPO_ROOT.glob("experiments/**/configs/**/*.yaml"))
+    paths.update(_REPO_ROOT.glob("experiments/**/configs/**/*.yml"))
+    return tuple(sorted(paths))
 
 
 def _config() -> dict[str, object]:
@@ -35,6 +53,25 @@ def _config() -> dict[str, object]:
         "model": {"layers": 4},
         "science": {"charge": 2},
     }
+
+
+@pytest.mark.parametrize(
+    "config_path",
+    _identity_config_paths(),
+    ids=lambda path: str(path.relative_to(_REPO_ROOT)),
+)
+def test_identity_accepts_every_in_repo_config(config_path: Path) -> None:
+    """Operational run paths in checked-in configs must never abort launch.
+
+    This is deliberately a broad guard over the config trees used by
+    integration artifacts and experiment studies.  Genuine science leaks stay
+    covered by the focused refusal tests below; this guard prevents a closed
+    operational-slot amendment from regressing a real run at startup.
+    """
+
+    config = OmegaConf.load(config_path)
+    assert resolved_config_identity(config)["schema"] == RESOLVED_CONFIG_IDENTITY_SCHEMA
+    assert expected_resolved_config_identity(config)["schema"] == RESOLVED_CONFIG_IDENTITY_SCHEMA
 
 
 def test_golden_identity_vector() -> None:
