@@ -130,7 +130,15 @@ class ReadoutTrajectoryMCMCGenerator(TrajectoryMCMCGenerator):
                     and torch.equal(raw.sign(), expected_sign)
                 ):
                     raise ValueError("readout replay disagrees with the retained signed log amplitude")
-                for row, value in zip(rows, raw.detach().cpu().tolist(), strict=True):
+                floor_active = raw.square() < torch.as_tensor(
+                    self.readout_eps, dtype=raw.dtype, device=raw.device
+                )
+                for row, value, active in zip(
+                    rows,
+                    raw.detach().cpu().tolist(),
+                    floor_active.detach().cpu().tolist(),
+                    strict=True,
+                ):
                     draw, walker = divmod(row_count, records.n_walkers)
                     expected_identity = (row_count, draw, walker)
                     actual_identity = (
@@ -140,14 +148,13 @@ class ReadoutTrajectoryMCMCGenerator(TrajectoryMCMCGenerator):
                     )
                     if actual_identity != expected_identity:
                         raise ValueError("readout replay input is not the complete ordered grid")
-                    active = value * value < self.readout_eps
                     writer.writerow(
                         {
                             "sample_index": row_count,
                             "draw_index": draw,
                             "walker_index": walker,
                             "raw_channel_sum": value,
-                            "floor_active": active,
+                            "floor_active": bool(active),
                         }
                     )
                     floor_count += int(active)
