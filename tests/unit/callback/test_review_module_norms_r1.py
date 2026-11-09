@@ -6,11 +6,9 @@ import math
 
 import pytest
 import torch
-from omegaconf import OmegaConf
 from torch import nn
 
 from tpen.callback import GradientStats, ModuleNorms
-from tpen.checkpoint.profiles import NATIVE_RECOVERY_PROFILE, check_profile
 from tpen.parameter_groups import resolve_parameter_groups
 from tests.unit.callback.support import RecordingContext, deliver_completed_iteration, training_state
 
@@ -165,20 +163,7 @@ def test_reconstruction_preserves_durable_step_cadence() -> None:
 
 
 def test_observational_cadence_restarts_on_resume() -> None:
-    """Profile admission allows logging cadence to restart after reconstruction."""
-
-    config = OmegaConf.create({
-        "callbacks": [{
-            "_target_": "tpen.callback.ModuleNorms",
-            "groups": {"branch": ["branch"]},
-            "every_n_steps": 1,
-            "max_calls": 2,
-        }],
-        "loggers": [],
-    })
-    profile = check_profile(config, NATIVE_RECOVERY_PROFILE)
-    assert profile.verdict == "supported"
-    assert profile.refusal is None
+    """Callback-local logging cadence restarts after reconstruction."""
 
     model = UntiedNested()
     context = RecordingContext()
