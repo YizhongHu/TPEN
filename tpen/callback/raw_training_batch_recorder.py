@@ -182,28 +182,38 @@ class TrainingBatchPartitionWriter:
         self._seen.add(record.iteration_step)
 
     def publish(self) -> dict[str, Any]:
-        """Write compressed and uncompressed bundles, sidecar, and manifest entry."""
+        """Write one compressed bundle, its sidecar, and manifest entry."""
 
         if set(self._seen) != set(self.planned_steps):
             missing = sorted(set(self.planned_steps) - self._seen)
             raise ValueError(f"training partition is missing updates: {missing}")
-        started = time.perf_counter()
-        arrays = _concatenate_records(self._records)
         stem = f"partition-{self.partition_index:05d}"
         compressed_path = self.root / f"{stem}.npz"
-        raw_path = self.root / f"{stem}.uncompressed.npz"
+        sidecar_path = self.root / f"{stem}.json"
+        if compressed_path.exists() or sidecar_path.exists():
+            raise FileExistsError(
+                f"published training partition {self.partition_index} already exists; resume cannot rewrite it"
+            )
+        started = time.perf_counter()
+        arrays = _concatenate_records(self._records)
         temp_path = self.root / f".{stem}.{os.getpid()}.tmp"
         with temp_path.open("wb") as handle:
             np.savez(handle, **arrays)
         uncompressed_bytes = temp_path.stat().st_size
-        os.replace(temp_path, raw_path)
+        uncompressed_sha256 = _sha256(temp_path)
         compressed_temp = self.root / f".{stem}.{os.getpid()}.compressed.tmp"
         with compressed_temp.open("wb") as handle:
             np.savez_compressed(handle, **arrays)
         compressed_bytes = compressed_temp.stat().st_size
         os.replace(compressed_temp, compressed_path)
+        # The uncompressed bundle is a measurement arm only.  The selected
+        # compressed format is the sole published data object.
+        temp_path.unlink()
         sidecar = {
             "schema": SCHEMA,
+            "source": "tpen.callback.RawTrainingBatchRecorder",
+            "capture_semantics": "pre_update_model_forward",
+            "writer_version": SCHEMA,
             "partition_index": self.partition_index,
             "planned_updates": self.planned_steps,
             "observed_updates": sorted(self._seen),
@@ -214,17 +224,16 @@ class TrainingBatchPartitionWriter:
             "columns": sorted(arrays),
             "logical_sha256": _digest_arrays_concatenated(self._records),
             "compressed_filename": compressed_path.name,
-            "uncompressed_filename": raw_path.name,
+            "uncompressed_filename": None,
             "compressed_byte_count": compressed_bytes,
             "uncompressed_byte_count": uncompressed_bytes,
             "compression_ratio": compressed_bytes / uncompressed_bytes,
             "compressed_sha256": _sha256(compressed_path),
-            "uncompressed_sha256": _sha256(raw_path),
+            "uncompressed_sha256": uncompressed_sha256,
             "selected_filename": compressed_path.name,
-            "selection_reason": "compressed bundle selected to reduce retained training-history bytes; the uncompressed sibling is retained for measurement",
+            "selection_reason": "compressed bundle selected to reduce retained training-history bytes; the uncompressed arm is measured then removed",
             "write_time_sec": time.perf_counter() - started,
         }
-        sidecar_path = self.root / f"{stem}.json"
         _write_json_exclusive(sidecar_path, sidecar)
         manifest_path = self.root / MANIFEST_FILENAME
         previous_hash = _sha256(manifest_path) if manifest_path.exists() else None
@@ -375,7 +384,7 @@ def _validate_bundle(arrays: Mapping[str, np.ndarray], sidecar: Mapping[str, Any
         if name.startswith("term/"):
             finite &= np.isfinite(arrays[name])
     if not np.array_equal(arrays["finite"], finite):
-            raise ValueError("training partition finite flag is inconsistent")
+        raise ValueError("training partition finite flag is inconsistent")
     if not bool(finite.all()):
         raise ValueError("training partition contains a nonfinite required field")
     digest = hashlib.sha256()
@@ -437,6 +446,12 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
                 & np.isfinite(local_energy)
                 & np.isfinite(output.logabs.detach().cpu().numpy().reshape(-1))
                 & np.isfinite(output.sign.detach().cpu().numpy().reshape(-1))
+                & np.logical_and.reduce(
+                    [
+                        np.isfinite(value.detach().cpu().numpy().reshape(-1))
+                        for value in state.local_energy_terms.values()
+                    ]
+                )
             ),
         )
         index = record.iteration_step // self.partition_size_steps

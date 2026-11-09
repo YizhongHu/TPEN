@@ -1,0 +1,168 @@
+"""Contract tests for the optional raw training-history recorder."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from tpen.callback.raw_training_batch_recorder import (
+    RawTrainingBatchRecorder,
+    TrainingBatchPartitionWriter,
+    TrainingBatchReader,
+    TrainingBatchRecord,
+)
+from tpen.data.batch import ElectronBatch, WavefunctionOutput
+from tpen.events import Occurrence
+from tpen.training.events import TrainingCompleted, TrainingIteration, TrainingIterationCompleted
+from tpen.training.state import TrainerState
+
+
+class _Context:
+    metadata = {}
+
+    def __init__(self) -> None:
+        self.logged: list[dict[str, object]] = []
+
+    def now_iso(self) -> str:
+        return "2026-01-01T00:00:00+00:00"
+
+    def log(self, metrics: dict[str, object], *, namespace: str) -> None:
+        self.logged.append({"metrics": metrics, "namespace": namespace})
+
+
+def _record(step: int, *, applied: bool = True) -> TrainingBatchRecord:
+    return TrainingBatchRecord(
+        iteration_step=step,
+        completed_updates=step + int(applied),
+        update_applied=applied,
+        walker_index=np.arange(2),
+        positions=np.asarray([[[0.0, 1.0, 2.0]], [[3.0, 4.0, 5.0]]]),
+        local_energy=np.asarray([step + 0.25, step + 0.5]),
+        term_energies={"kinetic": np.asarray([1.0, 2.0]), "potential": np.asarray([-0.5, -0.25])},
+        logabs=np.asarray([10.0 + step, 11.0 + step]),
+        sign=np.ones(2),
+        finite=np.ones(2, dtype=bool),
+    )
+
+
+def _publish_valid(root: Path) -> None:
+    writer = TrainingBatchPartitionWriter(root, partition_index=0, planned_steps=[0])
+    writer.append(_record(0))
+    writer.publish()
+
+
+def _rewrite_bundle(root: Path, mutate) -> None:
+    bundle = root / "partition-00000.npz"
+    arrays = dict(np.load(bundle, allow_pickle=False))
+    mutate(arrays)
+    np.savez_compressed(bundle, **arrays)
+    sidecar_path = root / "partition-00000.json"
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["compressed_sha256"] = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    sidecar_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n")
+
+
+def test_round_trip_publishes_only_the_selected_compressed_bundle(tmp_path: Path) -> None:
+    writer = TrainingBatchPartitionWriter(tmp_path, partition_index=0, planned_steps=[0, 1])
+    writer.append(_record(0))
+    writer.append(_record(1, applied=False))
+    sidecar = writer.publish()
+
+    assert sidecar["selected_filename"] == "partition-00000.npz"
+    assert sidecar["uncompressed_filename"] is None
+    assert sidecar["uncompressed_byte_count"] > sidecar["compressed_byte_count"]
+    assert not list(tmp_path.glob("*.uncompressed.npz"))
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "manifest.json",
+        "partition-00000.json",
+        "partition-00000.npz",
+    ]
+    rows = TrainingBatchReader(tmp_path).read()
+    np.testing.assert_array_equal(rows["iteration_step"], [0, 0, 1, 1])
+    np.testing.assert_array_equal(rows["walker_index"], [0, 1, 0, 1])
+    np.testing.assert_array_equal(rows["term/kinetic"], [1.0, 2.0, 1.0, 2.0])
+
+
+def test_callback_captures_pre_update_forward_and_records_skipped_update(tmp_path: Path) -> None:
+    callback = RawTrainingBatchRecorder(tmp_path, partition_size_steps=10, every_n_steps=1)
+    context = _Context()
+    state = TrainerState(
+        trainer=SimpleNamespace(completed_updates=0),
+        batch=ElectronBatch(torch.tensor([[[0.0, 1.0, 2.0]], [[3.0, 4.0, 5.0]]])),
+        local_energy=torch.tensor([2.0, 3.0]),
+        local_energy_terms={"kinetic": torch.tensor([1.0, 1.5]), "potential": torch.tensor([1.0, 1.5])},
+        wavefunction_output=WavefunctionOutput(torch.tensor([4.0, 5.0]), torch.ones(2)),
+        optimizer_step=False,
+    )
+    callback.handle_occurrence(
+        Occurrence(TrainingIterationCompleted(TrainingIteration(0)), 1), context, state
+    )
+    # Simulate later mutation of the in-process state after the callback's capture point.
+    state.wavefunction_output = WavefunctionOutput(torch.tensor([40.0, 50.0]), torch.ones(2))
+    state.local_energy = torch.tensor([20.0, 30.0])
+    callback.handle_occurrence(Occurrence(TrainingCompleted(), 1), context, state)
+
+    rows = TrainingBatchReader(tmp_path).read()
+    np.testing.assert_array_equal(rows["logabs"], [4.0, 5.0])
+    np.testing.assert_array_equal(rows["local_energy"], [2.0, 3.0])
+    np.testing.assert_array_equal(rows["update_applied"], [False, False])
+    np.testing.assert_array_equal(rows["completed_updates"], [0, 0])
+
+
+@pytest.mark.parametrize("defect", ["missing", "duplicate", "grid", "nonfinite", "digest", "manifest"])
+def test_reader_refuses_each_crafted_integrity_defect(tmp_path: Path, defect: str) -> None:
+    _publish_valid(tmp_path)
+    sidecar_path = tmp_path / "partition-00000.json"
+    sidecar = json.loads(sidecar_path.read_text())
+    if defect == "missing":
+        sidecar["planned_updates"] = [0, 1]
+        sidecar_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n")
+    elif defect == "duplicate":
+        _rewrite_bundle(tmp_path, lambda arrays: arrays["walker_index"].__setitem__(1, 0))
+    elif defect == "grid":
+        _rewrite_bundle(tmp_path, lambda arrays: arrays["walker_index"].__setitem__(0, 1))
+    elif defect == "nonfinite":
+        _rewrite_bundle(tmp_path, lambda arrays: arrays["local_energy"].__setitem__(0, np.nan))
+    elif defect == "digest":
+        sidecar["logical_sha256"] = "0" * 64
+        sidecar_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n")
+    else:
+        manifest_path = tmp_path / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["partitions"][0]["sidecar"] = "partition-99999.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises((ValueError, FileNotFoundError)):
+        TrainingBatchReader(tmp_path).validate()
+
+
+def test_resume_never_rewrites_a_published_partition(tmp_path: Path) -> None:
+    _publish_valid(tmp_path)
+    bundle = tmp_path / "partition-00000.npz"
+    before = (bundle.stat().st_mtime_ns, bundle.read_bytes())
+    resumed = TrainingBatchPartitionWriter(tmp_path, partition_index=0, planned_steps=[0])
+    resumed.append(_record(0))
+    with pytest.raises(FileExistsError):
+        resumed.publish()
+    assert (bundle.stat().st_mtime_ns, bundle.read_bytes()) == before
+
+
+def test_partition_memory_is_released_after_one_and_three_partitions(tmp_path: Path) -> None:
+    retained: list[int] = []
+    released: list[int] = []
+    for partition_index in range(3):
+        writer = TrainingBatchPartitionWriter(tmp_path / str(partition_index), partition_index=0, planned_steps=[0])
+        writer.append(_record(0))
+        retained.append(writer.memory_bytes)
+        writer.publish()
+        released.append(writer.memory_bytes)
+    assert retained[0] > 0
+    assert max(retained) - min(retained) <= 0.01 * retained[0]
+    assert released == [0, 0, 0]
+
