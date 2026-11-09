@@ -35,6 +35,38 @@ def _identity_config_paths() -> tuple[Path, ...]:
     return tuple(sorted(paths))
 
 
+def _guard_config(config_path: Path) -> dict[str, object]:
+    """Materialize each checked-in file as its real launch boundary does.
+
+    The scan intentionally includes config fragments that are not runnable as
+    standalone YAML: the pair scan merges the shared basis table, and the He
+    evaluator receives its trajectory/checkpoint identity from ``eval.py``.
+    Missing provider/run inputs are replaced with deterministic guard values so
+    this test exercises the identity boundary rather than unrelated Hydra
+    composition failures.
+    """
+
+    config = OmegaConf.load(config_path)
+    if "tpen-pair-scan-v1" in config_path.parts or config_path.name == "basis_levels_train.yaml":
+        basis = OmegaConf.load(_REPO_ROOT / "experiments" / "hooke" / "choices" / "basis_levels.yaml")
+        config = OmegaConf.merge(config, basis)
+    plain = OmegaConf.to_container(config, resolve=False, throw_on_missing=False)
+
+    def replace_missing(value: object, path: tuple[object, ...] = ()) -> object:
+        if isinstance(value, dict):
+            return {key: replace_missing(item, path + (key,)) for key, item in value.items()}
+        if isinstance(value, list):
+            return [replace_missing(item, path + (index,)) for index, item in enumerate(value)]
+        if value == "???":
+            dotted = ".".join(str(part) for part in path)
+            return f"identity-guard-missing:{dotted}"
+        return value
+
+    if not isinstance(plain, dict):
+        raise TypeError(f"config guard expected a mapping: {config_path}")
+    return replace_missing(plain)  # type: ignore[return-value]
+
+
 def _config() -> dict[str, object]:
     return {
         "run": {
@@ -69,7 +101,7 @@ def test_identity_accepts_every_in_repo_config(config_path: Path) -> None:
     operational-slot amendment from regressing a real run at startup.
     """
 
-    config = OmegaConf.load(config_path)
+    config = _guard_config(config_path)
     assert resolved_config_identity(config)["schema"] == RESOLVED_CONFIG_IDENTITY_SCHEMA
     assert expected_resolved_config_identity(config)["schema"] == RESOLVED_CONFIG_IDENTITY_SCHEMA
 

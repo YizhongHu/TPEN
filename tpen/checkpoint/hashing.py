@@ -53,10 +53,23 @@ _CALLBACK_OUTPUT_FIELDS = {
     # below this directory; consumer: ``RuntimeEquivariance.__init__`` and its
     # artifact writer.  This is an operational destination, not model input.
     "tpen.callback.RuntimeEquivariance": {"artifact_dir"},
+    # The ``spenn`` study configs use the same callback producers under their
+    # compatibility import prefix.  Keep these exact targets in the closed
+    # table rather than treating arbitrary callback output-like fields as
+    # operational.
+    "spenn.callback.ConfigSnapshot": {"output_path"},
+    "spenn.callback.ResolvedConfigSnapshot": {"output_path"},
+    "spenn.callback.Metadata": {"output_path"},
+    "spenn.callback.Status": {"output_path"},
+    "spenn.callback.Checkpoint": {"output_dir"},
+    "spenn.callback.InitialCheckpoint": {"output_dir"},
+    "spenn.callback.RuntimeEquivariance": {"artifact_dir"},
 }
 _LOGGER_PATH_FIELDS = {
     "tpen.logging.CSV": {"path"},
     "tpen.logging.JSONL": {"path"},
+    "spenn.logging.CSV": {"path"},
+    "spenn.logging.JSONL": {"path"},
 }
 _EVALUATOR_TARGET = "tpen.evaluation.Evaluator"
 
