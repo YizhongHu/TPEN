@@ -104,6 +104,7 @@ unset PYTHONPATH
 safe_mkdir "$UV_CACHE_DIR"; safe_mkdir "$TMPDIR"
 assert_write_path "$RUN_ROOT/evidence/clone.log"
 git clone --no-single-branch --tags "$REPO_URL" "$CLONE" > "$RUN_ROOT/evidence/clone.log" 2>&1
+git -C "$CLONE" fetch origin "$HEAD_SHA" >> "$RUN_ROOT/evidence/clone.log" 2>&1
 git -C "$CLONE" checkout --detach "$HEAD_SHA" >> "$RUN_ROOT/evidence/clone.log" 2>&1
 git -C "$CLONE" fetch --tags --force >> "$RUN_ROOT/evidence/clone.log" 2>&1
 [[ "$(git -C "$CLONE" rev-parse HEAD)" == "$HEAD_SHA" ]] || fail_precheck "exact SHA assertion failed"
