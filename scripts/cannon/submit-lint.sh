@@ -47,7 +47,15 @@ done
 ((${#ALLOWED_ROOTS[@]} > 0)) || { echo "LINT_FAIL at least one --allowed-root required" >&2; exit 2; }
 [[ -f "$SBATCH_PATH" ]] || { echo "LINT_FAIL sbatch script not found: $SBATCH_PATH" >&2; exit 2; }
 [[ -f "$MANIFEST" ]] || { echo "LINT_FAIL manifest not found: $MANIFEST" >&2; exit 2; }
+[[ ( -n "$REAL_ENV" && -n "$DRY_ENV" ) || ( -z "$REAL_ENV" && -z "$DRY_ENV" ) ]] ||
+  { echo "LINT_FAIL --real-env and --dry-env must be given together, never one alone" >&2; exit 2; }
 command -v realpath >/dev/null 2>&1 || { echo "LINT_FAIL realpath required" >&2; exit 2; }
+# BSD/macOS realpath lacks -m (resolve a path that may not exist); probe it
+# explicitly instead of trusting that any binary named 'realpath' is GNU's.
+realpath -m -- "$PWD" >/dev/null 2>&1 || {
+  echo "LINT_FAIL realpath does not support -m: GNU coreutils realpath is required (on macOS: brew install coreutils, then put its gnubin directory ahead of /usr/bin on PATH)" >&2
+  exit 2
+}
 
 CRITICAL_KEYS=(HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON)
 US=$'\x1f'  # unit separator; macOS/BSD awk's -F does not expand \x1f itself
@@ -139,6 +147,29 @@ for key in "${CRITICAL_KEYS[@]}"; do
   fi
 done
 
+# Check 4b: a critical field absent from BOTH files passes check 4 (nothing to
+# compare), so require the always-required subset present and nonempty in
+# both; PYTHON is required too, but only for a dry run (DRY_RUN=1).
+ALWAYS_REQUIRED_KEYS=(HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN)
+IFS=$'\x1f' read -r M_DRY_RUN_HAS M_DRY_RUN <<< "$(kv_get "$MANIFEST" DRY_RUN)"
+[[ "$M_DRY_RUN_HAS" == 1 ]] || M_DRY_RUN=0
+
+for key in "${ALWAYS_REQUIRED_KEYS[@]}"; do
+  IFS=$'\x1f' read -r m_has m_val <<< "$(kv_get "$MANIFEST" "$key")"
+  IFS=$'\x1f' read -r s_has s_val <<< "$(kv_get "$SBATCH_EXPORTS_FILE" "$key")"
+  if [[ "$m_has" != 1 || -z "$m_val" || "$s_has" != 1 || -z "$s_val" ]]; then
+    fail "required critical field '$key' is missing or empty (manifest and/or sbatch script)"
+  fi
+done
+
+if [[ "$M_DRY_RUN" == 1 ]]; then
+  IFS=$'\x1f' read -r m_has m_val <<< "$(kv_get "$MANIFEST" PYTHON)"
+  IFS=$'\x1f' read -r s_has s_val <<< "$(kv_get "$SBATCH_EXPORTS_FILE" PYTHON)"
+  if [[ "$m_has" != 1 || -z "$m_val" || "$s_has" != 1 || -z "$s_val" ]]; then
+    fail "required critical field 'PYTHON' is missing or empty for a dry run (DRY_RUN=1)"
+  fi
+fi
+
 # Check 5: TASK_ROOT/RUN_ROOT must not be staged under $HOME, literally or
 # after canonicalization (catches a resolved symlink into $HOME too).
 if [[ -n "$HOME_ROOT" ]]; then
@@ -180,18 +211,43 @@ fi
 
 # Check 8: any ssh invocation in the submission helper must pass
 # -o BatchMode=yes (case-insensitive), to avoid a 2FA prompt from a
-# non-interactive submit path.
+# non-interactive submit path. Checked per LOGICAL invocation, not per
+# physical line or whole-file substring: backslash continuations are joined,
+# comments are dropped, and each line is split on `;`, `&&`, `||`, and `|`
+# before testing which segments are an `ssh` command and whether that same
+# segment carries the option.
+join_continuations() {
+  local file="$1" acc="" line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == *\\ ]]; then
+      acc+="${line%\\} "
+    else
+      acc+="$line"
+      printf '%s\n' "$acc"
+      acc=""
+    fi
+  done < "$file"
+  [[ -n "$acc" ]] && printf '%s\n' "$acc"
+}
+
 if [[ -n "$SUBMIT_HELPER" ]]; then
   if [[ ! -f "$SUBMIT_HELPER" ]]; then
     fail "submit helper not found: '$SUBMIT_HELPER'"
   else
-    while IFS= read -r line; do
-      shopt -s nocasematch
-      if [[ "$line" != *"batchmode=yes"* ]]; then
-        fail "ssh invocation without -o BatchMode=yes: '$line'"
-      fi
-      shopt -u nocasematch
-    done < <(grep -E '(^|[^A-Za-z0-9_])ssh[[:space:]]' "$SUBMIT_HELPER" || true)
+    while IFS= read -r logical_line; do
+      [[ -z "${logical_line//[[:space:]]/}" ]] && continue
+      while IFS= read -r segment; do
+        segment="${segment#"${segment%%[![:space:]]*}"}"
+        [[ -z "$segment" ]] && continue
+        if [[ "$segment" =~ ^ssh([[:space:]]|$) ]]; then
+          shopt -s nocasematch
+          if [[ "$segment" != *"batchmode=yes"* ]]; then
+            fail "ssh invocation without -o BatchMode=yes: '$segment'"
+          fi
+          shopt -u nocasematch
+        fi
+      done < <(printf '%s\n' "$logical_line" | sed -e 's/&&/\n/g' -e 's/||/\n/g' -e 's/;/\n/g' -e 's/|/\n/g')
+    done < <(join_continuations "$SUBMIT_HELPER" | sed -E 's/(^|[[:space:]])#.*$//')
   fi
 fi
 
@@ -209,9 +265,13 @@ if [[ -n "$REAL_ENV" && -n "$DRY_ENV" ]]; then
       is_in_csv "$key" "$DRY_ONLY_KEYS" && continue
       IFS=$'\x1f' read -r rhas rval <<< "$(kv_get "$REAL_ENV" "$key")"
       IFS=$'\x1f' read -r dhas dval <<< "$(kv_get "$DRY_ENV" "$key")"
-      [[ "$rhas" == 1 ]] || rval="__unset__"
-      [[ "$dhas" == 1 ]] || dval="__unset__"
-      [[ "$rval" == "$dval" ]] || fail "real-vs-dry export delta on undocumented key '$key': real='$rval' dry='$dval'"
+      # Compare presence as well as value: a literal value equal to the
+      # display placeholder below must never be confused with "absent".
+      if [[ "$rhas" != "$dhas" ]]; then
+        fail "real-vs-dry export delta on undocumented key '$key': real='${rval:-<absent>}' dry='${dval:-<absent>}' (present on only one side)"
+      elif [[ "$rhas" == 1 && "$rval" != "$dval" ]]; then
+        fail "real-vs-dry export delta on undocumented key '$key': real='$rval' dry='$dval'"
+      fi
     done <<< "$ALL_KEYS"
   fi
 fi

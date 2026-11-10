@@ -318,6 +318,155 @@ def test_real_vs_dry_delta_limited_to_documented_keys_accepted(fixture_root: Pat
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_optional_key_unset_sentinel_vs_absent_rejected(fixture_root: Path) -> None:
+    """real='__unset__' vs dry=<absent> is a presence delta, not a value match."""
+    base = fixture_root
+    sbatch, manifest, *_ = good_fixture(base)
+    real_env = base / "stage" / "real-sentinel.env"
+    dry_env = base / "stage" / "dry-sentinel.env"
+    real_env.write_text(f"HEAD_SHA={SHA}\nDRY_RUN=0\nOPTIONAL=__unset__\n")
+    dry_env.write_text(f"HEAD_SHA={SHA}\nDRY_RUN=1\n")
+    result = run_lint(base, sbatch, manifest, "--real-env", str(real_env), "--dry-env", str(dry_env), "--dry-only-keys", "DRY_RUN")
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "present on only one side" in result.stdout
+
+
+def test_optional_key_empty_on_both_sides_accepted(fixture_root: Path) -> None:
+    base = fixture_root
+    sbatch, manifest, *_ = good_fixture(base)
+    real_env = base / "stage" / "real-empty.env"
+    dry_env = base / "stage" / "dry-empty.env"
+    real_env.write_text(f"HEAD_SHA={SHA}\nDRY_RUN=0\nOPTIONAL=\n")
+    dry_env.write_text(f"HEAD_SHA={SHA}\nDRY_RUN=1\nOPTIONAL=\n")
+    result = run_lint(base, sbatch, manifest, "--real-env", str(real_env), "--dry-env", str(dry_env), "--dry-only-keys", "DRY_RUN")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_critical_fields_missing_from_both_rejected(fixture_root: Path) -> None:
+    """Killer for mutant accept-fields-missing-from-both: a required field absent
+    from both the manifest and the sbatch script passes check 4 (nothing to
+    compare) and must be caught by the separate presence/nonempty check."""
+    base = fixture_root
+    manifest = base / "stage" / "min.manifest"
+    sbatch = base / "stage" / "min.sbatch"
+    manifest.write_text(f"HEAD_SHA={SHA}\nJOB_NAME={JOB_NAME}\n")
+    sbatch.write_text(f"#!/bin/bash\nexport HEAD_SHA={SHA}\nexport JOB_NAME={JOB_NAME}\n")
+    result = run_lint(base, sbatch, manifest)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "required critical field 'TASK_ROOT'" in result.stdout
+
+
+def test_python_missing_from_both_under_dry_run_rejected(fixture_root: Path) -> None:
+    base = fixture_root
+    task_root = base / "stage" / "task"
+    run_root = base / "stage" / "run"
+    manifest = base / "stage" / "min-dry.manifest"
+    sbatch = base / "stage" / "min-dry.sbatch"
+    manifest.write_text(
+        f"HEAD_SHA={SHA}\nJOB_NAME={JOB_NAME}\nTASK_ROOT={task_root}\nRUN_ROOT={run_root}\nDRY_RUN=1\n"
+    )
+    sbatch.write_text(
+        "#!/bin/bash\n"
+        f"export HEAD_SHA={SHA}\nexport JOB_NAME={JOB_NAME}\nexport TASK_ROOT={task_root}\n"
+        f"export RUN_ROOT={run_root}\nexport DRY_RUN=1\n"
+    )
+    result = run_lint(base, sbatch, manifest)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "required critical field 'PYTHON'" in result.stdout
+
+
+def test_ssh_batchmode_mentioned_only_in_trailing_comment_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    helper = fixture_root / "stage" / "helper-comment-trick.sh"
+    helper.write_text('#!/bin/bash\nssh cannon.example true # -o BatchMode=yes\n')
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "BatchMode" in result.stdout
+
+
+def test_ssh_second_command_without_batchmode_rejected(fixture_root: Path) -> None:
+    """Killer for mutant accept-ssh-second-command-no-batchmode: a second ssh
+    invocation on the same logical line, separated by ';', must be checked on
+    its own rather than inheriting the first invocation's BatchMode option."""
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    helper = fixture_root / "stage" / "helper-second-cmd.sh"
+    helper.write_text('#!/bin/bash\nssh -o BatchMode=yes a true; ssh b true\n')
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "BatchMode" in result.stdout
+
+
+def test_ssh_comment_mentioning_ssh_not_flagged(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    helper = fixture_root / "stage" / "helper-comment-mention.sh"
+    helper.write_text('#!/bin/bash\n# ssh invocations below always carry -o BatchMode=yes\ntrue\n')
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_ssh_continuation_with_batchmode_accepted(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    helper = fixture_root / "stage" / "helper-continuation.sh"
+    helper.write_text('#!/bin/bash\nssh \\\n  -o BatchMode=yes cannon.example "sbatch x"\n')
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_real_env_without_dry_env_rejected(fixture_root: Path) -> None:
+    base = fixture_root
+    sbatch, manifest, task_root, *_ = good_fixture(base)
+    real_env = base / "stage" / "real-only.env"
+    real_env.write_text(f"HEAD_SHA={SHA}\nDRY_RUN=0\nTASK_ROOT={task_root}\n")
+    result = run_lint(base, sbatch, manifest, "--real-env", str(real_env))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "must be given together" in result.stdout
+
+
+def test_dry_env_without_real_env_rejected(fixture_root: Path) -> None:
+    base = fixture_root
+    sbatch, manifest, task_root, *_ = good_fixture(base)
+    dry_env = base / "stage" / "dry-only.env"
+    dry_env.write_text(f"HEAD_SHA={SHA}\nDRY_RUN=1\nTASK_ROOT={task_root}\n")
+    result = run_lint(base, sbatch, manifest, "--dry-env", str(dry_env))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "must be given together" in result.stdout
+
+
+def test_realpath_without_dash_m_support_fails_clearly(fixture_root: Path, tmp_path: Path) -> None:
+    """A BSD/macOS-shaped realpath (no -m) must produce a clear, named LINT_FAIL
+    instead of a cryptic downstream error."""
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    orig_realpath = subprocess.run(["bash", "-c", "command -v realpath"], capture_output=True, text=True, check=True).stdout.strip()
+    shim_dir = tmp_path / "bsd-realpath-shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "realpath"
+    shim.write_text(
+        "#!/bin/bash\n"
+        "for a in \"$@\"; do\n"
+        "  if [[ \"$a\" == \"-m\" ]]; then\n"
+        "    echo 'realpath: illegal option -- m' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
+        "done\n"
+        f"exec {orig_realpath} \"$@\"\n"
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
+    env = dict(os.environ)
+    env["PATH"] = f"{shim_dir}:{env['PATH']}"
+    result = subprocess.run(
+        [
+            "bash", str(LINTER),
+            "--sbatch", str(sbatch), "--manifest", str(manifest),
+            "--allowed-root", str(fixture_root / "stage"),
+            "--shared-env-root", str(fixture_root / "shared-env"),
+            "--home", str(fixture_root / "home"),
+        ],
+        capture_output=True, text=True, check=False, env=env,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "GNU coreutils realpath is required" in result.stderr
+
+
 def test_real_vs_dry_delta_on_undocumented_key_rejected(fixture_root: Path) -> None:
     base = fixture_root
     sbatch, manifest, task_root, *_ = good_fixture(base)
