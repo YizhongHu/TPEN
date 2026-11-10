@@ -404,15 +404,23 @@ def gpu_route_g_fanout() -> tuple[dict[str, Any], ...]:
 #: Run via ``science_python -c <this> <module>``: a bare import probe, never
 #: a direct ``tpen`` import from this study module itself (the attached
 #: subprocess boundary already used by ``attached.assert_candidate_instantiates``).
+#: F8: catches ONLY ``ModuleNotFoundError`` for the target module (or one of
+#: its parent packages) as genuine absence -- any OTHER exception (a broken
+#: dependency import inside an otherwise-present module, a syntax error,
+#: etc.) propagates uncaught, giving a nonzero exit the caller refuses on,
+#: never a false "ABSENT".
 _READOUT_GENERATOR_PROBE_SCRIPT = """
 import importlib
 import sys
 
+name = sys.argv[1]
 try:
-    importlib.import_module(sys.argv[1])
-except ImportError:
-    print("ABSENT")
-    raise SystemExit(0)
+    importlib.import_module(name)
+except ModuleNotFoundError as error:
+    if error.name == name or (error.name is not None and name.startswith(error.name + ".")):
+        print("ABSENT")
+        raise SystemExit(0)
+    raise
 print("PRESENT")
 """
 
@@ -424,6 +432,18 @@ def probe_readout_trajectory_generator(science_python: str | Path) -> bool:
     absent on this job's own base, this probe is never skipped silently --
     the caller records the deviation (``readout_generator_enabled: false``)
     on the eval receipt instead.
+
+    F8 (review r1): a probe is only ever PRESENT or explicit ABSENT. A
+    nonzero exit, a malformed/empty stdout, or a broken dependency import
+    (which also raises ``ImportError`` and would otherwise be
+    indistinguishable from a genuinely missing target module) is refused
+    outright -- never silently converted into "treat readout as disabled".
+
+    Raises
+    ------
+    EvalJobRefusal
+        Code ``readout-probe-failed``, if the probe exits nonzero or its
+        stdout is neither exactly ``PRESENT`` nor exactly ``ABSENT``.
     """
 
     module_name = protocol.READOUT_TRAJECTORY_GENERATOR_TARGET.rsplit(".", 1)[0]
@@ -433,7 +453,14 @@ def probe_readout_trajectory_generator(science_python: str | Path) -> bool:
         text=True,
         check=False,
     )
-    return result.returncode == 0 and "PRESENT" in result.stdout
+    output = result.stdout.strip()
+    if result.returncode != 0 or output not in ("PRESENT", "ABSENT"):
+        raise EvalJobRefusal(
+            "readout-probe-failed",
+            f"readout-trajectory-generator probe did not report a clean PRESENT/ABSENT "
+            f"(rc={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr[-500:]!r})",
+        )
+    return output == "PRESENT"
 
 
 #: Run via ``science_python -c <this> <config path>``: loads the config and
@@ -535,25 +562,39 @@ def run_generation_direct(
             f"run metadata git_commit {actual_commit!r} does not match expected {expected_source_commit!r}",
         )
 
-    declared = {"resolved_config": "resolved_config.yaml", "metadata": "metadata.json"}
+    required = {"resolved_config": "resolved_config.yaml", "metadata": "metadata.json"}
     for task in config["evaluator"]["tasks"]:
         relative = str(task["output_dir"])
         if relative.startswith(_RUN_DIR_PREFIX):
             relative = relative[len(_RUN_DIR_PREFIX):]
         name = task["name"]
-        declared[f"{name}_csv"] = f"{relative}/sampled_eval_table.csv"
-        declared[f"{name}_metadata"] = f"{relative}/sampled_eval_table.metadata.json"
+        required[f"{name}_csv"] = f"{relative}/sampled_eval_table.csv"
+        required[f"{name}_metadata"] = f"{relative}/sampled_eval_table.metadata.json"
         if task.get("generator", {}).get("_target_") == protocol.READOUT_TRAJECTORY_GENERATOR_TARGET:
-            declared[f"{name}_raw_readout"] = f"{relative}/raw_readout.csv"
+            required[f"{name}_raw_readout"] = f"{relative}/raw_readout.csv"
+            required[f"{name}_raw_readout_metadata"] = f"{relative}/raw_readout.json"
 
     artifacts: dict[str, dict[str, str]] = {}
-    for name, relative in declared.items():
+    for name, relative in required.items():
         artifact_path = run_dir / relative
         if not artifact_path.is_file():
             raise EvalJobRefusal(
                 "eval-run-missing-artifact", f"{run_dir} is missing declared artifact {name!r} ({artifact_path})"
             )
         artifacts[name] = {"path": str(artifact_path), "sha256": _sha256_file(artifact_path)}
+
+    # F6 (review r1): the receipt previously carried only the explicitly
+    # named required artifacts above, dropping status.json/config.yaml/
+    # metrics.jsonl (and anything else core writes that this module does
+    # not name one of its own tasks after) from the written-file hash map.
+    # Every OTHER file actually present under run_dir is captured too, keyed
+    # by its path relative to run_dir, so nothing written is un-receipted.
+    already_declared = {Path(entry["path"]) for entry in artifacts.values()}
+    for file_path in sorted(run_dir.rglob("*")):
+        if not file_path.is_file() or file_path in already_declared:
+            continue
+        key = str(file_path.relative_to(run_dir))
+        artifacts[key] = {"path": str(file_path), "sha256": _sha256_file(file_path)}
 
     trajectory_metadata = json.loads(Path(artifacts["trajectory_metadata"]["path"]).read_text(encoding="utf-8"))
     trajectory_csv_sha256 = trajectory_metadata.get("csv_sha256")
@@ -575,12 +616,22 @@ def generation_record(
     seed: int,
     task_id: str,
     run_result: Mapping[str, Any],
+    checkpoint_files: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return one generation's eval-receipt entry from :func:`run_generation_direct`'s result.
 
     E3: called once per generation on completion, so a wall-killed job
     leaves every already-completed generation's output sha256s verifiable
     even though the job itself still exits non-zero (see ``run_job.py``).
+
+    Parameters
+    ----------
+    checkpoint_files : mapping, optional
+        F6 (review r1): the TRAIN inventory entry's own ``{relative path:
+        sha256}`` map for the checkpoint this generation restored --
+        recorded so a consumer can bind this generation to the EXACT input
+        checkpoint bytes it ran against, not only the fact that
+        verification passed at dispatch time.
     """
 
     return {
@@ -596,6 +647,7 @@ def generation_record(
         # its path kept too so a later consumer (the SEL step) can read the
         # trajectory CSV without re-deriving its location.
         "artifacts": {name: dict(entry) for name, entry in (run_result.get("artifacts") or {}).items()},
+        "checkpoint_files": dict(checkpoint_files) if checkpoint_files is not None else {},
     }
 
 

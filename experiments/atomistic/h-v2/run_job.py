@@ -316,6 +316,7 @@ def run_eval_fanout(
     if payload not in _EVAL_FANOUT_PAYLOADS:
         raise JobError(f"eval fan-out payload must be one of {_EVAL_FANOUT_PAYLOADS!r}, got {payload!r}")
 
+    selection_record: dict | None = None
     if payload == "science":
         if lineage not in launch_config.LINEAGES:
             raise JobError(
@@ -344,6 +345,16 @@ def run_eval_fanout(
             _, stage1_sha256 = eval_job.load_train_receipt(stage1_receipt_path)
             c1 = eval_job.verify_selection_record(selection, b1_eval_receipt_sha256=stage1_sha256)
             generations = eval_job.pilot_fanout(pilot_stage, c1=c1)
+            # F6: stage 2/2-core's receipt retains the SEL record it actually
+            # executed, bound by the selection FILE's own sha256 -- never
+            # left null for a consumer with no way to recover which
+            # selection a given stage-2 run used.
+            import hashlib
+
+            selection_record = {
+                **selection,
+                "selection_record_sha256": hashlib.sha256(selection_path.read_bytes()).hexdigest(),
+            }
     else:  # "gpu-route-g"
         train_task_id = _pilot_train_task_id(payload)
         expected_lineage = launch_config.PILOT_PAYLOAD_LINEAGES[payload]
@@ -371,6 +382,7 @@ def run_eval_fanout(
         # inventoried checkpoint bytes, never the original (shared,
         # externally-writable) checkpoint directory -- closes the
         # verify/load check-use window.
+        checkpoint_entry = eval_job.select_checkpoint(train_receipt, update=generation["update"])
         checkpoint_dir = eval_job.resolve_checkpoint(
             train_receipt, update=generation["update"], snapshot_dir=checkpoint_snapshot_root / gen_task_id
         )
@@ -395,6 +407,7 @@ def run_eval_fanout(
                 seed=generation["seed"],
                 task_id=gen_task_id,
                 run_result=run_result,
+                checkpoint_files=checkpoint_entry.get("files"),
             )
         )
         # E3: written on every generation's completion, so a wall-killed job
@@ -410,6 +423,7 @@ def run_eval_fanout(
             payload=payload,
             generations=records,
             readout_generator_enabled=readout_available,
+            selection=selection_record,
         )
     print(f"[h-v2] {task_label}: {len(records)} generation(s) accepted (readout_generator={readout_available})")
 
