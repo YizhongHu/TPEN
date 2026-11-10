@@ -119,8 +119,16 @@ def test_real_csv_and_jsonl_consumers_receive_every_n_steps(tmp_path) -> None:
     with csv_path.open(newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert {int(row["step"]) for row in rows} == {0, 2}
-    assert {row["namespace"] for row in rows} == {"train/optimizer_state/embed"}
+    assert {row["namespace"] for row in rows} == {
+        "train/optimizer_state/embed",
+        "train/optimizer_state/ungrouped",
+    }
     with jsonl_path.open() as stream:
         records = [json.loads(line) for line in stream]
     assert {record["step"] for record in records} == {0, 2}
-    assert all(record["namespace"] == "train/optimizer_state/embed" for record in records)
+    assert {
+        record["namespace"] for record in records
+    } == {
+        "train/optimizer_state/embed",
+        "train/optimizer_state/ungrouped",
+    }
