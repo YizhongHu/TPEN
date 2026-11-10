@@ -16,7 +16,7 @@ from uuid import uuid4
 from ._codec import canonical_bytes, decode_json, fields, text
 from .allocations import ConfiguredAllocation
 from .contracts import AttemptId, ReadyGroup
-from .results import AcceptedSegment, ManifestAttempt, OutcomeReceipt, RunManifest, SciencePlacementReceipt, StartReceipt
+from .results import AcceptedSegment, ManifestAttempt, OutcomeReceipt, RunManifest, SciencePlacementReceipt, SciencePlacementReceiptV2, StartReceipt
 from .runners import CoreRunEvidence
 from ._records import frozen_record
 
@@ -494,7 +494,7 @@ class DirectoryStore:
             _write_new(segment_path, segment.encode())
             return segment
 
-    def publish_placement(self, fence: AttemptFence, receipt: SciencePlacementReceipt) -> SciencePlacementReceipt:
+    def publish_placement(self, fence: AttemptFence, receipt: SciencePlacementReceipt | SciencePlacementReceiptV2) -> SciencePlacementReceipt | SciencePlacementReceiptV2:
         """Publish one validated placement receipt after child quiescence.
 
         The receipt is written beneath the same attempt fence as the start and
@@ -520,8 +520,8 @@ class DirectoryStore:
             receipt, or the receipt crosses any fence identity.
         """
 
-        if not isinstance(receipt, SciencePlacementReceipt):
-            raise TypeError("receipt must be SciencePlacementReceipt")
+        if not isinstance(receipt, (SciencePlacementReceipt, SciencePlacementReceiptV2)):
+            raise TypeError("receipt must be SciencePlacementReceipt or SciencePlacementReceiptV2")
         task_dir = self._task_dir_for_fence(fence)
         lock_path = os.path.join(task_dir, _TASK_LOCK)
         _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
@@ -730,7 +730,12 @@ class DirectoryStore:
                 placement_path = os.path.join(output_dir, "placement.json")
                 if os.path.lexists(placement_path):
                     _require_regular(placement_path, "placement receipt", ValueError)
-                    placement = SciencePlacementReceipt.decode(Path(placement_path).read_bytes())
+                    raw_placement = decode_json(Path(placement_path).read_bytes())
+                    placement = (
+                        SciencePlacementReceiptV2.from_mapping(raw_placement)
+                        if isinstance(raw_placement, dict) and raw_placement.get("schema") == SciencePlacementReceiptV2.schema
+                        else SciencePlacementReceipt.from_mapping(raw_placement)
+                    )
                     if (
                         placement.task_id != task_id
                         or placement.attempt_id.value != attempt_id

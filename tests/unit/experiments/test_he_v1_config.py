@@ -69,13 +69,16 @@ def _he_reference() -> float:
     return float(helium["reference_energy_hartree"])
 
 
-def _assert_he_system(config: dict) -> None:
+def _assert_he_system(config: dict, *, include_reference_energy: bool = True) -> None:
     system = config["system"]
     assert system["id"] == "he_atom"
     assert system["n_particles"] == 2
     assert system["spin"] == {"n_up": 1, "n_down": 1}
     assert system["nuclei"] == {"positions": [[0.0, 0.0, 0.0]], "charges": [2.0]}
-    assert float(system["reference_energy"]) == _he_reference()
+    if include_reference_energy:
+        assert float(system["reference_energy"]) == _he_reference()
+    else:
+        assert "reference_energy" not in system
 
 
 def _assert_factorized_model(config: dict) -> None:
@@ -94,7 +97,7 @@ def _assert_factorized_model(config: dict) -> None:
 
 def test_he_train_config_owns_batch_nuclear_context_and_coulomb_terms() -> None:
     config = _load(TRAIN)
-    _assert_he_system(config)
+    _assert_he_system(config, include_reference_energy=False)
     _assert_factorized_model(config)
     sampler = config["sampler"]
     assert sampler["nuclear_positions"] == {

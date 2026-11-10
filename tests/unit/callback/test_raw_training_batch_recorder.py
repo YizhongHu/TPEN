@@ -21,7 +21,9 @@ from tpen.callback.raw_training_batch_recorder import (
     TrainingBatchRecord,
 )
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
-from tpen.events import Occurrence
+from tpen.checkpoint import CheckpointRestored
+from tpen.checkpoint.restore import RestoreReport
+from tpen.events import Occurrence, Started
 from tpen.training.events import TrainingCompleted, TrainingIteration, TrainingIterationCompleted
 from tpen.training.state import TrainerState
 from tpen.training.trainer import VMCTrainer
@@ -73,6 +75,125 @@ def _publish_valid(root: Path) -> None:
     writer = TrainingBatchPartitionWriter(root, partition_index=0, planned_steps=[0])
     writer.append(_record(0))
     writer.publish()
+
+
+def _started(step: int) -> Occurrence[Started[TrainingIteration]]:
+    return Occurrence(Started(TrainingIteration(step)), 1)
+
+
+def _trainer(step: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        next_iteration=step,
+        completed_updates=step,
+        state_dict=lambda: {"next_iteration": step, "completed_updates": step},
+    )
+
+
+def _restored() -> Occurrence[CheckpointRestored]:
+    return Occurrence(
+        CheckpointRestored(
+            RestoreReport(
+                mode="train_resume",
+                checkpoint_dir="/source/checkpoint",
+                next_iteration=1,
+                completed_updates=1,
+                loaded_model=True,
+                loaded_optimizer=True,
+                loaded_trainer=True,
+                loaded_sampler=True,
+                loaded_rng=True,
+            )
+        ),
+        1,
+    )
+
+
+def test_refuses_restored_lineage_before_capture_or_file_write(tmp_path: Path) -> None:
+    """A train-resume report refuses the recorder before any history write."""
+
+    history_root = tmp_path / "training-history"
+    callback = RawTrainingBatchRecorder(history_root, partition_size_steps=1, every_n_steps=1)
+    context = _run_context(tmp_path)
+    callback.handle_occurrence(_restored(), context, None)
+
+    with pytest.raises(ValueError, match=r"unsupported-callback"):
+        callback.handle_occurrence(
+            Occurrence(TrainingIterationCompleted(TrainingIteration(0)), 1),
+            context,
+            TrainerState(
+                trainer=SimpleNamespace(completed_updates=0),
+                batch=ElectronBatch(torch.tensor([[[0.0, 1.0, 2.0]]])),
+                local_energy=torch.tensor([1.0]),
+                local_energy_terms={"kinetic": torch.tensor([1.0])},
+                wavefunction_output=WavefunctionOutput(torch.tensor([0.0]), torch.ones(1)),
+                optimizer_step=False,
+            ),
+        )
+    assert not history_root.exists()
+
+
+def test_first_nonzero_iteration_refuses_bypassed_restore_but_fresh_steps_continue(
+    tmp_path: Path,
+) -> None:
+    """Guard a direct trainer fit without the runner's restore notification."""
+
+    def state(step: int) -> TrainerState:
+        return TrainerState(
+            trainer=_trainer(step),
+            batch=ElectronBatch(torch.tensor([[[0.0, 1.0, 2.0]], [[3.0, 4.0, 5.0]]])),
+            local_energy=torch.tensor([1.0, 2.0]),
+            local_energy_terms={"kinetic": torch.tensor([1.0, 2.0])},
+            wavefunction_output=WavefunctionOutput(torch.tensor([0.0, 0.0]), torch.ones(2)),
+            optimizer_step=False,
+        )
+
+    refused_root = tmp_path / "refused" / "training-history"
+    refused = RawTrainingBatchRecorder(refused_root, partition_size_steps=1, every_n_steps=1)
+    context = _run_context(tmp_path / "refused")
+    with pytest.raises(ValueError, match=r"unsupported-callback"):
+        refused.handle_occurrence(
+            _started(1),
+            context,
+            state(1),
+        )
+    assert not refused_root.exists()
+
+    fresh_root = tmp_path / "fresh" / "training-history"
+    fresh = RawTrainingBatchRecorder(fresh_root, partition_size_steps=2, every_n_steps=1)
+    fresh_context = _run_context(tmp_path / "fresh")
+    for step in (0, 1):
+        fresh.handle_occurrence(_started(step), fresh_context, state(step))
+        fresh.handle_occurrence(
+            Occurrence(TrainingIterationCompleted(TrainingIteration(step)), 1),
+            fresh_context,
+            state(step),
+        )
+    fresh.handle_occurrence(Occurrence(TrainingCompleted(), 1), fresh_context, state(1))
+    assert TrainingBatchReader(fresh_root).read()["iteration_step"].tolist() == [0, 0, 1, 1]
+
+
+def test_fresh_recorder_history_remains_reader_compatible(tmp_path: Path) -> None:
+    """A fresh recorder still publishes a history consumed by its reader."""
+
+    history_root = tmp_path / "training-history"
+    callback = RawTrainingBatchRecorder(history_root, partition_size_steps=1, every_n_steps=1)
+    context = _run_context(tmp_path)
+    state = TrainerState(
+        trainer=_trainer(0),
+        batch=ElectronBatch(torch.tensor([[[0.0, 1.0, 2.0]]])),
+        local_energy=torch.tensor([1.0]),
+        local_energy_terms={"kinetic": torch.tensor([1.0])},
+        wavefunction_output=WavefunctionOutput(torch.tensor([0.0]), torch.ones(1)),
+        optimizer_step=False,
+    )
+    callback.handle_occurrence(_started(0), context, state)
+    callback.handle_occurrence(
+        Occurrence(TrainingIterationCompleted(TrainingIteration(0)), 1), context, state
+    )
+    callback.handle_occurrence(Occurrence(TrainingCompleted(), 1), context, state)
+
+    TrainingBatchReader(history_root).validate()
+    assert TrainingBatchReader(history_root).read()["iteration_step"].tolist() == [0]
 
 
 def test_reader_consumes_real_training_loop_output(tmp_path: Path) -> None:
@@ -251,16 +372,18 @@ def test_callback_captures_pre_update_forward_and_records_skipped_update(tmp_pat
     callback = RawTrainingBatchRecorder(tmp_path, partition_size_steps=10, every_n_steps=1)
     context = _run_context(tmp_path)
     state = TrainerState(
-        trainer=SimpleNamespace(completed_updates=0),
+        trainer=_trainer(0),
         batch=ElectronBatch(torch.tensor([[[0.0, 1.0, 2.0]], [[3.0, 4.0, 5.0]]])),
         local_energy=torch.tensor([2.0, 3.0]),
         local_energy_terms={"kinetic": torch.tensor([1.0, 1.5]), "potential": torch.tensor([1.0, 1.5])},
         wavefunction_output=WavefunctionOutput(torch.tensor([4.0, 5.0]), torch.ones(2)),
         optimizer_step=False,
     )
+    callback.handle_occurrence(_started(0), context, state)
     callback.handle_occurrence(
         Occurrence(TrainingIterationCompleted(TrainingIteration(0)), 1), context, state
     )
+    callback.handle_occurrence(_started(1), context, state)
     # Simulate later mutation of the in-process state after the callback's capture point.
     state.wavefunction_output = WavefunctionOutput(torch.tensor([40.0, 50.0]), torch.ones(2))
     state.local_energy = torch.tensor([20.0, 30.0])

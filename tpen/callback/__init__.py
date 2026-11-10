@@ -40,6 +40,10 @@ def __getattr__(name: str) -> object:
         from .module_norms import ModuleNorms
 
         return ModuleNorms
+    if name == "OptimizerState":
+        from .optimizer_state import OptimizerState
+
+        return OptimizerState
     if name == "ParameterActivity":
         from .parameter_activity import ParameterActivity
 
@@ -129,6 +133,7 @@ __all__ = [
     "InitialCheckpoint",
     "Metadata",
     "ModuleNorms",
+    "OptimizerState",
     "ParameterActivity",
     "RawTrainingBatchRecorder",
     "ResolvedConfigSnapshot",

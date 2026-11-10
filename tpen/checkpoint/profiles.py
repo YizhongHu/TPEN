@@ -119,6 +119,8 @@ RESUME_SENSITIVE_CALLBACK_TARGETS = frozenset(
         "tpen.callback.AmplitudeRiskFraction",
         "tpen.callback.InitialCheckpoint",
         "tpen.callback.ParameterActivity",
+        "tpen.callback.RawTrainingBatchRecorder",
+        "tpen.callback.TrainingBatchRecorder",
     }
 )
 # ``pop_step_cadence`` consumes five fields from these callbacks:
@@ -149,6 +151,8 @@ CADENCE_SENSITIVE_CALLBACK_TARGETS = frozenset(
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
         "tpen.callback.AmplitudeRiskFraction",
+        "tpen.callback.RawTrainingBatchRecorder",
+        "tpen.callback.TrainingBatchRecorder",
     }
 )
 # These schedules make decisions only from the durable completed-update

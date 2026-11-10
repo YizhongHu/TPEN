@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import re
 from types import MappingProxyType
 from typing import Any, ClassVar
 
@@ -41,6 +42,10 @@ class PlacementRefusal(ValueError):
 CHILD_PLACEMENT_SCHEMA = "tpen-executor/child-placement-v1"
 PLACEMENT_OUTPUT_ENV = "TPEN_PLACEMENT_OUTPUT"
 PLACEMENT_REFUSAL_ENV = "TPEN_PLACEMENT_REFUSAL"
+PLACEMENT_RECEIPT_VERSION_ENV = "TPEN_PLACEMENT_RECEIPT_VERSION"
+_GPU_UUID = re.compile(r"^GPU-[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$")
+_HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$")
+_MAX_SCHEDULER_HOSTS = 1024
 
 
 def canonical_host(value: str) -> str:
@@ -53,7 +58,184 @@ def canonical_host(value: str) -> str:
 
     if type(value) is not str or not value.strip():
         raise PlacementRefusal("invalid-host", "placement host must be non-empty text")
-    return value.strip().lower().rstrip(".").split(".", 1)[0]
+    complete = value.strip()
+    if complete.endswith("."):
+        complete = complete[:-1]
+    labels = complete.split(".")
+    if not complete or any(_HOST_LABEL.fullmatch(label) is None for label in labels):
+        raise PlacementRefusal("invalid-host", "placement host contains an invalid hostname label")
+    return complete.lower().split(".", 1)[0]
+
+
+def canonical_device_uuid(value: str) -> str:
+    """Return a canonical physical NVIDIA UUID, rejecting indices and aliases.
+
+    Device visibility values such as ``0`` and MIG indices are intentionally
+    not accepted: placement qualification compares the UUID emitted by the
+    same inventory query as the live PID rows.
+    """
+
+    if type(value) is not str or not value.strip():
+        raise PlacementRefusal("invalid-device-entitlement", "device entitlement must be non-empty text")
+    result = value.strip().upper()
+    if not _GPU_UUID.fullmatch(result):
+        raise PlacementRefusal("invalid-device-entitlement", f"device entitlement {value!r} is not a physical UUID")
+    if any(char.isspace() for char in result):
+        raise PlacementRefusal("invalid-device-entitlement", "device entitlement contains whitespace")
+    return result
+
+
+def _host_tokens(text: str, source: str) -> tuple[str, ...]:
+    """Parse one scheduler host text into canonical, unique host names."""
+
+    if type(text) is not str:
+        raise PlacementRefusal("host-map-unavailable", f"{source} is not text")
+    hosts: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if any(char.isspace() for char in line):
+            raise PlacementRefusal("host-map-ambiguous", f"{source} contains a host line with whitespace")
+        try:
+            host = canonical_host(line)
+        except PlacementRefusal as error:
+            raise PlacementRefusal("host-map-ambiguous", f"{source} contains an invalid hostname") from error
+        hosts.append(host)
+    if not hosts:
+        raise PlacementRefusal("host-map-unavailable", f"{source} contains no scheduler hosts")
+    return tuple(dict.fromkeys(hosts))
+
+
+def expand_slurm_nodelist(value: str) -> tuple[str, ...]:
+    """Expand a bounded Slurm nodelist without importing a scheduler client."""
+
+    if type(value) is not str or not value.strip():
+        raise PlacementRefusal("host-map-unavailable", "SLURM_NODELIST is absent or empty")
+
+    def expand_group(body: str, limit: int) -> list[str]:
+        result: list[str] = []
+        for item in body.split(","):
+            item = item.strip()
+            if "-" in item:
+                start, end = item.split("-", 1)
+                if not start.isdigit() or not end.isdigit() or int(start) > int(end):
+                    raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains an invalid range")
+                count = int(end) - int(start) + 1
+                if count > limit or len(result) + count > limit:
+                    raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST range exceeds the bounded host limit")
+                # Slurm preserves the width supplied by the range's start.
+                width = len(start)
+                result.extend(f"{index:0{width}d}" for index in range(int(start), int(end) + 1))
+            elif item.isdigit():
+                if len(result) >= limit:
+                    raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST token exceeds the bounded host limit")
+                result.append(f"{int(item):0{len(item)}d}")
+            else:
+                raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains an invalid host token")
+        return result
+
+    def expand_one(token: str, limit: int = _MAX_SCHEDULER_HOSTS) -> list[str]:
+        token = token.strip()
+        open_index = token.find("[")
+        if open_index < 0:
+            if "]" in token:
+                raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains malformed brackets")
+            return [token]
+        prefix = token[:open_index]
+        close_index = token.find("]", open_index + 1)
+        if close_index < 0:
+            raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains malformed brackets")
+        choices = expand_group(token[open_index + 1 : close_index], limit)
+        suffix = token[close_index + 1 :]
+        suffix_limit = max(1, limit // len(choices))
+        suffixes = expand_one(suffix, suffix_limit) if "[" in suffix else [suffix]
+        if len(choices) * len(suffixes) > limit:
+            raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST expands beyond the bounded host limit")
+        return [prefix + choice + tail for choice in choices for tail in suffixes]
+
+    def split_tokens(text: str) -> list[str]:
+        tokens: list[str] = []
+        start = 0
+        depth = 0
+        for index, char in enumerate(text):
+            if char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+                if depth < 0:
+                    raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains malformed brackets")
+            elif char == "," and depth == 0:
+                token = text[start:index].strip()
+                if not token:
+                    raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains an empty host token")
+                tokens.append(token)
+                start = index + 1
+        if depth:
+            raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains malformed brackets")
+        token = text[start:].strip()
+        if not token:
+            raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains an empty host token")
+        tokens.append(token)
+        return tokens
+
+    hosts: list[str] = []
+    for token in split_tokens(value):
+        hosts.extend(expand_one(token))
+        if len(hosts) > _MAX_SCHEDULER_HOSTS:
+            raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST expands beyond the bounded host limit")
+    if not hosts:
+        raise PlacementRefusal("host-map-unavailable", "SLURM_NODELIST expanded to no hosts")
+    normalized = []
+    for host in hosts:
+        try:
+            normalized.append(canonical_host(host))
+        except PlacementRefusal as error:
+            raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains an invalid hostname") from error
+    return tuple(dict.fromkeys(normalized))
+
+
+def scheduler_host_map(
+    scheduler: Mapping[str, Any] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Return canonical physical hosts captured from PBS or Slurm metadata.
+
+    ``scheduler`` is allocation-construction metadata.  It may contain raw
+    ``pbs_nodefile``/``PBS_NODEFILE`` text, a nodefile path, or
+    ``slurm_nodelist``/``SLURM_NODELIST`` text.  Environment lookup is offered
+    only for callers constructing that metadata; dispatch never discovers
+    scheduler state implicitly.
+    """
+
+    values: Mapping[str, Any] = scheduler if isinstance(scheduler, Mapping) else {}
+    env = environ if environ is not None else {}
+    pbs = next((values.get(key) for key in ("pbs_nodefile_text", "PBS_NODEFILE_TEXT") if values.get(key) is not None), None)
+    pbs_path = next((values.get(key) for key in ("pbs_nodefile_path", "PBS_NODEFILE_PATH") if values.get(key) is not None), None)
+    if pbs is None and pbs_path is None:
+        captured = next((values.get(key) for key in ("pbs_nodefile", "PBS_NODEFILE") if values.get(key) is not None), None)
+        if captured is not None:
+            # A newline identifies captured nodefile content. A scalar PBS
+            # value is a path and is never treated as a hostname.
+            if isinstance(captured, str) and "\n" in captured:
+                pbs = captured
+            else:
+                pbs_path = captured
+    slurm = next((values.get(key) for key in ("slurm_nodelist", "SLURM_NODELIST") if values.get(key) is not None), None)
+    if pbs is None and pbs_path is None and slurm is None and environ is not None:
+        pbs_path = env.get("PBS_NODEFILE")
+        slurm = env.get("SLURM_NODELIST")
+    if pbs_path is not None:
+        try:
+            pbs = Path(pbs_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise PlacementRefusal("host-map-unavailable", "PBS_NODEFILE could not be read") from error
+    if pbs is not None:
+        return _host_tokens(pbs, "PBS_NODEFILE")
+    if slurm is not None:
+        return expand_slurm_nodelist(slurm)
+    raise PlacementRefusal("host-map-unavailable", "scheduler physical host mapping is absent")
 
 
 def parse_proc_start_ticks(pid: int, stat_text: str | None = None) -> int:
@@ -531,6 +713,14 @@ class AllocationSlot:
             raise BindingError("slot threads and environment must be mappings")
         return cls(value["slot_id"], value["node"], devices, cpus, tuple(threads.items()), tuple(environment.items()))
 
+    def with_node(self, node: str) -> "AllocationSlot":
+        """Return this slot with a canonical scheduler node identity."""
+
+        environment = dict(self.environment)
+        if "TPEN_SLOT_NODE" in environment:
+            environment["TPEN_SLOT_NODE"] = node
+        return AllocationSlot(self.slot_id, node, self.devices, self.cpus, self.threads, tuple(environment.items()))
+
 
 def _string_tuple(value: Any, name: str) -> tuple[str, ...]:
     """Validate one non-string sequence of non-empty strings."""
@@ -602,6 +792,60 @@ def slots_from_allocation(allocation: ConfiguredAllocation) -> tuple[AllocationS
     return decoded
 
 
+def validate_physical_device_entitlements(slots: Sequence[AllocationSlot]) -> tuple[AllocationSlot, ...]:
+    """Canonicalize and validate GPU UUID entitlements for a v2 request."""
+
+    if isinstance(slots, (str, bytes, bytearray)) or not isinstance(slots, Sequence):
+        raise PlacementRefusal("invalid-device-entitlement", "physical slot entitlements must be a sequence")
+    normalized: list[AllocationSlot] = []
+    seen: set[str] = set()
+    for slot in slots:
+        devices: list[str] = []
+        for raw in slot.devices:
+            canonical = canonical_device_uuid(raw)
+            if canonical in seen:
+                raise PlacementRefusal("duplicate-device-entitlement", "canonical GPU UUID is entitled to multiple slots")
+            seen.add(canonical)
+            devices.append(canonical)
+        # Keep the raw slot record intact for v1 visibility compatibility;
+        # callers use the canonical values only for v2 comparison.
+        normalized.append(slot)
+    return tuple(normalized)
+
+
+def physical_slots_from_allocation(allocation: ConfiguredAllocation) -> tuple[AllocationSlot, ...]:
+    """Resolve slots to physical scheduler hosts captured at allocation time.
+
+    Legacy allocations without scheduler metadata retain their explicit node
+    field for v1 compatibility.  A v2 allocation that includes scheduler
+    metadata must resolve every slot through that metadata; an absent or
+    ambiguous map is a typed refusal, never a host mismatch.
+    """
+
+    slots = slots_from_allocation(allocation)
+    if not slots:
+        return slots
+    facts = allocation.facts
+    scheduler = facts.get("scheduler")
+    if scheduler is None:
+        scheduler = facts.get("scheduler_host_map")
+    if scheduler is None:
+        return slots
+    if isinstance(scheduler, Mapping) and isinstance(scheduler.get("pbs_nodefile_error"), Mapping):
+        error = scheduler["pbs_nodefile_error"]
+        if set(error) == {"code", "reason"}:
+            raise PlacementRefusal(error["code"], error["reason"])
+    hosts = scheduler_host_map(scheduler if isinstance(scheduler, Mapping) else None)
+    if len(hosts) == 1:
+        return tuple(slot.with_node(hosts[0]) for slot in slots)
+    if len(hosts) != len(slots):
+        raise PlacementRefusal(
+            "host-map-ambiguous",
+            f"scheduler host count {len(hosts)} does not match slot count {len(slots)}",
+        )
+    return tuple(slot.with_node(host) for slot, host in zip(slots, hosts, strict=True))
+
+
 def bindings_from_allocation(allocation: ConfiguredAllocation) -> tuple[WorkerBinding, ...]:
     """Return per-slot bindings, or the legacy one-binding fallback.
 
@@ -657,14 +901,20 @@ __all__ = [
     "CHILD_PLACEMENT_SCHEMA",
     "ChildPlacementObservation",
     "PLACEMENT_OUTPUT_ENV",
+    "PLACEMENT_RECEIPT_VERSION_ENV",
     "PlacementRefusal",
     "WorkerBinding",
     "binding_from_allocation",
     "bindings_from_allocation",
     "parse_cpu_set",
     "parse_proc_start_ticks",
+    "canonical_device_uuid",
+    "expand_slurm_nodelist",
+    "physical_slots_from_allocation",
     "placement_environment",
     "read_child_placement",
+    "scheduler_host_map",
     "slots_from_allocation",
+    "validate_physical_device_entitlements",
     "utc_timestamp",
 ]

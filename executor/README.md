@@ -41,6 +41,23 @@ Operational outcome receipts use the closed vocabulary `completed`, `failed`,
 `timed_out`, and `launch_failed`. These statuses describe execution only;
 scientific validity remains the responsibility of core evidence.
 
+## GPU placement qualification
+
+The L1a v2 placement receipt reports an explicit reason class: `not-sampled`,
+`mismatch`, or `refused`. L1a deliberately does not run an in-child GPU
+sampler: declared-device evidence is `device=unavailable` with the loud
+reason `not-sampled`. This is operationally advisory, so a completed segment
+may remain accepted and dispatch may return `0`; the manifest records that H-v2
+must perform its own delivered-GPU check. L1b adds attempted GPU telemetry and
+its separate failure reason; H-v2 does not wait for L1b.
+
+Post-launch host or affinity mismatch is also advisory: the segment remains
+accepted, dispatch returns `0`, and the receipt is unqualified for placement.
+Prelaunch refusal is fail-closed (`launch_failed`, a typed placement receipt,
+no accepted segment, and dispatch return code `3`). Host comparison uses the
+physical scheduler mapping only; a logical slot label is retained as metadata
+and cannot be attributed to the scheduler-node map.
+
 `DirectoryStore` requires a POSIX filesystem with advisory `fcntl.lockf`
 support. It holds one task lock across pointer advancement, fence validation,
 and outcome publication. Receipt publication writes and fsyncs a temporary

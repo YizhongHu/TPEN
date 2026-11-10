@@ -76,6 +76,32 @@ def test_subprocess_worker_preserves_setup_env_and_argument_boundaries(tmp_path:
     assert set(tmp_path.iterdir()) >= {out, err}
 
 
+def test_d1_run_shim_without_placement_runs_real_core_to_completion(tmp_path: Path) -> None:
+    """D1: an ordinary child without placement still imports and runs core."""
+
+    package = tmp_path / "core" / "tpen"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "run.py").write_text(
+        "from pathlib import Path\n"
+        "def main(argv):\n"
+        "    root = Path(next(arg.split('=', 1)[1] for arg in argv if arg.startswith('run.root=')))\n"
+        "    (root / 'core-ran.txt').write_text('completed', encoding='utf-8')\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    environment = PreparedPythonEnvironment(sys.executable, None, {"PYTHONPATH": str(tmp_path / "core")})
+    outcome = SubprocessWorker().run(
+        environment,
+        ("-c", RUN_SHIM, f"run.root={tmp_path}"),
+        cwd=tmp_path,
+        stdout_path=tmp_path / "d1.out",
+        stderr_path=tmp_path / "d1.err",
+    )
+    assert outcome.returncode == 0
+    assert (tmp_path / "core-ran.txt").read_text(encoding="utf-8") == "completed"
+
+
 def test_subprocess_worker_real_child_preserves_no_setup_argument_boundaries(tmp_path: Path) -> None:
     child = tmp_path / "child.py"
     child.write_text("import json,sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8")
