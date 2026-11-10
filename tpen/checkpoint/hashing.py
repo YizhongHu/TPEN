@@ -49,6 +49,20 @@ _CALLBACK_OUTPUT_FIELDS = {
     "tpen.callback.Status": {"output_path"},
     "tpen.callback.Checkpoint": {"output_dir"},
     "tpen.callback.InitialCheckpoint": {"output_dir"},
+    # ArtifactIndex.path is an optional diagnostics index destination, not a
+    # value consumed by the evaluation model.
+    "tpen.callback.ArtifactIndex": {"path"},
+    # FailureLog.path is an optional diagnostics failure-log destination, not
+    # a value consumed by the evaluation model.
+    "tpen.callback.FailureLog": {"path"},
+    # ParameterActivity.output_path is the run's first-update inventory file,
+    # an observational artifact rather than a science input.
+    "tpen.callback.ParameterActivity": {"output_path"},
+    # RawTrainingBatchRecorder.path is the destination for its immutable
+    # training-history partitions, not a model or sampler input.
+    "tpen.callback.RawTrainingBatchRecorder": {"path"},
+    # The package exports this compatibility alias for the same recorder.
+    "tpen.callback.TrainingBatchRecorder": {"path"},
     # Producer: ``tpen.callback.RuntimeEquivariance`` writes its diagnostics
     # below this directory; consumer: ``RuntimeEquivariance.__init__`` and its
     # artifact writer.  This is an operational destination, not model input.
@@ -63,14 +77,29 @@ _CALLBACK_OUTPUT_FIELDS = {
     "spenn.callback.Status": {"output_path"},
     "spenn.callback.Checkpoint": {"output_dir"},
     "spenn.callback.InitialCheckpoint": {"output_dir"},
+    # Compatibility aliases retain the same operational destinations for the
+    # evaluation diagnostics, parameter inventory, and training history.
+    "spenn.callback.ArtifactIndex": {"path"},
+    "spenn.callback.FailureLog": {"path"},
+    "spenn.callback.ParameterActivity": {"output_path"},
+    "spenn.callback.RawTrainingBatchRecorder": {"path"},
+    "spenn.callback.TrainingBatchRecorder": {"path"},
     "spenn.callback.RuntimeEquivariance": {"artifact_dir"},
 }
 _LOGGER_PATH_FIELDS = {
     "tpen.logging.CSV": {"path"},
     "tpen.logging.JSONL": {"path"},
+    # WandB.dir controls the local dashboard-artifact destination; it is not
+    # part of the science config represented by the logger's metrics.
+    "tpen.logging.WandB": {"dir"},
     "spenn.logging.CSV": {"path"},
     "spenn.logging.JSONL": {"path"},
+    "spenn.logging.WandB": {"dir"},
 }
+# No callback/logger constructor path-like fields are science inputs on this
+# head. Keep the empty, reason-bearing registry closed so a future exception
+# must be named explicitly instead of being inferred from a parameter name.
+_NON_OPERATIONAL_PATH_FIELDS: dict[str, dict[str, str]] = {}
 _EVALUATOR_TARGET = "tpen.evaluation.Evaluator"
 
 

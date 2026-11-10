@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import copy
+import importlib
+import inspect
+import pkgutil
 from pathlib import Path
 
 import pytest
@@ -10,6 +13,9 @@ from experiments.toolkit.config_identity import expected_resolved_config_identit
 from omegaconf import OmegaConf
 
 from tpen.checkpoint.hashing import (
+    _CALLBACK_OUTPUT_FIELDS,
+    _LOGGER_PATH_FIELDS,
+    _NON_OPERATIONAL_PATH_FIELDS,
     RESOLVED_CONFIG_IDENTITY_SCHEMA,
     ResolvedConfigIdentityError,
     _delete_known_operational_slots,
@@ -20,6 +26,87 @@ from tpen.checkpoint.hashing import (
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+
+_PATH_LIKE_PARAMETER_NAMES = frozenset(
+    {
+        "artifact_dir",
+        "dir",
+        "directory",
+        "file",
+        "filename",
+        "log_dir",
+        "output_dir",
+        "output_path",
+        "path",
+        "root",
+    }
+)
+_CALLBACK_LOGGER_ALIAS_TARGETS = {
+    "tpen.callback.RawTrainingBatchRecorder": (
+        "tpen.callback.TrainingBatchRecorder",
+    ),
+}
+
+
+def _callback_logger_path_slots() -> dict[str, set[str]]:
+    """Enumerate constructor path slots from the callback/logger packages."""
+
+    from tpen.callback import Callback
+    from tpen.logging import Logger
+
+    packages = ("tpen.callback", "tpen.logging")
+    discovered: dict[str, set[str]] = {}
+    for package_name in packages:
+        package = importlib.import_module(package_name)
+        module_names = (package_name,)
+        if hasattr(package, "__path__"):
+            module_names += tuple(
+                module_info.name
+                for module_info in pkgutil.walk_packages(
+                    package.__path__, package_name + "."
+                )
+            )
+        for module_name in module_names:
+            module = importlib.import_module(module_name)
+            for class_name, cls in inspect.getmembers(module, inspect.isclass):
+                if class_name.startswith("_") or cls.__module__ != module_name:
+                    continue
+                if not issubclass(cls, (Callback, Logger)) or cls in (Callback, Logger):
+                    continue
+                parameters = inspect.signature(cls.__init__).parameters.values()
+                fields = {
+                    parameter.name
+                    for parameter in parameters
+                    if parameter.name in _PATH_LIKE_PARAMETER_NAMES
+                }
+                if fields:
+                    prefix = "tpen.callback" if issubclass(cls, Callback) else "tpen.logging"
+                    discovered[f"{prefix}.{class_name}"] = fields
+
+    expanded = dict(discovered)
+    for target, aliases in _CALLBACK_LOGGER_ALIAS_TARGETS.items():
+        if target in discovered:
+            expanded.update({alias: set(discovered[target]) for alias in aliases})
+    for target, fields in tuple(expanded.items()):
+        if target.startswith("tpen.callback.") or target.startswith("tpen.logging."):
+            expanded.setdefault("spenn." + target.removeprefix("tpen."), set(fields))
+    return expanded
+
+
+def _declared_callback_logger_path_slots() -> dict[str, set[str]]:
+    """Return the operational and explicitly non-operational closed lists."""
+
+    declared: dict[str, set[str]] = {
+        target: set(fields)
+        for target, fields in {**_CALLBACK_OUTPUT_FIELDS, **_LOGGER_PATH_FIELDS}.items()
+    }
+    declared.update(
+        {
+            target: set(fields)
+            for target, fields in _NON_OPERATIONAL_PATH_FIELDS.items()
+        }
+    )
+    return declared
 
 # These are checked-in study inputs, not standalone identity-bound run
 # configurations.  Keep this list closed and named: removing an entry is a
@@ -111,6 +198,36 @@ def _config() -> dict[str, object]:
         "model": {"layers": 4},
         "science": {"charge": 2},
     }
+
+
+def test_callback_logger_path_census_has_no_unclassified_slots() -> None:
+    """Every callback/logger destination is operational or named as science."""
+
+    discovered = _callback_logger_path_slots()
+    declared = _declared_callback_logger_path_slots()
+    missing = {
+        target: fields
+        for target, fields in discovered.items()
+        if target not in declared or declared[target] != fields
+    }
+    extra = {
+        target: fields
+        for target, fields in declared.items()
+        if target not in discovered or fields != discovered[target]
+    }
+    assert not missing, f"unclassified callback/logger path slots: {missing}"
+    assert not extra, f"closed table has stale/extra path slots: {extra}"
+
+
+def test_callback_logger_path_table_is_closed_and_non_operational_reasons_exist() -> None:
+    """The closed table cannot silently gain a science field or stale target."""
+
+    assert _declared_callback_logger_path_slots() == _callback_logger_path_slots()
+    assert all(
+        reason.strip()
+        for fields in _NON_OPERATIONAL_PATH_FIELDS.values()
+        for reason in fields.values()
+    )
 
 
 @pytest.mark.parametrize(
