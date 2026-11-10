@@ -651,10 +651,12 @@ def test_m5_real_local_dispatch_preserves_segment_and_rc_zero(tmp_path: Path) ->
 
     class Evidence:
         def read(self, _process, _environment, run_dir, **_kwargs):
+            # New accepted segments require core's resolved-config identity.
             return CoreRunEvidence(
-                "tpen.run-evidence/v1", str(run_dir), "completed", "completed",
+                "tpen.run-evidence/v2", str(run_dir), "completed", "completed",
                 {"checkpoint_dir": str(tmp_path / "checkpoint"), "schema_version": 1,
                  "next_iteration": 1, "completed_updates": 1}, None,
+                {"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
             )
 
     worker = SimpleNamespace(materialize=lambda _env=None: {
