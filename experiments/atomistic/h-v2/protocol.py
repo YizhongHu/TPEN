@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -301,6 +301,40 @@ def remove_candidate_module(config: dict[str, Any], target: str) -> None:
     ]
 
 
+def reconcile_enabled_modules(config: dict[str, Any]) -> list[str]:
+    """Return every :data:`A1_TRAINING_MODULE_CANDIDATES` target actually in *config*.
+
+    F4: the TRAIN receipt's ``enabled_modules`` must be the complete,
+    disjoint partition of the A1 training-side candidate set that actually
+    ran -- including the base ``DataIntegrity``/``GradientStats`` leaves
+    already present in ``train.yaml``, which :func:`candidate_modules_to_append`
+    deliberately excludes from the probed candidate set (they are never
+    appended or removed). Reconciling against the final materialized
+    config's own callbacks, rather than trusting the probe's own
+    bookkeeping, means a candidate silently dropped or duplicated between
+    probing and dispatch cannot drift the receipt from what actually ran.
+
+    Parameters
+    ----------
+    config : mapping
+        The final materialized config (after probing), as actually written
+        to the task's effective config file.
+
+    Returns
+    -------
+    list of str
+        Candidates in :data:`A1_TRAINING_MODULE_CANDIDATES` order whose
+        ``_target_`` is present in ``config["callbacks"]``.
+    """
+
+    present = {
+        callback.get("_target_")
+        for callback in config.get("callbacks") or ()
+        if isinstance(callback, Mapping)
+    }
+    return [target for target in A1_TRAINING_MODULE_CANDIDATES if target in present]
+
+
 def append_measurement_callbacks(config: dict[str, Any]) -> None:
     """Append the pilot's own timing callbacks onto *config* in place.
 
@@ -477,6 +511,7 @@ __all__ = [
     "evaluation_config",
     "load_yaml",
     "pilot_training_config",
+    "reconcile_enabled_modules",
     "remove_candidate_module",
     "science_training_config",
     "training_config",

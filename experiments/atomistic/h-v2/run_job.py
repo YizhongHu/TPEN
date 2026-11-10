@@ -354,6 +354,11 @@ def run(
             science_config_identity=identity,
             payload_label=pilot_payload,
         )
+        # F4: reconcile against the final materialized config, not merely the
+        # probe's own bookkeeping -- this is the complete, disjoint partition
+        # of the A1 candidate set that actually ran, including the base
+        # DataIntegrity/GradientStats leaves the probe never appends/removes.
+        enabled_modules = protocol.reconcile_enabled_modules(config)
         prepared = attached.prepare_h_v2_run(plan, overrides, config, output_dir=handoff_dir)
         alloc_dir = run_root / "attached" / "alloc" / task_id
         allocation_path, worker_path = write_local_allocation_and_worker(
