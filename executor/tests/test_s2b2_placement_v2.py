@@ -21,6 +21,7 @@ import pytest
 
 from tpen_executor._codec import digest
 from tpen_executor.contracts import AllocationId, BackendJobId, AttemptId, ProgramSpecRef, ReadyGroup, TaskSpec
+from tpen_executor.cli import _operational_exit
 from tpen_executor.dispatch.contract import _placement_receipt_v2, _with_child_placement
 from tpen_executor.dispatch.local import LocalDispatcher
 from tpen_executor.allocations import ConfiguredAllocation
@@ -34,10 +35,13 @@ from tpen_executor.placement import (
     physical_slots_from_allocation,
 )
 from tpen_executor.results import AcceptedSegment, ManifestAttempt, OutcomeReceipt, RunManifest, SciencePlacementReceiptV2, StartReceipt
-from tpen_executor.runners import RUN_SHIM
+from tpen_executor.runners import CoreRunEvidence, RUN_SHIM
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.tasks import ConfiguredRun
 from tpen_executor.workers import ProcessOutcome, SubprocessWorker
+
+GPU_A = "GPU-12345678-1234-1234-1234-123456789ABC"
+GPU_B = "GPU-12345678-1234-1234-1234-123456789ABD"
 
 
 def _group() -> ReadyGroup:
@@ -46,7 +50,7 @@ def _group() -> ReadyGroup:
     return ReadyGroup("s2b2", (member,), digest("s2b2"))
 
 
-def _allocation(*, scheduler: object | None = None, device: str = "GPU-ABC") -> ConfiguredAllocation:
+def _allocation(*, scheduler: object | None = None, device: str = GPU_A) -> ConfiguredAllocation:
     allowed = sorted(getattr(os, "sched_getaffinity", lambda _pid: (0,))(0))
     slot = AllocationSlot("logical-slot", "logical-label", (device,), (allowed[0],), (), ()).to_dict()
     facts: dict[str, object] = {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot]}}
@@ -70,18 +74,42 @@ def _v2_inputs(tmp_path: Path, sampler: dict[str, object]):
     (tmp_path / "config.yaml").write_text("ok", encoding="utf-8")
     allocation = _allocation(scheduler={"PBS_NODEFILE": "physical-01\n"})
     fence = SimpleNamespace(attempt_id=AttemptId("attempt-a"), output_dir=str(tmp_path / "out"))
+    allowed = sorted(getattr(os, "sched_getaffinity", lambda _pid: (0,))(0))
+    sampler = dict(sampler)
+    if sampler.get("status") == "observed":
+        if not sampler.get("version"):
+            sampler["version"] = "NVIDIA"
+        sampler.setdefault("reason", "observed")
+        if not sampler.get("samples"):
+            sampler["samples"] = [{
+            "monotonic_start": 1.0, "monotonic_end": 1.1,
+            "inventory": sampler.get("inventory", []), "pid_rows": sampler.get("pid_rows", []),
+            }]
+        sampler["count"] = len(sampler["samples"])
+        sampler["monotonic_start"] = 1.0
+        sampler["monotonic_end"] = 1.1
+    else:
+        sampler.setdefault("samples", [])
+        sampler.setdefault("count", 0)
+        sampler.setdefault("monotonic_start", None)
+        sampler.setdefault("monotonic_end", None)
+    sampler.setdefault("command_pids", [111] if sampler.get("status") == "observed" else [])
+    sampler.setdefault("survivors", [])
+    sampler.setdefault("elapsed_seconds", 0.1)
+    sampler.setdefault("join_timeout_seconds", 4.0)
+    sampler.setdefault("quiescent", True)
     environment = PreparedPythonEnvironment(sys.executable, None, {
         "TPEN_SLOT_ID": "logical-slot",
         "TPEN_SLOT_NODE": "physical-01",
-        "TPEN_SLOT_CPUS": str(sorted(getattr(os, "sched_getaffinity", lambda _pid: (0,))(0))[0]),
-        "TPEN_PLACEMENT_DECLARED_DEVICES": "GPU-ABC",
+        "TPEN_SLOT_CPUS": str(allowed[0]),
+        "TPEN_PLACEMENT_DECLARED_DEVICES": GPU_A,
         "TPEN_PLACEMENT_RECEIPT_VERSION": "2",
         "TPEN_PLACEMENT_HOST_STATUS": "mapped",
     })
     base = ChildPlacementObservation(
         "task-a", "attempt-a", group.identity, "allocation-a", "job-a", "logical-slot",
         digest({"config": configured.config, "overrides": list(configured.overrides)}), fence.output_dir,
-        "physical-01", 1234, 55, tuple(sorted(getattr(os, "sched_getaffinity", lambda _pid: (0,))(0))), {}, None, "2026-11-10T00:00:00Z", None,
+        "physical-01", 1234, 55, (allowed[0],), {}, None, "2026-11-10T00:00:00Z", None,
     )
     return group, configured, allocation, fence, environment, ChildPlacementObservationV2(base, sampler)
 
@@ -92,8 +120,8 @@ def test_m2_live_pid_uuid_not_visibility_or_inventory(tmp_path: Path) -> None:
     sampler = {
         "status": "observed", "reason": "", "method": "nvidia-smi-pid-uuid-v1", "version": "NVIDIA",
         "cadence_seconds": 0.1, "count": 1, "monotonic_start": 1.0, "monotonic_end": 1.1,
-        "inventory": [{"uuid": "GPU-ABC", "pci.bus_id": "0000:00:01.0"}, {"uuid": "GPU-OUT", "pci.bus_id": "0000:00:02.0"}],
-        "pid_rows": [{"pid": 1234, "gpu_uuid": "GPU-OUT"}], "samples": [],
+        "inventory": [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}, {"uuid": GPU_B, "pci.bus_id": "0000:00:02.0"}],
+        "pid_rows": [{"pid": 1234, "gpu_uuid": GPU_B}],
     }
     group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path, sampler)
     receipt = _placement_receipt_v2(observation, allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((), 0, "", "", False, 1234, 55))
@@ -117,6 +145,43 @@ def test_m3_unavailable_is_typed_and_nonempty(tmp_path: Path, reason: str) -> No
     assert receipt.gpu_sampler["reason"]
 
 
+def test_n2_foreign_pid_rows_never_qualify(tmp_path: Path) -> None:
+    """N2: an entitled UUID on another process is not science evidence."""
+
+    sampler = {
+        "status": "observed", "reason": "observed", "method": "nvidia-smi-pid-uuid-v1", "version": "NVIDIA",
+        "cadence_seconds": 0.1, "count": 1, "monotonic_start": 1.0, "monotonic_end": 1.1,
+        "inventory": [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}],
+        "pid_rows": [{"pid": 9999, "gpu_uuid": GPU_A}],
+    }
+    group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path, sampler)
+    receipt = _placement_receipt_v2(
+        observation, allocation, fence, group, group.members[0], configured, environment,
+        ProcessOutcome((), 0, "", "", False, 1234, 55),
+    )
+    assert receipt.verdict["qualification"] == "unqualified"
+    assert receipt.gpu["active_uuids"] == ()
+
+
+def test_n9_v2_receipt_rejects_unknown_nested_key(tmp_path: Path) -> None:
+    """N9: closed v2 nested records cannot be silently widened."""
+
+    sampler = {
+        "status": "unavailable", "reason": "nvidia-smi-missing", "method": "nvidia-smi-pid-uuid-v1", "version": None,
+        "cadence_seconds": 0.1, "count": 0, "monotonic_start": 1.0, "monotonic_end": 1.1,
+        "inventory": [], "pid_rows": [], "samples": [],
+    }
+    group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path, sampler)
+    receipt = _placement_receipt_v2(
+        observation, allocation, fence, group, group.members[0], configured, environment,
+        ProcessOutcome((), 0, "", "", False, 1234, 55),
+    )
+    raw = receipt.to_dict()
+    raw["verdict"]["unexpected"] = "tamper"
+    with pytest.raises((TypeError, ValueError)):
+        SciencePlacementReceiptV2.from_mapping(raw)
+
+
 def test_c1_receipt_reason_distinguishes_unavailable_mismatch_and_refused(tmp_path: Path) -> None:
     """Manager condition 1: receipt reason classes cannot collapse together."""
 
@@ -131,7 +196,7 @@ def test_c1_receipt_reason_distinguishes_unavailable_mismatch_and_refused(tmp_pa
     assert no_telemetry.verdict["qualification"] != "qualified"
 
     mismatch_sampler = dict(unavailable)
-    mismatch_sampler.update({"status": "observed", "reason": "", "inventory": [{"uuid": "GPU-ABC", "pci.bus_id": "0000:00:01.0"}, {"uuid": "GPU-OUT", "pci.bus_id": "0000:00:02.0"}], "pid_rows": [{"pid": 1234, "gpu_uuid": "GPU-OUT"}]})
+    mismatch_sampler.update({"status": "observed", "reason": "observed", "inventory": [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}, {"uuid": GPU_B, "pci.bus_id": "0000:00:02.0"}], "pid_rows": [{"pid": 1234, "gpu_uuid": GPU_B}]})
     _, _, _, _, _, mismatched = _v2_inputs(tmp_path, mismatch_sampler)
     mismatch = _placement_receipt_v2(mismatched, allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((), 0, "", "", False, 1234, 55))
     assert mismatch.verdict["reason_class"] == "mismatch"
@@ -172,6 +237,10 @@ def test_c2_declared_devices_unavailable_is_loud_in_receipt_and_manifest(tmp_pat
     assert manifest.placement_verdict["science_acceptance"] == "not-accepted"
     assert "GPU PLACEMENT UNQUALIFIED" in manifest.placement_verdict["message"]
     assert RunManifest.decode(manifest.encode()).placement_verdict["status"] == "unqualified"
+    tampered = manifest.to_dict()
+    tampered["placement_verdict"] = {"status": "qualified", "science_acceptance": "accepted", "message": "override"}
+    with pytest.raises((TypeError, ValueError)):
+        RunManifest.from_mapping(tampered)
 
 
 def test_c3_logical_slot_name_does_not_drive_physical_verdict(tmp_path: Path) -> None:
@@ -180,8 +249,8 @@ def test_c3_logical_slot_name_does_not_drive_physical_verdict(tmp_path: Path) ->
     sampler = {
         "status": "observed", "reason": "", "method": "nvidia-smi-pid-uuid-v1", "version": "NVIDIA",
         "cadence_seconds": 0.1, "count": 1, "monotonic_start": 1.0, "monotonic_end": 1.1,
-        "inventory": [{"uuid": "GPU-ABC", "pci.bus_id": "0000:00:01.0"}],
-        "pid_rows": [{"pid": 1234, "gpu_uuid": "GPU-ABC"}], "samples": [],
+        "inventory": [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}],
+        "pid_rows": [{"pid": 1234, "gpu_uuid": GPU_A}],
     }
     group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path, sampler)
     receipt = _placement_receipt_v2(observation, allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((), 0, "", "", False, 1234, 55))
@@ -219,6 +288,9 @@ def test_m4_prelaunch_host_refusal_is_launch_failed_without_segment(tmp_path: Pa
     )
     assert not called
     assert manifest.attempts[0].outcome_receipt.status == "launch_failed"
+    assert manifest.attempts[0].placement_receipt.schema == "tpen-executor/science-placement-receipt-v2"
+    assert manifest.attempts[0].placement_receipt.host_mapping["status"] == "unavailable"
+    assert manifest.attempts[0].placement_receipt.verdict["reason_class"] == "refused"
     assert not manifest.segments
 
 
@@ -248,6 +320,61 @@ def test_m5_advisory_postlaunch_mismatch_keeps_segment_and_rc_zero(tmp_path: Pat
     assert receipt.verdict["reason_class"] == "mismatch"
 
 
+@pytest.mark.skipif(not hasattr(os, "sched_getaffinity"), reason="requires Linux controller affinity contract")
+def test_m5_real_local_dispatch_preserves_segment_and_rc_zero(tmp_path: Path) -> None:
+    """M5: serialized advisory evidence still yields an accepted segment."""
+
+    group = _group()
+    configured = ConfiguredRun("task-a", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("ok", encoding="utf-8")
+    allocation = _allocation(scheduler={"PBS_NODEFILE": "physical-01\n"})
+    sampler = {
+        "status": "unavailable", "reason": "nvidia-smi-missing", "method": "nvidia-smi-pid-uuid-v1", "version": None,
+        "cadence_seconds": 0.1, "count": 0, "monotonic_start": None, "monotonic_end": None,
+        "inventory": [], "pid_rows": [], "samples": [], "command_pids": [], "survivors": [],
+        "elapsed_seconds": 0.1, "join_timeout_seconds": 4.0, "quiescent": True,
+    }
+
+    class Process:
+        def run(self, environment, *args, **kwargs):
+            assert environment.env["TPEN_PLACEMENT_DECLARED_HOST"] == "physical-01"
+            assert environment.env["TPEN_SLOT_ID"] == "logical-slot"
+            base = ChildPlacementObservation(
+                environment.env["TPEN_PLACEMENT_TASK_ID"], environment.env["TPEN_PLACEMENT_ATTEMPT_ID"],
+                environment.env["TPEN_PLACEMENT_GROUP_DIGEST"], environment.env["TPEN_PLACEMENT_ALLOCATION_ID"],
+                environment.env["TPEN_PLACEMENT_BACKEND_JOB_ID"], environment.env["TPEN_PLACEMENT_SLOT_ID"],
+                digest({"config": configured.config, "overrides": []}), environment.env["TPEN_PLACEMENT_OUTPUT_DIR"],
+                "other-node", 123, 55, (int(environment.env["TPEN_PLACEMENT_DECLARED_CPUS"]),), {}, None,
+                "2026-11-10T00:00:00Z", None,
+            )
+            ChildPlacementObservationV2(base, sampler).to_dict()
+            Path(environment.env["TPEN_PLACEMENT_OUTPUT"]).write_text(
+                json.dumps(ChildPlacementObservationV2(base, sampler).to_dict()) + "\n", encoding="utf-8"
+            )
+            return ProcessOutcome((sys.executable,), 0, "", "", False, 123, 55)
+
+    class Evidence:
+        def read(self, _process, _environment, run_dir, **_kwargs):
+            return CoreRunEvidence(
+                "tpen.run-evidence/v1", str(run_dir), "completed", "completed",
+                {"checkpoint_dir": str(tmp_path / "checkpoint"), "schema_version": 1, "next_iteration": 1, "completed_updates": 1}, None,
+            )
+
+    worker = SimpleNamespace(materialize=lambda _env=None: {
+        "environment": PreparedPythonEnvironment(sys.executable, None, {}),
+        "process": Process(), "runner": object(), "evidence": Evidence(),
+    })
+    lifecycle = AttachedAllocation(allocation, DirectoryStore(tmp_path / "store"))
+    manifest = LocalDispatcher(worker).run(group, {"task-a": configured}, lifecycle)
+    attempt = manifest.attempts[0]
+    assert attempt.outcome_receipt.status == "completed"
+    assert _operational_exit(manifest) == 0
+    assert attempt.placement_receipt.schema == "tpen-executor/science-placement-receipt-v2"
+    assert attempt.placement_receipt.verdict["reason_class"] == "mismatch"
+    assert manifest.segments
+    assert manifest.placement_verdict["status"] == "unqualified"
+
+
 @pytest.mark.skipif(not hasattr(os, "sched_setaffinity"), reason="requires Linux child affinity contract")
 def test_m6_sampler_is_bounded_in_child_and_reaped(tmp_path: Path) -> None:
     """M6: deterministic fake sampler has bounded count and no child survivor."""
@@ -259,9 +386,9 @@ def test_m6_sampler_is_bounded_in_child_and_reaped(tmp_path: Path) -> None:
         if '--version' in sys.argv:
             print('NVIDIA-SMI 2.0')
         elif '--query-gpu=uuid,pci.bus_id' in sys.argv:
-            print('GPU-ABC, 0000:00:01.0')
+            print('GPU-12345678-1234-1234-1234-123456789ABC, 0000:00:01.0')
         else:
-            print(f'{os.getppid()}, GPU-ABC')
+            print(f'{os.getppid()}, GPU-12345678-1234-1234-1234-123456789ABC')
     """), encoding="utf-8")
     fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
     package = tmp_path / "pkg" / "tpen"
@@ -277,7 +404,7 @@ def test_m6_sampler_is_bounded_in_child_and_reaped(tmp_path: Path) -> None:
         "TPEN_PLACEMENT_TASK_ID": "task-a", "TPEN_PLACEMENT_ATTEMPT_ID": "attempt-a",
         "TPEN_PLACEMENT_GROUP_DIGEST": digest("s2b2"), "TPEN_PLACEMENT_ALLOCATION_ID": "allocation-a",
         "TPEN_PLACEMENT_BACKEND_JOB_ID": "job-a", "TPEN_PLACEMENT_SLOT_ID": "logical-slot",
-        "TPEN_PLACEMENT_DECLARED_DEVICES": "GPU-ABC", "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest("payload"),
+        "TPEN_PLACEMENT_DECLARED_DEVICES": GPU_A, "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest("payload"),
         "TPEN_PLACEMENT_GPU_SAMPLER_COUNT": "2", "TPEN_PLACEMENT_GPU_SAMPLER_CADENCE": "0.02",
     })
     outcome = SubprocessWorker().run(environment, ("-c", RUN_SHIM, f"run.root={tmp_path}"), cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
@@ -286,3 +413,8 @@ def test_m6_sampler_is_bounded_in_child_and_reaped(tmp_path: Path) -> None:
     assert payload["schema"] == "tpen-executor/child-placement-v2"
     assert payload["gpu_sampler"]["count"] <= 2
     assert payload["gpu_sampler"]["monotonic_end"] >= payload["gpu_sampler"]["monotonic_start"]
+    assert payload["gpu_sampler"]["command_pids"]
+    assert payload["gpu_sampler"]["survivors"] == []
+    assert payload["gpu_sampler"]["quiescent"] is True
+    assert payload["gpu_sampler"]["elapsed_seconds"] <= payload["gpu_sampler"]["join_timeout_seconds"]
+    assert all(not Path(f"/proc/{pid}").exists() for pid in payload["gpu_sampler"]["command_pids"])
