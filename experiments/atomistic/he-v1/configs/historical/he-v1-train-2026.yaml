@@ -1,38 +1,440 @@
 # HISTORICAL RECORD — NOT A RUNNABLE CONFIGURATION.
 #
-# This file preserves the training-time reference-energy declaration used for
-# the completed He-v1 science, so that the old result remains interpretable
-# after the live training input is corrected.  It is deliberately stored below
-# `configs/historical/`, which is not a live study-config path, and its runner
-# target is intentionally unresolvable.  Passing this file to the runner must
-# fail before a job can start; no core guard or special historical-loader is
-# required.
+# This is the FULL He-v1 training configuration used for the completed
+# train-seed0000 result, preserved byte-for-byte in content and original
+# comments from commit 418accf153368aab45586dc2a2cc97c18472691c, except for
+# this header, the section annotations below, and the deliberately unresolved
+# runner target near the end. The original runner target was tpen.runner.Train.
 #
-# Source config commit(s):
-#   - 418accf153368aab45586dc2a2cc97c18472691c — executed He-v1
-#     `train-seed0000` source (Cannon job 40907434).
-#   - b508e293479ce9275d395c0e351d6018cb448fd8 — He-v1 config lineage that
-#     introduced the reference-energy field.
+# Source identity was confirmed two ways: git cat-file found the config blob at
+# the named commit, and git show of that path produced the complete 407-line
+# source used here. The executed run is train-seed0000 (Cannon job 40907434),
+# as recorded in the He-v1 provenance notes. The reference-bearing config
+# lineage begins at b508e293479ce9275d395c0e351d6018cb448fd8.
 #
-# At that time `system.reference_energy` was present as the infinite-nuclear-
-# mass, nonrelativistic helium reference used for interpreting the completed
-# result.  Operator decision 2026-11-10 removes it from TRAINING: reference
-# comparisons belong to evaluation, while an unused training field still
-# reaches training artifacts through the source-config snapshot and can become
-# an optimizer input if a callback later consumes it.
+# Operator decision 2026-11-10: reference_energy must not reach TRAINING.
+# It remains here only to preserve interpretation of the completed result;
+# live training uses configs/train.yaml, while evaluation retains its allowed
+# reference comparison in configs/eval.yaml.
 #
-# Live replacement: `experiments/atomistic/he-v1/configs/train.yaml`.
-# Evaluation retains its reference declaration in `configs/eval.yaml`.
+# NON-RUNNABILITY: configs/historical/ is not a live config directory, and the
+# runner target below is intentionally unresolvable. An attempted execution
+# therefore fails at target resolution before any run starts.
+#
+# Commenting template followed: experiments/hooke/choices/tpen_presets.yaml at
+# commit 20761651cac520f8bb02eebc62d087315fb843c5, whose header explicitly
+# labels the YAML as a config fragment rather than a runnable config and uses
+# section-level rationale comments.
+# All-electron helium PRODUCTION training configuration (H-F1 predeclared arm).
+#
+# THIS FILE IS THE PRODUCTION ARM. The smoke is this same file with scale-only
+# dotlist overrides (`trainer.max_steps`, `sampler.n_walkers`), never a parallel
+# copy: a smoke that exercises different wiring than production is not
+# predictive of it, and `model.layers[0].mixing.channels` cannot be reached by
+# an override at all because `OmegaConf.from_dotlist` cannot index a list. So
+# width must live in a file, and one file is the only way the smoke and the
+# production run cannot drift apart.
+#
+# THE ARM IS FROZEN, chosen on capacity, memory, throughput and wall time only.
+# Selecting on energy, variance or reference error is a `production-grid-v0`
+# violation. Evidence, all from Cannon jobs recorded in H-C1's calibration
+# receipt (39515174 kozinsky_gpu/a100, 39515178 seas_gpu/h200, 39515184
+# seas_gpu/a100, delivered card asserted in-allocation on each):
+#
+#   channels 32     largest MEASURED-SAFE width. c32 w4096 uses 38921.1 MB of
+#                   an 80 GB a100 (49% headroom); c64 w4096 is a genuine device
+#                   OOM on a100 and fits an h200 only at 128370.9 MB of 139.8
+#                   GiB = 91.8%, which is not margin.
+#   walkers 4096    only measured fit above 1024. c32 w16384 OOMs on BOTH
+#                   strata (80473.3 MB / 142126.0 MB at failure). w8192 would
+#                   interpolate to ~77.8 GB on an 80 GB card, inside the region
+#                   that already failed, and is unmeasured -- so it is not used.
+#   300k updates    largest budget that fits kozinsky_gpu's 7-day ceiling at
+#                   this arm: 2922.8 implied wall minutes against 8064 usable
+#                   at margin 0.2, i.e. 2.76x. THE PARTITION IS PART OF THE
+#                   BUDGET -- the same arm supports only 100k on seas_gpu,
+#                   whose wall is 2 days. "The a100 budget" is not well formed.
+#   kozinsky_gpu    the only production target admitting 300k at this arm with
+#   +constraint     real margin: 2.76x against 1.27x for seas_gpu/h200. Under
+#   =a100           `--no-requeue` an overrun is a lost row, so this DECLINES a
+#                   61-65% faster card (h200) to buy margin.
+#
+# The width spelling below reproduces H-C1's `apply_width` mapping verbatim
+# (read read-only from its retained workspace), because a different spelling
+# would make 38921.1 MB and 1.7107 steps/s true about H-C1's model and false
+# about this one:
+#     embedding.out_channels                  = channels
+#     embedding.hidden_channels               = channels * 4
+#     layers[i].mixing.channels               = channels
+#     layers[i].path_aggregation.channels     = channels
+#     readout.channels                        = channels
+# The pre-production 4/16 pair was already this same channels*4 relationship,
+# so this generalizes what was here rather than importing a new convention.
 
-historical_record:
-  status: historical_non_runnable
-  source_config_sha: 418accf153368aab45586dc2a2cc97c18472691c
-  source_config_lineage_sha: b508e293479ce9275d395c0e351d6018cb448fd8
-  completed_run: train-seed0000
-  completed_cannon_job: "40907434"
+experiment:
+  name: tpen_he_v1
+  sector: atomistic
+  run_name: tpen_he_v1_train
+
+run:
+  root: experiments/atomistic/he-v1/outputs
+  run_id: null
+  dir: null
+  timezone: America/New_York
+
+runtime:
+  seed: 0
+  device: cuda
+  dtype: float64
+
+# HISTORICAL SYSTEM INPUT: this retains the reference energy used by the completed He-v1 result.
+system:
+  id: he_atom
+  n_particles: 2
+  spatial_dim: 3
+  spin:
+    n_up: 1
+    n_down: 1
+  nuclei:
+    positions: [[0.0, 0.0, 0.0]]
+    charges: [2.0]
+  # Infinite-nuclear-mass, nonrelativistic 1 1S reference from the canonical
+  # baseline registry. Keep this literal coupled to the registry test.
   reference_energy: -2.903724377034119598
-  live_config: experiments/atomistic/he-v1/configs/train.yaml
 
-# Deliberately unresolved.  This must never be changed to tpen.runner.Train.
+# Sole typed nuclear-geometry authority (A5): one declarative `atoms` source
+# consumed by the wavefunction's post-readout ElectronNucleusCusp factor AND
+# the generic Hamiltonian Coulomb terms below (`electron_nucleus`,
+# `nucleus_nucleus`). Every `${atoms}` reference here materializes its own
+# equal-valued, immutable `AtomicConfiguration` object -- Hydra's recursive
+# `instantiate` re-runs a `_target_` for each tree position it appears at, so
+# referencing one config node does not make separate `instantiate()` sites
+# share one Python object (checked empirically against this repo's pinned
+# hydra-core/omegaconf; see tests/unit/experiments/test_he_v1_config.py). The
+# sampler similarly constructs its own equal-valued `AtomicConfiguration` from
+# `nuclear_positions`/`nuclear_charges` for batch transport (A2). All of these
+# are reconciled by explicit value comparison, not object identity, at every
+# Hamiltonian term via `_validate_batch_atoms_context`.
+atoms:
+  _target_: tpen.data.atomic_configuration.AtomicConfiguration
+  positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+
 runner:
   _target_: tpen.historical_config.HeV1TrainingConfigThatMustNotRun
+  model: ${model}
+  sampler: ${sampler}
+  hamiltonian_terms: ${hamiltonian_terms}
+  optimizer: ${optimizer}
+  trainer: ${trainer}
+
+# HISTORICAL MODEL: preserve the exact architecture and factor wiring used for interpretation.
+model:
+  _target_: tpen.nn.TPENWaveFunction
+  trace_name: tpen
+  embedding:
+    _target_: tpen.nn.Embedding
+    max_order: 2
+    spatial_dim: ${system.spatial_dim}
+    out_channels: 32
+    hidden_channels: 128
+    num_hidden_layers: 1
+    include_spins: true
+  layers:
+    - _target_: tpen.nn.TPENLayer
+      mixing:
+        _target_: tpen.nn.EquivariantMixing
+        max_order: 2
+        max_virtual_order: 2
+        channels: 32
+        implementation: vectorized
+        initial_weight: 0.5
+        activation:
+          _target_: torch.nn.SiLU
+      path_aggregation:
+        _target_: tpen.nn.PathAggregation
+        max_order: 2
+        max_virtual_order: 2
+        channels: 32
+        activation:
+          _target_: torch.nn.SiLU
+      update:
+        _target_: tpen.nn.ResidualUpdater
+  # One composable generic post-readout factor pipeline (A5): electron-electron
+  # cusp and the electron-nucleus cusp sum directly, replacing the retired
+  # envelope/nuclear_envelope split.
+  #
+  # BOTH CUSP RANGE PARAMETERS ARE TRAINABLE HERE, and that is a predeclared
+  # BREAK rather than an additive change. Enabling the trainable en law adds
+  # exactly two state-dict keys, so a `strict: true` model-only restore fails
+  # across this change in BOTH directions. Consequences, stated rather than
+  # discovered by a failed restore:
+  #   - this block must stay SEMANTICALLY IDENTICAL WHEN PARSED to eval.yaml's.
+  #     NOT byte-identical: the two blocks differ in COMMENT PROSE (this file
+  #     carries the full rationale, eval.yaml a shortened cross-reference), and
+  #     measured they are 5784 versus 2117 bytes. Parsed equality is what a
+  #     `strict: true` restore depends on, because Hydra instantiates from the
+  #     parsed tree and not from the file text, and parsed equality is what the
+  #     config test actually asserts (`_load(TRAIN)["model"] ==
+  #     _load(EVAL)["model"]`, a dict comparison, not a diff);
+  #   - H-C2's pilot checkpoint (trained at cb63d980 with the linear law) is
+  #     UNLOADABLE under this config, so its measured tau describes a different
+  #     model and must be RE-MEASURED at the production checkpoint. Re-measured,
+  #     not re-selected: stride stays frozen at 20 whatever tau returns, and the
+  #     correlation-aware bar simply widens if tau grows;
+  #   - A5's bit-identity gate and the additive-compatibility guarantee hold up
+  #     to this switch and break at it. The defaults (no `law`, trainable false)
+  #     contribute zero checkpoint state and reproduce `-Z r` bitwise, so
+  #     nothing else in the repo is affected.
+  #
+  # curvature_coefficient is NONZERO on purpose. The law is Kato-exact for all
+  # parameter values, but at exactly c = 0 the gradient with respect to the
+  # range parameter d is identically zero, so a defaults-instantiated trainable
+  # range cannot move on step one -- the law's own defaults land in that trap.
+  # c = 0.01 against Z = 2 puts the initial asymptotic tail slope at
+  # -Z + c/d = -1.99, a 0.5% shift, far inside the unenforced physics bound
+  # c/d < Z that a decaying tail requires. Both scalars are O(1), so the
+  # inverse-softplus overflow above x ~ 709.78 (U1) is nowhere near.
+  #
+  # ONE OF THE FOUR TRAINABLE SCALARS IS EXPECTED TO STAY BITWISE FROZEN, AND
+  # THAT IS CORRECT RATHER THAN THE TRAP. `ElectronElectronCusp` carries a
+  # same-spin range and an opposite-spin range. Helium is `n_up: 1, n_down: 1`,
+  # so THERE ARE NO SAME-SPIN ELECTRON PAIRS -- the same-spin channel contributes
+  # nothing to the log-amplitude, receives no gradient, and its raw parameter is
+  # unchanged at the last step exactly as at the first.
+  #
+  # Predeclared here because a frozen trainable parameter is INDISTINGUISHABLE
+  # BY INSPECTION from the zero-gradient trap the nonzero `curvature_coefficient`
+  # exists to avoid, and anyone auditing "did every scalar settle" will find it
+  # and reasonably suspect a defect. The discriminator is which parameter: a
+  # frozen `raw_same_range` on a two-electron singlet is a property of the
+  # SYSTEM; a frozen `raw_curvature_range` would be the trap, because that
+  # channel does carry gradient here.
+  factors:
+    - _target_: tpen.nn.ElectronElectronCusp
+      trainable_range: true
+    - _target_: tpen.nn.ElectronNucleusCusp
+      atoms: ${atoms}
+      law:
+        _target_: tpen.nn.CurvatureElectronNucleusCuspLaw
+        curvature_coefficient: 0.01
+        curvature_range: 1.0
+        trainable: true
+  readout:
+    _target_: tpen.nn.readout.PfaffianReadout
+    channels: 32
+    # TRAINABLE ON PURPOSE, AND THE DEFAULT IS THE OPPOSITE. `PfaffianReadout`
+    # declares `trainable: bool = False`, documented as keeping the weights "as
+    # fixed buffers for scaffold determinism". Passing only `channels` therefore
+    # pinned w_c at uniform 1/32 for the entire run: Psi = (1/32) sum_c Pf[K_c]
+    # with the channel mixing UNLEARNABLE across all 300,000 updates.
+    #
+    # The silence was total, which is why this needed a test rather than care.
+    # Under the default, `channel_weights` is `register_parameter(..., None)` and
+    # the value lives in a NON-PERSISTENT buffer, so it is absent from
+    # `named_parameters()` AND from `state_dict()`. Nothing logs it, nothing
+    # restores it, and no gradient touches it. Measured at 0d74d2a2 (job
+    # 39680008): readout parameter names [], state-dict keys matching readout [],
+    # 43 parameters total.
+    #
+    # CHECKPOINT CONSEQUENCE, the same shape as the en-cusp law's two-key note
+    # above: enabling this ADDS the state-dict key `readout.channel_weights`.
+    # `eval.yaml` restores with `mode: model_only, strict: true`, so a ONE-SIDED
+    # change fails restore IN BOTH DIRECTIONS. The two model blocks must stay
+    # SEMANTICALLY IDENTICAL WHEN PARSED -- not byte-identical, which they have
+    # never been -- and that parsed equality is what a config test asserts.
+    #
+    # 1/32 uniform is now a CHOSEN INITIALIZATION, not an inherited default, and
+    # the difference between those two is the entire content of this bug. It is
+    # the maximum-entropy start over channels: it commits to no channel ordering
+    # and reproduces the previous fixed behaviour exactly at step 0, so the only
+    # thing that changes is that the weights can now move.
+    trainable: true
+
+hamiltonian_terms:
+  kinetic:
+    _target_: tpen.physics.kinetic.KineticEnergy
+  # Generic, constructor-owned AtomicConfiguration Coulomb terms (A3),
+  # declared from the same `${atoms}` source as the wavefunction's
+  # ElectronNucleusCusp above -- one declarative nuclear-geometry authority
+  # for the whole He run, materialized as equal-valued (not identical)
+  # objects per consumer; see the `atoms:` comment near the top of this file.
+  electron_nucleus:
+    _target_: tpen.physics.potential.ElectronNucleusPotential
+    atoms: ${atoms}
+    # The He raw-oracle contract measures the true Coulomb cancellation.
+    # A floor would mask the near-nucleus numerical behavior under test.
+    eps: 0.0
+  electron_electron:
+    _target_: tpen.physics.potential.ElectronElectronInteraction
+  nucleus_nucleus:
+    _target_: tpen.physics.potential.NucleusNucleusPotential
+    atoms: ${atoms}
+
+# HISTORICAL SAMPLER: preserve walkers, burn-in, steps, and proposal settings from the executed run.
+sampler:
+  _target_: tpen.sampling.metropolis.MetropolisSampler
+  n_walkers: 4096
+  burn_in: 100
+  # TRAINING decorrelation, deliberately left at 10 and NOT raised to the
+  # evaluation stride of 20. H-C2's stride tie-break is a statement about
+  # EVALUATION chains -- its own cost argument is that stride 20's 15% extra
+  # wall time falls on the cheap side of the study -- and raising it here would
+  # double the sampling cost of every training update and invalidate H-C1's
+  # measured 1.7107 steps/s, on which the entire 300k budget rests.
+  n_steps: 10
+  proposal_scale: 0.5
+  seed: ${runtime.seed}
+  n_electrons: ${system.n_particles}
+  spatial_dim: ${system.spatial_dim}
+  n_up: ${system.spin.n_up}
+  n_down: ${system.spin.n_down}
+  # MetropolisSampler's public constructor is tensor-typed.  Make the
+  # config boundary explicit rather than relying on an implementation detail
+  # of its internal nuclear-context normalizer.
+  nuclear_positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  nuclear_charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+  dtype: ${runtime.dtype}
+
+# HISTORICAL OPTIMIZER: preserve the optimizer and learning-rate choices used by train-seed0000.
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.005
+
+# HISTORICAL SCHEDULE: preserve update horizon, cadence, and checkpoint scheduling used by the completed run.
+trainer:
+  # 300,000 updates on kozinsky_gpu. `plan.py` overrides this with
+  # max(checkpoint_steps), so the grid config is the single authority and this
+  # value is the standalone default that must agree with it -- a config test
+  # pins the two together so they cannot silently diverge.
+  _target_: tpen.training.trainer.VMCTrainer
+  max_steps: 300000
+  log_every_n_steps: 1
+  return_terms: true
+
+# HISTORICAL CALLBACKS: preserve the recorded training-observation and checkpoint streams.
+callbacks:
+  - _target_: tpen.callback.ConfigSnapshot
+    output_path: ${run.dir}/config.yaml
+  - _target_: tpen.callback.ResolvedConfigSnapshot
+    output_path: ${run.dir}/resolved_config.yaml
+  - _target_: tpen.callback.Metadata
+    output_path: ${run.dir}/metadata.json
+  - _target_: tpen.callback.Status
+    output_path: ${run.dir}/status.json
+  - _target_: tpen.callback.DataIntegrity
+    every_n_steps: 1
+    fail_fast: true
+    max_nonfinite_energy_fraction: 0.0
+    max_nonfinite_logabs_fraction: 0.0
+    check_loss: true
+    check_wavefunction_output: true
+    check_batch: true
+    strict_sign_values: true
+  - _target_: tpen.callback.GradientStats
+    every_n_steps: 5
+    fail_fast: true
+    check_finite: true
+  - _target_: tpen.callback.SamplerHealth
+    every_n_steps: 5
+    fail_fast: false
+  # Convergence adequacy cannot be assessed on the loss alone once the cusp
+  # ranges are trainable. The energy is a weak instrument for a parameter it is
+  # insensitive to: a range 30% from its optimum can cost far less than the
+  # window-to-window scatter of the loss trace, so the loss would plateau on
+  # schedule while the model is still structurally in transit -- and the primary
+  # checkpoint cannot be moved after the fact. So the scalars are traced and
+  # assessed directly, on the same windows and by the same rule as the energy.
+  # Same discipline as testing initialization bias on the sampled MEAN because
+  # tau and split-Rhat cannot see it.
+  - _target_: tpen.callback.FactorScalars
+    every_n_steps: 5
+    fail_fast: false
+  # A PAID CHOICE, NOW THAT THE PRICE IS MEASURED. Every 5 steps at
+  # `permutation_fraction: 1.0` over 300,000 updates is 60,000 full-permutation
+  # checks, and pilot 39559205 shows the callback stack costs part of a 12.2%
+  # throughput shortfall against H-C1's callback-free capacity measurement
+  # (1.5025 vs 1.7107 steps/s). Before that pilot the cost was invisible; it is
+  # now a number, so leaving it unexamined would be a choice nobody made.
+  #
+  # RETAINED DELIBERATELY. The arm is frozen, the wall margin is 2.42x and
+  # viable, and `AGENTS.md` requires equivariance contracts stay executable. A
+  # correctness guard on a 146 GPU-hour study is worth real throughput: catching
+  # a violation at step 5,000 rather than at step 300,000 saves vastly more than
+  # 12%. The cadence and fraction are named here so a future study that wants
+  # the throughput back knows exactly what it is spending and what it would be
+  # giving up, rather than discovering the knob by accident.
+  #
+  # NOT ATTRIBUTED between this callback and the pilot-only
+  # `FactorScalars` override, because attributing it would cost another GPU run
+  # on a frozen SHA. An honestly labelled two-contributor gap beats a clean
+  # attribution bought at that price.
+  - _target_: tpen.callback.RuntimeEquivariance
+    every_n_steps: 5
+    probability: 1.0
+    fail_fast: true
+    artifact_dir: ${run.dir}/checks/equivariance
+    checkers:
+      - _target_: tpen.equivariance.checks.FullModelEquivarianceChecker
+        permutation_fraction: 1.0
+        max_permutations: 1
+        seed: ${runtime.seed}
+        atol: 1.0e-06
+        rtol: 1.0e-06
+      - _target_: tpen.equivariance.checks.TraceEquivarianceChecker
+        permutation_fraction: 1.0
+        max_permutations: 1
+        seed: ${runtime.seed}
+        compare_output: false
+        atol: 1.0e-06
+        rtol: 1.0e-06
+  # WRITE CADENCE IS DECOUPLED FROM THE EVALUATED SET, on purpose.
+  # Writing costs disk; EVALUATING costs GPU (4 chains x 3 checkpoints x 3
+  # seeds = 36 rows, already the bulk of the eval budget). So write often and
+  # evaluate exactly what was predeclared. Since resume is REJECTED, a crash
+  # loses the whole row at any cadence -- what a fine cadence buys is that a run
+  # that dies at 280k still leaves a usable 275k artifact instead of throwing
+  # away 75k updates of completed work.
+  #
+  # PROHIBITION, written here because this is the line that creates the
+  # temptation. Checkpoints outside the predeclared evaluated set
+  # [100000, 200000, 300000] exist for CRASH SALVAGE and post-hoc description
+  # ONLY. They are NOT evaluable without a rule predeclared BEFORE the run.
+  # Evaluating one after seeing the primary result is arm selection on energy
+  # laundered through a file that happened to be on disk, and is a
+  # `production-grid-v0` violation rather than a judgement call.
+  #
+  # RETENTION IS DECLARED EXPLICITLY, not left to the default. `keep_last: null`
+  # keeps every checkpoint. Pruning is the nastier sibling of the
+  # multiple-of-cadence hazard above: a pruned checkpoint IS written, satisfies
+  # every existence check at the moment it is written, and is deleted later --
+  # so a test asserting "the checkpoint was written" passes while the artifact
+  # is gone by evaluation time. At `keep_last: 3` this run would finish holding
+  # 250k/275k/300k and the 24 eval rows for 100k and 200k would restore
+  # directories deleted DURING the run that created them, after all 300,000
+  # updates had been paid for, three times over.
+  # Retaining the evaluated set requires
+  #     keep_last is null  or  keep_last >= (max_steps - min(evaluated))/cadence + 1
+  # which is 9 here. A test derives that rather than restating the 9.
+  # "Nobody set it" and "we decided not to prune" look identical in a config;
+  # only the second survives review.
+  - _target_: tpen.callback.Checkpoint
+    terminal: false
+    every_n_steps: 25000
+    keep_last: null
+    output_dir: ${run.dir}/checkpoints
+
+loggers:
+  - _target_: tpen.logging.CSV
+    path: ${run.dir}/metrics.csv
+  - _target_: tpen.logging.JSONL
+    path: ${run.dir}/metrics.jsonl
