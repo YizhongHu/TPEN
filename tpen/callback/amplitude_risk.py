@@ -155,6 +155,11 @@ def amplitude_risk_metrics(
     torch = require_torch(feature="AmplitudeRiskFraction")
     logabs = logabs.detach()
     sign = sign.detach()
+    if logabs.ndim != 1 or sign.ndim != 1:
+        raise ValueError(
+            f"logabs and sign must be one-dimensional, got ndim {logabs.ndim} vs "
+            f"{sign.ndim}"
+        )
     if logabs.shape != sign.shape:
         raise ValueError(
             f"logabs and sign must share a shape, got {tuple(logabs.shape)} vs "
@@ -221,7 +226,9 @@ def _finite_median(values: Any, torch: Any) -> Any:
     mid = n // 2
     if n % 2 == 1:
         return sorted_values[mid]
-    return (sorted_values[mid - 1] + sorted_values[mid]) / 2
+    lower = sorted_values[mid - 1]
+    upper = sorted_values[mid]
+    return lower + (upper - lower) / 2
 
 
 def _tau_key(tau: float) -> str:
