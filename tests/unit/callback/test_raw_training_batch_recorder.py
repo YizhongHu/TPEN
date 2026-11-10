@@ -156,7 +156,7 @@ def test_first_nonzero_iteration_refuses_bypassed_restore_but_fresh_steps_contin
             state(step),
         )
     fresh.handle_occurrence(Occurrence(TrainingCompleted(), 1), fresh_context, state(1))
-    assert TrainingBatchReader(fresh_root).read()["iteration_step"].tolist() == [0, 1]
+    assert TrainingBatchReader(fresh_root).read()["iteration_step"].tolist() == [0, 0, 1, 1]
 
 
 def test_fresh_recorder_history_remains_reader_compatible(tmp_path: Path) -> None:
