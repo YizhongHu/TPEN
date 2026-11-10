@@ -67,6 +67,7 @@ OBSERVATIONAL_CALLBACK_TARGETS = frozenset(
     {
         "tpen.callback.ElectronNucleusDistanceQuantiles",
         "tpen.callback.ModuleNorms",
+        "tpen.callback.OptimizerState",
     }
 )
 
