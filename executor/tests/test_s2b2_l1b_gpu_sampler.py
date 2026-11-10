@@ -2097,8 +2097,9 @@ def test_dispatch_records_typed_telemetry_failure_not_refusal(tmp_path: Path) ->
         def read(self, _process, environment, run_dir, **_kwargs):
             seen["inspection"] = environment.env.get(gs.GPU_SAMPLER_OUTPUT_ENV)
             return CoreRunEvidence(
-                "tpen.run-evidence/v1", str(run_dir), "completed", "completed",
+                "tpen.run-evidence/v2", str(run_dir), "completed", "completed",
                 {"checkpoint_dir": str(tmp_path / "checkpoint"), "schema_version": 1, "next_iteration": 1, "completed_updates": 1}, None,
+                {"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
             )
 
     worker = SimpleNamespace(materialize=lambda _env=None: {
