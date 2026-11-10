@@ -17,7 +17,7 @@ from tpen.callback.raw_training_batch_recorder import RawTrainingBatchRecorder, 
 from tpen.checkpoint import CheckpointRestored
 from tpen.checkpoint.restore import RestoreReport
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
-from tpen.events import Occurrence
+from tpen.events import Occurrence, Started
 from tpen.run import run_from_config
 from tpen.training.events import TrainingCompleted, TrainingIteration, TrainingIterationCompleted
 from tpen.training.state import TrainerState
@@ -174,7 +174,11 @@ def _restored_occurrence() -> CheckpointRestored:
 
 def _state() -> TrainerState:
     return TrainerState(
-        trainer=SimpleNamespace(completed_updates=0),
+        trainer=SimpleNamespace(
+            next_iteration=0,
+            completed_updates=0,
+            state_dict=lambda: {"next_iteration": 0, "completed_updates": 0},
+        ),
         batch=ElectronBatch(torch.tensor([[[0.0, 1.0, 2.0]]])),
         local_energy=torch.tensor([1.0]),
         local_energy_terms={"kinetic": torch.tensor([1.0])},
@@ -191,10 +195,11 @@ def test_recorder_reset_after_real_context_emit_restores_fresh_delivery(tmp_path
     context_a = _context(tmp_path, "context-a", callback)
     context_a.emit(_restored_occurrence())
     with pytest.raises(ValueError, match=re.escape(REFUSAL)):
-        context_a.emit(TrainingIterationCompleted(TrainingIteration(0)), state=_state())
+        context_a.emit(Started(TrainingIteration(0)), state=_state())
 
     context_b = _context(tmp_path, "context-b", callback)
     state = _state()
+    context_b.emit(Started(TrainingIteration(0)), state=state)
     context_b.emit(TrainingIterationCompleted(TrainingIteration(0)), state=state)
     context_b.emit(TrainingCompleted(), state=state)
 

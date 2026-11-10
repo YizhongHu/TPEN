@@ -21,10 +21,10 @@ from omegaconf import OmegaConf
 
 from tpen.artifacts import RunContext
 from tpen.checkpoint import CheckpointRestored
-from tpen.events import DomainState
+from tpen.events import DomainState, Started, started
 from tpen.events import Event as TypedEvent
 from tpen.events import Occurrence, Subscription
-from tpen.training.events import TrainingCompleted, TrainingIterationCompleted
+from tpen.training.events import TrainingCompleted, TrainingIteration, TrainingIterationCompleted
 from tpen.training.state import TrainerState
 
 from .base import StatefulCallback
@@ -509,7 +509,11 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
     A restored ``train_resume`` lineage is refused before capture or file
     publication. Full recorder resume semantics are deferred to item
     ``7eaf9e0c``; accepting a resumed callback here would risk appending a
-    history whose lineage cannot be proven.
+    history whose lineage cannot be proven. Like ``InitialCheckpoint``, the
+    defensive first-lineage check runs at ``started(TrainingIteration)``:
+    this boundary is emitted before ``CollectSamples`` and therefore sees the
+    pre-update trainer cursor, rather than the post-update counters available
+    at ``TrainingIterationCompleted``.
     """
 
     state_type: ClassVar[type[DomainState]] = TrainerState
@@ -524,7 +528,11 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
             raise ValueError("partition_size_steps must be positive")
         super().__init__(typed_groups=(
             SubscriptionGroup(
-                selectors=(Subscription.of(TrainingIterationCompleted), Subscription.of(TrainingCompleted))
+                selectors=(
+                    started(TrainingIteration),
+                    Subscription.of(TrainingIterationCompleted),
+                    Subscription.of(TrainingCompleted),
+                )
             ),
             SubscriptionGroup(selectors=(Subscription.of(CheckpointRestored),), stateless=True),
         ), **kwargs)
@@ -554,27 +562,26 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
                 "or publication [unsupported-callback]"
             )
         event = occurrence.event
+        if isinstance(event, Started) and isinstance(event.operation, TrainingIteration):
+            if not self._first_iteration_seen:
+                self._first_iteration_seen = True
+                # Match InitialCheckpoint: Started(TrainingIteration) is the
+                # pre-sampling boundary, before post-update counters change.
+                progress = state.trainer.state_dict()
+                fresh_lineage = event.operation.step == 0 and all(
+                    progress[key] == 0 for key in ("next_iteration", "completed_updates")
+                )
+                if not fresh_lineage:
+                    raise ValueError(
+                        "RawTrainingBatchRecorder refuses restored lineage before capture "
+                        "or publication [unsupported-callback]"
+                    )
+            return
         if isinstance(event, TrainingCompleted):
             self._publish(context, final=True)
             return
         if not isinstance(event, TrainingIterationCompleted):
             return
-        if not self._first_iteration_seen:
-            self._first_iteration_seen = True
-            next_iteration = getattr(state.trainer, "next_iteration", None)
-            nonzero_restored_cursor = (
-                next_iteration is not None and int(next_iteration) != 0
-            )
-            if not nonzero_restored_cursor and next_iteration is None:
-                nonzero_restored_cursor = (
-                    event.iteration.step != 0
-                    and int(getattr(state.trainer, "completed_updates", 0)) != 0
-                )
-            if nonzero_restored_cursor:
-                raise ValueError(
-                    "RawTrainingBatchRecorder refuses restored lineage before capture "
-                    "or publication [unsupported-callback]"
-                )
         if not self._steps.should_run(event.iteration.step):
             return
         if state.batch is None or state.local_energy is None or state.wavefunction_output is None:
