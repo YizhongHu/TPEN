@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+import enum
 import math
 import os
 from pathlib import Path
@@ -15,7 +16,6 @@ from ._records import frozen_record
 from .environments import PreparedPythonEnvironment
 from .gpu_sampler import (
     GPU_SAMPLER_OUTPUT_ENV,
-    INSPECTOR_ROLE,
     LAUNCH_ROLE_ENV,
     QUARANTINE_IDENTITY_KEYS,
     SLOT_QUARANTINE_ENV,
@@ -47,6 +47,29 @@ def _proc_start_ticks(pid: int) -> int | None:
     except ValueError:
         return None
     return ticks if ticks >= 0 else None
+
+
+class LaunchPurpose(enum.Enum):
+    """Typed purpose of one worker launch (review delta-4 D4-1).
+
+    ``SCIENCE`` is the default for every launch.  ``INSPECTION`` is passed
+    only by the trusted inspection call site
+    (:meth:`tpen_executor.runners.TPENEvidence.read`), which reads a
+    member's own output and is therefore exempt from the slot quarantine
+    and never sampled.
+
+    Notes
+    -----
+    This is a correctness guard against accidental slot reuse, not a
+    security boundary: any caller that controls the worker invocation can
+    pass ``INSPECTION``.  It is a typed argument rather than an environment
+    value so that no descriptor, configuration overlay, or ambient owner
+    environment can grant the exemption, and no environment-rewriting
+    helper (such as the legacy unsampled science fallback) can infer it.
+    """
+
+    SCIENCE = "science"
+    INSPECTION = "inspection"
 
 
 @frozen_record
@@ -107,12 +130,14 @@ class SubprocessWorker:
     process and, when the descriptor names a quarantine directory, durably
     in the attempt store; the quarantine is released only once the
     sampler's command cleanup is confirmed.  Every launch carrying a slot id
-    except an explicit inspector (descriptor role ``inspector``) first
+    except an inspection (``purpose=LaunchPurpose.INSPECTION``) first
     checks the quarantine and raises
     :class:`~tpen_executor.gpu_sampler.SlotQuarantined` before spawning if
-    the slot is still held.  The quarantine directory and role keys are
-    worker-only and, like the evidence path, are read only from the
-    descriptor and never reach the child.  A timeout or cancellation of the
+    the slot is still held.  The quarantine directory key is worker-only
+    and, like the evidence path, is read only from the descriptor and never
+    reaches the child.  The retired environment role key
+    (:data:`~tpen_executor.gpu_sampler.LAUNCH_ROLE_ENV`) is never honored
+    and is scrubbed from the child.  A timeout or cancellation of the
     child does not by itself make the telemetry fail; only a sampler that is
     itself cancelled or unfinalized does.
     """
@@ -128,6 +153,7 @@ class SubprocessWorker:
         timeout: float | None = None,
         process_handle: Any = None,
         pre_spawn_guard: Callable[[], bool] | None = None,
+        purpose: LaunchPurpose = LaunchPurpose.SCIENCE,
     ) -> ProcessOutcome:
         """Run the prepared interpreter with exact argument boundaries.
 
@@ -151,6 +177,11 @@ class SubprocessWorker:
             Optional thread-safe cancellation check made immediately before
             ``Popen``. When it returns true, no child is spawned and a
             never-spawned ``ProcessOutcome`` is returned.
+        purpose : LaunchPurpose, optional
+            Launch purpose; ``SCIENCE`` by default.  Only the trusted
+            inspection call site passes ``INSPECTION``, which is exempt from
+            the slot quarantine and never sampled.  This is a correctness
+            guard, not a security boundary (see :class:`LaunchPurpose`).
 
         Returns
         -------
@@ -160,7 +191,8 @@ class SubprocessWorker:
         Raises
         ------
         TypeError, ValueError
-            If inputs have invalid types or timeout is not finite and positive.
+            If inputs have invalid types (including a ``purpose`` that is not
+            a :class:`LaunchPurpose`) or timeout is not finite and positive.
         OSError
             If process launch or log creation fails.
         SlotQuarantined
@@ -174,6 +206,9 @@ class SubprocessWorker:
             raise TypeError("args must be a sequence of strings")
         if pre_spawn_guard is not None and not callable(pre_spawn_guard):
             raise TypeError("pre_spawn_guard must be callable or None")
+        if type(purpose) is not LaunchPurpose:
+            # A bare string such as "inspection" never grants the exemption.
+            raise TypeError("purpose must be a LaunchPurpose")
         if timeout is not None and (
             type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0
         ):
@@ -192,18 +227,17 @@ class SubprocessWorker:
         child_env = os.environ.copy()
         child_env.update(environment.env)
         # Only the explicit prepared descriptor opts this launch into
-        # sampling, names its quarantine directory, or declares a role; an
-        # ambient owner-environment value never does (review E3).
+        # sampling or names its quarantine directory; an ambient
+        # owner-environment value never does (review E3).
         sampler_output = environment.env.get(GPU_SAMPLER_OUTPUT_ENV)
         quarantine_dir = environment.env.get(SLOT_QUARANTINE_ENV)
-        role = environment.env.get(LAUNCH_ROLE_ENV)
         # These keys belong to this worker, never the child, whichever
-        # environment they came from.
+        # environment they came from.  The retired role key is scrubbed and
+        # never read: only the typed ``purpose`` argument exempts a launch
+        # (review delta-4 D4-1).
         for key in (GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, LAUNCH_ROLE_ENV):
             child_env.pop(key, None)
-        if role is not None and role != INSPECTOR_ROLE:
-            raise ValueError(f"unknown launch role {role!r}")
-        inspector = role == INSPECTOR_ROLE
+        inspector = purpose is LaunchPurpose.INSPECTION
         if inspector:
             # An inspection reads a member's output; it is never sampled.
             sampler_output = None
@@ -216,8 +250,9 @@ class SubprocessWorker:
                 return ProcessOutcome(logical_argv, None, stdout_name, stderr_name, timed_out)
             # Every science launch on a slot whose earlier sampled launch is
             # still unconfirmed is refused before any evidence claim or spawn,
-            # sampled or not.  Only the explicit inspector role is exempt; an
-            # unsampled launch is never assumed to be one (review delta-3 F1).
+            # sampled or not.  Only an explicit inspection is exempt; an
+            # unsampled launch is never assumed to be one (review delta-3 F1,
+            # delta-4 D4-1).
             if not inspector and (slot or sampler_output is not None):
                 ensure_slot_clean(slot, quarantine_dir)
             # Claim before spawn: a worker that dies later leaves attempted,
@@ -307,4 +342,4 @@ class SubprocessWorker:
         return ProcessOutcome(logical_argv, returncode, stdout_name, stderr_name, timed_out, spawned_pid, spawned_ticks)
 
 
-__all__ = ["ProcessOutcome", "SubprocessWorker"]
+__all__ = ["LaunchPurpose", "ProcessOutcome", "SubprocessWorker"]

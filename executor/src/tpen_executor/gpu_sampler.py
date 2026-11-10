@@ -35,9 +35,10 @@ Lifecycle
    evidence is non-quiescent and the slot stays quarantined: every later
    science launch on it, sampled or not, is refused by
    :func:`ensure_slot_clean` until the work is confirmed gone (review E2,
-   delta-3 F1).  Only a launch with the explicit inspector role
-   (:data:`LAUNCH_ROLE_ENV`) is exempt.  The bound is kept; the slot is
-   never silently reused.
+   delta-3 F1).  Only the member's own inspection, which the worker runs
+   with the typed ``LaunchPurpose.INSPECTION`` argument, is exempt (review
+   delta-4 D4-1); no environment value can grant that exemption.  The bound
+   is kept; the slot is never silently reused.
 
    Assumption: one controller per allocation.  The in-process lease covers
    every dispatcher (all run their workers in the controller process; Parsl
@@ -966,10 +967,12 @@ class SlotQuarantined(RuntimeError):
 #: Worker-only descriptor key naming the slot's durable quarantine directory
 #: in the attempt store; the controller sets it for sampled launches.
 SLOT_QUARANTINE_ENV = "TPEN_SLOT_QUARANTINE_DIR"
-#: Worker-only descriptor key naming an explicit non-science launch role.
+#: Retired environment key of the r5 launch role.  It is never honored: the
+#: launch purpose is a typed worker argument (``workers.LaunchPurpose``), and
+#: the controller and the worker scrub this key from every launch environment
+#: so neither a descriptor nor an ambient value can exempt a launch from the
+#: slot quarantine (review delta-4 D4-1).
 LAUNCH_ROLE_ENV = "TPEN_EXECUTOR_LAUNCH_ROLE"
-#: The only exempt role: a read-only inspection of a member's own output.
-INSPECTOR_ROLE = "inspector"
 QUARANTINE_SCHEMA = "tpen-executor/slot-quarantine-v1"
 #: Child-environment placement keys that identify one physical slot of one
 #: allocation: allocation, backend job, physical host, and slot.
@@ -1328,7 +1331,7 @@ def read_sampler_evidence(path: str | os.PathLike[str]) -> dict[str, Any]:
 __all__ = [
     "ATTEMPT_COMMANDS", "COMMAND_TIMEOUT", "CLEANUP_TIMEOUT", "DEFAULT_CADENCE", "EVIDENCE_SCHEMA",
     "GPU_SAMPLER_CADENCE_ENV", "GPU_SAMPLER_OUTPUT_ENV", "GPU_SAMPLER_RETAIN_ENV", "GpuSampler", "GpuSamplerFailure",
-    "INSPECTOR_ROLE", "JOIN_TIMEOUT", "LAUNCH_ROLE_ENV", "MAX_CONSECUTIVE_GAPS", "MAX_TOTAL_GAPS", "QUARANTINE_DIRNAME",
+    "JOIN_TIMEOUT", "LAUNCH_ROLE_ENV", "MAX_CONSECUTIVE_GAPS", "MAX_TOTAL_GAPS", "QUARANTINE_DIRNAME",
     "QUARANTINE_IDENTITY_KEYS", "QUARANTINE_SCHEMA", "SCHEDULING_MARGIN", "SLOT_ID_ENV", "SLOT_QUARANTINE_ENV",
     "SlotLease", "SlotQuarantined", "acquire_slot_lease", "claim_sampler_evidence", "csv_rows", "declared_devices",
     "ensure_slot_clean", "finish_deadline", "finish_gpu_sampler", "group_empty", "kill_group", "read_sampler_evidence",

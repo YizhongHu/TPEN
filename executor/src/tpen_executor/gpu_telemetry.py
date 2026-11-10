@@ -265,8 +265,9 @@ def _validate_gaps(sampler: Mapping[str, Any], start: float | None, end: float |
         events are unordered or outside the outer interval, the consecutive
         run numbering or the counters disagree with the events, the attempt
         timeline is incoherent, the record continues past the first budget
-        excess, or ``gap-budget-exceeded`` is claimed without an excess (or
-        an excess is labelled otherwise).
+        excess (including a successful sample after the excess attempt), or
+        ``gap-budget-exceeded`` is claimed without an excess (or an excess is
+        labelled otherwise).
 
     Notes
     -----
@@ -280,6 +281,17 @@ def _validate_gaps(sampler: Mapping[str, Any], start: float | None, end: float |
     samples to justify them, one distinct sample per reset.  The first
     budget excess ends sampling, so no event before the last may exceed
     either budget.
+
+    A dropped success can witness a reset only inside its possible eviction
+    window (review delta-4 D4-2).  The producer always retains its newest
+    success, so a dropped one is older than the newest retained sample; with
+    two or more retained samples the producer's retention is at least two,
+    so its first success is pinned and a dropped one is also newer than the
+    first retained sample.  (A single retained sample with dropped history
+    may come from a retention of one, which can evict the first success, so
+    no lower bound is then provable.)  The windows between consecutive gaps
+    are disjoint, so each reset needs its own dropped success.  The attempt
+    that exceeds a budget is the last one: no successful sample follows it.
     """
 
     gaps = sampler["gaps"]
@@ -298,6 +310,11 @@ def _validate_gaps(sampler: Mapping[str, Any], start: float | None, end: float |
     successes = [(float(sample["monotonic_start"]), float(sample["monotonic_end"])) for sample in sampler["samples"]]
     # Successful samples taken but not retained; zero means complete history.
     dropped = sampler["aggregate"]["samples_taken"] - sampler["count"]
+    # Possible eviction window of a dropped success (delta-4 D4-2): before the
+    # always-retained newest sample and, when the first is provably pinned
+    # (two or more retained), after the first retained sample.
+    newest_start = successes[-1][0] if successes else None
+    first_end = successes[0][1] if len(successes) > 1 else None
     previous_end, run, longest, summed, unproven_resets = start, 0, 0, 0.0, 0
     for index, event in enumerate(events):
         if not isinstance(event, Mapping) or set(event) != GAP_EVENT_KEYS:
@@ -324,7 +341,10 @@ def _validate_gaps(sampler: Mapping[str, Any], start: float | None, end: float |
             if succeeded_between and consecutive != 1:
                 raise ValueError("gpu_sampler gap run continues across a retained successful sample")
             if consecutive == 1 and not succeeded_between:
-                # Only a dropped sample can have reset this run.
+                # Only a dropped sample can have reset this run, and only one
+                # that lies inside the eviction window.
+                if newest_start is None or event_end > newest_start or (first_end is not None and previous_end < first_end):
+                    raise ValueError("gpu_sampler gap run resets where no dropped successful sample can lie")
                 unproven_resets += 1
         # The first excess ends sampling: no earlier event may exceed a budget.
         if index < len(events) - 1 and (index + 1 > allowed_total or consecutive > allowed_consecutive):
@@ -343,6 +363,9 @@ def _validate_gaps(sampler: Mapping[str, Any], start: float | None, end: float |
     if len(events) > allowed_total + 1 or longest > allowed_consecutive + 1:
         raise ValueError("gpu_sampler gaps continue past the first budget excess")
     exceeded = len(events) > allowed_total or longest > allowed_consecutive
+    # The excess attempt is the last attempt: no success may follow it.
+    if exceeded and any(success_start >= previous_end for success_start, _success_end in successes):
+        raise ValueError("gpu_sampler gap budget excess is followed by a successful sample")
     failure = sampler["failure"]
     if exceeded != (failure is not None and failure["code"] == "gap-budget-exceeded"):
         raise ValueError("gpu_sampler gap budget excess and gap-budget-exceeded failure disagree")

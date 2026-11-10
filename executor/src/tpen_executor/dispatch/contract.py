@@ -25,7 +25,6 @@ from ..environments import PreparedPythonEnvironment
 from ..lifecycle.attached import AttachedAllocation
 from ..gpu_sampler import (
     GPU_SAMPLER_OUTPUT_ENV,
-    INSPECTOR_ROLE,
     LAUNCH_ROLE_ENV,
     QUARANTINE_IDENTITY_KEYS,
     SLOT_QUARANTINE_ENV,
@@ -236,7 +235,10 @@ def _with_child_placement(
         if len(slots) != 1:
             # A local worker with no slot is a legacy path; a multi-slot
             # allocation must be resolved by the backend worker (Parsl).
-            # Neither is sampled, even with an inherited evidence path.
+            # Neither is sampled, even with an inherited evidence path.  This
+            # is still a SCIENCE launch: stripping its worker-only keys never
+            # makes it an inspection, so a carried TPEN_SLOT_ID is still
+            # checked against the quarantine by the worker (delta-4 D4-1).
             return _without_gpu_sampler(environment)
         slot = slots[0]
         slot_id, host, cpus = slot.slot_id, slot.node, ",".join(str(cpu) for cpu in slot.cpus)
@@ -314,21 +316,25 @@ def _with_child_placement(
 
 
 def _without_gpu_sampler(environment: Any) -> Any:
-    """Return the environment for the inspection process of a member.
+    """Return ``environment`` without any worker-only sampling or role key.
 
-    Only the science child is sampled; an inspection process launched with
-    the same prepared environment must not start a second sampler.  The
-    inspection carries the explicit inspector role, the only launch exempt
-    from the slot quarantine: it reads the member's own output and is not
-    slot reuse (review delta-3 F1).
+    Used for the legacy/no-unique-slot science fallback of
+    :func:`_with_child_placement` and for the environment handed to the
+    member inspection; neither starts a second sampler.  It grants NO launch
+    role and never marks a launch as an inspection: the quarantine exemption
+    is the typed ``LaunchPurpose.INSPECTION`` worker argument, passed only by
+    :meth:`tpen_executor.runners.TPENEvidence.read` (review delta-4 D4-1).
+    The retired environment role key is scrubbed so a descriptor cannot
+    carry it into any launch.
     """
 
     if not isinstance(environment, PreparedPythonEnvironment):
         return environment
     values = {
-        key: value for key, value in environment.env.items() if key not in (GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV)
+        key: value
+        for key, value in environment.env.items()
+        if key not in (GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, LAUNCH_ROLE_ENV)
     }
-    values[LAUNCH_ROLE_ENV] = INSPECTOR_ROLE
     return PreparedPythonEnvironment(environment.python, environment.setup, values)
 
 
@@ -1144,6 +1150,8 @@ class DispatcherContract:
                 output_dir, core_dir, _stdout, _stderr, evidence_stdout, evidence_stderr = _member_paths(fence)
                 if not callable(getattr(evidence, "read", None)):
                     raise TypeError("materialized worker evidence reader lacks read()")
+                # The reader itself launches with LaunchPurpose.INSPECTION; the
+                # environment only drops the worker-only sampling keys.
                 decoded = evidence.read(
                     process,
                     _without_gpu_sampler(environment),

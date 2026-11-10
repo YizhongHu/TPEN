@@ -58,7 +58,7 @@ from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.cli import _operational_exit
 from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
-from tpen_executor.dispatch.contract import _placement_receipt_v3, _without_gpu_sampler
+from tpen_executor.dispatch.contract import _admit_slot, _placement_receipt_v3, _with_child_placement, _without_gpu_sampler
 from tpen_executor.dispatch.local import LocalDispatcher
 from tpen_executor.environments import PreparedPythonEnvironment, SourceScript
 from tpen_executor.gpu_telemetry import (
@@ -83,10 +83,10 @@ from tpen_executor.results import (
     StartReceipt,
     decode_placement_receipt,
 )
-from tpen_executor.runners import CoreRunEvidence, RUN_SHIM
+from tpen_executor.runners import CoreRunEvidence, EvidenceUnavailable, RUN_SHIM, TPENEvidence
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.tasks import ConfiguredRun
-from tpen_executor.workers import ProcessOutcome, SubprocessWorker
+from tpen_executor.workers import LaunchPurpose, ProcessOutcome, SubprocessWorker
 
 GPU_A = "GPU-12345678-1234-1234-1234-123456789ABC"
 GPU_B = "GPU-12345678-1234-1234-1234-123456789ABD"
@@ -99,20 +99,6 @@ LINUX_CHILD = pytest.mark.skipif(
 )
 
 L1B_MUTANT_TABLE = (
-    {
-        "id": "H1", "target": "executor/src/tpen_executor/workers.py",
-        "old": "                    sampler = GpuSampler.from_environment(spawned_pid, child_env)\n                    sampler.start()",
-        "new": "                    pending = GpuSampler.from_environment(spawned_pid, child_env)\n                    pending.start()\n                    sampler = pending",
-        "killer": "test_worker_interrupted_right_after_sampler_start_keeps_cleanup",
-        "suite": "executor", "assertion": "the worker holds the sampler before start, so an interruption inside startup cannot orphan its command group (E1)",
-    },
-    {
-        "id": "G2", "target": "executor/src/tpen_executor/gpu_sampler.py",
-        "old": "        kill_group(pgid)\n        deadline = time.monotonic() + self.cleanup_timeout",
-        "new": "        pass\n        deadline = time.monotonic() + self.cleanup_timeout",
-        "killer": "test_sampler_success_path_kills_lingering_descendant",
-        "suite": "executor", "assertion": "the success path kills the retained group before claiming quiescence (D4 reaper)",
-    },
     {
         "id": "J1", "target": "executor/src/tpen_executor/workers.py",
         "old": "            if sampler_output is not None:\n                lease = acquire_slot_lease(",
@@ -128,11 +114,25 @@ L1B_MUTANT_TABLE = (
         "suite": "executor", "assertion": "a durable marker in the attempt store makes a fresh controller refuse the slot (delta-3 F1)",
     },
     {
-        "id": "J3", "target": "executor/src/tpen_executor/gpu_telemetry.py",
-        "old": "    if unproven_resets > dropped:\n        raise ValueError(\"gpu_sampler gap run resets without an intervening successful sample\")",
-        "new": "    if False:\n        raise ValueError(\"gpu_sampler gap run resets without an intervening successful sample\")",
-        "killer": "test_decoder_rejects_contradictory_sampler_evidence",
-        "suite": "executor", "assertion": "a consecutive-gap reset needs an intervening success when history is complete (delta-3 F3)",
+        "id": "K1", "target": "executor/src/tpen_executor/workers.py",
+        "old": "        inspector = purpose is LaunchPurpose.INSPECTION\n",
+        "new": "        inspector = purpose is LaunchPurpose.INSPECTION or GPU_SAMPLER_OUTPUT_ENV not in environment.env\n",
+        "killer": "test_legacy_science_fallback_is_refused_on_a_held_slot",
+        "suite": "executor", "assertion": "an unsampled launch, such as the legacy science fallback, is never inferred to be an inspection (delta-4 D4-1)",
+    },
+    {
+        "id": "K2", "target": "executor/src/tpen_executor/gpu_telemetry.py",
+        "old": "                if newest_start is None or event_end > newest_start or (first_end is not None and previous_end < first_end):\n                    raise ValueError(\"gpu_sampler gap run resets where no dropped successful sample can lie\")",
+        "new": "                if False:\n                    raise ValueError(\"gpu_sampler gap run resets where no dropped successful sample can lie\")",
+        "killer": "test_decoder_checks_a_coherent_gap_timeline",
+        "suite": "executor", "assertion": "a dropped success witnesses a reset only inside its eviction window (delta-4 D4-2)",
+    },
+    {
+        "id": "K3", "target": "executor/src/tpen_executor/gpu_telemetry.py",
+        "old": "    if exceeded and any(success_start >= previous_end for success_start, _success_end in successes):\n        raise ValueError(\"gpu_sampler gap budget excess is followed by a successful sample\")",
+        "new": "    if False:\n        raise ValueError(\"gpu_sampler gap budget excess is followed by a successful sample\")",
+        "killer": "test_decoder_checks_a_coherent_gap_timeline",
+        "suite": "executor", "assertion": "no successful sample follows the attempt that exceeded a gap budget (delta-4 D4-2)",
     },
 )
 
@@ -142,7 +142,7 @@ def test_l1b_mutant_table_targets_unique_executable_anchors() -> None:
 
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
-    assert [row["id"] for row in L1B_MUTANT_TABLE] == ["H1", "G2", "J1", "J2", "J3"]
+    assert [row["id"] for row in L1B_MUTANT_TABLE] == ["J1", "J2", "K1", "K2", "K3"]
     for row in L1B_MUTANT_TABLE:
         source = (root / row["target"]).read_text(encoding="utf-8")
         assert source.count(row["old"]) == 1, row
@@ -1308,13 +1308,13 @@ def test_durable_quarantine_refuses_a_fresh_controller_on_the_same_store(tmp_pat
 
 
 @POSIX_GROUPS
-def test_quarantined_slot_refuses_unsampled_science_but_admits_an_inspector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_files: list[Path]) -> None:
-    """Delta-3 F1: every science launch on a quarantined slot is refused, sampled or not.
+def test_quarantined_slot_refuses_unsampled_science_but_admits_an_inspection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_files: list[Path]) -> None:
+    """Delta-3 F1 / delta-4 D4-1: every science launch on a quarantined slot is refused, sampled or not.
 
     An unsampled launch carrying the same ``TPEN_SLOT_ID`` is refused before
-    spawning, also when the owner environment carries an ambient inspector
-    role; only the member inspection built by ``_without_gpu_sampler``, with
-    the explicit descriptor role, runs.
+    spawning, also when the owner environment or the descriptor carries the
+    retired ``inspector`` role key; only a launch with the typed
+    ``purpose=LaunchPurpose.INSPECTION`` argument runs.
     """
 
     environment, pid_file = _held_environment(tmp_path, monkeypatch, pid_files)
@@ -1330,25 +1330,35 @@ def test_quarantined_slot_refuses_unsampled_science_but_admits_an_inspector(tmp_
                 PreparedPythonEnvironment(sys.executable, None, unsampled), ("-c", f"open({str(science)!r}, 'w')"),
                 cwd=tmp_path, stdout_path=tmp_path / "science.out", stderr_path=tmp_path / "science.err",
             )
-        # An ambient role is never an exemption; only the descriptor's is.
-        monkeypatch.setenv(gs.LAUNCH_ROLE_ENV, gs.INSPECTOR_ROLE)
-        with pytest.raises(gs.SlotQuarantined):
+        # Neither an ambient nor a descriptor role value is an exemption: the
+        # retired environment key is never honored (delta-4 D4-1).
+        monkeypatch.setenv(gs.LAUNCH_ROLE_ENV, "inspector")
+        for overlay in (unsampled, {**unsampled, gs.LAUNCH_ROLE_ENV: "inspector"}):
+            with pytest.raises(gs.SlotQuarantined):
+                SubprocessWorker().run(
+                    PreparedPythonEnvironment(sys.executable, None, overlay), ("-c", f"open({str(science)!r}, 'w')"),
+                    cwd=tmp_path, stdout_path=tmp_path / "science.out", stderr_path=tmp_path / "science.err",
+                )
+        # A bare string is not the typed purpose and grants nothing.
+        with pytest.raises(TypeError, match="LaunchPurpose"):
             SubprocessWorker().run(
                 PreparedPythonEnvironment(sys.executable, None, unsampled), ("-c", f"open({str(science)!r}, 'w')"),
                 cwd=tmp_path, stdout_path=tmp_path / "science.out", stderr_path=tmp_path / "science.err",
+                purpose="inspection",
             )
-        monkeypatch.delenv(gs.LAUNCH_ROLE_ENV)
         assert not science.exists()
-        inspection = _without_gpu_sampler(PreparedPythonEnvironment(sys.executable, None, values))
-        assert inspection.env[gs.LAUNCH_ROLE_ENV] == gs.INSPECTOR_ROLE
-        assert gs.GPU_SAMPLER_OUTPUT_ENV not in inspection.env and gs.SLOT_QUARANTINE_ENV not in inspection.env
+        # The stripped environment handed to the inspection carries no role.
+        inspection = _without_gpu_sampler(PreparedPythonEnvironment(sys.executable, None, {**values, gs.LAUNCH_ROLE_ENV: "inspector"}))
+        assert not {gs.LAUNCH_ROLE_ENV, gs.GPU_SAMPLER_OUTPUT_ENV, gs.SLOT_QUARANTINE_ENV} & set(inspection.env)
         probe = f"import os; open({str(inspected)!r}, 'w').write(str({gs.LAUNCH_ROLE_ENV!r} in os.environ))"
         outcome = SubprocessWorker().run(
             inspection, ("-c", probe),
             cwd=tmp_path, stdout_path=tmp_path / "inspect.out", stderr_path=tmp_path / "inspect.err",
+            purpose=LaunchPurpose.INSPECTION,
         )
-        # The role is worker-only: the inspection child never sees it.
+        # The ambient role key is scrubbed: the inspection child never sees it.
         assert outcome.returncode == 0 and inspected.read_text(encoding="utf-8") == "False"
+        monkeypatch.delenv(gs.LAUNCH_ROLE_ENV)
     finally:
         held.release.set()
     _await_release(pid_file, slot, values[gs.SLOT_QUARANTINE_ENV])
@@ -1357,6 +1367,87 @@ def test_quarantined_slot_refuses_unsampled_science_but_admits_an_inspector(tmp_
         cwd=tmp_path, stdout_path=tmp_path / "science.out", stderr_path=tmp_path / "science.err",
     )
     assert outcome.returncode == 0 and science.exists()
+
+
+@POSIX_GROUPS
+@pytest.mark.parametrize(
+    "descriptor",
+    [
+        pytest.param({}, id="legacy-slot-only"),
+        pytest.param({gs.LAUNCH_ROLE_ENV: "inspector"}, id="legacy-with-retired-role"),
+        pytest.param({"TPEN_SLOT_NODE": "node-a"}, id="incompletely-placed"),
+    ],
+)
+def test_legacy_science_fallback_is_refused_on_a_held_slot(tmp_path: Path, descriptor: dict[str, str]) -> None:
+    """Delta-4 D4-1: the legacy/no-unique-slot SCIENCE fallback never becomes an inspection.
+
+    A real unsettled :class:`SlotLease` holds the slot.  A legacy or
+    incompletely placed descriptor carrying that ``TPEN_SLOT_ID`` goes
+    through the real :func:`_with_child_placement` fallback (no unique
+    physical slot), dispatch admission, and the real worker: it must be
+    refused with ``SlotQuarantined`` and no child spawned.  Controls: the
+    explicit inspection of the same environment runs while the lease is
+    held, and the science fallback runs once the lease is released.
+    """
+
+    # Unique per case: in-process leases are keyed by slot id.
+    slot = "slot-d4-1-" + ("-".join(sorted(descriptor)) or "bare")
+    store = tmp_path / "store"
+    legacy = PreparedPythonEnvironment(sys.executable, None, {"TPEN_SLOT_ID": slot, **descriptor})
+    allocation = ConfiguredAllocation(AllocationId("allocation-d4"), BackendJobId("job-d4"), {})
+    science, inspected = tmp_path / "science-ran", tmp_path / "inspection-ran"
+    lease = gs.acquire_slot_lease(slot, None, {"test": "no child spawned; unsettled lease"})
+    try:
+        fallback = _with_child_placement(legacy, allocation, None, None, None, None)
+        # Stripping worker-only keys never grants a role.
+        assert fallback.env == {"TPEN_SLOT_ID": slot, **{k: v for k, v in descriptor.items() if k != gs.LAUNCH_ROLE_ENV}}
+        # Admission has no placed identity to check; the worker is the backstop.
+        _admit_slot(fallback, SimpleNamespace(root=str(store)))
+        with pytest.raises(gs.SlotQuarantined, match="still owned by its worker"):
+            SubprocessWorker().run(
+                fallback, ("-c", f"open({str(science)!r}, 'w')"),
+                cwd=tmp_path, stdout_path=tmp_path / "science.out", stderr_path=tmp_path / "science.err", timeout=10,
+            )
+        assert not science.exists()
+        # Explicit-inspection control: the typed purpose is the only exemption.
+        outcome = SubprocessWorker().run(
+            fallback, ("-c", f"open({str(inspected)!r}, 'w')"),
+            cwd=tmp_path, stdout_path=tmp_path / "inspect.out", stderr_path=tmp_path / "inspect.err", timeout=10,
+            purpose=LaunchPurpose.INSPECTION,
+        )
+        assert outcome.returncode == 0 and inspected.exists() and not lease.settled
+    finally:
+        gs.settle_slot_lease(lease, None)
+    # Later-clean-reuse control: once the lease is released the same fallback runs.
+    assert slot not in gs._FENCED
+    outcome = SubprocessWorker().run(
+        fallback, ("-c", f"open({str(science)!r}, 'w')"),
+        cwd=tmp_path, stdout_path=tmp_path / "science.out", stderr_path=tmp_path / "science.err", timeout=10,
+    )
+    assert outcome.returncode == 0 and science.exists()
+
+
+def test_inspection_reader_is_the_only_inspection_launch(tmp_path: Path) -> None:
+    """Delta-4 D4-1: ``TPENEvidence.read`` launches with the typed inspection purpose.
+
+    The reader is the one trusted inspection call site; the worker default
+    is a science launch.
+    """
+
+    calls: list[dict[str, object]] = []
+
+    class Recording:
+        def run(self, environment, args, **kwargs):
+            calls.append(kwargs)
+            raise OSError("recorded; no child")
+
+    with pytest.raises(EvidenceUnavailable):
+        TPENEvidence().read(
+            Recording(), PreparedPythonEnvironment(sys.executable, None, {}), tmp_path,
+            stdout_path=tmp_path / "out", stderr_path=tmp_path / "err",
+        )
+    assert [call["purpose"] for call in calls] == [LaunchPurpose.INSPECTION]
+    assert SubprocessWorker.run.__kwdefaults__["purpose"] is LaunchPurpose.SCIENCE
 
 
 @POSIX_GROUPS
@@ -1450,7 +1541,7 @@ def test_worker_ignores_an_ambient_evidence_path(tmp_path: Path) -> None:
     """E3: only the prepared descriptor opts into sampling; an inherited key never does.
 
     Negative controls: an H-v2-shaped descriptor with ``env={}`` and the
-    inspection environment from ``_without_gpu_sampler``, both run while the
+    stripped environment from ``_without_gpu_sampler``, both run while the
     owner environment carries the key and a callable fake ``nvidia-smi``.
     """
 
@@ -1863,6 +1954,11 @@ CONTRADICTIONS = {
     # r5 (delta-3 F3): a coherent attempt timeline.  The sample is [1.0, 1.1].
     "gap-overlaps-success": lambda raw: _add_gaps(raw, ("command-timeout", 1.0, 1.1, 1)),
     "gap-reset-without-success": lambda raw: _add_gaps(raw, ("command-failed", 1.11, 1.12, 1), ("command-failed", 1.13, 1.14, 1)),
+    # r6 (delta-4 D4-2): a dropped success cannot lie after the newest retained sample.
+    "gap-reset-after-the-newest-success": lambda raw: (
+        raw["gpu_sampler"]["aggregate"].__setitem__("samples_taken", raw["gpu_sampler"]["count"] + 1),
+        _add_gaps(raw, ("command-failed", 1.11, 1.12, 1), ("command-failed", 1.13, 1.14, 1)),
+    ),
 }
 
 
@@ -1882,12 +1978,18 @@ def test_decoder_rejects_contradictory_sampler_evidence(tmp_path: Path, name: st
 GAP_TIMELINES = {
     "reset-after-a-retained-success": (True, 2, 0, None, (1, 3), [(1.11, 1.15, 1), (1.31, 1.32, 1)]),
     "run-across-a-retained-success": (False, 2, 0, None, (2, 3), [(1.11, 1.15, 1), (1.31, 1.32, 2)]),
-    "reset-after-an-evicted-success": (True, 1, 1, None, (1, 3), [(1.11, 1.12, 1), (1.13, 1.14, 1)]),
-    "resets-beyond-the-evicted-samples": (False, 1, 1, None, (1, 3), [(1.11, 1.115, 1), (1.12, 1.125, 1), (1.13, 1.135, 1)]),
+    # r6 (delta-4 D4-2): the evicted success lies between the two retained
+    # samples; in r5 the gaps followed the only retained sample, where no
+    # dropped success can lie.
+    "reset-after-an-evicted-success": (True, 2, 1, None, (1, 3), [(1.11, 1.12, 1), (1.13, 1.14, 1)]),
+    "resets-beyond-the-evicted-samples": (False, 2, 1, None, (1, 3), [(1.11, 1.115, 1), (1.12, 1.125, 1), (1.13, 1.135, 1)]),
     "excess-as-the-last-event": (True, 1, 0, "gap-budget-exceeded", (1, 3), [(1.11, 1.115, 1), (1.12, 1.125, 2)]),
     "events-after-the-first-excess": (
         False, 1, 1, "gap-budget-exceeded", (1, 3), [(1.11, 1.115, 1), (1.12, 1.125, 2), (1.13, 1.135, 1)],
     ),
+    # r6 (delta-4 D4-2): eviction window and the excess as the last attempt.
+    "reset-after-the-newest-success": (False, 2, 1, None, (1, 3), [(1.31, 1.32, 1), (1.33, 1.34, 1)]),
+    "success-after-the-excess": (False, 2, 0, "gap-budget-exceeded", (1, 3), [(1.11, 1.115, 1), (1.12, 1.125, 2)]),
 }
 
 
@@ -1897,8 +1999,9 @@ def test_decoder_checks_a_coherent_gap_timeline(name: str) -> None:
 
     With complete history every reset needs a retained success in between;
     with dropped history only what is provable is checked (one dropped
-    sample per unproven reset), and evicted successes legitimately justify
-    resets (controls).  No event may follow the first budget excess.
+    sample per unproven reset, inside its eviction window: delta-4 D4-2),
+    and evicted successes legitimately justify resets (controls).  No event
+    or success may follow the first budget excess.
     """
 
     accepted, retained, dropped, failure, budget, events = GAP_TIMELINES[name]

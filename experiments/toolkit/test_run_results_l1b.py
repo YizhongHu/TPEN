@@ -190,6 +190,13 @@ P8_CONTRADICTIONS = {
     # r5, review delta-3 F3 case 2: complete history, no success between two
     # failures, yet both claim a fresh run (the second exceeds the budget).
     "gap-reset-without-success": lambda r: _add_gaps(r, ("command-failed", 1.13, 1.15, 1), ("command-failed", 1.16, 1.18, 1)),
+    # r6, review delta-4 D4-2 (reset-after-newest.json): one dropped success
+    # cannot reset a run after the newest retained sample, which the producer
+    # always keeps; the impossible reset hides a consecutive-budget excess.
+    "gap-reset-after-the-newest-success": lambda r: (
+        r["gpu_sampler"]["aggregate"].__setitem__("samples_taken", r["gpu_sampler"]["count"] + 1),
+        _add_gaps(r, ("command-failed", 1.38, 1.4, 1), ("command-failed", 1.41, 1.43, 1)),
+    ),
 }
 # Contradictions applied to other baselines: (baseline fixture, mutation).
 P8_OTHER_CONTRADICTIONS = {
@@ -210,10 +217,28 @@ P8_OTHER_CONTRADICTIONS = {
 }
 
 
-def _timeline(taken: int, failure: str | None, budget: tuple[int, int], *events: tuple[float, float, int]):
-    """Return a mutation of the matched sampler record (samples [1.0, 1.125] and [1.25, 1.375])."""
+def _timeline(
+    taken: int,
+    failure: str | None,
+    budget: tuple[int, int],
+    *events: tuple[float, float, int],
+    outer_start: float | None = None,
+    newest_only: bool = False,
+):
+    """Return a mutation of the matched sampler record (samples [1.0, 1.125] and [1.25, 1.375]).
+
+    ``outer_start`` moves the record's start earlier (elapsed time follows);
+    ``newest_only`` keeps only the newest retained sample, as a retention of
+    one would.
+    """
 
     def mutate(record: dict) -> None:
+        if outer_start is not None:
+            record["monotonic_start"] = outer_start
+            record["elapsed_seconds"] = record["monotonic_end"] - outer_start
+        if newest_only:
+            record["samples"] = record["samples"][-1:]
+            record["count"] = 1
         record["aggregate"]["samples_taken"] = taken
         if failure is not None:
             record.update(status="unavailable", reason="telemetry-failed", failure={"code": failure, "detail": "timeline case"})
@@ -233,9 +258,23 @@ P8_GAP_TIMELINES = {
     "run-across-a-retained-success": (False, _timeline(2, None, (2, 3), (1.13, 1.2, 1), (1.38, 1.4, 2))),
     "reset-after-an-evicted-success": (True, _timeline(3, None, (1, 3), (1.13, 1.15, 1), (1.16, 1.18, 1))),
     "resets-beyond-the-evicted-samples": (False, _timeline(3, None, (1, 3), (1.13, 1.14, 1), (1.15, 1.16, 1), (1.17, 1.18, 1))),
-    "excess-as-the-last-event": (True, _timeline(2, "gap-budget-exceeded", (1, 3), (1.13, 1.14, 1), (1.15, 1.16, 2))),
+    # r6 (delta-4 D4-2): the excess is after the last success (the r5 data,
+    # with a success after the excess, is now "success-after-the-excess").
+    "excess-as-the-last-event": (True, _timeline(2, "gap-budget-exceeded", (1, 3), (1.38, 1.4, 1), (1.41, 1.43, 2))),
     "events-after-the-first-excess": (
         False, _timeline(3, "gap-budget-exceeded", (1, 3), (1.13, 1.14, 1), (1.15, 1.16, 2), (1.17, 1.18, 1)),
+    ),
+    # Review delta-4 D4-2: a dropped success witnesses a reset only inside its
+    # eviction window, and nothing follows the attempt that exceeded a budget.
+    "reset-after-the-newest-success": (False, _timeline(3, None, (1, 3), (1.38, 1.4, 1), (1.41, 1.43, 1))),
+    "success-after-the-excess": (False, _timeline(2, "gap-budget-exceeded", (1, 3), (1.13, 1.14, 1), (1.15, 1.16, 2))),
+    "reset-before-the-pinned-first-success": (
+        False, _timeline(3, None, (1, 3), (0.6, 0.7, 1), (0.8, 0.9, 1), outer_start=0.5),
+    ),
+    # Control: one retained sample may come from a retention of one, which
+    # can evict the first success, so a reset before it is possible.
+    "reset-before-the-only-retained-success": (
+        True, _timeline(2, None, (1, 3), (1.13, 1.15, 1), (1.16, 1.18, 1), newest_only=True),
     ),
 }
 
@@ -280,8 +319,9 @@ def test_p8_checks_a_coherent_gap_timeline(name: str) -> None:
     """Delta-3 F3: P8 mirrors the executor's attempt-timeline rules.
 
     Complete history requires a retained success between reset gaps;
-    dropped history allows one unproven reset per dropped sample (controls);
-    no event may follow the first budget excess.
+    dropped history allows one unproven reset per dropped sample (controls),
+    and only inside the dropped sample's eviction window (delta-4 D4-2); no
+    event or success may follow the first budget excess.
     """
 
     accepted, record = gap_timeline_records()[name]

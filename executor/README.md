@@ -89,10 +89,22 @@ Until then every science launch on that slot fails with `SlotQuarantined`
 before spawning, sampled or not: the worker checks the in-process lease by
 `TPEN_SLOT_ID`, and dispatch admission also checks the durable markers, so a
 restarted controller that reuses the same attempt store refuses the slot too.
-Only the member's own inspection, which carries the explicit `inspector`
-launch role, is exempt; an unsampled launch is never assumed to be an
-inspection. A marker whose owner died is not released by another process; the
-slot stays quarantined for the rest of the allocation.
+Only the member's own inspection is exempt. The exemption is the typed worker
+argument `purpose=LaunchPurpose.INSPECTION`, passed only by
+`TPENEvidence.read`; no environment value grants it, and the retired
+`TPEN_EXECUTOR_LAUNCH_ROLE` key is scrubbed from every launch environment. An
+unsampled launch, including the legacy/no-unique-slot science fallback, is
+never treated as an inspection. This argument is a correctness guard against
+accidental slot reuse, not a security boundary: any caller that controls the
+worker invocation can pass it.
+
+Quarantine release (pending a manager decision). A marker whose owner died is
+not released by another process, and no operator release command exists. The
+conservative default holds until the manager decides otherwise: the slot stays
+quarantined for the rest of the allocation, and allocation teardown is the
+release (a new allocation has a new allocation and backend job identity, so it
+does not see the old marker). The marker is kept as evidence until a separate
+disposition authorizes removing it.
 
 Assumption: one controller per allocation. Every dispatcher runs its workers
 in the controller process (Parsl is ThreadPool-only), so the in-process lease

@@ -457,6 +457,13 @@ def _placement_v3_gaps(record: Mapping[str, Any], start: float | None, end: floa
     sample in between, and resets with no retained sample in between are
     accepted only while enough samples were dropped to justify them (none
     with complete history).  No event before the last may exceed a budget.
+
+    A dropped success witnesses a reset only inside its possible eviction
+    window (review delta-4 D4-2): before the always-retained newest sample
+    and, when two or more samples are retained (so the first is pinned),
+    after the first retained sample; each reset needs its own dropped
+    success.  No successful sample follows the attempt that exceeded a
+    budget.
     """
 
     gaps = _fields(record["gaps"], set(GPU_SAMPLER_GAP_KEYS), "placement gpu sampler gaps")
@@ -472,6 +479,10 @@ def _placement_v3_gaps(record: Mapping[str, Any], start: float | None, end: floa
     # Retained successful attempts (validated) and the count of dropped ones.
     successes = [(float(sample["monotonic_start"]), float(sample["monotonic_end"])) for sample in record["samples"]]
     dropped = record["aggregate"]["samples_taken"] - record["count"]
+    # Eviction window of a dropped success: before the newest retained sample
+    # and, with two or more retained (first pinned), after the first.
+    newest_start = successes[-1][0] if successes else None
+    first_end = successes[0][1] if len(successes) > 1 else None
     previous_end, run, longest, summed, unproven_resets = start, 0, 0, 0.0, 0
     for index, event in enumerate(events):
         event = _fields(event, set(GPU_SAMPLER_GAP_EVENT_KEYS), "placement gpu sampler gap event")
@@ -494,7 +505,9 @@ def _placement_v3_gaps(record: Mapping[str, Any], start: float | None, end: floa
             if succeeded_between and consecutive != 1:
                 raise _sampler_refusal("gap run continues across a retained successful sample")
             if consecutive == 1 and not succeeded_between:
-                # Only a dropped sample can have reset this run.
+                # Only a dropped sample inside the eviction window can have reset this run.
+                if newest_start is None or event_end > newest_start or (first_end is not None and previous_end < first_end):
+                    raise _sampler_refusal("gap run resets where no dropped successful sample can lie")
                 unproven_resets += 1
         # The first excess ends sampling: no earlier event may exceed a budget.
         if index < len(events) - 1 and (index + 1 > allowed_total or consecutive > allowed_consecutive):
@@ -511,6 +524,9 @@ def _placement_v3_gaps(record: Mapping[str, Any], start: float | None, end: floa
     if len(events) > allowed_total + 1 or longest > allowed_consecutive + 1:
         raise _sampler_refusal("gaps continue past the first budget excess")
     exceeded = len(events) > allowed_total or longest > allowed_consecutive
+    # The excess attempt is the last attempt: no success may follow it.
+    if exceeded and any(success_start >= previous_end for success_start, _success_end in successes):
+        raise _sampler_refusal("gap budget excess is followed by a successful sample")
     failure = record["failure"]
     if exceeded != (failure is not None and failure["code"] == "gap-budget-exceeded"):
         raise _sampler_refusal("gap budget excess and gap-budget-exceeded failure disagree")
