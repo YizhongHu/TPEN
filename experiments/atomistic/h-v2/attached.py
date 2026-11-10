@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -125,6 +126,25 @@ SCIENCE_CONFIG_IDENTITY_KEYS = frozenset(
         "materialized_config_sha256",
     }
 )
+#: K1: required science-config identity fields a pilot/part-(g) receipt must
+#: carry (``protocol.pilot_training_config``'s own identity-dict shape,
+#: which differs from the science payload's -- ``payload``/``seed_namespace``/
+#: ``scale_overlay_sha256``/``payload_overlay_sha256`` rather than
+#: ``lineage_index``/``overlay_sha256``). A receipt refuses rather than being
+#: written with any of these silently dropped between the protocol builder,
+#: ``build_h_v2_train_plan``, and this receipt.
+PILOT_CONFIG_IDENTITY_KEYS = frozenset(
+    {
+        "payload",
+        "lineage",
+        "seed_namespace",
+        "scale_overlay_sha256",
+        "payload_overlay_sha256",
+        "base_train_sha256",
+        "contract_inputs_sha256",
+        "materialized_config_sha256",
+    }
+)
 
 #: D3: the unresolved ``${run.dir}/...`` prefix every per-run artifact path in
 #: these frozen configs is written under; stripping it from a callback's own
@@ -196,6 +216,147 @@ def _atomic_text(path: Path, text: str) -> None:
     temporary.replace(path)
 
 
+#: Run via ``science_python -c <this> <probe_config_path> <target>``: loads
+#: the unresolved probe config, finds *target*'s own callback node, and
+#: instantiates ONLY that node against its real constructor -- never the
+#: whole config (no model/context exists at probe time). A syntax-only
+#: profile admission (:func:`check_profile`) cannot by itself tell "this
+#: _target_ is allowlisted" apart from "this exact argument set constructs
+#: the real class" (amendment r4 finding: ENDQ/ModuleNorms both passed
+#: admission on dev while carrying the wrong/missing constructor arguments).
+_INSTANTIATE_CANDIDATE_SCRIPT = """
+import sys
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
+
+config = OmegaConf.load(sys.argv[1])
+target = sys.argv[2]
+node = next((cb for cb in config.get("callbacks", []) if cb.get("_target_") == target), None)
+if node is None:
+    print(f"MISSING:{target}")
+    raise SystemExit(1)
+try:
+    instantiate(node)
+except Exception as error:  # noqa: BLE001 - reported to the caller, never swallowed
+    print(f"INSTANTIATION_FAILED:{type(error).__name__}:{error}")
+    raise SystemExit(1)
+print("OK")
+"""
+
+
+def assert_candidate_instantiates(
+    science_python: str | Path,
+    probe_config_path: str | Path,
+    target: str,
+    *,
+    cwd: str | Path | None = None,
+) -> None:
+    """Instantiate *target*'s candidate node against its real constructor.
+
+    Raises
+    ------
+    HV2ReceiptRefusal
+        Code ``candidate-module-misconfigured``, if *target*'s node is
+        missing from the probe config or fails to construct. This is
+        ALWAYS a hard failure, never a skip: a candidate the recovery
+        profile admits (a syntax check) but whose arguments do not match
+        its real signature is a configuration bug in this study module,
+        not an absent core capability.
+    """
+
+    result = subprocess.run(
+        [str(science_python), "-c", _INSTANTIATE_CANDIDATE_SCRIPT, str(probe_config_path), target],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise HV2ReceiptRefusal(
+            "candidate-module-misconfigured",
+            f"{target} is admitted by the recovery profile but does not instantiate against its "
+            f"real constructor: {result.stdout.strip()!r} {result.stderr.strip()!r}",
+        )
+
+
+def probe_admitted_a1_modules(
+    config: dict[str, Any],
+    candidates: Sequence[str],
+    *,
+    science_python: str | Path,
+    probe_config_path: str | Path,
+    cwd: str | Path | None = None,
+) -> tuple[list[str], list[str]]:
+    """Enable every candidate A1 training-side module the recovery profile admits.
+
+    TO 63690220 amendment r3/r4: tries each of *candidates* in order,
+    appending it to *config* (:func:`protocol.append_candidate_module`) and
+    probing the runtime recovery profile (:func:`check_profile`, which
+    subprocesses the exact *science_python* this job will actually train
+    with -- never assumed from the branch); a refused candidate is removed
+    again (:func:`protocol.remove_candidate_module`) before the next is
+    tried, so *config* ends up carrying exactly the admitted subset.
+    Skipping is never silent: the caller records both lists on the TRAIN
+    receipt.
+
+    Amendment r4: profile admission is syntax-only (an allowlisted
+    ``_target_`` plus safe cadence fields) and cannot by itself tell a
+    genuinely absent capability apart from a candidate built with the wrong
+    arguments for its real constructor. Every admitted candidate is
+    therefore ALSO instantiated against its real class
+    (:func:`assert_candidate_instantiates`) before being recorded as
+    enabled. ONLY an :class:`ActivationRefusal` from :func:`check_profile`
+    counts as "not admitted"; any other error -- including an instantiation
+    failure -- propagates and is never recorded as a skip.
+
+    Parameters
+    ----------
+    config : dict
+        Mutated in place: ends up carrying exactly the admitted candidates.
+    candidates : sequence of str
+        Candidate callback targets, tried in order
+        (:data:`protocol.A1_TRAINING_MODULE_CANDIDATES`).
+    science_python : str or pathlib.Path
+        Exact job interpreter the real TRAIN dispatch will use.
+    probe_config_path : str or pathlib.Path
+        Scratch file this function repeatedly overwrites with *config*'s
+        current state; never the task's own materialized config path.
+
+    Returns
+    -------
+    tuple of list, list
+        ``(enabled, skipped_not_admitted)``, in candidate order.
+    """
+
+    enabled: list[str] = []
+    skipped: list[str] = []
+    probe_path = Path(probe_config_path)
+    _atomic_text(probe_path, yaml.safe_dump(config, sort_keys=False, allow_unicode=True))
+    # F3: the base config (no candidate appended yet) must itself be
+    # admitted. A failure here is a checker/environment problem, never a
+    # per-candidate "not admitted" verdict, so it is never caught -- it
+    # propagates unconditionally, including a ``profile-refused`` verdict.
+    check_profile(science_python, probe_path, cwd=cwd)
+    for target in candidates:
+        protocol.append_candidate_module(config, target)
+        _atomic_text(probe_path, yaml.safe_dump(config, sort_keys=False, allow_unicode=True))
+        try:
+            check_profile(science_python, probe_path, cwd=cwd)
+        except ActivationRefusal as error:
+            # F3: only a genuine checker REFUSAL of this candidate is a skip.
+            # Any other code (malformed/unavailable/mismatched checker
+            # output) is a checker failure, not an admission decision, and
+            # must propagate rather than silently drop a valid candidate.
+            if error.code != "profile-refused":
+                raise
+            protocol.remove_candidate_module(config, target)
+            skipped.append(target)
+            continue
+        assert_candidate_instantiates(science_python, probe_path, target, cwd=cwd)
+        enabled.append(target)
+    return enabled, skipped
+
+
 def build_h_v2_train_plan(
     *,
     output_dir: str | Path,
@@ -206,6 +367,7 @@ def build_h_v2_train_plan(
     max_steps: int | None = None,
     config: Mapping[str, Any] | None = None,
     science_config_identity: Mapping[str, Any] | None = None,
+    payload_label: str | None = None,
 ) -> tuple[StagePlanV2, dict[str, tuple[str, ...]], dict[str, Any]]:
     """Build the one-task H-v2 TRAIN plan from a training config.
 
@@ -234,7 +396,19 @@ def build_h_v2_train_plan(
         ``protocol.science_training_config`` returned alongside it (lineage,
         lineage index, and frozen-input sha256s). Carried into the task's
         metadata so the H-v2 accepted receipt can record it; ``None`` for the
-        pipeline-check payload.
+        pipeline-check payload. TO 63690220: also carries a pilot/part-(g)
+        payload's ``protocol.pilot_training_config`` identity record when
+        *payload_label* is one of those payloads -- the two uses are
+        distinguished by *payload_label*, never by the identity record's own
+        shape.
+    payload_label : str, optional
+        TO 63690220: an explicit payload label to record instead of deriving
+        one from whether *science_config_identity* is ``None``
+        (``"science"``/``"pipeline-check"``). Used for the pilot/part-(g)
+        payloads, whose own identity record is carried the same way a
+        science identity is, but under the payload's own name
+        (``"gpu-route-g"``/``"capacity-pilot"``), never mislabelled
+        ``"science"``.
 
     Returns
     -------
@@ -278,13 +452,13 @@ def build_h_v2_train_plan(
     )
     metadata: dict[str, Any] = {"route": ROUTE_NAME, "lineage": lineage}
     if science_config_identity is not None:
-        metadata["payload"] = "science"
+        metadata["payload"] = payload_label if payload_label is not None else "science"
         metadata["science_config_identity"] = {
             **dict(science_config_identity),
             "materialized_config_sha256": file_sha256(config_path),
         }
     else:
-        metadata["payload"] = "pipeline-check"
+        metadata["payload"] = payload_label if payload_label is not None else "pipeline-check"
     task = LogicalTaskSpec(
         logical_task_id=task_id,
         stage=TRAIN_STAGE,
@@ -518,9 +692,19 @@ def _derive_artifact_declarations(unresolved: Mapping[str, Any], *, stage: str) 
             continue
         target = callback.get("_target_")
         if target == "tpen.callback.InitialCheckpoint":
-            declared["initial_checkpoint"] = _run_dir_relative(
-                callback.get("output_dir"), name="InitialCheckpoint.output_dir"
-            )
+            output_dir = _run_dir_relative(callback.get("output_dir"), name="InitialCheckpoint.output_dir")
+            # InitialCheckpoint always writes its single publication at the
+            # fresh-lineage cursor (`next_iteration=0`), so the update-0
+            # checkpoint always lands at `<output_dir>/step_000000/` (see
+            # `tpen.callback.initial_checkpoint.InitialCheckpoint` and
+            # `tpen.checkpoint.artifact.checkpoint_step_dir_name`, mirrored
+            # here rather than imported -- see `_CHECKPOINT_STEP_DIR_PREFIX`
+            # above). `output_dir` itself is a directory, never a file, so it
+            # cannot be the declared artifact; the concrete files that prove
+            # a COMPLETE checkpoint are.
+            step_zero_dir = f"{output_dir}/{_CHECKPOINT_STEP_DIR_PREFIX}{0:06d}"
+            declared["initial_checkpoint_manifest"] = f"{step_zero_dir}/{_CHECKPOINT_MANIFEST_NAME}"
+            declared["initial_checkpoint_complete"] = f"{step_zero_dir}/{_CHECKPOINT_COMPLETE_MARKER}"
         elif target == "tpen.callback.ParameterActivity":
             declared["parameter_activity"] = _run_dir_relative(
                 callback.get("output_path"), name="ParameterActivity.output_path"
@@ -661,6 +845,9 @@ def activate_h_v2_run(
     cwd: str | Path | None = None,
     inspect_run: Any = None,
     artifact_declarations: Mapping[str, str] | None = None,
+    enabled_modules: Sequence[str] | None = None,
+    skipped_not_admitted: Sequence[str] | None = None,
+    skipped_unspecified: Sequence[Mapping[str, str]] | None = None,
 ) -> HV2Activation:
     """Run the complete H-v2 attached activation route for one prepared task.
 
@@ -687,6 +874,12 @@ def activate_h_v2_run(
         Working directory for profile and executor subprocesses.
     inspect_run : callable, optional
         Root public-reader inspector, or a test double.
+    enabled_modules, skipped_not_admitted : sequence of str, optional
+        TO 63690220 amendment r3: forwarded verbatim to
+        :func:`write_h_v2_accepted_receipt`.
+    skipped_unspecified : sequence of mapping, optional
+        TO 63690220 amendment r4: forwarded verbatim
+        (:func:`protocol.unspecified_modules`).
     artifact_declarations : mapping[str, str], optional
         Additional ``{name: relative_path}`` entries, beyond the base
         artifacts and whatever D3 already derives from ``prepared``'s own
@@ -811,6 +1004,9 @@ def activate_h_v2_run(
             artifact_declarations=reconciled_artifact_declarations,
             payload=prepared.payload,
             science_config_identity=prepared.science_config_identity,
+            enabled_modules=enabled_modules,
+            skipped_not_admitted=skipped_not_admitted,
+            skipped_unspecified=skipped_unspecified,
         )
     except (HV2ReceiptRefusal, ManifestRefusal) as error:
         write_activation_failure_receipt(
@@ -835,6 +1031,123 @@ def activate_h_v2_run(
     return HV2Activation(prepared, profile, dispatch, str(activation_receipt_path), str(h_v2_receipt_path))
 
 
+#: Checkpoint step directories carry this sentinel file once the write that
+#: produced them has committed (``tpen.checkpoint.artifact.COMPLETE_MARKER``,
+#: mirrored here as a filesystem convention rather than importing ``tpen``:
+#: ``experiments/README.md`` forbids any import of ``tpen`` outside
+#: ``tpen.inspection``). A directory missing this marker, or still named
+#: with the ``.tmp`` suffix, is an in-progress write and is never inventoried.
+_CHECKPOINT_COMPLETE_MARKER = "COMPLETE"
+_CHECKPOINT_MANIFEST_NAME = "manifest.json"
+_CHECKPOINT_STEP_DIR_PREFIX = "step_"
+#: Mirrored from ``tpen.checkpoint.manifest.CHECKPOINT_SCHEMA_VERSION`` as a
+#: filesystem convention (``experiments/README.md`` forbids importing
+#: anything from ``tpen`` here beyond ``tpen.inspection``). Only a v2
+#: manifest records ``completed_updates``; a v1/legacy or malformed manifest
+#: is refused, never relabelled (F1).
+_CHECKPOINT_MANIFEST_SCHEMA_VERSION_V2 = 2
+
+
+def _completed_updates_from_manifest(manifest_path: Path, entry: Path) -> int:
+    """Return the checkpoint's scientific update coordinate from its manifest.
+
+    F1: a checkpoint directory's own name (``step_<next_iteration>``) is the
+    trainer's RESUME CURSOR, not the count of optimizer updates actually
+    applied -- the two counters diverge whenever a completed iteration
+    skipped its update. The manifest's ``completed_updates`` field is the
+    coordinate E must select checkpoints by; the directory cursor is kept
+    only to reconcile against it, never substituted for it.
+
+    Raises
+    ------
+    HV2ReceiptRefusal
+        Code ``malformed-checkpoint-manifest``, if *manifest_path* is not
+        readable JSON, is not schema version 2, or omits
+        ``completed_updates``/``next_iteration`` (a v1/legacy manifest never
+        recorded ``completed_updates`` and is refused here, never
+        relabelled). Code ``checkpoint-cursor-mismatch``, if the directory's
+        own cursor disagrees with the manifest's recorded ``next_iteration``.
+    """
+
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        schema_version = int(data["schema_version"])
+        next_iteration = int(data["next_iteration"])
+        completed_updates = int(data["completed_updates"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise HV2ReceiptRefusal(
+            "malformed-checkpoint-manifest",
+            f"{manifest_path} does not carry a readable v2 completed_updates/next_iteration "
+            f"pair: {error}",
+        ) from error
+    if schema_version != _CHECKPOINT_MANIFEST_SCHEMA_VERSION_V2:
+        raise HV2ReceiptRefusal(
+            "malformed-checkpoint-manifest",
+            f"{manifest_path} is schema_version {schema_version}, expected "
+            f"{_CHECKPOINT_MANIFEST_SCHEMA_VERSION_V2} (a legacy v1 manifest never recorded "
+            "completed_updates and is refused, never relabelled)",
+        )
+    directory_cursor = int(entry.name[len(_CHECKPOINT_STEP_DIR_PREFIX):])
+    if next_iteration != directory_cursor:
+        raise HV2ReceiptRefusal(
+            "checkpoint-cursor-mismatch",
+            f"{entry} directory cursor {directory_cursor} disagrees with manifest "
+            f"next_iteration {next_iteration}",
+        )
+    return completed_updates
+
+
+def build_checkpoint_inventory(checkpoint_root: str | Path) -> list[dict[str, Any]]:
+    """Return every retained, committed checkpoint under *checkpoint_root*.
+
+    TO 63690220 orchestrator decision 1: the pilot/part-(g) TRAIN receipt
+    records the retained-checkpoint inventory (update, path, sha256 of each
+    file) so item E can hash-on-read against it rather than trust-on-first-use.
+
+    Parameters
+    ----------
+    checkpoint_root : str or pathlib.Path
+        The ``Checkpoint``/``InitialCheckpoint`` callbacks' shared
+        ``output_dir`` (``${run.dir}/checkpoints`` in these configs).
+
+    Returns
+    -------
+    list of dict
+        One entry per committed ``step_<N>`` directory, sorted by update
+        number: ``{"update": int, "path": str, "files": {filename: sha256}}``.
+        F1: ``update`` is the manifest's ``completed_updates`` -- the
+        scientific update coordinate E selects checkpoints by -- not the
+        directory's own resume-cursor name. A directory still suffixed
+        ``.tmp``, or missing its :data:`_CHECKPOINT_COMPLETE_MARKER`/manifest,
+        is an in-progress write and is never inventoried.
+
+    Raises
+    ------
+    HV2ReceiptRefusal
+        See :func:`_completed_updates_from_manifest`.
+    """
+
+    root = Path(checkpoint_root)
+    if not root.is_dir():
+        return []
+    inventory: list[dict[str, Any]] = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or entry.name.endswith(".tmp") or not entry.name.startswith(_CHECKPOINT_STEP_DIR_PREFIX):
+            continue
+        manifest_path = entry / _CHECKPOINT_MANIFEST_NAME
+        if not manifest_path.is_file() or not (entry / _CHECKPOINT_COMPLETE_MARKER).is_file():
+            continue
+        update = _completed_updates_from_manifest(manifest_path, entry)
+        files = {
+            str(file_path.relative_to(entry)): file_sha256(file_path)
+            for file_path in sorted(entry.rglob("*"))
+            if file_path.is_file()
+        }
+        inventory.append({"update": update, "path": str(entry), "files": files})
+    inventory.sort(key=lambda entry: entry["update"])
+    return inventory
+
+
 def build_h_v2_accepted_receipt(
     manifest_path: str | Path,
     *,
@@ -845,6 +1158,9 @@ def build_h_v2_accepted_receipt(
     artifact_declarations: Mapping[str, str] | None = None,
     payload: str = "pipeline-check",
     science_config_identity: Mapping[str, Any] | None = None,
+    enabled_modules: Sequence[str] | None = None,
+    skipped_not_admitted: Sequence[str] | None = None,
+    skipped_unspecified: Sequence[Mapping[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Build the study-side H-v2 accepted-receipt payload from one manifest.
 
@@ -883,6 +1199,16 @@ def build_h_v2_accepted_receipt(
         plus ``materialized_config_sha256``
         (:data:`SCIENCE_CONFIG_IDENTITY_KEYS`). A science receipt missing any
         of these fields refuses rather than being written incomplete.
+    enabled_modules, skipped_not_admitted : sequence of str, optional
+        TO 63690220 amendment r3: which A1 training-side module targets
+        (:data:`protocol.A1_TRAINING_MODULE_CANDIDATES`) the runtime recovery
+        profile admitted versus refused. Skipping is never silent: both
+        default to ``[]`` rather than being omitted.
+    skipped_unspecified : sequence of mapping, optional
+        TO 63690220 amendment r4: modules never probed or appended because
+        their configuration is not yet specified upstream
+        (:func:`protocol.unspecified_modules`), each as
+        ``{"target": ..., "reason": ...}``. Defaults to ``[]``.
 
     Returns
     -------
@@ -940,6 +1266,18 @@ def build_h_v2_accepted_receipt(
             raise HV2ReceiptRefusal(
                 "science-config-identity-missing",
                 f"payload=science receipt is missing required science config identity fields: "
+                f"{sorted(missing)!r}",
+            )
+    elif payload in protocol.PILOT_PAYLOADS:
+        # K1: a pilot/part-(g) receipt must carry its own complete identity
+        # record too (coverage gap: previously checked for payload=="science"
+        # only, so a dropped/corrupted payload_overlay_sha256 anywhere along
+        # protocol -> build_h_v2_train_plan -> this receipt went unnoticed).
+        missing = PILOT_CONFIG_IDENTITY_KEYS - set(science_config_identity or {})
+        if missing:
+            raise HV2ReceiptRefusal(
+                "pilot-config-identity-missing",
+                f"payload={payload!r} receipt is missing required pilot config identity fields: "
                 f"{sorted(missing)!r}",
             )
     manifest_path = Path(manifest_path)
@@ -1026,6 +1364,16 @@ def build_h_v2_accepted_receipt(
             }
         )
 
+    # TO 63690220 orchestrator decision 1: for TRAIN, every segment's
+    # checkpoint_dir names the LATEST committed checkpoint step under the
+    # callbacks' shared output_dir; that directory's parent is the full
+    # checkpoints root, so the inventory is derived here rather than asking
+    # the caller to resolve a run-time ${run.dir} path it does not itself know.
+    checkpoint_inventory: list[dict[str, Any]] = []
+    if stage == TRAIN_STAGE and segments_payload:
+        checkpoint_root = Path(segments_payload[0]["checkpoint_dir"]).parent
+        checkpoint_inventory = build_checkpoint_inventory(checkpoint_root)
+
     by_task: dict[str, list[str]] = {}
     for segment_payload in segments_payload:
         by_task.setdefault(segment_payload["task_id"], []).append(segment_payload["resolved_config_sha256"])
@@ -1043,6 +1391,10 @@ def build_h_v2_accepted_receipt(
         "retry": "forbidden",
         "payload": payload,
         "science_config_identity": dict(science_config_identity) if science_config_identity is not None else None,
+        "checkpoint_inventory": checkpoint_inventory,
+        "enabled_modules": list(enabled_modules) if enabled_modules else [],
+        "skipped_not_admitted": list(skipped_not_admitted) if skipped_not_admitted else [],
+        "skipped_unspecified": [dict(entry) for entry in skipped_unspecified] if skipped_unspecified else [],
     }
 
 
@@ -1087,14 +1439,18 @@ __all__ = [
     "H_V2_ACCEPTED_RECEIPT_SCHEMA",
     "HV2Activation",
     "HV2ReceiptRefusal",
+    "PILOT_CONFIG_IDENTITY_KEYS",
     "PreparedHV2Run",
     "ROUTE_NAME",
     "SCIENCE_CONFIG_IDENTITY_KEYS",
     "TRAIN_STAGE",
     "activate_h_v2_run",
+    "build_checkpoint_inventory",
     "build_h_v2_accepted_receipt",
     "build_h_v2_eval_plan",
     "build_h_v2_train_plan",
     "prepare_h_v2_run",
+    "assert_candidate_instantiates",
+    "probe_admitted_a1_modules",
     "write_h_v2_accepted_receipt",
 ]

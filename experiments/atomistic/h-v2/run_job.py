@@ -97,7 +97,13 @@ def _require_env(name: str) -> str:
     return value
 
 
-def check_identity(run_root: Path, expected_commit: str, science_python: str) -> None:
+def check_identity(
+    run_root: Path,
+    expected_commit: str,
+    science_python: str,
+    *,
+    expected_stratum: str = launch_config.APPROVED_GPU_STRATUM,
+) -> None:
     """Section B3's in-job identity block: print, then assert, before any payload."""
 
     job_id = os.environ.get("SLURM_JOB_ID", "absent")
@@ -133,11 +139,14 @@ def check_identity(run_root: Path, expected_commit: str, science_python: str) ->
     # submission (section B3: "must print NVIDIA A100-SXM4-80GB; anything
     # else fails the job loudly"). seas_gpu mixes A100-80GB and H200, and a
     # requeue can change which one a job lands on (policy
-    # gpu-hardware-strata-and-constraint-rule-2026-08-15).
-    if device_name != launch_config.APPROVED_GPU_STRATUM:
+    # gpu-hardware-strata-and-constraint-rule-2026-08-15). TO 63690220: the
+    # pilot/part-(g) payloads pass their own per-payload expected stratum
+    # (``gpu-route-g`` serves a ``gpu_test`` MIG slice, a different hardware
+    # stratum from the science/pipeline-check route's A100-80GB).
+    if device_name != expected_stratum:
         raise JobError(
             f"delivered GPU {device_name!r} does not match the approved stratum "
-            f"{launch_config.APPROVED_GPU_STRATUM!r} (design target section B3/C2); "
+            f"{expected_stratum!r} (design target section B3/C2); "
             "failing loudly rather than running on an unapproved card"
         )
     print(f"[h-v2] {device_name}")
@@ -256,7 +265,19 @@ def checkpoint_dir_for_eval(run_root: Path, lineage: str, *, pipeline_check: boo
     return Path(segments[0]["checkpoint_dir"])
 
 
-def run(stage: str, lineage: str, *, pipeline_check: bool = False) -> None:
+def _pilot_train_task_id(payload: str) -> str:
+    """Return a pilot/part-(g) payload's fixed TRAIN task id (TO 63690220)."""
+
+    return f"h-v2-train-{payload}"
+
+
+def run(
+    stage: str,
+    lineage: str,
+    *,
+    pipeline_check: bool = False,
+    pilot_payload: str | None = None,
+) -> None:
     """Build, prepare, and activate one H-v2 attached generation.
 
     Parameters
@@ -264,25 +285,109 @@ def run(stage: str, lineage: str, *, pipeline_check: bool = False) -> None:
     stage : {"train", "eval"}
         Job stage.
     lineage : str
-        Opaque lineage identity (for example ``"L1"``).
+        Opaque lineage identity (for example ``"L1"``), or the fixed
+        per-payload lineage label (``"G"``/``"P"``) when *pilot_payload* is
+        set.
     pipeline_check : bool, default=False
         Selects the non-science pipeline-check payload (its task id, job
         name and logs say so) instead of the science payload TRAIN builds
         by default for an approved lineage (TO baff945c,
         ``protocol.science_training_config``).
+    pilot_payload : {"gpu-route-g", "capacity-pilot"}, optional
+        TO 63690220: selects one of the two non-science, TRAIN-only pilot
+        payloads instead. Mutually exclusive with *pipeline_check*; EVAL is
+        refused unconditionally for a pilot payload (item E's scope).
 
     Raises
     ------
     JobError
         Code :data:`SCIENCE_CONFIG_UNAVAILABLE_CODE`, if ``stage`` is
-        ``"train"``, ``pipeline_check`` is not set, and ``lineage`` is not
-        one of ``launch_config.LINEAGES`` (the approved L1-L3 roster).
+        ``"train"``, neither ``pipeline_check`` nor *pilot_payload* is set,
+        and ``lineage`` is not one of ``launch_config.LINEAGES`` (the
+        approved L1-L3 roster). Also raised if *pilot_payload* is set and
+        ``stage`` is not ``"train"``, or *lineage* does not match the
+        payload's own fixed label.
     """
 
     run_root = Path(_require_env("RUN")).resolve()
     expected_commit = _require_env("SHA")
     science_python = _require_env("SCIENCE_PYTHON")
     executor_python = _require_env("EXECUTOR_PY")
+
+    if pilot_payload is not None:
+        if stage != "train":
+            raise JobError(f"pilot payload {pilot_payload!r} only runs stage 'train' (item E owns eval), got {stage!r}")
+        expected_lineage = launch_config.PILOT_PAYLOAD_LINEAGES[pilot_payload]
+        if lineage != expected_lineage:
+            raise JobError(
+                f"pilot payload {pilot_payload!r} refuses lineage {lineage!r}; "
+                f"it dispatches only its own fixed lineage {expected_lineage!r}"
+            )
+        check_identity(
+            run_root,
+            expected_commit,
+            science_python,
+            expected_stratum=launch_config.PILOT_PAYLOAD_GPU_STRATA[pilot_payload],
+        )
+        task_id = _pilot_train_task_id(pilot_payload)
+        handoff_dir = run_root / "attached" / "handoff" / task_id
+        results_root = run_root / "attached" / "results"
+        store = run_root / "attached" / "store" / task_id
+        receipts_dir = run_root / "attached" / "receipts"
+        receipts_dir.mkdir(parents=True, exist_ok=True)
+
+        config, identity = protocol.pilot_training_config(pilot_payload)
+        probe_path = handoff_dir / f"{task_id}.probe.yaml"
+        probe_path.parent.mkdir(parents=True, exist_ok=True)
+        enabled_modules, skipped_not_admitted = attached.probe_admitted_a1_modules(
+            config,
+            protocol.candidate_modules_to_append(),
+            science_python=science_python,
+            probe_config_path=probe_path,
+            cwd=run_root / "checkout",
+        )
+        plan, overrides, config = attached.build_h_v2_train_plan(
+            output_dir=handoff_dir,
+            results_root=results_root,
+            lineage=pilot_payload,
+            config=config,
+            science_config_identity=identity,
+            payload_label=pilot_payload,
+        )
+        # F4: reconcile against the final materialized config, not merely the
+        # probe's own bookkeeping -- this is the complete, disjoint partition
+        # of the A1 candidate set that actually ran, including the base
+        # DataIntegrity/GradientStats leaves the probe never appends/removes.
+        enabled_modules = protocol.reconcile_enabled_modules(config)
+        prepared = attached.prepare_h_v2_run(plan, overrides, config, output_dir=handoff_dir)
+        alloc_dir = run_root / "attached" / "alloc" / task_id
+        allocation_path, worker_path = write_local_allocation_and_worker(
+            alloc_dir,
+            science_python=science_python,
+            placeholder_config=prepared.effective_config,
+            backend_job_id=os.environ.get("SLURM_JOB_ID", "unknown"),
+        )
+        attached.activate_h_v2_run(
+            prepared,
+            science_python=science_python,
+            executor_python=executor_python,
+            allocation=allocation_path,
+            worker_config=worker_path,
+            store=store,
+            activation_receipt_path=receipts_dir / f"{task_id}.activation.json",
+            h_v2_receipt_path=receipts_dir / f"{task_id}.h-v2.json",
+            expected_source_commit=expected_commit,
+            dispatcher="local",
+            cwd=run_root / "checkout",
+            enabled_modules=enabled_modules,
+            skipped_not_admitted=skipped_not_admitted,
+            skipped_unspecified=protocol.unspecified_modules(),
+        )
+        print(
+            f"[h-v2] {task_id}: accepted (enabled={enabled_modules!r} "
+            f"skipped={skipped_not_admitted!r} unspecified={protocol.unspecified_modules()!r})"
+        )
+        return
 
     check_identity(run_root, expected_commit, science_python)
 
@@ -378,21 +483,26 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     pipeline_check = False
     explicit_science = False
+    pilot_payload: str | None = None
     if argv and argv[-1] == "--pipeline-check":
         pipeline_check = True
         argv = argv[:-1]
     elif len(argv) >= 2 and argv[-2:] == ["--payload", "science"]:
         explicit_science = True
         argv = argv[:-2]
-    if len(argv) != 2 or not (pipeline_check or explicit_science):
+    elif len(argv) >= 2 and argv[-2] == "--payload" and argv[-1] in protocol.PILOT_PAYLOADS:
+        pilot_payload = argv[-1]
+        argv = argv[:-2]
+    if len(argv) != 2 or not (pipeline_check or explicit_science or pilot_payload):
         print(
-            "usage: run_job.py {train|eval} <lineage> {--payload science|--pipeline-check}",
+            "usage: run_job.py {train|eval} <lineage> "
+            "{--payload science|--payload gpu-route-g|--payload capacity-pilot|--pipeline-check}",
             file=sys.stderr,
         )
         return 2
     stage, lineage = argv
     try:
-        run(stage, lineage, pipeline_check=pipeline_check)
+        run(stage, lineage, pipeline_check=pipeline_check, pilot_payload=pilot_payload)
     except Exception as error:  # noqa: BLE001 - this is the job's own top-level boundary
         # afterok sees only this exit code: any refusal here must be non-zero,
         # never a bare 0 (executor CLI exit 0 alone is not science complete).

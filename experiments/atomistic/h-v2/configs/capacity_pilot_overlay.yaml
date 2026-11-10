@@ -1,0 +1,7 @@
+# H-v2 capacity-pilot payload overlay (TO 63690220, acceptance-contract
+# amendment r2/r3). See `gpu_route_g_overlay.yaml` for the mechanism this
+# overlay shares; only `trainer.max_steps` differs between the two payloads.
+trainer.max_steps: 20000
+trainer.log_every_n_steps: 1
+callbacks.4.every_n_steps: 1
+callbacks.5.every_n_steps: 1
