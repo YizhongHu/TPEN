@@ -46,6 +46,8 @@ NEW_CALLBACK_TARGETS = frozenset(
         "tpen.callback.Checkpoint",
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
+        "tpen.callback.RawTrainingBatchRecorder",
+        "tpen.callback.TrainingBatchRecorder",
     }
 )
 # InitialCheckpoint and ParameterActivity are each admitted explicitly for
@@ -170,17 +172,18 @@ def test_observational_cadence_is_admitted_by_both_validators(
     validate_native_recovery_profile(config)
 
 
-def test_raw_training_recorder_is_refused_by_checkpoint_profile() -> None:
-    """Training history remains optional and is not a resumable checkpoint target."""
+def test_raw_training_recorder_is_admitted_by_checkpoint_profile() -> None:
+    """The optional recorder is admitted while its mutable cadence is refused."""
 
     result = check_profile(
         _config(callbacks=[{"_target_": "tpen.callback.RawTrainingBatchRecorder"}]),
         NATIVE_RECOVERY_PROFILE,
     )
-    assert result.verdict == "refused"
-    assert result.refusal is not None
-    assert result.refusal["code"] == "unsupported-callback"
-    assert "RawTrainingBatchRecorder" in result.refusal["reason"]
+    assert result.verdict == "supported"
+    assert result.refusal is None
+    validate_native_recovery_profile(
+        _config(callbacks=[{"_target_": "tpen.callback.RawTrainingBatchRecorder"}])
+    )
 
 
 def test_resume_sensitive_cadence_helper_audits_pop_step_cadence_fields() -> None:

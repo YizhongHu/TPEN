@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
+import re
 import string
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
@@ -18,11 +20,14 @@ from typing import Any, Callable, Mapping
 
 RUN_MANIFEST_V1 = "tpen-executor/run-manifest-v1"
 RUN_MANIFEST_V2 = "tpen-executor/run-manifest-v2"
+RUN_MANIFEST_V3 = "tpen-executor/run-manifest-v3"
 ACCEPTED_SEGMENT_SCHEMA = "tpen-executor/accepted-segment-v1"
 SCIENCE_PLACEMENT_RECEIPT_SCHEMA = "tpen-executor/science-placement-receipt-v1"
+SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2 = "tpen-executor/science-placement-receipt-v2"
 OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed"})
 PLACEMENT_COMPARISON_STATES = frozenset({"matched", "mismatch", "unavailable", "refused"})
 _HEX_DIGITS = frozenset(string.hexdigits.lower())
+_GPU_UUID = re.compile(r"^GPU-[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$")
 
 
 class ManifestRefusal(ValueError):
@@ -129,6 +134,7 @@ class ResultSet:
 
     chains: tuple[CommittedChain, ...]
     preserved_attempts: tuple[PreservedAttempt, ...]
+    placement_verdict: Mapping[str, Any] | None = None
 
     @property
     def chains_by_task(self) -> Mapping[str, CommittedChain]:
@@ -147,6 +153,12 @@ class ResultSet:
         """Return original attempts retained as preserved evidence."""
 
         return self.preserved_attempts
+
+    @property
+    def placement_unqualified(self) -> bool:
+        """Whether the manifest carries a loud, non-science-qualified verdict."""
+
+        return self.placement_verdict is not None and self.placement_verdict.get("status") == "unqualified"
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -205,8 +217,60 @@ def _sha256(value: Any, name: str) -> str:
     return value
 
 
+def _gpu_uuid(value: Any, name: str) -> str:
+    """Validate the physical GPU UUID grammar used by v2 receipts."""
+
+    _text(value, name)
+    if _GPU_UUID.fullmatch(value) is None:
+        raise ManifestRefusal("malformed-record", f"{name} must be a canonical physical GPU UUID")
+    return value
+
+
+def _receipt_host_key(value: Any, name: str) -> str:
+    """Derive the executor's physical-host comparison key."""
+
+    _text(value, name)
+    complete = value.strip().lower().rstrip(".")
+    labels = complete.split(".")
+    if not complete or any(not label for label in labels):
+        raise ManifestRefusal("malformed-record", f"{name} contains an empty hostname label")
+    return labels[0]
+
+
+def _finite_number(value: Any, name: str, *, nonnegative: bool = False) -> float | int:
+    if type(value) not in {int, float} or isinstance(value, bool) or not math.isfinite(value):
+        raise ManifestRefusal("malformed-record", f"{name} must be a finite number")
+    if nonnegative and value < 0:
+        raise ManifestRefusal("malformed-record", f"{name} must be nonnegative")
+    return value
+
+
+def _validate_json(value: Any, path: str = "placement") -> None:
+    """Reject non-JSON-shaped or non-finite placement evidence."""
+
+    if value is None or type(value) in {str, int, bool}:
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ManifestRefusal("non-finite-placement-evidence", f"{path} contains a non-finite number")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if type(key) is not str:
+                raise ManifestRefusal("non-string-placement-key", f"{path} contains a non-string key")
+            _validate_json(item, f"{path}.{key}")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_json(item, f"{path}[]")
+        return
+    raise ManifestRefusal("malformed-placement-evidence", f"{path} is not JSON-shaped")
+
+
 def _freeze_json(value: Any) -> Any:
     """Return immutable views of validated JSON-shaped placement evidence."""
+
+    _validate_json(value)
 
     if isinstance(value, dict):
         return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
@@ -215,8 +279,159 @@ def _freeze_json(value: Any) -> Any:
     return value
 
 
+def _placement_v2_host_mapping(value: Any) -> dict[str, Any]:
+    record = dict(_fields(value, {"status", "reason", "source", "slot_id", "host"}, "placement host mapping"))
+    for key in ("reason", "slot_id", "host"):
+        _text(record[key], f"placement.host_mapping.{key}")
+    _text(record["status"], "placement.host_mapping.status")
+    if record["status"] not in {"matched", "mismatch", "unavailable"}:
+        raise ManifestRefusal("malformed-record", "placement.host_mapping.status is invalid")
+    _text(record["source"], "placement.host_mapping.source")
+    if record["source"] not in {"scheduler-node-map", "declared-slot"}:
+        raise ManifestRefusal("malformed-record", "placement.host_mapping.source is invalid")
+    if record["status"] == "unavailable" and record["host"] != "unavailable":
+        raise ManifestRefusal("malformed-record", "unavailable host mapping must not name a logical host")
+    if record["status"] != "unavailable" and record["source"] != "scheduler-node-map":
+        raise ManifestRefusal("malformed-record", "mapped host evidence must come from the scheduler node map")
+    return record
+
+
+def _placement_v2_verdict(value: Any, declared: Mapping[str, Any]) -> dict[str, Any]:
+    record = dict(_fields(
+        value,
+        {"host", "device", "qualification", "reason_class", "reason", "science_acceptance", "warning"},
+        "placement verdict",
+    ))
+    for key in ("host", "device"):
+        _text(record[key], f"placement.verdict.{key}")
+        if record[key] not in PLACEMENT_COMPARISON_STATES:
+            raise ManifestRefusal("malformed-record", f"placement.verdict.{key} is invalid")
+    _text(record["qualification"], "placement.verdict.qualification")
+    if record["qualification"] != "unqualified":
+        raise ManifestRefusal("malformed-record", "L1a v2 placement cannot claim qualification")
+    _text(record["reason_class"], "placement.verdict.reason_class")
+    if record["reason_class"] not in {"mismatch", "not-sampled", "refused"}:
+        raise ManifestRefusal("malformed-record", "L1a placement verdict reason class is invalid")
+    _text(record["reason"], "placement.verdict.reason")
+    _text(record["science_acceptance"], "placement.verdict.science_acceptance")
+    if record["science_acceptance"] not in {"accepted", "not-accepted"}:
+        raise ManifestRefusal("malformed-record", "placement.verdict.science_acceptance is invalid")
+    if type(record["warning"]) is not str:
+        raise ManifestRefusal("malformed-record", "placement.verdict.warning must be text")
+    if record["device"] != "unavailable":
+        raise ManifestRefusal("malformed-record", "L1a device verdict must be unavailable")
+    expected_acceptance = "accepted" if record["reason_class"] == "not-sampled" else "not-accepted"
+    if record["science_acceptance"] != expected_acceptance:
+        raise ManifestRefusal("malformed-record", "placement verdict science acceptance contradicts reason class")
+    if declared["devices"]:
+        if not record["warning"]:
+            raise ManifestRefusal("unqualified-placement-not-loud", "declared GPU placement requires a loud warning")
+        if record["reason_class"] == "not-sampled" and "GPU PLACEMENT NOT-SAMPLED" not in record["warning"]:
+            raise ManifestRefusal("unqualified-placement-not-loud", "not-sampled placement warning is not loud")
+        if record["reason_class"] == "mismatch" and "GPU PLACEMENT UNQUALIFIED" not in record["warning"]:
+            raise ManifestRefusal("unqualified-placement-not-loud", "mismatched placement warning is not loud")
+        if record["reason_class"] == "refused" and not any(
+            phrase in record["warning"]
+            for phrase in ("GPU PLACEMENT REFUSED", "GPU PLACEMENT UNQUALIFIED")
+        ):
+            raise ManifestRefusal("unqualified-placement-not-loud", "refused placement warning is not loud")
+    return record
+
+
 def _placement_receipt(value: Any, attempt: Mapping[str, Any], start: Mapping[str, Any], group_digest: str) -> dict[str, Any]:
-    """Decode the optional v2 placement receipt with closed nested schemas."""
+    """Decode an optional v1/v2 placement receipt with closed schemas."""
+
+    _validate_json(value)
+    schema = value.get("schema") if isinstance(value, dict) else None
+    if schema == SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2:
+        record = dict(_fields(
+            value,
+            {
+                "schema", "task_id", "attempt_id", "group_digest", "allocation_id",
+                "backend_job_id", "slot_id", "payload_digest", "output_dir", "child",
+                "declared", "gpu", "comparison", "refusal", "host_mapping", "verdict",
+            },
+            "placement receipt v2",
+        ))
+        base = dict(record)
+        base.pop("host_mapping")
+        base.pop("verdict")
+        base["schema"] = SCIENCE_PLACEMENT_RECEIPT_SCHEMA
+        base = _placement_receipt(base, attempt, start, group_digest)
+        record["child"] = base["child"]
+        record["declared"] = base["declared"]
+        record["gpu"] = base["gpu"]
+        record["comparison"] = base["comparison"]
+        record["refusal"] = base["refusal"]
+        record["host_mapping"] = _placement_v2_host_mapping(record["host_mapping"])
+        record["verdict"] = _placement_v2_verdict(record["verdict"], record["declared"])
+        if (
+            record["gpu"]["status"] != "unavailable"
+            or record["gpu"]["reason"] != "not-sampled"
+            or record["gpu"]["method"] != "not-sampled"
+        ):
+            raise ManifestRefusal("malformed-record", "L1a v2 GPU evidence must be unavailable/not-sampled")
+        if record["gpu"]["samples"] or record["gpu"]["active_uuids"] or record["gpu"]["active_pci"]:
+            raise ManifestRefusal("malformed-record", "L1a v2 GPU evidence must not contain samples")
+        if record["refusal"] is None:
+            for device in record["declared"]["devices"]:
+                _gpu_uuid(device, "placement.declared.devices")
+        if record["host_mapping"]["slot_id"] != record["slot_id"]:
+            raise ManifestRefusal("malformed-record", "host mapping slot_id disagrees with the base receipt")
+        if record["host_mapping"]["status"] != record["verdict"]["host"]:
+            raise ManifestRefusal("malformed-record", "host mapping disagrees with placement verdict")
+        host_comparison = record["comparison"]["host"]
+        host_status = record["verdict"]["host"]
+        if host_comparison != host_status and not (host_status == "unavailable" and host_comparison == "refused"):
+            raise ManifestRefusal("malformed-record", "placement comparison disagrees with placement verdict")
+        if record["comparison"]["device"] != record["verdict"]["device"]:
+            raise ManifestRefusal("malformed-record", "placement comparison disagrees with placement verdict")
+
+        child_host = _receipt_host_key(record["child"]["host"], "placement.child.host")
+        declared_host = _receipt_host_key(record["declared"]["host"], "placement.declared.host")
+        affinity_matches = bool(record["child"]["affinity"]) and (
+            tuple(sorted(record["child"]["affinity"])) == tuple(sorted(record["declared"]["cpus"]))
+        )
+        if host_status == "unavailable":
+            derived_host_status = "unavailable"
+            if host_comparison not in {"unavailable", "refused"}:
+                raise ManifestRefusal("malformed-record", "unavailable host map contradicts base host comparison")
+        else:
+            mapped_host = _receipt_host_key(record["host_mapping"]["host"], "placement.host_mapping.host")
+            if declared_host != mapped_host:
+                raise ManifestRefusal("malformed-record", "declared host differs from physical scheduler host")
+            derived_host_status = "matched" if child_host == mapped_host else "mismatch"
+            if host_status != derived_host_status or host_comparison != derived_host_status:
+                raise ManifestRefusal("malformed-record", "host mapping contradicts child host evidence")
+        derived_affinity_status = "matched" if affinity_matches else (
+            "mismatch" if record["child"]["affinity"] else "unavailable"
+        )
+        if record["refusal"] is None and record["comparison"]["affinity"] != derived_affinity_status:
+            raise ManifestRefusal("malformed-record", "affinity comparison is not derived from child evidence")
+        if record["refusal"] is not None and record["comparison"]["affinity"] not in {
+            derived_affinity_status, "refused"
+        }:
+            raise ManifestRefusal("malformed-record", "refused affinity comparison contradicts child evidence")
+        has_postlaunch_mismatch = derived_host_status == "mismatch" or derived_affinity_status == "mismatch"
+        expected_reason_class = "mismatch" if has_postlaunch_mismatch else ("refused" if record["refusal"] is not None else "not-sampled")
+        if record["verdict"]["reason_class"] != expected_reason_class:
+            raise ManifestRefusal("malformed-record", "placement verdict does not preserve mismatch/refusal precedence")
+        if expected_reason_class == "not-sampled":
+            if (
+                record["refusal"] is not None
+                or host_status != "matched"
+                or derived_host_status != "matched"
+                or host_comparison != "matched"
+                or derived_affinity_status != "matched"
+            ):
+                raise ManifestRefusal("malformed-record", "not-sampled verdict requires matching mapped host and affinity evidence")
+        elif expected_reason_class == "mismatch":
+            if not has_postlaunch_mismatch or record["refusal"] is None:
+                raise ManifestRefusal("malformed-record", "mismatch verdict requires post-launch mismatch evidence")
+        elif expected_reason_class == "refused":
+            if record["refusal"] is None or has_postlaunch_mismatch or host_status != "unavailable":
+                raise ManifestRefusal("malformed-record", "refused verdict requires a prelaunch refusal")
+        return record
 
     record = dict(_fields(
         value,
@@ -389,7 +604,7 @@ def _segment(value: Any) -> dict[str, Any]:
     return record
 
 
-def _manifest(path: Path) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+def _manifest(path: Path) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], dict[str, Any] | None]:
     value = _load_json(path)
     schema = value.get("schema")
     if schema == RUN_MANIFEST_V1:
@@ -400,8 +615,20 @@ def _manifest(path: Path) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], t
         if isinstance(value["segments"], (str, bytes, bytearray)) or not isinstance(value["segments"], list):
             raise ManifestRefusal("malformed-record", "manifest segments must be a sequence")
         raw_segments = tuple(_segment(item) for item in value["segments"])
+        placement_verdict = None
+    elif schema == RUN_MANIFEST_V3:
+        _fields(value, {"schema", "group_id", "group_digest", "attempts", "segments", "placement_verdict"}, "run manifest")
+        if isinstance(value["segments"], (str, bytes, bytearray)) or not isinstance(value["segments"], list):
+            raise ManifestRefusal("malformed-record", "manifest segments must be a sequence")
+        raw_segments = tuple(_segment(item) for item in value["segments"])
+        _validate_json(value["placement_verdict"], "manifest.placement_verdict")
+        if not isinstance(value["placement_verdict"], dict):
+            raise ManifestRefusal("malformed-record", "manifest placement verdict must be an object")
+        placement_verdict = dict(value["placement_verdict"])
     else:
         raise ManifestRefusal("unknown-schema", f"unsupported run manifest schema {schema!r}")
+    if schema == RUN_MANIFEST_V1:
+        placement_verdict = None
     _text(value["group_id"], "manifest.group_id")
     _sha256(value["group_digest"], "manifest.group_digest")
     if isinstance(value["attempts"], (str, bytes, bytearray)) or not isinstance(value["attempts"], list):
@@ -417,7 +644,82 @@ def _manifest(path: Path) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], t
             raise ManifestRefusal("group-digest-mismatch", "outcome receipt group_digest differs from manifest")
     if len({item["attempt_id"] for item in attempts}) != len(attempts):
         raise ManifestRefusal("duplicate-attempt", "manifest contains duplicate attempt identities")
-    return dict(value), attempts, raw_segments
+    actual_blocking = {
+        (
+            attempt["task_id"],
+            attempt["attempt_id"],
+            attempt["placement_receipt"]["verdict"]["reason_class"],
+            attempt["placement_receipt"]["verdict"]["reason"],
+        )
+        for attempt in attempts
+        if attempt["placement_receipt"] is not None
+        and attempt["placement_receipt"]["schema"] == SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2
+        and attempt["placement_receipt"]["declared"]["devices"]
+        and attempt["placement_receipt"]["verdict"]["reason_class"] in {"mismatch", "refused"}
+    }
+    actual_not_sampled = {
+        (
+            attempt["task_id"],
+            attempt["attempt_id"],
+            attempt["placement_receipt"]["verdict"]["reason_class"],
+            attempt["placement_receipt"]["verdict"]["reason"],
+        )
+        for attempt in attempts
+        if attempt["placement_receipt"] is not None
+        and attempt["placement_receipt"]["schema"] == SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2
+        and attempt["placement_receipt"]["declared"]["devices"]
+        and attempt["placement_receipt"]["verdict"]["reason_class"] == "not-sampled"
+    }
+    if schema in {RUN_MANIFEST_V1, RUN_MANIFEST_V2} and (actual_blocking or actual_not_sampled):
+        raise ManifestRefusal("placement-verdict-missing", "v2 placement evidence must not hide its manifest verdict")
+    if schema == RUN_MANIFEST_V3:
+        has_blocking = bool(actual_blocking)
+        expected_keys = {"status", "science_acceptance", "message", "unqualified_gpu_segments"}
+        expected_status = "unqualified"
+        expected_acceptance = "not-accepted"
+        expected_message = "GPU PLACEMENT UNQUALIFIED: placement mismatch/refusal requires science review."
+        if not has_blocking:
+            expected_keys = {"status", "science_acceptance", "message", "not_sampled_gpu_segments"}
+            expected_status = "not-sampled"
+            expected_acceptance = "accepted"
+            expected_message = "GPU PLACEMENT NOT-SAMPLED: L1a intentionally does not sample devices; H-v2 performs its own delivered-GPU check."
+        elif actual_not_sampled:
+            expected_keys.add("not_sampled_gpu_segments")
+        if set(placement_verdict) != expected_keys:
+            raise ManifestRefusal("malformed-record", "manifest placement verdict keys differ")
+        if placement_verdict["status"] != expected_status or placement_verdict["science_acceptance"] != expected_acceptance:
+            raise ManifestRefusal("malformed-record", "manifest placement verdict status disagrees with v2 receipts")
+        _text(placement_verdict["message"], "manifest.placement_verdict.message")
+        if placement_verdict["message"] != expected_message:
+            raise ManifestRefusal("unqualified-placement-not-loud", "manifest placement verdict must be loud")
+
+        def _entries(value: Any, name: str, allowed: set[str]) -> set[tuple[str, str, str, str]]:
+            if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, list):
+                raise ManifestRefusal("malformed-record", f"{name} must be a sequence")
+            result: set[tuple[str, str, str, str]] = set()
+            for item in value:
+                entry = dict(_fields(item, {"task_id", "attempt_id", "reason_class", "reason"}, name))
+                for key in entry:
+                    _text(entry[key], f"{name}.{key}")
+                if entry["reason_class"] not in allowed:
+                    raise ManifestRefusal("malformed-record", f"{name} reason class is invalid")
+                result.add((entry["task_id"], entry["attempt_id"], entry["reason_class"], entry["reason"]))
+            if len(result) != len(value):
+                raise ManifestRefusal("malformed-record", f"{name} contains duplicate entries")
+            return result
+
+        if has_blocking:
+            advertised_blocking = _entries(placement_verdict["unqualified_gpu_segments"], "manifest unqualified GPU segment", {"mismatch", "refused"})
+        else:
+            advertised_blocking = set()
+        advertised_not_sampled = (
+            _entries(placement_verdict["not_sampled_gpu_segments"], "manifest not-sampled GPU segment", {"not-sampled"})
+            if actual_not_sampled
+            else set()
+        )
+        if advertised_blocking != actual_blocking or advertised_not_sampled != actual_not_sampled:
+            raise ManifestRefusal("placement-verdict-mismatch", "manifest placement verdict disagrees with v2 receipts")
+    return dict(value), attempts, raw_segments, placement_verdict
 
 
 def _check_segments(attempts: tuple[dict[str, Any], ...], segments: tuple[dict[str, Any], ...]) -> None:
@@ -508,7 +810,7 @@ def read(
     """
 
     path = Path(manifest_path)
-    _, attempts, segments = _manifest(path)
+    _, attempts, segments, placement_verdict = _manifest(path)
     _check_segments(attempts, segments)
     inspector = inspect_run or _default_inspect_run
     selected_ids = {segment["attempt_id"] for segment in segments}
@@ -561,7 +863,8 @@ def read(
         for attempt in attempts
         if attempt["attempt_id"] not in selected_ids
     )
-    return ResultSet(tuple(chains), preserved)
+    frozen_placement_verdict = None if placement_verdict is None else _freeze_json(placement_verdict)
+    return ResultSet(tuple(chains), preserved, frozen_placement_verdict)
 
 
 __all__ = [
@@ -573,7 +876,9 @@ __all__ = [
     "PreservedAttempt",
     "RUN_MANIFEST_V1",
     "RUN_MANIFEST_V2",
+    "RUN_MANIFEST_V3",
     "SCIENCE_PLACEMENT_RECEIPT_SCHEMA",
+    "SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2",
     "ResultSet",
     "read",
 ]
