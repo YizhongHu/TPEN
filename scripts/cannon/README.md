@@ -53,6 +53,19 @@ equality (e.g. comparing two calls of the mutated function to each other) will
 survive under typeguard-on too; that is a test-coverage gap, not a runner
 defect, and is out of this runner's scope to fix.
 
+A small number of tests assert a bare `TypeCheckError` with no
+manual-validation fallback (e.g.
+`tests/unit/nn/test_readout.py::test_pfaffian_readout_rejects_malformed_kernel_inputs`)
+and are marked `@pytest.mark.requires_typeguard`. `tests/conftest.py` skips
+these whenever typeguard is not instrumenting `tpen` — which is always true in
+quick mode's `--typecheck off` — so they are never silently reported as a
+baseline failure or a false SURVIVED/HARNESS_ERROR. **Quick mode does not
+exercise these tests; only the full suite (type checking on) does.** The
+one-line summary reports the skip count explicitly as
+`typeguard_skipped=N`; a nonzero count is the documented gap, not a defect.
+
+
+
 Write-destination containment (RUN_ROOT, WORK_ROOT, SHARED_ENV_ROOT, and every
 path passed through `assert_write_path`) is checked against canonicalized
 roots (`realpath -m`, resolving `..`, `.`, duplicate slashes, and symlinks of
@@ -61,7 +74,18 @@ outside the facility prefix is rejected rather than silently satisfied by a
 raw-string prefix match.
 
 Run `scripts/cannon/selftest.sh` to exercise these guarantees locally with
-bash/stdlib only — no Slurm, no pytest, no cluster access.
+bash/stdlib only — no Slurm, no pytest, no cluster access. Unlike `verify.sh`
+(which clones its own exact-SHA tree), `selftest.sh` reads the repo it is
+physically sitting inside to find the `*_EXECUTOR_PYTHON`/`*_ROOT_PYTHON`
+test family, so it must be run from inside a full repo checkout (a git clone,
+or a `git archive`/`git worktree` extraction at the exact head) with
+`scripts/cannon/selftest.sh` at its normal repo-relative depth — **not** a
+bare file-level stage of just the `scripts/cannon/*` files. Staging only those
+files at the same depth elsewhere (e.g. directly under a shared directory)
+makes `../..` resolve outside the repo entirely; `selftest.sh` now asserts the
+resolved root looks like a real `tpen` checkout (`pyproject.toml` with
+`name = "tpen"`) and fails loudly instead of silently reporting an empty,
+vacuously-passing F3 section.
 
 Use --mode measure --full-suite to record targeted type-checking/parallelism
 combinations plus one full-suite timing in the evidence root. All evidence is

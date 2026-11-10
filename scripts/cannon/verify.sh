@@ -224,6 +224,13 @@ purge_pycache() { assert_write_path "$CLONE"; find "$CLONE" -type d -name __pyca
 if [[ "$MODE" == quick ]]; then
   purge_pycache
   baseline_rc=0; run_pytest baseline "$TYPECHECK" "$PARALLEL" targeted "${TEST_PATHS[@]}" || baseline_rc=$?
+  # requires_typeguard tests assert a bare TypeCheckError with no manual
+  # fallback; tests/conftest.py skips them whenever typeguard is not
+  # instrumenting tpen (including this mode's --typecheck off), so the quick
+  # check never silently drops their signal without naming the gap here.
+  typeguard_skipped=0
+  baseline_junit="$RUN_ROOT/evidence/baseline.junit.xml"
+  [[ -f "$baseline_junit" ]] && typeguard_skipped="$(grep -c 'requires_typeguard' "$baseline_junit" || true)"
   mutant_fail=0 killed_count=0 survived_count=0 harness_error_count=0
   if [[ -n "$MUTANT_SPEC" ]]; then
     spec_json="$($PYTHON "$MUTANT_HELPER" validate --spec "$MUTANT_SPEC")"
@@ -270,8 +277,9 @@ if [[ "$MODE" == quick ]]; then
     done
   fi
   result=PASS; [[ "$baseline_rc" == 0 && "$mutant_fail" == 0 ]] || result=FAIL
-  printf '%s baseline_rc=%s mutants=%s killed=%s survived=%s harness_error=%s sha=%s statuses=%s\n' \
-    "$result" "$baseline_rc" "${#MUTANT_IDS[@]}" "$killed_count" "$survived_count" "$harness_error_count" "$HEAD_SHA" "${MUTANT_STATUS[*]:-none}"
+  printf '%s baseline_rc=%s mutants=%s killed=%s survived=%s harness_error=%s typeguard_skipped=%s sha=%s statuses=%s\n' \
+    "$result" "$baseline_rc" "${#MUTANT_IDS[@]}" "$killed_count" "$survived_count" "$harness_error_count" \
+    "$typeguard_skipped" "$HEAD_SHA" "${MUTANT_STATUS[*]:-none}"
   [[ "$result" == PASS ]]
   exit
 fi

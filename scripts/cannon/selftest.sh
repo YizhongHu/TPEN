@@ -99,7 +99,18 @@ PY
 "$PYTHON" "$WORK/f4probe.py" "$F4" "$SCRIPT_DIR"
 
 echo "== F3: *_EXECUTOR_PYTHON / *_ROOT_PYTHON discovery matches the real test family =="
+# This file must sit at <repo>/scripts/cannon/selftest.sh for this to resolve
+# correctly: a bare file-level stage of scripts/cannon/* (not a full repo
+# checkout) puts "../.." somewhere else entirely -- e.g. straight into a
+# shared parent directory full of unrelated lanes' work -- and the grep below
+# would silently scan the wrong tree and report a false PASS with zero
+# matches. Assert the repo root looks like a real tpen checkout before
+# trusting it, instead of letting an empty/wrong grep pass silently.
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
+if [[ ! -f "$REPO_ROOT/pyproject.toml" ]] || ! grep -q '^name = "tpen"' "$REPO_ROOT/pyproject.toml" 2>/dev/null; then
+  echo "FAIL: REPO_ROOT ($REPO_ROOT) does not look like a tpen checkout -- selftest.sh must be run from inside a full repo checkout (e.g. a git clone or git-archive extraction at the exact head), not a bare stage of scripts/cannon/* alone" >&2
+  exit 1
+fi
 found="$(grep -rhoE '[A-Z][A-Z0-9_]*_(EXECUTOR|ROOT)_PYTHON' "$REPO_ROOT" --include='*.py' 2>/dev/null | sort -u)"
 for expect in P8_EXECUTOR_PYTHON P9C_EXECUTOR_PYTHON P9C_ROOT_PYTHON P10_ROOT_PYTHON H_V2_EXECUTOR_PYTHON; do
   if grep -qx "$expect" <<< "$found"; then

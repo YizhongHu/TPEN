@@ -321,6 +321,7 @@ def test_pfaffian_readout_does_not_own_harmonic_confinement() -> None:
         PfaffianReadout(envelope=object(), channels=1)  # type: ignore[call-arg]
 
 
+@pytest.mark.requires_typeguard
 def test_pfaffian_readout_rejects_malformed_kernel_inputs() -> None:
     readout = PfaffianReadout(pair_channels=2)
     malformed_pair = BlockContainer([zero_block(dtype=torch.float64), torch.empty(1, 0, 3), torch.zeros(1, 1, 3)])
