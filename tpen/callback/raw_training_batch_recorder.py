@@ -20,6 +20,7 @@ import numpy as np
 from omegaconf import OmegaConf
 
 from tpen.artifacts import RunContext
+from tpen.checkpoint import CheckpointRestored
 from tpen.events import DomainState
 from tpen.events import Event as TypedEvent
 from tpen.events import Occurrence, Subscription
@@ -504,6 +505,11 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
     readers verify that digest before trusting sidecar provenance or bundle
     digests.  Because partition plans are deterministic, this recorder only
     accepts the full cadence (``probability=1`` and ``max_calls=None``).
+
+    A restored ``train_resume`` lineage is refused before capture or file
+    publication. Full recorder resume semantics are deferred to item
+    ``7eaf9e0c``; accepting a resumed callback here would risk appending a
+    history whose lineage cannot be proven.
     """
 
     state_type: ClassVar[type[DomainState]] = TrainerState
@@ -516,16 +522,36 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
             raise ValueError("RawTrainingBatchRecorder requires max_calls=None")
         if partition_size_steps < 1:
             raise ValueError("partition_size_steps must be positive")
-        super().__init__(typed_groups=(SubscriptionGroup(selectors=(Subscription.of(TrainingIterationCompleted), Subscription.of(TrainingCompleted))),), **kwargs)
+        super().__init__(typed_groups=(
+            SubscriptionGroup(
+                selectors=(Subscription.of(TrainingIterationCompleted), Subscription.of(TrainingCompleted))
+            ),
+            SubscriptionGroup(selectors=(Subscription.of(CheckpointRestored),), stateless=True),
+        ), **kwargs)
         self.path = Path(path)
         self.partition_size_steps = int(partition_size_steps)
         self._steps = StepCadenceGate(cadence)
         self._partition: TrainingBatchPartitionWriter | None = None
         self.last_measurement: dict[str, Any] | None = None
+        self._restored = False
+
+    def handle_stateless_occurrence_impl(
+        self, occurrence: Occurrence[TypedEvent], context: RunContext
+    ) -> None:
+        """Record that this callback's lineage was restored, not fresh."""
+
+        del context
+        if isinstance(occurrence.event, CheckpointRestored):
+            self._restored = True
 
     def handle_occurrence_impl(self, occurrence: Occurrence[TypedEvent], context: RunContext, state: TrainerState) -> None:
         """Capture the state produced by the pre-update model at a scheduled step."""
 
+        if self._restored:
+            raise ValueError(
+                "RawTrainingBatchRecorder refuses restored lineage before capture "
+                "or publication [unsupported-callback]"
+            )
         event = occurrence.event
         if isinstance(event, TrainingCompleted):
             self._publish(context, final=True)
@@ -597,7 +623,17 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
     def close(self, context: RunContext) -> None:
         """Publish a complete open partition at an explicit run boundary."""
 
+        if self._restored:
+            raise ValueError(
+                "RawTrainingBatchRecorder refuses restored lineage before capture "
+                "or publication [unsupported-callback]"
+            )
         self._publish(context, final=True)
+
+    def _reset_typed_state(self) -> None:
+        """Forget restore provenance when a new run context is delivered."""
+
+        self._restored = False
 
 
 TrainingBatchRecorder = RawTrainingBatchRecorder

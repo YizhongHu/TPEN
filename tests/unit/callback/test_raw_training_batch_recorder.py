@@ -21,6 +21,8 @@ from tpen.callback.raw_training_batch_recorder import (
     TrainingBatchRecord,
 )
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
+from tpen.checkpoint import CheckpointRestored
+from tpen.checkpoint.restore import RestoreReport
 from tpen.events import Occurrence
 from tpen.training.events import TrainingCompleted, TrainingIteration, TrainingIterationCompleted
 from tpen.training.state import TrainerState
@@ -73,6 +75,72 @@ def _publish_valid(root: Path) -> None:
     writer = TrainingBatchPartitionWriter(root, partition_index=0, planned_steps=[0])
     writer.append(_record(0))
     writer.publish()
+
+
+def _restored() -> Occurrence[CheckpointRestored]:
+    return Occurrence(
+        CheckpointRestored(
+            RestoreReport(
+                mode="train_resume",
+                checkpoint_dir="/source/checkpoint",
+                next_iteration=1,
+                completed_updates=1,
+                loaded_model=True,
+                loaded_optimizer=True,
+                loaded_trainer=True,
+                loaded_sampler=True,
+                loaded_rng=True,
+            )
+        ),
+        1,
+    )
+
+
+def test_refuses_restored_lineage_before_capture_or_file_write(tmp_path: Path) -> None:
+    """A train-resume report refuses the recorder before any history write."""
+
+    history_root = tmp_path / "training-history"
+    callback = RawTrainingBatchRecorder(history_root, partition_size_steps=1, every_n_steps=1)
+    context = _run_context(tmp_path)
+    callback.handle_occurrence(_restored(), context, None)
+
+    with pytest.raises(ValueError, match=r"unsupported-callback"):
+        callback.handle_occurrence(
+            Occurrence(TrainingIterationCompleted(TrainingIteration(0)), 1),
+            context,
+            TrainerState(
+                trainer=SimpleNamespace(completed_updates=0),
+                batch=ElectronBatch(torch.tensor([[[0.0, 1.0, 2.0]]])),
+                local_energy=torch.tensor([1.0]),
+                local_energy_terms={"kinetic": torch.tensor([1.0])},
+                wavefunction_output=WavefunctionOutput(torch.tensor([0.0]), torch.ones(1)),
+                optimizer_step=False,
+            ),
+        )
+    assert not history_root.exists()
+
+
+def test_fresh_recorder_history_remains_reader_compatible(tmp_path: Path) -> None:
+    """A fresh recorder still publishes a history consumed by its reader."""
+
+    history_root = tmp_path / "training-history"
+    callback = RawTrainingBatchRecorder(history_root, partition_size_steps=1, every_n_steps=1)
+    context = _run_context(tmp_path)
+    state = TrainerState(
+        trainer=SimpleNamespace(completed_updates=0),
+        batch=ElectronBatch(torch.tensor([[[0.0, 1.0, 2.0]]])),
+        local_energy=torch.tensor([1.0]),
+        local_energy_terms={"kinetic": torch.tensor([1.0])},
+        wavefunction_output=WavefunctionOutput(torch.tensor([0.0]), torch.ones(1)),
+        optimizer_step=False,
+    )
+    callback.handle_occurrence(
+        Occurrence(TrainingIterationCompleted(TrainingIteration(0)), 1), context, state
+    )
+    callback.handle_occurrence(Occurrence(TrainingCompleted(), 1), context, state)
+
+    TrainingBatchReader(history_root).validate()
+    assert TrainingBatchReader(history_root).read()["iteration_step"].tolist() == [0]
 
 
 def test_reader_consumes_real_training_loop_output(tmp_path: Path) -> None:
