@@ -14,6 +14,15 @@ M8
 M9
     Dropped: ``final_verdict2.py`` is not present in this repository.  There
     is no source mutant or root-suite killer for it.
+
+L1b (S2b-2 sampler layer)
+    The L1b shim samples every declared-GPU v2 child, so the real ``matched``
+    mode now yields a v3 ``qualified`` receipt.  The L1a v2 backward read is
+    proven on untouched L1a producer bytes in ``test_run_results_l1b.py``.
+    ``test_l1b_real_producer_outcomes_cross_p8_reader`` drives every v3
+    outcome through the real CLI dispatch/store with deterministic fake
+    ``nvidia-smi`` modes, and ``test_l1b_executor_and_p8_refuse_identical_tampers``
+    feeds the same tampered bytes to both decoders.
 """
 
 from __future__ import annotations
@@ -29,7 +38,12 @@ from omegaconf import OmegaConf
 import pytest
 
 from experiments.toolkit.config_identity import expected_resolved_config_identity
-from experiments.toolkit.run_results import ManifestRefusal, read
+from experiments.toolkit.run_results import (
+    PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE,
+    PLACEMENT_UNQUALIFIED_MESSAGE,
+    ManifestRefusal,
+    read,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -143,7 +157,8 @@ print(Path(sys.argv[1], "evidence.json").read_text(encoding="utf-8"))
         config.write_text(config_text, encoding="utf-8")
         group = ReadyGroup("l2-consumer", (TaskSpec("task-a", "task-a", ProgramSpecRef({}, digest({})), digest("task-a"), 1, "steps"),), digest("l2-consumer"))
         cpu = min(getattr(os, "sched_getaffinity", lambda _pid: {0})(0))
-        slot = AllocationSlot("logical-slot", "logical-label", ("GPU-12345678-1234-1234-1234-123456789ABC",), (cpu,), (), ()).to_dict()
+        devices = {"cpu-not-sampled": (), "gpu-unresolved": ("GPU-12345678-1234-1234-1234-123456789ABC", "GPU-12345678-1234-1234-1234-123456789ABE")}.get(mode, ("GPU-12345678-1234-1234-1234-123456789ABC",))
+        slot = AllocationSlot("logical-slot", "logical-label", devices, (cpu,), (), ()).to_dict()
         allocation = ConfiguredAllocation(
             AllocationId("allocation-a"), BackendJobId("job-a"),
             {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot]},
@@ -212,8 +227,20 @@ def _run_real_producer(tmp_path: Path, mode: str) -> Path:
     fake.chmod(0o755)
     root = tmp_path / mode
     env = dict(os.environ, PYTHONPATH=str(ROOT / "executor" / "src"))
-    if mode == "unavailable":
+    if mode in {"unavailable", "gpu-telemetry-failed"}:
         fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        fake.chmod(0o755)
+    elif mode in L1B_FAKE_ROWS:
+        # Deterministic shell fake: $PPID is the science child that runs the sampler.
+        fake.write_text(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  --version) echo 'NVIDIA-SMI consumer-test' ;;\n"
+            f"  --query-gpu=*) printf '%s, 0000:00:01.0\\n%s, 0000:00:02.0\\n' {GPU_A} {GPU_B} ;;\n"
+            f"  *) echo {L1B_FAKE_ROWS[mode]} ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
         fake.chmod(0o755)
     # Identity is computed here, in the root core environment, because the
     # stub ``tpen`` package shadows core inside the executor-side child.
@@ -226,6 +253,18 @@ def _run_real_producer(tmp_path: Path, mode: str) -> Path:
     return Path(marker.removeprefix("MANIFEST="))
 
 
+GPU_A = "GPU-12345678-1234-1234-1234-123456789ABC"
+GPU_B = "GPU-12345678-1234-1234-1234-123456789ABD"
+# Process-row output of each L1b fake mode; the sampler's parent is the child.
+L1B_FAKE_ROWS = {
+    "gpu-matched": f'"$PPID, {GPU_A}"',
+    "gpu-out-of-entitlement": f'"$PPID, {GPU_B}"',
+    "gpu-no-row": f'"999999, {GPU_A}"',
+    "gpu-unresolved": f'"$PPID, {GPU_A}"',
+    "cpu-not-sampled": f'"$PPID, {GPU_A}"',
+}
+
+
 def _reader_inspector(manifest: dict[str, object]):
     checkpoint = manifest["segments"][0]["checkpoint_dir"]
     identity = _consumer_identity()
@@ -233,14 +272,19 @@ def _reader_inspector(manifest: dict[str, object]):
 
 
 def test_l2_real_executor_producer_to_p8_reader_contract(tmp_path: Path) -> None:
-    """M7-M8: real dispatch output crosses P8 for all L1a verdict classes."""
+    """M7-M8: real dispatch output crosses P8 for host-map and refusal classes.
+
+    With L1b the declared-GPU ``matched`` child is sampled, so it is a v3
+    qualified receipt; refusals keep the unchanged v2 refusal receipt.
+    """
 
     matched_path = _run_real_producer(tmp_path, "matched")
     matched_manifest = json.loads(matched_path.read_text(encoding="utf-8"))
     matched = read(matched_path, _reader_inspector(matched_manifest))
     assert matched.chains[0].segments[0].resolved_config_identity == _consumer_identity()
-    assert matched.chains[0].segments[0].placement_receipt["verdict"]["qualification"] == "unqualified"
-    assert matched.chains[0].segments[0].placement_receipt["verdict"]["reason_class"] == "not-sampled"
+    assert matched.chains[0].segments[0].placement_receipt["schema"] == "tpen-executor/science-placement-receipt-v3"
+    assert matched.chains[0].segments[0].placement_receipt["verdict"]["qualification"] == "qualified"
+    assert matched.chains[0].segments[0].placement_receipt["verdict"]["reason_class"] == "qualified"
     assert not matched.placement_unqualified
 
     for mode, reason_class in (("mismatch", "mismatch"), ("unavailable", "refused"), ("refused", "refused")):
@@ -267,3 +311,98 @@ def test_l2_real_executor_producer_to_p8_reader_contract(tmp_path: Path) -> None
     v1 = ROOT / "experiments" / "toolkit" / "fixtures" / "run-manifest-v1.json"
     backward = read(v1, lambda _: pytest.fail("v1 backward read must not inspect an empty chain"))
     assert backward.chains == ()
+
+
+L1B_OUTCOMES = {
+    # mode: (reason_class, gpu.reason, science_acceptance, manifest message or None)
+    "gpu-matched": ("qualified", "matched", "accepted", None),
+    "gpu-out-of-entitlement": ("mismatch", "out-of-entitlement", "not-accepted", PLACEMENT_UNQUALIFIED_MESSAGE),
+    "gpu-telemetry-failed": ("telemetry-failed", "sampler-failed", "not-accepted", PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE),
+    "gpu-no-row": ("telemetry-failed", "no-exact-pid-row", "not-accepted", PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE),
+    "gpu-unresolved": ("telemetry-failed", "entitlement-unresolved", "not-accepted", PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE),
+    "cpu-not-sampled": ("not-sampled", "cpu-only", "accepted", None),
+}
+
+
+def test_l1b_real_producer_outcomes_cross_p8_reader(tmp_path: Path) -> None:
+    """F7: real CLI dispatch/store output for every v3 outcome crosses P8.
+
+    Every L1b outcome is post-launch evidence: the producer asserts dispatch
+    rc 0, and P8 must see the accepted segment, the typed verdict, the
+    preserved samples, and the exact manifest message.
+    """
+
+    for mode, (reason_class, code, acceptance, message) in L1B_OUTCOMES.items():
+        path = _run_real_producer(tmp_path, mode)
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        result = read(path, _reader_inspector(manifest))
+        assert result.chains, mode
+        receipt = result.chains[0].segments[0].placement_receipt
+        sampler = receipt["gpu_sampler"]
+        assert receipt["schema"] == "tpen-executor/science-placement-receipt-v3", mode
+        assert receipt["verdict"]["reason_class"] == reason_class, (mode, receipt["verdict"], sampler["failure"])
+        assert receipt["gpu"]["reason"] == code, mode
+        assert receipt["verdict"]["science_acceptance"] == acceptance, mode
+        if mode == "cpu-not-sampled":
+            assert sampler["attempted"] is False and sampler["count"] == 0, mode
+        elif mode == "gpu-telemetry-failed":
+            assert sampler["attempted"] is True and sampler["failure"]["code"] == "command-failed", mode
+        else:
+            assert sampler["reason"] == "observed" and sampler["quiescent"] is True, mode
+            assert sampler["survivors"] == [] and sampler["count"] >= 1, mode
+            child_rows = {row["pid"] for sample in sampler["samples"] for row in sample["pid_rows"]}
+            assert child_rows == ({999999} if mode == "gpu-no-row" else {receipt["child"]["pid"]}), mode
+        if mode == "gpu-out-of-entitlement":
+            assert receipt["gpu"]["active_uuids"] == (GPU_B,), mode
+        if message is None:
+            assert result.placement_verdict is None and not result.placement_unqualified, mode
+        else:
+            assert result.placement_unqualified, mode
+            assert result.placement_verdict["message"] == message, mode
+
+
+def test_l1b_executor_and_p8_refuse_identical_tampers(tmp_path: Path) -> None:
+    """F5: the executor decoder and P8 agree on every sampler contradiction.
+
+    The same tampered manifest bytes are decoded by the real executor
+    ``RunManifest`` (in the executor interpreter) and by P8 here.
+    """
+
+    executor_python = _executor_python()
+    from experiments.toolkit.test_run_results_l1b import P8_CONTRADICTIONS
+
+    baseline = json.loads((ROOT / "experiments" / "toolkit" / "fixtures" / "run-manifests-v3-sampler.json").read_text(encoding="utf-8"))["matched"]
+    cases = {"baseline": baseline}
+    for name, mutate in P8_CONTRADICTIONS.items():
+        tampered = copy.deepcopy(baseline)
+        mutate(tampered["attempts"][0]["placement_receipt"])
+        cases[name] = tampered
+    paths = {}
+    for name, manifest in cases.items():
+        paths[name] = tmp_path / f"{name}.json"
+        paths[name].write_text(json.dumps(manifest), encoding="utf-8")
+    probe = (
+        "import json, sys\n"
+        "from tpen_executor.results import RunManifest\n"
+        "verdicts = {}\n"
+        "for path in sys.argv[1:]:\n"
+        "    try:\n"
+        "        RunManifest.decode(open(path, encoding='utf-8').read()); verdicts[path] = 'accept'\n"
+        "    except (TypeError, ValueError):\n"
+        "        verdicts[path] = 'reject'\n"
+        "print(json.dumps(verdicts))\n"
+    )
+    result = subprocess.run(
+        [executor_python, "-c", probe, *map(str, paths.values())], cwd=ROOT / "executor",
+        env=dict(os.environ, PYTHONPATH=str(ROOT / "executor" / "src")), capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    executor_verdicts = json.loads(result.stdout)
+    for name, path in paths.items():
+        try:
+            read(path, lambda _: pytest.fail("attempt-only manifest must not inspect core"))
+            p8 = "accept"
+        except ManifestRefusal:
+            p8 = "reject"
+        expected = "accept" if name == "baseline" else "reject"
+        assert executor_verdicts[str(path)] == p8 == expected, name

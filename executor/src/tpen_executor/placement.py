@@ -398,7 +398,21 @@ class ChildPlacementObservation:
 
 @frozen_record
 class ChildPlacementObservationV2:
-    """Child placement sidecar with closed live-PID GPU sampler evidence."""
+    """Child placement sidecar carrying in-child GPU sampler evidence.
+
+    The v1 observation fields are unchanged.  ``gpu_sampler`` is kept as raw
+    JSON here; the controller validates it with
+    :func:`tpen_executor.gpu_telemetry.normalize_child_sampler` when it builds
+    the v3 science placement receipt, so invalid sampler evidence becomes a
+    typed telemetry failure instead of an unreadable sidecar.
+
+    Parameters
+    ----------
+    base : ChildPlacementObservation
+        v1 child identity, host, affinity, and refusal evidence.
+    gpu_sampler : mapping
+        Raw ``gpu_sampler`` record written by the RUN_SHIM sampler.
+    """
 
     schema: ClassVar[str] = "tpen-executor/child-placement-v2"
     base: ChildPlacementObservation
@@ -412,7 +426,13 @@ class ChildPlacementObservationV2:
         object.__setattr__(self, "gpu_sampler", _freeze(self.gpu_sampler, "gpu_sampler"))
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self.base, name)
+        if name == "base":
+            raise AttributeError(name)
+        try:
+            base = object.__getattribute__(self, "base")
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(base, name)
 
     def to_dict(self) -> dict[str, Any]:
         result = self.base.to_dict()

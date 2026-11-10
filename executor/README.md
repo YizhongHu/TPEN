@@ -48,8 +48,20 @@ The L1a v2 placement receipt reports an explicit reason class: `not-sampled`,
 sampler: declared-device evidence is `device=unavailable` with the loud
 reason `not-sampled`. This is operationally advisory, so a completed segment
 may remain accepted and dispatch may return `0`; the manifest records that H-v2
-must perform its own delivered-GPU check. L1b adds attempted GPU telemetry and
-its separate failure reason; H-v2 does not wait for L1b.
+must perform its own delivered-GPU check. H-v2 does not wait for L1b.
+
+L1b adds a bounded in-child `nvidia-smi` PID-to-UUID sampler and a separate
+closed wire, `science-placement-receipt-v3`; `v2` keeps its L1a meaning and
+`v1` is unchanged. A declared-GPU v2-placement child marks sampling attempted
+before any command launches. Each command runs in its own session; every exit
+path SIGKILLs the retained process group and the record is quiescent only
+when `killpg(pgid, 0)` reports the group empty. The v3 verdict is derived,
+never trusted: out-of-entitlement use by the exact science PID in any sample
+is `mismatch`; an attempted sampler failure, an unresolved entitlement, or no
+row for the exact PID is `telemetry-failed`; `qualified` requires quiescent
+evidence with every active UUID inside the slot entitlement. `not-sampled`
+(intentionally unattempted, for example a CPU-only slot) is not
+science-blocking; `telemetry-failed` is. Both stay operationally advisory.
 
 Post-launch host or affinity mismatch is also advisory: the segment remains
 accepted, dispatch returns `0`, and the receipt is unqualified for placement.

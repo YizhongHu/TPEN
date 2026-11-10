@@ -16,7 +16,11 @@ from uuid import uuid4
 from ._codec import canonical_bytes, decode_json, fields, text
 from .allocations import ConfiguredAllocation
 from .contracts import AttemptId, ReadyGroup
-from .results import AcceptedSegment, ManifestAttempt, OutcomeReceipt, RunManifest, SciencePlacementReceipt, SciencePlacementReceiptV2, StartReceipt
+from .results import (
+    AcceptedSegment, ManifestAttempt, OutcomeReceipt, PLACEMENT_RECEIPT_TYPES, RunManifest,
+    SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartReceipt,
+    decode_placement_receipt,
+)
 from .runners import CoreRunEvidence
 from ._records import frozen_record
 
@@ -494,7 +498,11 @@ class DirectoryStore:
             _write_new(segment_path, segment.encode())
             return segment
 
-    def publish_placement(self, fence: AttemptFence, receipt: SciencePlacementReceipt | SciencePlacementReceiptV2) -> SciencePlacementReceipt | SciencePlacementReceiptV2:
+    def publish_placement(
+        self,
+        fence: AttemptFence,
+        receipt: SciencePlacementReceipt | SciencePlacementReceiptV2 | SciencePlacementReceiptV3,
+    ) -> SciencePlacementReceipt | SciencePlacementReceiptV2 | SciencePlacementReceiptV3:
         """Publish one validated placement receipt after child quiescence.
 
         The receipt is written beneath the same attempt fence as the start and
@@ -505,12 +513,12 @@ class DirectoryStore:
         ----------
         fence : AttemptFence
             Store-owned attempt fence returned by :meth:`begin_attempt`.
-        receipt : SciencePlacementReceipt
+        receipt : SciencePlacementReceipt or SciencePlacementReceiptV2 or SciencePlacementReceiptV3
             Controller-validated child-generation record.
 
         Returns
         -------
-        SciencePlacementReceipt
+        SciencePlacementReceipt or SciencePlacementReceiptV2 or SciencePlacementReceiptV3
             The immutable receipt that was durably published.
 
         Raises
@@ -520,8 +528,8 @@ class DirectoryStore:
             receipt, or the receipt crosses any fence identity.
         """
 
-        if not isinstance(receipt, (SciencePlacementReceipt, SciencePlacementReceiptV2)):
-            raise TypeError("receipt must be SciencePlacementReceipt or SciencePlacementReceiptV2")
+        if not isinstance(receipt, PLACEMENT_RECEIPT_TYPES):
+            raise TypeError("receipt must be a v1, v2, or v3 science placement receipt")
         task_dir = self._task_dir_for_fence(fence)
         lock_path = os.path.join(task_dir, _TASK_LOCK)
         _existing(lock_path, "task lock") if os.path.lexists(lock_path) else None
@@ -731,11 +739,7 @@ class DirectoryStore:
                 if os.path.lexists(placement_path):
                     _require_regular(placement_path, "placement receipt", ValueError)
                     raw_placement = decode_json(Path(placement_path).read_bytes())
-                    placement = (
-                        SciencePlacementReceiptV2.from_mapping(raw_placement)
-                        if isinstance(raw_placement, dict) and raw_placement.get("schema") == SciencePlacementReceiptV2.schema
-                        else SciencePlacementReceipt.from_mapping(raw_placement)
-                    )
+                    placement = decode_placement_receipt(raw_placement)
                     if (
                         placement.task_id != task_id
                         or placement.attempt_id.value != attempt_id

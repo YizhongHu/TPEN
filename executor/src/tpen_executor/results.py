@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import field
-import math
-import re
 from typing import Any, ClassVar
 
 from ._codec import _freeze, canonical_bytes, decode_json, fields, sequence, sha256_text, text, thaw
 from .contracts import AllocationId, AttemptId, BackendJobId
+from .gpu_telemetry import SAMPLER_METHOD, DeviceDecision, derive_device_decision, validate_sampler_wire
 from ._records import frozen_record
 
 OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed"})
@@ -18,6 +17,28 @@ _SEGMENT_FIELDS = {
     "schema", "task_id", "attempt_id", "predecessor_checkpoint", "checkpoint_dir",
     "next_iteration", "completed_updates",
 }
+# Manifest placement messages: the single executor-side source of truth.  The
+# P8 toolkit reader mirrors these exact strings independently.
+PLACEMENT_UNQUALIFIED_MESSAGE = "GPU PLACEMENT UNQUALIFIED: placement mismatch/refusal requires science review."
+PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE = (
+    "GPU PLACEMENT UNQUALIFIED: attempted GPU telemetry failed or placement mismatch/refusal requires science review."
+)
+PLACEMENT_NOT_SAMPLED_MESSAGE = (
+    "GPU PLACEMENT NOT-SAMPLED: L1a intentionally does not sample devices; H-v2 performs its own delivered-GPU check."
+)
+# Declared-GPU v3 receipt warnings by reason class (mirrored by P8).  A v3
+# ``not-sampled`` receipt exists only for CPU-only slots, which carry no warning.
+PLACEMENT_V3_WARNINGS = {
+    "qualified": "GPU PLACEMENT QUALIFIED: live PID UUID telemetry matched the declared physical slot.",
+    "mismatch": "GPU PLACEMENT UNQUALIFIED: physical placement evidence requires review.",
+    "refused": "GPU PLACEMENT UNQUALIFIED: physical placement evidence requires review.",
+    "telemetry-failed": "GPU PLACEMENT UNQUALIFIED: attempted GPU telemetry failed; science acceptance is blocked.",
+}
+# Warnings the unchanged L1a v2 builder emits; used only by the v3 shadow check.
+_L1A_NOT_SAMPLED_WARNING = PLACEMENT_NOT_SAMPLED_MESSAGE
+_L1A_UNQUALIFIED_WARNING = "GPU PLACEMENT UNQUALIFIED: physical placement evidence requires review."
+_V3_VERDICT_KEYS = frozenset({"host", "device", "qualification", "reason_class", "reason", "science_acceptance", "warning"})
+_V3_REASON_CLASSES = frozenset({"qualified", "mismatch", "telemetry-failed", "not-sampled", "refused"})
 
 
 def _receipt_host_key(value: Any) -> str:
@@ -370,12 +391,17 @@ class SciencePlacementReceipt:
 
 @frozen_record
 class SciencePlacementReceiptV2:
-    """Versioned physical-host and live-PID GPU placement receipt."""
+    """Versioned physical-host placement receipt without device sampling.
+
+    SciencePlacementReceipt remains the immutable v1 wire record.  L1a
+    adds only the closed physical host map and verdict envelope.  Device
+    sampling is intentionally absent here and belongs to the dependent L1b
+    layer.
+    """
 
     schema: ClassVar[str] = "tpen-executor/science-placement-receipt-v2"
     base: SciencePlacementReceipt
     host_mapping: Mapping[str, Any]
-    gpu_sampler: Mapping[str, Any]
     verdict: Mapping[str, str]
 
     def __post_init__(self) -> None:
@@ -397,74 +423,6 @@ class SciencePlacementReceiptV2:
             raise ValueError("unavailable v2 host mapping must not name a logical host")
         if host_status != "unavailable" and source != "scheduler-node-map":
             raise ValueError("mapped v2 host evidence must come from the scheduler node map")
-        expected_sampler = {
-            "status", "reason", "method", "version", "cadence_seconds", "count",
-            "monotonic_start", "monotonic_end", "inventory", "pid_rows", "samples",
-            "command_pids", "survivors", "elapsed_seconds", "join_timeout_seconds", "quiescent",
-        }
-        if not isinstance(self.gpu_sampler, Mapping) or set(self.gpu_sampler) != expected_sampler:
-            raise ValueError("v2 gpu_sampler keys differ")
-        sampler = self.gpu_sampler
-        if sampler["status"] not in {"observed", "unavailable"}:
-            raise ValueError("v2 gpu_sampler status is invalid")
-        if type(sampler["reason"]) is not str or not sampler["reason"]:
-            raise ValueError("v2 gpu_sampler reason is required")
-        if sampler["method"] != "nvidia-smi-pid-uuid-v1":
-            raise ValueError("v2 gpu_sampler method is invalid")
-        if sampler["version"] is not None and type(sampler["version"]) is not str:
-            raise TypeError("v2 gpu_sampler version must be text or null")
-        for key in ("cadence_seconds", "elapsed_seconds", "join_timeout_seconds"):
-            value = sampler[key]
-            if type(value) not in (int, float) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
-                raise ValueError(f"v2 gpu_sampler {key} is invalid")
-        if not 1.0 <= sampler["join_timeout_seconds"] <= 4.0:
-            raise ValueError("v2 gpu_sampler join timeout is invalid")
-        if type(sampler["count"]) is not int or isinstance(sampler["count"], bool) or not 0 <= sampler["count"] <= 16:
-            raise ValueError("v2 gpu_sampler count is invalid")
-        for key in ("monotonic_start", "monotonic_end"):
-            value = sampler[key]
-            if value is not None and (type(value) not in (int, float) or isinstance(value, bool) or not math.isfinite(value)):
-                raise ValueError(f"v2 gpu_sampler {key} is invalid")
-        sequence_keys = ("inventory", "pid_rows", "samples", "command_pids", "survivors")
-        for key in sequence_keys:
-            if isinstance(sampler[key], (str, bytes, bytearray)) or not isinstance(sampler[key], Sequence):
-                raise TypeError(f"v2 gpu_sampler {key} must be a sequence")
-        if type(sampler["quiescent"]) is not bool:
-            raise TypeError("v2 gpu_sampler quiescent must be boolean")
-        if sampler["quiescent"] and sampler["survivors"]:
-            raise ValueError("quiescent sampler cannot report survivors")
-        uuid_re = re.compile(r"^GPU-[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$")
-        def validate_inventory(items: Any) -> None:
-            for item in items:
-                if not isinstance(item, Mapping) or set(item) != {"uuid", "pci.bus_id"} or type(item["uuid"]) is not str or not uuid_re.fullmatch(item["uuid"]) or type(item["pci.bus_id"]) is not str or not item["pci.bus_id"]:
-                    raise ValueError("v2 gpu_sampler inventory row is invalid")
-        def validate_rows(items: Any) -> None:
-            for item in items:
-                if not isinstance(item, Mapping) or set(item) != {"pid", "gpu_uuid"} or type(item["pid"]) is not int or isinstance(item["pid"], bool) or item["pid"] <= 0 or type(item["gpu_uuid"]) is not str or not uuid_re.fullmatch(item["gpu_uuid"]):
-                    raise ValueError("v2 gpu_sampler PID row is invalid")
-        validate_inventory(sampler["inventory"])
-        validate_rows(sampler["pid_rows"])
-        if any(type(pid) is not int or isinstance(pid, bool) or pid <= 0 for pid in sampler["command_pids"]):
-            raise ValueError("v2 gpu_sampler command PID is invalid")
-        for sample in sampler["samples"]:
-            if not isinstance(sample, Mapping) or set(sample) != {"monotonic_start", "monotonic_end", "inventory", "pid_rows"}:
-                raise ValueError("v2 gpu_sampler sample keys differ")
-            start, end = sample["monotonic_start"], sample["monotonic_end"]
-            if type(start) not in (int, float) or type(end) not in (int, float) or not math.isfinite(start) or not math.isfinite(end) or end < start:
-                raise ValueError("v2 gpu_sampler sample interval is invalid")
-            validate_inventory(sample["inventory"])
-            validate_rows(sample["pid_rows"])
-        if sampler["status"] == "observed":
-            if sampler["version"] is None or sampler["count"] <= 0 or len(sampler["samples"]) != sampler["count"] or not sampler["command_pids"]:
-                raise ValueError("observed sampler requires complete samples and command PIDs")
-            if sampler["monotonic_start"] is None or sampler["monotonic_end"] is None or sampler["monotonic_end"] <= sampler["monotonic_start"]:
-                raise ValueError("observed sampler requires a positive interval")
-        elif sampler["count"] != len(sampler["samples"]):
-            raise ValueError("sampler count disagrees with samples")
-        if sampler["count"] and (sampler["inventory"] != sampler["samples"][-1]["inventory"] or sampler["pid_rows"] != sampler["samples"][-1]["pid_rows"]):
-            raise ValueError("sampler summary disagrees with final sample")
-        if sampler["monotonic_start"] is not None and sampler["monotonic_end"] is not None and abs(sampler["elapsed_seconds"] - (sampler["monotonic_end"] - sampler["monotonic_start"])) > 1e-6:
-            raise ValueError("sampler elapsed time disagrees with interval")
         expected_verdict = {
             "host", "device", "qualification", "reason_class", "reason",
             "science_acceptance", "warning",
@@ -476,16 +434,24 @@ class SciencePlacementReceiptV2:
                 raise TypeError(f"v2 verdict {key} must be non-empty text")
         if self.verdict["host"] not in PLACEMENT_COMPARISON_STATES:
             raise ValueError("v2 verdict host state is invalid")
-        if self.verdict["device"] not in PLACEMENT_COMPARISON_STATES:
-            raise ValueError("v2 verdict device state is invalid")
-        if self.verdict["qualification"] not in {"qualified", "unqualified"}:
-            raise ValueError("v2 placement qualification is invalid")
-        if self.verdict["reason_class"] not in {"qualified", "mismatch", "telemetry-failed", "not-sampled", "refused"}:
-            raise ValueError("v2 verdict reason_class is invalid")
+        if self.verdict["device"] != "unavailable":
+            raise ValueError("L1a device verdict must be unavailable")
+        if self.verdict["qualification"] != "unqualified":
+            raise ValueError("L1a placement qualification must be unqualified")
+        if self.verdict["reason_class"] not in {"mismatch", "not-sampled", "refused"}:
+            raise ValueError("v2 verdict reason_class is invalid for L1a")
         if self.verdict["science_acceptance"] not in {"accepted", "not-accepted"}:
             raise ValueError("v2 verdict science acceptance is invalid")
-        if self.base.comparison["device"] != self.verdict["device"]:
-            raise ValueError("v2 device comparison disagrees with verdict")
+        if (
+            self.base.gpu["status"] != "unavailable"
+            or self.base.gpu["reason"] != "not-sampled"
+            or self.base.gpu["method"] != "not-sampled"
+            or self.base.gpu["samples"]
+            or self.base.gpu["active_uuids"]
+            or self.base.gpu["active_pci"]
+            or self.base.comparison["device"] != "unavailable"
+        ):
+            raise ValueError("L1a v2 receipts must carry unavailable, not-sampled device evidence")
         if self.host_mapping["slot_id"] != self.base.slot_id:
             raise ValueError("v2 host mapping slot_id disagrees with the base receipt")
         child_host = _receipt_host_key(self.base.child["host"])
@@ -524,8 +490,6 @@ class SciencePlacementReceiptV2:
             )
         )
         if self.verdict["reason_class"] == "not-sampled":
-            if sampler["reason"] != "not-sampled" or sampler["status"] != "unavailable" or sampler["count"]:
-                raise ValueError("not-sampled verdict requires no sampler run")
             if self.base.refusal is not None or host_status != "matched" or derived_host_status != "matched":
                 raise ValueError("not-sampled verdict requires mapped, matching host evidence")
             if self.base.comparison["host"] != "matched" or derived_affinity_status != "matched":
@@ -533,16 +497,10 @@ class SciencePlacementReceiptV2:
             if self.verdict["science_acceptance"] != "accepted":
                 raise ValueError("not-sampled device evidence is not science-blocking")
         elif self.verdict["reason_class"] == "mismatch":
-            if not (has_postlaunch_mismatch or self.verdict["device"] == "mismatch"):
-                raise ValueError("mismatch verdict requires physical mismatch evidence")
+            if not has_postlaunch_mismatch or self.base.refusal is None:
+                raise ValueError("mismatch verdict requires post-launch mismatch evidence")
             if self.verdict["science_acceptance"] != "not-accepted":
                 raise ValueError("mismatched placement cannot be science-accepted")
-        elif self.verdict["reason_class"] == "telemetry-failed":
-            if sampler["status"] != "unavailable" or sampler["reason"] != "telemetry-failed" or self.verdict["science_acceptance"] != "not-accepted":
-                raise ValueError("telemetry-failed verdict requires failed sampler evidence")
-        elif self.verdict["reason_class"] == "qualified":
-            if sampler["status"] != "observed" or self.verdict["qualification"] != "qualified" or self.verdict["science_acceptance"] != "accepted" or self.base.refusal is not None:
-                raise ValueError("qualified verdict requires complete sampler evidence")
         elif self.verdict["reason_class"] == "refused":
             if self.base.refusal is None or has_postlaunch_mismatch or host_status != "unavailable":
                 raise ValueError("refused verdict requires a prelaunch refusal")
@@ -550,8 +508,283 @@ class SciencePlacementReceiptV2:
                 raise ValueError("refused placement cannot be science-accepted")
         if self.base.declared["devices"] and not self.verdict["warning"]:
             raise ValueError("unqualified declared GPU placement requires a loud warning")
-        for name, value in (("host_mapping", self.host_mapping), ("gpu_sampler", self.gpu_sampler), ("verdict", self.verdict)):
+        for name, value in (("host_mapping", self.host_mapping), ("verdict", self.verdict)):
             object.__setattr__(self, name, _freeze(value, name))
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "base":
+            raise AttributeError(name)
+        try:
+            base = object.__getattribute__(self, "base")
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(base, name)
+
+    def to_dict(self) -> dict[str, Any]:
+        result = self.base.to_dict()
+        result.update({
+            "schema": self.schema,
+            "host_mapping": thaw(self.host_mapping),
+            "verdict": thaw(self.verdict),
+        })
+        return result
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "SciencePlacementReceiptV2":
+        if not isinstance(data, Mapping):
+            raise TypeError("SciencePlacementReceiptV2 must be a mapping")
+        expected = {
+            "schema", "task_id", "attempt_id", "group_digest", "allocation_id", "backend_job_id", "slot_id",
+            "payload_digest", "output_dir", "child", "declared", "gpu", "comparison", "refusal",
+            "host_mapping", "verdict",
+        }
+        if set(data) != expected or data.get("schema") != cls.schema:
+            raise ValueError("SciencePlacementReceiptV2 keys or schema differ")
+        base = dict(data)
+        base.pop("host_mapping")
+        base.pop("verdict")
+        base["schema"] = SciencePlacementReceipt.schema
+        return cls(
+            SciencePlacementReceipt.from_mapping(base),
+            data["host_mapping"],
+            data["verdict"],
+        )
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "SciencePlacementReceiptV2":
+        return cls.from_mapping(decode_json(data))
+
+
+def placement_unqualified_message(reason_classes: Sequence[str]) -> str:
+    """Return the manifest message for a set of blocking reason classes.
+
+    Parameters
+    ----------
+    reason_classes : sequence of str
+        ``reason_class`` of every blocking declared-GPU attempt.
+
+    Returns
+    -------
+    str
+        The telemetry-aware message when any attempt is ``telemetry-failed``,
+        otherwise the unchanged L1a mismatch/refusal message.
+    """
+
+    return PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE if "telemetry-failed" in reason_classes else PLACEMENT_UNQUALIFIED_MESSAGE
+
+
+def _v3_expected(
+    host: str,
+    l1a_class: str,
+    l1a_reason: str,
+    sampler: Mapping[str, Any],
+    decision: DeviceDecision,
+    declares_devices: bool,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Derive the v3 GPU block and verdict from L1a class plus device decision.
+
+    Parameters
+    ----------
+    host : str
+        Physical host verdict from the L1a evidence.
+    l1a_class, l1a_reason : str
+        L1a reason class (``refused``, ``mismatch``, or ``not-sampled``) and
+        its reason text; refusal and host/affinity mismatch dominate devices.
+    sampler : mapping
+        Validated sampler record.
+    decision : DeviceDecision
+        Device decision derived from ``sampler``.
+    declares_devices : bool
+        Whether the slot declares a GPU entitlement.
+
+    Returns
+    -------
+    tuple of dict
+        Expected ``gpu`` fields (without timestamps) and the full verdict.
+    """
+
+    if l1a_class in {"refused", "mismatch"}:
+        reason_class, reason = l1a_class, l1a_reason
+    elif decision.device == "matched":
+        reason_class, reason = "qualified", f"qualified: {decision.text}"
+    elif decision.device == "mismatch":
+        reason_class, reason = "mismatch", f"mismatch: {decision.text}"
+    elif decision.code == "cpu-only":
+        reason_class, reason = "not-sampled", f"not-sampled: {decision.text}"
+    else:
+        # Every other device outcome is attempted-and-unusable telemetry.
+        reason_class, reason = "telemetry-failed", f"telemetry-failed: {decision.text}"
+        if decision.code == "sampler-failed":
+            reason = f"{reason} ({sampler['failure']['code']})"
+    qualified = reason_class == "qualified"
+    shows_devices = decision.device in {"matched", "mismatch"}
+    gpu = {
+        "status": "qualified" if qualified else "unavailable",
+        "reason": decision.code,
+        "method": "not-sampled" if sampler["reason"] == "not-sampled" else SAMPLER_METHOD,
+        # Raw per-sample evidence lives only in gpu_sampler.samples.
+        "samples": [],
+        "active_uuids": list(decision.active_uuids) if shows_devices else [],
+        "active_pci": list(decision.active_pci) if shows_devices else [],
+    }
+    verdict = {
+        "host": host,
+        "device": decision.device,
+        "qualification": "qualified" if qualified else "unqualified",
+        "reason_class": reason_class,
+        "reason": reason,
+        "science_acceptance": "accepted" if reason_class in {"qualified", "not-sampled"} else "not-accepted",
+        "warning": PLACEMENT_V3_WARNINGS.get(reason_class, "") if declares_devices else "",
+    }
+    return gpu, verdict
+
+
+def _l1a_shadow(base: SciencePlacementReceipt, host_mapping: Any, verdict: Mapping[str, str], l1a_class: str) -> SciencePlacementReceiptV2:
+    """Validate v3 host/affinity/refusal evidence with the unchanged L1a decoder.
+
+    The shadow is the L1a v2 receipt the same child evidence would produce
+    without device sampling.  Constructing it runs every strict L1a check, so
+    v3 neither duplicates nor weakens the L1a host-map semantics.
+
+    Raises
+    ------
+    TypeError, ValueError
+        If the host map, affinity, refusal, or L1a class is contradictory.
+    """
+
+    gpu = {
+        "status": "unavailable", "reason": "not-sampled", "method": "not-sampled",
+        "started_at_utc": base.gpu["started_at_utc"], "finished_at_utc": base.gpu["finished_at_utc"],
+        "samples": [], "active_uuids": [], "active_pci": [],
+    }
+    comparison = dict(thaw(base.comparison), device="unavailable")
+    shadow_base = SciencePlacementReceipt(
+        base.task_id, base.attempt_id, base.group_digest, base.allocation_id, base.backend_job_id,
+        base.slot_id, base.payload_digest, base.output_dir, thaw(base.child), thaw(base.declared),
+        gpu, comparison, None if base.refusal is None else thaw(base.refusal),
+    )
+    warning = ""
+    if base.declared["devices"]:
+        warning = _L1A_NOT_SAMPLED_WARNING if l1a_class == "not-sampled" else _L1A_UNQUALIFIED_WARNING
+    return SciencePlacementReceiptV2(shadow_base, thaw(host_mapping), {
+        "host": verdict["host"], "device": "unavailable", "qualification": "unqualified",
+        "reason_class": l1a_class, "reason": verdict["reason"],
+        "science_acceptance": "accepted" if l1a_class == "not-sampled" else "not-accepted",
+        "warning": warning,
+    })
+
+
+@frozen_record
+class SciencePlacementReceiptV3:
+    """Versioned placement receipt carrying bounded live-PID GPU sampler evidence.
+
+    ``science-placement-receipt-v2`` keeps its L1a meaning (device always
+    ``not-sampled``).  v3 adds the closed ``gpu_sampler`` record and derives,
+    rather than trusts, the device and qualification verdict:
+
+    * host, affinity, and refusal evidence must pass the unchanged L1a v2
+      decoder (see :func:`_l1a_shadow`);
+    * ``gpu_sampler`` must pass :func:`~tpen_executor.gpu_telemetry.validate_sampler_wire`
+      (quiescence for observation, ordered contained sample intervals,
+      same-sample inventory membership);
+    * the device decision is the union of exact-child-PID rows over all
+      samples with out-of-entitlement dominance, and every declared UUID must
+      resolve in every sampled inventory before ``matched``;
+    * the verdict, ``gpu`` block, and device comparison must equal the
+      derivation exactly, so contradictory labels are rejected.
+
+    Parameters
+    ----------
+    base : SciencePlacementReceipt
+        Immutable v1 identity and child/declared evidence.
+    host_mapping : mapping
+        Closed L1a physical host map.
+    gpu_sampler : mapping
+        Closed sampler record, retained verbatim including all samples.
+    verdict : mapping
+        Closed derived verdict.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/science-placement-receipt-v3"
+    base: SciencePlacementReceipt
+    host_mapping: Mapping[str, Any]
+    gpu_sampler: Mapping[str, Any]
+    verdict: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.base, SciencePlacementReceipt):
+            raise TypeError("v3 base must be SciencePlacementReceipt")
+        if not isinstance(self.verdict, Mapping) or set(self.verdict) != _V3_VERDICT_KEYS:
+            raise ValueError("v3 verdict keys differ")
+        if any(type(value) is not str for value in self.verdict.values()):
+            raise TypeError("v3 verdict values must be text")
+        reason_class = self.verdict["reason_class"]
+        if reason_class not in _V3_REASON_CLASSES:
+            raise ValueError("v3 verdict reason_class is invalid")
+        sampler = validate_sampler_wire(self.gpu_sampler)
+        decision = derive_device_decision(sampler, self.base.child["pid"], self.base.declared["devices"])
+        # The L1a class is forced by the evidence: refusal and post-launch
+        # host/affinity mismatch carry a base refusal; everything else is the
+        # matched-host L1a class that devices then refine.
+        if reason_class == "refused":
+            l1a_class = "refused"
+        elif reason_class == "mismatch" and self.base.refusal is not None:
+            l1a_class = "mismatch"
+        else:
+            l1a_class = "not-sampled"
+        shadow = _l1a_shadow(self.base, self.host_mapping, self.verdict, l1a_class)
+        gpu, verdict = _v3_expected(
+            shadow.verdict["host"], l1a_class, self.verdict["reason"], sampler, decision,
+            bool(self.base.declared["devices"]),
+        )
+        if dict(self.verdict) != verdict:
+            raise ValueError("v3 verdict is not derived from its host and sampler evidence")
+        if any(thaw(self.base.gpu[key]) != value for key, value in gpu.items()):
+            raise ValueError("v3 gpu evidence is not derived from its sampler evidence")
+        if self.base.comparison["device"] != decision.device:
+            raise ValueError("v3 device comparison is not derived from its sampler evidence")
+        object.__setattr__(self, "host_mapping", _freeze(thaw(self.host_mapping), "host_mapping"))
+        object.__setattr__(self, "gpu_sampler", _freeze(sampler, "gpu_sampler"))
+        object.__setattr__(self, "verdict", _freeze(verdict, "verdict"))
+
+    @classmethod
+    def from_l1a(cls, receipt: SciencePlacementReceiptV2, sampler: Mapping[str, Any]) -> "SciencePlacementReceiptV3":
+        """Layer sampler evidence over the L1a receipt for the same child.
+
+        Parameters
+        ----------
+        receipt : SciencePlacementReceiptV2
+            Host/affinity verdict built by the unchanged L1a builder.
+        sampler : mapping
+            Sampler record accepted by ``validate_sampler_wire``; observed but
+            unusable evidence stays verbatim and derives ``telemetry-failed``.
+
+        Returns
+        -------
+        SciencePlacementReceiptV3
+            Receipt whose constructor re-derives and checks every verdict.
+        """
+
+        if not isinstance(receipt, SciencePlacementReceiptV2):
+            raise TypeError("receipt must be SciencePlacementReceiptV2")
+        sampler = validate_sampler_wire(sampler)
+        decision = derive_device_decision(sampler, receipt.child["pid"], receipt.declared["devices"])
+        gpu, verdict = _v3_expected(
+            receipt.verdict["host"], receipt.verdict["reason_class"], receipt.verdict["reason"],
+            sampler, decision, bool(receipt.declared["devices"]),
+        )
+        base = receipt.base
+        gpu = dict(gpu, started_at_utc=base.gpu["started_at_utc"], finished_at_utc=base.gpu["finished_at_utc"])
+        v3_base = SciencePlacementReceipt(
+            base.task_id, base.attempt_id, base.group_digest, base.allocation_id, base.backend_job_id,
+            base.slot_id, base.payload_digest, base.output_dir, thaw(base.child), thaw(base.declared),
+            gpu, dict(thaw(base.comparison), device=decision.device),
+            None if base.refusal is None else thaw(base.refusal),
+        )
+        return cls(v3_base, thaw(receipt.host_mapping), sampler, verdict)
 
     def __getattr__(self, name: str) -> Any:
         if name == "base":
@@ -576,30 +809,50 @@ class SciencePlacementReceiptV2:
         return canonical_bytes(self.to_dict())
 
     @classmethod
-    def from_mapping(cls, data: Any) -> "SciencePlacementReceiptV2":
+    def from_mapping(cls, data: Any) -> "SciencePlacementReceiptV3":
         if not isinstance(data, Mapping):
-            raise TypeError("SciencePlacementReceiptV2 must be a mapping")
+            raise TypeError("SciencePlacementReceiptV3 must be a mapping")
         expected = {
             "schema", "task_id", "attempt_id", "group_digest", "allocation_id", "backend_job_id", "slot_id",
             "payload_digest", "output_dir", "child", "declared", "gpu", "comparison", "refusal",
             "host_mapping", "gpu_sampler", "verdict",
         }
         if set(data) != expected or data.get("schema") != cls.schema:
-            raise ValueError("SciencePlacementReceiptV2 keys or schema differ")
+            raise ValueError("SciencePlacementReceiptV3 keys or schema differ")
         base = dict(data)
-        base.pop("host_mapping")
-        base.pop("gpu_sampler")
-        base.pop("verdict")
+        for key in ("host_mapping", "gpu_sampler", "verdict"):
+            base.pop(key)
         base["schema"] = SciencePlacementReceipt.schema
-        return cls(
-            SciencePlacementReceipt.from_mapping(base),
-            data["host_mapping"], data["gpu_sampler"],
-            data["verdict"],
-        )
+        return cls(SciencePlacementReceipt.from_mapping(base), data["host_mapping"], data["gpu_sampler"], data["verdict"])
 
     @classmethod
-    def decode(cls, data: bytes | str | dict[str, Any]) -> "SciencePlacementReceiptV2":
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "SciencePlacementReceiptV3":
         return cls.from_mapping(decode_json(data))
+
+
+PLACEMENT_RECEIPT_TYPES = (SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3)
+
+
+def decode_placement_receipt(data: Any) -> SciencePlacementReceipt | SciencePlacementReceiptV2 | SciencePlacementReceiptV3:
+    """Decode one persisted placement receipt by its closed schema.
+
+    Parameters
+    ----------
+    data : mapping
+        JSON-shaped v1, v2, or v3 placement receipt.
+
+    Returns
+    -------
+    SciencePlacementReceipt or SciencePlacementReceiptV2 or SciencePlacementReceiptV3
+        The strictly validated record; unknown schemas fail in the v1 decoder.
+    """
+
+    schema = data.get("schema") if isinstance(data, Mapping) else None
+    if schema == SciencePlacementReceiptV3.schema:
+        return SciencePlacementReceiptV3.from_mapping(data)
+    if schema == SciencePlacementReceiptV2.schema:
+        return SciencePlacementReceiptV2.from_mapping(data)
+    return SciencePlacementReceipt.from_mapping(data)
 
 
 @frozen_record
@@ -624,7 +877,7 @@ class ManifestAttempt:
     start_receipt: StartReceipt
     outcome_receipt: OutcomeReceipt | None
     output_dir: str
-    placement_receipt: SciencePlacementReceipt | SciencePlacementReceiptV2 | None = None
+    placement_receipt: SciencePlacementReceipt | SciencePlacementReceiptV2 | SciencePlacementReceiptV3 | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", text(self.task_id, "task_id")); _identity(self.attempt_id, AttemptId, "attempt_id"); _identity(self.start_receipt, StartReceipt, "start_receipt"); _identity(self.start_receipt.attempt_id, AttemptId, "start_receipt.attempt_id")
@@ -634,8 +887,8 @@ class ManifestAttempt:
         if self.outcome_receipt is not None and (self.task_id != self.outcome_receipt.task_id or self.attempt_id != self.outcome_receipt.attempt_id or self.output_dir != self.outcome_receipt.output_dir or self.start_receipt.group_digest != self.outcome_receipt.group_digest):
             raise ValueError("manifest attempt disagrees with outcome receipt")
         if self.placement_receipt is not None:
-            if not isinstance(self.placement_receipt, (SciencePlacementReceipt, SciencePlacementReceiptV2)):
-                raise TypeError("placement_receipt must be SciencePlacementReceipt, SciencePlacementReceiptV2, or None")
+            if not isinstance(self.placement_receipt, PLACEMENT_RECEIPT_TYPES):
+                raise TypeError("placement_receipt must be a v1, v2, or v3 science placement receipt, or None")
             if (
                 self.task_id != self.placement_receipt.task_id
                 or self.attempt_id != self.placement_receipt.attempt_id
@@ -666,12 +919,7 @@ class ManifestAttempt:
         if any(type(data[key]) is not str for key in ("task_id", "attempt_id", "output_dir")): raise TypeError("ManifestAttempt has an invalid scalar field")
         outcome = None if data["outcome_receipt"] is None else OutcomeReceipt.from_mapping(data["outcome_receipt"])
         placement_data = data.get("placement_receipt")
-        if placement_data is None:
-            placement = None
-        elif placement_data.get("schema") == SciencePlacementReceiptV2.schema:
-            placement = SciencePlacementReceiptV2.from_mapping(placement_data)
-        else:
-            placement = SciencePlacementReceipt.from_mapping(placement_data)
+        placement = None if placement_data is None else decode_placement_receipt(placement_data)
         return cls(data["task_id"], AttemptId(data["attempt_id"]), StartReceipt.from_mapping(data["start_receipt"]), outcome, data["output_dir"], placement)
 
     @classmethod
@@ -836,7 +1084,10 @@ class RunManifest:
         blocking = []
         for attempt in attempts:
             receipt = attempt.placement_receipt
-            if not isinstance(receipt, SciencePlacementReceiptV2) or not receipt.declared["devices"]:
+            if not isinstance(receipt, (SciencePlacementReceiptV2, SciencePlacementReceiptV3)) or not receipt.declared["devices"]:
+                continue
+            # Only a v3 receipt can be qualified; it needs no manifest flag.
+            if receipt.verdict["qualification"] == "qualified":
                 continue
             entry = {
                 "task_id": receipt.task_id,
@@ -846,14 +1097,14 @@ class RunManifest:
             }
             if receipt.verdict["reason_class"] == "not-sampled":
                 not_sampled.append(entry)
-            elif receipt.verdict["qualification"] != "qualified":
+            else:
                 blocking.append(entry)
         derived_verdict: Mapping[str, Any] = {}
         if blocking:
             derived_verdict = {
                 "status": "unqualified",
                 "science_acceptance": "not-accepted",
-                "message": "GPU PLACEMENT UNQUALIFIED: placement mismatch/refusal requires science review.",
+                "message": placement_unqualified_message([entry["reason_class"] for entry in blocking]),
                 "unqualified_gpu_segments": blocking,
             }
             if not_sampled:
@@ -863,7 +1114,7 @@ class RunManifest:
             derived_verdict = {
                 "status": "not-sampled",
                 "science_acceptance": "accepted",
-                "message": "GPU PLACEMENT NOT-SAMPLED: L1a intentionally does not sample devices; H-v2 performs its own delivered-GPU check.",
+                "message": PLACEMENT_NOT_SAMPLED_MESSAGE,
                 "not_sampled_gpu_segments": not_sampled,
             }
         if placement_verdict and dict(placement_verdict) != dict(derived_verdict):
@@ -913,7 +1164,13 @@ class RunManifest:
         return cls.from_mapping(decode_json(data))
 
 
-__all__ = ["AcceptedSegment", "AllocationObservation", "ManifestAttempt", "OutcomeReceipt", "OUTCOME_STATUSES", "RunManifest", "SciencePlacementReceipt", "SciencePlacementReceiptV2", "StartReceipt"]
+__all__ = [
+    "AcceptedSegment", "AllocationObservation", "ManifestAttempt", "OutcomeReceipt", "OUTCOME_STATUSES",
+    "PLACEMENT_NOT_SAMPLED_MESSAGE", "PLACEMENT_RECEIPT_TYPES", "PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE",
+    "PLACEMENT_UNQUALIFIED_MESSAGE", "PLACEMENT_V3_WARNINGS", "RunManifest", "SciencePlacementReceipt",
+    "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StartReceipt", "decode_placement_receipt",
+    "placement_unqualified_message",
+]
 
 
 def encode_manifest(manifest: RunManifest) -> bytes:
