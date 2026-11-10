@@ -428,3 +428,97 @@ def test_eval_job_dispatches_through_run_from_config_not_tpen_run_main() -> None
     assert "import main" not in script
     assert ".main(" not in script
     assert "from tpen.run import main" not in script
+
+
+# --- run_generation_direct: evidence verification without any executor ----
+
+
+def _fake_generation_config(run_root: Path, run_id: str) -> dict:
+    return {
+        "run": {"root": str(run_root), "run_id": run_id, "layout": "flat"},
+        "evaluator": {
+            "tasks": [
+                {
+                    "name": "trajectory",
+                    "output_dir": "${run.dir}/trajectory",
+                    "generator": {"_target_": "tpen.evaluation.generators.trajectory.TrajectoryMCMCGenerator"},
+                }
+            ]
+        },
+    }
+
+
+def _write_fake_run_output(run_dir: Path, *, commit: str, trajectory_bytes: bytes = b"a,b\n1,2\n") -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "status.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    (run_dir / "metadata.json").write_text(json.dumps({"git_commit": commit}), encoding="utf-8")
+    (run_dir / "resolved_config.yaml").write_text("resolved: true\n", encoding="utf-8")
+    trajectory_dir = run_dir / "trajectory"
+    trajectory_dir.mkdir(parents=True, exist_ok=True)
+    (trajectory_dir / "sampled_eval_table.csv").write_bytes(trajectory_bytes)
+    (trajectory_dir / "sampled_eval_table.metadata.json").write_text(
+        json.dumps({"csv_sha256": _sha256(trajectory_bytes)}), encoding="utf-8"
+    )
+
+
+def test_run_generation_direct_computes_real_artifact_hashes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No mutant yet named this directly, but this is the test that must exist
+    for 'drop a file-written hash' to be catchable at all: before this test,
+    nothing in the suite ever called run_generation_direct."""
+
+    run_root = tmp_path / "results"
+    config = _fake_generation_config(run_root, "gen-1")
+    run_dir = run_root / "gen-1"
+
+    def fake_subprocess_run(argv, **kwargs):
+        _write_fake_run_output(run_dir, commit="c" * 40)
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(eval_job.subprocess, "run", fake_subprocess_run)
+    result = eval_job.run_generation_direct(
+        science_python="/usr/bin/python3",
+        config=config,
+        config_path=tmp_path / "gen-1.yaml",
+        expected_source_commit="c" * 40,
+    )
+    assert result["resolved_config_sha256"] == _sha256((run_dir / "resolved_config.yaml").read_bytes())
+    assert result["trajectory_csv_sha256"] == _sha256(b"a,b\n1,2\n")
+    assert result["artifacts"]["trajectory_csv"]["sha256"] == _sha256(b"a,b\n1,2\n")
+    assert all(entry["sha256"] for entry in result["artifacts"].values())  # mutant: 'drop a file-written hash'
+
+
+def test_run_generation_direct_refuses_wrong_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_root = tmp_path / "results"
+    config = _fake_generation_config(run_root, "gen-1")
+    run_dir = run_root / "gen-1"
+
+    def fake_subprocess_run(argv, **kwargs):
+        _write_fake_run_output(run_dir, commit="a" * 40)
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(eval_job.subprocess, "run", fake_subprocess_run)
+    with pytest.raises(eval_job.EvalJobRefusal) as excinfo:
+        eval_job.run_generation_direct(
+            science_python="/usr/bin/python3",
+            config=config,
+            config_path=tmp_path / "gen-1.yaml",
+            expected_source_commit="b" * 40,
+        )
+    assert excinfo.value.code == "eval-run-wrong-commit"
+
+
+def test_run_generation_direct_refuses_a_failed_subprocess(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _fake_generation_config(tmp_path / "results", "gen-1")
+
+    def fake_subprocess_run(argv, **kwargs):
+        return type("Result", (), {"returncode": 1, "stdout": "", "stderr": "boom"})()
+
+    monkeypatch.setattr(eval_job.subprocess, "run", fake_subprocess_run)
+    with pytest.raises(eval_job.EvalJobRefusal) as excinfo:
+        eval_job.run_generation_direct(
+            science_python="/usr/bin/python3",
+            config=config,
+            config_path=tmp_path / "gen-1.yaml",
+            expected_source_commit="c" * 40,
+        )
+    assert excinfo.value.code == "eval-run-failed"
