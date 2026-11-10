@@ -68,6 +68,7 @@ dev = [
   "h5py==3.11.0",
   "matplotlib>=3.10.9",
   "pytest",
+  "pytest-xdist",
   "typeguard>=4",
 ]
 docs = [
