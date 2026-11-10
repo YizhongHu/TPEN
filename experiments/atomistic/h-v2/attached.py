@@ -1027,8 +1027,8 @@ def build_h_v2_accepted_receipt(
         )
 
     by_task: dict[str, list[str]] = {}
-    for payload in segments_payload:
-        by_task.setdefault(payload["task_id"], []).append(payload["resolved_config_sha256"])
+    for segment_payload in segments_payload:
+        by_task.setdefault(segment_payload["task_id"], []).append(segment_payload["resolved_config_sha256"])
     for task_id, hashes in by_task.items():
         if len(set(hashes)) != 1:
             raise HV2ReceiptRefusal(

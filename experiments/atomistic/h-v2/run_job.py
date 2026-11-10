@@ -232,10 +232,18 @@ def checkpoint_dir_for_eval(run_root: Path, lineage: str, *, pipeline_check: boo
     if not receipt_path.is_file():
         raise JobError(f"no TRAIN accepted receipt at {receipt_path}; TRAIN must complete before EVAL")
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    # TO baff945c: a receipt claiming the science payload without a complete
-    # science config identity is not trustworthy evidence of which science
-    # config actually trained this checkpoint; refuse rather than read past it.
-    if receipt.get("payload") == "science":
+    # TO baff945c review r1 (F1): require science identity whenever THIS CALL
+    # asks for a science checkpoint (pipeline_check=False), not merely when
+    # the receipt happens to carry a "science" payload string -- a receipt
+    # producer bug or tamper that drops/malforms the payload field must not
+    # silently bypass the identity check. The receipt's own payload is itself
+    # validated here, not trusted blind.
+    if not pipeline_check:
+        if receipt.get("payload") != "science":
+            raise JobError(
+                f"TRAIN accepted receipt {receipt_path} does not carry payload='science' "
+                f"(got {receipt.get('payload')!r}); refusing to trust it for a science checkpoint"
+            )
         missing = attached.SCIENCE_CONFIG_IDENTITY_KEYS - set(receipt.get("science_config_identity") or {})
         if missing:
             raise JobError(
@@ -359,13 +367,28 @@ def run(stage: str, lineage: str, *, pipeline_check: bool = False) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse and dispatch the in-job CLI.
+
+    Review r1 (F2): an explicit payload choice is required -- either
+    ``--pipeline-check`` or ``--payload science`` -- for both ``train`` and
+    ``eval``. A bare ``train L1``/``eval L1`` with neither refuses (exit 2)
+    rather than defaulting to the science payload.
+    """
+
     argv = list(sys.argv[1:] if argv is None else argv)
     pipeline_check = False
+    explicit_science = False
     if argv and argv[-1] == "--pipeline-check":
         pipeline_check = True
         argv = argv[:-1]
-    if len(argv) != 2:
-        print("usage: run_job.py {train|eval} <lineage> [--pipeline-check]", file=sys.stderr)
+    elif len(argv) >= 2 and argv[-2:] == ["--payload", "science"]:
+        explicit_science = True
+        argv = argv[:-2]
+    if len(argv) != 2 or not (pipeline_check or explicit_science):
+        print(
+            "usage: run_job.py {train|eval} <lineage> {--payload science|--pipeline-check}",
+            file=sys.stderr,
+        )
         return 2
     stage, lineage = argv
     try:
