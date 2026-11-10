@@ -65,19 +65,39 @@ fail_precheck() { echo "PRECHECK_FAILED $*" >&2; exit 2; }
 [[ "$PARALLEL" == serial || "$PARALLEL" == xdist ]] || fail_precheck "invalid PARALLEL"
 [[ -n "$RUN_ROOT" && -n "$WORK_ROOT" && -n "$REPO_URL" ]] || fail_precheck "missing required paths"
 [[ -n "$SHARED_ENV_ROOT" && -n "$FACILITY_RUN_PREFIX" ]] || fail_precheck "missing env prefix"
-[[ "$WORK_ROOT" == "/scratch/$USER/$SLURM_JOB_ID" ]] || fail_precheck "WORK_ROOT must be exact job scratch"
-[[ "$RUN_ROOT" == "$FACILITY_RUN_PREFIX"/* ]] || fail_precheck "RUN_ROOT outside facility prefix"
-[[ "$SHARED_ENV_ROOT" == "$FACILITY_RUN_PREFIX"/* ]] || fail_precheck "SHARED_ENV_ROOT outside facility prefix"
 [[ -x "$UV_BIN" && "$UV_BIN" == /* ]] || fail_precheck "UV_BIN must be executable absolute path"
 [[ ${#TEST_PATHS[@]} -gt 0 || "$MODE" == measure ]] || fail_precheck "no test paths"
 [[ -f "$MUTANT_HELPER" ]] || fail_precheck "mutant helper missing"
 [[ -z "$MUTANT_SPEC" || -s "$MUTANT_SPEC" ]] || fail_precheck "mutant spec missing or empty"
+command -v realpath >/dev/null 2>&1 || fail_precheck "realpath required for path containment checks"
+
+# Canonicalize before any containment check: resolves "..", ".", duplicate
+# slashes, and symlinks of existing ancestors, so a traversal or symlink
+# escape cannot slip past a raw-string prefix match. `-m` tolerates a
+# not-yet-created tail (e.g. WORK_ROOT/RUN_ROOT before mkdir).
+canon() { realpath -m -- "$1"; }
+CANON_WORK_ROOT="$(canon "$WORK_ROOT")"
+CANON_RUN_ROOT="$(canon "$RUN_ROOT")"
+CANON_SHARED_ENV_ROOT="$(canon "$SHARED_ENV_ROOT")"
+CANON_FACILITY_RUN_PREFIX="$(canon "$FACILITY_RUN_PREFIX")"
+CANON_JOB_SCRATCH="$(canon "/scratch/$USER/$SLURM_JOB_ID")"
+[[ "$CANON_WORK_ROOT" == "$CANON_JOB_SCRATCH" ]] || fail_precheck "WORK_ROOT must be exact job scratch"
+[[ "$CANON_RUN_ROOT" == "$CANON_FACILITY_RUN_PREFIX" || "$CANON_RUN_ROOT" == "$CANON_FACILITY_RUN_PREFIX"/* ]] ||
+  fail_precheck "RUN_ROOT outside facility prefix"
+[[ "$CANON_SHARED_ENV_ROOT" == "$CANON_FACILITY_RUN_PREFIX" || "$CANON_SHARED_ENV_ROOT" == "$CANON_FACILITY_RUN_PREFIX"/* ]] ||
+  fail_precheck "SHARED_ENV_ROOT outside facility prefix"
 
 assert_write_path() {
-  case "$1" in
-    "$WORK_ROOT"|"$WORK_ROOT"/*|"$RUN_ROOT"|"$RUN_ROOT"/*|"$SHARED_ENV_ROOT"|"$SHARED_ENV_ROOT"/*|"$SHARED_ENV_ROOT".lock|"$FACILITY_RUN_PREFIX"|"$FACILITY_RUN_PREFIX"/*) ;;
-    *) echo "PREFIX_ASSERT_FAILED $1" >&2; return 1 ;;
-  esac
+  local candidate canon_candidate root
+  candidate="$1"
+  canon_candidate="$(canon "$candidate")" || { echo "PREFIX_ASSERT_FAILED unresolvable: $candidate" >&2; return 1; }
+  for root in "$CANON_WORK_ROOT" "$CANON_RUN_ROOT" "$CANON_SHARED_ENV_ROOT" "$CANON_SHARED_ENV_ROOT.lock" "$CANON_FACILITY_RUN_PREFIX"; do
+    if [[ "$canon_candidate" == "$root" || "$canon_candidate" == "$root"/* ]]; then
+      return 0
+    fi
+  done
+  echo "PREFIX_ASSERT_FAILED $candidate -> $canon_candidate" >&2
+  return 1
 }
 safe_mkdir() { assert_write_path "$1"; mkdir -p -- "$1"; }
 
@@ -141,8 +161,25 @@ printf '%s\n' "$BASE_SITE" > "$OVERLAY_SITE/_tpen_shared_env.pth"
 $UV_BIN pip install --python "$OVERLAY/bin/python" --no-deps -e "$CLONE" >> "$RUN_ROOT/evidence/overlay-build.log" 2>&1
 $UV_BIN pip install --python "$OVERLAY/bin/python" "pytest-xdist==$CANNON_XDIST_VERSION" >> "$RUN_ROOT/evidence/overlay-build.log" 2>&1
 PYTHON="$OVERLAY/bin/python"
-export PYTHON TPEN_PYTHON="$PYTHON" ROOT_PYTHON="$PYTHON" P8_EXECUTOR_PYTHON="$PYTHON"
+export PYTHON TPEN_PYTHON="$PYTHON" ROOT_PYTHON="$PYTHON"
 export PATH="$OVERLAY/bin:$PATH"
+[[ -x "$PYTHON" ]] || fail_precheck "overlay interpreter missing after overlay build"
+# Tests read per-caller interpreter env vars named *_EXECUTOR_PYTHON /
+# *_ROOT_PYTHON (e.g. P8_EXECUTOR_PYTHON, P9C_EXECUTOR_PYTHON, P9C_ROOT_PYTHON,
+# P10_ROOT_PYTHON, H_V2_EXECUTOR_PYTHON) to launch a subprocess interpreter; an
+# unbound one is read as "skip" and an inherited one could select an unrelated
+# interpreter. Bind every such name the exact-SHA clone's tests reference,
+# after the overlay exists, to this same job's interpreter.
+assert_write_path "$RUN_ROOT/evidence/executor-python-bindings.txt"
+mapfile -t EXECUTOR_PYTHON_VARS < <(
+  grep -rhoE '[A-Z][A-Z0-9_]*_(EXECUTOR|ROOT)_PYTHON' "$CLONE" --include='*.py' 2>/dev/null | sort -u
+)
+: > "$RUN_ROOT/evidence/executor-python-bindings.txt"
+for executor_var in "${EXECUTOR_PYTHON_VARS[@]:-}"; do
+  [[ -n "$executor_var" ]] || continue
+  export "${executor_var}=${PYTHON}"
+  printf '%s=%s\n' "$executor_var" "$PYTHON" >> "$RUN_ROOT/evidence/executor-python-bindings.txt"
+done
 assert_write_path "$RUN_ROOT/evidence/interpreter-identity.txt"
 env -u PYTHONPATH "$PYTHON" - "$CLONE" > "$RUN_ROOT/evidence/interpreter-identity.txt" 2>&1 <<'PYCHECK'
 import importlib, os, sys
@@ -170,10 +207,12 @@ pytest_args() {
 run_pytest() {
   local name="$1" typecheck="$2" parallel="$3" mode="$4"; shift 4
   local log="$RUN_ROOT/evidence/$name.log" timing="$RUN_ROOT/evidence/$name.timing.tsv"
+  local junit="$RUN_ROOT/evidence/$name.junit.xml"
   local start end rc=0 item; local -a args=()
   while IFS= read -r -d '' item; do args+=("$item"); done < <(pytest_args "$typecheck" "$parallel")
+  args+=("--junit-xml=$junit")
   [[ "$mode" == targeted ]] && args+=("$@")
-  assert_write_path "$log"; start="$(date +%s.%N)"
+  assert_write_path "$log"; assert_write_path "$junit"; start="$(date +%s.%N)"
   (cd "$CLONE" && "$PYTHON" -m pytest "${args[@]}" > "$log" 2>&1) || rc=$?
   end="$(date +%s.%N)"; assert_write_path "$timing"
   printf 'name=%s\ttypecheck=%s\tparallel=%s\trc=%s\tseconds=%s\n' "$name" "$typecheck" "$parallel" "$rc" \
@@ -183,8 +222,9 @@ run_pytest() {
 purge_pycache() { assert_write_path "$CLONE"; find "$CLONE" -type d -name __pycache__ -prune -exec rm -rf -- {} +; }
 
 if [[ "$MODE" == quick ]]; then
+  purge_pycache
   baseline_rc=0; run_pytest baseline "$TYPECHECK" "$PARALLEL" targeted "${TEST_PATHS[@]}" || baseline_rc=$?
-  mutant_fail=0
+  mutant_fail=0 killed_count=0 survived_count=0 harness_error_count=0
   if [[ -n "$MUTANT_SPEC" ]]; then
     spec_json="$($PYTHON "$MUTANT_HELPER" validate --spec "$MUTANT_SPEC")"
     assert_write_path "$RUN_ROOT/evidence/mutant-spec.json"
@@ -201,17 +241,37 @@ if [[ "$MODE" == quick ]]; then
       if git -C "$CLONE" diff --quiet -- "$target_rel"; then MUTANT_STATUS+=("$mutant_id=EMPTY_DIFF"); exit 1; fi
       assert_write_path "$RUN_ROOT/evidence/mutant-$mutant_id.diff"
       git -C "$CLONE" diff -- "$target_rel" > "$RUN_ROOT/evidence/mutant-$mutant_id.diff"
+      purge_pycache
       mutant_rc=0; run_pytest "mutant-$mutant_id" "$TYPECHECK" "$PARALLEL" targeted "${TEST_PATHS[@]}" || mutant_rc=$?
-      if [[ "$baseline_rc" == 0 && "$mutant_rc" != 0 ]]; then MUTANT_STATUS+=("$mutant_id=KILLED")
-      elif [[ "$baseline_rc" == 0 ]]; then MUTANT_STATUS+=("$mutant_id=SURVIVED"); mutant_fail=1
-      else MUTANT_STATUS+=("$mutant_id=NOT_BASELINE_GREEN"); mutant_fail=1; fi
+      # Fail closed on any harness condition: a dirty baseline, or a mutant
+      # exit code outside pytest's normal {0=all passed, 1=some failed} range
+      # (2/3/4=internal or usage error, 5=no tests collected, 137=killed)
+      # can never be read as KILLED without inspecting the killer by name.
+      if [[ "$baseline_rc" != 0 ]]; then
+        MUTANT_STATUS+=("$mutant_id=HARNESS_ERROR:baseline_not_green"); mutant_fail=1; harness_error_count=$((harness_error_count + 1))
+      elif [[ "$mutant_rc" != 0 && "$mutant_rc" != 1 ]]; then
+        MUTANT_STATUS+=("$mutant_id=HARNESS_ERROR:mutant_rc_$mutant_rc"); mutant_fail=1; harness_error_count=$((harness_error_count + 1))
+      else
+        verdict_json="$($PYTHON "$MUTANT_HELPER" verdict --spec "$MUTANT_SPEC" --id "$mutant_id" \
+          --baseline-junit "$RUN_ROOT/evidence/baseline.junit.xml" \
+          --mutant-junit "$RUN_ROOT/evidence/mutant-$mutant_id.junit.xml")"
+        assert_write_path "$RUN_ROOT/evidence/mutant-$mutant_id-verdict.json"
+        printf '%s\n' "$verdict_json" > "$RUN_ROOT/evidence/mutant-$mutant_id-verdict.json"
+        mutant_verdict="$(printf '%s' "$verdict_json" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["verdict"])')"
+        case "$mutant_verdict" in
+          KILLED) MUTANT_STATUS+=("$mutant_id=KILLED"); killed_count=$((killed_count + 1)) ;;
+          SURVIVED) MUTANT_STATUS+=("$mutant_id=SURVIVED"); mutant_fail=1; survived_count=$((survived_count + 1)) ;;
+          *) MUTANT_STATUS+=("$mutant_id=HARNESS_ERROR:$mutant_verdict"); mutant_fail=1; harness_error_count=$((harness_error_count + 1)) ;;
+        esac
+      fi
       "$PYTHON" "$MUTANT_HELPER" restore --spec "$MUTANT_SPEC" --source "$CLONE" --backup "$backup" --target "$target_rel"
       [[ -z "$(git -C "$CLONE" status --porcelain)" ]] || fail_precheck "mutant restore left dirty clone"
       purge_pycache
     done
   fi
   result=PASS; [[ "$baseline_rc" == 0 && "$mutant_fail" == 0 ]] || result=FAIL
-  printf '%s baseline_rc=%s mutants=%s sha=%s statuses=%s\n' "$result" "$baseline_rc" "${#MUTANT_IDS[@]}" "$HEAD_SHA" "${MUTANT_STATUS[*]:-none}"
+  printf '%s baseline_rc=%s mutants=%s killed=%s survived=%s harness_error=%s sha=%s statuses=%s\n' \
+    "$result" "$baseline_rc" "${#MUTANT_IDS[@]}" "$killed_count" "$survived_count" "$harness_error_count" "$HEAD_SHA" "${MUTANT_STATUS[*]:-none}"
   [[ "$result" == PASS ]]
   exit
 fi

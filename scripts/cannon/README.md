@@ -14,24 +14,54 @@ xdist gives no speed-up on the small targeted sets this runner is meant for
 (~20.8s serial vs ~21.3s xdist with type checking on); pass `--parallel xdist`
 only where a measured speed-up justifies it (e.g. the full suite).
 
-`PYTHON`'s overlay interpreter is also exported as `TPEN_PYTHON`, `ROOT_PYTHON`,
-and `P8_EXECUTOR_PYTHON` (required by `experiments/toolkit/test_review_p8_*`),
-and `$OVERLAY/bin` is prepended to `PATH` so tests that spawn a bare `python`
-subprocess resolve the overlay interpreter.
+`PYTHON`'s overlay interpreter is also exported as `TPEN_PYTHON` and
+`ROOT_PYTHON`, and `$OVERLAY/bin` is prepended to `PATH` so tests that spawn a
+bare `python` subprocess resolve the overlay interpreter. In addition, every
+`*_EXECUTOR_PYTHON` / `*_ROOT_PYTHON` environment variable name referenced
+anywhere in the exact-SHA clone's `.py` files (e.g. `P8_EXECUTOR_PYTHON`,
+`P9C_EXECUTOR_PYTHON`, `P9C_ROOT_PYTHON`, `P10_ROOT_PYTHON`,
+`H_V2_EXECUTOR_PYTHON` as of this writing) is discovered by grep after the
+overlay is built and bound to the same job's interpreter; the resolved list is
+recorded in `executor-python-bindings.txt`. An inherited or unbound one is
+read by these tests as "skip this check", so binding by discovery (not a
+hardcoded name) matters whenever a new `*_EXECUTOR_PYTHON`/`*_ROOT_PYTHON`
+caller is added.
 
 Use --mutants SPEC for a JSON object or list containing 3-5 rows with id,
-target, old, and new. A mutant is KILLED only when the unmutated targeted run
-was green in the same job and the mutated run is non-zero. Every mutation is
-restored and the clone must be clean before the next one. The resolved spec and
-each applied mutant's diff are copied into the evidence directory
-(mutant-spec.json, mutant-<id>.diff) before restore, since the spec path and
-job scratch are both ephemeral — SURVIVED needs that diff to diagnose without
-re-running on the cluster. A SURVIVED verdict with typeguard off is not
-necessarily a quick-mode artifact: check the diff against the killer test's
-actual assertions first. A mutant that only cancels inside a self-referential
+target, old, new, and **killer** — the exact pytest node id (or bare id with
+parametrizations matched as `killer[...]`) that is expected to fail under the
+mutation. A mutant is KILLED only when: the unmutated targeted run is green in
+the same job (baseline_rc == 0), the mutated run exits in pytest's normal
+{0,1} range, AND the named killer's JUnit outcome (parsed from
+`--junit-xml`, never the bare process exit code) actually failed or errored
+while having passed cleanly in the baseline. Any other outcome — a harness-level
+mutant exit code (collection/usage/internal error, no tests collected, killed
+process), a killer missing from either report, or a killer whose
+parametrization set changed — is recorded as `HARNESS_ERROR` and fails the job
+closed; it is never read as KILLED. Every mutation is restored, `__pycache__`
+is purged immediately before the baseline run and before and after every
+mutant run (not only after restore, since a same-tick bytecode cache can
+otherwise mask an edit), and the clone must be clean before the next mutant.
+The resolved spec, each applied mutant's diff, and each mutant's verdict JSON
+are copied into the evidence directory (mutant-spec.json, mutant-<id>.diff,
+mutant-<id>-verdict.json) before restore, since the spec path and job scratch
+are both ephemeral — SURVIVED needs that diff to diagnose without re-running on
+the cluster. A SURVIVED verdict with typeguard off is not necessarily a
+quick-mode artifact: check the diff against the killer test's actual
+assertions first. A mutant that only cancels inside a self-referential
 equality (e.g. comparing two calls of the mutated function to each other) will
 survive under typeguard-on too; that is a test-coverage gap, not a runner
 defect, and is out of this runner's scope to fix.
+
+Write-destination containment (RUN_ROOT, WORK_ROOT, SHARED_ENV_ROOT, and every
+path passed through `assert_write_path`) is checked against canonicalized
+roots (`realpath -m`, resolving `..`, `.`, duplicate slashes, and symlinks of
+existing ancestors) before any write, so a `..`-traversal or symlinked escape
+outside the facility prefix is rejected rather than silently satisfied by a
+raw-string prefix match.
+
+Run `scripts/cannon/selftest.sh` to exercise these guarantees locally with
+bash/stdlib only — no Slurm, no pytest, no cluster access.
 
 Use --mode measure --full-suite to record targeted type-checking/parallelism
 combinations plus one full-suite timing in the evidence root. All evidence is

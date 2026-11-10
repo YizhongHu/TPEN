@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -17,6 +18,9 @@ def under(path: Path, root: Path) -> bool:
     return True
 
 
+REQUIRED_KEYS = ("id", "target", "old", "new", "killer")
+
+
 def spec(path: Path) -> list[dict[str, str]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     rows = payload if isinstance(payload, list) else payload.get("mutants")
@@ -25,10 +29,16 @@ def spec(path: Path) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     seen: set[str] = set()
     for row in rows:
-        if not isinstance(row, dict) or not {"id", "target", "old", "new"} <= row.keys():
-            raise ValueError("each mutant needs id, target, old, and new")
-        item = {key: str(row[key]) for key in ("id", "target", "old", "new")}
-        if not item["id"] or item["id"] in seen or Path(item["target"]).is_absolute() or ".." in Path(item["target"]).parts:
+        if not isinstance(row, dict) or not set(REQUIRED_KEYS) <= row.keys():
+            raise ValueError("each mutant needs id, target, old, new, and killer")
+        item = {key: str(row[key]) for key in REQUIRED_KEYS}
+        if (
+            not item["id"]
+            or item["id"] in seen
+            or Path(item["target"]).is_absolute()
+            or ".." in Path(item["target"]).parts
+            or not item["killer"]
+        ):
             raise ValueError(f"invalid mutant: {item['id']}")
         seen.add(item["id"])
         result.append(item)
@@ -72,17 +82,77 @@ def restore(source: Path, backup: Path, target: str) -> int:
     return 0
 
 
+def _junit_testcases(xml_path: Path) -> list[tuple[str, str]]:
+    """Return (nodeid, status) for every testcase in a pytest --junit-xml report.
+
+    nodeid is reconstructed from classname/name (classname dots -> path
+    separators, trailing ".py::name"); good enough for function-style tests,
+    which is all this runner's killers use.
+    """
+    root = ET.parse(xml_path).getroot()
+    cases: list[tuple[str, str]] = []
+    for testcase in root.iter("testcase"):
+        classname = testcase.get("classname", "")
+        name = testcase.get("name", "")
+        nodeid = f"{classname.replace('.', '/')}.py::{name}" if classname else name
+        if testcase.find("failure") is not None:
+            status = "failed"
+        elif testcase.find("error") is not None:
+            status = "error"
+        elif testcase.find("skipped") is not None:
+            status = "skipped"
+        else:
+            status = "passed"
+        cases.append((nodeid, status))
+    return cases
+
+
+def _matches_killer(nodeid: str, killer: str) -> bool:
+    return nodeid == killer or nodeid.startswith(killer + "[")
+
+
+def verdict(baseline_xml: Path, mutant_xml: Path, killer: str) -> dict[str, str]:
+    if not baseline_xml.is_file() or not mutant_xml.is_file():
+        return {"verdict": "HARNESS_ERROR", "reason": "missing junit xml report"}
+    try:
+        baseline_cases = [c for c in _junit_testcases(baseline_xml) if _matches_killer(c[0], killer)]
+        mutant_cases = [c for c in _junit_testcases(mutant_xml) if _matches_killer(c[0], killer)]
+    except ET.ParseError as exc:
+        return {"verdict": "HARNESS_ERROR", "reason": f"unparseable junit xml: {exc}"}
+    if not baseline_cases:
+        return {"verdict": "HARNESS_ERROR", "reason": "killer not collected in baseline"}
+    if any(status != "passed" for _, status in baseline_cases):
+        return {"verdict": "HARNESS_ERROR", "reason": "killer did not pass in baseline"}
+    if not mutant_cases:
+        return {"verdict": "HARNESS_ERROR", "reason": "killer not collected under mutant"}
+    baseline_ids = {nodeid for nodeid, _ in baseline_cases}
+    mutant_ids = {nodeid for nodeid, _ in mutant_cases}
+    if baseline_ids != mutant_ids:
+        return {"verdict": "HARNESS_ERROR", "reason": "killer parametrization set changed under mutant"}
+    if any(status in ("failed", "error") for _, status in mutant_cases):
+        return {"verdict": "KILLED"}
+    return {"verdict": "SURVIVED"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("validate", "apply", "restore"))
+    parser.add_argument("action", choices=("validate", "apply", "restore", "verdict"))
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--backup", type=Path)
     parser.add_argument("--id")
     parser.add_argument("--target")
+    parser.add_argument("--baseline-junit", type=Path)
+    parser.add_argument("--mutant-junit", type=Path)
     args = parser.parse_args()
     if args.action == "validate":
         print(json.dumps(spec(args.spec), sort_keys=True))
+        return 0
+    if args.action == "verdict":
+        if not args.id or not args.baseline_junit or not args.mutant_junit:
+            parser.error("verdict requires --id, --baseline-junit, and --mutant-junit")
+        killer = find(spec(args.spec), args.id)["killer"]
+        print(json.dumps(verdict(args.baseline_junit, args.mutant_junit, killer), sort_keys=True))
         return 0
     if not args.source:
         parser.error("apply and restore require --source")
