@@ -20,6 +20,7 @@ from helpers.p8_manifest_fixture import cross_project_manifest
 
 
 GROUP_DIGEST = "76a21ab64e2533a35421b67a8c16c832967fcc6cadf730c9fdfd505840389ebf"
+CONFIG_IDENTITY = {"schema": "tpen-config-identity-v1", "sha256": "a" * 64}
 
 
 def _member(task_id: str, attempt_id: str, status: str = "completed") -> ManifestAttempt:
@@ -52,6 +53,26 @@ def test_p8_records_are_frozen_hashable_and_reject_scalar_sequences() -> None:
         RunManifest("group-1", GROUP_DIGEST, "not-a-sequence")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("identity", [None, {"schema": "tpen-config-identity-v1", "sha256": "a" * 64}])
+def test_p8_accepted_segment_from_mapping_decodes_legacy_and_identity_records(identity: dict[str, str] | None) -> None:
+    segment = _segment("task-a", "attempt-1", None)
+    mapping = segment.to_dict()
+    if identity is not None:
+        mapping["resolved_config_identity"] = identity
+
+    decoded = AcceptedSegment.from_mapping(mapping)
+
+    assert decoded == AcceptedSegment(
+        "task-a",
+        AttemptId("attempt-1"),
+        None,
+        segment.checkpoint_dir,
+        1,
+        1,
+        identity,
+    )
+
+
 @pytest.mark.parametrize(
     "segments, message",
     [
@@ -82,23 +103,31 @@ def _allocation() -> ConfiguredAllocation:
     return ConfiguredAllocation(AllocationId("allocation-1"), BackendJobId("job-1"), {})
 
 
-def _evidence(run_dir: str, *, verdict: str = "completed", checkpoint_dir: str | None = None, step: int = 1) -> CoreRunEvidence:
+def _evidence(
+    run_dir: str,
+    *,
+    verdict: str = "completed",
+    checkpoint_dir: str | None = None,
+    step: int = 1,
+    identity: dict[str, str] | None = CONFIG_IDENTITY,
+) -> CoreRunEvidence:
     Path(run_dir).mkdir(parents=True, exist_ok=True)
-    return CoreRunEvidence.from_mapping(
-        {
-            "schema": "tpen.run-evidence/v1",
-            "run_dir": run_dir,
-            "verdict": verdict,
-            "run_status": verdict,
-            "checkpoint": {
-                "checkpoint_dir": checkpoint_dir or f"{run_dir}/checkpoint-{step}",
-                "schema_version": 1,
-                "next_iteration": step,
-                "completed_updates": step,
-            },
-            "refusal": None,
-        }
-    )
+    data = {
+        "schema": "tpen.run-evidence/v2" if identity is not None else "tpen.run-evidence/v1",
+        "run_dir": run_dir,
+        "verdict": verdict,
+        "run_status": verdict,
+        "checkpoint": {
+            "checkpoint_dir": checkpoint_dir or f"{run_dir}/checkpoint-{step}",
+            "schema_version": 1,
+            "next_iteration": step,
+            "completed_updates": step,
+        },
+        "refusal": None,
+    }
+    if identity is not None:
+        data["resolved_config_identity"] = identity
+    return CoreRunEvidence.from_mapping(data)
 
 
 def _evidence_without_checkpoint(run_dir: str) -> CoreRunEvidence:
@@ -155,6 +184,40 @@ def test_p8_dispatcher_accepts_one_completed_checkpoint_as_fresh_segment(tmp_pat
     assert segment.task_id == "task-a"
     assert segment.predecessor_checkpoint is None
     assert (segment.next_iteration, segment.completed_updates) == (1, 1)
+
+
+def test_p8_dispatcher_refuses_new_v1_evidence_without_identity(tmp_path: Path) -> None:
+    store = DirectoryStore(tmp_path / "store")
+    with pytest.raises(FenceRejected, match="identity"):
+        _dispatch_once(tmp_path, _dispatcher_worker(lambda run_dir: _evidence(run_dir, identity=None)), store)
+
+
+def test_p8_dispatcher_publishes_v2_identity_on_accepted_segment(tmp_path: Path) -> None:
+    identity = {"schema": "tpen-config-identity-v1", "sha256": "a" * 64}
+    store = DirectoryStore(tmp_path / "store")
+    manifest = _dispatch_once(tmp_path, _dispatcher_worker(lambda run_dir: _evidence(run_dir, identity=identity)), store)
+
+    assert manifest.segments[0].resolved_config_identity == identity
+    decoded = RunManifest.decode(manifest.encode())
+    assert decoded.segments[0].resolved_config_identity == identity
+
+
+def test_p8_decoders_refuse_explicit_null_identity_but_allow_absence(tmp_path: Path) -> None:
+    legacy = _segment("task-a", "attempt-1", None).to_dict()
+    assert AcceptedSegment.from_mapping(legacy).resolved_config_identity is None
+    with pytest.raises(TypeError, match="must not be null"):
+        AcceptedSegment.from_mapping({**legacy, "resolved_config_identity": None})
+    evidence = _evidence(str(tmp_path / "group-1" / "task-a" / "attempt-1" / "core"))
+    with pytest.raises(EvidenceUnavailable, match="non-null"):
+        CoreRunEvidence.from_mapping({
+            "schema": "tpen.run-evidence/v2",
+            "run_dir": evidence.run_dir,
+            "verdict": evidence.verdict,
+            "run_status": evidence.run_status,
+            "checkpoint": dict(evidence.checkpoint),
+            "refusal": None,
+            "resolved_config_identity": None,
+        })
 
 
 def test_p8_dispatcher_does_not_accept_failed_member(tmp_path: Path) -> None:

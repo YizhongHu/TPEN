@@ -63,7 +63,7 @@ def main(argv):
     assert selected_module.is_relative_to(stub_root)
     assert selected_module != (stub_root / '__init__.py').resolve()
     (run_dir / 'selected-tpen-module.txt').write_text(str(selected_module))
-    (run_dir / 'evidence.json').write_text(json.dumps({'schema':'tpen.run-evidence/v1','run_dir':str(run_dir),'verdict':'completed','run_status':'completed','checkpoint':{'checkpoint_dir':str(run_dir / 'checkpoint'),'schema_version':1,'next_iteration':1,'completed_updates':1},'refusal':None}))
+    (run_dir / 'evidence.json').write_text(json.dumps({'schema':'tpen.run-evidence/v2','run_dir':str(run_dir),'verdict':'completed','run_status':'completed','checkpoint':{'checkpoint_dir':str(run_dir / 'checkpoint'),'schema_version':1,'next_iteration':1,'completed_updates':1},'refusal':None,'resolved_config_identity':{'schema':'tpen-config-identity-v1','sha256':'a'*64}}))
     return 0
 """)
 (stub / "inspection.py").write_text("import sys\nfrom pathlib import Path\nprint(Path(sys.argv[1], 'evidence.json').read_text())\n")

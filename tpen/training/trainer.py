@@ -816,6 +816,11 @@ class VMCTrainer:
                     total_local_energy = result
                     term_energies = None
 
+                # `_detach_local_energy_value` already detached each term in
+                # the structured result. Reuse that mapping for callbacks so
+                # recorder-off training does not rebuild it on every step.
+                detached_term_energies = term_energies
+
                 # One forward, shaped by what the update method actually needs.
                 # A score method receives its raw per-sample score blocks in
                 # this same packet; running an ordinary forward and then
@@ -918,8 +923,8 @@ class VMCTrainer:
                 with context.scope(Metrics(step=step), state=state):
                     metrics: dict[str, Any] = dict(objective.metrics)
                     metrics.update(summarize_logabs(output.logabs))
-                    if term_energies is not None:
-                        metrics.update(summarize_local_energy_terms(term_energies))
+                    if detached_term_energies is not None:
+                        metrics.update(summarize_local_energy_terms(detached_term_energies))
                     metrics["grad_norm"] = grad_norm
                     metrics["param_norm"] = param_norm
                     metrics["loss_has_grad"] = bool(loss.requires_grad)
@@ -988,6 +993,7 @@ class VMCTrainer:
                 state.samples = walkers
                 state.batch = batch
                 state.local_energy = total_local_energy.detach()
+                state.local_energy_terms = detached_term_energies
                 state.loss = loss.detach()
                 state.wavefunction_output = output
                 state.sampler_stats = sampler_stats

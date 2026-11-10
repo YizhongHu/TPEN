@@ -107,6 +107,8 @@ def test_core_t2_constants_facade_and_chain_resume_remain_exact():
         "tpen.callback.InitialCheckpoint",
         "tpen.callback.ParameterActivity",
         "tpen.callback.AmplitudeRiskFraction",
+        "tpen.callback.ElectronNucleusDistanceQuantiles",
+        "tpen.callback.ModuleNorms",
     })
     assert profiles.SUPPORTED_LOGGER_TARGETS == frozenset({
         "tpen.logging.CSV", "tpen.logging.JSONL",

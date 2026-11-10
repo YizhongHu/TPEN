@@ -14,6 +14,7 @@ from ._records import frozen_record
 from .workers import SubprocessWorker
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
+RUN_EVIDENCE_SCHEMA_V2 = "tpen.run-evidence/v2"
 CHILD_CONTEXT_KEYS_ENV = "TPEN_EXECUTOR_CONTEXT_ENV_KEYS"
 CONTEXT_ENV_KEY_PATTERN = r"^(CUDA_VISIBLE_DEVICES|TPEN_CTX_[A-Z0-9_]{1,64})$"
 RUN_SHIM = (
@@ -95,7 +96,7 @@ RUN_SHIM = (
 REFUSAL_CODES = frozenset(
     {
         "missing-run-dir", "missing-status", "multiple-status", "malformed-status",
-        "status-io-error", "incomplete-checkpoint", "corrupt-checkpoint",
+        "status-io-error", "malformed-run-identity", "incomplete-checkpoint", "corrupt-checkpoint",
         "checkpoint-io-error", "corrupt-publication-catalog", "torn-publication-catalog",
         "missing-checkpoint", "no-train-resume-checkpoint",
         "unsupported-callback-cadence",
@@ -127,6 +128,7 @@ class CoreRunEvidence:
     run_status: str | None
     checkpoint: Mapping[str, Any] | None
     refusal: Mapping[str, str] | None
+    resolved_config_identity: Mapping[str, str] | None = None
 
     SCHEMA: ClassVar[str] = RUN_EVIDENCE_SCHEMA
     VERDICTS: ClassVar[frozenset[str]] = frozenset({"completed", "incomplete", "failed", "refused"})
@@ -135,6 +137,7 @@ class CoreRunEvidence:
     def __post_init__(self) -> None:
         object.__setattr__(self, "checkpoint", self._checkpoint(self.checkpoint))
         object.__setattr__(self, "refusal", self._refusal(self.refusal))
+        object.__setattr__(self, "resolved_config_identity", self._identity(self.resolved_config_identity))
 
     @classmethod
     def from_mapping(cls, value: Any) -> "CoreRunEvidence":
@@ -158,10 +161,15 @@ class CoreRunEvidence:
 
         if type(value) is not dict:
             raise EvidenceUnavailable("evidence is not a JSON object")
+        schema = value.get("schema")
         expected = {"schema", "run_dir", "verdict", "run_status", "checkpoint", "refusal"}
-        if set(value) != expected:
+        if schema == RUN_EVIDENCE_SCHEMA_V2:
+            expected.add("resolved_config_identity")
+        if schema not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2} or set(value) != expected:
             raise EvidenceUnavailable("evidence has unexpected keys")
-        if value["schema"] != cls.SCHEMA:
+        if schema == RUN_EVIDENCE_SCHEMA_V2 and value.get("resolved_config_identity") is None:
+            raise EvidenceUnavailable("v2 evidence requires a non-null resolved_config_identity")
+        if value["schema"] not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2}:
             raise EvidenceUnavailable("unknown evidence schema")
         if type(value["run_dir"]) is not str or not value["run_dir"]:
             raise EvidenceUnavailable("run_dir must be a non-empty string")
@@ -181,7 +189,10 @@ class CoreRunEvidence:
             raise EvidenceUnavailable("completed evidence requires checkpoint")
         if verdict != "refused" and refusal is not None:
             raise EvidenceUnavailable("non-refused evidence cannot contain refusal")
-        return cls(value["schema"], value["run_dir"], verdict, run_status, checkpoint, refusal)
+        return cls(
+            value["schema"], value["run_dir"], verdict, run_status, checkpoint, refusal,
+            value.get("resolved_config_identity"),
+        )
 
     def __hash__(self) -> int:
         """Hash the canonical JSON representation used by equality fields."""
@@ -193,6 +204,7 @@ class CoreRunEvidence:
             "run_status": self.run_status,
             "checkpoint": self.checkpoint,
             "refusal": self.refusal,
+            "resolved_config_identity": self.resolved_config_identity,
         }))
 
     @staticmethod
@@ -223,6 +235,21 @@ class CoreRunEvidence:
         if type(value["reason"]) is not str:
             raise EvidenceUnavailable("refusal reason must be a string")
         return MappingProxyType({"code": value["code"], "reason": value["reason"]})
+
+    @staticmethod
+    def _identity(value: Any) -> MappingProxyType | None:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping) or set(value) != {"schema", "sha256"}:
+            raise EvidenceUnavailable("resolved_config_identity has invalid keys")
+        if value["schema"] != "tpen-config-identity-v1":
+            raise EvidenceUnavailable("unknown resolved_config_identity schema")
+        digest = value["sha256"]
+        if type(digest) is not str or len(digest) != 64 or digest != digest.lower() or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise EvidenceUnavailable("resolved_config_identity sha256 is invalid")
+        return MappingProxyType({"schema": value["schema"], "sha256": digest})
 
 
 @frozen_record
@@ -345,4 +372,4 @@ class TPENEvidence:
         return CoreRunEvidence.from_mapping(decoded)
 
 
-__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CONTEXT_ENV_KEY_PATTERN", "CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "TPENCommand", "TPENEvidence"]
+__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CONTEXT_ENV_KEY_PATTERN", "CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "RUN_EVIDENCE_SCHEMA_V2", "TPENCommand", "TPENEvidence"]

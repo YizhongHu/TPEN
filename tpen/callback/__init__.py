@@ -36,6 +36,10 @@ def __getattr__(name: str) -> object:
         from .initial_checkpoint import InitialCheckpoint
 
         return InitialCheckpoint
+    if name == "ModuleNorms":
+        from .module_norms import ModuleNorms
+
+        return ModuleNorms
     if name == "ParameterActivity":
         from .parameter_activity import ParameterActivity
 
@@ -88,6 +92,10 @@ def __getattr__(name: str) -> object:
         from .resource_usage import ResourceUsage
 
         return ResourceUsage
+    if name in {"RawTrainingBatchRecorder", "TrainingBatchRecorder"}:
+        from .raw_training_batch_recorder import RawTrainingBatchRecorder
+
+        return RawTrainingBatchRecorder
     if name == "RunTiming":
         from .timing import RunTiming
 
@@ -120,7 +128,9 @@ __all__ = [
     "GradientStats",
     "InitialCheckpoint",
     "Metadata",
+    "ModuleNorms",
     "ParameterActivity",
+    "RawTrainingBatchRecorder",
     "ResolvedConfigSnapshot",
     "ResourceUsage",
     "RunTiming",
@@ -133,5 +143,6 @@ __all__ = [
     "SubscriptionGroup",
     "TrainPhaseTiming",
     "TrainStepTiming",
+    "TrainingBatchRecorder",
     "configure_terminal_logging",
 ]
