@@ -200,7 +200,7 @@ if [[ "$MODE" == quick ]]; then
       if [[ "$baseline_rc" == 0 && "$mutant_rc" != 0 ]]; then MUTANT_STATUS+=("$mutant_id=KILLED")
       elif [[ "$baseline_rc" == 0 ]]; then MUTANT_STATUS+=("$mutant_id=SURVIVED"); mutant_fail=1
       else MUTANT_STATUS+=("$mutant_id=NOT_BASELINE_GREEN"); mutant_fail=1; fi
-      "$PYTHON" "$MUTANT_HELPER" restore --source "$CLONE" --backup "$backup" --target "$target_rel"
+      "$PYTHON" "$MUTANT_HELPER" restore --spec "$MUTANT_SPEC" --source "$CLONE" --backup "$backup" --target "$target_rel"
       [[ -z "$(git -C "$CLONE" status --porcelain)" ]] || fail_precheck "mutant restore left dirty clone"
       purge_pycache
     done
