@@ -55,9 +55,16 @@ class ConfiguredAllocation:
                 # Scheduler paths are an input-time concern. Capture their
                 # contents before this allocation is frozen so later binding
                 # resolution cannot change an immutable allocation's host map.
-                from .placement import scheduler_host_map
+                from .placement import PlacementRefusal, scheduler_host_map
 
-                hosts = scheduler_host_map(scheduler, environ={})
+                try:
+                    hosts = scheduler_host_map(scheduler, environ={})
+                except PlacementRefusal as error:
+                    # Preserve a typed capture failure so dispatch can publish
+                    # launch_failed/rc=3 placement evidence instead of turning
+                    # an unreadable PBS path into admission rc=2.
+                    scheduler["pbs_nodefile_error"] = error.to_dict()
+                    hosts = ()
                 scheduler["pbs_nodefile_text"] = "\n".join(hosts)
                 for key in path_keys | {"pbs_nodefile", "PBS_NODEFILE"}:
                     scheduler.pop(key, None)
