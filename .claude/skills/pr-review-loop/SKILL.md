@@ -14,6 +14,10 @@ Review one implementation-slice PR with relevant stack context. **Improve behavi
 - **Orchestrator — Does it matter to this slice?** Accept, decline, or defer **each finding and test**, with a reason based on the slice's purpose and cost/benefit. For spikes, prioritize issues that inform the proof of concept or design. A deferral counts as declined *for this slice* and must identify a follow-up; it does not keep the loop open.
 - **Termination — Mechanical.** Stop if the reviewer proposes nothing or the orchestrator accepts nothing. Otherwise integrate and verify accepted fixes and tests, then review again. Revisit declined findings only when new evidence changes their relevance.
 
+## Tier gate
+
+Read the required `review-tier`. T0: no agent review. T1: one round. T2: one full round and at most one semantic delta round; any further state-machine/wire-semantics delta requires the recorded exception from amendment-1. Mark ready only when the immutable verification receipt names the current full head; a new commit drafts the PR unless the new head's git tree equals the verified head's tree (record both SHAs and the tree hash).
+
 ## Procedure
 
 1. **Initiate.** Once the PR is pushed and initially verified, spawn a Paseo reviewer in a dedicated workspace with the acceptance contract and PR context. Write `reviewer-initialization`.
