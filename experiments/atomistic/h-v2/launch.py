@@ -819,6 +819,37 @@ def _validate_wall_budget(t_wall: str, e_wall: str) -> None:
         )
 
 
+def _validate_single_stage_wall_seconds(time_value: str, *, label: str) -> None:
+    """F5: refuse a single-stage (TRAIN-only or EVAL-only) submission's own time budget.
+
+    :func:`_validate_wall_budget` only runs for the chained ``--stage
+    both``/omitted science route, where both ``T_WALL`` and ``E_WALL`` are
+    known together. A single-stage submission supplies only one side, but it
+    still must not alone exceed the per-job ceiling or the whole per-lineage
+    budget (review r1 F5: a standalone 33-hour request already exceeds the
+    32-hour total lineage allowance and was accepted).
+
+    Raises
+    ------
+    LaunchError
+        If *time_value* exceeds :data:`launch_config.MAX_JOB_WALL_SECONDS` or
+        :data:`launch_config.MAX_LINEAGE_WALL_SECONDS`.
+    """
+
+    seconds = _parse_wall_seconds(time_value)
+    if seconds > launch_config.MAX_JOB_WALL_SECONDS:
+        raise LaunchError(
+            f"{label} must be at most {launch_config.MAX_JOB_WALL_SECONDS}s (2 days, the seas_gpu "
+            f"ceiling); got {time_value!r} ({seconds}s)"
+        )
+    if seconds > launch_config.MAX_LINEAGE_WALL_SECONDS:
+        raise LaunchError(
+            f"{label} must be at most the per-lineage wall budget "
+            f"{launch_config.MAX_LINEAGE_WALL_SECONDS}s (32 hours, design target section C3) even alone; "
+            f"got {time_value!r} ({seconds}s)"
+        )
+
+
 def submit_lineage(
     lineage: str,
     *,
@@ -923,30 +954,34 @@ def submit_lineage(
 _PILOT_RUN_ROOT_STUDY_SEGMENT = "h-v2"
 
 
-def _validate_run_root_prefix(run_root: Path, run_root_prefix: str, *, payload: str, lineage: str) -> None:
-    """Refuse a run root outside its payload/lineage's own durable location.
+def _validate_run_root_prefix(
+    run_root: Path, run_root_prefix: str, *, payload: str, lineage: str | None = None
+) -> None:
+    """Refuse a run root outside its payload's own durable location.
 
-    Run-root amendment (harness r3 addendum3): pilot/part-(g) run roots must
-    live under a persistent, lifecycle-governed prefix, in the exact shape
-    ``<prefix>/h-v2/<payload>/<lineage>`` (or a child of it, for example an
-    attempt subdirectory) -- not merely anywhere under the broad prefix
-    (review r1 F5: a caller-supplied prefix ending in ``runs`` otherwise
-    accepted any sibling payload's or an unrelated root). The exact facility
-    path is never hardcoded here (``netscratch-never-referenced-from-repo``);
-    the caller supplies the prefix
-    (:data:`launch_config.PILOT_RUN_ROOT_PREFIX_ENV`).
+    Run-root amendment (harness r3 addendum3): every H-v2 run root -- pilot,
+    part-(g), and science -- must live under a persistent, lifecycle-governed
+    prefix, in the shape ``<prefix>/h-v2/<payload>`` (or, with *lineage*
+    given, the narrower ``<prefix>/h-v2/<payload>/<lineage>``), or a child of
+    it (for example an attempt subdirectory) -- not merely anywhere under the
+    broad prefix (review r1 F5: a caller-supplied prefix ending in ``runs``
+    otherwise accepted any sibling payload's or an unrelated root). The exact
+    facility path is never hardcoded here
+    (``netscratch-never-referenced-from-repo``); the caller supplies the
+    prefix (:data:`launch_config.PILOT_RUN_ROOT_PREFIX_ENV`).
 
     Raises
     ------
     LaunchError
-        If ``run_root_prefix`` is not absolute, or ``run_root`` is not
-        ``<run_root_prefix>/h-v2/<payload>/<lineage>`` or a descendant of it.
+        If ``run_root_prefix`` is not absolute, or ``run_root`` is not the
+        expected directory or a descendant of it.
     """
 
     prefix = Path(run_root_prefix)
     if not prefix.is_absolute():
         raise LaunchError(f"{launch_config.PILOT_RUN_ROOT_PREFIX_ENV} must be an absolute path, got {run_root_prefix!r}")
-    expected_root = (prefix / _PILOT_RUN_ROOT_STUDY_SEGMENT / payload / lineage).resolve()
+    segments = (_PILOT_RUN_ROOT_STUDY_SEGMENT, payload) + ((lineage,) if lineage is not None else ())
+    expected_root = prefix.joinpath(*segments).resolve()
     try:
         run_root.resolve().relative_to(expected_root)
     except ValueError:
@@ -1250,6 +1285,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise LaunchError("--expected-train-commit is required for --stage eval")
         if not args.time:
             raise LaunchError("--time is required for --stage eval")
+        # F5: the pilot/part-(g) EVAL route bypassed the same run-root
+        # containment guard --stage train already enforces; check it here,
+        # before any sbatch call, whenever a prefix is available (--stage
+        # train makes the prefix mandatory; --stage eval does not, to keep
+        # a prefix-less EVAL-only submission against an existing TRAIN run
+        # working unchanged when no prefix convention is in force).
+        pilot_run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
+        if pilot_run_root_prefix:
+            _validate_run_root_prefix(
+                run_root, pilot_run_root_prefix, payload=args.payload,
+                lineage=launch_config.PILOT_PAYLOAD_LINEAGES[args.payload],
+            )
         if args.payload == "capacity-pilot":
             if args.pilot_stage is None:
                 raise LaunchError("--pilot-stage {1,2,2-core} is required for capacity-pilot --stage eval")
@@ -1284,6 +1331,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         t_wall = os.environ.get("T_WALL")
         if not t_wall:
             raise LaunchError("T_WALL environment variable is required")
+        # F5: a single-stage TRAIN-only submission bypassed the chained
+        # route's wall-budget check; it alone must still fit the per-lineage
+        # budget. Run-root containment is checked only when a prefix is
+        # actually supplied (optional here, unlike a pilot payload).
+        _validate_single_stage_wall_seconds(t_wall, label="T_WALL")
+        science_run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
+        if science_run_root_prefix:
+            _validate_run_root_prefix(run_root, science_run_root_prefix, payload=args.payload)
         for lineage in launch_config.LINEAGES:
             _validate_science_lineage(args.payload, lineage)
         for lineage in launch_config.LINEAGES:
@@ -1305,6 +1360,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise LaunchError("--expected-train-commit is required for --stage eval")
         if not args.time:
             raise LaunchError("--time is required for --stage eval")
+        # F5: same single-stage wall-budget and optional run-root containment
+        # checks as --stage train, applied to the standalone EVAL route.
+        _validate_single_stage_wall_seconds(args.time, label="--time")
+        science_run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
+        if science_run_root_prefix:
+            _validate_run_root_prefix(run_root, science_run_root_prefix, payload=args.payload)
         for lineage in launch_config.LINEAGES:
             _validate_science_lineage(args.payload, lineage)
         for lineage in launch_config.LINEAGES:
