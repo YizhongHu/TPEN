@@ -46,7 +46,7 @@ def _cfg(
         OmegaConf.create(
             {
                 "_target_": "tpen.callback.RawTrainingBatchRecorder",
-                "path": "${run.dir}/training-history",
+                "path": str(root / "training-history"),
                 "partition_size_steps": 1,
                 "every_n_steps": 1,
             }

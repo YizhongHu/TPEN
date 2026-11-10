@@ -561,7 +561,16 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
             return
         if not self._first_iteration_seen:
             self._first_iteration_seen = True
-            if event.iteration.step != 0:
+            next_iteration = getattr(state.trainer, "next_iteration", None)
+            nonzero_restored_cursor = (
+                next_iteration is not None and int(next_iteration) != 0
+            )
+            if not nonzero_restored_cursor and next_iteration is None:
+                nonzero_restored_cursor = (
+                    event.iteration.step != 0
+                    and int(getattr(state.trainer, "completed_updates", 0)) != 0
+                )
+            if nonzero_restored_cursor:
                 raise ValueError(
                     "RawTrainingBatchRecorder refuses restored lineage before capture "
                     "or publication [unsupported-callback]"
