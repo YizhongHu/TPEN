@@ -474,8 +474,8 @@ def test_real_env_without_dry_env_rejected(fixture_root: Path) -> None:
     real_env = base / "stage" / "real-only.env"
     real_env.write_text(f"HEAD_SHA={SHA}\nDRY_RUN=0\nTASK_ROOT={task_root}\n")
     result = run_lint(base, sbatch, manifest, "--real-env", str(real_env))
-    assert result.returncode != 0, result.stdout + result.stderr
-    assert "must be given together" in result.stdout
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "must be given together" in result.stderr
 
 
 def test_dry_env_without_real_env_rejected(fixture_root: Path) -> None:
@@ -484,8 +484,8 @@ def test_dry_env_without_real_env_rejected(fixture_root: Path) -> None:
     dry_env = base / "stage" / "dry-only.env"
     dry_env.write_text(f"HEAD_SHA={SHA}\nDRY_RUN=1\nTASK_ROOT={task_root}\n")
     result = run_lint(base, sbatch, manifest, "--dry-env", str(dry_env))
-    assert result.returncode != 0, result.stdout + result.stderr
-    assert "must be given together" in result.stdout
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "must be given together" in result.stderr
 
 
 def test_realpath_without_dash_m_support_fails_clearly(fixture_root: Path, tmp_path: Path) -> None:
