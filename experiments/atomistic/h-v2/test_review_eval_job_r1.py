@@ -354,29 +354,76 @@ def test_readout_probe_errors_are_not_optional_absence(monkeypatch, rc, stdout):
         ev.probe_readout_trajectory_generator(sys.executable)
 
 
-def test_science_eval_wrapper_preserves_629_command(tmp_path):
-    """F9: kill changing #629's external science command while replacing its internals."""
+def test_science_train_leg_is_byte_identical_dry_run_stays_six_lines(tmp_path, monkeypatch, capsys):
+    """F9 (orchestrator decision, partial accept, comment 6774677893): E6's
+    'byte-identical' covers the sbatch wrapper and sidecar handling, not the
+    eval leg's arguments -- replacing the eval refusal is this item's
+    purpose. So the frozen contract is: (a) the TRAIN leg's own sbatch
+    command never changes shape when built through the eval-fanout-aware
+    call site, and (b) the whole science dry run stays exactly 6 lines.
+    Replaces the review's original full-command comparison, which would
+    have frozen the eval leg's arguments too.
+    """
     common = dict(science_python=sys.executable, executor_python=sys.executable,
                   run_root=tmp_path, checkout_root=tmp_path / "checkout", time_value="08:00:00",
-                  dependency="afterok:123", commit=EVAL_SHA)
-    legacy = launch.build_sbatch_command("eval", "L1", payload="science", **common)
-    current = launch.build_eval_fanout_sbatch_command(
-        "science", lineage="L1", expected_train_commit=EVAL_SHA,
-        resources=launch.launch_config.RESOURCES, **common)
-    assert current == legacy
+                  dependency=None, commit=EVAL_SHA)
+    train_via_direct_call = launch.build_sbatch_command("train", "L1", payload="science", **common)
+    train_via_submit_lineage = []
+    launch.submit_lineage(
+        "L1", payload="science", science_python=sys.executable, executor_python=sys.executable,
+        run_root=tmp_path, checkout_root=tmp_path / "checkout", t_wall="08:00:00", e_wall="24:00:00",
+        commit=EVAL_SHA,
+        runner=lambda command: (train_via_submit_lineage.append(list(command))
+                                 or __import__("subprocess").CompletedProcess(command, 0, "1;c\n", "")),
+    )
+    assert train_via_submit_lineage[0] == train_via_direct_call
+
+    monkeypatch.setenv("T_WALL", "08:00:00")
+    monkeypatch.setenv("E_WALL", "24:00:00")
+    code = launch.main(["--run-root", str(tmp_path), "--commit", EVAL_SHA, "--payload", "science",
+                        "--science-python", sys.executable, "--executor-python", sys.executable, "--dry-run"])
+    assert code == 0
+    assert capsys.readouterr().out.count("sbatch --parsable") == 6
 
 
-@pytest.mark.parametrize("c1", [18, 19])
-def test_b2_core_late_basin_obeys_literal_amendment(c1):
-    """F10: r3 says 'same as stage 2 without ordinal 20'; requires adjudication.
-
-    Removing this point also prevents c* at center 19. Do not blindly repair
-    the grid: the orchestrator must resolve that conflict before accepting
-    this test, or explicitly revise the core contract and test together.
+@pytest.mark.parametrize("c1,expected_core_count", [(18, 10), (19, 10)])
+def test_b2_core_late_basin_obeys_amendment_r5(c1, expected_core_count):
+    """F10 (orchestrator decision r5, comment 6774677893): 'stage 2-core: the
+    same as stage 2 without ordinal 20' means without the endpoint ANCHOR
+    runs at ordinal 20 (streams 1/2/3 added only as anchors) -- a run at
+    ordinal 20 that is already in the c1 window (stream 1 at lo..lo+4) or
+    at c1 itself is KEPT, so c*=19 stays reachable. For c1 in {18, 19},
+    lo=16 so the window already spans 16..20: core drops only (20, 2) and
+    (20, 3) (the anchor-only pairs), never (20, 1).
     """
     full = {(g["ordinal"], g["stream"]) for g in ev.pilot_fanout("2", c1=c1)}
     core = {(g["ordinal"], g["stream"]) for g in ev.pilot_fanout("2-core", c1=c1)}
-    assert core == {(ordinal, stream) for ordinal, stream in full if ordinal != 20}
+    assert (20, 1) in core, "ordinal 20 stream 1 is inside the c1 window and must stay in core"
+    assert full - core == {(20, 2), (20, 3)}
+    assert len(core) == expected_core_count
+
+
+def test_science_eval_seed_formula_matches_ci(tmp_path):
+    """F12 (orchestrator decision, accepted from scope notes): science eval
+    seeds must be read-checked against CI's own frozen formula field
+    (contract_inputs.json measurement.seed_roster.evaluation_stream_seed_formula),
+    never a hard-coded literal with no CI tie, the way pilot_eval_seed/
+    gpu_route_g_eval_seed already are against their own roster fields.
+    """
+    payload = json.loads(protocol.CONTRACT_INPUTS_PATH.read_text(encoding="utf-8"))
+    formula = payload["measurement"]["seed_roster"]["evaluation_stream_seed_formula"]
+    base, lineage_coeff, ordinal_coeff = (
+        int(n)
+        for n in __import__("re").findall(
+            r"(\d+)\s*\+\s*(\d+)\*lineage_index\s*\+\s*(\d+)\*evaluated_checkpoint_ordinal\s*\+\s*stream_index",
+            formula,
+        )[0]
+    )
+    for lineage_index in range(3):
+        for ordinal in range(27):
+            for stream in range(4):
+                expected = base + lineage_coeff * lineage_index + ordinal_coeff * ordinal + stream
+                assert protocol.science_eval_seed(lineage_index, ordinal, stream) == expected
 
 
 @pytest.mark.parametrize("explicit_eps", [False, True], ids=["p-base", "e-current-control"])
