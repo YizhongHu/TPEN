@@ -10,7 +10,7 @@ import time
 from typing import Any
 
 from ..environments import PreparedPythonEnvironment, SourceScript
-from ..placement import BindingError, WorkerBinding, bindings_from_allocation, slots_from_allocation
+from ..placement import BindingError, PlacementRefusal, WorkerBinding, bindings_from_allocation, physical_slots_from_allocation, slots_from_allocation
 from ..programs import WorkerProgram
 from .._records import frozen_record
 from ..results import RunManifest
@@ -297,7 +297,12 @@ class ParslDispatcher(DispatcherContract):
             if self.binding is None:
                 raise BindingError("binding is required when lifecycle is not AttachedAllocation")
             return (WorkerBinding.from_mapping(self.binding),)
-        slots = slots_from_allocation(lifecycle.allocation)
+        try:
+            slots = physical_slots_from_allocation(lifecycle.allocation)
+        except PlacementRefusal:
+            # Keep the raw slot binding long enough for the shared completion
+            # path to publish the typed prelaunch v2 refusal.
+            slots = ()
         if slots:
             if self.binding is not None:
                 raise BindingError("explicit binding is ambiguous when allocation slots are declared")
@@ -334,6 +339,10 @@ class ParslDispatcher(DispatcherContract):
                 available.append(binding)
                 return
             try:
+                # A fence is begun before preparation. Keep both values
+                # defined so preparation errors reach typed completion.
+                materialized = None
+                environment = None
                 materialized = self.worker.materialize(env)
                 environment = self._worker_environment(materialized, binding)
                 environment = _with_child_context_keys(environment, lifecycle.allocation)
@@ -381,12 +390,13 @@ class ParslDispatcher(DispatcherContract):
                     stderr_path=stderr_path,
                     timeout=timeout,
                 )
-            except Exception:
-                try:
-                    lifecycle.finish(fence, "launch_failed", self._utc_now(), None)
-                except BaseException as error:
-                    if finish_error is None and isinstance(error, Exception):
-                        finish_error = error
+            except Exception as error:
+                completion_error = self._complete_member(
+                    group, member, configured, lifecycle, fence, materialized, environment,
+                    None, timeout, error=error,
+                )
+                if completion_error is not None and finish_error is None:
+                    finish_error = completion_error
                 available.append(binding)
                 return
             except BaseException:

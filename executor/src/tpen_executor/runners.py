@@ -61,7 +61,7 @@ RUN_SHIM = (
     "    declared_host = os.environ.get('TPEN_PLACEMENT_DECLARED_HOST')\n"
     "    host_key = lambda value: value.strip().lower().rstrip('.').split('.', 1)[0]\n"
     "    if declared_host and host_key(placement_host) != host_key(declared_host) and placement_refusal is None:\n"
-    "        placement_refusal = {'code': 'child-placement-refused', 'reason': f'child host {placement_host!r} differs from declared host {declared_host!r}'}\n"
+    "        placement_refusal = {'code': 'child-placement-mismatch', 'reason': f'child host {placement_host!r} differs from declared host {declared_host!r}'}\n"
     "    observation = {\n"
     "        'schema': 'tpen-executor/child-placement-v1',\n"
     "        'task_id': os.environ.get('TPEN_PLACEMENT_TASK_ID', ''),\n"
