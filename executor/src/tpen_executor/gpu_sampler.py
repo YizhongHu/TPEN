@@ -23,14 +23,30 @@ Lifecycle
    sample, cancels whatever is still in flight at the shared deadline, kills,
    drains, reaps, and confirms every command group empty, and atomically
    rewrites the evidence file.
-4. If the shared deadline passes while a command launch or a group cleanup
-   is still outstanding, the evidence is non-quiescent and the worker fences
-   the slot (:func:`ensure_slot_clean`): no later sampled (science) launch
-   on that slot by this process proceeds until the outstanding work is
-   confirmed gone (review E2).  The bound is kept; the slot is never
-   silently reused.  The fence is process-local: every dispatcher runs its
-   workers in the controller process, and a process that exits leaves only
-   the truthful non-quiescent evidence behind.
+4. Before the child is spawned, the worker also quarantines the slot with
+   a :class:`SlotLease` (:func:`acquire_slot_lease`): an in-process lease
+   plus, when the controller supplies :data:`SLOT_QUARANTINE_ENV`, a durable
+   marker in the attempt store keyed by allocation, backend job, physical
+   host, and slot.  The lease is settled on every exit of
+   :func:`finish_gpu_sampler`, including an interrupted evidence
+   publication, and released (marker removed) only once every command
+   process is confirmed gone (review delta-3 F2).  If the shared deadline
+   passes while a command launch or group cleanup is outstanding, the
+   evidence is non-quiescent and the slot stays quarantined: every later
+   science launch on it, sampled or not, is refused by
+   :func:`ensure_slot_clean` until the work is confirmed gone (review E2,
+   delta-3 F1).  Only a launch with the explicit inspector role
+   (:data:`LAUNCH_ROLE_ENV`) is exempt.  The bound is kept; the slot is
+   never silently reused.
+
+   Assumption: one controller per allocation.  The in-process lease covers
+   every dispatcher (all run their workers in the controller process; Parsl
+   is ThreadPool-only), and the durable marker makes a restarted controller
+   that reuses the same attempt store refuse the slot.  A marker left by a
+   dead controller is never released by another process: the slot stays
+   quarantined until the allocation ends.  Leases across different stores
+   or concurrent independent controllers are not provided (follow-up item
+   0aa73edd).
 
 Telemetry quality is independent of the run's operational outcome (manager
 ruling Q4): a worker timeout or cancellation of the science child still calls
@@ -68,6 +84,7 @@ by :func:`tpen_executor.gpu_telemetry.validate_sampler_wire`.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import hashlib
 import json
 import math
 import os
@@ -80,6 +97,7 @@ import subprocess
 import threading
 import time
 from typing import Any
+import uuid
 
 from ._codec import decode_json
 from .gpu_telemetry import (
@@ -938,16 +956,76 @@ def claim_sampler_evidence(path: str | None) -> bool:
 class SlotQuarantined(RuntimeError):
     """Refusal to launch on a slot whose earlier sampler cleanup is unconfirmed.
 
-    Raised by :func:`ensure_slot_clean` before any child is spawned, so the
-    dispatcher records an ordinary launch failure for the member and the
-    fenced slot is never reused while a command may still be alive.
+    Raised by :func:`ensure_slot_clean` (and :func:`acquire_slot_lease`)
+    before any child is spawned, so the dispatcher records an ordinary launch
+    failure for the member and the quarantined slot is never reused while a
+    command may still be alive.
     """
 
 
-# Process-wide slot fence: slot id -> samplers whose cleanup is unconfirmed.
-# Every executor dispatcher runs its workers in this (controller) process.
+#: Worker-only descriptor key naming the slot's durable quarantine directory
+#: in the attempt store; the controller sets it for sampled launches.
+SLOT_QUARANTINE_ENV = "TPEN_SLOT_QUARANTINE_DIR"
+#: Worker-only descriptor key naming an explicit non-science launch role.
+LAUNCH_ROLE_ENV = "TPEN_EXECUTOR_LAUNCH_ROLE"
+#: The only exempt role: a read-only inspection of a member's own output.
+INSPECTOR_ROLE = "inspector"
+QUARANTINE_SCHEMA = "tpen-executor/slot-quarantine-v1"
+#: Child-environment placement keys that identify one physical slot of one
+#: allocation: allocation, backend job, physical host, and slot.
+QUARANTINE_IDENTITY_KEYS = (
+    "TPEN_PLACEMENT_ALLOCATION_ID", "TPEN_PLACEMENT_BACKEND_JOB_ID",
+    "TPEN_PLACEMENT_DECLARED_HOST", "TPEN_PLACEMENT_SLOT_ID",
+)
+#: Store-root subdirectory holding the durable slot quarantine markers.
+QUARANTINE_DIRNAME = "slot-quarantine"
+
+
+class SlotLease:
+    """In-process claim of one sampled launch on its slot.
+
+    A lease is registered, with its durable marker, before the child is
+    spawned and is released only once the launch is settled and every
+    command process of its sampler is confirmed gone (review delta-3 F2).
+
+    Parameters
+    ----------
+    slot : str
+        Slot id from :func:`slot_fence_key`.
+    marker : str or None
+        Durable quarantine marker path, or ``None`` when the launch carries
+        no quarantine directory (a direct worker use outside a dispatcher).
+    """
+
+    __slots__ = ("slot", "marker", "sampler", "settled", "child_unknown")
+
+    def __init__(self, slot: str, marker: str | None) -> None:
+        self.slot = slot
+        self.marker = marker
+        # The sampler is known once the owner settles the launch.
+        self.sampler: GpuSampler | None = None
+        self.settled = False
+        # True when the spawn was interrupted and a child may exist unowned.
+        self.child_unknown = False
+
+    def outstanding(self) -> str:
+        """Describe why this lease still holds its slot."""
+
+        if not self.settled:
+            return "a sampled launch on this slot is still owned by its worker"
+        if self.child_unknown:
+            return "an interrupted spawn may have left an unowned child"
+        if self.sampler is not None and not self.sampler.cleanup_confirmed():
+            return self.sampler.outstanding()
+        return f"its durable quarantine marker {self.marker!r} could not be removed"
+
+
+# Process-wide slot fence: slot id -> leases not yet released.  Every
+# executor dispatcher runs its workers in this (controller) process; the
+# durable markers carry the quarantine across a controller restart that
+# reuses the same attempt store.
 _FENCE_LOCK = threading.Lock()
-_FENCED: dict[str, list[GpuSampler]] = {}
+_FENCED: dict[str, list[SlotLease]] = {}
 
 
 def slot_fence_key(environ: Mapping[str, str]) -> str:
@@ -956,61 +1034,224 @@ def slot_fence_key(environ: Mapping[str, str]) -> str:
     return environ.get(SLOT_ID_ENV, "")
 
 
-def fence_slot(slot: str, sampler: GpuSampler) -> None:
-    """Fence ``slot`` until ``sampler``'s outstanding command work is confirmed gone.
+def slot_quarantine_dir(store_root: str | os.PathLike[str], values: Mapping[str, str]) -> str | None:
+    """Return the durable quarantine directory of one physical slot.
 
     Parameters
     ----------
-    slot : str
-        Slot id from :func:`slot_fence_key`.
-    sampler : GpuSampler
-        Finished sampler whose cleanup was not confirmed within its bound.
+    store_root : str or os.PathLike
+        Root of the attempt store (``DirectoryStore.root``).
+    values : mapping[str, str]
+        Placement environment carrying :data:`QUARANTINE_IDENTITY_KEYS`.
+
+    Returns
+    -------
+    str or None
+        ``<store_root>/slot-quarantine/<sha256 of the identity>``, or ``None``
+        when the environment does not identify a physical slot.
     """
 
-    with _FENCE_LOCK:
-        _FENCED.setdefault(slot, []).append(sampler)
+    identity = [values.get(key) for key in QUARANTINE_IDENTITY_KEYS]
+    if any(type(value) is not str or not value for value in identity):
+        return None
+    key = hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
+    return os.path.join(os.fspath(store_root), QUARANTINE_DIRNAME, key)
 
 
-def ensure_slot_clean(slot: str) -> None:
-    """Refuse to reuse a slot while an earlier sampler's cleanup is unconfirmed.
+def _fsync_directory(path: str) -> None:
+    """Best-effort durability of a directory entry change."""
 
-    Each fenced sampler is cancelled again (re-killing any published group)
-    and re-checked with :meth:`GpuSampler.cleanup_confirmed`; confirmed ones
-    are released from the fence.
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _write_marker(quarantine_dir: str, identity: Mapping[str, Any]) -> str:
+    """Durably create one new quarantine marker and return its path."""
+
+    os.makedirs(quarantine_dir, exist_ok=True)
+    path = os.path.join(quarantine_dir, f"{uuid.uuid4().hex}.json")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"schema": QUARANTINE_SCHEMA, **identity}, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(quarantine_dir)
+    return path
+
+
+def _markers(quarantine_dir: str | None) -> list[str]:
+    """List durable markers; an unreadable directory is itself a refusal."""
+
+    if quarantine_dir is None:
+        return []
+    try:
+        names = os.listdir(quarantine_dir)
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise SlotQuarantined(f"slot quarantine directory {quarantine_dir!r} is unreadable: {error}") from error
+    return [os.path.join(quarantine_dir, name) for name in sorted(names)]
+
+
+def _release_locked(lease: SlotLease) -> bool:
+    """Release ``lease`` if its cleanup is confirmed (fence lock held).
+
+    The durable marker is removed only after the launch is settled, no
+    unowned child can exist, and the sampler's command processes are
+    confirmed gone.  A marker that cannot be removed keeps the lease.
+    """
+
+    if not lease.settled or lease.child_unknown:
+        return False
+    if lease.sampler is not None and not lease.sampler.cleanup_confirmed():
+        return False
+    if lease.marker is not None:
+        try:
+            os.unlink(lease.marker)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        _fsync_directory(os.path.dirname(lease.marker))
+        lease.marker = None
+    return True
+
+
+def _check_slot_locked(slot: str, quarantine_dir: str | None) -> None:
+    """Release confirmed leases and refuse the slot if anything remains (lock held)."""
+
+    leases = _FENCED.get(slot, [])
+    for lease in leases:
+        # Re-kill any group a settled, unconfirmed sampler still publishes.
+        if lease.settled and lease.sampler is not None:
+            lease.sampler.cancel()
+    remaining = [lease for lease in leases if not _release_locked(lease)]
+    if remaining:
+        _FENCED[slot] = remaining
+    else:
+        _FENCED.pop(slot, None)
+    # Markers of this process's remaining leases are already reported; any
+    # other marker belongs to an earlier controller using the same store.
+    held = {lease.marker for lease in remaining}
+    foreign = [marker for marker in _markers(quarantine_dir) if marker not in held]
+    if remaining or foreign:
+        details = [lease.outstanding() for lease in remaining]
+        details += [f"durable quarantine marker {marker!r} is unreleased" for marker in foreign]
+        raise SlotQuarantined(f"slot {slot!r} is quarantined: earlier GPU sampler cleanup is unconfirmed ({'; '.join(details)})")
+
+
+def ensure_slot_clean(slot: str, quarantine_dir: str | None = None) -> None:
+    """Refuse to reuse a slot while an earlier launch's cleanup is unconfirmed.
+
+    Each settled lease's sampler is cancelled again (re-killing any published
+    group) and re-checked with :meth:`GpuSampler.cleanup_confirmed`;
+    confirmed leases are released and their durable markers removed.  Any
+    remaining lease, or any durable marker left in ``quarantine_dir`` by
+    another controller using the same attempt store, refuses the slot.
 
     Parameters
     ----------
     slot : str
         Slot id of the launch about to happen.
+    quarantine_dir : str or None, default=None
+        Durable quarantine directory from :func:`slot_quarantine_dir`.
 
     Raises
     ------
     SlotQuarantined
-        If any earlier sampler on ``slot`` still has outstanding work.
+        If any earlier launch on ``slot`` still has outstanding work.
     """
 
     with _FENCE_LOCK:
-        pending = _FENCED.get(slot, [])
-        for sampler in pending:
+        _check_slot_locked(slot, quarantine_dir)
+
+
+def acquire_slot_lease(slot: str, quarantine_dir: str | None, identity: Mapping[str, Any]) -> SlotLease:
+    """Quarantine ``slot`` for one sampled launch before its child is spawned.
+
+    The check and registration happen under one lock, and the durable marker
+    is written before the lease is published, so the slot is quarantined
+    before any later fallible step, including evidence publication.
+
+    Parameters
+    ----------
+    slot : str
+        Slot id from :func:`slot_fence_key`.
+    quarantine_dir : str or None
+        Durable quarantine directory, or ``None`` for an in-process lease only.
+    identity : mapping
+        JSON-serialisable launch identity recorded in the marker.
+
+    Returns
+    -------
+    SlotLease
+        The registered lease; settle it with :func:`settle_slot_lease`.
+
+    Raises
+    ------
+    SlotQuarantined
+        If the slot is already quarantined.
+    OSError
+        If the durable marker cannot be written; nothing is registered.
+    """
+
+    with _FENCE_LOCK:
+        _check_slot_locked(slot, quarantine_dir)
+        marker = None if quarantine_dir is None else _write_marker(quarantine_dir, identity)
+        lease = SlotLease(slot, marker)
+        _FENCED.setdefault(slot, []).append(lease)
+    return lease
+
+
+def settle_slot_lease(lease: SlotLease | None, sampler: GpuSampler | None, *, child_known: bool = True) -> None:
+    """Record that the owner is done with its launch and release it if clean.
+
+    Parameters
+    ----------
+    lease : SlotLease or None
+        Lease from :func:`acquire_slot_lease`; ``None`` is a no-op.
+    sampler : GpuSampler or None
+        The launch's sampler, or ``None`` when none was created.
+    child_known : bool, default=True
+        False when the spawn was interrupted and a child may exist without
+        an owner; such a lease is never released by this process.
+    """
+
+    if lease is None:
+        return
+    with _FENCE_LOCK:
+        lease.sampler = sampler
+        lease.child_unknown = not child_known
+        lease.settled = True
+        # Bounded is not clean: stop any further launch of an unconfirmed sampler.
+        if sampler is not None and not sampler.cleanup_confirmed():
             sampler.cancel()
-        remaining = [sampler for sampler in pending if not sampler.cleanup_confirmed()]
-        if remaining:
-            _FENCED[slot] = remaining
-        else:
-            _FENCED.pop(slot, None)
-    if remaining:
-        detail = "; ".join(sampler.outstanding() for sampler in remaining)
-        raise SlotQuarantined(f"slot {slot!r} is fenced: earlier GPU sampler cleanup is unconfirmed ({detail})")
+        if _release_locked(lease):
+            leases = [held for held in _FENCED.get(lease.slot, []) if held is not lease]
+            if leases:
+                _FENCED[lease.slot] = leases
+            else:
+                _FENCED.pop(lease.slot, None)
 
 
-def finish_gpu_sampler(sampler: GpuSampler | None, path: str | None, slot: str = "") -> list[BaseException]:
-    """Finish the sampler, confirm its groups, publish the record, and fence if dirty.
+def finish_gpu_sampler(sampler: GpuSampler | None, path: str | None, lease: SlotLease | None = None) -> list[BaseException]:
+    """Finish the sampler, confirm its groups, publish the record, and settle the lease.
 
     The worker calls this after reaping the science child on every path.  An
     interruption raised while finishing is collected and finishing resumes
     under the same shared deadline, so a repeated owner interruption cannot
-    abandon command-group cleanup.  If cleanup is still unconfirmed when the
-    bound is spent, ``slot`` is fenced (:func:`fence_slot`) before return.
+    abandon command-group cleanup.  The slot was quarantined by ``lease``
+    before the child was spawned; the lease is settled on every exit,
+    including an interruption of the evidence publication, and is released
+    only if cleanup is confirmed.
 
     Parameters
     ----------
@@ -1018,8 +1259,8 @@ def finish_gpu_sampler(sampler: GpuSampler | None, path: str | None, slot: str =
         Sampler held by the worker since before it was started.
     path : str or None
         Evidence path owned by this worker.
-    slot : str, default=""
-        Slot id of the launch, from :func:`slot_fence_key`.
+    lease : SlotLease or None, default=None
+        Slot lease acquired before spawn.
 
     Returns
     -------
@@ -1027,29 +1268,29 @@ def finish_gpu_sampler(sampler: GpuSampler | None, path: str | None, slot: str =
         Interruptions observed while finishing, for the caller to propagate.
     """
 
-    if sampler is None or path is None:
-        return []
     interruptions: list[BaseException] = []
-    record = None
-    # finish() is bounded by its shared deadline, so retries end promptly;
-    # the attempt cap only guards against a deterministic error.
-    for _attempt in range(FINISH_ATTEMPTS):
-        try:
-            record = sampler.finish()
-            break
-        except BaseException as error:
-            interruptions.append(error)
-    if record is not None:
-        try:
-            _write_evidence(path, record)
-        except OSError:
-            # The claimed unfinalized record stays in place: still attempted,
-            # telemetry-failed, and science-blocking.
-            pass
-    # Bounded is not clean: outstanding launch or cleanup work fences the slot.
-    if not sampler.cleanup_confirmed():
-        sampler.cancel()
-        fence_slot(slot, sampler)
+    try:
+        if sampler is not None and path is not None:
+            record = None
+            # finish() is bounded by its shared deadline, so retries end
+            # promptly; the attempt cap only guards a deterministic error.
+            for _attempt in range(FINISH_ATTEMPTS):
+                try:
+                    record = sampler.finish()
+                    break
+                except BaseException as error:
+                    interruptions.append(error)
+            if record is not None:
+                try:
+                    _write_evidence(path, record)
+                except OSError:
+                    # The claimed unfinalized record stays in place: still
+                    # attempted, telemetry-failed, and science-blocking.
+                    pass
+    finally:
+        # Publication may fail or be interrupted; the slot stays quarantined
+        # until cleanup is confirmed either way (review delta-3 F2).
+        settle_slot_lease(lease, sampler)
     return interruptions
 
 
@@ -1087,7 +1328,9 @@ def read_sampler_evidence(path: str | os.PathLike[str]) -> dict[str, Any]:
 __all__ = [
     "ATTEMPT_COMMANDS", "COMMAND_TIMEOUT", "CLEANUP_TIMEOUT", "DEFAULT_CADENCE", "EVIDENCE_SCHEMA",
     "GPU_SAMPLER_CADENCE_ENV", "GPU_SAMPLER_OUTPUT_ENV", "GPU_SAMPLER_RETAIN_ENV", "GpuSampler", "GpuSamplerFailure",
-    "JOIN_TIMEOUT", "MAX_CONSECUTIVE_GAPS", "MAX_TOTAL_GAPS", "SCHEDULING_MARGIN", "SLOT_ID_ENV", "SlotQuarantined",
-    "claim_sampler_evidence", "csv_rows", "declared_devices", "ensure_slot_clean", "fence_slot", "finish_deadline",
-    "finish_gpu_sampler", "group_empty", "kill_group", "read_sampler_evidence", "slot_fence_key",
+    "INSPECTOR_ROLE", "JOIN_TIMEOUT", "LAUNCH_ROLE_ENV", "MAX_CONSECUTIVE_GAPS", "MAX_TOTAL_GAPS", "QUARANTINE_DIRNAME",
+    "QUARANTINE_IDENTITY_KEYS", "QUARANTINE_SCHEMA", "SCHEDULING_MARGIN", "SLOT_ID_ENV", "SLOT_QUARANTINE_ENV",
+    "SlotLease", "SlotQuarantined", "acquire_slot_lease", "claim_sampler_evidence", "csv_rows", "declared_devices",
+    "ensure_slot_clean", "finish_deadline", "finish_gpu_sampler", "group_empty", "kill_group", "read_sampler_evidence",
+    "settle_slot_lease", "slot_fence_key", "slot_quarantine_dir",
 ]

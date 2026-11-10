@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 from typing import Any
 
@@ -14,10 +15,16 @@ from ._records import frozen_record
 from .environments import PreparedPythonEnvironment
 from .gpu_sampler import (
     GPU_SAMPLER_OUTPUT_ENV,
+    INSPECTOR_ROLE,
+    LAUNCH_ROLE_ENV,
+    QUARANTINE_IDENTITY_KEYS,
+    SLOT_QUARANTINE_ENV,
     GpuSampler,
+    acquire_slot_lease,
     claim_sampler_evidence,
     ensure_slot_clean,
     finish_gpu_sampler,
+    settle_slot_lease,
     slot_fence_key,
 )
 
@@ -95,13 +102,19 @@ class SubprocessWorker:
     (normal exit, timeout, cancellation) finishes it within its bound and
     publishes the final record before returning.  Only the descriptor opts a
     launch into sampling: an inherited owner-environment value is ignored,
-    and the key is removed from the child environment either way.  If the
-    sampler's command cleanup is still unconfirmed at its bound, the slot
-    (``TPEN_SLOT_ID``) is fenced and a later sampled launch on it raises
-    :class:`~tpen_executor.gpu_sampler.SlotQuarantined` before spawning.
-    A timeout or cancellation of the child does not by itself make the
-    telemetry fail; only a sampler that is itself cancelled or unfinalized
-    does.
+    and the key is removed from the child environment either way.  A sampled
+    launch quarantines its slot (``TPEN_SLOT_ID``) before spawning, in
+    process and, when the descriptor names a quarantine directory, durably
+    in the attempt store; the quarantine is released only once the
+    sampler's command cleanup is confirmed.  Every launch carrying a slot id
+    except an explicit inspector (descriptor role ``inspector``) first
+    checks the quarantine and raises
+    :class:`~tpen_executor.gpu_sampler.SlotQuarantined` before spawning if
+    the slot is still held.  The quarantine directory and role keys are
+    worker-only and, like the evidence path, are read only from the
+    descriptor and never reach the child.  A timeout or cancellation of the
+    child does not by itself make the telemetry fail; only a sampler that is
+    itself cancelled or unfinalized does.
     """
 
     def run(
@@ -151,8 +164,8 @@ class SubprocessWorker:
         OSError
             If process launch or log creation fails.
         SlotQuarantined
-            If this is a sampled launch and an earlier sampler on the same
-            slot still has unconfirmed command cleanup; no child is spawned.
+            If this is a science launch on a slot whose earlier sampled
+            launch still has unconfirmed command cleanup; no child is spawned.
         """
 
         if not isinstance(environment, PreparedPythonEnvironment):
@@ -179,11 +192,21 @@ class SubprocessWorker:
         child_env = os.environ.copy()
         child_env.update(environment.env)
         # Only the explicit prepared descriptor opts this launch into
-        # sampling; an ambient owner-environment value never does (review E3).
+        # sampling, names its quarantine directory, or declares a role; an
+        # ambient owner-environment value never does (review E3).
         sampler_output = environment.env.get(GPU_SAMPLER_OUTPUT_ENV)
-        # The evidence path belongs to this worker, never the child, whichever
-        # environment it came from.
-        child_env.pop(GPU_SAMPLER_OUTPUT_ENV, None)
+        quarantine_dir = environment.env.get(SLOT_QUARANTINE_ENV)
+        role = environment.env.get(LAUNCH_ROLE_ENV)
+        # These keys belong to this worker, never the child, whichever
+        # environment they came from.
+        for key in (GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, LAUNCH_ROLE_ENV):
+            child_env.pop(key, None)
+        if role is not None and role != INSPECTOR_ROLE:
+            raise ValueError(f"unknown launch role {role!r}")
+        inspector = role == INSPECTOR_ROLE
+        if inspector:
+            # An inspection reads a member's output; it is never sampled.
+            sampler_output = None
         slot = slot_fence_key(child_env)
         stdout_name = os.fspath(stdout_path)
         stderr_name = os.fspath(stderr_path)
@@ -191,24 +214,41 @@ class SubprocessWorker:
         with Path(stdout_name).open("wb") as stdout, Path(stderr_name).open("wb") as stderr:
             if pre_spawn_guard is not None and pre_spawn_guard():
                 return ProcessOutcome(logical_argv, None, stdout_name, stderr_name, timed_out)
-            # A science launch on a slot whose earlier sampler cleanup is
-            # unconfirmed is refused before any evidence claim or spawn.  The
-            # fence gates sampled (science) launches; an inspection of the
-            # same member carries no evidence path and is not slot reuse.
-            if sampler_output is not None:
-                ensure_slot_clean(slot)
+            # Every science launch on a slot whose earlier sampled launch is
+            # still unconfirmed is refused before any evidence claim or spawn,
+            # sampled or not.  Only the explicit inspector role is exempt; an
+            # unsampled launch is never assumed to be one (review delta-3 F1).
+            if not inspector and (slot or sampler_output is not None):
+                ensure_slot_clean(slot, quarantine_dir)
             # Claim before spawn: a worker that dies later leaves attempted,
             # unfinalized evidence, never an absent or not-sampled record.
             if not claim_sampler_evidence(sampler_output):
                 sampler_output = None
-            process = subprocess.Popen(
-                command,
-                cwd=None if cwd is None else os.fspath(cwd),
-                env=child_env,
-                stdout=stdout,
-                stderr=stderr,
-                start_new_session=True,
-            )
+            # Quarantine the slot before spawn, so every later fallible step
+            # (including evidence publication) happens under it (delta-3 F2).
+            lease = None
+            if sampler_output is not None:
+                lease = acquire_slot_lease(slot, quarantine_dir, {
+                    **{key: child_env.get(key) for key in QUARANTINE_IDENTITY_KEYS},
+                    "evidence_path": sampler_output, "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
+                })
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=None if cwd is None else os.fspath(cwd),
+                    env=child_env,
+                    stdout=stdout,
+                    stderr=stderr,
+                    start_new_session=True,
+                )
+            except OSError:
+                # Popen raised from the launch itself: no child exists.
+                settle_slot_lease(lease, None)
+                raise
+            except BaseException:
+                # An interrupted spawn may have left a child no one owns.
+                settle_slot_lease(lease, None, child_known=False)
+                raise
             spawned_pid = process.pid
             spawned_ticks = _proc_start_ticks(spawned_pid)
             sampler = None
@@ -245,8 +285,13 @@ class SubprocessWorker:
                     except BaseException as cleanup_error:
                         cleanup_errors.append(cleanup_error)
                 # The cancelled child is reaped; drain the sampler's command
-                # groups before the cancellation leaves this worker.
-                cleanup_errors.extend(finish_gpu_sampler(sampler, sampler_output, slot))
+                # groups and settle the lease before the cancellation leaves
+                # this worker.  A further interruption of that finalizer is
+                # recorded on the original, which still propagates.
+                try:
+                    cleanup_errors.extend(finish_gpu_sampler(sampler, sampler_output, lease))
+                except BaseException as finish_error:
+                    cleanup_errors.append(finish_error)
                 for cleanup_error in cleanup_errors:
                     original.add_note(f"cleanup wait interruption: {cleanup_error!r}")
                 raise
@@ -254,8 +299,9 @@ class SubprocessWorker:
                 if process_handle is not None:
                     process_handle.clear(process)
         # Normal exit and worker timeout: the child is reaped; finish the
-        # sampler, and fence the slot if its cleanup is still unconfirmed.
-        interruptions = finish_gpu_sampler(sampler, sampler_output, slot)
+        # sampler and settle the lease, which stays quarantined if cleanup is
+        # still unconfirmed.
+        interruptions = finish_gpu_sampler(sampler, sampler_output, lease)
         if interruptions:
             raise interruptions[0]
         return ProcessOutcome(logical_argv, returncode, stdout_name, stderr_name, timed_out, spawned_pid, spawned_ticks)

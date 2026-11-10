@@ -19,12 +19,18 @@ mutant assertion fails.
 Mutant ids: the r2 ids K1-K5 targeted the removed in-child sampler and are
 retired, not renamed.  Of the r3 ids, G1 (worker timeout drain), G3 (bounded
 join) and G5 (decoder aggregate) are retired in r4 and remain covered by
-their named behaviour tests; G2 and G4 are kept unchanged.  H1-H3 are the r4
-runtime-path mutants for worker ownership at startup (E1), the slot fence
-(E2) and the gap budget (Q1).  Historical N6/N8/N11 remain unclosed by any
-mutant id; N6/N8 objectives are covered by named behaviour tests
-(``test_sampler_keeps_samples_taken_before_a_late_failure`` and the
-``qualified-over-failed-sampler`` decoder case); N11 is L1a scope.
+their named behaviour tests; G2 is kept unchanged.  H1 (r4, worker ownership
+at startup, E1) is kept.  In r5, H2 (the r4 post-finish fence, whose anchor
+no longer exists), G4 (aggregate stickiness) and H3 (total gap budget) are
+retired and remain covered by
+``test_worker_fences_the_slot_while_a_held_launch_is_outstanding``,
+``test_sampler_aggregate_remembers_evicted_outside_use`` and
+``test_sampler_isolated_gaps_past_the_total_budget_fail``.  J1-J3 are the r5
+runtime-path mutants for the pre-spawn slot lease (delta-3 F2), the durable
+quarantine marker (F1) and the decoder gap timeline (F3).  Historical
+N6/N8/N11 remain unclosed by any mutant id; N6/N8 objectives are covered by
+named behaviour tests (``test_sampler_keeps_samples_taken_before_a_late_failure``
+and the ``qualified-over-failed-sampler`` decoder case); N11 is L1a scope.
 """
 
 from __future__ import annotations
@@ -108,25 +114,25 @@ L1B_MUTANT_TABLE = (
         "suite": "executor", "assertion": "the success path kills the retained group before claiming quiescence (D4 reaper)",
     },
     {
-        "id": "H2", "target": "executor/src/tpen_executor/gpu_sampler.py",
-        "old": "    if not sampler.cleanup_confirmed():\n        sampler.cancel()\n        fence_slot(slot, sampler)",
-        "new": "    if False:\n        sampler.cancel()\n        fence_slot(slot, sampler)",
-        "killer": "test_worker_fences_the_slot_while_a_held_launch_is_outstanding",
-        "suite": "executor", "assertion": "unconfirmed launch/cleanup at the bound fences the slot until it is confirmed empty (E2)",
+        "id": "J1", "target": "executor/src/tpen_executor/workers.py",
+        "old": "            if sampler_output is not None:\n                lease = acquire_slot_lease(",
+        "new": "            if False:\n                lease = acquire_slot_lease(",
+        "killer": "test_interrupted_evidence_publication_keeps_the_slot_quarantined",
+        "suite": "executor", "assertion": "the slot is quarantined before spawn, so an interrupted evidence publication cannot leave it reusable (delta-3 F2)",
     },
     {
-        "id": "G4", "target": "executor/src/tpen_executor/gpu_sampler.py",
-        "old": '            aggregate["outside_use_seen"] = aggregate["outside_use_seen"] or uuid not in self.declared',
-        "new": '            aggregate["outside_use_seen"] = uuid not in self.declared',
-        "killer": "test_sampler_aggregate_remembers_evicted_outside_use",
-        "suite": "executor", "assertion": "outside use seen in a sample that is not retained stays in the aggregate",
+        "id": "J2", "target": "executor/src/tpen_executor/gpu_sampler.py",
+        "old": "    foreign = [marker for marker in _markers(quarantine_dir) if marker not in held]",
+        "new": "    foreign = []",
+        "killer": "test_durable_quarantine_refuses_a_fresh_controller_on_the_same_store",
+        "suite": "executor", "assertion": "a durable marker in the attempt store makes a fresh controller refuse the slot (delta-3 F1)",
     },
     {
-        "id": "H3", "target": "executor/src/tpen_executor/gpu_sampler.py",
-        "old": "            if count > self.max_total_gaps or consecutive > self.max_consecutive_gaps:",
-        "new": "            if consecutive > self.max_consecutive_gaps:",
-        "killer": "test_sampler_isolated_gaps_past_the_total_budget_fail",
-        "suite": "executor", "assertion": "isolated transient gaps beyond the total budget are terminal telemetry failure (Q1)",
+        "id": "J3", "target": "executor/src/tpen_executor/gpu_telemetry.py",
+        "old": "    if unproven_resets > dropped:\n        raise ValueError(\"gpu_sampler gap run resets without an intervening successful sample\")",
+        "new": "    if False:\n        raise ValueError(\"gpu_sampler gap run resets without an intervening successful sample\")",
+        "killer": "test_decoder_rejects_contradictory_sampler_evidence",
+        "suite": "executor", "assertion": "a consecutive-gap reset needs an intervening success when history is complete (delta-3 F3)",
     },
 )
 
@@ -136,7 +142,7 @@ def test_l1b_mutant_table_targets_unique_executable_anchors() -> None:
 
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
-    assert [row["id"] for row in L1B_MUTANT_TABLE] == ["H1", "G2", "H2", "G4", "H3"]
+    assert [row["id"] for row in L1B_MUTANT_TABLE] == ["H1", "G2", "J1", "J2", "J3"]
     for row in L1B_MUTANT_TABLE:
         source = (root / row["target"]).read_text(encoding="utf-8")
         assert source.count(row["old"]) == 1, row
@@ -1129,6 +1135,316 @@ def test_worker_fences_the_slot_while_a_held_launch_is_outstanding(tmp_path: Pat
     assert outcome.returncode == 0 and marker.exists() and slot not in gs._FENCED
 
 
+# ------------------------------------- durable slot quarantine (delta-3 F1/F2)
+
+
+def _slot_values(environment: PreparedPythonEnvironment, store: Path, slot: str) -> dict[str, str]:
+    """Placed slot identity plus the controller-assigned quarantine directory."""
+
+    values = dict(
+        environment.env,
+        TPEN_SLOT_ID=slot,
+        TPEN_PLACEMENT_ALLOCATION_ID="allocation-a",
+        TPEN_PLACEMENT_BACKEND_JOB_ID="job-a",
+        TPEN_PLACEMENT_DECLARED_HOST=socket.gethostname(),
+        TPEN_PLACEMENT_SLOT_ID=slot,
+    )
+    values[gs.SLOT_QUARANTINE_ENV] = gs.slot_quarantine_dir(store, values)
+    return values
+
+
+class _HeldLaunch:
+    """Hold the first ``nvidia-smi`` Popen after its process exists, until released.
+
+    The held command is in no published handle, so the worker's bounded
+    finish cannot confirm its cleanup; the sampler thread kills and reaps it
+    once the Popen is released.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.release, self.held = threading.Event(), threading.Event()
+        release, held = self.release, self.held
+        real_popen = subprocess.Popen
+
+        class HeldPopen(real_popen):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                if not held.is_set() and str(args[0][0]).endswith("nvidia-smi"):
+                    held.set()
+                    release.wait(10.0)
+
+        monkeypatch.setattr(gs.subprocess, "Popen", HeldPopen)
+
+
+def _held_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_files: list[Path]) -> tuple[PreparedPythonEnvironment, Path]:
+    environment, pid_file = _hung_worker(tmp_path, monkeypatch, pid_files)
+    monkeypatch.setattr(gs, "CLEANUP_TIMEOUT", 0.2)
+    monkeypatch.setattr(gs, "JOIN_TIMEOUT", 0.6)
+    return environment, pid_file
+
+
+def _run_held_first_launch(tmp_path: Path, values: dict[str, str], pid_file: Path, held: _HeldLaunch) -> ProcessOutcome:
+    """Run the first sampled launch; it returns in bound with its command held alive."""
+
+    started = time.monotonic()
+    outcome = SubprocessWorker().run(
+        PreparedPythonEnvironment(sys.executable, None, values), ("-c", "import time; time.sleep(0.2)"),
+        cwd=tmp_path, stdout_path=tmp_path / "first.out", stderr_path=tmp_path / "first.err",
+    )
+    assert outcome.returncode == 0 and time.monotonic() - started < 5.0
+    assert held.held.is_set() and [_alive(pid) for pid in _pids(pid_file)] == [True]
+    return outcome
+
+
+def _await_release(pid_file: Path, slot: str, quarantine: str | None) -> None:
+    """Wait until the owning sampler reaped the held command and the slot is released."""
+
+    deadline = time.monotonic() + 10.0
+    while any(_alive(pid) for pid in _pids(pid_file)) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert [_alive(pid) for pid in _pids(pid_file)] == [False]
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            gs.ensure_slot_clean(slot, quarantine)
+            return
+        except gs.SlotQuarantined:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.02)
+
+
+def _markers(quarantine: str) -> list[Path]:
+    directory = Path(quarantine)
+    return sorted(directory.iterdir()) if directory.exists() else []
+
+
+_FRESH_CONTROLLER = """\
+import json, sys
+from types import SimpleNamespace
+from tpen_executor import gpu_sampler as gs
+from tpen_executor.dispatch.contract import _admit_slot
+from tpen_executor.environments import PreparedPythonEnvironment
+from tpen_executor.workers import SubprocessWorker
+spec = json.loads(sys.argv[1])
+verdicts = {}
+try:
+    SubprocessWorker().run(
+        PreparedPythonEnvironment(sys.executable, None, spec["sampled"]), ("-c", spec["child"]),
+        cwd=spec["cwd"], stdout_path=spec["cwd"] + "/fresh.out", stderr_path=spec["cwd"] + "/fresh.err",
+    )
+    verdicts["sampled"] = "ran"
+except gs.SlotQuarantined:
+    verdicts["sampled"] = "SlotQuarantined"
+try:
+    _admit_slot(PreparedPythonEnvironment(sys.executable, None, spec["unsampled"]), SimpleNamespace(root=spec["store"]))
+    verdicts["admission"] = "admitted"
+except gs.SlotQuarantined:
+    verdicts["admission"] = "SlotQuarantined"
+print(json.dumps(verdicts))
+"""
+
+
+def _fresh_controller(tmp_path: Path, store: Path, values: dict[str, str], fast_bin: Path, ran: Path) -> dict[str, str]:
+    """Launch on the same slot and store from a fresh Python process (a restarted controller).
+
+    The fresh process imports this test's own ``tpen_executor`` source tree.
+    Its sampled launch uses a responsive fake, and its unsampled science
+    launch goes through dispatch admission without any quarantine key.
+    """
+
+    sampled = dict(values, PATH=f"{fast_bin}{os.pathsep}/usr/bin{os.pathsep}/bin")
+    sampled[gs.GPU_SAMPLER_OUTPUT_ENV] = str(tmp_path / "fresh.json")
+    unsampled = {key: value for key, value in values.items() if key not in (gs.GPU_SAMPLER_OUTPUT_ENV, gs.SLOT_QUARANTINE_ENV)}
+    spec = {"sampled": sampled, "unsampled": unsampled, "store": str(store), "cwd": str(tmp_path),
+            "child": f"open({str(ran)!r}, 'w')"}
+    # The source tree under test comes first (a mutant arm's copy included).
+    search = os.pathsep.join(filter(None, (str(Path(gs.__file__).resolve().parents[1]), os.environ.get("PYTHONPATH"))))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", _FRESH_CONTROLLER, json.dumps(spec)], cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=search), capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+@POSIX_GROUPS
+def test_durable_quarantine_refuses_a_fresh_controller_on_the_same_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_files: list[Path]) -> None:
+    """Delta-3 F1/J2: a restarted controller using the same attempt store refuses the slot.
+
+    While the first launch's held command is alive, the durable marker
+    written before spawn makes a fresh Python process refuse both a sampled
+    launch (worker) and an unsampled science launch (dispatch admission) on
+    the same slot, before any claim or spawn.  Once the owning sampler has
+    reaped the command, the marker is removed and the same fresh controller
+    launches (control).
+    """
+
+    environment, pid_file = _held_environment(tmp_path, monkeypatch, pid_files)
+    fast_bin = tmp_path / "fast-bin"
+    fast_bin.mkdir()
+    _fake(fast_bin, "nvidia-smi", _OK_BODY)
+    store, slot = tmp_path / "store", "slot-f1-fresh-controller"
+    values = _slot_values(environment, store, slot)
+    quarantine = values[gs.SLOT_QUARANTINE_ENV]
+    ran = tmp_path / "fresh-child-ran"
+    held = _HeldLaunch(monkeypatch)
+    try:
+        _run_held_first_launch(tmp_path, values, pid_file, held)
+        markers = _markers(quarantine)
+        assert len(markers) == 1
+        identity = json.loads(markers[0].read_text(encoding="utf-8"))
+        assert identity["schema"] == gs.QUARANTINE_SCHEMA and identity["TPEN_PLACEMENT_SLOT_ID"] == slot
+        assert _fresh_controller(tmp_path, store, values, fast_bin, ran) == {
+            "sampled": "SlotQuarantined", "admission": "SlotQuarantined",
+        }
+        assert not ran.exists() and not (tmp_path / "fresh.json").exists()
+    finally:
+        held.release.set()
+    _await_release(pid_file, slot, quarantine)
+    assert _markers(quarantine) == []
+    assert _fresh_controller(tmp_path, store, values, fast_bin, ran) == {"sampled": "ran", "admission": "admitted"}
+    assert ran.exists() and _markers(quarantine) == []
+
+
+@POSIX_GROUPS
+def test_quarantined_slot_refuses_unsampled_science_but_admits_an_inspector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_files: list[Path]) -> None:
+    """Delta-3 F1: every science launch on a quarantined slot is refused, sampled or not.
+
+    An unsampled launch carrying the same ``TPEN_SLOT_ID`` is refused before
+    spawning, also when the owner environment carries an ambient inspector
+    role; only the member inspection built by ``_without_gpu_sampler``, with
+    the explicit descriptor role, runs.
+    """
+
+    environment, pid_file = _held_environment(tmp_path, monkeypatch, pid_files)
+    store, slot = tmp_path / "store", "slot-f1-unsampled"
+    values = _slot_values(environment, store, slot)
+    unsampled = {key: value for key, value in values.items() if key not in (gs.GPU_SAMPLER_OUTPUT_ENV, gs.SLOT_QUARANTINE_ENV)}
+    science, inspected = tmp_path / "science-ran", tmp_path / "inspector-ran"
+    held = _HeldLaunch(monkeypatch)
+    try:
+        _run_held_first_launch(tmp_path, values, pid_file, held)
+        with pytest.raises(gs.SlotQuarantined, match="launch is in flight"):
+            SubprocessWorker().run(
+                PreparedPythonEnvironment(sys.executable, None, unsampled), ("-c", f"open({str(science)!r}, 'w')"),
+                cwd=tmp_path, stdout_path=tmp_path / "science.out", stderr_path=tmp_path / "science.err",
+            )
+        # An ambient role is never an exemption; only the descriptor's is.
+        monkeypatch.setenv(gs.LAUNCH_ROLE_ENV, gs.INSPECTOR_ROLE)
+        with pytest.raises(gs.SlotQuarantined):
+            SubprocessWorker().run(
+                PreparedPythonEnvironment(sys.executable, None, unsampled), ("-c", f"open({str(science)!r}, 'w')"),
+                cwd=tmp_path, stdout_path=tmp_path / "science.out", stderr_path=tmp_path / "science.err",
+            )
+        monkeypatch.delenv(gs.LAUNCH_ROLE_ENV)
+        assert not science.exists()
+        inspection = _without_gpu_sampler(PreparedPythonEnvironment(sys.executable, None, values))
+        assert inspection.env[gs.LAUNCH_ROLE_ENV] == gs.INSPECTOR_ROLE
+        assert gs.GPU_SAMPLER_OUTPUT_ENV not in inspection.env and gs.SLOT_QUARANTINE_ENV not in inspection.env
+        probe = f"import os; open({str(inspected)!r}, 'w').write(str({gs.LAUNCH_ROLE_ENV!r} in os.environ))"
+        outcome = SubprocessWorker().run(
+            inspection, ("-c", probe),
+            cwd=tmp_path, stdout_path=tmp_path / "inspect.out", stderr_path=tmp_path / "inspect.err",
+        )
+        # The role is worker-only: the inspection child never sees it.
+        assert outcome.returncode == 0 and inspected.read_text(encoding="utf-8") == "False"
+    finally:
+        held.release.set()
+    _await_release(pid_file, slot, values[gs.SLOT_QUARANTINE_ENV])
+    outcome = SubprocessWorker().run(
+        PreparedPythonEnvironment(sys.executable, None, unsampled), ("-c", f"open({str(science)!r}, 'w')"),
+        cwd=tmp_path, stdout_path=tmp_path / "science.out", stderr_path=tmp_path / "science.err",
+    )
+    assert outcome.returncode == 0 and science.exists()
+
+
+@POSIX_GROUPS
+def test_interrupted_evidence_publication_keeps_the_slot_quarantined(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_files: list[Path]) -> None:
+    """Delta-3 F2/J1: an interruption of the final evidence write cannot unfence the slot.
+
+    The slot is quarantined before spawn, so when the publication of the
+    non-quiescent record is interrupted the interruption propagates, the
+    claimed record stays unfinalized, the slot is refused in process and by
+    its durable marker, and it is released only once the sampler has
+    reaped the held command.
+    """
+
+    environment, pid_file = _held_environment(tmp_path, monkeypatch, pid_files)
+    store, slot = tmp_path / "store", "slot-f2-publication"
+    values = _slot_values(environment, store, slot)
+    quarantine = values[gs.SLOT_QUARANTINE_ENV]
+
+    def interrupted_publication(_path, _record):
+        raise _Cancel()
+
+    monkeypatch.setattr(gs, "_write_evidence", interrupted_publication)
+    second = tmp_path / "second-ran"
+    held = _HeldLaunch(monkeypatch)
+    try:
+        started = time.monotonic()
+        with pytest.raises(_Cancel):
+            SubprocessWorker().run(
+                PreparedPythonEnvironment(sys.executable, None, values), ("-c", "import time; time.sleep(0.2)"),
+                cwd=tmp_path, stdout_path=tmp_path / "first.out", stderr_path=tmp_path / "first.err",
+            )
+        assert time.monotonic() - started < 5.0
+        assert held.held.is_set() and [_alive(pid) for pid in _pids(pid_file)] == [True]
+        assert _evidence(tmp_path)["failure"]["code"] == "sampler-unfinalized"
+        with pytest.raises(gs.SlotQuarantined, match="launch is in flight"):
+            gs.ensure_slot_clean(slot, quarantine)
+        assert len(_markers(quarantine)) == 1
+        other = dict(values, **{gs.GPU_SAMPLER_OUTPUT_ENV: str(tmp_path / "second.json")})
+        with pytest.raises(gs.SlotQuarantined):
+            SubprocessWorker().run(
+                PreparedPythonEnvironment(sys.executable, None, other), ("-c", f"open({str(second)!r}, 'w')"),
+                cwd=tmp_path, stdout_path=tmp_path / "second.out", stderr_path=tmp_path / "second.err",
+            )
+        assert not second.exists() and not (tmp_path / "second.json").exists()
+    finally:
+        held.release.set()
+    _await_release(pid_file, slot, quarantine)
+    assert _markers(quarantine) == [] and slot not in gs._FENCED
+
+
+@POSIX_GROUPS
+def test_interrupted_publication_with_confirmed_cleanup_releases_the_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Delta-3 F2 control: a quiescent sampler whose publication fails does not quarantine.
+
+    The interruption still propagates and the claimed record stays
+    unfinalized (science-blocking), but every command is confirmed gone, so
+    the lease and its marker are released and the next launch runs.
+    """
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _fake(bin_dir, "nvidia-smi", _OK_BODY)
+    store, slot = tmp_path / "store", "slot-f2-quiescent"
+    values = _slot_values(_worker_env(tmp_path, bin_dir), store, slot)
+    quarantine = values[gs.SLOT_QUARANTINE_ENV]
+    real_write = gs._write_evidence
+
+    def interrupted_publication(_path, _record):
+        raise _Cancel()
+
+    monkeypatch.setattr(gs, "_write_evidence", interrupted_publication)
+    with pytest.raises(_Cancel):
+        SubprocessWorker().run(
+            PreparedPythonEnvironment(sys.executable, None, values), ("-c", "import time; time.sleep(0.2)"),
+            cwd=tmp_path, stdout_path=tmp_path / "first.out", stderr_path=tmp_path / "first.err",
+        )
+    assert _evidence(tmp_path)["failure"]["code"] == "sampler-unfinalized"
+    assert slot not in gs._FENCED and _markers(quarantine) == []
+    monkeypatch.setattr(gs, "_write_evidence", real_write)
+    marker = tmp_path / "next-ran"
+    following = dict(values, **{gs.GPU_SAMPLER_OUTPUT_ENV: str(tmp_path / "next.json")})
+    outcome = SubprocessWorker().run(
+        PreparedPythonEnvironment(sys.executable, None, following), ("-c", f"open({str(marker)!r}, 'w')"),
+        cwd=tmp_path, stdout_path=tmp_path / "next.out", stderr_path=tmp_path / "next.err",
+    )
+    assert outcome.returncode == 0 and marker.exists() and slot not in gs._FENCED
+
+
 @POSIX_GROUPS
 def test_worker_ignores_an_ambient_evidence_path(tmp_path: Path) -> None:
     """E3: only the prepared descriptor opts into sampling; an inherited key never does.
@@ -1544,6 +1860,9 @@ CONTRADICTIONS = {
     "gap-total-disagrees": lambda raw: (_add_gaps(raw, ("command-timeout", 1.11, 1.12, 1)), raw["gpu_sampler"]["gaps"].__setitem__("total_seconds", 5.0)),
     "gap-run-numbering": lambda raw: _add_gaps(raw, ("command-failed", 1.11, 1.12, 2)),
     "gap-budget-above-cap": lambda raw: raw["gpu_sampler"]["gaps"].__setitem__("max_total_allowed", 17),
+    # r5 (delta-3 F3): a coherent attempt timeline.  The sample is [1.0, 1.1].
+    "gap-overlaps-success": lambda raw: _add_gaps(raw, ("command-timeout", 1.0, 1.1, 1)),
+    "gap-reset-without-success": lambda raw: _add_gaps(raw, ("command-failed", 1.11, 1.12, 1), ("command-failed", 1.13, 1.14, 1)),
 }
 
 
@@ -1556,6 +1875,41 @@ def test_decoder_rejects_contradictory_sampler_evidence(tmp_path: Path, name: st
     CONTRADICTIONS[name](raw)
     with pytest.raises((TypeError, ValueError)):
         SciencePlacementReceiptV3.from_mapping(raw)
+
+
+# (accepted, retained samples, dropped samples, failure, budget, gap events)
+# for one record whose samples are [1.0, 1.1] and, with two, [1.2, 1.3].
+GAP_TIMELINES = {
+    "reset-after-a-retained-success": (True, 2, 0, None, (1, 3), [(1.11, 1.15, 1), (1.31, 1.32, 1)]),
+    "run-across-a-retained-success": (False, 2, 0, None, (2, 3), [(1.11, 1.15, 1), (1.31, 1.32, 2)]),
+    "reset-after-an-evicted-success": (True, 1, 1, None, (1, 3), [(1.11, 1.12, 1), (1.13, 1.14, 1)]),
+    "resets-beyond-the-evicted-samples": (False, 1, 1, None, (1, 3), [(1.11, 1.115, 1), (1.12, 1.125, 1), (1.13, 1.135, 1)]),
+    "excess-as-the-last-event": (True, 1, 0, "gap-budget-exceeded", (1, 3), [(1.11, 1.115, 1), (1.12, 1.125, 2)]),
+    "events-after-the-first-excess": (
+        False, 1, 1, "gap-budget-exceeded", (1, 3), [(1.11, 1.115, 1), (1.12, 1.125, 2), (1.13, 1.135, 1)],
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(GAP_TIMELINES))
+def test_decoder_checks_a_coherent_gap_timeline(name: str) -> None:
+    """Delta-3 F3: gaps, resets, and the first excess agree with the successful samples.
+
+    With complete history every reset needs a retained success in between;
+    with dropped history only what is provable is checked (one dropped
+    sample per unproven reset), and evicted successes legitimately justify
+    resets (controls).  No event may follow the first budget excess.
+    """
+
+    accepted, retained, dropped, failure, budget, events = GAP_TIMELINES[name]
+    gaps = empty_gaps(*budget)
+    _add_gaps({"gpu_sampler": {"gaps": gaps}}, *[("command-failed", *event) for event in events])
+    record = _sampler([[(1234, GPU_A)]] * retained, dropped=[[(1234, GPU_A)]] * dropped, failure=failure, gaps=gaps)
+    if accepted:
+        assert validate_sampler_wire(record)["gaps"] == gaps
+    else:
+        with pytest.raises(ValueError, match="gap"):
+            validate_sampler_wire(record)
 
 
 def test_decoder_rejects_whitespace_failure_detail(tmp_path: Path) -> None:

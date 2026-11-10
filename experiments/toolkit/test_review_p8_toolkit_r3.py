@@ -437,3 +437,47 @@ def test_l1b_executor_and_p8_refuse_identical_tampers(tmp_path: Path) -> None:
             p8 = "reject"
         expected = "accept" if name.startswith("baseline-") else "reject"
         assert executor_verdicts[str(path)] == p8 == expected, name
+
+
+def test_l1b_executor_and_p8_agree_on_gap_timelines(tmp_path: Path) -> None:
+    """Review delta-3 F3: both readers apply the same attempt-timeline rules to identical bytes.
+
+    Each record is written once and decoded by the executor's
+    ``validate_sampler_wire`` (executor interpreter) and by P8's mirror here;
+    both must accept exactly the expected controls and reject the rest.
+    """
+
+    executor_python = _executor_python()
+    from experiments.toolkit.run_results import _placement_v3_sampler
+    from experiments.toolkit.test_run_results_l1b import gap_timeline_records
+
+    cases = gap_timeline_records()
+    paths = {}
+    for name, (_accepted, record) in cases.items():
+        paths[name] = tmp_path / f"{name}.json"
+        paths[name].write_text(json.dumps(record), encoding="utf-8")
+    probe = (
+        "import json, sys\n"
+        "from tpen_executor.gpu_telemetry import validate_sampler_wire\n"
+        "verdicts = {}\n"
+        "for path in sys.argv[1:]:\n"
+        "    try:\n"
+        "        validate_sampler_wire(json.load(open(path, encoding='utf-8'))); verdicts[path] = 'accept'\n"
+        "    except (TypeError, ValueError):\n"
+        "        verdicts[path] = 'reject'\n"
+        "print(json.dumps(verdicts))\n"
+    )
+    result = subprocess.run(
+        [executor_python, "-c", probe, *map(str, paths.values())], cwd=ROOT / "executor",
+        env=dict(os.environ, PYTHONPATH=str(ROOT / "executor" / "src")), capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    executor_verdicts = json.loads(result.stdout)
+    for name, path in paths.items():
+        try:
+            _placement_v3_sampler(json.loads(path.read_text(encoding="utf-8")))
+            p8 = "accept"
+        except ManifestRefusal:
+            p8 = "reject"
+        expected = "accept" if cases[name][0] else "reject"
+        assert executor_verdicts[str(path)] == p8 == expected, name

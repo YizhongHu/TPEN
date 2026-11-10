@@ -31,6 +31,7 @@ from experiments.toolkit.run_results import (
     SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2,
     SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V3,
     ManifestRefusal,
+    _placement_v3_sampler,
     read,
 )
 
@@ -132,6 +133,14 @@ def _add_gaps(receipt: dict, *events: tuple[str, float, float, int]) -> None:
     gaps["total_seconds"] = sum(event["monotonic_end"] - event["monotonic_start"] for event in gaps["events"])
 
 
+def _gap_overlaps_first_sample(receipt: dict) -> None:
+    """Review delta-3 F3 case 1: the one forgiven gap equals the first successful sample."""
+
+    gaps = receipt["gpu_sampler"]["gaps"]
+    gaps["events"][0].update(monotonic_start=1.0, monotonic_end=1.125)
+    gaps["total_seconds"] = 0.125
+
+
 def _hide_dropped_outside(receipt: dict) -> None:
     aggregate = receipt["gpu_sampler"]["aggregate"]
     aggregate["samples_taken"] = receipt["gpu_sampler"]["count"] + 1
@@ -178,6 +187,9 @@ P8_CONTRADICTIONS = {
     "gap-total-disagrees": lambda r: (_add_gaps(r, ("command-timeout", 1.13, 1.2, 1)), r["gpu_sampler"]["gaps"].__setitem__("total_seconds", 5.0)),
     "gap-run-numbering": lambda r: _add_gaps(r, ("command-failed", 1.13, 1.2, 2)),
     "gap-budget-above-cap": lambda r: r["gpu_sampler"]["gaps"].__setitem__("max_total_allowed", 17),
+    # r5, review delta-3 F3 case 2: complete history, no success between two
+    # failures, yet both claim a fresh run (the second exceeds the budget).
+    "gap-reset-without-success": lambda r: _add_gaps(r, ("command-failed", 1.13, 1.15, 1), ("command-failed", 1.16, 1.18, 1)),
 }
 # Contradictions applied to other baselines: (baseline fixture, mutation).
 P8_OTHER_CONTRADICTIONS = {
@@ -193,7 +205,51 @@ P8_OTHER_CONTRADICTIONS = {
         "gaps-within-budget", lambda r: r["gpu_sampler"]["gaps"].update(max_consecutive_allowed=0, max_total_allowed=0),
     ),
     "mig-failure-detail-whitespace": ("mig-unsupported", lambda r: r["gpu_sampler"]["failure"].__setitem__("detail", " ")),
+    # r5, review delta-3 F3 case 1: a gap overlapping a retained success.
+    "gap-overlaps-success": ("gaps-within-budget", _gap_overlaps_first_sample),
 }
+
+
+def _timeline(taken: int, failure: str | None, budget: tuple[int, int], *events: tuple[float, float, int]):
+    """Return a mutation of the matched sampler record (samples [1.0, 1.125] and [1.25, 1.375])."""
+
+    def mutate(record: dict) -> None:
+        record["aggregate"]["samples_taken"] = taken
+        if failure is not None:
+            record.update(status="unavailable", reason="telemetry-failed", failure={"code": failure, "detail": "timeline case"})
+        record["gaps"] = {
+            "max_consecutive_allowed": budget[0], "max_total_allowed": budget[1], "count": 0,
+            "max_consecutive": 0, "total_seconds": 0.0, "events": [],
+        }
+        _add_gaps({"gpu_sampler": record}, *[("command-failed", *event) for event in events])
+
+    return mutate
+
+
+# Review delta-3 F3: record-level attempt-timeline cases, (accepted, mutation)
+# of the matched fixture's sampler record.  Shared with the executor parity test.
+P8_GAP_TIMELINES = {
+    "reset-after-a-retained-success": (True, _timeline(2, None, (1, 3), (1.13, 1.2, 1), (1.38, 1.4, 1))),
+    "run-across-a-retained-success": (False, _timeline(2, None, (2, 3), (1.13, 1.2, 1), (1.38, 1.4, 2))),
+    "reset-after-an-evicted-success": (True, _timeline(3, None, (1, 3), (1.13, 1.15, 1), (1.16, 1.18, 1))),
+    "resets-beyond-the-evicted-samples": (False, _timeline(3, None, (1, 3), (1.13, 1.14, 1), (1.15, 1.16, 1), (1.17, 1.18, 1))),
+    "excess-as-the-last-event": (True, _timeline(2, "gap-budget-exceeded", (1, 3), (1.13, 1.14, 1), (1.15, 1.16, 2))),
+    "events-after-the-first-excess": (
+        False, _timeline(3, "gap-budget-exceeded", (1, 3), (1.13, 1.14, 1), (1.15, 1.16, 2), (1.17, 1.18, 1)),
+    ),
+}
+
+
+def gap_timeline_records() -> dict[str, tuple[bool, dict]]:
+    """Return every timeline case as ``(accepted, sampler record)`` built from the matched fixture."""
+
+    base = _v3_manifests()["matched"]["attempts"][0]["placement_receipt"]["gpu_sampler"]
+    cases = {}
+    for name, (accepted, mutate) in P8_GAP_TIMELINES.items():
+        record = copy.deepcopy(base)
+        mutate(record)
+        cases[name] = (accepted, record)
+    return cases
 
 
 @pytest.mark.parametrize("name", sorted(P8_CONTRADICTIONS))
@@ -217,6 +273,23 @@ def test_p8_rejects_contradictions_on_other_baselines(tmp_path: Path, name: str)
     mutate(manifest["attempts"][0]["placement_receipt"])
     with pytest.raises(ManifestRefusal):
         _read(tmp_path, name, manifest)
+
+
+@pytest.mark.parametrize("name", sorted(P8_GAP_TIMELINES))
+def test_p8_checks_a_coherent_gap_timeline(name: str) -> None:
+    """Delta-3 F3: P8 mirrors the executor's attempt-timeline rules.
+
+    Complete history requires a retained success between reset gaps;
+    dropped history allows one unproven reset per dropped sample (controls);
+    no event may follow the first budget excess.
+    """
+
+    accepted, record = gap_timeline_records()[name]
+    if accepted:
+        assert _placement_v3_sampler(record)["gaps"]["count"] == len(record["gaps"]["events"])
+    else:
+        with pytest.raises(ManifestRefusal, match="gap"):
+            _placement_v3_sampler(record)
 
 
 def test_p8_types_mig_and_gap_budget_failures_distinctly(tmp_path: Path) -> None:

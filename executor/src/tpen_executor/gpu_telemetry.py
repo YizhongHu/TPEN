@@ -263,9 +263,23 @@ def _validate_gaps(sampler: Mapping[str, Any], start: float | None, end: float |
         If the keys or types are invalid, a budget exceeds
         :data:`GAP_BUDGET_CAP`, an event is not a forgivable transient code,
         events are unordered or outside the outer interval, the consecutive
-        run numbering or the counters disagree with the events, the record
-        continues past the first budget excess, or ``gap-budget-exceeded``
-        is claimed without an excess (or an excess is labelled otherwise).
+        run numbering or the counters disagree with the events, the attempt
+        timeline is incoherent, the record continues past the first budget
+        excess, or ``gap-budget-exceeded`` is claimed without an excess (or
+        an excess is labelled otherwise).
+
+    Notes
+    -----
+    Attempts are sequential and a successful attempt is exactly one sample,
+    which resets the consecutive run (review delta-3 F3).  So no gap may
+    overlap a retained sample, a run cannot continue across a retained
+    sample, and every reset after the first gap needs a successful sample
+    between it and the previous gap.  A reset with no retained sample in
+    between is provable only when no sample was dropped; with dropped
+    history such resets are accepted only while there are enough dropped
+    samples to justify them, one distinct sample per reset.  The first
+    budget excess ends sampling, so no event before the last may exceed
+    either budget.
     """
 
     gaps = sampler["gaps"]
@@ -280,8 +294,12 @@ def _validate_gaps(sampler: Mapping[str, Any], start: float | None, end: float |
     events = _rows(gaps["events"], "gap events")
     if gaps["count"] != len(events):
         raise ValueError("gpu_sampler gap count disagrees with its events")
-    previous_end, run, longest, summed = start, 0, 0, 0.0
-    for event in events:
+    # Retained successful attempts, already validated as ordered intervals.
+    successes = [(float(sample["monotonic_start"]), float(sample["monotonic_end"])) for sample in sampler["samples"]]
+    # Successful samples taken but not retained; zero means complete history.
+    dropped = sampler["aggregate"]["samples_taken"] - sampler["count"]
+    previous_end, run, longest, summed, unproven_resets = start, 0, 0, 0.0, 0
+    for index, event in enumerate(events):
         if not isinstance(event, Mapping) or set(event) != GAP_EVENT_KEYS:
             raise ValueError("gpu_sampler gap event keys differ")
         if event["code"] not in GAP_CODES:
@@ -295,9 +313,28 @@ def _validate_gaps(sampler: Mapping[str, Any], start: float | None, end: float |
         # A run either starts afresh or extends the previous gap's run.
         if consecutive not in (1, run + 1):
             raise ValueError("gpu_sampler gap consecutive run numbering is inconsistent")
+        # A failed attempt never overlaps a successful one.
+        if any(event_start < success_end and success_start < event_end for success_start, success_end in successes):
+            raise ValueError("gpu_sampler gap overlaps a retained successful sample")
+        if index:
+            # Whether a retained success lies between the previous gap and this one.
+            succeeded_between = any(
+                previous_end <= success_start and success_end <= event_start for success_start, success_end in successes
+            )
+            if succeeded_between and consecutive != 1:
+                raise ValueError("gpu_sampler gap run continues across a retained successful sample")
+            if consecutive == 1 and not succeeded_between:
+                # Only a dropped sample can have reset this run.
+                unproven_resets += 1
+        # The first excess ends sampling: no earlier event may exceed a budget.
+        if index < len(events) - 1 and (index + 1 > allowed_total or consecutive > allowed_consecutive):
+            raise ValueError("gpu_sampler gaps continue past the first budget excess")
         previous_end, run = event_end, consecutive
         longest = max(longest, consecutive)
         summed += event_end - event_start
+    # Each unproven reset needs its own dropped sample (none with complete history).
+    if unproven_resets > dropped:
+        raise ValueError("gpu_sampler gap run resets without an intervening successful sample")
     if gaps["max_consecutive"] != longest:
         raise ValueError("gpu_sampler gap max_consecutive disagrees with its events")
     if abs(_number(gaps["total_seconds"], "gap total_seconds") - summed) > 1e-6:

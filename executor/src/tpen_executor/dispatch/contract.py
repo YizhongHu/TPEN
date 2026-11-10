@@ -23,7 +23,17 @@ from .._codec import digest
 from ..contracts import ReadyGroup
 from ..environments import PreparedPythonEnvironment
 from ..lifecycle.attached import AttachedAllocation
-from ..gpu_sampler import GPU_SAMPLER_OUTPUT_ENV, read_sampler_evidence
+from ..gpu_sampler import (
+    GPU_SAMPLER_OUTPUT_ENV,
+    INSPECTOR_ROLE,
+    LAUNCH_ROLE_ENV,
+    QUARANTINE_IDENTITY_KEYS,
+    SLOT_QUARANTINE_ENV,
+    ensure_slot_clean,
+    read_sampler_evidence,
+    slot_fence_key,
+    slot_quarantine_dir,
+)
 from ..gpu_telemetry import not_sampled_sampler
 from ..results import RunManifest, SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3
 from ..placement import (
@@ -192,14 +202,16 @@ def _with_child_placement(
     CPU-only slots intentionally retain an empty declared-device field.
 
     A declared-GPU v2-placement slot also receives a worker-only GPU sampler
-    evidence path; any inherited value is discarded so only the controller
-    decides which slots are sampled.
+    evidence path and the slot's durable quarantine directory in the attempt
+    store; any inherited value is discarded so only the controller decides
+    which slots are sampled.
     """
 
     if not isinstance(environment, PreparedPythonEnvironment):
         return environment
     values = dict(environment.env)
-    values.pop(GPU_SAMPLER_OUTPUT_ENV, None)
+    for key in (GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, LAUNCH_ROLE_ENV):
+        values.pop(key, None)
     facts = getattr(allocation, "facts", {})
     v2_requested = _placement_v2_requested(allocation, values)
     scheduler_metadata = facts.get("scheduler", facts.get("scheduler_host_map")) if isinstance(facts, Mapping) else None
@@ -288,8 +300,13 @@ def _with_child_placement(
         placement_values[PLACEMENT_RECEIPT_VERSION_ENV] = "2"
         placement_values["TPEN_PLACEMENT_HOST_STATUS"] = "mapped" if scheduler_metadata is not None else "declared"
         if devices:
-            # The worker that owns the child samples it for its lifetime.
+            # The worker that owns the child samples it for its lifetime and
+            # quarantines its physical slot durably in this attempt store.
             placement_values[GPU_SAMPLER_OUTPUT_ENV] = os.path.join(fence.output_dir, "gpu-sampler.json")
+            # Keyed by allocation, backend job, physical host, and slot.
+            quarantine_dir = slot_quarantine_dir(fence.root, placement_values)
+            if quarantine_dir is not None:
+                placement_values[SLOT_QUARANTINE_ENV] = quarantine_dir
     if controller_refusal is not None:
         placement_values[PLACEMENT_REFUSAL_ENV] = json.dumps(controller_refusal, sort_keys=True)
     values = placement_environment(values, **placement_values)
@@ -297,16 +314,50 @@ def _with_child_placement(
 
 
 def _without_gpu_sampler(environment: Any) -> Any:
-    """Return the environment for a non-science process launched for a member.
+    """Return the environment for the inspection process of a member.
 
     Only the science child is sampled; an inspection process launched with
-    the same prepared environment must not start a second sampler.
+    the same prepared environment must not start a second sampler.  The
+    inspection carries the explicit inspector role, the only launch exempt
+    from the slot quarantine: it reads the member's own output and is not
+    slot reuse (review delta-3 F1).
     """
 
-    if not isinstance(environment, PreparedPythonEnvironment) or GPU_SAMPLER_OUTPUT_ENV not in environment.env:
+    if not isinstance(environment, PreparedPythonEnvironment):
         return environment
-    values = {key: value for key, value in environment.env.items() if key != GPU_SAMPLER_OUTPUT_ENV}
+    values = {
+        key: value for key, value in environment.env.items() if key not in (GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV)
+    }
+    values[LAUNCH_ROLE_ENV] = INSPECTOR_ROLE
     return PreparedPythonEnvironment(environment.python, environment.setup, values)
+
+
+def _admit_slot(environment: Any, fence: Any) -> None:
+    """Dispatch admission: refuse a member whose physical slot is quarantined.
+
+    Every placed science launch consults the in-process slot quarantine and
+    the durable markers in this attempt store, sampled or not, so a
+    restarted controller that reuses the store refuses a slot whose earlier
+    sampled launch never confirmed cleanup.  This assumes one controller per
+    allocation: markers in a different store, or held by a concurrently
+    running independent controller, are not seen (follow-up item 0aa73edd).
+
+    Raises
+    ------
+    SlotQuarantined
+        If the slot is still quarantined; no child is launched.
+    """
+
+    if not isinstance(environment, PreparedPythonEnvironment):
+        return
+    values = environment.env
+    if any(not values.get(key) for key in QUARANTINE_IDENTITY_KEYS):
+        # Legacy launches without a placed physical slot are not admitted here;
+        # the worker still consults the in-process quarantine by slot id.
+        return
+    quarantine_dir = slot_quarantine_dir(fence.root, values)
+    # The in-process key matches the worker's: owner environment then descriptor.
+    ensure_slot_clean(slot_fence_key({**os.environ, **values}), quarantine_dir)
 
 
 def _placement_refusal_from_environment(environment: Any) -> PlacementRefusal | None:
@@ -979,6 +1030,7 @@ class DispatcherContract:
                 placement_refusal = _placement_refusal_from_environment(environment)
                 if placement_refusal is not None:
                     raise placement_refusal
+                _admit_slot(environment, fence)
                 process = materialized["process"]
                 materialized["runner"]
                 evidence = materialized["evidence"]

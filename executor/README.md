@@ -76,10 +76,30 @@ under one shared deadline before it returns. The deadline is derived from the
 command bounds: at most one attempt in progress plus one final attempt, each
 of at most three commands bounded by a 5 s read plus a 2 s cleanup, plus a
 3 s cancel reserve (`2 * 3 * (5 + 2) + 3 = 45` s). If a launch or a group
-cleanup is still outstanding at the deadline, the record is not quiescent,
-keeps the surviving group ids, and the worker fences the slot: a later
-sampled launch on the same `TPEN_SLOT_ID` in this process fails with
-`SlotQuarantined` before spawning until that work is confirmed gone.
+cleanup is still outstanding at the deadline, the record is not quiescent and
+keeps the surviving group ids.
+
+Slot quarantine. Before it spawns a sampled child, the worker quarantines the
+slot: an in-process lease plus a durable marker in the attempt store under
+`<store root>/slot-quarantine/<sha256 of allocation id, backend job id,
+physical host, slot id>/`. The lease is settled on every exit, including an
+interrupted or failed evidence write, and released (marker removed) only once
+the child is reaped and every sampler command group is confirmed empty.
+Until then every science launch on that slot fails with `SlotQuarantined`
+before spawning, sampled or not: the worker checks the in-process lease by
+`TPEN_SLOT_ID`, and dispatch admission also checks the durable markers, so a
+restarted controller that reuses the same attempt store refuses the slot too.
+Only the member's own inspection, which carries the explicit `inspector`
+launch role, is exempt; an unsampled launch is never assumed to be an
+inspection. A marker whose owner died is not released by another process; the
+slot stays quarantined for the rest of the allocation.
+
+Assumption: one controller per allocation. Every dispatcher runs its workers
+in the controller process (Parsl is ThreadPool-only), so the in-process lease
+sees every launch, and the durable marker covers a controller restart on the
+same store. Markers in a different attempt store, and concurrent independent
+controllers on one allocation, are not detected; cross-store leases are
+deferred to follow-up item `0aa73edd`.
 
 Telemetry quality is kept separate from the operational outcome: a worker
 timeout or cancellation of the science child still finishes the sampler, so
