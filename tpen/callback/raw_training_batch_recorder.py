@@ -534,6 +534,7 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         self._partition: TrainingBatchPartitionWriter | None = None
         self.last_measurement: dict[str, Any] | None = None
         self._restored = False
+        self._first_iteration_seen = False
 
     def handle_stateless_occurrence_impl(
         self, occurrence: Occurrence[TypedEvent], context: RunContext
@@ -556,7 +557,16 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         if isinstance(event, TrainingCompleted):
             self._publish(context, final=True)
             return
-        if not isinstance(event, TrainingIterationCompleted) or not self._steps.should_run(event.iteration.step):
+        if not isinstance(event, TrainingIterationCompleted):
+            return
+        if not self._first_iteration_seen:
+            self._first_iteration_seen = True
+            if event.iteration.step != 0:
+                raise ValueError(
+                    "RawTrainingBatchRecorder refuses restored lineage before capture "
+                    "or publication [unsupported-callback]"
+                )
+        if not self._steps.should_run(event.iteration.step):
             return
         if state.batch is None or state.local_energy is None or state.wavefunction_output is None:
             raise ValueError("raw training recorder requires batch, local energy, and wavefunction output")
@@ -629,6 +639,7 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
         """Forget restore provenance when a new run context is delivered."""
 
         self._restored = False
+        self._first_iteration_seen = False
 
 
 TrainingBatchRecorder = RawTrainingBatchRecorder
