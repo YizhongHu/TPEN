@@ -104,3 +104,53 @@ runner (and any other facility-specific test that previously lived under
 excludes `scripts` via `norecursedirs`, so a bare `pytest`/`uv run pytest` from
 the repository root never collects facility-specific tests; run them
 explicitly with `uv run pytest scripts/cannon/tests`.
+
+## submit-lint.sh — pre-submit submission-contract linter
+
+`submit-lint.sh` is a generic, facility-neutral linter that the submission
+wrapper runs on itself before calling `sbatch`, so a recurring
+staging/argument mistake fails before an allocation is consumed. It never
+runs `verify.sh`'s own semantics (exact-SHA clone, mutant testing, JUnit
+verdicts) — it only validates the generated sbatch script and manifest that
+the wrapper is about to submit. All facility paths (stage root, shared-env
+root, `$HOME`) arrive by CLI; the script hardcodes none.
+
+```
+scripts/cannon/submit-lint.sh \
+  --sbatch /absolute/canonical/path/to/generated.sbatch \
+  --manifest /absolute/path/to/generated.manifest \
+  --allowed-root <facility stage/run prefix> [--allowed-root <prefix> ...] \
+  --shared-env-root <facility shared-env root> \
+  [--home "$HOME"] \
+  [--submit-helper /path/to/the/sbatch-invoking/helper] \
+  [--real-env /path/to/real-run.env --dry-env /path/to/dry-run.env \
+   --dry-only-keys DRY_RUN]
+```
+
+The manifest is a `KEY=VALUE` file the wrapper generates alongside the
+sbatch script, carrying the same critical values it exported into the
+script: `HEAD_SHA`, `JOB_NAME`, `TASK_ROOT`, `RUN_ROOT`, `DRY_RUN`, `PYTHON`.
+Checks performed (exit 0 on `LINT_PASS`, non-zero on `LINT_FAIL`):
+
+| # | Check |
+|---|---|
+| 1 | `HEAD_SHA` is exactly 40 hex characters |
+| 2 | `JOB_NAME` contains `HEAD_SHA[:12]` |
+| 3 | sbatch path is absolute, canonical, and inside a declared `--allowed-root` |
+| 4 | critical exports (`HEAD_SHA`, `JOB_NAME`, `TASK_ROOT`, `RUN_ROOT`, `DRY_RUN`, `PYTHON`) match exactly between the manifest and the sbatch script's `export` lines — no stale, missing, or extra values |
+| 5 | `TASK_ROOT`/`RUN_ROOT` are not staged under `$HOME`, literally or after canonicalization (catches a symlink into `$HOME`) |
+| 6 | `TASK_ROOT`/`RUN_ROOT` stay inside a declared `--allowed-root` (facility-root escape) |
+| 7 | when `DRY_RUN=1`, `PYTHON` resolves under `--shared-env-root` |
+| 8 | every `ssh` invocation in `--submit-helper` passes `-o BatchMode=yes` |
+| 9 | with `--real-env`/`--dry-env`, every exported key matches between a real and a dry run except the `--dry-only-keys` list |
+
+Run `scripts/cannon/submit-lint-selftest.sh` to exercise all nine checks
+locally with bash/stdlib fixtures only — no Slurm, no pytest, no cluster
+access. `scripts/cannon/tests/test_cannon_submit_lint.py` is the pytest-run
+contract for the same checks, with its own local `conftest.py`/pytest config
+(see Layout above), run on Cannon by the verification runner (not locally,
+since it uses the repo's `uv`-managed interpreter) via
+`uv run pytest scripts/cannon/tests`; its directory also carries
+`mutant-spec.json`, three deliberate linter mutants
+(`accept-relative-sbatch`, `omit-job-sha-check`, `allow-home-staging`) for
+`verify.sh --mutants`.

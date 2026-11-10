@@ -1,0 +1,23 @@
+[
+  {
+    "id": "accept-relative-sbatch",
+    "target": "scripts/cannon/submit-lint.sh",
+    "old": "fail \"sbatch path is not absolute: '$SBATCH_PATH'\"",
+    "new": ":  # mutant: accept-relative-sbatch disables the absolute-path check",
+    "killer": "tests/unit/infra/test_cannon_submit_lint.py::test_relative_sbatch_path_rejected"
+  },
+  {
+    "id": "omit-job-sha-check",
+    "target": "scripts/cannon/submit-lint.sh",
+    "old": "[[ \"$M_JOB_NAME_HAS\" == 1 && \"$M_JOB_NAME\" == *\"$short_sha\"* ]] || fail \"JOB_NAME does not contain SHA[:12] ('$short_sha'): '${M_JOB_NAME:-<missing>}'\"",
+    "new": "[[ \"$M_JOB_NAME_HAS\" == 1 && \"$M_JOB_NAME\" == *\"$short_sha\"* ]] || true  # mutant: omit-job-sha-check",
+    "killer": "tests/unit/infra/test_cannon_submit_lint.py::test_job_name_missing_short_sha_rejected"
+  },
+  {
+    "id": "allow-home-staging",
+    "target": "scripts/cannon/submit-lint.sh",
+    "old": "if [[ -n \"$HOME_ROOT\" ]]; then",
+    "new": "if false; then  # mutant: allow-home-staging",
+    "killer": "tests/unit/infra/test_cannon_submit_lint.py::test_home_staging_literal_rejected"
+  }
+]
