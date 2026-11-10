@@ -8,8 +8,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -25,16 +27,17 @@ from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.placement import (
     AllocationSlot,
     ChildPlacementObservation,
+    ChildPlacementObservationV2,
     PlacementRefusal,
     expand_slurm_nodelist,
     physical_slots_from_allocation,
     scheduler_host_map,
 )
 from tpen_executor.results import AcceptedSegment, ManifestAttempt, OutcomeReceipt, RunManifest, SciencePlacementReceiptV2, StartReceipt
-from tpen_executor.runners import CoreRunEvidence
+from tpen_executor.runners import CoreRunEvidence, RUN_SHIM
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.tasks import ConfiguredRun
-from tpen_executor.workers import ProcessOutcome
+from tpen_executor.workers import ProcessOutcome, SubprocessWorker
 
 GPU_A = "GPU-12345678-1234-1234-1234-123456789ABC"
 GPU_B = "GPU-12345678-1234-1234-1234-123456789ABD"
@@ -100,6 +103,14 @@ L1A_MUTANT_TABLE = (
     },
 )
 
+L1B_MUTANT_TABLE = (
+    {"id": "N6", "target": "executor/src/tpen_executor/runners.py", "old": "    \"    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, preexec_fn=_gpu_child_setup)\\n\"", "new": "    \"    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\\n\"", "killer": "test_sampler_timeout_kills_and_reaps_process_group", "suite": "executor", "assertion": "timeout cleanup targets the command process group"},
+    {"id": "N8", "target": "executor/src/tpen_executor/runners.py", "old": "    \"    placement_gpu_sampler.update({'status': 'observed' if complete else 'unavailable',", "new": "    \"    placement_gpu_sampler.update({'status': 'observed',", "killer": "test_sampler_failure_is_telemetry_failed", "suite": "executor", "assertion": "attempted command failure cannot become matched"},
+    {"id": "N11", "target": "executor/src/tpen_executor/runners.py", "old": "    \"            if placement_sampler_thread.is_alive():\\n\"", "new": "    \"            if False:\\n\"", "killer": "test_sampler_survivor_makes_quiescence_false", "suite": "executor", "assertion": "survivor is never reported quiescent"},
+    {"id": "D4", "target": "executor/src/tpen_executor/dispatch/contract.py", "old": '    """Validate sampler evidence and retain every per-sample observation."""', "new": '    """Validate only the final sampler summary."""', "killer": "test_sampler_preserves_each_per_sample_record", "suite": "executor", "assertion": "reader and receipt retain all samples"},
+    {"id": "D5", "target": "executor/src/tpen_executor/dispatch/contract.py", "old": "    elif not set(active_uuids).issubset(declared_uuids):", "new": "    elif False:", "killer": "test_out_of_slot_uuid_precedes_missing_entitlement", "suite": "executor", "assertion": "proven mismatch is not masked by telemetry failure"},
+)
+
 
 def _group() -> ReadyGroup:
     program = ProgramSpecRef({}, digest({}))
@@ -146,7 +157,7 @@ def test_r12_slurm_expansion_bounds_each_bracket_token() -> None:
         expand_slurm_nodelist("nid[0001-1024,0001-1024]")
 
 
-def _v2_inputs(tmp_path: Path, declared_devices: tuple[str, ...] = (GPU_A,)):
+def _v2_inputs(tmp_path: Path, declared_devices: tuple[str, ...] = (GPU_A,), sampler: dict[str, object] | None = None):
     group = _group()
     configured = ConfiguredRun("task-a", str(tmp_path / "config.yaml"), ("payload.seed=1",))
     (tmp_path / "config.yaml").write_text("ok", encoding="utf-8")
@@ -166,6 +177,8 @@ def _v2_inputs(tmp_path: Path, declared_devices: tuple[str, ...] = (GPU_A,)):
         digest({"config": configured.config, "overrides": list(configured.overrides)}), fence.output_dir,
         "physical-01", 1234, 55, (allowed[0],), {}, None, "2026-11-10T00:00:00Z", None,
     )
+    if sampler is not None:
+        observation = ChildPlacementObservationV2(observation, sampler)
     return group, configured, allocation, fence, environment, observation
 
 
@@ -177,6 +190,131 @@ def _receipt(tmp_path: Path, declared_devices: tuple[str, ...] = (GPU_A,)):
     ), group, configured, allocation, fence, environment
 
 
+def _observed_sampler(*, uuid: str = GPU_A, pid: int = 1234, reason: str = "observed", status: str = "observed") -> dict[str, object]:
+    inventory = [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}, {"uuid": GPU_B, "pci.bus_id": "0000:00:02.0"}]
+    rows = [{"pid": pid, "gpu_uuid": uuid}]
+    sample = {"monotonic_start": 1.0, "monotonic_end": 1.1, "inventory": inventory, "pid_rows": rows}
+    return {
+        "status": status, "reason": reason, "method": "nvidia-smi-pid-uuid-v1", "version": "NVIDIA-SMI 2.0",
+        "cadence_seconds": 0.1, "count": 1, "monotonic_start": 1.0, "monotonic_end": 1.1,
+        "inventory": inventory, "pid_rows": rows, "samples": [sample], "command_pids": [111], "survivors": [],
+        "elapsed_seconds": 0.1, "join_timeout_seconds": 4.0, "quiescent": True,
+    }
+
+
+def _failed_sampler() -> dict[str, object]:
+    return {"status": "unavailable", "reason": "telemetry-failed", "method": "nvidia-smi-pid-uuid-v1", "version": None, "cadence_seconds": 0.1, "count": 0, "monotonic_start": None, "monotonic_end": None, "inventory": [], "pid_rows": [], "samples": [], "command_pids": [111], "survivors": [], "elapsed_seconds": 0.1, "join_timeout_seconds": 4.0, "quiescent": True}
+
+
+def test_l1b_mutant_table_has_exact_fields_and_unique_old_anchors() -> None:
+    root = Path(__file__).parents[2]
+    assert {row["id"] for row in L1B_MUTANT_TABLE} == {"N6", "N8", "N11", "D4", "D5"}
+    for row in L1B_MUTANT_TABLE:
+        result = subprocess.run(["grep", "-F", "-c", row["old"], str(root / row["target"])], check=True, capture_output=True, text=True)
+        assert result.stdout.strip() == "1", row
+        assert row["target"].startswith("executor/src/") and row["suite"] == "executor"
+        assert row["killer"] and row["assertion"] and row["new"]
+
+
+def test_sampler_outcomes_are_closed_and_distinct(tmp_path: Path) -> None:
+    outcomes = (("matched", _observed_sampler()), ("mismatch", _observed_sampler(uuid=GPU_B)), ("telemetry-failed", _failed_sampler()), ("not-sampled", None))
+    seen = set()
+    for label, sampler in outcomes:
+        case_dir = tmp_path / label
+        case_dir.mkdir()
+        args = _v2_inputs(case_dir, sampler=sampler)
+        receipt = _placement_receipt_v2(args[5], args[2], args[3], args[0], args[0].members[0], args[1], args[4], ProcessOutcome((), 0, "", "", False, 1234, 55))
+        seen.add(receipt.verdict["reason_class"])
+    assert seen == {"qualified", "mismatch", "telemetry-failed", "not-sampled"}
+
+
+def test_sampler_preserves_each_per_sample_record(tmp_path: Path) -> None:
+    sampler = _observed_sampler()
+    sampler["count"] = 2
+    second = dict(sampler["samples"][0])
+    second["monotonic_start"], second["monotonic_end"] = 1.2, 1.3
+    sampler["samples"] = [sampler["samples"][0], second]
+    sampler["monotonic_end"], sampler["elapsed_seconds"] = 1.3, 0.3
+    args = _v2_inputs(tmp_path, sampler=sampler)
+    receipt = _placement_receipt_v2(args[5], args[2], args[3], args[0], args[0].members[0], args[1], args[4], ProcessOutcome((), 0, "", "", False, 1234, 55))
+    assert len(receipt.gpu_sampler["samples"]) == 2
+
+
+def test_out_of_slot_uuid_precedes_missing_entitlement(tmp_path: Path) -> None:
+    """D5: a proven out-of-slot live PID is never masked by another missing UUID."""
+
+    args = _v2_inputs(tmp_path, declared_devices=(GPU_A, GPU_C), sampler=_observed_sampler(uuid=GPU_B))
+    receipt = _placement_receipt_v2(args[5], args[2], args[3], args[0], args[0].members[0], args[1], args[4], ProcessOutcome((), 0, "", "", False, 1234, 55))
+    assert receipt.verdict["reason_class"] == "mismatch"
+    assert receipt.verdict["device"] == "mismatch"
+
+
+def test_sampler_timeout_kills_and_reaps_process_group() -> None:
+    """N6: timeout cleanup is process-group based and bounded."""
+
+    assert "start_new_session=True" in RUN_SHIM
+    assert "prctl(1, signal.SIGKILL)" in RUN_SHIM
+    assert "os.killpg(os.getpgid(pid), signal.SIGKILL)" in RUN_SHIM
+    assert RUN_SHIM.count("communicate(timeout=GPU_COMMAND_TIMEOUT)") >= 2
+
+
+def test_sampler_failure_is_telemetry_failed(tmp_path: Path) -> None:
+    """N8: an attempted command failure is not the L1a not-sampled state."""
+
+    args = _v2_inputs(tmp_path, sampler=_failed_sampler())
+    receipt = _placement_receipt_v2(args[5], args[2], args[3], args[0], args[0].members[0], args[1], args[4], ProcessOutcome((), 0, "", "", False, 1234, 55))
+    assert receipt.gpu_sampler["reason"] == "telemetry-failed"
+    assert receipt.verdict["reason_class"] == "telemetry-failed"
+    assert receipt.verdict["science_acceptance"] == "not-accepted"
+
+
+def test_sampler_survivor_makes_quiescence_false() -> None:
+    """N11: a sampler survivor cannot be reported as quiescent."""
+
+    assert "'quiescent': not survivors" in RUN_SHIM
+    assert "'quiescent': False" in RUN_SHIM
+
+
+@pytest.mark.skipif(not hasattr(os, "sched_setaffinity"), reason="requires Linux child affinity contract")
+def test_real_producer_fake_nvidia_smi_sidecar_is_reader_ready(tmp_path: Path) -> None:
+    """The child producer emits closed sampler evidence from a deterministic PATH fake."""
+
+    fake = tmp_path / "nvidia-smi"
+    fake.write_text(textwrap.dedent("""\
+        #!/usr/bin/env python3
+        import os, sys
+        if '--version' in sys.argv:
+            print('NVIDIA-SMI 2.0')
+        elif '--query-gpu=uuid,pci.bus_id' in sys.argv:
+            print('GPU-12345678-1234-1234-1234-123456789ABC, 0000:00:01.0')
+        else:
+            print(f'{os.getppid()}, GPU-12345678-1234-1234-1234-123456789ABC')
+    """), encoding="utf-8")
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    package = tmp_path / "pkg" / "tpen"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "run.py").write_text("import time\ndef main(argv):\n    time.sleep(0.15)\n    return 0\n", encoding="utf-8")
+    sidecar = tmp_path / "child-placement.json"
+    cpus = str(sorted(os.sched_getaffinity(0))[0])
+    env = PreparedPythonEnvironment(sys.executable, None, {
+        "PYTHONPATH": str(package.parent), "PATH": str(tmp_path) + os.pathsep + os.environ.get("PATH", ""),
+        "TPEN_PLACEMENT_OUTPUT": str(sidecar), "TPEN_PLACEMENT_OUTPUT_DIR": str(tmp_path),
+        "TPEN_PLACEMENT_DECLARED_CPUS": cpus, "TPEN_PLACEMENT_DECLARED_HOST": __import__("socket").gethostname(),
+        "TPEN_PLACEMENT_TASK_ID": "task-a", "TPEN_PLACEMENT_ATTEMPT_ID": "attempt-a", "TPEN_PLACEMENT_GROUP_DIGEST": digest("s2b2"),
+        "TPEN_PLACEMENT_ALLOCATION_ID": "allocation-a", "TPEN_PLACEMENT_BACKEND_JOB_ID": "job-a", "TPEN_PLACEMENT_SLOT_ID": "logical-slot",
+        "TPEN_PLACEMENT_DECLARED_DEVICES": GPU_A, "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest("payload"),
+        "TPEN_PLACEMENT_GPU_SAMPLER_COUNT": "2", "TPEN_PLACEMENT_GPU_SAMPLER_CADENCE": "0.02",
+    })
+    outcome = SubprocessWorker().run(env, ("-c", RUN_SHIM, f"run.root={tmp_path}"), cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert outcome.returncode == 0
+    assert payload["schema"] == "tpen-executor/child-placement-v2"
+    assert payload["gpu_sampler"]["reason"] in {"observed", "telemetry-failed"}
+    assert payload["gpu_sampler"]["survivors"] == []
+    assert payload["gpu_sampler"]["quiescent"] is True
+
+
 def test_l1a_v2_wire_is_closed_and_v1_remains_readable(tmp_path: Path) -> None:
     """The v2 envelope is closed while its nested v1 record remains immutable."""
 
@@ -185,7 +323,7 @@ def test_l1a_v2_wire_is_closed_and_v1_remains_readable(tmp_path: Path) -> None:
     assert set(raw) == {
         "schema", "task_id", "attempt_id", "group_digest", "allocation_id", "backend_job_id",
         "slot_id", "payload_digest", "output_dir", "child", "declared", "gpu", "comparison",
-        "refusal", "host_mapping", "verdict",
+        "refusal", "host_mapping", "gpu_sampler", "verdict",
     }
     assert receipt.base.schema == "tpen-executor/science-placement-receipt-v1"
     raw["verdict"]["unexpected"] = "tamper"

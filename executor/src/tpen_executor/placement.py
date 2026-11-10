@@ -396,7 +396,45 @@ class ChildPlacementObservation:
         )
 
 
-def read_child_placement(path: str | os.PathLike[str]) -> ChildPlacementObservation:
+@frozen_record
+class ChildPlacementObservationV2:
+    """Child placement sidecar with closed live-PID GPU sampler evidence."""
+
+    schema: ClassVar[str] = "tpen-executor/child-placement-v2"
+    base: ChildPlacementObservation
+    gpu_sampler: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.base, ChildPlacementObservation):
+            raise TypeError("v2 placement base must be ChildPlacementObservation")
+        if not isinstance(self.gpu_sampler, Mapping):
+            raise TypeError("gpu_sampler must be a mapping")
+        object.__setattr__(self, "gpu_sampler", _freeze(self.gpu_sampler, "gpu_sampler"))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.base, name)
+
+    def to_dict(self) -> dict[str, Any]:
+        result = self.base.to_dict()
+        result["schema"] = self.schema
+        result["gpu_sampler"] = thaw(self.gpu_sampler)
+        return result
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "ChildPlacementObservationV2":
+        expected = {
+            "schema", "task_id", "attempt_id", "group_digest", "allocation_id", "backend_job_id", "slot_id",
+            "payload_digest", "output_dir", "host", "pid", "proc_start_ticks", "affinity", "thread_settings",
+            "cuda_visible_devices", "observed_at_utc", "refusal", "gpu_sampler",
+        }
+        fields(data, expected, cls.schema, "ChildPlacementObservationV2")
+        base = dict(data)
+        base.pop("gpu_sampler")
+        base["schema"] = CHILD_PLACEMENT_SCHEMA
+        return cls(ChildPlacementObservation.from_mapping(base), data["gpu_sampler"])
+
+
+def read_child_placement(path: str | os.PathLike[str]) -> ChildPlacementObservation | ChildPlacementObservationV2:
     """Read one non-symlink child placement sidecar.
 
     Parameters
@@ -423,7 +461,10 @@ def read_child_placement(path: str | os.PathLike[str]) -> ChildPlacementObservat
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise PlacementRefusal("placement-invalid-file", "child placement sidecar must be a regular file")
     try:
-        return ChildPlacementObservation.from_mapping(decode_json(candidate.read_bytes()))
+        payload = decode_json(candidate.read_bytes())
+        if isinstance(payload, Mapping) and payload.get("schema") == ChildPlacementObservationV2.schema:
+            return ChildPlacementObservationV2.from_mapping(payload)
+        return ChildPlacementObservation.from_mapping(payload)
     except (OSError, UnicodeError, TypeError, ValueError) as error:
         raise PlacementRefusal("placement-malformed", "child placement sidecar is not a strict record") from error
 
@@ -900,6 +941,7 @@ __all__ = [
     "BindingError",
     "CHILD_PLACEMENT_SCHEMA",
     "ChildPlacementObservation",
+    "ChildPlacementObservationV2",
     "PLACEMENT_OUTPUT_ENV",
     "PLACEMENT_RECEIPT_VERSION_ENV",
     "PlacementRefusal",

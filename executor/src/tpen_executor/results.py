@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import field
+import math
+import re
 from typing import Any, ClassVar
 
 from ._codec import _freeze, canonical_bytes, decode_json, fields, sequence, sha256_text, text, thaw
@@ -368,17 +370,12 @@ class SciencePlacementReceipt:
 
 @frozen_record
 class SciencePlacementReceiptV2:
-    """Versioned physical-host placement receipt without device sampling.
-
-    SciencePlacementReceipt remains the immutable v1 wire record.  L1a
-    adds only the closed physical host map and verdict envelope.  Device
-    sampling is intentionally absent here and belongs to the dependent L1b
-    layer.
-    """
+    """Versioned physical-host and live-PID GPU placement receipt."""
 
     schema: ClassVar[str] = "tpen-executor/science-placement-receipt-v2"
     base: SciencePlacementReceipt
     host_mapping: Mapping[str, Any]
+    gpu_sampler: Mapping[str, Any]
     verdict: Mapping[str, str]
 
     def __post_init__(self) -> None:
@@ -400,6 +397,74 @@ class SciencePlacementReceiptV2:
             raise ValueError("unavailable v2 host mapping must not name a logical host")
         if host_status != "unavailable" and source != "scheduler-node-map":
             raise ValueError("mapped v2 host evidence must come from the scheduler node map")
+        expected_sampler = {
+            "status", "reason", "method", "version", "cadence_seconds", "count",
+            "monotonic_start", "monotonic_end", "inventory", "pid_rows", "samples",
+            "command_pids", "survivors", "elapsed_seconds", "join_timeout_seconds", "quiescent",
+        }
+        if not isinstance(self.gpu_sampler, Mapping) or set(self.gpu_sampler) != expected_sampler:
+            raise ValueError("v2 gpu_sampler keys differ")
+        sampler = self.gpu_sampler
+        if sampler["status"] not in {"observed", "unavailable"}:
+            raise ValueError("v2 gpu_sampler status is invalid")
+        if type(sampler["reason"]) is not str or not sampler["reason"]:
+            raise ValueError("v2 gpu_sampler reason is required")
+        if sampler["method"] != "nvidia-smi-pid-uuid-v1":
+            raise ValueError("v2 gpu_sampler method is invalid")
+        if sampler["version"] is not None and type(sampler["version"]) is not str:
+            raise TypeError("v2 gpu_sampler version must be text or null")
+        for key in ("cadence_seconds", "elapsed_seconds", "join_timeout_seconds"):
+            value = sampler[key]
+            if type(value) not in (int, float) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"v2 gpu_sampler {key} is invalid")
+        if not 1.0 <= sampler["join_timeout_seconds"] <= 4.0:
+            raise ValueError("v2 gpu_sampler join timeout is invalid")
+        if type(sampler["count"]) is not int or isinstance(sampler["count"], bool) or not 0 <= sampler["count"] <= 16:
+            raise ValueError("v2 gpu_sampler count is invalid")
+        for key in ("monotonic_start", "monotonic_end"):
+            value = sampler[key]
+            if value is not None and (type(value) not in (int, float) or isinstance(value, bool) or not math.isfinite(value)):
+                raise ValueError(f"v2 gpu_sampler {key} is invalid")
+        sequence_keys = ("inventory", "pid_rows", "samples", "command_pids", "survivors")
+        for key in sequence_keys:
+            if isinstance(sampler[key], (str, bytes, bytearray)) or not isinstance(sampler[key], Sequence):
+                raise TypeError(f"v2 gpu_sampler {key} must be a sequence")
+        if type(sampler["quiescent"]) is not bool:
+            raise TypeError("v2 gpu_sampler quiescent must be boolean")
+        if sampler["quiescent"] and sampler["survivors"]:
+            raise ValueError("quiescent sampler cannot report survivors")
+        uuid_re = re.compile(r"^GPU-[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$")
+        def validate_inventory(items: Any) -> None:
+            for item in items:
+                if not isinstance(item, Mapping) or set(item) != {"uuid", "pci.bus_id"} or type(item["uuid"]) is not str or not uuid_re.fullmatch(item["uuid"]) or type(item["pci.bus_id"]) is not str or not item["pci.bus_id"]:
+                    raise ValueError("v2 gpu_sampler inventory row is invalid")
+        def validate_rows(items: Any) -> None:
+            for item in items:
+                if not isinstance(item, Mapping) or set(item) != {"pid", "gpu_uuid"} or type(item["pid"]) is not int or isinstance(item["pid"], bool) or item["pid"] <= 0 or type(item["gpu_uuid"]) is not str or not uuid_re.fullmatch(item["gpu_uuid"]):
+                    raise ValueError("v2 gpu_sampler PID row is invalid")
+        validate_inventory(sampler["inventory"])
+        validate_rows(sampler["pid_rows"])
+        if any(type(pid) is not int or isinstance(pid, bool) or pid <= 0 for pid in sampler["command_pids"]):
+            raise ValueError("v2 gpu_sampler command PID is invalid")
+        for sample in sampler["samples"]:
+            if not isinstance(sample, Mapping) or set(sample) != {"monotonic_start", "monotonic_end", "inventory", "pid_rows"}:
+                raise ValueError("v2 gpu_sampler sample keys differ")
+            start, end = sample["monotonic_start"], sample["monotonic_end"]
+            if type(start) not in (int, float) or type(end) not in (int, float) or not math.isfinite(start) or not math.isfinite(end) or end < start:
+                raise ValueError("v2 gpu_sampler sample interval is invalid")
+            validate_inventory(sample["inventory"])
+            validate_rows(sample["pid_rows"])
+        if sampler["status"] == "observed":
+            if sampler["version"] is None or sampler["count"] <= 0 or len(sampler["samples"]) != sampler["count"] or not sampler["command_pids"]:
+                raise ValueError("observed sampler requires complete samples and command PIDs")
+            if sampler["monotonic_start"] is None or sampler["monotonic_end"] is None or sampler["monotonic_end"] <= sampler["monotonic_start"]:
+                raise ValueError("observed sampler requires a positive interval")
+        elif sampler["count"] != len(sampler["samples"]):
+            raise ValueError("sampler count disagrees with samples")
+        if sampler["count"] and (sampler["inventory"] != sampler["samples"][-1]["inventory"] or sampler["pid_rows"] != sampler["samples"][-1]["pid_rows"]):
+            raise ValueError("sampler summary disagrees with final sample")
+        if sampler["monotonic_start"] is not None and sampler["monotonic_end"] is not None and abs(sampler["elapsed_seconds"] - (sampler["monotonic_end"] - sampler["monotonic_start"])) > 1e-6:
+            raise ValueError("sampler elapsed time disagrees with interval")
         expected_verdict = {
             "host", "device", "qualification", "reason_class", "reason",
             "science_acceptance", "warning",
@@ -411,24 +476,16 @@ class SciencePlacementReceiptV2:
                 raise TypeError(f"v2 verdict {key} must be non-empty text")
         if self.verdict["host"] not in PLACEMENT_COMPARISON_STATES:
             raise ValueError("v2 verdict host state is invalid")
-        if self.verdict["device"] != "unavailable":
-            raise ValueError("L1a device verdict must be unavailable")
-        if self.verdict["qualification"] != "unqualified":
-            raise ValueError("L1a placement qualification must be unqualified")
-        if self.verdict["reason_class"] not in {"mismatch", "not-sampled", "refused"}:
-            raise ValueError("v2 verdict reason_class is invalid for L1a")
+        if self.verdict["device"] not in PLACEMENT_COMPARISON_STATES:
+            raise ValueError("v2 verdict device state is invalid")
+        if self.verdict["qualification"] not in {"qualified", "unqualified"}:
+            raise ValueError("v2 placement qualification is invalid")
+        if self.verdict["reason_class"] not in {"qualified", "mismatch", "telemetry-failed", "not-sampled", "refused"}:
+            raise ValueError("v2 verdict reason_class is invalid")
         if self.verdict["science_acceptance"] not in {"accepted", "not-accepted"}:
             raise ValueError("v2 verdict science acceptance is invalid")
-        if (
-            self.base.gpu["status"] != "unavailable"
-            or self.base.gpu["reason"] != "not-sampled"
-            or self.base.gpu["method"] != "not-sampled"
-            or self.base.gpu["samples"]
-            or self.base.gpu["active_uuids"]
-            or self.base.gpu["active_pci"]
-            or self.base.comparison["device"] != "unavailable"
-        ):
-            raise ValueError("L1a v2 receipts must carry unavailable, not-sampled device evidence")
+        if self.base.comparison["device"] != self.verdict["device"]:
+            raise ValueError("v2 device comparison disagrees with verdict")
         if self.host_mapping["slot_id"] != self.base.slot_id:
             raise ValueError("v2 host mapping slot_id disagrees with the base receipt")
         child_host = _receipt_host_key(self.base.child["host"])
@@ -467,6 +524,8 @@ class SciencePlacementReceiptV2:
             )
         )
         if self.verdict["reason_class"] == "not-sampled":
+            if sampler["reason"] != "not-sampled" or sampler["status"] != "unavailable" or sampler["count"]:
+                raise ValueError("not-sampled verdict requires no sampler run")
             if self.base.refusal is not None or host_status != "matched" or derived_host_status != "matched":
                 raise ValueError("not-sampled verdict requires mapped, matching host evidence")
             if self.base.comparison["host"] != "matched" or derived_affinity_status != "matched":
@@ -474,10 +533,16 @@ class SciencePlacementReceiptV2:
             if self.verdict["science_acceptance"] != "accepted":
                 raise ValueError("not-sampled device evidence is not science-blocking")
         elif self.verdict["reason_class"] == "mismatch":
-            if not has_postlaunch_mismatch or self.base.refusal is None:
-                raise ValueError("mismatch verdict requires post-launch mismatch evidence")
+            if not (has_postlaunch_mismatch or self.verdict["device"] == "mismatch"):
+                raise ValueError("mismatch verdict requires physical mismatch evidence")
             if self.verdict["science_acceptance"] != "not-accepted":
                 raise ValueError("mismatched placement cannot be science-accepted")
+        elif self.verdict["reason_class"] == "telemetry-failed":
+            if sampler["status"] != "unavailable" or sampler["reason"] != "telemetry-failed" or self.verdict["science_acceptance"] != "not-accepted":
+                raise ValueError("telemetry-failed verdict requires failed sampler evidence")
+        elif self.verdict["reason_class"] == "qualified":
+            if sampler["status"] != "observed" or self.verdict["qualification"] != "qualified" or self.verdict["science_acceptance"] != "accepted" or self.base.refusal is not None:
+                raise ValueError("qualified verdict requires complete sampler evidence")
         elif self.verdict["reason_class"] == "refused":
             if self.base.refusal is None or has_postlaunch_mismatch or host_status != "unavailable":
                 raise ValueError("refused verdict requires a prelaunch refusal")
@@ -485,7 +550,7 @@ class SciencePlacementReceiptV2:
                 raise ValueError("refused placement cannot be science-accepted")
         if self.base.declared["devices"] and not self.verdict["warning"]:
             raise ValueError("unqualified declared GPU placement requires a loud warning")
-        for name, value in (("host_mapping", self.host_mapping), ("verdict", self.verdict)):
+        for name, value in (("host_mapping", self.host_mapping), ("gpu_sampler", self.gpu_sampler), ("verdict", self.verdict)):
             object.__setattr__(self, name, _freeze(value, name))
 
     def __getattr__(self, name: str) -> Any:
@@ -502,6 +567,7 @@ class SciencePlacementReceiptV2:
         result.update({
             "schema": self.schema,
             "host_mapping": thaw(self.host_mapping),
+            "gpu_sampler": thaw(self.gpu_sampler),
             "verdict": thaw(self.verdict),
         })
         return result
@@ -516,17 +582,18 @@ class SciencePlacementReceiptV2:
         expected = {
             "schema", "task_id", "attempt_id", "group_digest", "allocation_id", "backend_job_id", "slot_id",
             "payload_digest", "output_dir", "child", "declared", "gpu", "comparison", "refusal",
-            "host_mapping", "verdict",
+            "host_mapping", "gpu_sampler", "verdict",
         }
         if set(data) != expected or data.get("schema") != cls.schema:
             raise ValueError("SciencePlacementReceiptV2 keys or schema differ")
         base = dict(data)
         base.pop("host_mapping")
+        base.pop("gpu_sampler")
         base.pop("verdict")
         base["schema"] = SciencePlacementReceipt.schema
         return cls(
             SciencePlacementReceipt.from_mapping(base),
-            data["host_mapping"],
+            data["host_mapping"], data["gpu_sampler"],
             data["verdict"],
         )
 
@@ -779,7 +846,7 @@ class RunManifest:
             }
             if receipt.verdict["reason_class"] == "not-sampled":
                 not_sampled.append(entry)
-            else:
+            elif receipt.verdict["qualification"] != "qualified":
                 blocking.append(entry)
         derived_verdict: Mapping[str, Any] = {}
         if blocking:

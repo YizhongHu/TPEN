@@ -10,7 +10,7 @@ emitting PID zero).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import json
@@ -438,6 +438,71 @@ def _placement_receipt(
     )
 
 
+_SAMPLER_KEYS = {
+    "status", "reason", "method", "version", "cadence_seconds", "count", "monotonic_start", "monotonic_end",
+    "inventory", "pid_rows", "samples", "command_pids", "survivors", "elapsed_seconds", "join_timeout_seconds", "quiescent",
+}
+_GPU_UUID = re.compile(r"^GPU-[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$")
+
+
+def _validated_sampler(sampler: Any, expected_pid: int | None) -> tuple[str, str, list[str], list[str], list[dict[str, Any]]]:
+    """Validate sampler evidence and retain every per-sample observation."""
+
+    if not isinstance(sampler, Mapping) or set(sampler) != _SAMPLER_KEYS:
+        return "not-sampled", "not-sampled", [], [], []
+    status = sampler["status"]
+    if status not in {"observed", "unavailable"} or sampler["method"] != "nvidia-smi-pid-uuid-v1":
+        return "telemetry-failed", "telemetry-failed", [], [], []
+    if type(sampler["quiescent"]) is not bool or sampler["survivors"]:
+        return "telemetry-failed", "telemetry-failed", [], [], []
+    if any(type(pid) is not int or isinstance(pid, bool) or pid <= 0 for pid in sampler["command_pids"]):
+        return "telemetry-failed", "telemetry-failed", [], [], []
+    if type(sampler["count"]) is not int or sampler["count"] < 0 or sampler["count"] > 16:
+        return "telemetry-failed", "telemetry-failed", [], [], []
+    if not isinstance(sampler["samples"], Sequence) or isinstance(sampler["samples"], (str, bytes, bytearray)):
+        return "telemetry-failed", "telemetry-failed", [], [], []
+    if status == "unavailable" and sampler["reason"] == "not-sampled" and sampler["count"] == 0:
+        return "not-sampled", "not-sampled", [], [], []
+    if status == "unavailable" and sampler["reason"] != "telemetry-failed":
+        return "telemetry-failed", "telemetry-failed", [], [], []
+    if sampler["count"] <= 0 or len(sampler["samples"]) != sampler["count"]:
+        return "telemetry-failed", "telemetry-failed", [], [], []
+    active: list[str] = []
+    active_pci: list[str] = []
+    normalized: list[dict[str, Any]] = []
+    try:
+        for sample in sampler["samples"]:
+            if not isinstance(sample, Mapping) or set(sample) != {"monotonic_start", "monotonic_end", "inventory", "pid_rows"}:
+                raise ValueError("sample keys are invalid")
+            inventory: dict[str, str] = {}
+            for item in sample["inventory"]:
+                if not isinstance(item, Mapping) or set(item) != {"uuid", "pci.bus_id"} or type(item["pci.bus_id"]) is not str:
+                    raise ValueError("inventory row is invalid")
+                uuid = canonical_device_uuid(item["uuid"])
+                inventory[uuid] = item["pci.bus_id"]
+            rows: list[dict[str, Any]] = []
+            for item in sample["pid_rows"]:
+                if not isinstance(item, Mapping) or set(item) != {"pid", "gpu_uuid"} or type(item["pid"]) is not int or item["pid"] <= 0:
+                    raise ValueError("PID row is invalid")
+                uuid = canonical_device_uuid(item["gpu_uuid"])
+                if uuid not in inventory:
+                    raise ValueError("PID row is absent from inventory")
+                rows.append({"pid": item["pid"], "gpu_uuid": uuid})
+                if expected_pid is not None and item["pid"] == expected_pid and uuid not in active:
+                    active.append(uuid)
+                    active_pci.append(inventory[uuid])
+            normalized.append({"monotonic_start": sample["monotonic_start"], "monotonic_end": sample["monotonic_end"], "inventory": [{"uuid": uuid, "pci.bus_id": pci} for uuid, pci in inventory.items()], "pid_rows": rows})
+    except (PlacementRefusal, TypeError, ValueError):
+        return "telemetry-failed", "telemetry-failed", [], [], []
+    if list(sampler["inventory"]) != normalized[-1]["inventory"] or list(sampler["pid_rows"]) != normalized[-1]["pid_rows"]:
+        return "telemetry-failed", "telemetry-failed", [], [], []
+    if status == "observed" and (not active or not sampler["command_pids"]):
+        return "telemetry-failed", "telemetry-failed", [], [], normalized
+    if status == "unavailable":
+        return "partial", "telemetry-failed", active, active_pci, normalized
+    return status, sampler["reason"], active, active_pci, normalized
+
+
 def _placement_receipt_v2(
     observation: Any,
     allocation: Any,
@@ -448,100 +513,63 @@ def _placement_receipt_v2(
     environment: Any,
     process_outcome: Any = None,
 ) -> SciencePlacementReceiptV2:
-    """Build the L1a physical-host verdict with an explicit not-sampled device."""
+    """Build v2 host, affinity, and bounded live-PID UUID evidence."""
 
-    base = _placement_receipt(
-        observation, allocation, fence, group, member, configured, environment, process_outcome
-    )
+    base = _placement_receipt(observation, allocation, fence, group, member, configured, environment, process_outcome)
     values = environment.env
     scheduler_status = values.get("TPEN_PLACEMENT_HOST_STATUS")
     expected_host = values.get("TPEN_SLOT_NODE")
-    child_precore_refusal = (
-        base.refusal is not None and base.refusal.get("code") == "child-placement-refused"
-    )
-    if child_precore_refusal:
-        host_state = "unavailable"
-        host_reason = "child refused placement before core import"
-        mapped_host = "unavailable"
-    elif scheduler_status == "unavailable" or not expected_host or expected_host == "unavailable":
-        host_state = "unavailable"
-        host_reason = "physical scheduler host mapping is unavailable"
-        mapped_host = "unavailable"
+    host_state = base.comparison["host"] if scheduler_status == "mapped" and expected_host else "unavailable"
+    host_reason = "" if host_state == "matched" else ("physical scheduler host mapping is unavailable" if host_state == "unavailable" else "child host differs from physical scheduler host")
+    declared_devices = [item for item in values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "").split(",") if item]
+    sampler_input = getattr(observation, "gpu_sampler", None)
+    sampler_status, sampler_reason, active_uuids, active_pci, samples = _validated_sampler(sampler_input, getattr(observation, "pid", None))
+    try:
+        declared_uuids = {canonical_device_uuid(item) for item in declared_devices}
+    except PlacementRefusal:
+        declared_uuids = set()
+    inventory_uuids = {item["uuid"] for item in (sampler_input or {}).get("inventory", ())} if isinstance(sampler_input, Mapping) else set()
+    if not declared_devices:
+        device_state, gpu_reason = "unavailable", "CPU-only slot has no GPU entitlement"
+    elif sampler_status == "not-sampled":
+        device_state, gpu_reason = "unavailable", "not-sampled"
+    elif sampler_status == "telemetry-failed":
+        device_state, gpu_reason = "unavailable", "telemetry-failed"
+    elif not set(active_uuids).issubset(declared_uuids):
+        device_state, gpu_reason = "mismatch", "live science PID used a UUID outside its slot entitlement"
+    elif not declared_uuids or not declared_uuids.issubset(inventory_uuids):
+        device_state, gpu_reason = "unavailable", "declared GPU entitlement is absent from sampler inventory"
+    elif not set(active_uuids):
+        device_state, gpu_reason = "unavailable", "telemetry-failed"
     else:
-        host_state = base.comparison["host"]
-        host_reason = "" if host_state == "matched" else "child host differs from physical scheduler host"
-        mapped_host = expected_host
-    declared_devices = [
-        item for item in values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "").split(",") if item
-    ]
-    device_state = "unavailable"
-    device_reason = "not-sampled: L1a intentionally does not sample device placement"
-    comparison = {
-        "host": host_state,
-        "affinity": base.comparison["affinity"],
-        "device": device_state,
-    }
+        device_state, gpu_reason = "matched", "live PID UUIDs match the physical slot entitlement"
+    comparison = {"host": host_state, "affinity": base.comparison["affinity"], "device": device_state}
     refusal = base.refusal
-    postlaunch_mismatch = (
-        base.refusal is not None
-        and base.refusal.get("code") in {"placement-affinity-mismatch", "child-placement-mismatch", "placement-generation-mismatch"}
-    )
-    if refusal is not None:
-        reason_class = "mismatch" if postlaunch_mismatch else "refused"
-        verdict_reason = (
-            f"mismatch: {refusal['reason']}"
-            if reason_class == "mismatch"
-            else f"refused: {refusal['reason']}"
-        )
-    elif host_state == "mismatch" or comparison["affinity"] == "mismatch":
-        reason_class = "mismatch"
-        verdict_reason = "mismatch: child host or CPU affinity differs from the declared physical slot"
+    postlaunch_mismatch = base.refusal is not None and base.refusal.get("code") in {"placement-affinity-mismatch", "child-placement-mismatch", "placement-generation-mismatch"}
+    qualified = all(value == "matched" for value in comparison.values()) and refusal is None and sampler_status == "observed"
+    if base.refusal is not None and not postlaunch_mismatch:
+        reason_class, verdict_reason = "refused", f"refused: {base.refusal['reason']}"
+    elif host_state == "mismatch" or base.comparison["affinity"] == "mismatch" or device_state == "mismatch":
+        reason_class, verdict_reason = "mismatch", f"mismatch: {gpu_reason if device_state == 'mismatch' else host_reason}"
+    elif qualified:
+        reason_class, verdict_reason = "qualified", "physical host, affinity, and live PID telemetry matched"
+    elif sampler_status == "not-sampled":
+        reason_class, verdict_reason = "not-sampled", "not-sampled: L1a intentionally does not sample device placement"
     else:
-        reason_class = "not-sampled"
-        verdict_reason = device_reason
-    v2_base = SciencePlacementReceipt(
-        base.task_id, base.attempt_id, base.group_digest, base.allocation_id,
-        base.backend_job_id, base.slot_id, base.payload_digest, base.output_dir,
-        base.child, base.declared, {
-            "status": "unavailable",
-            "reason": "not-sampled",
-            "method": "not-sampled",
-            "started_at_utc": base.gpu["started_at_utc"],
-            "finished_at_utc": base.gpu["finished_at_utc"],
-            "samples": [],
-            "active_uuids": [],
-            "active_pci": [],
-        },
-        comparison,
-        refusal,
-    )
-    warning = ""
-    if declared_devices:
-        warning = (
-            "GPU PLACEMENT NOT-SAMPLED: L1a intentionally does not sample devices; "
-            "H-v2 performs its own delivered-GPU check."
-            if reason_class == "not-sampled"
-            else "GPU PLACEMENT UNQUALIFIED: physical placement evidence requires review."
-        )
-    return SciencePlacementReceiptV2(
-        v2_base,
-        {
-            "status": host_state,
-            "reason": host_reason or "physical scheduler host mapped",
-            "source": "scheduler-node-map" if scheduler_status == "mapped" else "declared-slot",
-            "slot_id": base.slot_id,
-            "host": mapped_host,
-        },
-        {
-            "host": host_state,
-            "device": device_state,
-            "qualification": "unqualified",
-            "reason_class": reason_class,
-            "reason": verdict_reason,
-            "science_acceptance": "accepted" if reason_class == "not-sampled" else "not-accepted",
-            "warning": warning,
-        },
-    )
+        reason_class, verdict_reason = "telemetry-failed", "telemetry-failed"
+    if reason_class == "telemetry-failed" and refusal is None:
+        refusal = {"code": "placement-telemetry-unavailable", "reason": "telemetry-failed"}
+    gpu = {
+        "status": "qualified" if qualified else "unavailable",
+        "reason": gpu_reason,
+        "method": "not-sampled" if sampler_status == "not-sampled" else "nvidia-smi-pid-uuid-v1",
+        "started_at_utc": base.gpu["started_at_utc"], "finished_at_utc": base.gpu["finished_at_utc"],
+        "samples": samples, "active_uuids": active_uuids if device_state == "matched" else [], "active_pci": active_pci if device_state == "matched" else [],
+    }
+    v2_base = SciencePlacementReceipt(base.task_id, base.attempt_id, base.group_digest, base.allocation_id, base.backend_job_id, base.slot_id, base.payload_digest, base.output_dir, base.child, base.declared, gpu, comparison, refusal)
+    sampler = sampler_input if isinstance(sampler_input, Mapping) else {"status": "unavailable", "reason": "not-sampled", "method": "nvidia-smi-pid-uuid-v1", "version": None, "cadence_seconds": 0.0, "count": 0, "monotonic_start": None, "monotonic_end": None, "inventory": [], "pid_rows": [], "samples": [], "command_pids": [], "survivors": [], "elapsed_seconds": 0.0, "join_timeout_seconds": 4.0, "quiescent": True}
+    warning = "" if not declared_devices else ("GPU PLACEMENT NOT-SAMPLED: L1a intentionally does not sample devices; H-v2 performs its own delivered-GPU check." if reason_class == "not-sampled" else ("GPU PLACEMENT QUALIFIED: live PID UUID telemetry matched the declared physical slot." if reason_class == "qualified" else "GPU PLACEMENT UNQUALIFIED: telemetry or physical placement evidence requires science review."))
+    return SciencePlacementReceiptV2(v2_base, {"status": host_state, "reason": host_reason or "physical scheduler host mapped", "source": "scheduler-node-map" if scheduler_status == "mapped" else "declared-slot", "slot_id": base.slot_id, "host": expected_host or "unavailable"}, sampler, {"host": host_state, "device": device_state, "qualification": "qualified" if qualified else "unqualified", "reason_class": reason_class, "reason": verdict_reason, "science_acceptance": "accepted" if qualified or reason_class == "not-sampled" else "not-accepted", "warning": warning})
 
 
 def _placement_refusal_receipt(
@@ -628,6 +656,12 @@ def _placement_refusal_receipt(
             "source": "scheduler-node-map" if values.get("TPEN_PLACEMENT_HOST_STATUS") == "mapped" else "declared-slot",
             "slot_id": base.slot_id,
             "host": "unavailable",
+        },
+        {
+            "status": "unavailable", "reason": "not-sampled", "method": "nvidia-smi-pid-uuid-v1", "version": None,
+            "cadence_seconds": 0.0, "count": 0, "monotonic_start": None, "monotonic_end": None,
+            "inventory": [], "pid_rows": [], "samples": [], "command_pids": [], "survivors": [],
+            "elapsed_seconds": 0.0, "join_timeout_seconds": 4.0, "quiescent": True,
         },
         {
             "host": "unavailable",
