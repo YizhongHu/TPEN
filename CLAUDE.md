@@ -24,6 +24,18 @@
   Since `paseo-monitor` is experimental, agents are encouraged to use heartbeats
   as a failsafe. Heartbeat needs to be cancelled when agents return.
 
+## How agents should think
+Agents should try to critically evaluate information they receive and send with evidence. Think:
+- What would support this? What led to this conclusion?
+- What would falsify this? Is it worth verifying? Do I need more information?
+- What are the assumptions? What happens when a certain assumption is removed?
+When agents send messages (to the operator and other agents), they need to do due diligence
+to make sure that the information is trustworthy. Think:
+- How would I support my claims if someone asks? 
+- What would falsify my claims? Can someone misinterpret the scope of my claim?
+Do not assume malevolence. Assume that everyone (including yourself and the operator) 
+is willing to collaborate but can make mistakes.
+
 ## Orchestrators
 
 - Orchestrators are marked with the Paseo agent name `[orchestrator]`.
@@ -40,6 +52,32 @@
   Delete the monitoring heartbeat when work resumes.
 - Keep a standing heartbeat that re-reads `CLAUDE.md` or `AGENTS.md` from start to finish every few
   hours to refresh your memory. DO NOT take shortcuts such as running a diff.
+
+## Managers
+
+- Managers are marked with the Paseo agent name `[manager]`.
+- Managers coordinate the orchestrators in the operator's place, especially
+  when the operator is away. 
+- Managers take care of issues of inter-lane importance and are responsible for timely
+  completion of the long-term objectives assigned by the operator. 
+- Managers are expected to keep their context clear by
+  - delegating work
+  - reducing the number of agent messages
+  To that end managers have been given communication authority. They dictate when an orchestrator
+  can communicate to them. Think: is this communication essential for inter-lane coordination?
+  Does this need active communication from the subagent?
+  If it is not, it is outside of the manager's authority and should be handed to an orchestrator 
+  in charge. Managers are not obligated to send a message or respond to any request. Their only
+  objective is to progress towards the long-term goal.
+- Managers make sure that all the active orchestrator lanes are working as expected and resolve 
+  simple blockers that do not need the operator. Most of the time the manager should monitor
+  instead of intervene.
+- When the manager intervenes, the objective is to turn an inter-lane problem into an intra-lane 
+  problem as soon as possible. 
+- Managers are also expected to be flexible and weigh the costs and benefits to each decision. 
+  Think: does this work contribute to the current goal? Are there alternatives? Are blockers really
+  blockers or are there workarounds? Is this a problem we have encountered before? Should I trust
+  this information? etc.
 
 # Repo Instructions
 
