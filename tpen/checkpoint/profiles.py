@@ -116,6 +116,7 @@ RESUME_SENSITIVE_CALLBACK_TARGETS = frozenset(
         "tpen.callback.Checkpoint",
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
+        "tpen.callback.AmplitudeRiskFraction",
         "tpen.callback.InitialCheckpoint",
         "tpen.callback.ParameterActivity",
         "tpen.callback.RawTrainingBatchRecorder",
@@ -136,13 +137,20 @@ RESUME_SENSITIVE_CALLBACK_TARGETS = frozenset(
 # ``tpen/callback/timing/train_step_timing.py:41-57`` and TrainPhaseTiming at
 # ``tpen/callback/timing/train_phase_timing.py:64-83``; both gate only
 # observational ``train/perf`` logging. Those three observational callbacks
-# therefore remain admitted.
+# therefore remain admitted. AmplitudeRiskFraction consumes the same five
+# fields at ``tpen/callback/amplitude_risk.py`` (via ``pop_step_cadence``) and
+# gates which completed-iteration batches get a published descriptive
+# occupancy fraction; a gap or duplicate in that published set is exactly the
+# resume-fidelity failure this allowlist exists to catch, so it is held to the
+# same cadence-sensitive standard as DataIntegrity and GradientStats rather
+# than the three purely-timing callbacks above.
 CALLBACK_CADENCE_REFUSAL_CODE = "unsupported-callback-cadence"
 CADENCE_SENSITIVE_CALLBACK_TARGETS = frozenset(
     {
         "tpen.callback.Checkpoint",
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
+        "tpen.callback.AmplitudeRiskFraction",
         "tpen.callback.RawTrainingBatchRecorder",
         "tpen.callback.TrainingBatchRecorder",
     }

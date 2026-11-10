@@ -20,6 +20,10 @@ def __getattr__(name: str) -> object:
     a module with `ArtifactIndex`, so it is loaded lazily with it.
     """
 
+    if name == "AmplitudeRiskFraction":
+        from .amplitude_risk import AmplitudeRiskFraction
+
+        return AmplitudeRiskFraction
     if name == "ArtifactIndex":
         from .evaluation import ArtifactIndex
 
@@ -111,6 +115,7 @@ def __getattr__(name: str) -> object:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
+    "AmplitudeRiskFraction",
     "ArtifactIndex",
     "Cadence",
     "CadenceGate",
