@@ -216,6 +216,9 @@ def test_p8_reader_accepts_cpu_only_v2_receipts(tmp_path: Path) -> None:
             reason_class=reason_class,
             declared_devices=(),
         )
+        # CPU-only receipts have no declared GPU entitlement and may therefore
+        # omit the GPU warning that the M10 guard requires only for GPU slots.
+        placement["verdict"]["warning"] = ""
         payload["attempts"][0]["placement_receipt"] = placement
         if reason_class == "refused":
             payload["attempts"][0]["outcome_receipt"]["status"] = "launch_failed"
