@@ -56,6 +56,7 @@ imports no ``tpen``, no ``tpen_executor``, and no ``hydra``
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.util
 import os
 import shlex
@@ -274,17 +275,31 @@ while True:
     time.sleep(max(0.0, SAMPLE_INTERVAL_SECONDS - elapsed))
 """
 
+#: F2 (fixed, round 2): the dry-run printer (:func:`submit_pilot_payload`) and
+#: every test built around it assume ``print(shlex.join(command))`` emits
+#: exactly ONE printed line per job -- a ``--wrap`` value that itself
+#: contains a literal newline (the original heredoc-based sidecar launch)
+#: breaks that invariant even though it is still a single shell *token*
+#: (``shlex.quote`` escapes it, but escaping does not stop a raw newline
+#: byte from starting a new terminal line when printed). Launching the
+#: sidecar via a base64-encoded ``-c`` payload avoids a heredoc entirely, so
+#: the whole pilot wrapper body can be ONE line, joined by ``;``/``&``
+#: instead of real newlines.
+_GPU_SIDECAR_LAUNCHER = "import base64,sys;exec(base64.b64decode(sys.argv.pop(1)).decode())"
+_GPU_SIDECAR_SOURCE_B64 = base64.b64encode(_GPU_SIDECAR_SOURCE.encode("utf-8")).decode("ascii")
+
 
 def _gpu_sidecar_wrap_lines(
     *, checkout_quoted: str, science_python: str, executor_python: str, payload_command: str
 ) -> list[str]:
-    """Return the pilot-only wrapper lines: sidecar, payload, bounded cleanup.
+    """Return the pilot-only wrapper statements: sidecar, payload, bounded cleanup.
 
     F2: unlike the plain ``exec``-based science/pipeline-check wrapper
     (:func:`_wrap_command`), this never ``exec``s the payload -- its exit
     status is captured (``RC=$?``) so the sidecar can be stopped and reaped
     (``kill``/``wait``) before the wrapper itself exits with that SAME
-    status, preserved unchanged.
+    status, preserved unchanged. Every statement here is joined on one line
+    (see :data:`_GPU_SIDECAR_LAUNCHER`); none may contain a literal newline.
     """
 
     science_quoted = shlex.quote(science_python)
@@ -296,9 +311,8 @@ def _gpu_sidecar_wrap_lines(
         f"export SCIENCE_PYTHON={shlex.quote(science_python)}",
         f"export EXECUTOR_PY={shlex.quote(executor_python)}",
         'mkdir -p "$RUN/logs"',
-        f"{science_quoted} - \"$RUN/logs/gpu-sidecar.log\" <<'PYEOF' &",
-        _GPU_SIDECAR_SOURCE.rstrip("\n"),
-        "PYEOF",
+        f"{science_quoted} -c {shlex.quote(_GPU_SIDECAR_LAUNCHER)} {shlex.quote(_GPU_SIDECAR_SOURCE_B64)} "
+        '"$RUN/logs/gpu-sidecar.log" &',
         "MONITOR_PID=$!",
         # The payload's own exit status is captured with errexit disabled
         # around it, never allowed to abort the script before it is read.
@@ -390,15 +404,22 @@ def _wrap_command(
     if payload in PILOT_PAYLOADS:
         # F2: these two payloads run under a bounded GPU-utilization sidecar
         # (:data:`_GPU_SIDECAR_SOURCE`); the science/pipeline-check wrapper
-        # below stays byte-identical to #629 (no sidecar).
-        return "\n".join(
-            _gpu_sidecar_wrap_lines(
-                checkout_quoted=checkout_quoted,
-                science_python=science_python,
-                executor_python=executor_python,
-                payload_command=payload_command,
-            )
+        # below stays byte-identical to #629 (no sidecar). Joined onto ONE
+        # line (never a literal newline): a `--wrap` value containing one
+        # breaks the "print(shlex.join(command)) is exactly one printed
+        # line" convention every dry-run caller/test relies on, even though
+        # it is still a single shell token. A statement already ending in
+        # `&` (the backgrounded sidecar launch) needs no extra separator.
+        statements = _gpu_sidecar_wrap_lines(
+            checkout_quoted=checkout_quoted,
+            science_python=science_python,
+            executor_python=executor_python,
+            payload_command=payload_command,
         )
+        body = statements[0]
+        for statement in statements[1:]:
+            body += statement if body.endswith("&") else f"; {statement}"
+        return body
     return (
         f"cd {checkout_quoted} && "
         f"CHECKOUT={checkout_quoted} && "
