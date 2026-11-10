@@ -5,8 +5,8 @@ Mutant controls
 M7
     Old: accept only ``science-placement-receipt-v1`` and discard v2 fields.
     New: decode the producer's closed L1a v2 receipt and manifest-v3 verdict.
-    Killer: ``test_l2_real_executor_producer_to_p8_reader_contract`` in the
-    root suite, using the real executor dispatch/store producer.
+    Killer: the real executor producer-to-reader contract test in the root
+    suite, using the real executor dispatch/store producer.
 M8
     Old: freeze placement evidence after core inspection.
     New: validate the closed L1a JSON evidence while reading the manifest.
