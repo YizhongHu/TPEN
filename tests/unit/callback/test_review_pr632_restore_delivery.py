@@ -17,7 +17,7 @@ from tpen.callback.raw_training_batch_recorder import RawTrainingBatchRecorder, 
 from tpen.checkpoint import CheckpointRestored
 from tpen.checkpoint.restore import RestoreReport
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
-from tpen.events import Occurrence, Started
+from tpen.events import Occurrence
 from tpen.run import run_from_config
 from tpen.training.events import TrainingCompleted, TrainingIteration, TrainingIterationCompleted
 from tpen.training.state import TrainerState
@@ -195,11 +195,13 @@ def test_recorder_reset_after_real_context_emit_restores_fresh_delivery(tmp_path
     context_a = _context(tmp_path, "context-a", callback)
     context_a.emit(_restored_occurrence())
     with pytest.raises(ValueError, match=re.escape(REFUSAL)):
-        context_a.emit(Started(TrainingIteration(0)), state=_state())
+        with context_a.scope(TrainingIteration(0), state=_state()):
+            pass
 
     context_b = _context(tmp_path, "context-b", callback)
     state = _state()
-    context_b.emit(Started(TrainingIteration(0)), state=state)
+    with context_b.scope(TrainingIteration(0), state=state):
+        pass
     context_b.emit(TrainingIterationCompleted(TrainingIteration(0)), state=state)
     context_b.emit(TrainingCompleted(), state=state)
 
