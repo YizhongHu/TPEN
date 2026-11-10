@@ -112,12 +112,12 @@ Avoid large PRs that change multiple things at the same time.
 
 For each TO implementation slice:
 
-1. The orchestrator claims and advances to `work`, creates the worktree, dispatches, then releases its claim.
+1. Using the `paseo` skill, the orchestrator claims and advances to `work`, creates the worktree, dispatches, then releases its claim.
 2. The worker claims before editing with a short renewable TTL.
 3. The worker pushes the PR, records its full head, releases the claim, then finishes.
 4. The orchestrator confirms release and preserved work before worker archival.
-5. A separate verifier checks the current PR head; archive only after its receipt. On a passing receipt, advance the item to `review`; this unblocks downstream slices with `unblockAt: review`.
-6. Run tiered review; ready requires verification at the current head.
+5. A separate verifier checks the current PR head with the `pr-verification` skill; archive only after its receipt. On a passing receipt, advance the item to `review`; this unblocks downstream slices with `unblockAt: review`.
+6. Run tiered review with the `pr-review-loop` skill; ready requires verification at the current head.
 7. Any new commit returns the PR to draft unless the new head's git tree equals the verified head's tree (record both SHAs and the tree hash).
 8. After confirmed merge, delete the merged branch and worktree; record both deletions in `pr-disposition`.
 9. Complete/cancel only after that disposition.

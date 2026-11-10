@@ -36,14 +36,14 @@ work_item_schemas:
         role: queue
         required: true
         description: "Review tier and reason."
-        guidance: "Declare T0, T1, or T2 with one-line reason under manager-ruling-review-scope-20261109 and amendment-1; when unsure use the higher tier."
+        guidance: "Use the tier list in the `pr-review-loop` skill. Record T0, T1 or T2 with a one-line reason and post the same line on the PR. When unsure, use the higher tier."
+        maxLength: 300
 
       - key: implementation-worker-initialization
         role: work
         required: true
         description: "Orchestrator: spawn an isolated implementation worker."
-        guidance: "Before dispatch, the orchestrator claims and advances the item, creates the isolated worktree, spawns the worker, then releases its claim. The worker claims before any edit with a short renewable TTL; record worker, claimRef, TTL, workspace and branch."
-        skill: paseo
+        guidance: "Use the `paseo` skill. Before dispatch, the orchestrator claims and advances the item, creates the isolated worktree, spawns the worker, then releases its claim. The worker claims before any edit with a short renewable TTL; record worker, claimRef, TTL, workspace and branch."
         maxLength: 1000
 
       - key: implementation-receipt
@@ -57,36 +57,28 @@ work_item_schemas:
         role: work
         required: true
         description: "Orchestrator: dispose of the implementation worker and workspace."
-        guidance: "Confirm the worker finished, its changes are pushed, no unpreserved work remains, and its claim is released before archiving the workspace."
-        skill: paseo
+        guidance: "Use the `paseo` skill. Confirm the worker finished, its changes are pushed, no unpreserved work remains, and its claim is released before archiving the workspace."
         maxLength: 1000
 
       - key: tip-verification
         role: work
         required: true
         description: "Verifier: independent test results."
-        guidance: "A separate clean verifier tests the current full PR head. Record that SHA, commands, outcomes, job IDs and TO receipts. Once item 55799bad is delivered, use its versioned fast Cannon runner. Per-job checkout, mutants, cache and TMPDIR are `/scratch/$USER/$SLURM_JOB_ID`, never `/tmp`; only `Lab/rhu/envs` and `Lab/rhu/runs` persist, and final evidence is in TO. The required literal `tip-verification` note names the current head and points to the immutable per-head receipt `tip-verification-<sha8>`. A changed head returns the PR to draft until independently verified at that head, unless the new head's git tree equals the verified head's tree (record both SHAs and the tree hash)."
-        skill:
-          - paseo
-          - clean-final-verifier
+        guidance: "Use the `pr-verification` skill. A separate clean verifier tests the current full PR head and writes the receipt that skill defines, then its workspace is archived through Paseo."
         maxLength: 4000
 
       - key: reviewer-initialization
         role: review
         required: true
         description: "Orchestrator: initiate independent PR review."
-        guidance: "Read `review-tier`: T0 records no agent review; T1 uses one pr-review-loop round; T2 follows the amendment. Record tier, reviewer/workspace IDs when used, and PR link."
-        skill:
-          - paseo
-          - pr-review-loop
+        guidance: "Use the `pr-review-loop` and `paseo` skills. Read `review-tier`: T0 records no agent review; T1 uses one round; T2 uses one full round and at most one delta round. Record tier, reviewer/workspace IDs when used, and PR link."
         maxLength: 1000
 
       - key: reviewer-archival
         role: review
         required: true
         description: "Orchestrator: archive reviewer and review-owned workspaces."
-        guidance: "Confirm review handoff and safe cleanup of test branches/workspaces. Archive the reviewer with Paseo; record outcome or recovery blocker."
-        skill: paseo
+        guidance: "Use the `paseo` skill. Confirm review handoff and safe cleanup of test branches/workspaces. Archive the reviewer with Paseo; record outcome or recovery blocker."
         maxLength: 1000
 
       - key: review-summary
