@@ -76,7 +76,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("validate", "apply", "restore"))
     parser.add_argument("--spec", type=Path, required=True)
-    parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--source", type=Path)
     parser.add_argument("--backup", type=Path)
     parser.add_argument("--id")
     parser.add_argument("--target")
@@ -84,6 +84,8 @@ def main() -> int:
     if args.action == "validate":
         print(json.dumps(spec(args.spec), sort_keys=True))
         return 0
+    if not args.source:
+        parser.error("apply and restore require --source")
     if not args.backup or (args.action == "apply" and not args.id) or (args.action == "restore" and not args.target):
         parser.error("apply requires --id and --backup; restore requires --target and --backup")
     if args.action == "apply":
