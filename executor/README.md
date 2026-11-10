@@ -98,13 +98,16 @@ never treated as an inspection. This argument is a correctness guard against
 accidental slot reuse, not a security boundary: any caller that controls the
 worker invocation can pass it.
 
-Quarantine release (pending a manager decision). A marker whose owner died is
+Quarantine release (decided: no in-allocation release; manager ruling
+2026-11-10, Task Orchestrator item 08eeff51 note
+`manager-ruling-quarantine-release-20261110`). A marker whose owner died is
 not released by another process, and no operator release command exists. The
-conservative default holds until the manager decides otherwise: the slot stays
-quarantined for the rest of the allocation, and allocation teardown is the
-release (a new allocation has a new allocation and backend job identity, so it
-does not see the old marker). The marker is kept as evidence until a separate
-disposition authorizes removing it.
+slot stays quarantined for the rest of the allocation, and allocation teardown
+is the release (a new allocation has a new allocation and backend job
+identity, so it does not see the old marker). The marker is kept as evidence
+until a separate disposition authorizes removing it. A supervised release
+command, which must prove that all possibly-launched work is gone, is a future
+follow-up.
 
 Assumption: one controller per allocation. Every dispatcher runs its workers
 in the controller process (Parsl is ThreadPool-only), so the in-process lease
