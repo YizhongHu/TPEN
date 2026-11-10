@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import field
 from typing import Any, ClassVar
 
 from ._codec import _freeze, canonical_bytes, decode_json, fields, sequence, sha256_text, text, thaw
@@ -356,8 +357,10 @@ class SciencePlacementReceiptV2:
             if not isinstance(value, Mapping):
                 raise TypeError(f"{name} must be a mapping")
             object.__setattr__(self, name, _freeze(value, name))
-        if any(type(self.verdict.get(key)) is not str or not self.verdict[key] for key in ("host", "device", "qualification")):
-            raise TypeError("v2 verdict must contain non-empty host, device, and qualification states")
+        if any(type(self.verdict.get(key)) is not str or not self.verdict[key] for key in ("host", "device", "qualification", "reason_class", "reason")):
+            raise TypeError("v2 verdict must contain non-empty placement states and reason")
+        if self.verdict["reason_class"] not in {"qualified", "mismatch", "telemetry-unavailable", "refused"}:
+            raise ValueError("v2 verdict reason_class is invalid")
         for section in (self.host_mapping, self.gpu_sampler):
             if section.get("status") == "unavailable" and (type(section.get("reason")) is not str or not section["reason"]):
                 raise ValueError("unavailable placement evidence requires a non-empty reason")
@@ -586,10 +589,12 @@ class RunManifest:
     schema: ClassVar[str] = "tpen-executor/run-manifest-v2"
     V1_SCHEMA: ClassVar[str] = "tpen-executor/run-manifest-v1"
     V2_SCHEMA: ClassVar[str] = schema
+    V3_SCHEMA: ClassVar[str] = "tpen-executor/run-manifest-v3"
     group_id: str
     group_digest: str
     attempts: tuple[ManifestAttempt, ...]
     segments: tuple[AcceptedSegment, ...] = ()
+    placement_verdict: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "group_id", text(self.group_id, "group_id")); object.__setattr__(self, "group_digest", sha256_text(self.group_digest, "group_digest"))
@@ -627,15 +632,42 @@ class RunManifest:
                     raise ValueError("accepted segment progress coordinate is not strictly increasing")
             previous_by_task[segment.task_id] = segment
         object.__setattr__(self, "segments", segments)
+        placement_verdict = self.placement_verdict
+        if not isinstance(placement_verdict, Mapping):
+            raise TypeError("placement_verdict must be a mapping")
+        if not placement_verdict:
+            unqualified = []
+            for attempt in attempts:
+                receipt = attempt.placement_receipt
+                if not isinstance(receipt, SciencePlacementReceiptV2):
+                    continue
+                if receipt.verdict["qualification"] == "unqualified" and receipt.declared["devices"]:
+                    unqualified.append({
+                        "task_id": receipt.task_id,
+                        "attempt_id": receipt.attempt_id.value,
+                        "reason_class": receipt.verdict["reason_class"],
+                        "reason": receipt.verdict["reason"],
+                    })
+            if unqualified:
+                placement_verdict = {
+                    "status": "unqualified",
+                    "science_acceptance": "not-accepted",
+                    "message": "GPU PLACEMENT UNQUALIFIED: H-v2/science acceptance MUST NOT accept these GPU segments.",
+                    "unqualified_gpu_segments": unqualified,
+                }
+        object.__setattr__(self, "placement_verdict", _freeze(placement_verdict, "placement_verdict"))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema": self.schema,
+        result = {
+            "schema": self.V3_SCHEMA if self.placement_verdict else self.schema,
             "group_id": self.group_id,
             "group_digest": self.group_digest,
             "attempts": [attempt.to_dict() for attempt in self.attempts],
             "segments": [segment.to_dict() for segment in self.segments],
         }
+        if self.placement_verdict:
+            result["placement_verdict"] = thaw(self.placement_verdict)
+        return result
 
     def encode(self) -> bytes: return canonical_bytes(self.to_dict())
 
@@ -647,11 +679,20 @@ class RunManifest:
         if schema == cls.V1_SCHEMA:
             fields(data, {"schema", "group_id", "group_digest", "attempts"}, cls.V1_SCHEMA, "RunManifest")
             segments: tuple[AcceptedSegment, ...] = ()
-        else:
-            fields(data, {"schema", "group_id", "group_digest", "attempts", "segments"}, cls.schema, "RunManifest")
+            placement_verdict: Mapping[str, Any] = {}
+        elif schema in (cls.schema, cls.V3_SCHEMA):
+            expected = {"schema", "group_id", "group_digest", "attempts", "segments"}
+            if schema == cls.V3_SCHEMA:
+                expected.add("placement_verdict")
+            fields(data, expected, schema, "RunManifest")
             segments = tuple(AcceptedSegment.from_mapping(item) for item in sequence(data["segments"], "segments"))
+            placement_verdict = data.get("placement_verdict", {})
+            if not isinstance(placement_verdict, Mapping):
+                raise TypeError("placement_verdict must be a mapping")
+        else:
+            raise ValueError("RunManifest schema is unknown")
         if type(data["group_id"]) is not str or type(data["group_digest"]) is not str: raise TypeError("RunManifest scalar fields have invalid types")
-        return cls(data["group_id"], data["group_digest"], tuple(ManifestAttempt.from_mapping(item) for item in sequence(data["attempts"], "attempts")), segments)
+        return cls(data["group_id"], data["group_digest"], tuple(ManifestAttempt.from_mapping(item) for item in sequence(data["attempts"], "attempts")), segments, placement_verdict)
 
     @classmethod
     def decode(cls, data: bytes | str | dict[str, Any]) -> "RunManifest":

@@ -41,6 +41,22 @@ Operational outcome receipts use the closed vocabulary `completed`, `failed`,
 `timed_out`, and `launch_failed`. These statuses describe execution only;
 scientific validity remains the responsibility of core evidence.
 
+## GPU placement qualification
+
+The v2 placement receipt reports an explicit reason class: `qualified`,
+`mismatch`, `telemetry-unavailable`, or `refused`. A GPU segment is never
+qualified without live science-PID telemetry matched to the canonical physical
+UUID entitlement. Missing or unavailable telemetry, and post-launch mismatch,
+are operationally advisory: the segment may remain accepted and dispatch may
+return `0`, but the receipt and manifest mark the GPU placement unqualified.
+Prelaunch refusal is fail-closed (`launch_failed`, no accepted segment, and
+dispatch return code `3`).
+
+H-v2/science qualification must treat every unqualified GPU segment as *not
+accepted for science*, even when its operational segment was accepted. Host
+comparison uses the physical scheduler mapping only; a logical slot label by
+itself cannot cause refusal or unqualification.
+
 `DirectoryStore` requires a POSIX filesystem with advisory `fcntl.lockf`
 support. It holds one task lock across pointer advancement, fence validation,
 and outcome publication. Receipt publication writes and fsyncs a temporary

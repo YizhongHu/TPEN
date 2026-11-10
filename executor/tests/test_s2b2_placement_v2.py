@@ -33,7 +33,7 @@ from tpen_executor.placement import (
     PlacementRefusal,
     physical_slots_from_allocation,
 )
-from tpen_executor.results import SciencePlacementReceiptV2
+from tpen_executor.results import AcceptedSegment, ManifestAttempt, OutcomeReceipt, RunManifest, SciencePlacementReceiptV2, StartReceipt
 from tpen_executor.runners import RUN_SHIM
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.tasks import ConfiguredRun
@@ -117,6 +117,82 @@ def test_m3_unavailable_is_typed_and_nonempty(tmp_path: Path, reason: str) -> No
     assert receipt.gpu_sampler["reason"]
 
 
+def test_c1_receipt_reason_distinguishes_unavailable_mismatch_and_refused(tmp_path: Path) -> None:
+    """Manager condition 1: receipt reason classes cannot collapse together."""
+
+    unavailable = {
+        "status": "unavailable", "reason": "nvidia-smi-missing", "method": "nvidia-smi-pid-uuid-v1", "version": None,
+        "cadence_seconds": 0.1, "count": 0, "monotonic_start": 1.0, "monotonic_end": 1.1,
+        "inventory": [], "pid_rows": [], "samples": [],
+    }
+    group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path, unavailable)
+    no_telemetry = _placement_receipt_v2(observation, allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((), 0, "", "", False, 1234, 55))
+    assert no_telemetry.verdict["reason_class"] == "telemetry-unavailable"
+    assert no_telemetry.verdict["qualification"] != "qualified"
+
+    mismatch_sampler = dict(unavailable)
+    mismatch_sampler.update({"status": "observed", "reason": "", "inventory": [{"uuid": "GPU-ABC", "pci.bus_id": "0000:00:01.0"}, {"uuid": "GPU-OUT", "pci.bus_id": "0000:00:02.0"}], "pid_rows": [{"pid": 1234, "gpu_uuid": "GPU-OUT"}]})
+    _, _, _, _, _, mismatched = _v2_inputs(tmp_path, mismatch_sampler)
+    mismatch = _placement_receipt_v2(mismatched, allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((), 0, "", "", False, 1234, 55))
+    assert mismatch.verdict["reason_class"] == "mismatch"
+
+    refused_base = ChildPlacementObservation(
+        observation.task_id, observation.attempt_id, observation.group_digest, observation.allocation_id,
+        observation.backend_job_id, observation.slot_id, observation.payload_digest, observation.output_dir,
+        observation.host, observation.pid, observation.proc_start_ticks, observation.affinity,
+        observation.thread_settings, observation.cuda_visible_devices, observation.observed_at_utc,
+        {"code": "child-placement-refused", "reason": "controller refused placement"},
+    )
+    refused = _placement_receipt_v2(ChildPlacementObservationV2(refused_base, unavailable), allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((), 0, "", "", False, 1234, 55))
+    assert refused.verdict["reason_class"] == "refused"
+    assert {no_telemetry.verdict["reason_class"], mismatch.verdict["reason_class"], refused.verdict["reason_class"]} == {"telemetry-unavailable", "mismatch", "refused"}
+
+
+def test_c2_declared_devices_unavailable_is_loud_in_receipt_and_manifest(tmp_path: Path) -> None:
+    """Manager condition 2: operational acceptance cannot imply science acceptance."""
+
+    sampler = {
+        "status": "unavailable", "reason": "nvidia-smi-missing", "method": "nvidia-smi-pid-uuid-v1", "version": None,
+        "cadence_seconds": 0.1, "count": 0, "monotonic_start": 1.0, "monotonic_end": 1.1,
+        "inventory": [], "pid_rows": [], "samples": [],
+    }
+    group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path, sampler)
+    receipt = _placement_receipt_v2(observation, allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((), 0, "", "", False, 1234, 55))
+    assert receipt.declared["devices"]
+    assert receipt.verdict["qualification"] == "unqualified"
+    assert receipt.verdict["science_acceptance"] == "not-accepted"
+    assert "GPU PLACEMENT UNQUALIFIED" in receipt.verdict["warning"]
+    start = StartReceipt("task-a", fence.attempt_id, allocation.allocation_id, allocation.backend_job_id, group.identity, "2026-11-10T00:00:00Z", fence.output_dir)
+    outcome = OutcomeReceipt("task-a", fence.attempt_id, group.identity, "2026-11-10T00:00:01Z", "completed", fence.output_dir)
+    attempt = ManifestAttempt("task-a", fence.attempt_id, start, outcome, fence.output_dir, receipt)
+    segment = AcceptedSegment("task-a", fence.attempt_id, None, str(tmp_path / "checkpoint"), 1, 1)
+    manifest = RunManifest(group.group_id, group.identity, (attempt,), (segment,))
+    assert manifest.segments == (segment,)
+    assert manifest.placement_verdict["status"] == "unqualified"
+    assert manifest.placement_verdict["science_acceptance"] == "not-accepted"
+    assert "GPU PLACEMENT UNQUALIFIED" in manifest.placement_verdict["message"]
+    assert RunManifest.decode(manifest.encode()).placement_verdict["status"] == "unqualified"
+
+
+def test_c3_logical_slot_name_does_not_drive_physical_verdict(tmp_path: Path) -> None:
+    """Manager condition 3: only mapped physical host and live telemetry qualify."""
+
+    sampler = {
+        "status": "observed", "reason": "", "method": "nvidia-smi-pid-uuid-v1", "version": "NVIDIA",
+        "cadence_seconds": 0.1, "count": 1, "monotonic_start": 1.0, "monotonic_end": 1.1,
+        "inventory": [{"uuid": "GPU-ABC", "pci.bus_id": "0000:00:01.0"}],
+        "pid_rows": [{"pid": 1234, "gpu_uuid": "GPU-ABC"}], "samples": [],
+    }
+    group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path, sampler)
+    receipt = _placement_receipt_v2(observation, allocation, fence, group, group.members[0], configured, environment, ProcessOutcome((), 0, "", "", False, 1234, 55))
+    assert receipt.slot_id == "logical-slot"
+    assert receipt.declared["host"] == "physical-01"
+    assert receipt.child["host"] == "physical-01"
+    assert receipt.verdict["host"] == "matched"
+    assert receipt.verdict["qualification"] == "qualified"
+    assert receipt.verdict["reason_class"] == "qualified"
+
+
 def test_m4_prelaunch_host_refusal_is_launch_failed_without_segment(tmp_path: Path) -> None:
     """M4: a missing physical map fails closed before child launch."""
 
@@ -169,6 +245,7 @@ def test_m5_advisory_postlaunch_mismatch_keeps_segment_and_rc_zero(tmp_path: Pat
     assert receipt.refusal is not None
     assert receipt.comparison["host"] == "mismatch"
     assert receipt.verdict["qualification"] == "unqualified"
+    assert receipt.verdict["reason_class"] == "mismatch"
 
 
 @pytest.mark.skipif(not hasattr(os, "sched_setaffinity"), reason="requires Linux child affinity contract")

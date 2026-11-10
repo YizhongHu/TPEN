@@ -448,7 +448,23 @@ def _placement_receipt_v2(
     refusal = base.refusal
     if refusal is None and qualification == "unqualified":
         reason = host_reason if host_state == "unavailable" else gpu_reason
-        refusal = {"code": "placement-unqualified", "reason": reason or "placement evidence is unqualified"}
+        if host_state == "mismatch" or device_state == "mismatch":
+            refusal = {"code": "placement-mismatch", "reason": f"mismatch: {reason or 'physical placement differs from entitlement'}"}
+        else:
+            refusal = {"code": "placement-telemetry-unavailable", "reason": f"telemetry-unavailable: {reason or 'placement telemetry is unavailable'}"}
+    postlaunch_mismatch = base.refusal is not None and base.refusal.get("code") == "placement-affinity-mismatch"
+    if base.refusal is not None and not postlaunch_mismatch:
+        reason_class = "refused"
+        verdict_reason = f"refused: {base.refusal['reason']}"
+    elif postlaunch_mismatch or host_state == "mismatch" or device_state == "mismatch":
+        reason_class = "mismatch"
+        verdict_reason = f"mismatch: {base.refusal['reason'] if postlaunch_mismatch else (host_reason if host_state == 'mismatch' else gpu_reason)}"
+    elif qualification != "qualified":
+        reason_class = "telemetry-unavailable"
+        verdict_reason = f"telemetry-unavailable: {host_reason if host_state == 'unavailable' else gpu_reason}"
+    else:
+        reason_class = "qualified"
+        verdict_reason = "physical host, affinity, and live PID telemetry matched"
     v2_base = SciencePlacementReceipt(
         base.task_id, base.attempt_id, base.group_digest, base.allocation_id, base.backend_job_id, base.slot_id,
         base.payload_digest, base.output_dir, base.child, base.declared, gpu, comparison, refusal,
@@ -474,7 +490,15 @@ def _placement_receipt_v2(
             "inventory": list(inventory),
             "pid_rows": list(rows),
         },
-        {"host": host_state, "device": device_state, "qualification": qualification},
+        {
+            "host": host_state,
+            "device": device_state,
+            "qualification": qualification,
+            "reason_class": reason_class,
+            "reason": verdict_reason,
+            "science_acceptance": "accepted" if qualification == "qualified" else "not-accepted",
+            "warning": "GPU PLACEMENT UNQUALIFIED: H-v2/science acceptance MUST NOT accept this GPU segment." if qualification != "qualified" and declared_devices else "",
+        },
     )
 
 
@@ -558,7 +582,15 @@ def _placement_refusal_receipt(
         base,
         {"status": "unavailable", "reason": reason, "source": "scheduler-node-map", "slot_id": base.slot_id, "host": base.declared["host"]},
         {"status": "unavailable", "reason": reason, "method": "nvidia-smi-pid-uuid-v1", "version": None, "cadence_seconds": 0.0, "count": 0, "monotonic_start": None, "monotonic_end": None, "inventory": [], "pid_rows": []},
-        {"host": "unavailable", "device": "unavailable", "qualification": "unqualified"},
+        {
+            "host": "unavailable",
+            "device": "unavailable",
+            "qualification": "unqualified",
+            "reason_class": "refused",
+            "reason": f"refused: {observation_error.reason}",
+            "science_acceptance": "not-accepted",
+            "warning": "GPU PLACEMENT UNQUALIFIED: H-v2/science acceptance MUST NOT accept this GPU segment." if declared_devices else "",
+        },
     )
 
 
