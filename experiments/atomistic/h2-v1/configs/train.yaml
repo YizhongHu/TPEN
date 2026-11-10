@@ -29,10 +29,6 @@ system:
   nuclei:
     positions: [[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0]]
     charges: [1.0, 1.0]
-  # Fixed-nuclei, nonrelativistic singlet reference at R = 1.4 bohr from the
-  # canonical baseline registry. Keep this literal coupled to the registry
-  # test.
-  reference_energy: -1.17447
 
 # Sole typed nuclear-geometry authority (A5): one declarative `atoms` source
 # consumed by the wavefunction's post-readout ElectronNucleusCusp factor AND

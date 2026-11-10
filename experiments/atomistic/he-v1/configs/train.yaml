@@ -70,9 +70,6 @@ system:
   nuclei:
     positions: [[0.0, 0.0, 0.0]]
     charges: [2.0]
-  # Infinite-nuclear-mass, nonrelativistic 1 1S reference from the canonical
-  # baseline registry. Keep this literal coupled to the registry test.
-  reference_energy: -2.903724377034119598
 
 # Sole typed nuclear-geometry authority (A5): one declarative `atoms` source
 # consumed by the wavefunction's post-readout ElectronNucleusCusp factor AND

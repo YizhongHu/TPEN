@@ -1,0 +1,38 @@
+# HISTORICAL RECORD — NOT A RUNNABLE CONFIGURATION.
+#
+# This file preserves the training-time reference-energy declaration used for
+# the completed He-v1 science, so that the old result remains interpretable
+# after the live training input is corrected.  It is deliberately stored below
+# `configs/historical/`, which is not a live study-config path, and its runner
+# target is intentionally unresolvable.  Passing this file to the runner must
+# fail before a job can start; no core guard or special historical-loader is
+# required.
+#
+# Source config commit(s):
+#   - 418accf153368aab45586dc2a2cc97c18472691c — executed He-v1
+#     `train-seed0000` source (Cannon job 40907434).
+#   - b508e293479ce9275d395c0e351d6018cb448fd8 — He-v1 config lineage that
+#     introduced the reference-energy field.
+#
+# At that time `system.reference_energy` was present as the infinite-nuclear-
+# mass, nonrelativistic helium reference used for interpreting the completed
+# result.  Operator decision 2026-11-10 removes it from TRAINING: reference
+# comparisons belong to evaluation, while an unused training field still
+# reaches training artifacts through the source-config snapshot and can become
+# an optimizer input if a callback later consumes it.
+#
+# Live replacement: `experiments/atomistic/he-v1/configs/train.yaml`.
+# Evaluation retains its reference declaration in `configs/eval.yaml`.
+
+historical_record:
+  status: historical_non_runnable
+  source_config_sha: 418accf153368aab45586dc2a2cc97c18472691c
+  source_config_lineage_sha: b508e293479ce9275d395c0e351d6018cb448fd8
+  completed_run: train-seed0000
+  completed_cannon_job: "40907434"
+  reference_energy: -2.903724377034119598
+  live_config: experiments/atomistic/he-v1/configs/train.yaml
+
+# Deliberately unresolved.  This must never be changed to tpen.runner.Train.
+runner:
+  _target_: tpen.historical_config.HeV1TrainingConfigThatMustNotRun
