@@ -4,34 +4,34 @@
     "target": "scripts/cannon/submit-lint.sh",
     "old": "fail \"sbatch path is not absolute: '$SBATCH_PATH'\"",
     "new": ":  # mutant: accept-relative-sbatch disables the absolute-path check",
-    "killer": "tests/unit/infra/test_cannon_submit_lint.py::test_relative_sbatch_path_rejected"
+    "killer": "scripts/cannon/tests/test_cannon_submit_lint.py::test_relative_sbatch_path_rejected"
   },
   {
     "id": "omit-job-sha-check",
     "target": "scripts/cannon/submit-lint.sh",
     "old": "[[ \"$M_JOB_NAME_HAS\" == 1 && \"$M_JOB_NAME\" == *\"$short_sha\"* ]] || fail \"JOB_NAME does not contain SHA[:12] ('$short_sha'): '${M_JOB_NAME:-<missing>}'\"",
     "new": "[[ \"$M_JOB_NAME_HAS\" == 1 && \"$M_JOB_NAME\" == *\"$short_sha\"* ]] || true  # mutant: omit-job-sha-check",
-    "killer": "tests/unit/infra/test_cannon_submit_lint.py::test_job_name_missing_short_sha_rejected"
+    "killer": "scripts/cannon/tests/test_cannon_submit_lint.py::test_job_name_missing_short_sha_rejected"
   },
   {
     "id": "allow-home-staging",
     "target": "scripts/cannon/submit-lint.sh",
     "old": "if [[ -n \"$HOME_ROOT\" ]]; then",
     "new": "if false; then  # mutant: allow-home-staging",
-    "killer": "tests/unit/infra/test_cannon_submit_lint.py::test_home_staging_literal_rejected"
+    "killer": "scripts/cannon/tests/test_cannon_submit_lint.py::test_home_staging_literal_rejected"
   },
   {
     "id": "accept-fields-missing-from-both",
     "target": "scripts/cannon/submit-lint.sh",
     "old": "  if [[ \"$m_has\" != 1 || -z \"$m_val\" || \"$s_has\" != 1 || -z \"$s_val\" ]]; then\n    fail \"required critical field '$key' is missing or empty (manifest and/or sbatch script)\"\n  fi\ndone",
     "new": "  if false; then  # mutant: accept-fields-missing-from-both\n    fail \"required critical field '$key' is missing or empty (manifest and/or sbatch script)\"\n  fi\ndone",
-    "killer": "tests/unit/infra/test_cannon_submit_lint.py::test_critical_fields_missing_from_both_rejected"
+    "killer": "scripts/cannon/tests/test_cannon_submit_lint.py::test_critical_fields_missing_from_both_rejected"
   },
   {
     "id": "accept-ssh-second-command-no-batchmode",
     "target": "scripts/cannon/submit-lint.sh",
     "old": "if [[ \"$segment\" =~ $SSH_LIKE_CMD_RE ]]; then",
     "new": "if false; then  # mutant: accept-ssh-second-command-no-batchmode",
-    "killer": "tests/unit/infra/test_cannon_submit_lint.py::test_ssh_second_command_without_batchmode_rejected"
+    "killer": "scripts/cannon/tests/test_cannon_submit_lint.py::test_ssh_second_command_without_batchmode_rejected"
   }
 ]
