@@ -298,6 +298,24 @@ def _placement_refusal_from_environment(environment: Any) -> PlacementRefusal | 
         return PlacementRefusal("placement-refusal-malformed", str(error))
 
 
+def _child_precore_refusal(environment: Any, outcome: Any) -> PlacementRefusal | None:
+    """Recover a typed RUN_SHIM refusal before lifecycle status is finalized."""
+
+    if not isinstance(environment, PreparedPythonEnvironment) or getattr(outcome, "returncode", None) != 2:
+        return None
+    path = environment.env.get(PLACEMENT_OUTPUT_ENV)
+    if path is None:
+        return None
+    try:
+        observation = read_child_placement(path)
+    except PlacementRefusal:
+        return None
+    refusal = observation.refusal
+    if not isinstance(refusal, Mapping) or refusal.get("code") != "child-placement-refused":
+        return None
+    return PlacementRefusal(refusal["code"], refusal["reason"])
+
+
 def _placement_receipt(
     observation: Any,
     allocation: Any,
@@ -359,8 +377,15 @@ def _placement_receipt(
         }
     expected_host = values.get("TPEN_SLOT_NODE")
     expected_cpus = parse_cpu_set(values.get("TPEN_SLOT_CPUS", ""))
+    child_precore_refusal = observation.refusal is not None and observation.refusal.get("code") == "child-placement-refused"
     host_match = expected_host is not None and canonical_host(observation.host) == canonical_host(expected_host)
     affinity_match = expected_cpus == observation.affinity
+    if child_precore_refusal:
+        comparison_host = "unavailable"
+        comparison_affinity = "unavailable"
+    else:
+        comparison_host = "matched" if host_match else "mismatch"
+        comparison_affinity = "matched" if affinity_match else "mismatch"
     if not host_match or not affinity_match:
         refusal = refusal or {
             "code": "placement-affinity-mismatch",
@@ -399,11 +424,7 @@ def _placement_receipt(
             "active_uuids": [],
             "active_pci": [],
         },
-        {
-            "host": "matched" if host_match else "mismatch",
-            "affinity": "matched" if affinity_match else "mismatch",
-            "device": "unavailable",
-        },
+        {"host": comparison_host, "affinity": comparison_affinity, "device": "unavailable"},
         refusal,
     )
 
@@ -426,7 +447,14 @@ def _placement_receipt_v2(
     values = environment.env
     scheduler_status = values.get("TPEN_PLACEMENT_HOST_STATUS")
     expected_host = values.get("TPEN_SLOT_NODE")
-    if scheduler_status == "unavailable" or not expected_host or expected_host == "unavailable":
+    child_precore_refusal = (
+        base.refusal is not None and base.refusal.get("code") == "child-placement-refused"
+    )
+    if child_precore_refusal:
+        host_state = "unavailable"
+        host_reason = "child refused placement before core import"
+        mapped_host = "unavailable"
+    elif scheduler_status == "unavailable" or not expected_host or expected_host == "unavailable":
         host_state = "unavailable"
         host_reason = "physical scheduler host mapping is unavailable"
         mapped_host = "unavailable"
@@ -958,6 +986,7 @@ class DispatcherContract:
         """
 
         invalid_outcome = False
+        child_refusal = _child_precore_refusal(environment, outcome) if error is None else None
         if error is None:
             try:
                 status = _status(outcome)
@@ -969,10 +998,14 @@ class DispatcherContract:
             # BaseException is a cancellation and remains an operational
             # failure while its original exception propagates.
             status = "launch_failed" if isinstance(error, Exception) else "failed"
+        if child_refusal is not None:
+            # The sidecar is the typed source of truth for a RUN_SHIM refusal;
+            # classify it before finish so return code 2 cannot become failed.
+            status = "launch_failed"
         result_digest: str | None = None
         segment_evidence: CoreRunEvidence | None = None
         inspection_error: BaseException | None = None
-        if error is None and not invalid_outcome:
+        if error is None and not invalid_outcome and child_refusal is None:
             try:
                 evidence = materialized["evidence"]
                 process = materialized["process"]

@@ -44,7 +44,7 @@ PLACEMENT_OUTPUT_ENV = "TPEN_PLACEMENT_OUTPUT"
 PLACEMENT_REFUSAL_ENV = "TPEN_PLACEMENT_REFUSAL"
 PLACEMENT_RECEIPT_VERSION_ENV = "TPEN_PLACEMENT_RECEIPT_VERSION"
 _GPU_UUID = re.compile(r"^GPU-[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$")
-_HOST_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_HOST_LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$")
 _MAX_SCHEDULER_HOSTS = 1024
 
 
@@ -58,7 +58,13 @@ def canonical_host(value: str) -> str:
 
     if type(value) is not str or not value.strip():
         raise PlacementRefusal("invalid-host", "placement host must be non-empty text")
-    return value.strip().lower().rstrip(".").split(".", 1)[0]
+    complete = value.strip()
+    if complete.endswith("."):
+        complete = complete[:-1]
+    labels = complete.split(".")
+    if not complete or any(_HOST_LABEL.fullmatch(label) is None for label in labels):
+        raise PlacementRefusal("invalid-host", "placement host contains an invalid hostname label")
+    return complete.lower().split(".", 1)[0]
 
 
 def canonical_device_uuid(value: str) -> str:
@@ -91,16 +97,14 @@ def _host_tokens(text: str, source: str) -> tuple[str, ...]:
             continue
         if any(char.isspace() for char in line):
             raise PlacementRefusal("host-map-ambiguous", f"{source} contains a host line with whitespace")
-        host = canonical_host(line)
-        if not _HOST_NAME.fullmatch(host):
-            raise PlacementRefusal("host-map-ambiguous", f"{source} contains an invalid hostname")
+        try:
+            host = canonical_host(line)
+        except PlacementRefusal as error:
+            raise PlacementRefusal("host-map-ambiguous", f"{source} contains an invalid hostname") from error
         hosts.append(host)
     if not hosts:
         raise PlacementRefusal("host-map-unavailable", f"{source} contains no scheduler hosts")
     return tuple(dict.fromkeys(hosts))
-
-
-_SLURM_RANGE = re.compile(r"^(?P<prefix>[^\[\],]+)\[(?P<body>[^\]]+)\](?P<suffix>.*)$")
 
 
 def expand_slurm_nodelist(value: str) -> tuple[str, ...]:
@@ -109,34 +113,46 @@ def expand_slurm_nodelist(value: str) -> tuple[str, ...]:
     if type(value) is not str or not value.strip():
         raise PlacementRefusal("host-map-unavailable", "SLURM_NODELIST is absent or empty")
 
-    def expand_one(token: str) -> list[str]:
-        match = _SLURM_RANGE.fullmatch(token.strip())
-        if match is None:
-            if "[" in token or "]" in token:
-                raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains malformed brackets")
-            return [canonical_host(token)]
-        prefix, body, suffix = match.group("prefix"), match.group("body"), match.group("suffix")
-        if "[" in suffix or "]" in suffix:
-            raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains multiple bracket groups")
+    def expand_group(body: str, limit: int) -> list[str]:
         result: list[str] = []
         for item in body.split(","):
+            item = item.strip()
             if "-" in item:
                 start, end = item.split("-", 1)
                 if not start.isdigit() or not end.isdigit() or int(start) > int(end):
                     raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains an invalid range")
-                if int(end) - int(start) + 1 > _MAX_SCHEDULER_HOSTS:
+                count = int(end) - int(start) + 1
+                if count > limit or len(result) + count > limit:
                     raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST range exceeds the bounded host limit")
-                if len(result) + (int(end) - int(start) + 1) > _MAX_SCHEDULER_HOSTS:
-                    raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST token exceeds the bounded host limit")
-                width = max(len(start), len(end))
-                result.extend(f"{prefix}{index:0{width}d}{suffix}" for index in range(int(start), int(end) + 1))
+                # Slurm preserves the width supplied by the range's start.
+                width = len(start)
+                result.extend(f"{index:0{width}d}" for index in range(int(start), int(end) + 1))
             elif item.isdigit():
-                if len(result) >= _MAX_SCHEDULER_HOSTS:
+                if len(result) >= limit:
                     raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST token exceeds the bounded host limit")
-                result.append(f"{prefix}{int(item):0{len(item)}d}{suffix}")
+                result.append(f"{int(item):0{len(item)}d}")
             else:
                 raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains an invalid host token")
         return result
+
+    def expand_one(token: str, limit: int = _MAX_SCHEDULER_HOSTS) -> list[str]:
+        token = token.strip()
+        open_index = token.find("[")
+        if open_index < 0:
+            if "]" in token:
+                raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains malformed brackets")
+            return [token]
+        prefix = token[:open_index]
+        close_index = token.find("]", open_index + 1)
+        if close_index < 0:
+            raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains malformed brackets")
+        choices = expand_group(token[open_index + 1 : close_index], limit)
+        suffix = token[close_index + 1 :]
+        suffix_limit = max(1, limit // len(choices))
+        suffixes = expand_one(suffix, suffix_limit) if "[" in suffix else [suffix]
+        if len(choices) * len(suffixes) > limit:
+            raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST expands beyond the bounded host limit")
+        return [prefix + choice + tail for choice in choices for tail in suffixes]
 
     def split_tokens(text: str) -> list[str]:
         tokens: list[str] = []
@@ -172,10 +188,10 @@ def expand_slurm_nodelist(value: str) -> tuple[str, ...]:
         raise PlacementRefusal("host-map-unavailable", "SLURM_NODELIST expanded to no hosts")
     normalized = []
     for host in hosts:
-        short = canonical_host(host)
-        if not _HOST_NAME.fullmatch(short):
-            raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains an invalid hostname")
-        normalized.append(short)
+        try:
+            normalized.append(canonical_host(host))
+        except PlacementRefusal as error:
+            raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains an invalid hostname") from error
     return tuple(dict.fromkeys(normalized))
 
 
@@ -700,7 +716,10 @@ class AllocationSlot:
     def with_node(self, node: str) -> "AllocationSlot":
         """Return this slot with a canonical scheduler node identity."""
 
-        return AllocationSlot(self.slot_id, node, self.devices, self.cpus, self.threads, self.environment)
+        environment = dict(self.environment)
+        if "TPEN_SLOT_NODE" in environment:
+            environment["TPEN_SLOT_NODE"] = node
+        return AllocationSlot(self.slot_id, node, self.devices, self.cpus, self.threads, tuple(environment.items()))
 
 
 def _string_tuple(value: Any, name: str) -> tuple[str, ...]:

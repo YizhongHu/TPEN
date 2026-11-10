@@ -14,6 +14,18 @@ OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed
 PLACEMENT_COMPARISON_STATES = frozenset({"matched", "mismatch", "unavailable", "refused"})
 
 
+def _receipt_host_key(value: Any) -> str:
+    """Derive the comparison key from a complete receipt hostname."""
+
+    if type(value) is not str or not value.strip():
+        raise ValueError("placement hostname must be non-empty text")
+    complete = value.strip().lower().rstrip(".")
+    labels = complete.split(".")
+    if not complete or any(not label for label in labels):
+        raise ValueError("placement hostname contains an empty label")
+    return labels[0]
+
+
 def _identity(value: Any, cls: type, name: str) -> Any:
     if not isinstance(value, cls):
         raise TypeError(f"{name} must be {cls.__name__}")
@@ -388,34 +400,51 @@ class SciencePlacementReceiptV2:
             raise ValueError("v2 verdict reason_class is invalid for L1a")
         if self.verdict["science_acceptance"] not in {"accepted", "not-accepted"}:
             raise ValueError("v2 verdict science acceptance is invalid")
-        if self.base.gpu["status"] != "unavailable" or self.base.gpu["reason"] != "not-sampled":
-            raise ValueError("L1a v2 receipts must carry device reason not-sampled")
-        child_host = self.base.child["host"].strip().lower().rstrip(".").split(".", 1)[0]
-        declared_host = self.base.declared["host"].strip().lower().rstrip(".").split(".", 1)[0]
-        mapped_host = self.host_mapping["host"].strip().lower().rstrip(".").split(".", 1)[0]
-        affinity_matches = tuple(sorted(self.base.child["affinity"])) == tuple(sorted(self.base.declared["cpus"]))
+        if (
+            self.base.gpu["status"] != "unavailable"
+            or self.base.gpu["reason"] != "not-sampled"
+            or self.base.gpu["method"] != "not-sampled"
+            or self.base.gpu["samples"]
+            or self.base.gpu["active_uuids"]
+            or self.base.gpu["active_pci"]
+            or self.base.comparison["device"] != "unavailable"
+        ):
+            raise ValueError("L1a v2 receipts must carry unavailable, not-sampled device evidence")
+        if self.host_mapping["slot_id"] != self.base.slot_id:
+            raise ValueError("v2 host mapping slot_id disagrees with the base receipt")
+        child_host = _receipt_host_key(self.base.child["host"])
+        declared_host = _receipt_host_key(self.base.declared["host"])
+        affinity_matches = bool(self.base.child["affinity"]) and (
+            tuple(sorted(self.base.child["affinity"])) == tuple(sorted(self.base.declared["cpus"]))
+        )
         if host_status == "unavailable":
+            derived_host_status = "unavailable"
             if self.base.comparison["host"] not in {"unavailable", "refused"}:
                 raise ValueError("unavailable v2 host map contradicts base host comparison")
         else:
+            mapped_host = _receipt_host_key(self.host_mapping["host"])
             if declared_host != mapped_host:
                 raise ValueError("v2 declared host differs from physical scheduler host")
-            expected_host_status = "matched" if child_host == mapped_host else "mismatch"
-            if host_status != expected_host_status or self.base.comparison["host"] != expected_host_status:
+            derived_host_status = "matched" if child_host == mapped_host else "mismatch"
+            if host_status != derived_host_status or self.base.comparison["host"] != derived_host_status:
                 raise ValueError("v2 host mapping contradicts child host evidence")
-        if self.base.comparison["affinity"] == "matched" and not affinity_matches:
-            raise ValueError("v2 matched affinity contradicts child affinity")
-        if self.base.comparison["affinity"] == "mismatch" and affinity_matches:
-            raise ValueError("v2 mismatched affinity contradicts child affinity")
+        derived_affinity_status = "matched" if affinity_matches else (
+            "mismatch" if self.base.child["affinity"] else "unavailable"
+        )
+        if self.base.refusal is None and self.base.comparison["affinity"] != derived_affinity_status:
+            raise ValueError("v2 affinity comparison is not derived from child evidence")
+        if self.base.refusal is not None and self.base.comparison["affinity"] not in {
+            derived_affinity_status, "refused"
+        }:
+            raise ValueError("v2 refused affinity comparison contradicts child evidence")
         if self.verdict["host"] != host_status:
             raise ValueError("v2 verdict host contradicts host mapping")
-        has_postlaunch_mismatch = (
-            self.base.comparison["host"] == "mismatch"
-            or self.base.comparison["affinity"] == "mismatch"
-        )
+        has_postlaunch_mismatch = derived_host_status == "mismatch" or derived_affinity_status == "mismatch"
         if self.verdict["reason_class"] == "not-sampled":
-            if self.base.refusal is not None or has_postlaunch_mismatch:
-                raise ValueError("not-sampled verdict cannot hide a placement mismatch or refusal")
+            if self.base.refusal is not None or host_status != "matched" or derived_host_status != "matched":
+                raise ValueError("not-sampled verdict requires mapped, matching host evidence")
+            if self.base.comparison["host"] != "matched" or derived_affinity_status != "matched":
+                raise ValueError("not-sampled verdict requires matching affinity evidence")
             if self.verdict["science_acceptance"] != "accepted":
                 raise ValueError("not-sampled device evidence is not science-blocking")
         elif self.verdict["reason_class"] == "mismatch":
@@ -424,7 +453,7 @@ class SciencePlacementReceiptV2:
             if self.verdict["science_acceptance"] != "not-accepted":
                 raise ValueError("mismatched placement cannot be science-accepted")
         elif self.verdict["reason_class"] == "refused":
-            if self.base.refusal is None or has_postlaunch_mismatch:
+            if self.base.refusal is None or has_postlaunch_mismatch or host_status != "unavailable":
                 raise ValueError("refused verdict requires a prelaunch refusal")
             if self.verdict["science_acceptance"] != "not-accepted":
                 raise ValueError("refused placement cannot be science-accepted")
