@@ -23,7 +23,7 @@ FACILITY_RUN_PREFIX="${FACILITY_RUN_PREFIX:-}"
 MUTANT_SPEC="${MUTANT_SPEC:-}"
 MODE="${MODE:-quick}"
 TYPECHECK="${TYPECHECK:-off}"
-PARALLEL="${PARALLEL:-xdist}"
+PARALLEL="${PARALLEL:-serial}"
 FULL_SUITE="${FULL_SUITE:-0}"
 TEST_PATHS=()
 MUTANT_IDS=()
@@ -141,7 +141,8 @@ printf '%s\n' "$BASE_SITE" > "$OVERLAY_SITE/_tpen_shared_env.pth"
 $UV_BIN pip install --python "$OVERLAY/bin/python" --no-deps -e "$CLONE" >> "$RUN_ROOT/evidence/overlay-build.log" 2>&1
 $UV_BIN pip install --python "$OVERLAY/bin/python" "pytest-xdist==$CANNON_XDIST_VERSION" >> "$RUN_ROOT/evidence/overlay-build.log" 2>&1
 PYTHON="$OVERLAY/bin/python"
-export PYTHON TPEN_PYTHON="$PYTHON" ROOT_PYTHON="$PYTHON"
+export PYTHON TPEN_PYTHON="$PYTHON" ROOT_PYTHON="$PYTHON" P8_EXECUTOR_PYTHON="$PYTHON"
+export PATH="$OVERLAY/bin:$PATH"
 assert_write_path "$RUN_ROOT/evidence/interpreter-identity.txt"
 env -u PYTHONPATH "$PYTHON" - "$CLONE" > "$RUN_ROOT/evidence/interpreter-identity.txt" 2>&1 <<'PYCHECK'
 import importlib, os, sys
@@ -186,6 +187,8 @@ if [[ "$MODE" == quick ]]; then
   mutant_fail=0
   if [[ -n "$MUTANT_SPEC" ]]; then
     spec_json="$($PYTHON "$MUTANT_HELPER" validate --spec "$MUTANT_SPEC")"
+    assert_write_path "$RUN_ROOT/evidence/mutant-spec.json"
+    printf '%s\n' "$spec_json" > "$RUN_ROOT/evidence/mutant-spec.json"
     mapfile -t MUTANT_IDS < <(printf '%s' "$spec_json" | "$PYTHON" -c 'import json,sys; print(*[x["id"] for x in json.load(sys.stdin)], sep="\n")')
     for mutant_id in "${MUTANT_IDS[@]}"; do
       backup="$WORK_ROOT/mutant-$mutant_id.original"; assert_write_path "$backup"
@@ -196,6 +199,8 @@ if [[ "$MODE" == quick ]]; then
       target="$(printf '%s' "$apply_json" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["target"])')"
       target_rel="${target#$CLONE/}"; assert_write_path "$CLONE/$target_rel"
       if git -C "$CLONE" diff --quiet -- "$target_rel"; then MUTANT_STATUS+=("$mutant_id=EMPTY_DIFF"); exit 1; fi
+      assert_write_path "$RUN_ROOT/evidence/mutant-$mutant_id.diff"
+      git -C "$CLONE" diff -- "$target_rel" > "$RUN_ROOT/evidence/mutant-$mutant_id.diff"
       mutant_rc=0; run_pytest "mutant-$mutant_id" "$TYPECHECK" "$PARALLEL" targeted "${TEST_PATHS[@]}" || mutant_rc=$?
       if [[ "$baseline_rc" == 0 && "$mutant_rc" != 0 ]]; then MUTANT_STATUS+=("$mutant_id=KILLED")
       elif [[ "$baseline_rc" == 0 ]]; then MUTANT_STATUS+=("$mutant_id=SURVIVED"); mutant_fail=1
