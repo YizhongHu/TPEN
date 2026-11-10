@@ -157,25 +157,18 @@ RESUME_SENSITIVE_CALLBACK_TARGETS = frozenset(
 # ``tpen/callback/timing/train_step_timing.py:41-57`` and TrainPhaseTiming at
 # ``tpen/callback/timing/train_phase_timing.py:64-83``; both gate only
 # observational ``train/perf`` logging. Those three observational callbacks
-# therefore remain admitted. AmplitudeRiskFraction consumes the same five
-# fields at ``tpen/callback/amplitude_risk.py`` (via ``pop_step_cadence``) and
-# gates which completed-iteration batches get a published descriptive
-# occupancy fraction; a gap or duplicate in that published set is exactly the
-# resume-fidelity failure this allowlist exists to catch, so it is held to the
-# same cadence-sensitive standard as DataIntegrity and GradientStats rather
-# than the three purely-timing callbacks above.
-# observational ``train/perf`` logging. OptimizerState validates its update
-# method at iteration entry, then uses its non-restored gate only for
-# completed-update optimizer metrics; it therefore remains admitted despite
-# owning cadence state. SamplerHealth and FactorScalars are listed above
-# because their same gate can suppress a configured run-aborting check.
-# AmplitudeRiskFraction consumes the same five fields at
-# ``tpen/callback/amplitude_risk.py`` (via ``pop_step_cadence``) and gates
-# which completed-iteration batches get a published descriptive occupancy
-# fraction; a gap or duplicate in that published set is exactly the
-# resume-fidelity failure this allowlist exists to catch, so it is held to
-# the same cadence-sensitive standard as DataIntegrity and GradientStats
-# rather than the three purely-timing callbacks above.
+# therefore remain admitted. OptimizerState validates its update method at
+# iteration entry, then uses its non-restored gate only for completed-update
+# optimizer metrics; it therefore remains admitted despite owning cadence
+# state. SamplerHealth and FactorScalars are listed above because their same
+# gate can suppress a configured run-aborting check. AmplitudeRiskFraction
+# consumes the same five fields at ``tpen/callback/amplitude_risk.py`` (via
+# ``pop_step_cadence``) and gates which completed-iteration batches get a
+# published descriptive occupancy fraction; a gap or duplicate in that
+# published set is exactly the resume-fidelity failure this allowlist exists
+# to catch, so it is held to the same cadence-sensitive standard as
+# DataIntegrity and GradientStats rather than the three purely-timing
+# callbacks above.
 CALLBACK_CADENCE_REFUSAL_CODE = "unsupported-callback-cadence"
 CADENCE_SENSITIVE_CALLBACK_TARGETS = frozenset(
     {
