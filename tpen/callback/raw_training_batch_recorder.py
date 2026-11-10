@@ -30,7 +30,7 @@ from .base import StatefulCallback
 from .cadence import StepCadenceGate, SubscriptionGroup, pop_step_cadence
 
 LEGACY_SCHEMA = "training_history/v1"
-SCHEMA = "training_history/v2"
+SCHEMA = "training_history/v3"
 MANIFEST_FILENAME = "manifest.json"
 
 
@@ -252,10 +252,18 @@ class TrainingBatchPartitionWriter:
             },
         }
         _write_json_exclusive(sidecar_path, sidecar)
+        sidecar_sha256 = _sha256(sidecar_path)
         manifest_path = self.root / MANIFEST_FILENAME
         previous_hash = _sha256(manifest_path) if manifest_path.exists() else None
         manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {"schema": SCHEMA, "partitions": []}
-        manifest["partitions"].append({"sidecar": sidecar_path.name, "parent_manifest_sha256": previous_hash})
+        manifest["schema"] = SCHEMA
+        manifest["partitions"].append(
+            {
+                "sidecar": sidecar_path.name,
+                "sidecar_sha256": sidecar_sha256,
+                "parent_manifest_sha256": previous_hash,
+            }
+        )
         _atomic_json(manifest_path, manifest)
         self._records.clear()
         self._seen.clear()
@@ -390,6 +398,11 @@ class TrainingBatchReader:
             if parent_hash != expected_parent:
                 raise ValueError("training manifest partition lineage is broken")
             sidecar_path = self.root / entry["sidecar"]
+            expected_sidecar_hash = entry.get("sidecar_sha256")
+            if not isinstance(expected_sidecar_hash, str):
+                raise ValueError("training manifest entry is missing the sidecar digest")
+            if not sidecar_path.exists() or _sha256(sidecar_path) != expected_sidecar_hash:
+                raise ValueError("training sidecar digest does not match its manifest entry")
             sidecar = json.loads(sidecar_path.read_text())
             _validate_sidecar(self.root, sidecar, entry=entry)
             if sidecar["schema"] == SCHEMA:
