@@ -564,6 +564,12 @@ def _placement_refusal_receipt(
     -------
     SciencePlacementReceipt
         Placement evidence whose comparison is explicitly refused.
+
+    Raises
+    ------
+    PlacementRefusal
+        If the prepared child environment cannot provide the refusal receipt's
+        declared placement context.
     """
 
     if not isinstance(environment, PreparedPythonEnvironment):

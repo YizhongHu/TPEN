@@ -21,7 +21,7 @@ needed to inspect the child-side contract.
 | C1 | drop refusal receipt construction | missing sidecars remain typed and readable |
 | C2 | treat empty devices as absent | CPU-only children retain explicit placement input |
 | M1 | compare raw host strings only | short/FQDN host forms still match canonically |
-| N1 | derive entitlement from merged CUDA visibility | Local and Parsl explicit slot declarations agree |
+| N1 | omit explicit declared-device propagation | Local and Parsl explicit slot declarations agree |
 | H1 | delete the controller affinity subset check | dispatcher refuses an out-of-affinity slot before launch |
 | H2 | delete invalid-receipt exception handling | dispatcher stores a typed construction refusal |
 | D1 | derive declared devices from CUDA visibility | prepared visibility cannot alter slot entitlement |
@@ -415,7 +415,7 @@ def _slot_allocation(slot: AllocationSlot) -> ConfiguredAllocation:
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux sched affinity")
 def test_n1_local_and_parsl_preset_device_declarations_agree(tmp_path: Path) -> None:
-    """N1 kills a dropped CUDA visibility fallback for preset device slots."""
+    """N1 kills omission of explicit declared-device propagation for preset slots."""
 
     cpu = min(os.sched_getaffinity(0))
     group = _group()
