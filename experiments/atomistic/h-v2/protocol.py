@@ -22,6 +22,25 @@ CONTRACT_NUCLEAR_LAW = {
     "trainable": True,
 }
 
+#: Frozen amplitude-risk study thresholds (``measurement.amplitude_risk.thresholds``
+#: in ``contract_inputs.json``, decided by note ``amplitude-risk-call-20261106``).
+#: Descriptive only: this list gates nothing on its own, it is the single value
+#: every configured `tpen.callback.AmplitudeRiskFraction` instance in an H-v2
+#: config must match, checked by `assert_hydrogen_contract`.
+AMPLITUDE_RISK_THRESHOLDS = (-3, -4, -5, -7, -10)
+AMPLITUDE_RISK_PRIMARY_THRESHOLD = -5
+AMPLITUDE_RISK_LABELS = {
+    "-3": "resolved sensitivity",
+    "-4": "resolved sensitivity",
+    "-5": "primary descriptive scale",
+    "-7": (
+        "marginal resolution at the spike's evaluation scale (4096 x 64 rows "
+        "per stream, 17 of 20 streams resolved); unmeasured at the contract's "
+        "4096 x 256"
+    ),
+    "-10": "rare or unresolved; a zero is not a healthy zero",
+}
+
 
 def load_yaml(path: Path) -> dict[str, Any]:
     """Load one frozen configuration without resolving Hydra interpolations."""
@@ -99,14 +118,42 @@ def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False
             raise ValueError("fresh evaluation must request model-only restore")
         if "optimizer" in config or "trainer" in config:
             raise ValueError("fresh evaluation must not carry training state")
+    assert_amplitude_risk_thresholds(config)
+
+
+def assert_amplitude_risk_thresholds(config: dict[str, Any]) -> None:
+    """Refuse a configured ``AmplitudeRiskFraction`` whose thresholds drift.
+
+    A no-op when ``config`` carries no such callback entry: this module adds
+    no gate of its own, it only enforces agreement, once such a callback is
+    present, with the frozen study list `AMPLITUDE_RISK_THRESHOLDS` decided by
+    note ``amplitude-risk-call-20261106``.
+    """
+
+    callbacks = config.get("callbacks") or []
+    for entry in callbacks:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("_target_") != "tpen.callback.AmplitudeRiskFraction":
+            continue
+        thresholds = entry.get("thresholds")
+        if list(thresholds) != list(AMPLITUDE_RISK_THRESHOLDS):
+            raise ValueError(
+                "H-v2 amplitude-risk callback thresholds must equal the frozen "
+                f"study list {AMPLITUDE_RISK_THRESHOLDS}, got {thresholds!r}"
+            )
 
 
 __all__ = [
+    "AMPLITUDE_RISK_LABELS",
+    "AMPLITUDE_RISK_PRIMARY_THRESHOLD",
+    "AMPLITUDE_RISK_THRESHOLDS",
     "CONTRACT_NUCLEAR_LAW",
     "EVALUATION_SEEDS",
     "ROOT",
     "SAMPLER_SEED",
     "TRAINING_SEED",
+    "assert_amplitude_risk_thresholds",
     "assert_hydrogen_contract",
     "evaluation_config",
     "load_yaml",

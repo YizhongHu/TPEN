@@ -197,3 +197,48 @@ def test_exceedance_probability_matches_independent_numeric_integration(threshol
 def test_energy_exceedance_threshold_inverts_exceedance_probability(level) -> None:
     threshold = oracle.energy_exceedance_threshold(level, 1.2)
     assert oracle.exceedance_probability(threshold, 1.2) == pytest.approx(level, abs=1e-8)
+
+
+def _contract_inputs() -> dict:
+    import json
+
+    return json.loads((HERE / "contract_inputs.json").read_text(encoding="utf-8"))
+
+
+def test_amplitude_risk_thresholds_agree_with_the_frozen_contract() -> None:
+    risk = _contract_inputs()["measurement"]["amplitude_risk"]["thresholds"]
+    assert list(protocol.AMPLITUDE_RISK_THRESHOLDS) == risk["frozen_tau"]
+    assert protocol.AMPLITUDE_RISK_PRIMARY_THRESHOLD == risk["primary"]
+    assert protocol.AMPLITUDE_RISK_LABELS == risk["labels"]
+
+
+def test_amplitude_risk_module_yaml_matches_the_frozen_thresholds() -> None:
+    config = protocol.load_yaml(HERE / "configs" / "amplitude_risk_module.yaml")
+    entry = config["amplitude_risk_callback"]
+    assert entry["_target_"] == "tpen.callback.AmplitudeRiskFraction"
+    assert entry["thresholds"] == list(protocol.AMPLITUDE_RISK_THRESHOLDS)
+
+
+def test_assert_amplitude_risk_thresholds_is_a_noop_without_the_callback() -> None:
+    protocol.assert_amplitude_risk_thresholds(protocol.training_config())
+    protocol.assert_hydrogen_contract(protocol.training_config())
+
+
+def test_assert_amplitude_risk_thresholds_accepts_the_frozen_list() -> None:
+    config = protocol.training_config()
+    config["callbacks"].append(
+        {"_target_": "tpen.callback.AmplitudeRiskFraction", "thresholds": [-3, -4, -5, -7, -10]}
+    )
+    protocol.assert_amplitude_risk_thresholds(config)
+    protocol.assert_hydrogen_contract(config)
+
+
+def test_assert_amplitude_risk_thresholds_refuses_a_drifted_list() -> None:
+    config = protocol.training_config()
+    config["callbacks"].append(
+        {"_target_": "tpen.callback.AmplitudeRiskFraction", "thresholds": [-1, -2]}
+    )
+    with pytest.raises(ValueError, match="frozen"):
+        protocol.assert_amplitude_risk_thresholds(config)
+    with pytest.raises(ValueError, match="frozen"):
+        protocol.assert_hydrogen_contract(config)
