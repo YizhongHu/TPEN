@@ -13,8 +13,6 @@ from typing import Any
 
 from omegaconf import OmegaConf
 
-from tpen.config_schema import iter_interpolations, split_resolver
-
 RESOLVED_CONFIG_HASH_EXCLUSIONS = (
     ("run", "run_id"),
     ("run", "dir"),
@@ -73,10 +71,7 @@ _LOGGER_PATH_FIELDS = {
     "spenn.logging.CSV": {"path"},
     "spenn.logging.JSONL": {"path"},
 }
-_EVALUATOR_TARGETS = {
-    "tpen.evaluation.Evaluator",
-    "spenn.evaluation.Evaluator",
-}
+_EVALUATOR_TARGET = "tpen.evaluation.Evaluator"
 
 
 _FILE_HASH_CHUNK_BYTES = 1 << 20
@@ -279,14 +274,10 @@ def _identity_resolved_container(
     _reject_science_run_interpolations(prepared)
     for field in _IDENTITY_RUN_FIELDS:
         run[field] = _run_sentinel(field)
-    # Resolve ordinary node references, but keep resolver expressions opaque.
-    # OmegaConf evaluates custom resolvers while resolving a container; a
-    # resolver such as ``tpen.basis_feature_dim`` calls Hydra instantiate and
-    # can import/construct an arbitrary ``_target_``.  Identity computation is
-    # a hashing boundary, not a construction boundary, so resolver syntax is
-    # represented by a deterministic token instead of being executed.
-    safe_source = _opaque_resolver_interpolations(prepared)
-    resolved = OmegaConf.to_container(OmegaConf.create(safe_source), resolve=True)
+    # Resolve the same config semantics as the run path.  The public identity
+    # is over the resolved config, so resolver values are part of science
+    # identity and must not be replaced by expression text.
+    resolved = OmegaConf.to_container(OmegaConf.create(prepared), resolve=True)
     normalized = copy.deepcopy(resolved)
     if not isinstance(normalized, Mapping):
         raise TypeError("resolved configuration identity requires a mapping")
@@ -299,57 +290,6 @@ def _identity_resolved_container(
     _delete_known_operational_slots(scan_target)
     _reject_run_sentinels(scan_target)
     return normalized
-
-
-def _opaque_resolver_interpolations(value: Any) -> Any:
-    """Replace resolver calls with deterministic tokens before OmegaConf resolve.
-
-    Plain node interpolations still resolve, preserving the useful alias/copy
-    behavior of the identity contract.  Any interpolation containing a
-    resolver call is kept as syntax because evaluating it may run user code or
-    Hydra construction.  The replacement is content-derived so core and study
-    callers hash the same intended configuration.
-    """
-
-    if isinstance(value, Mapping):
-        return {key: _opaque_resolver_interpolations(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        converted = [_opaque_resolver_interpolations(item) for item in value]
-        return type(value)(converted)
-    if not isinstance(value, str) or "${" not in value:
-        return value
-
-    text = value
-    output: list[str] = []
-    cursor = 0
-    while cursor < len(text):
-        start = text.find("${", cursor)
-        if start < 0:
-            output.append(text[cursor:])
-            break
-        output.append(text[cursor:start])
-        depth = 1
-        index = start + 2
-        while index < len(text) and depth:
-            if text.startswith("${", index):
-                depth += 1
-                index += 2
-                continue
-            if text[index] == "}":
-                depth -= 1
-            index += 1
-        if depth:
-            output.append(text[start:])
-            break
-        expression = text[start + 2 : index - 1]
-        expressions = (expression, *iter_interpolations(expression))
-        if any(split_resolver(candidate)[1] for candidate in expressions):
-            token = hashlib.sha256(text[start:index].encode("utf-8")).hexdigest()
-            output.append(f"__tpen_identity_resolver__:{token}__")
-        else:
-            output.append(text[start:index])
-        cursor = index
-    return "".join(output)
 
 
 def _normalized_text(value: Any) -> str | None:
@@ -423,14 +363,7 @@ def _is_operational_slot(path: tuple[object, ...], owner: Mapping[str, Any], key
         and len(path) == 4
         and path[:2] == ("evaluator", "tasks")
         and isinstance(path[2], int)
-        and any(target in ancestors for target in _EVALUATOR_TARGETS)
-    ) or (
-        key == "output_dir"
-        and len(path) == 4
-        and path[0] == "evaluation_suites"
-        and isinstance(path[1], str)
-        and path[2] == "tasks"
-        and isinstance(path[3], int)
+        and _EVALUATOR_TARGET in ancestors
     )
 
 
@@ -441,7 +374,7 @@ def _delete_known_operational_slots(container: Any) -> None:
             if isinstance(target, str):
                 for key in _CALLBACK_OUTPUT_FIELDS.get(target, set()) | _LOGGER_PATH_FIELDS.get(target, set()):
                     container.pop(key, None)
-                if target in _EVALUATOR_TARGETS:
+                if target == _EVALUATOR_TARGET:
                     tasks = container.get("tasks")
                     if isinstance(tasks, (list, tuple)):
                         for task in tasks:
@@ -452,13 +385,6 @@ def _delete_known_operational_slots(container: Any) -> None:
                 for task in evaluation_tasks.values():
                     if isinstance(task, dict):
                         task.pop("output_dir", None)
-            evaluation_suites = container.get("evaluation_suites")
-            if isinstance(evaluation_suites, dict):
-                for suite in evaluation_suites.values():
-                    if isinstance(suite, dict) and isinstance(suite.get("tasks"), (list, tuple)):
-                        for task in suite["tasks"]:
-                            if isinstance(task, dict):
-                                task.pop("output_dir", None)
             for value in tuple(container.values()):
                 _delete_known_operational_slots(value)
     elif isinstance(container, (list, tuple)):

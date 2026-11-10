@@ -147,23 +147,28 @@ def test_identity_config_exclusions_are_closed_and_explicit() -> None:
     assert covered.isdisjoint(expected)
 
 
-def test_identity_does_not_execute_custom_resolvers() -> None:
-    """Counterfactual: the old resolver path called the probe during hashing."""
+def test_identity_is_sensitive_to_resolved_resolver_values() -> None:
+    """Resolved resolver output is part of the public identity contract."""
 
-    calls: list[str] = []
+    value = ["first"]
     OmegaConf.register_new_resolver(
         "identity_probe",
-        lambda: calls.append("called") or "constructed",
+        lambda: value[0],
         replace=True,
     )
     try:
-        identity = resolved_config_identity(
+        first = resolved_config_identity(
+            OmegaConf.create({"science": {"value": "${identity_probe:}"}})
+        )
+        value[0] = "second"
+        second = resolved_config_identity(
             OmegaConf.create({"science": {"value": "${identity_probe:}"}})
         )
     finally:
         OmegaConf.clear_resolver("identity_probe")
-    assert identity["schema"] == RESOLVED_CONFIG_IDENTITY_SCHEMA
-    assert calls == []
+    assert first["schema"] == RESOLVED_CONFIG_IDENTITY_SCHEMA
+    assert second["schema"] == RESOLVED_CONFIG_IDENTITY_SCHEMA
+    assert first != second
 
 
 def test_golden_identity_vector() -> None:
