@@ -22,6 +22,12 @@ class JobResources:
     cpus_per_task: int
     mem: str
     no_requeue: bool = True
+    #: K2: optional typed GRES model name (for example
+    #: ``"nvidia_a100_3g.20gb"``), rendered as ``--gres=gpu:<model>:<gpus>``
+    #: instead of the generic ``--gres=gpu:<gpus>``. Empty for every resource
+    #: profile except :data:`GPU_TEST_RESOURCES`: science/pipeline-check
+    #: output must stay byte-identical.
+    gpu_model: str = ""
 
 
 #: Approved for both the TRAIN and EVAL job of every lineage (D1): one A100,
@@ -64,6 +70,11 @@ APPROVED_GPU_STRATUM = "NVIDIA A100-SXM4-80GB"
 #: ``a100`` constraint (``gpu_test`` serves MIG slices, a different hardware
 #: stratum -- ``gpu-hardware-strata-and-constraint-rule-2026-08-15``), and a
 #: dedicated GRES request for one MIG slice.
+#: K2: the exact typed GRES model FASRC documents for the ``gpu_test`` MIG
+#: slice (https://docs.rc.fas.harvard.edu/kb/running-jobs/); distinct from
+#: :data:`APPROVED_GPU_TEST_STRATUM` (the in-job ``torch`` device-name
+#: string), which is the delivered-device check, not the scheduler request.
+GPU_TEST_GRES_MODEL = "nvidia_a100_3g.20gb"
 GPU_TEST_RESOURCES = JobResources(
     partition="gpu_test",
     constraint="",
@@ -72,6 +83,7 @@ GPU_TEST_RESOURCES = JobResources(
     ntasks=1,
     cpus_per_task=4,
     mem="32G",
+    gpu_model=GPU_TEST_GRES_MODEL,
 )
 #: The exact MIG device name ``gpu-route-g`` must verify it was delivered
 #: (orchestrator-decisions-open-points-20261110 item 6; measured on
@@ -110,6 +122,7 @@ PILOT_RUN_ROOT_PREFIX_ENV = "H_V2_PILOT_RUN_ROOT_PREFIX"
 __all__ = [
     "APPROVED_GPU_STRATUM",
     "APPROVED_GPU_TEST_STRATUM",
+    "GPU_TEST_GRES_MODEL",
     "GPU_TEST_RESOURCES",
     "JOB_SCRIPT_RELATIVE",
     "JobResources",

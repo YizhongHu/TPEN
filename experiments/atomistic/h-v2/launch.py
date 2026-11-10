@@ -201,6 +201,109 @@ def _validate_interpreter(path_value: str, *, label: str) -> str:
     return path_value
 
 
+#: F2: a self-contained GPU-utilization sidecar for the pilot/part-(g)
+#: payloads, run via ``<science_python> - <log_path>`` so no sibling file
+#: dependency exists (mirrors :func:`_wrap_command`'s own rationale). Stdlib
+#: only (``os``/``signal``/``subprocess``/``sys``/``time``): no new
+#: dependency. Samples ``memory.used``/``utilization.gpu`` roughly every
+#: five seconds with a bounded per-query timeout; a failing or hung
+#: ``nvidia-smi`` invocation is isolated (never raised to the caller) and
+#: never blocks the next sample. On SIGTERM (the wrapper's own cleanup,
+#: after the payload exits) it kills its own in-flight ``nvidia-smi`` process
+#: group, if any, and exits -- it is never left running or orphaned past the
+#: payload's own lifetime.
+_GPU_SIDECAR_SOURCE = """\
+import os
+import signal
+import subprocess
+import sys
+import time
+
+LOG_PATH = sys.argv[1]
+SAMPLE_INTERVAL_SECONDS = 5.0
+QUERY_TIMEOUT_SECONDS = 3.0
+_current = {"proc": None}
+
+
+def _cleanup(signum, frame):
+    proc = _current["proc"]
+    if proc is not None and proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _cleanup)
+
+while True:
+    start = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            ["nvidia-smi", "--query-gpu=memory.used,utilization.gpu", "--format=csv,noheader"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        _current["proc"] = proc
+        try:
+            output, _ = proc.communicate(timeout=QUERY_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            output, _ = proc.communicate()
+        _current["proc"] = None
+        if output:
+            with open(LOG_PATH, "a", encoding="utf-8") as handle:
+                handle.write(output if output.endswith("\\n") else output + "\\n")
+    except Exception:
+        _current["proc"] = None
+    elapsed = time.monotonic() - start
+    time.sleep(max(0.0, SAMPLE_INTERVAL_SECONDS - elapsed))
+"""
+
+
+def _gpu_sidecar_wrap_lines(
+    *, checkout_quoted: str, science_python: str, executor_python: str, payload_command: str
+) -> list[str]:
+    """Return the pilot-only wrapper lines: sidecar, payload, bounded cleanup.
+
+    F2: unlike the plain ``exec``-based science/pipeline-check wrapper
+    (:func:`_wrap_command`), this never ``exec``s the payload -- its exit
+    status is captured (``RC=$?``) so the sidecar can be stopped and reaped
+    (``kill``/``wait``) before the wrapper itself exits with that SAME
+    status, preserved unchanged.
+    """
+
+    science_quoted = shlex.quote(science_python)
+    return [
+        "set -e",
+        f"cd {checkout_quoted}",
+        f"CHECKOUT={checkout_quoted}",
+        'export PYTHONPATH="$CHECKOUT${PYTHONPATH:+:$PYTHONPATH}"',
+        f"export SCIENCE_PYTHON={shlex.quote(science_python)}",
+        f"export EXECUTOR_PY={shlex.quote(executor_python)}",
+        'mkdir -p "$RUN/logs"',
+        f"{science_quoted} - \"$RUN/logs/gpu-sidecar.log\" <<'PYEOF' &",
+        _GPU_SIDECAR_SOURCE.rstrip("\n"),
+        "PYEOF",
+        "MONITOR_PID=$!",
+        # The payload's own exit status is captured with errexit disabled
+        # around it, never allowed to abort the script before it is read.
+        "set +e",
+        payload_command,
+        "RC=$?",
+        "set -e",
+        'kill "$MONITOR_PID" >/dev/null 2>&1 || true',
+        'wait "$MONITOR_PID" >/dev/null 2>&1 || true',
+        "exit $RC",
+    ]
+
+
 def _wrap_command(
     stage: str,
     lineage: str,
@@ -272,14 +375,29 @@ def _wrap_command(
         # refuse in run_job.py's main(), not silently dispatch science.
         extra_arg = f" {shlex.quote('--payload')} {shlex.quote('science')}"
     checkout_quoted = shlex.quote(str(checkout_root))
+    payload_command = (
+        f"{shlex.quote(science_python)} {shlex.quote(str(job_script))} "
+        f"{shlex.quote(stage)} {shlex.quote(lineage)}{extra_arg}"
+    )
+    if payload in PILOT_PAYLOADS:
+        # F2: these two payloads run under a bounded GPU-utilization sidecar
+        # (:data:`_GPU_SIDECAR_SOURCE`); the science/pipeline-check wrapper
+        # below stays byte-identical to #629 (no sidecar).
+        return "\n".join(
+            _gpu_sidecar_wrap_lines(
+                checkout_quoted=checkout_quoted,
+                science_python=science_python,
+                executor_python=executor_python,
+                payload_command=payload_command,
+            )
+        )
     return (
         f"cd {checkout_quoted} && "
         f"CHECKOUT={checkout_quoted} && "
         'PYTHONPATH="$CHECKOUT${PYTHONPATH:+:$PYTHONPATH}" '
         f"SCIENCE_PYTHON={shlex.quote(science_python)} "
         f"EXECUTOR_PY={shlex.quote(executor_python)} "
-        f"exec {shlex.quote(science_python)} {shlex.quote(str(job_script))} "
-        f"{shlex.quote(stage)} {shlex.quote(lineage)}{extra_arg}"
+        f"exec {payload_command}"
     )
 
 
@@ -356,8 +474,12 @@ def build_sbatch_command(
     ]
     if resources.constraint:
         command.append(f"--constraint={resources.constraint}")
+    # K2: an optional typed GRES model renders as gpu:<model>:<count>; every
+    # other resource profile (science, pipeline-check, capacity-pilot) keeps
+    # the generic gpu:<count> it always has.
+    gres = f"gpu:{resources.gpu_model}:{resources.gpus}" if resources.gpu_model else f"gpu:{resources.gpus}"
     command += [
-        f"--gres=gpu:{resources.gpus}",
+        f"--gres={gres}",
         f"--nodes={resources.nodes}",
         f"--ntasks={resources.ntasks}",
         f"--cpus-per-task={resources.cpus_per_task}",
@@ -559,31 +681,43 @@ def submit_lineage(
     return train_id, eval_id
 
 
-def _validate_run_root_prefix(run_root: Path, run_root_prefix: str) -> None:
-    """Refuse a run root outside the durable, lifecycle-governed prefix.
+#: F5: the fixed study segment every pilot/part-(g) run root lives under,
+#: between the durable prefix and the payload/lineage pair
+#: (``<prefix>/h-v2/<payload>/<lineage>``, harness r3 addendum3).
+_PILOT_RUN_ROOT_STUDY_SEGMENT = "h-v2"
+
+
+def _validate_run_root_prefix(run_root: Path, run_root_prefix: str, *, payload: str, lineage: str) -> None:
+    """Refuse a run root outside its payload/lineage's own durable location.
 
     Run-root amendment (harness r3 addendum3): pilot/part-(g) run roots must
-    live under a persistent, lifecycle-governed prefix; every other
-    ``Lab/rhu`` root is ephemeral and auto-cleaned. The exact facility path
-    is never hardcoded here (``netscratch-never-referenced-from-repo``); the
-    caller supplies it (:data:`launch_config.PILOT_RUN_ROOT_PREFIX_ENV`).
+    live under a persistent, lifecycle-governed prefix, in the exact shape
+    ``<prefix>/h-v2/<payload>/<lineage>`` (or a child of it, for example an
+    attempt subdirectory) -- not merely anywhere under the broad prefix
+    (review r1 F5: a caller-supplied prefix ending in ``runs`` otherwise
+    accepted any sibling payload's or an unrelated root). The exact facility
+    path is never hardcoded here (``netscratch-never-referenced-from-repo``);
+    the caller supplies the prefix
+    (:data:`launch_config.PILOT_RUN_ROOT_PREFIX_ENV`).
 
     Raises
     ------
     LaunchError
-        If ``run_root_prefix`` is not absolute, or ``run_root`` does not lie
-        under it.
+        If ``run_root_prefix`` is not absolute, or ``run_root`` is not
+        ``<run_root_prefix>/h-v2/<payload>/<lineage>`` or a descendant of it.
     """
 
     prefix = Path(run_root_prefix)
     if not prefix.is_absolute():
         raise LaunchError(f"{launch_config.PILOT_RUN_ROOT_PREFIX_ENV} must be an absolute path, got {run_root_prefix!r}")
+    expected_root = (prefix / _PILOT_RUN_ROOT_STUDY_SEGMENT / payload / lineage).resolve()
     try:
-        run_root.relative_to(prefix)
+        run_root.resolve().relative_to(expected_root)
     except ValueError:
         raise LaunchError(
-            f"run root {run_root} must be under the durable prefix {prefix} "
-            f"({launch_config.PILOT_RUN_ROOT_PREFIX_ENV}); refusing before any sbatch call"
+            f"run root {run_root} must be {expected_root} or a descendant of it "
+            f"({launch_config.PILOT_RUN_ROOT_PREFIX_ENV}={run_root_prefix!r}, payload={payload!r}, "
+            f"lineage={lineage!r}); refusing before any sbatch call"
         ) from None
 
 
@@ -634,7 +768,8 @@ def submit_pilot_payload(
     if payload not in PILOT_PAYLOADS:
         raise LaunchError(f"--payload must be one of {PILOT_PAYLOADS!r}, got {payload!r}")
     run_root = Path(run_root)
-    _validate_run_root_prefix(run_root, run_root_prefix)
+    lineage = launch_config.PILOT_PAYLOAD_LINEAGES[payload]
+    _validate_run_root_prefix(run_root, run_root_prefix, payload=payload, lineage=lineage)
     cap_seconds = launch_config.PILOT_PAYLOAD_MAX_WALL_SECONDS[payload]
     if t_wall is None:
         time_value = _format_wall_seconds(cap_seconds)
@@ -646,7 +781,6 @@ def submit_pilot_payload(
                 f"--time for payload {payload!r} must be at most {cap_seconds}s "
                 f"({_format_wall_seconds(cap_seconds)}); got {time_value!r} ({requested_seconds}s)"
             )
-    lineage = launch_config.PILOT_PAYLOAD_LINEAGES[payload]
     command = build_sbatch_command(
         "train",
         lineage,
@@ -823,6 +957,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"--run-root-prefix or {launch_config.PILOT_RUN_ROOT_PREFIX_ENV} is required for "
                 f"payload {args.payload!r}"
             )
+        # F6: an explicit, smaller TRAIN wall time is honored (via
+        # :func:`submit_pilot_payload`'s own cap check), not silently
+        # replaced by the payload's maximum.
         train_id = submit_pilot_payload(
             args.payload,
             science_python=science_python,
@@ -830,6 +967,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_root=run_root,
             checkout_root=checkout_root,
             run_root_prefix=run_root_prefix,
+            t_wall=os.environ.get("T_WALL"),
             commit=args.commit,
             dry_run=args.dry_run,
         )
