@@ -251,3 +251,21 @@ def test_science_pipeline_check_train_dispatch_reaches_real_store_reservation(
     assert dispatch.returncode == 0, (dispatch.returncode, dispatch.stdout, dispatch.stderr)
     assert dispatch.manifest is not None
     assert store.is_dir()
+
+    # Orchestrator b55087ba, round-1 addition: a SIBLING lineage under the
+    # SAME run_root shares attached/store's parent -- _reserve_store_parent's
+    # mkdir(..., exist_ok=True) must see that parent already present and
+    # reserve its OWN sibling store root without refusing.
+    sibling_task_id = "h-v2-train-pipeline-check-L2"
+    sibling_store = run_root / "attached" / "store" / sibling_task_id
+    assert sibling_store.parent == store.parent
+    assert not sibling_store.exists()
+
+    run_job.run("train", "L2", pipeline_check=True)
+
+    sibling_dispatch = captured["dispatch"]
+    assert sibling_dispatch.returncode == 0, (
+        sibling_dispatch.returncode, sibling_dispatch.stdout, sibling_dispatch.stderr
+    )
+    assert sibling_dispatch.manifest is not None
+    assert sibling_store.is_dir()
