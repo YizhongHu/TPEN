@@ -10,14 +10,17 @@ fallback. Each job runs ``run_job.py`` (the executor's attached route from
 item 9d3aa0a3) inside its own allocation.
 
 Round 2 (PR 619 decisions F1/F3): ``--payload`` is required, with no
-default. ``science`` always refuses before any ``sbatch`` call (no approved
-per-lineage science configuration interface exists yet); ``pipeline-check``
-explicitly selects the non-science payload, labelled as such in job names
-and in-job argv. ``--science-python``/``--executor-python`` are also
-required, absolute, existing-file paths, embedded literally into the job
-wrapper rather than left to whatever the submitting shell happened to
-export. ``run_job.py``'s own in-job gate for the same refusal is kept as
-defence in depth.
+default. ``pipeline-check`` explicitly selects the non-science payload,
+labelled as such in job names and in-job argv. ``--science-python``/
+``--executor-python`` are also required, absolute, existing-file paths,
+embedded literally into the job wrapper rather than left to whatever the
+submitting shell happened to export.
+
+TO baff945c: ``science`` dispatches the approved per-lineage science
+training config (``protocol.science_training_config``) for lineages L1-L3
+(``launch_config.LINEAGES``); any other lineage still refuses before any
+``sbatch`` call. ``run_job.py``'s own in-job gate for the same refusal is
+kept as defence in depth.
 
 Round 3 (K4). Invocation: run this file with the SCIENCE environment's
 interpreter (the one later passed as ``--science-python``), not a bare
@@ -123,36 +126,48 @@ def _default_runner(command: Sequence[str]) -> subprocess.CompletedProcess:
 
 
 def _validate_payload(payload: str) -> None:
-    """G1 (decision F3): refuse a ``science`` payload before any dispatch.
+    """Refuse any ``--payload`` value other than ``science``/``pipeline-check``.
 
-    No approved per-lineage science configuration interface exists yet
-    (design target section A1; follow-up tracked on item 3c13ba74), so this
-    script must not silently submit ``protocol.training_config()``'s CPU
-    pipeline-check defaults relabeled as a science run. The refusal reuses
-    ``run_job.py``'s own refusal code (:data:`run_job.SCIENCE_CONFIG_UNAVAILABLE_CODE`)
-    so the two refusal sites -- here, before any ``sbatch`` call, and
-    ``run_job.py``'s in-job gate, kept as defence in depth -- never drift
-    apart into two different codes for the same condition.
+    TO baff945c lifted the former blanket refusal of ``payload == "science"``
+    for the approved L1-L3 lineage roster; :func:`_validate_science_lineage`
+    now carries the per-lineage refusal that used to live here, reusing
+    ``run_job.py``'s own refusal code
+    (:data:`run_job.SCIENCE_CONFIG_UNAVAILABLE_CODE`) so the two refusal
+    sites -- there, before any ``sbatch`` call, and ``run_job.py``'s in-job
+    gate, kept as defence in depth -- never drift apart into two different
+    codes for the same condition.
 
     Raises
     ------
     LaunchError
-        Always, for ``payload == "science"``; also for any other value that
-        is not ``"pipeline-check"``.
+        If ``payload`` is not ``"science"`` or ``"pipeline-check"``.
     """
 
-    if payload == "science":
+    if payload not in ("science", "pipeline-check"):
+        raise LaunchError(f"--payload must be 'science' or 'pipeline-check', got {payload!r}")
+
+
+def _validate_science_lineage(payload: str, lineage: str) -> None:
+    """TO baff945c: refuse a science payload for an unapproved lineage.
+
+    EVAL stays refused unconditionally regardless of lineage
+    (``attached.EVAL_ROUTE_UNSUPPORTED_CODE``, BLOCKER-EVAL); this only
+    gates which lineage a ``science`` TRAIN/EVAL job may be submitted for.
+
+    Raises
+    ------
+    LaunchError
+        Code :data:`run_job.SCIENCE_CONFIG_UNAVAILABLE_CODE`, if
+        ``payload == "science"`` and ``lineage`` is not one of
+        ``launch_config.LINEAGES``.
+    """
+
+    if payload == "science" and lineage not in launch_config.LINEAGES:
         code = _run_job_module().SCIENCE_CONFIG_UNAVAILABLE_CODE
         raise LaunchError(
-            f"{code}: no approved per-lineage science configuration interface "
-            "exists yet (design target section A1; follow-up tracked on item "
-            "3c13ba74). Refusing before any sbatch submission rather than "
-            "dispatching the non-science pipeline-check payload under a "
-            "science label. Pass --payload pipeline-check to explicitly "
-            "select the non-science payload instead."
+            f"{code}: lineage {lineage!r} is not an approved science lineage "
+            f"({launch_config.LINEAGES!r}); refusing before any sbatch submission"
         )
-    if payload != "pipeline-check":
-        raise LaunchError(f"--payload must be 'science' or 'pipeline-check', got {payload!r}")
 
 
 def _validate_interpreter(path_value: str, *, label: str) -> str:
@@ -208,9 +223,12 @@ def _wrap_command(
 
     G1: when ``payload == "pipeline-check"``, ``--pipeline-check`` is
     appended to the in-job argv, selecting the explicit non-science payload
-    in ``run_job.py``. ``payload == "science"`` never reaches this function
-    (:func:`_validate_payload` refuses first), so no flag is ever added for
-    it.
+    in ``run_job.py``. For ``payload == "science"`` (an approved L1-L3
+    lineage; :func:`_validate_science_lineage` refuses any other lineage
+    before this function is reached), ``--payload science`` is appended
+    instead (review r1 F2): ``run_job.py``'s in-job parser requires one of
+    these two explicit tokens and refuses a bare ``train``/``eval`` argv
+    rather than defaulting to science.
 
     K1: Slurm spools only the submitted ``--wrap`` body itself, as its own
     fresh process -- ``sys.path`` there starts at the checkout's
@@ -230,7 +248,13 @@ def _wrap_command(
     """
 
     job_script = checkout_root / launch_config.JOB_SCRIPT_RELATIVE
-    extra_arg = f" {shlex.quote('--pipeline-check')}" if payload == "pipeline-check" else ""
+    if payload == "pipeline-check":
+        extra_arg = f" {shlex.quote('--pipeline-check')}"
+    else:
+        # F2 (review r1): an explicit science token, never an implicit default
+        # -- a dropped flag or a bare "train L1"/"eval L1" invocation must
+        # refuse in run_job.py's main(), not silently dispatch science.
+        extra_arg = f" {shlex.quote('--payload')} {shlex.quote('science')}"
     checkout_quoted = shlex.quote(str(checkout_root))
     return (
         f"cd {checkout_quoted} && "
@@ -266,10 +290,11 @@ def build_sbatch_command(
     lineage : str
         Opaque lineage identity (for example ``"L1"``).
     payload : {"science", "pipeline-check"}
-        G1: which payload this job dispatches. ``"science"`` is refused by
-        :func:`_validate_payload` before this function is ever reached;
-        ``"pipeline-check"`` labels the job name and appends
-        ``--pipeline-check`` to the in-job argv (:func:`_wrap_command`).
+        G1/TO baff945c: which payload this job dispatches. ``"science"`` is
+        refused by :func:`_validate_science_lineage` for any lineage outside
+        ``launch_config.LINEAGES``; ``"pipeline-check"`` labels the job name
+        and appends ``--pipeline-check`` to the in-job argv
+        (:func:`_wrap_command`).
     science_python, executor_python : str
         G2: explicit, pre-validated absolute interpreter paths, embedded
         literally into the wrapper (:func:`_wrap_command`).
@@ -302,9 +327,10 @@ def build_sbatch_command(
     if stage not in ("train", "eval"):
         raise LaunchError(f"stage must be 'train' or 'eval', got {stage!r}")
     _validate_payload(payload)
+    _validate_science_lineage(payload, lineage)
     run_root = Path(run_root)
     checkout_root = Path(checkout_root)
-    label = _run_job_module().PIPELINE_CHECK_LABEL
+    label = payload if payload == "science" else _run_job_module().PIPELINE_CHECK_LABEL
     job_name = f"h-v2-{label}-{lineage}-{stage}"
     command = [
         "sbatch",
@@ -460,9 +486,10 @@ def submit_lineage(
     Raises
     ------
     LaunchError
-        G1: if ``payload == "science"`` (or any value other than
-        ``"pipeline-check"``), before any submission, dry-run included. If
-        the train submission fails or yields no job id, the eval job is
+        If ``payload`` is not ``"science"``/``"pipeline-check"``, or
+        ``payload == "science"`` for a lineage outside
+        ``launch_config.LINEAGES``, before any submission, dry-run included.
+        If the train submission fails or yields no job id, the eval job is
         never submitted in that case.
     """
 
@@ -529,17 +556,26 @@ def submit_all(
 ) -> dict[str, tuple[str | None, str | None]]:
     """Submit every lineage's two jobs in order; abort on the first failure.
 
-    G1: validates ``payload`` first, before anything else, so a ``science``
-    payload (or any unrecognized value) raises before the T_WALL/E_WALL
-    budget is even checked, with zero runner calls, dry-run included. Then
-    validates the T_WALL/E_WALL budget (F4) before any lineage is attempted.
-    A lineage whose train submission fails raises before any later lineage
-    is attempted: this function does no partial-progress bookkeeping beyond
-    what each already-successful ``submit_lineage`` call returned to the
-    caller before the failure.
+    G1: validates ``payload`` first, before anything else, so an
+    unrecognized value raises before the T_WALL/E_WALL budget is even
+    checked, with zero runner calls, dry-run included (the default
+    ``lineages`` roster, ``launch_config.LINEAGES``, is always approved for
+    ``payload == "science"``). Review r1 (F3): the ENTIRE requested
+    ``lineages`` roster is then validated before any submission or dry-run
+    print -- a caller-supplied roster mixing an approved and an unapproved
+    lineage (for example ``("L1", "L9")``) refuses before ``L1`` is ever
+    submitted, not partway through. :func:`submit_lineage`/
+    :func:`build_sbatch_command` repeat the same per-lineage check as
+    defence in depth. Then validates the T_WALL/E_WALL budget (F4) before
+    any lineage is attempted. A lineage whose train submission fails raises
+    before any later lineage is attempted: this function does no
+    partial-progress bookkeeping beyond what each already-successful
+    :func:`submit_lineage` call returned to the caller before the failure.
     """
 
     _validate_payload(payload)
+    for lineage in lineages:
+        _validate_science_lineage(payload, lineage)
     _validate_wall_budget(t_wall, e_wall)
     results: dict[str, tuple[str | None, str | None]] = {}
     for lineage in lineages:
@@ -569,11 +605,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         choices=("science", "pipeline-check"),
         help=(
-            "Which payload every lineage dispatches (G1/decision F3). 'science' always "
-            "refuses before any sbatch submission (no approved per-lineage science "
-            "configuration interface exists yet). 'pipeline-check' explicitly selects "
-            "the non-science pipeline-check payload, labelled as such in job names and "
-            "in-job argv. No default: the caller must choose."
+            "Which payload every lineage dispatches (G1/decision F3; TO baff945c). "
+            "'science' dispatches the approved per-lineage science training config for "
+            "L1-L3; any other lineage still refuses before any sbatch submission. "
+            "'pipeline-check' explicitly selects the non-science pipeline-check payload, "
+            "labelled as such in job names and in-job argv. No default: the caller must "
+            "choose."
         ),
     )
     parser.add_argument(

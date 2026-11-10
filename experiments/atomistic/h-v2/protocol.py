@@ -3,16 +3,40 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from experiments.toolkit.attached_activation import file_sha256
 
 ROOT = Path(__file__).parent
 TRAINING_SEED = 910001
 SAMPLER_SEED = 910002
 EVALUATION_SEEDS = (910003, 910004)
+
+#: A1/TO baff945c: scale-only overrides onto the frozen pipeline-check
+#: training config, applied by explicit dotted key path (never a blind
+#: ``OmegaConf.merge``, which replaces ``model.layers`` wholesale instead of
+#: touching one nested leaf). The overlay file's key set must equal this
+#: allowlist exactly.
+SCIENCE_SCALE_OVERLAY_PATH = ROOT / "configs" / "science_scale_overlay.yaml"
+SCIENCE_SCALE_OVERLAY_KEYS = frozenset(
+    {
+        "runtime.device",
+        "sampler.n_walkers",
+        "trainer.max_steps",
+        "model.embedding.out_channels",
+        "model.embedding.hidden_channels",
+        "model.layers.0.mixing.channels",
+        "model.layers.0.path_aggregation.channels",
+        "model.readout.channels",
+    }
+)
+
+#: Source of per-lineage science seeds (A1: "no seed literal outside CI").
+CONTRACT_INPUTS_PATH = ROOT / "contract_inputs.json"
 
 #: Contract-frozen nuclear cusp law literals (``admission.pipeline_check.nuclear_law_note``).
 CONTRACT_NUCLEAR_LAW = {
@@ -36,6 +60,96 @@ def training_config() -> dict[str, Any]:
     """Return a fresh copy of the frozen short-route training config."""
 
     return copy.deepcopy(load_yaml(ROOT / "configs" / "train.yaml"))
+
+
+def _set_by_dotted_path(config: dict[str, Any], dotted: str, value: Any) -> None:
+    """Set one leaf of *config* addressed by a ``.``-separated path.
+
+    A purely-numeric segment indexes a list (``model.layers.0...``); any
+    other segment indexes a mapping. This never creates a missing
+    intermediate node -- the overlay only ever touches leaves that already
+    exist in the frozen base config.
+    """
+
+    parts = dotted.split(".")
+    node: Any = config
+    for part in parts[:-1]:
+        node = node[int(part)] if part.isdigit() else node[part]
+    last = parts[-1]
+    if last.isdigit():
+        node[int(last)] = value
+    else:
+        node[last] = value
+
+
+def _science_seed_roster() -> dict[str, list[int]]:
+    """Read the frozen per-lineage training seeds from ``contract_inputs.json``.
+
+    Returns
+    -------
+    dict
+        ``measurement.seed_roster``'s ``training_initialization_seeds`` and
+        ``training_sampler_seeds`` lists -- the single frozen source; no
+        seed literal is duplicated here.
+    """
+
+    payload = json.loads(CONTRACT_INPUTS_PATH.read_text(encoding="utf-8"))
+    roster = payload["measurement"]["seed_roster"]
+    return {
+        "training_initialization_seeds": roster["training_initialization_seeds"],
+        "training_sampler_seeds": roster["training_sampler_seeds"],
+    }
+
+
+def science_training_config(lineage: str, lineage_index: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return one lineage's science TRAIN config, plus its config identity.
+
+    Parameters
+    ----------
+    lineage : str
+        Opaque lineage identity (for example ``"L1"``); recorded in the
+        identity, never used here to decide which lineages are approved --
+        that roster stays owned by ``launch_config.LINEAGES``, checked by
+        the caller before this function is ever reached.
+    lineage_index : int
+        0-based index into ``contract_inputs.json``'s seed roster
+        (``launch_config.LINEAGES.index(lineage)``).
+
+    Returns
+    -------
+    tuple of dict, dict
+        The resolved science training config (base ``train.yaml`` plus the
+        scale overlay plus the lineage's frozen seeds), and a science-config
+        identity record (lineage, lineage index, and the sha256 of every
+        frozen input file this config was built from).
+
+    Raises
+    ------
+    ValueError
+        If the overlay file's key set has drifted from
+        :data:`SCIENCE_SCALE_OVERLAY_KEYS`.
+    """
+
+    config = training_config()
+    overlay = load_yaml(SCIENCE_SCALE_OVERLAY_PATH)
+    if set(overlay) != SCIENCE_SCALE_OVERLAY_KEYS:
+        raise ValueError(
+            f"science scale overlay key set {set(overlay)!r} does not match the allowlist "
+            f"{set(SCIENCE_SCALE_OVERLAY_KEYS)!r}"
+        )
+    for dotted, value in overlay.items():
+        _set_by_dotted_path(config, dotted, value)
+    seeds = _science_seed_roster()
+    config["runtime"]["seed"] = seeds["training_initialization_seeds"][lineage_index]
+    config["sampler"]["seed"] = seeds["training_sampler_seeds"][lineage_index]
+    identity = {
+        "lineage": lineage,
+        "lineage_index": lineage_index,
+        "overlay_sha256": file_sha256(SCIENCE_SCALE_OVERLAY_PATH),
+        "base_train_sha256": file_sha256(ROOT / "configs" / "train.yaml"),
+        "contract_inputs_sha256": file_sha256(CONTRACT_INPUTS_PATH),
+    }
+    return config, identity
 
 
 def evaluation_config(checkpoint: Path, *, stream: int = 0, root: Path | None = None) -> dict[str, Any]:
@@ -102,13 +216,17 @@ def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False
 
 
 __all__ = [
+    "CONTRACT_INPUTS_PATH",
     "CONTRACT_NUCLEAR_LAW",
     "EVALUATION_SEEDS",
     "ROOT",
     "SAMPLER_SEED",
+    "SCIENCE_SCALE_OVERLAY_KEYS",
+    "SCIENCE_SCALE_OVERLAY_PATH",
     "TRAINING_SEED",
     "assert_hydrogen_contract",
     "evaluation_config",
     "load_yaml",
+    "science_training_config",
     "training_config",
 ]

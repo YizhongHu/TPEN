@@ -20,6 +20,7 @@ extend without redefining this schema.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import sys
@@ -111,6 +112,20 @@ _TRAJECTORY_ARTIFACTS = {
     "trajectory_csv": "trajectory/sampled_eval_table.csv",
     "trajectory_metadata": "trajectory/sampled_eval_table.metadata.json",
 }
+#: TO baff945c: required science-config identity fields a payload=science
+#: receipt must carry (see :func:`build_h_v2_accepted_receipt`'s refusal and
+#: ``run_job.checkpoint_dir_for_eval``'s consumer-side check).
+SCIENCE_CONFIG_IDENTITY_KEYS = frozenset(
+    {
+        "lineage",
+        "lineage_index",
+        "overlay_sha256",
+        "base_train_sha256",
+        "contract_inputs_sha256",
+        "materialized_config_sha256",
+    }
+)
+
 #: D3: the unresolved ``${run.dir}/...`` prefix every per-run artifact path in
 #: these frozen configs is written under; stripping it from a callback's own
 #: unresolved config value gives the artifact's path relative to the fenced
@@ -152,6 +167,8 @@ class PreparedHV2Run:
     config: Mapping[str, Any]
     overrides: tuple[str, ...]
     artifact_declarations: Mapping[str, str]
+    payload: str = "pipeline-check"
+    science_config_identity: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,8 +204,10 @@ def build_h_v2_train_plan(
     seed: int | None = None,
     n_walkers: int | None = None,
     max_steps: int | None = None,
+    config: Mapping[str, Any] | None = None,
+    science_config_identity: Mapping[str, Any] | None = None,
 ) -> tuple[StagePlanV2, dict[str, tuple[str, ...]], dict[str, Any]]:
-    """Build the one-task H-v2 TRAIN plan from the frozen training config.
+    """Build the one-task H-v2 TRAIN plan from a training config.
 
     Parameters
     ----------
@@ -200,9 +219,22 @@ def build_h_v2_train_plan(
         Opaque lineage identity (for example ``"L1"``); becomes part of the
         task identity and the run's ``run.run_id``.
     seed, n_walkers, max_steps : int, optional
-        Overrides of the frozen training config's literals.  Omitted values
-        default to the config's own values, so a bare call reproduces the
-        frozen pipeline-check config exactly.
+        Overrides of ``config``'s literals.  Omitted values default to
+        ``config``'s own values, so a bare call reproduces whichever base
+        config was passed in exactly -- this never reapplies the frozen
+        pipeline-check config's own defaults on top of a different ``config``.
+    config : mapping, optional
+        Base config to build from. Defaults to
+        ``protocol.training_config()`` (the frozen pipeline-check config).
+        A caller building the science config passes
+        ``protocol.science_training_config(...)``'s resolved config here
+        instead.
+    science_config_identity : mapping, optional
+        TO baff945c: when *config* is a science config, the identity record
+        ``protocol.science_training_config`` returned alongside it (lineage,
+        lineage index, and frozen-input sha256s). Carried into the task's
+        metadata so the H-v2 accepted receipt can record it; ``None`` for the
+        pipeline-check payload.
 
     Returns
     -------
@@ -221,7 +253,7 @@ def build_h_v2_train_plan(
 
     out = _absolute(output_dir, "output_dir")
     results = _absolute(results_root, "results_root")
-    config = protocol.training_config()
+    config = copy.deepcopy(dict(config)) if config is not None else protocol.training_config()
     seed = config["runtime"]["seed"] if seed is None else seed
     n_walkers = config["sampler"]["n_walkers"] if n_walkers is None else n_walkers
     max_steps = config["trainer"]["max_steps"] if max_steps is None else max_steps
@@ -244,6 +276,15 @@ def build_h_v2_train_plan(
         f"trainer.max_steps={max_steps}",
         f"sampler.n_walkers={n_walkers}",
     )
+    metadata: dict[str, Any] = {"route": ROUTE_NAME, "lineage": lineage}
+    if science_config_identity is not None:
+        metadata["payload"] = "science"
+        metadata["science_config_identity"] = {
+            **dict(science_config_identity),
+            "materialized_config_sha256": file_sha256(config_path),
+        }
+    else:
+        metadata["payload"] = "pipeline-check"
     task = LogicalTaskSpec(
         logical_task_id=task_id,
         stage=TRAIN_STAGE,
@@ -258,7 +299,7 @@ def build_h_v2_train_plan(
             "max_steps": max_steps,
             "executor_overrides": overrides,
         },
-        metadata={"route": ROUTE_NAME, "lineage": lineage},
+        metadata=metadata,
     ).validate()
     plan = StagePlanV2(
         study="tpen_h_v2",
@@ -592,7 +633,15 @@ def prepare_h_v2_run(
         metadata={"route": ROUTE_NAME, "stage": task.stage},
     )
     return PreparedHV2Run(
-        plan, handoff, task.logical_task_id, str(effective_config), dict(config), overrides, artifact_declarations
+        plan,
+        handoff,
+        task.logical_task_id,
+        str(effective_config),
+        dict(config),
+        overrides,
+        artifact_declarations,
+        payload=task.metadata.get("payload", "pipeline-check"),
+        science_config_identity=task.metadata.get("science_config_identity"),
     )
 
 
@@ -760,6 +809,8 @@ def activate_h_v2_run(
             stage=stage,
             inspect_run=inspect_run,
             artifact_declarations=reconciled_artifact_declarations,
+            payload=prepared.payload,
+            science_config_identity=prepared.science_config_identity,
         )
     except (HV2ReceiptRefusal, ManifestRefusal) as error:
         write_activation_failure_receipt(
@@ -792,6 +843,8 @@ def build_h_v2_accepted_receipt(
     stage: str = TRAIN_STAGE,
     inspect_run: Any = None,
     artifact_declarations: Mapping[str, str] | None = None,
+    payload: str = "pipeline-check",
+    science_config_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the study-side H-v2 accepted-receipt payload from one manifest.
 
@@ -821,6 +874,15 @@ def build_h_v2_accepted_receipt(
         for EVAL, the trajectory artifacts this function already declares.
         Later logging layers extend this without redefining the receipt
         schema.
+    payload : {"science", "pipeline-check"}, default="pipeline-check"
+        TO baff945c: which payload this TRAIN segment dispatched. Recorded
+        verbatim on the receipt.
+    science_config_identity : mapping, optional
+        Required when ``payload == "science"``: the identity record
+        returned alongside the config by ``protocol.science_training_config``
+        plus ``materialized_config_sha256``
+        (:data:`SCIENCE_CONFIG_IDENTITY_KEYS`). A science receipt missing any
+        of these fields refuses rather than being written incomplete.
 
     Returns
     -------
@@ -830,6 +892,9 @@ def build_h_v2_accepted_receipt(
 
     Raises
     ------
+    HV2ReceiptRefusal
+        Code ``science-config-identity-missing``, if ``payload == "science"``
+        and ``science_config_identity`` omits any required field.
     ManifestRefusal
         If the manifest, chain, or public core evidence is inconsistent
         (propagated unchanged from ``read()``), the task-set does not match
@@ -869,6 +934,14 @@ def build_h_v2_accepted_receipt(
 
     if stage not in (TRAIN_STAGE, EVAL_STAGE):
         raise ValueError(f"stage must be {TRAIN_STAGE!r} or {EVAL_STAGE!r}, got {stage!r}")
+    if payload == "science":
+        missing = SCIENCE_CONFIG_IDENTITY_KEYS - set(science_config_identity or {})
+        if missing:
+            raise HV2ReceiptRefusal(
+                "science-config-identity-missing",
+                f"payload=science receipt is missing required science config identity fields: "
+                f"{sorted(missing)!r}",
+            )
     manifest_path = Path(manifest_path)
     expected = tuple(str(item) for item in expected_task_ids)
     declared = dict(_BASE_ARTIFACTS)
@@ -954,8 +1027,8 @@ def build_h_v2_accepted_receipt(
         )
 
     by_task: dict[str, list[str]] = {}
-    for payload in segments_payload:
-        by_task.setdefault(payload["task_id"], []).append(payload["resolved_config_sha256"])
+    for segment_payload in segments_payload:
+        by_task.setdefault(segment_payload["task_id"], []).append(segment_payload["resolved_config_sha256"])
     for task_id, hashes in by_task.items():
         if len(set(hashes)) != 1:
             raise HV2ReceiptRefusal(
@@ -968,6 +1041,8 @@ def build_h_v2_accepted_receipt(
         "run_manifest_sha256": file_sha256(manifest_path),
         "segments": segments_payload,
         "retry": "forbidden",
+        "payload": payload,
+        "science_config_identity": dict(science_config_identity) if science_config_identity is not None else None,
     }
 
 
@@ -1014,6 +1089,7 @@ __all__ = [
     "HV2ReceiptRefusal",
     "PreparedHV2Run",
     "ROUTE_NAME",
+    "SCIENCE_CONFIG_IDENTITY_KEYS",
     "TRAIN_STAGE",
     "activate_h_v2_run",
     "build_h_v2_accepted_receipt",

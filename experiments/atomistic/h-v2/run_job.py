@@ -72,12 +72,12 @@ def _h_v2_module(name: str):
 
 attached = _h_v2_module("attached")
 launch_config = _h_v2_module("launch_config")
+protocol = _h_v2_module("protocol")
 
-#: F3: no approved per-lineage science configuration interface exists yet
-#: (design target section A1; the follow-up is tracked on item 3c13ba74).
-#: TRAIN refuses with this code rather than silently submitting
-#: ``protocol.training_config()``'s CPU pipeline-check defaults relabeled
-#: with a science lineage name.
+#: TO baff945c: TRAIN refuses with this code for any lineage outside
+#: ``launch_config.LINEAGES`` (the approved L1-L3 roster), before any
+#: dispatch -- never silently submitting ``protocol.training_config()``'s
+#: CPU pipeline-check defaults relabeled with an unapproved lineage name.
 SCIENCE_CONFIG_UNAVAILABLE_CODE = "h-v2-science-config-unavailable"
 
 #: F3: the label an explicitly-selected non-science dispatch carries in its
@@ -231,8 +231,26 @@ def checkpoint_dir_for_eval(run_root: Path, lineage: str, *, pipeline_check: boo
     receipt_path = run_root / "attached" / "receipts" / f"{task_id}.h-v2.json"
     if not receipt_path.is_file():
         raise JobError(f"no TRAIN accepted receipt at {receipt_path}; TRAIN must complete before EVAL")
-    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
-    segments = payload.get("segments") or []
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    # TO baff945c review r1 (F1): require science identity whenever THIS CALL
+    # asks for a science checkpoint (pipeline_check=False), not merely when
+    # the receipt happens to carry a "science" payload string -- a receipt
+    # producer bug or tamper that drops/malforms the payload field must not
+    # silently bypass the identity check. The receipt's own payload is itself
+    # validated here, not trusted blind.
+    if not pipeline_check:
+        if receipt.get("payload") != "science":
+            raise JobError(
+                f"TRAIN accepted receipt {receipt_path} does not carry payload='science' "
+                f"(got {receipt.get('payload')!r}); refusing to trust it for a science checkpoint"
+            )
+        missing = attached.SCIENCE_CONFIG_IDENTITY_KEYS - set(receipt.get("science_config_identity") or {})
+        if missing:
+            raise JobError(
+                f"TRAIN accepted receipt {receipt_path} claims payload=science but is missing "
+                f"science config identity fields: {sorted(missing)!r}"
+            )
+    segments = receipt.get("segments") or []
     if not segments:
         raise JobError(f"TRAIN accepted receipt {receipt_path} carries no segments")
     return Path(segments[0]["checkpoint_dir"])
@@ -248,20 +266,17 @@ def run(stage: str, lineage: str, *, pipeline_check: bool = False) -> None:
     lineage : str
         Opaque lineage identity (for example ``"L1"``).
     pipeline_check : bool, default=False
-        F3: TRAIN refuses before dispatch unless this is explicitly set,
-        because no approved per-lineage science configuration interface
-        exists yet (design target section A1) and the only config this
-        route can otherwise build is ``protocol.training_config()``'s CPU
-        pipeline-check payload -- not a science run. Setting this
-        explicitly selects that non-science payload (its task id, job
-        name and logs say so); production launch (``launch.py``) never
-        sets it.
+        Selects the non-science pipeline-check payload (its task id, job
+        name and logs say so) instead of the science payload TRAIN builds
+        by default for an approved lineage (TO baff945c,
+        ``protocol.science_training_config``).
 
     Raises
     ------
     JobError
         Code :data:`SCIENCE_CONFIG_UNAVAILABLE_CODE`, if ``stage`` is
-        ``"train"`` and ``pipeline_check`` is not set.
+        ``"train"``, ``pipeline_check`` is not set, and ``lineage`` is not
+        one of ``launch_config.LINEAGES`` (the approved L1-L3 roster).
     """
 
     run_root = Path(_require_env("RUN")).resolve()
@@ -271,18 +286,24 @@ def run(stage: str, lineage: str, *, pipeline_check: bool = False) -> None:
 
     check_identity(run_root, expected_commit, science_python)
 
+    science_config = None
+    science_config_identity = None
     if stage == "train":
-        if not pipeline_check:
-            raise JobError(
-                f"{SCIENCE_CONFIG_UNAVAILABLE_CODE}: no approved per-lineage science "
-                "configuration interface exists yet (design target section A1; "
-                "follow-up tracked on item 3c13ba74). Refusing before dispatch "
-                "rather than silently submitting protocol.training_config()'s CPU "
-                f"pipeline-check defaults for lineage {lineage!r}. Pass "
-                "pipeline_check=True (CLI: --pipeline-check) to explicitly select "
-                "the non-science pipeline-check payload."
-            )
-        build_lineage = f"{PIPELINE_CHECK_LABEL}-{lineage}"
+        if pipeline_check:
+            build_lineage = f"{PIPELINE_CHECK_LABEL}-{lineage}"
+        else:
+            if lineage not in launch_config.LINEAGES:
+                raise JobError(
+                    f"{SCIENCE_CONFIG_UNAVAILABLE_CODE}: lineage {lineage!r} is not an approved "
+                    f"science lineage ({launch_config.LINEAGES!r}); refusing before any dispatch "
+                    "rather than silently submitting protocol.training_config()'s CPU "
+                    "pipeline-check defaults under an unapproved lineage name. Pass "
+                    "pipeline_check=True (CLI: --pipeline-check) to explicitly select "
+                    "the non-science pipeline-check payload instead."
+                )
+            build_lineage = lineage
+            lineage_index = launch_config.LINEAGES.index(lineage)
+            science_config, science_config_identity = protocol.science_training_config(lineage, lineage_index)
         task_id = _train_task_id(lineage, pipeline_check=pipeline_check)
     elif stage == "eval":
         build_lineage = lineage
@@ -305,7 +326,11 @@ def run(stage: str, lineage: str, *, pipeline_check: bool = False) -> None:
 
     if stage == "train":
         plan, overrides, config = attached.build_h_v2_train_plan(
-            output_dir=handoff_dir, results_root=results_root, lineage=build_lineage
+            output_dir=handoff_dir,
+            results_root=results_root,
+            lineage=build_lineage,
+            config=science_config,
+            science_config_identity=science_config_identity,
         )
     else:
         checkpoint_dir = checkpoint_dir_for_eval(run_root, lineage, pipeline_check=pipeline_check)
@@ -342,13 +367,28 @@ def run(stage: str, lineage: str, *, pipeline_check: bool = False) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse and dispatch the in-job CLI.
+
+    Review r1 (F2): an explicit payload choice is required -- either
+    ``--pipeline-check`` or ``--payload science`` -- for both ``train`` and
+    ``eval``. A bare ``train L1``/``eval L1`` with neither refuses (exit 2)
+    rather than defaulting to the science payload.
+    """
+
     argv = list(sys.argv[1:] if argv is None else argv)
     pipeline_check = False
+    explicit_science = False
     if argv and argv[-1] == "--pipeline-check":
         pipeline_check = True
         argv = argv[:-1]
-    if len(argv) != 2:
-        print("usage: run_job.py {train|eval} <lineage> [--pipeline-check]", file=sys.stderr)
+    elif len(argv) >= 2 and argv[-2:] == ["--payload", "science"]:
+        explicit_science = True
+        argv = argv[:-2]
+    if len(argv) != 2 or not (pipeline_check or explicit_science):
+        print(
+            "usage: run_job.py {train|eval} <lineage> {--payload science|--pipeline-check}",
+            file=sys.stderr,
+        )
         return 2
     stage, lineage = argv
     try:
