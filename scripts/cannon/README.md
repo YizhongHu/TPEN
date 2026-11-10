@@ -92,3 +92,15 @@ combinations plus one full-suite timing in the evidence root. All evidence is
 written live below RUN_ROOT; throwaway checkout, cache, temporary files,
 overlays, and mutant backups are removed from the exact job scratch directory
 by the exit trap.
+
+## Layout
+
+Facility-specific code and its tests live under `scripts/cannon/`, never under
+the core `tpen` package or core `tests/` tree: core may provide generic
+structure (markers, hooks) but never facility specifics. Tests for this
+runner (and any other facility-specific test that previously lived under
+`tests/unit/infra`) belong in `scripts/cannon/tests/`, with their own
+`conftest.py`/pytest config local to that directory. The root `pyproject.toml`
+excludes `scripts` via `norecursedirs`, so a bare `pytest`/`uv run pytest` from
+the repository root never collects facility-specific tests; run them
+explicitly with `uv run pytest scripts/cannon/tests`.

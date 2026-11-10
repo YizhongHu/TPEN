@@ -34,7 +34,7 @@ def _typeguard_instruments_tpen(config: pytest.Config) -> bool:
     ``pytest_configure`` uses (``typeguard._pytest_plugin``), rather than
     guessing from an env var, so this agrees with what actually got
     instrumented regardless of how ``--typeguard-packages`` was set or
-    cleared (e.g. Cannon quick mode's ``-o addopts=`` override).
+    cleared (e.g. a runner disabling typeguard via ``-o addopts=``).
     """
 
     packages_option = config.getoption("typeguard_packages", default=None) or config.getini(
@@ -54,8 +54,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     """Skip ``requires_typeguard`` tests when typeguard is not instrumenting tpen.
 
     These tests assert a bare ``TypeCheckError`` with no manual-validation
-    fallback, so they always fail when runtime type checking is off (e.g.
-    Cannon quick mode); the full suite still runs them with typeguard on.
+    fallback, so they always fail when runtime type checking is off (e.g. a
+    runner disabling typeguard for a quick pass); the full suite still runs
+    them with typeguard on.
     """
 
     if _typeguard_instruments_tpen(config):
