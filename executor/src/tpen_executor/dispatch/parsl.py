@@ -339,6 +339,10 @@ class ParslDispatcher(DispatcherContract):
                 available.append(binding)
                 return
             try:
+                # A fence is begun before preparation. Keep both values
+                # defined so preparation errors reach typed completion.
+                materialized = None
+                environment = None
                 materialized = self.worker.materialize(env)
                 environment = self._worker_environment(materialized, binding)
                 environment = _with_child_context_keys(environment, lifecycle.allocation)

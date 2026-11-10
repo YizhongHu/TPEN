@@ -126,9 +126,13 @@ def expand_slurm_nodelist(value: str) -> tuple[str, ...]:
                     raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains an invalid range")
                 if int(end) - int(start) + 1 > _MAX_SCHEDULER_HOSTS:
                     raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST range exceeds the bounded host limit")
+                if len(result) + (int(end) - int(start) + 1) > _MAX_SCHEDULER_HOSTS:
+                    raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST token exceeds the bounded host limit")
                 width = max(len(start), len(end))
                 result.extend(f"{prefix}{index:0{width}d}{suffix}" for index in range(int(start), int(end) + 1))
             elif item.isdigit():
+                if len(result) >= _MAX_SCHEDULER_HOSTS:
+                    raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST token exceeds the bounded host limit")
                 result.append(f"{prefix}{int(item):0{len(item)}d}{suffix}")
             else:
                 raise PlacementRefusal("host-map-ambiguous", "SLURM_NODELIST contains an invalid host token")
@@ -203,7 +207,7 @@ def scheduler_host_map(
             else:
                 pbs_path = captured
     slurm = next((values.get(key) for key in ("slurm_nodelist", "SLURM_NODELIST") if values.get(key) is not None), None)
-    if pbs is None and slurm is None and environ is not None:
+    if pbs is None and pbs_path is None and slurm is None and environ is not None:
         pbs_path = env.get("PBS_NODEFILE")
         slurm = env.get("SLURM_NODELIST")
     if pbs_path is not None:

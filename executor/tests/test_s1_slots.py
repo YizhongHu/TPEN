@@ -726,6 +726,20 @@ def test_n1_unusable_shared_evidence_reader_refuses_before_child_launch(tmp_path
 
 
 @PARSL_REQUIRED
+def test_d2_pool_materialization_failure_finishes_each_begun_fence_once(tmp_path: Path) -> None:
+    """D2: early pool preparation failures publish typed terminal outcomes."""
+
+    dispatcher = _dispatcher(tmp_path, _stub_package(tmp_path))
+    object.__setattr__(dispatcher, "worker", SimpleNamespace(materialize=lambda _env: (_ for _ in ()).throw(RuntimeError("materialize failed"))))
+    group = _group("first", "second")
+    lifecycle = AttachedAllocation(_allocation(tmp_path, slots=_slots(2)), DirectoryStore(tmp_path / "store"))
+    manifest = dispatcher.run(group, _runs(tmp_path, "first", "second"), lifecycle)
+    assert [attempt.task_id for attempt in manifest.attempts] == ["first", "second"]
+    assert [attempt.outcome_receipt.status for attempt in manifest.attempts] == ["launch_failed", "launch_failed"]  # type: ignore[union-attr]
+    assert all(attempt.outcome_receipt is not None for attempt in manifest.attempts)
+
+
+@PARSL_REQUIRED
 def test_t7_cancel_before_spawn_finishes_only_the_begun_fence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """T7 kills post-cancel refill and dropped terminal-fence mutants."""
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import field
 import math
+import re
 from typing import Any, ClassVar
 
 from ._codec import _freeze, canonical_bytes, decode_json, fields, sequence, sha256_text, text, thaw
@@ -13,6 +14,7 @@ from ._records import frozen_record
 
 OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed"})
 PLACEMENT_COMPARISON_STATES = frozenset({"matched", "mismatch", "unavailable", "refused"})
+_GPU_UUID_RE = re.compile(r"^GPU-[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$", re.IGNORECASE)
 
 
 def _identity(value: Any, cls: type, name: str) -> Any:
@@ -383,9 +385,9 @@ class SciencePlacementReceiptV2:
             value = self.gpu_sampler[key]
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"v2 gpu_sampler {key} is invalid")
-        if self.gpu_sampler["join_timeout_seconds"] < 1.0:
+        if self.gpu_sampler["join_timeout_seconds"] < 1.0 or self.gpu_sampler["join_timeout_seconds"] > 4.0:
             raise ValueError("v2 gpu_sampler join timeout is too short")
-        if type(self.gpu_sampler["count"]) is not int or self.gpu_sampler["count"] < 0 or self.gpu_sampler["count"] > 16:
+        if type(self.gpu_sampler["count"]) is not int or isinstance(self.gpu_sampler["count"], bool) or self.gpu_sampler["count"] < 0 or self.gpu_sampler["count"] > 16:
             raise ValueError("v2 gpu_sampler count is invalid")
         for key in ("monotonic_start", "monotonic_end"):
             value = self.gpu_sampler[key]
@@ -396,8 +398,16 @@ class SciencePlacementReceiptV2:
                 raise ValueError("observed sampler requires version and samples")
             if self.gpu_sampler["monotonic_start"] is None or self.gpu_sampler["monotonic_end"] is None or self.gpu_sampler["monotonic_end"] <= self.gpu_sampler["monotonic_start"]:
                 raise ValueError("observed sampler requires a positive interval")
-        elif self.gpu_sampler["count"] != 0 or self.gpu_sampler["samples"]:
-            raise ValueError("unavailable sampler cannot contain samples")
+            if self.gpu_sampler["cadence_seconds"] <= 0:
+                raise ValueError("observed sampler cadence must be positive")
+        elif self.gpu_sampler["count"] == 0:
+            if self.gpu_sampler["monotonic_start"] is not None or self.gpu_sampler["monotonic_end"] is not None or self.gpu_sampler["samples"]:
+                raise ValueError("empty unavailable sampler has an interval or samples")
+        elif self.gpu_sampler["count"] != len(self.gpu_sampler["samples"]):
+            raise ValueError("partial unavailable sampler count disagrees with samples")
+        if self.gpu_sampler["monotonic_start"] is not None and self.gpu_sampler["monotonic_end"] is not None:
+            if self.gpu_sampler["monotonic_end"] < self.gpu_sampler["monotonic_start"] or abs(self.gpu_sampler["elapsed_seconds"] - (self.gpu_sampler["monotonic_end"] - self.gpu_sampler["monotonic_start"])) > 1e-6:
+                raise ValueError("v2 gpu_sampler elapsed time disagrees with interval")
         for key in ("inventory", "pid_rows", "samples", "command_pids", "survivors"):
             if isinstance(self.gpu_sampler[key], (str, bytes, bytearray)) or not isinstance(self.gpu_sampler[key], Sequence):
                 raise TypeError(f"v2 gpu_sampler {key} must be a sequence")
@@ -405,20 +415,20 @@ class SciencePlacementReceiptV2:
             if not isinstance(sample, Mapping) or set(sample) != {"monotonic_start", "monotonic_end", "inventory", "pid_rows"}:
                 raise ValueError("v2 gpu_sampler sample keys differ")
             for row in sample["inventory"]:
-                if not isinstance(row, Mapping) or set(row) != {"uuid", "pci.bus_id"}:
+                if not isinstance(row, Mapping) or set(row) != {"uuid", "pci.bus_id"} or type(row["uuid"]) is not str or not _GPU_UUID_RE.fullmatch(row["uuid"]) or type(row["pci.bus_id"]) is not str or not row["pci.bus_id"]:
                     raise ValueError("v2 gpu_sampler inventory row keys differ")
             for row in sample["pid_rows"]:
-                if not isinstance(row, Mapping) or set(row) != {"pid", "gpu_uuid"}:
+                if not isinstance(row, Mapping) or set(row) != {"pid", "gpu_uuid"} or type(row["pid"]) is not int or row["pid"] <= 0 or type(row["gpu_uuid"]) is not str or not _GPU_UUID_RE.fullmatch(row["gpu_uuid"]):
                     raise ValueError("v2 gpu_sampler PID row keys differ")
         for row in self.gpu_sampler["inventory"]:
-            if not isinstance(row, Mapping) or set(row) != {"uuid", "pci.bus_id"}:
+            if not isinstance(row, Mapping) or set(row) != {"uuid", "pci.bus_id"} or type(row["uuid"]) is not str or not _GPU_UUID_RE.fullmatch(row["uuid"]) or type(row["pci.bus_id"]) is not str or not row["pci.bus_id"]:
                 raise ValueError("v2 gpu_sampler inventory row keys differ")
         for row in self.gpu_sampler["pid_rows"]:
-            if not isinstance(row, Mapping) or set(row) != {"pid", "gpu_uuid"}:
+            if not isinstance(row, Mapping) or set(row) != {"pid", "gpu_uuid"} or type(row["pid"]) is not int or row["pid"] <= 0 or type(row["gpu_uuid"]) is not str or not _GPU_UUID_RE.fullmatch(row["gpu_uuid"]):
                 raise ValueError("v2 gpu_sampler PID row keys differ")
-        if self.gpu_sampler["status"] == "observed":
+        if self.gpu_sampler["status"] == "observed" or self.gpu_sampler["count"]:
             if len(self.gpu_sampler["samples"]) != self.gpu_sampler["count"]:
-                raise ValueError("observed sampler count disagrees with samples")
+                raise ValueError("sampler count disagrees with samples")
             for sample in self.gpu_sampler["samples"]:
                 start, end = sample["monotonic_start"], sample["monotonic_end"]
                 if (
@@ -431,6 +441,8 @@ class SciencePlacementReceiptV2:
                 raise ValueError("v2 gpu_sampler summary disagrees with final sample")
         if any(type(pid) is not int or pid <= 0 for pid in self.gpu_sampler["command_pids"]):
             raise ValueError("v2 gpu_sampler command PID is invalid")
+        if self.gpu_sampler["status"] == "observed" and not self.gpu_sampler["command_pids"]:
+            raise ValueError("observed sampler requires command PIDs")
         if self.gpu_sampler["quiescent"] is True and self.gpu_sampler["survivors"]:
             raise ValueError("quiescent sampler cannot report survivors")
         expected_verdict = {"host", "device", "qualification", "reason_class", "reason", "science_acceptance", "warning"}
@@ -455,10 +467,22 @@ class SciencePlacementReceiptV2:
         if self.verdict["science_acceptance"] not in {"accepted", "not-accepted"}:
             raise ValueError("v2 verdict science acceptance is invalid")
         if self.verdict["qualification"] == "qualified":
-            if self.verdict["host"] != "matched" or self.verdict["device"] != "matched" or self.verdict["reason_class"] != "qualified" or self.verdict["science_acceptance"] != "accepted" or self.verdict["warning"]:
+            if self.host_mapping["status"] != "matched" or self.base.comparison != {"host": "matched", "affinity": "matched", "device": "matched"} or self.verdict["host"] != "matched" or self.verdict["device"] != "matched" or self.verdict["reason_class"] != "qualified" or self.verdict["science_acceptance"] != "accepted" or self.verdict["warning"]:
                 raise ValueError("qualified v2 verdict is internally inconsistent")
+            if self.base.refusal is not None or not self.base.declared["devices"] or self.gpu_sampler["status"] != "observed":
+                raise ValueError("qualified v2 verdict requires live GPU telemetry")
+            child_pid = self.base.child["pid"]
+            declared = {item.upper() for item in self.base.declared["devices"]}
+            inventory = {row["uuid"].upper() for row in self.gpu_sampler["inventory"]}
+            if not declared.issubset(inventory):
+                raise ValueError("qualified v2 verdict has unresolved GPU entitlement")
+            live = {row["gpu_uuid"].upper() for row in self.gpu_sampler["pid_rows"] if row["pid"] == child_pid}
+            if not live or not live.issubset(declared):
+                raise ValueError("qualified v2 verdict lacks entitled live PID telemetry")
         elif self.verdict["science_acceptance"] != "not-accepted":
             raise ValueError("unqualified v2 verdict must be rejected for science")
+        if self.base.declared["devices"] and self.verdict["qualification"] == "unqualified" and not self.verdict["warning"]:
+            raise ValueError("unqualified declared GPU placement requires a warning")
         if self.verdict["reason_class"] == "qualified" and self.verdict["qualification"] != "qualified":
             raise ValueError("qualified reason class requires qualified verdict")
 

@@ -42,7 +42,30 @@ class ConfiguredAllocation:
             raise TypeError("allocation identities have invalid types")
         if not isinstance(self.facts, Mapping):
             raise TypeError("facts must be a mapping")
-        object.__setattr__(self, "facts", _freeze(self.facts, "facts"))
+        facts = dict(self.facts)
+        scheduler = facts.get("scheduler", facts.get("scheduler_host_map"))
+        if isinstance(scheduler, Mapping):
+            scheduler = dict(scheduler)
+            path_keys = {"pbs_nodefile_path", "PBS_NODEFILE_PATH"}
+            scalar_pbs = scheduler.get("pbs_nodefile", scheduler.get("PBS_NODEFILE"))
+            has_path = any(scheduler.get(key) is not None for key in path_keys) or (
+                isinstance(scalar_pbs, str) and "\n" not in scalar_pbs
+            )
+            if has_path:
+                # Scheduler paths are an input-time concern. Capture their
+                # contents before this allocation is frozen so later binding
+                # resolution cannot change an immutable allocation's host map.
+                from .placement import scheduler_host_map
+
+                hosts = scheduler_host_map(scheduler, environ={})
+                scheduler["pbs_nodefile_text"] = "\n".join(hosts)
+                for key in path_keys | {"pbs_nodefile", "PBS_NODEFILE"}:
+                    scheduler.pop(key, None)
+                if "scheduler" in facts:
+                    facts["scheduler"] = scheduler
+                else:
+                    facts["scheduler_host_map"] = scheduler
+        object.__setattr__(self, "facts", _freeze(facts, "facts"))
 
     def to_dict(self) -> dict[str, Any]:
         """Return the strict JSON representation."""

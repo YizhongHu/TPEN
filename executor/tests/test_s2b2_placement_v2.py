@@ -32,7 +32,9 @@ from tpen_executor.placement import (
     ChildPlacementObservation,
     ChildPlacementObservationV2,
     PlacementRefusal,
+    expand_slurm_nodelist,
     physical_slots_from_allocation,
+    scheduler_host_map,
 )
 from tpen_executor.results import AcceptedSegment, ManifestAttempt, OutcomeReceipt, RunManifest, SciencePlacementReceiptV2, StartReceipt
 from tpen_executor.runners import CoreRunEvidence, RUN_SHIM
@@ -42,6 +44,7 @@ from tpen_executor.workers import ProcessOutcome, SubprocessWorker
 
 GPU_A = "GPU-12345678-1234-1234-1234-123456789ABC"
 GPU_B = "GPU-12345678-1234-1234-1234-123456789ABD"
+GPU_C = "GPU-12345678-1234-1234-1234-123456789ABE"
 
 
 def _group() -> ReadyGroup:
@@ -50,9 +53,10 @@ def _group() -> ReadyGroup:
     return ReadyGroup("s2b2", (member,), digest("s2b2"))
 
 
-def _allocation(*, scheduler: object | None = None, device: str = GPU_A) -> ConfiguredAllocation:
+def _allocation(*, scheduler: object | None = None, device: str | tuple[str, ...] = GPU_A) -> ConfiguredAllocation:
     allowed = sorted(getattr(os, "sched_getaffinity", lambda _pid: (0,))(0))
-    slot = AllocationSlot("logical-slot", "logical-label", (device,), (allowed[0],), (), ()).to_dict()
+    devices = (device,) if isinstance(device, str) else device
+    slot = AllocationSlot("logical-slot", "logical-label", devices, (allowed[0],), (), ()).to_dict()
     facts: dict[str, object] = {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot]}}
     if scheduler is not None:
         facts["scheduler"] = scheduler
@@ -68,11 +72,40 @@ def test_m1_scheduler_map_replaces_logical_label_with_physical_node() -> None:
     assert physical_slots_from_allocation(_allocation(scheduler={"SLURM_NODELIST": "nid[001-001]"}))[0].node == "nid001"
 
 
-def _v2_inputs(tmp_path: Path, sampler: dict[str, object]):
+def test_r8_scheduler_path_is_captured_before_allocation_freezes(tmp_path: Path) -> None:
+    """R8: changing a nodefile cannot change an existing allocation map."""
+
+    nodefile = tmp_path / "PBS_NODEFILE"
+    nodefile.write_text("physical-01\n", encoding="utf-8")
+    allocation = _allocation(scheduler={"pbs_nodefile_path": str(nodefile)})
+    encoded = allocation.encode()
+    nodefile.write_text("physical-02\n", encoding="utf-8")
+    assert physical_slots_from_allocation(allocation)[0].node == "physical-01"
+    assert b"physical-01" in encoded and b"physical-02" not in encoded
+    assert scheduler_host_map({"pbs_nodefile_path": str(nodefile)}, environ={}) == ("physical-02",)
+
+
+def test_r12_slurm_expansion_bounds_each_bracket_token() -> None:
+    """R12: cumulative range budget is checked before list expansion."""
+
+    with pytest.raises(PlacementRefusal, match="bounded host limit"):
+        expand_slurm_nodelist("nid[0001-1024,0001-1024]")
+
+
+def test_r4_sampler_stays_in_child_group_and_has_bounded_drain() -> None:
+    """R4: sampler commands inherit cancellation and never unbounded-communicate."""
+
+    assert "start_new_session=True" not in RUN_SHIM
+    assert RUN_SHIM.count("communicate(timeout=GPU_COMMAND_TIMEOUT)") >= 2
+    assert "process.wait(timeout=GPU_COMMAND_TIMEOUT)" in RUN_SHIM
+    assert "process.kill()" in RUN_SHIM
+
+
+def _v2_inputs(tmp_path: Path, sampler: dict[str, object], declared_devices: tuple[str, ...] = (GPU_A,)):
     group = _group()
     configured = ConfiguredRun("task-a", str(tmp_path / "config.yaml"), ("payload.seed=1",))
     (tmp_path / "config.yaml").write_text("ok", encoding="utf-8")
-    allocation = _allocation(scheduler={"PBS_NODEFILE": "physical-01\n"})
+    allocation = _allocation(scheduler={"PBS_NODEFILE": "physical-01\n"}, device=declared_devices)
     fence = SimpleNamespace(attempt_id=AttemptId("attempt-a"), output_dir=str(tmp_path / "out"))
     allowed = sorted(getattr(os, "sched_getaffinity", lambda _pid: (0,))(0))
     sampler = dict(sampler)
@@ -102,7 +135,7 @@ def _v2_inputs(tmp_path: Path, sampler: dict[str, object]):
         "TPEN_SLOT_ID": "logical-slot",
         "TPEN_SLOT_NODE": "physical-01",
         "TPEN_SLOT_CPUS": str(allowed[0]),
-        "TPEN_PLACEMENT_DECLARED_DEVICES": GPU_A,
+        "TPEN_PLACEMENT_DECLARED_DEVICES": ",".join(declared_devices),
         "TPEN_PLACEMENT_RECEIPT_VERSION": "2",
         "TPEN_PLACEMENT_HOST_STATUS": "mapped",
     })
@@ -145,6 +178,50 @@ def test_m3_unavailable_is_typed_and_nonempty(tmp_path: Path, reason: str) -> No
     assert receipt.gpu_sampler["reason"]
 
 
+def test_d3_unresolved_declared_gpu_is_unavailable_even_when_another_is_active(tmp_path: Path) -> None:
+    """D3: every declared physical entitlement must resolve in inventory."""
+
+    sampler = {
+        "status": "observed", "reason": "observed", "method": "nvidia-smi-pid-uuid-v1", "version": "NVIDIA",
+        "cadence_seconds": 0.1, "count": 1, "monotonic_start": 1.0, "monotonic_end": 1.1,
+        "inventory": [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}],
+        "pid_rows": [{"pid": 1234, "gpu_uuid": GPU_A}],
+    }
+    group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path, sampler, (GPU_A, GPU_C))
+    receipt = _placement_receipt_v2(
+        observation, allocation, fence, group, group.members[0], configured, environment,
+        ProcessOutcome((), 0, "", "", False, 1234, 55),
+    )
+    assert receipt.comparison["device"] == "unavailable"
+    assert receipt.verdict["qualification"] == "unqualified"
+    assert "absent from sampler inventory" in receipt.verdict["reason"]
+
+
+def test_r1_partial_sampler_preserves_samples_and_out_of_slot_mismatch(tmp_path: Path) -> None:
+    """R1/R2: a terminal sampler failure cannot erase prior mismatch evidence."""
+
+    sample = {
+        "monotonic_start": 1.0, "monotonic_end": 1.1,
+        "inventory": [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}, {"uuid": GPU_B, "pci.bus_id": "0000:00:02.0"}],
+        "pid_rows": [{"pid": 1234, "gpu_uuid": GPU_B}],
+    }
+    sampler = {
+        "status": "unavailable", "reason": "nvidia-smi-timeout", "method": "nvidia-smi-pid-uuid-v1", "version": "NVIDIA",
+        "cadence_seconds": 0.1, "count": 1, "monotonic_start": 1.0, "monotonic_end": 1.2,
+        "inventory": sample["inventory"], "pid_rows": sample["pid_rows"], "samples": [sample],
+        "command_pids": [111], "survivors": [], "elapsed_seconds": 0.2, "join_timeout_seconds": 4.0, "quiescent": True,
+    }
+    group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path, sampler)
+    receipt = _placement_receipt_v2(
+        observation, allocation, fence, group, group.members[0], configured, environment,
+        ProcessOutcome((), 0, "", "", False, 1234, 55),
+    )
+    assert receipt.gpu_sampler["status"] == "unavailable"
+    assert receipt.gpu_sampler["samples"]
+    assert receipt.verdict["reason_class"] == "mismatch"
+    assert receipt.gpu_sampler["reason"] == "nvidia-smi-timeout"
+
+
 def test_n2_foreign_pid_rows_never_qualify(tmp_path: Path) -> None:
     """N2: an entitled UUID on another process is not science evidence."""
 
@@ -178,6 +255,68 @@ def test_n9_v2_receipt_rejects_unknown_nested_key(tmp_path: Path) -> None:
     )
     raw = receipt.to_dict()
     raw["verdict"]["unexpected"] = "tamper"
+    with pytest.raises((TypeError, ValueError)):
+        SciencePlacementReceiptV2.from_mapping(raw)
+
+
+def test_n9_v2_receipt_rejects_unknown_top_level_key(tmp_path: Path) -> None:
+    """N9: the outer v2 decoder is closed as well as nested records."""
+
+    sampler = {
+        "status": "unavailable", "reason": "nvidia-smi-missing", "method": "nvidia-smi-pid-uuid-v1", "version": None,
+        "cadence_seconds": 0.1, "count": 0, "monotonic_start": None, "monotonic_end": None,
+        "inventory": [], "pid_rows": [], "samples": [], "command_pids": [], "survivors": [],
+        "elapsed_seconds": 0.0, "join_timeout_seconds": 4.0, "quiescent": True,
+    }
+    group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path, sampler)
+    raw = _placement_receipt_v2(
+        observation, allocation, fence, group, group.members[0], configured, environment,
+        ProcessOutcome((), 0, "", "", False, 1234, 55),
+    ).to_dict()
+    raw["unexpected"] = "tamper"
+    with pytest.raises((TypeError, ValueError)):
+        SciencePlacementReceiptV2.from_mapping(raw)
+
+
+def test_r3_decoder_rejects_qualified_receipt_with_unavailable_sampler(tmp_path: Path) -> None:
+    """R3: persisted v2 evidence cannot claim qualification without telemetry."""
+
+    observed = {
+        "status": "observed", "reason": "observed", "method": "nvidia-smi-pid-uuid-v1", "version": "NVIDIA",
+        "cadence_seconds": 0.1, "count": 1, "monotonic_start": 1.0, "monotonic_end": 1.1,
+        "inventory": [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}],
+        "pid_rows": [{"pid": 1234, "gpu_uuid": GPU_A}],
+    }
+    group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path, observed)
+    raw = _placement_receipt_v2(
+        observation, allocation, fence, group, group.members[0], configured, environment,
+        ProcessOutcome((), 0, "", "", False, 1234, 55),
+    ).to_dict()
+    raw["gpu_sampler"] = {
+        "status": "unavailable", "reason": "nvidia-smi-timeout", "method": "nvidia-smi-pid-uuid-v1", "version": None,
+        "cadence_seconds": 0.1, "count": 0, "monotonic_start": None, "monotonic_end": None,
+        "inventory": [], "pid_rows": [], "samples": [], "command_pids": [], "survivors": [],
+        "elapsed_seconds": 0.0, "join_timeout_seconds": 4.0, "quiescent": True,
+    }
+    with pytest.raises((TypeError, ValueError)):
+        SciencePlacementReceiptV2.from_mapping(raw)
+
+
+def test_r3_decoder_rejects_missing_warning_for_unqualified_declared_gpu(tmp_path: Path) -> None:
+    """R3: declared GPU unqualification must remain loud at decode time."""
+
+    sampler = {
+        "status": "unavailable", "reason": "nvidia-smi-missing", "method": "nvidia-smi-pid-uuid-v1", "version": None,
+        "cadence_seconds": 0.1, "count": 0, "monotonic_start": None, "monotonic_end": None,
+        "inventory": [], "pid_rows": [], "samples": [], "command_pids": [], "survivors": [],
+        "elapsed_seconds": 0.0, "join_timeout_seconds": 4.0, "quiescent": True,
+    }
+    group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path, sampler)
+    raw = _placement_receipt_v2(
+        observation, allocation, fence, group, group.members[0], configured, environment,
+        ProcessOutcome((), 0, "", "", False, 1234, 55),
+    ).to_dict()
+    raw["verdict"]["warning"] = ""
     with pytest.raises((TypeError, ValueError)):
         SciencePlacementReceiptV2.from_mapping(raw)
 
@@ -292,6 +431,33 @@ def test_m4_prelaunch_host_refusal_is_launch_failed_without_segment(tmp_path: Pa
     assert manifest.attempts[0].placement_receipt.host_mapping["status"] == "unavailable"
     assert manifest.attempts[0].placement_receipt.verdict["reason_class"] == "refused"
     assert not manifest.segments
+
+
+def test_r7_prelaunch_refusal_preserves_declared_gpu_and_manifest_warning(tmp_path: Path) -> None:
+    """R7: physical-map failure retains the raw slot entitlement."""
+
+    class Process:
+        def run(self, *args, **kwargs):
+            raise AssertionError("prelaunch refusal must not launch the child")
+
+    class Evidence:
+        def read(self, *args, **kwargs):
+            raise AssertionError("prelaunch refusal must not inspect a child")
+
+    worker = SimpleNamespace(materialize=lambda _env=None: {
+        "environment": PreparedPythonEnvironment(sys.executable, None, {}),
+        "process": Process(), "runner": object(), "evidence": Evidence(),
+    })
+    allocation = _allocation(scheduler=None)
+    manifest = LocalDispatcher(worker).run(
+        _group(), {"task-a": ConfiguredRun("task-a", str(tmp_path / "config.yaml"))},
+        AttachedAllocation(allocation, DirectoryStore(tmp_path / "store")),
+    )
+    receipt = manifest.attempts[0].placement_receipt
+    assert receipt is not None
+    assert receipt.declared["devices"] == (GPU_A,)
+    assert receipt.verdict["warning"]
+    assert manifest.placement_verdict["status"] == "unqualified"
 
 
 def test_m5_advisory_postlaunch_mismatch_keeps_segment_and_rc_zero(tmp_path: Path) -> None:
