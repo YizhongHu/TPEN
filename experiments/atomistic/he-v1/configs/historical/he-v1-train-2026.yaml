@@ -1,16 +1,22 @@
 # HISTORICAL RECORD — NOT A RUNNABLE CONFIGURATION.
 #
-# This is the FULL He-v1 training configuration used for the completed
-# train-seed0000 result, preserved byte-for-byte in content and original
-# comments from commit 418accf153368aab45586dc2a2cc97c18472691c, except for
-# this header, the section annotations below, and the deliberately unresolved
-# runner target near the end. The original runner target was tpen.runner.Train.
+# This is the SOURCE He-v1 training configuration at commit
+# 418accf153368aab45586dc2a2cc97c18472691c, preserved byte-for-byte in
+# configuration values and original comments, except for this header, the
+# section annotations below, and the deliberately unresolved runner target near
+# the end. The original runner target was tpen.runner.Train. It is not, by
+# itself, the fully resolved configuration used by the completed run.
 #
 # Source identity was confirmed two ways: git cat-file found the config blob at
 # the named commit, and git show of that path produced the complete 407-line
 # source used here. The executed run is train-seed0000 (Cannon job 40907434),
-# as recorded in the He-v1 provenance notes. The reference-bearing config
-# lineage begins at b508e293479ce9275d395c0e351d6018cb448fd8.
+# as recorded in the He-v1 provenance notes. Launch-time overrides that differ
+# from this source are run.root, run.run_id, run.dir, run.layout, and
+# trainer.max_steps=50000. The resolved receipt is
+# /Users/yizhonghu/he-v1-independent-report-20260823/receipts/resolved_config.yaml
+# with SHA-256 b9234c469ceadb36291833a2f8ef8a02f29feeba73cdd330949eebbd90d2e8c1.
+# The reference-bearing config lineage begins at
+# b508e293479ce9275d395c0e351d6018cb448fd8.
 #
 # Operator decision 2026-11-10: reference_energy must not reach TRAINING.
 # It remains here only to preserve interpretation of the completed result;
@@ -18,8 +24,11 @@
 # reference comparison in configs/eval.yaml.
 #
 # NON-RUNNABILITY: configs/historical/ is not a live config directory, and the
-# runner target below is intentionally unresolvable. An attempted execution
-# therefore fails at target resolution before any run starts.
+# runner target below is intentionally unresolvable. The unresolved target
+# prevents TRAINING, but YAML loading and prepare_run_context run first, so a
+# startup run directory or artifacts may be created before target resolution
+# fails. The broad glob in tests/unit/checkpoint/test_config_identity.py loads
+# this file as a config-identity input without instantiating its targets.
 #
 # Commenting template followed: experiments/hooke/choices/tpen_presets.yaml at
 # commit 20761651cac520f8bb02eebc62d087315fb843c5, whose header explicitly
@@ -310,12 +319,19 @@ optimizer:
   _partial_: true
   lr: 0.005
 
-# HISTORICAL SCHEDULE: preserve update horizon, cadence, and checkpoint scheduling used by the completed run.
+# HISTORICAL SCHEDULE: preserve the source update horizon, cadence, and
+# checkpoint scheduling. The executed run applied trainer.max_steps=50000 at
+# launch time; see the resolved-config receipt and SHA-256 in the header.
 trainer:
-  # 300,000 updates on kozinsky_gpu. `plan.py` overrides this with
-  # max(checkpoint_steps), so the grid config is the single authority and this
-  # value is the standalone default that must agree with it -- a config test
-  # pins the two together so they cannot silently diverge.
+  # Source default: 300,000 updates on kozinsky_gpu. The completed
+  # train-seed0000 run executed 50,000 updates via the launch-time override
+  # trainer.max_steps=50000, recorded at
+  # /Users/yizhonghu/he-v1-independent-report-20260823/receipts/resolved_config.yaml
+  # (SHA-256 b9234c469ceadb36291833a2f8ef8a02f29feeba73cdd330949eebbd90d2e8c1).
+  # `plan.py` overrides this with max(checkpoint_steps), so the grid config is
+  # the single authority and this value is the standalone source default that
+  # must agree with it -- a config test pins the two together so they cannot
+  # silently diverge.
   _target_: tpen.training.trainer.VMCTrainer
   max_steps: 300000
   log_every_n_steps: 1
