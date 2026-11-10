@@ -30,7 +30,7 @@ from .base import StatefulCallback
 from .cadence import StepCadenceGate, SubscriptionGroup, pop_step_cadence
 
 LEGACY_SCHEMA = "training_history/v1"
-SCHEMA = "training_history/v3"
+SCHEMA = "training_history/v2"
 MANIFEST_FILENAME = "manifest.json"
 
 
@@ -402,7 +402,9 @@ class TrainingBatchReader:
             if not isinstance(expected_sidecar_hash, str):
                 raise ValueError("training manifest entry is missing the sidecar digest")
             if not sidecar_path.exists() or _sha256(sidecar_path) != expected_sidecar_hash:
-                raise ValueError("training sidecar digest does not match its manifest entry")
+            raise ValueError(
+                "training partition sidecar digest does not match its manifest entry"
+            )
             sidecar = json.loads(sidecar_path.read_text())
             _validate_sidecar(self.root, sidecar, entry=entry)
             if sidecar["schema"] == SCHEMA:
