@@ -21,6 +21,26 @@ from tpen.checkpoint.hashing import (
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
+# These are checked-in study inputs, not standalone identity-bound run
+# configurations.  Keep this list closed and named: removing an entry is a
+# deliberate follow-up when the corresponding study composition is repaired.
+_IDENTITY_CONFIG_EXCLUSIONS = {
+    "experiments/hooke/pair_stability_v3/configs/pair_stability.yaml": (
+        "legacy SpENN targets are unavailable in the dev checkout; the real run path "
+        "fails during full-tree resolution before identity is written"
+    ),
+    "experiments/hooke/pair_stability_v3/configs/pair_validation.yaml": (
+        "legacy SpENN targets are unavailable in the dev checkout; the real run path "
+        "fails during full-tree resolution before identity is written"
+    ),
+    "experiments/hooke/tpen-pair-scan-v1/configs/grid.yaml": (
+        "launcher metadata, not a tpen run config; its basis merge has no system.omega"
+    ),
+    "experiments/hooke/tpen-pair-scan-v1/configs/smoke.yaml": (
+        "launcher metadata, not a tpen run config; its basis merge has no system.omega"
+    ),
+}
+
 
 def _identity_config_paths() -> tuple[Path, ...]:
     """Return every checked-in config tree covered by the identity boundary."""
@@ -32,7 +52,13 @@ def _identity_config_paths() -> tuple[Path, ...]:
     paths = {path for root in roots if root.is_dir() for path in root.rglob("*.yaml")}
     paths.update(_REPO_ROOT.glob("experiments/**/configs/**/*.yaml"))
     paths.update(_REPO_ROOT.glob("experiments/**/configs/**/*.yml"))
-    return tuple(sorted(paths))
+    return tuple(
+        sorted(
+            path
+            for path in paths
+            if str(path.relative_to(_REPO_ROOT)) not in _IDENTITY_CONFIG_EXCLUSIONS
+        )
+    )
 
 
 def _guard_config(config_path: Path) -> dict[str, object]:
@@ -104,6 +130,40 @@ def test_identity_accepts_every_in_repo_config(config_path: Path) -> None:
     config = _guard_config(config_path)
     assert resolved_config_identity(config)["schema"] == RESOLVED_CONFIG_IDENTITY_SCHEMA
     assert expected_resolved_config_identity(config)["schema"] == RESOLVED_CONFIG_IDENTITY_SCHEMA
+
+
+def test_identity_config_exclusions_are_closed_and_explicit() -> None:
+    """Stale/metadata inputs cannot silently become identity test coverage."""
+
+    expected = {
+        "experiments/hooke/pair_stability_v3/configs/pair_stability.yaml",
+        "experiments/hooke/pair_stability_v3/configs/pair_validation.yaml",
+        "experiments/hooke/tpen-pair-scan-v1/configs/grid.yaml",
+        "experiments/hooke/tpen-pair-scan-v1/configs/smoke.yaml",
+    }
+    assert set(_IDENTITY_CONFIG_EXCLUSIONS) == expected
+    assert all(reason for reason in _IDENTITY_CONFIG_EXCLUSIONS.values())
+    covered = {str(path.relative_to(_REPO_ROOT)) for path in _identity_config_paths()}
+    assert covered.isdisjoint(expected)
+
+
+def test_identity_does_not_execute_custom_resolvers() -> None:
+    """Counterfactual: the old resolver path called the probe during hashing."""
+
+    calls: list[str] = []
+    OmegaConf.register_new_resolver(
+        "identity_probe",
+        lambda: calls.append("called") or "constructed",
+        replace=True,
+    )
+    try:
+        identity = resolved_config_identity(
+            OmegaConf.create({"science": {"value": "${identity_probe:}"}})
+        )
+    finally:
+        OmegaConf.clear_resolver("identity_probe")
+    assert identity["schema"] == RESOLVED_CONFIG_IDENTITY_SCHEMA
+    assert calls == []
 
 
 def test_golden_identity_vector() -> None:
