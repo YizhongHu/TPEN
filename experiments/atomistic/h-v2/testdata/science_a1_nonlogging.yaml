@@ -78,6 +78,7 @@ model:
     _target_: tpen.nn.readout.PfaffianReadout
     channels: 32
     trainable: true
+    eps: 1.0e-12
 
 hamiltonian_terms:
   kinetic: {_target_: tpen.physics.kinetic.KineticEnergy}

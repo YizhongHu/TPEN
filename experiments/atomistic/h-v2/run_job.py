@@ -73,6 +73,7 @@ def _h_v2_module(name: str):
 attached = _h_v2_module("attached")
 launch_config = _h_v2_module("launch_config")
 protocol = _h_v2_module("protocol")
+eval_job = _h_v2_module("eval_job")
 
 #: TO baff945c: TRAIN refuses with this code for any lineage outside
 #: ``launch_config.LINEAGES`` (the approved L1-L3 roster), before any
@@ -269,6 +270,171 @@ def _pilot_train_task_id(payload: str) -> str:
     """Return a pilot/part-(g) payload's fixed TRAIN task id (TO 63690220)."""
 
     return f"h-v2-train-{payload}"
+
+
+#: TO 8a5e926f (item E): every eval-fanout payload's own TRAIN task id and
+#: fixed lineage label (science's lineage is caller-supplied, checked
+#: against ``launch_config.LINEAGES``).
+_EVAL_FANOUT_PAYLOADS = ("science", "capacity-pilot", "gpu-route-g")
+
+
+def _eval_receipt_path(run_root: Path, task_label: str) -> Path:
+    return run_root / "attached" / "receipts" / f"{task_label}.h-v2-eval.json"
+
+
+def run_eval_fanout(
+    *,
+    run_root: Path,
+    expected_commit: str,
+    science_python: str,
+    payload: str,
+    lineage: str,
+    expected_train_commit: str,
+    lineage_index: int | None = None,
+    pilot_stage: str | None = None,
+) -> None:
+    """Dispatch one EVAL fan-out job (item E, acceptance-contract 8a5e926f).
+
+    "A study-side job, NOT an executor dispatch": every scheduled generation
+    runs directly through ``tpen.run.main`` (:func:`eval_job.run_generation_direct`),
+    verified and consolidated into this job's own eval receipt -- never the
+    TRAIN-only executor route ``attached.activate_h_v2_run`` refuses for
+    EVAL (:data:`attached.EVAL_ROUTE_UNSUPPORTED_CODE`).
+
+    Raises
+    ------
+    JobError
+        Code :data:`SCIENCE_CONFIG_UNAVAILABLE_CODE`, for an unapproved
+        science lineage; otherwise propagates :class:`eval_job.EvalJobRefusal`
+        (checkpoint-hash mismatch, wrong-commit TRAIN receipt, a missing SEL
+        selection record, a failed generation, ...) unchanged -- any of
+        these is a non-zero exit via :func:`main`.
+    """
+
+    if payload not in _EVAL_FANOUT_PAYLOADS:
+        raise JobError(f"eval fan-out payload must be one of {_EVAL_FANOUT_PAYLOADS!r}, got {payload!r}")
+
+    if payload == "science":
+        if lineage not in launch_config.LINEAGES:
+            raise JobError(
+                f"{SCIENCE_CONFIG_UNAVAILABLE_CODE}: eval fan-out refuses lineage {lineage!r} outside "
+                f"the approved roster {launch_config.LINEAGES!r}"
+            )
+        train_task_id = _train_task_id(lineage, pipeline_check=False)
+        expected_lineage = lineage
+        resolved_lineage_index = launch_config.LINEAGES.index(lineage) if lineage_index is None else lineage_index
+        generations = eval_job.science_fanout(lineage_index=resolved_lineage_index)
+        task_label = f"h-v2-eval-science-{lineage}"
+    elif payload == "capacity-pilot":
+        train_task_id = _pilot_train_task_id(payload)
+        expected_lineage = launch_config.PILOT_PAYLOAD_LINEAGES[payload]
+        if pilot_stage is None:
+            raise JobError("capacity-pilot eval fan-out requires --pilot-stage")
+        task_label = f"h-v2-eval-{payload}-stage{pilot_stage}"
+        if pilot_stage == "1":
+            generations = eval_job.pilot_fanout("1")
+        else:
+            selection_path = run_root / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
+            if not selection_path.is_file():
+                raise JobError(f"no SEL selection record at {selection_path}; run the SEL step first")
+            selection = json.loads(selection_path.read_text(encoding="utf-8"))
+            stage1_receipt_path = _eval_receipt_path(run_root, f"h-v2-eval-{payload}-stage1")
+            _, stage1_sha256 = eval_job.load_train_receipt(stage1_receipt_path)
+            c1 = eval_job.verify_selection_record(selection, b1_eval_receipt_sha256=stage1_sha256)
+            generations = eval_job.pilot_fanout(pilot_stage, c1=c1)
+    else:  # "gpu-route-g"
+        train_task_id = _pilot_train_task_id(payload)
+        expected_lineage = launch_config.PILOT_PAYLOAD_LINEAGES[payload]
+        task_label = f"h-v2-eval-{payload}"
+        generations = eval_job.gpu_route_g_fanout()
+
+    train_receipt_path = run_root / "attached" / "receipts" / f"{train_task_id}.h-v2.json"
+    train_receipt, train_receipt_sha256 = eval_job.load_train_receipt(train_receipt_path)
+    eval_job.verify_train_receipt_identity(
+        train_receipt,
+        expected_commit=expected_train_commit,
+        expected_lineage=expected_lineage,
+        expected_payload=payload,
+    )
+
+    readout_available = eval_job.probe_readout_trajectory_generator(science_python)
+    results_root = run_root / "attached" / "results" / "attached"
+    handoff_root = run_root / "attached" / "handoff"
+    receipt_path = _eval_receipt_path(run_root, task_label)
+    records: list[dict] = []
+    for generation in generations:
+        checkpoint_dir = eval_job.resolve_checkpoint(train_receipt, update=generation["update"])
+        config = protocol.science_evaluation_config(
+            checkpoint_dir, seed=generation["seed"], enable_readout_trajectory=readout_available
+        )
+        gen_task_id = f"{task_label}-ck{generation['update']:06d}-s{generation['stream']}"
+        config["run"]["root"] = str(results_root)
+        config["run"]["run_id"] = gen_task_id
+        config["run"]["layout"] = "flat"
+        run_result = eval_job.run_generation_direct(
+            science_python=science_python,
+            config=config,
+            config_path=handoff_root / f"{gen_task_id}.yaml",
+            expected_source_commit=expected_commit,
+            cwd=run_root / "checkout",
+        )
+        records.append(
+            eval_job.generation_record(
+                ordinal=generation["ordinal"],
+                update=generation["update"],
+                stream=generation["stream"],
+                seed=generation["seed"],
+                task_id=gen_task_id,
+                run_result=run_result,
+            )
+        )
+        # E3: written on every generation's completion, so a wall-killed job
+        # leaves every already-completed generation's output sha256s
+        # verifiable even though the job still exits non-zero overall if it
+        # does not finish the whole schedule.
+        eval_job.write_eval_receipt(
+            receipt_path,
+            eval_commit=expected_commit,
+            train_commit=expected_train_commit,
+            train_receipt_path=train_receipt_path,
+            train_receipt_sha256=train_receipt_sha256,
+            payload=payload,
+            generations=records,
+            readout_generator_enabled=readout_available,
+        )
+    print(f"[h-v2] {task_label}: {len(records)} generation(s) accepted (readout_generator={readout_available})")
+
+
+def run_pilot_sel(run_root: Path) -> None:
+    """Compute and write the pilot SEL selection record (amendment r3/r4 E1).
+
+    Reads the completed capacity-pilot stage-1 eval receipt, computes the
+    stream-0 ``W`` per ordinal, and writes the selection record
+    (:func:`eval_job.build_selection_record`) stage 2 verifies against.
+
+    Raises
+    ------
+    JobError
+        If the stage-1 eval receipt is missing or incomplete.
+    """
+
+    stage1_path = _eval_receipt_path(run_root, "h-v2-eval-capacity-pilot-stage1")
+    if not stage1_path.is_file():
+        raise JobError(f"no capacity-pilot stage-1 eval receipt at {stage1_path}; stage 1 must complete before SEL")
+    stage1_receipt = eval_job.read_eval_receipt(stage1_path)
+    selection_core = eval_job.compute_pilot_selection(stage1_receipt)
+    import hashlib
+
+    stage1_sha256 = hashlib.sha256(stage1_path.read_bytes()).hexdigest()
+    record = eval_job.build_selection_record(
+        c1=selection_core["c1"],
+        triple_means=selection_core["triple_means"],
+        b1_eval_receipt_sha256=stage1_sha256,
+    )
+    selection_path = run_root / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    print(f"[h-v2] SEL: c1={record['c1']}")
 
 
 def run(
@@ -471,6 +637,70 @@ def run(
     print(f"[h-v2] {task_id}: accepted")
 
 
+def _main_eval_fanout(argv: list[str]) -> int:
+    """Parse and dispatch ``run_job.py eval-fanout ...`` (item E)."""
+
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="run_job.py eval-fanout")
+    parser.add_argument("payload", choices=_EVAL_FANOUT_PAYLOADS)
+    parser.add_argument("lineage", nargs="?", default=None, help="Required, science only.")
+    parser.add_argument("--expected-train-commit", required=True)
+    parser.add_argument("--pilot-stage", choices=("1", "2", "2-core"), default=None)
+    args = parser.parse_args(argv)
+
+    if args.payload == "science":
+        if not args.lineage:
+            print("usage: run_job.py eval-fanout science <lineage> --expected-train-commit <sha>", file=sys.stderr)
+            return 2
+        lineage = args.lineage
+        expected_stratum = launch_config.APPROVED_GPU_STRATUM
+    else:
+        lineage = launch_config.PILOT_PAYLOAD_LINEAGES[args.payload]
+        expected_stratum = launch_config.PILOT_PAYLOAD_GPU_STRATA[args.payload]
+        if args.payload == "capacity-pilot" and args.pilot_stage is None:
+            print(
+                "usage: run_job.py eval-fanout capacity-pilot --pilot-stage {1,2,2-core} "
+                "--expected-train-commit <sha>",
+                file=sys.stderr,
+            )
+            return 2
+
+    run_root = Path(_require_env("RUN")).resolve()
+    expected_commit = _require_env("SHA")
+    science_python = _require_env("SCIENCE_PYTHON")
+    try:
+        check_identity(run_root, expected_commit, science_python, expected_stratum=expected_stratum)
+        run_eval_fanout(
+            run_root=run_root,
+            expected_commit=expected_commit,
+            science_python=science_python,
+            payload=args.payload,
+            lineage=lineage,
+            expected_train_commit=args.expected_train_commit,
+            pilot_stage=args.pilot_stage,
+        )
+    except Exception as error:  # noqa: BLE001 - this is the job's own top-level boundary
+        print(f"[h-v2] job failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _main_sel(argv: list[str]) -> int:
+    """Parse and dispatch ``run_job.py sel capacity-pilot``."""
+
+    if argv != ["capacity-pilot"]:
+        print("usage: run_job.py sel capacity-pilot", file=sys.stderr)
+        return 2
+    run_root = Path(_require_env("RUN")).resolve()
+    try:
+        run_pilot_sel(run_root)
+    except Exception as error:  # noqa: BLE001 - this is the job's own top-level boundary
+        print(f"[h-v2] job failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse and dispatch the in-job CLI.
 
@@ -478,9 +708,17 @@ def main(argv: list[str] | None = None) -> int:
     ``--pipeline-check`` or ``--payload science`` -- for both ``train`` and
     ``eval``. A bare ``train L1``/``eval L1`` with neither refuses (exit 2)
     rather than defaulting to the science payload.
+
+    TO 8a5e926f: ``eval-fanout``/``sel`` are separate subcommands (item E's
+    own direct-dispatch route), dispatched before the ``train``/``eval``
+    parsing below ever runs.
     """
 
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "eval-fanout":
+        return _main_eval_fanout(argv[1:])
+    if argv and argv[0] == "sel":
+        return _main_sel(argv[1:])
     pipeline_check = False
     explicit_science = False
     pilot_payload: str | None = None

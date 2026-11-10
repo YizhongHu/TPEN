@@ -85,6 +85,7 @@ model:
     _target_: tpen.nn.readout.PfaffianReadout
     channels: 8
     trainable: true
+    eps: 1.0e-12
 
 hamiltonian_terms:
   kinetic:
