@@ -98,6 +98,7 @@ OBSERVATIONAL_CALLBACK_TARGETS = frozenset(
         "tpen.callback.Status",
         "tpen.callback.ElectronNucleusDistanceQuantiles",
         "tpen.callback.ModuleNorms",
+        "tpen.callback.OptimizerState",
     }
 )
 # These callbacks are admitted explicitly because their resume behavior is
@@ -135,8 +136,10 @@ RESUME_SENSITIVE_CALLBACK_TARGETS = frozenset(
 # training-line logging (lines 133-140). TrainStepTiming consumes them at
 # ``tpen/callback/timing/train_step_timing.py:41-57`` and TrainPhaseTiming at
 # ``tpen/callback/timing/train_phase_timing.py:64-83``; both gate only
-# observational ``train/perf`` logging. Those three observational callbacks
-# therefore remain admitted.
+# observational ``train/perf`` logging. OptimizerState validates its update
+# method at iteration entry, then uses the gate only for completed-update
+# optimizer metrics; it likewise owns no resume state. Those observational
+# callbacks therefore remain admitted.
 CALLBACK_CADENCE_REFUSAL_CODE = "unsupported-callback-cadence"
 CADENCE_SENSITIVE_CALLBACK_TARGETS = frozenset(
     {

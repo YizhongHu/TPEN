@@ -108,6 +108,7 @@ def test_core_t2_constants_facade_and_chain_resume_remain_exact():
         "tpen.callback.ParameterActivity",
         "tpen.callback.ElectronNucleusDistanceQuantiles",
         "tpen.callback.ModuleNorms",
+        "tpen.callback.OptimizerState",
         "tpen.callback.RawTrainingBatchRecorder",
         "tpen.callback.TrainingBatchRecorder",
     })
