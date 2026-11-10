@@ -87,7 +87,7 @@ print(Path(sys.argv[1], "evidence.json").read_text(encoding="utf-8"))
         config.write_text("mode: consumer-test\\n", encoding="utf-8")
         group = ReadyGroup("l2-consumer", (TaskSpec("task-a", "task-a", ProgramSpecRef({}, digest({})), digest("task-a"), 1, "steps"),), digest("l2-consumer"))
         cpu = min(getattr(os, "sched_getaffinity", lambda _pid: {0})(0))
-        slot = AllocationSlot("logical-slot", "logical-label", ("GPU-ABC",), (cpu,), (), ()).to_dict()
+        slot = AllocationSlot("logical-slot", "logical-label", ("GPU-12345678-1234-1234-1234-123456789ABC",), (cpu,), (), ()).to_dict()
         allocation = ConfiguredAllocation(
             AllocationId("allocation-a"), BackendJobId("job-a"),
             {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot]},
@@ -134,10 +134,10 @@ def _run_real_producer(tmp_path: Path, mode: str) -> Path:
         "import os, sys\n"
         "if '--version' in sys.argv: print('NVIDIA-SMI consumer-test')\n"
         "elif '--query-gpu=uuid,pci.bus_id' in sys.argv:\n"
-        "    print('GPU-ABC, 0000:00:01.0')\n"
-        "    if os.environ.get('L2_GPU_MISMATCH') == '1': print('GPU-OUT, 0000:00:02.0')\n"
+        "    print('GPU-12345678-1234-1234-1234-123456789ABC, 0000:00:01.0')\n"
+        "    if os.environ.get('L2_GPU_MISMATCH') == '1': print('GPU-12345678-1234-1234-1234-123456789ABD, 0000:00:02.0')\n"
         "elif '--query-compute-apps=pid,gpu_uuid' in sys.argv:\n"
-        "    print(f\"{os.getppid()},GPU-OUT\" if os.environ.get('L2_GPU_MISMATCH') == '1' else f\"{os.getppid()},GPU-ABC\")\n",
+        "    print(f\"{os.getppid()},GPU-12345678-1234-1234-1234-123456789ABD\" if os.environ.get('L2_GPU_MISMATCH') == '1' else f\"{os.getppid()},GPU-12345678-1234-1234-1234-123456789ABC\")\n",
         encoding="utf-8",
     )
     fake.chmod(0o755)

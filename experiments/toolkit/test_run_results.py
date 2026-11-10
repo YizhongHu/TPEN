@@ -20,6 +20,7 @@ from experiments.toolkit.run_results import ManifestRefusal, read
 
 FIXTURE = Path(__file__).parent / "fixtures" / "run-manifest-v2.json"
 FIXTURE_V1 = Path(__file__).parent / "fixtures" / "run-manifest-v1.json"
+GPU_A = "GPU-12345678-1234-1234-1234-123456789ABC"
 
 
 def _placement_receipt(output_dir: str = "/runs/group-1/task-a/attempt-1") -> dict[str, object]:
@@ -65,12 +66,28 @@ def _placement_receipt_v2(output_dir: str, *, qualified: bool) -> dict[str, obje
 
     receipt = _placement_receipt(output_dir)
     receipt["schema"] = "tpen-executor/science-placement-receipt-v2"
-    receipt["declared"]["devices"] = ["GPU-ABC"]
-    receipt["gpu"].update({"status": "qualified" if qualified else "unavailable", "reason": "live PID UUIDs match" if qualified else "nvidia-smi-missing"})
+    receipt["declared"]["devices"] = [GPU_A]
+    receipt["gpu"].update({
+        "status": "qualified" if qualified else "unavailable",
+        "reason": "live PID UUIDs match" if qualified else "nvidia-smi-missing",
+        "active_uuids": [GPU_A] if qualified else [],
+        "active_pci": ["0000:00:01.0"] if qualified else [],
+    })
     receipt["comparison"]["device"] = "matched" if qualified else "unavailable"
     receipt.update({
         "host_mapping": {"status": "matched", "reason": "physical scheduler host mapped", "source": "scheduler-node-map", "slot_id": "slot-a", "host": "node-a"},
-        "gpu_sampler": {"status": "matched" if qualified else "unavailable", "reason": "live PID UUIDs match" if qualified else "nvidia-smi-missing", "method": "nvidia-smi-pid-uuid-v1", "version": "NVIDIA" if qualified else None, "cadence_seconds": 0.1, "count": 1 if qualified else 0, "monotonic_start": 1.0, "monotonic_end": 1.1, "inventory": [{"uuid": "GPU-ABC", "pci.bus_id": "0000:00:01.0"}] if qualified else [], "pid_rows": [{"pid": 1234, "gpu_uuid": "GPU-ABC"}] if qualified else []},
+        "gpu_sampler": {
+            "status": "observed" if qualified else "unavailable",
+            "reason": "live PID UUIDs match" if qualified else "nvidia-smi-missing",
+            "method": "nvidia-smi-pid-uuid-v1", "version": "NVIDIA" if qualified else None,
+            "cadence_seconds": 0.1, "count": 1 if qualified else 0,
+            "monotonic_start": 1.0 if qualified else None, "monotonic_end": 1.1 if qualified else None,
+            "inventory": [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}] if qualified else [],
+            "pid_rows": [{"pid": 1234, "gpu_uuid": GPU_A}] if qualified else [],
+            "samples": [{"monotonic_start": 1.0, "monotonic_end": 1.1, "inventory": [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}], "pid_rows": [{"pid": 1234, "gpu_uuid": GPU_A}]}] if qualified else [],
+            "command_pids": [4321] if qualified else [], "survivors": [],
+            "elapsed_seconds": 0.1, "join_timeout_seconds": 4.0, "quiescent": True,
+        },
         "verdict": {"host": "matched", "device": "matched" if qualified else "unavailable", "qualification": "qualified" if qualified else "unqualified", "reason_class": "qualified" if qualified else "telemetry-unavailable", "reason": "physical host, affinity, and live PID telemetry matched" if qualified else "telemetry-unavailable: nvidia-smi-missing", "science_acceptance": "accepted" if qualified else "not-accepted", "warning": "" if qualified else "GPU PLACEMENT UNQUALIFIED: H-v2/science acceptance MUST NOT accept this GPU segment."},
     })
     return receipt
