@@ -25,12 +25,17 @@ from pathlib import Path
 import subprocess
 import textwrap
 
+from omegaconf import OmegaConf
 import pytest
 
+from experiments.toolkit.config_identity import expected_resolved_config_identity
 from experiments.toolkit.run_results import ManifestRefusal, read
 
 
 ROOT = Path(__file__).resolve().parents[2]
+# The consumer config is the single source for both the producer's config file
+# and the identity the stub core stamps, mirroring the real core boundary.
+CONSUMER_CONFIG = "mode: consumer-test\n"
 
 
 MUTANT_TABLE = (
@@ -79,6 +84,14 @@ def _executor_python() -> str:
     return value
 
 
+def _consumer_identity() -> dict[str, str]:
+    """Compute the consumer config identity with core's public function."""
+
+    return expected_resolved_config_identity(
+        OmegaConf.to_container(OmegaConf.create(CONSUMER_CONFIG), resolve=False)
+    )
+
+
 def _producer_code() -> str:
     source = textwrap.dedent(
         """
@@ -93,6 +106,8 @@ def _producer_code() -> str:
         root = Path(sys.argv[1])
         mode = sys.argv[2]
         fake_bin = Path(sys.argv[3])
+        config_text = sys.argv[4]
+        identity = sys.argv[5]
         stub = root / "stub" / "tpen"
         stub.mkdir(parents=True)
         (stub / "__init__.py").write_text("", encoding="utf-8")
@@ -107,11 +122,12 @@ def _producer_code() -> str:
             "    checkpoint = run_dir / 'checkpoint' / 'step_000001'\\n"
             "    checkpoint.mkdir(parents=True, exist_ok=True)\\n"
             "    (run_dir / 'evidence.json').write_text(json.dumps({\\n"
-            "        'schema': 'tpen.run-evidence/v1', 'run_dir': str(run_dir),\\n"
+            "        'schema': 'tpen.run-evidence/v2', 'run_dir': str(run_dir),\\n"
             "        'verdict': 'completed', 'run_status': 'completed',\\n"
             "        'checkpoint': {'checkpoint_dir': str(checkpoint), 'schema_version': 1,\\n"
             "                       'next_iteration': 1, 'completed_updates': 1},\\n"
             "        'refusal': None,\\n"
+            "        'resolved_config_identity': json.loads(os.environ['L2_RESOLVED_CONFIG_IDENTITY']),\\n"
             "    }), encoding='utf-8')\\n"
             "    return 3 if os.environ.get('L2_REFUSED') == '1' else 0\\n"
             "if __name__ == '__main__': raise SystemExit(main(sys.argv[1:]))\\n",
@@ -124,7 +140,7 @@ print(Path(sys.argv[1], "evidence.json").read_text(encoding="utf-8"))
 ''', encoding="utf-8")
 
         config = root / "config.yaml"
-        config.write_text("mode: consumer-test\\n", encoding="utf-8")
+        config.write_text(config_text, encoding="utf-8")
         group = ReadyGroup("l2-consumer", (TaskSpec("task-a", "task-a", ProgramSpecRef({}, digest({})), digest("task-a"), 1, "steps"),), digest("l2-consumer"))
         cpu = min(getattr(os, "sched_getaffinity", lambda _pid: {0})(0))
         slot = AllocationSlot("logical-slot", "logical-label", ("GPU-12345678-1234-1234-1234-123456789ABC",), (cpu,), (), ()).to_dict()
@@ -140,6 +156,7 @@ print(Path(sys.argv[1], "evidence.json").read_text(encoding="utf-8"))
         child_env = {
             "PYTHONPATH": str(stub.parent),
             "L2_STUB_ORIGIN": str(stub.resolve()),
+            "L2_RESOLVED_CONFIG_IDENTITY": identity,
             "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
         }
         if mode == "refused":
@@ -198,7 +215,12 @@ def _run_real_producer(tmp_path: Path, mode: str) -> Path:
     if mode == "unavailable":
         fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         fake.chmod(0o755)
-    result = subprocess.run([executor_python, "-c", _producer_code(), str(root), mode, str(fake_bin)], cwd=ROOT / "executor", env=env, capture_output=True, text=True, timeout=60)
+    # Identity is computed here, in the root core environment, because the
+    # stub ``tpen`` package shadows core inside the executor-side child.
+    result = subprocess.run(
+        [executor_python, "-c", _producer_code(), str(root), mode, str(fake_bin), CONSUMER_CONFIG, json.dumps(_consumer_identity())],
+        cwd=ROOT / "executor", env=env, capture_output=True, text=True, timeout=60,
+    )
     assert result.returncode == 0, (result.stdout, result.stderr)
     marker = next(line for line in result.stdout.splitlines() if line.startswith("MANIFEST="))
     return Path(marker.removeprefix("MANIFEST="))
@@ -206,7 +228,8 @@ def _run_real_producer(tmp_path: Path, mode: str) -> Path:
 
 def _reader_inspector(manifest: dict[str, object]):
     checkpoint = manifest["segments"][0]["checkpoint_dir"]
-    return lambda _: {"verdict": "completed", "checkpoint": {"checkpoint_dir": checkpoint, "schema_version": 1, "next_iteration": 1, "completed_updates": 1}}
+    identity = _consumer_identity()
+    return lambda _: {"verdict": "completed", "checkpoint": {"checkpoint_dir": checkpoint, "schema_version": 1, "next_iteration": 1, "completed_updates": 1}, "resolved_config_identity": identity}
 
 
 def test_l2_real_executor_producer_to_p8_reader_contract(tmp_path: Path) -> None:
@@ -215,6 +238,7 @@ def test_l2_real_executor_producer_to_p8_reader_contract(tmp_path: Path) -> None
     matched_path = _run_real_producer(tmp_path, "matched")
     matched_manifest = json.loads(matched_path.read_text(encoding="utf-8"))
     matched = read(matched_path, _reader_inspector(matched_manifest))
+    assert matched.chains[0].segments[0].resolved_config_identity == _consumer_identity()
     assert matched.chains[0].segments[0].placement_receipt["verdict"]["qualification"] == "unqualified"
     assert matched.chains[0].segments[0].placement_receipt["verdict"]["reason_class"] == "not-sampled"
     assert not matched.placement_unqualified
