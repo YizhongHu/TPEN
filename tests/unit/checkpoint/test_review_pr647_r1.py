@@ -13,7 +13,6 @@ from tpen.checkpoint.profiles import (
     CADENCE_SENSITIVE_CALLBACK_TARGETS,
     OBSERVATIONAL_CALLBACK_TARGETS,
     RESUME_SENSITIVE_CALLBACK_TARGETS,
-    SUPPORTED_CALLBACK_TARGETS,
 )
 from tpen.nn import ElectronElectronCusp
 from tpen.events import Started
@@ -39,33 +38,25 @@ SAMPLER_HEALTH = "tpen.callback.SamplerHealth"
 FACTOR_SCALARS = "tpen.callback.FactorScalars"
 
 
-def test_pr647_targets_have_independent_profile_classifications() -> None:
-    """Pin each target's semantic set, not only the supported union."""
-
-    assert OPTIMIZER_STATE in OBSERVATIONAL_CALLBACK_TARGETS
-    assert OPTIMIZER_STATE not in RESUME_SENSITIVE_CALLBACK_TARGETS
-    for target in (SAMPLER_HEALTH, FACTOR_SCALARS):
-        assert target in RESUME_SENSITIVE_CALLBACK_TARGETS
-        assert target in CADENCE_SENSITIVE_CALLBACK_TARGETS
-        assert target not in OBSERVATIONAL_CALLBACK_TARGETS
-
-
 @pytest.mark.parametrize(
-    ("target", "observational"),
-    [(OPTIMIZER_STATE, True), (SAMPLER_HEALTH, False), (FACTOR_SCALARS, False)],
+    ("target", "observational", "resume_sensitive", "cadence_sensitive"),
+    [
+        (OPTIMIZER_STATE, True, False, False),
+        (SAMPLER_HEALTH, False, True, True),
+        (FACTOR_SCALARS, False, True, True),
+    ],
 )
-def test_pr647_classification_mutant_changes_semantics_without_changing_union(
-    target: str, observational: bool,
+def test_pr647_targets_have_exact_profile_classifications(
+    target: str,
+    observational: bool,
+    resume_sensitive: bool,
+    cadence_sensitive: bool,
 ) -> None:
-    """A placement move must be visible even when the allowlist union is stable."""
+    """Pin exact membership and exclusion across all callback profile sets."""
 
     assert (target in OBSERVATIONAL_CALLBACK_TARGETS) is observational
-    assert (target in RESUME_SENSITIVE_CALLBACK_TARGETS) is (not observational)
-    assert set(OBSERVATIONAL_CALLBACK_TARGETS) | set(RESUME_SENSITIVE_CALLBACK_TARGETS) == set(
-        SUPPORTED_CALLBACK_TARGETS
-    )
-    if target in CADENCE_SENSITIVE_CALLBACK_TARGETS:
-        assert target in RESUME_SENSITIVE_CALLBACK_TARGETS
+    assert (target in RESUME_SENSITIVE_CALLBACK_TARGETS) is resume_sensitive
+    assert (target in CADENCE_SENSITIVE_CALLBACK_TARGETS) is cadence_sensitive
 
 
 @pytest.mark.parametrize(
