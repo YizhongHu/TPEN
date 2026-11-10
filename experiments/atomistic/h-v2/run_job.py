@@ -296,8 +296,10 @@ def run_eval_fanout(
     """Dispatch one EVAL fan-out job (item E, acceptance-contract 8a5e926f).
 
     "A study-side job, NOT an executor dispatch": every scheduled generation
-    runs directly through ``tpen.run.main`` (:func:`eval_job.run_generation_direct`),
-    verified and consolidated into this job's own eval receipt -- never the
+    runs directly through ``tpen.run.run_from_config``
+    (:func:`eval_job.run_generation_direct`), never ``tpen.run.main`` or
+    ``python -m tpen.run``, verified and consolidated into this job's own
+    eval receipt -- never the
     TRAIN-only executor route ``attached.activate_h_v2_run`` refuses for
     EVAL (:data:`attached.EVAL_ROUTE_UNSUPPORTED_CODE`).
 
