@@ -33,6 +33,45 @@ from experiments.toolkit.run_results import ManifestRefusal, read
 ROOT = Path(__file__).resolve().parents[2]
 
 
+MUTANT_TABLE = (
+    {
+        "id": "M7",
+        "target": "experiments/toolkit/run_results.py",
+        "old": "    if schema == SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2:\n",
+        "new": "    if False:\n",
+        "killer": "test_l2_real_executor_producer_to_p8_reader_contract",
+        "suite": "root",
+    },
+    {
+        "id": "M8",
+        "target": "experiments/toolkit/run_results.py",
+        "old": "    _validate_json(value)\n    schema = value.get(\"schema\") if isinstance(value, dict) else None\n",
+        "new": "    schema = value.get(\"schema\") if isinstance(value, dict) else None\n",
+        "killer": "test_p8_reader_rejects_nonfinite_before_inspection",
+        "suite": "root",
+    },
+    {
+        "id": "M10",
+        "target": "experiments/toolkit/run_results.py",
+        "old": "    if declared[\"devices\"]:\n",
+        "new": "    if True:\n",
+        "killer": "test_p8_reader_accepts_cpu_only_v2_receipts",
+        "suite": "root",
+    },
+)
+
+
+def test_l2_mutant_table_has_exact_unique_source_anchors() -> None:
+    """Mutation packets must name literal production replacements."""
+
+    assert {row["id"] for row in MUTANT_TABLE} == {"M7", "M8", "M10"}
+    for row in MUTANT_TABLE:
+        source = (ROOT / row["target"]).read_text(encoding="utf-8")
+        assert source.count(row["old"]) == 1, row
+        assert row["old"] != row["new"]
+        assert row["killer"] and row["suite"] in {"root", "executor"}
+
+
 def _executor_python() -> str:
     value = os.environ.get("P8_EXECUTOR_PYTHON") or os.environ.get("P9C_EXECUTOR_PYTHON")
     if not value:
@@ -60,6 +99,8 @@ def _producer_code() -> str:
         (stub / "run.py").write_text(
             "import json, os, sys\\n"
             "from pathlib import Path\\n"
+            "if Path(__file__).resolve().parent != Path(os.environ['L2_STUB_ORIGIN']).resolve():\\n"
+            "    raise RuntimeError('consumer-test imported an unexpected tpen.run')\\n"
             "def main(argv):\\n"
             "    values = dict(item.split('=', 1) for item in argv if '=' in item)\\n"
             "    run_dir = Path(values['run.root']) / values.get('run.run_id', 'core')\\n"
@@ -96,7 +137,11 @@ print(Path(sys.argv[1], "evidence.json").read_text(encoding="utf-8"))
         paths["input.json"].write_bytes(group.encode())
         paths["allocation.json"].write_bytes(allocation.encode())
         paths["runs.json"].write_bytes(ConfiguredRunTable(group.identity, (ConfiguredRun("task-a", str(config)),)).encode())
-        child_env = {"PYTHONPATH": str(stub), "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", "")}
+        child_env = {
+            "PYTHONPATH": str(stub.parent),
+            "L2_STUB_ORIGIN": str(stub.resolve()),
+            "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+        }
         if mode == "refused":
             child_env["TPEN_PLACEMENT_REFUSAL"] = json.dumps({"code": "child-placement-refused", "reason": "consumer refusal control"})
             child_env["L2_REFUSED"] = "1"
@@ -182,6 +227,9 @@ def test_l2_real_executor_producer_to_p8_reader_contract(tmp_path: Path) -> None
         placement = attempts[0].placement_receipt
         assert placement["verdict"]["reason_class"] == reason_class
         if mode in {"unavailable", "refused"}:
+            assert result.chains == ()
+            assert result.preserved_attempts
+            assert result.preserved_attempts[0].outcome == "launch_failed"
             assert result.placement_unqualified
             assert "GPU PLACEMENT UNQUALIFIED" in result.placement_verdict["message"]
 

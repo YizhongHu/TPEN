@@ -322,14 +322,18 @@ def _placement_v2_verdict(value: Any, declared: Mapping[str, Any]) -> dict[str, 
     expected_acceptance = "accepted" if record["reason_class"] == "not-sampled" else "not-accepted"
     if record["science_acceptance"] != expected_acceptance:
         raise ManifestRefusal("malformed-record", "placement verdict science acceptance contradicts reason class")
-    if declared["devices"] and not record["warning"]:
-        raise ManifestRefusal("unqualified-placement-not-loud", "declared GPU placement requires a loud warning")
-    if record["reason_class"] == "not-sampled" and "GPU PLACEMENT NOT-SAMPLED" not in record["warning"]:
-        raise ManifestRefusal("unqualified-placement-not-loud", "not-sampled placement warning is not loud")
-    if record["reason_class"] == "mismatch" and "GPU PLACEMENT UNQUALIFIED" not in record["warning"]:
-        raise ManifestRefusal("unqualified-placement-not-loud", "mismatched placement warning is not loud")
-    if record["reason_class"] == "refused" and "GPU PLACEMENT REFUSED" not in record["warning"]:
-        raise ManifestRefusal("unqualified-placement-not-loud", "refused placement warning is not loud")
+    if declared["devices"]:
+        if not record["warning"]:
+            raise ManifestRefusal("unqualified-placement-not-loud", "declared GPU placement requires a loud warning")
+        if record["reason_class"] == "not-sampled" and "GPU PLACEMENT NOT-SAMPLED" not in record["warning"]:
+            raise ManifestRefusal("unqualified-placement-not-loud", "not-sampled placement warning is not loud")
+        if record["reason_class"] == "mismatch" and "GPU PLACEMENT UNQUALIFIED" not in record["warning"]:
+            raise ManifestRefusal("unqualified-placement-not-loud", "mismatched placement warning is not loud")
+        if record["reason_class"] == "refused" and not any(
+            phrase in record["warning"]
+            for phrase in ("GPU PLACEMENT REFUSED", "GPU PLACEMENT UNQUALIFIED")
+        ):
+            raise ManifestRefusal("unqualified-placement-not-loud", "refused placement warning is not loud")
     return record
 
 
@@ -368,8 +372,9 @@ def _placement_receipt(value: Any, attempt: Mapping[str, Any], start: Mapping[st
             raise ManifestRefusal("malformed-record", "L1a v2 GPU evidence must be unavailable/not-sampled")
         if record["gpu"]["samples"] or record["gpu"]["active_uuids"] or record["gpu"]["active_pci"]:
             raise ManifestRefusal("malformed-record", "L1a v2 GPU evidence must not contain samples")
-        for device in record["declared"]["devices"]:
-            _gpu_uuid(device, "placement.declared.devices")
+        if record["refusal"] is None:
+            for device in record["declared"]["devices"]:
+                _gpu_uuid(device, "placement.declared.devices")
         if record["host_mapping"]["slot_id"] != record["slot_id"]:
             raise ManifestRefusal("malformed-record", "host mapping slot_id disagrees with the base receipt")
         if record["host_mapping"]["status"] != record["verdict"]["host"]:
