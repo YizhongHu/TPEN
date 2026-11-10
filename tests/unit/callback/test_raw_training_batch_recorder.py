@@ -172,6 +172,53 @@ def test_reader_refuses_physical_bundle_hash_mismatch(tmp_path: Path) -> None:
         TrainingBatchReader(tmp_path).validate()
 
 
+def test_reader_refuses_bundle_byte_corruption_with_envelopes_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Reject altered bundle bytes before trusting the decoded arrays."""
+
+    _publish_valid(tmp_path)
+    sidecar_before = (tmp_path / "partition-00000.json").read_bytes()
+    manifest_before = (tmp_path / "manifest.json").read_bytes()
+    bundle = tmp_path / "partition-00000.npz"
+    corrupted = bytearray(bundle.read_bytes())
+    corrupted[-1] ^= 0x01
+    bundle.write_bytes(corrupted)
+
+    assert (tmp_path / "partition-00000.json").read_bytes() == sidecar_before
+    assert (tmp_path / "manifest.json").read_bytes() == manifest_before
+    with pytest.raises(ValueError, match="physical hash"):
+        TrainingBatchReader(tmp_path).validate()
+
+
+def test_reader_refuses_logical_digest_mismatch_after_rebinding_physical_hash(
+    tmp_path: Path,
+) -> None:
+    """Reach the logical digest guard with both physical envelopes consistent."""
+
+    _publish_valid(tmp_path)
+    bundle = tmp_path / "partition-00000.npz"
+    arrays = dict(np.load(bundle, allow_pickle=False))
+    arrays["local_energy"] = arrays["local_energy"].copy()
+    arrays["local_energy"][0] += 1.0
+    np.savez_compressed(bundle, **arrays)
+
+    sidecar_path = tmp_path / "partition-00000.json"
+    sidecar = json.loads(sidecar_path.read_text())
+    sidecar["compressed_sha256"] = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    sidecar_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n")
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["partitions"][0]["sidecar_sha256"] = hashlib.sha256(
+        sidecar_path.read_bytes()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="logical digest"):
+        TrainingBatchReader(tmp_path).validate()
+
+
 def test_partition_provenance_is_written_and_exposed_by_reader(tmp_path: Path) -> None:
     """Keep run, source, sampler, and partition acceptance provenance typed."""
 
