@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -288,6 +289,35 @@ def test_assert_candidate_instantiates_refuses_a_misconfigured_candidate(tmp_pat
     assert excinfo.value.code == "candidate-module-misconfigured"
 
 
+#: experiments/README.md and test_import_boundary.py forbid any ``import
+#: tpen`` in this directory outside ``tpen.run.run_from_config``, so class
+#: presence is checked in a separate, real *science_python* subprocess
+#: (mirrors ``attached.assert_candidate_instantiates``'s own pattern), never
+#: by importing ``tpen.callback`` in this process. ``hasattr`` alone catches
+#: ``tpen.callback``'s lazy ``__getattr__`` raising ``AttributeError`` for an
+#: unknown name (exit 2 below); any OTHER exception, e.g. a real
+#: ``ImportError`` from a broken environment, is a normal Python traceback on
+#: a different exit code and is never mistaken for "class absent".
+_CLASS_PRESENT_PROBE_SCRIPT = """
+import sys
+import tpen.callback as callback_module
+sys.exit(0 if hasattr(callback_module, sys.argv[1]) else 2)
+"""
+
+
+def _candidate_class_is_present(science_python: str, class_name: str) -> bool:
+    result = subprocess.run(
+        [str(science_python), "-c", _CLASS_PRESENT_PROBE_SCRIPT, class_name],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 2:
+        return False
+    raise RuntimeError(f"probing tpen.callback.{class_name} failed unexpectedly: {result.stderr}")
+
+
 @pytest.mark.parametrize(
     "target",
     [
@@ -300,20 +330,14 @@ def test_assert_candidate_instantiates_accepts_the_real_candidate_entry(target: 
     """Amendment r4 rule 4: each appended candidate instantiates against its real class.
 
     SKIPS, with an explicit reason, only when the class itself does not
-    exist on this base (dev-only classes on a pre-merge stack head, #616);
-    this is checked via ``hasattr`` on ``tpen.callback``'s lazy
-    ``__getattr__`` (an unmatched name there raises ``AttributeError``,
-    which ``hasattr`` alone catches -- any OTHER exception, e.g. a real
-    ``ImportError`` from a broken environment, propagates and is never
-    mistaken for "class absent"). When the class IS present, this test
-    always proceeds to the real instantiation call below and FAILS if it
-    does not construct -- the skip can never hide that case.
+    exist on this base (dev-only classes on a pre-merge stack head, #616).
+    When the class IS present, this test always proceeds to the real
+    instantiation call below and FAILS if it does not construct -- the skip
+    can never hide that case.
     """
 
-    import tpen.callback as tpen_callback
-
     class_name = target.rsplit(".", 1)[-1]
-    if not hasattr(tpen_callback, class_name):
+    if not _candidate_class_is_present(sys.executable, class_name):
         pytest.skip(f"{target} is absent from tpen.callback on this base (dev-only, #616)")
 
     config, _ = protocol.pilot_training_config("capacity-pilot")
