@@ -623,11 +623,6 @@ class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
     def close(self, context: RunContext) -> None:
         """Publish a complete open partition at an explicit run boundary."""
 
-        if self._restored:
-            raise ValueError(
-                "RawTrainingBatchRecorder refuses restored lineage before capture "
-                "or publication [unsupported-callback]"
-            )
         self._publish(context, final=True)
 
     def _reset_typed_state(self) -> None:
