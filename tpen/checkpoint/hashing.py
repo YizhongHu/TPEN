@@ -67,6 +67,20 @@ _CALLBACK_OUTPUT_FIELDS = {
     # below this directory; consumer: ``RuntimeEquivariance.__init__`` and its
     # artifact writer.  This is an operational destination, not model input.
     "tpen.callback.RuntimeEquivariance": {"artifact_dir"},
+    # Defining-module targets are also valid Hydra targets for these same
+    # callback implementations; keep their operational slots closed too.
+    "tpen.callback.checkpoint.Checkpoint": {"output_dir"},
+    "tpen.callback.equivariance.RuntimeEquivariance": {"artifact_dir"},
+    "tpen.callback.evaluation.ArtifactIndex": {"path"},
+    "tpen.callback.evaluation.FailureLog": {"path"},
+    "tpen.callback.initial_checkpoint.InitialCheckpoint": {"output_dir"},
+    "tpen.callback.metadata.Metadata": {"output_path"},
+    "tpen.callback.parameter_activity.ParameterActivity": {"output_path"},
+    "tpen.callback.raw_training_batch_recorder.RawTrainingBatchRecorder": {"path"},
+    "tpen.callback.raw_training_batch_recorder.TrainingBatchRecorder": {"path"},
+    "tpen.callback.snapshot.ConfigSnapshot": {"output_path"},
+    "tpen.callback.snapshot.ResolvedConfigSnapshot": {"output_path"},
+    "tpen.callback.status.Status": {"output_path"},
     # The ``spenn`` study configs use the same callback producers under their
     # compatibility import prefix.  Keep these exact targets in the closed
     # table rather than treating arbitrary callback output-like fields as
@@ -92,6 +106,9 @@ _LOGGER_PATH_FIELDS = {
     # WandB.dir controls the local dashboard-artifact destination; it is not
     # part of the science config represented by the logger's metrics.
     "tpen.logging.WandB": {"dir"},
+    "tpen.logging.csv.CSV": {"path"},
+    "tpen.logging.jsonl.JSONL": {"path"},
+    "tpen.logging.wandb.WandB": {"dir"},
     "spenn.logging.CSV": {"path"},
     "spenn.logging.JSONL": {"path"},
     "spenn.logging.WandB": {"dir"},
