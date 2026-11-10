@@ -563,6 +563,14 @@ step,namespace,key,value
 1,checks/equivariance/full_model,max_abs_error,0.0
 ```
 
+`OptimizerState` is an optional callback, not an always-on trainer metric. It
+writes one namespace per configured group under
+`train/optimizer_state/<group>` with `step`, `step_min`, `step_max`, and
+`step_mismatch`; `exp_avg_l2`, `exp_avg_rms`, `exp_avg_max_abs`;
+`exp_avg_sq_l2`, `exp_avg_sq_rms`, `exp_avg_sq_max_abs`; and
+`n_no_optimizer_state`. A mismatched step is represented by `step = null` and
+the explicit `step_mismatch = true` flag rather than by averaging steps.
+
 The metric identity is:
 
 ```text
