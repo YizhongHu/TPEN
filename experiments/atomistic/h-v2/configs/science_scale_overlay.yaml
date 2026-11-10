@@ -1,0 +1,26 @@
+# H-v2 science scale overlay (design target section A1, TO baff945c).
+#
+# Scale-only overrides applied onto the frozen pipeline-check `train.yaml`
+# by EXPLICIT dotted key path (`protocol.py`'s `_apply_science_overlay`),
+# never a blind `OmegaConf.merge` -- a merge replaces `model.layers`
+# wholesale instead of touching one nested leaf under `model.layers.0`.
+#
+# Logging fields (`trainer.log_every_n_steps`, `callbacks`, `loggers`) are
+# deliberately NOT here: they are inherited unchanged from `train.yaml` and
+# owned by the cadence slice (TO 69c5a5a6), not this overlay.
+#
+# `runtime.seed` and `sampler.seed` are also NOT here: they come from
+# `contract_inputs.json`'s frozen `measurement.seed_roster`, never a second
+# literal copy (that duplication is exactly what a wrong-seed mutant would
+# target).
+#
+# This file's key set is pinned by `protocol.SCIENCE_SCALE_OVERLAY_KEYS` and
+# checked for exact equality before it is ever applied.
+runtime.device: cuda
+sampler.n_walkers: 4096
+trainer.max_steps: 50000
+model.embedding.out_channels: 32
+model.embedding.hidden_channels: 128
+model.layers.0.mixing.channels: 32
+model.layers.0.path_aggregation.channels: 32
+model.readout.channels: 32
