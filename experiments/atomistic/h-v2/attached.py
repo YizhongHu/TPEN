@@ -126,6 +126,25 @@ SCIENCE_CONFIG_IDENTITY_KEYS = frozenset(
         "materialized_config_sha256",
     }
 )
+#: K1: required science-config identity fields a pilot/part-(g) receipt must
+#: carry (``protocol.pilot_training_config``'s own identity-dict shape,
+#: which differs from the science payload's -- ``payload``/``seed_namespace``/
+#: ``scale_overlay_sha256``/``payload_overlay_sha256`` rather than
+#: ``lineage_index``/``overlay_sha256``). A receipt refuses rather than being
+#: written with any of these silently dropped between the protocol builder,
+#: ``build_h_v2_train_plan``, and this receipt.
+PILOT_CONFIG_IDENTITY_KEYS = frozenset(
+    {
+        "payload",
+        "lineage",
+        "seed_namespace",
+        "scale_overlay_sha256",
+        "payload_overlay_sha256",
+        "base_train_sha256",
+        "contract_inputs_sha256",
+        "materialized_config_sha256",
+    }
+)
 
 #: D3: the unresolved ``${run.dir}/...`` prefix every per-run artifact path in
 #: these frozen configs is written under; stripping it from a callback's own
@@ -312,12 +331,24 @@ def probe_admitted_a1_modules(
     enabled: list[str] = []
     skipped: list[str] = []
     probe_path = Path(probe_config_path)
+    _atomic_text(probe_path, yaml.safe_dump(config, sort_keys=False, allow_unicode=True))
+    # F3: the base config (no candidate appended yet) must itself be
+    # admitted. A failure here is a checker/environment problem, never a
+    # per-candidate "not admitted" verdict, so it is never caught -- it
+    # propagates unconditionally, including a ``profile-refused`` verdict.
+    check_profile(science_python, probe_path, cwd=cwd)
     for target in candidates:
         protocol.append_candidate_module(config, target)
         _atomic_text(probe_path, yaml.safe_dump(config, sort_keys=False, allow_unicode=True))
         try:
             check_profile(science_python, probe_path, cwd=cwd)
-        except ActivationRefusal:
+        except ActivationRefusal as error:
+            # F3: only a genuine checker REFUSAL of this candidate is a skip.
+            # Any other code (malformed/unavailable/mismatched checker
+            # output) is a checker failure, not an admission decision, and
+            # must propagate rather than silently drop a valid candidate.
+            if error.code != "profile-refused":
+                raise
             protocol.remove_candidate_module(config, target)
             skipped.append(target)
             continue
@@ -999,6 +1030,61 @@ def activate_h_v2_run(
 _CHECKPOINT_COMPLETE_MARKER = "COMPLETE"
 _CHECKPOINT_MANIFEST_NAME = "manifest.json"
 _CHECKPOINT_STEP_DIR_PREFIX = "step_"
+#: Mirrored from ``tpen.checkpoint.manifest.CHECKPOINT_SCHEMA_VERSION`` as a
+#: filesystem convention (``experiments/README.md`` forbids importing
+#: anything from ``tpen`` here beyond ``tpen.inspection``). Only a v2
+#: manifest records ``completed_updates``; a v1/legacy or malformed manifest
+#: is refused, never relabelled (F1).
+_CHECKPOINT_MANIFEST_SCHEMA_VERSION_V2 = 2
+
+
+def _completed_updates_from_manifest(manifest_path: Path, entry: Path) -> int:
+    """Return the checkpoint's scientific update coordinate from its manifest.
+
+    F1: a checkpoint directory's own name (``step_<next_iteration>``) is the
+    trainer's RESUME CURSOR, not the count of optimizer updates actually
+    applied -- the two counters diverge whenever a completed iteration
+    skipped its update. The manifest's ``completed_updates`` field is the
+    coordinate E must select checkpoints by; the directory cursor is kept
+    only to reconcile against it, never substituted for it.
+
+    Raises
+    ------
+    HV2ReceiptRefusal
+        Code ``malformed-checkpoint-manifest``, if *manifest_path* is not
+        readable JSON, is not schema version 2, or omits
+        ``completed_updates``/``next_iteration`` (a v1/legacy manifest never
+        recorded ``completed_updates`` and is refused here, never
+        relabelled). Code ``checkpoint-cursor-mismatch``, if the directory's
+        own cursor disagrees with the manifest's recorded ``next_iteration``.
+    """
+
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        schema_version = int(data["schema_version"])
+        next_iteration = int(data["next_iteration"])
+        completed_updates = int(data["completed_updates"])
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise HV2ReceiptRefusal(
+            "malformed-checkpoint-manifest",
+            f"{manifest_path} does not carry a readable v2 completed_updates/next_iteration "
+            f"pair: {error}",
+        ) from error
+    if schema_version != _CHECKPOINT_MANIFEST_SCHEMA_VERSION_V2:
+        raise HV2ReceiptRefusal(
+            "malformed-checkpoint-manifest",
+            f"{manifest_path} is schema_version {schema_version}, expected "
+            f"{_CHECKPOINT_MANIFEST_SCHEMA_VERSION_V2} (a legacy v1 manifest never recorded "
+            "completed_updates and is refused, never relabelled)",
+        )
+    directory_cursor = int(entry.name[len(_CHECKPOINT_STEP_DIR_PREFIX):])
+    if next_iteration != directory_cursor:
+        raise HV2ReceiptRefusal(
+            "checkpoint-cursor-mismatch",
+            f"{entry} directory cursor {directory_cursor} disagrees with manifest "
+            f"next_iteration {next_iteration}",
+        )
+    return completed_updates
 
 
 def build_checkpoint_inventory(checkpoint_root: str | Path) -> list[dict[str, Any]]:
@@ -1019,9 +1105,16 @@ def build_checkpoint_inventory(checkpoint_root: str | Path) -> list[dict[str, An
     list of dict
         One entry per committed ``step_<N>`` directory, sorted by update
         number: ``{"update": int, "path": str, "files": {filename: sha256}}``.
-        A directory still suffixed ``.tmp``, or missing its
-        :data:`_CHECKPOINT_COMPLETE_MARKER`/manifest, is an in-progress write
-        and is never inventoried.
+        F1: ``update`` is the manifest's ``completed_updates`` -- the
+        scientific update coordinate E selects checkpoints by -- not the
+        directory's own resume-cursor name. A directory still suffixed
+        ``.tmp``, or missing its :data:`_CHECKPOINT_COMPLETE_MARKER`/manifest,
+        is an in-progress write and is never inventoried.
+
+    Raises
+    ------
+    HV2ReceiptRefusal
+        See :func:`_completed_updates_from_manifest`.
     """
 
     root = Path(checkpoint_root)
@@ -1031,12 +1124,13 @@ def build_checkpoint_inventory(checkpoint_root: str | Path) -> list[dict[str, An
     for entry in sorted(root.iterdir()):
         if not entry.is_dir() or entry.name.endswith(".tmp") or not entry.name.startswith(_CHECKPOINT_STEP_DIR_PREFIX):
             continue
-        if not (entry / _CHECKPOINT_MANIFEST_NAME).is_file() or not (entry / _CHECKPOINT_COMPLETE_MARKER).is_file():
+        manifest_path = entry / _CHECKPOINT_MANIFEST_NAME
+        if not manifest_path.is_file() or not (entry / _CHECKPOINT_COMPLETE_MARKER).is_file():
             continue
-        update = int(entry.name[len(_CHECKPOINT_STEP_DIR_PREFIX):])
+        update = _completed_updates_from_manifest(manifest_path, entry)
         files = {
-            file_path.name: file_sha256(file_path)
-            for file_path in sorted(entry.iterdir())
+            str(file_path.relative_to(entry)): file_sha256(file_path)
+            for file_path in sorted(entry.rglob("*"))
             if file_path.is_file()
         }
         inventory.append({"update": update, "path": str(entry), "files": files})
@@ -1162,6 +1256,18 @@ def build_h_v2_accepted_receipt(
             raise HV2ReceiptRefusal(
                 "science-config-identity-missing",
                 f"payload=science receipt is missing required science config identity fields: "
+                f"{sorted(missing)!r}",
+            )
+    elif payload in protocol.PILOT_PAYLOADS:
+        # K1: a pilot/part-(g) receipt must carry its own complete identity
+        # record too (coverage gap: previously checked for payload=="science"
+        # only, so a dropped/corrupted payload_overlay_sha256 anywhere along
+        # protocol -> build_h_v2_train_plan -> this receipt went unnoticed).
+        missing = PILOT_CONFIG_IDENTITY_KEYS - set(science_config_identity or {})
+        if missing:
+            raise HV2ReceiptRefusal(
+                "pilot-config-identity-missing",
+                f"payload={payload!r} receipt is missing required pilot config identity fields: "
                 f"{sorted(missing)!r}",
             )
     manifest_path = Path(manifest_path)
@@ -1323,6 +1429,7 @@ __all__ = [
     "H_V2_ACCEPTED_RECEIPT_SCHEMA",
     "HV2Activation",
     "HV2ReceiptRefusal",
+    "PILOT_CONFIG_IDENTITY_KEYS",
     "PreparedHV2Run",
     "ROUTE_NAME",
     "SCIENCE_CONFIG_IDENTITY_KEYS",

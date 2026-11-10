@@ -181,7 +181,11 @@ def test_append_and_remove_candidate_module_round_trips() -> None:
 
 
 class _FakeRefusal(Exception):
-    code = "unsupported-callback"
+    # F3: the real checker only ever raises "profile-refused" for a genuine
+    # not-admitted verdict (the other real codes -- profile-unavailable,
+    # profile-mismatch -- are checker failures, never a skip). A fabricated
+    # code here would no longer be treated as a skip by the fixed probe.
+    code = "profile-refused"
     reason = "not in the declared profile"
 
 
@@ -222,15 +226,26 @@ def test_probe_admitted_a1_modules_keeps_only_admitted_candidates(
 
 
 def test_probe_admitted_a1_modules_admits_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stack-head-shaped stub: the recovery profile admits nothing beyond the base config."""
+    """Stack-head-shaped stub: the recovery profile admits nothing beyond the base config.
+
+    F3: the base config (no candidate appended) must itself still be
+    admitted -- only a config carrying a non-base A1 candidate is refused.
+    """
 
     config, _ = protocol.pilot_training_config("capacity-pilot")
 
-    def _refuse_everything(science_python: Any, probe_path: Any, **kwargs: Any) -> None:
-        del science_python, probe_path, kwargs
-        raise attached.ActivationRefusal(_FakeRefusal.code, _FakeRefusal.reason)
+    def _refuse_added_candidates(science_python: Any, probe_path: Any, **kwargs: Any) -> None:
+        del science_python, kwargs
+        loaded = yaml.safe_load(Path(probe_path).read_text(encoding="utf-8"))
+        for callback in loaded["callbacks"]:
+            target = callback["_target_"]
+            if target in protocol.A1_TRAINING_MODULE_CANDIDATES and target not in {
+                "tpen.callback.DataIntegrity",
+                "tpen.callback.GradientStats",
+            }:
+                raise attached.ActivationRefusal(_FakeRefusal.code, _FakeRefusal.reason)
 
-    monkeypatch.setattr(attached, "check_profile", _refuse_everything)
+    monkeypatch.setattr(attached, "check_profile", _refuse_added_candidates)
     enabled, skipped = attached.probe_admitted_a1_modules(
         config,
         protocol.candidate_modules_to_append(),
@@ -352,10 +367,29 @@ def test_assert_candidate_instantiates_accepts_the_real_candidate_entry(target: 
 # ---------------------------------------------------------------------------
 
 
-def _write_fake_checkpoint(root: Path, update: int) -> Path:
+def _write_fake_checkpoint(root: Path, update: int, *, completed_updates: int | None = None) -> Path:
+    """Real-shaped v2 checkpoint manifest (F1): directory name is the resume
+    cursor (``next_iteration``); ``completed_updates`` defaults to the same
+    value but a caller may diverge the two to exercise F1's distinction."""
+
     step_dir = root / f"step_{update:06d}"
     step_dir.mkdir(parents=True)
-    (step_dir / "manifest.json").write_text(json.dumps({"step": update}), encoding="utf-8")
+    (step_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "kind": "tpen.checkpoint",
+                "next_iteration": update,
+                "completed_updates": update if completed_updates is None else completed_updates,
+                "created_at_unix": 0.0,
+                "files": {"model": "model.pt"},
+                "hashes": {},
+                "runtime": {},
+                "provenance": {},
+            }
+        ),
+        encoding="utf-8",
+    )
     (step_dir / "model.pt").write_bytes(f"model-{update}".encode())
     (step_dir / "COMPLETE").write_text("complete\n", encoding="utf-8")
     return step_dir
@@ -490,7 +524,16 @@ def test_build_h_v2_accepted_receipt_records_checkpoint_inventory_from_real_prod
         stage=attached.TRAIN_STAGE,
         inspect_run=lambda path: _completed_evidence(str(checkpoint_dir), 1000, 1000),
         payload="capacity-pilot",
-        science_config_identity={"lineage": "P"},
+        science_config_identity={
+            "payload": "capacity-pilot",
+            "lineage": "P",
+            "seed_namespace": "capacity_pilot",
+            "scale_overlay_sha256": _sha(),
+            "payload_overlay_sha256": _sha(),
+            "base_train_sha256": _sha(),
+            "contract_inputs_sha256": _sha(),
+            "materialized_config_sha256": _sha(),
+        },
         enabled_modules=["tpen.callback.InitialCheckpoint"],
         skipped_not_admitted=["tpen.callback.ModuleNorms"],
     )
@@ -572,7 +615,10 @@ def test_dry_run_prints_exactly_one_sbatch_line_with_expected_partition_gres_tim
     (line,) = lines
     resources = launch_config.PILOT_PAYLOAD_RESOURCES[payload]
     assert f"--partition={resources.partition}" in line
-    assert f"--gres=gpu:{resources.gpus}" in line
+    expected_gres = (
+        f"--gres=gpu:{resources.gpu_model}:{resources.gpus}" if resources.gpu_model else f"--gres=gpu:{resources.gpus}"
+    )
+    assert expected_gres in line
     cap_seconds = launch_config.PILOT_PAYLOAD_MAX_WALL_SECONDS[payload]
     assert f"--time={launch._format_wall_seconds(cap_seconds)}" in line
     assert "--dependency" not in line
@@ -626,7 +672,7 @@ def test_submit_pilot_payload_refuses_a_run_root_outside_the_prefix(tmp_path: Pa
     def _forbidden(command: list) -> None:
         raise AssertionError("sbatch must never be called for a run root outside the prefix")
 
-    with pytest.raises(launch.LaunchError, match="durable prefix"):
+    with pytest.raises(launch.LaunchError, match="must be .* or a descendant of it"):
         launch.submit_pilot_payload(
             "gpu-route-g",
             science_python=sys.executable,
