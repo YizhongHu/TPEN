@@ -460,6 +460,82 @@ def run_pilot_sel(run_root: Path) -> None:
     print(f"[h-v2] SEL: c1={record['c1']}")
 
 
+def run_pilot_final_sel(run_root: Path) -> None:
+    """Compute and write the pilot final-basin ``c*`` record (F7, review r1).
+
+    In scope per orchestrator decision 2026-11-10: the final-basin selector
+    (:func:`protocol.select_final_basin_ordinal`) had no production caller --
+    B2 finished without ever combining streams 0/1 or publishing ``c*``. This
+    is that completion step: an explicit CPU command run after B2, reading
+    the verified B1 (stage-1) and B2 (stage-2 or stage-2-core) eval receipts
+    plus the SEL selection record, pooling each candidate ordinal's stream-0
+    (B1) and stream-1 (B2) local energies, computing the instrument's ``W``
+    per pooled ordinal, and writing the bound final-selection record.
+
+    Raises
+    ------
+    JobError
+        If the SEL selection record, the stage-1 receipt, or a stage-2/
+        stage-2-core receipt is missing, or pooled stream-0/1 data is
+        missing for any candidate ordinal.
+    """
+
+    import hashlib
+
+    selection_path = run_root / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
+    if not selection_path.is_file():
+        raise JobError(f"no SEL selection record at {selection_path}; run `sel capacity-pilot` first")
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+
+    stage1_path = _eval_receipt_path(run_root, "h-v2-eval-capacity-pilot-stage1")
+    if not stage1_path.is_file():
+        raise JobError(f"no capacity-pilot stage-1 eval receipt at {stage1_path}")
+    stage1_sha256 = hashlib.sha256(stage1_path.read_bytes()).hexdigest()
+    c1 = eval_job.verify_selection_record(selection, b1_eval_receipt_sha256=stage1_sha256)
+    stage1_receipt = eval_job.read_eval_receipt(stage1_path)
+
+    stage2_path = _eval_receipt_path(run_root, "h-v2-eval-capacity-pilot-stage2")
+    if not stage2_path.is_file():
+        stage2_path = _eval_receipt_path(run_root, "h-v2-eval-capacity-pilot-stage2-core")
+    if not stage2_path.is_file():
+        raise JobError(
+            f"no capacity-pilot stage-2/stage-2-core eval receipt under {run_root}; "
+            "run `eval-fanout capacity-pilot --pilot-stage 2` (or 2-core) first"
+        )
+    stage2_receipt = eval_job.read_eval_receipt(stage2_path)
+
+    candidates = sorted({c for c in (c1 - 1, c1, c1 + 1) if 3 <= c <= 19} | {c1})
+    needed_ordinals = sorted({o for c in candidates for o in (c - 1, c, c + 1)})
+    pooled_energies: dict[int, list[float]] = {ordinal: [] for ordinal in needed_ordinals}
+    for generation in stage1_receipt.get("generations") or []:
+        if generation.get("stream") == 0 and generation["ordinal"] in pooled_energies:
+            pooled_energies[generation["ordinal"]].extend(
+                eval_job.read_stream_local_energies(eval_job.trajectory_csv_path(generation))
+            )
+    for generation in stage2_receipt.get("generations") or []:
+        if generation.get("stream") == 1 and generation["ordinal"] in pooled_energies:
+            pooled_energies[generation["ordinal"]].extend(
+                eval_job.read_stream_local_energies(eval_job.trajectory_csv_path(generation))
+            )
+    missing = sorted(ordinal for ordinal, energies in pooled_energies.items() if not energies)
+    if missing:
+        raise JobError(f"final-SEL is missing pooled stream-0/1 data for ordinals {missing!r}")
+
+    pooled01_w_by_ordinal = {ordinal: protocol.w_statistic(energies) for ordinal, energies in pooled_energies.items()}
+    c_star = protocol.select_final_basin_ordinal(c1, pooled01_w_by_ordinal)
+    record = {
+        "c1": c1,
+        "c_star": c_star,
+        "b1_eval_receipt_sha256": stage1_sha256,
+        "stage2_eval_receipt_sha256": hashlib.sha256(stage2_path.read_bytes()).hexdigest(),
+        "pooled01_w_by_ordinal": {str(ordinal): w for ordinal, w in pooled01_w_by_ordinal.items()},
+    }
+    final_path = run_root / "attached" / "receipts" / "h-v2-eval-capacity-pilot-final-selection.json"
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    final_path.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    print(f"[h-v2] final-SEL: c1={c1} c*={c_star}")
+
+
 def run(
     stage: str,
     lineage: str,
@@ -724,6 +800,21 @@ def _main_sel(argv: list[str]) -> int:
     return 0
 
 
+def _main_final_sel(argv: list[str]) -> int:
+    """Parse and dispatch ``run_job.py final-sel capacity-pilot`` (F7)."""
+
+    if argv != ["capacity-pilot"]:
+        print("usage: run_job.py final-sel capacity-pilot", file=sys.stderr)
+        return 2
+    run_root = Path(_require_env("RUN")).resolve()
+    try:
+        run_pilot_final_sel(run_root)
+    except Exception as error:  # noqa: BLE001 - this is the job's own top-level boundary
+        print(f"[h-v2] job failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse and dispatch the in-job CLI.
 
@@ -732,9 +823,9 @@ def main(argv: list[str] | None = None) -> int:
     ``eval``. A bare ``train L1``/``eval L1`` with neither refuses (exit 2)
     rather than defaulting to the science payload.
 
-    TO 8a5e926f: ``eval-fanout``/``sel`` are separate subcommands (item E's
-    own direct-dispatch route), dispatched before the ``train``/``eval``
-    parsing below ever runs.
+    TO 8a5e926f: ``eval-fanout``/``sel``/``final-sel`` are separate
+    subcommands (item E's own direct-dispatch route), dispatched before the
+    ``train``/``eval`` parsing below ever runs.
     """
 
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -742,6 +833,8 @@ def main(argv: list[str] | None = None) -> int:
         return _main_eval_fanout(argv[1:])
     if argv and argv[0] == "sel":
         return _main_sel(argv[1:])
+    if argv and argv[0] == "final-sel":
+        return _main_final_sel(argv[1:])
     pipeline_check = False
     explicit_science = False
     pilot_payload: str | None = None

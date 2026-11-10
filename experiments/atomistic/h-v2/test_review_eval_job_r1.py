@@ -322,8 +322,16 @@ def test_full_b2_run_set_has_independent_boundary_oracle(c1):
     assert all(g["seed"] == 996000 + 10 * g["ordinal"] + g["stream"] for g in actual)
 
 
-def test_stage2_computes_final_basin(tmp_path, monkeypatch):
-    """F7: kill leaving the final-basin selector unused after B2 completion."""
+def test_final_sel_is_a_separate_cpu_command_after_b2(tmp_path, monkeypatch):
+    """F7 (implemented): the final-basin selector has an explicit CPU caller.
+
+    Per the orchestrator's fix (run_job.py final-sel capacity-pilot /
+    job.run_pilot_final_sel), B2 itself never computes c* -- it is a
+    separate, explicit completion step run after B2, reading the verified
+    B1/B2 eval receipts and the SEL selection record. Replaces the review's
+    original assertion (B2 calls the selector inline), which predated that
+    design choice and is noted in the implementation receipt.
+    """
     _train(tmp_path)
     _b1(tmp_path)
     job.run_pilot_sel(tmp_path)
@@ -339,10 +347,16 @@ def test_stage2_computes_final_basin(tmp_path, monkeypatch):
     job.run_eval_fanout(run_root=tmp_path, expected_commit=EVAL_SHA,
                         science_python=sys.executable, payload="capacity-pilot", lineage="P",
                         expected_train_commit=TRAIN_SHA, pilot_stage="2")
-    # Proposed completion contract: compute final c* from the real B1/B2 outputs.
-    # If implemented as a separate CPU command, move this assertion to that command.
-    assert calls, "B2 returned success without ever computing the in-scope final c*"
+    assert not calls, "B2 must not compute c* itself -- that is final-sel's own job"
+
+    job.run_pilot_final_sel(tmp_path)
+    assert calls, "run_pilot_final_sel never called the final-basin selector"
     assert calls[0][0] == 10
+    final_path = tmp_path / "attached" / "receipts" / "h-v2-eval-capacity-pilot-final-selection.json"
+    assert final_path.is_file()
+    record = json.loads(final_path.read_text(encoding="utf-8"))
+    assert record["c1"] == 10
+    assert "c_star" in record
 
 
 @pytest.mark.parametrize("rc,stdout", [(1, ""), (0, "unparseable output\n")])
