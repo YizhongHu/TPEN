@@ -402,9 +402,10 @@ class TrainingBatchReader:
             if not isinstance(expected_sidecar_hash, str):
                 raise ValueError("training manifest entry is missing the sidecar digest")
             if not sidecar_path.exists() or _sha256(sidecar_path) != expected_sidecar_hash:
-            raise ValueError(
-                "training partition sidecar digest does not match its manifest entry"
-            )
+                raise ValueError(
+                    "training partition sidecar digest does not match its manifest entry"
+                    " (partition integrity failure)"
+                )
             sidecar = json.loads(sidecar_path.read_text())
             _validate_sidecar(self.root, sidecar, entry=entry)
             if sidecar["schema"] == SCHEMA:
