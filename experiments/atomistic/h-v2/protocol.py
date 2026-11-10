@@ -38,6 +38,65 @@ SCIENCE_SCALE_OVERLAY_KEYS = frozenset(
 #: Source of per-lineage science seeds (A1: "no seed literal outside CI").
 CONTRACT_INPUTS_PATH = ROOT / "contract_inputs.json"
 
+#: TO 63690220 (pilot and part (g) TRAIN payloads): per-payload lineage
+#: label, payload-overlay path, and CI non-science seed namespace. Each
+#: payload refuses any other lineage or seed (acceptance-contract amendment
+#: r2 P1/P2).
+PILOT_PAYLOADS: dict[str, dict[str, Any]] = {
+    "gpu-route-g": {
+        "lineage": "G",
+        "overlay_path": ROOT / "configs" / "gpu_route_g_overlay.yaml",
+        "seed_namespace": "pipeline_gpu_smoke_g",
+    },
+    "capacity-pilot": {
+        "lineage": "P",
+        "overlay_path": ROOT / "configs" / "capacity_pilot_overlay.yaml",
+        "seed_namespace": "capacity_pilot",
+    },
+}
+
+#: Allowlist for both pilot payload overlays (A1/TO 63690220):
+#: ``trainer.max_steps`` and the A1-cadence keys of the two A1 training-side
+#: modules that are already present leaves in ``train.yaml`` (DataIntegrity
+#: at ``callbacks.4``, GradientStats at ``callbacks.5``). Every other A1
+#: training-side module this payload enables is appended, never set here --
+#: ``_set_by_dotted_path`` only ever touches a leaf that already exists.
+PILOT_PAYLOAD_OVERLAY_KEYS = frozenset(
+    {
+        "trainer.max_steps",
+        "trainer.log_every_n_steps",
+        "callbacks.4.every_n_steps",
+        "callbacks.5.every_n_steps",
+    }
+)
+
+#: A1 cadence value shared by every pilot/part-(g) measurement callback:
+#: every update (acceptance-contract: "log_every_n_steps 1; DataIntegrity,
+#: GradientStats every 1").
+PILOT_A1_CADENCE = 1
+
+#: TO 63690220 amendment r3: every "A1 training-side logging module"
+#: candidate the pilot tries to enable at A1 cadence. Admission is decided
+#: per candidate, never as a block, by probing the runtime recovery profile
+#: (:func:`experiments.toolkit.attached_activation.check_profile`) -- never
+#: assumed from the branch. ``DataIntegrity``/``GradientStats`` are already
+#: present leaves in ``train.yaml`` (cadence set by the payload overlay
+#: above); the rest are appended fresh by :func:`append_measurement_callbacks`.
+A1_TRAINING_MODULE_CANDIDATES: tuple[str, ...] = (
+    "tpen.callback.DataIntegrity",
+    "tpen.callback.GradientStats",
+    "tpen.callback.InitialCheckpoint",
+    "tpen.callback.ParameterActivity",
+    "tpen.callback.ElectronNucleusDistanceQuantiles",
+    "tpen.callback.ModuleNorms",
+)
+
+#: Candidates already present as leaves in the base ``train.yaml`` callbacks
+#: list; never appended again by :func:`append_candidate_module`.
+_A1_CANDIDATES_PRESENT_IN_BASE_CONFIG = frozenset(
+    {"tpen.callback.DataIntegrity", "tpen.callback.GradientStats"}
+)
+
 #: Contract-frozen nuclear cusp law literals (``admission.pipeline_check.nuclear_law_note``).
 CONTRACT_NUCLEAR_LAW = {
     "_target_": "tpen.nn.CurvatureElectronNucleusCuspLaw",
@@ -152,6 +211,167 @@ def science_training_config(lineage: str, lineage_index: int) -> tuple[dict[str,
     return config, identity
 
 
+def _non_science_seed_namespace(namespace: str) -> dict[str, list[int]]:
+    """Read one frozen non-science seed namespace from ``contract_inputs.json``.
+
+    Raises
+    ------
+    KeyError
+        If *namespace* is not declared in
+        ``measurement.seed_roster.non_science_seed_namespaces``.
+    """
+
+    payload = json.loads(CONTRACT_INPUTS_PATH.read_text(encoding="utf-8"))
+    roster = payload["measurement"]["seed_roster"]["non_science_seed_namespaces"]
+    return roster[namespace]
+
+
+def _build_candidate_callback(target: str) -> dict[str, Any]:
+    """Return one A1 training-side module's candidate callback entry.
+
+    Raises
+    ------
+    ValueError
+        If *target* is not one of :data:`A1_TRAINING_MODULE_CANDIDATES`.
+    """
+
+    if target == "tpen.callback.InitialCheckpoint":
+        # No cadence field: it fires exactly once, at the pre-sampling
+        # zero-update boundary.
+        return {"_target_": target, "output_dir": "${run.dir}/checkpoints"}
+    if target == "tpen.callback.ParameterActivity":
+        # No cadence field: it fires exactly once, on the first applied update.
+        return {"_target_": target, "output_path": "${run.dir}/parameter_activity.json"}
+    if target == "tpen.callback.ElectronNucleusDistanceQuantiles":
+        return {
+            "_target_": target,
+            "every_n_steps": PILOT_A1_CADENCE,
+            "output_path": "${run.dir}/en_distance_quantiles.jsonl",
+        }
+    if target == "tpen.callback.ModuleNorms":
+        return {
+            "_target_": target,
+            "every_n_steps": PILOT_A1_CADENCE,
+            "output_path": "${run.dir}/module_norms.jsonl",
+        }
+    raise ValueError(f"no candidate-callback builder for A1 training-side module {target!r}")
+
+
+def candidate_modules_to_append() -> tuple[str, ...]:
+    """Return the A1 training-side module candidates not already in ``train.yaml``."""
+
+    return tuple(
+        target
+        for target in A1_TRAINING_MODULE_CANDIDATES
+        if target not in _A1_CANDIDATES_PRESENT_IN_BASE_CONFIG
+    )
+
+
+def append_candidate_module(config: dict[str, Any], target: str) -> None:
+    """Append one candidate module's callback entry onto *config* in place."""
+
+    config["callbacks"].append(_build_candidate_callback(target))
+
+
+def remove_candidate_module(config: dict[str, Any], target: str) -> None:
+    """Remove a previously appended candidate module's entry from *config* in place."""
+
+    config["callbacks"] = [
+        callback for callback in config["callbacks"] if callback.get("_target_") != target
+    ]
+
+
+def append_measurement_callbacks(config: dict[str, Any]) -> None:
+    """Append the pilot's own timing callbacks onto *config* in place.
+
+    TO 63690220: ``RunTiming`` and ``TrainStepTiming`` (A1 cadence,
+    ``accelerator_synchronize: false``), appended by this one protocol-owned
+    helper -- distinct from the dotted-path overlay mechanism, which can only
+    set a leaf that already exists in ``train.yaml``.
+    """
+
+    config["callbacks"].append({"_target_": "tpen.callback.RunTiming"})
+    config["callbacks"].append(
+        {
+            "_target_": "tpen.callback.TrainStepTiming",
+            "every_n_steps": PILOT_A1_CADENCE,
+            "rolling_window": 20,
+            "accelerator_synchronize": False,
+        }
+    )
+
+
+def pilot_training_config(payload: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return one pilot/part-(g) payload's TRAIN config, plus its identity.
+
+    Builds ``train.yaml`` plus the UNCHANGED ``science_scale_overlay.yaml``
+    (TO baff945c) plus *payload*'s own overlay (allowlisted by
+    :data:`PILOT_PAYLOAD_OVERLAY_KEYS`), then appends
+    :func:`append_measurement_callbacks`'s timing pair. It does NOT append
+    any :data:`A1_TRAINING_MODULE_CANDIDATES` entry: the caller (which alone
+    has a science interpreter to probe the runtime recovery profile) owns
+    deciding which candidates are admitted, via
+    :func:`append_candidate_module`/:func:`remove_candidate_module`.
+
+    Parameters
+    ----------
+    payload : {"gpu-route-g", "capacity-pilot"}
+
+    Returns
+    -------
+    tuple of dict, dict
+        The resolved TRAIN config (before any candidate module is appended),
+        and an identity record (payload, lineage, seed namespace, and the
+        sha256 of every frozen input file this config was built from).
+
+    Raises
+    ------
+    ValueError
+        If *payload* is not a declared pilot payload, or either overlay's key
+        set has drifted from its allowlist.
+    """
+
+    if payload not in PILOT_PAYLOADS:
+        raise ValueError(f"payload must be one of {sorted(PILOT_PAYLOADS)!r}, got {payload!r}")
+    spec = PILOT_PAYLOADS[payload]
+
+    config = training_config()
+    scale_overlay = load_yaml(SCIENCE_SCALE_OVERLAY_PATH)
+    if set(scale_overlay) != SCIENCE_SCALE_OVERLAY_KEYS:
+        raise ValueError(
+            f"science scale overlay key set {set(scale_overlay)!r} does not match the allowlist "
+            f"{set(SCIENCE_SCALE_OVERLAY_KEYS)!r}"
+        )
+    for dotted, value in scale_overlay.items():
+        _set_by_dotted_path(config, dotted, value)
+
+    payload_overlay = load_yaml(spec["overlay_path"])
+    if set(payload_overlay) != PILOT_PAYLOAD_OVERLAY_KEYS:
+        raise ValueError(
+            f"{payload} overlay key set {set(payload_overlay)!r} does not match the allowlist "
+            f"{set(PILOT_PAYLOAD_OVERLAY_KEYS)!r}"
+        )
+    for dotted, value in payload_overlay.items():
+        _set_by_dotted_path(config, dotted, value)
+
+    seeds = _non_science_seed_namespace(spec["seed_namespace"])
+    config["runtime"]["seed"] = seeds["training"][0]
+    config["sampler"]["seed"] = seeds["sampler"][0]
+
+    append_measurement_callbacks(config)
+
+    identity = {
+        "payload": payload,
+        "lineage": spec["lineage"],
+        "seed_namespace": spec["seed_namespace"],
+        "scale_overlay_sha256": file_sha256(SCIENCE_SCALE_OVERLAY_PATH),
+        "payload_overlay_sha256": file_sha256(spec["overlay_path"]),
+        "base_train_sha256": file_sha256(ROOT / "configs" / "train.yaml"),
+        "contract_inputs_sha256": file_sha256(CONTRACT_INPUTS_PATH),
+    }
+    return config, identity
+
+
 def evaluation_config(checkpoint: Path, *, stream: int = 0, root: Path | None = None) -> dict[str, Any]:
     """Return a fresh model-only evaluation config for one stream."""
 
@@ -216,17 +436,26 @@ def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False
 
 
 __all__ = [
+    "A1_TRAINING_MODULE_CANDIDATES",
     "CONTRACT_INPUTS_PATH",
     "CONTRACT_NUCLEAR_LAW",
     "EVALUATION_SEEDS",
+    "PILOT_A1_CADENCE",
+    "PILOT_PAYLOAD_OVERLAY_KEYS",
+    "PILOT_PAYLOADS",
     "ROOT",
     "SAMPLER_SEED",
     "SCIENCE_SCALE_OVERLAY_KEYS",
     "SCIENCE_SCALE_OVERLAY_PATH",
     "TRAINING_SEED",
+    "append_candidate_module",
+    "append_measurement_callbacks",
     "assert_hydrogen_contract",
+    "candidate_modules_to_append",
     "evaluation_config",
     "load_yaml",
+    "pilot_training_config",
+    "remove_candidate_module",
     "science_training_config",
     "training_config",
 ]

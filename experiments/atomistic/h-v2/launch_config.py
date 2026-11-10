@@ -59,12 +59,67 @@ MAX_JOB_WALL_SECONDS = 2 * 24 * 60 * 60
 #: device is checked inside every job, not merely requested at submission.
 APPROVED_GPU_STRATUM = "NVIDIA A100-SXM4-80GB"
 
+#: TO 63690220 (pilot and part (g) TRAIN payloads). ``gpu-route-g`` submits
+#: to the ``gpu_test`` QOS/partition instead of :data:`RESOURCES`: no
+#: ``a100`` constraint (``gpu_test`` serves MIG slices, a different hardware
+#: stratum -- ``gpu-hardware-strata-and-constraint-rule-2026-08-15``), and a
+#: dedicated GRES request for one MIG slice.
+GPU_TEST_RESOURCES = JobResources(
+    partition="gpu_test",
+    constraint="",
+    gpus=1,
+    nodes=1,
+    ntasks=1,
+    cpus_per_task=4,
+    mem="32G",
+)
+#: The exact MIG device name ``gpu-route-g`` must verify it was delivered
+#: (orchestrator-decisions-open-points-20261110 item 6; measured on
+#: ``gpu_test`` by layer-10 verifier probe job 59353097, 2026-11-10). A
+#: mismatch exits before the payload, the same way :data:`APPROVED_GPU_STRATUM`
+#: does for the science/pipeline-check route.
+APPROVED_GPU_TEST_STRATUM = "NVIDIA A100-SXM4-40GB MIG 3g.20gb"
+
+#: Per-payload pilot/part-(g) TRAIN resources, lineage label, GPU stratum,
+#: and ``--time`` ceiling (acceptance-contract amendment r2 P1/P2: g capped
+#: at one hour, pilot capped at eight). Neither payload submits an EVAL job
+#: here (item E owns that route); :func:`JobResources` carries no stage
+#: distinction because each of these payloads only ever runs TRAIN.
+PILOT_PAYLOAD_RESOURCES: dict[str, JobResources] = {
+    "gpu-route-g": GPU_TEST_RESOURCES,
+    "capacity-pilot": RESOURCES,
+}
+PILOT_PAYLOAD_LINEAGES: dict[str, str] = {"gpu-route-g": "G", "capacity-pilot": "P"}
+PILOT_PAYLOAD_GPU_STRATA: dict[str, str] = {
+    "gpu-route-g": APPROVED_GPU_TEST_STRATUM,
+    "capacity-pilot": APPROVED_GPU_STRATUM,
+}
+PILOT_PAYLOAD_MAX_WALL_SECONDS: dict[str, int] = {
+    "gpu-route-g": 1 * 60 * 60,
+    "capacity-pilot": 8 * 60 * 60,
+}
+
+#: Name of the environment variable the submitter must set to the durable,
+#: lifecycle-governed run-root prefix (harness r3 addendum3) before any
+#: pilot/part-(g) ``sbatch`` call. The exact facility path is never
+#: hardcoded in this repository (``netscratch-never-referenced-from-repo``);
+#: it is supplied at invocation time, the same way ``T_WALL``/``E_WALL``
+#: already are.
+PILOT_RUN_ROOT_PREFIX_ENV = "H_V2_PILOT_RUN_ROOT_PREFIX"
+
 __all__ = [
     "APPROVED_GPU_STRATUM",
+    "APPROVED_GPU_TEST_STRATUM",
+    "GPU_TEST_RESOURCES",
     "JOB_SCRIPT_RELATIVE",
     "JobResources",
     "LINEAGES",
     "MAX_JOB_WALL_SECONDS",
     "MAX_LINEAGE_WALL_SECONDS",
+    "PILOT_PAYLOAD_GPU_STRATA",
+    "PILOT_PAYLOAD_LINEAGES",
+    "PILOT_PAYLOAD_MAX_WALL_SECONDS",
+    "PILOT_PAYLOAD_RESOURCES",
+    "PILOT_RUN_ROOT_PREFIX_ENV",
     "RESOURCES",
 ]
