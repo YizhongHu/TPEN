@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,6 +47,21 @@ class FakePartialTorch:
     """Torch-like module missing optional CUDA and NN surfaces."""
 
     __version__ = "partial"
+
+
+def test_artifacts_imports_first_in_a_fresh_interpreter() -> None:
+    """Keep checkpoint package initialization from reintroducing an import cycle."""
+
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", "import tpen.artifacts; print('import-ok')"],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "import-ok"
 
 
 def test_collect_hardware_metadata_records_runtime_hardware_and_slurm(

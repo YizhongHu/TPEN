@@ -6,8 +6,11 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import pytest
+from omegaconf import OmegaConf
 from experiments.toolkit.run_results import ManifestRefusal, read, RUN_MANIFEST_V1, RUN_MANIFEST_V2
+from experiments.toolkit.config_identity import expected_resolved_config_identity
 from tpen.checkpoint.manifest import CheckpointManifest
 from tpen.inspection import inspect_run
 
@@ -46,9 +49,10 @@ def write(tmp_path, p):
     return path
 
 
-def executor(code, *args):
+def executor(code, *args, python=None):
     env = dict(os.environ, PYTHONPATH=str(ROOT / "executor/src"))
-    return subprocess.run([os.environ["P8_EXECUTOR_PYTHON"], "-c", code, *map(str, args)], cwd=ROOT / "executor", env=env, text=True, capture_output=True, timeout=60)
+    executable = python or os.environ["P8_EXECUTOR_PYTHON"]
+    return subprocess.run([executable, "-c", code, *map(str, args)], cwd=ROOT / "executor", env=env, text=True, capture_output=True, timeout=60)
 
 
 @pytest.mark.parametrize("bad", ["foreign-group", "receipt-group-mismatch", "short-digest", "bad-result-digest", "unknown-outcome"])
@@ -84,46 +88,133 @@ def test_t6_default_reader_uses_real_core_and_refuses_changed_bytes(tmp_path):
         read(path)
 
 
-def test_t7_real_core_evidence_can_cross_store_to_default_toolkit(tmp_path):
-    code = '''import json, sys
+def test_t7_real_core_executor_and_study_identity_agree(tmp_path):
+    config = tmp_path / "native_recovery.yaml"
+    source = ROOT / "tests/integration/artifacts/execution/native_recovery.yaml"
+    config.write_text(
+        source.read_text(),
+        encoding="utf-8",
+    )
+    overrides = ("trainer.max_steps=1", "sampler.n_walkers=2", "sampler.burn_in=0", "system.omega=0.75")
+    manifest = tmp_path / "manifest.json"
+    code = '''import os, sys
 from pathlib import Path
+from types import SimpleNamespace
 from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
-from tpen_executor.runners import CoreRunEvidence
+from tpen_executor.dispatch import LocalDispatcher
+from tpen_executor.environments import PreparedPythonEnvironment
+from tpen_executor.lifecycle import AttachedAllocation
+from tpen_executor.runners import TPENCommand, TPENEvidence
 from tpen_executor.storage import DirectoryStore
-store = DirectoryStore(Path(sys.argv[1]) / 'store')
+from tpen_executor.tasks import ConfiguredRun
+from tpen_executor.workers import SubprocessWorker
+root = Path(sys.argv[3]).resolve()
+config = Path(sys.argv[1]).resolve()
+env = PreparedPythonEnvironment(sys.executable, env={"PYTHONPATH": os.pathsep.join((str(root), str(root / "executor" / "src")))})
+worker = SimpleNamespace(materialize=lambda _: {"environment": env, "process": SubprocessWorker(), "runner": TPENCommand(str(config)), "evidence": TPENEvidence()})
 program = ProgramSpecRef({}, digest({}))
-group = ReadyGroup('g', (TaskSpec('a', 'a', program, digest('a'), 1, 'steps'),), digest('group'))
-if sys.argv[2] == 'begin':
-    f = store.begin_attempt(group, 'a', ConfiguredAllocation(AllocationId('alloc'), BackendJobId('job'), {}), '2026-11-05T00:00:00Z')
-    Path(sys.argv[1], 'fence.json').write_text(json.dumps(dict(root=f.root, group_digest=f.group_digest, task_id=f.task_id, allocation_id=f.allocation_id, attempt_id=f.attempt_id.value, output_dir=f.output_dir)))
-    print(f.output_dir)
-else:
-    from tpen_executor.storage import AttemptFence
-    from tpen_executor.contracts import AttemptId
-    d = json.loads(Path(sys.argv[1], 'fence.json').read_text()); d['attempt_id'] = AttemptId(d['attempt_id'])
-    f = AttemptFence(**d)
-    store.finish_attempt(f, 'completed', '2026-11-05T00:01:00Z')
-    evidence = CoreRunEvidence.from_mapping(json.loads(Path(sys.argv[1], 'evidence.json').read_text()))
-    store.accept_segment(f, evidence)
-    Path(sys.argv[1], 'manifest.json').write_bytes(store.manifest(group).encode())
+group = ReadyGroup("g", (TaskSpec("run", "run", program, digest("run"), 1, "steps"),), digest("group"))
+allocation = ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {})
+store = DirectoryStore(Path(sys.argv[2]).with_suffix(".store"))
+configured = ConfiguredRun("run", str(config), tuple(sys.argv[4:]))
+result = LocalDispatcher(worker).run(group, {"run": configured}, AttachedAllocation(allocation, store), timeout=120)
+Path(sys.argv[2]).write_bytes(result.encode())
 '''
-    start = executor(code, tmp_path, "begin")
-    assert start.returncode == 0, start.stderr
-    core = Path(start.stdout.strip()) / "core"
-    core_checkpoint(core)
-    evidence = inspect_run(core)
-    assert evidence.verdict == "completed", evidence.to_dict()
-    (tmp_path / "evidence.json").write_text(json.dumps(evidence.to_dict()))
-    accept = executor(code, tmp_path, "accept")
-    assert accept.returncode == 0, accept.stderr
-    result = read(tmp_path / "manifest.json")
-    assert len(result.chains[0].segments) == 1
+    # The executor process itself is the real dispatcher path, while the
+    # launched core child must use the Torch-enabled root environment.  The
+    # arm-specific P8 interpreter is intentionally dependency-light and cannot
+    # stand in for the core runtime here.
+    run = executor(code, config, manifest, ROOT, *overrides, python=sys.executable)
+    assert run.returncode == 0, (run.stdout, run.stderr)
+    result = read(manifest)
+    assert len(result.chains) == 1 and len(result.chains[0].segments) == 1
+    actual_identity = result.chains[0].segments[0].resolved_config_identity
+    intended = OmegaConf.to_container(
+        OmegaConf.merge(OmegaConf.load(config), OmegaConf.from_dotlist(list(overrides))),
+        resolve=False,
+    )
+    expected = expected_resolved_config_identity(intended)
+    assert actual_identity == expected
+    mismatched = copy.deepcopy(intended)
+    mismatched["system"]["omega"] = 0.5
+    assert expected_resolved_config_identity(mismatched) != actual_identity
+
+    # Exercise the exact H-v2 EVAL composition shape at the identity boundary:
+    # ``runner.evaluator: ${evaluator}`` and the evaluator task's operational
+    # ``output_dir: ${run.dir}/...``.  A full EVAL child would require a
+    # model-only checkpoint and the heavy evaluation runtime, so this probe is
+    # intentionally limited to the real study helper versus a separate core
+    # process running the same public identity function.
+    eval_config = {
+        "experiment": {"name": "h-v2", "run_name": "  h-v2-eval  "},
+        "run": {"root": "outputs", "run_id": None, "dir": None, "timezone": "UTC"},
+        "runtime": {"seed": 910003},
+        "evaluation": {"namespace": "eval", "seed": "${runtime.seed}"},
+        "runner": {"_target_": "tpen.runner.Evaluate", "evaluator": "${evaluator}"},
+        "evaluator": {
+            "_target_": "tpen.evaluation.Evaluator",
+            "namespace": "${evaluation.namespace}",
+            "seed": "${evaluation.seed}",
+            "tasks": [
+                {
+                    "name": "trajectory",
+                    "output_dir": "${run.dir}/trajectory",
+                    "generator": {"seed": "${evaluation.seed}"},
+                }
+            ],
+        },
+        "science": {"charge": 1},
+    }
+    eval_path = tmp_path / "h_v2_eval_shape.json"
+    eval_path.write_text(json.dumps(eval_config), encoding="utf-8")
+    eval_run_values = {
+        "root": "outputs",
+        "run_id": "h-v2-eval",
+        "dir": str(tmp_path / "outputs" / "h-v2-eval"),
+        "layout": "nested",
+        "timezone": "UTC",
+    }
+    expected_eval = expected_resolved_config_identity(eval_config, run_values=eval_run_values)
+    eval_code = """import json, sys
+from pathlib import Path
+from tpen.checkpoint.hashing import resolved_config_identity
+config = json.loads(Path(sys.argv[1]).read_text())
+run_values = json.loads(sys.argv[2])
+print(json.dumps(resolved_config_identity(config, run_values=run_values)))
+"""
+    eval_run = executor(
+        eval_code,
+        eval_path,
+        json.dumps(eval_run_values),
+        python=sys.executable,
+    )
+    assert eval_run.returncode == 0, (eval_run.stdout, eval_run.stderr)
+    assert json.loads(eval_run.stdout) == expected_eval
 
 
-def test_t10_real_executor_store_manifest_with_placement_receipt_reads_in_toolkit(tmp_path):
-    """A real executor store manifest with S2b-1 placement crosses the boundary."""
+def test_t7_reader_refuses_explicit_null_segment_identity(tmp_path):
+    payload, _ = materialize(tmp_path)
+    payload["segments"][0]["resolved_config_identity"] = None
+    path = write(tmp_path, payload)
+    with pytest.raises(ManifestRefusal, match="must not be null"):
+        read(path, lambda _: pytest.fail("must refuse before inspection"))
+
+
+def test_t10_reader_refuses_a_segment_identity_mismatch(tmp_path):
+    p, out = materialize(tmp_path)
+    identity = expected_resolved_config_identity({"science": {"charge": 1}})
+    (out / "core" / "run_start.json").write_text(json.dumps({"resolved_config_identity": identity}))
+    p["segments"][0]["resolved_config_identity"] = identity
+    p["segments"][0]["resolved_config_identity"]["sha256"] = "b" * 64
+    path = write(tmp_path, p)
+    with pytest.raises(ManifestRefusal, match="identity"):
+        read(path)
+
+
+def test_t10_real_executor_store_manifest_with_placement_and_identity_reads_in_toolkit(tmp_path):
+    """One real P8 manifest carries both S2b-1 placement and core identity."""
 
     code = '''import json, sys
 from pathlib import Path
@@ -161,8 +252,11 @@ else:
     assert start.returncode == 0, start.stderr
     core = Path(start.stdout.strip()) / "core"
     checkpoint = core_checkpoint(core)
+    identity = expected_resolved_config_identity({"science": {"charge": 1}})
+    (core / "run_start.json").write_text(json.dumps({"resolved_config_identity": identity}))
     evidence = inspect_run(core)
     assert evidence.verdict == "completed", evidence.to_dict()
+    assert evidence.resolved_config_identity == identity
     (tmp_path / "evidence.json").write_text(json.dumps(evidence.to_dict()))
     finish = executor(code, tmp_path, "accept")
     assert finish.returncode == 0, finish.stderr
@@ -175,6 +269,7 @@ else:
     assert placement["child"]["proc_start_ticks"] == 55
     assert placement["gpu"]["status"] == "unavailable"
     assert result.chains[0].segments[0].checkpoint_dir == str(checkpoint)
+    assert result.chains[0].segments[0].resolved_config_identity == identity
 
 
 def test_t8_wire_fixtures_and_experiment_boundary():

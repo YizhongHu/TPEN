@@ -878,6 +878,10 @@ def write_error_artifact(
 def write_run_start_artifact(context: RunContext) -> None:
     """Write the early run-start breadcrumb before long-running work begins."""
 
+    # Import lazily: importing ``tpen.checkpoint`` initializes its directory
+    # artifact helpers, which import this module for ``write_json``.
+    from tpen.checkpoint.hashing import resolved_config_identity
+
     cfg = context.cfg
     study = OmegaConf.select(cfg, "study", default={}) or {}
     if OmegaConf.is_config(study):
@@ -885,6 +889,20 @@ def write_run_start_artifact(context: RunContext) -> None:
     if not isinstance(study, Mapping):
         study = {}
     data = {
+        # Identity starts from the unresolved composition retained in
+        # ``source_cfg``.  Runtime-populated values are supplied separately so
+        # an interpolation can be rejected before resolution turns it into a
+        # science-looking scalar.
+        "resolved_config_identity": resolved_config_identity(
+            context.source_cfg,
+            run_values={
+                "root": OmegaConf.select(cfg, "run.root"),
+                "run_id": context.metadata.run_id,
+                "dir": context.metadata.run_dir,
+                "layout": OmegaConf.select(cfg, "run.layout"),
+                "timezone": context.clock.timezone,
+            },
+        ),
         "run_id": context.metadata.run_id,
         "run_dir": context.metadata.run_dir,
         "study": {

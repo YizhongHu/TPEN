@@ -91,6 +91,22 @@ agreement (`rel=1e-10`), which a float32 downcast anywhere in the record
 path (~1e-7 relative error) would fail. The trajectory manifest exposes no
 separate dtype/column-precision field to assert directly; this pointwise
 check is the precision gate.
+
+**Calibrated moment band.** The imperfect-state (alpha=1.2) final-draw mean
+and variance were previously checked only for internal bookkeeping (agreement
+with their own recomputation), never for accuracy against a reference. Both
+are now also required to fall inside a moment band calibrated by
+`moment_bands.calibrate_moment_band` (see `test_moment_bands.py` for that
+module's own unit tests) at `sample_count=N_WALKERS`, matching this draw's
+independent walker count exactly -- walkers are independent after burn-in,
+while successive draws of one walker are not, so only a walker count is a
+valid calibration sample size here. The full-grid comparisons below are
+unaffected and keep their existing whole-walker uncertainty.
+
+**CUDA parametrization.** Both canary tests are parametrized over
+`runtime.device` (`cpu`, `cuda`), set purely through configuration. The
+`cuda` case is skipped with an explicit reason when no CUDA device is
+available; a GPU verification run is expected to collect it unskipped.
 """
 
 from __future__ import annotations
@@ -105,6 +121,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
 import yaml
 from omegaconf import OmegaConf
 
@@ -113,11 +130,30 @@ from tpen.run import run_from_config
 HERE = Path(__file__).parent
 CONFIG_PATH = HERE / "configs" / "exact_canary_eval.yaml"
 
-_collect_spec = importlib.util.spec_from_file_location("h_v2_exact_canary_collect", HERE / "collect.py")
-assert _collect_spec is not None and _collect_spec.loader is not None
-collect = importlib.util.module_from_spec(_collect_spec)
-sys.modules[_collect_spec.name] = collect
-_collect_spec.loader.exec_module(collect)
+
+def _module(name: str):
+    spec = importlib.util.spec_from_file_location(f"h_v2_{name}", HERE / f"{name}.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+collect = _module("collect")
+moment_bands = _module("moment_bands")
+
+#: Parametrized pytest ids come out as ``[cuda-...]``/``[cpu-...]`` (the
+#: device parameter, not a guessed ``[..-cuda]`` suffix) -- select tests by
+#: their collected id, not an assumed string shape.
+_CUDA_DEVICE = pytest.param(
+    "cuda",
+    marks=pytest.mark.skipif(
+        not torch.cuda.is_available(),
+        reason="CUDA exact canary requires an allocated CUDA device",
+    ),
+)
+_DEVICES = ("cpu", _CUDA_DEVICE)
 
 pytestmark = pytest.mark.integration
 
@@ -157,11 +193,12 @@ def _load_config() -> dict[str, Any]:
     return value
 
 
-def _run_canary(tmp_path: Path, *, alpha: float, run_id: str) -> dict[str, Any]:
+def _run_canary(tmp_path: Path, *, alpha: float, run_id: str, device: str = "cpu") -> dict[str, Any]:
     config = _load_config()
     config["model"]["alpha"] = alpha
     config["run"]["root"] = str(tmp_path)
     config["run"]["run_id"] = run_id
+    config["runtime"]["device"] = device
 
     status = run_from_config(
         OmegaConf.create(config), command=f"h-v2 exact canary {run_id}", raise_exceptions=True
@@ -174,6 +211,18 @@ def _run_canary(tmp_path: Path, *, alpha: float, run_id: str) -> dict[str, Any]:
 def _read_rows(run_dir: Path) -> list[dict[str, str]]:
     with (run_dir / "trajectory" / "sampled_eval_table.csv").open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
+
+
+def _assert_resolved_device(result: dict[str, Any], device: str) -> None:
+    """Require the parametrized device to reach the real configured runner.
+
+    A passing [cuda] id alone cannot detect a dropped device override: the
+    YAML default is CPU, where all the same numerical assertions also pass.
+    This checks the configuration artifact, not the location of every tensor.
+    """
+
+    resolved = yaml.safe_load((result["run_dir"] / "resolved_config.yaml").read_text(encoding="utf-8"))
+    assert resolved["runtime"]["device"] == device
 
 
 def _read_trajectory_manifest(run_dir: Path) -> dict[str, Any]:
@@ -278,7 +327,7 @@ def _collect_without_checkpoint(result: dict[str, Any]) -> dict[str, Any]:
     spec = collect.RecordSpec(
         source_sha=source_sha,
         checkpoint_model_sha256="not-applicable-no-configured-checkpoint-route",
-        resolved_config_sha256=collect.file_sha256(resolved_config_path),
+        resolved_config_sha256=collect.expected_resolved_config_identity_from_path(resolved_config_path)["sha256"],
         walkers=N_WALKERS,
         draws=N_DRAWS,
     )
@@ -332,9 +381,11 @@ def test_no_configured_checkpoint_route_exists_for_the_parameterless_model(tmp_p
         run_from_config(cfg, command="h-v2 exact canary configured-route probe", raise_exceptions=True)
 
 
-def test_exact_ground_state_every_record_is_minus_half_hartree(tmp_path: Path) -> None:
-    result = _run_canary(tmp_path, alpha=1.0, run_id="exact-alpha-1")
+@pytest.mark.parametrize("device", _DEVICES)
+def test_exact_ground_state_every_record_is_minus_half_hartree(tmp_path: Path, device: str) -> None:
+    result = _run_canary(tmp_path, alpha=1.0, run_id=f"exact-alpha-1-{device}", device=device)
     assert result["status"] == 0
+    _assert_resolved_device(result, device)
     rows = _read_rows(result["run_dir"])
     assert len(rows) == 1024 * 64
     energies = [float(row["local_energy"]) for row in rows]
@@ -380,19 +431,34 @@ def test_exact_ground_state_every_record_is_minus_half_hartree(tmp_path: Path) -
     assert receipt["row_count"] == 1024 * 64
 
 
-def test_imperfect_state_matches_closed_form_analytic_controls(tmp_path: Path) -> None:
+@pytest.fixture(scope="module")
+def _alpha_1_2_moment_band() -> Any:
+    """Calibrate once and reuse across the cpu/cuda parametrizations below.
+
+    `sample_count=N_WALKERS` matches the canary's final retained draw's
+    independent walker count exactly, per the acceptance contract.
+    """
+
+    return moment_bands.calibrate_moment_band(alpha=1.2, sample_count=N_WALKERS, seed=120001)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_imperfect_state_matches_closed_form_analytic_controls(
+    tmp_path: Path, device: str, _alpha_1_2_moment_band: Any,
+) -> None:
     alpha = 1.2
-    result = _run_canary(tmp_path, alpha=alpha, run_id="exact-alpha-1-2")
+    result = _run_canary(tmp_path, alpha=alpha, run_id=f"exact-alpha-1-2-{device}", device=device)
     assert result["status"] == 0
+    _assert_resolved_device(result, device)
     rows = _read_rows(result["run_dir"])
     energies = [float(row["local_energy"]) for row in rows]
     assert all(row["finite"] == "True" for row in rows)
 
     # The JSONL trajectory metric is a final-draw snapshot (see module
-    # docstring). Its sample variance has no reliable predeclared band at
-    # this alpha (see the comment above `ALPHA_1_2_MEAN`); keep it only as
-    # an exact recomputation from its own rows below, never compared to the
-    # analytic target directly.
+    # docstring). Its sample variance has no Gaussian error bar at this
+    # alpha (see the comment above `ALPHA_1_2_MEAN`); below it is checked
+    # both as an exact recomputation from its own rows and against the
+    # calibrated moment band, never against the analytic target directly.
     mean = _read_metric(result["run_dir"], namespace="trajectory", key="local_energy_mean")
     variance = _read_metric(result["run_dir"], namespace="trajectory", key="local_energy_variance")
     assert _w_statistic(energies) == pytest.approx(ALPHA_1_2_W, rel=0.3)
@@ -411,11 +477,27 @@ def test_imperfect_state_matches_closed_form_analytic_controls(tmp_path: Path) -
     assert mean == pytest.approx(final_draw_mean, rel=1e-10, abs=1e-12)
     assert variance == pytest.approx(final_draw_variance, rel=1e-10, abs=1e-12)
 
+    # Calibrated moment band (contract f5068c1a): the final-draw mean and
+    # variance checked above only against their own recomputation, with no
+    # band on their accuracy. `_alpha_1_2_moment_band` is calibrated at
+    # `sample_count=N_WALKERS`, matching this draw's independent walker
+    # count exactly (walkers are independent after burn-in; successive
+    # draws of one walker are not, so only a walker count is a valid
+    # calibration sample size here). The closed-form moments must lie
+    # inside the same band.
+    assert _alpha_1_2_moment_band[0, 0] <= ALPHA_1_2_MEAN <= _alpha_1_2_moment_band[1, 0]
+    assert _alpha_1_2_moment_band[0, 1] <= ALPHA_1_2_VARIANCE <= _alpha_1_2_moment_band[1, 1]
+    assert _alpha_1_2_moment_band[0, 0] <= final_draw_mean <= _alpha_1_2_moment_band[1, 0]
+    assert _alpha_1_2_moment_band[0, 1] <= final_draw_variance <= _alpha_1_2_moment_band[1, 1]
+
     # Exact bookkeeping, separate from the Monte Carlo bands: the
     # summary mean/variance must equal the mean/variance of the recorded
     # rows, recomputed independently from the full record set. The analytic
     # bands below apply here, to the full-grid aggregate, which the seed
     # sweep showed to be robust (see the comment above `ALPHA_1_2_MEAN`).
+    # These whole-grid comparisons keep their existing whole-walker
+    # uncertainty and are unchanged by the calibrated band above, which
+    # applies only to the final-draw moments.
     manifest = _read_trajectory_manifest(result["run_dir"])
     assert manifest["row_count"] == 1024 * 64
     assert manifest["finite_count"] == 1024 * 64

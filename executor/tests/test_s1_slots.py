@@ -128,12 +128,13 @@ def _stub_package(tmp_path: Path) -> Path:
                 core.mkdir(parents=True, exist_ok=True)
                 (core / 's1-observation.json').write_text(json.dumps({'start': start, 'end': time.time(), 'mode': mode, 'pid': os.getpid(), 'env': dict(os.environ)}), encoding='utf-8')
                 (core / 'evidence.json').write_text(json.dumps({
-                    'schema': 'tpen.run-evidence/v1',
+                    'schema': 'tpen.run-evidence/v2',
                     'run_dir': str(core),
                     'verdict': 'completed',
                     'run_status': 'completed',
                     'checkpoint': {'checkpoint_dir': str(core / 'checkpoint'), 'schema_version': 1, 'next_iteration': 1, 'completed_updates': 1},
                     'refusal': None,
+                    'resolved_config_identity': {'schema': 'tpen-config-identity-v1', 'sha256': 'a' * 64},
                 }), encoding='utf-8')
                 return 0
 

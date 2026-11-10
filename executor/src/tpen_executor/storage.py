@@ -447,6 +447,10 @@ class DirectoryStore:
             evidence_core_dir = _strict_real_directory(evidence.run_dir)
             if evidence_core_dir != expected_core_dir:
                 raise FenceRejected(_CORE_EVIDENCE_FENCE_REASON)
+            # Integrity failures must win over the newer identity requirement:
+            # never let malformed or foreign evidence bypass the attempt fence.
+            if evidence.resolved_config_identity is None:
+                raise FenceRejected("new accepted segment requires resolved-config identity")
             outcome_path = os.path.join(output_dir, "outcome.json")
             _require_regular(outcome_path, "outcome receipt")
             try:
@@ -474,6 +478,7 @@ class DirectoryStore:
                 str(checkpoint["checkpoint_dir"]),
                 checkpoint["next_iteration"],
                 checkpoint["completed_updates"],
+                evidence.resolved_config_identity,
             )
             prior_segments = self._segments_for_task(task_dir)
             if prior_segments:

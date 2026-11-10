@@ -48,6 +48,17 @@ NEW_CALLBACK_TARGETS = frozenset(
         "tpen.callback.GradientStats",
     }
 )
+# InitialCheckpoint and ParameterActivity are each admitted explicitly for
+# their own documented resume behaviour (see `tpen/checkpoint/profiles.py`'s
+# `RESUME_SENSITIVE_CALLBACK_TARGETS` comment), not inferred cadence state --
+# neither takes a `pop_step_cadence` field, so neither is parametrized through
+# the cadence-refusal tests above this set.
+NEW_RESUME_SAFE_CALLBACK_TARGETS = frozenset(
+    {
+        "tpen.callback.InitialCheckpoint",
+        "tpen.callback.ParameterActivity",
+    }
+)
 
 
 def test_supported_profile_reports_declared_state_owners() -> None:
@@ -319,3 +330,52 @@ assert REFUSAL_CODES == {
     "unsupported-logger",
     "malformed-config",
 }
+
+
+@pytest.mark.parametrize("target", sorted(NEW_RESUME_SAFE_CALLBACK_TARGETS))
+def test_each_new_resume_safe_callback_target_is_admitted(target: str) -> None:
+    config = _config(callbacks=[{"_target_": target}])
+
+    result = check_profile(config, NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "supported"
+    assert result.refusal is None
+    validate_native_recovery_profile(config)
+
+
+def test_check_profile_admits_a_config_listing_both_new_resume_safe_callbacks() -> None:
+    config = _config(
+        callbacks=[
+            {"_target_": "tpen.callback.InitialCheckpoint", "output_dir": "/tmp/ckpt"},
+            {"_target_": "tpen.callback.ParameterActivity", "output_path": "/tmp/pa.json"},
+        ]
+    )
+
+    result = check_profile(config, NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "supported"
+    assert result.refusal is None
+    validate_native_recovery_profile(config)
+
+
+@pytest.mark.parametrize("target", sorted(NEW_RESUME_SAFE_CALLBACK_TARGETS))
+def test_dropping_each_new_resume_safe_target_refuses_it(
+    target: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each newly admitted resume-safe target is independently covered by the gate."""
+
+    config = _config(callbacks=[{"_target_": target}])
+    mutant = Profile(
+        name=NATIVE_PROFILE.name,
+        state_owners=NATIVE_PROFILE.state_owners,
+        callbacks=NATIVE_PROFILE.callbacks - {target},
+        loggers=NATIVE_PROFILE.loggers,
+        callback_state_supported=NATIVE_PROFILE.callback_state_supported,
+    )
+    monkeypatch.setattr(profiles, "PROFILES", {NATIVE_RECOVERY_PROFILE: mutant})
+
+    result = check_profile(config, NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "refused"
+    assert result.refusal["code"] == "unsupported-callback"
+    assert target in result.refusal["reason"]

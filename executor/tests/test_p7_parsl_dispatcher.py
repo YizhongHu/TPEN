@@ -109,12 +109,13 @@ def _make_stub_package(tmp_path: Path) -> Path:
                     "cwd": os.getcwd(),
                 }), encoding="utf-8")
                 (run_dir / "evidence.json").write_text(json.dumps({
-                    "schema": "tpen.run-evidence/v1",
+                    "schema": "tpen.run-evidence/v2",
                     "run_dir": str(run_dir),
                     "verdict": "completed",
                     "run_status": "completed",
                     "checkpoint": {"checkpoint_dir": str(run_dir / "checkpoint"), "schema_version": 1, "next_iteration": 1, "completed_updates": 1},
                     "refusal": None,
+                    "resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
                 }), encoding="utf-8")
                 return 0
 

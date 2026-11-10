@@ -41,6 +41,8 @@ from typing import Any
 
 import yaml
 
+from experiments.toolkit.config_identity import expected_resolved_config_identity
+
 #: Schema and row-semantics constants mirrored from
 #: ``tpen.evaluation.trajectory_records`` so this module never imports tpen
 #: (see ``experiments/README.md``).
@@ -117,10 +119,18 @@ def validate_run_identity(
         run_metadata.get("git_commit") == spec.source_sha,
         "altered source/checkpoint/config identity",
     )
-    _require(
-        file_sha256(resolved_config_path) == spec.resolved_config_sha256,
-        "altered source/checkpoint/config identity",
-    )
+    try:
+        observed_identity = expected_resolved_config_identity_from_path(resolved_config_path)
+    except (OSError, UnicodeError, yaml.YAMLError, TypeError, ValueError) as exc:
+        raise RecordIntegrityError("altered source/checkpoint/config identity") from exc
+    _require(observed_identity["sha256"] == spec.resolved_config_sha256, "altered source/checkpoint/config identity")
+
+
+def expected_resolved_config_identity_from_path(path: Path) -> dict[str, str]:
+    """Compute the public identity from one intended resolved-config YAML."""
+
+    resolved_config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return expected_resolved_config_identity(resolved_config)
 
 
 def validate_restore_mode(resolved_config: dict[str, Any]) -> None:
@@ -374,8 +384,8 @@ def collect_records(
 
     validate_checkpoint_identity(checkpoint_dir, spec)
     run_metadata = json.loads(run_metadata_path.read_text(encoding="utf-8"))
-    validate_run_identity(run_metadata, resolved_config_path, spec)
     resolved_config = yaml.safe_load(resolved_config_path.read_text(encoding="utf-8"))
+    validate_run_identity(run_metadata, resolved_config_path, spec)
     validate_restore_mode(resolved_config)
     validate_restore_event(occurrences_path, checkpoint_dir=checkpoint_dir, step=checkpoint_step)
     if not metadata_path.is_file():
@@ -408,6 +418,7 @@ __all__ = [
     "SAMPLER_TRAJECTORY_DIAGNOSTICS_SCHEMA",
     "TRAJECTORY_RECORD_SCHEMA",
     "collect_records",
+    "expected_resolved_config_identity_from_path",
     "file_sha256",
     "validate_checkpoint_identity",
     "validate_checkpoint_manifest_hashes",

@@ -102,11 +102,20 @@ OBSERVATIONAL_CALLBACK_TARGETS = frozenset(
 # part of the callback's contract.  This is deliberately not inferred from
 # ``StatefulCallback``: that generic describes the domain state a callback
 # observes, not callback-owned state restored by ``train_resume``.
+# ``InitialCheckpoint`` (tpen/callback/initial_checkpoint.py) and
+# ``ParameterActivity`` (tpen/callback/parameter_activity.py) each become a
+# VERIFIED no-op on a resumed lineage at step > 0: each checks that its own
+# prior artifact already exists and is well-formed at the same configured
+# path, and refuses rather than writing late (or mislabeling a later
+# update's data as the lineage's first) when it does not. Neither consumes
+# any ``pop_step_cadence`` field, so neither is cadence-sensitive.
 RESUME_SENSITIVE_CALLBACK_TARGETS = frozenset(
     {
         "tpen.callback.Checkpoint",
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
+        "tpen.callback.InitialCheckpoint",
+        "tpen.callback.ParameterActivity",
     }
 )
 # ``pop_step_cadence`` consumes five fields from these callbacks:
