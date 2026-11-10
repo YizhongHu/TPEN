@@ -430,7 +430,12 @@ def test_science_evaluation_config_applies_the_a2_overlay_and_readout_generator(
     assert config["runtime"]["seed"] == 1234567
     assert len(config["evaluator"]["tasks"]) == 2
     assert config["evaluator"]["tasks"][1]["generator"]["_target_"] == protocol.READOUT_TRAJECTORY_GENERATOR_TARGET
-    assert config["model"]["readout"]["eps"] == config["evaluator"]["tasks"][1]["generator"]["readout_eps"]
+    assert config["evaluator"]["tasks"][1]["generator"]["readout_eps"] == protocol.READOUT_EPS
+    # F1: the model mapping must stay exactly what eval.yaml carries (no
+    # eps key) -- never mutated to match the generator's expected floor,
+    # which would break restore identity against an earlier TRAIN receipt
+    # whose authenticated model mapping has no explicit eps either.
+    assert "eps" not in config["model"]["readout"]
 
 
 def test_science_evaluation_config_can_omit_the_readout_generator(tmp_path: Path) -> None:

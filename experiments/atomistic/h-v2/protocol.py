@@ -469,11 +469,19 @@ EVAL_SCALE_OVERLAY_KEYS = frozenset(
 #: instrument control, never a training or evaluation input.
 EVAL_FORBIDDEN_KEYS: tuple[str, ...] = ("reference_energy",)
 
-#: ``tpen.nn.readout.pfaffian.PfaffianReadout``'s own default floor, frozen
-#: here (amendment r4 E5) so the model's ``readout.eps`` and the optional
-#: readout-trajectory generator's ``readout_eps`` can never drift apart --
-#: ``ReadoutTrajectoryMCMCGenerator.generate`` refuses outright if they
-#: disagree.
+#: ``tpen.nn.readout.pfaffian.PfaffianReadout``'s own default floor
+#: (amendment r4 E5), restated here as the readout-trajectory generator's
+#: expected ``readout_eps`` -- the generator's own internal floor check
+#: (``ReadoutTrajectoryMCMCGenerator.generate``) refuses at runtime if the
+#: RESTORED model's actual eps disagrees. F1 (review r1): this constant is
+#: never written into a TRAIN or EVAL config's ``model.readout.eps`` --
+#: doing so would change the model mapping core hashes for restore identity,
+#: so an earlier TRAIN checkpoint (whose receipt's authenticated mapping has
+#: no explicit ``eps``) would fail to restore against a later EVAL config
+#: that added one, even though the value is numerically identical to the
+#: class's own constructor default. The model mapping used for restore is
+#: always the TRAIN receipt's own, untouched; only the generator's
+#: *expected* floor is supplied here.
 READOUT_EPS = 1.0e-12
 
 #: Orchestrator decision 2(a) (TO 8a5e926f): enabled for every eval payload
@@ -500,14 +508,16 @@ def _assert_no_forbidden_keys(node: Any, *, path: str = "") -> None:
 def enable_readout_trajectory_generator(config: dict[str, Any]) -> None:
     """Append a readout-trajectory evaluator task onto *config* in place.
 
-    ``model.readout.eps`` and the generator's own ``readout_eps`` are both
-    set from the single frozen :data:`READOUT_EPS` constant, never two
-    separate literals that could drift apart and make the generator refuse
-    at runtime (``ReadoutTrajectoryMCMCGenerator.generate``'s own floor
-    check).
+    F1 (review r1, fix): the generator's ``readout_eps`` is set from the
+    frozen :data:`READOUT_EPS` constant, but ``config["model"]["readout"]``
+    is never touched here -- the model mapping stays exactly whatever the
+    TRAIN receipt's authenticated config carries (restore identity depends
+    on it matching bit-for-bit), and the generator's own runtime floor check
+    (``ReadoutTrajectoryMCMCGenerator.generate``) is what actually confirms
+    the restored model's real eps agrees with the expected floor supplied
+    here, not a config-level mutation performed in advance.
     """
 
-    config["model"]["readout"]["eps"] = READOUT_EPS
     base_task = config["evaluator"]["tasks"][0]
     readout_task = copy.deepcopy(base_task)
     readout_task["name"] = "readout_trajectory"
