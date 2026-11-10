@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 HERE = Path(__file__).parent
 spec = importlib.util.spec_from_file_location("h_v2_collect", HERE / "collect.py")
@@ -41,12 +42,22 @@ def _checkpoint_fixture(tmp_path: Path, *, model_bytes: bytes = b"model-bytes") 
 
 
 def _run_metadata_fixture(tmp_path: Path, *, git_commit: str = "deadbeef") -> tuple[Path, Path, str]:
-    """Write a minimal run metadata.json and resolved_config.yaml pair."""
+    """Write a minimal run metadata.json/status.json and resolved_config.yaml.
+
+    ``status.json`` is written next to ``metadata.json`` (``run_metadata_path``'s
+    own directory), matching the real evaluation run layout and the convention
+    ``collect_records`` uses to find it: both are required by
+    ``validate_run_is_clean_and_complete``, which ``collect_records`` now
+    applies to the evaluation it collects, not only to training.
+    """
 
     resolved_config_path = tmp_path / "resolved_config.yaml"
     resolved_config_path.write_text("load:\n  mode: model_only\n", encoding="utf-8")
     run_metadata_path = tmp_path / "metadata.json"
-    run_metadata_path.write_text(json.dumps({"git_commit": git_commit, "status": "completed"}), encoding="utf-8")
+    run_metadata_path.write_text(
+        json.dumps({"git_commit": git_commit, "status": "completed", "dirty_worktree": False}), encoding="utf-8"
+    )
+    (tmp_path / "status.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
     return run_metadata_path, resolved_config_path, collect.expected_resolved_config_identity_from_path(resolved_config_path)["sha256"]
 
 
@@ -98,6 +109,11 @@ def _trajectory_fixture(tmp_path: Path, *, walkers: int = 2, draws: int = 3) -> 
         "term_names": _TERM_NAMES,
         "variance": 0.0,
         "csv_sha256": collect.file_sha256(csv_path),
+        # Matches the crafted sampler draw receipt's "draw_stride": 20 and the
+        # crafted resolved config's generator "discard_draws": 0 (see
+        # ``_full_fixture``), so the R1 sampler-receipt binding reconciles.
+        "draw_stride": 20,
+        "burn_in_draws": 0,
     }), encoding="utf-8")
     return csv_path, metadata_path
 
@@ -162,7 +178,18 @@ def _full_fixture(tmp_path: Path) -> tuple[dict, collect.RecordSpec]:
     """Assemble one complete, self-consistent fixture: paths and a matching spec."""
 
     checkpoint_dir, checkpoint_sha = _checkpoint_fixture(tmp_path)
-    run_metadata_path, resolved_config_path, config_sha = _run_metadata_fixture(tmp_path)
+    run_metadata_path, resolved_config_path, _ = _run_metadata_fixture(tmp_path)
+    # Carries the sampler/evaluator settings the R1 sampler-receipt binding
+    # reconciles against (see ``_sampler_diagnostics_fixture`` and the
+    # ``draw_stride``/``burn_in_draws`` added to ``_trajectory_fixture``'s
+    # manifest). Written before hashing, so ``config_sha`` covers it.
+    resolved_config_path.write_text(
+        "load:\n  mode: model_only\n"
+        "sampler:\n  burn_in: 1000\n  n_steps: 20\n"
+        "evaluator:\n  tasks:\n    - generator:\n        discard_draws: 0\n",
+        encoding="utf-8",
+    )
+    config_sha = collect.expected_resolved_config_identity_from_path(resolved_config_path)["sha256"]
     csv_path, metadata_path = _trajectory_fixture(tmp_path)
     occurrences_path = _occurrences_fixture(tmp_path, checkpoint_dir=checkpoint_dir)
     sampler_diagnostics_path = _sampler_diagnostics_fixture(tmp_path)
@@ -403,12 +430,28 @@ def test_sampler_draw_receipt_bad_acceptance_refuses(tmp_path: Path) -> None:
 
 
 def _training_run_fixture(tmp_path: Path, *, expected_updates: int = 1000) -> Path:
-    """Write a minimal clean, complete training run with one checkpoint."""
+    """Write a minimal clean, complete training run with one checkpoint.
+
+    ``log_every_n_steps`` is set equal to ``expected_updates``, so the R2
+    cadence-aware log-evidence check schedules exactly one row, at step 0
+    (``range(0, expected_updates, expected_updates) == [0]``), matching the
+    one ``metrics.jsonl`` row written here. Tests of log-evidence refusals
+    write their own ``resolved_config.yaml``/``metrics.jsonl`` with an
+    explicit cadence instead of relying on this default.
+    """
 
     training_dir = tmp_path / "training"
     training_dir.mkdir()
     (training_dir / "status.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
     (training_dir / "metadata.json").write_text(json.dumps({"dirty_worktree": False}), encoding="utf-8")
+    (training_dir / "resolved_config.yaml").write_text(
+        yaml.safe_dump({"trainer": {"max_steps": expected_updates, "log_every_n_steps": expected_updates}}),
+        encoding="utf-8",
+    )
+    (training_dir / "metrics.jsonl").write_text(
+        json.dumps({"namespace": "train", "step": 0, "metrics": {"optimizer_step": True}}) + "\n",
+        encoding="utf-8",
+    )
     checkpoints_dir = training_dir / "checkpoints"
     step_dir = checkpoints_dir / f"step_{expected_updates:06d}"
     step_dir.mkdir(parents=True)

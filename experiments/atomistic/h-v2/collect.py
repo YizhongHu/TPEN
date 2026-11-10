@@ -17,16 +17,24 @@ The collector is deliberately conservative: it validates every identity and
 the entire grid before calculating any statistic.  It never repairs, clips,
 filters, replaces, or silently accepts a final-draw-only file.
 
-``collect_records`` additionally refuses: a row whose term energies do not
-sum to its local energy or whose sign is not +-1; a model-only restore not
-confirmed by the emitted ``tpen.checkpoint.events.CheckpointRestored``
-occurrence (``occurrences.jsonl``); a missing or malformed per-stream sampler
-draw receipt (``sampler_trajectory_diagnostics.json``, written by
-``tpen.evaluation.SamplerStatsSummary``); and a whole-trajectory variance that
-does not reconcile with the record manifest. ``validate_training_run``
-separately refuses a dirty or incomplete training run, a checkpoint whose file
-content does not match its manifest hash, and a training log that skipped an
-update or fell short of the declared number of updates.
+``collect_records`` additionally refuses: a dirty or incomplete evaluation run
+(the same ``validate_run_is_clean_and_complete`` lifecycle check applied to
+training); a row whose term energies do not sum to its local energy or whose
+sign is not +-1; a model-only restore not confirmed by the emitted
+``tpen.checkpoint.events.CheckpointRestored`` occurrence (``occurrences.jsonl``),
+with every ``loaded_*`` flag required present and exactly ``False``; a missing
+or malformed per-stream sampler draw receipt
+(``sampler_trajectory_diagnostics.json``, written by
+``tpen.evaluation.SamplerStatsSummary``), bound to the evaluation's own
+sampler config and to the trajectory envelope's ``burn_in_draws``/
+``draw_stride``, with ordered per-draw identity; and a whole-trajectory
+variance that does not reconcile with the record manifest.
+``validate_training_run`` separately refuses a dirty or incomplete training
+run, a checkpoint whose file content does not match its manifest hash, a
+training log whose terminal checkpoint step is not exactly the declared
+number of updates, and a training log missing a ``metrics.jsonl`` row with
+``optimizer_step is True`` at any step its ``log_every_n_steps`` cadence
+schedules.
 """
 
 from __future__ import annotations
@@ -56,6 +64,10 @@ CHECKPOINT_RESTORED_EVENT = "tpen.checkpoint.events.CheckpointRestored"
 #: Schema mirrored from ``tpen.sampling.trajectory.SamplerTrajectoryDiagnostics``.
 SAMPLER_TRAJECTORY_DIAGNOSTICS_SCHEMA = "sampler_trajectory_diagnostics/v1"
 
+#: These tolerances assume float64 evaluation end to end (H-v2's frozen
+#: route): binary64 round-off at ordinary hydrogen energy scales is several
+#: orders of magnitude below 1e-9. A float32 run is out of scope; it is not
+#: guaranteed to pass these tolerances and must not be used to loosen them.
 _TERM_SUM_REL_TOL = 1e-9
 _TERM_SUM_ABS_TOL = 1e-9
 _VARIANCE_REL_TOL = 1e-9
@@ -260,15 +272,35 @@ def validate_restore_event(occurrences_path: Path, *, checkpoint_dir: Path, step
         and report.get("completed_updates") == step
         and report.get("next_iteration") == step
         and report.get("loaded_model") is True
-        and not any(
-            report.get(key) for key in ("loaded_optimizer", "loaded_rng", "loaded_sampler", "loaded_trainer")
+        and all(
+            key in report and report[key] is False
+            for key in ("loaded_optimizer", "loaded_rng", "loaded_sampler", "loaded_trainer")
         ),
         "checkpoint restore event differs from the intended fresh model-only restore",
     )
 
 
-def validate_sampler_draw_receipt(sidecar_path: Path, spec: RecordSpec) -> None:
-    """Validate the per-stream sampler draw receipt: draw count, burn-in, stride, acceptance."""
+def validate_sampler_draw_receipt(
+    sidecar_path: Path,
+    spec: RecordSpec,
+    *,
+    resolved_config: dict[str, Any] | None = None,
+    manifest: dict[str, Any] | None = None,
+) -> None:
+    """Validate the per-stream sampler draw receipt: draw count, burn-in, stride, acceptance.
+
+    When ``resolved_config`` and ``manifest`` are both supplied (the
+    ``collect_records`` path), the receipt is additionally bound to the
+    evaluation's own sampler settings (``resolved_config["sampler"]``) and to
+    the trajectory envelope's collector-level discard count
+    (``manifest["burn_in_draws"]``), and every retained draw's own recorded
+    walkers/burn-in/stride/transition-count and collection order must agree
+    with the receipt's own envelope values. The sampler-internal burn-in
+    (``sampler_burn_in``) is a distinct quantity from the collector's
+    ``burn_in_draws``: the former is one-time walker equilibration before any
+    draw, the latter is how many of the collector's own visible draws are
+    discarded before the retained region begins.
+    """
 
     _require(sidecar_path.is_file(), "missing sampler draw receipt")
     receipt = json.loads(sidecar_path.read_text(encoding="utf-8"))
@@ -292,6 +324,61 @@ def validate_sampler_draw_receipt(sidecar_path: Path, spec: RecordSpec) -> None:
             isinstance(acceptance, int | float) and not isinstance(acceptance, bool) and 0.0 <= float(acceptance) <= 1.0,
             "sampler draw receipt acceptance rate is invalid",
         )
+
+    discarded = receipt.get("discarded_draws")
+    _require(isinstance(discarded, list), "sampler draw receipt is missing its discarded draws")
+    ordered_draws = discarded + retained
+    collection_indexes = [draw.get("collection_index") for draw in ordered_draws]
+    _require(
+        collection_indexes == list(range(len(collection_indexes))),
+        "sampler draw receipt draw index order is not contiguous: duplicate or skipped index",
+    )
+    for draw in retained:
+        _require(
+            draw.get("n_walkers") == spec.walkers
+            and draw.get("burn_in") == burn_in
+            and draw.get("draw_stride") == stride
+            and draw.get("transition_count") == spec.walkers * stride,
+            "sampler draw receipt draw settings differ from its own envelope",
+        )
+
+    if resolved_config is None and manifest is None:
+        return
+    _require(
+        resolved_config is not None and manifest is not None,
+        "sampler draw receipt binding requires both the resolved config and the trajectory manifest",
+    )
+
+    sampler_config = resolved_config.get("sampler")
+    _require(isinstance(sampler_config, dict), "evaluation config is missing its sampler settings")
+    config_burn_in = sampler_config.get("burn_in")
+    config_stride = sampler_config.get("n_steps")
+    _require(
+        isinstance(config_burn_in, int) and not isinstance(config_burn_in, bool) and config_burn_in == burn_in,
+        "sampler draw receipt burn-in does not match the evaluation's sampler config",
+    )
+    _require(
+        isinstance(config_stride, int) and not isinstance(config_stride, bool) and config_stride == stride,
+        "sampler draw receipt stride does not match the evaluation's sampler config",
+    )
+
+    tasks = (resolved_config.get("evaluator") or {}).get("tasks")
+    _require(isinstance(tasks, list) and bool(tasks), "evaluation config is missing its evaluator tasks")
+    generator = tasks[0].get("generator") if isinstance(tasks[0], dict) else None
+    _require(isinstance(generator, dict), "evaluation config is missing its trajectory generator")
+    discard_draws = generator.get("discard_draws")
+    _require(
+        isinstance(discard_draws, int) and not isinstance(discard_draws, bool),
+        "evaluation config is missing a valid discard_draws",
+    )
+    _require(
+        manifest.get("burn_in_draws") == discard_draws,
+        "trajectory burn_in_draws does not match the evaluation's discard_draws",
+    )
+    _require(
+        manifest.get("draw_stride") == stride,
+        "trajectory draw_stride does not match the sampler draw receipt stride",
+    )
 
 
 def validate_checkpoint_manifest_hashes(checkpoint_dir: Path, manifest: dict[str, Any]) -> None:
@@ -317,13 +404,16 @@ def validate_checkpoint_manifest_hashes(checkpoint_dir: Path, manifest: dict[str
 
 
 def validate_training_log_completeness(checkpoints_dir: Path, *, expected_updates: int) -> None:
-    """Refuse a training run that skipped an update or stopped short of its contract target.
+    """Refuse a training run that skipped an update or whose terminal step is not exact.
 
     Every checkpoint's own ``completed_updates``/``next_iteration`` counters
     must agree with its directory step: a skipped update would make
     ``completed_updates`` permanently lag ``next_iteration`` from that
     checkpoint onward, so requiring equality at every checkpoint is enough to
-    rule out a skip anywhere in the run, without needing a per-update log row.
+    rule out a skip anywhere in the run. The run's final checkpoint step must
+    equal ``expected_updates`` exactly: a run that stopped short, or one that
+    kept going past the contract target, is refused either way, rather than
+    admitting any checkpoint set that merely contains the target step.
     """
 
     step_dirs = sorted(
@@ -331,7 +421,7 @@ def validate_training_log_completeness(checkpoints_dir: Path, *, expected_update
         key=lambda path: path.name,
     )
     _require(bool(step_dirs), "training run has no checkpoints")
-    reached_target = False
+    steps: list[int] = []
     for step_dir in step_dirs:
         _require((step_dir / "COMPLETE").is_file(), "incomplete checkpoint directory")
         manifest = json.loads((step_dir / "manifest.json").read_text(encoding="utf-8"))
@@ -343,8 +433,57 @@ def validate_training_log_completeness(checkpoints_dir: Path, *, expected_update
             manifest.get("completed_updates") == step and manifest.get("next_iteration") == step,
             "training log contains a skipped or mislabeled update",
         )
-        reached_target = reached_target or step == expected_updates
-    _require(reached_target, "training log does not contain the declared number of updates")
+        steps.append(step)
+    _require(
+        max(steps) == expected_updates,
+        "training log does not contain the declared number of updates",
+    )
+
+
+def validate_training_log_evidence(training_dir: Path, *, expected_updates: int) -> None:
+    """Refuse a training run whose per-update log is incomplete for its logging cadence.
+
+    Checkpoint existence alone does not establish that the run's training log
+    is complete: this reads ``resolved_config.yaml``'s ``trainer.log_every_n_steps``
+    and ``metrics.jsonl``, and requires a ``namespace: train`` row with
+    ``metrics.optimizer_step is True`` at every step the declared cadence
+    schedules in ``[0, expected_updates)`` (step 0 is always scheduled). With
+    today's pipeline default ``log_every_n_steps=100`` this checks every
+    100th step; once science logs every update (``log_every_n_steps=1``) the
+    same check covers every step, with no change to this function.
+    """
+
+    resolved_config_path = training_dir / "resolved_config.yaml"
+    _require(resolved_config_path.is_file(), "training run is missing resolved_config.yaml for log cadence")
+    resolved_config = yaml.safe_load(resolved_config_path.read_text(encoding="utf-8"))
+    trainer_config = resolved_config.get("trainer") if isinstance(resolved_config, dict) else None
+    log_every_n_steps = (trainer_config or {}).get("log_every_n_steps")
+    _require(
+        isinstance(log_every_n_steps, int) and not isinstance(log_every_n_steps, bool) and log_every_n_steps >= 1,
+        "training run resolved config is missing a valid trainer log_every_n_steps",
+    )
+    metrics_path = training_dir / "metrics.jsonl"
+    _require(metrics_path.is_file(), "training run is missing its metrics training log")
+    optimizer_step_by_train_step: dict[int, Any] = {}
+    for line in metrics_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        record = json.loads(line)
+        if record.get("namespace") != "train":
+            continue
+        step = record.get("step")
+        if isinstance(step, int) and not isinstance(step, bool):
+            optimizer_step_by_train_step[step] = (record.get("metrics") or {}).get("optimizer_step")
+    for step in range(0, expected_updates, log_every_n_steps):
+        _require(
+            step in optimizer_step_by_train_step,
+            f"training log is missing the scheduled metrics row at step {step}",
+        )
+        _require(
+            optimizer_step_by_train_step[step] is True,
+            f"training log metrics row at step {step} does not have optimizer_step True",
+        )
 
 
 def validate_run_is_clean_and_complete(status_path: Path, metadata_path: Path) -> None:
@@ -362,6 +501,7 @@ def validate_training_run(training_dir: Path, *, expected_updates: int) -> None:
     validate_run_is_clean_and_complete(training_dir / "status.json", training_dir / "metadata.json")
     checkpoints_dir = training_dir / "checkpoints"
     validate_training_log_completeness(checkpoints_dir, expected_updates=expected_updates)
+    validate_training_log_evidence(training_dir, expected_updates=expected_updates)
     for step_dir in checkpoints_dir.iterdir():
         if step_dir.is_dir() and step_dir.name.startswith("step_"):
             manifest = json.loads((step_dir / "manifest.json").read_text(encoding="utf-8"))
@@ -382,6 +522,7 @@ def collect_records(
 ) -> dict[str, Any]:
     """Read and validate one complete real evaluation stream, returning a receipt."""
 
+    validate_run_is_clean_and_complete(run_metadata_path.parent / "status.json", run_metadata_path)
     validate_checkpoint_identity(checkpoint_dir, spec)
     run_metadata = json.loads(run_metadata_path.read_text(encoding="utf-8"))
     resolved_config = yaml.safe_load(resolved_config_path.read_text(encoding="utf-8"))
@@ -392,7 +533,7 @@ def collect_records(
         raise RecordIntegrityError("uncommitted tail")
     manifest = json.loads(metadata_path.read_text(encoding="utf-8"))
     validate_manifest(manifest, csv_path, spec)
-    validate_sampler_draw_receipt(sampler_diagnostics_path, spec)
+    validate_sampler_draw_receipt(sampler_diagnostics_path, spec, resolved_config=resolved_config, manifest=manifest)
     with csv_path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     ordered = validate_rows(rows, spec)
@@ -431,6 +572,7 @@ __all__ = [
     "validate_sampler_draw_receipt",
     "validate_term_sum_and_sign",
     "validate_training_log_completeness",
+    "validate_training_log_evidence",
     "validate_training_run",
     "validate_variance_reconciliation",
 ]
