@@ -53,8 +53,9 @@ class RecordingLifecycle(AttachedAllocation):
         return super().finish(fence, status, finished_at_utc, result_digest)
 
 
-def payload(run_dir, verdict="completed", *, identity=True):
-    Path(run_dir).mkdir(parents=True, exist_ok=True)
+def payload(run_dir, verdict="completed", *, identity=True, create=True):
+    if create:
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
     value = {
         "schema": "tpen.run-evidence/v2" if identity else "tpen.run-evidence/v1", "run_dir": str(run_dir),
         "verdict": verdict, "run_status": "failed" if verdict == "refused" else verdict,
@@ -71,7 +72,7 @@ def payload(run_dir, verdict="completed", *, identity=True):
 
 def test_r1_t8_legacy_evidence_digest_omits_absent_identity(tmp_path: Path) -> None:
     """Legacy v1 evidence keeps its pre-identity canonical bytes and digest."""
-    legacy = payload(tmp_path / "legacy" / "core", identity=False)
+    legacy = payload("/runs/legacy/core", identity=False, create=False)
     evidence = CoreRunEvidence.from_mapping(legacy)
     assert _evidence_payload(evidence) == legacy
     assert digest(_evidence_payload(evidence)) == "366743525e63dace38629a282b6836bd49538e8fa3e669daa5af631b0c2c8c19"
