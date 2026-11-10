@@ -692,9 +692,19 @@ def _derive_artifact_declarations(unresolved: Mapping[str, Any], *, stage: str) 
             continue
         target = callback.get("_target_")
         if target == "tpen.callback.InitialCheckpoint":
-            declared["initial_checkpoint"] = _run_dir_relative(
-                callback.get("output_dir"), name="InitialCheckpoint.output_dir"
-            )
+            output_dir = _run_dir_relative(callback.get("output_dir"), name="InitialCheckpoint.output_dir")
+            # InitialCheckpoint always writes its single publication at the
+            # fresh-lineage cursor (`next_iteration=0`), so the update-0
+            # checkpoint always lands at `<output_dir>/step_000000/` (see
+            # `tpen.callback.initial_checkpoint.InitialCheckpoint` and
+            # `tpen.checkpoint.artifact.checkpoint_step_dir_name`, mirrored
+            # here rather than imported -- see `_CHECKPOINT_STEP_DIR_PREFIX`
+            # above). `output_dir` itself is a directory, never a file, so it
+            # cannot be the declared artifact; the concrete files that prove
+            # a COMPLETE checkpoint are.
+            step_zero_dir = f"{output_dir}/{_CHECKPOINT_STEP_DIR_PREFIX}{0:06d}"
+            declared["initial_checkpoint_manifest"] = f"{step_zero_dir}/{_CHECKPOINT_MANIFEST_NAME}"
+            declared["initial_checkpoint_complete"] = f"{step_zero_dir}/{_CHECKPOINT_COMPLETE_MARKER}"
         elif target == "tpen.callback.ParameterActivity":
             declared["parameter_activity"] = _run_dir_relative(
                 callback.get("output_path"), name="ParameterActivity.output_path"

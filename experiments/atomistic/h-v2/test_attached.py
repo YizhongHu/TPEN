@@ -314,7 +314,8 @@ def test_prepare_h_v2_run_derives_initial_checkpoint_and_parameter_activity_requ
         output_dir=tmp_path / "handoff", results_root=tmp_path / "results", lineage="L1"
     )
     prepared = attached.prepare_h_v2_run(plan, overrides, config, output_dir=tmp_path / "handoff")
-    assert prepared.artifact_declarations["initial_checkpoint"] == "checkpoints"
+    assert prepared.artifact_declarations["initial_checkpoint_manifest"] == "checkpoints/step_000000/manifest.json"
+    assert prepared.artifact_declarations["initial_checkpoint_complete"] == "checkpoints/step_000000/COMPLETE"
     assert prepared.artifact_declarations["parameter_activity"] == "parameter_activity.json"
 
 
@@ -364,7 +365,7 @@ def test_activate_h_v2_run_refuses_a_mismatched_caller_artifact_declaration(
         output_dir=tmp_path / "handoff", results_root=tmp_path / "results", lineage="L1"
     )
     prepared = attached.prepare_h_v2_run(plan, overrides, config, output_dir=tmp_path / "handoff")
-    assert prepared.artifact_declarations["initial_checkpoint"] == "checkpoints"
+    assert prepared.artifact_declarations["initial_checkpoint_manifest"] == "checkpoints/step_000000/manifest.json"
 
     output_dir = tmp_path / "attempt"
     _write_core_dir(output_dir / "core", git_commit="a" * 40)
@@ -391,7 +392,7 @@ def test_activate_h_v2_run_refuses_a_mismatched_caller_artifact_declaration(
             h_v2_receipt_path=tmp_path / "h-v2-receipt.json",
             expected_source_commit="a" * 40,
             inspect_run=lambda path: _completed_evidence("/fake/checkpoint", 10, 10),
-            artifact_declarations={"initial_checkpoint": "wrong/path"},
+            artifact_declarations={"initial_checkpoint_manifest": "wrong/path"},
         )
     assert excinfo.value.code == "artifact-declaration-mismatch"
 
@@ -411,7 +412,7 @@ def test_accepted_receipt_refuses_a_missing_derived_initial_checkpoint(tmp_path:
             expected_task_ids=("t1",),
             expected_source_commit="a" * 40,
             inspect_run=lambda path: _completed_evidence("/fake/checkpoint", 10, 10),
-            artifact_declarations={"initial_checkpoint": "checkpoints"},
+            artifact_declarations={"initial_checkpoint_manifest": "checkpoints/step_000000/manifest.json"},
         )
     assert excinfo.value.code == "missing-artifact"
 
