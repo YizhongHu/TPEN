@@ -297,7 +297,24 @@ def test_assert_candidate_instantiates_refuses_a_misconfigured_candidate(tmp_pat
     ],
 )
 def test_assert_candidate_instantiates_accepts_the_real_candidate_entry(target: str, tmp_path: Path) -> None:
-    """Amendment r4 rule 4: each appended candidate instantiates against its real class."""
+    """Amendment r4 rule 4: each appended candidate instantiates against its real class.
+
+    SKIPS, with an explicit reason, only when the class itself does not
+    exist on this base (dev-only classes on a pre-merge stack head, #616);
+    this is checked via ``hasattr`` on ``tpen.callback``'s lazy
+    ``__getattr__`` (an unmatched name there raises ``AttributeError``,
+    which ``hasattr`` alone catches -- any OTHER exception, e.g. a real
+    ``ImportError`` from a broken environment, propagates and is never
+    mistaken for "class absent"). When the class IS present, this test
+    always proceeds to the real instantiation call below and FAILS if it
+    does not construct -- the skip can never hide that case.
+    """
+
+    import tpen.callback as tpen_callback
+
+    class_name = target.rsplit(".", 1)[-1]
+    if not hasattr(tpen_callback, class_name):
+        pytest.skip(f"{target} is absent from tpen.callback on this base (dev-only, #616)")
 
     config, _ = protocol.pilot_training_config("capacity-pilot")
     protocol.append_candidate_module(config, target)
