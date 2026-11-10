@@ -17,6 +17,7 @@ SHARED_ENV_ROOT="${SHARED_ENV_ROOT:-}"
 SHARED_ENV_PROJECT="${SHARED_ENV_PROJECT:-tpen}"
 SHARED_ENV_EXTRA="${SHARED_ENV_EXTRA:-cpu}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
+CANNON_XDIST_VERSION="${CANNON_XDIST_VERSION:-3.8.0}"
 UV_BIN="${UV_BIN:-}"
 FACILITY_RUN_PREFIX="${FACILITY_RUN_PREFIX:-}"
 MUTANT_SPEC="${MUTANT_SPEC:-}"
@@ -135,6 +136,7 @@ OVERLAY_SITE="$($OVERLAY/bin/python -c 'import sysconfig; print(sysconfig.get_pa
 assert_write_path "$OVERLAY_SITE/_tpen_shared_env.pth"
 printf '%s\n' "$BASE_SITE" > "$OVERLAY_SITE/_tpen_shared_env.pth"
 $UV_BIN pip install --python "$OVERLAY/bin/python" --no-deps -e "$CLONE" >> "$RUN_ROOT/evidence/overlay-build.log" 2>&1
+$UV_BIN pip install --python "$OVERLAY/bin/python" "pytest-xdist==$CANNON_XDIST_VERSION" >> "$RUN_ROOT/evidence/overlay-build.log" 2>&1
 PYTHON="$OVERLAY/bin/python"
 export PYTHON TPEN_PYTHON="$PYTHON" ROOT_PYTHON="$PYTHON"
 env -u PYTHONPATH "$PYTHON" - "$CLONE" > "$RUN_ROOT/evidence/interpreter-identity.txt" 2>&1 <<'PYCHECK'
