@@ -60,6 +60,9 @@ class TrainerState(TrainingTimingState):
         Most recent electron batch.
     local_energy : Any, optional
         Most recent per-sample local energy (detached).
+    local_energy_terms : mapping of str to Any or None, optional
+        Per-term local energies from the same evaluation as ``local_energy``.
+        ``None`` means the trainer was not configured to return terms.
     loss : torch.Tensor or None, optional
         Most recent surrogate loss (detached).
     wavefunction_output : WavefunctionOutput or None, optional
@@ -89,6 +92,7 @@ class TrainerState(TrainingTimingState):
     samples: Any = None
     batch: Any = None
     local_energy: Any = None
+    local_energy_terms: dict[str, Any] | None = None
     loss: torch.Tensor | None = None
     wavefunction_output: WavefunctionOutput | None = None
     sampler_stats: SamplerStats | None = None

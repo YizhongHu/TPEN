@@ -88,6 +88,10 @@ def __getattr__(name: str) -> object:
         from .resource_usage import ResourceUsage
 
         return ResourceUsage
+    if name in {"RawTrainingBatchRecorder", "TrainingBatchRecorder"}:
+        from .raw_training_batch_recorder import RawTrainingBatchRecorder
+
+        return RawTrainingBatchRecorder
     if name == "RunTiming":
         from .timing import RunTiming
 
@@ -121,6 +125,7 @@ __all__ = [
     "Metadata",
     "ModuleNorms",
     "ParameterActivity",
+    "RawTrainingBatchRecorder",
     "ResolvedConfigSnapshot",
     "ResourceUsage",
     "RunTiming",
@@ -133,5 +138,6 @@ __all__ = [
     "SubscriptionGroup",
     "TrainPhaseTiming",
     "TrainStepTiming",
+    "TrainingBatchRecorder",
     "configure_terminal_logging",
 ]
