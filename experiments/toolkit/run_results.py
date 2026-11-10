@@ -298,7 +298,9 @@ def _placement_v2_gpu_sampler(value: Any) -> dict[str, Any]:
         raise ManifestRefusal("malformed-record", "placement.gpu_sampler.method is invalid")
     if record["version"] is not None:
         _text(record["version"], "placement.gpu_sampler.version")
-    _finite_number(record["cadence_seconds"], "placement.gpu_sampler.cadence_seconds", nonnegative=True)
+    cadence = _finite_number(record["cadence_seconds"], "placement.gpu_sampler.cadence_seconds", nonnegative=True)
+    if cadence > 1.0 or (record["status"] == "observed" and cadence <= 0):
+        raise ManifestRefusal("malformed-record", "placement.gpu_sampler cadence is invalid")
     count = record["count"]
     if type(count) is not int or count < 0 or count > 16:
         raise ManifestRefusal("malformed-record", "placement.gpu_sampler.count is invalid")
@@ -310,8 +312,8 @@ def _placement_v2_gpu_sampler(value: Any) -> dict[str, Any]:
     if record["status"] == "observed":
         if record["version"] is None or count <= 0 or start is None or end is None or end <= start:
             raise ManifestRefusal("malformed-record", "observed sampler requires a positive interval and samples")
-    elif count != 0 or record["samples"]:
-        raise ManifestRefusal("malformed-record", "unavailable sampler cannot contain samples")
+    elif count == 0 and (start is not None or end is not None or record["samples"]):
+        raise ManifestRefusal("malformed-record", "empty unavailable sampler has an interval or samples")
     for key in ("inventory", "pid_rows", "samples", "command_pids", "survivors"):
         if isinstance(record[key], (str, bytes, bytearray)) or not isinstance(record[key], list):
             raise ManifestRefusal("malformed-record", f"placement.gpu_sampler.{key} must be a sequence")
@@ -319,7 +321,7 @@ def _placement_v2_gpu_sampler(value: Any) -> dict[str, Any]:
         raise ManifestRefusal("malformed-record", "placement.gpu_sampler.quiescent must be boolean")
     _finite_number(record["elapsed_seconds"], "placement.gpu_sampler.elapsed_seconds", nonnegative=True)
     _finite_number(record["join_timeout_seconds"], "placement.gpu_sampler.join_timeout_seconds", nonnegative=True)
-    if record["join_timeout_seconds"] < 1.0:
+    if record["join_timeout_seconds"] < 1.0 or record["join_timeout_seconds"] > 4.0:
         raise ManifestRefusal("malformed-record", "placement.gpu_sampler join timeout is too short")
     if record["quiescent"] is True and record["survivors"]:
         raise ManifestRefusal("malformed-record", "quiescent sampler cannot report survivors")
@@ -362,11 +364,15 @@ def _placement_v2_gpu_sampler(value: Any) -> dict[str, Any]:
             raise ManifestRefusal("malformed-record", "placement.gpu_sampler sample interval is invalid")
         sample_inventory, sample_rows = _rows(sample["inventory"], sample["pid_rows"], "placement.gpu_sampler.sample")
         normalized_samples.append({"monotonic_start": sample_start, "monotonic_end": sample_end, "inventory": sample_inventory, "pid_rows": sample_rows})
-    if record["status"] == "observed":
+    if record["status"] == "observed" and not record["command_pids"]:
+        raise ManifestRefusal("malformed-record", "observed sampler requires command PIDs")
+    if record["status"] == "observed" or count:
         if len(normalized_samples) != count:
             raise ManifestRefusal("malformed-record", "observed sampler count disagrees with samples")
         if inventory != normalized_samples[-1]["inventory"] or pid_rows != normalized_samples[-1]["pid_rows"]:
             raise ManifestRefusal("malformed-record", "sampler summary disagrees with final sample")
+    if start is not None and end is not None and abs(record["elapsed_seconds"] - (end - start)) > 1e-6:
+        raise ManifestRefusal("malformed-record", "sampler elapsed time disagrees with interval")
     return record
 
 
@@ -450,26 +456,40 @@ def _placement_receipt(value: Any, attempt: Mapping[str, Any], start: Mapping[st
         declared_uuids = {_gpu_uuid(device, "placement.declared.devices") for device in record["declared"]["devices"]}
         active_uuids: list[str] = []
         active_pci: list[str] = []
-        if declared_uuids and record["gpu_sampler"]["status"] == "observed":
+        if declared_uuids and record["gpu_sampler"]["count"] > 0:
             for sample in record["gpu_sampler"]["samples"]:
                 inventory = {item["uuid"]: item["pci.bus_id"] for item in sample["inventory"]}
                 for row in sample["pid_rows"]:
                     if row["pid"] == record["child"]["pid"] and row["gpu_uuid"] not in active_uuids:
                         active_uuids.append(row["gpu_uuid"])
                         active_pci.append(inventory[row["gpu_uuid"]])
+        sampler_has_samples = record["gpu_sampler"]["count"] > 0
         if not declared_uuids:
             derived_device = "unavailable"
-        elif record["gpu_sampler"]["status"] != "observed":
+        elif record["gpu_sampler"]["status"] not in {"observed", "unavailable"} or not sampler_has_samples:
             derived_device = "unavailable"
+        elif record["gpu_sampler"]["status"] == "unavailable":
+            if any(device not in declared_uuids for device in active_uuids):
+                derived_device = "mismatch"
+            else:
+                derived_device = "unavailable"
         elif any(device not in declared_uuids for device in active_uuids):
             derived_device = "mismatch"
+        elif declared_uuids - {
+            item["uuid"] for item in record["gpu_sampler"]["inventory"]
+        }:
+            derived_device = "unavailable"
         elif not set(active_uuids).intersection(declared_uuids):
             derived_device = "unavailable"
         else:
             derived_device = "matched"
         if derived_device != record["verdict"]["device"]:
             raise ManifestRefusal("malformed-record", "placement sampler evidence disagrees with device verdict")
-        if record["gpu"]["active_uuids"] != active_uuids or record["gpu"]["active_pci"] != active_pci:
+        expected_active_uuids = active_uuids if derived_device != "unavailable" else []
+        expected_active_pci = active_pci if derived_device != "unavailable" else []
+        if record["gpu"]["samples"] != record["gpu_sampler"]["samples"]:
+            raise ManifestRefusal("malformed-record", "placement GPU samples disagree with sampler samples")
+        if record["gpu"]["active_uuids"] != expected_active_uuids or record["gpu"]["active_pci"] != expected_active_pci:
             raise ManifestRefusal("malformed-record", "placement GPU active evidence disagrees with sampler samples")
         if record["gpu"]["status"] != ("qualified" if derived_device == "matched" else "unavailable"):
             raise ManifestRefusal("malformed-record", "placement GPU status disagrees with device verdict")

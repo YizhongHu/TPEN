@@ -61,15 +61,21 @@ def _placement_receipt(output_dir: str = "/runs/group-1/task-a/attempt-1") -> di
     }
 
 
-def _placement_receipt_v2(output_dir: str, *, qualified: bool) -> dict[str, object]:
+def _placement_receipt_v2(output_dir: str, *, qualified: bool, partial: bool = False) -> dict[str, object]:
     """Return the closed v2 receipt emitted by the L1 producer."""
 
     receipt = _placement_receipt(output_dir)
     receipt["schema"] = "tpen-executor/science-placement-receipt-v2"
     receipt["declared"]["devices"] = [GPU_A]
+    has_samples = qualified or partial
+    sampler_reason = "nvidia-smi-partial" if partial else "nvidia-smi-missing"
+    sample_inventory = [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}] if has_samples else []
+    sample_rows = [{"pid": 1234, "gpu_uuid": GPU_A}] if has_samples else []
+    sample = {"monotonic_start": 1.0, "monotonic_end": 1.1, "inventory": sample_inventory, "pid_rows": sample_rows}
     receipt["gpu"].update({
         "status": "qualified" if qualified else "unavailable",
-        "reason": "live PID UUIDs match" if qualified else "nvidia-smi-missing",
+        "reason": "live PID UUIDs match" if qualified else sampler_reason,
+        "samples": [sample] if has_samples else [],
         "active_uuids": [GPU_A] if qualified else [],
         "active_pci": ["0000:00:01.0"] if qualified else [],
     })
@@ -78,17 +84,15 @@ def _placement_receipt_v2(output_dir: str, *, qualified: bool) -> dict[str, obje
         "host_mapping": {"status": "matched", "reason": "physical scheduler host mapped", "source": "scheduler-node-map", "slot_id": "slot-a", "host": "node-a"},
         "gpu_sampler": {
             "status": "observed" if qualified else "unavailable",
-            "reason": "live PID UUIDs match" if qualified else "nvidia-smi-missing",
+            "reason": "live PID UUIDs match" if qualified else sampler_reason,
             "method": "nvidia-smi-pid-uuid-v1", "version": "NVIDIA" if qualified else None,
-            "cadence_seconds": 0.1, "count": 1 if qualified else 0,
-            "monotonic_start": 1.0 if qualified else None, "monotonic_end": 1.1 if qualified else None,
-            "inventory": [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}] if qualified else [],
-            "pid_rows": [{"pid": 1234, "gpu_uuid": GPU_A}] if qualified else [],
-            "samples": [{"monotonic_start": 1.0, "monotonic_end": 1.1, "inventory": [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}], "pid_rows": [{"pid": 1234, "gpu_uuid": GPU_A}]}] if qualified else [],
-            "command_pids": [4321] if qualified else [], "survivors": [],
-            "elapsed_seconds": 0.1, "join_timeout_seconds": 4.0, "quiescent": True,
+            "cadence_seconds": 0.1, "count": 1 if has_samples else 0,
+            "monotonic_start": 1.0 if has_samples else None, "monotonic_end": 1.1 if has_samples else None,
+            "inventory": sample_inventory, "pid_rows": sample_rows,
+            "samples": [sample] if has_samples else [], "command_pids": [4321] if has_samples else [], "survivors": [],
+            "elapsed_seconds": 0.1 if has_samples else 0.0, "join_timeout_seconds": 4.0, "quiescent": True,
         },
-        "verdict": {"host": "matched", "device": "matched" if qualified else "unavailable", "qualification": "qualified" if qualified else "unqualified", "reason_class": "qualified" if qualified else "telemetry-unavailable", "reason": "physical host, affinity, and live PID telemetry matched" if qualified else "telemetry-unavailable: nvidia-smi-missing", "science_acceptance": "accepted" if qualified else "not-accepted", "warning": "" if qualified else "GPU PLACEMENT UNQUALIFIED: H-v2/science acceptance MUST NOT accept this GPU segment."},
+        "verdict": {"host": "matched", "device": "matched" if qualified else "unavailable", "qualification": "qualified" if qualified else "unqualified", "reason_class": "qualified" if qualified else "telemetry-unavailable", "reason": "physical host, affinity, and live PID telemetry matched" if qualified else f"telemetry-unavailable: {sampler_reason}", "science_acceptance": "accepted" if qualified else "not-accepted", "warning": "" if qualified else "GPU PLACEMENT UNQUALIFIED: H-v2/science acceptance MUST NOT accept this GPU segment."},
     })
     return receipt
 
@@ -189,6 +193,26 @@ def test_p8_reader_accepts_v2_and_reconciles_loud_v3_verdict(tmp_path: Path) -> 
     assert result.chains[0].segments[0].placement_receipt["verdict"]["reason_class"] == "telemetry-unavailable"
     assert result.placement_unqualified
     assert "GPU PLACEMENT UNQUALIFIED" in result.placement_verdict["message"]
+
+
+def test_p8_reader_accepts_partial_unavailable_sampler_without_qualification(tmp_path: Path) -> None:
+    path, _ = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    placement = _placement_receipt_v2(payload["attempts"][0]["output_dir"], qualified=False, partial=True)
+    payload["attempts"][0]["placement_receipt"] = placement
+    payload["schema"] = "tpen-executor/run-manifest-v3"
+    payload["placement_verdict"] = {
+        "status": "unqualified",
+        "science_acceptance": "not-accepted",
+        "message": "GPU PLACEMENT UNQUALIFIED: H-v2/science acceptance MUST NOT accept these GPU segments.",
+        "unqualified_gpu_segments": [{"task_id": "task-a", "attempt_id": "attempt-1", "reason_class": "telemetry-unavailable", "reason": "telemetry-unavailable: nvidia-smi-partial"}],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    result = read(path, lambda _: {"verdict": "completed", "checkpoint": {"checkpoint_dir": str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001"), "schema_version": 1, "next_iteration": 1, "completed_updates": 1}})
+    sampler = result.chains[0].segments[0].placement_receipt["gpu_sampler"]
+    assert sampler["status"] == "unavailable"
+    assert sampler["count"] == 1 and sampler["samples"]
+    assert result.placement_unqualified
 
 
 @pytest.mark.parametrize("mutation", ["unknown-version", "closed-key", "non-finite"])

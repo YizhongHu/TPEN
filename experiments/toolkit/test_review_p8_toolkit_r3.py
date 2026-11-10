@@ -99,6 +99,7 @@ print(Path(sys.argv[1], "evidence.json").read_text(encoding="utf-8"))
         paths["runs.json"].write_bytes(ConfiguredRunTable(group.identity, (ConfiguredRun("task-a", str(config)),)).encode())
         child_env = {"PYTHONPATH": str(stub), "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", "")}
         if mode == "mismatch": child_env["L2_GPU_MISMATCH"] = "1"
+        if mode == "partial": child_env["L2_GPU_PARTIAL_MARKER"] = str(root / "nvidia-smi-count")
         if mode == "refused":
             child_env["TPEN_PLACEMENT_REFUSAL"] = json.dumps({"code": "child-placement-refused", "reason": "consumer refusal control"})
         worker = {
@@ -132,6 +133,13 @@ def _run_real_producer(tmp_path: Path, mode: str) -> Path:
     fake.write_text(
         "#!/usr/bin/env python3\n"
         "import os, sys\n"
+        "from pathlib import Path\n"
+        "marker = os.environ.get('L2_GPU_PARTIAL_MARKER')\n"
+        "if marker:\n"
+        "    path = Path(marker)\n"
+        "    count = int(path.read_text()) + 1 if path.exists() else 1\n"
+        "    path.write_text(str(count))\n"
+        "    if count > 3: raise SystemExit(1)\n"
         "if '--version' in sys.argv: print('NVIDIA-SMI consumer-test')\n"
         "elif '--query-gpu=uuid,pci.bus_id' in sys.argv:\n"
         "    print('GPU-12345678-1234-1234-1234-123456789ABC, 0000:00:01.0')\n"
@@ -170,7 +178,7 @@ def test_l2_real_executor_producer_to_p8_reader_contract(tmp_path: Path) -> None
     assert matched.chains[0].segments[0].placement_receipt["verdict"]["reason_class"] == "qualified"
     assert not matched.placement_unqualified
 
-    for mode, reason_class in (("mismatch", "mismatch"), ("unavailable", "telemetry-unavailable"), ("refused", "refused")):
+    for mode, reason_class in (("mismatch", "mismatch"), ("unavailable", "telemetry-unavailable"), ("partial", "telemetry-unavailable"), ("refused", "refused")):
         path = _run_real_producer(tmp_path, mode)
         manifest = json.loads(path.read_text(encoding="utf-8"))
         result = read(path, _reader_inspector(manifest) if manifest["segments"] else None)
@@ -180,6 +188,11 @@ def test_l2_real_executor_producer_to_p8_reader_contract(tmp_path: Path) -> None
         if mode == "unavailable":
             assert result.placement_unqualified
             assert "GPU PLACEMENT UNQUALIFIED" in result.placement_verdict["message"]
+        if mode == "partial":
+            assert placement["gpu_sampler"]["status"] == "unavailable"
+            assert placement["gpu_sampler"]["count"] > 0
+            assert placement["gpu_sampler"]["samples"]
+            assert result.placement_unqualified
 
     foreign = copy.deepcopy(matched_manifest)
     foreign["attempts"][0]["placement_receipt"]["attempt_id"] = "foreign-attempt"
