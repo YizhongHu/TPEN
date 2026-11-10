@@ -61,38 +61,36 @@ def _placement_receipt(output_dir: str = "/runs/group-1/task-a/attempt-1") -> di
     }
 
 
-def _placement_receipt_v2(output_dir: str, *, qualified: bool, partial: bool = False) -> dict[str, object]:
-    """Return the closed v2 receipt emitted by the L1 producer."""
+def _placement_receipt_v2(output_dir: str, *, reason_class: str = "not-sampled") -> dict[str, object]:
+    """Return the closed no-sampler v2 receipt emitted by the L1a producer."""
 
     receipt = _placement_receipt(output_dir)
     receipt["schema"] = "tpen-executor/science-placement-receipt-v2"
     receipt["declared"]["devices"] = [GPU_A]
-    has_samples = qualified or partial
-    sampler_reason = "nvidia-smi-partial" if partial else "nvidia-smi-missing"
-    sample_inventory = [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}] if has_samples else []
-    sample_rows = [{"pid": 1234, "gpu_uuid": GPU_A}] if has_samples else []
-    sample = {"monotonic_start": 1.0, "monotonic_end": 1.1, "inventory": sample_inventory, "pid_rows": sample_rows}
     receipt["gpu"].update({
-        "status": "qualified" if qualified else "unavailable",
-        "reason": "live PID UUIDs match" if qualified else sampler_reason,
-        "samples": [sample] if has_samples else [],
-        "active_uuids": [GPU_A] if qualified else [],
-        "active_pci": ["0000:00:01.0"] if qualified else [],
+        "status": "unavailable", "reason": "not-sampled", "method": "not-sampled",
+        "samples": [], "active_uuids": [], "active_pci": [],
     })
-    receipt["comparison"]["device"] = "matched" if qualified else "unavailable"
+    receipt["comparison"]["device"] = "unavailable"
+    if reason_class == "mismatch":
+        receipt["comparison"]["host"] = "mismatch"
+        receipt["refusal"] = {"code": "child-placement-mismatch", "reason": "child host differs from declared host"}
+        host_status, host_reason, host = "mismatch", "child host differs from physical scheduler host", "node-a"
+        warning = "GPU PLACEMENT UNQUALIFIED: physical placement evidence requires review."
+        acceptance = "not-accepted"
+    elif reason_class == "refused":
+        receipt["comparison"].update({"host": "refused", "affinity": "refused"})
+        receipt["refusal"] = {"code": "host-map-unavailable", "reason": "physical scheduler host mapping is unavailable"}
+        host_status, host_reason, host = "unavailable", "physical scheduler host mapping is unavailable", "unavailable"
+        warning = "GPU PLACEMENT REFUSED: physical placement was refused before launch."
+        acceptance = "not-accepted"
+    else:
+        host_status, host_reason, host = "matched", "physical scheduler host mapped", "node-a"
+        warning = "GPU PLACEMENT NOT-SAMPLED: L1a intentionally does not sample devices; H-v2 performs its own delivered-GPU check."
+        acceptance = "accepted"
     receipt.update({
-        "host_mapping": {"status": "matched", "reason": "physical scheduler host mapped", "source": "scheduler-node-map", "slot_id": "slot-a", "host": "node-a"},
-        "gpu_sampler": {
-            "status": "observed" if qualified else "unavailable",
-            "reason": "live PID UUIDs match" if qualified else sampler_reason,
-            "method": "nvidia-smi-pid-uuid-v1", "version": "NVIDIA" if qualified else None,
-            "cadence_seconds": 0.1, "count": 1 if has_samples else 0,
-            "monotonic_start": 1.0 if has_samples else None, "monotonic_end": 1.1 if has_samples else None,
-            "inventory": sample_inventory, "pid_rows": sample_rows,
-            "samples": [sample] if has_samples else [], "command_pids": [4321] if has_samples else [], "survivors": [],
-            "elapsed_seconds": 0.1 if has_samples else 0.0, "join_timeout_seconds": 4.0, "quiescent": True,
-        },
-        "verdict": {"host": "matched", "device": "matched" if qualified else "unavailable", "qualification": "qualified" if qualified else "unqualified", "reason_class": "qualified" if qualified else "telemetry-unavailable", "reason": "physical host, affinity, and live PID telemetry matched" if qualified else f"telemetry-unavailable: {sampler_reason}", "science_acceptance": "accepted" if qualified else "not-accepted", "warning": "" if qualified else "GPU PLACEMENT UNQUALIFIED: H-v2/science acceptance MUST NOT accept this GPU segment."},
+        "host_mapping": {"status": host_status, "reason": host_reason, "source": "declared-slot" if host_status == "unavailable" else "scheduler-node-map", "slot_id": "slot-a", "host": host},
+        "verdict": {"host": host_status, "device": "unavailable", "qualification": "unqualified", "reason_class": reason_class, "reason": ("not-sampled: L1a intentionally does not sample device placement" if reason_class == "not-sampled" else ("mismatch: child host or CPU affinity differs from the declared physical slot" if reason_class == "mismatch" else "refused: physical scheduler host mapping is unavailable")), "science_acceptance": acceptance, "warning": warning},
     })
     return receipt
 
@@ -179,53 +177,78 @@ def test_p8_reader_accepts_optional_placement_receipt_and_surfaces_it(tmp_path: 
 def test_p8_reader_accepts_v2_and_reconciles_loud_v3_verdict(tmp_path: Path) -> None:
     path, _ = _materialized_manifest(tmp_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    placement = _placement_receipt_v2(payload["attempts"][0]["output_dir"], qualified=False)
+    placement = _placement_receipt_v2(payload["attempts"][0]["output_dir"])
     payload["attempts"][0]["placement_receipt"] = placement
     payload["schema"] = "tpen-executor/run-manifest-v3"
     payload["placement_verdict"] = {
-        "status": "unqualified",
-        "science_acceptance": "not-accepted",
-        "message": "GPU PLACEMENT UNQUALIFIED: H-v2/science acceptance MUST NOT accept these GPU segments.",
-        "unqualified_gpu_segments": [{"task_id": "task-a", "attempt_id": "attempt-1", "reason_class": "telemetry-unavailable", "reason": "telemetry-unavailable: nvidia-smi-missing"}],
+        "status": "not-sampled",
+        "science_acceptance": "accepted",
+        "message": "GPU PLACEMENT NOT-SAMPLED: L1a intentionally does not sample devices; H-v2 performs its own delivered-GPU check.",
+        "not_sampled_gpu_segments": [{"task_id": "task-a", "attempt_id": "attempt-1", "reason_class": "not-sampled", "reason": "not-sampled: L1a intentionally does not sample device placement"}],
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
     result = read(path, lambda _: {"verdict": "completed", "checkpoint": {"checkpoint_dir": str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001"), "schema_version": 1, "next_iteration": 1, "completed_updates": 1}})
-    assert result.chains[0].segments[0].placement_receipt["verdict"]["reason_class"] == "telemetry-unavailable"
-    assert result.placement_unqualified
-    assert "GPU PLACEMENT UNQUALIFIED" in result.placement_verdict["message"]
+    assert result.chains[0].segments[0].placement_receipt["verdict"]["reason_class"] == "not-sampled"
+    assert not result.placement_unqualified
+    assert "GPU PLACEMENT NOT-SAMPLED" in result.placement_verdict["message"]
 
 
-def test_p8_reader_accepts_partial_unavailable_sampler_without_qualification(tmp_path: Path) -> None:
+def test_p8_reader_rejects_v1_envelope_that_hides_v2_verdict(tmp_path: Path) -> None:
     path, _ = _materialized_manifest(tmp_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    placement = _placement_receipt_v2(payload["attempts"][0]["output_dir"], qualified=False, partial=True)
+    payload["attempts"][0]["placement_receipt"] = _placement_receipt_v2(payload["attempts"][0]["output_dir"])
+    payload["schema"] = "tpen-executor/run-manifest-v1"
+    payload.pop("segments")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestRefusal, match="must not hide"):
+        read(path, lambda _: pytest.fail("v1 envelope must refuse before inspection"))
+
+
+def test_p8_reader_accepts_l1a_prelaunch_refusal_shape(tmp_path: Path) -> None:
+    path, _ = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    placement = _placement_receipt_v2(payload["attempts"][0]["output_dir"], reason_class="refused")
     payload["attempts"][0]["placement_receipt"] = placement
+    payload["attempts"][0]["outcome_receipt"]["status"] = "launch_failed"
     payload["schema"] = "tpen-executor/run-manifest-v3"
+    payload["segments"] = []
     payload["placement_verdict"] = {
         "status": "unqualified",
         "science_acceptance": "not-accepted",
-        "message": "GPU PLACEMENT UNQUALIFIED: H-v2/science acceptance MUST NOT accept these GPU segments.",
-        "unqualified_gpu_segments": [{"task_id": "task-a", "attempt_id": "attempt-1", "reason_class": "telemetry-unavailable", "reason": "telemetry-unavailable: nvidia-smi-partial"}],
+        "message": "GPU PLACEMENT UNQUALIFIED: placement mismatch/refusal requires science review.",
+        "unqualified_gpu_segments": [{"task_id": "task-a", "attempt_id": "attempt-1", "reason_class": "refused", "reason": placement["verdict"]["reason"]}],
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
-    result = read(path, lambda _: {"verdict": "completed", "checkpoint": {"checkpoint_dir": str(tmp_path / "attempt-1" / "core" / "checkpoint" / "step_000001"), "schema_version": 1, "next_iteration": 1, "completed_updates": 1}})
-    sampler = result.chains[0].segments[0].placement_receipt["gpu_sampler"]
-    assert sampler["status"] == "unavailable"
-    assert sampler["count"] == 1 and sampler["samples"]
+    result = read(path)
+    assert not result.chains
     assert result.placement_unqualified
+    assert result.preserved_attempts[0].placement_receipt["verdict"]["reason_class"] == "refused"
+
+
+def test_p8_reader_rejects_refusal_that_hides_observed_mismatch(tmp_path: Path) -> None:
+    path, _ = _materialized_manifest(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    placement = _placement_receipt_v2(payload["attempts"][0]["output_dir"], reason_class="mismatch")
+    placement["refusal"] = {"code": "host-map-unavailable", "reason": "controller map was unavailable"}
+    placement["verdict"]["reason_class"] = "refused"
+    placement["verdict"]["warning"] = "GPU PLACEMENT REFUSED: physical placement was refused before launch."
+    payload["attempts"][0]["placement_receipt"] = placement
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestRefusal, match="mismatch/refusal precedence"):
+        read(path, lambda _: pytest.fail("contradictory refusal must refuse before inspection"))
 
 
 @pytest.mark.parametrize("mutation", ["unknown-version", "closed-key", "non-finite"])
 def test_p8_reader_refuses_v2_wire_mutations_before_inspection(tmp_path: Path, mutation: str) -> None:
     path, _ = _materialized_manifest(tmp_path)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    placement = _placement_receipt_v2(payload["attempts"][0]["output_dir"], qualified=True)
+    placement = _placement_receipt_v2(payload["attempts"][0]["output_dir"])
     if mutation == "unknown-version":
         placement["schema"] = "tpen-executor/science-placement-receipt-v9"
     elif mutation == "closed-key":
         placement["host_mapping"]["unexpected"] = True
     else:
-        placement["gpu_sampler"]["monotonic_start"] = float("nan")
+        placement["gpu"]["started_at_utc"] = None
     payload["attempts"][0]["placement_receipt"] = placement
     path.write_text(json.dumps(payload, allow_nan=True), encoding="utf-8")
     with pytest.raises(ManifestRefusal):

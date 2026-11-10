@@ -4,18 +4,16 @@ Mutant controls
 ---------------
 M7
     Old: accept only ``science-placement-receipt-v1`` and discard v2 fields.
-    New: decode the producer's closed v2 receipt and manifest-v3 verdict.
+    New: decode the producer's closed L1a v2 receipt and manifest-v3 verdict.
     Killer: ``test_l2_real_executor_producer_to_p8_reader_contract`` in the
     root suite, using the real executor dispatch/store producer.
 M8
     Old: freeze placement evidence after core inspection.
-    New: validate finite JSON evidence while reading the manifest.
+    New: validate the closed L1a JSON evidence while reading the manifest.
     Killer: ``test_p8_reader_refuses_v2_wire_mutations_before_inspection``.
 M9
-    Old: trust a root placement verdict without reconciling its entries.
-    New: require the manifest-level UNQUALIFIED entries to equal v2 receipts.
-    Killer: the real unavailable producer path plus the manifest reconciliation
-    check in ``run_results._manifest``.
+    Dropped: ``final_verdict2.py`` is not present in this repository.  There
+    is no source mutant or root-suite killer for it.
 """
 
 from __future__ import annotations
@@ -59,24 +57,25 @@ def _producer_code() -> str:
         stub = root / "stub" / "tpen"
         stub.mkdir(parents=True)
         (stub / "__init__.py").write_text("", encoding="utf-8")
-        (stub / "run.py").write_text('''
-import json, sys
-from pathlib import Path
-def main(argv):
-    values = dict(item.split("=", 1) for item in argv if "=" in item)
-    run_dir = Path(values["run.root"]) / values.get("run.run_id", "core")
-    checkpoint = run_dir / "checkpoint" / "step_000001"
-    checkpoint.mkdir(parents=True, exist_ok=True)
-    (run_dir / "evidence.json").write_text(json.dumps({
-        "schema": "tpen.run-evidence/v1", "run_dir": str(run_dir),
-        "verdict": "completed", "run_status": "completed",
-        "checkpoint": {"checkpoint_dir": str(checkpoint), "schema_version": 1,
-                        "next_iteration": 1, "completed_updates": 1},
-        "refusal": None,
-    }), encoding="utf-8")
-    return 0
-if __name__ == "__main__": raise SystemExit(main(sys.argv[1:]))
-''', encoding="utf-8")
+        (stub / "run.py").write_text(
+            "import json, os, sys\\n"
+            "from pathlib import Path\\n"
+            "def main(argv):\\n"
+            "    values = dict(item.split('=', 1) for item in argv if '=' in item)\\n"
+            "    run_dir = Path(values['run.root']) / values.get('run.run_id', 'core')\\n"
+            "    checkpoint = run_dir / 'checkpoint' / 'step_000001'\\n"
+            "    checkpoint.mkdir(parents=True, exist_ok=True)\\n"
+            "    (run_dir / 'evidence.json').write_text(json.dumps({\\n"
+            "        'schema': 'tpen.run-evidence/v1', 'run_dir': str(run_dir),\\n"
+            "        'verdict': 'completed', 'run_status': 'completed',\\n"
+            "        'checkpoint': {'checkpoint_dir': str(checkpoint), 'schema_version': 1,\\n"
+            "                       'next_iteration': 1, 'completed_updates': 1},\\n"
+            "        'refusal': None,\\n"
+            "    }), encoding='utf-8')\\n"
+            "    return 3 if os.environ.get('L2_REFUSED') == '1' else 0\\n"
+            "if __name__ == '__main__': raise SystemExit(main(sys.argv[1:]))\\n",
+            encoding="utf-8",
+        )
         (stub / "inspection.py").write_text('''
 import json, sys
 from pathlib import Path
@@ -91,17 +90,16 @@ print(Path(sys.argv[1], "evidence.json").read_text(encoding="utf-8"))
         allocation = ConfiguredAllocation(
             AllocationId("allocation-a"), BackendJobId("job-a"),
             {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot]},
-             "scheduler": {"PBS_NODEFILE": socket.gethostname() + "\\n"}},
+             "scheduler": ({"PBS_NODEFILE": str(root / "missing-nodefile")} if mode == "unavailable" else {"PBS_NODEFILE": ("other-node" if mode == "mismatch" else socket.gethostname()) + "\\n"})},
         )
         paths = {name: root / name for name in ("input.json", "allocation.json", "runs.json", "worker.yaml", "store")}
         paths["input.json"].write_bytes(group.encode())
         paths["allocation.json"].write_bytes(allocation.encode())
         paths["runs.json"].write_bytes(ConfiguredRunTable(group.identity, (ConfiguredRun("task-a", str(config)),)).encode())
         child_env = {"PYTHONPATH": str(stub), "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", "")}
-        if mode == "mismatch": child_env["L2_GPU_MISMATCH"] = "1"
-        if mode == "partial": child_env["L2_GPU_PARTIAL_MARKER"] = str(root / "nvidia-smi-count")
         if mode == "refused":
             child_env["TPEN_PLACEMENT_REFUSAL"] = json.dumps({"code": "child-placement-refused", "reason": "consumer refusal control"})
+            child_env["L2_REFUSED"] = "1"
         worker = {
             "worker": {"_target_": "tpen_executor.programs.WorkerProgram", "_recursive_": False,
                 "environment": {"_target_": "tpen_executor.environments.PreparedPythonEnvironment", "_recursive_": False,
@@ -116,10 +114,11 @@ print(Path(sys.argv[1], "evidence.json").read_text(encoding="utf-8"))
         lines += ["  process:", "    _target_: tpen_executor.workers.SubprocessWorker", "    _recursive_: false", "  runner:", "    _target_: tpen_executor.runners.TPENCommand", "    _recursive_: false", "    config: " + json.dumps(str(config)), "  evidence:", "    _target_: tpen_executor.runners.TPENEvidence", "    _recursive_: false"]
         paths["worker.yaml"].write_text("\\n".join(lines) + "\\n", encoding="utf-8")
         command = [sys.executable, "-m", "tpen_executor", "dispatch", "--input", str(paths["input.json"]), "--store", str(paths["store"]), "--allocation", str(paths["allocation.json"]), "--worker-config", str(paths["worker.yaml"]), "--runs", str(paths["runs.json"])]
-        result = subprocess.run(command, cwd=root, env=dict(os.environ, PYTHONPATH=os.environ["PYTHONPATH"]), capture_output=True, text=True)
-        if result.returncode != 0:
+        result = subprocess.run(command, cwd=root, env=dict(os.environ, PYTHONPATH=os.environ.get("PYTHONPATH", "")), capture_output=True, text=True)
+        expected_rc = 3 if mode in {"unavailable", "refused"} else 0
+        if result.returncode != expected_rc:
             print(result.stdout, file=sys.stderr); print(result.stderr, file=sys.stderr); raise SystemExit(result.returncode)
-        print(paths["store"] / "run-manifest.json")
+        print("MANIFEST=" + str(paths["store"] / "run-manifest.json"))
         """
     )
     return "\n".join(line[8:] if line.startswith("        ") else line for line in source.splitlines()) + "\n"
@@ -151,14 +150,13 @@ def _run_real_producer(tmp_path: Path, mode: str) -> Path:
     fake.chmod(0o755)
     root = tmp_path / mode
     env = dict(os.environ, PYTHONPATH=str(ROOT / "executor" / "src"))
-    if mode == "mismatch":
-        env["L2_GPU_MISMATCH"] = "1"
     if mode == "unavailable":
         fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         fake.chmod(0o755)
     result = subprocess.run([executor_python, "-c", _producer_code(), str(root), mode, str(fake_bin)], cwd=ROOT / "executor", env=env, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, (result.stdout, result.stderr)
-    return Path(result.stdout.strip())
+    marker = next(line for line in result.stdout.splitlines() if line.startswith("MANIFEST="))
+    return Path(marker.removeprefix("MANIFEST="))
 
 
 def _reader_inspector(manifest: dict[str, object]):
@@ -167,32 +165,25 @@ def _reader_inspector(manifest: dict[str, object]):
 
 
 def test_l2_real_executor_producer_to_p8_reader_contract(tmp_path: Path) -> None:
-    """M7-M9: real dispatch output crosses P8 for all placement verdict classes."""
+    """M7-M8: real dispatch output crosses P8 for all L1a verdict classes."""
 
-    if not hasattr(os, "sched_getaffinity"):
-        pytest.skip("named skip: real placement producer requires Linux CPU-affinity support")
     matched_path = _run_real_producer(tmp_path, "matched")
     matched_manifest = json.loads(matched_path.read_text(encoding="utf-8"))
     matched = read(matched_path, _reader_inspector(matched_manifest))
-    assert matched.chains[0].segments[0].placement_receipt["verdict"]["qualification"] == "qualified"
-    assert matched.chains[0].segments[0].placement_receipt["verdict"]["reason_class"] == "qualified"
+    assert matched.chains[0].segments[0].placement_receipt["verdict"]["qualification"] == "unqualified"
+    assert matched.chains[0].segments[0].placement_receipt["verdict"]["reason_class"] == "not-sampled"
     assert not matched.placement_unqualified
 
-    for mode, reason_class in (("mismatch", "mismatch"), ("unavailable", "telemetry-unavailable"), ("partial", "telemetry-unavailable"), ("refused", "refused")):
+    for mode, reason_class in (("mismatch", "mismatch"), ("unavailable", "refused"), ("refused", "refused")):
         path = _run_real_producer(tmp_path, mode)
         manifest = json.loads(path.read_text(encoding="utf-8"))
         result = read(path, _reader_inspector(manifest) if manifest["segments"] else None)
         attempts = result.chains[0].segments if result.chains else result.preserved_attempts
         placement = attempts[0].placement_receipt
         assert placement["verdict"]["reason_class"] == reason_class
-        if mode == "unavailable":
+        if mode in {"unavailable", "refused"}:
             assert result.placement_unqualified
             assert "GPU PLACEMENT UNQUALIFIED" in result.placement_verdict["message"]
-        if mode == "partial":
-            assert placement["gpu_sampler"]["status"] == "unavailable"
-            assert placement["gpu_sampler"]["count"] > 0
-            assert placement["gpu_sampler"]["samples"]
-            assert result.placement_unqualified
 
     foreign = copy.deepcopy(matched_manifest)
     foreign["attempts"][0]["placement_receipt"]["attempt_id"] = "foreign-attempt"
