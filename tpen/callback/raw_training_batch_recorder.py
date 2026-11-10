@@ -495,12 +495,22 @@ def _canonical_hash(value: Mapping[str, Any]) -> str:
 
 
 class RawTrainingBatchRecorder(StatefulCallback[TrainerState]):
-    """Optionally capture pre-update batches as NumPy training-history partitions."""
+    """Optionally capture pre-update batches as NumPy training-history partitions.
+
+    The manifest commits each closed sidecar's SHA-256 in ``sidecar_sha256``;
+    readers verify that digest before trusting sidecar provenance or bundle
+    digests.  Because partition plans are deterministic, this recorder only
+    accepts the full cadence (``probability=1`` and ``max_calls=None``).
+    """
 
     state_type: ClassVar[type[DomainState]] = TrainerState
 
     def __init__(self, path: str | Path, *, partition_size_steps: int = 1000, **kwargs: Any) -> None:
         cadence = pop_step_cadence(kwargs)
+        if cadence.probability != 1.0:
+            raise ValueError("RawTrainingBatchRecorder requires probability=1.0")
+        if cadence.max_calls is not None:
+            raise ValueError("RawTrainingBatchRecorder requires max_calls=None")
         if partition_size_steps < 1:
             raise ValueError("partition_size_steps must be positive")
         super().__init__(typed_groups=(SubscriptionGroup(selectors=(Subscription.of(TrainingIterationCompleted), Subscription.of(TrainingCompleted))),), **kwargs)
