@@ -148,6 +148,26 @@ def test_candidate_modules_to_append_excludes_base_config_leaves() -> None:
     assert "tpen.callback.GradientStats" not in candidates
     assert "tpen.callback.InitialCheckpoint" in candidates
     assert "tpen.callback.ParameterActivity" in candidates
+    assert "tpen.callback.ElectronNucleusDistanceQuantiles" in candidates
+    # Amendment r4 rule 2: ModuleNorms is NEVER a probed/appended candidate.
+    assert "tpen.callback.ModuleNorms" not in candidates
+    assert "tpen.callback.ModuleNorms" not in protocol.A1_TRAINING_MODULE_CANDIDATES
+
+
+def test_endq_candidate_carries_quantiles_not_output_path() -> None:
+    """Mutant: ENDQ quantiles dropped."""
+
+    entry = protocol._build_candidate_callback("tpen.callback.ElectronNucleusDistanceQuantiles")
+    assert entry["quantiles"] == list(protocol.ENDQ_A1_QUANTILES)
+    assert "output_path" not in entry
+    assert entry["every_n_steps"] == protocol.PILOT_A1_CADENCE
+
+
+def test_unspecified_modules_names_module_norms_with_reason() -> None:
+    """Mutant: ModuleNorms appended with placeholder groups."""
+
+    unspecified = protocol.unspecified_modules()
+    assert unspecified == [{"target": "tpen.callback.ModuleNorms", "reason": "6c29fe1d"}]
 
 
 def test_append_and_remove_candidate_module_round_trips() -> None:
@@ -186,6 +206,7 @@ def test_probe_admitted_a1_modules_keeps_only_admitted_candidates(
                 raise attached.ActivationRefusal(_FakeRefusal.code, _FakeRefusal.reason)
 
     monkeypatch.setattr(attached, "check_profile", _fake_check_profile)
+    monkeypatch.setattr(attached, "assert_candidate_instantiates", lambda *args, **kwargs: None)
     enabled, skipped = attached.probe_admitted_a1_modules(
         config,
         protocol.candidate_modules_to_append(),
@@ -217,6 +238,72 @@ def test_probe_admitted_a1_modules_admits_none(tmp_path: Path, monkeypatch: pyte
     )
     assert enabled == []
     assert set(skipped) == set(protocol.candidate_modules_to_append())
+
+
+def test_probe_raises_on_instantiation_failure_not_swallowed_as_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutant: probe swallows non-refusal errors as skips.
+
+    Amendment r4 rule 3: only an ActivationRefusal from check_profile counts
+    as "not admitted"; a misconfigured-but-admitted candidate (the exact
+    ENDQ/ModuleNorms bug this amendment fixes) must RAISE, never be recorded
+    in ``skipped``.
+    """
+
+    config, _ = protocol.pilot_training_config("gpu-route-g")
+    monkeypatch.setattr(attached, "check_profile", lambda *args, **kwargs: None)
+
+    def _raise_misconfigured(*args: Any, **kwargs: Any) -> None:
+        raise attached.HV2ReceiptRefusal("candidate-module-misconfigured", "boom")
+
+    monkeypatch.setattr(attached, "assert_candidate_instantiates", _raise_misconfigured)
+    with pytest.raises(attached.HV2ReceiptRefusal) as excinfo:
+        attached.probe_admitted_a1_modules(
+            config,
+            protocol.candidate_modules_to_append(),
+            science_python=sys.executable,
+            probe_config_path=tmp_path / "probe.yaml",
+        )
+    assert excinfo.value.code == "candidate-module-misconfigured"
+
+
+def test_assert_candidate_instantiates_refuses_a_misconfigured_candidate(tmp_path: Path) -> None:
+    """Regression + mutant control for the ENDQ/dropped-quantiles bug amendment r4 fixed.
+
+    Exercises the REAL ``tpen.callback.ElectronNucleusDistanceQuantiles``
+    class (requires torch/tpen in *science_python*; run on Cannon/dev per the
+    receipt, like every other torch-backed test in this directory).
+    """
+
+    config, _ = protocol.pilot_training_config("capacity-pilot")
+    broken = {"_target_": "tpen.callback.ElectronNucleusDistanceQuantiles", "every_n_steps": 1}
+    config["callbacks"].append(broken)
+    probe_path = tmp_path / "probe.yaml"
+    probe_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    with pytest.raises(attached.HV2ReceiptRefusal) as excinfo:
+        attached.assert_candidate_instantiates(
+            sys.executable, probe_path, "tpen.callback.ElectronNucleusDistanceQuantiles"
+        )
+    assert excinfo.value.code == "candidate-module-misconfigured"
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "tpen.callback.InitialCheckpoint",
+        "tpen.callback.ParameterActivity",
+        "tpen.callback.ElectronNucleusDistanceQuantiles",
+    ],
+)
+def test_assert_candidate_instantiates_accepts_the_real_candidate_entry(target: str, tmp_path: Path) -> None:
+    """Amendment r4 rule 4: each appended candidate instantiates against its real class."""
+
+    config, _ = protocol.pilot_training_config("capacity-pilot")
+    protocol.append_candidate_module(config, target)
+    probe_path = tmp_path / "probe.yaml"
+    probe_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    attached.assert_candidate_instantiates(sys.executable, probe_path, target)
 
 
 # ---------------------------------------------------------------------------

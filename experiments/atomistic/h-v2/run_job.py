@@ -376,8 +376,12 @@ def run(
             cwd=run_root / "checkout",
             enabled_modules=enabled_modules,
             skipped_not_admitted=skipped_not_admitted,
+            skipped_unspecified=protocol.unspecified_modules(),
         )
-        print(f"[h-v2] {task_id}: accepted (enabled={enabled_modules!r} skipped={skipped_not_admitted!r})")
+        print(
+            f"[h-v2] {task_id}: accepted (enabled={enabled_modules!r} "
+            f"skipped={skipped_not_admitted!r} unspecified={protocol.unspecified_modules()!r})"
+        )
         return
 
     check_identity(run_root, expected_commit, science_python)

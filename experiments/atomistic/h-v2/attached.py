@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -196,6 +197,69 @@ def _atomic_text(path: Path, text: str) -> None:
     temporary.replace(path)
 
 
+#: Run via ``science_python -c <this> <probe_config_path> <target>``: loads
+#: the unresolved probe config, finds *target*'s own callback node, and
+#: instantiates ONLY that node against its real constructor -- never the
+#: whole config (no model/context exists at probe time). A syntax-only
+#: profile admission (:func:`check_profile`) cannot by itself tell "this
+#: _target_ is allowlisted" apart from "this exact argument set constructs
+#: the real class" (amendment r4 finding: ENDQ/ModuleNorms both passed
+#: admission on dev while carrying the wrong/missing constructor arguments).
+_INSTANTIATE_CANDIDATE_SCRIPT = """
+import sys
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
+
+config = OmegaConf.load(sys.argv[1])
+target = sys.argv[2]
+node = next((cb for cb in config.get("callbacks", []) if cb.get("_target_") == target), None)
+if node is None:
+    print(f"MISSING:{target}")
+    raise SystemExit(1)
+try:
+    instantiate(node)
+except Exception as error:  # noqa: BLE001 - reported to the caller, never swallowed
+    print(f"INSTANTIATION_FAILED:{type(error).__name__}:{error}")
+    raise SystemExit(1)
+print("OK")
+"""
+
+
+def assert_candidate_instantiates(
+    science_python: str | Path,
+    probe_config_path: str | Path,
+    target: str,
+    *,
+    cwd: str | Path | None = None,
+) -> None:
+    """Instantiate *target*'s candidate node against its real constructor.
+
+    Raises
+    ------
+    HV2ReceiptRefusal
+        Code ``candidate-module-misconfigured``, if *target*'s node is
+        missing from the probe config or fails to construct. This is
+        ALWAYS a hard failure, never a skip: a candidate the recovery
+        profile admits (a syntax check) but whose arguments do not match
+        its real signature is a configuration bug in this study module,
+        not an absent core capability.
+    """
+
+    result = subprocess.run(
+        [str(science_python), "-c", _INSTANTIATE_CANDIDATE_SCRIPT, str(probe_config_path), target],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise HV2ReceiptRefusal(
+            "candidate-module-misconfigured",
+            f"{target} is admitted by the recovery profile but does not instantiate against its "
+            f"real constructor: {result.stdout.strip()!r} {result.stderr.strip()!r}",
+        )
+
+
 def probe_admitted_a1_modules(
     config: dict[str, Any],
     candidates: Sequence[str],
@@ -206,14 +270,25 @@ def probe_admitted_a1_modules(
 ) -> tuple[list[str], list[str]]:
     """Enable every candidate A1 training-side module the recovery profile admits.
 
-    TO 63690220 amendment r3: tries each of *candidates* in order, appending
-    it to *config* (:func:`protocol.append_candidate_module`) and probing the
-    runtime recovery profile (:func:`check_profile`, which subprocesses the
-    exact *science_python* this job will actually train with -- never
-    assumed from the branch); a refused candidate is removed again
-    (:func:`protocol.remove_candidate_module`) before the next is tried, so
-    *config* ends up carrying exactly the admitted subset. Skipping is never
-    silent: the caller records both lists on the TRAIN receipt.
+    TO 63690220 amendment r3/r4: tries each of *candidates* in order,
+    appending it to *config* (:func:`protocol.append_candidate_module`) and
+    probing the runtime recovery profile (:func:`check_profile`, which
+    subprocesses the exact *science_python* this job will actually train
+    with -- never assumed from the branch); a refused candidate is removed
+    again (:func:`protocol.remove_candidate_module`) before the next is
+    tried, so *config* ends up carrying exactly the admitted subset.
+    Skipping is never silent: the caller records both lists on the TRAIN
+    receipt.
+
+    Amendment r4: profile admission is syntax-only (an allowlisted
+    ``_target_`` plus safe cadence fields) and cannot by itself tell a
+    genuinely absent capability apart from a candidate built with the wrong
+    arguments for its real constructor. Every admitted candidate is
+    therefore ALSO instantiated against its real class
+    (:func:`assert_candidate_instantiates`) before being recorded as
+    enabled. ONLY an :class:`ActivationRefusal` from :func:`check_profile`
+    counts as "not admitted"; any other error -- including an instantiation
+    failure -- propagates and is never recorded as a skip.
 
     Parameters
     ----------
@@ -245,8 +320,9 @@ def probe_admitted_a1_modules(
         except ActivationRefusal:
             protocol.remove_candidate_module(config, target)
             skipped.append(target)
-        else:
-            enabled.append(target)
+            continue
+        assert_candidate_instantiates(science_python, probe_path, target, cwd=cwd)
+        enabled.append(target)
     return enabled, skipped
 
 
@@ -730,6 +806,7 @@ def activate_h_v2_run(
     artifact_declarations: Mapping[str, str] | None = None,
     enabled_modules: Sequence[str] | None = None,
     skipped_not_admitted: Sequence[str] | None = None,
+    skipped_unspecified: Sequence[Mapping[str, str]] | None = None,
 ) -> HV2Activation:
     """Run the complete H-v2 attached activation route for one prepared task.
 
@@ -759,6 +836,9 @@ def activate_h_v2_run(
     enabled_modules, skipped_not_admitted : sequence of str, optional
         TO 63690220 amendment r3: forwarded verbatim to
         :func:`write_h_v2_accepted_receipt`.
+    skipped_unspecified : sequence of mapping, optional
+        TO 63690220 amendment r4: forwarded verbatim
+        (:func:`protocol.unspecified_modules`).
     artifact_declarations : mapping[str, str], optional
         Additional ``{name: relative_path}`` entries, beyond the base
         artifacts and whatever D3 already derives from ``prepared``'s own
@@ -885,6 +965,7 @@ def activate_h_v2_run(
             science_config_identity=prepared.science_config_identity,
             enabled_modules=enabled_modules,
             skipped_not_admitted=skipped_not_admitted,
+            skipped_unspecified=skipped_unspecified,
         )
     except (HV2ReceiptRefusal, ManifestRefusal) as error:
         write_activation_failure_receipt(
@@ -975,6 +1056,7 @@ def build_h_v2_accepted_receipt(
     science_config_identity: Mapping[str, Any] | None = None,
     enabled_modules: Sequence[str] | None = None,
     skipped_not_admitted: Sequence[str] | None = None,
+    skipped_unspecified: Sequence[Mapping[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Build the study-side H-v2 accepted-receipt payload from one manifest.
 
@@ -1018,6 +1100,11 @@ def build_h_v2_accepted_receipt(
         (:data:`protocol.A1_TRAINING_MODULE_CANDIDATES`) the runtime recovery
         profile admitted versus refused. Skipping is never silent: both
         default to ``[]`` rather than being omitted.
+    skipped_unspecified : sequence of mapping, optional
+        TO 63690220 amendment r4: modules never probed or appended because
+        their configuration is not yet specified upstream
+        (:func:`protocol.unspecified_modules`), each as
+        ``{"target": ..., "reason": ...}``. Defaults to ``[]``.
 
     Returns
     -------
@@ -1191,6 +1278,7 @@ def build_h_v2_accepted_receipt(
         "checkpoint_inventory": checkpoint_inventory,
         "enabled_modules": list(enabled_modules) if enabled_modules else [],
         "skipped_not_admitted": list(skipped_not_admitted) if skipped_not_admitted else [],
+        "skipped_unspecified": [dict(entry) for entry in skipped_unspecified] if skipped_unspecified else [],
     }
 
 
@@ -1245,6 +1333,7 @@ __all__ = [
     "build_h_v2_eval_plan",
     "build_h_v2_train_plan",
     "prepare_h_v2_run",
+    "assert_candidate_instantiates",
     "probe_admitted_a1_modules",
     "write_h_v2_accepted_receipt",
 ]

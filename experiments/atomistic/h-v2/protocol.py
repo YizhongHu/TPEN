@@ -82,20 +82,41 @@ PILOT_A1_CADENCE = 1
 #: assumed from the branch. ``DataIntegrity``/``GradientStats`` are already
 #: present leaves in ``train.yaml`` (cadence set by the payload overlay
 #: above); the rest are appended fresh by :func:`append_measurement_callbacks`.
+#: Amendment r4: ``ModuleNorms`` is deliberately NOT a candidate here. Its
+#: required ``groups`` mapping names model-structure paths that are not yet
+#: frozen (placeholders until 6c29fe1d/69c5a5a6), so there is no value this
+#: module could honestly supply; appending it with a placeholder would pass
+#: profile admission (a syntax-only check) and then fail at instantiation.
+#: It is recorded separately, always, under :data:`UNSPECIFIED_MODULES`.
 A1_TRAINING_MODULE_CANDIDATES: tuple[str, ...] = (
     "tpen.callback.DataIntegrity",
     "tpen.callback.GradientStats",
     "tpen.callback.InitialCheckpoint",
     "tpen.callback.ParameterActivity",
     "tpen.callback.ElectronNucleusDistanceQuantiles",
-    "tpen.callback.ModuleNorms",
 )
+
+#: Amendment r4 rule 2: module candidates never probed or appended, recorded
+#: unconditionally on the TRAIN receipt's ``skipped_unspecified`` list with
+#: their reason (the TO item whose merge would specify them).
+UNSPECIFIED_MODULES: dict[str, str] = {"tpen.callback.ModuleNorms": "6c29fe1d"}
 
 #: Candidates already present as leaves in the base ``train.yaml`` callbacks
 #: list; never appended again by :func:`append_candidate_module`.
 _A1_CANDIDATES_PRESENT_IN_BASE_CONFIG = frozenset(
     {"tpen.callback.DataIntegrity", "tpen.callback.GradientStats"}
 )
+
+#: Design doc A1's frozen quantile levels for
+#: ``tpen.callback.ElectronNucleusDistanceQuantiles``, taken from this one
+#: protocol constant (amendment r4 rule 1), never a second literal copy.
+ENDQ_A1_QUANTILES: tuple[float, ...] = (0.0, 0.001, 0.01, 0.5, 0.99, 0.999)
+
+
+def unspecified_modules() -> list[dict[str, str]]:
+    """Return :data:`UNSPECIFIED_MODULES` as the receipt's ``skipped_unspecified`` shape."""
+
+    return [{"target": target, "reason": reason} for target, reason in UNSPECIFIED_MODULES.items()]
 
 #: Contract-frozen nuclear cusp law literals (``admission.pipeline_check.nuclear_law_note``).
 CONTRACT_NUCLEAR_LAW = {
@@ -243,16 +264,15 @@ def _build_candidate_callback(target: str) -> dict[str, Any]:
         # No cadence field: it fires exactly once, on the first applied update.
         return {"_target_": target, "output_path": "${run.dir}/parameter_activity.json"}
     if target == "tpen.callback.ElectronNucleusDistanceQuantiles":
+        # Design doc A1 exactly: no output_path -- the real constructor
+        # (``ElectronNucleusDistanceQuantiles(*, quantiles, **kwargs)``) takes
+        # none, and a config key that signature does not accept would pass
+        # this module's own syntax-only profile probe and fail only at real
+        # instantiation (amendment r4).
         return {
             "_target_": target,
             "every_n_steps": PILOT_A1_CADENCE,
-            "output_path": "${run.dir}/en_distance_quantiles.jsonl",
-        }
-    if target == "tpen.callback.ModuleNorms":
-        return {
-            "_target_": target,
-            "every_n_steps": PILOT_A1_CADENCE,
-            "output_path": "${run.dir}/module_norms.jsonl",
+            "quantiles": list(ENDQ_A1_QUANTILES),
         }
     raise ValueError(f"no candidate-callback builder for A1 training-side module {target!r}")
 
@@ -439,6 +459,7 @@ __all__ = [
     "A1_TRAINING_MODULE_CANDIDATES",
     "CONTRACT_INPUTS_PATH",
     "CONTRACT_NUCLEAR_LAW",
+    "ENDQ_A1_QUANTILES",
     "EVALUATION_SEEDS",
     "PILOT_A1_CADENCE",
     "PILOT_PAYLOAD_OVERLAY_KEYS",
@@ -448,6 +469,7 @@ __all__ = [
     "SCIENCE_SCALE_OVERLAY_KEYS",
     "SCIENCE_SCALE_OVERLAY_PATH",
     "TRAINING_SEED",
+    "UNSPECIFIED_MODULES",
     "append_candidate_module",
     "append_measurement_callbacks",
     "assert_hydrogen_contract",
@@ -458,4 +480,5 @@ __all__ = [
     "remove_candidate_module",
     "science_training_config",
     "training_config",
+    "unspecified_modules",
 ]
