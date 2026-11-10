@@ -7,6 +7,12 @@ validated interpreter, and no test killed the mutant where
 ``checkpoint_dir_for_eval`` silently falls back to a placeholder path. No
 live scheduler is touched; every test either injects a stub ``sbatch``
 runner or stays at the pure argument-building/validation layer.
+
+TO baff945c superseded the G1 blanket ``science`` refusal below: a
+``science`` payload now dispatches the approved per-lineage science
+training config for ``launch_config.LINEAGES`` (L1-L3); the refusal is
+scoped to a lineage outside that roster instead
+(``test_science_config_routing.py`` covers the routing itself).
 """
 
 from __future__ import annotations
@@ -51,10 +57,11 @@ def _runner(calls: list[list[str]], job_ids: list[str]):
 # --- G1: explicit payload choice -------------------------------------------
 
 
-def test_g1_science_payload_refuses_before_any_submission(tmp_path: Path) -> None:
+def test_g1_science_payload_refuses_for_an_unapproved_lineage_before_any_submission(tmp_path: Path) -> None:
     calls: list[list[str]] = []
     with pytest.raises(launch.LaunchError) as excinfo:
-        launch.submit_all(
+        launch.submit_lineage(
+            "L9",
             payload="science",
             science_python=sys.executable,
             executor_python=sys.executable,
@@ -68,12 +75,13 @@ def test_g1_science_payload_refuses_before_any_submission(tmp_path: Path) -> Non
     assert job.SCIENCE_CONFIG_UNAVAILABLE_CODE in str(excinfo.value)
 
 
-def test_g1_science_payload_refuses_in_dry_run_too(
+def test_g1_science_payload_refuses_for_an_unapproved_lineage_in_dry_run_too(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     calls: list[list[str]] = []
     with pytest.raises(launch.LaunchError) as excinfo:
-        launch.submit_all(
+        launch.submit_lineage(
+            "L9",
             payload="science",
             science_python=sys.executable,
             executor_python=sys.executable,
@@ -89,23 +97,32 @@ def test_g1_science_payload_refuses_in_dry_run_too(
     assert capsys.readouterr().out == ""
 
 
-def test_g1_science_payload_refuses_through_main_with_zero_runner_calls(
+def test_g1_science_payload_submits_through_main_for_the_approved_roster(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[list[str]] = []
-    monkeypatch.setattr(launch.subprocess, "run", lambda *a, **k: calls.append(a))
+    job_ids = iter(str(n) for n in range(1, 2 * len(launch.launch_config.LINEAGES) + 1))
+
+    def _fake_run(command, **kwargs):
+        calls.append(list(command))
+        return subprocess.CompletedProcess(command, 0, f"{next(job_ids)};cluster\n", "")
+
+    monkeypatch.setattr(launch.subprocess, "run", _fake_run)
     monkeypatch.setenv("T_WALL", "08:00:00")
     monkeypatch.setenv("E_WALL", "24:00:00")
-    with pytest.raises(launch.LaunchError) as excinfo:
-        launch.main([
-            "--run-root", str(tmp_path),
-            "--commit", SHA,
-            "--payload", "science",
-            "--science-python", sys.executable,
-            "--executor-python", sys.executable,
-        ])
-    assert calls == []
-    assert job.SCIENCE_CONFIG_UNAVAILABLE_CODE in str(excinfo.value)
+    exit_code = launch.main([
+        "--run-root", str(tmp_path),
+        "--commit", SHA,
+        "--payload", "science",
+        "--science-python", sys.executable,
+        "--executor-python", sys.executable,
+    ])
+    assert exit_code == 0
+    assert len(calls) == 2 * len(launch.launch_config.LINEAGES)
+    for lineage in launch.launch_config.LINEAGES:
+        assert any(f"--job-name=h-v2-science-{lineage}-train" in command for command in calls)
+        assert any(f"--job-name=h-v2-science-{lineage}-eval" in command for command in calls)
+    assert not any("pipeline-check" in " ".join(command) for command in calls)
 
 
 def test_g1_pipeline_check_submits_two_labelled_commands_per_lineage_with_afterok(

@@ -10,14 +10,17 @@ fallback. Each job runs ``run_job.py`` (the executor's attached route from
 item 9d3aa0a3) inside its own allocation.
 
 Round 2 (PR 619 decisions F1/F3): ``--payload`` is required, with no
-default. ``science`` always refuses before any ``sbatch`` call (no approved
-per-lineage science configuration interface exists yet); ``pipeline-check``
-explicitly selects the non-science payload, labelled as such in job names
-and in-job argv. ``--science-python``/``--executor-python`` are also
-required, absolute, existing-file paths, embedded literally into the job
-wrapper rather than left to whatever the submitting shell happened to
-export. ``run_job.py``'s own in-job gate for the same refusal is kept as
-defence in depth.
+default. ``pipeline-check`` explicitly selects the non-science payload,
+labelled as such in job names and in-job argv. ``--science-python``/
+``--executor-python`` are also required, absolute, existing-file paths,
+embedded literally into the job wrapper rather than left to whatever the
+submitting shell happened to export.
+
+TO baff945c: ``science`` dispatches the approved per-lineage science
+training config (``protocol.science_training_config``) for lineages L1-L3
+(``launch_config.LINEAGES``); any other lineage still refuses before any
+``sbatch`` call. ``run_job.py``'s own in-job gate for the same refusal is
+kept as defence in depth.
 
 Round 3 (K4). Invocation: run this file with the SCIENCE environment's
 interpreter (the one later passed as ``--science-python``), not a bare
@@ -53,6 +56,7 @@ imports no ``tpen``, no ``tpen_executor``, and no ``hydra``
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.util
 import os
 import shlex
@@ -122,37 +126,60 @@ def _default_runner(command: Sequence[str]) -> subprocess.CompletedProcess:
     return subprocess.run(list(command), check=False, capture_output=True, text=True)
 
 
-def _validate_payload(payload: str) -> None:
-    """G1 (decision F3): refuse a ``science`` payload before any dispatch.
+#: TO 63690220: the two non-science, TRAIN-only pilot/part-(g) payloads
+#: (acceptance-contract). Each dispatches exactly one lineage, refuses any
+#: other lineage or stage, and never chains an EVAL job (item E's scope).
+PILOT_PAYLOADS = ("gpu-route-g", "capacity-pilot")
 
-    No approved per-lineage science configuration interface exists yet
-    (design target section A1; follow-up tracked on item 3c13ba74), so this
-    script must not silently submit ``protocol.training_config()``'s CPU
-    pipeline-check defaults relabeled as a science run. The refusal reuses
-    ``run_job.py``'s own refusal code (:data:`run_job.SCIENCE_CONFIG_UNAVAILABLE_CODE`)
-    so the two refusal sites -- here, before any ``sbatch`` call, and
-    ``run_job.py``'s in-job gate, kept as defence in depth -- never drift
-    apart into two different codes for the same condition.
+
+def _validate_payload(payload: str) -> None:
+    """Refuse any ``--payload`` value outside the declared set.
+
+    TO baff945c lifted the former blanket refusal of ``payload == "science"``
+    for the approved L1-L3 lineage roster; :func:`_validate_science_lineage`
+    now carries the per-lineage refusal that used to live here, reusing
+    ``run_job.py``'s own refusal code
+    (:data:`run_job.SCIENCE_CONFIG_UNAVAILABLE_CODE`) so the two refusal
+    sites -- there, before any ``sbatch`` call, and ``run_job.py``'s in-job
+    gate, kept as defence in depth -- never drift apart into two different
+    codes for the same condition. TO 63690220 adds the two pilot payloads
+    (:data:`PILOT_PAYLOADS`), dispatched by :func:`submit_pilot_payload`
+    rather than :func:`submit_lineage`/:func:`submit_all`.
 
     Raises
     ------
     LaunchError
-        Always, for ``payload == "science"``; also for any other value that
-        is not ``"pipeline-check"``.
+        If ``payload`` is not ``"science"``, ``"pipeline-check"``, or one of
+        :data:`PILOT_PAYLOADS`.
     """
 
-    if payload == "science":
+    if payload not in ("science", "pipeline-check") + PILOT_PAYLOADS:
+        raise LaunchError(
+            f"--payload must be 'science', 'pipeline-check', or one of {PILOT_PAYLOADS!r}, got {payload!r}"
+        )
+
+
+def _validate_science_lineage(payload: str, lineage: str) -> None:
+    """TO baff945c: refuse a science payload for an unapproved lineage.
+
+    EVAL stays refused unconditionally regardless of lineage
+    (``attached.EVAL_ROUTE_UNSUPPORTED_CODE``, BLOCKER-EVAL); this only
+    gates which lineage a ``science`` TRAIN/EVAL job may be submitted for.
+
+    Raises
+    ------
+    LaunchError
+        Code :data:`run_job.SCIENCE_CONFIG_UNAVAILABLE_CODE`, if
+        ``payload == "science"`` and ``lineage`` is not one of
+        ``launch_config.LINEAGES``.
+    """
+
+    if payload == "science" and lineage not in launch_config.LINEAGES:
         code = _run_job_module().SCIENCE_CONFIG_UNAVAILABLE_CODE
         raise LaunchError(
-            f"{code}: no approved per-lineage science configuration interface "
-            "exists yet (design target section A1; follow-up tracked on item "
-            "3c13ba74). Refusing before any sbatch submission rather than "
-            "dispatching the non-science pipeline-check payload under a "
-            "science label. Pass --payload pipeline-check to explicitly "
-            "select the non-science payload instead."
+            f"{code}: lineage {lineage!r} is not an approved science lineage "
+            f"({launch_config.LINEAGES!r}); refusing before any sbatch submission"
         )
-    if payload != "pipeline-check":
-        raise LaunchError(f"--payload must be 'science' or 'pipeline-check', got {payload!r}")
 
 
 def _validate_interpreter(path_value: str, *, label: str) -> str:
@@ -173,6 +200,130 @@ def _validate_interpreter(path_value: str, *, label: str) -> str:
     if not Path(path_value).is_file():
         raise LaunchError(f"{label} does not exist: {path_value!r}")
     return path_value
+
+
+#: F2: a self-contained GPU-utilization sidecar for the pilot/part-(g)
+#: payloads, run via ``<science_python> - <log_path>`` so no sibling file
+#: dependency exists (mirrors :func:`_wrap_command`'s own rationale). Stdlib
+#: only (``os``/``signal``/``subprocess``/``sys``/``time``): no new
+#: dependency. Samples ``memory.used``/``utilization.gpu`` roughly every
+#: five seconds with a bounded per-query timeout; a failing or hung
+#: ``nvidia-smi`` invocation is isolated (never raised to the caller) and
+#: never blocks the next sample. On SIGTERM (the wrapper's own cleanup,
+#: after the payload exits) it kills its own in-flight ``nvidia-smi`` process
+#: group, if any, and exits -- it is never left running or orphaned past the
+#: payload's own lifetime.
+_GPU_SIDECAR_SOURCE = """\
+import os
+import signal
+import subprocess
+import sys
+import time
+
+LOG_PATH = sys.argv[1]
+SAMPLE_INTERVAL_SECONDS = 5.0
+QUERY_TIMEOUT_SECONDS = 3.0
+_current = {"proc": None}
+
+
+def _cleanup(signum, frame):
+    proc = _current["proc"]
+    if proc is not None and proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        # Reap immediately: an unreaped killed child stays a zombie (its pid
+        # stays valid for a pid-0 liveness probe) until this process exits
+        # AND the kernel reparents/collects it -- a race a caller polling
+        # os.kill(pid, 0) right after this process exits can lose.
+        try:
+            proc.wait()
+        except Exception:
+            pass
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _cleanup)
+
+while True:
+    start = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            ["nvidia-smi", "--query-gpu=memory.used,utilization.gpu", "--format=csv,noheader"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        _current["proc"] = proc
+        try:
+            output, _ = proc.communicate(timeout=QUERY_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            output, _ = proc.communicate()
+        _current["proc"] = None
+        if output:
+            with open(LOG_PATH, "a", encoding="utf-8") as handle:
+                handle.write(output if output.endswith("\\n") else output + "\\n")
+    except Exception:
+        _current["proc"] = None
+    elapsed = time.monotonic() - start
+    time.sleep(max(0.0, SAMPLE_INTERVAL_SECONDS - elapsed))
+"""
+
+#: F2 (fixed, round 2): the dry-run printer (:func:`submit_pilot_payload`) and
+#: every test built around it assume ``print(shlex.join(command))`` emits
+#: exactly ONE printed line per job -- a ``--wrap`` value that itself
+#: contains a literal newline (the original heredoc-based sidecar launch)
+#: breaks that invariant even though it is still a single shell *token*
+#: (``shlex.quote`` escapes it, but escaping does not stop a raw newline
+#: byte from starting a new terminal line when printed). Launching the
+#: sidecar via a base64-encoded ``-c`` payload avoids a heredoc entirely, so
+#: the whole pilot wrapper body can be ONE line, joined by ``;``/``&``
+#: instead of real newlines.
+_GPU_SIDECAR_LAUNCHER = "import base64,sys;exec(base64.b64decode(sys.argv.pop(1)).decode())"
+_GPU_SIDECAR_SOURCE_B64 = base64.b64encode(_GPU_SIDECAR_SOURCE.encode("utf-8")).decode("ascii")
+
+
+def _gpu_sidecar_wrap_lines(
+    *, checkout_quoted: str, science_python: str, executor_python: str, payload_command: str
+) -> list[str]:
+    """Return the pilot-only wrapper statements: sidecar, payload, bounded cleanup.
+
+    F2: unlike the plain ``exec``-based science/pipeline-check wrapper
+    (:func:`_wrap_command`), this never ``exec``s the payload -- its exit
+    status is captured (``RC=$?``) so the sidecar can be stopped and reaped
+    (``kill``/``wait``) before the wrapper itself exits with that SAME
+    status, preserved unchanged. Every statement here is joined on one line
+    (see :data:`_GPU_SIDECAR_LAUNCHER`); none may contain a literal newline.
+    """
+
+    science_quoted = shlex.quote(science_python)
+    return [
+        "set -e",
+        f"cd {checkout_quoted}",
+        f"CHECKOUT={checkout_quoted}",
+        'export PYTHONPATH="$CHECKOUT${PYTHONPATH:+:$PYTHONPATH}"',
+        f"export SCIENCE_PYTHON={shlex.quote(science_python)}",
+        f"export EXECUTOR_PY={shlex.quote(executor_python)}",
+        'mkdir -p "$RUN/logs"',
+        f"{science_quoted} -c {shlex.quote(_GPU_SIDECAR_LAUNCHER)} {shlex.quote(_GPU_SIDECAR_SOURCE_B64)} "
+        '"$RUN/logs/gpu-sidecar.log" &',
+        "MONITOR_PID=$!",
+        # The payload's own exit status is captured with errexit disabled
+        # around it, never allowed to abort the script before it is read.
+        "set +e",
+        payload_command,
+        "RC=$?",
+        "set -e",
+        'kill "$MONITOR_PID" >/dev/null 2>&1 || true',
+        'wait "$MONITOR_PID" >/dev/null 2>&1 || true',
+        "exit $RC",
+    ]
 
 
 def _wrap_command(
@@ -208,9 +359,15 @@ def _wrap_command(
 
     G1: when ``payload == "pipeline-check"``, ``--pipeline-check`` is
     appended to the in-job argv, selecting the explicit non-science payload
-    in ``run_job.py``. ``payload == "science"`` never reaches this function
-    (:func:`_validate_payload` refuses first), so no flag is ever added for
-    it.
+    in ``run_job.py``. For ``payload == "science"`` (an approved L1-L3
+    lineage; :func:`_validate_science_lineage` refuses any other lineage
+    before this function is reached), ``--payload science`` is appended
+    instead (review r1 F2): ``run_job.py``'s in-job parser requires one of
+    these two explicit tokens and refuses a bare ``train``/``eval`` argv
+    rather than defaulting to science. TO 63690220: for a pilot payload
+    (:data:`PILOT_PAYLOADS`), ``--payload <payload>`` is appended with the
+    exact pilot payload name, so ``run_job.py`` dispatches
+    ``protocol.pilot_training_config`` instead of either of the above.
 
     K1: Slurm spools only the submitted ``--wrap`` body itself, as its own
     fresh process -- ``sys.path`` there starts at the checkout's
@@ -230,16 +387,46 @@ def _wrap_command(
     """
 
     job_script = checkout_root / launch_config.JOB_SCRIPT_RELATIVE
-    extra_arg = f" {shlex.quote('--pipeline-check')}" if payload == "pipeline-check" else ""
+    if payload == "pipeline-check":
+        extra_arg = f" {shlex.quote('--pipeline-check')}"
+    elif payload in PILOT_PAYLOADS:
+        extra_arg = f" {shlex.quote('--payload')} {shlex.quote(payload)}"
+    else:
+        # F2 (review r1): an explicit science token, never an implicit default
+        # -- a dropped flag or a bare "train L1"/"eval L1" invocation must
+        # refuse in run_job.py's main(), not silently dispatch science.
+        extra_arg = f" {shlex.quote('--payload')} {shlex.quote('science')}"
     checkout_quoted = shlex.quote(str(checkout_root))
+    payload_command = (
+        f"{shlex.quote(science_python)} {shlex.quote(str(job_script))} "
+        f"{shlex.quote(stage)} {shlex.quote(lineage)}{extra_arg}"
+    )
+    if payload in PILOT_PAYLOADS:
+        # F2: these two payloads run under a bounded GPU-utilization sidecar
+        # (:data:`_GPU_SIDECAR_SOURCE`); the science/pipeline-check wrapper
+        # below stays byte-identical to #629 (no sidecar). Joined onto ONE
+        # line (never a literal newline): a `--wrap` value containing one
+        # breaks the "print(shlex.join(command)) is exactly one printed
+        # line" convention every dry-run caller/test relies on, even though
+        # it is still a single shell token. A statement already ending in
+        # `&` (the backgrounded sidecar launch) needs no extra separator.
+        statements = _gpu_sidecar_wrap_lines(
+            checkout_quoted=checkout_quoted,
+            science_python=science_python,
+            executor_python=executor_python,
+            payload_command=payload_command,
+        )
+        body = statements[0]
+        for statement in statements[1:]:
+            body += statement if body.endswith("&") else f"; {statement}"
+        return body
     return (
         f"cd {checkout_quoted} && "
         f"CHECKOUT={checkout_quoted} && "
         'PYTHONPATH="$CHECKOUT${PYTHONPATH:+:$PYTHONPATH}" '
         f"SCIENCE_PYTHON={shlex.quote(science_python)} "
         f"EXECUTOR_PY={shlex.quote(executor_python)} "
-        f"exec {shlex.quote(science_python)} {shlex.quote(str(job_script))} "
-        f"{shlex.quote(stage)} {shlex.quote(lineage)}{extra_arg}"
+        f"exec {payload_command}"
     )
 
 
@@ -266,10 +453,11 @@ def build_sbatch_command(
     lineage : str
         Opaque lineage identity (for example ``"L1"``).
     payload : {"science", "pipeline-check"}
-        G1: which payload this job dispatches. ``"science"`` is refused by
-        :func:`_validate_payload` before this function is ever reached;
-        ``"pipeline-check"`` labels the job name and appends
-        ``--pipeline-check`` to the in-job argv (:func:`_wrap_command`).
+        G1/TO baff945c: which payload this job dispatches. ``"science"`` is
+        refused by :func:`_validate_science_lineage` for any lineage outside
+        ``launch_config.LINEAGES``; ``"pipeline-check"`` labels the job name
+        and appends ``--pipeline-check`` to the in-job argv
+        (:func:`_wrap_command`).
     science_python, executor_python : str
         G2: explicit, pre-validated absolute interpreter paths, embedded
         literally into the wrapper (:func:`_wrap_command`).
@@ -302,17 +490,25 @@ def build_sbatch_command(
     if stage not in ("train", "eval"):
         raise LaunchError(f"stage must be 'train' or 'eval', got {stage!r}")
     _validate_payload(payload)
+    _validate_science_lineage(payload, lineage)
     run_root = Path(run_root)
     checkout_root = Path(checkout_root)
-    label = _run_job_module().PIPELINE_CHECK_LABEL
+    label = _run_job_module().PIPELINE_CHECK_LABEL if payload == "pipeline-check" else payload
     job_name = f"h-v2-{label}-{lineage}-{stage}"
     command = [
         "sbatch",
         "--parsable",
         f"--job-name={job_name}",
         f"--partition={resources.partition}",
-        f"--constraint={resources.constraint}",
-        f"--gres=gpu:{resources.gpus}",
+    ]
+    if resources.constraint:
+        command.append(f"--constraint={resources.constraint}")
+    # K2: an optional typed GRES model renders as gpu:<model>:<count>; every
+    # other resource profile (science, pipeline-check, capacity-pilot) keeps
+    # the generic gpu:<count> it always has.
+    gres = f"gpu:{resources.gpu_model}:{resources.gpus}" if resources.gpu_model else f"gpu:{resources.gpus}"
+    command += [
+        f"--gres={gres}",
         f"--nodes={resources.nodes}",
         f"--ntasks={resources.ntasks}",
         f"--cpus-per-task={resources.cpus_per_task}",
@@ -460,9 +656,10 @@ def submit_lineage(
     Raises
     ------
     LaunchError
-        G1: if ``payload == "science"`` (or any value other than
-        ``"pipeline-check"``), before any submission, dry-run included. If
-        the train submission fails or yields no job id, the eval job is
+        If ``payload`` is not ``"science"``/``"pipeline-check"``, or
+        ``payload == "science"`` for a lineage outside
+        ``launch_config.LINEAGES``, before any submission, dry-run included.
+        If the train submission fails or yields no job id, the eval job is
         never submitted in that case.
     """
 
@@ -513,6 +710,135 @@ def submit_lineage(
     return train_id, eval_id
 
 
+#: F5: the fixed study segment every pilot/part-(g) run root lives under,
+#: between the durable prefix and the payload/lineage pair
+#: (``<prefix>/h-v2/<payload>/<lineage>``, harness r3 addendum3).
+_PILOT_RUN_ROOT_STUDY_SEGMENT = "h-v2"
+
+
+def _validate_run_root_prefix(run_root: Path, run_root_prefix: str, *, payload: str, lineage: str) -> None:
+    """Refuse a run root outside its payload/lineage's own durable location.
+
+    Run-root amendment (harness r3 addendum3): pilot/part-(g) run roots must
+    live under a persistent, lifecycle-governed prefix, in the exact shape
+    ``<prefix>/h-v2/<payload>/<lineage>`` (or a child of it, for example an
+    attempt subdirectory) -- not merely anywhere under the broad prefix
+    (review r1 F5: a caller-supplied prefix ending in ``runs`` otherwise
+    accepted any sibling payload's or an unrelated root). The exact facility
+    path is never hardcoded here (``netscratch-never-referenced-from-repo``);
+    the caller supplies the prefix
+    (:data:`launch_config.PILOT_RUN_ROOT_PREFIX_ENV`).
+
+    Raises
+    ------
+    LaunchError
+        If ``run_root_prefix`` is not absolute, or ``run_root`` is not
+        ``<run_root_prefix>/h-v2/<payload>/<lineage>`` or a descendant of it.
+    """
+
+    prefix = Path(run_root_prefix)
+    if not prefix.is_absolute():
+        raise LaunchError(f"{launch_config.PILOT_RUN_ROOT_PREFIX_ENV} must be an absolute path, got {run_root_prefix!r}")
+    expected_root = (prefix / _PILOT_RUN_ROOT_STUDY_SEGMENT / payload / lineage).resolve()
+    try:
+        run_root.resolve().relative_to(expected_root)
+    except ValueError:
+        raise LaunchError(
+            f"run root {run_root} must be {expected_root} or a descendant of it "
+            f"({launch_config.PILOT_RUN_ROOT_PREFIX_ENV}={run_root_prefix!r}, payload={payload!r}, "
+            f"lineage={lineage!r}); refusing before any sbatch call"
+        ) from None
+
+
+def submit_pilot_payload(
+    payload: str,
+    *,
+    science_python: str,
+    executor_python: str,
+    run_root: Path,
+    checkout_root: Path,
+    run_root_prefix: str,
+    t_wall: str | None = None,
+    commit: str | None = None,
+    runner: Runner = _default_runner,
+    dry_run: bool = False,
+) -> str | None:
+    """Submit one pilot/part-(g) payload's single TRAIN job (TO 63690220).
+
+    Unlike :func:`submit_lineage`, this never chains an EVAL job (item E's
+    scope) and never accepts a caller-supplied lineage: each pilot payload
+    carries exactly one fixed lineage label
+    (:data:`launch_config.PILOT_PAYLOAD_LINEAGES`).
+
+    Parameters
+    ----------
+    payload : {"gpu-route-g", "capacity-pilot"}
+    run_root_prefix : str
+        The durable, lifecycle-governed prefix *run_root* must lie under
+        (:func:`_validate_run_root_prefix`), checked before any ``sbatch``
+        call, dry-run included.
+    t_wall : str, optional
+        Exact Slurm ``--time`` value. Defaults to the payload's own cap
+        (:data:`launch_config.PILOT_PAYLOAD_MAX_WALL_SECONDS`) formatted as
+        ``HH:MM:SS``. A caller-supplied value above the cap refuses.
+
+    Returns
+    -------
+    str or None
+        The submitted TRAIN job id, or ``None`` under ``--dry-run``.
+
+    Raises
+    ------
+    LaunchError
+        If *payload* is not one of :data:`PILOT_PAYLOADS`, *run_root* is
+        outside *run_root_prefix*, or *t_wall* exceeds the payload's cap.
+    """
+
+    if payload not in PILOT_PAYLOADS:
+        raise LaunchError(f"--payload must be one of {PILOT_PAYLOADS!r}, got {payload!r}")
+    run_root = Path(run_root)
+    lineage = launch_config.PILOT_PAYLOAD_LINEAGES[payload]
+    _validate_run_root_prefix(run_root, run_root_prefix, payload=payload, lineage=lineage)
+    cap_seconds = launch_config.PILOT_PAYLOAD_MAX_WALL_SECONDS[payload]
+    if t_wall is None:
+        time_value = _format_wall_seconds(cap_seconds)
+    else:
+        time_value = t_wall
+        requested_seconds = _parse_wall_seconds(time_value)
+        if requested_seconds > cap_seconds:
+            raise LaunchError(
+                f"--time for payload {payload!r} must be at most {cap_seconds}s "
+                f"({_format_wall_seconds(cap_seconds)}); got {time_value!r} ({requested_seconds}s)"
+            )
+    command = build_sbatch_command(
+        "train",
+        lineage,
+        payload=payload,
+        science_python=science_python,
+        executor_python=executor_python,
+        run_root=run_root,
+        checkout_root=checkout_root,
+        time_value=time_value,
+        dependency=None,
+        commit=commit,
+        resources=launch_config.PILOT_PAYLOAD_RESOURCES[payload],
+    )
+    if dry_run:
+        print(shlex.join(command))
+        return None
+    return _submit(command, runner=runner)
+
+
+def _format_wall_seconds(total_seconds: int) -> str:
+    """Return a Slurm ``[D-]HH:MM:SS`` value for *total_seconds* (inverse of :func:`_parse_wall_seconds`)."""
+
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    body = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{days}-{body}" if days else body
+
+
 def submit_all(
     *,
     payload: str,
@@ -529,17 +855,26 @@ def submit_all(
 ) -> dict[str, tuple[str | None, str | None]]:
     """Submit every lineage's two jobs in order; abort on the first failure.
 
-    G1: validates ``payload`` first, before anything else, so a ``science``
-    payload (or any unrecognized value) raises before the T_WALL/E_WALL
-    budget is even checked, with zero runner calls, dry-run included. Then
-    validates the T_WALL/E_WALL budget (F4) before any lineage is attempted.
-    A lineage whose train submission fails raises before any later lineage
-    is attempted: this function does no partial-progress bookkeeping beyond
-    what each already-successful ``submit_lineage`` call returned to the
-    caller before the failure.
+    G1: validates ``payload`` first, before anything else, so an
+    unrecognized value raises before the T_WALL/E_WALL budget is even
+    checked, with zero runner calls, dry-run included (the default
+    ``lineages`` roster, ``launch_config.LINEAGES``, is always approved for
+    ``payload == "science"``). Review r1 (F3): the ENTIRE requested
+    ``lineages`` roster is then validated before any submission or dry-run
+    print -- a caller-supplied roster mixing an approved and an unapproved
+    lineage (for example ``("L1", "L9")``) refuses before ``L1`` is ever
+    submitted, not partway through. :func:`submit_lineage`/
+    :func:`build_sbatch_command` repeat the same per-lineage check as
+    defence in depth. Then validates the T_WALL/E_WALL budget (F4) before
+    any lineage is attempted. A lineage whose train submission fails raises
+    before any later lineage is attempted: this function does no
+    partial-progress bookkeeping beyond what each already-successful
+    :func:`submit_lineage` call returned to the caller before the failure.
     """
 
     _validate_payload(payload)
+    for lineage in lineages:
+        _validate_science_lineage(payload, lineage)
     _validate_wall_budget(t_wall, e_wall)
     results: dict[str, tuple[str | None, str | None]] = {}
     for lineage in lineages:
@@ -567,13 +902,34 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--payload",
         required=True,
-        choices=("science", "pipeline-check"),
+        choices=("science", "pipeline-check") + PILOT_PAYLOADS,
         help=(
-            "Which payload every lineage dispatches (G1/decision F3). 'science' always "
-            "refuses before any sbatch submission (no approved per-lineage science "
-            "configuration interface exists yet). 'pipeline-check' explicitly selects "
-            "the non-science pipeline-check payload, labelled as such in job names and "
-            "in-job argv. No default: the caller must choose."
+            "Which payload every lineage dispatches (G1/decision F3; TO baff945c). "
+            "'science' dispatches the approved per-lineage science training config for "
+            "L1-L3; any other lineage still refuses before any sbatch submission. "
+            "'pipeline-check' explicitly selects the non-science pipeline-check payload, "
+            "labelled as such in job names and in-job argv. 'gpu-route-g'/'capacity-pilot' "
+            "(TO 63690220) each submit exactly one TRAIN-only job; --stage train is "
+            "required for these, and --run-root-prefix. No default: the caller must "
+            "choose."
+        ),
+    )
+    parser.add_argument(
+        "--stage",
+        choices=("train", "eval"),
+        default=None,
+        help=(
+            "Required, and must be 'train', for a pilot payload (TO 63690220; eval for "
+            "these is item E's scope, not this script). Omitted for 'science'/"
+            "'pipeline-check', which always submit both stages chained."
+        ),
+    )
+    parser.add_argument(
+        "--run-root-prefix",
+        default=None,
+        help=(
+            f"Required for a pilot payload: the durable, lifecycle-governed run-root prefix "
+            f"(falls back to the {launch_config.PILOT_RUN_ROOT_PREFIX_ENV} environment variable)."
         ),
     )
     parser.add_argument(
@@ -618,6 +974,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     checkout_root = run_root / "checkout"
     science_python = _validate_interpreter(args.science_python, label="--science-python")
     executor_python = _validate_interpreter(args.executor_python, label="--executor-python")
+    if args.payload in PILOT_PAYLOADS:
+        if args.stage != "train":
+            raise LaunchError(
+                f"--stage train is required for payload {args.payload!r} "
+                "(TO 63690220; eval is item E's scope, not this script)"
+            )
+        run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
+        if not run_root_prefix:
+            raise LaunchError(
+                f"--run-root-prefix or {launch_config.PILOT_RUN_ROOT_PREFIX_ENV} is required for "
+                f"payload {args.payload!r}"
+            )
+        # F6: an explicit, smaller TRAIN wall time is honored (via
+        # :func:`submit_pilot_payload`'s own cap check), not silently
+        # replaced by the payload's maximum.
+        train_id = submit_pilot_payload(
+            args.payload,
+            science_python=science_python,
+            executor_python=executor_python,
+            run_root=run_root,
+            checkout_root=checkout_root,
+            run_root_prefix=run_root_prefix,
+            t_wall=os.environ.get("T_WALL"),
+            commit=args.commit,
+            dry_run=args.dry_run,
+        )
+        print(f"[h-v2] {launch_config.PILOT_PAYLOAD_LINEAGES[args.payload]}: train={train_id}")
+        return 0
+    if args.stage is not None:
+        raise LaunchError(f"--stage is not supported for payload {args.payload!r}")
     # K3: required unconditionally, dry-run included -- _validate_wall_budget
     # cannot parse the prior placeholder values ("<T_WALL>"/"<E_WALL>"), so a
     # dry run without both set always raised "malformed wall-time value"

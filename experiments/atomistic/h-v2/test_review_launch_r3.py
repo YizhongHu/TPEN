@@ -172,10 +172,17 @@ def test_k2_checkpoint_dir_for_eval_agrees_with_train_task_id(tmp_path):
     checkpoint = tmp_path / "ckpt"
     for pipeline_check in (False, True):
         task_id = job._train_task_id("L1", pipeline_check=pipeline_check)
-        (receipts_dir / f"{task_id}.h-v2.json").write_text(
-            json.dumps({"segments": [{"checkpoint_dir": str(checkpoint)}]}),
-            encoding="utf-8",
-        )
+        payload = {"segments": [{"checkpoint_dir": str(checkpoint)}]}
+        if not pipeline_check:
+            # TO baff945c review r1 (F1): a pipeline_check=False lookup now
+            # requires payload="science" plus a complete config identity.
+            payload["payload"] = "science"
+            payload["science_config_identity"] = {
+                "lineage": "L1", "lineage_index": 0,
+                "overlay_sha256": "a" * 64, "base_train_sha256": "b" * 64,
+                "contract_inputs_sha256": "c" * 64, "materialized_config_sha256": "d" * 64,
+            }
+        (receipts_dir / f"{task_id}.h-v2.json").write_text(json.dumps(payload), encoding="utf-8")
         assert job.checkpoint_dir_for_eval(
             tmp_path, "L1", pipeline_check=pipeline_check
         ) == checkpoint

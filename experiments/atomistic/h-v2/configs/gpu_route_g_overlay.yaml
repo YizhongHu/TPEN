@@ -1,0 +1,20 @@
+# H-v2 part (g) GPU-route payload overlay (TO 63690220, acceptance-contract
+# amendment r2/r3). Applied on top of `train.yaml` + the UNCHANGED
+# `science_scale_overlay.yaml` (TO baff945c), by the same explicit
+# dotted-key-path mechanism (`protocol._set_by_dotted_path`), never a blind
+# merge. This file's key set is pinned by
+# `protocol.PILOT_PAYLOAD_OVERLAY_KEYS` and checked for exact equality
+# before it is ever applied.
+#
+# `callbacks.4`/`callbacks.5` are `train.yaml`'s existing DataIntegrity and
+# GradientStats entries; setting their cadence here is the only way this
+# allowlist mechanism can reach them (`_set_by_dotted_path` only ever touches
+# a leaf that already exists -- see `protocol.science_training_config`'s own
+# docstring). Every OTHER A1 training-side module this payload enables
+# (InitialCheckpoint, ParameterActivity, and whichever further modules the
+# runtime recovery profile admits) is appended by the separate protocol-owned
+# helper (`protocol.append_measurement_callbacks`), never by this overlay.
+trainer.max_steps: 1000
+trainer.log_every_n_steps: 1
+callbacks.4.every_n_steps: 1
+callbacks.5.every_n_steps: 1

@@ -10,6 +10,7 @@
   action on Cannon, Polaris, Aurora, or Frontier, read and follow
   `cluster-access` and the current Task Orchestrator cluster notes. Do not infer
   facility policy from another cluster or an older receipt.
+- Every ssh/scp/rsync uses `ssh -o BatchMode=yes` (rsync: `-e 'ssh -o BatchMode=yes'`); on failure stop and never retry plain SSH.
 - Before any Paseo action - creating, staffing, messaging, or scheduling an
   agent, or arming a heartbeat - read and follow the `paseo` skill. This is
   mandatory, not advisory.
@@ -111,17 +112,17 @@ Avoid large PRs that change multiple things at the same time.
 
 For each TO implementation slice:
 
-1. The orchestrator claims the item and advances it to `work` before dispatch.
-2. Use Paseo to create a dedicated worktree and agent-namespaced branch from `dev` or the stack predecessor.
-3. Spawn one implementation worker in that workspace.
-4. After implementation, confirm the PR is pushed and no unpreserved local changes remain.
-5. Archive the implementation worker's workspace through Paseo.
-6. Spawn a verifier worker in a separate Paseo workspace to test the implemented code.
-7. Record verification results, then archive the verifier's workspace through Paseo.
-8. Upon successful verification, advance the item to `review` and release its claim. This unblocks downstream slices with `unblockAt: review`.
-9. When the PR is resolved, record its disposition and complete or cancel the TO item accordingly.
+1. Using the `paseo` skill, the orchestrator claims and advances to `work`, creates the worktree, dispatches, then releases its claim.
+2. The worker claims before editing with a short renewable TTL.
+3. The worker pushes the PR, records its full head, releases the claim, then finishes.
+4. The orchestrator confirms release and preserved work before worker archival.
+5. A separate verifier checks the current PR head with the `pr-verification` skill; archive only after its receipt. On a passing receipt, advance the item to `review`; this unblocks downstream slices with `unblockAt: review`.
+6. Run tiered review with the `pr-review-loop` skill; ready requires verification at the current head.
+7. Any new commit returns the PR to draft unless the new head's git tree equals the verified head's tree (record both SHAs and the tree hash).
+8. After confirmed merge, delete the merged branch and worktree; record both deletions in `pr-disposition`.
+9. Complete/cancel only after that disposition.
 
-Before spawning a worker, check for existing agents or workspaces associated with the item. Preserve workspaces containing uncommitted or unpushed work, and retain verification evidence before cleanup. Failed verification triggers the next round of implementation work starting at step 3.
+Before spawning a worker, check for existing agents or workspaces associated with the item. Preserve workspaces containing uncommitted or unpushed work, and retain verification evidence before cleanup. Failed verification triggers the next round of implementation work starting at step 2.
 
 ## Branches
 
