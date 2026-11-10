@@ -14,13 +14,15 @@ NOT an executor dispatch." Unlike ``attached.py``'s TRAIN/single-generation
 EVAL route (which dispatches through ``tpen_executor`` and is blocked for
 EVAL on an unrelated core/executor checkpoint-evidence contract -- TO item
 9d3aa0a3, ``attached.EVAL_ROUTE_UNSUPPORTED_CODE``), this module runs each
-fan-out generation directly: ``SCIENCE_PYTHON`` subprocess calls
-``tpen.run.main`` explicitly (never ``python -m tpen.run``, which has no
-``__main__`` guard and silently does nothing), then verifies the written
-evidence itself (``status.json``, the source commit, every declared
-artifact's sha256) -- reaching core only through ``run_from_config``/the
-``tpen`` command, per ``experiments/README.md``; it never imports ``tpen``
-directly.
+fan-out generation directly: a ``SCIENCE_PYTHON`` subprocess calls
+``tpen.run.run_from_config`` explicitly on a loaded config (never
+``tpen.run.main``, which is not an experiment-facing surface per
+``experiments/README.md``, and never ``python -m tpen.run``, which has no
+``__main__`` guard and silently does nothing), then this module verifies
+the written evidence itself (``status.json``, the source commit, every
+declared artifact's sha256) -- reaching core only through
+``run_from_config``/the ``tpen`` command, per ``experiments/README.md``;
+this module itself never imports ``tpen`` directly.
 """
 
 from __future__ import annotations
@@ -309,15 +311,21 @@ def probe_readout_trajectory_generator(science_python: str | Path) -> bool:
     return result.returncode == 0 and "PRESENT" in result.stdout
 
 
-#: Run via ``science_python -c <this> --config <path>``: calls ``tpen.run.main``
-#: explicitly (operator policy 2026-11-06: no ``__main__`` guard will be added
-#: to ``tpen/run.py``, so ``python -m tpen.run`` silently exits 0 and does
-#: nothing -- every caller must import and call ``main`` itself instead).
+#: Run via ``science_python -c <this> <config path>``: loads the config and
+#: calls ``tpen.run.run_from_config`` directly -- never ``tpen.run.main``
+#: (not an experiment-facing surface per ``experiments/README.md``; this is
+#: the exact boundary the orchestrator's binding correction names) and never
+#: ``python -m tpen.run`` (operator policy 2026-11-06: no ``__main__`` guard
+#: will be added to ``tpen/run.py``, so that invocation silently exits 0 and
+#: does nothing).
 _RUN_FROM_CONFIG_SCRIPT = """
 import sys
-from tpen.run import main as _tpen_main
+from omegaconf import OmegaConf
+from tpen.run import run_from_config
 
-raise SystemExit(_tpen_main(sys.argv[1:]))
+config_path = sys.argv[1]
+cfg = OmegaConf.load(config_path)
+raise SystemExit(run_from_config(cfg, config_path=config_path, command=f"eval_job {config_path}"))
 """
 
 #: Literal unresolved ``${run.dir}/`` prefix every evaluator task's
@@ -336,7 +344,7 @@ def run_generation_direct(
     cwd: str | Path | None = None,
     timeout: float | None = None,
 ) -> dict[str, Any]:
-    """Write *config*, run it directly through ``tpen.run.main``, and verify its output.
+    """Write *config*, run it directly through ``tpen.run.run_from_config``, and verify its output.
 
     EVAL is "a study-side job, NOT an executor dispatch" (acceptance
     contract): this calls the real ``tpen`` route directly, then verifies
@@ -368,7 +376,7 @@ def run_generation_direct(
     run_dir = Path(config["run"]["root"]) / config["run"]["run_id"]
 
     result = subprocess.run(
-        [str(science_python), "-c", _RUN_FROM_CONFIG_SCRIPT, "--config", str(config_path)],
+        [str(science_python), "-c", _RUN_FROM_CONFIG_SCRIPT, str(config_path)],
         capture_output=True,
         text=True,
         cwd=cwd,

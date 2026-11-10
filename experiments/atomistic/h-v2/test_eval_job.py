@@ -410,3 +410,21 @@ def test_science_evaluation_config_carries_no_reference_energy(tmp_path: Path) -
                 _walk(value)
 
     _walk(config)
+
+
+# --- dispatch boundary: run_from_config only, never tpen.run.main ---------
+
+
+def test_eval_job_dispatches_through_run_from_config_not_tpen_run_main() -> None:
+    """Mutant: 'dispatch via tpen.run.main' -- the orchestrator's binding correction.
+
+    ``tpen.run.main`` is not an experiment-facing surface
+    (``experiments/README.md``); the subprocess script must call
+    ``tpen.run.run_from_config`` on a loaded config directly.
+    """
+
+    script = eval_job._RUN_FROM_CONFIG_SCRIPT
+    assert "run_from_config" in script
+    assert "import main" not in script
+    assert ".main(" not in script
+    assert "from tpen.run import main" not in script
