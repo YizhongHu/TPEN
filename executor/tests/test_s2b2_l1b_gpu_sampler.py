@@ -17,10 +17,14 @@ sampler kills and reaps.  Every fixture kills what it recorded, even after a
 mutant assertion fails.
 
 Mutant ids: the r2 ids K1-K5 targeted the removed in-child sampler and are
-retired, not renamed.  G1-G5 below are the r3 runtime-path contract mutants.
-Historical N6/N8/N11 remain unclosed by any mutant id; N6/N8 objectives are
-covered by named behaviour tests (``test_sampler_keeps_samples_taken_before_a_late_failure``
-and the ``qualified-over-failed-sampler`` decoder case); N11 is L1a scope.
+retired, not renamed.  Of the r3 ids, G1 (worker timeout drain), G3 (bounded
+join) and G5 (decoder aggregate) are retired in r4 and remain covered by
+their named behaviour tests; G2 and G4 are kept unchanged.  H1-H3 are the r4
+runtime-path mutants for worker ownership at startup (E1), the slot fence
+(E2) and the gap budget (Q1).  Historical N6/N8/N11 remain unclosed by any
+mutant id; N6/N8 objectives are covered by named behaviour tests
+(``test_sampler_keeps_samples_taken_before_a_late_failure`` and the
+``qualified-over-failed-sampler`` decoder case); N11 is L1a scope.
 """
 
 from __future__ import annotations
@@ -48,10 +52,16 @@ from tpen_executor._codec import digest
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.cli import _operational_exit
 from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
-from tpen_executor.dispatch.contract import _placement_receipt_v3
+from tpen_executor.dispatch.contract import _placement_receipt_v3, _without_gpu_sampler
 from tpen_executor.dispatch.local import LocalDispatcher
-from tpen_executor.environments import PreparedPythonEnvironment
-from tpen_executor.gpu_telemetry import derive_device_decision, not_sampled_sampler, validate_sampler_wire
+from tpen_executor.environments import PreparedPythonEnvironment, SourceScript
+from tpen_executor.gpu_telemetry import (
+    MAX_JOIN_TIMEOUT,
+    derive_device_decision,
+    empty_gaps,
+    not_sampled_sampler,
+    validate_sampler_wire,
+)
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.placement import AllocationSlot, ChildPlacementObservation
 from tpen_executor.results import (
@@ -84,11 +94,11 @@ LINUX_CHILD = pytest.mark.skipif(
 
 L1B_MUTANT_TABLE = (
     {
-        "id": "G1", "target": "executor/src/tpen_executor/workers.py",
-        "old": "        interruptions = finish_gpu_sampler(sampler, sampler_output)",
-        "new": "        interruptions = [] if timed_out else finish_gpu_sampler(sampler, sampler_output)",
-        "killer": "test_worker_timeout_drains_sampler_groups_before_return",
-        "suite": "executor", "assertion": "a worker timeout of the science child still drains every sampler group before release (D1)",
+        "id": "H1", "target": "executor/src/tpen_executor/workers.py",
+        "old": "                    sampler = GpuSampler.from_environment(spawned_pid, child_env)\n                    sampler.start()",
+        "new": "                    pending = GpuSampler.from_environment(spawned_pid, child_env)\n                    pending.start()\n                    sampler = pending",
+        "killer": "test_worker_interrupted_right_after_sampler_start_keeps_cleanup",
+        "suite": "executor", "assertion": "the worker holds the sampler before start, so an interruption inside startup cannot orphan its command group (E1)",
     },
     {
         "id": "G2", "target": "executor/src/tpen_executor/gpu_sampler.py",
@@ -98,11 +108,11 @@ L1B_MUTANT_TABLE = (
         "suite": "executor", "assertion": "the success path kills the retained group before claiming quiescence (D4 reaper)",
     },
     {
-        "id": "G3", "target": "executor/src/tpen_executor/gpu_sampler.py",
-        "old": "                thread.join(max(0.0, deadline - time.monotonic()))",
-        "new": "                thread.join()",
-        "killer": "test_sampler_finish_is_bounded_while_a_launch_blocks",
-        "suite": "executor", "assertion": "finish returns non-quiescent evidence at the shared deadline even while Popen blocks (D2)",
+        "id": "H2", "target": "executor/src/tpen_executor/gpu_sampler.py",
+        "old": "    if not sampler.cleanup_confirmed():\n        sampler.cancel()\n        fence_slot(slot, sampler)",
+        "new": "    if False:\n        sampler.cancel()\n        fence_slot(slot, sampler)",
+        "killer": "test_worker_fences_the_slot_while_a_held_launch_is_outstanding",
+        "suite": "executor", "assertion": "unconfirmed launch/cleanup at the bound fences the slot until it is confirmed empty (E2)",
     },
     {
         "id": "G4", "target": "executor/src/tpen_executor/gpu_sampler.py",
@@ -112,11 +122,11 @@ L1B_MUTANT_TABLE = (
         "suite": "executor", "assertion": "outside use seen in a sample that is not retained stays in the aggregate",
     },
     {
-        "id": "G5", "target": "executor/src/tpen_executor/gpu_telemetry.py",
-        "old": '    if aggregate["outside_use_seen"]:',
-        "new": '    if any(row["pid"] == child_pid and row["gpu_uuid"] not in declared for sample in sampler["samples"] for row in sample["pid_rows"]):',
-        "killer": "test_outside_use_in_an_evicted_sample_dominates",
-        "suite": "executor", "assertion": "the device decision uses the lifetime aggregate, not only retained samples",
+        "id": "H3", "target": "executor/src/tpen_executor/gpu_sampler.py",
+        "old": "            if count > self.max_total_gaps or consecutive > self.max_consecutive_gaps:",
+        "new": "            if consecutive > self.max_consecutive_gaps:",
+        "killer": "test_sampler_isolated_gaps_past_the_total_budget_fail",
+        "suite": "executor", "assertion": "isolated transient gaps beyond the total budget are terminal telemetry failure (Q1)",
     },
 )
 
@@ -126,7 +136,7 @@ def test_l1b_mutant_table_targets_unique_executable_anchors() -> None:
 
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
-    assert [row["id"] for row in L1B_MUTANT_TABLE] == ["G1", "G2", "G3", "G4", "G5"]
+    assert [row["id"] for row in L1B_MUTANT_TABLE] == ["H1", "G2", "H2", "G4", "H3"]
     for row in L1B_MUTANT_TABLE:
         source = (root / row["target"]).read_text(encoding="utf-8")
         assert source.count(row["old"]) == 1, row
@@ -308,7 +318,8 @@ def test_sampler_launch_failure_is_attempted_telemetry_failed(tmp_path: Path) ->
     assert record["attempted"] is True
     assert record["reason"] == "telemetry-failed"
     assert record["failure"]["code"] == "launch-failed"
-    assert "FileNotFoundError" in record["failure"]["detail"]
+    assert "was not found on the prepared PATH" in record["failure"]["detail"]
+    assert record["executable"] is None
     assert record["command_pids"] == [] and record["quiescent"] is True
     assert record["target_pid"] == os.getpid()
     assert validate_sampler_wire(record)["reason"] == "telemetry-failed"
@@ -325,6 +336,8 @@ def test_sampler_one_session_mechanism_launches_commands(tmp_path: Path) -> None
     assert len(record["command_pids"]) == 1 + 2 * record["aggregate"]["samples_taken"]
     assert record["samples"][0]["pid_rows"] == [{"pid": os.getpid(), "gpu_uuid": GPU_A}]
     assert record["aggregate"]["exact_pid_gpus"] == [{"uuid": GPU_A, "pci.bus_id": "0000:00:01.0"}]
+    # The budget in force is recorded even when no gap occurred.
+    assert record["gaps"] == empty_gaps(gs.MAX_CONSECUTIVE_GAPS, gs.MAX_TOTAL_GAPS)
     assert validate_sampler_wire(record) == record
 
 
@@ -371,9 +384,14 @@ def test_sampler_timeout_kills_and_confirms_retained_group(tmp_path: Path, pid_f
     pid_file = tmp_path / "hung.pids"
     pid_files.append(pid_file)
     started = time.monotonic()
-    record = _finished(_sampler_for(_hung(tmp_path, pid_file), command_timeout=0.3, cleanup_timeout=0.5, join_timeout=3.0))
+    # A zero gap budget makes the first transient failure terminal.
+    record = _finished(_sampler_for(
+        _hung(tmp_path, pid_file), command_timeout=0.3, cleanup_timeout=0.5, join_timeout=3.0,
+        max_consecutive_gaps=0, max_total_gaps=0,
+    ))
     assert time.monotonic() - started < 3.0
-    assert record["failure"]["code"] == "command-timeout"
+    assert record["failure"]["code"] == "gap-budget-exceeded"
+    assert [event["code"] for event in record["gaps"]["events"]] == ["command-timeout"]
     assert record["quiescent"] is True and record["survivors"] == []
     assert len(record["command_pids"]) == 1
     assert [_alive(pid) for pid in record["command_pids"]] == [False]
@@ -395,8 +413,11 @@ def test_sampler_read_error_path_cleans_retained_group(tmp_path: Path, monkeypat
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(gs.subprocess.Popen, "communicate", failing_once)
-    record = _finished(_sampler_for(_hung(tmp_path, pid_file), command_timeout=5.0, cleanup_timeout=1.0))
-    assert record["failure"]["code"] == "read-failed"
+    record = _finished(_sampler_for(
+        _hung(tmp_path, pid_file), command_timeout=5.0, cleanup_timeout=1.0, max_consecutive_gaps=0, max_total_gaps=0,
+    ))
+    assert record["failure"]["code"] == "gap-budget-exceeded"
+    assert [event["code"] for event in record["gaps"]["events"]] == ["read-failed"]
     assert record["quiescent"] is True and record["survivors"] == []
     assert len(record["command_pids"]) == 1
     assert [_alive(pid) for pid in record["command_pids"]] == [False]
@@ -425,6 +446,8 @@ def test_sampler_unconfirmed_group_is_survivor_and_not_quiescent(tmp_path: Path,
     monkeypatch.setattr(gs, "group_empty", lambda _pgid: False)
     record = _finished(_sampler_for(_fake(tmp_path, "nvidia-smi", _OK_BODY), cleanup_timeout=0.1))
     assert record["failure"]["code"] == "cleanup-unconfirmed"
+    # Unconfirmed cleanup is never forgiven by the gap budget.
+    assert record["gaps"]["count"] == 0
     assert record["quiescent"] is False
     assert record["survivors"] == record["command_pids"][:1]
     assert validate_sampler_wire(record)["quiescent"] is False
@@ -493,7 +516,9 @@ def test_sampler_keeps_samples_taken_before_a_late_failure(tmp_path: Path) -> No
     sampler.start()
     record = _wait_for(sampler, lambda value: value["failure"]["code"] != "sampler-unfinalized")
     record = sampler.finish()
-    assert record["failure"]["code"] == "command-failed"
+    # Persistent failure: the second consecutive gap exceeds the budget.
+    assert record["failure"]["code"] == "gap-budget-exceeded"
+    assert [event["code"] for event in record["gaps"]["events"]] == ["command-failed", "command-failed"]
     assert record["count"] == 1 and record["aggregate"]["samples_taken"] == 1
     assert validate_sampler_wire(record)["samples"] == record["samples"]
 
@@ -540,6 +565,208 @@ def test_sampler_aggregate_remembers_evicted_outside_use(tmp_path: Path) -> None
     assert [row["uuid"] for row in record["aggregate"]["exact_pid_gpus"]] == [GPU_B, GPU_A]
     decision = derive_device_decision(validate_sampler_wire(record), os.getpid(), (GPU_A,))
     assert decision.code == "out-of-entitlement" and decision.active_uuids == (GPU_B, GPU_A)
+
+
+# ------------------------------------------------ gap budget, MIG, deadline
+
+
+def _counted(directory: Path, counter: Path, fail_when: str, body: str = _OK_BODY) -> str:
+    """Fake that counts its invocations in ``counter`` and exits 1 when ``fail_when`` holds."""
+
+    return _fake(directory, "nvidia-smi", f"""\
+        n=$(cat {counter} 2>/dev/null || echo 0); n=$((n + 1)); echo $n > {counter}
+        if {fail_when}; then exit 1; fi
+        """ + body)
+
+
+@POSIX_GROUPS
+def test_sampler_forgives_an_isolated_transient_gap_and_records_it(tmp_path: Path) -> None:
+    """Q1: one failed attempt inside the budget is a recorded gap, not a failure.
+
+    Invocations: 1 version, 2-3 first sample, 4 inventory, 5 process (fails).
+    """
+
+    executable = _counted(tmp_path, tmp_path / "count", '[ "$n" -eq 5 ]')
+    sampler = _sampler_for(executable)
+    sampler.start()
+    _wait_for(sampler, lambda value: value["aggregate"]["samples_taken"] >= 3)
+    record = sampler.finish()
+    assert record["reason"] == "observed", record["failure"]
+    gaps = record["gaps"]
+    assert (gaps["max_consecutive_allowed"], gaps["max_total_allowed"]) == (gs.MAX_CONSECUTIVE_GAPS, gs.MAX_TOTAL_GAPS)
+    assert (gaps["count"], gaps["max_consecutive"]) == (1, 1)
+    assert [(event["code"], event["consecutive"]) for event in gaps["events"]] == [("command-failed", 1)]
+    assert gaps["total_seconds"] == gaps["events"][0]["monotonic_end"] - gaps["events"][0]["monotonic_start"] > 0
+    assert validate_sampler_wire(record) == record
+
+
+@POSIX_GROUPS
+def test_sampler_isolated_gaps_past_the_total_budget_fail(tmp_path: Path) -> None:
+    """Q1/H3: isolated gaps never exceed the consecutive budget but do exceed the total.
+
+    Every fourth invocation fails, so each gap is followed by a complete
+    sample; the fourth gap passes ``MAX_TOTAL_GAPS`` and is terminal.
+    """
+
+    assert gs.MAX_TOTAL_GAPS == 3 and gs.MAX_CONSECUTIVE_GAPS == 1
+    executable = _counted(tmp_path, tmp_path / "count", '[ $((n % 4)) -eq 0 ]')
+    sampler = _sampler_for(executable)
+    sampler.start()
+    _wait_for(sampler, lambda value: value["gaps"]["count"] > gs.MAX_TOTAL_GAPS or value["failure"]["code"] != "sampler-unfinalized")
+    record = sampler.finish()
+    assert record["failure"]["code"] == "gap-budget-exceeded", record["failure"]
+    assert record["gaps"]["count"] == gs.MAX_TOTAL_GAPS + 1 and record["gaps"]["max_consecutive"] == 1
+    # Telemetry failure is still attempted, never relabelled not-sampled.
+    assert record["attempted"] is True and record["reason"] == "telemetry-failed"
+    assert record["aggregate"]["samples_taken"] >= gs.MAX_TOTAL_GAPS
+    assert validate_sampler_wire(record) == record
+
+
+@POSIX_GROUPS
+def test_sampler_never_forgives_malformed_output(tmp_path: Path) -> None:
+    """Q1: malformed output is terminal even with budget to spare."""
+
+    counter = tmp_path / "count"
+    executable = _fake(tmp_path, "nvidia-smi", f"""\
+        n=$(cat {counter} 2>/dev/null || echo 0); n=$((n + 1)); echo $n > {counter}
+        if [ "$n" -eq 5 ]; then echo "not, a, row"; exit 0; fi
+        """ + _OK_BODY)
+    sampler = _sampler_for(executable)
+    sampler.start()
+    record = _wait_for(sampler, lambda value: value["failure"]["code"] != "sampler-unfinalized")
+    record = sampler.finish()
+    assert record["failure"]["code"] == "malformed-output"
+    assert record["gaps"]["count"] == 0
+    assert validate_sampler_wire(record)["failure"]["code"] == "malformed-output"
+
+
+@POSIX_GROUPS
+@pytest.mark.parametrize("where", ["inventory", "process"])
+def test_sampler_mig_identifiers_are_a_distinct_unsupported_failure(tmp_path: Path, where: str) -> None:
+    """Q5: a MIG identifier is the typed ``mig-unsupported`` failure, not malformed output."""
+
+    mig = "MIG-12345678-1234-1234-1234-123456789ABC"
+    inventory = f'echo "{mig}, 0000:00:01.0"' if where == "inventory" else f'echo "{GPU_A}, 0000:00:01.0"'
+    executable = _fake(tmp_path, "nvidia-smi", f"""\
+        case "$1" in
+          --version) echo "NVIDIA-SMI fake" ;;
+          --query-gpu=*) {inventory} ;;
+          *) echo "$PPID, {mig}" ;;
+        esac
+        """)
+    record = _finished(_sampler_for(executable))
+    assert record["failure"]["code"] == "mig-unsupported", record["failure"]
+    assert mig in record["failure"]["detail"]
+    assert record["gaps"]["count"] == 0
+    receipt = _receipt(tmp_path, _sampler([], failure="mig-unsupported"))
+    assert receipt.verdict["reason_class"] == "telemetry-failed"
+    assert receipt.verdict["reason"] == "telemetry-failed: attempted GPU sampler failed (mig-unsupported)"
+
+
+def test_gap_budget_excess_is_a_typed_receipt_failure(tmp_path: Path) -> None:
+    """Q1: an exceeded budget derives ``telemetry-failed`` with its own reason; relabelling is rejected."""
+
+    gaps = empty_gaps(1, 3)
+    raw = {"gpu_sampler": {"gaps": gaps}}
+    _add_gaps(raw, ("command-failed", 1.0, 1.01, 1), ("command-failed", 1.02, 1.03, 2))
+    receipt = _receipt(tmp_path, _sampler([], failure="gap-budget-exceeded", gaps=gaps))
+    assert receipt.verdict["reason"] == "telemetry-failed: attempted GPU sampler failed (gap-budget-exceeded)"
+    tampered = receipt.to_dict()
+    tampered["gpu_sampler"]["failure"]["code"] = "command-failed"
+    with pytest.raises((TypeError, ValueError)):
+        SciencePlacementReceiptV3.from_mapping(tampered)
+
+
+def test_finish_deadline_fits_two_worst_case_attempts() -> None:
+    """Orchestrator decision (a): the finish bound is derived from the command bounds.
+
+    An attempt in progress plus a final attempt, each of ``ATTEMPT_COMMANDS``
+    commands bounded by read plus cleanup, plus the cancel reserve.
+    """
+
+    worst_attempt = gs.ATTEMPT_COMMANDS * (gs.COMMAND_TIMEOUT + gs.CLEANUP_TIMEOUT)
+    reserve = gs.CLEANUP_TIMEOUT + gs.SCHEDULING_MARGIN
+    assert gs.JOIN_TIMEOUT == gs.finish_deadline(gs.COMMAND_TIMEOUT, gs.CLEANUP_TIMEOUT) == 2 * worst_attempt + reserve
+    assert (gs.COMMAND_TIMEOUT, gs.CLEANUP_TIMEOUT, gs.ATTEMPT_COMMANDS, gs.JOIN_TIMEOUT) == (5.0, 2.0, 3, 45.0)
+    assert gs.JOIN_TIMEOUT <= MAX_JOIN_TIMEOUT
+    sampler = gs.GpuSampler.from_environment(1, {})
+    assert sampler.join_timeout == gs.JOIN_TIMEOUT and sampler.command_timeout == gs.COMMAND_TIMEOUT
+
+
+@POSIX_GROUPS
+def test_sampler_final_sample_survives_one_transient_failure(tmp_path: Path) -> None:
+    """Orchestrator decision (a) with Q1: a transient failure at stop is retried within the bound.
+
+    The fake fails exactly once after the stop flag exists; either the
+    in-progress or the final attempt absorbs it, and a complete sample that
+    starts after stop is still taken.
+    """
+
+    flag, once = tmp_path / "stopped", tmp_path / "failed-once"
+    executable = _fake(tmp_path, "nvidia-smi", f"""\
+        if [ -e {flag} ] && [ ! -e {once} ]; then touch {once}; exit 1; fi
+        """ + _OK_BODY)
+    sampler = _sampler_for(executable, command_timeout=0.5, cleanup_timeout=0.1, join_timeout=gs.finish_deadline(0.5, 0.1))
+    sampler.start()
+    _wait_for(sampler, lambda value: value["aggregate"]["samples_taken"] >= 1)
+    flag.touch()
+    stopped = time.monotonic()
+    record = sampler.finish()
+    assert once.exists()
+    assert record["reason"] == "observed", record["failure"]
+    assert record["gaps"]["count"] == 1
+    assert record["samples"][-1]["monotonic_start"] >= stopped
+    assert validate_sampler_wire(record) == record
+
+
+@POSIX_GROUPS
+def test_sampler_final_retry_must_fit_the_remaining_deadline(tmp_path: Path) -> None:
+    """Orchestrator decision (a): no final retry starts unless a worst-case attempt fits."""
+
+    flag = tmp_path / "stopped"
+    executable = _fake(tmp_path, "nvidia-smi", f"if [ -e {flag} ]; then exit 1; fi\n" + _OK_BODY)
+    # join_timeout is far below two worst-case attempts (2 * 3 * 0.6 s); a
+    # generous gap budget isolates the remaining-deadline rule.
+    sampler = _sampler_for(
+        executable, command_timeout=0.5, cleanup_timeout=0.1, join_timeout=1.0, max_consecutive_gaps=5, max_total_gaps=5,
+    )
+    sampler.start()
+    _wait_for(sampler, lambda value: value["aggregate"]["samples_taken"] >= 1)
+    flag.touch()
+    started = time.monotonic()
+    record = sampler.finish()
+    assert time.monotonic() - started < 1.0
+    assert record["failure"]["code"] == "command-failed", record["failure"]
+    assert "no retry fits the finish deadline" in record["failure"]["detail"]
+    assert record["gaps"]["count"] <= 2 and record["quiescent"] is True
+    assert validate_sampler_wire(record) == record
+
+
+@POSIX_GROUPS
+def test_worker_resolves_nvidia_smi_through_the_prepared_path_and_records_it(tmp_path: Path) -> None:
+    """Orchestrator decision (b): the prepared PATH resolves nvidia-smi, not the setup script.
+
+    The setup script prepends a directory holding a different fake; the
+    sampler must use the descriptor's PATH and record that path and version.
+    """
+
+    bin_dir, shadow = tmp_path / "bin", tmp_path / "setup-bin"
+    bin_dir.mkdir()
+    shadow.mkdir()
+    _fake(bin_dir, "nvidia-smi", _PID_FILE_BODY)
+    _fake(shadow, "nvidia-smi", "echo shadowed; exit 1\n")
+    setup = tmp_path / "setup.sh"
+    setup.write_text(f'export PATH="{shadow}:$PATH"\n', encoding="utf-8")
+    environment = _worker_env(tmp_path, bin_dir, L1B_CHILD_PID_FILE=str(tmp_path / "never"))
+    outcome = SubprocessWorker().run(
+        PreparedPythonEnvironment(sys.executable, SourceScript(str(setup)), dict(environment.env)),
+        ("-c", "import time; time.sleep(0.2)"),
+        cwd=tmp_path, stdout_path=tmp_path / "out.log", stderr_path=tmp_path / "err.log",
+    )
+    record = _evidence(tmp_path)
+    assert outcome.returncode == 0 and record["reason"] == "observed", record["failure"]
+    assert record["executable"] == str(bin_dir / "nvidia-smi")
+    assert record["version"] == "NVIDIA-SMI fake"
 
 
 # ------------------------------------------------------ worker ownership
@@ -725,6 +952,273 @@ def test_worker_without_an_evidence_path_does_not_sample(tmp_path: Path) -> None
     assert not marker.exists() and not (tmp_path / "gpu-sampler.json").exists()
 
 
+# ------------------------------------- worker startup, slot fence, ambient
+
+
+class _InterruptingThread(threading.Thread):
+    """Sampler thread whose ``start`` is interrupted before or after it really starts."""
+
+    mode = "before"
+    launched: Path | None = None
+
+    def start(self) -> None:
+        if self.name != "tpen-gpu-sampler":
+            return super().start()
+        if self.mode == "before":
+            raise _Cancel()
+        super().start()
+        # Interrupt only once a real command session exists.
+        deadline = time.monotonic() + 5.0
+        while not _pids(self.launched) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        raise _Cancel()
+
+
+def _hung_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_files: list[Path]) -> tuple[PreparedPythonEnvironment, Path]:
+    monkeypatch.setattr(gs, "COMMAND_TIMEOUT", 10.0)
+    monkeypatch.setattr(gs, "CLEANUP_TIMEOUT", 0.3)
+    monkeypatch.setattr(gs, "JOIN_TIMEOUT", 1.0)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    pid_file = tmp_path / "hung.pids"
+    pid_files.append(pid_file)
+    _hung(bin_dir, pid_file)
+    return _worker_env(tmp_path, bin_dir), pid_file
+
+
+def _run_interrupted(tmp_path: Path, environment: PreparedPythonEnvironment, pid_file: Path) -> list[bool]:
+    """Run a long child whose startup is interrupted; return hung-command liveness at propagation."""
+
+    started = time.monotonic()
+    with pytest.raises(_Cancel):
+        SubprocessWorker().run(
+            environment, ("-c", "import time; time.sleep(30)"),
+            cwd=tmp_path, stdout_path=tmp_path / "out.log", stderr_path=tmp_path / "err.log",
+        )
+    alive = [_alive(pid) for pid in _pids(pid_file)]
+    assert time.monotonic() - started < 8.0
+    return alive
+
+
+@POSIX_GROUPS
+def test_worker_interrupted_before_the_sampler_thread_starts_is_settled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_files: list[Path]) -> None:
+    """E1: an interruption before the thread starts leaves finalized, quiescent, blocking evidence."""
+
+    environment, pid_file = _hung_worker(tmp_path, monkeypatch, pid_files)
+    monkeypatch.setattr(_InterruptingThread, "mode", "before")
+    monkeypatch.setattr(gs.threading, "Thread", _InterruptingThread)
+    assert _run_interrupted(tmp_path, environment, pid_file) == []
+    record = _evidence(tmp_path)
+    assert record["failure"]["code"] == "sampler-cancelled" and record["reason"] == "telemetry-failed"
+    assert record["quiescent"] is True and record["command_pids"] == []
+
+
+@POSIX_GROUPS
+def test_worker_interrupted_during_sampler_start_keeps_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_files: list[Path]) -> None:
+    """E1: an interruption inside ``Thread.start`` after the thread runs cannot orphan its command.
+
+    The thread handle is published before ``start``, so finish still cancels,
+    kills, and reaps the hung command before the interruption propagates.
+    """
+
+    environment, pid_file = _hung_worker(tmp_path, monkeypatch, pid_files)
+    monkeypatch.setattr(_InterruptingThread, "mode", "during")
+    monkeypatch.setattr(_InterruptingThread, "launched", pid_file)
+    monkeypatch.setattr(gs.threading, "Thread", _InterruptingThread)
+    assert _run_interrupted(tmp_path, environment, pid_file) == [False]
+    record = _evidence(tmp_path)
+    assert record["failure"]["code"] == "sampler-cancelled"
+    assert record["quiescent"] is True and record["survivors"] == []
+    assert [_alive(pid) for pid in record["command_pids"]] == [False]
+
+
+@POSIX_GROUPS
+def test_worker_interrupted_right_after_sampler_start_keeps_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_files: list[Path]) -> None:
+    """E1/H1: an interruption right after ``start`` returns, before the worker continues, is cleaned.
+
+    The worker holds the sampler before calling ``start``, so its outer
+    cleanup never depends on a startup helper returning a handle.
+    """
+
+    environment, pid_file = _hung_worker(tmp_path, monkeypatch, pid_files)
+    original = gs.GpuSampler.start
+
+    def start_then_interrupt(self) -> None:
+        original(self)
+        deadline = time.monotonic() + 5.0
+        while not _pids(pid_file) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        raise _Cancel()
+
+    monkeypatch.setattr(gs.GpuSampler, "start", start_then_interrupt)
+    assert _run_interrupted(tmp_path, environment, pid_file) == [False]
+    record = _evidence(tmp_path)
+    assert record["failure"]["code"] == "sampler-cancelled"
+    assert record["quiescent"] is True and record["survivors"] == []
+    assert [_alive(pid) for pid in record["command_pids"]] == [False]
+
+
+@POSIX_GROUPS
+def test_worker_fences_the_slot_while_a_held_launch_is_outstanding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_files: list[Path]) -> None:
+    """E2/H2: a command created before Popen publishes it keeps the slot fenced until it is gone.
+
+    The first command process really exists but its ``Popen`` is held, so it
+    is in no published handle.  The worker returns within its bound with
+    non-quiescent evidence, a second science launch on the same slot is
+    refused before spawning, and the slot is reusable only once the sampler
+    thread has killed and reaped the held process.
+    """
+
+    environment, pid_file = _hung_worker(tmp_path, monkeypatch, pid_files)
+    monkeypatch.setattr(gs, "CLEANUP_TIMEOUT", 0.2)
+    monkeypatch.setattr(gs, "JOIN_TIMEOUT", 0.6)
+    slot = "slot-e2-held-launch"
+    release, held = threading.Event(), threading.Event()
+    real_popen = subprocess.Popen
+
+    class HeldPopen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Hold only the first sampler command, never the science child.
+            if not held.is_set() and str(args[0][0]).endswith("nvidia-smi"):
+                # The process exists; its handle is not yet published.
+                held.set()
+                release.wait(10.0)
+
+    monkeypatch.setattr(gs.subprocess, "Popen", HeldPopen)
+    values = dict(environment.env, TPEN_SLOT_ID=slot)
+    marker = tmp_path / "second-child-ran"
+    try:
+        started = time.monotonic()
+        outcome = SubprocessWorker().run(
+            PreparedPythonEnvironment(sys.executable, None, values), ("-c", "import time; time.sleep(0.2)"),
+            cwd=tmp_path, stdout_path=tmp_path / "out.log", stderr_path=tmp_path / "err.log",
+        )
+        assert outcome.returncode == 0 and time.monotonic() - started < 5.0
+        assert held.is_set() and [_alive(pid) for pid in _pids(pid_file)] == [True]
+        record = _evidence(tmp_path)
+        assert record["failure"]["code"] == "sampler-join-expired"
+        assert "launch was still in flight" in record["failure"]["detail"]
+        assert record["quiescent"] is False
+        # The slot is fenced: no child is spawned on it.
+        second = dict(values, **{gs.GPU_SAMPLER_OUTPUT_ENV: str(tmp_path / "second.json")})
+        with pytest.raises(gs.SlotQuarantined, match="launch is in flight"):
+            SubprocessWorker().run(
+                PreparedPythonEnvironment(sys.executable, None, second), ("-c", f"open({str(marker)!r}, 'w')"),
+                cwd=tmp_path, stdout_path=tmp_path / "out2.log", stderr_path=tmp_path / "err2.log",
+            )
+        assert not marker.exists() and not (tmp_path / "second.json").exists()
+    finally:
+        release.set()
+    # The owning thread publishes, kills, and reaps the late process.
+    deadline = time.monotonic() + 10.0
+    while any(_alive(pid) for pid in _pids(pid_file)) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert [_alive(pid) for pid in _pids(pid_file)] == [False]
+    deadline = time.monotonic() + 5.0
+    while gs._FENCED.get(slot) and time.monotonic() < deadline:
+        try:
+            gs.ensure_slot_clean(slot)
+        except gs.SlotQuarantined:
+            time.sleep(0.02)
+    third = dict(values, **{gs.GPU_SAMPLER_OUTPUT_ENV: str(tmp_path / "third.json")})
+    outcome = SubprocessWorker().run(
+        PreparedPythonEnvironment(sys.executable, None, third), ("-c", f"open({str(marker)!r}, 'w')"),
+        cwd=tmp_path, stdout_path=tmp_path / "out3.log", stderr_path=tmp_path / "err3.log",
+    )
+    assert outcome.returncode == 0 and marker.exists() and slot not in gs._FENCED
+
+
+@POSIX_GROUPS
+def test_worker_ignores_an_ambient_evidence_path(tmp_path: Path) -> None:
+    """E3: only the prepared descriptor opts into sampling; an inherited key never does.
+
+    Negative controls: an H-v2-shaped descriptor with ``env={}`` and the
+    inspection environment from ``_without_gpu_sampler``, both run while the
+    owner environment carries the key and a callable fake ``nvidia-smi``.
+    """
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "invoked"
+    _fake(bin_dir, "nvidia-smi", f"touch {marker}\n" + _OK_BODY)
+    ambient = tmp_path / "ambient.json"
+    probe = f"import json, os; print(json.dumps({gs.GPU_SAMPLER_OUTPUT_ENV!r} in os.environ))"
+    saved = {key: os.environ.get(key) for key in (gs.GPU_SAMPLER_OUTPUT_ENV, "PATH")}
+    os.environ[gs.GPU_SAMPLER_OUTPUT_ENV] = str(ambient)
+    os.environ["PATH"] = f"{bin_dir}{os.pathsep}{saved['PATH'] or os.defpath}"
+    try:
+        for name, environment in {
+            "env-empty": PreparedPythonEnvironment(sys.executable, None, {}),
+            "inspection": _without_gpu_sampler(_worker_env(tmp_path, bin_dir)),
+        }.items():
+            assert gs.GPU_SAMPLER_OUTPUT_ENV not in environment.env, name
+            SubprocessWorker().run(
+                environment, ("-c", probe),
+                cwd=tmp_path, stdout_path=tmp_path / f"{name}.out", stderr_path=tmp_path / f"{name}.err",
+            )
+            assert json.loads((tmp_path / f"{name}.out").read_text(encoding="utf-8")) is False, name
+            assert not ambient.exists() and not marker.exists(), name
+            assert not (tmp_path / "gpu-sampler.json").exists(), name
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@POSIX_GROUPS
+def test_worker_timeout_with_fast_commands_keeps_usable_telemetry(tmp_path: Path) -> None:
+    """Q4: a worker timeout of the child does not by itself fail usable, quiescent telemetry."""
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _fake(bin_dir, "nvidia-smi", _PID_FILE_BODY)
+    pid_file = tmp_path / "child.pid"
+    child = f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(30)"
+    outcome = SubprocessWorker().run(
+        _worker_env(tmp_path, bin_dir, L1B_CHILD_PID_FILE=str(pid_file)), ("-c", child),
+        cwd=tmp_path, stdout_path=tmp_path / "out.log", stderr_path=tmp_path / "err.log", timeout=0.8,
+    )
+    record = _evidence(tmp_path)
+    assert outcome.timed_out is True
+    assert record["reason"] == "observed" and record["failure"] is None, record["failure"]
+    assert record["quiescent"] is True
+    assert derive_device_decision(record, outcome.pid, (GPU_A,)).code == "matched"
+
+
+@POSIX_GROUPS
+@pytest.mark.skipif(not hasattr(signal, "setitimer"), reason="requires POSIX interval timers")
+def test_worker_cancellation_with_fast_commands_keeps_usable_telemetry(tmp_path: Path) -> None:
+    """Q4: an owner cancellation of the child keeps usable, quiescent telemetry observed."""
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _fake(bin_dir, "nvidia-smi", _PID_FILE_BODY)
+    pid_file = tmp_path / "child.pid"
+    child = f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(30)"
+
+    def cancel(_signum, _frame):
+        raise _Cancel()
+
+    previous = signal.signal(signal.SIGALRM, cancel)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0.8)
+        with pytest.raises(_Cancel):
+            SubprocessWorker().run(
+                _worker_env(tmp_path, bin_dir, L1B_CHILD_PID_FILE=str(pid_file)), ("-c", child),
+                cwd=tmp_path, stdout_path=tmp_path / "out.log", stderr_path=tmp_path / "err.log",
+            )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    record = _evidence(tmp_path)
+    assert record["reason"] == "observed" and record["failure"] is None, record["failure"]
+    assert record["quiescent"] is True
+    assert derive_device_decision(record, record["target_pid"], (GPU_A,)).code == "matched"
+
+
 # ------------------------------------------------------- real RUN_SHIM child
 
 
@@ -884,6 +1378,7 @@ def _sampler(
     declared: tuple[str, ...] = (GPU_A,),
     dropped: list[list[tuple[int, str]]] = (),
     target: int = 1234,
+    gaps: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a valid worker sampler record with one sample per row list.
 
@@ -911,6 +1406,7 @@ def _sampler(
         "count": len(records), "monotonic_start": 1.0, "monotonic_end": end, "samples": records,
         "command_pids": [101, 102, 103], "survivors": [], "elapsed_seconds": end - 1.0,
         "join_timeout_seconds": 4.0, "quiescent": True, "target_pid": target,
+        "executable": "/opt/fake/bin/nvidia-smi", "gaps": empty_gaps(1, 3) if gaps is None else gaps,
         "aggregate": {
             "samples_taken": len(records) + len(dropped), "exact_pid_gpus": exact,
             "outside_use_seen": any(item["uuid"] not in declared for item in exact),
@@ -982,6 +1478,17 @@ def test_outside_use_in_an_evicted_sample_dominates(tmp_path: Path) -> None:
         SciencePlacementReceiptV3.from_mapping(raw)
 
 
+def _add_gaps(raw: dict, *events: tuple[str, float, float, int]) -> None:
+    """Append gap events ``(code, start, end, consecutive)`` with consistent counters."""
+
+    gaps = raw["gpu_sampler"]["gaps"]
+    for code, start, end, run in events:
+        gaps["events"].append({"code": code, "monotonic_start": start, "monotonic_end": end, "consecutive": run})
+    gaps["count"] = len(gaps["events"])
+    gaps["max_consecutive"] = max(event["consecutive"] for event in gaps["events"])
+    gaps["total_seconds"] = sum(event["monotonic_end"] - event["monotonic_start"] for event in gaps["events"])
+
+
 def _set_all_rows(raw: dict, key: str, value: object) -> None:
     for sample in raw["gpu_sampler"]["samples"]:
         for row in sample["pid_rows"]:
@@ -1028,6 +1535,15 @@ CONTRADICTIONS = {
     "aggregate-omits-retained-gpu": lambda raw: raw["gpu_sampler"]["aggregate"].__setitem__("exact_pid_gpus", []),
     "aggregate-below-count": lambda raw: raw["gpu_sampler"]["aggregate"].__setitem__("samples_taken", 0),
     "aggregate-unresolved-tamper": lambda raw: raw["gpu_sampler"]["aggregate"].__setitem__("entitlement_unresolved_seen", True),
+    # r4: resolved executable and the recorded gap budget (manager ruling Q1).
+    "null-executable": lambda raw: raw["gpu_sampler"].__setitem__("executable", None),
+    "gap-count-disagrees": lambda raw: raw["gpu_sampler"]["gaps"].__setitem__("count", 1),
+    "gap-unforgivable-code": lambda raw: _add_gaps(raw, ("malformed-output", 1.11, 1.15, 1)),
+    "gap-outside-outer": lambda raw: _add_gaps(raw, ("command-failed", 2.0, 2.1, 1)),
+    "gap-budget-exceeded-but-observed": lambda raw: _add_gaps(raw, ("command-failed", 1.11, 1.12, 1), ("command-failed", 1.13, 1.14, 2)),
+    "gap-total-disagrees": lambda raw: (_add_gaps(raw, ("command-timeout", 1.11, 1.12, 1)), raw["gpu_sampler"]["gaps"].__setitem__("total_seconds", 5.0)),
+    "gap-run-numbering": lambda raw: _add_gaps(raw, ("command-failed", 1.11, 1.12, 2)),
+    "gap-budget-above-cap": lambda raw: raw["gpu_sampler"]["gaps"].__setitem__("max_total_allowed", 17),
 }
 
 
@@ -1204,6 +1720,7 @@ def test_manifest_message_is_derived_from_one_source(tmp_path: Path) -> None:
 V3_FIXTURE_CASES = {
     "matched", "out-of-entitlement", "evicted-out-of-entitlement", "sampler-failed",
     "no-exact-pid-row", "entitlement-unresolved", "not-sampled",
+    "gaps-within-budget", "gap-budget-exceeded", "mig-unsupported",
 }
 
 

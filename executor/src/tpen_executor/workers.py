@@ -12,7 +12,14 @@ from typing import Any
 
 from ._records import frozen_record
 from .environments import PreparedPythonEnvironment
-from .gpu_sampler import GPU_SAMPLER_OUTPUT_ENV, claim_sampler_evidence, finish_gpu_sampler, start_gpu_sampler
+from .gpu_sampler import (
+    GPU_SAMPLER_OUTPUT_ENV,
+    GpuSampler,
+    claim_sampler_evidence,
+    ensure_slot_clean,
+    finish_gpu_sampler,
+    slot_fence_key,
+)
 
 
 def _proc_start_ticks(pid: int) -> int | None:
@@ -81,12 +88,20 @@ class SubprocessWorker:
     exception, and then propagates that original exception.
 
     When the controller assigns a GPU sampler evidence path
-    (:data:`~tpen_executor.gpu_sampler.GPU_SAMPLER_OUTPUT_ENV`, removed from the
-    child environment), this worker owns the lifetime GPU sampler of the
-    child: it claims the evidence before spawn, samples the exact child PID
-    until exit, and on every path (normal exit, timeout, cancellation) kills,
-    drains, reaps, and confirms every ``nvidia-smi`` command group and
-    publishes the final record before returning.
+    (:data:`~tpen_executor.gpu_sampler.GPU_SAMPLER_OUTPUT_ENV`) in the
+    descriptor overlay, this worker owns the lifetime GPU sampler of the
+    child: it claims the evidence before spawn, holds the sampler before
+    starting it, samples the exact child PID until exit, and on every path
+    (normal exit, timeout, cancellation) finishes it within its bound and
+    publishes the final record before returning.  Only the descriptor opts a
+    launch into sampling: an inherited owner-environment value is ignored,
+    and the key is removed from the child environment either way.  If the
+    sampler's command cleanup is still unconfirmed at its bound, the slot
+    (``TPEN_SLOT_ID``) is fenced and a later sampled launch on it raises
+    :class:`~tpen_executor.gpu_sampler.SlotQuarantined` before spawning.
+    A timeout or cancellation of the child does not by itself make the
+    telemetry fail; only a sampler that is itself cancelled or unfinalized
+    does.
     """
 
     def run(
@@ -135,6 +150,9 @@ class SubprocessWorker:
             If inputs have invalid types or timeout is not finite and positive.
         OSError
             If process launch or log creation fails.
+        SlotQuarantined
+            If this is a sampled launch and an earlier sampler on the same
+            slot still has unconfirmed command cleanup; no child is spawned.
         """
 
         if not isinstance(environment, PreparedPythonEnvironment):
@@ -160,14 +178,25 @@ class SubprocessWorker:
             ]
         child_env = os.environ.copy()
         child_env.update(environment.env)
-        # The sampler evidence path belongs to this worker, never the child.
-        sampler_output = child_env.pop(GPU_SAMPLER_OUTPUT_ENV, None)
+        # Only the explicit prepared descriptor opts this launch into
+        # sampling; an ambient owner-environment value never does (review E3).
+        sampler_output = environment.env.get(GPU_SAMPLER_OUTPUT_ENV)
+        # The evidence path belongs to this worker, never the child, whichever
+        # environment it came from.
+        child_env.pop(GPU_SAMPLER_OUTPUT_ENV, None)
+        slot = slot_fence_key(child_env)
         stdout_name = os.fspath(stdout_path)
         stderr_name = os.fspath(stderr_path)
         timed_out = False
         with Path(stdout_name).open("wb") as stdout, Path(stderr_name).open("wb") as stderr:
             if pre_spawn_guard is not None and pre_spawn_guard():
                 return ProcessOutcome(logical_argv, None, stdout_name, stderr_name, timed_out)
+            # A science launch on a slot whose earlier sampler cleanup is
+            # unconfirmed is refused before any evidence claim or spawn.  The
+            # fence gates sampled (science) launches; an inspection of the
+            # same member carries no evidence path and is not slot reuse.
+            if sampler_output is not None:
+                ensure_slot_clean(slot)
             # Claim before spawn: a worker that dies later leaves attempted,
             # unfinalized evidence, never an absent or not-sampled record.
             if not claim_sampler_evidence(sampler_output):
@@ -186,7 +215,12 @@ class SubprocessWorker:
             try:
                 if process_handle is not None:
                     process_handle.attach(process)
-                sampler = start_gpu_sampler(sampler_output, spawned_pid, child_env)
+                if sampler_output is not None:
+                    # Hold the sampler before any asynchronous work starts, so
+                    # an interruption during or right after start() still
+                    # leaves this worker owning its cleanup (review E1).
+                    sampler = GpuSampler.from_environment(spawned_pid, child_env)
+                    sampler.start()
                 try:
                     returncode = process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
@@ -212,16 +246,16 @@ class SubprocessWorker:
                         cleanup_errors.append(cleanup_error)
                 # The cancelled child is reaped; drain the sampler's command
                 # groups before the cancellation leaves this worker.
-                cleanup_errors.extend(finish_gpu_sampler(sampler, sampler_output))
+                cleanup_errors.extend(finish_gpu_sampler(sampler, sampler_output, slot))
                 for cleanup_error in cleanup_errors:
                     original.add_note(f"cleanup wait interruption: {cleanup_error!r}")
                 raise
             finally:
                 if process_handle is not None:
                     process_handle.clear(process)
-        # Normal exit and worker timeout: the child is reaped; confirm every
-        # sampler command group empty before the slot is released.
-        interruptions = finish_gpu_sampler(sampler, sampler_output)
+        # Normal exit and worker timeout: the child is reaped; finish the
+        # sampler, and fence the slot if its cleanup is still unconfirmed.
+        interruptions = finish_gpu_sampler(sampler, sampler_output, slot)
         if interruptions:
             raise interruptions[0]
         return ProcessOutcome(logical_argv, returncode, stdout_name, stderr_name, timed_out, spawned_pid, spawned_ticks)

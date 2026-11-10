@@ -62,11 +62,39 @@ lifetime, and takes a final sample once it has observed the exit. At most 16
 samples are retained; a closed lifetime aggregate records every GPU the
 exact PID ever used and whether out-of-entitlement use or an unresolved
 entitlement was ever seen, including in samples that were not retained.
+Only the explicit prepared descriptor opts a launch into sampling; an
+inherited owner-environment value of the evidence key is ignored and the key
+is never passed to the child. The worker holds the sampler before starting
+it, so an interruption during or right after startup cannot lose its cleanup.
+`nvidia-smi` is resolved once through the `PATH` of the worker's prepared
+child environment (the descriptor's setup script is not applied to it); the
+resolved path and its reported version are recorded.
 Each command runs in its own session. On every path, including a worker
 timeout or cancellation of the science child, the worker SIGKILLs, drains,
 reaps, and confirms every command group empty (ESRCH from `killpg(pgid, 0)`)
-under one shared deadline before it returns and the slot is released;
-otherwise the record is not quiescent and keeps the surviving group ids.
+under one shared deadline before it returns. The deadline is derived from the
+command bounds: at most one attempt in progress plus one final attempt, each
+of at most three commands bounded by a 5 s read plus a 2 s cleanup, plus a
+3 s cancel reserve (`2 * 3 * (5 + 2) + 3 = 45` s). If a launch or a group
+cleanup is still outstanding at the deadline, the record is not quiescent,
+keeps the surviving group ids, and the worker fences the slot: a later
+sampled launch on the same `TPEN_SLOT_ID` in this process fails with
+`SlotQuarantined` before spawning until that work is confirmed gone.
+
+Telemetry quality is kept separate from the operational outcome: a worker
+timeout or cancellation of the science child still finishes the sampler, so
+usable, quiescent observations taken before it survive. Only a sampler that
+is itself cancelled (a command still in flight at the deadline) or never
+finalized is `telemetry-failed`. Transient command failures (non-zero exit,
+read timeout, read error) are bounded by a recorded gap budget: one isolated
+failed attempt is skipped, while two in a row or a fourth over the lifetime
+is the terminal `gap-budget-exceeded` failure. Every gap is recorded (count,
+longest consecutive run, total seconds, and each event) together with the
+budget in force. Outside use, malformed or contradictory output, and
+unconfirmed cleanup are never forgiven. MIG device identifiers are
+unsupported and fail with the distinct `mig-unsupported` code. The timeout
+and gap-budget values are unmeasured defaults to be calibrated on a real-GPU
+run.
 
 The v3 verdict is derived, never trusted: out-of-entitlement use by the exact
 science PID at any time is `mismatch`; an attempted sampler failure, an

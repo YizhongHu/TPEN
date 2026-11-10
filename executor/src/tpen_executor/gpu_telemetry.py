@@ -15,6 +15,15 @@ exact target PID and whether out-of-entitlement use or an unresolved
 entitlement was ever seen.  The device decision is taken from the aggregate,
 which must agree with the retained samples.
 
+Transient command failures (fix round r4, manager ruling Q1) are bounded by a
+gap budget that the record carries explicitly in its closed ``gaps`` block:
+every failed sample attempt is recorded, and exceeding either the
+consecutive or the total budget is the terminal ``gap-budget-exceeded``
+failure.  Only :data:`GAP_CODES` are ever forgiven; outside use,
+contradictory or malformed output, MIG identifiers, and unconfirmed cleanup
+never are.  MIG device identifiers are unsupported and fail with the distinct
+``mig-unsupported`` code (manager ruling Q5).
+
 Binding vocabulary (manager decision split-20261110): ``not-sampled`` means
 sampling was intentionally never attempted and is not science-blocking;
 ``telemetry-failed`` means sampling was attempted and did not yield usable,
@@ -35,23 +44,33 @@ SAMPLER_METHOD = "nvidia-smi-pid-uuid-v1"
 SAMPLER_KEYS = frozenset({
     "status", "reason", "method", "version", "attempted", "failure", "cadence_seconds", "count",
     "monotonic_start", "monotonic_end", "samples", "command_pids", "survivors", "elapsed_seconds",
-    "join_timeout_seconds", "quiescent", "target_pid", "aggregate",
+    "join_timeout_seconds", "quiescent", "target_pid", "aggregate", "executable", "gaps",
 })
 SAMPLE_KEYS = frozenset({"monotonic_start", "monotonic_end", "inventory", "pid_rows"})
 AGGREGATE_KEYS = frozenset({"samples_taken", "exact_pid_gpus", "outside_use_seen", "entitlement_unresolved_seen"})
+GAP_KEYS = frozenset({"max_consecutive_allowed", "max_total_allowed", "count", "max_consecutive", "total_seconds", "events"})
+GAP_EVENT_KEYS = frozenset({"code", "monotonic_start", "monotonic_end", "consecutive"})
+#: The only failure codes a gap budget may forgive: transient command/read
+#: failures.  Every other failure code is terminal.
+GAP_CODES = frozenset({"command-failed", "command-timeout", "read-failed"})
+#: Hard wire cap on either recorded gap budget; it bounds the event list.
+GAP_BUDGET_CAP = 16
 #: Maximum number of retained samples; the aggregate covers every sample.
 MAX_SAMPLES = 16
 #: Bounds of the lifetime sampling cadence, in seconds between samples.
 MIN_CADENCE = 0.01
 MAX_CADENCE = 60.0
-#: Default and maximum bound of the worker's shared finish deadline.
-DEFAULT_JOIN_TIMEOUT = 30.0
+#: Join bound carried by records of a sampler that never ran (``not-sampled``
+#: and controller-substituted invalid evidence).  The worker's own derived
+#: finish bound is :data:`tpen_executor.gpu_sampler.JOIN_TIMEOUT`.
+UNRUN_JOIN_TIMEOUT = 30.0
+#: Wire bound of any recorded finish deadline.
 MAX_JOIN_TIMEOUT = 60.0
 #: Failure codes the worker-side sampler may emit.
 SAMPLER_FAILURE_CODES = frozenset({
     "launch-failed", "command-failed", "command-timeout", "read-failed", "malformed-output",
     "cleanup-unconfirmed", "no-sample", "sampler-cancelled", "sampler-join-expired",
-    "sampler-unfinalized", "sampler-error",
+    "sampler-unfinalized", "sampler-error", "mig-unsupported", "gap-budget-exceeded",
 })
 #: Failure code the controller substitutes for missing or invalid sampler evidence.
 EVIDENCE_INVALID = "sampler-evidence-invalid"
@@ -82,6 +101,27 @@ def empty_aggregate() -> dict[str, Any]:
     return {"samples_taken": 0, "exact_pid_gpus": [], "outside_use_seen": False, "entitlement_unresolved_seen": False}
 
 
+def empty_gaps(max_consecutive_allowed: int = 0, max_total_allowed: int = 0) -> dict[str, Any]:
+    """Return the gap block of a sampler that has recorded no failed attempt.
+
+    Parameters
+    ----------
+    max_consecutive_allowed, max_total_allowed : int, default=0
+        Gap budget in force.  Records of a sampler that never ran carry the
+        zero budget, so their exact shape does not depend on calibration.
+
+    Returns
+    -------
+    dict
+        The budget, zero counters, and an empty event list.
+    """
+
+    return {
+        "max_consecutive_allowed": max_consecutive_allowed, "max_total_allowed": max_total_allowed,
+        "count": 0, "max_consecutive": 0, "total_seconds": 0.0, "events": [],
+    }
+
+
 def not_sampled_sampler() -> dict[str, Any]:
     """Return the exact ``not-sampled`` sampler record.
 
@@ -96,8 +136,8 @@ def not_sampled_sampler() -> dict[str, Any]:
         "version": None, "attempted": False, "failure": None, "cadence_seconds": 0.0,
         "count": 0, "monotonic_start": None, "monotonic_end": None, "samples": [],
         "command_pids": [], "survivors": [], "elapsed_seconds": 0.0,
-        "join_timeout_seconds": DEFAULT_JOIN_TIMEOUT, "quiescent": True,
-        "target_pid": None, "aggregate": empty_aggregate(),
+        "join_timeout_seconds": UNRUN_JOIN_TIMEOUT, "quiescent": True,
+        "target_pid": None, "aggregate": empty_aggregate(), "executable": None, "gaps": empty_gaps(),
     }
 
 
@@ -124,8 +164,8 @@ def invalid_sampler(detail: str) -> dict[str, Any]:
         "failure": {"code": EVIDENCE_INVALID, "detail": (detail.strip() or "invalid sampler evidence")[:500]},
         "cadence_seconds": 0.0, "count": 0, "monotonic_start": None, "monotonic_end": None,
         "samples": [], "command_pids": [], "survivors": [], "elapsed_seconds": 0.0,
-        "join_timeout_seconds": DEFAULT_JOIN_TIMEOUT, "quiescent": False,
-        "target_pid": None, "aggregate": empty_aggregate(),
+        "join_timeout_seconds": UNRUN_JOIN_TIMEOUT, "quiescent": False,
+        "target_pid": None, "aggregate": empty_aggregate(), "executable": None, "gaps": empty_gaps(),
     }
 
 
@@ -207,6 +247,70 @@ def _validate_aggregate(sampler: Mapping[str, Any], retained: list[tuple[str, st
         raise ValueError("gpu_sampler aggregate differs from its complete retained samples")
 
 
+def _validate_gaps(sampler: Mapping[str, Any], start: float | None, end: float | None) -> None:
+    """Check the closed gap block against its budget and the failure code.
+
+    Parameters
+    ----------
+    sampler : mapping
+        Sampler record whose top-level fields were already validated.
+    start, end : float or None
+        Validated outer interval of the record.
+
+    Raises
+    ------
+    ValueError
+        If the keys or types are invalid, a budget exceeds
+        :data:`GAP_BUDGET_CAP`, an event is not a forgivable transient code,
+        events are unordered or outside the outer interval, the consecutive
+        run numbering or the counters disagree with the events, the record
+        continues past the first budget excess, or ``gap-budget-exceeded``
+        is claimed without an excess (or an excess is labelled otherwise).
+    """
+
+    gaps = sampler["gaps"]
+    if not isinstance(gaps, Mapping) or set(gaps) != GAP_KEYS:
+        raise ValueError("gpu_sampler gaps keys differ")
+    counters = ("max_consecutive_allowed", "max_total_allowed", "count", "max_consecutive")
+    if any(type(gaps[key]) is not int or gaps[key] < 0 for key in counters):
+        raise ValueError("gpu_sampler gap counters must be non-negative integers")
+    allowed_consecutive, allowed_total = gaps["max_consecutive_allowed"], gaps["max_total_allowed"]
+    if allowed_consecutive > GAP_BUDGET_CAP or allowed_total > GAP_BUDGET_CAP:
+        raise ValueError("gpu_sampler gap budget exceeds its wire cap")
+    events = _rows(gaps["events"], "gap events")
+    if gaps["count"] != len(events):
+        raise ValueError("gpu_sampler gap count disagrees with its events")
+    previous_end, run, longest, summed = start, 0, 0, 0.0
+    for event in events:
+        if not isinstance(event, Mapping) or set(event) != GAP_EVENT_KEYS:
+            raise ValueError("gpu_sampler gap event keys differ")
+        if event["code"] not in GAP_CODES:
+            raise ValueError("gpu_sampler gap event is not a forgivable transient failure")
+        event_start = _number(event["monotonic_start"], "gap start")
+        event_end = _number(event["monotonic_end"], "gap end")
+        consecutive = _positive_int(event["consecutive"], "gap consecutive run")
+        # Gaps are ordered, non-overlapping, and inside the outer interval.
+        if start is None or event_end < event_start or event_start < previous_end or event_end > end:
+            raise ValueError("gpu_sampler gap interval is not ordered inside the outer interval")
+        # A run either starts afresh or extends the previous gap's run.
+        if consecutive not in (1, run + 1):
+            raise ValueError("gpu_sampler gap consecutive run numbering is inconsistent")
+        previous_end, run = event_end, consecutive
+        longest = max(longest, consecutive)
+        summed += event_end - event_start
+    if gaps["max_consecutive"] != longest:
+        raise ValueError("gpu_sampler gap max_consecutive disagrees with its events")
+    if abs(_number(gaps["total_seconds"], "gap total_seconds") - summed) > 1e-6:
+        raise ValueError("gpu_sampler gap total_seconds disagrees with its events")
+    # Sampling stops at the first excess, so no counter passes its budget by more than one.
+    if len(events) > allowed_total + 1 or longest > allowed_consecutive + 1:
+        raise ValueError("gpu_sampler gaps continue past the first budget excess")
+    exceeded = len(events) > allowed_total or longest > allowed_consecutive
+    failure = sampler["failure"]
+    if exceeded != (failure is not None and failure["code"] == "gap-budget-exceeded"):
+        raise ValueError("gpu_sampler gap budget excess and gap-budget-exceeded failure disagree")
+
+
 def validate_sampler_wire(value: Any) -> dict[str, Any]:
     """Validate one closed ``gpu_sampler`` record and return a JSON copy.
 
@@ -260,6 +364,9 @@ def validate_sampler_wire(value: Any) -> dict[str, Any]:
     version = sampler["version"]
     if version is not None and (type(version) is not str or not version.strip()):
         raise ValueError("gpu_sampler version must be non-empty text or null")
+    executable = sampler["executable"]
+    if executable is not None and not _text(executable):
+        raise ValueError("gpu_sampler executable must be non-empty text or null")
     cadence = _number(sampler["cadence_seconds"], "cadence_seconds")
     if cadence != 0.0 and not MIN_CADENCE <= cadence <= MAX_CADENCE:
         raise ValueError("gpu_sampler cadence is outside its bound")
@@ -292,8 +399,11 @@ def validate_sampler_wire(value: Any) -> dict[str, Any]:
         if end < start or abs(elapsed - (end - start)) > 1e-6:
             raise ValueError("gpu_sampler outer interval disagrees with elapsed time")
     if status == "observed":
-        if not sampler["quiescent"] or version is None or start is None or count < 1 or not command_pids:
-            raise ValueError("observed gpu_sampler requires quiescent, complete, versioned samples")
+        if (
+            not sampler["quiescent"] or version is None or executable is None or start is None
+            or count < 1 or not command_pids
+        ):
+            raise ValueError("observed gpu_sampler requires quiescent, complete, versioned samples from a resolved executable")
     previous_end = start
     pci_by_uuid: dict[str, str] = {}
     retained: list[tuple[str, str]] = []
@@ -328,6 +438,7 @@ def validate_sampler_wire(value: Any) -> dict[str, Any]:
             if pid == target and uuid not in {seen for seen, _ in retained}:
                 retained.append((uuid, pci_by_uuid[uuid]))
     _validate_aggregate(sampler, retained, pci_by_uuid)
+    _validate_gaps(sampler, start, end)
     return sampler
 
 
@@ -446,8 +557,9 @@ def derive_device_decision(sampler: Mapping[str, Any], child_pid: int, declared_
 
 
 __all__ = [
-    "AGGREGATE_KEYS", "DEFAULT_JOIN_TIMEOUT", "DEVICE_DECISIONS", "DeviceDecision", "EVIDENCE_INVALID",
-    "FAILURE_CODES", "MAX_CADENCE", "MAX_JOIN_TIMEOUT", "MAX_SAMPLES", "MIN_CADENCE", "SAMPLER_FAILURE_CODES",
-    "SAMPLER_KEYS", "SAMPLER_METHOD", "derive_device_decision", "empty_aggregate", "invalid_sampler",
-    "normalize_sampler", "not_sampled_sampler", "validate_sampler_wire",
+    "AGGREGATE_KEYS", "DEVICE_DECISIONS", "DeviceDecision", "EVIDENCE_INVALID", "FAILURE_CODES",
+    "GAP_BUDGET_CAP", "GAP_CODES", "GAP_EVENT_KEYS", "GAP_KEYS", "MAX_CADENCE", "MAX_JOIN_TIMEOUT", "MAX_SAMPLES",
+    "MIN_CADENCE", "SAMPLER_FAILURE_CODES", "SAMPLER_KEYS", "SAMPLER_METHOD", "UNRUN_JOIN_TIMEOUT",
+    "derive_device_decision", "empty_aggregate", "empty_gaps", "invalid_sampler", "normalize_sampler",
+    "not_sampled_sampler", "validate_sampler_wire",
 ]

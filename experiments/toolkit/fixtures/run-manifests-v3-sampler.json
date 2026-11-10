@@ -75,7 +75,16 @@
       ],
       "count": 1,
       "elapsed_seconds": 0.25,
+      "executable": "/usr/bin/nvidia-smi",
       "failure": null,
+      "gaps": {
+       "count": 0,
+       "events": [],
+       "max_consecutive": 0,
+       "max_consecutive_allowed": 1,
+       "max_total_allowed": 3,
+       "total_seconds": 0.0
+      },
       "join_timeout_seconds": 4.0,
       "method": "nvidia-smi-pid-uuid-v1",
       "monotonic_end": 1.25,
@@ -250,7 +259,16 @@
       ],
       "count": 2,
       "elapsed_seconds": 0.5,
+      "executable": "/usr/bin/nvidia-smi",
       "failure": null,
+      "gaps": {
+       "count": 0,
+       "events": [],
+       "max_consecutive": 0,
+       "max_consecutive_allowed": 1,
+       "max_total_allowed": 3,
+       "total_seconds": 0.0
+      },
       "join_timeout_seconds": 4.0,
       "method": "nvidia-smi-pid-uuid-v1",
       "monotonic_end": 1.5,
@@ -360,7 +378,171 @@
   "schema": "tpen-executor/run-manifest-v3",
   "segments": []
  },
- "matched": {
+ "gap-budget-exceeded": {
+  "attempts": [
+   {
+    "attempt_id": "attempt-a",
+    "outcome_receipt": {
+     "attempt_id": "attempt-a",
+     "finished_at_utc": "2026-11-10T00:00:01Z",
+     "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+     "output_dir": "/runs/group-1/task-a/attempt-a",
+     "result_digest": null,
+     "schema": "tpen-executor/outcome-receipt-v1",
+     "status": "completed",
+     "task_id": "task-a"
+    },
+    "output_dir": "/runs/group-1/task-a/attempt-a",
+    "placement_receipt": {
+     "allocation_id": "allocation-a",
+     "attempt_id": "attempt-a",
+     "backend_job_id": "job-a",
+     "child": {
+      "affinity": [
+       0
+      ],
+      "cuda_visible_devices": null,
+      "host": "physical-01",
+      "observed_at_utc": "2026-11-10T00:00:00Z",
+      "pid": 1234,
+      "proc_start_ticks": 55,
+      "thread_settings": {}
+     },
+     "comparison": {
+      "affinity": "matched",
+      "device": "unavailable",
+      "host": "matched"
+     },
+     "declared": {
+      "cpus": [
+       0
+      ],
+      "devices": [
+       "GPU-12345678-1234-1234-1234-123456789ABC"
+      ],
+      "host": "physical-01"
+     },
+     "gpu": {
+      "active_pci": [],
+      "active_uuids": [],
+      "finished_at_utc": "2026-11-10T00:00:01Z",
+      "method": "nvidia-smi-pid-uuid-v1",
+      "reason": "sampler-failed",
+      "samples": [],
+      "started_at_utc": "2026-11-10T00:00:00Z",
+      "status": "unavailable"
+     },
+     "gpu_sampler": {
+      "aggregate": {
+       "entitlement_unresolved_seen": false,
+       "exact_pid_gpus": [],
+       "outside_use_seen": false,
+       "samples_taken": 0
+      },
+      "attempted": true,
+      "cadence_seconds": 0.125,
+      "command_pids": [
+       101,
+       102,
+       103
+      ],
+      "count": 0,
+      "elapsed_seconds": 0.125,
+      "executable": "/usr/bin/nvidia-smi",
+      "failure": {
+       "code": "gap-budget-exceeded",
+       "detail": "2 gaps (2 consecutive) exceed the fixture budget"
+      },
+      "gaps": {
+       "count": 2,
+       "events": [
+        {
+         "code": "command-failed",
+         "consecutive": 1,
+         "monotonic_end": 1.05,
+         "monotonic_start": 1.0
+        },
+        {
+         "code": "command-failed",
+         "consecutive": 2,
+         "monotonic_end": 1.1,
+         "monotonic_start": 1.06
+        }
+       ],
+       "max_consecutive": 2,
+       "max_consecutive_allowed": 1,
+       "max_total_allowed": 3,
+       "total_seconds": 0.09000000000000008
+      },
+      "join_timeout_seconds": 4.0,
+      "method": "nvidia-smi-pid-uuid-v1",
+      "monotonic_end": 1.125,
+      "monotonic_start": 1.0,
+      "quiescent": true,
+      "reason": "telemetry-failed",
+      "samples": [],
+      "status": "unavailable",
+      "survivors": [],
+      "target_pid": 1234,
+      "version": null
+     },
+     "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+     "host_mapping": {
+      "host": "physical-01",
+      "reason": "physical scheduler host mapped",
+      "slot_id": "logical-slot",
+      "source": "scheduler-node-map",
+      "status": "matched"
+     },
+     "output_dir": "/runs/group-1/task-a/attempt-a",
+     "payload_digest": "786fc932ed522da06d98f10efc1104626f4bb6697c99386ca34a78ce5b17e692",
+     "refusal": null,
+     "schema": "tpen-executor/science-placement-receipt-v3",
+     "slot_id": "logical-slot",
+     "task_id": "task-a",
+     "verdict": {
+      "device": "unavailable",
+      "host": "matched",
+      "qualification": "unqualified",
+      "reason": "telemetry-failed: attempted GPU sampler failed (gap-budget-exceeded)",
+      "reason_class": "telemetry-failed",
+      "science_acceptance": "not-accepted",
+      "warning": "GPU PLACEMENT UNQUALIFIED: attempted GPU telemetry failed; science acceptance is blocked."
+     }
+    },
+    "schema": "tpen-executor/manifest-attempt-v1",
+    "start_receipt": {
+     "allocation_id": "allocation-a",
+     "attempt_id": "attempt-a",
+     "backend_job_id": "job-a",
+     "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+     "output_dir": "/runs/group-1/task-a/attempt-a",
+     "schema": "tpen-executor/start-receipt-v1",
+     "started_at_utc": "2026-11-10T00:00:00Z",
+     "task_id": "task-a"
+    },
+    "task_id": "task-a"
+   }
+  ],
+  "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+  "group_id": "s2b2",
+  "placement_verdict": {
+   "message": "GPU PLACEMENT UNQUALIFIED: attempted GPU telemetry failed or placement mismatch/refusal requires science review.",
+   "science_acceptance": "not-accepted",
+   "status": "unqualified",
+   "unqualified_gpu_segments": [
+    {
+     "attempt_id": "attempt-a",
+     "reason": "telemetry-failed: attempted GPU sampler failed (gap-budget-exceeded)",
+     "reason_class": "telemetry-failed",
+     "task_id": "task-a"
+    }
+   ]
+  },
+  "schema": "tpen-executor/run-manifest-v3",
+  "segments": []
+ },
+ "gaps-within-budget": {
   "attempts": [
    {
     "attempt_id": "attempt-a",
@@ -439,7 +621,23 @@
       ],
       "count": 2,
       "elapsed_seconds": 0.5,
+      "executable": "/usr/bin/nvidia-smi",
       "failure": null,
+      "gaps": {
+       "count": 1,
+       "events": [
+        {
+         "code": "command-timeout",
+         "consecutive": 1,
+         "monotonic_end": 1.24,
+         "monotonic_start": 1.13
+        }
+       ],
+       "max_consecutive": 1,
+       "max_consecutive_allowed": 1,
+       "max_total_allowed": 3,
+       "total_seconds": 0.1100000000000001
+      },
       "join_timeout_seconds": 4.0,
       "method": "nvidia-smi-pid-uuid-v1",
       "monotonic_end": 1.5,
@@ -536,6 +734,342 @@
   "schema": "tpen-executor/run-manifest-v2",
   "segments": []
  },
+ "matched": {
+  "attempts": [
+   {
+    "attempt_id": "attempt-a",
+    "outcome_receipt": {
+     "attempt_id": "attempt-a",
+     "finished_at_utc": "2026-11-10T00:00:01Z",
+     "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+     "output_dir": "/runs/group-1/task-a/attempt-a",
+     "result_digest": null,
+     "schema": "tpen-executor/outcome-receipt-v1",
+     "status": "completed",
+     "task_id": "task-a"
+    },
+    "output_dir": "/runs/group-1/task-a/attempt-a",
+    "placement_receipt": {
+     "allocation_id": "allocation-a",
+     "attempt_id": "attempt-a",
+     "backend_job_id": "job-a",
+     "child": {
+      "affinity": [
+       0
+      ],
+      "cuda_visible_devices": null,
+      "host": "physical-01",
+      "observed_at_utc": "2026-11-10T00:00:00Z",
+      "pid": 1234,
+      "proc_start_ticks": 55,
+      "thread_settings": {}
+     },
+     "comparison": {
+      "affinity": "matched",
+      "device": "matched",
+      "host": "matched"
+     },
+     "declared": {
+      "cpus": [
+       0
+      ],
+      "devices": [
+       "GPU-12345678-1234-1234-1234-123456789ABC"
+      ],
+      "host": "physical-01"
+     },
+     "gpu": {
+      "active_pci": [
+       "0000:00:01.0"
+      ],
+      "active_uuids": [
+       "GPU-12345678-1234-1234-1234-123456789ABC"
+      ],
+      "finished_at_utc": "2026-11-10T00:00:01Z",
+      "method": "nvidia-smi-pid-uuid-v1",
+      "reason": "matched",
+      "samples": [],
+      "started_at_utc": "2026-11-10T00:00:00Z",
+      "status": "qualified"
+     },
+     "gpu_sampler": {
+      "aggregate": {
+       "entitlement_unresolved_seen": false,
+       "exact_pid_gpus": [
+        {
+         "pci.bus_id": "0000:00:01.0",
+         "uuid": "GPU-12345678-1234-1234-1234-123456789ABC"
+        }
+       ],
+       "outside_use_seen": false,
+       "samples_taken": 2
+      },
+      "attempted": true,
+      "cadence_seconds": 0.125,
+      "command_pids": [
+       101,
+       102,
+       103
+      ],
+      "count": 2,
+      "elapsed_seconds": 0.5,
+      "executable": "/usr/bin/nvidia-smi",
+      "failure": null,
+      "gaps": {
+       "count": 0,
+       "events": [],
+       "max_consecutive": 0,
+       "max_consecutive_allowed": 1,
+       "max_total_allowed": 3,
+       "total_seconds": 0.0
+      },
+      "join_timeout_seconds": 4.0,
+      "method": "nvidia-smi-pid-uuid-v1",
+      "monotonic_end": 1.5,
+      "monotonic_start": 1.0,
+      "quiescent": true,
+      "reason": "observed",
+      "samples": [
+       {
+        "inventory": [
+         {
+          "pci.bus_id": "0000:00:01.0",
+          "uuid": "GPU-12345678-1234-1234-1234-123456789ABC"
+         },
+         {
+          "pci.bus_id": "0000:00:02.0",
+          "uuid": "GPU-12345678-1234-1234-1234-123456789ABD"
+         }
+        ],
+        "monotonic_end": 1.125,
+        "monotonic_start": 1.0,
+        "pid_rows": [
+         {
+          "gpu_uuid": "GPU-12345678-1234-1234-1234-123456789ABC",
+          "pid": 1234
+         }
+        ]
+       },
+       {
+        "inventory": [
+         {
+          "pci.bus_id": "0000:00:01.0",
+          "uuid": "GPU-12345678-1234-1234-1234-123456789ABC"
+         },
+         {
+          "pci.bus_id": "0000:00:02.0",
+          "uuid": "GPU-12345678-1234-1234-1234-123456789ABD"
+         }
+        ],
+        "monotonic_end": 1.375,
+        "monotonic_start": 1.25,
+        "pid_rows": [
+         {
+          "gpu_uuid": "GPU-12345678-1234-1234-1234-123456789ABC",
+          "pid": 1234
+         }
+        ]
+       }
+      ],
+      "status": "observed",
+      "survivors": [],
+      "target_pid": 1234,
+      "version": "NVIDIA-SMI fixture"
+     },
+     "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+     "host_mapping": {
+      "host": "physical-01",
+      "reason": "physical scheduler host mapped",
+      "slot_id": "logical-slot",
+      "source": "scheduler-node-map",
+      "status": "matched"
+     },
+     "output_dir": "/runs/group-1/task-a/attempt-a",
+     "payload_digest": "786fc932ed522da06d98f10efc1104626f4bb6697c99386ca34a78ce5b17e692",
+     "refusal": null,
+     "schema": "tpen-executor/science-placement-receipt-v3",
+     "slot_id": "logical-slot",
+     "task_id": "task-a",
+     "verdict": {
+      "device": "matched",
+      "host": "matched",
+      "qualification": "qualified",
+      "reason": "qualified: live science PID used only GPU UUIDs inside its physical slot entitlement",
+      "reason_class": "qualified",
+      "science_acceptance": "accepted",
+      "warning": "GPU PLACEMENT QUALIFIED: live PID UUID telemetry matched the declared physical slot."
+     }
+    },
+    "schema": "tpen-executor/manifest-attempt-v1",
+    "start_receipt": {
+     "allocation_id": "allocation-a",
+     "attempt_id": "attempt-a",
+     "backend_job_id": "job-a",
+     "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+     "output_dir": "/runs/group-1/task-a/attempt-a",
+     "schema": "tpen-executor/start-receipt-v1",
+     "started_at_utc": "2026-11-10T00:00:00Z",
+     "task_id": "task-a"
+    },
+    "task_id": "task-a"
+   }
+  ],
+  "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+  "group_id": "s2b2",
+  "schema": "tpen-executor/run-manifest-v2",
+  "segments": []
+ },
+ "mig-unsupported": {
+  "attempts": [
+   {
+    "attempt_id": "attempt-a",
+    "outcome_receipt": {
+     "attempt_id": "attempt-a",
+     "finished_at_utc": "2026-11-10T00:00:01Z",
+     "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+     "output_dir": "/runs/group-1/task-a/attempt-a",
+     "result_digest": null,
+     "schema": "tpen-executor/outcome-receipt-v1",
+     "status": "completed",
+     "task_id": "task-a"
+    },
+    "output_dir": "/runs/group-1/task-a/attempt-a",
+    "placement_receipt": {
+     "allocation_id": "allocation-a",
+     "attempt_id": "attempt-a",
+     "backend_job_id": "job-a",
+     "child": {
+      "affinity": [
+       0
+      ],
+      "cuda_visible_devices": null,
+      "host": "physical-01",
+      "observed_at_utc": "2026-11-10T00:00:00Z",
+      "pid": 1234,
+      "proc_start_ticks": 55,
+      "thread_settings": {}
+     },
+     "comparison": {
+      "affinity": "matched",
+      "device": "unavailable",
+      "host": "matched"
+     },
+     "declared": {
+      "cpus": [
+       0
+      ],
+      "devices": [
+       "GPU-12345678-1234-1234-1234-123456789ABC"
+      ],
+      "host": "physical-01"
+     },
+     "gpu": {
+      "active_pci": [],
+      "active_uuids": [],
+      "finished_at_utc": "2026-11-10T00:00:01Z",
+      "method": "nvidia-smi-pid-uuid-v1",
+      "reason": "sampler-failed",
+      "samples": [],
+      "started_at_utc": "2026-11-10T00:00:00Z",
+      "status": "unavailable"
+     },
+     "gpu_sampler": {
+      "aggregate": {
+       "entitlement_unresolved_seen": false,
+       "exact_pid_gpus": [],
+       "outside_use_seen": false,
+       "samples_taken": 0
+      },
+      "attempted": true,
+      "cadence_seconds": 0.125,
+      "command_pids": [
+       101,
+       102,
+       103
+      ],
+      "count": 0,
+      "elapsed_seconds": 0.125,
+      "executable": "/usr/bin/nvidia-smi",
+      "failure": {
+       "code": "mig-unsupported",
+       "detail": "inventory UUID names a MIG device (fixture)"
+      },
+      "gaps": {
+       "count": 0,
+       "events": [],
+       "max_consecutive": 0,
+       "max_consecutive_allowed": 1,
+       "max_total_allowed": 3,
+       "total_seconds": 0.0
+      },
+      "join_timeout_seconds": 4.0,
+      "method": "nvidia-smi-pid-uuid-v1",
+      "monotonic_end": 1.125,
+      "monotonic_start": 1.0,
+      "quiescent": true,
+      "reason": "telemetry-failed",
+      "samples": [],
+      "status": "unavailable",
+      "survivors": [],
+      "target_pid": 1234,
+      "version": null
+     },
+     "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+     "host_mapping": {
+      "host": "physical-01",
+      "reason": "physical scheduler host mapped",
+      "slot_id": "logical-slot",
+      "source": "scheduler-node-map",
+      "status": "matched"
+     },
+     "output_dir": "/runs/group-1/task-a/attempt-a",
+     "payload_digest": "786fc932ed522da06d98f10efc1104626f4bb6697c99386ca34a78ce5b17e692",
+     "refusal": null,
+     "schema": "tpen-executor/science-placement-receipt-v3",
+     "slot_id": "logical-slot",
+     "task_id": "task-a",
+     "verdict": {
+      "device": "unavailable",
+      "host": "matched",
+      "qualification": "unqualified",
+      "reason": "telemetry-failed: attempted GPU sampler failed (mig-unsupported)",
+      "reason_class": "telemetry-failed",
+      "science_acceptance": "not-accepted",
+      "warning": "GPU PLACEMENT UNQUALIFIED: attempted GPU telemetry failed; science acceptance is blocked."
+     }
+    },
+    "schema": "tpen-executor/manifest-attempt-v1",
+    "start_receipt": {
+     "allocation_id": "allocation-a",
+     "attempt_id": "attempt-a",
+     "backend_job_id": "job-a",
+     "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+     "output_dir": "/runs/group-1/task-a/attempt-a",
+     "schema": "tpen-executor/start-receipt-v1",
+     "started_at_utc": "2026-11-10T00:00:00Z",
+     "task_id": "task-a"
+    },
+    "task_id": "task-a"
+   }
+  ],
+  "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+  "group_id": "s2b2",
+  "placement_verdict": {
+   "message": "GPU PLACEMENT UNQUALIFIED: attempted GPU telemetry failed or placement mismatch/refusal requires science review.",
+   "science_acceptance": "not-accepted",
+   "status": "unqualified",
+   "unqualified_gpu_segments": [
+    {
+     "attempt_id": "attempt-a",
+     "reason": "telemetry-failed: attempted GPU sampler failed (mig-unsupported)",
+     "reason_class": "telemetry-failed",
+     "task_id": "task-a"
+    }
+   ]
+  },
+  "schema": "tpen-executor/run-manifest-v3",
+  "segments": []
+ },
  "no-exact-pid-row": {
   "attempts": [
    {
@@ -606,7 +1140,16 @@
       ],
       "count": 1,
       "elapsed_seconds": 0.25,
+      "executable": "/usr/bin/nvidia-smi",
       "failure": null,
+      "gaps": {
+       "count": 0,
+       "events": [],
+       "max_consecutive": 0,
+       "max_consecutive_allowed": 1,
+       "max_total_allowed": 3,
+       "total_seconds": 0.0
+      },
       "join_timeout_seconds": 4.0,
       "method": "nvidia-smi-pid-uuid-v1",
       "monotonic_end": 1.25,
@@ -760,7 +1303,16 @@
       "command_pids": [],
       "count": 0,
       "elapsed_seconds": 0.0,
+      "executable": null,
       "failure": null,
+      "gaps": {
+       "count": 0,
+       "events": [],
+       "max_consecutive": 0,
+       "max_consecutive_allowed": 0,
+       "max_total_allowed": 0,
+       "total_seconds": 0.0
+      },
       "join_timeout_seconds": 30.0,
       "method": "nvidia-smi-pid-uuid-v1",
       "monotonic_end": null,
@@ -901,7 +1453,16 @@
       ],
       "count": 2,
       "elapsed_seconds": 0.5,
+      "executable": "/usr/bin/nvidia-smi",
       "failure": null,
+      "gaps": {
+       "count": 0,
+       "events": [],
+       "max_consecutive": 0,
+       "max_consecutive_allowed": 1,
+       "max_total_allowed": 3,
+       "total_seconds": 0.0
+      },
       "join_timeout_seconds": 4.0,
       "method": "nvidia-smi-pid-uuid-v1",
       "monotonic_end": 1.5,
@@ -1081,9 +1642,18 @@
       ],
       "count": 0,
       "elapsed_seconds": 0.125,
+      "executable": "/usr/bin/nvidia-smi",
       "failure": {
        "code": "launch-failed",
        "detail": "fixture failure"
+      },
+      "gaps": {
+       "count": 0,
+       "events": [],
+       "max_consecutive": 0,
+       "max_consecutive_allowed": 1,
+       "max_total_allowed": 3,
+       "total_seconds": 0.0
       },
       "join_timeout_seconds": 4.0,
       "method": "nvidia-smi-pid-uuid-v1",

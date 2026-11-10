@@ -366,10 +366,16 @@ def test_l1b_real_producer_outcomes_cross_p8_reader(tmp_path: Path) -> None:
         if mode == "cpu-not-sampled":
             assert sampler["attempted"] is False and sampler["count"] == 0, mode
         elif mode == "gpu-telemetry-failed":
-            assert sampler["attempted"] is True and sampler["failure"]["code"] == "command-failed", mode
+            # Every command fails: the second consecutive gap exceeds the
+            # recorded budget (manager ruling Q1).
+            assert sampler["attempted"] is True and sampler["failure"]["code"] == "gap-budget-exceeded", mode
+            assert sampler["gaps"]["count"] == 2 and sampler["gaps"]["max_consecutive"] == 2, mode
         else:
             assert sampler["reason"] == "observed" and sampler["quiescent"] is True, mode
-            assert sampler["survivors"] == [] and sampler["count"] >= 1, mode
+            # Decoded P8 records are frozen: JSON arrays read back as tuples.
+            assert sampler["survivors"] == () and sampler["count"] >= 1, mode
+            # The worker resolved the fake through the prepared PATH.
+            assert sampler["executable"].endswith("/bin/nvidia-smi") and sampler["version"], mode
             # The worker sampled the exact science child for its lifetime.
             assert sampler["target_pid"] == receipt["child"]["pid"], mode
             assert sampler["aggregate"]["samples_taken"] >= sampler["count"], mode

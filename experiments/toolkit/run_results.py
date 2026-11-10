@@ -50,16 +50,22 @@ GPU_SAMPLER_METHOD = "nvidia-smi-pid-uuid-v1"
 GPU_SAMPLER_KEYS = frozenset({
     "status", "reason", "method", "version", "attempted", "failure", "cadence_seconds", "count",
     "monotonic_start", "monotonic_end", "samples", "command_pids", "survivors", "elapsed_seconds",
-    "join_timeout_seconds", "quiescent", "target_pid", "aggregate",
+    "join_timeout_seconds", "quiescent", "target_pid", "aggregate", "executable", "gaps",
 })
 GPU_SAMPLER_AGGREGATE_KEYS = frozenset({"samples_taken", "exact_pid_gpus", "outside_use_seen", "entitlement_unresolved_seen"})
 GPU_SAMPLER_MAX_SAMPLES = 16
 GPU_SAMPLER_CADENCE_BOUNDS = (0.01, 60.0)
 GPU_SAMPLER_MAX_JOIN_TIMEOUT = 60.0
+# Gap budget block (mirrors the executor's gpu_telemetry): only transient
+# command/read failures may be forgiven, and either budget is capped on the wire.
+GPU_SAMPLER_GAP_KEYS = frozenset({"max_consecutive_allowed", "max_total_allowed", "count", "max_consecutive", "total_seconds", "events"})
+GPU_SAMPLER_GAP_EVENT_KEYS = frozenset({"code", "monotonic_start", "monotonic_end", "consecutive"})
+GPU_SAMPLER_GAP_CODES = frozenset({"command-failed", "command-timeout", "read-failed"})
+GPU_SAMPLER_GAP_BUDGET_CAP = 16
 GPU_SAMPLER_FAILURE_CODES = frozenset({
     "launch-failed", "command-failed", "command-timeout", "read-failed", "malformed-output",
     "cleanup-unconfirmed", "no-sample", "sampler-cancelled", "sampler-join-expired",
-    "sampler-unfinalized", "sampler-error", "sampler-evidence-invalid",
+    "sampler-unfinalized", "sampler-error", "sampler-evidence-invalid", "mig-unsupported", "gap-budget-exceeded",
 })
 GPU_DEVICE_DECISIONS = {
     "matched": ("matched", "live science PID used only GPU UUIDs inside its physical slot entitlement"),
@@ -77,6 +83,8 @@ _GPU_NOT_SAMPLED = {
     "command_pids": [], "survivors": [], "elapsed_seconds": 0.0,
     "join_timeout_seconds": 30.0, "quiescent": True, "target_pid": None,
     "aggregate": {"samples_taken": 0, "exact_pid_gpus": [], "outside_use_seen": False, "entitlement_unresolved_seen": False},
+    "executable": None,
+    "gaps": {"max_consecutive_allowed": 0, "max_total_allowed": 0, "count": 0, "max_consecutive": 0, "total_seconds": 0.0, "events": []},
 }
 
 
@@ -435,14 +443,61 @@ def _placement_v3_aggregate(record: Mapping[str, Any], retained: list[tuple[str,
         raise _sampler_refusal("aggregate differs from its complete retained samples")
 
 
+def _placement_v3_gaps(record: Mapping[str, Any], start: float | None, end: float | None) -> None:
+    """Mirror the executor's gap-budget check (manager ruling Q1).
+
+    Every recorded gap must be a forgivable transient failure, ordered inside
+    the outer interval, with consistent run numbering and counters; sampling
+    must stop at the first budget excess, and ``gap-budget-exceeded`` must be
+    the failure exactly when a budget was exceeded.
+    """
+
+    gaps = _fields(record["gaps"], set(GPU_SAMPLER_GAP_KEYS), "placement gpu sampler gaps")
+    counters = ("max_consecutive_allowed", "max_total_allowed", "count", "max_consecutive")
+    if any(type(gaps[key]) is not int or gaps[key] < 0 for key in counters):
+        raise _sampler_refusal("gap counters must be non-negative integers")
+    allowed_consecutive, allowed_total = gaps["max_consecutive_allowed"], gaps["max_total_allowed"]
+    if allowed_consecutive > GPU_SAMPLER_GAP_BUDGET_CAP or allowed_total > GPU_SAMPLER_GAP_BUDGET_CAP:
+        raise _sampler_refusal("gap budget exceeds its wire cap")
+    events = _sampler_list(gaps["events"], "gap events")
+    if gaps["count"] != len(events):
+        raise _sampler_refusal("gap count disagrees with its events")
+    previous_end, run, longest, summed = start, 0, 0, 0.0
+    for event in events:
+        event = _fields(event, set(GPU_SAMPLER_GAP_EVENT_KEYS), "placement gpu sampler gap event")
+        if event["code"] not in GPU_SAMPLER_GAP_CODES:
+            raise _sampler_refusal("gap event is not a forgivable transient failure")
+        event_start = _sampler_number(event["monotonic_start"], "gap start")
+        event_end = _sampler_number(event["monotonic_end"], "gap end")
+        consecutive = _sampler_positive_int(event["consecutive"], "gap consecutive run")
+        if start is None or event_end < event_start or event_start < previous_end or event_end > end:
+            raise _sampler_refusal("gap interval is not ordered inside the outer interval")
+        if consecutive not in (1, run + 1):
+            raise _sampler_refusal("gap consecutive run numbering is inconsistent")
+        previous_end, run = event_end, consecutive
+        longest = max(longest, consecutive)
+        summed += event_end - event_start
+    if gaps["max_consecutive"] != longest:
+        raise _sampler_refusal("gap max_consecutive disagrees with its events")
+    if abs(_sampler_number(gaps["total_seconds"], "gap total_seconds") - summed) > 1e-6:
+        raise _sampler_refusal("gap total_seconds disagrees with its events")
+    if len(events) > allowed_total + 1 or longest > allowed_consecutive + 1:
+        raise _sampler_refusal("gaps continue past the first budget excess")
+    exceeded = len(events) > allowed_total or longest > allowed_consecutive
+    failure = record["failure"]
+    if exceeded != (failure is not None and failure["code"] == "gap-budget-exceeded"):
+        raise _sampler_refusal("gap budget excess and gap-budget-exceeded failure disagree")
+
+
 def _placement_v3_sampler(value: Any) -> dict[str, Any]:
     """Mirror the executor's closed ``gpu_sampler`` validator.
 
     Rejects unknown keys, inconsistent status/reason/attempted labels,
-    untyped failures, observation without confirmed quiescence, survivors
-    under a quiescent label, unordered or uncontained sample intervals, PID
-    rows absent from their own sample's inventory, and a lifetime aggregate
-    that disagrees with the retained samples.
+    untyped failures, observation without confirmed quiescence or a
+    resolved executable, survivors under a quiescent label, unordered or
+    uncontained sample intervals, PID rows absent from their own sample's
+    inventory, a lifetime aggregate that disagrees with the retained samples,
+    and a gap block that disagrees with its budget or failure code.
     """
 
     record = dict(_fields(value, set(GPU_SAMPLER_KEYS), "placement gpu sampler"))
@@ -471,6 +526,9 @@ def _placement_v3_sampler(value: Any) -> dict[str, Any]:
     version = record["version"]
     if version is not None:
         _text(version, "placement.gpu_sampler.version")
+    executable = record["executable"]
+    if executable is not None:
+        _text(executable, "placement.gpu_sampler.executable")
     cadence = _sampler_number(record["cadence_seconds"], "cadence_seconds")
     if cadence != 0.0 and not GPU_SAMPLER_CADENCE_BOUNDS[0] <= cadence <= GPU_SAMPLER_CADENCE_BOUNDS[1]:
         raise _sampler_refusal("cadence is outside its bound")
@@ -501,9 +559,10 @@ def _placement_v3_sampler(value: Any) -> dict[str, Any]:
         if end < start or abs(elapsed - (end - start)) > 1e-6:
             raise _sampler_refusal("outer interval disagrees with elapsed time")
     if status == "observed" and (
-        not record["quiescent"] or version is None or start is None or count < 1 or not command_pids
+        not record["quiescent"] or version is None or executable is None or start is None
+        or count < 1 or not command_pids
     ):
-        raise _sampler_refusal("observed record requires quiescent, complete, versioned samples")
+        raise _sampler_refusal("observed record requires quiescent, complete, versioned samples from a resolved executable")
     previous_end = start
     pci_by_uuid: dict[str, str] = {}
     retained: list[tuple[str, str]] = []
@@ -533,6 +592,7 @@ def _placement_v3_sampler(value: Any) -> dict[str, Any]:
             if pid == target and uuid not in {seen for seen, _ in retained}:
                 retained.append((uuid, pci_by_uuid[uuid]))
     _placement_v3_aggregate(record, retained, pci_by_uuid)
+    _placement_v3_gaps(record, start, end)
     return record
 
 

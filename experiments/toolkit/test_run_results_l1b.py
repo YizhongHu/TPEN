@@ -8,8 +8,10 @@ Fixtures (root suite, no executor import):
 ``run-manifests-v3-sampler.json``
     Serialized output of the L1b producer (``SciencePlacementReceiptV3.from_l1a``
     over the L1a shadow, then ``RunManifest``) for every v3 outcome, including
-    outside use seen only in a dropped sample (``evicted-out-of-entitlement``);
-    wall-clock fields pinned.  ``executor/tests/test_s2b2_l1b_gpu_sampler.py``
+    outside use seen only in a dropped sample (``evicted-out-of-entitlement``),
+    one forgiven transient gap (``gaps-within-budget``), an exceeded gap
+    budget (``gap-budget-exceeded``), and the distinct MIG failure
+    (``mig-unsupported``); wall-clock fields pinned.  ``executor/tests/test_s2b2_l1b_gpu_sampler.py``
     re-decodes this file with the executor decoder byte-for-byte, and the live
     producer-to-reader gate lives in ``test_review_p8_toolkit_r3.py``.
 """
@@ -44,6 +46,9 @@ V3_EXPECTED = {
     "no-exact-pid-row": ("telemetry-failed", "no-exact-pid-row", PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE),
     "entitlement-unresolved": ("telemetry-failed", "entitlement-unresolved", PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE),
     "not-sampled": ("not-sampled", "cpu-only", None),
+    "gaps-within-budget": ("qualified", "matched", None),
+    "gap-budget-exceeded": ("telemetry-failed", "sampler-failed", PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE),
+    "mig-unsupported": ("telemetry-failed", "sampler-failed", PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE),
 }
 
 
@@ -116,6 +121,17 @@ def _blank_active_pci(receipt: dict) -> None:
     receipt["gpu"]["active_pci"] = [" "]
 
 
+def _add_gaps(receipt: dict, *events: tuple[str, float, float, int]) -> None:
+    """Append gap events ``(code, start, end, consecutive)`` with consistent counters."""
+
+    gaps = receipt["gpu_sampler"]["gaps"]
+    for code, start, end, run in events:
+        gaps["events"].append({"code": code, "monotonic_start": start, "monotonic_end": end, "consecutive": run})
+    gaps["count"] = len(gaps["events"])
+    gaps["max_consecutive"] = max(event["consecutive"] for event in gaps["events"])
+    gaps["total_seconds"] = sum(event["monotonic_end"] - event["monotonic_start"] for event in gaps["events"])
+
+
 def _hide_dropped_outside(receipt: dict) -> None:
     aggregate = receipt["gpu_sampler"]["aggregate"]
     aggregate["samples_taken"] = receipt["gpu_sampler"]["count"] + 1
@@ -153,6 +169,15 @@ P8_CONTRADICTIONS = {
     "aggregate-omits-retained-gpu": lambda r: r["gpu_sampler"]["aggregate"].__setitem__("exact_pid_gpus", []),
     "aggregate-below-count": lambda r: r["gpu_sampler"]["aggregate"].__setitem__("samples_taken", 1),
     "aggregate-unresolved-tamper": lambda r: r["gpu_sampler"]["aggregate"].__setitem__("entitlement_unresolved_seen", True),
+    # r4: resolved executable and the recorded gap budget (manager ruling Q1).
+    "null-executable": lambda r: r["gpu_sampler"].__setitem__("executable", None),
+    "gap-count-disagrees": lambda r: r["gpu_sampler"]["gaps"].__setitem__("count", 1),
+    "gap-unforgivable-code": lambda r: _add_gaps(r, ("malformed-output", 1.13, 1.2, 1)),
+    "gap-outside-outer": lambda r: _add_gaps(r, ("command-failed", 2.0, 2.1, 1)),
+    "gap-budget-exceeded-but-observed": lambda r: _add_gaps(r, ("command-failed", 1.13, 1.15, 1), ("command-failed", 1.16, 1.2, 2)),
+    "gap-total-disagrees": lambda r: (_add_gaps(r, ("command-timeout", 1.13, 1.2, 1)), r["gpu_sampler"]["gaps"].__setitem__("total_seconds", 5.0)),
+    "gap-run-numbering": lambda r: _add_gaps(r, ("command-failed", 1.13, 1.2, 2)),
+    "gap-budget-above-cap": lambda r: r["gpu_sampler"]["gaps"].__setitem__("max_total_allowed", 17),
 }
 # Contradictions applied to other baselines: (baseline fixture, mutation).
 P8_OTHER_CONTRADICTIONS = {
@@ -160,6 +185,14 @@ P8_OTHER_CONTRADICTIONS = {
     "evicted-outside-flag-cleared": (
         "evicted-out-of-entitlement", lambda r: r["gpu_sampler"]["aggregate"].__setitem__("outside_use_seen", False),
     ),
+    # An exceeded budget must be labelled gap-budget-exceeded, and only then.
+    "gap-excess-relabelled": ("gap-budget-exceeded", lambda r: r["gpu_sampler"]["failure"].__setitem__("code", "command-failed")),
+    "gap-excess-claimed-without-gaps": ("sampler-failed", lambda r: r["gpu_sampler"]["failure"].__setitem__("code", "gap-budget-exceeded")),
+    "gap-event-dropped": ("gaps-within-budget", lambda r: r["gpu_sampler"]["gaps"].__setitem__("events", [])),
+    "gap-forgiven-past-budget": (
+        "gaps-within-budget", lambda r: r["gpu_sampler"]["gaps"].update(max_consecutive_allowed=0, max_total_allowed=0),
+    ),
+    "mig-failure-detail-whitespace": ("mig-unsupported", lambda r: r["gpu_sampler"]["failure"].__setitem__("detail", " ")),
 }
 
 
@@ -184,6 +217,19 @@ def test_p8_rejects_contradictions_on_other_baselines(tmp_path: Path, name: str)
     mutate(manifest["attempts"][0]["placement_receipt"])
     with pytest.raises(ManifestRefusal):
         _read(tmp_path, name, manifest)
+
+
+def test_p8_types_mig_and_gap_budget_failures_distinctly(tmp_path: Path) -> None:
+    """Q1/Q5: MIG and an exceeded gap budget are distinct typed failures, not malformed output."""
+
+    manifests = _v3_manifests()
+    for name in ("mig-unsupported", "gap-budget-exceeded"):
+        receipt = _read(tmp_path, name, manifests[name]).preserved_attempts[0].placement_receipt
+        assert receipt["gpu_sampler"]["failure"]["code"] == name, name
+        assert receipt["verdict"]["reason"] == f"telemetry-failed: attempted GPU sampler failed ({name})", name
+    gaps = _read(tmp_path, "gaps", manifests["gaps-within-budget"]).preserved_attempts[0].placement_receipt["gpu_sampler"]["gaps"]
+    # The budget in force is recorded with every gap.
+    assert (gaps["max_consecutive_allowed"], gaps["max_total_allowed"], gaps["count"], gaps["max_consecutive"]) == (1, 3, 1, 1)
 
 
 def test_p8_requires_the_telemetry_message_for_telemetry_failures(tmp_path: Path) -> None:
