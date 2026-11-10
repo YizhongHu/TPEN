@@ -6,11 +6,12 @@ Fixtures (root suite, no executor import):
     Bytes produced by the untouched L1a producer at ``f384f44d`` (the L2
     base): the backward-read control for ``science-placement-receipt-v2``.
 ``run-manifests-v3-sampler.json``
-    Real serialized output of the L1b producer (``_placement_receipt_v3`` and
-    ``RunManifest.encode``) for every v3 outcome; wall-clock fields pinned.
-    ``executor/tests/test_s2b2_l1b_gpu_sampler.py`` re-decodes this file with
-    the executor decoder, and the live producer-to-reader gate lives in
-    ``test_review_p8_toolkit_r3.py``.
+    Serialized output of the L1b producer (``SciencePlacementReceiptV3.from_l1a``
+    over the L1a shadow, then ``RunManifest``) for every v3 outcome, including
+    outside use seen only in a dropped sample (``evicted-out-of-entitlement``);
+    wall-clock fields pinned.  ``executor/tests/test_s2b2_l1b_gpu_sampler.py``
+    re-decodes this file with the executor decoder byte-for-byte, and the live
+    producer-to-reader gate lives in ``test_review_p8_toolkit_r3.py``.
 """
 
 from __future__ import annotations
@@ -32,11 +33,13 @@ from experiments.toolkit.run_results import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+GPU_A = "GPU-12345678-1234-1234-1234-123456789ABC"
 GPU_B = "GPU-12345678-1234-1234-1234-123456789ABD"
 GPU_C = "GPU-12345678-1234-1234-1234-123456789ABE"
 V3_EXPECTED = {
     "matched": ("qualified", "matched", None),
     "out-of-entitlement": ("mismatch", "out-of-entitlement", PLACEMENT_UNQUALIFIED_MESSAGE),
+    "evicted-out-of-entitlement": ("mismatch", "out-of-entitlement", PLACEMENT_UNQUALIFIED_MESSAGE),
     "sampler-failed": ("telemetry-failed", "sampler-failed", PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE),
     "no-exact-pid-row": ("telemetry-failed", "no-exact-pid-row", PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE),
     "entitlement-unresolved": ("telemetry-failed", "entitlement-unresolved", PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE),
@@ -102,6 +105,23 @@ def _rows(receipt: dict, key: str, value: object) -> None:
             row[key] = value
 
 
+def _blank_active_pci(receipt: dict) -> None:
+    """D3: the active UUID's PCI is whitespace everywhere it appears."""
+
+    for sample in receipt["gpu_sampler"]["samples"]:
+        for item in sample["inventory"]:
+            if item["uuid"] == GPU_A:
+                item["pci.bus_id"] = " "
+    receipt["gpu_sampler"]["aggregate"]["exact_pid_gpus"][0]["pci.bus_id"] = " "
+    receipt["gpu"]["active_pci"] = [" "]
+
+
+def _hide_dropped_outside(receipt: dict) -> None:
+    aggregate = receipt["gpu_sampler"]["aggregate"]
+    aggregate["samples_taken"] = receipt["gpu_sampler"]["count"] + 1
+    aggregate["exact_pid_gpus"] = aggregate["exact_pid_gpus"] + [{"uuid": GPU_B, "pci.bus_id": "0000:00:02.0"}]
+
+
 # Every executor sampler invariant, mirrored independently by P8.
 P8_CONTRADICTIONS = {
     "quiescent-false": lambda r: r["gpu_sampler"].__setitem__("quiescent", False),
@@ -126,6 +146,20 @@ P8_CONTRADICTIONS = {
     "warning-tamper": lambda r: r["verdict"].__setitem__("warning", "quiet"),
     "acceptance-tamper": lambda r: r["verdict"].__setitem__("science_acceptance", "not-accepted"),
     "device-comparison-tamper": lambda r: r["comparison"].__setitem__("device", "unavailable"),
+    "inventory-pci-whitespace": _blank_active_pci,
+    "target-pid-tamper": lambda r: r["gpu_sampler"].__setitem__("target_pid", 4321),
+    "aggregate-outside-flag-tamper": lambda r: r["gpu_sampler"]["aggregate"].__setitem__("outside_use_seen", True),
+    "aggregate-hides-dropped-outside": _hide_dropped_outside,
+    "aggregate-omits-retained-gpu": lambda r: r["gpu_sampler"]["aggregate"].__setitem__("exact_pid_gpus", []),
+    "aggregate-below-count": lambda r: r["gpu_sampler"]["aggregate"].__setitem__("samples_taken", 1),
+    "aggregate-unresolved-tamper": lambda r: r["gpu_sampler"]["aggregate"].__setitem__("entitlement_unresolved_seen", True),
+}
+# Contradictions applied to other baselines: (baseline fixture, mutation).
+P8_OTHER_CONTRADICTIONS = {
+    "failure-detail-whitespace": ("sampler-failed", lambda r: r["gpu_sampler"]["failure"].__setitem__("detail", " ")),
+    "evicted-outside-flag-cleared": (
+        "evicted-out-of-entitlement", lambda r: r["gpu_sampler"]["aggregate"].__setitem__("outside_use_seen", False),
+    ),
 }
 
 
@@ -136,6 +170,18 @@ def test_p8_rejects_contradictory_v3_sampler_evidence(tmp_path: Path, name: str)
     manifest = copy.deepcopy(_v3_manifests()["matched"])
     _read(tmp_path, "baseline", copy.deepcopy(manifest))
     P8_CONTRADICTIONS[name](manifest["attempts"][0]["placement_receipt"])
+    with pytest.raises(ManifestRefusal):
+        _read(tmp_path, name, manifest)
+
+
+@pytest.mark.parametrize("name", sorted(P8_OTHER_CONTRADICTIONS))
+def test_p8_rejects_contradictions_on_other_baselines(tmp_path: Path, name: str) -> None:
+    """D3 and the lifetime aggregate: contradictions on non-matched baselines are refused."""
+
+    baseline, mutate = P8_OTHER_CONTRADICTIONS[name]
+    manifest = copy.deepcopy(_v3_manifests()[baseline])
+    _read(tmp_path, "baseline", copy.deepcopy(manifest))
+    mutate(manifest["attempts"][0]["placement_receipt"])
     with pytest.raises(ManifestRefusal):
         _read(tmp_path, name, manifest)
 

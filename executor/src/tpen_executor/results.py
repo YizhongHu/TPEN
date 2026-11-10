@@ -690,9 +690,11 @@ class SciencePlacementReceiptV3:
     * ``gpu_sampler`` must pass :func:`~tpen_executor.gpu_telemetry.validate_sampler_wire`
       (quiescence for observation, ordered contained sample intervals,
       same-sample inventory membership);
-    * the device decision is the union of exact-child-PID rows over all
-      samples with out-of-entitlement dominance, and every declared UUID must
-      resolve in every sampled inventory before ``matched``;
+    * the device decision is taken from the sampler's lifetime aggregate
+      (the union of exact-child-PID GPUs over every sample, retained or not,
+      plus sticky outside-use and unresolved-entitlement flags) with
+      out-of-entitlement dominance; the aggregate must agree with the
+      retained samples and name the receipt's child PID;
     * the verdict, ``gpu`` block, and device comparison must equal the
       derivation exactly, so contradictory labels are rejected.
 
@@ -703,7 +705,8 @@ class SciencePlacementReceiptV3:
     host_mapping : mapping
         Closed L1a physical host map.
     gpu_sampler : mapping
-        Closed sampler record, retained verbatim including all samples.
+        Closed worker sampler record, kept verbatim with its (at most 16)
+        retained samples and its lifetime aggregate.
     verdict : mapping
         Closed derived verdict.
     """

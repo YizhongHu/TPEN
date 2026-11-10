@@ -50,8 +50,12 @@ GPU_SAMPLER_METHOD = "nvidia-smi-pid-uuid-v1"
 GPU_SAMPLER_KEYS = frozenset({
     "status", "reason", "method", "version", "attempted", "failure", "cadence_seconds", "count",
     "monotonic_start", "monotonic_end", "samples", "command_pids", "survivors", "elapsed_seconds",
-    "join_timeout_seconds", "quiescent",
+    "join_timeout_seconds", "quiescent", "target_pid", "aggregate",
 })
+GPU_SAMPLER_AGGREGATE_KEYS = frozenset({"samples_taken", "exact_pid_gpus", "outside_use_seen", "entitlement_unresolved_seen"})
+GPU_SAMPLER_MAX_SAMPLES = 16
+GPU_SAMPLER_CADENCE_BOUNDS = (0.01, 60.0)
+GPU_SAMPLER_MAX_JOIN_TIMEOUT = 60.0
 GPU_SAMPLER_FAILURE_CODES = frozenset({
     "launch-failed", "command-failed", "command-timeout", "read-failed", "malformed-output",
     "cleanup-unconfirmed", "no-sample", "sampler-cancelled", "sampler-join-expired",
@@ -71,7 +75,8 @@ _GPU_NOT_SAMPLED = {
     "version": None, "attempted": False, "failure": None, "cadence_seconds": 0.0,
     "count": 0, "monotonic_start": None, "monotonic_end": None, "samples": [],
     "command_pids": [], "survivors": [], "elapsed_seconds": 0.0,
-    "join_timeout_seconds": 4.0, "quiescent": True,
+    "join_timeout_seconds": 30.0, "quiescent": True, "target_pid": None,
+    "aggregate": {"samples_taken": 0, "exact_pid_gpus": [], "outside_use_seen": False, "entitlement_unresolved_seen": False},
 }
 
 
@@ -405,13 +410,39 @@ def _sampler_list(value: Any, name: str) -> list[Any]:
     return value
 
 
+def _placement_v3_aggregate(record: Mapping[str, Any], retained: list[tuple[str, str]], pci_by_uuid: Mapping[str, str]) -> None:
+    """Mirror the executor's lifetime-aggregate check against retained samples."""
+
+    aggregate = _fields(record["aggregate"], set(GPU_SAMPLER_AGGREGATE_KEYS), "placement gpu sampler aggregate")
+    taken = aggregate["samples_taken"]
+    if type(taken) is not int or taken < record["count"] or (taken == 0) != (record["count"] == 0):
+        raise _sampler_refusal("aggregate sample total disagrees with its retained samples")
+    if type(aggregate["outside_use_seen"]) is not bool or type(aggregate["entitlement_unresolved_seen"]) is not bool:
+        raise _sampler_refusal("aggregate flags must be booleans")
+    if taken and record["target_pid"] is None:
+        raise _sampler_refusal("samples require a target PID")
+    union: list[tuple[str, str]] = []
+    for item in _sampler_list(aggregate["exact_pid_gpus"], "aggregate exact_pid_gpus"):
+        item = _fields(item, {"uuid", "pci.bus_id"}, "placement gpu sampler aggregate GPU")
+        uuid = _gpu_uuid(item["uuid"], "placement gpu sampler aggregate uuid")
+        pci = _text(item["pci.bus_id"], "placement gpu sampler aggregate pci.bus_id")
+        if uuid in {seen for seen, _ in union} or pci_by_uuid.get(uuid, pci) != pci:
+            raise _sampler_refusal("aggregate GPU row is inconsistent")
+        union.append((uuid, pci))
+    if not set(retained) <= set(union):
+        raise _sampler_refusal("aggregate omits a retained exact-target GPU")
+    if taken == record["count"] and union != retained:
+        raise _sampler_refusal("aggregate differs from its complete retained samples")
+
+
 def _placement_v3_sampler(value: Any) -> dict[str, Any]:
     """Mirror the executor's closed ``gpu_sampler`` validator.
 
     Rejects unknown keys, inconsistent status/reason/attempted labels,
     untyped failures, observation without confirmed quiescence, survivors
-    under a quiescent label, unordered or uncontained sample intervals, and
-    PID rows absent from their own sample's inventory.
+    under a quiescent label, unordered or uncontained sample intervals, PID
+    rows absent from their own sample's inventory, and a lifetime aggregate
+    that disagrees with the retained samples.
     """
 
     record = dict(_fields(value, set(GPU_SAMPLER_KEYS), "placement gpu sampler"))
@@ -441,14 +472,14 @@ def _placement_v3_sampler(value: Any) -> dict[str, Any]:
     if version is not None:
         _text(version, "placement.gpu_sampler.version")
     cadence = _sampler_number(record["cadence_seconds"], "cadence_seconds")
-    if cadence != 0.0 and not 0.01 <= cadence <= 1.0:
+    if cadence != 0.0 and not GPU_SAMPLER_CADENCE_BOUNDS[0] <= cadence <= GPU_SAMPLER_CADENCE_BOUNDS[1]:
         raise _sampler_refusal("cadence is outside its bound")
-    if not 0.0 < _sampler_number(record["join_timeout_seconds"], "join_timeout_seconds") <= 4.0:
+    if not 0.0 < _sampler_number(record["join_timeout_seconds"], "join_timeout_seconds") <= GPU_SAMPLER_MAX_JOIN_TIMEOUT:
         raise _sampler_refusal("join timeout is outside its bound")
     elapsed = _sampler_number(record["elapsed_seconds"], "elapsed_seconds")
     samples = _sampler_list(record["samples"], "samples")
     count = record["count"]
-    if type(count) is not int or not 0 <= count <= 16 or count != len(samples):
+    if type(count) is not int or not 0 <= count <= GPU_SAMPLER_MAX_SAMPLES or count != len(samples):
         raise _sampler_refusal("count disagrees with its samples")
     command_pids = [_sampler_positive_int(pid, "command PID") for pid in _sampler_list(record["command_pids"], "command_pids")]
     survivors = [_sampler_positive_int(pid, "survivor") for pid in _sampler_list(record["survivors"], "survivors")]
@@ -458,6 +489,9 @@ def _placement_v3_sampler(value: Any) -> dict[str, Any]:
         raise _sampler_refusal("survivor was never launched")
     if record["quiescent"] and survivors:
         raise _sampler_refusal("quiescent record cannot report survivors")
+    target = record["target_pid"]
+    if target is not None:
+        _sampler_positive_int(target, "target PID")
     start, end = record["monotonic_start"], record["monotonic_end"]
     if start is None:
         if end is not None or count or elapsed != 0.0:
@@ -472,6 +506,7 @@ def _placement_v3_sampler(value: Any) -> dict[str, Any]:
         raise _sampler_refusal("observed record requires quiescent, complete, versioned samples")
     previous_end = start
     pci_by_uuid: dict[str, str] = {}
+    retained: list[tuple[str, str]] = []
     for sample in samples:
         sample = _fields(sample, {"monotonic_start", "monotonic_end", "inventory", "pid_rows"}, "placement gpu sample")
         sample_start = _sampler_number(sample["monotonic_start"], "sample start")
@@ -491,14 +526,18 @@ def _placement_v3_sampler(value: Any) -> dict[str, Any]:
             raise _sampler_refusal("sample inventory is empty")
         for item in _sampler_list(sample["pid_rows"], "pid_rows"):
             item = _fields(item, {"pid", "gpu_uuid"}, "placement gpu sample PID row")
-            _sampler_positive_int(item["pid"], "row PID")
-            if _gpu_uuid(item["gpu_uuid"], "placement gpu sample PID uuid") not in inventory:
+            pid = _sampler_positive_int(item["pid"], "row PID")
+            uuid = _gpu_uuid(item["gpu_uuid"], "placement gpu sample PID uuid")
+            if uuid not in inventory:
                 raise _sampler_refusal("PID row is absent from its sample inventory")
+            if pid == target and uuid not in {seen for seen, _ in retained}:
+                retained.append((uuid, pci_by_uuid[uuid]))
+    _placement_v3_aggregate(record, retained, pci_by_uuid)
     return record
 
 
 def _placement_v3_device(sampler: Mapping[str, Any], child_pid: int, declared_devices: list[str]) -> tuple[str, list[str], list[str]]:
-    """Mirror the executor device decision over the union of all samples."""
+    """Mirror the executor device decision over the lifetime aggregate."""
 
     declared = [_gpu_uuid(device, "placement.declared.devices") for device in declared_devices]
     if len(set(declared)) != len(declared):
@@ -509,20 +548,24 @@ def _placement_v3_device(sampler: Mapping[str, Any], child_pid: int, declared_de
         return "cpu-only", [], []
     if sampler["reason"] == "not-sampled":
         return "sampler-not-run", [], []
-    active: list[str] = []
-    active_pci: list[str] = []
-    for sample in sampler["samples"]:
-        pci_by_uuid = {item["uuid"]: item["pci.bus_id"] for item in sample["inventory"]}
-        for row in sample["pid_rows"]:
-            if row["pid"] == child_pid and row["gpu_uuid"] not in active:
-                active.append(row["gpu_uuid"])
-                active_pci.append(pci_by_uuid[row["gpu_uuid"]])
-    # Out-of-entitlement use in any sample dominates every other outcome.
-    if any(uuid not in declared for uuid in active):
+    if sampler["target_pid"] is not None and sampler["target_pid"] != child_pid:
+        raise ManifestRefusal("malformed-record", "placement gpu sampler watched a PID other than the science child")
+    aggregate = sampler["aggregate"]
+    active = [item["uuid"] for item in aggregate["exact_pid_gpus"]]
+    active_pci = [item["pci.bus_id"] for item in aggregate["exact_pid_gpus"]]
+    if aggregate["outside_use_seen"] != any(uuid not in declared for uuid in active):
+        raise ManifestRefusal("malformed-record", "placement gpu sampler outside-use flag contradicts its exact-PID GPUs")
+    unresolved = any(not set(declared) <= {item["uuid"] for item in sample["inventory"]} for sample in sampler["samples"])
+    if unresolved and not aggregate["entitlement_unresolved_seen"]:
+        raise ManifestRefusal("malformed-record", "placement gpu sampler aggregate hides an unresolved entitlement")
+    if aggregate["samples_taken"] == sampler["count"] and aggregate["entitlement_unresolved_seen"] != unresolved:
+        raise ManifestRefusal("malformed-record", "placement gpu sampler unresolved flag differs from its complete samples")
+    # Out-of-entitlement use in any sample, retained or not, dominates.
+    if aggregate["outside_use_seen"]:
         return "out-of-entitlement", active, active_pci
     if sampler["reason"] == "telemetry-failed":
         return "sampler-failed", [], []
-    if any(not set(declared) <= {item["uuid"] for item in sample["inventory"]} for sample in sampler["samples"]):
+    if aggregate["entitlement_unresolved_seen"]:
         return "entitlement-unresolved", [], []
     if not active:
         return "no-exact-pid-row", [], []

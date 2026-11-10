@@ -23,11 +23,12 @@ from .._codec import digest
 from ..contracts import ReadyGroup
 from ..environments import PreparedPythonEnvironment
 from ..lifecycle.attached import AttachedAllocation
-from ..gpu_telemetry import normalize_child_sampler
+from ..gpu_sampler import GPU_SAMPLER_OUTPUT_ENV, read_sampler_evidence
+from ..gpu_telemetry import not_sampled_sampler
 from ..results import RunManifest, SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3
 from ..placement import (
     BindingError,
-    ChildPlacementObservationV2,
+    ChildPlacementObservation,
     PLACEMENT_OUTPUT_ENV,
     PLACEMENT_RECEIPT_VERSION_ENV,
     PLACEMENT_REFUSAL_ENV,
@@ -189,11 +190,16 @@ def _with_child_placement(
     enforcement is enabled only by the explicit sidecar output path.
 
     CPU-only slots intentionally retain an empty declared-device field.
+
+    A declared-GPU v2-placement slot also receives a worker-only GPU sampler
+    evidence path; any inherited value is discarded so only the controller
+    decides which slots are sampled.
     """
 
     if not isinstance(environment, PreparedPythonEnvironment):
         return environment
     values = dict(environment.env)
+    values.pop(GPU_SAMPLER_OUTPUT_ENV, None)
     facts = getattr(allocation, "facts", {})
     v2_requested = _placement_v2_requested(allocation, values)
     scheduler_metadata = facts.get("scheduler", facts.get("scheduler_host_map")) if isinstance(facts, Mapping) else None
@@ -218,7 +224,8 @@ def _with_child_placement(
         if len(slots) != 1:
             # A local worker with no slot is a legacy path; a multi-slot
             # allocation must be resolved by the backend worker (Parsl).
-            return environment
+            # Neither is sampled, even with an inherited evidence path.
+            return _without_gpu_sampler(environment)
         slot = slots[0]
         slot_id, host, cpus = slot.slot_id, slot.node, ",".join(str(cpu) for cpu in slot.cpus)
         devices = ",".join(slot.devices)
@@ -280,9 +287,25 @@ def _with_child_placement(
     if v2_requested:
         placement_values[PLACEMENT_RECEIPT_VERSION_ENV] = "2"
         placement_values["TPEN_PLACEMENT_HOST_STATUS"] = "mapped" if scheduler_metadata is not None else "declared"
+        if devices:
+            # The worker that owns the child samples it for its lifetime.
+            placement_values[GPU_SAMPLER_OUTPUT_ENV] = os.path.join(fence.output_dir, "gpu-sampler.json")
     if controller_refusal is not None:
         placement_values[PLACEMENT_REFUSAL_ENV] = json.dumps(controller_refusal, sort_keys=True)
     values = placement_environment(values, **placement_values)
+    return PreparedPythonEnvironment(environment.python, environment.setup, values)
+
+
+def _without_gpu_sampler(environment: Any) -> Any:
+    """Return the environment for a non-science process launched for a member.
+
+    Only the science child is sampled; an inspection process launched with
+    the same prepared environment must not start a second sampler.
+    """
+
+    if not isinstance(environment, PreparedPythonEnvironment) or GPU_SAMPLER_OUTPUT_ENV not in environment.env:
+        return environment
+    values = {key: value for key, value in environment.env.items() if key != GPU_SAMPLER_OUTPUT_ENV}
     return PreparedPythonEnvironment(environment.python, environment.setup, values)
 
 
@@ -547,7 +570,7 @@ def _placement_receipt_v2(
 
 
 def _placement_receipt_v3(
-    observation: ChildPlacementObservationV2,
+    observation: ChildPlacementObservation,
     allocation: Any,
     fence: Any,
     group: ReadyGroup,
@@ -556,23 +579,25 @@ def _placement_receipt_v3(
     environment: Any,
     process_outcome: Any = None,
 ) -> SciencePlacementReceiptV3:
-    """Layer the child's live-PID GPU sampler evidence over the L1a verdict.
+    """Layer the worker's lifetime GPU sampler evidence over the L1a verdict.
 
     Parameters
     ----------
-    observation : ChildPlacementObservationV2
-        Sampler-bearing child sidecar read after process quiescence.
+    observation : ChildPlacementObservation
+        Unchanged L1a child sidecar read after process quiescence.
     allocation, fence, group, member, configured, environment, process_outcome
         Controller context, exactly as for :func:`_placement_receipt_v2`.
+        A declared-GPU slot carries the worker evidence path in
+        ``environment``; a slot without one is intentionally ``not-sampled``.
 
     Returns
     -------
     SciencePlacementReceiptV3
-        Receipt whose device verdict is derived from all samples.  Observed
-        but unusable telemetry (no exact-PID row, foreign rows only, or an
-        unresolved entitlement) is a typed ``telemetry-failed`` receipt with
-        the raw samples preserved; structurally invalid child evidence is
-        replaced by typed ``sampler-evidence-invalid`` failed evidence.
+        Receipt whose device verdict is derived from the lifetime aggregate.
+        Observed but unusable telemetry (no exact-PID row, foreign rows only,
+        or an unresolved entitlement) is a typed ``telemetry-failed`` receipt
+        with the retained samples preserved; missing or invalid worker
+        evidence is typed ``sampler-evidence-invalid`` failed evidence.
 
     Raises
     ------
@@ -583,9 +608,11 @@ def _placement_receipt_v3(
     """
 
     l1a = _placement_receipt_v2(
-        observation.base, allocation, fence, group, member, configured, environment, process_outcome
+        observation, allocation, fence, group, member, configured, environment, process_outcome
     )
-    return SciencePlacementReceiptV3.from_l1a(l1a, normalize_child_sampler(observation.gpu_sampler))
+    path = environment.env.get(GPU_SAMPLER_OUTPUT_ENV) if isinstance(environment, PreparedPythonEnvironment) else None
+    sampler = not_sampled_sampler() if path is None else read_sampler_evidence(path)
+    return SciencePlacementReceiptV3.from_l1a(l1a, sampler)
 
 
 def _placement_refusal_receipt(
@@ -1067,7 +1094,7 @@ class DispatcherContract:
                     raise TypeError("materialized worker evidence reader lacks read()")
                 decoded = evidence.read(
                     process,
-                    environment,
+                    _without_gpu_sampler(environment),
                     core_dir,
                     cwd=output_dir,
                     stdout_path=evidence_stdout,
@@ -1126,13 +1153,9 @@ class DispatcherContract:
                 if requested_refusal is not None:
                     raise requested_refusal
                 observation = read_child_placement(placement_path)
-                receipt_builder = _placement_receipt
-                if environment.env.get(PLACEMENT_RECEIPT_VERSION_ENV) == "2":
-                    # A sampler-bearing sidecar gets the v3 receipt; an L1a
-                    # sidecar keeps the unchanged v2 meaning.
-                    receipt_builder = (
-                        _placement_receipt_v3 if isinstance(observation, ChildPlacementObservationV2) else _placement_receipt_v2
-                    )
+                # v2 placement gets the sampler-bearing v3 receipt; legacy
+                # placement keeps the v1 receipt.
+                receipt_builder = _placement_receipt_v3 if environment.env.get(PLACEMENT_RECEIPT_VERSION_ENV) == "2" else _placement_receipt
                 receipt = receipt_builder(
                     observation, lifecycle.allocation, fence, group, member, configured, environment, outcome,
                 )

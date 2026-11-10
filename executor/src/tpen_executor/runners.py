@@ -8,7 +8,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, ClassVar, Mapping
 
-from . import _child_gpu_sampler
 from ._codec import canonical_bytes, decode_json
 from .environments import PreparedPythonEnvironment
 from ._records import frozen_record
@@ -19,9 +18,6 @@ RUN_EVIDENCE_SCHEMA_V2 = "tpen.run-evidence/v2"
 CHILD_CONTEXT_KEYS_ENV = "TPEN_EXECUTOR_CONTEXT_ENV_KEYS"
 CHILD_OBSERVATION_FILENAME = "executor-child-observation.json"
 CONTEXT_ENV_KEY_PATTERN = r"^(CUDA_VISIBLE_DEVICES|TPEN_CTX_[A-Z0-9_]{1,64})$"
-# The in-child GPU sampler is a real stdlib-only module so tests can drive it
-# directly; RUN_SHIM embeds its exact source so the child needs no executor.
-GPU_SAMPLER_SOURCE = Path(_child_gpu_sampler.__file__).read_text(encoding="utf-8")
 RUN_SHIM = (
     "import json, os, re, socket, sys\n"
     "from pathlib import Path\n"
@@ -38,8 +34,6 @@ RUN_SHIM = (
     "placement_pid = os.getpid()\n"
     "placement_host = socket.gethostname()\n"
     "placement_abort = False\n"
-    + GPU_SAMPLER_SOURCE
-    + "placement_gpu_sampler = None\n"
     "if run_roots and placement_path:\n"
     "    placement_refusal = None\n"
     "    placement_ticks = 0\n"
@@ -69,7 +63,7 @@ RUN_SHIM = (
     "    if declared_host and host_key(placement_host) != host_key(declared_host) and placement_refusal is None:\n"
     "        placement_refusal = {'code': 'child-placement-mismatch', 'reason': f'child host {placement_host!r} differs from declared host {declared_host!r}'}\n"
     "    observation = {\n"
-    "        'schema': 'tpen-executor/child-placement-v2',\n"
+    "        'schema': 'tpen-executor/child-placement-v1',\n"
     "        'task_id': os.environ.get('TPEN_PLACEMENT_TASK_ID', ''),\n"
     "        'attempt_id': os.environ.get('TPEN_PLACEMENT_ATTEMPT_ID', ''),\n"
     "        'group_digest': os.environ.get('TPEN_PLACEMENT_GROUP_DIGEST', ''),\n"
@@ -86,25 +80,14 @@ RUN_SHIM = (
     "        'cuda_visible_devices': observed_environment.get('CUDA_VISIBLE_DEVICES'),\n"
     "        'observed_at_utc': placement_stamp,\n"
     "        'refusal': placement_refusal,\n"
-    "        'gpu_sampler': gpu_not_sampled_record(),\n"
     "    }\n"
     "    if placement_refusal is not None:\n"
     "        print(f\"child-placement-refused: {placement_refusal['reason']}\", file=sys.stderr)\n"
-    # A declared-GPU v2-placement child that will reach core marks sampling
-    # attempted before the first sidecar write and before any nvidia-smi
-    # launch.  Legacy v1 placement and CPU-only slots stay not-sampled.
-    "    if not placement_abort and os.environ.get('TPEN_PLACEMENT_RECEIPT_VERSION') == '2' and os.environ.get('TPEN_PLACEMENT_DECLARED_DEVICES'):\n"
-    "        placement_gpu_sampler = GpuSampler.from_environment(os.environ)\n"
-    "        placement_gpu_sampler.begin()\n"
-    "        observation['gpu_sampler'] = placement_gpu_sampler.record()\n"
     "    try:\n"
     "        Path(placement_path).write_text(json.dumps(observation, sort_keys=True) + '\\n', encoding='utf-8')\n"
     "    except OSError as error:\n"
     "        print(f\"child-placement-refused: could not write sidecar: {error}\", file=sys.stderr)\n"
     "        raise SystemExit(2)\n"
-    "    if placement_gpu_sampler is not None:\n"
-    "        gpu_register_finalizer(placement_gpu_sampler, observation, placement_path)\n"
-    "        placement_gpu_sampler.start()\n"
     f"Path(run_roots[-1], {CHILD_OBSERVATION_FILENAME!r}).write_text(json.dumps({{'schema': 'tpen-executor/child-observation-v1', 'cuda_visible_devices': observed_environment.get('CUDA_VISIBLE_DEVICES'), 'environment': observed_environment, 'thread_settings': {{name: observed_environment.get(name) for name in ('OMP_NUM_THREADS', 'MKL_NUM_THREADS')}}, 'hostname': placement_host, 'pid': placement_pid}}, sort_keys=True) + '\\n', encoding='utf-8') if run_roots else None\n"
     "if placement_abort:\n"
     "    raise SystemExit(2)\n"

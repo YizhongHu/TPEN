@@ -55,6 +55,17 @@
       "status": "unavailable"
      },
      "gpu_sampler": {
+      "aggregate": {
+       "entitlement_unresolved_seen": true,
+       "exact_pid_gpus": [
+        {
+         "pci.bus_id": "0000:00:01.0",
+         "uuid": "GPU-12345678-1234-1234-1234-123456789ABC"
+        }
+       ],
+       "outside_use_seen": false,
+       "samples_taken": 1
+      },
       "attempted": true,
       "cadence_seconds": 0.125,
       "command_pids": [
@@ -95,6 +106,7 @@
       ],
       "status": "observed",
       "survivors": [],
+      "target_pid": 1234,
       "version": "NVIDIA-SMI fixture"
      },
      "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
@@ -146,6 +158,201 @@
      "attempt_id": "attempt-a",
      "reason": "telemetry-failed: declared GPU entitlement is absent from a sampled inventory",
      "reason_class": "telemetry-failed",
+     "task_id": "task-a"
+    }
+   ]
+  },
+  "schema": "tpen-executor/run-manifest-v3",
+  "segments": []
+ },
+ "evicted-out-of-entitlement": {
+  "attempts": [
+   {
+    "attempt_id": "attempt-a",
+    "outcome_receipt": {
+     "attempt_id": "attempt-a",
+     "finished_at_utc": "2026-11-10T00:00:01Z",
+     "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+     "output_dir": "/runs/group-1/task-a/attempt-a",
+     "result_digest": null,
+     "schema": "tpen-executor/outcome-receipt-v1",
+     "status": "completed",
+     "task_id": "task-a"
+    },
+    "output_dir": "/runs/group-1/task-a/attempt-a",
+    "placement_receipt": {
+     "allocation_id": "allocation-a",
+     "attempt_id": "attempt-a",
+     "backend_job_id": "job-a",
+     "child": {
+      "affinity": [
+       0
+      ],
+      "cuda_visible_devices": null,
+      "host": "physical-01",
+      "observed_at_utc": "2026-11-10T00:00:00Z",
+      "pid": 1234,
+      "proc_start_ticks": 55,
+      "thread_settings": {}
+     },
+     "comparison": {
+      "affinity": "matched",
+      "device": "mismatch",
+      "host": "matched"
+     },
+     "declared": {
+      "cpus": [
+       0
+      ],
+      "devices": [
+       "GPU-12345678-1234-1234-1234-123456789ABC"
+      ],
+      "host": "physical-01"
+     },
+     "gpu": {
+      "active_pci": [
+       "0000:00:02.0",
+       "0000:00:01.0"
+      ],
+      "active_uuids": [
+       "GPU-12345678-1234-1234-1234-123456789ABD",
+       "GPU-12345678-1234-1234-1234-123456789ABC"
+      ],
+      "finished_at_utc": "2026-11-10T00:00:01Z",
+      "method": "nvidia-smi-pid-uuid-v1",
+      "reason": "out-of-entitlement",
+      "samples": [],
+      "started_at_utc": "2026-11-10T00:00:00Z",
+      "status": "unavailable"
+     },
+     "gpu_sampler": {
+      "aggregate": {
+       "entitlement_unresolved_seen": false,
+       "exact_pid_gpus": [
+        {
+         "pci.bus_id": "0000:00:02.0",
+         "uuid": "GPU-12345678-1234-1234-1234-123456789ABD"
+        },
+        {
+         "pci.bus_id": "0000:00:01.0",
+         "uuid": "GPU-12345678-1234-1234-1234-123456789ABC"
+        }
+       ],
+       "outside_use_seen": true,
+       "samples_taken": 3
+      },
+      "attempted": true,
+      "cadence_seconds": 0.125,
+      "command_pids": [
+       101,
+       102,
+       103
+      ],
+      "count": 2,
+      "elapsed_seconds": 0.5,
+      "failure": null,
+      "join_timeout_seconds": 4.0,
+      "method": "nvidia-smi-pid-uuid-v1",
+      "monotonic_end": 1.5,
+      "monotonic_start": 1.0,
+      "quiescent": true,
+      "reason": "observed",
+      "samples": [
+       {
+        "inventory": [
+         {
+          "pci.bus_id": "0000:00:01.0",
+          "uuid": "GPU-12345678-1234-1234-1234-123456789ABC"
+         },
+         {
+          "pci.bus_id": "0000:00:02.0",
+          "uuid": "GPU-12345678-1234-1234-1234-123456789ABD"
+         }
+        ],
+        "monotonic_end": 1.125,
+        "monotonic_start": 1.0,
+        "pid_rows": [
+         {
+          "gpu_uuid": "GPU-12345678-1234-1234-1234-123456789ABC",
+          "pid": 1234
+         }
+        ]
+       },
+       {
+        "inventory": [
+         {
+          "pci.bus_id": "0000:00:01.0",
+          "uuid": "GPU-12345678-1234-1234-1234-123456789ABC"
+         },
+         {
+          "pci.bus_id": "0000:00:02.0",
+          "uuid": "GPU-12345678-1234-1234-1234-123456789ABD"
+         }
+        ],
+        "monotonic_end": 1.375,
+        "monotonic_start": 1.25,
+        "pid_rows": [
+         {
+          "gpu_uuid": "GPU-12345678-1234-1234-1234-123456789ABC",
+          "pid": 1234
+         }
+        ]
+       }
+      ],
+      "status": "observed",
+      "survivors": [],
+      "target_pid": 1234,
+      "version": "NVIDIA-SMI fixture"
+     },
+     "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+     "host_mapping": {
+      "host": "physical-01",
+      "reason": "physical scheduler host mapped",
+      "slot_id": "logical-slot",
+      "source": "scheduler-node-map",
+      "status": "matched"
+     },
+     "output_dir": "/runs/group-1/task-a/attempt-a",
+     "payload_digest": "786fc932ed522da06d98f10efc1104626f4bb6697c99386ca34a78ce5b17e692",
+     "refusal": null,
+     "schema": "tpen-executor/science-placement-receipt-v3",
+     "slot_id": "logical-slot",
+     "task_id": "task-a",
+     "verdict": {
+      "device": "mismatch",
+      "host": "matched",
+      "qualification": "unqualified",
+      "reason": "mismatch: live science PID used a GPU UUID outside its physical slot entitlement",
+      "reason_class": "mismatch",
+      "science_acceptance": "not-accepted",
+      "warning": "GPU PLACEMENT UNQUALIFIED: physical placement evidence requires review."
+     }
+    },
+    "schema": "tpen-executor/manifest-attempt-v1",
+    "start_receipt": {
+     "allocation_id": "allocation-a",
+     "attempt_id": "attempt-a",
+     "backend_job_id": "job-a",
+     "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+     "output_dir": "/runs/group-1/task-a/attempt-a",
+     "schema": "tpen-executor/start-receipt-v1",
+     "started_at_utc": "2026-11-10T00:00:00Z",
+     "task_id": "task-a"
+    },
+    "task_id": "task-a"
+   }
+  ],
+  "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
+  "group_id": "s2b2",
+  "placement_verdict": {
+   "message": "GPU PLACEMENT UNQUALIFIED: placement mismatch/refusal requires science review.",
+   "science_acceptance": "not-accepted",
+   "status": "unqualified",
+   "unqualified_gpu_segments": [
+    {
+     "attempt_id": "attempt-a",
+     "reason": "mismatch: live science PID used a GPU UUID outside its physical slot entitlement",
+     "reason_class": "mismatch",
      "task_id": "task-a"
     }
    ]
@@ -212,6 +419,17 @@
       "status": "qualified"
      },
      "gpu_sampler": {
+      "aggregate": {
+       "entitlement_unresolved_seen": false,
+       "exact_pid_gpus": [
+        {
+         "pci.bus_id": "0000:00:01.0",
+         "uuid": "GPU-12345678-1234-1234-1234-123456789ABC"
+        }
+       ],
+       "outside_use_seen": false,
+       "samples_taken": 2
+      },
       "attempted": true,
       "cadence_seconds": 0.125,
       "command_pids": [
@@ -272,6 +490,7 @@
       ],
       "status": "observed",
       "survivors": [],
+      "target_pid": 1234,
       "version": "NVIDIA-SMI fixture"
      },
      "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
@@ -372,6 +591,12 @@
       "status": "unavailable"
      },
      "gpu_sampler": {
+      "aggregate": {
+       "entitlement_unresolved_seen": false,
+       "exact_pid_gpus": [],
+       "outside_use_seen": false,
+       "samples_taken": 1
+      },
       "attempted": true,
       "cadence_seconds": 0.125,
       "command_pids": [
@@ -412,6 +637,7 @@
       ],
       "status": "observed",
       "survivors": [],
+      "target_pid": 1234,
       "version": "NVIDIA-SMI fixture"
      },
      "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
@@ -523,13 +749,19 @@
       "status": "unavailable"
      },
      "gpu_sampler": {
+      "aggregate": {
+       "entitlement_unresolved_seen": false,
+       "exact_pid_gpus": [],
+       "outside_use_seen": false,
+       "samples_taken": 0
+      },
       "attempted": false,
       "cadence_seconds": 0.0,
       "command_pids": [],
       "count": 0,
       "elapsed_seconds": 0.0,
       "failure": null,
-      "join_timeout_seconds": 4.0,
+      "join_timeout_seconds": 30.0,
       "method": "nvidia-smi-pid-uuid-v1",
       "monotonic_end": null,
       "monotonic_start": null,
@@ -538,6 +770,7 @@
       "samples": [],
       "status": "unavailable",
       "survivors": [],
+      "target_pid": null,
       "version": null
      },
      "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
@@ -644,6 +877,21 @@
       "status": "unavailable"
      },
      "gpu_sampler": {
+      "aggregate": {
+       "entitlement_unresolved_seen": false,
+       "exact_pid_gpus": [
+        {
+         "pci.bus_id": "0000:00:02.0",
+         "uuid": "GPU-12345678-1234-1234-1234-123456789ABD"
+        },
+        {
+         "pci.bus_id": "0000:00:01.0",
+         "uuid": "GPU-12345678-1234-1234-1234-123456789ABC"
+        }
+       ],
+       "outside_use_seen": true,
+       "samples_taken": 2
+      },
       "attempted": true,
       "cadence_seconds": 0.125,
       "command_pids": [
@@ -704,6 +952,7 @@
       ],
       "status": "observed",
       "survivors": [],
+      "target_pid": 1234,
       "version": "NVIDIA-SMI fixture"
      },
      "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",
@@ -817,6 +1066,12 @@
       "status": "unavailable"
      },
      "gpu_sampler": {
+      "aggregate": {
+       "entitlement_unresolved_seen": false,
+       "exact_pid_gpus": [],
+       "outside_use_seen": false,
+       "samples_taken": 0
+      },
       "attempted": true,
       "cadence_seconds": 0.125,
       "command_pids": [
@@ -839,6 +1094,7 @@
       "samples": [],
       "status": "unavailable",
       "survivors": [],
+      "target_pid": 1234,
       "version": null
      },
      "group_digest": "d1b3c79fc13ef5381edea2e2779a2317a7c1e984ce127c668088fe3b0c5a64fa",

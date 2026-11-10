@@ -1,11 +1,19 @@
-"""Closed semantics of in-child GPU sampler evidence.
+"""Closed semantics of worker-owned GPU sampler evidence.
 
-This module owns the ``gpu_sampler`` wire carried by child placement v2
-sidecars and science placement v3 receipts.  :func:`validate_sampler_wire` is
-the single structural validator and :func:`derive_device_decision` the single
-device decision; the receipt builder and the receipt decoder both reach them
-through :class:`tpen_executor.results.SciencePlacementReceiptV3`, and the P8
-toolkit reader mirrors them independently.
+This module owns the ``gpu_sampler`` wire written by the worker-side sampler
+(:mod:`tpen_executor.gpu_sampler`) and carried by science placement v3
+receipts.  :func:`validate_sampler_wire` is the single structural validator
+and :func:`derive_device_decision` the single device decision; the receipt
+builder and the receipt decoder both reach them through
+:class:`tpen_executor.results.SciencePlacementReceiptV3`, and the P8 toolkit
+reader mirrors them independently.
+
+The sampler watches the science child for its whole lifetime but retains at
+most :data:`MAX_SAMPLES` samples.  The closed ``aggregate`` record summarises
+every complete sample, retained or not: the ordered union of GPUs used by the
+exact target PID and whether out-of-entitlement use or an unresolved
+entitlement was ever seen.  The device decision is taken from the aggregate,
+which must agree with the retained samples.
 
 Binding vocabulary (manager decision split-20261110): ``not-sampled`` means
 sampling was intentionally never attempted and is not science-blocking;
@@ -27,20 +35,27 @@ SAMPLER_METHOD = "nvidia-smi-pid-uuid-v1"
 SAMPLER_KEYS = frozenset({
     "status", "reason", "method", "version", "attempted", "failure", "cadence_seconds", "count",
     "monotonic_start", "monotonic_end", "samples", "command_pids", "survivors", "elapsed_seconds",
-    "join_timeout_seconds", "quiescent",
+    "join_timeout_seconds", "quiescent", "target_pid", "aggregate",
 })
 SAMPLE_KEYS = frozenset({"monotonic_start", "monotonic_end", "inventory", "pid_rows"})
+AGGREGATE_KEYS = frozenset({"samples_taken", "exact_pid_gpus", "outside_use_seen", "entitlement_unresolved_seen"})
+#: Maximum number of retained samples; the aggregate covers every sample.
 MAX_SAMPLES = 16
-MAX_JOIN_TIMEOUT = 4.0
-#: Failure codes the in-child sampler may emit.
-CHILD_FAILURE_CODES = frozenset({
+#: Bounds of the lifetime sampling cadence, in seconds between samples.
+MIN_CADENCE = 0.01
+MAX_CADENCE = 60.0
+#: Default and maximum bound of the worker's shared finish deadline.
+DEFAULT_JOIN_TIMEOUT = 30.0
+MAX_JOIN_TIMEOUT = 60.0
+#: Failure codes the worker-side sampler may emit.
+SAMPLER_FAILURE_CODES = frozenset({
     "launch-failed", "command-failed", "command-timeout", "read-failed", "malformed-output",
     "cleanup-unconfirmed", "no-sample", "sampler-cancelled", "sampler-join-expired",
     "sampler-unfinalized", "sampler-error",
 })
-#: Failure code the controller substitutes for structurally invalid child evidence.
+#: Failure code the controller substitutes for missing or invalid sampler evidence.
 EVIDENCE_INVALID = "sampler-evidence-invalid"
-FAILURE_CODES = CHILD_FAILURE_CODES | {EVIDENCE_INVALID}
+FAILURE_CODES = SAMPLER_FAILURE_CODES | {EVIDENCE_INVALID}
 #: Device decision code -> (device comparison state, human-readable reason).
 DEVICE_DECISIONS: Mapping[str, tuple[str, str]] = {
     "matched": ("matched", "live science PID used only GPU UUIDs inside its physical slot entitlement"),
@@ -55,13 +70,25 @@ _GPU_UUID = re.compile(r"^GPU-[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0
 _STATUS_REASONS = {("observed", "observed"), ("unavailable", "telemetry-failed"), ("unavailable", "not-sampled")}
 
 
+def empty_aggregate() -> dict[str, Any]:
+    """Return the aggregate of a sampler that has taken no sample.
+
+    Returns
+    -------
+    dict
+        Zero samples, no exact-PID GPUs, and no outside or unresolved use.
+    """
+
+    return {"samples_taken": 0, "exact_pid_gpus": [], "outside_use_seen": False, "entitlement_unresolved_seen": False}
+
+
 def not_sampled_sampler() -> dict[str, Any]:
     """Return the exact ``not-sampled`` sampler record.
 
     Returns
     -------
     dict
-        Equal to the in-child ``gpu_not_sampled_record()``.
+        The single legal record for intentionally unattempted sampling.
     """
 
     return {
@@ -69,7 +96,8 @@ def not_sampled_sampler() -> dict[str, Any]:
         "version": None, "attempted": False, "failure": None, "cadence_seconds": 0.0,
         "count": 0, "monotonic_start": None, "monotonic_end": None, "samples": [],
         "command_pids": [], "survivors": [], "elapsed_seconds": 0.0,
-        "join_timeout_seconds": MAX_JOIN_TIMEOUT, "quiescent": True,
+        "join_timeout_seconds": DEFAULT_JOIN_TIMEOUT, "quiescent": True,
+        "target_pid": None, "aggregate": empty_aggregate(),
     }
 
 
@@ -79,23 +107,25 @@ def invalid_sampler(detail: str) -> dict[str, Any]:
     Parameters
     ----------
     detail : str
-        Why the child record failed :func:`validate_sampler_wire`.
+        Why the worker evidence was missing or failed :func:`validate_sampler_wire`.
 
     Returns
     -------
     dict
-        Attempted, failed, non-quiescent evidence with no samples.  Invalid
-        evidence cannot prove sampling was intentionally skipped, so it is
-        conservatively science-blocking rather than ``not-sampled``.
+        Attempted, failed, non-quiescent evidence with no samples.  Missing or
+        invalid evidence for a sampled slot cannot prove sampling was
+        intentionally skipped, so it is conservatively science-blocking
+        rather than ``not-sampled``.
     """
 
     return {
         "status": "unavailable", "reason": "telemetry-failed", "method": SAMPLER_METHOD,
         "version": None, "attempted": True,
-        "failure": {"code": EVIDENCE_INVALID, "detail": (detail or "invalid sampler evidence")[:500]},
+        "failure": {"code": EVIDENCE_INVALID, "detail": (detail.strip() or "invalid sampler evidence")[:500]},
         "cadence_seconds": 0.0, "count": 0, "monotonic_start": None, "monotonic_end": None,
         "samples": [], "command_pids": [], "survivors": [], "elapsed_seconds": 0.0,
-        "join_timeout_seconds": MAX_JOIN_TIMEOUT, "quiescent": False,
+        "join_timeout_seconds": DEFAULT_JOIN_TIMEOUT, "quiescent": False,
+        "target_pid": None, "aggregate": empty_aggregate(),
     }
 
 
@@ -121,6 +151,60 @@ def _rows(value: Any, name: str) -> list[Any]:
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
         raise ValueError(f"gpu_sampler {name} must be a sequence")
     return list(value)
+
+
+def _text(value: Any) -> bool:
+    """Return whether ``value`` is text with at least one non-whitespace character.
+
+    This matches the P8 reader's non-empty text rule exactly.
+    """
+
+    return type(value) is str and bool(value.strip())
+
+
+def _validate_aggregate(sampler: Mapping[str, Any], retained: list[tuple[str, str]], pci_by_uuid: Mapping[str, str]) -> None:
+    """Check the lifetime aggregate against the retained samples.
+
+    Parameters
+    ----------
+    sampler : mapping
+        Sampler record whose top-level fields were already validated.
+    retained : list of tuple of str
+        Ordered ``(uuid, pci)`` union of exact-target rows in retained samples.
+    pci_by_uuid : mapping
+        PCI bus id of every UUID seen in a retained inventory.
+
+    Raises
+    ------
+    ValueError
+        If the aggregate keys or types are invalid, it covers fewer samples
+        than are retained, it omits a retained exact-target GPU, or, when no
+        sample was dropped, it differs from the retained union.
+    """
+
+    aggregate = sampler["aggregate"]
+    if not isinstance(aggregate, Mapping) or set(aggregate) != AGGREGATE_KEYS:
+        raise ValueError("gpu_sampler aggregate keys differ")
+    taken = aggregate["samples_taken"]
+    if type(taken) is not int or taken < sampler["count"] or (taken == 0) != (sampler["count"] == 0):
+        raise ValueError("gpu_sampler aggregate sample total disagrees with its retained samples")
+    if type(aggregate["outside_use_seen"]) is not bool or type(aggregate["entitlement_unresolved_seen"]) is not bool:
+        raise ValueError("gpu_sampler aggregate flags must be booleans")
+    if taken and sampler["target_pid"] is None:
+        raise ValueError("gpu_sampler samples require a target PID")
+    union: list[tuple[str, str]] = []
+    for item in _rows(aggregate["exact_pid_gpus"], "aggregate exact_pid_gpus"):
+        if not isinstance(item, Mapping) or set(item) != {"uuid", "pci.bus_id"}:
+            raise ValueError("gpu_sampler aggregate GPU row is invalid")
+        uuid, pci = _uuid(item["uuid"], "aggregate UUID"), item["pci.bus_id"]
+        if not _text(pci) or uuid in {seen for seen, _ in union} or pci_by_uuid.get(uuid, pci) != pci:
+            raise ValueError("gpu_sampler aggregate GPU row is inconsistent")
+        union.append((uuid, pci))
+    if not set(retained) <= set(union):
+        raise ValueError("gpu_sampler aggregate omits a retained exact-target GPU")
+    # With nothing dropped the aggregate is fully determined by the samples.
+    if taken == sampler["count"] and union != retained:
+        raise ValueError("gpu_sampler aggregate differs from its complete retained samples")
 
 
 def validate_sampler_wire(value: Any) -> dict[str, Any]:
@@ -170,15 +254,14 @@ def validate_sampler_wire(value: Any) -> dict[str, Any]:
         not isinstance(failure, Mapping)
         or set(failure) != {"code", "detail"}
         or failure["code"] not in FAILURE_CODES
-        or type(failure["detail"]) is not str
-        or not failure["detail"]
+        or not _text(failure["detail"])
     ):
         raise ValueError("telemetry-failed gpu_sampler requires a typed failure")
     version = sampler["version"]
     if version is not None and (type(version) is not str or not version.strip()):
         raise ValueError("gpu_sampler version must be non-empty text or null")
     cadence = _number(sampler["cadence_seconds"], "cadence_seconds")
-    if cadence != 0.0 and not 0.01 <= cadence <= 1.0:
+    if cadence != 0.0 and not MIN_CADENCE <= cadence <= MAX_CADENCE:
         raise ValueError("gpu_sampler cadence is outside its bound")
     join_timeout = _number(sampler["join_timeout_seconds"], "join_timeout_seconds")
     if not 0.0 < join_timeout <= MAX_JOIN_TIMEOUT:
@@ -197,6 +280,9 @@ def validate_sampler_wire(value: Any) -> dict[str, Any]:
     # Quiescence is the confirmed absence of survivors, never a free label.
     if sampler["quiescent"] and survivors:
         raise ValueError("quiescent gpu_sampler cannot report survivors")
+    target = sampler["target_pid"]
+    if target is not None:
+        _positive_int(target, "target PID")
     start, end = sampler["monotonic_start"], sampler["monotonic_end"]
     if start is None:
         if end is not None or count or elapsed != 0.0:
@@ -210,6 +296,7 @@ def validate_sampler_wire(value: Any) -> dict[str, Any]:
             raise ValueError("observed gpu_sampler requires quiescent, complete, versioned samples")
     previous_end = start
     pci_by_uuid: dict[str, str] = {}
+    retained: list[tuple[str, str]] = []
     for sample in samples:
         if not isinstance(sample, Mapping) or set(sample) != SAMPLE_KEYS:
             raise ValueError("gpu_sampler sample keys differ")
@@ -225,7 +312,7 @@ def validate_sampler_wire(value: Any) -> dict[str, Any]:
                 raise ValueError("gpu_sampler inventory row is invalid")
             uuid = _uuid(item["uuid"], "inventory UUID")
             pci = item["pci.bus_id"]
-            if type(pci) is not str or not pci or uuid in inventory or pci_by_uuid.setdefault(uuid, pci) != pci:
+            if not _text(pci) or uuid in inventory or pci_by_uuid.setdefault(uuid, pci) != pci:
                 raise ValueError("gpu_sampler inventory row is inconsistent")
             inventory.add(uuid)
         if not inventory:
@@ -233,26 +320,30 @@ def validate_sampler_wire(value: Any) -> dict[str, Any]:
         for item in _rows(sample["pid_rows"], "pid_rows"):
             if not isinstance(item, Mapping) or set(item) != {"pid", "gpu_uuid"}:
                 raise ValueError("gpu_sampler PID row is invalid")
-            _positive_int(item["pid"], "row PID")
+            pid = _positive_int(item["pid"], "row PID")
             # A PID row must name a GPU from its own sample's inventory.
-            if _uuid(item["gpu_uuid"], "row UUID") not in inventory:
+            uuid = _uuid(item["gpu_uuid"], "row UUID")
+            if uuid not in inventory:
                 raise ValueError("gpu_sampler PID row is absent from its sample inventory")
+            if pid == target and uuid not in {seen for seen, _ in retained}:
+                retained.append((uuid, pci_by_uuid[uuid]))
+    _validate_aggregate(sampler, retained, pci_by_uuid)
     return sampler
 
 
-def normalize_child_sampler(value: Any) -> dict[str, Any]:
-    """Validate child evidence, or replace it with typed failed evidence.
+def normalize_sampler(value: Any) -> dict[str, Any]:
+    """Validate worker evidence, or replace it with typed failed evidence.
 
     Parameters
     ----------
     value : mapping
-        Raw ``gpu_sampler`` from a child placement v2 sidecar.
+        Raw ``gpu_sampler`` record read from the worker evidence file.
 
     Returns
     -------
     dict
-        The validated record, preserved verbatim including all samples, or
-        :func:`invalid_sampler` when the child record is structurally invalid.
+        The validated record, preserved verbatim including all retained
+        samples, or :func:`invalid_sampler` when it is structurally invalid.
     """
 
     try:
@@ -270,8 +361,9 @@ class DeviceDecision:
     code : str
         Key of :data:`DEVICE_DECISIONS`.
     active_uuids, active_pci : tuple of str
-        Ordered union of GPUs used by the exact science PID across all
-        samples; populated only for ``matched`` and ``out-of-entitlement``.
+        Ordered union of GPUs used by the exact science PID across every
+        sample, retained or not (the aggregate); populated only for
+        ``matched`` and ``out-of-entitlement``.
     """
 
     code: str
@@ -292,7 +384,7 @@ class DeviceDecision:
 
 
 def derive_device_decision(sampler: Mapping[str, Any], child_pid: int, declared_devices: Sequence[str]) -> DeviceDecision:
-    """Derive the device verdict from the union of exact-child-PID rows.
+    """Derive the device verdict from the lifetime exact-child-PID aggregate.
 
     Parameters
     ----------
@@ -306,15 +398,17 @@ def derive_device_decision(sampler: Mapping[str, Any], child_pid: int, declared_
     Returns
     -------
     DeviceDecision
-        Out-of-entitlement use in any sample dominates every other outcome;
-        then attempted failure, unresolved entitlement, and a missing
-        exact-PID row are all telemetry failures; only then ``matched``.
+        Out-of-entitlement use in any sample, retained or not, dominates
+        every other outcome; then attempted failure, unresolved entitlement,
+        and a missing exact-PID row are all telemetry failures; only then
+        ``matched``.
 
     Raises
     ------
     ValueError
-        If the entitlement is not canonical or a CPU-only slot carries
-        attempted sampler evidence.
+        If the entitlement is not canonical, a CPU-only slot carries
+        attempted sampler evidence, the sampler watched a different PID, or
+        the aggregate flags contradict the aggregate GPUs or retained samples.
     """
 
     declared = [_uuid(device, "declared device") for device in declared_devices]
@@ -326,27 +420,34 @@ def derive_device_decision(sampler: Mapping[str, Any], child_pid: int, declared_
         return DeviceDecision("cpu-only")
     if sampler["reason"] == "not-sampled":
         return DeviceDecision("sampler-not-run")
-    active: list[str] = []
-    active_pci: list[str] = []
-    for sample in sampler["samples"]:
-        pci_by_uuid = {item["uuid"]: item["pci.bus_id"] for item in sample["inventory"]}
-        for row in sample["pid_rows"]:
-            if row["pid"] == child_pid and row["gpu_uuid"] not in active:
-                active.append(row["gpu_uuid"])
-                active_pci.append(pci_by_uuid[row["gpu_uuid"]])
-    if any(uuid not in declared for uuid in active):
-        return DeviceDecision("out-of-entitlement", tuple(active), tuple(active_pci))
+    if sampler["target_pid"] is not None and sampler["target_pid"] != child_pid:
+        raise ValueError("gpu_sampler watched a PID other than the science child")
+    aggregate = sampler["aggregate"]
+    active = tuple(item["uuid"] for item in aggregate["exact_pid_gpus"])
+    active_pci = tuple(item["pci.bus_id"] for item in aggregate["exact_pid_gpus"])
+    # The flags are durable lifetime facts; they must agree with the GPUs
+    # and, where retained samples show the condition, with those samples.
+    if aggregate["outside_use_seen"] != any(uuid not in declared for uuid in active):
+        raise ValueError("gpu_sampler aggregate outside-use flag contradicts its exact-PID GPUs")
+    unresolved = any(not set(declared) <= {item["uuid"] for item in sample["inventory"]} for sample in sampler["samples"])
+    if unresolved and not aggregate["entitlement_unresolved_seen"]:
+        raise ValueError("gpu_sampler aggregate hides an unresolved entitlement in a retained sample")
+    if aggregate["samples_taken"] == sampler["count"] and aggregate["entitlement_unresolved_seen"] != unresolved:
+        raise ValueError("gpu_sampler aggregate unresolved flag differs from its complete retained samples")
+    if aggregate["outside_use_seen"]:
+        return DeviceDecision("out-of-entitlement", active, active_pci)
     if sampler["reason"] == "telemetry-failed":
         return DeviceDecision("sampler-failed")
-    if any(not set(declared) <= {item["uuid"] for item in sample["inventory"]} for sample in sampler["samples"]):
+    if aggregate["entitlement_unresolved_seen"]:
         return DeviceDecision("entitlement-unresolved")
     if not active:
         return DeviceDecision("no-exact-pid-row")
-    return DeviceDecision("matched", tuple(active), tuple(active_pci))
+    return DeviceDecision("matched", active, active_pci)
 
 
 __all__ = [
-    "CHILD_FAILURE_CODES", "DEVICE_DECISIONS", "DeviceDecision", "EVIDENCE_INVALID", "FAILURE_CODES",
-    "SAMPLER_KEYS", "SAMPLER_METHOD", "derive_device_decision", "invalid_sampler", "normalize_child_sampler",
-    "not_sampled_sampler", "validate_sampler_wire",
+    "AGGREGATE_KEYS", "DEFAULT_JOIN_TIMEOUT", "DEVICE_DECISIONS", "DeviceDecision", "EVIDENCE_INVALID",
+    "FAILURE_CODES", "MAX_CADENCE", "MAX_JOIN_TIMEOUT", "MAX_SAMPLES", "MIN_CADENCE", "SAMPLER_FAILURE_CODES",
+    "SAMPLER_KEYS", "SAMPLER_METHOD", "derive_device_decision", "empty_aggregate", "invalid_sampler",
+    "normalize_sampler", "not_sampled_sampler", "validate_sampler_wire",
 ]

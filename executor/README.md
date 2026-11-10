@@ -50,17 +50,31 @@ reason `not-sampled`. This is operationally advisory, so a completed segment
 may remain accepted and dispatch may return `0`; the manifest records that H-v2
 must perform its own delivered-GPU check. H-v2 does not wait for L1b.
 
-L1b adds a bounded in-child `nvidia-smi` PID-to-UUID sampler and a separate
-closed wire, `science-placement-receipt-v3`; `v2` keeps its L1a meaning and
-`v1` is unchanged. A declared-GPU v2-placement child marks sampling attempted
-before any command launches. Each command runs in its own session; every exit
-path SIGKILLs the retained process group and the record is quiescent only
-when `killpg(pgid, 0)` reports the group empty. The v3 verdict is derived,
-never trusted: out-of-entitlement use by the exact science PID in any sample
-is `mismatch`; an attempted sampler failure, an unresolved entitlement, or no
-row for the exact PID is `telemetry-failed`; `qualified` requires quiescent
-evidence with every active UUID inside the slot entitlement. `not-sampled`
-(intentionally unattempted, for example a CPU-only slot) is not
+L1b adds an `nvidia-smi` PID-to-UUID sampler and a separate closed wire,
+`science-placement-receipt-v3`; `v2` keeps its L1a meaning and `v1` is
+unchanged. The sampler lives in the worker that launches and owns the science
+child (`SubprocessWorker`), not in the child, so `RUN_SHIM` is unchanged from
+L1a. For a declared-GPU v2-placement slot the controller assigns a
+worker-only evidence path; the worker claims it with an attempted,
+unfinalized record before spawn, samples the exact child PID immediately and
+then every cadence (default 2 s, bounded to 0.01-60 s) for the child's whole
+lifetime, and takes a final sample once it has observed the exit. At most 16
+samples are retained; a closed lifetime aggregate records every GPU the
+exact PID ever used and whether out-of-entitlement use or an unresolved
+entitlement was ever seen, including in samples that were not retained.
+Each command runs in its own session. On every path, including a worker
+timeout or cancellation of the science child, the worker SIGKILLs, drains,
+reaps, and confirms every command group empty (ESRCH from `killpg(pgid, 0)`)
+under one shared deadline before it returns and the slot is released;
+otherwise the record is not quiescent and keeps the surviving group ids.
+
+The v3 verdict is derived, never trusted: out-of-entitlement use by the exact
+science PID at any time is `mismatch`; an attempted sampler failure, an
+unresolved entitlement, or no row for the exact PID during the whole
+lifetime is `telemetry-failed`; `qualified` requires quiescent evidence with
+every active UUID inside the slot entitlement. A GPU child that never creates
+a CUDA context is therefore `telemetry-failed` and science-blocking.
+`not-sampled` (intentionally unattempted, for example a CPU-only slot) is not
 science-blocking; `telemetry-failed` is. Both stay operationally advisory.
 
 Post-launch host or affinity mismatch is also advisory: the segment remains

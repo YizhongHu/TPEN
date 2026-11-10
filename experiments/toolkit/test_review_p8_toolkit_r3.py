@@ -16,9 +16,12 @@ M9
     is no source mutant or root-suite killer for it.
 
 L1b (S2b-2 sampler layer)
-    The L1b shim samples every declared-GPU v2 child, so the real ``matched``
-    mode now yields a v3 ``qualified`` receipt.  The L1a v2 backward read is
-    proven on untouched L1a producer bytes in ``test_run_results_l1b.py``.
+    The worker that owns each declared-GPU v2 child samples it for its whole
+    lifetime, so the real ``matched`` mode yields a v3 ``qualified`` receipt.
+    The fake ``nvidia-smi`` runs as a child of the worker, so it reports the
+    science child's PID from the child placement sidecar (and only while that
+    PID is alive) instead of ``$PPID``.  The L1a v2 backward read is proven on
+    untouched L1a producer bytes in ``test_run_results_l1b.py``.
     ``test_l1b_real_producer_outcomes_cross_p8_reader`` drives every v3
     outcome through the real CLI dispatch/store with deterministic fake
     ``nvidia-smi`` modes, and ``test_l1b_executor_and_p8_refuse_identical_tampers``
@@ -131,6 +134,7 @@ def _producer_code() -> str:
             "if Path(__file__).resolve().parent != Path(os.environ['L2_STUB_ORIGIN']).resolve():\\n"
             "    raise RuntimeError('consumer-test imported an unexpected tpen.run')\\n"
             "def main(argv):\\n"
+            "    import time; time.sleep(float(os.environ.get('L1B_STUB_SECONDS', '0')))\\n"
             "    values = dict(item.split('=', 1) for item in argv if '=' in item)\\n"
             "    run_dir = Path(values['run.root']) / values.get('run.run_id', 'core')\\n"
             "    checkpoint = run_dir / 'checkpoint' / 'step_000001'\\n"
@@ -173,6 +177,10 @@ print(Path(sys.argv[1], "evidence.json").read_text(encoding="utf-8"))
             "L2_STUB_ORIGIN": str(stub.resolve()),
             "L2_RESOLVED_CONFIG_IDENTITY": identity,
             "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+            # The worker samples the child's lifetime; keep it alive for
+            # several sampling cadences after its sidecar exists.
+            "L1B_STUB_SECONDS": "1.0",
+            "TPEN_PLACEMENT_GPU_SAMPLER_CADENCE": "0.05",
         }
         if mode == "refused":
             child_env["TPEN_PLACEMENT_REFUSAL"] = json.dumps({"code": "child-placement-refused", "reason": "consumer refusal control"})
@@ -208,8 +216,16 @@ def _run_real_producer(tmp_path: Path, mode: str) -> Path:
     fake = fake_bin / "nvidia-smi"
     fake.write_text(
         "#!/usr/bin/env python3\n"
-        "import os, sys\n"
+        "import json, os, sys\n"
         "from pathlib import Path\n"
+        "def child_pid():\n"
+        "    # The worker runs this fake; the science child PID is in its sidecar.\n"
+        "    try:\n"
+        "        pid = json.loads(Path(os.environ['TPEN_PLACEMENT_OUTPUT']).read_text())['pid']\n"
+        "        os.kill(pid, 0)\n"
+        "        return pid\n"
+        "    except Exception:\n"
+        "        return None\n"
         "marker = os.environ.get('L2_GPU_PARTIAL_MARKER')\n"
         "if marker:\n"
         "    path = Path(marker)\n"
@@ -220,8 +236,8 @@ def _run_real_producer(tmp_path: Path, mode: str) -> Path:
         "elif '--query-gpu=uuid,pci.bus_id' in sys.argv:\n"
         "    print('GPU-12345678-1234-1234-1234-123456789ABC, 0000:00:01.0')\n"
         "    if os.environ.get('L2_GPU_MISMATCH') == '1': print('GPU-12345678-1234-1234-1234-123456789ABD, 0000:00:02.0')\n"
-        "elif '--query-compute-apps=pid,gpu_uuid' in sys.argv:\n"
-        "    print(f\"{os.getppid()},GPU-12345678-1234-1234-1234-123456789ABD\" if os.environ.get('L2_GPU_MISMATCH') == '1' else f\"{os.getppid()},GPU-12345678-1234-1234-1234-123456789ABC\")\n",
+        "elif '--query-compute-apps=pid,gpu_uuid' in sys.argv and child_pid() is not None:\n"
+        "    print(f\"{child_pid()},GPU-12345678-1234-1234-1234-123456789ABD\" if os.environ.get('L2_GPU_MISMATCH') == '1' else f\"{child_pid()},GPU-12345678-1234-1234-1234-123456789ABC\")\n",
         encoding="utf-8",
     )
     fake.chmod(0o755)
@@ -231,13 +247,16 @@ def _run_real_producer(tmp_path: Path, mode: str) -> Path:
         fake.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         fake.chmod(0o755)
     elif mode in L1B_FAKE_ROWS:
-        # Deterministic shell fake: $PPID is the science child that runs the sampler.
+        # Deterministic shell fake run by the worker: the science child PID is
+        # read from its placement sidecar and reported only while it is alive.
         fake.write_text(
             "#!/bin/sh\n"
+            "pid=$(sed -n 's/.*\"pid\": \\([0-9][0-9]*\\).*/\\1/p' \"$TPEN_PLACEMENT_OUTPUT\" 2>/dev/null)\n"
+            "if [ -z \"$pid\" ] || ! kill -0 \"$pid\" 2>/dev/null; then pid=''; fi\n"
             "case \"$1\" in\n"
             "  --version) echo 'NVIDIA-SMI consumer-test' ;;\n"
             f"  --query-gpu=*) printf '%s, 0000:00:01.0\\n%s, 0000:00:02.0\\n' {GPU_A} {GPU_B} ;;\n"
-            f"  *) echo {L1B_FAKE_ROWS[mode]} ;;\n"
+            f"  *) {L1B_FAKE_ROWS[mode]} ;;\n"
             "esac\n",
             encoding="utf-8",
         )
@@ -255,13 +274,14 @@ def _run_real_producer(tmp_path: Path, mode: str) -> Path:
 
 GPU_A = "GPU-12345678-1234-1234-1234-123456789ABC"
 GPU_B = "GPU-12345678-1234-1234-1234-123456789ABD"
-# Process-row output of each L1b fake mode; the sampler's parent is the child.
+# Process-row command of each L1b fake mode; ``$pid`` is the live science child.
+# Every command exits 0 when the child has no row yet.
 L1B_FAKE_ROWS = {
-    "gpu-matched": f'"$PPID, {GPU_A}"',
-    "gpu-out-of-entitlement": f'"$PPID, {GPU_B}"',
-    "gpu-no-row": f'"999999, {GPU_A}"',
-    "gpu-unresolved": f'"$PPID, {GPU_A}"',
-    "cpu-not-sampled": f'"$PPID, {GPU_A}"',
+    "gpu-matched": f'if [ -n "$pid" ]; then echo "$pid, {GPU_A}"; fi',
+    "gpu-out-of-entitlement": f'if [ -n "$pid" ]; then echo "$pid, {GPU_B}"; fi',
+    "gpu-no-row": f'echo "999999, {GPU_A}"',
+    "gpu-unresolved": f'if [ -n "$pid" ]; then echo "$pid, {GPU_A}"; fi',
+    "cpu-not-sampled": f'if [ -n "$pid" ]; then echo "$pid, {GPU_A}"; fi',
 }
 
 
@@ -350,6 +370,9 @@ def test_l1b_real_producer_outcomes_cross_p8_reader(tmp_path: Path) -> None:
         else:
             assert sampler["reason"] == "observed" and sampler["quiescent"] is True, mode
             assert sampler["survivors"] == [] and sampler["count"] >= 1, mode
+            # The worker sampled the exact science child for its lifetime.
+            assert sampler["target_pid"] == receipt["child"]["pid"], mode
+            assert sampler["aggregate"]["samples_taken"] >= sampler["count"], mode
             child_rows = {row["pid"] for sample in sampler["samples"] for row in sample["pid_rows"]}
             assert child_rows == ({999999} if mode == "gpu-no-row" else {receipt["child"]["pid"]}), mode
         if mode == "gpu-out-of-entitlement":
@@ -369,12 +392,14 @@ def test_l1b_executor_and_p8_refuse_identical_tampers(tmp_path: Path) -> None:
     """
 
     executor_python = _executor_python()
-    from experiments.toolkit.test_run_results_l1b import P8_CONTRADICTIONS
+    from experiments.toolkit.test_run_results_l1b import P8_CONTRADICTIONS, P8_OTHER_CONTRADICTIONS
 
-    baseline = json.loads((ROOT / "experiments" / "toolkit" / "fixtures" / "run-manifests-v3-sampler.json").read_text(encoding="utf-8"))["matched"]
-    cases = {"baseline": baseline}
-    for name, mutate in P8_CONTRADICTIONS.items():
-        tampered = copy.deepcopy(baseline)
+    fixtures = json.loads((ROOT / "experiments" / "toolkit" / "fixtures" / "run-manifests-v3-sampler.json").read_text(encoding="utf-8"))
+    corpus = {name: ("matched", mutate) for name, mutate in P8_CONTRADICTIONS.items()}
+    corpus.update(P8_OTHER_CONTRADICTIONS)
+    cases = {f"baseline-{name}": fixtures[name] for name in sorted({baseline for baseline, _ in corpus.values()})}
+    for name, (baseline, mutate) in corpus.items():
+        tampered = copy.deepcopy(fixtures[baseline])
         mutate(tampered["attempts"][0]["placement_receipt"])
         cases[name] = tampered
     paths = {}
@@ -404,5 +429,5 @@ def test_l1b_executor_and_p8_refuse_identical_tampers(tmp_path: Path) -> None:
             p8 = "accept"
         except ManifestRefusal:
             p8 = "reject"
-        expected = "accept" if name == "baseline" else "reject"
+        expected = "accept" if name.startswith("baseline-") else "reject"
         assert executor_verdicts[str(path)] == p8 == expected, name
