@@ -256,6 +256,63 @@ def test_probe_admitted_a1_modules_admits_none(tmp_path: Path, monkeypatch: pyte
     assert set(skipped) == set(protocol.candidate_modules_to_append())
 
 
+def test_probe_propagates_non_refusal_error_from_a_later_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F3 coverage gap: a checker failure on a LATER candidate (baseline OK).
+
+    ``test_probe_propagates_checker_failures`` (cherry-picked review r1 test)
+    fails every ``check_profile`` call unconditionally, including the base
+    probe -- so it is satisfied by the unconditional baseline check alone and
+    never actually exercises the per-candidate ``error.code != "profile-refused"``
+    discrimination. This test makes the baseline succeed and only the second
+    candidate's check raise a non-refusal code, so only the per-candidate
+    branch can be responsible for propagating it.
+    """
+
+    config, _ = protocol.pilot_training_config("gpu-route-g")
+    candidates = protocol.candidate_modules_to_append()
+    failure = attached.ActivationRefusal("profile-unavailable", "malformed checker response")
+    calls = {"count": 0}
+
+    def _fake_check_profile(science_python: Any, probe_path: Any, **kwargs: Any) -> None:
+        del science_python, probe_path, kwargs
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return  # baseline: admitted
+        raise failure
+
+    monkeypatch.setattr(attached, "check_profile", _fake_check_profile)
+    with pytest.raises(attached.ActivationRefusal) as caught:
+        attached.probe_admitted_a1_modules(
+            config, candidates, science_python=sys.executable, probe_config_path=tmp_path / "probe.yaml"
+        )
+    assert caught.value is failure
+
+
+def test_build_checkpoint_inventory_hashes_nested_files(tmp_path: Path) -> None:
+    """F1 coverage gap: a checkpoint with a genuinely NESTED file.
+
+    ``test_inventory_covers_all_file_names_and_streams_hashes`` (cherry-picked
+    review r1 test) only adds sibling top-level files, so reverting
+    ``entry.rglob("*")`` to ``entry.iterdir()`` is unobservable there -- a
+    flat fixture cannot distinguish recursive from non-recursive. This test
+    adds a file under a subdirectory inside the checkpoint.
+    """
+
+    checkpoint = _write_fake_checkpoint(tmp_path, 0)
+    nested_dir = checkpoint / "shard"
+    nested_dir.mkdir()
+    nested_file = nested_dir / "optimizer_shard_0.pt"
+    nested_file.write_bytes(b"nested-shard-bytes")
+
+    inventory = attached.build_checkpoint_inventory(tmp_path)
+    assert len(inventory) == 1
+    expected_key = str(nested_file.relative_to(checkpoint))
+    assert expected_key in inventory[0]["files"]
+    assert inventory[0]["files"][expected_key] == hashlib.sha256(nested_file.read_bytes()).hexdigest()
+
+
 def test_probe_raises_on_instantiation_failure_not_swallowed_as_skip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

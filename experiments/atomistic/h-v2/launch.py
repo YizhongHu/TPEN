@@ -232,6 +232,14 @@ def _cleanup(signum, frame):
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        # Reap immediately: an unreaped killed child stays a zombie (its pid
+        # stays valid for a pid-0 liveness probe) until this process exits
+        # AND the kernel reparents/collects it -- a race a caller polling
+        # os.kill(pid, 0) right after this process exits can lose.
+        try:
+            proc.wait()
+        except Exception:
+            pass
     raise SystemExit(0)
 
 
