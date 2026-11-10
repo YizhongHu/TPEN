@@ -60,6 +60,13 @@ NEW_RESUME_SAFE_CALLBACK_TARGETS = frozenset(
     }
 )
 
+OBSERVATIONAL_CALLBACK_TARGETS = frozenset(
+    {
+        "tpen.callback.ElectronNucleusDistanceQuantiles",
+        "tpen.callback.ModuleNorms",
+    }
+)
+
 
 def test_supported_profile_reports_declared_state_owners() -> None:
     result = check_profile(OmegaConf.create(_config()), NATIVE_RECOVERY_PROFILE)
@@ -142,6 +149,38 @@ def test_reconstructible_cadence_is_admitted_by_both_validators(target: str) -> 
     assert result.verdict == "supported"
     assert result.refusal is None
     validate_native_recovery_profile(config)
+
+
+@pytest.mark.parametrize("target", sorted(OBSERVATIONAL_CALLBACK_TARGETS))
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("every_n_steps", 3), ("max_calls", 2), ("probability", 0.5)],
+)
+def test_observational_cadence_is_admitted_by_both_validators(
+    target: str, field: str, value: object
+) -> None:
+    """Observational cadence gates logging only and is restart-safe by design."""
+
+    config = _config(callbacks=[{"_target_": target, field: value}])
+
+    result = check_profile(config, NATIVE_RECOVERY_PROFILE)
+
+    assert result.verdict == "supported"
+    assert result.refusal is None
+    validate_native_recovery_profile(config)
+
+
+def test_raw_training_recorder_is_refused_by_checkpoint_profile() -> None:
+    """Training history remains optional and is not a resumable checkpoint target."""
+
+    result = check_profile(
+        _config(callbacks=[{"_target_": "tpen.callback.RawTrainingBatchRecorder"}]),
+        NATIVE_RECOVERY_PROFILE,
+    )
+    assert result.verdict == "refused"
+    assert result.refusal is not None
+    assert result.refusal["code"] == "unsupported-callback"
+    assert "RawTrainingBatchRecorder" in result.refusal["reason"]
 
 
 def test_resume_sensitive_cadence_helper_audits_pop_step_cadence_fields() -> None:
