@@ -47,6 +47,8 @@ NEW_CALLBACK_TARGETS = frozenset(
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
         "tpen.callback.AmplitudeRiskFraction",
+        "tpen.callback.SamplerHealth",
+        "tpen.callback.FactorScalars",
         "tpen.callback.RawTrainingBatchRecorder",
         "tpen.callback.TrainingBatchRecorder",
     }

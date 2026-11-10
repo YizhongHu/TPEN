@@ -104,6 +104,8 @@ def test_core_t2_constants_facade_and_chain_resume_remain_exact():
         "tpen.callback.Checkpoint",
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
+        "tpen.callback.SamplerHealth",
+        "tpen.callback.FactorScalars",
         "tpen.callback.InitialCheckpoint",
         "tpen.callback.ParameterActivity",
         "tpen.callback.AmplitudeRiskFraction",

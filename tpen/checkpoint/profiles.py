@@ -105,6 +105,23 @@ OBSERVATIONAL_CALLBACK_TARGETS = frozenset(
 # part of the callback's contract.  This is deliberately not inferred from
 # ``StatefulCallback``: that generic describes the domain state a callback
 # observes, not callback-owned state restored by ``train_resume``.
+#
+# #614 audit for OptimizerState: its state source is ``TrainerState.update_state``
+# and the live model's Adam/AdamW carrier. It is observational: validation can
+# reject an incompatible state, but the callback has no run-aborting policy of
+# its own. Its ``StepCadenceGate`` (including ``num_calls`` and its RNG) is
+# callback-owned and not restored by ``train_resume``, but it gates only metric
+# logging, so cadence remains admitted.
+# #614 audit for SamplerHealth: its state source is the typed
+# ``TrainerState.sampler_stats`` record. ``fail_fast`` can abort the run, so it
+# belongs with the resume-sensitive health checks. Its callback-owned
+# ``StepCadenceGate`` (including ``num_calls`` and its RNG) is not restored;
+# ``max_calls`` or ``probability < 1`` must therefore refuse.
+# #614 audit for FactorScalars: its state source is each model factor's
+# ``scalar_diagnostics`` contract. Its ``fail_fast`` path can also abort the
+# run, so it is resume-sensitive. Its callback-owned ``StepCadenceGate``
+# (including ``num_calls`` and its RNG) is not restored; the same
+# ``max_calls``/``probability < 1`` refusal applies.
 # ``InitialCheckpoint`` (tpen/callback/initial_checkpoint.py) and
 # ``ParameterActivity`` (tpen/callback/parameter_activity.py) each become a
 # VERIFIED no-op on a resumed lineage at step > 0: each checks that its own
@@ -120,6 +137,8 @@ RESUME_SENSITIVE_CALLBACK_TARGETS = frozenset(
         "tpen.callback.AmplitudeRiskFraction",
         "tpen.callback.InitialCheckpoint",
         "tpen.callback.ParameterActivity",
+        "tpen.callback.SamplerHealth",
+        "tpen.callback.FactorScalars",
         "tpen.callback.RawTrainingBatchRecorder",
         "tpen.callback.TrainingBatchRecorder",
     }
@@ -146,16 +165,17 @@ RESUME_SENSITIVE_CALLBACK_TARGETS = frozenset(
 # same cadence-sensitive standard as DataIntegrity and GradientStats rather
 # than the three purely-timing callbacks above.
 # observational ``train/perf`` logging. OptimizerState validates its update
-# method at iteration entry, then uses the gate only for completed-update
-# optimizer metrics; it likewise owns no resume state. Those observational
-# callbacks therefore remain admitted. AmplitudeRiskFraction consumes the
-# same five fields at ``tpen/callback/amplitude_risk.py`` (via
-# ``pop_step_cadence``) and gates which completed-iteration batches get a
-# published descriptive occupancy fraction; a gap or duplicate in that
-# published set is exactly the resume-fidelity failure this allowlist exists
-# to catch, so it is held to the same cadence-sensitive standard as
-# DataIntegrity and GradientStats rather than the three purely-timing
-# callbacks above.
+# method at iteration entry, then uses its non-restored gate only for
+# completed-update optimizer metrics; it therefore remains admitted despite
+# owning cadence state. SamplerHealth and FactorScalars are listed above
+# because their same gate can suppress a configured run-aborting check.
+# AmplitudeRiskFraction consumes the same five fields at
+# ``tpen/callback/amplitude_risk.py`` (via ``pop_step_cadence``) and gates
+# which completed-iteration batches get a published descriptive occupancy
+# fraction; a gap or duplicate in that published set is exactly the
+# resume-fidelity failure this allowlist exists to catch, so it is held to
+# the same cadence-sensitive standard as DataIntegrity and GradientStats
+# rather than the three purely-timing callbacks above.
 CALLBACK_CADENCE_REFUSAL_CODE = "unsupported-callback-cadence"
 CADENCE_SENSITIVE_CALLBACK_TARGETS = frozenset(
     {
@@ -163,6 +183,8 @@ CADENCE_SENSITIVE_CALLBACK_TARGETS = frozenset(
         "tpen.callback.DataIntegrity",
         "tpen.callback.GradientStats",
         "tpen.callback.AmplitudeRiskFraction",
+        "tpen.callback.SamplerHealth",
+        "tpen.callback.FactorScalars",
         "tpen.callback.RawTrainingBatchRecorder",
         "tpen.callback.TrainingBatchRecorder",
     }
