@@ -455,8 +455,10 @@ def test_late_proc_refusal_preserves_observed_affinity_and_cause(tmp_path: Path)
                 "physical-01", 123, 0, (allowed[0],), {}, None, "2026-11-10T00:00:00Z",
                 {"code": "child-placement-refused", "reason": "/proc stat unavailable"},
             )
+            payload = observation.to_dict()
+            payload["refusal"] = dict(observation.refusal)
             Path(environment.env["TPEN_PLACEMENT_OUTPUT"]).write_text(
-                json.dumps(observation.to_dict()) + "\n", encoding="utf-8"
+                json.dumps(payload) + "\n", encoding="utf-8"
             )
             return ProcessOutcome((sys.executable,), 2, "", "", False, 123, 55)
 

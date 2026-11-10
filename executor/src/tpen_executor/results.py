@@ -470,7 +470,13 @@ class SciencePlacementReceiptV2:
             object.__setattr__(self, name, _freeze(value, name))
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self.base, name)
+        if name == "base":
+            raise AttributeError(name)
+        try:
+            base = object.__getattribute__(self, "base")
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(base, name)
 
     def to_dict(self) -> dict[str, Any]:
         result = self.base.to_dict()
