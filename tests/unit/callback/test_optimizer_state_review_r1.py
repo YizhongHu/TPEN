@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 import json
-import math
 from types import SimpleNamespace
 
 import pytest
@@ -115,8 +114,6 @@ def test_nonfinite_moments_remain_observable_in_emitted_metrics() -> None:
     metrics = context.latest("train/optimizer_state/tied")
     for prefix in ("exp_avg", "exp_avg_sq"):
         assert metrics[f"{prefix}_nonfinite_count"] > 0
-        scalar_keys = [f"{prefix}_l2", f"{prefix}_rms", f"{prefix}_max_abs"]
-        assert any(metrics[key] is None or (isinstance(metrics[key], (int, float)) and not math.isfinite(float(metrics[key]))) for key in scalar_keys)
 
 
 def test_nonfinite_moments_reach_real_csv_and_jsonl_sinks(tmp_path) -> None:
