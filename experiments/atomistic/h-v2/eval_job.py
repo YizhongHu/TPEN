@@ -716,19 +716,45 @@ def compute_pilot_selection(stage1_receipt: Mapping[str, Any]) -> dict[str, Any]
     the caller's job to fill in from the receipt file it read this payload
     from, since this function only sees the in-memory receipt).
 
+    F4 (review r1): every stream-0 trajectory CSV is re-hashed and checked
+    against the receipt's OWN recorded ``trajectory_csv`` sha256 before its
+    bytes are read for ``W`` -- a CSV replaced on disk without updating the
+    receipt it is bound to is refused, never silently included. Stage 1
+    must carry all 21 stream-0 generations (ordinals 0..20); a receipt
+    missing any of them refuses even if the missing ordinals fall outside
+    every candidate triple ``select_pilot_basin_ordinal`` happens to need.
+
     Raises
     ------
     EvalJobRefusal
-        Code ``sel-missing-stream0-ordinal``, if stage 1 is incomplete for
-        any of the ordinals 2..20 a candidate triple needs.
+        Code ``sel-incomplete-stage1``, if stage 1 is missing any stream-0
+        ordinal in ``0..20``; code ``sel-trajectory-hash-mismatch``, if a
+        trajectory CSV's current bytes do not match the receipt's own
+        recorded hash for it.
     """
 
     w_by_ordinal: dict[int, float] = {}
+    seen_ordinals: set[int] = set()
     for generation in stage1_receipt.get("generations") or []:
         if generation.get("stream") != 0:
             continue
-        energies = read_stream_local_energies(trajectory_csv_path(generation))
+        seen_ordinals.add(generation["ordinal"])
+        path = trajectory_csv_path(generation)
+        recorded_sha256 = generation.get("artifacts", {}).get("trajectory_csv", {}).get("sha256")
+        actual_sha256 = _sha256_file(path)
+        if actual_sha256 != recorded_sha256:
+            raise EvalJobRefusal(
+                "sel-trajectory-hash-mismatch",
+                f"{path} sha256 {actual_sha256} does not match the B1 receipt's recorded "
+                f"{recorded_sha256!r} for ordinal {generation['ordinal']}",
+            )
+        energies = read_stream_local_energies(path)
         w_by_ordinal[generation["ordinal"]] = protocol.w_statistic(energies)
+    missing = sorted(set(protocol.PILOT_STAGE1_ORDINALS) - seen_ordinals)
+    if missing:
+        raise EvalJobRefusal(
+            "sel-incomplete-stage1", f"B1 receipt is missing stream-0 generations for ordinals {missing!r}"
+        )
     c1, triple_means = protocol.select_pilot_basin_ordinal(w_by_ordinal)
     return {"c1": c1, "triple_means": triple_means}
 
