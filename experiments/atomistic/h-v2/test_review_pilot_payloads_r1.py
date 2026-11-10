@@ -34,13 +34,15 @@ OPTIONAL_MODULES = {"tpen.callback.InitialCheckpoint", "tpen.callback.ParameterA
 
 def _module(name):
     key = f"h_v2_{name}"
-    if key not in sys.modules:
-        spec = importlib.util.spec_from_file_location(key, HERE / f"{name}.py")
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[key] = module
-        spec.loader.exec_module(module)
-    return sys.modules[key]
+    cached = sys.modules.get(key)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(key, HERE / f"{name}.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 protocol = _module("protocol")

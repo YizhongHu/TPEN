@@ -182,3 +182,72 @@ def test_store_exists_refusal_still_holds(tmp_path: Path) -> None:
     assert dispatch.returncode == 2, (dispatch.returncode, dispatch.stdout, dispatch.stderr)
     assert dispatch.manifest is None
     assert "store-exists" in dispatch.stderr
+
+
+def test_science_pipeline_check_train_dispatch_reaches_real_store_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TO 8d9a31b3 K1: the science/pipeline-check TRAIN path's OWN
+    ``_reserve_store_parent`` call site (``run_job.py`` ~:444, inside
+    ``run_job.run()``) must run before dispatch, not only the pilot-payload
+    call site (~:350) the two tests above already exercise directly by
+    calling ``_reserve_store_parent``/``run_executor_cli`` themselves rather
+    than going through ``run_job.run()``. A verifier's mutant that removed
+    only the second call site (keeping the first) SURVIVED the targeted
+    suite -- note ``tip-verification-a16cff94`` on this item -- precisely
+    because no test drove the public ``run_job.run()`` entry point far
+    enough to reach it. This test does, through a genuinely fresh, empty run
+    root, with the real, installed ``tpen_executor`` CLI still doing the
+    actual store reservation (not mocked).
+
+    ``check_identity`` (host/GPU/CUDA stratum assertion) is stubbed to a
+    no-op: orthogonal to store-parent creation, and this facility is CPU-only.
+    ``attached.activate_h_v2_run`` is replaced with a thin wrapper that still
+    dispatches through the real executor CLI but skips the separate,
+    already-tracked resolved-config-identity reader fence (#618,
+    ``test_review_p8_toolkit_r3.py::test_l2_real_executor_producer_to_p8_reader_contract``)
+    that is orthogonal to this item's acceptance contract. Fake compute,
+    real store reservation.
+    """
+
+    science_python, executor_python = _require_real_cli_env()
+    run_root = tmp_path / "fresh_science_run_root"
+    assert not run_root.exists()
+    task_id = "h-v2-train-pipeline-check-L1"
+    store = run_root / "attached" / "store" / task_id
+    assert not store.parent.exists()
+
+    monkeypatch.setattr(run_job, "check_identity", lambda *a, **kw: None)
+
+    real_run_executor_cli = attached.run_executor_cli
+    captured: dict[str, object] = {}
+
+    def _stub_activate(prepared, *, store, **_kwargs):
+        store_path = Path(store)
+        assert not store_path.exists(), "store must still be absent when activation begins -- the fix must not pre-create it"
+        allocation_path, worker_path = _real_cli_allocation_and_worker(
+            tmp_path, science_python=science_python, placeholder_config=prepared.effective_config
+        )
+        dispatch = real_run_executor_cli(
+            executor_python,
+            prepared.handoff,
+            allocation=allocation_path,
+            worker_config=worker_path,
+            store=store_path,
+            dispatcher="local",
+            timeout=180.0,
+        )
+        captured["dispatch"] = dispatch
+
+    monkeypatch.setattr(attached, "activate_h_v2_run", _stub_activate)
+    monkeypatch.setenv("RUN", str(run_root))
+    monkeypatch.setenv("SHA", "f" * 40)
+    monkeypatch.setenv("SCIENCE_PYTHON", science_python)
+    monkeypatch.setenv("EXECUTOR_PY", executor_python)
+
+    run_job.run("train", "L1", pipeline_check=True)
+
+    dispatch = captured["dispatch"]
+    assert dispatch.returncode == 0, (dispatch.returncode, dispatch.stdout, dispatch.stderr)
+    assert dispatch.manifest is not None
+    assert store.is_dir()
