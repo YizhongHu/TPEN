@@ -335,6 +335,73 @@ class SciencePlacementReceipt:
 
 
 @frozen_record
+class SciencePlacementReceiptV2:
+    """Versioned placement receipt with physical host and live-PID evidence.
+
+    ``SciencePlacementReceipt`` remains the immutable v1 wire record.  V2
+    composes it rather than widening its closed key set, so old manifests can
+    still be decoded byte-for-byte while new producer fields are explicit.
+    """
+
+    schema: ClassVar[str] = "tpen-executor/science-placement-receipt-v2"
+    base: SciencePlacementReceipt
+    host_mapping: Mapping[str, Any]
+    gpu_sampler: Mapping[str, Any]
+    verdict: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.base, SciencePlacementReceipt):
+            raise TypeError("v2 base must be SciencePlacementReceipt")
+        for name, value in (("host_mapping", self.host_mapping), ("gpu_sampler", self.gpu_sampler), ("verdict", self.verdict)):
+            if not isinstance(value, Mapping):
+                raise TypeError(f"{name} must be a mapping")
+            object.__setattr__(self, name, _freeze(value, name))
+        if any(type(self.verdict.get(key)) is not str or not self.verdict[key] for key in ("host", "device", "qualification")):
+            raise TypeError("v2 verdict must contain non-empty host, device, and qualification states")
+        for section in (self.host_mapping, self.gpu_sampler):
+            if section.get("status") == "unavailable" and (type(section.get("reason")) is not str or not section["reason"]):
+                raise ValueError("unavailable placement evidence requires a non-empty reason")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.base, name)
+
+    def to_dict(self) -> dict[str, Any]:
+        result = self.base.to_dict()
+        result.update({
+            "schema": self.schema,
+            "host_mapping": thaw(self.host_mapping),
+            "gpu_sampler": thaw(self.gpu_sampler),
+            "verdict": thaw(self.verdict),
+        })
+        return result
+
+    def encode(self) -> bytes:
+        return canonical_bytes(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "SciencePlacementReceiptV2":
+        if not isinstance(data, Mapping):
+            raise TypeError("SciencePlacementReceiptV2 must be a mapping")
+        expected = {
+            "schema", "task_id", "attempt_id", "group_digest", "allocation_id", "backend_job_id", "slot_id",
+            "payload_digest", "output_dir", "child", "declared", "gpu", "comparison", "refusal",
+            "host_mapping", "gpu_sampler", "verdict",
+        }
+        if set(data) != expected or data.get("schema") != cls.schema:
+            raise ValueError("SciencePlacementReceiptV2 keys or schema differ")
+        base = dict(data)
+        base.pop("host_mapping")
+        base.pop("gpu_sampler")
+        base.pop("verdict")
+        base["schema"] = SciencePlacementReceipt.schema
+        return cls(SciencePlacementReceipt.from_mapping(base), data["host_mapping"], data["gpu_sampler"], data["verdict"])
+
+    @classmethod
+    def decode(cls, data: bytes | str | dict[str, Any]) -> "SciencePlacementReceiptV2":
+        return cls.from_mapping(decode_json(data))
+
+
+@frozen_record
 class ManifestAttempt:
     """One group member's attempt and receipt references.
 
@@ -356,7 +423,7 @@ class ManifestAttempt:
     start_receipt: StartReceipt
     outcome_receipt: OutcomeReceipt | None
     output_dir: str
-    placement_receipt: SciencePlacementReceipt | None = None
+    placement_receipt: SciencePlacementReceipt | SciencePlacementReceiptV2 | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", text(self.task_id, "task_id")); _identity(self.attempt_id, AttemptId, "attempt_id"); _identity(self.start_receipt, StartReceipt, "start_receipt"); _identity(self.start_receipt.attempt_id, AttemptId, "start_receipt.attempt_id")
@@ -366,8 +433,8 @@ class ManifestAttempt:
         if self.outcome_receipt is not None and (self.task_id != self.outcome_receipt.task_id or self.attempt_id != self.outcome_receipt.attempt_id or self.output_dir != self.outcome_receipt.output_dir or self.start_receipt.group_digest != self.outcome_receipt.group_digest):
             raise ValueError("manifest attempt disagrees with outcome receipt")
         if self.placement_receipt is not None:
-            if not isinstance(self.placement_receipt, SciencePlacementReceipt):
-                raise TypeError("placement_receipt must be SciencePlacementReceipt or None")
+            if not isinstance(self.placement_receipt, (SciencePlacementReceipt, SciencePlacementReceiptV2)):
+                raise TypeError("placement_receipt must be SciencePlacementReceipt, SciencePlacementReceiptV2, or None")
             if (
                 self.task_id != self.placement_receipt.task_id
                 or self.attempt_id != self.placement_receipt.attempt_id
@@ -397,7 +464,13 @@ class ManifestAttempt:
         fields(data, set(data), cls.schema, "ManifestAttempt")
         if any(type(data[key]) is not str for key in ("task_id", "attempt_id", "output_dir")): raise TypeError("ManifestAttempt has an invalid scalar field")
         outcome = None if data["outcome_receipt"] is None else OutcomeReceipt.from_mapping(data["outcome_receipt"])
-        placement = None if data.get("placement_receipt") is None else SciencePlacementReceipt.from_mapping(data["placement_receipt"])
+        placement_data = data.get("placement_receipt")
+        if placement_data is None:
+            placement = None
+        elif placement_data.get("schema") == SciencePlacementReceiptV2.schema:
+            placement = SciencePlacementReceiptV2.from_mapping(placement_data)
+        else:
+            placement = SciencePlacementReceipt.from_mapping(placement_data)
         return cls(data["task_id"], AttemptId(data["attempt_id"]), StartReceipt.from_mapping(data["start_receipt"]), outcome, data["output_dir"], placement)
 
     @classmethod
@@ -585,7 +658,7 @@ class RunManifest:
         return cls.from_mapping(decode_json(data))
 
 
-__all__ = ["AcceptedSegment", "AllocationObservation", "ManifestAttempt", "OutcomeReceipt", "OUTCOME_STATUSES", "RunManifest", "SciencePlacementReceipt", "StartReceipt"]
+__all__ = ["AcceptedSegment", "AllocationObservation", "ManifestAttempt", "OutcomeReceipt", "OUTCOME_STATUSES", "RunManifest", "SciencePlacementReceipt", "SciencePlacementReceiptV2", "StartReceipt"]
 
 
 def encode_manifest(manifest: RunManifest) -> bytes:

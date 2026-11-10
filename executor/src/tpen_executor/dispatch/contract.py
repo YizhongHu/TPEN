@@ -10,7 +10,7 @@ emitting PID zero).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import json
@@ -23,16 +23,18 @@ from .._codec import digest
 from ..contracts import ReadyGroup
 from ..environments import PreparedPythonEnvironment
 from ..lifecycle.attached import AttachedAllocation
-from ..results import RunManifest, SciencePlacementReceipt
+from ..results import RunManifest, SciencePlacementReceipt, SciencePlacementReceiptV2
 from ..placement import (
     PLACEMENT_OUTPUT_ENV,
+    PLACEMENT_RECEIPT_VERSION_ENV,
     PLACEMENT_REFUSAL_ENV,
     PlacementRefusal,
+    canonical_device_uuid,
     canonical_host,
     parse_cpu_set,
+    physical_slots_from_allocation,
     placement_environment,
     read_child_placement,
-    slots_from_allocation,
 )
 from ..runners import CONTEXT_ENV_KEY_PATTERN, CHILD_CONTEXT_KEYS_ENV, CoreRunEvidence, EvidenceUnavailable
 from ..tasks import ConfiguredRun
@@ -159,6 +161,20 @@ def _with_child_placement(
     if not isinstance(environment, PreparedPythonEnvironment):
         return environment
     values = dict(environment.env)
+    facts = getattr(allocation, "facts", {})
+    scheduler_metadata = facts.get("scheduler", facts.get("scheduler_host_map")) if isinstance(facts, Mapping) else None
+    raw_slot_devices = (
+        device
+        for entry in facts.get("slots", {}).get("slots", ())
+        for device in entry.get("devices", ())
+    ) if isinstance(facts.get("slots"), Mapping) else ()
+    v2_requested = scheduler_metadata is not None or any(
+        value.upper().startswith(("GPU-", "MIG-GPU-"))
+        for value in values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "").split(",")
+        if value
+    ) or any(type(value) is str and value.upper().startswith(("GPU-", "MIG-GPU-")) for value in raw_slot_devices)
+    if v2_requested and scheduler_metadata is None:
+        raise PlacementRefusal("host-map-unavailable", "v2 placement requires a captured PBS/Slurm physical host map")
     slot_id = values.get("TPEN_SLOT_ID")
     host = values.get("TPEN_SLOT_NODE")
     cpus = values.get("TPEN_SLOT_CPUS")
@@ -169,7 +185,7 @@ def _with_child_placement(
         )
     devices = values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "")
     if not (slot_id and host and cpus):
-        slots = slots_from_allocation(allocation)
+        slots = physical_slots_from_allocation(allocation)
         if len(slots) != 1:
             # A local worker with no slot is a legacy path; a multi-slot
             # allocation must be resolved by the backend worker (Parsl).
@@ -178,6 +194,18 @@ def _with_child_placement(
         slot_id, host, cpus = slot.slot_id, slot.node, ",".join(str(cpu) for cpu in slot.cpus)
         devices = ",".join(slot.devices)
         values.update(slot.env)
+    elif scheduler_metadata is not None:
+        # A prepared logical slot is not a physical host map.  Resolve it by
+        # slot_id from the immutable scheduler metadata captured at attach.
+        slots = physical_slots_from_allocation(allocation)
+        matching = tuple(slot for slot in slots if slot.slot_id == slot_id)
+        if len(matching) != 1:
+            raise PlacementRefusal("host-map-unavailable", "slot_id has no unique physical scheduler host")
+        slot = matching[0]
+        host, cpus, devices = slot.node, ",".join(str(cpu) for cpu in slot.cpus), ",".join(slot.devices)
+        values.update(slot.env)
+    if v2_requested and devices:
+        devices = ",".join(canonical_device_uuid(device) for device in devices.split(",") if device)
     declared_cpus = parse_cpu_set(cpus)
     controller_refusal: dict[str, str] | None = None
     try:
@@ -208,6 +236,9 @@ def _with_child_placement(
         "TPEN_PLACEMENT_DECLARED_DEVICES": devices,
         "TPEN_PLACEMENT_PAYLOAD_DIGEST": payload_digest,
     }
+    if v2_requested:
+        placement_values[PLACEMENT_RECEIPT_VERSION_ENV] = "2"
+        placement_values["TPEN_PLACEMENT_HOST_STATUS"] = "mapped" if scheduler_metadata is not None else "declared"
     if controller_refusal is not None:
         placement_values[PLACEMENT_REFUSAL_ENV] = json.dumps(controller_refusal, sort_keys=True)
     values = placement_environment(values, **placement_values)
@@ -240,7 +271,7 @@ def _placement_receipt(
     configured: ConfiguredRun,
     environment: Any,
     process_outcome: Any = None,
-) -> SciencePlacementReceipt:
+) -> SciencePlacementReceipt | SciencePlacementReceiptV2:
     """Validate a quiescent child sidecar and convert it to a receipt.
 
     Parameters
@@ -341,6 +372,112 @@ def _placement_receipt(
     )
 
 
+def _placement_receipt_v2(
+    observation: Any,
+    allocation: Any,
+    fence: Any,
+    group: ReadyGroup,
+    member: Any,
+    configured: ConfiguredRun,
+    environment: Any,
+    process_outcome: Any = None,
+) -> SciencePlacementReceiptV2:
+    """Build v2 evidence with physical-host and live-PID UUID verdicts."""
+
+    base = _placement_receipt(observation, allocation, fence, group, member, configured, environment, process_outcome)
+    values = environment.env
+    scheduler_status = values.get("TPEN_PLACEMENT_HOST_STATUS")
+    expected_host = values.get("TPEN_SLOT_NODE")
+    if scheduler_status == "unavailable" or not expected_host:
+        host_state = "unavailable"
+        host_reason = "physical scheduler host mapping is unavailable"
+    else:
+        host_state = base.comparison["host"]
+        host_reason = "" if host_state == "matched" else "child host differs from physical scheduler host"
+    sampler = getattr(observation, "gpu_sampler", None)
+    if not isinstance(sampler, Mapping):
+        sampler = {}
+    declared_devices = [item for item in values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "").split(",") if item]
+    gpu_reason = str(sampler.get("reason") or "")
+    active_uuids: list[str] = []
+    active_pci: list[str] = []
+    try:
+        declared_uuids = {canonical_device_uuid(item) for item in declared_devices}
+    except PlacementRefusal as error:
+        declared_uuids = set()
+        gpu_reason = error.reason
+    inventory = sampler.get("inventory") if isinstance(sampler.get("inventory"), Sequence) and not isinstance(sampler.get("inventory"), (str, bytes, bytearray)) else ()
+    inventory_by_uuid = {
+        str(item.get("uuid", "")).upper(): item
+        for item in inventory
+        if isinstance(item, Mapping) and item.get("uuid")
+    }
+    rows = sampler.get("pid_rows") if isinstance(sampler.get("pid_rows"), Sequence) and not isinstance(sampler.get("pid_rows"), (str, bytes, bytearray)) else ()
+    expected_pid = getattr(observation, "pid", None)
+    for row in rows:
+        if isinstance(row, Mapping) and row.get("pid") == expected_pid and isinstance(row.get("gpu_uuid"), str):
+            uuid = row["gpu_uuid"].upper()
+            active_uuids.append(uuid)
+            if uuid in inventory_by_uuid and inventory_by_uuid[uuid].get("pci.bus_id"):
+                active_pci.append(str(inventory_by_uuid[uuid]["pci.bus_id"]))
+    if not declared_devices:
+        device_state, gpu_reason = "unavailable", "CPU-only slot has no GPU entitlement"
+    elif not sampler or sampler.get("status") == "unavailable":
+        device_state = "unavailable"
+        gpu_reason = gpu_reason or "GPU sampler is unavailable"
+    elif not declared_uuids or not declared_uuids.issubset(inventory_by_uuid):
+        device_state, gpu_reason = "unavailable", "GPU entitlement UUID is absent from sampler inventory"
+    elif not active_uuids:
+        device_state, gpu_reason = "unavailable", "no live PID row was observed within the sampler interval"
+    elif not set(active_uuids).issubset(declared_uuids):
+        device_state, gpu_reason = "mismatch", "live science PID uses a UUID outside its slot entitlement"
+    else:
+        device_state, gpu_reason = "matched", ""
+    gpu = {
+        "status": "qualified" if device_state == "matched" else "unavailable",
+        "reason": gpu_reason or "live PID UUIDs match the physical slot entitlement",
+        "method": sampler.get("method", "nvidia-smi-pid-uuid-v1"),
+        "started_at_utc": base.gpu["started_at_utc"],
+        "finished_at_utc": base.gpu["finished_at_utc"],
+        "samples": list(sampler.get("samples", ())),
+        "active_uuids": active_uuids,
+        "active_pci": active_pci,
+    }
+    comparison = {"host": host_state, "affinity": base.comparison["affinity"], "device": device_state}
+    qualification = "qualified" if all(value == "matched" for value in comparison.values()) and base.refusal is None else "unqualified"
+    refusal = base.refusal
+    if refusal is None and qualification == "unqualified":
+        reason = host_reason if host_state == "unavailable" else gpu_reason
+        refusal = {"code": "placement-unqualified", "reason": reason or "placement evidence is unqualified"}
+    v2_base = SciencePlacementReceipt(
+        base.task_id, base.attempt_id, base.group_digest, base.allocation_id, base.backend_job_id, base.slot_id,
+        base.payload_digest, base.output_dir, base.child, base.declared, gpu, comparison, refusal,
+    )
+    return SciencePlacementReceiptV2(
+        v2_base,
+        {
+            "status": host_state,
+            "reason": host_reason or "physical scheduler host mapped",
+            "source": "scheduler-node-map" if scheduler_status == "mapped" else "declared-slot",
+            "slot_id": base.slot_id,
+            "host": expected_host or "unavailable",
+        },
+        {
+            "status": device_state,
+            "reason": gpu_reason or "live PID UUID sampler matched",
+            "method": sampler.get("method", "nvidia-smi-pid-uuid-v1"),
+            "version": sampler.get("version"),
+            "cadence_seconds": sampler.get("cadence_seconds", 0.0),
+            "count": sampler.get("count", 0),
+            "monotonic_start": sampler.get("monotonic_start"),
+            "monotonic_end": sampler.get("monotonic_end"),
+            "inventory": list(inventory),
+            "pid_rows": list(rows),
+        },
+        {"host": host_state, "device": device_state, "qualification": qualification},
+    )
+
+
 def _placement_refusal_receipt(
     observation_error: PlacementRefusal,
     allocation: Any,
@@ -350,7 +487,7 @@ def _placement_refusal_receipt(
     configured: ConfiguredRun,
     environment: Any,
     process_outcome: Any,
-) -> SciencePlacementReceipt:
+) -> SciencePlacementReceipt | SciencePlacementReceiptV2:
     """Encode a missing or malformed child sidecar as explicit refusal evidence.
 
     Parameters
@@ -378,7 +515,7 @@ def _placement_refusal_receipt(
     declared_devices = [item for item in values.get("TPEN_PLACEMENT_DECLARED_DEVICES", "").split(",") if item]
     pid = getattr(process_outcome, "pid", None)
     ticks = getattr(process_outcome, "proc_start_ticks", None)
-    return SciencePlacementReceipt(
+    base = SciencePlacementReceipt(
         member.task_id,
         fence.attempt_id,
         group.identity,
@@ -413,6 +550,15 @@ def _placement_refusal_receipt(
         },
         {"host": "refused", "affinity": "refused", "device": "unavailable"},
         observation_error.to_dict(),
+    )
+    if values.get(PLACEMENT_RECEIPT_VERSION_ENV) != "2":
+        return base
+    reason = observation_error.reason
+    return SciencePlacementReceiptV2(
+        base,
+        {"status": "unavailable", "reason": reason, "source": "scheduler-node-map", "slot_id": base.slot_id, "host": base.declared["host"]},
+        {"status": "unavailable", "reason": reason, "method": "nvidia-smi-pid-uuid-v1", "version": None, "cadence_seconds": 0.0, "count": 0, "monotonic_start": None, "monotonic_end": None, "inventory": [], "pid_rows": []},
+        {"host": "unavailable", "device": "unavailable", "qualification": "unqualified"},
     )
 
 
@@ -460,7 +606,7 @@ def _ensure_placement_refusal_environment(
     host = values.get("TPEN_SLOT_NODE", "unknown")
     cpus = values.get("TPEN_SLOT_CPUS", "0")
     try:
-        slots = slots_from_allocation(allocation)
+        slots = physical_slots_from_allocation(allocation)
     except (TypeError, ValueError):
         slots = ()
     if len(slots) == 1:
@@ -488,6 +634,9 @@ def _ensure_placement_refusal_environment(
         "TPEN_PLACEMENT_PAYLOAD_DIGEST": digest({"config": configured.config, "overrides": list(configured.overrides)}),
         PLACEMENT_REFUSAL_ENV: json.dumps(refusal.to_dict(), sort_keys=True),
     }
+    facts = getattr(allocation, "facts", {})
+    if isinstance(facts, Mapping) and (facts.get("scheduler") is not None or facts.get("scheduler_host_map") is not None):
+        placement_values[PLACEMENT_RECEIPT_VERSION_ENV] = "2"
     values = placement_environment(values, **placement_values)
     return PreparedPythonEnvironment(environment.python, environment.setup, values)
 
@@ -818,15 +967,9 @@ class DispatcherContract:
                 if requested_refusal is not None:
                     raise requested_refusal
                 observation = read_child_placement(placement_path)
-                receipt = _placement_receipt(
-                    observation,
-                    lifecycle.allocation,
-                    fence,
-                    group,
-                    member,
-                    configured,
-                    environment,
-                    outcome,
+                receipt_builder = _placement_receipt_v2 if environment.env.get(PLACEMENT_RECEIPT_VERSION_ENV) == "2" else _placement_receipt
+                receipt = receipt_builder(
+                    observation, lifecycle.allocation, fence, group, member, configured, environment, outcome,
                 )
             except PlacementRefusal as placement_error:
                 receipt = _placement_refusal_receipt(

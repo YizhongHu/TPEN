@@ -10,7 +10,7 @@ import time
 from typing import Any
 
 from ..environments import PreparedPythonEnvironment, SourceScript
-from ..placement import BindingError, WorkerBinding, bindings_from_allocation, slots_from_allocation
+from ..placement import BindingError, WorkerBinding, bindings_from_allocation, physical_slots_from_allocation, slots_from_allocation
 from ..programs import WorkerProgram
 from .._records import frozen_record
 from ..results import RunManifest
@@ -297,7 +297,7 @@ class ParslDispatcher(DispatcherContract):
             if self.binding is None:
                 raise BindingError("binding is required when lifecycle is not AttachedAllocation")
             return (WorkerBinding.from_mapping(self.binding),)
-        slots = slots_from_allocation(lifecycle.allocation)
+        slots = physical_slots_from_allocation(lifecycle.allocation)
         if slots:
             if self.binding is not None:
                 raise BindingError("explicit binding is ambiguous when allocation slots are declared")
