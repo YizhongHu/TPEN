@@ -32,7 +32,11 @@ def _module(name):
         spec = importlib.util.spec_from_file_location(key, HERE / f"{name}.py")
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        sys.modules[key] = module
+        # tests/unit/experiments/test_study_module_identity.py: publish under
+        # spec.name itself (the unique key), never a bare Name subscript --
+        # the module-identity rule's structural check matches only the
+        # attribute-access form.
+        sys.modules[spec.name] = module
         spec.loader.exec_module(module)
     return sys.modules[key]
 
