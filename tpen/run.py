@@ -33,6 +33,7 @@ from tpen.distributed import (
     execution_topology_from_facts,
 )
 from tpen.callback import configure_terminal_logging
+from tpen.checkpoint.hashing import populate_resolved_config_defaults
 from tpen.config import register_resolvers
 from tpen.dependencies import OptionalDependencyError, require_torch
 from tpen.events import Event as TypedEvent
@@ -145,10 +146,10 @@ def prepare_run_context(
     validate_hi_train_config(cfg)
 
     run_clock = resolve_run_clock(cfg)
-    source_cfg = _rerunnable_config(cfg)
-    OmegaConf.update(source_cfg, "run.timezone", run_clock.timezone, merge=False, force_add=True)
-    resolved_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
-    OmegaConf.update(resolved_cfg, "run.timezone", run_clock.timezone, merge=False, force_add=True)
+    source_cfg = _rerunnable_config(
+        OmegaConf.create(populate_resolved_config_defaults(cfg, timezone=run_clock.timezone))
+    )
+    resolved_cfg = OmegaConf.create(populate_resolved_config_defaults(cfg, timezone=run_clock.timezone))
     experiment_name = _nonempty_text(OmegaConf.select(resolved_cfg, "experiment.name"))
     run_name = (
         _nonempty_text(OmegaConf.select(resolved_cfg, "experiment.run_name"))

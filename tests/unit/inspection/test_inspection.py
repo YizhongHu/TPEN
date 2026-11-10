@@ -11,7 +11,7 @@ import pytest
 import tpen.inspection as inspection
 from tpen.checkpoint import PUBLICATION_CATALOG_FILENAME
 from tpen.checkpoint.manifest import CheckpointManifest
-from tpen.inspection import RUN_EVIDENCE_SCHEMA, RunEvidence, inspect_run
+from tpen.inspection import RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2, RunEvidence, inspect_run
 
 
 def _write_status(run_dir: Path, value: object) -> None:
@@ -66,6 +66,32 @@ def test_completed_evidence_preserves_manifest_counters(tmp_path: Path) -> None:
         "next_iteration": 7,
         "completed_updates": 5,
     }
+
+
+def test_run_start_identity_is_published_as_v2_evidence(tmp_path: Path) -> None:
+    run_dir = _write_run(tmp_path)
+    identity = {"schema": "tpen-config-identity-v1", "sha256": "a" * 64}
+    (run_dir / "run_start.json").write_text(json.dumps({"resolved_config_identity": identity}), encoding="utf-8")
+
+    evidence = inspect_run(run_dir)
+
+    assert evidence.schema == RUN_EVIDENCE_SCHEMA_V2
+    assert evidence.resolved_config_identity == identity
+    assert RunEvidence.from_mapping(evidence.to_dict()) == evidence
+
+
+def test_malformed_run_start_identity_is_a_typed_refusal(tmp_path: Path) -> None:
+    run_dir = _write_run(tmp_path)
+    (run_dir / "run_start.json").write_text(
+        json.dumps({"resolved_config_identity": {"schema": "wrong", "sha256": "a" * 64}}),
+        encoding="utf-8",
+    )
+
+    evidence = inspect_run(run_dir)
+
+    assert evidence.verdict == "refused"
+    assert evidence.refusal is not None
+    assert evidence.refusal["code"] == "malformed-run-identity"
 
 
 @pytest.mark.parametrize(

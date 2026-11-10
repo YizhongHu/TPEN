@@ -22,7 +22,18 @@ from .catalog import (
     read_publications,
 )
 from .events import CheckpointRestored, LoadFailed, LoadStarted, LoadSucceeded
-from .hashing import checkpoint_hashes, component_config_hash, resolved_config_hash, stable_config_hash
+from .hashing import (
+    RESOLVED_CONFIG_IDENTITY_EXCLUSIONS,
+    RESOLVED_CONFIG_IDENTITY_SCHEMA,
+    ResolvedConfigIdentityError,
+    canonical_resolved_config_bytes,
+    checkpoint_hashes,
+    component_config_hash,
+    populate_resolved_config_defaults,
+    resolved_config_hash,
+    resolved_config_identity,
+    stable_config_hash,
+)
 from .manifest import CHECKPOINT_KIND, CHECKPOINT_SCHEMA_VERSION, CheckpointManifest
 from .payload import (
     MODEL_ONLY_PAYLOAD,
@@ -136,9 +147,14 @@ __all__ = [
     "backfill_publication_receipt",
     "build_publication_receipt",
     "checkpoint_hashes",
+    "canonical_resolved_config_bytes",
     "checkpoint_ref",
     "checkpoint_step_dir_name",
     "component_config_hash",
+    "populate_resolved_config_defaults",
+    "RESOLVED_CONFIG_IDENTITY_EXCLUSIONS",
+    "RESOLVED_CONFIG_IDENTITY_SCHEMA",
+    "ResolvedConfigIdentityError",
     "coerce_checkpoint_replay_semantics",
     "deserialize_checkpoint_ref",
     "has_publication_receipt",
@@ -150,6 +166,7 @@ __all__ = [
     "read_publications",
     "record_publication_receipt",
     "resolved_config_hash",
+    "resolved_config_identity",
     "resolve_checkpoint_dir",
     "restore_checkpoint",
     "restore_checkpoint_with_events",

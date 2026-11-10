@@ -47,7 +47,7 @@ def _run_metadata_fixture(tmp_path: Path, *, git_commit: str = "deadbeef") -> tu
     resolved_config_path.write_text("load:\n  mode: model_only\n", encoding="utf-8")
     run_metadata_path = tmp_path / "metadata.json"
     run_metadata_path.write_text(json.dumps({"git_commit": git_commit, "status": "completed"}), encoding="utf-8")
-    return run_metadata_path, resolved_config_path, collect.file_sha256(resolved_config_path)
+    return run_metadata_path, resolved_config_path, collect.expected_resolved_config_identity_from_path(resolved_config_path)["sha256"]
 
 
 def _trajectory_fixture(tmp_path: Path, *, walkers: int = 2, draws: int = 3) -> tuple[Path, Path]:
@@ -121,6 +121,28 @@ def test_complete_records_are_collected(tmp_path: Path) -> None:
     receipt = collect.collect_records(spec=spec, **paths)
     assert receipt["status"] == "complete"
     assert receipt["row_count"] == 6
+
+
+def test_study_recompute_matches_recorded_identity_and_tracks_science_override(tmp_path: Path) -> None:
+    run_metadata_path, resolved_config_path, _ = _run_metadata_fixture(tmp_path)
+    resolved_config_path.write_text(
+        "run:\n  root: /tmp/one\n  run_id: first\n"
+        "science:\n  charge: 2\nload:\n  mode: model_only\n",
+        encoding="utf-8",
+    )
+    intended = collect.expected_resolved_config_identity_from_path(resolved_config_path)
+    spec = collect.RecordSpec("deadbeef", "a" * 64, intended["sha256"])
+    run_metadata = json.loads(run_metadata_path.read_text(encoding="utf-8"))
+    collect.validate_run_identity(run_metadata, resolved_config_path, spec)
+
+    resolved_config_path.write_text(
+        "run:\n  root: /tmp/two\n  run_id: second\n"
+        "science:\n  charge: 3\nload:\n  mode: model_only\n",
+        encoding="utf-8",
+    )
+    assert collect.expected_resolved_config_identity_from_path(resolved_config_path)["sha256"] != intended["sha256"]
+    with pytest.raises(collect.RecordIntegrityError, match="altered"):
+        collect.validate_run_identity(run_metadata, resolved_config_path, spec)
 
 
 def test_missing_draw_refuses(tmp_path: Path) -> None:
@@ -277,7 +299,7 @@ def test_collector_admits_the_real_smoke_evaluation_output(tmp_path: Path, recor
     spec = collect.RecordSpec(
         source_sha=source_sha,
         checkpoint_model_sha256=collect.file_sha256(checkpoint_dir / "model.pt"),
-        resolved_config_sha256=collect.file_sha256(resolved_config_path),
+        resolved_config_sha256=collect.expected_resolved_config_identity_from_path(resolved_config_path)["sha256"],
         walkers=8,
         draws=3,
     )

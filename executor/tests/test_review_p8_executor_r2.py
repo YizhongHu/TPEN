@@ -46,7 +46,7 @@ def test_r2_t2_each_outcome_binding_is_checked_independently(tmp_path, field, va
 def test_r2_t3_schema_version_is_nonbool_integer(tmp_path, value):
     store, group, allocation = setup_store(tmp_path)
     _, evidence = finish(store, group, allocation, 1)
-    payload = dict(schema=evidence.schema, run_dir=evidence.run_dir, verdict=evidence.verdict, run_status=evidence.run_status, checkpoint=dict(evidence.checkpoint), refusal=None)
+    payload = dict(schema=evidence.schema, run_dir=evidence.run_dir, verdict=evidence.verdict, run_status=evidence.run_status, checkpoint=dict(evidence.checkpoint), refusal=None, resolved_config_identity=dict(evidence.resolved_config_identity))
     assert payload["checkpoint"]["schema_version"] == 2
     assert type(payload["checkpoint"]["schema_version"]) is int
     payload["checkpoint"]["schema_version"] = value
