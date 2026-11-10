@@ -439,7 +439,14 @@ class SciencePlacementReceiptV2:
             raise ValueError("v2 refused affinity comparison contradicts child evidence")
         if self.verdict["host"] != host_status:
             raise ValueError("v2 verdict host contradicts host mapping")
-        has_postlaunch_mismatch = derived_host_status == "mismatch" or derived_affinity_status == "mismatch"
+        has_postlaunch_mismatch = (
+            derived_host_status == "mismatch"
+            or derived_affinity_status == "mismatch"
+            or (
+                self.base.refusal is not None
+                and self.base.refusal.get("code") == "placement-generation-mismatch"
+            )
+        )
         if self.verdict["reason_class"] == "not-sampled":
             if self.base.refusal is not None or host_status != "matched" or derived_host_status != "matched":
                 raise ValueError("not-sampled verdict requires mapped, matching host evidence")

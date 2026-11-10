@@ -45,48 +45,58 @@ PBS_NODEFILE_TEXT = "physical-01\n"
 L1A_MUTANT_TABLE = (
     {
         "id": "M1", "target": "executor/src/tpen_executor/results.py",
-        "old": '        if self.verdict["reason_class"] == "not-sampled":',
-        "new": "        if False:", "killer": "test_decoder_derives_verdict_from_evidence",
-        "suite": "executor", "assertion": "contradictory unavailable host/affinity/device evidence is rejected",
+        "old": '        if not isinstance(self.verdict, Mapping) or set(self.verdict) != expected_verdict:',
+        "new": "        if not isinstance(self.verdict, Mapping):",
+        "killer": "test_l1a_v2_wire_is_closed_and_v1_remains_readable",
+        "suite": "executor", "assertion": "unexpected verdict keys are rejected",
     },
     {
-        "id": "M2", "target": "executor/src/tpen_executor/placement.py",
-        "old": '            environment["TPEN_SLOT_NODE"] = node',
-        "new": '            environment["TPEN_SLOT_NODE"] = self.node',
-        "killer": "test_physical_remap_rewrites_derived_node_overlay",
-        "suite": "executor", "assertion": "mapped node and TPEN_SLOT_NODE both equal physical-01",
+        "id": "M2", "target": "executor/src/tpen_executor/allocations.py",
+        "old": "                    hosts = ()",
+        "new": "                    hosts = scheduler_host_map(scheduler, environ={})",
+        "killer": "test_d6_unreadable_pbs_nodefile_is_typed_launch_failure",
+        "suite": "executor", "assertion": "unreadable PBS nodefile becomes launch_failed rc=3",
     },
     {
-        "id": "M3", "target": "executor/src/tpen_executor/dispatch/contract.py",
-        "old": "        if child_refusal is not None:", "new": "        if False:",
-        "killer": "test_child_precore_refusal_stays_launch_failed", "suite": "executor",
-        "assertion": "child-placement-refused preserves launch_failed and rc 3",
+        "id": "M3", "target": "executor/src/tpen_executor/results.py",
+        "old": '            if receipt.verdict["reason_class"] == "not-sampled":',
+        "new": "            if False:",
+        "killer": "test_c2_not_sampled_is_loud_but_not_science_blocking",
+        "suite": "executor", "assertion": "manifest retains the not-sampled flag",
     },
     {
-        "id": "M4", "target": "executor/src/tpen_executor/placement.py",
-        "old": "                width = len(start)", "new": "                width = max(len(start), len(end))",
-        "killer": "test_slurm_range_width_and_bracket_products", "suite": "executor",
-        "assertion": "nid[9-10] expands to nid9,nid10 without invented padding",
+        "id": "M4", "target": "executor/src/tpen_executor/runners.py",
+        "old": '    "raise SystemExit(main(sys.argv[1:]))"',
+        "new": '    "raise SystemExit(2)"',
+        "killer": "test_d1_run_shim_without_placement_runs_real_core_to_completion",
+        "suite": "executor", "assertion": "an unplaced child reaches core and completes",
     },
     {
-        "id": "M5", "target": "executor/src/tpen_executor/placement.py",
-        "old": "    complete = value.strip()",
-        "new": '    complete = value.strip().lower().rstrip(".").split(".", 1)[0]',
-        "killer": "test_scheduler_host_validation_precedes_suffix_truncation", "suite": "executor",
-        "assertion": "physical-01./evil is rejected as host-map-ambiguous",
+        "id": "M5", "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": '            status == "completed"',
+        "new": '            status == "failed"',
+        "killer": "test_m5_real_local_dispatch_preserves_segment_and_rc_zero",
+        "suite": "executor", "assertion": "advisory mismatch still accepts the completed segment",
     },
     {
-        "id": "M6", "target": "executor/tests/test_s2b2_placement_v2.py",
-        "old": "PBS_NODEFILE_TEXT = " + '"physical-01\\n"', "new": 'PBS_NODEFILE_TEXT = "physical-01\\\\n"',
-        "killer": "test_m5_real_local_dispatch_preserves_segment_and_rc_zero", "suite": "executor",
-        "assertion": "captured PBS nodefile text contains a real newline",
+        "id": "N1", "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": "    if type(reason) is not str or not reason:", "new": "    if False:",
+        "killer": "test_malformed_child_refusal_reason_finishes_typed_launch_failure",
+        "suite": "executor", "assertion": "empty refusal reason cannot strand the begun attempt",
     },
     {
-        "id": "M7", "target": "executor/tests/test_s2b2_placement_v2.py",
-        "old": "                json.dumps(base.to_dict()) + " + '"\\n", encoding="utf-8"',
-        "new": '                json.dumps(base.to_dict()) + "\\\\n", encoding="utf-8"',
-        "killer": "test_m5_real_local_dispatch_preserves_segment_and_rc_zero", "suite": "executor",
-        "assertion": "serialized child sidecar has one JSON record and the fenced core exists",
+        "id": "N2", "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": '        and base.refusal.get("code") in {"placement-affinity-mismatch", "child-placement-mismatch", "placement-generation-mismatch"}',
+        "new": '        and base.refusal.get("code") in {"placement-affinity-mismatch", "child-placement-mismatch"}',
+        "killer": "test_generation_mismatch_preserves_physical_evidence",
+        "suite": "executor", "assertion": "generation mismatch remains a typed mismatch with matched host evidence",
+    },
+    {
+        "id": "F3", "target": "executor/src/tpen_executor/dispatch/contract.py",
+        "old": '        comparison_affinity = "matched" if affinity_match else ("unavailable" if not observation.affinity else "mismatch")',
+        "new": '        comparison_affinity = "unavailable"',
+        "killer": "test_late_proc_refusal_preserves_observed_affinity_and_cause",
+        "suite": "executor", "assertion": "late /proc refusal retains matched affinity and child cause",
     },
 )
 
@@ -344,6 +354,132 @@ def test_child_precore_refusal_stays_launch_failed(tmp_path: Path) -> None:
     assert not manifest.segments
 
 
+@pytest.mark.parametrize("reason", ["", 123], ids=["empty", "non-string"])
+def test_malformed_child_refusal_reason_finishes_typed_launch_failure(tmp_path: Path, reason: object) -> None:
+    """N1: malformed child refusal still gets one terminal lifecycle receipt."""
+
+    group = _group()
+    configured = ConfiguredRun("task-a", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("ok", encoding="utf-8")
+    allocation = _allocation(scheduler={"PBS_NODEFILE": PBS_NODEFILE_TEXT})
+
+    class Process:
+        def run(self, environment, *args, **kwargs):
+            observation = ChildPlacementObservation(
+                environment.env["TPEN_PLACEMENT_TASK_ID"], environment.env["TPEN_PLACEMENT_ATTEMPT_ID"],
+                environment.env["TPEN_PLACEMENT_GROUP_DIGEST"], environment.env["TPEN_PLACEMENT_ALLOCATION_ID"],
+                environment.env["TPEN_PLACEMENT_BACKEND_JOB_ID"], environment.env["TPEN_PLACEMENT_SLOT_ID"],
+                digest({"config": configured.config, "overrides": []}), environment.env["TPEN_PLACEMENT_OUTPUT_DIR"],
+                "physical-01", 123, 0, (), {}, None, "2026-11-10T00:00:00Z",
+                {"code": "child-placement-refused", "reason": reason},
+            )
+            payload = observation.to_dict()
+            payload["refusal"] = dict(observation.refusal)
+            Path(environment.env["TPEN_PLACEMENT_OUTPUT"]).write_text(json.dumps(payload) + "\n", encoding="utf-8")
+            return ProcessOutcome((sys.executable,), 2, "", "", False, 123, 55)
+
+    class Evidence:
+        def read(self, *args, **kwargs):
+            raise AssertionError("malformed pre-core refusal must not inspect core evidence")
+
+    worker = SimpleNamespace(materialize=lambda _env=None: {
+        "environment": PreparedPythonEnvironment(sys.executable, None, {}),
+        "process": Process(), "runner": object(), "evidence": Evidence(),
+    })
+    inner = AttachedAllocation(allocation, DirectoryStore(tmp_path / "store"))
+
+    class CountingLifecycle:
+        def __init__(self, wrapped):
+            self.allocation = wrapped.allocation
+            self.store = wrapped.store
+            self.wrapped = wrapped
+            self.finished = []
+
+        def begin(self, *args, **kwargs):
+            return self.wrapped.begin(*args, **kwargs)
+
+        def finish(self, *args, **kwargs):
+            self.finished.append(args[0])
+            return self.wrapped.finish(*args, **kwargs)
+
+    lifecycle = CountingLifecycle(inner)
+    manifest = LocalDispatcher(worker).run(group, {"task-a": configured}, lifecycle)
+    attempt = manifest.attempts[0]
+    assert len(lifecycle.finished) == 1
+    assert attempt.outcome_receipt is not None
+    assert attempt.outcome_receipt.status == "launch_failed"
+    assert attempt.placement_receipt.refusal["code"] == "placement-receipt-invalid"
+    assert "non-empty string" in attempt.placement_receipt.refusal["reason"]
+
+
+def test_generation_mismatch_preserves_physical_evidence(tmp_path: Path) -> None:
+    """N2: a child generation mismatch is not rewritten as refused host evidence."""
+
+    group, configured, allocation, fence, environment, observation = _v2_inputs(tmp_path)
+    mismatched = ChildPlacementObservation(
+        observation.task_id, observation.attempt_id, observation.group_digest,
+        observation.allocation_id, observation.backend_job_id, observation.slot_id,
+        observation.payload_digest, observation.output_dir, observation.host,
+        observation.pid, observation.proc_start_ticks, observation.affinity,
+        observation.thread_settings, observation.cuda_visible_devices,
+        observation.observed_at_utc, None,
+    )
+    receipt = _placement_receipt_v2(
+        mismatched, allocation, fence, group, group.members[0], configured, environment,
+        ProcessOutcome((), 0, "", "", False, 1234, 999),
+    )
+    assert receipt.refusal["code"] == "placement-generation-mismatch"
+    assert receipt.host_mapping["status"] == "matched"
+    assert receipt.host_mapping["host"] == "physical-01"
+    assert receipt.comparison["host"] == "matched"
+    assert receipt.comparison["affinity"] == "matched"
+    assert receipt.verdict["reason_class"] == "mismatch"
+
+
+def test_late_proc_refusal_preserves_observed_affinity_and_cause(tmp_path: Path) -> None:
+    """F3: /proc failure after affinity observation keeps the child cause."""
+
+    group = _group()
+    configured = ConfiguredRun("task-a", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("ok", encoding="utf-8")
+    allocation = _allocation(scheduler={"PBS_NODEFILE": PBS_NODEFILE_TEXT})
+    allowed = sorted(getattr(os, "sched_getaffinity", lambda _pid: (0,))(0))
+
+    class Process:
+        def run(self, environment, *args, **kwargs):
+            observation = ChildPlacementObservation(
+                environment.env["TPEN_PLACEMENT_TASK_ID"], environment.env["TPEN_PLACEMENT_ATTEMPT_ID"],
+                environment.env["TPEN_PLACEMENT_GROUP_DIGEST"], environment.env["TPEN_PLACEMENT_ALLOCATION_ID"],
+                environment.env["TPEN_PLACEMENT_BACKEND_JOB_ID"], environment.env["TPEN_PLACEMENT_SLOT_ID"],
+                digest({"config": configured.config, "overrides": []}), environment.env["TPEN_PLACEMENT_OUTPUT_DIR"],
+                "physical-01", 123, 0, (allowed[0],), {}, None, "2026-11-10T00:00:00Z",
+                {"code": "child-placement-refused", "reason": "/proc stat unavailable"},
+            )
+            Path(environment.env["TPEN_PLACEMENT_OUTPUT"]).write_text(
+                json.dumps(observation.to_dict()) + "\n", encoding="utf-8"
+            )
+            return ProcessOutcome((sys.executable,), 2, "", "", False, 123, 55)
+
+    class Evidence:
+        def read(self, *args, **kwargs):
+            raise AssertionError("late pre-core refusal must not inspect core evidence")
+
+    worker = SimpleNamespace(materialize=lambda _env=None: {
+        "environment": PreparedPythonEnvironment(sys.executable, None, {}),
+        "process": Process(), "runner": object(), "evidence": Evidence(),
+    })
+    manifest = LocalDispatcher(worker).run(
+        group, {"task-a": configured}, AttachedAllocation(allocation, DirectoryStore(tmp_path / "store")),
+    )
+    attempt = manifest.attempts[0]
+    assert attempt.outcome_receipt.status == "launch_failed"
+    assert _operational_exit(manifest) == 3
+    assert attempt.placement_receipt.refusal["code"] == "child-placement-refused"
+    assert attempt.placement_receipt.comparison["affinity"] == "matched"
+    assert "/proc stat unavailable" in attempt.placement_receipt.refusal["reason"]
+    assert not manifest.segments
+
+
 def test_slurm_range_width_and_bracket_products() -> None:
     """F4: Slurm preserves start-token width and expands bracket products."""
 
@@ -366,7 +502,7 @@ def test_l1a_mutant_table_has_exact_fields_and_unique_old_anchors() -> None:
     """F7: every mutation packet row is executable and has a unique anchor."""
 
     root = Path(__file__).parents[2]
-    assert {row["id"] for row in L1A_MUTANT_TABLE} == {f"M{index}" for index in range(1, 8)}
+    assert {row["id"] for row in L1A_MUTANT_TABLE} == {"M1", "M2", "M3", "M4", "M5", "N1", "N2", "F3"}
     for row in L1A_MUTANT_TABLE:
         target = root / row["target"]
         result = subprocess.run(
@@ -374,6 +510,7 @@ def test_l1a_mutant_table_has_exact_fields_and_unique_old_anchors() -> None:
             check=True, capture_output=True, text=True,
         )
         assert result.stdout.strip() == "1", row
+        assert row["target"].startswith("executor/src/"), row
         assert row["suite"] == "executor"
         assert row["killer"] and row["assertion"] and row["new"]
 

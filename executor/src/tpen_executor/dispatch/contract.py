@@ -313,7 +313,13 @@ def _child_precore_refusal(environment: Any, outcome: Any) -> PlacementRefusal |
     refusal = observation.refusal
     if not isinstance(refusal, Mapping) or refusal.get("code") != "child-placement-refused":
         return None
-    return PlacementRefusal(refusal["code"], refusal["reason"])
+    reason = refusal.get("reason")
+    if type(reason) is not str or not reason:
+        return PlacementRefusal(
+            "placement-receipt-invalid",
+            f"child-placement-refused reason must be a non-empty string, got {reason!r}",
+        )
+    return PlacementRefusal(refusal["code"], reason)
 
 
 def _placement_receipt(
@@ -382,7 +388,7 @@ def _placement_receipt(
     affinity_match = expected_cpus == observation.affinity
     if child_precore_refusal:
         comparison_host = "unavailable"
-        comparison_affinity = "unavailable"
+        comparison_affinity = "matched" if affinity_match else ("unavailable" if not observation.affinity else "mismatch")
     else:
         comparison_host = "matched" if host_match else "mismatch"
         comparison_affinity = "matched" if affinity_match else "mismatch"
@@ -475,7 +481,7 @@ def _placement_receipt_v2(
     refusal = base.refusal
     postlaunch_mismatch = (
         base.refusal is not None
-        and base.refusal.get("code") in {"placement-affinity-mismatch", "child-placement-mismatch"}
+        and base.refusal.get("code") in {"placement-affinity-mismatch", "child-placement-mismatch", "placement-generation-mismatch"}
     )
     if refusal is not None:
         reason_class = "mismatch" if postlaunch_mismatch else "refused"
@@ -1055,7 +1061,19 @@ class DispatcherContract:
         placement_path = None
         if isinstance(environment, PreparedPythonEnvironment):
             placement_path = environment.env.get("TPEN_PLACEMENT_OUTPUT")
-        if placement_path is not None:
+        receipt = None
+        if child_refusal is not None and child_refusal.code == "placement-receipt-invalid":
+            receipt = _placement_refusal_receipt(
+                child_refusal,
+                lifecycle.allocation,
+                fence,
+                group,
+                member,
+                configured,
+                environment,
+                outcome,
+            )
+        elif placement_path is not None:
             try:
                 requested_refusal = _placement_refusal_from_environment(environment)
                 if requested_refusal is not None:
@@ -1087,6 +1105,7 @@ class DispatcherContract:
                     environment,
                     outcome,
                 )
+        if receipt is not None:
             try:
                 lifecycle.store.publish_placement(fence, receipt)
             except Exception as placement_error:
