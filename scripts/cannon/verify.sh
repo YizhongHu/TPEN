@@ -102,6 +102,7 @@ OVERLAY="$WORK_ROOT/overlay"
 export UV_CACHE_DIR="$WORK_ROOT/uv-cache" TMPDIR="$WORK_ROOT/tmp" TZ=UTC PYTHONDONTWRITEBYTECODE=1 COPYFILE_DISABLE=1
 unset PYTHONPATH
 safe_mkdir "$UV_CACHE_DIR"; safe_mkdir "$TMPDIR"
+assert_write_path "$CLONE"
 assert_write_path "$RUN_ROOT/evidence/clone.log"
 git clone --no-single-branch --tags "$REPO_URL" "$CLONE" > "$RUN_ROOT/evidence/clone.log" 2>&1
 git -C "$CLONE" fetch origin "$HEAD_SHA" >> "$RUN_ROOT/evidence/clone.log" 2>&1
@@ -132,6 +133,7 @@ flock -x "$SHARED_LOCK" bash -c '
 
 BASE_SITE="$($SHARED_ENV_ROOT/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 safe_mkdir "$OVERLAY"
+assert_write_path "$RUN_ROOT/evidence/overlay-build.log"
 $SHARED_ENV_ROOT/bin/python -m venv --without-pip "$OVERLAY" > "$RUN_ROOT/evidence/overlay-build.log" 2>&1
 OVERLAY_SITE="$($OVERLAY/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 assert_write_path "$OVERLAY_SITE/_tpen_shared_env.pth"
@@ -140,6 +142,7 @@ $UV_BIN pip install --python "$OVERLAY/bin/python" --no-deps -e "$CLONE" >> "$RU
 $UV_BIN pip install --python "$OVERLAY/bin/python" "pytest-xdist==$CANNON_XDIST_VERSION" >> "$RUN_ROOT/evidence/overlay-build.log" 2>&1
 PYTHON="$OVERLAY/bin/python"
 export PYTHON TPEN_PYTHON="$PYTHON" ROOT_PYTHON="$PYTHON"
+assert_write_path "$RUN_ROOT/evidence/interpreter-identity.txt"
 env -u PYTHONPATH "$PYTHON" - "$CLONE" > "$RUN_ROOT/evidence/interpreter-identity.txt" 2>&1 <<'PYCHECK'
 import importlib, os, sys
 clone = os.path.realpath(sys.argv[1])
