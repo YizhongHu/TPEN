@@ -147,7 +147,7 @@ Checks performed (exit 0 on `LINT_PASS`, non-zero on `LINT_FAIL`):
 | 5 | `TASK_ROOT`/`RUN_ROOT` are not staged under `$HOME`, literally or after canonicalization (catches a symlink into `$HOME`) |
 | 6 | `TASK_ROOT`/`RUN_ROOT` stay inside a declared `--allowed-root` (facility-root escape) |
 | 7 | when `DRY_RUN=1`, `PYTHON` resolves under `--shared-env-root` |
-| 8 | every `ssh` invocation in `--submit-helper` passes `-o BatchMode=yes`, checked per logical invocation (backslash continuations joined, comments dropped, split on `;`/`&&`/`\|\|`/`\|`) rather than per physical line or whole-file substring |
+| 8 | every `ssh`/`scp`/`rsync` invocation in `--submit-helper` passes `-o BatchMode=yes` (for `rsync`, via `-e "ssh -o BatchMode=yes"`), checked per logical invocation (backslash continuations joined, comments dropped, split on `;`/`&&`/`\|\|`/`\|`) rather than per physical line or whole-file substring; the command is matched as a WORD anywhere in the segment (`timeout 30 ssh ...`, `x=$(ssh ...)`, `rsync -e ssh ...`), not only when the segment starts with it, while still excluding substrings like `sshd_config`/`rsync_log` |
 | 9 | with `--real-env`/`--dry-env`, every exported key matches between a real and a dry run except the `--dry-only-keys` list; a key present on only one side is a delta even if the other side's value happens to look like an "absent" placeholder |
 
 `--real-env` and `--dry-env` must be given together or not at all; supplying

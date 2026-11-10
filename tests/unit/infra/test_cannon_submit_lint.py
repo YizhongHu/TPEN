@@ -412,6 +412,62 @@ def test_ssh_continuation_with_batchmode_accepted(fixture_root: Path) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    "helper_body",
+    [
+        "timeout 30 ssh host true\n",
+        "env X=1 ssh host\n",
+        "command ssh host\n",
+    ],
+)
+def test_ssh_wrapped_by_another_command_without_batchmode_rejected(fixture_root: Path, helper_body: str) -> None:
+    """ssh/scp/rsync must be caught as a command word anywhere in the
+    segment, not only when the segment starts with it."""
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    helper = fixture_root / "stage" / "helper-wrapped.sh"
+    helper.write_text(f"#!/bin/bash\n{helper_body}")
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "BatchMode" in result.stdout
+
+
+def test_rsync_via_ssh_without_batchmode_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    helper = fixture_root / "stage" / "helper-rsync.sh"
+    helper.write_text("#!/bin/bash\nrsync -a -e ssh src host:dst\n")
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "BatchMode" in result.stdout
+
+
+def test_ssh_inside_command_substitution_without_batchmode_rejected(fixture_root: Path) -> None:
+    """Killer for mutant accept-ssh-command-word-anywhere: a bare prefix-anchored
+    check misses ssh invoked inside `$( ... )`."""
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    helper = fixture_root / "stage" / "helper-subshell.sh"
+    helper.write_text("#!/bin/bash\nx=$(ssh host true)\n")
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "BatchMode" in result.stdout
+
+
+def test_scp_without_batchmode_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    helper = fixture_root / "stage" / "helper-scp.sh"
+    helper.write_text("#!/bin/bash\nscp host:a b\n")
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "BatchMode" in result.stdout
+
+
+def test_sshd_config_and_rsync_log_substrings_not_flagged(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    helper = fixture_root / "stage" / "helper-no-match.sh"
+    helper.write_text("#!/bin/bash\ncat /etc/sshd_config\nrotate rsync_log\n")
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_real_env_without_dry_env_rejected(fixture_root: Path) -> None:
     base = fixture_root
     sbatch, manifest, task_root, *_ = good_fixture(base)

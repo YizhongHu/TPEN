@@ -209,13 +209,14 @@ if [[ "$dry_run" == 1 && "$py_has" == 1 ]]; then
     fail "dry-run PYTHON is not under the shared-env root: '$py_val' -> '$canon_python'"
 fi
 
-# Check 8: any ssh invocation in the submission helper must pass
-# -o BatchMode=yes (case-insensitive), to avoid a 2FA prompt from a
-# non-interactive submit path. Checked per LOGICAL invocation, not per
-# physical line or whole-file substring: backslash continuations are joined,
-# comments are dropped, and each line is split on `;`, `&&`, `||`, and `|`
-# before testing which segments are an `ssh` command and whether that same
-# segment carries the option.
+# Check 8: any ssh/scp/rsync invocation in the submission helper must pass
+# -o BatchMode=yes (case-insensitive; for rsync this means `-e "ssh -o
+# BatchMode=yes"`), to avoid a 2FA prompt from a non-interactive submit path.
+# Checked per LOGICAL invocation, not per physical line or whole-file
+# substring: backslash continuations are joined, comments are dropped, and
+# each logical line is split on `;`, `&&`, `||`, and `|` before testing which
+# segments invoke one of these commands and whether that same segment
+# carries the option.
 join_continuations() {
   local file="$1" acc="" line
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -230,6 +231,28 @@ join_continuations() {
   [[ -n "$acc" ]] && printf '%s\n' "$acc"
 }
 
+# Splits a logical line into command segments on `;`, `&&`, `||`, and `|`.
+# Done with plain bash substring substitution (not `sed 's/.../\n/g'`): GNU
+# sed treats `\n` in a replacement as a newline, but a BSD/POSIX sed may emit
+# it as a literal backslash-n depending on build/version, which would silently
+# stop splitting on some platforms. Longest operators are replaced first so a
+# `||`/`&&` is never partially consumed by the single-character `|` pass.
+split_logical_commands() {
+  local s="$1"
+  s="${s//&&/$'\n'}"
+  s="${s//||/$'\n'}"
+  s="${s//;/$'\n'}"
+  s="${s//|/$'\n'}"
+  printf '%s\n' "$s"
+}
+
+# Matches ssh/scp/rsync as a command WORD anywhere in the segment: preceded
+# by start-of-segment, whitespace, `(`, a backtick, `/`, or a quote (so
+# `x=$(ssh ...)`, `` `ssh ...` ``, `/usr/bin/ssh`, and quoted forms all
+# count), and followed by whitespace, a quote, or end-of-segment (so
+# `sshd_config`/`rsync_log` do NOT match).
+SSH_LIKE_CMD_RE="(^|[[:space:](\`/\"'])(ssh|scp|rsync)([[:space:]\"']|\$)"
+
 if [[ -n "$SUBMIT_HELPER" ]]; then
   if [[ ! -f "$SUBMIT_HELPER" ]]; then
     fail "submit helper not found: '$SUBMIT_HELPER'"
@@ -239,14 +262,14 @@ if [[ -n "$SUBMIT_HELPER" ]]; then
       while IFS= read -r segment; do
         segment="${segment#"${segment%%[![:space:]]*}"}"
         [[ -z "$segment" ]] && continue
-        if [[ "$segment" =~ ^ssh([[:space:]]|$) ]]; then
+        if [[ "$segment" =~ $SSH_LIKE_CMD_RE ]]; then
           shopt -s nocasematch
           if [[ "$segment" != *"batchmode=yes"* ]]; then
-            fail "ssh invocation without -o BatchMode=yes: '$segment'"
+            fail "ssh/scp/rsync invocation without -o BatchMode=yes: '$segment'"
           fi
           shopt -u nocasematch
         fi
-      done < <(printf '%s\n' "$logical_line" | sed -e 's/&&/\n/g' -e 's/||/\n/g' -e 's/;/\n/g' -e 's/|/\n/g')
+      done < <(split_logical_commands "$logical_line")
     done < <(join_continuations "$SUBMIT_HELPER" | sed -E 's/(^|[[:space:]])#.*$//')
   fi
 fi

@@ -274,6 +274,38 @@ CONTINUATION_HELPER="$BASE/stage/helper-continuation.sh"
 printf '#!/bin/bash\nssh \\\n  -o BatchMode=yes cannon.example "sbatch x"\n' > "$CONTINUATION_HELPER"
 expect "ssh continued onto the next line with BatchMode is accepted" pass lint "$GOOD_SBATCH" "$GOOD_MANIFEST" --submit-helper "$CONTINUATION_HELPER"
 
+# --- ssh/scp/rsync must be caught as a command WORD anywhere in the
+# segment, not only when the segment literally starts with it; words that
+# merely contain "ssh"/"rsync" as a substring (sshd_config, rsync_log) must
+# NOT be mistaken for the command. ---
+WRAPPED1_HELPER="$BASE/stage/helper-wrapped1.sh"
+printf '#!/bin/bash\ntimeout 30 ssh host true\n' > "$WRAPPED1_HELPER"
+expect "'timeout 30 ssh ...' without BatchMode is rejected" fail lint "$GOOD_SBATCH" "$GOOD_MANIFEST" --submit-helper "$WRAPPED1_HELPER"
+
+WRAPPED2_HELPER="$BASE/stage/helper-wrapped2.sh"
+printf '#!/bin/bash\nenv X=1 ssh host\n' > "$WRAPPED2_HELPER"
+expect "'env X=1 ssh ...' without BatchMode is rejected" fail lint "$GOOD_SBATCH" "$GOOD_MANIFEST" --submit-helper "$WRAPPED2_HELPER"
+
+WRAPPED3_HELPER="$BASE/stage/helper-wrapped3.sh"
+printf '#!/bin/bash\ncommand ssh host\n' > "$WRAPPED3_HELPER"
+expect "'command ssh ...' without BatchMode is rejected" fail lint "$GOOD_SBATCH" "$GOOD_MANIFEST" --submit-helper "$WRAPPED3_HELPER"
+
+RSYNC_HELPER="$BASE/stage/helper-rsync.sh"
+printf '#!/bin/bash\nrsync -a -e ssh src host:dst\n' > "$RSYNC_HELPER"
+expect "'rsync -e ssh ...' without BatchMode is rejected" fail lint "$GOOD_SBATCH" "$GOOD_MANIFEST" --submit-helper "$RSYNC_HELPER"
+
+SUBSHELL_HELPER="$BASE/stage/helper-subshell.sh"
+printf '#!/bin/bash\nx=$(ssh host true)\n' > "$SUBSHELL_HELPER"
+expect "'x=\$(ssh ...)' without BatchMode is rejected" fail lint "$GOOD_SBATCH" "$GOOD_MANIFEST" --submit-helper "$SUBSHELL_HELPER"
+
+SCP_HELPER="$BASE/stage/helper-scp.sh"
+printf '#!/bin/bash\nscp host:a b\n' > "$SCP_HELPER"
+expect "scp without BatchMode is rejected" fail lint "$GOOD_SBATCH" "$GOOD_MANIFEST" --submit-helper "$SCP_HELPER"
+
+NO_MATCH_HELPER="$BASE/stage/helper-no-match.sh"
+printf '#!/bin/bash\ncat /etc/sshd_config\nrotate rsync_log\n' > "$NO_MATCH_HELPER"
+expect "sshd_config/rsync_log substrings are not mistaken for the commands" pass lint "$GOOD_SBATCH" "$GOOD_MANIFEST" --submit-helper "$NO_MATCH_HELPER"
+
 # --- --real-env/--dry-env must be given together or not at all. ---
 expect_contains "orphan --real-env (no --dry-env) is LINT_FAIL" fail "must be given together" "$LINTER" --sbatch "$GOOD_SBATCH" --manifest "$GOOD_MANIFEST" --allowed-root "$BASE/stage" --shared-env-root "$BASE/shared-env" --home "$BASE/home" --real-env "$REAL_ENV"
 expect_contains "orphan --dry-env (no --real-env) is LINT_FAIL" fail "must be given together" "$LINTER" --sbatch "$GOOD_SBATCH" --manifest "$GOOD_MANIFEST" --allowed-root "$BASE/stage" --shared-env-root "$BASE/shared-env" --home "$BASE/home" --dry-env "$DRY_ENV_GOOD"
