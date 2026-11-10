@@ -120,6 +120,45 @@ def test_refuses_restored_lineage_before_capture_or_file_write(tmp_path: Path) -
     assert not history_root.exists()
 
 
+def test_first_nonzero_iteration_refuses_bypassed_restore_but_fresh_steps_continue(
+    tmp_path: Path,
+) -> None:
+    """Guard a direct trainer fit without the runner's restore notification."""
+
+    def state(step: int) -> TrainerState:
+        return TrainerState(
+            trainer=SimpleNamespace(completed_updates=step),
+            batch=ElectronBatch(torch.tensor([[[0.0, 1.0, 2.0]], [[3.0, 4.0, 5.0]]])),
+            local_energy=torch.tensor([1.0, 2.0]),
+            local_energy_terms={"kinetic": torch.tensor([1.0, 2.0])},
+            wavefunction_output=WavefunctionOutput(torch.tensor([0.0, 0.0]), torch.ones(2)),
+            optimizer_step=False,
+        )
+
+    refused_root = tmp_path / "refused" / "training-history"
+    refused = RawTrainingBatchRecorder(refused_root, partition_size_steps=1, every_n_steps=1)
+    context = _run_context(tmp_path / "refused")
+    with pytest.raises(ValueError, match=r"unsupported-callback"):
+        refused.handle_occurrence(
+            Occurrence(TrainingIterationCompleted(TrainingIteration(1)), 1),
+            context,
+            state(1),
+        )
+    assert not refused_root.exists()
+
+    fresh_root = tmp_path / "fresh" / "training-history"
+    fresh = RawTrainingBatchRecorder(fresh_root, partition_size_steps=2, every_n_steps=1)
+    fresh_context = _run_context(tmp_path / "fresh")
+    for step in (0, 1):
+        fresh.handle_occurrence(
+            Occurrence(TrainingIterationCompleted(TrainingIteration(step)), 1),
+            fresh_context,
+            state(step),
+        )
+    fresh.handle_occurrence(Occurrence(TrainingCompleted(), 1), fresh_context, state(1))
+    assert TrainingBatchReader(fresh_root).read()["iteration_step"].tolist() == [0, 1]
+
+
 def test_fresh_recorder_history_remains_reader_compatible(tmp_path: Path) -> None:
     """A fresh recorder still publishes a history consumed by its reader."""
 
