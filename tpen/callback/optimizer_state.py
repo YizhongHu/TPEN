@@ -8,9 +8,9 @@ from tpen.artifacts import RunContext
 from tpen.dependencies import require_torch
 from tpen.events import DomainState
 from tpen.events import Event as TypedEvent
-from tpen.events import Occurrence, Subscription
+from tpen.events import Occurrence, Started, Subscription, started
 from tpen.parameter_groups import resolve_parameter_groups
-from tpen.training.events import TrainingIterationCompleted
+from tpen.training.events import TrainingIteration, TrainingIterationCompleted
 from tpen.training.state import TrainerState
 from tpen.training.update import LegacyAutogradUpdate
 
@@ -45,6 +45,9 @@ class OptimizerState(StatefulCallback[TrainerState]):
         cadence = pop_step_cadence(kwargs)
         super().__init__(
             typed_groups=(
+                # Validate at iteration entry, before sampling, independently
+                # of the observational completed-step cadence.
+                SubscriptionGroup(selectors=(started(TrainingIteration),)),
                 SubscriptionGroup(selectors=(Subscription.of(TrainingIterationCompleted),)),
             ),
             **kwargs,
@@ -61,6 +64,9 @@ class OptimizerState(StatefulCallback[TrainerState]):
         """Measure optimizer state at the completed-update boundary."""
 
         event = occurrence.event
+        if isinstance(event, Started) and isinstance(event.operation, TrainingIteration):
+            _validate_update_method(state)
+            return
         if not isinstance(event, TrainingIterationCompleted):
             return
         step = int(event.iteration.step)
@@ -153,15 +159,17 @@ def _state_tensor(state: Mapping[str, Any], key: str) -> Any:
 
 
 def _tensor_metrics(torch: Any, name: str, values: list[Any]) -> dict[str, Any]:
-    """Summarize finite entries of one optimizer moment."""
+    """Summarize one optimizer moment while preserving invalidity evidence."""
 
     flat = torch.cat([value.detach().reshape(-1) for value in values]) if values else torch.empty(0)
-    flat = flat[torch.isfinite(flat)]
+    finite = torch.isfinite(flat)
+    finite_values = flat[finite]
     prefix = f"{name}_"
     return {
-        f"{prefix}l2": float(flat.norm().item()) if flat.numel() else 0.0,
-        f"{prefix}rms": float(flat.square().mean().sqrt().item()) if flat.numel() else 0.0,
-        f"{prefix}max_abs": float(flat.abs().max().item()) if flat.numel() else 0.0,
+        f"{prefix}l2": float(finite_values.norm().item()) if finite_values.numel() else None,
+        f"{prefix}rms": float(finite_values.square().mean().sqrt().item()) if finite_values.numel() else None,
+        f"{prefix}max_abs": float(finite_values.abs().max().item()) if finite_values.numel() else None,
+        f"{prefix}nonfinite_count": int((~finite).sum().item()),
     }
 
 

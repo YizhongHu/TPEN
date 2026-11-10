@@ -568,7 +568,10 @@ writes one namespace per configured group under
 `train/optimizer_state/<group>` with `step`, `step_min`, `step_max`, and
 `step_mismatch`; `exp_avg_l2`, `exp_avg_rms`, `exp_avg_max_abs`;
 `exp_avg_sq_l2`, `exp_avg_sq_rms`, `exp_avg_sq_max_abs`; and
-`n_no_optimizer_state`. A mismatched step is represented by `step = null` and
+`exp_avg_nonfinite_count`, `exp_avg_sq_nonfinite_count`, and
+`n_no_optimizer_state`. The nonfinite counts cover all entries before the
+finite reductions; when a moment has no finite entries, its three reductions
+are `null` rather than an uninformative zero. A mismatched step is represented by `step = null` and
 the explicit `step_mismatch = true` flag rather than by averaging steps.
 
 The metric identity is:
