@@ -68,6 +68,10 @@ def __getattr__(name: str) -> object:
         from .factor_scalars import FactorScalars
 
         return FactorScalars
+    if name == "ElectronNucleusDistanceQuantiles":
+        from .electron_nucleus_distance import ElectronNucleusDistanceQuantiles
+
+        return ElectronNucleusDistanceQuantiles
     if name == "DiagnosticTiming":
         from .timing import DiagnosticTiming
 
@@ -110,6 +114,7 @@ __all__ = [
     "DiagnosticTiming",
     "EvaluationComponentTiming",
     "EvaluationTiming",
+    "ElectronNucleusDistanceQuantiles",
     "FailureLog",
     "FactorScalars",
     "GradientStats",

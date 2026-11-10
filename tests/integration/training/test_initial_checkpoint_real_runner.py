@@ -436,3 +436,100 @@ def test_initial_checkpoint_and_periodic_checkpoint_coexist_across_an_update(
     assert (one_dir / "COMPLETE").is_file()
     _assert_model_equal(reference_zero, zero_dir)
     _assert_sampler_equal(reference_zero, zero_dir)
+
+
+# --------------------------------------------------------------------------
+# Probe 5: a requeue-style resume into the SAME keep-all directory completes,
+# with BOTH InitialCheckpoint and ParameterActivity a verified no-op against
+# the SAME reused paths -- never a late write, never a mislabeled record.
+# --------------------------------------------------------------------------
+
+
+_PARAMETER_ACTIVITY_NAME = "parameter_activity.json"
+
+
+_REQUEUE_MAX_STEPS = 2
+
+
+def _requeue_cfg(*, run_id: str, load: dict[str, str] | None = None) -> DictConfig:
+    """A fixed-`run_id`, fixed-`max_steps` config, so two invocations share one
+    keep-all directory AND one `trainer_config` hash -- a genuine requeue
+    reuses the identical trainer config; only its `runner.load` differs."""
+
+    cfg = OmegaConf.load(FIXTURE)
+    cfg.trainer.max_steps = _REQUEUE_MAX_STEPS
+    cfg.run.run_id = run_id
+    for callback in cfg.callbacks:
+        if callback.get("_target_") == "tpen.callback.Checkpoint":
+            # Default cadence (`every_n: 2`) only writes the terminal step at
+            # `max_steps=2`; `every_n: 1` also writes step 1 as a genuine
+            # intermediate checkpoint to resume arm B from.
+            callback.schedule.every_n = 1
+    cfg.callbacks.append(OmegaConf.create(_INITIAL_CHECKPOINT_CALLBACK))
+    cfg.callbacks.append(
+        OmegaConf.create(
+            {
+                "_target_": "tpen.callback.ParameterActivity",
+                "output_path": "${run.dir}/" + _PARAMETER_ACTIVITY_NAME,
+            }
+        )
+    )
+    if load is not None:
+        cfg.runner.load = load
+    return cfg
+
+
+def test_requeue_into_the_same_directory_completes_with_a_verified_no_op(tmp_path) -> None:
+    """A step > 0 resume into the SAME output directory completes end to end.
+
+    Arm A is a fresh, ``max_steps=2`` run (periodic cadence widened to
+    ``every_n: 1`` so ``step_000001`` is a genuine intermediate checkpoint,
+    not only the terminal one), fixed to a known ``run.run_id`` so its
+    ``run.dir`` (and therefore both callbacks' shared output paths) is
+    reused, not a fresh per-attempt directory, by arm B below -- the requeue
+    shape this follow-up targets, not the independent-directory restore the
+    probes above pin.
+
+    Arm B resumes from arm A's INTERMEDIATE (``step_000001``) checkpoint,
+    reusing arm A's exact ``run.run_id`` (so its ``run.dir``) AND its exact
+    ``max_steps`` (so the restore's ``trainer_config`` hash matches -- a
+    genuine requeue reuses the identical trainer config, it does not widen
+    it). So arm B trains exactly one more update (to ``max_steps=2``), and
+    its restored trainer counters (asserted below via ``CheckpointRestored``)
+    are nonzero, with its first iteration/applied-update both reading a
+    nonzero step. `InitialCheckpoint` and `ParameterActivity` must each
+    become a VERIFIED no-op against their SAME, reused output paths --
+    neither refuses, and neither writes anything new; `ParameterActivity` in
+    particular must never record arm B's own later-update gradients as
+    though they were the lineage's first.
+    """
+
+    run_id = "requeue-same-directory"
+    source_dir = _run(tmp_path, _requeue_cfg(run_id=run_id))
+    zero_dir = _checkpoint_dir(source_dir, 0)
+    one_dir = _checkpoint_dir(source_dir, 1)
+    assert (zero_dir / "COMPLETE").is_file()
+    assert (one_dir / "COMPLETE").is_file()
+    zero_model_before = (zero_dir / "model.pt").read_bytes()
+    inventory_path = source_dir / _PARAMETER_ACTIVITY_NAME
+    assert inventory_path.is_file()
+    inventory_before = inventory_path.read_bytes()
+    inventory_mtime_before = inventory_path.stat().st_mtime_ns
+
+    resumed_cfg = _requeue_cfg(run_id=run_id, load={"mode": "train_resume", "path": str(one_dir)})
+    resumed_dir = _run(tmp_path, resumed_cfg)
+    assert resumed_dir == source_dir
+
+    restored = _occurrences(resumed_dir, "CheckpointRestored")
+    assert len(restored) == 1
+    report = restored[0]["fields"]["report"]
+    assert report["next_iteration"] == 1
+    assert report["completed_updates"] == 1
+
+    # InitialCheckpoint's verified no-op: the shared `step_000000` checkpoint
+    # is untouched by the resumed arm.
+    assert (zero_dir / "model.pt").read_bytes() == zero_model_before
+    # ParameterActivity's verified no-op: the shared inventory is untouched,
+    # never overwritten with arm B's own (later) first-applied-update record.
+    assert inventory_path.read_bytes() == inventory_before
+    assert inventory_path.stat().st_mtime_ns == inventory_mtime_before
