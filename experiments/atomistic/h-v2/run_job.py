@@ -364,12 +364,19 @@ def run_eval_fanout(
     handoff_root = run_root / "attached" / "handoff"
     receipt_path = _eval_receipt_path(run_root, task_label)
     records: list[dict] = []
+    checkpoint_snapshot_root = run_root / "attached" / "checkpoint-snapshots" / task_label
     for generation in generations:
-        checkpoint_dir = eval_job.resolve_checkpoint(train_receipt, update=generation["update"])
+        gen_task_id = f"{task_label}-ck{generation['update']:06d}-s{generation['stream']}"
+        # F2: core loads from a job-local verified snapshot of the
+        # inventoried checkpoint bytes, never the original (shared,
+        # externally-writable) checkpoint directory -- closes the
+        # verify/load check-use window.
+        checkpoint_dir = eval_job.resolve_checkpoint(
+            train_receipt, update=generation["update"], snapshot_dir=checkpoint_snapshot_root / gen_task_id
+        )
         config = protocol.science_evaluation_config(
             checkpoint_dir, seed=generation["seed"], enable_readout_trajectory=readout_available
         )
-        gen_task_id = f"{task_label}-ck{generation['update']:06d}-s{generation['stream']}"
         config["run"]["root"] = str(results_root)
         config["run"]["run_id"] = gen_task_id
         config["run"]["layout"] = "flat"

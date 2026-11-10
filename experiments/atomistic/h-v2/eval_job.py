@@ -104,6 +104,17 @@ def load_train_receipt(path: str | Path) -> tuple[dict[str, Any], str]:
     return json.loads(receipt_path.read_text(encoding="utf-8")), _sha256_file(receipt_path)
 
 
+def _segment_resolved_config_sha256(segment: Mapping[str, Any]) -> str | None:
+    """Return one TRAIN segment's recorded resolved-config sha256, if any."""
+
+    direct = segment.get("resolved_config_sha256")
+    if direct is not None:
+        return direct
+    artifacts = segment.get("artifacts") or {}
+    resolved = artifacts.get("resolved_config") or {}
+    return resolved.get("sha256")
+
+
 def verify_train_receipt_identity(
     receipt: Mapping[str, Any],
     *,
@@ -120,11 +131,28 @@ def verify_train_receipt_identity(
     ``science_config_identity``/pilot-identity ``lineage`` field must equal
     *expected_payload*/*expected_lineage*.
 
+    F3 (review r1): a correct commit/lineage/payload is not sufficient -- the
+    receipt's seed namespace and every frozen-input hash it recorded are
+    checked too, against THIS checkout's own current frozen inputs (never
+    the caller's historical TRAIN checkout, which this EVAL job never has):
+    for a pilot/part-(g) *expected_payload*, ``seed_namespace`` and
+    ``payload_overlay_sha256`` must equal :data:`protocol.PILOT_PAYLOADS`'
+    own entry; for ``"science"``, ``overlay_sha256`` must equal the current
+    :data:`protocol.SCIENCE_SCALE_OVERLAY_PATH` hash. ``contract_inputs_sha256``
+    must equal the current :data:`protocol.CONTRACT_INPUTS_PATH` hash for
+    either kind. ``materialized_config_sha256`` is cross-checked against the
+    segment's OWN recorded ``resolved_config`` artifact hash (never an
+    external expectation this job cannot have): a receipt whose identity
+    block disagrees with what it itself says it wrote is refused.
+
     Raises
     ------
     EvalJobRefusal
         Code ``train-receipt-empty``, ``wrong-train-payload``,
-        ``wrong-train-commit``, or ``wrong-train-lineage``.
+        ``wrong-train-commit``, ``wrong-train-lineage``,
+        ``wrong-train-seed-namespace``, ``wrong-train-overlay``,
+        ``wrong-train-contract-inputs``, or
+        ``wrong-train-materialized-config``.
     """
 
     if receipt.get("payload") != expected_payload:
@@ -147,6 +175,49 @@ def verify_train_receipt_identity(
         raise EvalJobRefusal(
             "wrong-train-lineage",
             f"TRAIN receipt lineage {identity.get('lineage')!r} does not match expected {expected_lineage!r}",
+        )
+
+    pilot_spec = protocol.PILOT_PAYLOADS.get(expected_payload)
+    if pilot_spec is not None:
+        if identity.get("seed_namespace") != pilot_spec["seed_namespace"]:
+            raise EvalJobRefusal(
+                "wrong-train-seed-namespace",
+                f"TRAIN receipt seed_namespace {identity.get('seed_namespace')!r} does not match "
+                f"expected {pilot_spec['seed_namespace']!r}",
+            )
+        expected_overlay_sha256 = _sha256_file(pilot_spec["overlay_path"])
+        if identity.get("payload_overlay_sha256") != expected_overlay_sha256:
+            raise EvalJobRefusal(
+                "wrong-train-overlay",
+                f"TRAIN receipt payload_overlay_sha256 {identity.get('payload_overlay_sha256')!r} "
+                f"does not match this checkout's {expected_overlay_sha256!r}",
+            )
+    else:
+        expected_overlay_sha256 = _sha256_file(protocol.SCIENCE_SCALE_OVERLAY_PATH)
+        if identity.get("overlay_sha256") != expected_overlay_sha256:
+            raise EvalJobRefusal(
+                "wrong-train-overlay",
+                f"TRAIN receipt overlay_sha256 {identity.get('overlay_sha256')!r} does not match "
+                f"this checkout's {expected_overlay_sha256!r}",
+            )
+
+    expected_contract_sha256 = _sha256_file(protocol.CONTRACT_INPUTS_PATH)
+    if identity.get("contract_inputs_sha256") != expected_contract_sha256:
+        raise EvalJobRefusal(
+            "wrong-train-contract-inputs",
+            f"TRAIN receipt contract_inputs_sha256 {identity.get('contract_inputs_sha256')!r} does "
+            f"not match this checkout's {expected_contract_sha256!r}",
+        )
+
+    materialized_sha256 = identity.get("materialized_config_sha256")
+    segment_resolved_sha256 = next(
+        (value for value in (_segment_resolved_config_sha256(segment) for segment in segments) if value), None
+    )
+    if materialized_sha256 is None or materialized_sha256 != segment_resolved_sha256:
+        raise EvalJobRefusal(
+            "wrong-train-materialized-config",
+            f"TRAIN receipt materialized_config_sha256 {materialized_sha256!r} does not match its own "
+            f"segment resolved_config sha256 {segment_resolved_sha256!r}",
         )
 
 
@@ -200,10 +271,64 @@ def verify_checkpoint_files(entry: Mapping[str, Any]) -> Path:
     return checkpoint_dir
 
 
-def resolve_checkpoint(receipt: Mapping[str, Any], *, update: int) -> Path:
-    """Select *update*'s inventory entry and verify its files in one call."""
+def materialize_verified_checkpoint(entry: Mapping[str, Any], destination: str | Path) -> Path:
+    """Copy *entry*'s inventoried files into *destination*, verifying each hash while copying.
+
+    F2 (review r1): :func:`verify_checkpoint_files` leaves a check/use
+    window -- core opens the ORIGINAL checkpoint directory after this
+    function returns, so a swap between verification and load would pass
+    hashes it never re-checks. This function instead reads, verifies, and
+    writes each inventoried file's bytes into a private destination this job
+    alone controls; the caller points core at *destination*, never the
+    original directory, eliminating that window. Reads ONLY the files the
+    inventory names -- never a directory listing or glob, same as
+    :func:`verify_checkpoint_files`.
+
+    Raises
+    ------
+    EvalJobRefusal
+        Code ``checkpoint-file-missing`` or ``checkpoint-hash-mismatch``.
+    """
+
+    source_dir = Path(entry["path"])
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    for relative, expected_sha256 in (entry.get("files") or {}).items():
+        source_path = source_dir / relative
+        if not source_path.is_file():
+            raise EvalJobRefusal("checkpoint-file-missing", f"inventoried file {source_path} is missing")
+        data = source_path.read_bytes()
+        actual = hashlib.sha256(data).hexdigest()
+        if actual != expected_sha256:
+            raise EvalJobRefusal(
+                "checkpoint-hash-mismatch",
+                f"{source_path} sha256 {actual} does not match inventoried {expected_sha256}",
+            )
+        target_path = destination / relative
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_bytes(data)
+    return destination
+
+
+def resolve_checkpoint(
+    receipt: Mapping[str, Any], *, update: int, snapshot_dir: str | Path | None = None
+) -> Path:
+    """Select *update*'s inventory entry and verify its files in one call.
+
+    Parameters
+    ----------
+    snapshot_dir : path, optional
+        When given, the verified files are copied into this job-local
+        directory (:func:`materialize_verified_checkpoint`) and that
+        directory is returned, closing F2's check/use window. When omitted
+        (the default), the original checkpoint directory is verified and
+        returned unchanged, for a caller that cannot yet supply a private
+        destination.
+    """
 
     entry = select_checkpoint(receipt, update=update)
+    if snapshot_dir is not None:
+        return materialize_verified_checkpoint(entry, snapshot_dir)
     return verify_checkpoint_files(entry)
 
 
@@ -660,6 +785,7 @@ __all__ = [
     "build_selection_record",
     "compute_pilot_selection",
     "generation_record",
+    "materialize_verified_checkpoint",
     "gpu_route_g_fanout",
     "load_train_receipt",
     "pilot_fanout",

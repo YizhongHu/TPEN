@@ -48,10 +48,28 @@ def _checkpoint_entry(tmp_path: Path, *, update: int, content: bytes = b"model-b
 
 
 def _train_receipt(tmp_path: Path, *, lineage: str, payload: str, commit: str, inventory: list[dict]) -> dict:
+    """Return a synthetic TRAIN receipt with a REAL, currently-matching identity block.
+
+    F3: :func:`eval_job.verify_train_receipt_identity` now checks every
+    identity field against this checkout's own current frozen inputs, so a
+    fixture carrying only ``{"lineage": ...}`` no longer accepts. Identity is
+    built through the real protocol functions (the same ones a real TRAIN
+    writer uses) so every hash matches today's checkout; ``lineage`` is a
+    pilot payload's own fixed value (never overridden here -- the
+    wrong-lineage/wrong-payload tests below pass a *payload*/*lineage*
+    combination that is naturally inconsistent instead).
+    """
+
+    if payload in protocol.PILOT_PAYLOADS:
+        _, identity = protocol.pilot_training_config(payload)
+    else:
+        _, identity = protocol.science_training_config(lineage, 0)
+    materialized_sha256 = _sha256(b"materialized-config-bytes-for-tests")
+    identity["materialized_config_sha256"] = materialized_sha256
     return {
         "payload": payload,
-        "segments": [{"source_commit": commit}],
-        "science_config_identity": {"lineage": lineage},
+        "segments": [{"source_commit": commit, "resolved_config_sha256": materialized_sha256}],
+        "science_config_identity": identity,
         "checkpoint_inventory": inventory,
     }
 
@@ -123,6 +141,31 @@ def test_verify_checkpoint_files_never_reads_a_file_not_in_the_inventory(tmp_pat
     (Path(entry["path"]) / "extra.bin").write_bytes(b"not tracked, never read")
     out = eval_job.verify_checkpoint_files(entry)
     assert out == Path(entry["path"])
+
+
+def test_resolve_checkpoint_snapshot_closes_the_check_use_window(tmp_path: Path) -> None:
+    """F2: core must load the verified SNAPSHOT, never the original directory."""
+
+    entry = _checkpoint_entry(tmp_path, update=1000)
+    receipt = _train_receipt(tmp_path, lineage="L1", payload="science", commit="a" * 40, inventory=[entry])
+    snapshot_dir = tmp_path / "snapshot"
+    resolved = eval_job.resolve_checkpoint(receipt, update=1000, snapshot_dir=snapshot_dir)
+    assert resolved == snapshot_dir
+    assert resolved != Path(entry["path"])
+    assert (resolved / "model.pt").read_bytes() == (Path(entry["path"]) / "model.pt").read_bytes()
+    # Tampering the ORIGINAL after the snapshot was taken must not affect it.
+    (Path(entry["path"]) / "model.pt").write_bytes(b"swapped-after-verification")
+    assert (resolved / "model.pt").read_bytes() == b"model-bytes"
+
+
+def test_materialize_verified_checkpoint_refuses_a_tampered_file(tmp_path: Path) -> None:
+    """F2: a hash mismatch refuses before any bytes are copied into the snapshot."""
+
+    entry = _checkpoint_entry(tmp_path, update=1000)
+    (Path(entry["path"]) / "model.pt").write_bytes(b"tampered")
+    with pytest.raises(eval_job.EvalJobRefusal) as excinfo:
+        eval_job.materialize_verified_checkpoint(entry, tmp_path / "snapshot")
+    assert excinfo.value.code == "checkpoint-hash-mismatch"
 
 
 # --- TRAIN receipt identity (EVAL-only against an earlier commit) ---------
