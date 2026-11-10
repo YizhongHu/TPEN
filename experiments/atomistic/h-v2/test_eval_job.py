@@ -41,10 +41,31 @@ def _sha256(data: bytes) -> str:
 
 
 def _checkpoint_entry(tmp_path: Path, *, update: int, content: bytes = b"model-bytes") -> dict:
+    """Return an inventory entry carrying the full load closure (F2).
+
+    model.pt, manifest.json, and COMPLETE -- every file
+    eval_job.REQUIRED_CHECKPOINT_CLOSURE_FILES names -- so this fixture
+    satisfies verify_checkpoint_files'/materialize_verified_checkpoint's
+    closure-completeness check by default; tests targeting a specific
+    missing/tampered file still delete or overwrite just that one file.
+    """
+
     checkpoint_dir = tmp_path / f"ck{update}"
     checkpoint_dir.mkdir()
+    manifest = b'{"completed_updates": %d}' % update
+    complete_marker = b""
     (checkpoint_dir / "model.pt").write_bytes(content)
-    return {"update": update, "path": str(checkpoint_dir), "files": {"model.pt": _sha256(content)}}
+    (checkpoint_dir / "manifest.json").write_bytes(manifest)
+    (checkpoint_dir / "COMPLETE").write_bytes(complete_marker)
+    return {
+        "update": update,
+        "path": str(checkpoint_dir),
+        "files": {
+            "model.pt": _sha256(content),
+            "manifest.json": _sha256(manifest),
+            "COMPLETE": _sha256(complete_marker),
+        },
+    }
 
 
 def _train_receipt(tmp_path: Path, *, lineage: str, payload: str, commit: str, inventory: list[dict]) -> dict:

@@ -244,6 +244,15 @@ def select_checkpoint(receipt: Mapping[str, Any], *, update: int) -> dict[str, A
     )
 
 
+#: F2 (review r1): every file core's model-only restore opens for ONE
+#: checkpoint -- the model weights, the manifest recording
+#: ``completed_updates``, and the ``COMPLETE`` marker written only once that
+#: checkpoint finished saving. An inventory entry missing any of these is
+#: refused outright, before this module ever opens the checkpoint directory:
+#: never load from a directory whose full read closure is not inventoried.
+REQUIRED_CHECKPOINT_CLOSURE_FILES: tuple[str, ...] = ("model.pt", "manifest.json", "COMPLETE")
+
+
 def verify_checkpoint_files(entry: Mapping[str, Any]) -> Path:
     """Verify every inventoried file's sha256, then return the checkpoint directory.
 
@@ -254,11 +263,20 @@ def verify_checkpoint_files(entry: Mapping[str, Any]) -> Path:
     Raises
     ------
     EvalJobRefusal
-        Code ``checkpoint-file-missing`` or ``checkpoint-hash-mismatch``.
+        Code ``checkpoint-closure-incomplete``, ``checkpoint-file-missing``,
+        or ``checkpoint-hash-mismatch``.
     """
 
+    files = entry.get("files") or {}
+    missing_from_inventory = sorted(set(REQUIRED_CHECKPOINT_CLOSURE_FILES) - set(files))
+    if missing_from_inventory:
+        raise EvalJobRefusal(
+            "checkpoint-closure-incomplete",
+            f"inventory entry for update={entry.get('update')} is missing required closure file(s) "
+            f"{missing_from_inventory!r}",
+        )
     checkpoint_dir = Path(entry["path"])
-    for relative, expected_sha256 in (entry.get("files") or {}).items():
+    for relative, expected_sha256 in files.items():
         file_path = checkpoint_dir / relative
         if not file_path.is_file():
             raise EvalJobRefusal("checkpoint-file-missing", f"inventoried file {file_path} is missing")
@@ -287,13 +305,22 @@ def materialize_verified_checkpoint(entry: Mapping[str, Any], destination: str |
     Raises
     ------
     EvalJobRefusal
-        Code ``checkpoint-file-missing`` or ``checkpoint-hash-mismatch``.
+        Code ``checkpoint-closure-incomplete``, ``checkpoint-file-missing``,
+        or ``checkpoint-hash-mismatch``.
     """
 
+    files = entry.get("files") or {}
+    missing_from_inventory = sorted(set(REQUIRED_CHECKPOINT_CLOSURE_FILES) - set(files))
+    if missing_from_inventory:
+        raise EvalJobRefusal(
+            "checkpoint-closure-incomplete",
+            f"inventory entry for update={entry.get('update')} is missing required closure file(s) "
+            f"{missing_from_inventory!r}",
+        )
     source_dir = Path(entry["path"])
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
-    for relative, expected_sha256 in (entry.get("files") or {}).items():
+    for relative, expected_sha256 in files.items():
         source_path = source_dir / relative
         if not source_path.is_file():
             raise EvalJobRefusal("checkpoint-file-missing", f"inventoried file {source_path} is missing")
@@ -864,6 +891,7 @@ __all__ = [
     "compute_pilot_selection",
     "generation_record",
     "materialize_verified_checkpoint",
+    "REQUIRED_CHECKPOINT_CLOSURE_FILES",
     "gpu_route_g_fanout",
     "load_train_receipt",
     "pilot_fanout",
