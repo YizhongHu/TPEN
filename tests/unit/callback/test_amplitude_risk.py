@@ -202,6 +202,21 @@ def test_all_nonfinite_input_is_unavailable_not_a_healthy_zero() -> None:
     assert metrics["low_amplitude_count.-3.0"] is None
 
 
+def test_denominator_is_the_full_batch_not_just_the_finite_count() -> None:
+    """A nonfinite row must shrink no denominator: N stays the full batch size."""
+
+    logabs = torch.tensor([0.0, 0.0, -10.0, float("nan")], dtype=torch.float64)
+    sign = torch.ones(4, dtype=torch.float64)
+    metrics = amplitude_risk_metrics(logabs, sign, (-3.0,))
+    # median of the finite values {0, 0, -10} is 0; centered -10 clears tau=-3.
+    assert metrics["finite_logabs_count"] == 3
+    assert metrics["total_count"] == 4
+    assert metrics["low_amplitude_count.-3.0"] == 1
+    # Dividing by finite_logabs_count (3) instead of total_count (4) would give
+    # 0.333...; the contract requires the full sampled denominator, 0.25.
+    assert metrics["low_amplitude_fraction.-3.0"] == pytest.approx(0.25)
+
+
 def test_shape_mismatch_between_logabs_and_sign_is_refused() -> None:
     logabs = torch.zeros(3, dtype=torch.float64)
     sign = torch.ones(4, dtype=torch.float64)
