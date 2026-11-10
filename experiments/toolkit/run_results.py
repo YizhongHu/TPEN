@@ -225,6 +225,17 @@ def _gpu_uuid(value: Any, name: str) -> str:
     return value
 
 
+def _receipt_host_key(value: Any, name: str) -> str:
+    """Derive the executor's physical-host comparison key."""
+
+    _text(value, name)
+    complete = value.strip().lower().rstrip(".")
+    labels = complete.split(".")
+    if not complete or any(not label for label in labels):
+        raise ManifestRefusal("malformed-record", f"{name} contains an empty hostname label")
+    return labels[0]
+
+
 def _finite_number(value: Any, name: str, *, nonnegative: bool = False) -> float | int:
     if type(value) not in {int, float} or isinstance(value, bool) or not math.isfinite(value):
         raise ManifestRefusal("malformed-record", f"{name} must be a finite number")
@@ -349,12 +360,18 @@ def _placement_receipt(value: Any, attempt: Mapping[str, Any], start: Mapping[st
         record["refusal"] = base["refusal"]
         record["host_mapping"] = _placement_v2_host_mapping(record["host_mapping"])
         record["verdict"] = _placement_v2_verdict(record["verdict"], record["declared"])
-        if record["gpu"]["status"] != "unavailable" or record["gpu"]["reason"] != "not-sampled":
+        if (
+            record["gpu"]["status"] != "unavailable"
+            or record["gpu"]["reason"] != "not-sampled"
+            or record["gpu"]["method"] != "not-sampled"
+        ):
             raise ManifestRefusal("malformed-record", "L1a v2 GPU evidence must be unavailable/not-sampled")
         if record["gpu"]["samples"] or record["gpu"]["active_uuids"] or record["gpu"]["active_pci"]:
             raise ManifestRefusal("malformed-record", "L1a v2 GPU evidence must not contain samples")
         for device in record["declared"]["devices"]:
             _gpu_uuid(device, "placement.declared.devices")
+        if record["host_mapping"]["slot_id"] != record["slot_id"]:
+            raise ManifestRefusal("malformed-record", "host mapping slot_id disagrees with the base receipt")
         if record["host_mapping"]["status"] != record["verdict"]["host"]:
             raise ManifestRefusal("malformed-record", "host mapping disagrees with placement verdict")
         host_comparison = record["comparison"]["host"]
@@ -363,14 +380,51 @@ def _placement_receipt(value: Any, attempt: Mapping[str, Any], start: Mapping[st
             raise ManifestRefusal("malformed-record", "placement comparison disagrees with placement verdict")
         if record["comparison"]["device"] != record["verdict"]["device"]:
             raise ManifestRefusal("malformed-record", "placement comparison disagrees with placement verdict")
-        postlaunch_mismatch = record["comparison"]["host"] == "mismatch" or record["comparison"]["affinity"] == "mismatch"
-        expected_reason_class = "mismatch" if postlaunch_mismatch else ("refused" if record["refusal"] is not None else "not-sampled")
+
+        child_host = _receipt_host_key(record["child"]["host"], "placement.child.host")
+        declared_host = _receipt_host_key(record["declared"]["host"], "placement.declared.host")
+        affinity_matches = bool(record["child"]["affinity"]) and (
+            tuple(sorted(record["child"]["affinity"])) == tuple(sorted(record["declared"]["cpus"]))
+        )
+        if host_status == "unavailable":
+            derived_host_status = "unavailable"
+            if host_comparison not in {"unavailable", "refused"}:
+                raise ManifestRefusal("malformed-record", "unavailable host map contradicts base host comparison")
+        else:
+            mapped_host = _receipt_host_key(record["host_mapping"]["host"], "placement.host_mapping.host")
+            if declared_host != mapped_host:
+                raise ManifestRefusal("malformed-record", "declared host differs from physical scheduler host")
+            derived_host_status = "matched" if child_host == mapped_host else "mismatch"
+            if host_status != derived_host_status or host_comparison != derived_host_status:
+                raise ManifestRefusal("malformed-record", "host mapping contradicts child host evidence")
+        derived_affinity_status = "matched" if affinity_matches else (
+            "mismatch" if record["child"]["affinity"] else "unavailable"
+        )
+        if record["refusal"] is None and record["comparison"]["affinity"] != derived_affinity_status:
+            raise ManifestRefusal("malformed-record", "affinity comparison is not derived from child evidence")
+        if record["refusal"] is not None and record["comparison"]["affinity"] not in {
+            derived_affinity_status, "refused"
+        }:
+            raise ManifestRefusal("malformed-record", "refused affinity comparison contradicts child evidence")
+        has_postlaunch_mismatch = derived_host_status == "mismatch" or derived_affinity_status == "mismatch"
+        expected_reason_class = "mismatch" if has_postlaunch_mismatch else ("refused" if record["refusal"] is not None else "not-sampled")
         if record["verdict"]["reason_class"] != expected_reason_class:
             raise ManifestRefusal("malformed-record", "placement verdict does not preserve mismatch/refusal precedence")
-        if expected_reason_class == "not-sampled" and record["refusal"] is not None:
-            raise ManifestRefusal("malformed-record", "not-sampled placement cannot carry a refusal")
-        if expected_reason_class in {"mismatch", "refused"} and record["refusal"] is None:
-            raise ManifestRefusal("malformed-record", "blocking placement verdict requires refusal evidence")
+        if expected_reason_class == "not-sampled":
+            if (
+                record["refusal"] is not None
+                or host_status != "matched"
+                or derived_host_status != "matched"
+                or host_comparison != "matched"
+                or derived_affinity_status != "matched"
+            ):
+                raise ManifestRefusal("malformed-record", "not-sampled verdict requires matching mapped host and affinity evidence")
+        elif expected_reason_class == "mismatch":
+            if not has_postlaunch_mismatch or record["refusal"] is None:
+                raise ManifestRefusal("malformed-record", "mismatch verdict requires post-launch mismatch evidence")
+        elif expected_reason_class == "refused":
+            if record["refusal"] is None or has_postlaunch_mismatch or host_status != "unavailable":
+                raise ManifestRefusal("malformed-record", "refused verdict requires a prelaunch refusal")
         return record
 
     record = dict(_fields(

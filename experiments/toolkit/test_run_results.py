@@ -73,12 +73,15 @@ def _placement_receipt_v2(output_dir: str, *, reason_class: str = "not-sampled")
     })
     receipt["comparison"]["device"] = "unavailable"
     if reason_class == "mismatch":
+        receipt["child"]["host"] = "other-node"
         receipt["comparison"]["host"] = "mismatch"
         receipt["refusal"] = {"code": "child-placement-mismatch", "reason": "child host differs from declared host"}
         host_status, host_reason, host = "mismatch", "child host differs from physical scheduler host", "node-a"
         warning = "GPU PLACEMENT UNQUALIFIED: physical placement evidence requires review."
         acceptance = "not-accepted"
     elif reason_class == "refused":
+        receipt["child"].update({"host": "unavailable", "pid": 1, "affinity": []})
+        receipt["declared"]["host"] = "unavailable"
         receipt["comparison"].update({"host": "refused", "affinity": "refused"})
         receipt["refusal"] = {"code": "host-map-unavailable", "reason": "physical scheduler host mapping is unavailable"}
         host_status, host_reason, host = "unavailable", "physical scheduler host mapping is unavailable", "unavailable"
@@ -236,6 +239,33 @@ def test_p8_reader_rejects_refusal_that_hides_observed_mismatch(tmp_path: Path) 
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ManifestRefusal, match="mismatch/refusal precedence"):
         read(path, lambda _: pytest.fail("contradictory refusal must refuse before inspection"))
+
+
+def test_p8_reader_rejects_v2_verdicts_not_derived_from_l1a_evidence(tmp_path: Path) -> None:
+    """L1a reason classes must follow the physical host and affinity evidence."""
+
+    for mutation in ("unavailable-not-sampled", "mapped-refused", "observed-host-hidden"):
+        path, _ = _materialized_manifest(tmp_path / mutation)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        placement = _placement_receipt_v2(payload["attempts"][0]["output_dir"])
+        if mutation == "unavailable-not-sampled":
+            placement["host_mapping"].update({"status": "unavailable", "host": "unavailable"})
+            placement["comparison"]["host"] = "unavailable"
+            placement["verdict"].update({"host": "unavailable"})
+        elif mutation == "mapped-refused":
+            placement["refusal"] = {"code": "child-placement-refused", "reason": "pre-core refusal"}
+            placement["verdict"].update({
+                "reason_class": "refused",
+                "reason": "refused: pre-core refusal",
+                "science_acceptance": "not-accepted",
+                "warning": "GPU PLACEMENT REFUSED: physical placement was refused before launch.",
+            })
+        else:
+            placement["child"]["host"] = "other-node"
+        payload["attempts"][0]["placement_receipt"] = placement
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(ManifestRefusal):
+            read(path, lambda _: pytest.fail("contradictory v2 verdict must refuse before inspection"))
 
 
 @pytest.mark.parametrize("mutation", ["unknown-version", "closed-key", "non-finite"])
