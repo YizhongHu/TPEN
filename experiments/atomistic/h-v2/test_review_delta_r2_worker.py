@@ -143,3 +143,18 @@ def test_fully_assembled_science_control_is_accepted(tmp_path):
         plan, overrides, resolved, output_dir=tmp_path / "prepared"
     )
     assert prepared.payload == "science"
+
+
+def test_science_payload_cannot_opt_into_incomplete_a1(tmp_path):
+    """A science identity cannot use the intermediate pipeline marker."""
+
+    config, identity = protocol.science_training_config("L1", 0)
+    with pytest.raises(ValueError, match="A1|callback"):
+        attached.build_h_v2_train_plan(
+            output_dir=tmp_path / "handoff",
+            results_root=tmp_path / "results",
+            lineage="L1",
+            config=config,
+            science_config_identity=identity,
+            payload_label="pipeline-check",
+        )
