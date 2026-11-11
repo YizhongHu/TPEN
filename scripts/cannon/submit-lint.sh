@@ -16,12 +16,15 @@ REAL_ENV=""
 DRY_ENV=""
 DRY_ONLY_KEYS=""
 ALLOWED_ROOTS=()
+STAGING_LOCAL_ROOTS=()
+STAGING_FINAL_ROOTS=()
 
 usage() {
   cat >&2 <<'USAGE'
 usage: submit-lint.sh --sbatch PATH --manifest PATH --allowed-root PATH
                        [--allowed-root PATH ...] --shared-env-root PATH
                        [--submit-helper PATH] [--home PATH]
+                       [--staging-root LOCAL=FINAL ...]
                        [--real-env PATH --dry-env PATH --dry-only-keys K1,K2]
 Validates the submission contract before sbatch is invoked. Exits 0 on PASS.
 USAGE
@@ -35,6 +38,12 @@ while (($#)); do
     --shared-env-root) SHARED_ENV_ROOT="${2:?missing shared env root}"; shift 2 ;;
     --submit-helper) SUBMIT_HELPER="${2:?missing submit helper path}"; shift 2 ;;
     --home) HOME_ROOT="${2:?missing home path}"; shift 2 ;;
+    --staging-root)
+      _staging_arg="${2:?missing staging-root mapping LOCAL=FINAL}"
+      [[ "$_staging_arg" == *=* ]] || { echo "LINT_FAIL malformed --staging-root (expected LOCAL=FINAL): '$_staging_arg'" >&2; exit 2; }
+      STAGING_LOCAL_ROOTS+=("${_staging_arg%%=*}")
+      STAGING_FINAL_ROOTS+=("${_staging_arg#*=}")
+      shift 2 ;;
     --real-env) REAL_ENV="${2:?missing real-env path}"; shift 2 ;;
     --dry-env) DRY_ENV="${2:?missing dry-env path}"; shift 2 ;;
     --dry-only-keys) DRY_ONLY_KEYS="${2:?missing dry-only keys}"; shift 2 ;;
@@ -63,11 +72,6 @@ FAILED=0
 fail() { printf 'FAIL: %s\n' "$*"; FAILED=1; }
 canon() { realpath -m -- "$1"; }
 
-SBATCH_EXPORTS_FILE="$(mktemp)"
-cleanup_tmp() { rm -f -- "$SBATCH_EXPORTS_FILE"; }
-trap cleanup_tmp EXIT
-grep -E '^[[:space:]]*export[[:space:]]+[A-Z_][A-Z0-9_]*=' "$SBATCH_PATH" > "$SBATCH_EXPORTS_FILE" || true
-
 under_any_root() {
   local candidate="$1" root canon_root
   for root in "${ALLOWED_ROOTS[@]}"; do
@@ -75,6 +79,31 @@ under_any_root() {
     [[ "$candidate" == "$canon_root" || "$candidate" == "$canon_root"/* ]] && return 0
   done
   return 1
+}
+
+# Maps a canonicalized path staged under a declared `--staging-root
+# LOCAL=FINAL` prefix to its final-root equivalent, so containment checks can
+# validate a linted-in-place local staging copy as if it already sat at its
+# eventual facility path (a linter run before rsync never has the final path
+# to canonicalize). A path outside every declared local root is returned
+# unchanged: the mapping only substitutes a matched prefix, it never widens
+# or skips the containment check that runs on its result.
+map_staging_to_final() {
+  local candidate="$1" i n=${#STAGING_LOCAL_ROOTS[@]} local_root final_root canon_local canon_final
+  for ((i = 0; i < n; i++)); do
+    local_root="${STAGING_LOCAL_ROOTS[i]}"
+    final_root="${STAGING_FINAL_ROOTS[i]}"
+    canon_local="$(canon "$local_root")"
+    canon_final="$(canon "$final_root")"
+    if [[ "$candidate" == "$canon_local" ]]; then
+      printf '%s\n' "$canon_final"
+      return 0
+    elif [[ "$candidate" == "$canon_local"/* ]]; then
+      printf '%s\n' "$canon_final${candidate#"$canon_local"}"
+      return 0
+    fi
+  done
+  printf '%s\n' "$candidate"
 }
 
 # Normalizes KEY=VALUE / `export KEY=VALUE` lines to `KEY<US>VALUE` (comments
@@ -108,6 +137,100 @@ is_in_csv() {
   return 1
 }
 
+# Splits the token list after an `export` keyword on whitespace, honoring
+# single/double-quoted spans so `export A="x y" B=z` yields two tokens, not
+# four. Each emitted token is either `KEY=VALUE` or a bare `KEY` name (the
+# `sbatch --export=` re-export shape with no '=').
+split_export_tokens() {
+  local s="$1" i=0 n=${#1} c tok="" quote="" out=()
+  while ((i < n)); do
+    c="${s:i:1}"
+    if [[ -n "$quote" ]]; then
+      [[ "$c" == "$quote" ]] && quote="" || tok+="$c"
+    else
+      case "$c" in
+        "'"|'"') quote="$c" ;;
+        [[:space:]]) [[ -n "$tok" ]] && { out+=("$tok"); tok=""; } ;;
+        *) tok+="$c" ;;
+      esac
+    fi
+    ((i++))
+  done
+  [[ -n "$tok" ]] && out+=("$tok")
+  ((${#out[@]} > 0)) && printf '%s\n' "${out[@]}"
+  return 0
+}
+
+# Builds the effective sbatch export table into $2 as `KEY=VALUE` lines (one
+# per assignment, in file order, so parse_kv's "last line wins" lookup still
+# applies). Three sources feed it, each a real deployment shape seen in the
+# trial log on ef480b65:
+#   1. `#SBATCH --export=K=V,K2=V2,...` — the values sbatch hands the job
+#      environment before the script body runs.
+#   2. `export KEY=VALUE` body lines, parsed per-token so a multi-assignment
+#      line (`export DRY_RUN="${DRY_RUN:-0}" DRY_NODE_TMP="..."`) never lets
+#      one key's value swallow a sibling assignment on the same line.
+#   3. A bare re-export token (`export HEAD_SHA JOB_NAME`, no '=') counts as
+#      present with the value sbatch already supplied via --export (source
+#      1); a self-referential default expansion (`KEY="${KEY:-DEFAULT}"`)
+#      resolves the same way, falling back to its literal DEFAULT only when
+#      --export did not supply the key.
+# A key referenced by (2)/(3) that --export never supplied, and that carries
+# no literal value of its own, is simply omitted — the existing missing/stale
+# checks downstream still catch that case correctly.
+build_sbatch_kv_file() {
+  local sbatch_file="$1" out="$2"
+  local export_kv_tmp line
+  export_kv_tmp="$(mktemp)"
+  : > "$out"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*#SBATCH[[:space:]]+--export=(.*)$ ]]; then
+      local spec="${BASH_REMATCH[1]}" item key val
+      local IFS=','
+      for item in $spec; do
+        [[ "$item" == *=* ]] || continue
+        key="${item%%=*}"; val="${item#*=}"
+        [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
+        printf '%s=%s\n' "$key" "$val" >> "$export_kv_tmp"
+        printf '%s=%s\n' "$key" "$val" >> "$out"
+      done
+      continue
+    fi
+    if [[ "$line" =~ ^[[:space:]]*export[[:space:]]+(.*)$ ]]; then
+      local rest="${BASH_REMATCH[1]}" tok key val resolved rhas rval default
+      while IFS= read -r tok; do
+        [[ -z "$tok" ]] && continue
+        if [[ "$tok" == *=* ]]; then
+          key="${tok%%=*}"; val="${tok#*=}"
+          [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
+          if [[ "$val" =~ ^\$\{"$key":-(.*)\}$ ]]; then
+            default="${BASH_REMATCH[1]}"
+            resolved="$(kv_get "$export_kv_tmp" "$key")"
+            IFS=$'\x1f' read -r rhas rval <<< "$resolved"
+            [[ "$rhas" == 1 ]] && val="$rval" || val="$default"
+          elif [[ "$val" == "\${$key}" ]]; then
+            resolved="$(kv_get "$export_kv_tmp" "$key")"
+            IFS=$'\x1f' read -r rhas rval <<< "$resolved"
+            [[ "$rhas" == 1 ]] && val="$rval"
+          fi
+          printf '%s=%s\n' "$key" "$val" >> "$out"
+        else
+          [[ "$tok" =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue
+          resolved="$(kv_get "$export_kv_tmp" "$tok")"
+          IFS=$'\x1f' read -r rhas rval <<< "$resolved"
+          [[ "$rhas" == 1 ]] && printf '%s=%s\n' "$tok" "$rval" >> "$out"
+        fi
+      done < <(split_export_tokens "$rest")
+    fi
+  done < "$sbatch_file"
+  rm -f -- "$export_kv_tmp"
+}
+
+SBATCH_EXPORTS_FILE="$(mktemp)"
+cleanup_tmp() { rm -f -- "$SBATCH_EXPORTS_FILE"; }
+trap cleanup_tmp EXIT
+build_sbatch_kv_file "$SBATCH_PATH" "$SBATCH_EXPORTS_FILE"
+
 IFS=$'\x1f' read -r M_HEAD_SHA_HAS M_HEAD_SHA <<< "$(kv_get "$MANIFEST" HEAD_SHA)"
 IFS=$'\x1f' read -r M_JOB_NAME_HAS M_JOB_NAME <<< "$(kv_get "$MANIFEST" JOB_NAME)"
 
@@ -125,12 +248,13 @@ fi
 # Check 3: sbatch path must be absolute, canonical (realpath -m matches the
 # raw path, i.e. no unresolved '..'/'.'/symlink), and inside an allowed root.
 CANON_SBATCH="$(canon "$SBATCH_PATH")"
+MAPPED_SBATCH="$(map_staging_to_final "$CANON_SBATCH")"
 if [[ "$SBATCH_PATH" != /* ]]; then
   fail "sbatch path is not absolute: '$SBATCH_PATH'"
 elif [[ "$SBATCH_PATH" != "$CANON_SBATCH" ]]; then
   fail "sbatch path is not canonical: '$SBATCH_PATH' -> '$CANON_SBATCH'"
-elif ! under_any_root "$CANON_SBATCH"; then
-  fail "sbatch path escapes every declared stage root: '$CANON_SBATCH'"
+elif ! under_any_root "$MAPPED_SBATCH"; then
+  fail "sbatch path escapes every declared stage root: '$CANON_SBATCH' (mapped to '$MAPPED_SBATCH')"
 fi
 
 # Check 4: critical exports must match the manifest exactly — no stale,
@@ -181,20 +305,24 @@ if [[ -n "$HOME_ROOT" ]]; then
       fail "$key is staged under literal \$HOME: '$val'"
     else
       canon_val="$(canon "$val")"
-      if [[ "$canon_val" == "$CANON_HOME" || "$canon_val" == "$CANON_HOME"/* ]]; then
-        fail "$key resolves under \$HOME: '$val' -> '$canon_val'"
+      mapped_val="$(map_staging_to_final "$canon_val")"
+      if [[ "$canon_val" == "$CANON_HOME" || "$canon_val" == "$CANON_HOME"/* ||
+            "$mapped_val" == "$CANON_HOME" || "$mapped_val" == "$CANON_HOME"/* ]]; then
+        fail "$key resolves under \$HOME: '$val' -> '$canon_val' (mapped to '$mapped_val')"
       fi
     fi
   done
 fi
 
 # Check 6: TASK_ROOT/RUN_ROOT must stay inside a declared allowed root
-# (facility-root escape).
+# (facility-root escape). A path staged under a declared `--staging-root`
+# prefix is checked at its mapped final-root equivalent, never relaxed.
 for key in TASK_ROOT RUN_ROOT; do
   IFS=$'\x1f' read -r has val <<< "$(kv_get "$MANIFEST" "$key")"
   [[ "$has" == 1 ]] || continue
   canon_val="$(canon "$val")"
-  under_any_root "$canon_val" || fail "$key escapes every declared allowed root: '$val' -> '$canon_val'"
+  mapped_val="$(map_staging_to_final "$canon_val")"
+  under_any_root "$mapped_val" || fail "$key escapes every declared allowed root: '$val' -> '$canon_val' (mapped to '$mapped_val')"
 done
 
 # Check 7: in a dry run, the interpreter must resolve under the declared

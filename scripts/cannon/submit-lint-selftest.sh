@@ -338,5 +338,43 @@ run_under_bsd_realpath_shim() (
 )
 expect_contains "stock-macOS-shaped realpath without -m fails clearly" fail "GNU coreutils realpath is required" run_under_bsd_realpath_shim
 
+# --- Check 4 (ef480b65 linter-trial-log false blocks): critical values
+# passed via `sbatch --export=` and only bare-re-exported in the body
+# (`export A B C`, no '=') must count as present, from the --export list. ---
+REEXPORT_MANIFEST="$BASE/stage/reexport.manifest"
+REEXPORT_SBATCH="$BASE/stage/reexport.sbatch"
+write_manifest "$REEXPORT_MANIFEST" "$SHA" "tpen-verify-$SHORT" "$GOOD_TASK_ROOT" "$GOOD_RUN_ROOT" 0 "$GOOD_PYTHON"
+cat > "$REEXPORT_SBATCH" <<EOF
+#!/bin/bash
+#SBATCH --job-name=tpen-verify-$SHORT
+#SBATCH --export=HEAD_SHA=$SHA,JOB_NAME=tpen-verify-$SHORT,TASK_ROOT=$GOOD_TASK_ROOT,RUN_ROOT=$GOOD_RUN_ROOT,DRY_RUN=0,PYTHON=$GOOD_PYTHON
+export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON
+EOF
+expect "bare re-export after sbatch --export= is accepted" pass lint "$REEXPORT_SBATCH" "$REEXPORT_MANIFEST"
+
+# --- A multi-assignment export line must parse each key independently: one
+# key's value must not swallow a sibling assignment on the same line. ---
+MULTI_SBATCH="$BASE/stage/multiassign.sbatch"
+cat > "$MULTI_SBATCH" <<EOF
+#!/bin/bash
+#SBATCH --job-name=tpen-verify-$SHORT
+#SBATCH --export=HEAD_SHA=$SHA,JOB_NAME=tpen-verify-$SHORT,TASK_ROOT=$GOOD_TASK_ROOT,RUN_ROOT=$GOOD_RUN_ROOT,DRY_RUN=0,PYTHON=$GOOD_PYTHON
+export DRY_RUN="\${DRY_RUN:-0}" DRY_NODE_TMP="\${DRY_NODE_TMP:-}"
+export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT PYTHON
+EOF
+expect "multi-assignment export line parsed per key" pass lint "$MULTI_SBATCH" "$REEXPORT_MANIFEST"
+
+# --- --staging-root LOCAL=FINAL: a sbatch script linted in place at a local
+# staging root is validated for containment at its mapped final root. ---
+mkdir -p "$BASE/local-stage" "$BASE/final-stage/task" "$BASE/final-stage/run"
+STAGING_MANIFEST="$BASE/local-stage/staged.manifest"
+STAGING_SBATCH="$BASE/local-stage/staged.sbatch"
+write_manifest "$STAGING_MANIFEST" "$SHA" "tpen-verify-$SHORT" "$BASE/final-stage/task" "$BASE/final-stage/run" 0 "$GOOD_PYTHON"
+write_sbatch "$STAGING_SBATCH" "$SHA" "tpen-verify-$SHORT" "$BASE/final-stage/task" "$BASE/final-stage/run" 0 "$GOOD_PYTHON"
+expect "sbatch linted at a mapped local staging root is accepted" pass \
+  "$LINTER" --sbatch "$STAGING_SBATCH" --manifest "$STAGING_MANIFEST" \
+  --allowed-root "$BASE/final-stage" --shared-env-root "$BASE/shared-env" --home "$BASE/home" \
+  --staging-root "$BASE/local-stage=$BASE/final-stage"
+
 printf 'SELFTEST pass=%s fail=%s\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
