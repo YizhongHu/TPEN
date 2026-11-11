@@ -23,7 +23,9 @@ publishing them.  Durable publication stays with the controller.  The S2b
 worker-owned GPU sampler and slot quarantine are unchanged because the leaf
 launches through the same :class:`~tpen_executor.workers.SubprocessWorker`;
 their worker-only keys travel in the prepared environment exactly as for a
-local launch.
+local launch.  Before that launch the leaf applies local dispatch slot
+admission against the durable quarantine markers under the request's store
+root, so a slot is never admitted on the strength of its overlay alone.
 
 Layer A does not wire this module into any dispatcher, so local and
 ThreadPool dispatch are unchanged.  Remote submission (Layer B) and remote
@@ -41,15 +43,24 @@ import math
 import os
 import socket
 import sys
+from types import MappingProxyType
 from typing import Any, ClassVar
 
 from .._codec import _freeze, canonical_bytes, decode_json, digest, fields, thaw
 from .._records import frozen_record
-from ..environments import PreparedPythonEnvironment
+from ..environments import PreparedPythonEnvironment, SourceScript
+from ..gpu_sampler import GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, slot_quarantine_dir
 from ..placement import PLACEMENT_REFUSAL_ENV
 from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
 from ..workers import SubprocessWorker
-from .contract import _child_precore_refusal, _evidence_payload, _member_paths, _without_gpu_sampler
+from .contract import (
+    _admit_slot,
+    _child_precore_refusal,
+    _evidence_payload,
+    _inside,
+    _member_paths,
+    _without_gpu_sampler,
+)
 
 LEAF_REQUEST_SCHEMA = "tpen-executor/leaf-request-v1"
 LEAF_RESULT_SCHEMA = "tpen-executor/leaf-result-v1"
@@ -117,6 +128,49 @@ def _require_plain(value: Any, path: str) -> None:
     raise TypeError(f"{path} is not plain wire data: {type(value).__name__}")
 
 
+def _require_json(value: Any, path: str) -> None:
+    """Refuse every nested value of a fact that is not exact JSON-shaped data.
+
+    Parameters
+    ----------
+    value : object
+        Candidate fact.  Exact ``dict``/mapping-proxy containers with exact
+        ``str`` keys, exact ``list``/``tuple`` containers, and plain leaves
+        (:func:`_require_plain`) are accepted at every depth.
+    path : str
+        Field name used in the error message.
+
+    Raises
+    ------
+    TypeError
+        If any nested key, container or leaf is anything else, including a
+        ``str`` subclass that :func:`~tpen_executor._codec._freeze` would
+        otherwise retain together with whatever live handle it carries.
+    """
+
+    if type(value) in (dict, MappingProxyType):
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError(f"{path} key is not plain wire data: {type(key).__name__}")
+            _require_json(item, f"{path}.{key}")
+        return
+    if type(value) in (list, tuple):
+        for item in value:
+            _require_json(item, f"{path}[]")
+        return
+    _require_plain(value, path)
+
+
+def _path_component(value: str, name: str) -> str:
+    """Validate one identity used as a single store path component."""
+
+    # The store names attempts ``groups/<group>/<task>/<attempt>``; an
+    # identity that is not one component could bind a different directory.
+    if value in {".", ".."} or os.sep in value or (os.altsep is not None and os.altsep in value):
+        raise ValueError(f"{name} is not a single store path component")
+    return value
+
+
 def _text(value: Any, name: str) -> str:
     """Validate non-empty request or result text."""
 
@@ -159,10 +213,12 @@ class LeafRequest:
     payload_digest : str
         Digest of ``config`` and ``overrides``; it must match them.
     root : str
-        Lexical attempt-store root.  It is used only to check that the fenced
-        paths stay below it, never to open the store.
+        Lexical attempt-store root.  It binds the fenced output path and
+        names the slot's durable quarantine directory; the leaf never opens
+        the store through it.
     output_dir : str
-        Fenced attempt output directory below ``root``.
+        Fenced attempt output directory ``<root>/groups/<group_digest>/
+        <task_id>/<attempt_id>``.
     environment : PreparedPythonEnvironment
         Prepared science environment after every controller overlay.
     timeout : int, float or None
@@ -173,8 +229,11 @@ class LeafRequest:
     TypeError
         If any value is not plain wire data or has the wrong type.
     ValueError
-        If paths, digests or the timeout are invalid, or if the payload digest
-        or a placement identity in the environment crosses this request.
+        If paths, digests or the timeout are invalid; if the output directory
+        is not the store directory of this group, task and attempt; if the
+        payload digest or a placement identity in the environment crosses
+        this request; or if a carried slot quarantine directory is not the
+        one derived from ``root`` (or a sampled launch lacks it).
 
     Notes
     -----
@@ -206,6 +265,10 @@ class LeafRequest:
             _require_plain(getattr(self, name), name)
         if type(self.environment) is not PreparedPythonEnvironment:
             raise TypeError(f"environment is not plain wire data: {type(self.environment).__name__}")
+        # The descriptor validates its own python and env as exact strings but
+        # accepts any SourceScript subclass; only the exact setup is wire data.
+        if self.environment.setup is not None and type(self.environment.setup) is not SourceScript:
+            raise TypeError(f"environment.setup is not plain wire data: {type(self.environment.setup).__name__}")
         for name in ("group_digest", "task_id", "attempt_id", "allocation_id", "backend_job_id"):
             _text(getattr(self, name), name)
         if self.slot_id is not None:
@@ -242,6 +305,28 @@ class LeafRequest:
         )
         if crossed:
             raise ValueError(f"prepared environment placement identity crosses the request: {','.join(crossed)}")
+        # The slot quarantine directory is derived from this request's store
+        # root and the placement slot identity, exactly as the controller
+        # overlay derives it; a carried directory may only repeat it.  A
+        # sampled launch always carries it, so its durable marker lands where
+        # admission looks.
+        quarantine_dir = slot_quarantine_dir(self.root, values)
+        carried = values.get(SLOT_QUARANTINE_ENV)
+        if carried is not None and carried != quarantine_dir:
+            raise ValueError("prepared environment slot quarantine directory is not the store-derived one")
+        if carried is None and quarantine_dir is not None and GPU_SAMPLER_OUTPUT_ENV in values:
+            raise ValueError("a sampled launch must carry its store-derived slot quarantine directory")
+        # The fenced output is the store's directory of exactly this group,
+        # task and attempt, independently of any optional placement identity.
+        expected = os.path.join(
+            self.root,
+            "groups",
+            _path_component(self.group_digest, "group_digest"),
+            _path_component(self.task_id, "task_id"),
+            _path_component(self.attempt_id, "attempt_id"),
+        )
+        if self.output_dir != expected:
+            raise ValueError("output_dir does not bind this group, task and attempt below the store root")
 
     @classmethod
     def for_attempt(
@@ -277,12 +362,14 @@ class LeafRequest:
         Raises
         ------
         ValueError
-            If the fence and allocation identities disagree, or any request
-            invariant fails.
+            If the fence and allocation identities disagree, the configured
+            run belongs to another task, or any request invariant fails.
         """
 
         if fence.allocation_id != allocation.allocation_id.value:
             raise ValueError("fence allocation does not match the allocation")
+        if configured.id != fence.task_id:
+            raise ValueError("configured run does not belong to the fenced task")
         return cls(
             fence.group_digest,
             fence.task_id,
@@ -398,13 +485,19 @@ class LeafRequest:
         Raises
         ------
         TypeError, ValueError
-            If ``data`` is not bytes, not one JSON object, or not a valid
-            request.
+            If ``data`` is not bytes, not one JSON object, not a valid
+            request, or not byte-identical to the request's canonical
+            encoding.
         """
 
         if type(data) is not bytes:
             raise TypeError("leaf request must be canonical JSON bytes")
-        return cls.from_mapping(decode_json(data.decode("utf-8")))
+        request = cls.from_mapping(decode_json(data.decode("utf-8")))
+        # Only the canonical form is wire data: whitespace, key order or
+        # number spelling that re-encodes differently is refused.
+        if request.encode() != data:
+            raise ValueError("leaf request bytes are not canonical")
+        return request
 
 
 def _optional_fact(value: Any, keys: set[str], name: str) -> Mapping[str, Any] | None:
@@ -513,6 +606,10 @@ class LeafResult:
         if not isinstance(self.teardown, Mapping) or set(self.teardown) != _TEARDOWN_KEYS or type(self.teardown["leaders_reaped"]) is not bool:
             raise ValueError("teardown must be {'leaders_reaped': bool}")
         object.__setattr__(self, "teardown", _freeze(self.teardown, "teardown"))
+        # Freezing keeps builtin subclasses at any depth; every retained key
+        # and leaf must be exact wire data.
+        for name in ("science", "launch_error", "child_refusal", "evidence", "inspection_error", "teardown"):
+            _require_json(getattr(self, name), name)
         # Cross-fact consistency: every fact has exactly one leaf-side cause.
         inspected = "inspection" in self.phases
         if (self.science is None) != (self.launch_error is not None):
@@ -608,11 +705,21 @@ class LeafResult:
 
     @classmethod
     def decode(cls, data: bytes) -> "LeafResult":
-        """Decode canonical result bytes; an in-process object is refused."""
+        """Decode canonical result bytes; an in-process object is refused.
+
+        Raises
+        ------
+        TypeError, ValueError
+            If ``data`` is not bytes, not a valid result, or not
+            byte-identical to the result's canonical encoding.
+        """
 
         if type(data) is not bytes:
             raise TypeError("leaf result must be canonical JSON bytes")
-        return cls.from_mapping(decode_json(data.decode("utf-8")))
+        result = cls.from_mapping(decode_json(data.decode("utf-8")))
+        if result.encode() != data:
+            raise ValueError("leaf result bytes are not canonical")
+        return result
 
     def core_evidence(self) -> CoreRunEvidence | None:
         """Return the leaf-decoded public evidence as a controller record."""
@@ -665,9 +772,17 @@ def validate_leaf_result(request: LeafRequest, result: LeafResult) -> LeafResult
         If either argument has the wrong type.
     LeafResultRejected
         If the request digest, any echoed identity, the science argv or log
-        paths cross the request, or the leaf did not confirm its reaped
-        children.  Every echoed field is compared; the request digest alone
-        is not trusted.
+        paths, or the evidence run or checkpoint directory cross the
+        request; if a science outcome without a pre-core refusal lacks the
+        inspection phase; or if the leaf did not confirm its reaped children.
+        Every echoed field is compared; the request digest alone is not
+        trusted.
+
+    Notes
+    -----
+    Evidence directories are compared after resolving symbolic links on the
+    controller, as the store does when it accepts a segment, because public
+    core inspection reports its resolved run directory.
     """
 
     if type(request) is not LeafRequest or type(result) is not LeafResult:
@@ -682,10 +797,21 @@ def validate_leaf_result(request: LeafRequest, result: LeafResult) -> LeafResult
         "slot": result.slot_id == request.slot_id,
         "payload": result.payload_digest == request.payload_digest,
     }
+    _output, core_dir, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = request.paths()
     if result.science is not None:
-        _output, _core, stdout_path, stderr_path, _evidence_stdout, _evidence_stderr = request.paths()
         checks["argv"] = tuple(result.science["argv"]) == (request.environment.python, *request.science_args())
         checks["logs"] = (result.science["stdout_path"], result.science["stderr_path"]) == (stdout_path, stderr_path)
+    # Every science outcome without a pre-core refusal is inspected in the
+    # leaf, as in a local completion; a result that skipped inspection is
+    # never published as that outcome.
+    checks["inspection"] = ("inspection" in result.phases) == (result.science is not None and result.child_refusal is None)
+    if result.evidence is not None:
+        # Evidence must describe this attempt's core run, not a foreign one.
+        real_core = os.path.realpath(core_dir)
+        checkpoint = result.evidence["checkpoint"]
+        checks["evidence"] = os.path.realpath(result.evidence["run_dir"]) == real_core and (
+            checkpoint is None or _inside(real_core, os.path.realpath(checkpoint["checkpoint_dir"]))
+        )
     checks["teardown"] = result.teardown["leaders_reaped"] is True
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
@@ -739,9 +865,13 @@ def run_leaf(payload: bytes) -> bytes:
 
     Notes
     -----
-    Science runs exactly once through :class:`SubprocessWorker` with the
-    request's exact ``RUN_SHIM`` arguments.  Public inspection then runs here,
-    on the same worker and through the trusted
+    Before science, the leaf refuses a used or invisible fenced output and
+    applies local dispatch slot admission
+    (:func:`tpen_executor.dispatch.contract._admit_slot`) against the store
+    root named by the request; a refusal is a launch error and no child is
+    spawned.  Science runs exactly once through :class:`SubprocessWorker`
+    with the request's exact ``RUN_SHIM`` arguments.  Public inspection then
+    runs here, on the same worker and through the trusted
     :meth:`~tpen_executor.runners.TPENEvidence.read` call site, under the same
     conditions as a local completion: after any reaped science outcome that
     carries no pre-core placement refusal.  Ordinary errors become facts; the
@@ -761,6 +891,12 @@ def run_leaf(payload: bytes) -> bytes:
     inspection_error: dict[str, str] | None = None
     try:
         _require_fresh_output(request)
+        # Local dispatch admission, run in the leaf before any spawn: a placed
+        # slot is checked against the durable quarantine markers derived from
+        # the request's store root and slot identity, sampled or not and
+        # whatever quarantine overlay the environment carries.  A fresh leaf
+        # has no in-process controller fence, so only the markers hold it.
+        _admit_slot(environment, request)
         outcome = worker.run(
             environment,
             request.science_args(),
