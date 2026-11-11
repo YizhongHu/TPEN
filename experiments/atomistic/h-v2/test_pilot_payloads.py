@@ -225,8 +225,9 @@ def test_short_run_from_config_writes_logging_outputs(tmp_path: Path) -> None:
             entry["partition_size_steps"] = 2
 
     assert run_from_config(OmegaConf.create(config), command="h-v2 logging check", raise_exceptions=True) == 0
-    run_dir = tmp_path / "runs" / "h-v2-log-check"
-    metrics = (run_dir / "metrics.jsonl").read_text(encoding="utf-8")
+    metrics_path = next((tmp_path / "runs").rglob("metrics.jsonl"))
+    run_dir = metrics_path.parent
+    metrics = metrics_path.read_text(encoding="utf-8")
     for namespace in (
         "checks/sampler",
         "train/factors",

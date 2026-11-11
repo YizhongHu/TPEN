@@ -120,6 +120,15 @@ MODULE_NORM_GROUPS: dict[str, tuple[str, ...]] = {
 _A1_CANDIDATES_PRESENT_IN_BASE_CONFIG = frozenset(
     {"tpen.callback.DataIntegrity", "tpen.callback.GradientStats"}
 )
+_A1_LOGGING_MODULES = frozenset(
+    {
+        "tpen.callback.SamplerHealth",
+        "tpen.callback.FactorScalars",
+        "tpen.callback.ModuleNorms",
+        "tpen.callback.OptimizerState",
+        "tpen.callback.RawTrainingBatchRecorder",
+    }
+)
 
 #: Design doc A1's frozen quantile levels for
 #: ``tpen.callback.ElectronNucleusDistanceQuantiles``, taken from this one
@@ -981,7 +990,7 @@ def _assert_a1_callbacks(config: Mapping[str, Any]) -> None:
     configured_a1 = (set(present) & set(A1_TRAINING_MODULE_CANDIDATES)) - set(
         _A1_CANDIDATES_PRESENT_IN_BASE_CONFIG
     )
-    if not configured_a1:
+    if not configured_a1 & _A1_LOGGING_MODULES:
         return
     missing = set(A1_TRAINING_MODULE_CANDIDATES) - set(present)
     if missing:
