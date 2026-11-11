@@ -19,3 +19,10 @@ gateway. The system YAMLs are copied/adapted from the existing He-v1 and H2-v1
 contracts, while Hooke's physics is owned by the sibling S1-B slice. A missing
 Hooke reference key is therefore an explicit collection error. Launch renders
 the guarded sbatch text directly; there is no second static template to drift.
+
+Current limitation: the nucleus-free Hooke trajectory route is explicitly
+blocked. TPEN's trajectory writer requires `Walkers.atomic_configuration`,
+while `AtomicConfiguration` rejects zero nuclei; the Stage-1 test preserves
+this generator/restore evidence and skips only Hooke collection. He and H2
+remain runnable through the real train/eval/collect route. This PR does not
+change core physics or artifact code.
