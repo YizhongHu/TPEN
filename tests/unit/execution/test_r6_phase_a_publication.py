@@ -66,16 +66,40 @@ def _arrange_stale_indexes(root: Path, *, keep_catalog: bool):
     return old, new
 
 
-@pytest.mark.parametrize("keep_catalog", [True, False], ids=["old-catalog", "old-latest-no-catalog"])
-def test_r6_read_only_discovery_refuses_stale_predecessor_index(tmp_path, keep_catalog):
-    """A predecessor's stale index (pointer behind the newest complete
-    checkpoint) must refuse on the read-only successor-discovery path, not
-    silently select the uncatalogued directory (H1 addendum F1)."""
+def test_r6_read_only_discovery_ignores_unpublished_newer_dir(tmp_path):
+    """A predecessor killed between a newer checkpoint directory's rename and
+    its catalog/``latest.json`` publish (a normal crash/timeout state, not
+    corruption) must not be refused forever: discovery selects the newest
+    PUBLISHED checkpoint and leaves the unpublished directory untouched
+    (orchestrator decision decision-unpublished-newer-dir-20261111 on item
+    4023abbb, refining H1 addendum F1 -- refusing here would strand the
+    lineage, since read-only discovery can never publish it either)."""
+
+    from tpen.execution.invocation import _committed_checkpoint
+    from tests.unit.execution.test_s15_resume_predecessor_leaf_measurement import _snapshot_leaf
+
+    root = tmp_path / "run"
+    old, new = _arrange_stale_indexes(root, keep_catalog=True)
+    before = _snapshot_leaf(root)
+    selected = _committed_checkpoint(root)
+    after = _snapshot_leaf(root)
+    assert selected is not None
+    assert selected.checkpoint_dir == old
+    assert selected.next_iteration == 1
+    assert after == before, "read-only discovery mutated the sealed predecessor leaf"
+    assert old.exists() and new.exists()
+
+
+def test_r6_read_only_discovery_refuses_when_nothing_was_ever_published(tmp_path):
+    """A predecessor whose publication catalog never existed at all (not
+    merely behind the newest directory) still refuses: distinct from the
+    ignore-and-select-published case above, there is nothing published here
+    to select."""
 
     from tpen.execution.invocation import PredecessorDiscoveryRefusal, _committed_checkpoint
 
     root = tmp_path / "run"
-    old, new = _arrange_stale_indexes(root, keep_catalog=keep_catalog)
+    old, new = _arrange_stale_indexes(root, keep_catalog=False)
     before = _payload_hashes(new)
     old_before = _payload_hashes(old)
     with pytest.raises(PredecessorDiscoveryRefusal):
