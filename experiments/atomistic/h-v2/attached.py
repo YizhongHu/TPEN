@@ -974,8 +974,9 @@ def activate_h_v2_run(
         required = set(protocol.A1_TRAINING_MODULE_CANDIDATES)
         if configured != required:
             missing = sorted(required - configured)
-            _fail("incomplete-a1-callback-set", f"final TRAIN config is missing {missing!r}")
-            raise ActivationRefusal("incomplete-a1-callback-set", f"final TRAIN config is missing {missing!r}")
+            reason = f"incomplete-a1-callback-set: final TRAIN config is missing {missing!r}"
+            _fail("incomplete-a1-callback-set", reason)
+            raise ActivationRefusal("incomplete-a1-callback-set", reason)
 
     try:
         profile = check_profile(science_python, prepared.effective_config, overrides=prepared.overrides, cwd=cwd)
