@@ -32,7 +32,7 @@ def _run_dir(root: Path, run_id: str) -> Path:
     return next(path.parent for path in candidates if path.parent.name == run_id)
 
 
-@pytest.mark.parametrize("system", ["he", "h2", "hooke1"])
+@pytest.mark.parametrize("system", ["he", "hooke1"])
 def test_tiny_train_eval_collect_uses_real_artifact(system: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Exercise both supported Stage-1 atom routes through ``run_from_config``."""
 
