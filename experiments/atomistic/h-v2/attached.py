@@ -445,7 +445,11 @@ def build_h_v2_train_plan(
     config["runtime"]["seed"] = seed
     config["sampler"]["n_walkers"] = n_walkers
     config["trainer"]["max_steps"] = max_steps
-    protocol.assert_hydrogen_contract(config, evaluation=False)
+    protocol.assert_hydrogen_contract(
+        config,
+        evaluation=False,
+        allow_incomplete_a1=payload_label == "pipeline-check" and science_config_identity is None,
+    )
     task_id = f"h-v2-train-{lineage}"
     result_dir = results / "attached" / task_id
     config["run"]["root"] = str(result_dir.parent)
@@ -816,7 +820,11 @@ def prepare_h_v2_run(
     overrides = tuple(str(item) for item in overrides_by_task[task.logical_task_id])
     merged = _merge_config_with_overrides(effective_config, overrides)
     resolved = _resolve_bound_config(merged)
-    protocol.assert_hydrogen_contract(resolved, evaluation=(task.stage == EVAL_STAGE))
+    protocol.assert_hydrogen_contract(
+        resolved,
+        evaluation=(task.stage == EVAL_STAGE),
+        allow_incomplete_a1=task.metadata.get("payload") == "pipeline-check",
+    )
     unresolved = _unresolved_bound_config(merged)
     artifact_declarations = _derive_artifact_declarations(unresolved, stage=task.stage)
     handoff = write_attached_handoff(

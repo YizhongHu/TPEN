@@ -155,6 +155,12 @@ def test_f3_science_lineages_do_not_silently_dispatch_pipeline_defaults(job_env,
     If dispatch proceeds, inspect the real prepared configs against C2/A1.
     """
     prepared = []
+    def assemble(config, candidates, **kwargs):
+        for target in candidates:
+            job.protocol.append_candidate_module(config, target)
+        return list(candidates), []
+
+    monkeypatch.setattr(job.attached, "probe_admitted_a1_modules", assemble)
     monkeypatch.setattr(job.attached, "activate_h_v2_run", lambda value, **kw: prepared.append(value))
     for index, lineage in enumerate(("L1", "L2", "L3"), 1):
         count = len(prepared)

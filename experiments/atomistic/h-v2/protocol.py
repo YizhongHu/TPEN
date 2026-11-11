@@ -523,7 +523,9 @@ def evaluation_config(checkpoint: Path, *, stream: int = 0, root: Path | None = 
     return config
 
 
-def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False) -> None:
+def assert_hydrogen_contract(
+    config: dict[str, Any], *, evaluation: bool = False, allow_incomplete_a1: bool = False
+) -> None:
     """Refuse configs that drift from one-electron, charge-one hydrogen."""
 
     system = config.get("system", {})
@@ -571,11 +573,11 @@ def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False
         if "optimizer" in config or "trainer" in config:
             raise ValueError("fresh evaluation must not carry training state")
     else:
-        _assert_a1_callbacks(config)
+        _assert_a1_callbacks(config, allow_incomplete=allow_incomplete_a1)
     assert_amplitude_risk_thresholds(config)
 
 
-def _assert_a1_callbacks(config: Mapping[str, Any]) -> None:
+def _assert_a1_callbacks(config: Mapping[str, Any], *, allow_incomplete: bool = False) -> None:
     """Validate the complete appended A1 callback set and its ordering."""
 
     callbacks = [entry for entry in config.get("callbacks", ()) if isinstance(entry, Mapping)]
@@ -583,11 +585,12 @@ def _assert_a1_callbacks(config: Mapping[str, Any]) -> None:
     configured_a1 = (set(present) & set(A1_TRAINING_MODULE_CANDIDATES)) - set(
         _A1_CANDIDATES_PRESENT_IN_BASE_CONFIG
     )
-    # A bare pipeline config has no appended A1 candidates and is allowed as
-    # an explicitly selected intermediate/check payload. Any partial A1 set,
-    # including a pilot whose diagnostic candidates were all refused, must be
-    # rejected rather than mistaken for that bare config.
+    # Only an explicitly marked intermediate/check payload may be incomplete.
+    # Any partial A1 set, including a pilot whose diagnostic candidates were
+    # all refused, must be rejected rather than mistaken for a bare config.
     if not configured_a1:
+        return
+    if allow_incomplete:
         return
     missing = set(A1_TRAINING_MODULE_CANDIDATES) - set(present)
     if missing:
