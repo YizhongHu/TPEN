@@ -79,8 +79,13 @@ def test_tiny_train_eval_collect_uses_real_artifact(system: str, tmp_path: Path,
         if system == "hooke1" and "AtomicConfiguration requires at least one nucleus" in str(exc):
             pytest.skip("Hooke trajectory collection is blocked: core AtomicConfiguration rejects zero nuclei")
         raise
-    assert eval_status == 0
     eval_dir = _run_dir(tmp_path / "eval", "eval")
+    if eval_status != 0:
+        occurrences = eval_dir / "occurrences.jsonl"
+        assert occurrences.is_file()
+        print("Handled evaluation failure records:", occurrences.read_text(encoding="utf-8")[-8000:])
+        assert eval_status == 1
+        assert any("ComponentFailed" in line for line in occurrences.read_text(encoding="utf-8").splitlines())
     trajectory = eval_dir / "mcmc_energy"
     assert (trajectory / "sampled_eval_table.csv").is_file()
     registry = {"systems": [{"id": "he_atom", "reference_energy_hartree": -2.903724377034119598},

@@ -44,6 +44,14 @@ evaluation:
   task_failure_policy: continue
   return_terms: true
 
+trajectory_identity:
+  stage: ???
+  run_id: ???
+  attempt_id: ???
+  evaluator_id: ???
+  checkpoint_file: ???
+  config_sha256: ???
+
 evaluation_sampler:
   _target_: tpen.sampling.metropolis.MetropolisSampler
   n_walkers: 4096
