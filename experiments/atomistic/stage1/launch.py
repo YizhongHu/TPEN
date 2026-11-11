@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import shlex
 from pathlib import Path
 from typing import Any, Mapping
@@ -29,14 +31,23 @@ def shell_command_for_row(row: Mapping[str, Any], *, python: str, driver: str) -
     return shlex.join(command_for_row(row, python=python, driver=driver))
 
 
-def render(*, driver: str, config: str, python: str, job_root: str,
+def render(*, row: Mapping[str, Any], driver: str, python: str, head_sha: str,
+           results_root: str,
            partition: str = "test", allowlist: tuple[str, ...] = ("test", "gpu_test")) -> str:
-    """Render a test/gpu_test-only script with explicit runtime bindings."""
+    """Render one manifest row with explicit identity and results bindings."""
 
     if not Path(python).is_absolute():
         raise ValueError("--python must be an absolute interpreter path")
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        raise ValueError("--head-sha must be a full 40-character git SHA")
+    if not results_root or results_root.startswith("experiments/"):
+        raise ValueError("--results-root must be outside the checkout")
     if partition not in allowlist:
         raise ValueError(f"partition {partition!r} is not in the explicit allowlist {allowlist!r}")
+    command = shell_command_for_row(row, python=python, driver=driver)
+    row_root = row.get("overrides", {}).get("run.root")
+    if not isinstance(row_root, str) or not row_root.startswith(results_root.rstrip("/") + "/"):
+        raise ValueError("manifest row run.root must be below the explicit results root")
     return f'''#!/usr/bin/env bash
 # Stage-1 generated script; no production partition is permitted.
 #SBATCH --partition={partition}
@@ -47,19 +58,19 @@ def render(*, driver: str, config: str, python: str, job_root: str,
 set -euo pipefail
 JOB_ROOT="/scratch/$USER/$SLURM_JOB_ID"
 PYTHON={python!r}
-DRIVER={driver!r}
-CONFIG={config!r}
+RESULTS_ROOT={results_root!r}
 REQUESTED_PARTITION={partition!r}
+HEAD_SHA={head_sha!r}
 trap 'rm -rf -- "$JOB_ROOT"' EXIT
 if [[ "${{SLURM_JOB_PARTITION:-}}" != "$REQUESTED_PARTITION" ]]; then exit 2; fi
 : "${{SLURM_JOB_ID:?must run inside Slurm}}"
-: "${{HEAD_SHA:?head SHA is required}}"
 export HEAD_SHA
 export TPEN_SOURCE_SHA="$HEAD_SHA"
+export STAGE1_RESULTS_ROOT="$RESULTS_ROOT"
 [[ "$JOB_ROOT" == "/scratch/$USER/$SLURM_JOB_ID" ]]
 mkdir -p "$JOB_ROOT"
 set +e
-"$PYTHON" "$DRIVER" --config "$CONFIG"
+{command}
 rc=$?
 set -e
 printf 'job_id=%s host=%s partition=%s requested_partition=%s head=%s exit=%s\\n' \\
@@ -74,13 +85,17 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--driver", required=True)
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--row", type=Path, required=True,
+                        help="JSON manifest row")
     parser.add_argument("--python", required=True)
-    parser.add_argument("--job-root", required=True)
+    parser.add_argument("--head-sha", required=True)
+    parser.add_argument("--results-root", required=True)
     parser.add_argument("--partition", default="test")
     args = parser.parse_args()
-    args.output.write_text(render(driver=args.driver, config=args.config, python=args.python,
-                                  job_root=args.job_root, partition=args.partition), encoding="utf-8")
+    row = json.loads(args.row.read_text(encoding="utf-8"))
+    args.output.write_text(render(driver=args.driver, row=row, python=args.python,
+                                  head_sha=args.head_sha, results_root=args.results_root,
+                                  partition=args.partition), encoding="utf-8")
     args.output.chmod(0o750)
     return 0
 

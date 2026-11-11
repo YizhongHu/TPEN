@@ -16,8 +16,11 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--checkpoints", type=int, nargs="+", default=[1000, 10000, 25000, 50000])
     parser.add_argument("--seeds", type=int, nargs=3, default=[73001, 73002, 73003])
+    parser.add_argument("--results-root", required=True,
+                        help="durable results root outside this checkout")
     args = parser.parse_args()
-    rows = build_manifest(Protocol(), checkpoints=args.checkpoints, seeds=args.seeds)
+    rows = build_manifest(Protocol(), checkpoints=args.checkpoints, seeds=args.seeds,
+                          results_root=args.results_root)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps({"schema": "stage1/v1", "manifest_hash": manifest_hash(rows),
                                        "rows": rows}, indent=2) + "\n", encoding="utf-8")

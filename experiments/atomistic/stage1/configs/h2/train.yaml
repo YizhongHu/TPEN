@@ -129,7 +129,7 @@ hamiltonian_terms:
 
 sampler:
   _target_: tpen.sampling.metropolis.MetropolisSampler
-  n_walkers: 128
+  n_walkers: 4096
   burn_in: 100
   n_steps: 10
   proposal_scale: 0.5

@@ -32,7 +32,7 @@ def _run_dir(root: Path, run_id: str) -> Path:
     return next(path.parent for path in candidates if path.parent.name == run_id)
 
 
-@pytest.mark.parametrize("system", ["he", "hooke1"])
+@pytest.mark.parametrize("system", ["he", "h2", "hooke1"])
 def test_tiny_train_eval_collect_uses_real_artifact(system: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Exercise both supported Stage-1 atom routes through ``run_from_config``."""
 
@@ -66,35 +66,25 @@ def test_tiny_train_eval_collect_uses_real_artifact(system: str, tmp_path: Path,
     eval_cfg.evaluation_tasks.mcmc_energy.generator.chunk_size = 2
     eval_cfg.evaluation_tasks.mcmc_energy.summaries[-1].max_samples = 4
     eval_cfg.evaluator.tasks = [eval_cfg.evaluation_tasks.mcmc_energy]
-    if system == "he":
+    if system in {"he", "h2"}:
         eval_cfg.trajectory_identity.stage = "stage1"
         eval_cfg.trajectory_identity.run_id = "eval"
         eval_cfg.trajectory_identity.attempt_id = "tiny"
         eval_cfg.trajectory_identity.evaluator_id = "stage1"
         eval_cfg.trajectory_identity.checkpoint_file = str(checkpoint / "model.pt")
         eval_cfg.trajectory_identity.config_sha256 = "tiny"
-    # Evaluation task summaries may return TPEN's handled failure code while
-    # still publishing a complete trajectory artifact; collection is the
-    # science-facing verdict for this tiny route and must inspect that file.
     try:
         eval_status = run_from_config(eval_cfg, command=f"stage1 {system} tiny eval", raise_exceptions=True)
     except ValueError as exc:
         if system == "hooke1" and "AtomicConfiguration requires at least one nucleus" in str(exc):
             pytest.skip("Hooke trajectory collection is blocked: core AtomicConfiguration rejects zero nuclei")
         raise
-    assert eval_status in (0, 1)
+    assert eval_status == 0
     eval_dir = _run_dir(tmp_path / "eval", "eval")
     trajectory = eval_dir / "mcmc_energy"
-    if system == "hooke1" and not (trajectory / "sampled_eval_table.csv").is_file():
-        print("Hooke eval artifacts:", sorted(str(path.relative_to(eval_dir)) for path in eval_dir.rglob("*")))
-        for error_path in eval_dir.rglob("error.json"):
-            print(error_path.read_text(encoding="utf-8"))
-        for log_path in (eval_dir / "events.jsonl", eval_dir / "occurrences.jsonl", eval_dir / "metrics.jsonl", eval_dir / "status.json"):
-            if log_path.is_file():
-                print(f"{log_path.name}:", log_path.read_text(encoding="utf-8")[-4000:])
-        pytest.skip("Hooke trajectory collection is blocked: core AtomicConfiguration rejects zero nuclei")
     assert (trajectory / "sampled_eval_table.csv").is_file()
     registry = {"systems": [{"id": "he_atom", "reference_energy_hartree": -2.903724377034119598},
+                              {"id": "h2_molecule", "reference_energy_hartree": -1.17447},
                               {"id": "hooke_one_electron_omega0.5", "reference_energy_hartree": 0.75}]}
     result = collect_records(trajectory, system=system, registry=registry,
                              spec=RecordSpec(walkers=2, draws=2), run_dir=eval_dir)

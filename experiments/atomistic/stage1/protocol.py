@@ -14,6 +14,8 @@ from typing import Any, Mapping
 SYSTEMS = ("hooke1", "he", "h2")
 SYSTEM_IDS = {"hooke1": "hooke_one_electron_omega0.5", "he": "he_atom", "h2": "h2_molecule"}
 SYSTEM_CONFIGS = {name: f"configs/{name}" for name in SYSTEMS}
+EVAL_SEED_BASE = 1_000_000
+EVAL_SEED_STRIDE = 100
 
 
 class ProtocolError(ValueError):
@@ -54,7 +56,22 @@ def stable_row_id(*, system: str, kind: str, lineage: int = 0, checkpoint: int =
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 
-def build_manifest(protocol: Protocol, *, checkpoints: list[int], seeds: list[int]) -> list[dict[str, Any]]:
+def evaluation_seed(*, lineage: int, stream: int) -> int:
+    """Derive evaluation seeds in a namespace disjoint from training seeds.
+
+    Training seeds are supplied by the caller.  The reserved million-range
+    namespace prevents accidental overlap even when a caller chooses ordinary
+    small integer lineage seeds; the stride leaves room for four streams and
+    makes the lineage/stream coordinates inspectable in manifests.
+    """
+
+    if lineage < 0 or stream < 0 or stream >= EVAL_SEED_STRIDE:
+        raise ProtocolError("invalid lineage/stream coordinate")
+    return EVAL_SEED_BASE + lineage * EVAL_SEED_STRIDE + stream
+
+
+def build_manifest(protocol: Protocol, *, checkpoints: list[int], seeds: list[int],
+                   results_root: str) -> list[dict[str, Any]]:
     """Expand each system into smoke, lineage, and fresh-evaluation rows."""
 
     protocol.validate()
@@ -62,33 +79,57 @@ def build_manifest(protocol: Protocol, *, checkpoints: list[int], seeds: list[in
         raise ProtocolError("seeds must contain one distinct seed per lineage")
     if not checkpoints or any(step <= 0 for step in checkpoints):
         raise ProtocolError("checkpoints must be a non-empty list of positive updates")
+    if not results_root or results_root.startswith("experiments/"):
+        raise ProtocolError("results_root must be an explicit path outside the checkout")
     rows: list[dict[str, Any]] = []
     for system in SYSTEMS:
         rows.append({"row_id": stable_row_id(system=system, kind="smoke"), "system": system,
                      "kind": "smoke", "config": f"configs/{system}/smoke.yaml",
                      "updates": protocol.smoke_updates, "walkers": protocol.smoke_walkers,
                      "overrides": {"trainer.max_steps": protocol.smoke_updates,
-                                   "sampler.n_walkers": protocol.smoke_walkers}})
+                                   "sampler.n_walkers": protocol.smoke_walkers,
+                                   "run.root": f"{results_root}/{system}/smoke",
+                                   "run.run_id": "smoke"}})
         for lineage, seed in enumerate(seeds):
             train_id = stable_row_id(system=system, kind="train", lineage=lineage)
+            train_root = f"{results_root}/{system}/train"
+            train_run_id = f"lineage-{lineage}"
             rows.append({"row_id": train_id, "system": system, "kind": "train", "lineage": lineage,
                          "config": f"configs/{system}/train.yaml", "seed": seed,
                          "updates": protocol.lineage_updates, "walkers": protocol.lineage_walkers,
                          "overrides": {"trainer.max_steps": protocol.lineage_updates,
                                        "sampler.n_walkers": protocol.lineage_walkers,
-                                       "runtime.seed": seed}})
+                                       "runtime.seed": seed,
+                                       "run.root": train_root,
+                                       "run.run_id": train_run_id}})
             for checkpoint in checkpoints:
                 for stream in range(protocol.eval_streams):
-                    rows.append({"row_id": stable_row_id(system=system, kind="eval", lineage=lineage,
-                                                          checkpoint=checkpoint, stream=stream),
-                                 "system": system, "kind": "eval", "lineage": lineage,
+                    row_id = stable_row_id(system=system, kind="eval", lineage=lineage,
+                                           checkpoint=checkpoint, stream=stream)
+                    eval_run_id = f"lineage-{lineage}-checkpoint-{checkpoint:06d}-stream-{stream}"
+                    checkpoint_dir = f"{train_root}/{train_run_id}/checkpoints/step_{checkpoint:06d}"
+                    eval_seed = evaluation_seed(lineage=lineage, stream=stream)
+                    rows.append({"row_id": row_id, "system": system, "kind": "eval", "lineage": lineage,
                                  "checkpoint": checkpoint, "stream": stream,
                                  "walkers": protocol.eval_walkers, "draws": protocol.eval_draws,
                                  "config": f"configs/{system}/eval.yaml",
+                                 "seed": eval_seed,
                                  "overrides": {"evaluation_sampler.n_walkers": protocol.eval_walkers,
-                                               "evaluation_tasks.mcmc_energy.generator.max_samples": protocol.eval_draws,
-                                               "evaluation.seed": seed + stream},
+                                               "evaluation_tasks.mcmc_energy.generator.n_draws": protocol.eval_draws,
+                                               "evaluation.seed": eval_seed,
+                                               "load.path": checkpoint_dir,
+                                               "run.root": f"{results_root}/{system}/eval",
+                                               "run.run_id": eval_run_id,
+                                               "trajectory_identity.stage": "stage1",
+                                               "trajectory_identity.run_id": eval_run_id,
+                                               "trajectory_identity.attempt_id": f"stream-{stream}",
+                                               "trajectory_identity.evaluator_id": f"stage1-{system}",
+                                               "trajectory_identity.checkpoint_file": f"{checkpoint_dir}/model.pt",
+                                               "trajectory_identity.config_sha256": row_id},
                                  "depends_on": train_id})
+    row_seeds = [row["seed"] for row in rows if "seed" in row]
+    if len(row_seeds) != len(set(row_seeds)):
+        raise ProtocolError("training and evaluation seeds must be globally unique")
     return rows
 
 
