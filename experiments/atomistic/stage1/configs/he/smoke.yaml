@@ -1,0 +1,3 @@
+system: {id: he_atom, n_particles: 2, spin: {n_up: 1, n_down: 1}}
+protocol: {updates: 1000, walkers: 256}
+source_contract: experiments/atomistic/he-v1/configs

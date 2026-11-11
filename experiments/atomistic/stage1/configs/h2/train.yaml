@@ -1,0 +1,3 @@
+system: {id: h2_molecule, n_particles: 2, spin: {n_up: 1, n_down: 1}, bond_length_bohr: 1.4}
+protocol: {updates: 50000, walkers: 4096, lineages: 3}
+source_contract: experiments/atomistic/h2-v1/configs/train.yaml

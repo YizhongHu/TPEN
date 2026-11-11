@@ -1,0 +1,18 @@
+# Stage-1 shared atom benchmark scaffold
+
+This directory is the common study layer for 1e-Hooke (`omega=0.5`), He, and
+H2 (`R=1.4`). It records one protocol: a 1,000-update/256-walker smoke,
+three independent 50,000-update/4,096-walker lineages, and four fresh
+4,096-walker by 256-draw model-only evaluation streams per checkpoint.
+
+The manifest is deterministic and the collector admits only complete
+draw-by-walker tables. It reports means, correlation-aware MCSE when the
+available blocking statistic can be applied, reference error, variance,
+finite checks, and supported task values. Missing task values remain `null`;
+they are never interpreted as zero. Tolerances are deliberately absent until
+capacity measurements exist.
+
+Execution enters core only through the configured `tpen.run.run_from_config`
+gateway. The system YAMLs are copied/adapted from the existing He-v1 and H2-v1
+contracts, while Hooke's physics is owned by the sibling S1-B slice. A missing
+Hooke reference key is therefore an explicit collection error.

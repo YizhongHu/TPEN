@@ -1,0 +1,4 @@
+system: {id: h2_molecule, n_particles: 2, spin: {n_up: 1, n_down: 1}, bond_length_bohr: 1.4}
+protocol: {walkers: 4096, draws: 256, streams: 4}
+load: {mode: model_only, strict: true}
+source_contract: experiments/atomistic/h2-v1/configs/eval.yaml

@@ -1,0 +1,11 @@
+experiment: {name: stage1_hooke1_smoke}
+system: {id: hooke_one_electron_omega0.5, n_particles: 1, spatial_dim: 3, spin: {n_up: 1, n_down: 0}}
+runtime: {seed: 0, dtype: float64}
+protocol: {updates: 1000, walkers: 256}
+physics:
+  kinetic: tpen.physics.kinetic.KineticEnergy
+  confinement: {target: tpen.nn.HookeGaussianConfinement, omega: 0.5, alpha: 0.25}
+  harmonic_trap: {target: tpen.physics.potential.HarmonicTrap, omega: 0.5}
+  electron_electron: absent
+  nuclei: absent
+model: {embedding_coordinates: raw, readout: odd_bordered_pfaffian}

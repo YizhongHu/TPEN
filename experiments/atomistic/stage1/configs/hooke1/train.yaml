@@ -1,0 +1,4 @@
+system: {id: hooke_one_electron_omega0.5, n_particles: 1, spin: {n_up: 1, n_down: 0}}
+protocol: {updates: 50000, walkers: 4096, lineages: 3}
+physics: {kinetic: KineticEnergy, harmonic_trap: {omega: 0.5}, confinement: {omega: 0.5, alpha: 0.25}, nuclei: absent, electron_electron: absent}
+model: {embedding_coordinates: raw, readout: odd_bordered_pfaffian}

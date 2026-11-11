@@ -1,0 +1,4 @@
+system: {id: hooke_one_electron_omega0.5, n_particles: 1, spin: {n_up: 1, n_down: 0}}
+protocol: {walkers: 4096, draws: 256, streams: 4}
+load: {mode: model_only, strict: true}
+model: {embedding_coordinates: raw, readout: odd_bordered_pfaffian}

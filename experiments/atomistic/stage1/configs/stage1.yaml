@@ -1,0 +1,14 @@
+schema: stage1/v1
+timezone: America/New_York
+protocol:
+  smoke_updates: 1000
+  smoke_walkers: 256
+  lineage_updates: 50000
+  lineage_walkers: 4096
+  lineages: 3
+  eval_streams: 4
+  eval_walkers: 4096
+  eval_draws: 256
+reporting:
+  tolerances: absent
+  absent_is_zero: false
