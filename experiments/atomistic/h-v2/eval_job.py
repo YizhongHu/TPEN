@@ -31,6 +31,7 @@ import csv
 import hashlib
 import importlib.util
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -104,17 +105,6 @@ def load_train_receipt(path: str | Path) -> tuple[dict[str, Any], str]:
     return json.loads(receipt_path.read_text(encoding="utf-8")), _sha256_file(receipt_path)
 
 
-def _segment_resolved_config_sha256(segment: Mapping[str, Any]) -> str | None:
-    """Return one TRAIN segment's recorded resolved-config sha256, if any."""
-
-    direct = segment.get("resolved_config_sha256")
-    if direct is not None:
-        return direct
-    artifacts = segment.get("artifacts") or {}
-    resolved = artifacts.get("resolved_config") or {}
-    return resolved.get("sha256")
-
-
 def verify_train_receipt_identity(
     receipt: Mapping[str, Any],
     *,
@@ -131,28 +121,37 @@ def verify_train_receipt_identity(
     ``science_config_identity``/pilot-identity ``lineage`` field must equal
     *expected_payload*/*expected_lineage*.
 
-    F3 (review r1): a correct commit/lineage/payload is not sufficient -- the
-    receipt's seed namespace and every frozen-input hash it recorded are
-    checked too, against THIS checkout's own current frozen inputs (never
-    the caller's historical TRAIN checkout, which this EVAL job never has):
-    for a pilot/part-(g) *expected_payload*, ``seed_namespace`` and
-    ``payload_overlay_sha256`` must equal :data:`protocol.PILOT_PAYLOADS`'
-    own entry; for ``"science"``, ``overlay_sha256`` must equal the current
-    :data:`protocol.SCIENCE_SCALE_OVERLAY_PATH` hash. ``contract_inputs_sha256``
-    must equal the current :data:`protocol.CONTRACT_INPUTS_PATH` hash for
-    either kind. ``materialized_config_sha256`` is cross-checked against the
-    segment's OWN recorded ``resolved_config`` artifact hash (never an
-    external expectation this job cannot have): a receipt whose identity
-    block disagrees with what it itself says it wrote is refused.
+    F3 (review r1) / D4 (review r2 delta): a correct commit/lineage/payload
+    is not sufficient -- the receipt's seed namespace (checked against
+    :data:`protocol.PILOT_PAYLOADS`' own entry, a fixed code-level mapping,
+    never a frozen-input file) and the presence of every required identity
+    field are checked too.
+
+    D4 (review r2 delta): the overlay/contract-inputs/materialized-config
+    identity hashes are NOT re-derived by hashing THIS checkout's OWN
+    current frozen-input files -- a real EVAL-only submission runs against a
+    TRAIN receipt an EARLIER commit wrote (the acceptance contract's own
+    words), so "this checkout" and "the commit that wrote the receipt" are
+    routinely different, and re-hashing the current files would re-bind a
+    historical receipt to a checkout it never saw. These fields are instead
+    required present (the TRAIN side, not this job, is responsible for
+    writing them correctly) and authenticated by their OWN DISTINCT
+    ``resolved_config`` ARTIFACT'S ACTUAL BYTES on disk being re-hashed and
+    compared to its own recorded sha256 -- a tampered or stale artifact file
+    is refused even though its string-recorded hash was never touched.
+    ``materialized_config_sha256`` (the INPUT yaml TRAIN submitted) and each
+    segment's ``resolved_config_sha256`` (core's RESOLVED runtime yaml) are
+    NOT compared to each other: they are different artifacts by design
+    (interpolation/placeholder resolution changes the bytes), and a prior
+    equality check here falsely refused every real TRAIN receipt.
 
     Raises
     ------
     EvalJobRefusal
         Code ``train-receipt-empty``, ``wrong-train-payload``,
         ``wrong-train-commit``, ``wrong-train-lineage``,
-        ``wrong-train-seed-namespace``, ``wrong-train-overlay``,
-        ``wrong-train-contract-inputs``, or
-        ``wrong-train-materialized-config``.
+        ``wrong-train-seed-namespace``, ``wrong-train-identity-missing``, or
+        ``wrong-train-resolved-config-bytes``.
     """
 
     if receipt.get("payload") != expected_payload:
@@ -185,40 +184,29 @@ def verify_train_receipt_identity(
                 f"TRAIN receipt seed_namespace {identity.get('seed_namespace')!r} does not match "
                 f"expected {pilot_spec['seed_namespace']!r}",
             )
-        expected_overlay_sha256 = _sha256_file(pilot_spec["overlay_path"])
-        if identity.get("payload_overlay_sha256") != expected_overlay_sha256:
-            raise EvalJobRefusal(
-                "wrong-train-overlay",
-                f"TRAIN receipt payload_overlay_sha256 {identity.get('payload_overlay_sha256')!r} "
-                f"does not match this checkout's {expected_overlay_sha256!r}",
-            )
+        required_identity_fields = ("payload_overlay_sha256", "contract_inputs_sha256", "materialized_config_sha256")
     else:
-        expected_overlay_sha256 = _sha256_file(protocol.SCIENCE_SCALE_OVERLAY_PATH)
-        if identity.get("overlay_sha256") != expected_overlay_sha256:
+        required_identity_fields = ("overlay_sha256", "contract_inputs_sha256", "materialized_config_sha256")
+    for field in required_identity_fields:
+        if not identity.get(field):
             raise EvalJobRefusal(
-                "wrong-train-overlay",
-                f"TRAIN receipt overlay_sha256 {identity.get('overlay_sha256')!r} does not match "
-                f"this checkout's {expected_overlay_sha256!r}",
+                "wrong-train-identity-missing", f"TRAIN receipt science_config_identity is missing {field!r}"
             )
 
-    expected_contract_sha256 = _sha256_file(protocol.CONTRACT_INPUTS_PATH)
-    if identity.get("contract_inputs_sha256") != expected_contract_sha256:
-        raise EvalJobRefusal(
-            "wrong-train-contract-inputs",
-            f"TRAIN receipt contract_inputs_sha256 {identity.get('contract_inputs_sha256')!r} does "
-            f"not match this checkout's {expected_contract_sha256!r}",
-        )
-
-    materialized_sha256 = identity.get("materialized_config_sha256")
-    segment_resolved_sha256 = next(
-        (value for value in (_segment_resolved_config_sha256(segment) for segment in segments) if value), None
-    )
-    if materialized_sha256 is None or materialized_sha256 != segment_resolved_sha256:
-        raise EvalJobRefusal(
-            "wrong-train-materialized-config",
-            f"TRAIN receipt materialized_config_sha256 {materialized_sha256!r} does not match its own "
-            f"segment resolved_config sha256 {segment_resolved_sha256!r}",
-        )
+    for segment in segments:
+        artifact = (segment.get("artifacts") or {}).get("resolved_config")
+        if not artifact or not artifact.get("path"):
+            raise EvalJobRefusal(
+                "wrong-train-resolved-config-bytes", "TRAIN receipt segment has no resolved_config artifact"
+            )
+        recorded_sha256 = artifact.get("sha256")
+        actual_sha256 = _sha256_file(Path(artifact["path"]))
+        if actual_sha256 != recorded_sha256:
+            raise EvalJobRefusal(
+                "wrong-train-resolved-config-bytes",
+                f"{artifact['path']} sha256 {actual_sha256} does not match the TRAIN receipt's "
+                f"recorded {recorded_sha256!r}",
+            )
 
 
 def select_checkpoint(receipt: Mapping[str, Any], *, update: int) -> dict[str, Any]:
@@ -302,11 +290,21 @@ def materialize_verified_checkpoint(entry: Mapping[str, Any], destination: str |
     inventory names -- never a directory listing or glob, same as
     :func:`verify_checkpoint_files`.
 
+    D3 (review r2 delta): *destination* is created FRESH, PRIVATE and
+    EXCLUSIVE (never reused or silently merged into an existing directory,
+    so a pre-planted file or symlink there is refused rather than followed).
+    Every inventoried relative path is checked for containment -- an escape
+    (``..``/absolute) is refused before any read. ``manifest.json``'s own
+    parsed ``completed_updates`` must equal *entry*'s ``update`` label --
+    an inventory entry whose declared update disagrees with what the
+    manifest it points at actually records is refused.
+
     Raises
     ------
     EvalJobRefusal
         Code ``checkpoint-closure-incomplete``, ``checkpoint-file-missing``,
-        or ``checkpoint-hash-mismatch``.
+        ``checkpoint-hash-mismatch``, ``checkpoint-path-escape``,
+        ``checkpoint-snapshot-escape``, or ``checkpoint-wrong-update``.
     """
 
     files = entry.get("files") or {}
@@ -319,9 +317,19 @@ def materialize_verified_checkpoint(entry: Mapping[str, Any], destination: str |
         )
     source_dir = Path(entry["path"])
     destination = Path(destination)
-    destination.mkdir(parents=True, exist_ok=True)
+    try:
+        destination.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        raise EvalJobRefusal(
+            "checkpoint-snapshot-escape", f"snapshot destination {destination} already exists"
+        ) from None
     for relative, expected_sha256 in files.items():
-        source_path = source_dir / relative
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise EvalJobRefusal(
+                "checkpoint-path-escape", f"inventoried path {relative!r} is not contained in the checkpoint directory"
+            )
+        source_path = source_dir / relative_path
         if not source_path.is_file():
             raise EvalJobRefusal("checkpoint-file-missing", f"inventoried file {source_path} is missing")
         data = source_path.read_bytes()
@@ -331,7 +339,19 @@ def materialize_verified_checkpoint(entry: Mapping[str, Any], destination: str |
                 "checkpoint-hash-mismatch",
                 f"{source_path} sha256 {actual} does not match inventoried {expected_sha256}",
             )
-        target_path = destination / relative
+        if relative == "manifest.json":
+            manifest = json.loads(data.decode("utf-8"))
+            if manifest.get("completed_updates") != entry.get("update"):
+                raise EvalJobRefusal(
+                    "checkpoint-wrong-update",
+                    f"{source_path} completed_updates={manifest.get('completed_updates')!r} does not match "
+                    f"the inventory entry's update={entry.get('update')!r}",
+                )
+        target_path = destination / relative_path
+        if target_path.exists() or target_path.is_symlink():
+            raise EvalJobRefusal(
+                "checkpoint-snapshot-escape", f"{target_path} unexpectedly already exists in a fresh snapshot"
+            )
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_bytes(data)
     return destination
@@ -761,16 +781,41 @@ def read_eval_receipt(path: str | Path) -> dict[str, Any]:
         Code ``eval-receipt-missing`` or ``eval-receipt-bad-schema``.
     """
 
+    payload, _ = _read_eval_receipt_bytes(path)
+    return payload
+
+
+def read_eval_receipt_with_hash(path: str | Path) -> tuple[dict[str, Any], str]:
+    """Return ``(receipt, sha256)``, the sha256 computed from the EXACT bytes parsed.
+
+    D5 (review r2 delta): a caller that reads a receipt and separately
+    re-reads the file later to hash it (``path.read_bytes()`` after the
+    fact) can bind the wrong bytes if the file is atomically replaced in
+    between -- the published selection/final-selection record would then
+    carry a hash for bytes nobody actually computed from. This function
+    hashes the SAME buffer it parses, closing that window.
+
+    Raises
+    ------
+    EvalJobRefusal
+        Code ``eval-receipt-missing`` or ``eval-receipt-bad-schema``.
+    """
+
+    return _read_eval_receipt_bytes(path)
+
+
+def _read_eval_receipt_bytes(path: str | Path) -> tuple[dict[str, Any], str]:
     receipt_path = Path(path)
     if not receipt_path.is_file():
         raise EvalJobRefusal("eval-receipt-missing", f"no eval receipt at {receipt_path}")
-    payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    raw = receipt_path.read_bytes()
+    payload = json.loads(raw.decode("utf-8"))
     if payload.get("schema") != EVAL_RECEIPT_SCHEMA:
         raise EvalJobRefusal(
             "eval-receipt-bad-schema",
             f"{receipt_path} schema {payload.get('schema')!r} != {EVAL_RECEIPT_SCHEMA!r}",
         )
-    return payload
+    return payload, hashlib.sha256(raw).hexdigest()
 
 
 def read_stream_local_energies(trajectory_csv: str | Path) -> list[float]:
@@ -786,6 +831,34 @@ def read_stream_local_energies(trajectory_csv: str | Path) -> list[float]:
         return [float(row["local_energy"]) for row in reader]
 
 
+def read_verified_stream_local_energies(generation: Mapping[str, Any]) -> list[float]:
+    """Verify one generation's trajectory CSV bytes against its own recorded hash, then read it.
+
+    D2/D5 (review r2 delta): shared by :func:`compute_pilot_selection` and
+    the final-SEL reader (``run_job.run_pilot_final_sel``) so every
+    consumer of a generation's trajectory CSV authenticates it the same
+    way -- never trusting a receipt's recorded hash without re-checking the
+    bytes actually on disk.
+
+    Raises
+    ------
+    EvalJobRefusal
+        Code ``sel-trajectory-hash-mismatch``, if the CSV's current bytes do
+        not match the generation's own recorded ``trajectory_csv`` sha256.
+    """
+
+    path = trajectory_csv_path(generation)
+    recorded_sha256 = generation.get("artifacts", {}).get("trajectory_csv", {}).get("sha256")
+    actual_sha256 = _sha256_file(path)
+    if actual_sha256 != recorded_sha256:
+        raise EvalJobRefusal(
+            "sel-trajectory-hash-mismatch",
+            f"{path} sha256 {actual_sha256} does not match the receipt's recorded {recorded_sha256!r} "
+            f"for ordinal {generation.get('ordinal')} stream {generation.get('stream')}",
+        )
+    return read_stream_local_energies(path)
+
+
 def compute_pilot_selection(stage1_receipt: Mapping[str, Any]) -> dict[str, Any]:
     """Compute the SEL step from a completed pilot stage-1 eval receipt.
 
@@ -797,18 +870,27 @@ def compute_pilot_selection(stage1_receipt: Mapping[str, Any]) -> dict[str, Any]
 
     F4 (review r1): every stream-0 trajectory CSV is re-hashed and checked
     against the receipt's OWN recorded ``trajectory_csv`` sha256 before its
-    bytes are read for ``W`` -- a CSV replaced on disk without updating the
-    receipt it is bound to is refused, never silently included. Stage 1
-    must carry all 21 stream-0 generations (ordinals 0..20); a receipt
-    missing any of them refuses even if the missing ordinals fall outside
-    every candidate triple ``select_pilot_basin_ordinal`` happens to need.
+    bytes are read for ``W`` (:func:`read_verified_stream_local_energies`)
+    -- a CSV replaced on disk without updating the receipt it is bound to is
+    refused, never silently included. Stage 1 must carry all 21 stream-0
+    generations (ordinals 0..20); a receipt missing any of them refuses even
+    if the missing ordinals fall outside every candidate triple
+    ``select_pilot_basin_ordinal`` happens to need.
+
+    D5 (review r2 delta): an ordinal appearing MORE THAN ONCE among stream-0
+    generations is refused (never silently overwritten); each generation's
+    recorded seed must equal :func:`protocol.pilot_eval_seed`'s own formula
+    for its ordinal; every local-energy sample must be finite (not NaN/inf)
+    -- none of this is implied by "all 21 ordinals present with matching
+    hashes".
 
     Raises
     ------
     EvalJobRefusal
         Code ``sel-incomplete-stage1``, if stage 1 is missing any stream-0
-        ordinal in ``0..20``; code ``sel-trajectory-hash-mismatch``, if a
-        trajectory CSV's current bytes do not match the receipt's own
+        ordinal in ``0..20``; code ``sel-duplicate-ordinal``, ``sel-wrong-seed``,
+        or ``sel-nonfinite-energy``; code ``sel-trajectory-hash-mismatch``, if
+        a trajectory CSV's current bytes do not match the receipt's own
         recorded hash for it.
     """
 
@@ -817,18 +899,25 @@ def compute_pilot_selection(stage1_receipt: Mapping[str, Any]) -> dict[str, Any]
     for generation in stage1_receipt.get("generations") or []:
         if generation.get("stream") != 0:
             continue
-        seen_ordinals.add(generation["ordinal"])
-        path = trajectory_csv_path(generation)
-        recorded_sha256 = generation.get("artifacts", {}).get("trajectory_csv", {}).get("sha256")
-        actual_sha256 = _sha256_file(path)
-        if actual_sha256 != recorded_sha256:
+        ordinal = generation["ordinal"]
+        if ordinal in seen_ordinals:
             raise EvalJobRefusal(
-                "sel-trajectory-hash-mismatch",
-                f"{path} sha256 {actual_sha256} does not match the B1 receipt's recorded "
-                f"{recorded_sha256!r} for ordinal {generation['ordinal']}",
+                "sel-duplicate-ordinal", f"B1 receipt carries more than one stream-0 generation for ordinal {ordinal}"
             )
-        energies = read_stream_local_energies(path)
-        w_by_ordinal[generation["ordinal"]] = protocol.w_statistic(energies)
+        seen_ordinals.add(ordinal)
+        expected_seed = protocol.pilot_eval_seed(ordinal, 0)
+        if generation.get("seed") != expected_seed:
+            raise EvalJobRefusal(
+                "sel-wrong-seed",
+                f"B1 generation for ordinal {ordinal} has seed {generation.get('seed')!r}, "
+                f"expected {expected_seed!r}",
+            )
+        energies = read_verified_stream_local_energies(generation)
+        if not all(math.isfinite(energy) for energy in energies):
+            raise EvalJobRefusal(
+                "sel-nonfinite-energy", f"B1 generation for ordinal {ordinal} has a non-finite local_energy sample"
+            )
+        w_by_ordinal[ordinal] = protocol.w_statistic(energies)
     missing = sorted(set(protocol.PILOT_STAGE1_ORDINALS) - seen_ordinals)
     if missing:
         raise EvalJobRefusal(
@@ -903,7 +992,9 @@ __all__ = [
     "pilot_fanout",
     "probe_readout_trajectory_generator",
     "read_eval_receipt",
+    "read_eval_receipt_with_hash",
     "read_stream_local_energies",
+    "read_verified_stream_local_energies",
     "resolve_checkpoint",
     "run_generation_direct",
     "science_fanout",

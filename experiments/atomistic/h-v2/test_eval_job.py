@@ -85,11 +85,21 @@ def _train_receipt(tmp_path: Path, *, lineage: str, payload: str, commit: str, i
         _, identity = protocol.pilot_training_config(payload)
     else:
         _, identity = protocol.science_training_config(lineage, 0)
-    materialized_sha256 = _sha256(b"materialized-config-bytes-for-tests")
-    identity["materialized_config_sha256"] = materialized_sha256
+    identity["materialized_config_sha256"] = _sha256(b"materialized-input-bytes-for-tests")
+    # D4 (review r2 delta): the resolved_config artifact's ACTUAL bytes are
+    # re-hashed, so this fixture needs a real file -- distinct from the
+    # materialized input digest above, matching the real producer's two
+    # different artifacts.
+    resolved_config_path = tmp_path / f"resolved-config-{lineage}-{commit}.yaml"
+    resolved_config_path.write_text("resolved-runtime-config-bytes-for-tests\n", encoding="utf-8")
+    resolved_config_sha256 = _sha256(resolved_config_path.read_bytes())
     return {
         "payload": payload,
-        "segments": [{"source_commit": commit, "resolved_config_sha256": materialized_sha256}],
+        "segments": [{
+            "source_commit": commit,
+            "resolved_config_sha256": resolved_config_sha256,
+            "artifacts": {"resolved_config": {"path": str(resolved_config_path), "sha256": resolved_config_sha256}},
+        }],
         "science_config_identity": identity,
         "checkpoint_inventory": inventory,
     }
