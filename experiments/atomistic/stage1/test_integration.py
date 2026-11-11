@@ -84,7 +84,7 @@ def test_tiny_train_eval_collect_uses_real_artifact(system: str, tmp_path: Path,
         print("Hooke eval artifacts:", sorted(str(path.relative_to(eval_dir)) for path in eval_dir.rglob("*")))
         for error_path in eval_dir.rglob("error.json"):
             print(error_path.read_text(encoding="utf-8"))
-        for log_path in (eval_dir / "events.jsonl", eval_dir / "metrics.jsonl", eval_dir / "status.json"):
+        for log_path in (eval_dir / "events.jsonl", eval_dir / "occurrences.jsonl", eval_dir / "metrics.jsonl", eval_dir / "status.json"):
             if log_path.is_file():
                 print(f"{log_path.name}:", log_path.read_text(encoding="utf-8")[-4000:])
     assert (trajectory / "sampled_eval_table.csv").is_file()
