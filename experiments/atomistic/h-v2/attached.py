@@ -940,6 +940,17 @@ def activate_h_v2_run(
         _fail(EVAL_ROUTE_UNSUPPORTED_CODE, EVAL_ROUTE_UNSUPPORTED_REASON)
         raise ActivationRefusal(EVAL_ROUTE_UNSUPPORTED_CODE, EVAL_ROUTE_UNSUPPORTED_REASON)
 
+    # Probe configs may be incomplete while candidates are being tested, but
+    # no non-pipeline TRAIN payload may cross this final dispatch boundary
+    # without the complete A1 history set.
+    if stage == TRAIN_STAGE and prepared.payload != "pipeline-check":
+        configured = set(protocol.reconcile_enabled_modules(prepared.config))
+        required = set(protocol.A1_TRAINING_MODULE_CANDIDATES)
+        if configured != required:
+            missing = sorted(required - configured)
+            _fail("incomplete-a1-callback-set", f"final TRAIN config is missing {missing!r}")
+            raise ActivationRefusal("incomplete-a1-callback-set", f"final TRAIN config is missing {missing!r}")
+
     try:
         profile = check_profile(science_python, prepared.effective_config, overrides=prepared.overrides, cwd=cwd)
     except ActivationRefusal as error:

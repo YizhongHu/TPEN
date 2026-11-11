@@ -259,6 +259,15 @@ def science_training_config(lineage: str, lineage_index: int) -> tuple[dict[str,
         )
     for dotted, value in overlay.items():
         _set_by_dotted_path(config, dotted, value)
+    # Science TRAIN is an A1 contract route, so its base callbacks and scalar
+    # logger must use the same per-update cadence as the assembled pilot.
+    config["trainer"]["log_every_n_steps"] = PILOT_A1_CADENCE
+    for callback in config["callbacks"]:
+        if callback.get("_target_") in {
+            "tpen.callback.DataIntegrity",
+            "tpen.callback.GradientStats",
+        }:
+            callback["every_n_steps"] = PILOT_A1_CADENCE
     seeds = _science_seed_roster()
     config["runtime"]["seed"] = seeds["training_initialization_seeds"][lineage_index]
     config["sampler"]["seed"] = seeds["training_sampler_seeds"][lineage_index]
@@ -574,7 +583,11 @@ def _assert_a1_callbacks(config: Mapping[str, Any]) -> None:
     configured_a1 = (set(present) & set(A1_TRAINING_MODULE_CANDIDATES)) - set(
         _A1_CANDIDATES_PRESENT_IN_BASE_CONFIG
     )
-    if not configured_a1 & _A1_LOGGING_MODULES:
+    # A bare pipeline config has no appended A1 candidates and is allowed as
+    # an explicitly selected intermediate/check payload. Any partial A1 set,
+    # including a pilot whose diagnostic candidates were all refused, must be
+    # rejected rather than mistaken for that bare config.
+    if not configured_a1:
         return
     missing = set(A1_TRAINING_MODULE_CANDIDATES) - set(present)
     if missing:
@@ -592,14 +605,29 @@ def _assert_a1_callbacks(config: Mapping[str, Any]) -> None:
         raise ValueError(f"H-v2 health callbacks must precede Checkpoint: {late!r}")
     expected_groups = {name: list(paths) for name, paths in module_norm_groups(config).items()}
     for entry in callbacks:
+        target = entry.get("_target_")
+        if target == "tpen.callback.DataIntegrity" and entry.get("every_n_steps") != PILOT_A1_CADENCE:
+            raise ValueError("H-v2 DataIntegrity cadence must be every update")
+        if target == "tpen.callback.GradientStats" and entry.get("every_n_steps") != PILOT_A1_CADENCE:
+            raise ValueError("H-v2 GradientStats cadence must be every update")
         if entry.get("_target_") in {"tpen.callback.ModuleNorms", "tpen.callback.OptimizerState"}:
             if entry.get("every_n_steps") != HEALTH_CALLBACK_CADENCE or entry.get("groups") != expected_groups:
                 raise ValueError("H-v2 grouped callback cadence or groups drifted")
+        if target in {"tpen.callback.SamplerHealth", "tpen.callback.FactorScalars"}:
+            if entry.get("every_n_steps") != HEALTH_CALLBACK_CADENCE:
+                raise ValueError(f"H-v2 {target.rsplit('.', 1)[-1]} cadence must be every update")
+        if target == "tpen.callback.ElectronNucleusDistanceQuantiles":
+            if entry.get("every_n_steps") != PILOT_A1_CADENCE:
+                raise ValueError("H-v2 ENDQ cadence must be every update")
+            if entry.get("quantiles") != list(ENDQ_A1_QUANTILES):
+                raise ValueError("H-v2 ENDQ quantiles drifted")
         if entry.get("_target_") == "tpen.callback.RawTrainingBatchRecorder":
             if entry.get("every_n_steps") != TRAINING_BATCH_RECORDER_CADENCE:
                 raise ValueError("H-v2 training recorder cadence must be 50 iterations")
             if entry.get("partition_size_steps") != TRAINING_HISTORY_PARTITION_SIZE:
                 raise ValueError("H-v2 training history partitions must be 1000 iterations")
+            if entry.get("start_step", 0) != 0:
+                raise ValueError("H-v2 training recorder must start at iteration 0")
 
 
 def assert_amplitude_risk_thresholds(config: dict[str, Any]) -> None:
