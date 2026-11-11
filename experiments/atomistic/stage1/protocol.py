@@ -74,6 +74,14 @@ def evaluation_seed(*, system: str, lineage: int, checkpoint: int, stream: int) 
             + checkpoint * EVAL_SEED_STRIDE + lineage * EVAL_SEED_STRIDE + stream)
 
 
+def training_seed(*, system: str, lineage_seed: int) -> int:
+    """Namespace a caller's lineage seed by system for global uniqueness."""
+
+    if system not in SYSTEMS:
+        raise ProtocolError(f"unknown Stage-1 system {system!r}")
+    return SYSTEMS.index(system) * 1_000_000_000_000 + lineage_seed
+
+
 def build_manifest(protocol: Protocol, *, checkpoints: list[int], seeds: list[int],
                    results_root: str) -> list[dict[str, Any]]:
     """Expand each system into smoke, lineage, and fresh-evaluation rows."""
@@ -98,12 +106,13 @@ def build_manifest(protocol: Protocol, *, checkpoints: list[int], seeds: list[in
             train_id = stable_row_id(system=system, kind="train", lineage=lineage)
             train_root = f"{results_root}/{system}/train"
             train_run_id = f"lineage-{lineage}"
+            train_seed_value = training_seed(system=system, lineage_seed=seed)
             rows.append({"row_id": train_id, "system": system, "kind": "train", "lineage": lineage,
-                         "config": f"configs/{system}/train.yaml", "seed": seed,
+                         "config": f"configs/{system}/train.yaml", "seed": train_seed_value,
                          "updates": protocol.lineage_updates, "walkers": protocol.lineage_walkers,
                          "overrides": {"trainer.max_steps": protocol.lineage_updates,
                                        "sampler.n_walkers": protocol.lineage_walkers,
-                                       "runtime.seed": seed,
+                                       "runtime.seed": train_seed_value,
                                        "run.root": train_root,
                                        "run.run_id": train_run_id}})
             for checkpoint in checkpoints:
