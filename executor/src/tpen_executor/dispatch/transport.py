@@ -25,7 +25,10 @@ launches through the same :class:`~tpen_executor.workers.SubprocessWorker`;
 their worker-only keys travel in the prepared environment exactly as for a
 local launch.  Before that launch the leaf applies local dispatch slot
 admission against the durable quarantine markers under the request's store
-root, so a slot is never admitted on the strength of its overlay alone.
+root, so a slot is never admitted on the strength of its overlay alone.  It
+also refuses a placed slot whose declared CPUs are not all permitted to the
+worker it runs on (S3 Layer B review F2): the controller's affinity says
+nothing about a remote worker.
 
 Layer A does not wire this module into any dispatcher, so local and
 ThreadPool dispatch are unchanged.  Remote submission (Layer B) and remote
@@ -50,7 +53,7 @@ from .._codec import _freeze, canonical_bytes, decode_json, digest, fields, thaw
 from .._records import frozen_record
 from ..environments import PreparedPythonEnvironment, SourceScript
 from ..gpu_sampler import GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, slot_quarantine_dir
-from ..placement import PLACEMENT_REFUSAL_ENV
+from ..placement import PLACEMENT_REFUSAL_ENV, parse_cpu_set
 from ..runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
 from ..workers import SubprocessWorker
 from .contract import (
@@ -90,10 +93,39 @@ _ERROR_KEYS = {"type", "message"}
 _TEARDOWN_KEYS = {"leaders_reaped"}
 _PHASES = ((), ("science",), ("science", "inspection"))
 INSPECTION_STATES = frozenset({"not-run", "evidence", "unavailable", "error"})
+# Typed placement refusals a leaf reports, before science, for the CPUs of its
+# own worker; the controller publishes them as placement refusals.
+WORKER_AFFINITY_REFUSAL_CODES = frozenset(
+    {"placement-cpu-outside-worker-affinity", "placement-worker-affinity-unavailable"}
+)
 
 
 class LeafRefused(RuntimeError):
     """Raised inside a leaf that refuses to launch science for a request."""
+
+
+class LeafPlacementRefused(LeafRefused):
+    """Raised inside a leaf whose placed slot CPUs are unavailable on its worker.
+
+    Parameters
+    ----------
+    code : str
+        One of :data:`WORKER_AFFINITY_REFUSAL_CODES`.
+    reason : str
+        Non-empty human-readable reason.
+
+    Notes
+    -----
+    The message is ``"<code>: <reason>"``, so the plain launch-error fact
+    of the result carries the typed code across the wire.
+    """
+
+    def __init__(self, code: str, reason: str) -> None:
+        if code not in WORKER_AFFINITY_REFUSAL_CODES or type(reason) is not str or not reason:
+            raise ValueError("worker placement refusal needs a known code and a reason")
+        self.code = code
+        self.reason = reason
+        super().__init__(f"{code}: {reason}")
 
 
 class LeafResultRejected(ValueError):
@@ -841,6 +873,40 @@ def _require_fresh_output(request: LeafRequest) -> None:
         raise LeafRefused("fenced attempt output is not fresh: " + ",".join(os.path.basename(path) for path in used))
 
 
+def _require_worker_cpus(environment: PreparedPythonEnvironment) -> None:
+    """Refuse a placed slot whose declared CPUs this worker may not use.
+
+    The controller's own CPU affinity says nothing about a remote worker, so
+    the execution-local check runs here, on the worker, before science.  It
+    is the same subset rule local dispatch applies to the controller, and is
+    independent of the controller placement identity and overlay.  An
+    unplaced launch (no ``TPEN_PLACEMENT_DECLARED_CPUS``) sets no affinity in
+    :data:`~tpen_executor.runners.RUN_SHIM` and is not checked.
+
+    Raises
+    ------
+    LeafPlacementRefused
+        If the worker affinity is unavailable or lacks a declared CPU.
+    PlacementRefusal
+        If the declared CPU set is malformed.
+    """
+
+    raw = environment.env.get("TPEN_PLACEMENT_DECLARED_CPUS")
+    if raw is None:
+        return
+    declared = set(parse_cpu_set(raw))
+    try:
+        permitted = set(os.sched_getaffinity(0))
+    except (AttributeError, OSError) as error:
+        raise LeafPlacementRefused(
+            "placement-worker-affinity-unavailable", f"worker CPU affinity is unavailable: {error}",
+        ) from error
+    if not declared <= permitted:
+        raise LeafPlacementRefused(
+            "placement-cpu-outside-worker-affinity", "declared slot CPUs are not all permitted to this worker",
+        )
+
+
 def run_leaf(payload: bytes) -> bytes:
     """Run one fenced member on this worker and return plain result bytes.
 
@@ -865,11 +931,12 @@ def run_leaf(payload: bytes) -> bytes:
 
     Notes
     -----
-    Before science, the leaf refuses a used or invisible fenced output and
+    Before science, the leaf refuses a used or invisible fenced output,
     applies local dispatch slot admission
     (:func:`tpen_executor.dispatch.contract._admit_slot`) against the store
-    root named by the request; a refusal is a launch error and no child is
-    spawned.  Science runs exactly once through :class:`SubprocessWorker`
+    root named by the request, and refuses a placed slot whose declared CPUs
+    are not all permitted to this worker (:class:`LeafPlacementRefused`); a
+    refusal is a launch error and no child is spawned.  Science runs exactly once through :class:`SubprocessWorker`
     with the request's exact ``RUN_SHIM`` arguments.  Public inspection then
     runs here, on the same worker and through the trusted
     :meth:`~tpen_executor.runners.TPENEvidence.read` call site, under the same
@@ -897,6 +964,9 @@ def run_leaf(payload: bytes) -> bytes:
         # whatever quarantine overlay the environment carries.  A fresh leaf
         # has no in-process controller fence, so only the markers hold it.
         _admit_slot(environment, request)
+        # The slot's CPUs must be usable on THIS worker, whatever the
+        # controller's affinity is; a refusal spawns no child.
+        _require_worker_cpus(environment)
         outcome = worker.run(
             environment,
             request.science_args(),
@@ -966,10 +1036,12 @@ __all__ = [
     "INSPECTION_STATES",
     "LEAF_REQUEST_SCHEMA",
     "LEAF_RESULT_SCHEMA",
+    "LeafPlacementRefused",
     "LeafRefused",
     "LeafRequest",
     "LeafResult",
     "LeafResultRejected",
     "run_leaf",
     "validate_leaf_result",
+    "WORKER_AFFINITY_REFUSAL_CODES",
 ]

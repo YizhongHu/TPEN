@@ -9,13 +9,19 @@ survives controller ambient values at the remote boundary; that Parsl never
 retries a submission; that leaf facts are validated before the controller
 publishes them; and that ThreadPool and local dispatch never build a leaf.
 
+Fix round r2 adds: shared-store probes in separate processes that overlap
+their lock acquisition still both reach the barrier (review F1), and a remote
+slot's CPUs are checked against the worker's affinity, not the controller's
+(review F2).
+
 A real local HighThroughputExecutor with a LocalProvider and an MpiExecLauncher
 (``test_real_attached_htex_runs_the_leaf_on_its_workers``) runs when the Parsl
 extra is installed on Linux.  It uses a test-owned ``mpiexec`` stand-in that
 starts the worker pool locally, because a test-partition job has no MPI
 launcher configured and no facility value may enter the test.
 
-``S3B_MUTANT_TABLE`` lists the contract mutants M1-M5; each names its killer.
+``S3B_MUTANT_TABLE`` lists the contract mutants M1-M4 and M6; each names its
+killer.
 """
 
 from __future__ import annotations
@@ -28,11 +34,16 @@ import json
 import os
 from pathlib import Path
 import pickle
+import shlex
 import stat
 import sys
 import textwrap
 import threading
 import types
+
+import socket
+import subprocess
+import time
 
 import pytest
 
@@ -88,13 +99,18 @@ S3B_MUTANT_TABLE = (
         "suite": "executor", "assertion": "no DFK is reused across runs or allocations",
     },
     {
-        "id": "M5", "target": PARSL_MODULE,
-        "old": "            retries=0,\n            strategy=\"none\",\n",
-        "new": "            retries=2,\n            strategy=\"none\",\n",
-        "killer": "test_a_failed_remote_submission_is_not_retried",
-        "suite": "executor", "assertion": "a failed remote submission is a durable launch failure, never retried by Parsl",
+        "id": "M6", "target": PARSL_MODULE,
+        "old": "    _lockf_probe(private_lock)\n",
+        "new": "    _lockf_probe(token)\n",
+        "killer": "test_overlapping_store_probes_in_separate_processes_both_reach_the_barrier",
+        "suite": "executor", "assertion": "probes never contend for one shared lock, so ordinary overlap never refuses a healthy store",
     },
 )
+# M5 (retries=2 in the attached config) is retired in fix round r2 to keep the
+# table at five rows.  It was the weakest control: its killer failed only
+# through the duplicate retries check in _validate_attached_config, not by
+# observing a retry.  test_a_failed_remote_submission_is_not_retried still
+# asserts one leaf call and one launch_failed attempt.
 
 
 def test_s3b_mutant_table_targets_unique_executable_anchors() -> None:
@@ -102,7 +118,7 @@ def test_s3b_mutant_table_targets_unique_executable_anchors() -> None:
 
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
-    assert [row["id"] for row in S3B_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M5"]
+    assert [row["id"] for row in S3B_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M6"]
     for row in S3B_MUTANT_TABLE:
         source = (root / row["target"]).read_text(encoding="utf-8")
         assert source.count(row["old"]) == 1, row
@@ -114,6 +130,13 @@ def test_s3b_mutant_table_targets_unique_executable_anchors() -> None:
 
 
 # ----------------------------------------------------------- parsl doubles
+
+
+# Same leading script name and placeholder style as Parsl's DEFAULT_LAUNCH_CMD.
+_DEFAULT_LAUNCH_CMD = (
+    "process_worker_pool.py {debug} {max_workers_per_node} -a {addresses} -p {prefetch_capacity} "
+    "--block_id={{block_id}} --cpu-affinity {cpu_affinity} --available-accelerators {accelerators}"
+)
 
 
 class _Config:
@@ -214,6 +237,8 @@ class _Parsl:
             "parsl.app": types.ModuleType("parsl.app"),
             "parsl.app.app": types.SimpleNamespace(python_app=python_app),
             "parsl.executors": types.SimpleNamespace(HighThroughputExecutor=_HTEX),
+            "parsl.executors.high_throughput": types.ModuleType("parsl.executors.high_throughput"),
+            "parsl.executors.high_throughput.executor": types.SimpleNamespace(DEFAULT_LAUNCH_CMD=_DEFAULT_LAUNCH_CMD),
             "parsl.executors.threads": types.SimpleNamespace(ThreadPoolExecutor=_ThreadPool),
             "parsl.launchers": types.SimpleNamespace(MpiExecLauncher=_MpiExec),
             "parsl.providers": types.SimpleNamespace(LocalProvider=_LocalProvider),
@@ -350,6 +375,18 @@ def _lifecycle(tmp_path: Path, name: str = "store") -> AttachedAllocation:
     root = tmp_path / name
     root.mkdir(exist_ok=True)
     return AttachedAllocation(_allocation(), DirectoryStore(root))
+
+
+def _placed_lifecycle(tmp_path: Path, cpu: int) -> AttachedAllocation:
+    """Return an attached lifecycle whose one slot declares ``cpu`` on this host."""
+
+    slot = AllocationSlot("slot-a", socket.gethostname(), (), (cpu,), (), ())
+    facts = {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": [slot.to_dict()]}}
+    root = tmp_path / "placed-store"
+    root.mkdir()
+    return AttachedAllocation(
+        ConfiguredAllocation(AllocationId("s3b-allocation"), BackendJobId("job-s3b"), facts), DirectoryStore(root),
+    )
 
 
 def _summary(manifest) -> dict:
@@ -518,6 +555,30 @@ def test_attached_run_submits_the_leaf_through_a_fresh_htex_dfk(tmp_path: Path, 
         assert request.task_id == task_id and request.allocation_id == "s3b-allocation"
 
 
+def test_attached_htex_starts_its_interchange_and_workers_with_this_interpreter(tmp_path: Path, fake_parsl: _Parsl) -> None:
+    """Cannon baseline 59775545: neither HTEX process is resolved on PATH.
+
+    The interchange argv and the worker-pool template both run the current
+    interpreter with ``-m``; the template keeps every Parsl placeholder.
+    """
+
+    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), binding=BINDING, transport=_transport())
+    manifest = dispatcher.run(_group("s3b-interpreter", "member"), _runs(tmp_path, "member"), _lifecycle(tmp_path), timeout=60)
+    assert _summary(manifest) == {"member": ("completed", False)}
+
+    [executor] = fake_parsl.dfks[0].config.executors
+    assert executor.options["interchange_launch_cmd"] == [sys.executable, "-m", "parsl.executors.high_throughput.interchange"]
+    assert executor.options["launch_cmd"] == (
+        f"{shlex.quote(sys.executable)} -m parsl.executors.high_throughput.process_worker_pool "
+        + _DEFAULT_LAUNCH_CMD.removeprefix("process_worker_pool.py ")
+    )
+    assert "interchange.py" not in executor.options["interchange_launch_cmd"]
+    assert "process_worker_pool.py" not in executor.options["launch_cmd"]
+    # Any other Parsl template is refused rather than half-rewritten.
+    with pytest.raises(parsl_dispatch.UnsupportedTransportError, match="reviewed process_worker_pool.py form"):
+        parsl_dispatch._interpreter_launch_commands("worker_pool {debug}")
+
+
 def test_slot_binding_survives_controller_ambient_at_the_remote_boundary(
     tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -645,7 +706,7 @@ def test_shared_store_probe_checks_identity_lockf_and_every_worker(tmp_path: Pat
         parsl_dispatch._shared_store_probe(root, real_root, "nonce", 3, 0.3)
 
 
-@pytest.mark.parametrize("case", ["foreign-root", "worker-error", "missing-worker", "controller-lockf"])
+@pytest.mark.parametrize("case", ["foreign-root", "worker-error", "missing-worker", "controller-lockf", "worker-lockf"])
 def test_shared_store_preflight_fails_closed_before_any_attempt(
     tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch, case: str,
 ) -> None:
@@ -661,9 +722,15 @@ def test_shared_store_preflight_fails_closed_before_any_attempt(
         return function(*args, **kwargs)
 
     fake_parsl.hooks["_shared_store_probe"] = probe
-    if case == "controller-lockf":
-        def no_lock(_path):
-            raise OSError("lockf unsupported")
+    if case in ("controller-lockf", "worker-lockf"):
+        real_lockf_probe = parsl_dispatch._lockf_probe
+
+        def no_lock(path):
+            # The controller locks the shared token; each worker probe locks
+            # only its private lock-capability file.
+            if case == "controller-lockf" or os.path.basename(path).startswith("lock-"):
+                raise OSError("lockf unsupported")
+            real_lockf_probe(path)
 
         monkeypatch.setattr(parsl_dispatch, "_lockf_probe", no_lock)
     group = _group(f"s3b-preflight-{case}", "member")
@@ -675,6 +742,179 @@ def test_shared_store_preflight_fails_closed_before_any_attempt(
     assert fake_parsl.leaf_submissions() == []
     [dfk] = fake_parsl.dfks
     assert dfk.cleaned == 1
+
+
+# Each probe process runs the production probe.  The "holder" pauses right
+# after any successful exclusive lockf, before releasing it, until the test
+# creates <control>/go: a peer probe then acquires while the holder holds.
+_PROBE_PROCESS = """
+import fcntl, json, os, sys, time
+from tpen_executor.dispatch import parsl as dispatch
+
+control, role, root, real_root, nonce, expected, timeout = sys.argv[1:8]
+real_lockf = fcntl.lockf
+
+def lockf(fd, command, *args):
+    result = real_lockf(fd, command, *args)
+    if role == "holder" and command & fcntl.LOCK_EX:
+        open(os.path.join(control, "held"), "w").close()
+        deadline = time.monotonic() + 60
+        while not os.path.exists(os.path.join(control, "go")):
+            if time.monotonic() > deadline:
+                raise TimeoutError("the test never released the held lock")
+            time.sleep(0.01)
+    return result
+
+fcntl.lockf = lockf
+print(json.dumps(dispatch._shared_store_probe(root, real_root, nonce, int(expected), float(timeout))))
+"""
+
+
+def _start_probe(tmp_path: Path, role: str, root: str, real_root: str, expected: int, timeout: float) -> subprocess.Popen:
+    control = tmp_path / "control"
+    control.mkdir(exist_ok=True)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(EXECUTOR_ROOT / "src"), os.environ.get("PYTHONPATH")]))}
+    return subprocess.Popen(
+        [sys.executable, "-c", _PROBE_PROCESS, str(control), role, root, real_root, "nonce", str(expected), str(timeout)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+    )
+
+
+def _wait_for(condition, bound: float = 30) -> bool:
+    deadline = time.monotonic() + bound
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def test_overlapping_store_probes_in_separate_processes_both_reach_the_barrier(tmp_path: Path) -> None:
+    """M6 killer (review F1): overlapping lock acquisition never refuses a healthy store.
+
+    POSIX record locks belong to processes, so only separate processes can
+    contend.  The holder probe pauses while it holds its lock; the peer probe
+    then takes its own lock and arrives at the barrier during the hold.
+    """
+
+    root, real_root = _probe_setup(tmp_path)
+    probe_dir = Path(root) / "parsl" / "store-preflight-nonce"
+    holder = _start_probe(tmp_path, "holder", root, real_root, 2, 30)
+    peer = None
+    try:
+        assert _wait_for(lambda: (tmp_path / "control" / "held").exists() or holder.poll() is not None)
+        assert holder.poll() is None, holder.communicate()
+        peer = _start_probe(tmp_path, "peer", root, real_root, 2, 30)
+        # The peer arrives while the holder still holds its lock: the two
+        # acquisitions overlapped.  On contention the peer exits instead.
+        arrived = _wait_for(lambda: len(list(probe_dir.glob("arrival-*"))) == 1 or peer.poll() is not None)
+        assert arrived and peer.poll() is None, peer.communicate()
+        assert holder.poll() is None
+        (tmp_path / "control" / "go").touch()
+        results = [process.communicate(timeout=60) for process in (holder, peer)]
+    finally:
+        for process in (holder, peer):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+    assert (holder.returncode, peer.returncode) == (0, 0), results
+    facts = [json.loads(stdout) for stdout, _stderr in results]
+    assert [fact["root"] for fact in facts] == [real_root, real_root]
+    assert facts[0]["pid"] != facts[1]["pid"]
+    assert len(list(probe_dir.glob("arrival-*"))) == 2
+    # Each probe proved lockf on its own file, never on the shared token.
+    assert len(list(probe_dir.glob("lock-*"))) == 2
+
+
+def test_a_missing_worker_process_keeps_the_barrier_closed(tmp_path: Path) -> None:
+    """Missing-worker control: one probe process alone never passes a two-worker barrier."""
+
+    root, real_root = _probe_setup(tmp_path)
+    probe = _start_probe(tmp_path, "peer", root, real_root, 2, 0.5)
+    _stdout, stderr = probe.communicate(timeout=60)
+    assert probe.returncode != 0 and "not every worker reached" in stderr
+    assert len(list((Path(root) / "parsl" / "store-preflight-nonce").glob("arrival-*"))) == 1
+
+
+# ------------------------------------------------------- remote CPU affinity
+
+
+def _split_affinity(monkeypatch: pytest.MonkeyPatch, controller_mask, worker_mask) -> list[str]:
+    """Give the controller thread and the doubled worker threads different masks.
+
+    Each mask is a callable of the real mask; it may raise.  Returns the list
+    of callers, in order, that queried the affinity.
+    """
+
+    real = os.sched_getaffinity
+    controller = threading.get_ident()
+    callers: list[str] = []
+
+    def affinity(pid):
+        if threading.get_ident() == controller:
+            callers.append("controller")
+            return controller_mask(set(real(pid)))
+        callers.append("worker")
+        return worker_mask(set(real(pid)))
+
+    monkeypatch.setattr(os, "sched_getaffinity", affinity)
+    return callers
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux sched affinity and /proc")
+def test_a_remote_slot_is_admitted_by_the_worker_affinity_not_the_controller(
+    tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review F2: disjoint controller and worker masks admit a valid worker slot."""
+
+    cpu = min(os.sched_getaffinity(0))
+    # The controller may not use the slot CPU; the worker may.
+    callers = _split_affinity(monkeypatch, lambda real: {max(real) + 1}, lambda real: real)
+    group = _group("s3b-affinity-disjoint", "member")
+    lifecycle = _placed_lifecycle(tmp_path, cpu)
+    manifest = parsl_dispatch.ParslDispatcher(_worker(tmp_path), transport=_transport()).run(
+        group, _runs(tmp_path, "member"), lifecycle, timeout=60,
+    )
+
+    assert _summary(manifest) == {"member": ("completed", False)}
+    [attempt] = manifest.attempts
+    assert attempt.placement_receipt.refusal is None
+    # The leaf checked its worker mask; the controller mask was never consulted.
+    assert "worker" in callers and "controller" not in callers
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs Linux sched affinity and /proc")
+@pytest.mark.parametrize(
+    "case, code",
+    [("outside", "placement-cpu-outside-worker-affinity"), ("unavailable", "placement-worker-affinity-unavailable")],
+)
+def test_an_invalid_worker_mask_is_refused_before_science(
+    tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch, case: str, code: str,
+) -> None:
+    """Review F2: a slot CPU the worker may not use is refused on the worker before any child."""
+
+    cpu = min(os.sched_getaffinity(0))
+
+    def worker_mask(_real):
+        if case == "unavailable":
+            raise OSError("affinity is not supported on this worker")
+        return {cpu + 1}
+
+    # The controller may use the slot CPU, so only the worker check refuses.
+    _split_affinity(monkeypatch, lambda real: real, worker_mask)
+    group = _group(f"s3b-affinity-{case}", "member")
+    lifecycle = _placed_lifecycle(tmp_path, cpu)
+    manifest = parsl_dispatch.ParslDispatcher(_worker(tmp_path), transport=_transport()).run(
+        group, _runs(tmp_path, "member"), lifecycle, timeout=60,
+    )
+
+    assert _summary(manifest) == {"member": ("launch_failed", True)} and manifest.segments == ()
+    [attempt] = manifest.attempts
+    assert attempt.placement_receipt.refusal["code"] == code
+    # No science child ran: no core directory, science log or sidecar exists.
+    output_dir = Path(lifecycle.store.root) / "groups" / group.identity / "member" / attempt.attempt_id.value
+    assert not any((output_dir / name).exists() for name in ("core", "stdout.log", "stderr.log", "child-placement.json"))
+    assert len(fake_parsl.leaf_submissions()) == 1
 
 
 # ------------------------------------------------------- unchanged routes
@@ -741,15 +981,19 @@ def test_real_attached_htex_runs_the_leaf_on_its_workers(tmp_path: Path, monkeyp
     (shim / "mpiexec").chmod(stat.S_IRWXU)
     mpiexec_log = tmp_path / "mpiexec.log"
     venv_bin = os.path.dirname(sys.executable)
-    # The controller needs interchange.py on PATH; its ambient CUDA/CPU
-    # values conflict with the binding and reach the workers by inheritance.
-    monkeypatch.setenv("PATH", os.pathsep.join([str(shim), venv_bin, os.environ.get("PATH", "")]))
+    # The interchange and worker pool run as modules of this interpreter, so
+    # this environment's bin directory is deliberately kept OFF PATH (Cannon
+    # baseline 59775545 failed on a missing interchange.py there).  Only the
+    # mpiexec stand-in is added.  Controller ambient CUDA/CPU values conflict
+    # with the binding and reach the workers by inheritance.
+    path = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry and os.path.realpath(entry) != os.path.realpath(venv_bin)]
+    monkeypatch.setenv("PATH", os.pathsep.join([str(shim), *path]))
     monkeypatch.setenv("S3B_MPIEXEC_LOG", str(mpiexec_log))
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "controller-ambient-0")
     monkeypatch.setenv("OMP_NUM_THREADS", "99")
     monkeypatch.delenv(WORKER_MARK, raising=False)
     worker_init = "\n".join([
-        f"export PATH={shim}:{venv_bin}:$PATH",
+        f"export PATH={shim}:$PATH",
         f"export PYTHONPATH={EXECUTOR_ROOT / 'src'}${{PYTHONPATH:+:$PYTHONPATH}}",
         f"export {WORKER_MARK}=htex-worker",
     ])

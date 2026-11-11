@@ -22,7 +22,9 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
+import sys
 import threading
 import time
 from typing import Any, ClassVar
@@ -45,8 +47,16 @@ from .contract import (
     _placement_refusal_from_environment,
     _with_child_context_keys,
     _with_child_placement,
+    _with_placement_refusal,
 )
-from .transport import LeafRequest, LeafResult, run_leaf, validate_leaf_result
+from .transport import (
+    WORKER_AFFINITY_REFUSAL_CODES,
+    LeafPlacementRefused,
+    LeafRequest,
+    LeafResult,
+    run_leaf,
+    validate_leaf_result,
+)
 
 
 class ParslUnavailableError(RuntimeError):
@@ -82,6 +92,12 @@ ATTACHED_TRANSPORT_SCHEMA = "tpen-executor/attached-transport-v1"
 _ATTACHED_FORM = {"executor": "htex", "provider": "local", "launcher": "mpiexec"}
 _LABEL_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
 _PREFLIGHT_PREFIX = "store-preflight-"
+# HTEX starts its interchange and worker pool as console scripts found on
+# PATH by default.  The attached route runs both modules with the current
+# interpreter instead, so neither depends on PATH.
+_INTERCHANGE_MODULE = "parsl.executors.high_throughput.interchange"
+_WORKER_POOL_MODULE = "parsl.executors.high_throughput.process_worker_pool"
+_WORKER_POOL_SCRIPT = "process_worker_pool.py "
 
 
 @frozen_record
@@ -236,6 +252,40 @@ def _require_standard_worker(materialized: Any) -> None:
         raise UnsupportedTransportError("remote worker program setup must be exactly SourceScript")
 
 
+def _interpreter_launch_commands(default_launch_cmd: Any) -> tuple[list[str], str]:
+    """Return HTEX interchange and worker-pool commands for this interpreter.
+
+    Parameters
+    ----------
+    default_launch_cmd : str
+        Parsl's own ``DEFAULT_LAUNCH_CMD`` template.  Only its leading
+        ``process_worker_pool.py`` script name is replaced, so every
+        placeholder Parsl fills stays exactly Parsl's.
+
+    Returns
+    -------
+    tuple
+        ``interchange_launch_cmd`` (an argv list) and ``launch_cmd`` (a
+        format template), both running :data:`sys.executable` ``-m``.
+
+    Raises
+    ------
+    UnsupportedTransportError
+        If there is no current interpreter path or the Parsl template is not
+        the reviewed ``process_worker_pool.py`` form.
+    """
+
+    if type(default_launch_cmd) is not str or not default_launch_cmd.startswith(_WORKER_POOL_SCRIPT):
+        raise UnsupportedTransportError("Parsl's worker launch command is not the reviewed process_worker_pool.py form")
+    if not sys.executable or not os.path.isabs(sys.executable):
+        raise UnsupportedTransportError("the attached transport needs an absolute current interpreter path")
+    # The worker template is a shell string that Parsl formats: quote the
+    # interpreter and escape any brace in its path.
+    python = shlex.quote(sys.executable).replace("{", "{{").replace("}", "}}")
+    worker = f"{python} -m {_WORKER_POOL_MODULE} {default_launch_cmd[len(_WORKER_POOL_SCRIPT):]}"
+    return [sys.executable, "-m", _INTERCHANGE_MODULE], worker
+
+
 def _lockf_probe(path: str) -> None:
     """Take and release one non-blocking POSIX ``lockf`` on ``path``."""
 
@@ -251,11 +301,14 @@ def _shared_store_probe(root: str, real_root: str, nonce: str, expected: int, ti
     """Worker side of the shared-store preflight; returns plain facts.
 
     Each probe confirms that ``root`` resolves to the controller's canonical
-    path, that the controller-written token is visible with its nonce, and
-    that POSIX ``lockf`` works on it.  It then waits at a file barrier until
-    ``expected`` probes have arrived.  A worker runs one task at a time, so
-    the barrier completes only when every worker of the block holds a probe
-    at once; a missing, slow or store-blind worker makes it time out.
+    path and that the controller-written token is visible with its nonce.
+    It proves POSIX ``lockf`` on a lock-capability file private to this
+    probe, never on the shared token, so a peer probe holding its own lock
+    cannot make a healthy store look unlockable.  It then waits at a file
+    barrier until ``expected`` probes have arrived.  A worker runs one task
+    at a time, so the barrier completes only when every worker of the block
+    holds a probe at once; a missing, slow or store-blind worker makes it
+    time out.
 
     Parameters
     ----------
@@ -289,9 +342,16 @@ def _shared_store_probe(root: str, real_root: str, nonce: str, expected: int, ti
     with open(token, encoding="utf-8") as handle:
         if handle.read() != nonce:
             raise RuntimeError("attempt store token differs on this worker")
-    _lockf_probe(token)
+    # Lock capability is proven on a file only this probe ever opens: probes
+    # on other workers never contend for it, so ordinary contention between
+    # probes cannot become a refusal.  The shared token above still proves
+    # store identity.
+    probe_id = uuid.uuid4().hex
+    private_lock = os.path.join(probe_dir, f"lock-{probe_id}")
+    os.close(os.open(private_lock, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600))
+    _lockf_probe(private_lock)
     host, pid = socket.gethostname(), os.getpid()
-    with open(os.path.join(probe_dir, f"arrival-{uuid.uuid4().hex}"), "x", encoding="utf-8") as handle:
+    with open(os.path.join(probe_dir, f"arrival-{probe_id}"), "x", encoding="utf-8") as handle:
         handle.write(f"{host} {pid}\n")
     while sum(name.startswith("arrival-") for name in os.listdir(probe_dir)) < expected:
         if time.monotonic() > deadline:
@@ -353,8 +413,10 @@ class _RemoteLeaf:
         ------
         TypeError, ValueError, LeafResultRejected
             If the bytes are not a result answering this request.
+        PlacementRefusal
+            If the leaf refused its slot's CPUs on its worker before science.
         RemoteLeafLaunchError
-            If the leaf returned a launch error instead of science.
+            If the leaf returned any other launch error instead of science.
         """
 
         if type(payload) is not bytes:
@@ -362,6 +424,12 @@ class _RemoteLeaf:
         result = validate_leaf_result(self.request, LeafResult.decode(payload))
         if result.science is None:
             error = result.launch_error or {"type": "unknown", "message": ""}
+            if error["type"] == LeafPlacementRefused.__name__:
+                # Only the closed worker-affinity codes become typed
+                # placement refusals; any other text stays a launch error.
+                code, _, reason = error["message"].partition(": ")
+                if code in WORKER_AFFINITY_REFUSAL_CODES and reason:
+                    raise PlacementRefusal(code, reason)
             raise RemoteLeafLaunchError(f"{error['type']}: {error['message']}")
         science = result.science
         outcome = ProcessOutcome(
@@ -523,6 +591,7 @@ class ParslDispatcher(DispatcherContract):
     _dfk_type: Any = field(init=False, repr=False, compare=False)
     _thread_pool_type: Any = field(init=False, repr=False, compare=False)
     _htex_type: Any = field(init=False, default=None, repr=False, compare=False)
+    _htex_launch_commands: tuple[list[str], str] | None = field(init=False, default=None, repr=False, compare=False)
     _local_provider_type: Any = field(init=False, default=None, repr=False, compare=False)
     _mpiexec_launcher_type: Any = field(init=False, default=None, repr=False, compare=False)
     _python_app_factory: Any = field(init=False, repr=False, compare=False)
@@ -562,9 +631,11 @@ class ParslDispatcher(DispatcherContract):
             # The remote route's Parsl types are imported only when selected,
             # so the default ThreadPool route imports exactly what it did.
             from parsl.executors import HighThroughputExecutor
+            from parsl.executors.high_throughput.executor import DEFAULT_LAUNCH_CMD
             from parsl.launchers import MpiExecLauncher
             from parsl.providers import LocalProvider
 
+            object.__setattr__(self, "_htex_launch_commands", _interpreter_launch_commands(DEFAULT_LAUNCH_CMD))
             object.__setattr__(self, "_htex_type", HighThroughputExecutor)
             object.__setattr__(self, "_local_provider_type", LocalProvider)
             object.__setattr__(self, "_mpiexec_launcher_type", MpiExecLauncher)
@@ -772,6 +843,9 @@ class ParslDispatcher(DispatcherContract):
                     group,
                     member,
                     configured,
+                    # A remote slot's CPUs are not the controller's: the
+                    # attached leaf checks them on its worker before science.
+                    check_controller_affinity=self.transport is None,
                 )
                 placement_refusal = _placement_refusal_from_environment(environment)
                 if placement_refusal is not None:
@@ -856,7 +930,14 @@ class ParslDispatcher(DispatcherContract):
                     if isinstance(record["handle"], _RemoteLeaf):
                         # Validated leaf facts replace controller inspection;
                         # the controller still publishes every record.
-                        result, record["materialized"] = record["handle"].resolve(result)
+                        try:
+                            result, record["materialized"] = record["handle"].resolve(result)
+                        except PlacementRefusal as refusal:
+                            # The worker refused the slot before science:
+                            # publish its typed refusal, as a controller
+                            # placement refusal is published.
+                            record["environment"] = _with_placement_refusal(record["environment"], refusal)
+                            raise
                     if isinstance(result, _ChildFailure):
                         raise result.error
                     if not isinstance(result, ProcessOutcome):
@@ -1001,7 +1082,8 @@ class ParslDispatcher(DispatcherContract):
             One HighThroughputExecutor with a one-block LocalProvider and an
             MpiExecLauncher.  Retries are disabled and the strategy only
             starts the initial block, so nothing is acquired, replaced or
-            retried after submission.
+            retried after submission.  The interchange and the worker pool
+            run as modules of the current interpreter, independent of PATH.
         """
 
         launcher = self._mpiexec_launcher_type(
@@ -1016,6 +1098,8 @@ class ParslDispatcher(DispatcherContract):
             max_blocks=1,
             worker_init=transport.worker_init,
         )
+        assert self._htex_launch_commands is not None
+        interchange_launch_cmd, launch_cmd = self._htex_launch_commands
         executor = self._htex_type(
             label=transport.label,
             provider=provider,
@@ -1026,6 +1110,9 @@ class ParslDispatcher(DispatcherContract):
             cpu_affinity="none",
             available_accelerators=(),
             prefetch_capacity=0,
+            # Never resolve interchange.py or process_worker_pool.py on PATH.
+            interchange_launch_cmd=list(interchange_launch_cmd),
+            launch_cmd=launch_cmd,
         )
         return self._config_type(
             executors=[executor],
@@ -1061,7 +1148,9 @@ class ParslDispatcher(DispatcherContract):
         The controller writes a nonce token below the store's Parsl run
         directory and checks POSIX ``lockf`` on it, then submits one
         :func:`_shared_store_probe` per worker.  All probes must return the
-        controller's canonical root within ``preflight_timeout``.
+        controller's canonical root within ``preflight_timeout``.  Probes
+        prove ``lockf`` on private files, so they never contend with each
+        other, and no Parsl app is ever retried.
 
         Raises
         ------

@@ -239,8 +239,12 @@ The spec holds generic values only: `label`, `nodes_per_block`,
 `max_workers_per_node`, `worker_init`, `address`, `mpiexec_bind_cmd`,
 `mpiexec_overrides` and `preflight_timeout`. The executor ships no facility
 value. An operator-owned profile supplies the worker environment setup, the
-interchange address and launcher arguments, and must put Parsl's
-`interchange.py` and `process_worker_pool.py` on `PATH`. The route never
+interchange address and launcher arguments. The interchange and the worker
+pool are started as `python -m parsl.executors.high_throughput.interchange`
+and `python -m parsl.executors.high_throughput.process_worker_pool` with the
+controller's own interpreter (`sys.executable`), so neither depends on
+`PATH`; that interpreter path must therefore also be valid on every worker
+node, as it is for a shared environment. The route never
 acquires, replaces or retries an allocation: Parsl retries are 0 and the
 scaling strategy only starts the initial block.
 
@@ -257,10 +261,13 @@ Each run then builds a fresh config and DataFlowKernel and preflights the
 shared store. The controller writes a nonce token under
 `<store>/parsl/store-preflight-<nonce>/` and checks POSIX `lockf` on it. It
 then submits one probe per worker. Each probe must resolve the store root to
-the controller's canonical path, read the token, take `lockf`, and wait at a
-file barrier until every worker holds a probe at once. A store-blind, slow or
+the controller's canonical path and read the token. It then takes and
+releases `lockf` on a lock-capability file private to that probe, never on the
+shared token, so probes never contend with each other and a healthy store is
+never refused for ordinary contention. Finally it waits at a file barrier until
+every worker holds a probe at once. A store-blind, lock-incapable, slow or
 missing worker refuses the whole run (`SharedStorePreflightError`) before the
-first `begin`, so no attempt exists.
+first `begin`, so no attempt exists. No probe or other Parsl app is retried.
 
 Each begun member is submitted as the Layer A leaf with its canonical
 `LeafRequest` bytes as the only argument. The request environment is the
@@ -270,6 +277,15 @@ environment, so neither controller nor worker ambient `CUDA_VISIBLE_DEVICES`
 or thread values can replace a bound key. The controller validates the
 returned bytes against the request and publishes through the shared
 completion path; the leaf's inspection facts replace controller inspection.
+
+A remote slot's CPUs are checked where the slot runs. Local and ThreadPool
+dispatch still refuse a declared CPU outside the controller's affinity
+(`placement-cpu-outside-controller-affinity`). The attached route skips that
+controller check, and the leaf instead refuses, on its worker and before any
+child is spawned, a declared CPU outside the worker's affinity
+(`placement-cpu-outside-worker-affinity`) or an unavailable worker affinity
+(`placement-worker-affinity-unavailable`). The controller publishes that
+refusal as the attempt's placement receipt and the attempt is `launch_failed`.
 
 These cases are durable `launch_failed` attempts and never accepted segments:
 
@@ -281,9 +297,18 @@ On cancellation, the controller finishes every in-flight remote attempt
 `failed` without waiting for it or signalling a remote PID. Bounded remote
 teardown acknowledgement is S3 Layer C.
 
-HTEX routes a task to any idle worker, so a declared slot node is not a
-routing constraint. An S2b placement receipt reports any host mismatch;
-rank or node binding correctness is outside S3.
+Node routing is not implemented in Layer B. HTEX sends a task to any idle
+worker, so a declared slot node is not a routing constraint, and a leaf may
+run science on a host other than its slot's declared node. Under the
+inherited S2b policy such a host mismatch is ADVISORY, not blocking: the
+child records `child-placement-mismatch` in its placement sidecar but science
+still runs, and the attempt can complete and be accepted with an unqualified
+placement receipt. Layer B therefore does NOT qualify placement, and it does
+NOT qualify R5 (two-node) evidence. Deterministic routing is deferred to
+Layer D: a node-to-executor-label map with one worker pool constrained to
+each named node by operator-supplied launcher data, each slot submitted only
+to its node's label, and observed node identity preflighted, which revises
+Layer B's one-executor validator.
 
 ## Local dispatch
 
