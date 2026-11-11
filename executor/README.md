@@ -109,10 +109,12 @@ until a separate disposition authorizes removing it. A supervised release
 command, which must prove that all possibly-launched work is gone, is a future
 follow-up.
 
-Assumption: one controller per allocation. Every dispatcher runs its workers
-in the controller process (Parsl is ThreadPool-only), so the in-process lease
-sees every launch, and the durable marker covers a controller restart on the
-same store. Markers in a different attempt store, and concurrent independent
+Assumption: one controller per allocation. The local and ThreadPool
+dispatchers run their workers in the controller process, so the in-process
+lease sees every launch, and the durable marker covers a controller restart on
+the same store. A leaf on the attached remote route (S3 Layer B) is a fresh
+process on a worker: it is admitted against the durable markers in the shared
+attempt store only. Markers in a different attempt store, and concurrent independent
 controllers on one allocation, are not detected; cross-store leases are
 deferred to follow-up item `0aa73edd`.
 
@@ -220,6 +222,68 @@ sampler and worker slot quarantine are unchanged because the leaf launches
 through the same worker. Layer A wires no dispatcher, so local and ThreadPool dispatch
 are unchanged. Remote submission and cancellation acknowledgement belong to
 later S3 layers.
+
+## Attached remote transport (S3 Layer B)
+
+`ParslDispatcher(worker, transport=...)` selects the attached remote route.
+`transport` is an `AttachedTransportSpec`, or its strict mapping with
+`schema: tpen-executor/attached-transport-v1`. Only one form is admitted:
+`executor: htex`, `provider: local` and `launcher: mpiexec`, which is one
+HighThroughputExecutor whose LocalProvider starts exactly one worker block
+through MpiExecLauncher inside the allocation the controller already holds.
+Any other executor, provider or launcher is refused, and `transport` cannot be
+combined with `executor_config`. Without `transport`, Parsl dispatch is the
+unchanged in-process ThreadPool route.
+
+The spec holds generic values only: `label`, `nodes_per_block`,
+`max_workers_per_node`, `worker_init`, `address`, `mpiexec_bind_cmd`,
+`mpiexec_overrides` and `preflight_timeout`. The executor ships no facility
+value. An operator-owned profile supplies the worker environment setup, the
+interchange address and launcher arguments, and must put Parsl's
+`interchange.py` and `process_worker_pool.py` on `PATH`. The route never
+acquires, replaces or retries an allocation: Parsl retries are 0 and the
+scaling strategy only starts the initial block.
+
+Before any lifecycle write, admission refuses:
+
+* a lifecycle that is not `AttachedAllocation`;
+* a worker program other than the standard `SubprocessWorker`,
+  `TPENCommand` and `TPENEvidence` with a `PreparedPythonEnvironment`,
+  because the leaf would silently run the standard program instead;
+* more slots than `nodes_per_block * max_workers_per_node` workers;
+* an attempt-store root that is not an existing absolute POSIX directory.
+
+Each run then builds a fresh config and DataFlowKernel and preflights the
+shared store. The controller writes a nonce token under
+`<store>/parsl/store-preflight-<nonce>/` and checks POSIX `lockf` on it. It
+then submits one probe per worker. Each probe must resolve the store root to
+the controller's canonical path, read the token, take `lockf`, and wait at a
+file barrier until every worker holds a probe at once. A store-blind, slow or
+missing worker refuses the whole run (`SharedStorePreflightError`) before the
+first `begin`, so no attempt exists.
+
+Each begun member is submitted as the Layer A leaf with its canonical
+`LeafRequest` bytes as the only argument. The request environment is the
+controller's prepared environment after the slot binding, context-key and
+placement overlays. The leaf applies it over the worker's ambient
+environment, so neither controller nor worker ambient `CUDA_VISIBLE_DEVICES`
+or thread values can replace a bound key. The controller validates the
+returned bytes against the request and publishes through the shared
+completion path; the leaf's inspection facts replace controller inspection.
+
+These cases are durable `launch_failed` attempts and never accepted segments:
+
+* a returned result that does not answer its request;
+* a leaf launch error or refusal;
+* a failed remote future.
+
+On cancellation, the controller finishes every in-flight remote attempt
+`failed` without waiting for it or signalling a remote PID. Bounded remote
+teardown acknowledgement is S3 Layer C.
+
+HTEX routes a task to any idle worker, so a declared slot node is not a
+routing constraint. An S2b placement receipt reports any host mismatch;
+rank or node binding correctness is outside S3.
 
 ## Local dispatch
 
