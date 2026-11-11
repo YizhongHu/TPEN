@@ -109,10 +109,12 @@ until a separate disposition authorizes removing it. A supervised release
 command, which must prove that all possibly-launched work is gone, is a future
 follow-up.
 
-Assumption: one controller per allocation. Every dispatcher runs its workers
-in the controller process (Parsl is ThreadPool-only), so the in-process lease
-sees every launch, and the durable marker covers a controller restart on the
-same store. Markers in a different attempt store, and concurrent independent
+Assumption: one controller per allocation. The local and ThreadPool
+dispatchers run their workers in the controller process, so the in-process
+lease sees every launch, and the durable marker covers a controller restart on
+the same store. A leaf on the attached remote route (S3 Layer B) is a fresh
+process on a worker: it is admitted against the durable markers in the shared
+attempt store only. Markers in a different attempt store, and concurrent independent
 controllers on one allocation, are not detected; cross-store leases are
 deferred to follow-up item `0aa73edd`.
 
@@ -220,6 +222,93 @@ sampler and worker slot quarantine are unchanged because the leaf launches
 through the same worker. Layer A wires no dispatcher, so local and ThreadPool dispatch
 are unchanged. Remote submission and cancellation acknowledgement belong to
 later S3 layers.
+
+## Attached remote transport (S3 Layer B)
+
+`ParslDispatcher(worker, transport=...)` selects the attached remote route.
+`transport` is an `AttachedTransportSpec`, or its strict mapping with
+`schema: tpen-executor/attached-transport-v1`. Only one form is admitted:
+`executor: htex`, `provider: local` and `launcher: mpiexec`, which is one
+HighThroughputExecutor whose LocalProvider starts exactly one worker block
+through MpiExecLauncher inside the allocation the controller already holds.
+Any other executor, provider or launcher is refused, and `transport` cannot be
+combined with `executor_config`. Without `transport`, Parsl dispatch is the
+unchanged in-process ThreadPool route.
+
+The spec holds generic values only: `label`, `nodes_per_block`,
+`max_workers_per_node`, `worker_init`, `address`, `mpiexec_bind_cmd`,
+`mpiexec_overrides` and `preflight_timeout`. The executor ships no facility
+value. An operator-owned profile supplies the worker environment setup, the
+interchange address and launcher arguments. The interchange and the worker
+pool are started as `python -m parsl.executors.high_throughput.interchange`
+and `python -m parsl.executors.high_throughput.process_worker_pool` with the
+controller's own interpreter (`sys.executable`), so neither depends on
+`PATH`; that interpreter path must therefore also be valid on every worker
+node, as it is for a shared environment. The route never
+acquires, replaces or retries an allocation: Parsl retries are 0 and the
+scaling strategy only starts the initial block.
+
+Before any lifecycle write, admission refuses:
+
+* a lifecycle that is not `AttachedAllocation`;
+* a worker program other than the standard `SubprocessWorker`,
+  `TPENCommand` and `TPENEvidence` with a `PreparedPythonEnvironment`,
+  because the leaf would silently run the standard program instead;
+* more slots than `nodes_per_block * max_workers_per_node` workers;
+* an attempt-store root that is not an existing absolute POSIX directory.
+
+Each run then builds a fresh config and DataFlowKernel and preflights the
+shared store. The controller writes a nonce token under
+`<store>/parsl/store-preflight-<nonce>/` and checks POSIX `lockf` on it. It
+then submits one probe per worker. Each probe must resolve the store root to
+the controller's canonical path and read the token. It then takes and
+releases `lockf` on a lock-capability file private to that probe, never on the
+shared token, so probes never contend with each other and a healthy store is
+never refused for ordinary contention. Finally it waits at a file barrier until
+every worker holds a probe at once. A store-blind, lock-incapable, slow or
+missing worker refuses the whole run (`SharedStorePreflightError`) before the
+first `begin`, so no attempt exists. No probe or other Parsl app is retried.
+
+Each begun member is submitted as the Layer A leaf with its canonical
+`LeafRequest` bytes as the only argument. The request environment is the
+controller's prepared environment after the slot binding, context-key and
+placement overlays. The leaf applies it over the worker's ambient
+environment, so neither controller nor worker ambient `CUDA_VISIBLE_DEVICES`
+or thread values can replace a bound key. The controller validates the
+returned bytes against the request and publishes through the shared
+completion path; the leaf's inspection facts replace controller inspection.
+
+A remote slot's CPUs are checked where the slot runs. Local and ThreadPool
+dispatch still refuse a declared CPU outside the controller's affinity
+(`placement-cpu-outside-controller-affinity`). The attached route skips that
+controller check, and the leaf instead refuses, on its worker and before any
+child is spawned, a declared CPU outside the worker's affinity
+(`placement-cpu-outside-worker-affinity`) or an unavailable worker affinity
+(`placement-worker-affinity-unavailable`). The controller publishes that
+refusal as the attempt's placement receipt and the attempt is `launch_failed`.
+
+These cases are durable `launch_failed` attempts and never accepted segments:
+
+* a returned result that does not answer its request;
+* a leaf launch error or refusal;
+* a failed remote future.
+
+On cancellation, the controller finishes every in-flight remote attempt
+`failed` without waiting for it or signalling a remote PID. Bounded remote
+teardown acknowledgement is S3 Layer C.
+
+Node routing is not implemented in Layer B. HTEX sends a task to any idle
+worker, so a declared slot node is not a routing constraint, and a leaf may
+run science on a host other than its slot's declared node. Under the
+inherited S2b policy such a host mismatch is ADVISORY, not blocking: the
+child records `child-placement-mismatch` in its placement sidecar but science
+still runs, and the attempt can complete and be accepted with an unqualified
+placement receipt. Layer B therefore does NOT qualify placement, and it does
+NOT qualify R5 (two-node) evidence. Deterministic routing is deferred to
+Layer D: a node-to-executor-label map with one worker pool constrained to
+each named node by operator-supplied launcher data, each slot submitted only
+to its node's label, and observed node identity preflighted, which revises
+Layer B's one-executor validator.
 
 ## Local dispatch
 

@@ -844,8 +844,14 @@ def test_leaf_module_has_no_publication_or_scheduler_authority() -> None:
 
 
 def test_local_and_threadpool_dispatch_do_not_route_through_the_wire() -> None:
-    """Layer A adds the wire only; existing dispatchers do not import it."""
+    """Layer A adds the wire only; local and shared dispatch do not import it.
+
+    Layer B imports the wire in ``parsl.py`` for the explicitly selected
+    attached route only; ``test_threadpool_and_local_routes_never_build_a_leaf``
+    in ``test_s3_transport_parsl.py`` proves behaviourally that the default
+    ThreadPool route never reaches it.
+    """
 
     dispatch = EXECUTOR_ROOT / "src" / "tpen_executor" / "dispatch"
-    for name in ("__init__.py", "local.py", "parsl.py", "contract.py"):
+    for name in ("__init__.py", "local.py", "contract.py"):
         assert "transport" not in (dispatch / name).read_text(encoding="utf-8"), name

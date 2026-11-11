@@ -186,6 +186,8 @@ def _with_child_placement(
     group: ReadyGroup,
     member: Any,
     configured: ConfiguredRun,
+    *,
+    check_controller_affinity: bool = True,
 ) -> Any:
     """Overlay the one concrete slot and fenced identities for the child.
 
@@ -204,6 +206,13 @@ def _with_child_placement(
     evidence path and the slot's durable quarantine directory in the attempt
     store; any inherited value is discarded so only the controller decides
     which slots are sampled.
+
+    Local and ThreadPool children run on the controller host, so their
+    declared CPUs must be permitted to the controller; a violation is carried
+    as a controller placement refusal.  ``check_controller_affinity=False``
+    is only for a child that runs on another host (the S3 attached remote
+    leaf), whose leaf checks the declared CPUs against its own worker
+    affinity before science instead.
     """
 
     if not isinstance(environment, PreparedPythonEnvironment):
@@ -271,14 +280,14 @@ def _with_child_placement(
     declared_cpus = parse_cpu_set(cpus)
     controller_refusal: dict[str, str] | None = None
     try:
-        permitted_cpus = set(os.sched_getaffinity(0))
+        permitted_cpus = set(os.sched_getaffinity(0)) if check_controller_affinity else None
     except (AttributeError, OSError) as error:
         controller_refusal = {
             "code": "placement-controller-affinity-unavailable",
             "reason": f"controller CPU affinity is unavailable: {error}",
         }
     else:
-        if not set(declared_cpus).issubset(permitted_cpus):
+        if permitted_cpus is not None and not set(declared_cpus).issubset(permitted_cpus):
             controller_refusal = {
                 "code": "placement-cpu-outside-controller-affinity",
                 "reason": "declared slot CPUs are not all permitted to this controller",
@@ -364,6 +373,20 @@ def _admit_slot(environment: Any, fence: Any) -> None:
     quarantine_dir = slot_quarantine_dir(fence.root, values)
     # The in-process key matches the worker's: owner environment then descriptor.
     ensure_slot_clean(slot_fence_key({**os.environ, **values}), quarantine_dir)
+
+
+def _with_placement_refusal(environment: Any, refusal: PlacementRefusal) -> Any:
+    """Carry a pre-science placement refusal to completion in ``environment``.
+
+    Uses the same envelope as the controller refusal of
+    :func:`_with_child_placement`, so completion publishes the typed refusal
+    receipt instead of reading a sidecar that no child ever wrote.
+    """
+
+    if not isinstance(environment, PreparedPythonEnvironment):
+        return environment
+    values = {**environment.env, PLACEMENT_REFUSAL_ENV: json.dumps(refusal.to_dict(), sort_keys=True)}
+    return PreparedPythonEnvironment(environment.python, environment.setup, values)
 
 
 def _placement_refusal_from_environment(environment: Any) -> PlacementRefusal | None:
