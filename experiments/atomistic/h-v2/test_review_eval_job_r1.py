@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 import yaml
 
 HERE = Path(__file__).resolve().parent
@@ -501,6 +502,17 @@ def test_real_eval_restores_p_and_e_checkpoints(tmp_path, monkeypatch, explicit_
         expected_source_commit=commit, dispatcher="local", timeout=180, cwd=REPO)
     receipt, train_sha = ev.load_train_receipt(train_path)
     checkpoint = ev.resolve_checkpoint(receipt, update=1)
+    if not explicit_eps:
+        resolved_config = yaml.safe_load(
+            Path(receipt["segments"][0]["artifacts"]["resolved_config"]["path"]).read_text()
+        )
+        assert "eps" not in resolved_config["model"]["readout"], (
+            "P historical model mapping must omit model.readout.eps"
+        )
+        model_state = torch.load(checkpoint / "model.pt", map_location="cpu", weights_only=False)
+        assert not any("model.readout.eps" in key for key in model_state), (
+            "P checkpoint model state must not contain model.readout.eps"
+        )
     evaluation = protocol.science_evaluation_config(checkpoint, seed=999004)
     evaluation["runtime"]["device"] = "cpu"
     evaluation["sampler"].update(n_walkers=4, burn_in=1, n_steps=1)
