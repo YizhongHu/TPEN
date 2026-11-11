@@ -1157,7 +1157,10 @@ def run_configured_once(cfg: Any, *, decision: RecoveryDecision, output_path: Pa
     from .recovery import OperationalRestoreRequest
 
     worker_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
-    if decision.load is not None and dict(decision.load).get("mode") == "train_resume":
+    if decision.load is None:
+        OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
+        return run_from_config(worker_cfg, restore_request=None, **kwargs)
+    if dict(decision.load).get("mode") == "train_resume":
         OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
         return run_from_config(worker_cfg, restore_request=OperationalRestoreRequest(decision), **kwargs)
 
