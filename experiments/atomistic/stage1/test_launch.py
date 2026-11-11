@@ -12,6 +12,9 @@ def test_template_is_partition_and_allocation_guarded() -> None:
     assert "SLURM_JOB_PARTITION" in script
     assert "SLURM_JOB_ID" in script
     assert "trap 'rm -rf -- \"$JOB_ROOT\"' EXIT" in script
+    assert 'JOB_ROOT="/scratch/$USER/$SLURM_JOB_ID"' in script
+    assert "HEAD_SHA" in script
+    assert "exec \"$PYTHON\"" not in script
 
 
 def test_relative_interpreter_is_rejected() -> None:

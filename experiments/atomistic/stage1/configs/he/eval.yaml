@@ -1,4 +1,664 @@
-system: {id: he_atom, n_particles: 2, spin: {n_up: 1, n_down: 1}}
-protocol: {walkers: 4096, draws: 256, streams: 4}
-load: {mode: model_only, strict: true}
-source_contract: experiments/atomistic/he-v1/configs/eval.yaml
+# Evaluate a restored helium checkpoint. The model block must stay identical
+# to train.yaml because model-only restore is strict.
+
+experiment:
+  name: tpen_he_v1
+  sector: atomistic
+  run_name: stage1_he_eval
+
+run:
+  root: experiments/atomistic/stage1/outputs/he
+  run_id: null
+  dir: null
+  timezone: America/New_York
+
+runtime:
+  seed: 0
+  device: cuda
+  dtype: float64
+
+system:
+  id: he_atom
+  n_particles: 2
+  spatial_dim: 3
+  spin:
+    n_up: 1
+    n_down: 1
+  nuclei:
+    positions: [[0.0, 0.0, 0.0]]
+    charges: [2.0]
+  # Infinite-nuclear-mass, nonrelativistic helium reference energy.
+  reference_energy: -2.903724377034119598
+
+# Sole typed nuclear-geometry authority (A5): one declarative `atoms` source
+# consumed by the wavefunction's post-readout ElectronNucleusCusp factor and
+# the generic Hamiltonian Coulomb terms below; each `${atoms}` reference
+# materializes its own equal-valued, immutable `AtomicConfiguration` object,
+# reconciled by explicit value comparison rather than object identity (see
+# train.yaml's `atoms:` comment). Must stay identical to train.yaml since
+# model-only restore is strict.
+atoms:
+  _target_: tpen.data.atomic_configuration.AtomicConfiguration
+  positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+
+evaluation:
+  namespace: eval
+  seed: ${runtime.seed}
+  # `production-grid-v0` requires raw [draw, walker] retention. Note that this
+  # level ALONE retains nothing: every raw-record writer returns early unless
+  # `artifact_level == "records"`, but each only runs if it is IN a task's
+  # summaries list, and none was. Setting the level without adding the writer
+  # satisfies the contract's letter and keeps no records at all -- the same
+  # shape as A6-C sitting merged-but-unreferenced. `SampledRecordWriter` is
+  # therefore wired into the energy task below, and the test asserts the FILE
+  # EXISTS after a records-level run rather than that this key is set.
+  artifact_level: records
+  task_failure_policy: continue
+  return_terms: true
+
+# A6-C join identity, supplied per row by `eval.py` and MISSING by default.
+# Every field is `???` on purpose: the trajectory statistics producer refuses to
+# construct without a complete identity ("the join identity admits no blanks"),
+# so a run that forgot to supply one must fail loudly at config resolution
+# rather than emit a sidecar nobody can join. `checkpoint_file` is the model.pt
+# FILE while `load.path` below is the checkpoint DIRECTORY -- they are different
+# paths on purpose, because content hashing reads the file and restore reads the
+# directory. Passing the directory raises IsADirectoryError inside the summary,
+# which is a wiring asymmetry this lane has already paid for once.
+trajectory_identity:
+  stage: ???
+  run_id: ???
+  attempt_id: ???
+  evaluator_id: ???
+  checkpoint_file: ???
+  config_sha256: ???
+
+load:
+  path: ???
+  mode: model_only
+  strict: true
+  allow_protocol_mismatch: false
+  # Source/checkpoint values are injected from manifest.json by eval.py.  The
+  # forms and values below make the executed cusp-distance behavior legible
+  # without changing its existing parameters.
+  replay_semantics:
+    record_schema_version: 1
+    source_git_sha: ???
+    source_tpen_version: ???
+    checkpoint_schema_version: ???
+    checkpoint_kind: ???
+    checkpoint_model_sha256: ???
+    evaluation_config_sha256: ${trajectory_identity.config_sha256}
+    runtime_dtype: ${runtime.dtype}
+    cusp_distance:
+      electron_electron_distance_form: sqrt_squared_distance_plus_eps_squared
+      electron_electron_distance_eps: 1.0e-12
+      electron_electron_range_offset_form: softplus_plus_eps
+      electron_electron_range_offset_eps: 1.0e-12
+      electron_nucleus_coulomb_distance_form: euclidean_norm_clamp_min_eps
+      electron_nucleus_coulomb_distance_eps: ${hamiltonian_terms.electron_nucleus.eps}
+    reference_energy_qualification: infinite_nuclear_mass_nonrelativistic
+
+runner:
+  _target_: tpen.runner.Evaluate
+  model: ${model}
+  load: ${load}
+  evaluator: ${evaluator}
+
+evaluator:
+  _target_: tpen.evaluation.Evaluator
+  namespace: ${evaluation.namespace}
+  seed: ${evaluation.seed}
+  artifact_level: ${evaluation.artifact_level}
+  task_failure_policy: ${evaluation.task_failure_policy}
+  tasks:
+    - ${evaluation_tasks.mcmc_energy}
+    - ${evaluation_tasks.he_radial_profiles}
+    - ${evaluation_tasks.full_model_antisymmetry}
+    - ${evaluation_tasks.spatial_exchange_symmetry}
+    - ${evaluation_tasks.trace_equivariance}
+    # P3 singular/tail atlas block: append-only for cross-chain convergence.
+    - ${evaluation_tasks.he_en_numerical_atlas}
+    - ${evaluation_tasks.he_ee_ideal_vs_executed_numerical_atlas}
+    - ${evaluation_tasks.he_one_electron_tail_atlas}
+    - ${evaluation_tasks.he_center_of_mass_tail_atlas}
+    - ${evaluation_tasks.he_angular_shell_atlas}
+
+model:
+  _target_: tpen.nn.TPENWaveFunction
+  trace_name: tpen
+  embedding:
+    _target_: tpen.nn.Embedding
+    max_order: 2
+    spatial_dim: ${system.spatial_dim}
+    out_channels: 32
+    hidden_channels: 128
+    num_hidden_layers: 1
+    include_spins: true
+  layers:
+    - _target_: tpen.nn.TPENLayer
+      mixing:
+        _target_: tpen.nn.EquivariantMixing
+        max_order: 2
+        max_virtual_order: 2
+        channels: 32
+        implementation: vectorized
+        initial_weight: 0.5
+        activation:
+          _target_: torch.nn.SiLU
+      path_aggregation:
+        _target_: tpen.nn.PathAggregation
+        max_order: 2
+        max_virtual_order: 2
+        channels: 32
+        activation:
+          _target_: torch.nn.SiLU
+      update:
+        _target_: tpen.nn.ResidualUpdater
+  # SEMANTICALLY IDENTICAL WHEN PARSED to train.yaml's factors block.
+  # NOT byte-identical: this file carries shortened comment prose. And a
+  # config test asserts the whole `model:` subtree as a PARSED dict rather than
+  # trusting hand-sync. Parsed equality is the property `strict: true` needs,
+  # because Hydra instantiates the parsed tree and never the file text. Enabling
+  # the trainable en law adds exactly two state-dict keys, so `strict: true`
+  # restore fails in BOTH directions across this change: a train/eval mismatch
+  # here is not a degraded run, it is a run that cannot start. See train.yaml
+  # for the full predeclared-break note and the c != 0 rationale.
+  factors:
+    - _target_: tpen.nn.ElectronElectronCusp
+      trainable_range: true
+    - _target_: tpen.nn.ElectronNucleusCusp
+      atoms: ${atoms}
+      law:
+        _target_: tpen.nn.CurvatureElectronNucleusCuspLaw
+        curvature_coefficient: 0.01
+        curvature_range: 1.0
+        trainable: true
+  readout:
+    _target_: tpen.nn.readout.PfaffianReadout
+    channels: 32
+    # MUST MATCH train.yaml EXACTLY. Enabling `trainable` adds the state-dict key
+    # `readout.channel_weights`, and this config restores with
+    # `mode: model_only, strict: true`, so a one-sided change fails restore in
+    # BOTH directions: a trained checkpoint into a non-trainable eval model, or
+    # the reverse. See train.yaml for why the default was wrong and why 1/32 is
+    # now a chosen initialization rather than an inherited one.
+    trainable: true
+
+hamiltonian_terms:
+  kinetic:
+    _target_: tpen.physics.kinetic.KineticEnergy
+  electron_nucleus:
+    _target_: tpen.physics.potential.ElectronNucleusPotential
+    atoms: ${atoms}
+    # Match train: evaluation must not reintroduce a hidden distance floor.
+    eps: 0.0
+  electron_electron:
+    _target_: tpen.physics.potential.ElectronElectronInteraction
+  nucleus_nucleus:
+    _target_: tpen.physics.potential.NucleusNucleusPotential
+    atoms: ${atoms}
+
+evaluation_sampler:
+  _target_: tpen.sampling.metropolis.MetropolisSampler
+  n_walkers: 4096
+  # BURN-IN 100, demonstrated sufficient ON THE MEAN, which is the only
+  # quantity that can see initialization bias -- tau and split-Rhat cannot.
+  # H-C2 job 39533419: across burn_in 100/200/400/800 every mean local energy
+  # differs from the burn-in-100 value by less than the median MCSE (1.69e-4)
+  # AND less than the within-arm cross-chain spread (2.3e-4 to 4.0e-4).
+  # This does not contradict the analytic hydrogenic probe (job 39213047,
+  # ~400 steps at 0.23 acceptance); it FAILS TO TRANSFER from it. On the
+  # trained He target the same proposal 0.5 gives 0.30-0.31 acceptance across
+  # all 32 chains -- a different target with different mixing.
+  burn_in: 100
+  # STRIDE 20 IS A DECLARED TIE-BREAK, NOT A THROUGHPUT WINNER. H-C2 job
+  # 39533396 measured ESS/second 2340.2 at stride 10 against 2295.8 at stride
+  # 20 -- 1.9% apart, INSIDE the 2.2% spread H-C1 measured between two nodes of
+  # the same stratum. So ESS/second could not distinguish them and decided
+  # nothing. Strides 1 and 5 are decisively excluded (643.0 and 1898.8).
+  # The tie is broken on a stated non-throughput ground: stride 20 gives lower
+  # MCSE (1.508e-4 vs 1.687e-4), lower inflation (1.110 vs 1.243) and tighter
+  # split-Rhat (1.0006 vs 1.0020), i.e. less sensitivity to error in tau, at
+  # the cost of 15% more evaluation wall time -- which falls on the cheap side
+  # of the study and does not touch the training budget at all.
+  n_steps: 20
+  proposal_scale: 0.5
+  seed: ${evaluation.seed}
+  n_electrons: ${system.n_particles}
+  spatial_dim: ${system.spatial_dim}
+  n_up: ${system.spin.n_up}
+  n_down: ${system.spin.n_down}
+  nuclear_positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  nuclear_charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+  dtype: ${runtime.dtype}
+
+evaluation_tasks:
+  mcmc_energy:
+    name: mcmc_energy
+    namespace: ${evaluation.namespace}/mcmc_energy
+    output_dir: ${run.dir}/mcmc_energy
+    # TrajectoryMCMCGenerator, not the one-snapshot MCMCGenerator: only the
+    # trajectory path publishes the explicit [draw, walker] ObservableTrajectory
+    # the A6-C producer needs, and without it a He run emits NO MCSE at all.
+    # 256 draws x 4096 walkers. At the pilot's measured tau this is far past the
+    # ~100 effective samples the QMC audit requires (H-C2 pooled ESS 911,949 at
+    # stride 20), and if the production tau is larger the correlation-aware bar
+    # simply widens -- it does not become wrong.
+    generator:
+      _target_: tpen.evaluation.generators.TrajectoryMCMCGenerator
+      sampler: ${evaluation_sampler}
+      hamiltonian_terms: ${hamiltonian_terms}
+      n_draws: 256
+      seed: ${evaluation.seed}
+      chunk_size: 256
+    # NOT EMPTY. `LocalEnergySummary` consumes what `LocalEnergyCalculator`
+    # produces, and a task wired `calculators: []` fails at the SUMMARY stage --
+    # after every expensive thing has already been paid for. That defect cannot
+    # fail early by construction and cost this lane ~3 GPU-hours.
+    calculators:
+      - _target_: tpen.evaluation.calculators.LocalEnergyCalculator
+        hamiltonian_terms: ${hamiltonian_terms}
+        return_terms: ${evaluation.return_terms}
+        chunk_size: 256
+      # Produces the `wavefunction` bundle field that `SampledRecordWriter`
+      # requires for its logabs/sign columns. MEASURED, not anticipated: without
+      # it the task ran the whole chain, emitted every metric including MCSE and
+      # acceptance, and then FAILED at the record writer -- the identical shape
+      # to the `calculators: []` defect, reintroduced by adding a summary
+      # without its producer.
+      - _target_: tpen.evaluation.calculators.WavefunctionCalculator
+    summaries:
+      - _target_: tpen.evaluation.summaries.LocalEnergySummary
+      - _target_: tpen.evaluation.summaries.ReferenceEnergySummary
+        reference_energy: ${system.reference_energy}
+      # The correlation-aware bar. MCSE inflation at stride 20 is 1.110, so an
+      # IID bar would understate the uncertainty by ~11%; both are emitted side
+      # by side and distinctly labelled, which is what makes the factor visible
+      # rather than inferred. The pre-existing snapshot `local_energy_stderr`
+      # keeps its name and meaning.
+      - _target_: tpen.evaluation.summaries.TrajectoryStatisticsSummary
+        stage: ${trajectory_identity.stage}
+        run_id: ${trajectory_identity.run_id}
+        attempt_id: ${trajectory_identity.attempt_id}
+        evaluator_id: ${trajectory_identity.evaluator_id}
+        checkpoint_path: ${trajectory_identity.checkpoint_file}
+        config_sha256: ${trajectory_identity.config_sha256}
+        observable: local_energy
+        prefix: local_energy
+      # MCMC health beside every evaluation, as production-grid-v0 requires.
+      # The record already rides in generated metadata and this summary is
+      # already exported -- it was simply never named by a config, so an eval
+      # row reported no acceptance rate at all.
+      - _target_: tpen.evaluation.summaries.SamplerStatsSummary
+      # Raw [draw, walker] retention. This is a complete streamed grid, not a
+      # snapshot table: max_samples is an explicit capacity contract for all
+      # 256 x 4096 = 1048576 rows. A smaller bound fails the task loudly rather
+      # than silently replacing the trajectory with a head slice.
+      - _target_: tpen.evaluation.summaries.SampledRecordWriter
+        max_samples: 1048576
+        include_term_energies: true
+  he_radial_profiles:
+    name: he_radial_profiles
+    namespace: ${evaluation.namespace}/he_radial_profiles
+    output_dir: ${run.dir}/he_radial_profiles
+    generator:
+      _target_: tpen.evaluation.generators.HeliumRadialGridGenerator
+      cusp_radii: [0.0001, 0.0002, 0.0005, 0.001]
+      tail_radii: [4.0, 6.0, 8.0]
+      spectator_radius: 1.0
+      n_directions: 3
+      nuclear_positions:
+        _target_: torch.tensor
+        data: ${system.nuclei.positions}
+      nuclear_charges:
+        _target_: torch.tensor
+        data: ${system.nuclei.charges}
+    calculators:
+      - _target_: tpen.evaluation.calculators.ElectronNucleusRadialCalculator
+        chunk_size: 32
+    summaries:
+      - _target_: tpen.evaluation.summaries.ElectronNucleusCuspSummary
+        max_fit_points: 4
+      - _target_: tpen.evaluation.summaries.ElectronNucleusTailSummary
+      - _target_: tpen.evaluation.summaries.ElectronNucleusRadialProfileWriter
+  full_model_antisymmetry:
+    name: full_model_antisymmetry
+    namespace: ${evaluation.namespace}/full_model_antisymmetry
+    output_dir: ${run.dir}/full_model_antisymmetry
+    generator:
+      _target_: tpen.evaluation.generators.PermutationOrbitGenerator
+      n_permutations: 1
+      seed: ${evaluation.seed}
+      base_generator:
+        _target_: tpen.evaluation.generators.MCMCGenerator
+        sampler: ${evaluation_sampler}
+        seed: ${evaluation.seed}
+        # Raised off the smoke value of 8. At 8 samples a reported fraction
+        # moves in steps of 0.125, so the singlet-purity number this lane gates
+        # on could not resolve its own bound. 4096 gives a resolution of
+        # 2.4e-4, finer than the tolerance being applied to it.
+        max_samples: 4096
+    calculators:
+      - _target_: tpen.evaluation.calculators.FullModelAntisymmetryCalculator
+    summaries:
+      - _target_: tpen.evaluation.summaries.TransformConsistencySummary
+  spatial_exchange_symmetry:
+    name: spatial_exchange_symmetry
+    namespace: ${evaluation.namespace}/spatial_exchange_symmetry
+    output_dir: ${run.dir}/spatial_exchange_symmetry
+    generator:
+      _target_: tpen.evaluation.generators.ExchangeOrbitGenerator
+      exchange: opposite_spin_pair
+      base_generator:
+        _target_: tpen.evaluation.generators.MCMCGenerator
+        sampler: ${evaluation_sampler}
+        seed: ${evaluation.seed}
+        # Raised off the smoke value of 8. At 8 samples a reported fraction
+        # moves in steps of 0.125, so the singlet-purity number this lane gates
+        # on could not resolve its own bound. 4096 gives a resolution of
+        # 2.4e-4, finer than the tolerance being applied to it.
+        max_samples: 4096
+    calculators:
+      - _target_: tpen.evaluation.calculators.SpatialExchangeSymmetryCalculator
+    summaries:
+      - _target_: tpen.evaluation.summaries.TransformConsistencySummary
+  trace_equivariance:
+    name: trace_equivariance
+    namespace: ${evaluation.namespace}/trace_equivariance
+    output_dir: ${run.dir}/trace_equivariance
+    generator:
+      _target_: tpen.evaluation.generators.PermutationOrbitGenerator
+      n_permutations: 1
+      seed: ${evaluation.seed}
+      base_generator:
+        _target_: tpen.evaluation.generators.MCMCGenerator
+        sampler: ${evaluation_sampler}
+        seed: ${evaluation.seed}
+        max_samples: 4
+    calculators:
+      - _target_: tpen.evaluation.calculators.TraceEquivarianceCalculator
+    summaries:
+      - _target_: tpen.evaluation.summaries.TraceEquivarianceSummary
+
+  factor_response:
+    name: factor_response
+    namespace: ${evaluation.namespace}/factor_response
+    output_dir: ${run.dir}/factor_response
+    generator:
+      _target_: tpen.evaluation.generators.MCMCGenerator
+      sampler: ${evaluation_sampler}
+      seed: ${evaluation.seed}
+      max_samples: 4096
+    calculators:
+      - _target_: tpen.evaluation.calculators.FactorResponseCalculator
+        hamiltonian_terms: ${hamiltonian_terms}
+        chunk_size: 256
+        arms:
+          - {label: baseline}
+          - {label: b_ee_minus_10, b_ee: 0.9}
+          - {label: b_ee_plus_10, b_ee: 1.1}
+          - {label: c_en_minus_10, c_electron_nucleus: 0.9}
+          - {label: c_en_plus_10, c_electron_nucleus: 1.1}
+          - {label: d_en_minus_10, d_electron_nucleus: 0.9}
+          - {label: d_en_plus_10, d_electron_nucleus: 1.1}
+    summaries:
+      - _target_: tpen.evaluation.summaries.FactorResponseSummary
+        filename: factor_response.csv
+        max_records: 28672
+  factor_response_re_equilibrated:
+    name: factor_response_re_equilibrated
+    namespace: ${evaluation.namespace}/factor_response_re_equilibrated
+    output_dir: ${run.dir}/factor_response_re_equilibrated
+    generator:
+      _target_: tpen.evaluation.generators.ReequilibratedFactorGenerator
+      generator:
+        _target_: tpen.evaluation.generators.TrajectoryMCMCGenerator
+        sampler: ${evaluation_sampler}
+        hamiltonian_terms: ${hamiltonian_terms}
+        n_draws: 1
+        discard_draws: 0
+        chunk_size: 256
+        reset: true
+        seed: ${evaluation.seed}
+      arm: {label: baseline}
+    calculators:
+      - _target_: tpen.evaluation.calculators.FactorArmCalculator
+        calculator:
+          _target_: tpen.evaluation.calculators.LocalEnergyCalculator
+          hamiltonian_terms: ${hamiltonian_terms}
+          return_terms: ${evaluation.return_terms}
+          chunk_size: 256
+        arm: {label: baseline}
+      - _target_: tpen.evaluation.calculators.WavefunctionCalculator
+    summaries:
+      - _target_: tpen.evaluation.summaries.LocalEnergySummary
+      - _target_: tpen.evaluation.summaries.SampledRecordWriter
+        include_term_energies: true
+
+  # P3 singular/tail atlas block: kept contiguous and appended so the records
+  # and physics stacks can converge without interleaving shared-list edits.
+  # Refinement schedules are generated on pinned CPU float64, then transferred
+  # to this evaluation runtime with both provenances recorded in every row.
+  he_en_numerical_atlas:
+    name: he_en_numerical_atlas
+    namespace: ${evaluation.namespace}/he_en_numerical_atlas
+    output_dir: ${run.dir}/he_en_numerical_atlas
+    generator:
+      _target_: tpen.evaluation.generators.HeliumElectronNucleusApproachGenerator
+      atoms: ${atoms}
+      directions:
+        - [1.0, 0.0, 0.0]
+        - [-1.0, 0.0, 0.0]
+        - [0.0, 1.0, 0.0]
+        - [0.0, -1.0, 0.0]
+        - [0.0, 0.0, 1.0]
+        - [0.0, 0.0, -1.0]
+      spectator_position: [0.0, 0.0, -1.0]
+      start_radius: 1.0e-2
+      refinement_ratio: 1.0e-8
+      probe_electrons: [0, 1]
+      max_refinement_steps: 128
+    calculators:
+      - _target_: tpen.evaluation.calculators.HeliumAtlasCalculator
+        hamiltonian_terms: ${hamiltonian_terms}
+        factor_indices:
+          executed_smoothed_ee_factor: 0
+          executed_electron_nucleus_factor: 1
+        chunk_size: 8
+    summaries:
+      - _target_: tpen.evaluation.summaries.HeliumCurvatureSummary
+        series_name: executed_electron_nucleus_factor
+        metric_prefix: executed_electron_nucleus_factor_curvature
+        windows:
+          near_zero: 1.0e-10
+          near_nucleus: 1.0e-6
+          cusp_region: 1.0e-2
+      - _target_: tpen.evaluation.summaries.HeliumCurvatureSummary
+        series_name: executed_full_logabs
+        metric_prefix: executed_full_logabs_en_curvature
+        windows:
+          near_zero: 1.0e-10
+          near_nucleus: 1.0e-6
+          cusp_region: 1.0e-2
+      - _target_: tpen.evaluation.summaries.HeliumNumericalLimitSummary
+      - _target_: tpen.evaluation.summaries.HeliumAtlasWriter
+        filename: helium_en_numerical_atlas.csv
+
+  he_ee_ideal_vs_executed_numerical_atlas:
+    name: he_ee_ideal_vs_executed_numerical_atlas
+    namespace: ${evaluation.namespace}/he_ee_ideal_vs_executed_numerical_atlas
+    output_dir: ${run.dir}/he_ee_ideal_vs_executed_numerical_atlas
+    generator:
+      _target_: tpen.evaluation.generators.HeliumElectronElectronApproachGenerator
+      atoms: ${atoms}
+      directions:
+        - [1.0, 0.0, 0.0]
+        - [-1.0, 0.0, 0.0]
+        - [0.0, 1.0, 0.0]
+        - [0.0, -1.0, 0.0]
+        - [0.0, 0.0, 1.0]
+        - [0.0, 0.0, -1.0]
+      center_of_mass: [0.0, 0.0, 0.0]
+      start_radius: 1.0e-2
+      refinement_ratio: 1.0e-8
+      max_refinement_steps: 128
+    calculators:
+      - _target_: tpen.evaluation.calculators.HeliumAtlasCalculator
+        hamiltonian_terms: ${hamiltonian_terms}
+        factor_indices:
+          executed_smoothed_ee_factor: 0
+          executed_electron_nucleus_factor: 1
+        chunk_size: 8
+    summaries:
+      - _target_: tpen.evaluation.summaries.HeliumCurvatureSummary
+        series_name: executed_smoothed_ee_factor
+        metric_prefix: executed_smoothed_ee_factor_curvature
+        windows:
+          below_executed_smoothing_scale: 1.0e-14
+          executed_smoothing_transition: 1.0e-10
+          coalescence_region: 1.0e-2
+      - _target_: tpen.evaluation.summaries.HeliumCurvatureSummary
+        series_name: executed_full_logabs
+        metric_prefix: executed_full_logabs_ee_curvature
+        windows:
+          below_executed_smoothing_scale: 1.0e-14
+          executed_smoothing_transition: 1.0e-10
+          coalescence_region: 1.0e-2
+      - _target_: tpen.evaluation.summaries.HeliumNumericalLimitSummary
+      - _target_: tpen.evaluation.summaries.HeliumAtlasWriter
+        filename: helium_ideal_unfloored_vs_executed_smoothed_ee_atlas.csv
+
+  he_one_electron_tail_atlas:
+    name: he_one_electron_tail_atlas
+    namespace: ${evaluation.namespace}/he_one_electron_tail_atlas
+    output_dir: ${run.dir}/he_one_electron_tail_atlas
+    generator:
+      _target_: tpen.evaluation.generators.HeliumOneElectronEscapeGenerator
+      atoms: ${atoms}
+      directions:
+        - [1.0, 0.0, 0.0]
+        - [-1.0, 0.0, 0.0]
+        - [0.0, 1.0, 0.0]
+        - [0.0, -1.0, 0.0]
+        - [0.0, 0.0, 1.0]
+        - [0.0, 0.0, -1.0]
+      radii: [2.0, 4.0, 6.0, 8.0, 10.0]
+      spectator_position: [0.0, 0.0, -1.0]
+      probe_electron: 0
+    calculators:
+      - _target_: tpen.evaluation.calculators.HeliumAtlasCalculator
+        hamiltonian_terms: ${hamiltonian_terms}
+        factor_indices:
+          executed_smoothed_ee_factor: 0
+          executed_electron_nucleus_factor: 1
+        chunk_size: 8
+    summaries:
+      - _target_: tpen.evaluation.summaries.HeliumTailSummary
+        series_name: executed_full_logabs
+        metric_prefix: executed_full_logabs_one_electron_tail
+      - _target_: tpen.evaluation.summaries.HeliumAtlasWriter
+        filename: helium_one_electron_tail_atlas.csv
+
+  he_center_of_mass_tail_atlas:
+    name: he_center_of_mass_tail_atlas
+    namespace: ${evaluation.namespace}/he_center_of_mass_tail_atlas
+    output_dir: ${run.dir}/he_center_of_mass_tail_atlas
+    generator:
+      _target_: tpen.evaluation.generators.HeliumCenterOfMassEscapeGenerator
+      atoms: ${atoms}
+      directions:
+        - [1.0, 0.0, 0.0]
+        - [-1.0, 0.0, 0.0]
+        - [0.0, 1.0, 0.0]
+        - [0.0, -1.0, 0.0]
+        - [0.0, 0.0, 1.0]
+        - [0.0, 0.0, -1.0]
+      radii: [2.0, 4.0, 6.0, 8.0, 10.0]
+      relative_positions:
+        - [0.0, 0.0, 0.5]
+        - [0.0, 0.0, -0.5]
+    calculators:
+      - _target_: tpen.evaluation.calculators.HeliumAtlasCalculator
+        hamiltonian_terms: ${hamiltonian_terms}
+        factor_indices:
+          executed_smoothed_ee_factor: 0
+          executed_electron_nucleus_factor: 1
+        chunk_size: 8
+    summaries:
+      - _target_: tpen.evaluation.summaries.HeliumTailSummary
+        series_name: executed_full_logabs
+        metric_prefix: executed_full_logabs_center_of_mass_tail
+      - _target_: tpen.evaluation.summaries.HeliumAtlasWriter
+        filename: helium_center_of_mass_tail_atlas.csv
+
+  he_angular_shell_atlas:
+    name: he_angular_shell_atlas
+    namespace: ${evaluation.namespace}/he_angular_shell_atlas
+    output_dir: ${run.dir}/he_angular_shell_atlas
+    generator:
+      _target_: tpen.evaluation.generators.HeliumAngularShellGenerator
+      atoms: ${atoms}
+      directions:
+        - [1.0, 0.0, 0.0]
+        - [-1.0, 0.0, 0.0]
+        - [0.0, 1.0, 0.0]
+        - [0.0, -1.0, 0.0]
+        - [0.0, 0.0, 1.0]
+        - [0.0, 0.0, -1.0]
+      radii: [4.0, 8.0, 12.0]
+      spectator_position: [0.0, 0.0, -1.0]
+      probe_electron: 0
+    calculators:
+      - _target_: tpen.evaluation.calculators.HeliumAtlasCalculator
+        hamiltonian_terms: ${hamiltonian_terms}
+        factor_indices:
+          executed_smoothed_ee_factor: 0
+          executed_electron_nucleus_factor: 1
+        chunk_size: 8
+    summaries:
+      - _target_: tpen.evaluation.summaries.HeliumTailSummary
+        series_name: executed_full_logabs
+        metric_prefix: executed_full_logabs_angular_shell_tail
+      - _target_: tpen.evaluation.summaries.HeliumAtlasWriter
+        filename: helium_angular_shell_atlas.csv
+
+
+callbacks:
+  - _target_: tpen.callback.ConfigSnapshot
+    output_path: ${run.dir}/config.yaml
+  - _target_: tpen.callback.ResolvedConfigSnapshot
+    output_path: ${run.dir}/resolved_config.yaml
+  - _target_: tpen.callback.Metadata
+    output_path: ${run.dir}/metadata.json
+  - _target_: tpen.callback.Status
+    output_path: ${run.dir}/status.json
+  # Evaluation cost diagnostics consume the canonical typed Event Clock
+  # boundaries. Device synchronization stays disabled: the current callback
+  # dispatch order cannot make that flag bracket device work truthfully, while
+  # CPU runs need honest host-wall timing rather than a synchronization claim.
+  - _target_: tpen.callback.EvaluationTiming
+    accelerator_synchronize: false
+  - _target_: tpen.callback.EvaluationComponentTiming
+    accelerator_synchronize: false
+  - _target_: tpen.callback.DiagnosticTiming
+    accelerator_synchronize: false
+  - _target_: tpen.callback.ResourceUsage
+    allocator_probe:
+      _target_: tpen.accelerator.TorchAllocatorPeakProbe
+      device: ${runtime.device}
+
+loggers:
+  - _target_: tpen.logging.CSV
+    path: ${run.dir}/metrics.csv
+  - _target_: tpen.logging.JSONL
+    path: ${run.dir}/metrics.jsonl

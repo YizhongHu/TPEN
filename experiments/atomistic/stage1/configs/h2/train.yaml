@@ -1,3 +1,220 @@
-system: {id: h2_molecule, n_particles: 2, spin: {n_up: 1, n_down: 1}, bond_length_bohr: 1.4}
-protocol: {updates: 50000, walkers: 4096, lineages: 3}
-source_contract: experiments/atomistic/h2-v1/configs/train.yaml
+# Minimal all-electron hydrogen-molecule smoke configuration.
+#
+# This is deliberately a development configuration.  Production atom runs are
+# submitted only after its PR stack has reached `main`.
+
+experiment:
+  name: tpen_h2_v1
+  sector: atomistic
+  run_name: stage1_h2_train
+
+run:
+  root: experiments/atomistic/stage1/outputs/h2
+  run_id: null
+  dir: null
+  timezone: America/New_York
+
+runtime:
+  seed: 0
+  device: cuda
+  dtype: float64
+
+system:
+  id: h2_molecule
+  n_particles: 2
+  spatial_dim: 3
+  spin:
+    n_up: 1
+    n_down: 1
+  nuclei:
+    positions: [[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0]]
+    charges: [1.0, 1.0]
+
+# Sole typed nuclear-geometry authority (A5): one declarative `atoms` source
+# consumed by the wavefunction's post-readout ElectronNucleusCusp factor AND
+# the generic Hamiltonian Coulomb terms below (`electron_nucleus`,
+# `nucleus_nucleus`). Every `${atoms}` reference here materializes its own
+# equal-valued, immutable `AtomicConfiguration` object -- Hydra's recursive
+# `instantiate` re-runs a `_target_` for each tree position it appears at, so
+# referencing one config node does not make separate `instantiate()` sites
+# share one Python object (checked empirically against this repo's pinned
+# hydra-core/omegaconf; see tests/unit/experiments/test_h2_v1_config.py). The
+# sampler similarly constructs its own equal-valued `AtomicConfiguration` from
+# `nuclear_positions`/`nuclear_charges` for batch transport (A2). All of these
+# are reconciled by explicit value comparison, not object identity, at every
+# Hamiltonian term via `_validate_batch_atoms_context`. This is the same
+# generic `AtomicConfiguration`/`ElectronNucleusCusp`/potential wiring as
+# `experiments/atomistic/he-v1`, differing only in the `system.nuclei` and
+# `system.spin` data below (two unit-charge nuclei instead of one Z=2
+# nucleus) -- no molecule-specific classes exist.
+atoms:
+  _target_: tpen.data.atomic_configuration.AtomicConfiguration
+  positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+
+runner:
+  _target_: tpen.runner.Train
+  model: ${model}
+  sampler: ${sampler}
+  hamiltonian_terms: ${hamiltonian_terms}
+  optimizer: ${optimizer}
+  trainer: ${trainer}
+
+model:
+  _target_: tpen.nn.TPENWaveFunction
+  trace_name: tpen
+  embedding:
+    _target_: tpen.nn.Embedding
+    max_order: 2
+    spatial_dim: ${system.spatial_dim}
+    out_channels: 4
+    hidden_channels: 16
+    num_hidden_layers: 1
+    include_spins: true
+  layers:
+    - _target_: tpen.nn.TPENLayer
+      mixing:
+        _target_: tpen.nn.EquivariantMixing
+        max_order: 2
+        max_virtual_order: 2
+        channels: 4
+        implementation: vectorized
+        initial_weight: 0.5
+        activation:
+          _target_: torch.nn.SiLU
+      path_aggregation:
+        _target_: tpen.nn.PathAggregation
+        max_order: 2
+        max_virtual_order: 2
+        channels: 4
+        activation:
+          _target_: torch.nn.SiLU
+      update:
+        _target_: tpen.nn.ResidualUpdater
+  # One composable generic post-readout factor pipeline (A5): electron-electron
+  # cusp and the electron-nucleus cusp (linear He-compatibility law, which
+  # sums over both H nuclei here) add directly, with no envelope/nuclear_envelope
+  # split and no molecule-specific factor class.
+  factors:
+    - _target_: tpen.nn.ElectronElectronCusp
+    - _target_: tpen.nn.ElectronNucleusCusp
+      atoms: ${atoms}
+  readout:
+    _target_: tpen.nn.readout.PfaffianReadout
+    channels: 4
+
+hamiltonian_terms:
+  kinetic:
+    _target_: tpen.physics.kinetic.KineticEnergy
+  # Generic, constructor-owned AtomicConfiguration Coulomb terms (A3),
+  # declared from the same `${atoms}` source as the wavefunction's
+  # ElectronNucleusCusp above -- one declarative nuclear-geometry authority
+  # for the whole H2 run, materialized as equal-valued (not identical)
+  # objects per consumer; see the `atoms:` comment near the top of this file.
+  electron_nucleus:
+    _target_: tpen.physics.potential.ElectronNucleusPotential
+    atoms: ${atoms}
+    # Raw-oracle contract: measure the true Coulomb cancellation near each
+    # nucleus. A floor would mask near-nucleus numerical behavior under test.
+    eps: 0.0
+  electron_electron:
+    _target_: tpen.physics.potential.ElectronElectronInteraction
+  nucleus_nucleus:
+    _target_: tpen.physics.potential.NucleusNucleusPotential
+    atoms: ${atoms}
+
+sampler:
+  _target_: tpen.sampling.metropolis.MetropolisSampler
+  n_walkers: 128
+  burn_in: 100
+  n_steps: 10
+  proposal_scale: 0.5
+  seed: ${runtime.seed}
+  n_electrons: ${system.n_particles}
+  spatial_dim: ${system.spatial_dim}
+  n_up: ${system.spin.n_up}
+  n_down: ${system.spin.n_down}
+  # MetropolisSampler's public constructor is tensor-typed.  Make the
+  # config boundary explicit rather than relying on an implementation detail
+  # of its internal nuclear-context normalizer.
+  nuclear_positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  nuclear_charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+  dtype: ${runtime.dtype}
+
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.005
+
+trainer:
+  _target_: tpen.training.trainer.VMCTrainer
+  max_steps: 50000
+  log_every_n_steps: 1
+  return_terms: true
+
+callbacks:
+  - _target_: tpen.callback.ConfigSnapshot
+    output_path: ${run.dir}/config.yaml
+  - _target_: tpen.callback.ResolvedConfigSnapshot
+    output_path: ${run.dir}/resolved_config.yaml
+  - _target_: tpen.callback.Metadata
+    output_path: ${run.dir}/metadata.json
+  - _target_: tpen.callback.Status
+    output_path: ${run.dir}/status.json
+  - _target_: tpen.callback.DataIntegrity
+    every_n_steps: 1
+    fail_fast: true
+    max_nonfinite_energy_fraction: 0.0
+    max_nonfinite_logabs_fraction: 0.0
+    check_loss: true
+    check_wavefunction_output: true
+    check_batch: true
+    strict_sign_values: true
+  - _target_: tpen.callback.GradientStats
+    every_n_steps: 5
+    fail_fast: true
+    check_finite: true
+  - _target_: tpen.callback.SamplerHealth
+    every_n_steps: 5
+    fail_fast: false
+  - _target_: tpen.callback.RuntimeEquivariance
+    every_n_steps: 5
+    probability: 1.0
+    fail_fast: true
+    artifact_dir: ${run.dir}/checks/equivariance
+    checkers:
+      - _target_: tpen.equivariance.checks.FullModelEquivarianceChecker
+        permutation_fraction: 1.0
+        max_permutations: 1
+        seed: ${runtime.seed}
+        atol: 1.0e-06
+        rtol: 1.0e-06
+      - _target_: tpen.equivariance.checks.TraceEquivarianceChecker
+        permutation_fraction: 1.0
+        max_permutations: 1
+        seed: ${runtime.seed}
+        compare_output: false
+        atol: 1.0e-06
+        rtol: 1.0e-06
+  - _target_: tpen.callback.Checkpoint
+    terminal: false
+    schedule:
+      _target_: tpen.checkpoint.EveryNUpdates
+      every_n: 5
+    payload:
+      _target_: tpen.checkpoint.TrainResume
+    output_dir: ${run.dir}/checkpoints
+
+loggers:
+  - _target_: tpen.logging.CSV
+    path: ${run.dir}/metrics.csv
+  - _target_: tpen.logging.JSONL
+    path: ${run.dir}/metrics.jsonl

@@ -65,11 +65,18 @@ def build_manifest(protocol: Protocol, *, checkpoints: list[int], seeds: list[in
     rows: list[dict[str, Any]] = []
     for system in SYSTEMS:
         rows.append({"row_id": stable_row_id(system=system, kind="smoke"), "system": system,
-                     "kind": "smoke", "updates": protocol.smoke_updates, "walkers": protocol.smoke_walkers})
+                     "kind": "smoke", "config": f"configs/{system}/smoke.yaml",
+                     "updates": protocol.smoke_updates, "walkers": protocol.smoke_walkers,
+                     "overrides": {"trainer.max_steps": protocol.smoke_updates,
+                                   "sampler.n_walkers": protocol.smoke_walkers}})
         for lineage, seed in enumerate(seeds):
             train_id = stable_row_id(system=system, kind="train", lineage=lineage)
             rows.append({"row_id": train_id, "system": system, "kind": "train", "lineage": lineage,
-                         "seed": seed, "updates": protocol.lineage_updates, "walkers": protocol.lineage_walkers})
+                         "config": f"configs/{system}/train.yaml", "seed": seed,
+                         "updates": protocol.lineage_updates, "walkers": protocol.lineage_walkers,
+                         "overrides": {"trainer.max_steps": protocol.lineage_updates,
+                                       "sampler.n_walkers": protocol.lineage_walkers,
+                                       "runtime.seed": seed}})
             for checkpoint in checkpoints:
                 for stream in range(protocol.eval_streams):
                     rows.append({"row_id": stable_row_id(system=system, kind="eval", lineage=lineage,
@@ -77,6 +84,10 @@ def build_manifest(protocol: Protocol, *, checkpoints: list[int], seeds: list[in
                                  "system": system, "kind": "eval", "lineage": lineage,
                                  "checkpoint": checkpoint, "stream": stream,
                                  "walkers": protocol.eval_walkers, "draws": protocol.eval_draws,
+                                 "config": f"configs/{system}/eval.yaml",
+                                 "overrides": {"evaluation_sampler.n_walkers": protocol.eval_walkers,
+                                               "evaluation_tasks.mcmc_energy.generator.max_samples": protocol.eval_draws,
+                                               "evaluation.seed": seed + stream},
                                  "depends_on": train_id})
     return rows
 

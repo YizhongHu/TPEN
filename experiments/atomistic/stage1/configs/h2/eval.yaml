@@ -1,4 +1,245 @@
-system: {id: h2_molecule, n_particles: 2, spin: {n_up: 1, n_down: 1}, bond_length_bohr: 1.4}
-protocol: {walkers: 4096, draws: 256, streams: 4}
-load: {mode: model_only, strict: true}
-source_contract: experiments/atomistic/h2-v1/configs/eval.yaml
+# Evaluate a restored hydrogen-molecule checkpoint. The model block must stay
+# identical to train.yaml because model-only restore is strict.
+
+experiment:
+  name: tpen_h2_v1
+  sector: atomistic
+  run_name: stage1_h2_eval
+
+run:
+  root: experiments/atomistic/stage1/outputs/h2
+  run_id: null
+  dir: null
+  timezone: America/New_York
+
+runtime:
+  seed: 0
+  device: cuda
+  dtype: float64
+
+system:
+  id: h2_molecule
+  n_particles: 2
+  spatial_dim: 3
+  spin:
+    n_up: 1
+    n_down: 1
+  nuclei:
+    positions: [[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0]]
+    charges: [1.0, 1.0]
+  reference_energy: -1.17447
+
+# Sole typed nuclear-geometry authority (A5): one declarative `atoms` source
+# consumed by the wavefunction's post-readout ElectronNucleusCusp factor and
+# the generic Hamiltonian Coulomb terms below; each `${atoms}` reference
+# materializes its own equal-valued, immutable `AtomicConfiguration` object,
+# reconciled by explicit value comparison rather than object identity (see
+# train.yaml's `atoms:` comment). Must stay identical to train.yaml since
+# model-only restore is strict.
+atoms:
+  _target_: tpen.data.atomic_configuration.AtomicConfiguration
+  positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+
+evaluation:
+  namespace: eval
+  seed: ${runtime.seed}
+  artifact_level: records
+  task_failure_policy: continue
+  return_terms: true
+
+load:
+  path: ???
+  mode: model_only
+  strict: true
+  allow_protocol_mismatch: false
+
+runner:
+  _target_: tpen.runner.Evaluate
+  model: ${model}
+  load: ${load}
+  evaluator: ${evaluator}
+
+# H2 has no He-owned single-nucleus radial diagnostic task
+# (`HeliumRadialGridGenerator` requires exactly one Z=2 nucleus and is not a
+# generic multi-center capability), so this study wires only the four
+# generic, system-agnostic evaluation tasks that also run for He.
+evaluator:
+  _target_: tpen.evaluation.Evaluator
+  namespace: ${evaluation.namespace}
+  seed: ${evaluation.seed}
+  artifact_level: ${evaluation.artifact_level}
+  task_failure_policy: ${evaluation.task_failure_policy}
+  tasks:
+    - ${evaluation_tasks.mcmc_energy}
+    - ${evaluation_tasks.full_model_antisymmetry}
+    - ${evaluation_tasks.spatial_exchange_symmetry}
+    - ${evaluation_tasks.trace_equivariance}
+
+model:
+  _target_: tpen.nn.TPENWaveFunction
+  trace_name: tpen
+  embedding:
+    _target_: tpen.nn.Embedding
+    max_order: 2
+    spatial_dim: ${system.spatial_dim}
+    out_channels: 4
+    hidden_channels: 16
+    num_hidden_layers: 1
+    include_spins: true
+  layers:
+    - _target_: tpen.nn.TPENLayer
+      mixing:
+        _target_: tpen.nn.EquivariantMixing
+        max_order: 2
+        max_virtual_order: 2
+        channels: 4
+        implementation: vectorized
+        initial_weight: 0.5
+        activation:
+          _target_: torch.nn.SiLU
+      path_aggregation:
+        _target_: tpen.nn.PathAggregation
+        max_order: 2
+        max_virtual_order: 2
+        channels: 4
+        activation:
+          _target_: torch.nn.SiLU
+      update:
+        _target_: tpen.nn.ResidualUpdater
+  factors:
+    - _target_: tpen.nn.ElectronElectronCusp
+    - _target_: tpen.nn.ElectronNucleusCusp
+      atoms: ${atoms}
+  readout:
+    _target_: tpen.nn.readout.PfaffianReadout
+    channels: 4
+
+hamiltonian_terms:
+  kinetic:
+    _target_: tpen.physics.kinetic.KineticEnergy
+  electron_nucleus:
+    _target_: tpen.physics.potential.ElectronNucleusPotential
+    atoms: ${atoms}
+    # Match train: evaluation must not reintroduce a hidden distance floor.
+    eps: 0.0
+  electron_electron:
+    _target_: tpen.physics.potential.ElectronElectronInteraction
+  nucleus_nucleus:
+    _target_: tpen.physics.potential.NucleusNucleusPotential
+    atoms: ${atoms}
+
+evaluation_sampler:
+  _target_: tpen.sampling.metropolis.MetropolisSampler
+  n_walkers: 4096
+  burn_in: 100
+  n_steps: 10
+  proposal_scale: 0.5
+  seed: ${evaluation.seed}
+  n_electrons: ${system.n_particles}
+  spatial_dim: ${system.spatial_dim}
+  n_up: ${system.spin.n_up}
+  n_down: ${system.spin.n_down}
+  nuclear_positions:
+    _target_: torch.tensor
+    data: ${system.nuclei.positions}
+  nuclear_charges:
+    _target_: torch.tensor
+    data: ${system.nuclei.charges}
+  dtype: ${runtime.dtype}
+
+evaluation_tasks:
+  mcmc_energy:
+    name: mcmc_energy
+    namespace: ${evaluation.namespace}/mcmc_energy
+    output_dir: ${run.dir}/mcmc_energy
+    generator:
+      _target_: tpen.evaluation.generators.TrajectoryMCMCGenerator
+      sampler: ${evaluation_sampler}
+      hamiltonian_terms: ${hamiltonian_terms}
+      n_draws: 256
+      seed: ${evaluation.seed}
+      chunk_size: 256
+    calculators:
+      - _target_: tpen.evaluation.calculators.LocalEnergyCalculator
+        hamiltonian_terms: ${hamiltonian_terms}
+        return_terms: ${evaluation.return_terms}
+        chunk_size: 256
+      - _target_: tpen.evaluation.calculators.WavefunctionCalculator
+    summaries:
+      - _target_: tpen.evaluation.summaries.LocalEnergySummary
+      - _target_: tpen.evaluation.summaries.ReferenceEnergySummary
+        reference_energy: ${system.reference_energy}
+      - _target_: tpen.evaluation.summaries.SampledRecordWriter
+        max_samples: 1048576
+        include_term_energies: true
+  full_model_antisymmetry:
+    name: full_model_antisymmetry
+    namespace: ${evaluation.namespace}/full_model_antisymmetry
+    output_dir: ${run.dir}/full_model_antisymmetry
+    generator:
+      _target_: tpen.evaluation.generators.PermutationOrbitGenerator
+      n_permutations: 1
+      seed: ${evaluation.seed}
+      base_generator:
+        _target_: tpen.evaluation.generators.MCMCGenerator
+        sampler: ${evaluation_sampler}
+        seed: ${evaluation.seed}
+        max_samples: 8
+    calculators:
+      - _target_: tpen.evaluation.calculators.FullModelAntisymmetryCalculator
+    summaries:
+      - _target_: tpen.evaluation.summaries.TransformConsistencySummary
+  spatial_exchange_symmetry:
+    name: spatial_exchange_symmetry
+    namespace: ${evaluation.namespace}/spatial_exchange_symmetry
+    output_dir: ${run.dir}/spatial_exchange_symmetry
+    generator:
+      _target_: tpen.evaluation.generators.ExchangeOrbitGenerator
+      exchange: opposite_spin_pair
+      base_generator:
+        _target_: tpen.evaluation.generators.MCMCGenerator
+        sampler: ${evaluation_sampler}
+        seed: ${evaluation.seed}
+        max_samples: 8
+    calculators:
+      - _target_: tpen.evaluation.calculators.SpatialExchangeSymmetryCalculator
+    summaries:
+      - _target_: tpen.evaluation.summaries.TransformConsistencySummary
+  trace_equivariance:
+    name: trace_equivariance
+    namespace: ${evaluation.namespace}/trace_equivariance
+    output_dir: ${run.dir}/trace_equivariance
+    generator:
+      _target_: tpen.evaluation.generators.PermutationOrbitGenerator
+      n_permutations: 1
+      seed: ${evaluation.seed}
+      base_generator:
+        _target_: tpen.evaluation.generators.MCMCGenerator
+        sampler: ${evaluation_sampler}
+        seed: ${evaluation.seed}
+        max_samples: 4
+    calculators:
+      - _target_: tpen.evaluation.calculators.TraceEquivarianceCalculator
+    summaries:
+      - _target_: tpen.evaluation.summaries.TraceEquivarianceSummary
+
+callbacks:
+  - _target_: tpen.callback.ConfigSnapshot
+    output_path: ${run.dir}/config.yaml
+  - _target_: tpen.callback.ResolvedConfigSnapshot
+    output_path: ${run.dir}/resolved_config.yaml
+  - _target_: tpen.callback.Metadata
+    output_path: ${run.dir}/metadata.json
+  - _target_: tpen.callback.Status
+    output_path: ${run.dir}/status.json
+
+loggers:
+  - _target_: tpen.logging.CSV
+    path: ${run.dir}/metrics.csv
+  - _target_: tpen.logging.JSONL
+    path: ${run.dir}/metrics.jsonl
