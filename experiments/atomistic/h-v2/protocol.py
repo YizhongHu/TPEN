@@ -590,10 +590,10 @@ def _assert_a1_callbacks(config: Mapping[str, Any], *, allow_incomplete: bool = 
     # all refused, must be rejected rather than mistaken for a bare config.
     if not configured_a1:
         return
-    if config.get("trainer", {}).get("log_every_n_steps") != PILOT_A1_CADENCE:
-        raise ValueError("H-v2 trainer scalar logging must be every update")
     if allow_incomplete:
         return
+    if config.get("trainer", {}).get("log_every_n_steps") != PILOT_A1_CADENCE:
+        raise ValueError("H-v2 trainer scalar logging must be every update")
     missing = set(A1_TRAINING_MODULE_CANDIDATES) - set(present)
     if missing:
         raise ValueError(f"H-v2 A1 callback set is missing {sorted(missing)!r}")
