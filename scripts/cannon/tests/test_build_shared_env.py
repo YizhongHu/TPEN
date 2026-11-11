@@ -270,11 +270,13 @@ def test_no_mkdir_and_no_uv_call_on_cap_refusal(tmp_path: Path, envs_root: Path,
     checkout = make_checkout(tmp_path)
     uv_bin, uv_log = make_uv_stub(tmp_path)
     target = env_name_for(checkout)
-    before = {p.name for p in envs_root.iterdir()}
+    before_dirs = {p.name for p in envs_root.iterdir() if p.is_dir()}
     make_filler_dirs(envs_root, 20)
     result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
     assert result.returncode != 0
-    after = {p.name for p in envs_root.iterdir()}
-    assert target not in after
-    assert after - before == {f"filler-{i}" for i in range(20)}
+    # The root-level flock file (not a directory, and not counted toward the
+    # cap) is expected; only directory entries must be limited to the fillers.
+    after_dirs = {p.name for p in envs_root.iterdir() if p.is_dir()}
+    assert target not in after_dirs
+    assert after_dirs - before_dirs == {f"filler-{i}" for i in range(20)}
     assert not uv_log.exists()
