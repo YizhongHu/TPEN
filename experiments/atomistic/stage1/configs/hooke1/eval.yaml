@@ -55,6 +55,16 @@ evaluation_sampler:
   spatial_dim: ${system.spatial_dim}
   n_up: ${system.spin.n_up}
   n_down: ${system.spin.n_down}
+  # The one-electron Hooke system has no nuclei, but trajectory records still
+  # require a typed geometry reference. Preserve that empty geometry explicitly.
+  nuclear_positions:
+    _target_: torch.zeros
+    size: [0, 3]
+    dtype: ${runtime.dtype}
+  nuclear_charges:
+    _target_: torch.zeros
+    size: [0]
+    dtype: ${runtime.dtype}
   dtype: ${runtime.dtype}
 
 load:
