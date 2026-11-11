@@ -19,4 +19,5 @@ def test_incomplete_grid_is_rejected(tmp_path) -> None:
         writer.writeheader()
         writer.writerow({"walker": 0, "draw": 0, "local_energy": 1.0})
     with pytest.raises(CollectionError, match="incomplete"):
-        collect_table(path, system="he", registry={"systems": [{"id": "he_atom", "reference_energy_hartree": -2.9}]})
+        collect_table(path, system="he", registry={"systems": [{"id": "he_atom", "reference_energy_hartree": -2.9}]},
+                     walkers=1, draws=2)

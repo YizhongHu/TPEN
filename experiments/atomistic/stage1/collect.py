@@ -33,7 +33,7 @@ def reference_energy(system: str, registry: Mapping[str, Any]) -> float:
     raise CollectionError(f"systems.yaml has no required key {key!r}")
 
 
-def require_grid(rows: list[Mapping[str, Any]], *, walkers: int, draws: int) -> None:
+def require_grid(rows: list[Mapping[str, Any]], *, walkers: int, draws: int) -> list[float]:
     """Require exactly one record for every walker/draw coordinate."""
 
     if not rows:
@@ -42,19 +42,22 @@ def require_grid(rows: list[Mapping[str, Any]], *, walkers: int, draws: int) -> 
     observed = {(int(row["walker"]), int(row["draw"])) for row in rows}
     if observed != expected or len(rows) != len(expected):
         raise CollectionError(f"incomplete draw-by-walker grid: expected {len(expected)}, got {len(rows)}")
-    if any(not isinstance(row.get("local_energy"), (int, float)) or row["local_energy"] != row["local_energy"]
-           for row in rows):
+    try:
+        values = [float(row["local_energy"]) for row in rows]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CollectionError("local-energy table contains a non-numeric value") from exc
+    if any(value != value or value in {float("inf"), float("-inf")} for value in values):
         raise CollectionError("local-energy table contains a nonfinite value")
+    return values
 
 
-def collect_table(path: str | Path, *, system: str, registry: Mapping[str, Any]) -> dict[str, Any]:
+def collect_table(path: str | Path, *, system: str, registry: Mapping[str, Any],
+                  walkers: int = 4096, draws: int = 256) -> dict[str, Any]:
     """Collect one CSV table, preserving absent optional task metrics."""
 
     with Path(path).open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    require_grid(rows, walkers=max(int(row["walker"]) for row in rows) + 1,
-                 draws=max(int(row["draw"]) for row in rows) + 1)
-    values = [float(row["local_energy"]) for row in rows]
+    values = require_grid(rows, walkers=walkers, draws=draws)
     mean = sum(values) / len(values)
     reference = reference_energy(system, registry)
     mcse, block_level = blocking_stderr(values, allow_below_floor=True)
@@ -71,9 +74,12 @@ def main() -> int:
     parser.add_argument("--table", type=Path, required=True)
     parser.add_argument("--system", choices=SYSTEM_IDS, required=True)
     parser.add_argument("--registry", type=Path, required=True)
+    parser.add_argument("--walkers", type=int, default=4096)
+    parser.add_argument("--draws", type=int, default=256)
     args = parser.parse_args()
     registry = yaml.safe_load(args.registry.read_text(encoding="utf-8"))
-    print(json.dumps(collect_table(args.table, system=args.system, registry=registry), indent=2))
+    print(json.dumps(collect_table(args.table, system=args.system, registry=registry,
+                                   walkers=args.walkers, draws=args.draws), indent=2))
     return 0
 
 
