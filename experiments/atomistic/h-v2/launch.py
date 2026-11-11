@@ -1285,18 +1285,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise LaunchError("--expected-train-commit is required for --stage eval")
         if not args.time:
             raise LaunchError("--time is required for --stage eval")
-        # F5: the pilot/part-(g) EVAL route bypassed the same run-root
-        # containment guard --stage train already enforces; check it here,
-        # before any sbatch call, whenever a prefix is available (--stage
-        # train makes the prefix mandatory; --stage eval does not, to keep
-        # a prefix-less EVAL-only submission against an existing TRAIN run
-        # working unchanged when no prefix convention is in force).
+        # F5/D6 (review r2 delta): the pilot/part-(g) EVAL route must pass
+        # the same run-root containment guard --stage train already
+        # enforces, on EVERY submission path, before any sbatch call -- an
+        # omitted prefix is refused rather than silently admitting a
+        # disposable root (the guard is never optional).
         pilot_run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
-        if pilot_run_root_prefix:
-            _validate_run_root_prefix(
-                run_root, pilot_run_root_prefix, payload=args.payload,
-                lineage=launch_config.PILOT_PAYLOAD_LINEAGES[args.payload],
+        if not pilot_run_root_prefix:
+            raise LaunchError(
+                f"--run-root-prefix or {launch_config.PILOT_RUN_ROOT_PREFIX_ENV} is required for "
+                f"payload {args.payload!r} --stage eval"
             )
+        _validate_run_root_prefix(
+            run_root, pilot_run_root_prefix, payload=args.payload,
+            lineage=launch_config.PILOT_PAYLOAD_LINEAGES[args.payload],
+        )
         if args.payload == "capacity-pilot":
             if args.pilot_stage is None:
                 raise LaunchError("--pilot-stage {1,2,2-core} is required for capacity-pilot --stage eval")
@@ -1333,12 +1336,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise LaunchError("T_WALL environment variable is required")
         # F5: a single-stage TRAIN-only submission bypassed the chained
         # route's wall-budget check; it alone must still fit the per-lineage
-        # budget. Run-root containment is checked only when a prefix is
-        # actually supplied (optional here, unlike a pilot payload).
+        # budget.
         _validate_single_stage_wall_seconds(t_wall, label="T_WALL")
+        # D6 (review r2 delta): the guard is REQUIRED on every submission
+        # path, never optional just because this is a single-stage route.
         science_run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
-        if science_run_root_prefix:
-            _validate_run_root_prefix(run_root, science_run_root_prefix, payload=args.payload)
+        if not science_run_root_prefix:
+            raise LaunchError(
+                f"--run-root-prefix or {launch_config.PILOT_RUN_ROOT_PREFIX_ENV} is required for "
+                f"payload {args.payload!r} --stage train"
+            )
+        _validate_run_root_prefix(run_root, science_run_root_prefix, payload=args.payload)
         for lineage in launch_config.LINEAGES:
             _validate_science_lineage(args.payload, lineage)
         for lineage in launch_config.LINEAGES:
@@ -1360,12 +1368,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise LaunchError("--expected-train-commit is required for --stage eval")
         if not args.time:
             raise LaunchError("--time is required for --stage eval")
-        # F5: same single-stage wall-budget and optional run-root containment
-        # checks as --stage train, applied to the standalone EVAL route.
+        # F5/D6: same single-stage wall-budget and MANDATORY run-root
+        # containment checks as --stage train, applied to the standalone
+        # EVAL route.
         _validate_single_stage_wall_seconds(args.time, label="--time")
         science_run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
-        if science_run_root_prefix:
-            _validate_run_root_prefix(run_root, science_run_root_prefix, payload=args.payload)
+        if not science_run_root_prefix:
+            raise LaunchError(
+                f"--run-root-prefix or {launch_config.PILOT_RUN_ROOT_PREFIX_ENV} is required for "
+                f"payload {args.payload!r} --stage eval"
+            )
+        _validate_run_root_prefix(run_root, science_run_root_prefix, payload=args.payload)
         for lineage in launch_config.LINEAGES:
             _validate_science_lineage(args.payload, lineage)
         for lineage in launch_config.LINEAGES:
@@ -1395,6 +1408,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     e_wall = os.environ.get("E_WALL")
     if not t_wall or not e_wall:
         raise LaunchError("T_WALL and E_WALL environment variables are required")
+    # D6 (review r2 delta): F5's run-root guard reached every OTHER
+    # submission path but never this chained one -- the worst gap, since it
+    # is the default route (``--stage`` omitted). Required and enforced
+    # here too, before any sbatch call.
+    chained_run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
+    if not chained_run_root_prefix:
+        raise LaunchError(
+            f"--run-root-prefix or {launch_config.PILOT_RUN_ROOT_PREFIX_ENV} is required for "
+            f"payload {args.payload!r}"
+        )
+    _validate_run_root_prefix(run_root, chained_run_root_prefix, payload=args.payload)
     results = submit_all(
         payload=args.payload,
         science_python=science_python,

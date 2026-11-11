@@ -60,7 +60,8 @@ def test_science_both_default_dry_run_is_exactly_six_lines(tmp_path: Path, capsy
         [
             "env", "-i", *(f"{k}={v}" for k, v in env.items()),
             sys.executable, str(HERE / "launch.py"),
-            "--run-root", str(tmp_path),
+            "--run-root", str(tmp_path / "runs" / "h-v2" / "science"),
+            "--run-root-prefix", str(tmp_path / "runs"),
             "--commit", SHA,
             "--payload", "science",
             "--science-python", sys.executable,
@@ -83,7 +84,8 @@ def test_science_stage_train_dry_run_is_exactly_three_lines_no_eval(
     monkeypatch.setenv("T_WALL", "08:00:00")
     code = launch.main(
         [
-            "--run-root", str(tmp_path),
+            "--run-root", str(tmp_path / "runs" / "h-v2" / "science"),
+            "--run-root-prefix", str(tmp_path / "runs"),
             "--commit", SHA,
             "--payload", "science",
             "--stage", "train",
@@ -135,7 +137,8 @@ def test_science_stage_eval_dry_run_is_one_line_per_lineage_no_afterok(
 
     code = launch.main(
         [
-            "--run-root", str(tmp_path),
+            "--run-root", str(tmp_path / "runs" / "h-v2" / "science"),
+            "--run-root-prefix", str(tmp_path / "runs"),
             "--commit", SHA,
             "--payload", "science",
             "--stage", "eval",
@@ -189,7 +192,8 @@ def test_gpu_route_g_stage_eval_dry_run_is_one_line_gpu_test_resources(
 ) -> None:
     code = launch.main(
         [
-            "--run-root", str(tmp_path),
+            "--run-root", str(tmp_path / "runs" / "h-v2" / "gpu-route-g" / "G"),
+            "--run-root-prefix", str(tmp_path / "runs"),
             "--commit", SHA,
             "--payload", "gpu-route-g",
             "--stage", "eval",
@@ -212,7 +216,8 @@ def test_gpu_route_g_stage_eval_refuses_a_pilot_stage_flag(tmp_path: Path) -> No
     with pytest.raises(launch.LaunchError, match="--pilot-stage is not supported"):
         launch.main(
             [
-                "--run-root", str(tmp_path),
+                "--run-root", str(tmp_path / "runs" / "h-v2" / "gpu-route-g" / "G"),
+                "--run-root-prefix", str(tmp_path / "runs"),
                 "--commit", SHA,
                 "--payload", "gpu-route-g",
                 "--stage", "eval",
@@ -232,7 +237,8 @@ def test_gpu_route_g_stage_eval_refuses_a_pilot_stage_flag(tmp_path: Path) -> No
 def test_capacity_pilot_stage1_dry_run_is_one_line(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     code = launch.main(
         [
-            "--run-root", str(tmp_path),
+            "--run-root", str(tmp_path / "runs" / "h-v2" / "capacity-pilot" / "P"),
+            "--run-root-prefix", str(tmp_path / "runs"),
             "--commit", SHA,
             "--payload", "capacity-pilot",
             "--stage", "eval",
@@ -264,7 +270,8 @@ def test_capacity_pilot_stage1_never_auto_submits_stage2(
 
     code = launch.main(
         [
-            "--run-root", str(tmp_path),
+            "--run-root", str(tmp_path / "runs" / "h-v2" / "capacity-pilot" / "P"),
+            "--run-root-prefix", str(tmp_path / "runs"),
             "--commit", SHA,
             "--payload", "capacity-pilot",
             "--stage", "eval",
@@ -280,7 +287,7 @@ def test_capacity_pilot_stage1_never_auto_submits_stage2(
     printed = capsys.readouterr().out
     assert printed.count("sbatch --parsable") == 1
     assert "--pilot-stage 2" not in printed
-    selection_path = tmp_path / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
+    selection_path = tmp_path / "runs" / "h-v2" / "capacity-pilot" / "P" / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
     assert not selection_path.exists()
 
 
@@ -288,7 +295,8 @@ def test_capacity_pilot_stage2_refuses_before_sbatch_when_no_selection_record(tm
     with pytest.raises(launch.LaunchError, match="no SEL selection record"):
         launch.main(
             [
-                "--run-root", str(tmp_path),
+                "--run-root", str(tmp_path / "runs" / "h-v2" / "capacity-pilot" / "P"),
+                "--run-root-prefix", str(tmp_path / "runs"),
                 "--commit", SHA,
                 "--payload", "capacity-pilot",
                 "--stage", "eval",
@@ -305,13 +313,15 @@ def test_capacity_pilot_stage2_refuses_before_sbatch_when_no_selection_record(tm
 def test_capacity_pilot_stage2_refuses_before_sbatch_for_an_out_of_range_c1(tmp_path: Path) -> None:
     """Refusal of an out-of-range c1 before any sbatch call."""
 
-    selection_path = tmp_path / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
+    run_root = tmp_path / "runs" / "h-v2" / "capacity-pilot" / "P"
+    selection_path = run_root / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
     selection_path.parent.mkdir(parents=True)
     selection_path.write_text(json.dumps({"c1": 25, "triple_means": {}, "b1_eval_receipt_sha256": "x"}), encoding="utf-8")
     with pytest.raises(launch.LaunchError, match="refusing before any sbatch call"):
         launch.main(
             [
-                "--run-root", str(tmp_path),
+                "--run-root", str(run_root),
+                "--run-root-prefix", str(tmp_path / "runs"),
                 "--commit", SHA,
                 "--payload", "capacity-pilot",
                 "--stage", "eval",
@@ -328,12 +338,14 @@ def test_capacity_pilot_stage2_refuses_before_sbatch_for_an_out_of_range_c1(tmp_
 def test_capacity_pilot_stage2_core_dry_run_succeeds_with_a_valid_selection_record(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    selection_path = tmp_path / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
+    run_root = tmp_path / "runs" / "h-v2" / "capacity-pilot" / "P"
+    selection_path = run_root / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
     selection_path.parent.mkdir(parents=True)
     selection_path.write_text(json.dumps({"c1": 10, "triple_means": {}, "b1_eval_receipt_sha256": "x"}), encoding="utf-8")
     code = launch.main(
         [
-            "--run-root", str(tmp_path),
+            "--run-root", str(run_root),
+            "--run-root-prefix", str(tmp_path / "runs"),
             "--commit", SHA,
             "--payload", "capacity-pilot",
             "--stage", "eval",

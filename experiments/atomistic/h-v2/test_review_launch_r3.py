@@ -71,7 +71,8 @@ def test_k1_launch_py_dry_run_gets_past_import_outside_pytest(tmp_path):
         [
             sys.executable,
             str(HERE / "launch.py"),
-            "--run-root", str(tmp_path),
+            "--run-root", str(tmp_path / "runs" / "h-v2" / "pipeline-check"),
+            "--run-root-prefix", str(tmp_path / "runs"),
             "--commit", SHA,
             "--payload", "pipeline-check",
             "--science-python", sys.executable,
