@@ -41,6 +41,7 @@ This module imports no ``tpen``, no ``hydra``, and no ``tpen_executor``
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -363,8 +364,6 @@ def run_eval_fanout(
             # executed, bound by the selection FILE's own sha256 -- never
             # left null for a consumer with no way to recover which
             # selection a given stage-2 run used.
-            import hashlib
-
             selection_record = {
                 **selection,
                 "selection_record_sha256": hashlib.sha256(selection_path.read_bytes()).hexdigest(),
@@ -458,11 +457,10 @@ def run_pilot_sel(run_root: Path) -> None:
     stage1_path = _eval_receipt_path(run_root, "h-v2-eval-capacity-pilot-stage1")
     if not stage1_path.is_file():
         raise JobError(f"no capacity-pilot stage-1 eval receipt at {stage1_path}; stage 1 must complete before SEL")
-    stage1_receipt = eval_job.read_eval_receipt(stage1_path)
+    # D5 (review r2 delta): hash the EXACT bytes parsed, not a later re-read
+    # of the file (which an atomic replacement mid-computation could race).
+    stage1_receipt, stage1_sha256 = eval_job.read_eval_receipt_with_hash(stage1_path)
     selection_core = eval_job.compute_pilot_selection(stage1_receipt)
-    import hashlib
-
-    stage1_sha256 = hashlib.sha256(stage1_path.read_bytes()).hexdigest()
     record = eval_job.build_selection_record(
         c1=selection_core["c1"],
         triple_means=selection_core["triple_means"],
@@ -490,11 +488,11 @@ def run_pilot_final_sel(run_root: Path) -> None:
     ------
     JobError
         If the SEL selection record, the stage-1 receipt, or a stage-2/
-        stage-2-core receipt is missing, or pooled stream-0/1 data is
-        missing for any candidate ordinal.
+        stage-2-core receipt is missing, pooled stream-0/1 data is missing
+        for any candidate ordinal, or B2 is not bound to this same B1/SEL
+        (D2, review r2 delta): wrong TRAIN receipt, a selection record
+        belonging to a different B1, or a partial stage-2 run set.
     """
-
-    import hashlib
 
     selection_path = run_root / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
     if not selection_path.is_file():
@@ -504,9 +502,9 @@ def run_pilot_final_sel(run_root: Path) -> None:
     stage1_path = _eval_receipt_path(run_root, "h-v2-eval-capacity-pilot-stage1")
     if not stage1_path.is_file():
         raise JobError(f"no capacity-pilot stage-1 eval receipt at {stage1_path}")
-    stage1_sha256 = hashlib.sha256(stage1_path.read_bytes()).hexdigest()
+    # D5: hash the exact bytes parsed, not a later re-read.
+    stage1_receipt, stage1_sha256 = eval_job.read_eval_receipt_with_hash(stage1_path)
     c1 = eval_job.verify_selection_record(selection, b1_eval_receipt_sha256=stage1_sha256)
-    stage1_receipt = eval_job.read_eval_receipt(stage1_path)
 
     stage2_path = _eval_receipt_path(run_root, "h-v2-eval-capacity-pilot-stage2")
     if not stage2_path.is_file():
@@ -516,32 +514,58 @@ def run_pilot_final_sel(run_root: Path) -> None:
             f"no capacity-pilot stage-2/stage-2-core eval receipt under {run_root}; "
             "run `eval-fanout capacity-pilot --pilot-stage 2` (or 2-core) first"
         )
-    stage2_receipt = eval_job.read_eval_receipt(stage2_path)
+    stage2_receipt, stage2_sha256 = eval_job.read_eval_receipt_with_hash(stage2_path)
+
+    # D2 (review r2 delta): B2 must be bound to THIS B1/TRAIN, not merely
+    # schema-shaped. Refuse a stage-2 receipt dispatched against a different
+    # TRAIN receipt, or against a different (or absent) SEL selection.
+    if stage2_receipt.get("train_receipt_sha256") != stage1_receipt.get("train_receipt_sha256"):
+        raise JobError(
+            f"{stage2_path} train_receipt_sha256 {stage2_receipt.get('train_receipt_sha256')!r} does not "
+            f"match the B1 receipt's {stage1_receipt.get('train_receipt_sha256')!r}"
+        )
+    stage2_selection = stage2_receipt.get("selection")
+    if stage2_selection is None:
+        raise JobError(f"{stage2_path} carries no selection record; it was not dispatched from SEL's own record")
+    stage2_c1 = eval_job.verify_selection_record(stage2_selection, b1_eval_receipt_sha256=stage1_sha256)
+    if stage2_c1 != c1 or stage2_selection.get("selection_record_sha256") != hashlib.sha256(
+        selection_path.read_bytes()
+    ).hexdigest():
+        raise JobError(f"{stage2_path} selection record does not match the current SEL selection file")
 
     candidates = sorted({c for c in (c1 - 1, c1, c1 + 1) if 3 <= c <= 19} | {c1})
     needed_ordinals = sorted({o for c in candidates for o in (c - 1, c, c + 1)})
-    pooled_energies: dict[int, list[float]] = {ordinal: [] for ordinal in needed_ordinals}
+    stream0_energies: dict[int, list[float]] = {ordinal: [] for ordinal in needed_ordinals}
+    stream1_energies: dict[int, list[float]] = {ordinal: [] for ordinal in needed_ordinals}
     for generation in stage1_receipt.get("generations") or []:
-        if generation.get("stream") == 0 and generation["ordinal"] in pooled_energies:
-            pooled_energies[generation["ordinal"]].extend(
-                eval_job.read_stream_local_energies(eval_job.trajectory_csv_path(generation))
-            )
+        if generation.get("stream") == 0 and generation["ordinal"] in stream0_energies:
+            stream0_energies[generation["ordinal"]].extend(eval_job.read_verified_stream_local_energies(generation))
     for generation in stage2_receipt.get("generations") or []:
-        if generation.get("stream") == 1 and generation["ordinal"] in pooled_energies:
-            pooled_energies[generation["ordinal"]].extend(
-                eval_job.read_stream_local_energies(eval_job.trajectory_csv_path(generation))
-            )
-    missing = sorted(ordinal for ordinal, energies in pooled_energies.items() if not energies)
-    if missing:
-        raise JobError(f"final-SEL is missing pooled stream-0/1 data for ordinals {missing!r}")
+        if generation.get("stream") == 1 and generation["ordinal"] in stream1_energies:
+            stream1_energies[generation["ordinal"]].extend(eval_job.read_verified_stream_local_energies(generation))
+    # D2: the missing-data check must fail an ordinal missing EITHER stream
+    # separately -- a complete B1 must never mask a dropped B2 stream-1 run.
+    missing_stream0 = sorted(ordinal for ordinal, energies in stream0_energies.items() if not energies)
+    missing_stream1 = sorted(ordinal for ordinal, energies in stream1_energies.items() if not energies)
+    if missing_stream0 or missing_stream1:
+        raise JobError(
+            f"final-SEL is missing pooled data for ordinals: stream0={missing_stream0!r} "
+            f"stream1={missing_stream1!r}"
+        )
 
-    pooled01_w_by_ordinal = {ordinal: protocol.w_statistic(energies) for ordinal, energies in pooled_energies.items()}
+    # D1 (review r2 delta): each stream is centered about its OWN median
+    # before its deviations are pooled -- a shift in one stream's location
+    # (with its dispersion unchanged) must not move the pooled W.
+    pooled01_w_by_ordinal = {
+        ordinal: protocol.pooled_w_statistic([stream0_energies[ordinal], stream1_energies[ordinal]])
+        for ordinal in needed_ordinals
+    }
     c_star = protocol.select_final_basin_ordinal(c1, pooled01_w_by_ordinal)
     record = {
         "c1": c1,
         "c_star": c_star,
         "b1_eval_receipt_sha256": stage1_sha256,
-        "stage2_eval_receipt_sha256": hashlib.sha256(stage2_path.read_bytes()).hexdigest(),
+        "stage2_eval_receipt_sha256": stage2_sha256,
         "pooled01_w_by_ordinal": {str(ordinal): w for ordinal, w in pooled01_w_by_ordinal.items()},
         # K4 (final-verify finding on operator-rulings-pilot-20261110-1900,
         # item 3): carried from the SEL record's own c1, not recomputed from

@@ -156,12 +156,20 @@ def test_checkpoint_load_closure_must_be_inventoried(tmp_path, omitted):
 
 @pytest.mark.parametrize("field,value", [
     ("seed_namespace", "pipeline_gpu_smoke_g"),
-    ("contract_inputs_sha256", "0" * 64),
-    ("payload_overlay_sha256", "0" * 64),
-    ("materialized_config_sha256", "0" * 64),
+    ("contract_inputs_sha256", None),
+    ("payload_overlay_sha256", None),
+    ("materialized_config_sha256", None),
 ])
 def test_eval_refuses_wrong_train_identity(tmp_path, field, value):
-    """F3: kill accepting correct lineage/commit but wrong namespace/config identity."""
+    """F3/D4 (review r2 delta): kill accepting correct lineage/commit but a
+    wrong seed namespace, or a DROPPED identity field. D4 stopped re-hashing
+    this checkout's own current overlay/contract-inputs files against the
+    receipt's recorded hashes (a real EVAL-only submission against an
+    earlier-commit TRAIN receipt legitimately disagrees with "this
+    checkout"'s current frozen inputs) -- these three fields are instead
+    required PRESENT; a dropped field is refused, never a silently-missing
+    identity block.
+    """
     receipt, _ = _train(tmp_path, updates=(1000,))
     ev.verify_train_receipt_identity(receipt, expected_commit=TRAIN_SHA,
                                      expected_lineage="P", expected_payload="capacity-pilot")
@@ -201,7 +209,7 @@ def test_k2_completed_generation_survives_next_failure(tmp_path, monkeypatch):
         assert _sha(artifact["path"]) == artifact["sha256"]
 
 
-def _b1(root):
+def _b1(root, *, train_receipt_sha256="c" * 64):
     generations = []
     for ordinal in range(21):
         width = 1 if ordinal in (9, 10, 11) else 10
@@ -212,7 +220,7 @@ def _b1(root):
                             "artifacts": {"trajectory_csv": {"path": str(path), "sha256": _sha(path)}}})
     path = job._eval_receipt_path(root, "h-v2-eval-capacity-pilot-stage1")
     receipt = ev.write_eval_receipt(path, eval_commit=EVAL_SHA, train_commit=TRAIN_SHA,
-                                   train_receipt_path=root / "train.json", train_receipt_sha256="c" * 64,
+                                   train_receipt_path=root / "train.json", train_receipt_sha256=train_receipt_sha256,
                                    payload="capacity-pilot", generations=generations,
                                    readout_generator_enabled=True)
     return path, receipt
@@ -336,8 +344,10 @@ def test_final_sel_is_a_separate_cpu_command_after_b2(tmp_path, monkeypatch):
     original assertion (B2 calls the selector inline), which predated that
     design choice and is noted in the implementation receipt.
     """
-    _train(tmp_path)
-    _b1(tmp_path)
+    _, train_path = _train(tmp_path)
+    # D2 (review r2 delta): B1 and B2's train_receipt_sha256 must agree (the
+    # real producer binds both to the SAME TRAIN receipt's actual bytes).
+    _b1(tmp_path, train_receipt_sha256=_sha(train_path))
     job.run_pilot_sel(tmp_path)
     calls = []
     original = protocol.select_final_basin_ordinal
@@ -398,7 +408,10 @@ def test_science_train_leg_is_byte_identical_dry_run_stays_six_lines(tmp_path, m
 
     monkeypatch.setenv("T_WALL", "08:00:00")
     monkeypatch.setenv("E_WALL", "24:00:00")
-    code = launch.main(["--run-root", str(tmp_path), "--commit", EVAL_SHA, "--payload", "science",
+    # D6 (review r2 delta): the run-root guard is now required on every path.
+    code = launch.main(["--run-root", str(tmp_path / "runs" / "h-v2" / "science"),
+                        "--run-root-prefix", str(tmp_path / "runs"),
+                        "--commit", EVAL_SHA, "--payload", "science",
                         "--science-python", sys.executable, "--executor-python", sys.executable, "--dry-run"])
     assert code == 0
     assert capsys.readouterr().out.count("sbatch --parsable") == 6
@@ -593,10 +606,15 @@ def test_k4_interior_minimum_flag_on_sel_and_final_sel_records(tmp_path, center,
         path.write_text("local_energy\n-1\n0\n1\n")
         stage2_generations.append({"ordinal": ordinal, "update": ordinal * 1000, "stream": 1, "seed": 1,
                                    "artifacts": {"trajectory_csv": {"path": str(path), "sha256": _sha(path)}}})
+    # D2 (review r2 delta): B2's own receipt must carry the SEL selection it
+    # actually ran against, bound by the selection file's own sha256 -- the
+    # same shape ``run_job.run_eval_fanout`` writes.
+    stage2_selection = {**selection, "selection_record_sha256": _sha(selection_path)}
     stage2_path = job._eval_receipt_path(tmp_path, "h-v2-eval-capacity-pilot-stage2")
     ev.write_eval_receipt(stage2_path, eval_commit=EVAL_SHA, train_commit=TRAIN_SHA,
                          train_receipt_path=tmp_path / "train.json", train_receipt_sha256="c" * 64,
-                         payload="capacity-pilot", generations=stage2_generations, readout_generator_enabled=True)
+                         payload="capacity-pilot", generations=stage2_generations, readout_generator_enabled=True,
+                         selection=stage2_selection)
 
     job.run_pilot_final_sel(tmp_path)
     final_path = tmp_path / "attached" / "receipts" / "h-v2-eval-capacity-pilot-final-selection.json"
