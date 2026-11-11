@@ -242,16 +242,70 @@ def test_science_launch_requires_root_admission_on_every_path(tmp_path, monkeypa
     assert submitted == []
 
 
+#: D7 (orchestrator decision, replacing the occurrence-count test): the exact
+#: TRAIN-leg sbatch argv commit b9ba7c2d (PR 629) itself produced for these
+#: fixed inputs, computed once from that commit's own build_sbatch_command
+#: and frozen here as a literal -- comparing against the CURRENT builder
+#: would catch nothing (it would trivially equal itself). Fixed, non-tmp_path
+#: literal paths are used so the comparison needs no runtime substitution;
+#: build_sbatch_command performs no filesystem access on these arguments.
+_FROZEN_629_SCIENCE_L1_TRAIN_COMMAND = [
+    "sbatch",
+    "--parsable",
+    "--job-name=h-v2-science-L1-train",
+    "--partition=seas_gpu,kozinsky_gpu",
+    "--constraint=a100",
+    "--gres=gpu:1",
+    "--nodes=1",
+    "--ntasks=1",
+    "--cpus-per-task=4",
+    "--mem=32G",
+    "--time=08:00:00",
+    "--no-requeue",
+    "--export=ALL,RUN=/frozen/h-v2-629-fixture/run,SHA=" + "b" * 40,
+    "--output=/frozen/h-v2-629-fixture/run/logs/%x-%j.out",
+    "--error=/frozen/h-v2-629-fixture/run/logs/%x-%j.err",
+    "--wrap=cd /frozen/h-v2-629-fixture/run/checkout && "
+    "CHECKOUT=/frozen/h-v2-629-fixture/run/checkout && "
+    'PYTHONPATH="$CHECKOUT${PYTHONPATH:+:$PYTHONPATH}" '
+    "SCIENCE_PYTHON=/frozen/science-python/bin/python "
+    "EXECUTOR_PY=/frozen/executor-python/bin/python "
+    "exec /frozen/science-python/bin/python "
+    "/frozen/h-v2-629-fixture/run/checkout/experiments/atomistic/h-v2/run_job.py train L1 --payload science",
+]
+
+
 def test_science_dry_run_is_exactly_six_lines(tmp_path, monkeypatch, capsys):
-    """D7: count all stdout lines, not just occurrences of sbatch."""
+    """D7 (orchestrator decision, comment 6785258752, "Decline, with
+    clarification"): "exactly 6 lines" in the contract and F9 has always
+    meant six SBATCH COMMAND lines -- the three summary lines B3 prints
+    afterward predate this PR and are established output, not a defect.
+    This asserts exactly 6 lines that start with "sbatch ", and that the
+    TRAIN leg's own sbatch command stays byte-identical to the historical
+    #629 fixture above -- never another call to the CURRENT builder, which
+    would compare against itself and catch nothing.
+    """
+    produced = launch.build_sbatch_command(
+        "train", "L1", payload="science",
+        science_python="/frozen/science-python/bin/python",
+        executor_python="/frozen/executor-python/bin/python",
+        run_root="/frozen/h-v2-629-fixture/run",
+        checkout_root="/frozen/h-v2-629-fixture/run/checkout",
+        time_value="08:00:00", dependency=None, commit="b" * 40,
+    )
+    assert produced == _FROZEN_629_SCIENCE_L1_TRAIN_COMMAND
+
     monkeypatch.setenv("T_WALL", "08:00:00")
     monkeypatch.setenv("E_WALL", "24:00:00")
-    launch.main(["--run-root", str(tmp_path / "runs/h-v2/science"),
-                 "--run-root-prefix", str(tmp_path / "runs"), "--commit", helpers.EVAL_SHA,
-                 "--payload", "science", "--science-python", sys.executable,
-                 "--executor-python", sys.executable, "--dry-run"])
+    code = launch.main(["--run-root", str(tmp_path / "runs/h-v2/science"),
+                        "--run-root-prefix", str(tmp_path / "runs"), "--commit", helpers.EVAL_SHA,
+                        "--payload", "science", "--science-python", sys.executable,
+                        "--executor-python", sys.executable, "--dry-run"])
+    assert code == 0
     lines = capsys.readouterr().out.splitlines()
-    assert len(lines) == 6 and all(line.startswith("sbatch ") for line in lines)
+    sbatch_lines = [line for line in lines if line.startswith("sbatch ")]
+    assert len(sbatch_lines) == 6
+    assert len(sbatch_lines) == len(lines) - 3, "exactly the established 3 non-sbatch summary lines, no more"
 
 
 def test_science_seed_runtime_reads_or_refuses_changed_ci(tmp_path, monkeypatch):
