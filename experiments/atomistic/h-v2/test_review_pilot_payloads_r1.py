@@ -180,13 +180,13 @@ def test_fully_assembled_capacity_config_is_a_valid_contract_control():
         ),
         (
             "tpen.callback.RawTrainingBatchRecorder",
-            lambda entry: entry.update(max_calls=1),
+            lambda entry: entry.update(start_step=1),
             "recorder",
         ),
     ],
 )
 def test_contract_rejects_logging_cadence_and_sampling_mutants(target, mutation, message):
-    """Every contract cadence/quantile/throttle mutation needs a refusal."""
+    """Every contract cadence, quantile, and recorder-start mutation needs refusal."""
 
     config = _fully_assembled_capacity_config()
     entry = next(callback for callback in config["callbacks"] if callback["_target_"] == target)
