@@ -275,6 +275,61 @@ def test_request_rejects_a_checkpoint_beyond_the_target_horizon(tmp_path):
         OperationalRestoreRequest(decision=decision)
 
 
+def test_request_rejects_completed_updates_beyond_horizon_with_next_iteration_in_range(tmp_path):
+    """R3.2: E1's own gate (recovery.py:517-521) refuses when EITHER counter
+    exceeds the fixed horizon, but construction previously bounded only
+    ``ref.next_iteration``. Vary ``completed_updates`` alone beyond H while
+    ``next_iteration`` stays within it, with the manifest and trainer-cursor
+    counters mutually consistent, to isolate the omitted check."""
+
+    import torch
+    from tpen.checkpoint import TrainResume, save_checkpoint
+    from tpen.checkpoint.reference import CheckpointRef
+
+    next_iteration = _TARGET_ITERATIONS
+    completed_updates = _TARGET_ITERATIONS + 1
+    model = torch.nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer = SimpleNamespace(
+        state_dict=lambda: {
+            "next_iteration": next_iteration,
+            "completed_updates": completed_updates,
+        }
+    )
+    sampler = SimpleNamespace(mcmc_state_dict=lambda: {"walker": next_iteration})
+    context = SimpleNamespace(
+        cfg=OmegaConf.create({"study": {"name": "s2-restore"}, "trainer": {"max_steps": _TARGET_ITERATIONS}}),
+        metadata=SimpleNamespace(device="cpu", dtype="float64", run_id="s2-restore-beyond-h", extra={}),
+        run_dir=tmp_path,
+    )
+    checkpoint_dir = save_checkpoint(
+        output_dir=tmp_path / "checkpoints",
+        next_iteration=next_iteration,
+        completed_updates=completed_updates,
+        model=model,
+        optimizer=optimizer,
+        trainer=trainer,
+        sampler=sampler,
+        payload=TrainResume(),
+        context=context,
+    )
+    ref = CheckpointRef.from_directory(checkpoint_dir)
+    assert ref.next_iteration <= _TARGET_ITERATIONS
+    assert ref.completed_updates > _TARGET_ITERATIONS
+
+    decision = RecoveryDecision(
+        phase=RecoveryPhase.RECOVERY,
+        outcome=RecoveryOutcome.RECOVERY,
+        target_iterations=_TARGET_ITERATIONS,
+        next_iteration=ref.next_iteration,
+        completed_updates=ref.completed_updates,
+        checkpoint=ref,
+        load=train_resume_load_overlay(ref),
+    )
+    with pytest.raises(ValueError, match="horizon"):
+        OperationalRestoreRequest(decision=decision)
+
+
 @pytest.mark.parametrize(
     ("phase", "outcome"),
     [

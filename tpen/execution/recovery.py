@@ -643,6 +643,11 @@ class OperationalRestoreRequest:
                 "checkpoint reference exceeds the fixed total target horizon "
                 f"({ref.next_iteration!r} > {self.decision.target_iterations!r})"
             )
+        if ref.completed_updates > self.decision.target_iterations:
+            raise ValueError(
+                "checkpoint reference exceeds the fixed total target horizon "
+                f"({ref.completed_updates!r} > {self.decision.target_iterations!r})"
+            )
         object.__setattr__(self, "ref", ref)
         object.__setattr__(
             self, "target_iterations",
