@@ -11,7 +11,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     args, extra = parser.parse_known_args()
-    from tpen.run import load_config, run_from_config
+    from tpen.run import run_from_config
+    from tpen.run import load_config
 
     cfg = load_config(args.config, extra)
     return int(run_from_config(cfg, config_path=args.config, command="stage1 eval"))

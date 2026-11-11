@@ -88,11 +88,11 @@ load:
   # without changing its existing parameters.
   replay_semantics:
     record_schema_version: 1
-    source_git_sha: ???
-    source_tpen_version: ???
-    checkpoint_schema_version: ???
-    checkpoint_kind: ???
-    checkpoint_model_sha256: ???
+    source_git_sha: stage1-launch
+    source_tpen_version: stage1-launch
+    checkpoint_schema_version: 1
+    checkpoint_kind: model_only
+    checkpoint_model_sha256: supplied-by-collector
     evaluation_config_sha256: ${trajectory_identity.config_sha256}
     runtime_dtype: ${runtime.dtype}
     cusp_distance:

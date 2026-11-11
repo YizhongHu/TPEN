@@ -63,6 +63,13 @@ load:
   mode: model_only
   strict: true
   allow_protocol_mismatch: false
+  replay_semantics:
+    record_schema_version: 1
+    source_git_sha: stage1-launch
+    source_tpen_version: stage1-launch
+    checkpoint_schema_version: 1
+    checkpoint_kind: model_only
+    checkpoint_model_sha256: supplied-by-collector
 
 runner:
   _target_: tpen.runner.Evaluate
