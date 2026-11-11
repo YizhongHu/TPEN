@@ -203,6 +203,20 @@ def write_local_allocation_and_worker(
     return allocation_path, worker_path
 
 
+def _reserve_store_parent(store: Path) -> None:
+    """Create *store*'s parent directory, never *store* itself.
+
+    ``executor/src/tpen_executor/composition.py``'s ``_reserve_store`` does a
+    bare, non-recursive ``mkdir()`` on the store root and must see an absent
+    root to atomically reserve it; this only ensures the ancestry above it
+    exists (TO 8d9a31b3: a fresh run root has no ``attached/store`` yet, so
+    the bare ``mkdir()`` raised ``ENOENT`` before it ever reached the
+    store-exists/store-create distinction).
+    """
+
+    store.parent.mkdir(parents=True, exist_ok=True)
+
+
 def _train_task_id(lineage: str, *, pipeline_check: bool) -> str:
     """Return TRAIN's task id for *lineage* (K2/H1).
 
@@ -333,6 +347,7 @@ def run(
         handoff_dir = run_root / "attached" / "handoff" / task_id
         results_root = run_root / "attached" / "results"
         store = run_root / "attached" / "store" / task_id
+        _reserve_store_parent(store)
         receipts_dir = run_root / "attached" / "receipts"
         receipts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -426,6 +441,7 @@ def run(
     handoff_dir = run_root / "attached" / "handoff" / task_id
     results_root = run_root / "attached" / "results"
     store = run_root / "attached" / "store" / task_id
+    _reserve_store_parent(store)
     receipts_dir = run_root / "attached" / "receipts"
     receipts_dir.mkdir(parents=True, exist_ok=True)
 
