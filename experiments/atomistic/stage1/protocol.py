@@ -56,7 +56,7 @@ def stable_row_id(*, system: str, kind: str, lineage: int = 0, checkpoint: int =
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 
-def evaluation_seed(*, lineage: int, stream: int) -> int:
+def evaluation_seed(*, system: str, lineage: int, checkpoint: int, stream: int) -> int:
     """Derive evaluation seeds in a namespace disjoint from training seeds.
 
     Training seeds are supplied by the caller.  The reserved million-range
@@ -65,9 +65,13 @@ def evaluation_seed(*, lineage: int, stream: int) -> int:
     makes the lineage/stream coordinates inspectable in manifests.
     """
 
-    if lineage < 0 or stream < 0 or stream >= EVAL_SEED_STRIDE:
+    if system not in SYSTEMS or lineage < 0 or checkpoint <= 0 or stream < 0 or stream >= EVAL_SEED_STRIDE:
         raise ProtocolError("invalid lineage/stream coordinate")
-    return EVAL_SEED_BASE + lineage * EVAL_SEED_STRIDE + stream
+    # The large system stride makes every manifest coordinate unique without
+    # relying on a probabilistic hash, while retaining human-readable seeds.
+    system_index = SYSTEMS.index(system)
+    return (EVAL_SEED_BASE + system_index * 1_000_000_000_000
+            + checkpoint * EVAL_SEED_STRIDE + lineage * EVAL_SEED_STRIDE + stream)
 
 
 def build_manifest(protocol: Protocol, *, checkpoints: list[int], seeds: list[int],
@@ -108,7 +112,8 @@ def build_manifest(protocol: Protocol, *, checkpoints: list[int], seeds: list[in
                                            checkpoint=checkpoint, stream=stream)
                     eval_run_id = f"lineage-{lineage}-checkpoint-{checkpoint:06d}-stream-{stream}"
                     checkpoint_dir = f"{train_root}/{train_run_id}/checkpoints/step_{checkpoint:06d}"
-                    eval_seed = evaluation_seed(lineage=lineage, stream=stream)
+                    eval_seed = evaluation_seed(system=system, lineage=lineage,
+                                                checkpoint=checkpoint, stream=stream)
                     rows.append({"row_id": row_id, "system": system, "kind": "eval", "lineage": lineage,
                                  "checkpoint": checkpoint, "stream": stream,
                                  "walkers": protocol.eval_walkers, "draws": protocol.eval_draws,
