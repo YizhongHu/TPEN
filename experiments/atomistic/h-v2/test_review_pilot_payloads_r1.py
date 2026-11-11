@@ -29,7 +29,9 @@ PAYLOADS = [("gpu-route-g", "G", "pipeline_gpu_smoke_g", 1000),
             ("capacity-pilot", "P", "capacity_pilot", 20000)]
 BASE_MODULES = {"tpen.callback.DataIntegrity", "tpen.callback.GradientStats"}
 OPTIONAL_MODULES = {"tpen.callback.InitialCheckpoint", "tpen.callback.ParameterActivity",
-                    "tpen.callback.ElectronNucleusDistanceQuantiles"}
+                    "tpen.callback.ElectronNucleusDistanceQuantiles", "tpen.callback.SamplerHealth",
+                    "tpen.callback.FactorScalars", "tpen.callback.ModuleNorms",
+                    "tpen.callback.OptimizerState", "tpen.callback.RawTrainingBatchRecorder"}
 
 
 def _module(name):
@@ -159,8 +161,8 @@ def test_job_module_lists_partition_actual_config(tmp_path, monkeypatch, admit_o
     assert enabled == BASE_MODULES | (OPTIONAL_MODULES if admit_optional else set())
     assert skipped == (set() if admit_optional else OPTIONAL_MODULES)
     assert not (enabled & skipped)
-    assert captured["skipped_unspecified"] == [{"target": "tpen.callback.ModuleNorms", "reason": "6c29fe1d"}]
-    assert "tpen.callback.ModuleNorms" not in configured
+    assert captured["skipped_unspecified"] == []
+    assert ("tpen.callback.ModuleNorms" in configured) is admit_optional
 
 
 def _checkpoint(root, iteration, updates):
