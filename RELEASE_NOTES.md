@@ -2,18 +2,18 @@
 
 ## v0.5.0 - Atomic hydrogen, checkpoint admissions, and durable execution
 
-185 commits since `origin/main` (`5d920226`). The release brings the H-v2
+186 commits since `origin/main` (`5d920226`). The release brings the H-v2
 atomic-hydrogen experiment through science-config routing, pilot/TRAIN
 payloads, study-side evaluation, and contract-cadence logging; admits
 checkpoint-profile callbacks with fail-closed resume behavior; and lands the
 independent `tpen_executor` project through placement v2, the L1b GPU sampler,
 and resolved-config identity fences.
 
-The census below covers every commit in `origin/main..294d7ee0` (185 total),
+The census below covers every commit in `origin/main..ca0f93b3` (186 total),
 measured with:
 
 ```
-git log --format='%H' origin/main..294d7ee0e34a0a403b8fd6daaa51f64b7c49efb5 | wc -l  # 185
+git log --format='%H' origin/main..ca0f93b3bdd6761399a2506f7829adc06532b7c6 | wc -l  # 186
 ```
 
 No commits are excluded. Entries without a pull-request number are cited by
@@ -84,6 +84,8 @@ commit hash; the hash/PR list is the complete census for the range.
 
 ### Fixed
 
+- **H-v2 review-test modules register under their spec name** (#648, #655),
+  as the study-module identity rule requires.
 - **H-v2 store-parent creation is ordered before dispatch** (#648, #650),
   preventing pilot runs from reserving a child store without its parent.
 - **Checkpoint and callback lifecycle holes are closed.** Raw recorder resume
@@ -110,7 +112,7 @@ when present):
 4c95175a#424, 90022009#428, 0eb40797#429, 01055bab#450, f58ef39c#435, 75bae018#437, ff5aff29#441, 323da175#443, 09c950e1#451, d1fe29f8#453, 95a0771a#456, 0cc82e27#458,
 b39d5269#452, 5ea3da07#454, 85d81b1e#459, 01c8712d#460, 73016557#464, 77317556#462, 23a16afd, 7cd2a897, f05a7c65, b1bfcfdf, 49c82663, 561ff743,
 b806d0e3, 0e7b2040, 838e5ca8, aafa4a03, 66bf630d, 7ee49320#468, 4ec7c8cb#472, 56308c8b#476, 72128573#477, 8d1ca6fd#481, c16afd0e#473, bf011cf2#474, e8d637f6#479, 4798b7dd#480, 4d67d5b0#482, 7d86d090#483, c2ce426e#484, 223b81fb#486, 0f622481#487, 80f6249a#488, 1bfeac1a#489, fe497899#491, 28ab5446#492, 36cfddc5#494,
-8e2bef6d#490, 4a580e64#495, ae20c11a#496, a1f76b92#497, de7a5677#505, a37d7c62#509, d39aa2cd#510, 71ac61ed#511, 5fc56983#499, 9c415376#503, d04a50cd#512, e9204d68#513, 3143e43a#515, be3d0a5a#522, 842698e8#518, edc0228e#517, 7735ac80#519, b972a023#521, 29a41df1#528, 46ab6585#538, 8dc25f00#523, df700150#524, 4f8ebb0f#537, 1677bf6f#536, d727375f#527, a757ed76#540, 2f5b8d56#542, 3994845f#543, 1afffde9#544, f1419267#547, d7649753#546, 56d95c4b#529, b3ed0406#530, e9c67890#532, 29ffe95d#533, 5b42a8f8#534, a6761c3e#535, e27b29ae#545, 62ba7ebb#549, 58445152#551, bf2f208f#550, 3425ecf7#552, 1ed309f0#556, 8a18cd14#555, d55c6d11#558, 3a54cf85#559, 07305a9b#561, 7a04317a#554, 98da8760#557, 1db9e4b0#563, cde285a6#564, 6514b1b7#565, 241fe16f#566, 19a22ed5#568, fbbebe69#569, a0dd9b52#571, 67beab20#575, 1ae776c9#572, 1ead406c#573, efc33bb3#580, b80b0428#594, 8d148c47#587, 0b5ba7d5#590, ae9de462#592, 2a7e5fb3#576, e4d45e69#577, 019469f3#578, 2b3926e9#579, 184c3fd4#581, 2629a3a4#582, 9fe71f9e#583, 56f16bc9#584, 33ef1ce3#585, 98ce5e8b#586, ec826201#588, 0f7e8b3c#589, 12d1ad73#591, d2a58495#593, 060044d8#596, 8535bc05#597, 043d365b#599, 179240d5#601, 7029de22#595, 8d3e81af#600, 2630ea7b#609, d48e60e2#610, f6b7c398#611, b3a4ccac#605, 389c5ce4#608, 8222b5cd#598, d31747ce#612, 29acb155#614, fbed0263#613, e2d4a449#619, cf146d39#615, 6323db7d#624, 637aa5c5#616, aef23069#618, 78390364#622, 15aebfb1#621, c284e29f#620, deca8d44#626, aba217ad#634, 8a142f84#625, 08e54ea8#635, 152792af#631, b9ba7c2d#629, f71e0a5e#637, 096d724d#632, d8ca479a#633, fd061d73#627, f8a0f40d#628, aa53b1f0#638, df46e2db#645, 672926c9#630, 5b441878#646, b60c6771#647, 7f1e0432#636, 1d295253#639, 26285862#649, f1116084#640, 47e342a2#648, 4970ba1d#650, 9091b678#641, 294d7ee0#651
+8e2bef6d#490, 4a580e64#495, ae20c11a#496, a1f76b92#497, de7a5677#505, a37d7c62#509, d39aa2cd#510, 71ac61ed#511, 5fc56983#499, 9c415376#503, d04a50cd#512, e9204d68#513, 3143e43a#515, be3d0a5a#522, 842698e8#518, edc0228e#517, 7735ac80#519, b972a023#521, 29a41df1#528, 46ab6585#538, 8dc25f00#523, df700150#524, 4f8ebb0f#537, 1677bf6f#536, d727375f#527, a757ed76#540, 2f5b8d56#542, 3994845f#543, 1afffde9#544, f1419267#547, d7649753#546, 56d95c4b#529, b3ed0406#530, e9c67890#532, 29ffe95d#533, 5b42a8f8#534, a6761c3e#535, e27b29ae#545, 62ba7ebb#549, 58445152#551, bf2f208f#550, 3425ecf7#552, 1ed309f0#556, 8a18cd14#555, d55c6d11#558, 3a54cf85#559, 07305a9b#561, 7a04317a#554, 98da8760#557, 1db9e4b0#563, cde285a6#564, 6514b1b7#565, 241fe16f#566, 19a22ed5#568, fbbebe69#569, a0dd9b52#571, 67beab20#575, 1ae776c9#572, 1ead406c#573, efc33bb3#580, b80b0428#594, 8d148c47#587, 0b5ba7d5#590, ae9de462#592, 2a7e5fb3#576, e4d45e69#577, 019469f3#578, 2b3926e9#579, 184c3fd4#581, 2629a3a4#582, 9fe71f9e#583, 56f16bc9#584, 33ef1ce3#585, 98ce5e8b#586, ec826201#588, 0f7e8b3c#589, 12d1ad73#591, d2a58495#593, 060044d8#596, 8535bc05#597, 043d365b#599, 179240d5#601, 7029de22#595, 8d3e81af#600, 2630ea7b#609, d48e60e2#610, f6b7c398#611, b3a4ccac#605, 389c5ce4#608, 8222b5cd#598, d31747ce#612, 29acb155#614, fbed0263#613, e2d4a449#619, cf146d39#615, 6323db7d#624, 637aa5c5#616, aef23069#618, 78390364#622, 15aebfb1#621, c284e29f#620, deca8d44#626, aba217ad#634, 8a142f84#625, 08e54ea8#635, 152792af#631, b9ba7c2d#629, f71e0a5e#637, 096d724d#632, d8ca479a#633, fd061d73#627, f8a0f40d#628, aa53b1f0#638, df46e2db#645, 672926c9#630, 5b441878#646, b60c6771#647, 7f1e0432#636, 1d295253#639, 26285862#649, f1116084#640, 47e342a2#648, 4970ba1d#650, 9091b678#641, 294d7ee0#651, ca0f93b3#655
 ```
 
 ## v0.4.0 - Analytic electron-nucleus cusp local energy
