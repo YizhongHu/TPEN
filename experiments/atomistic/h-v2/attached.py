@@ -448,7 +448,9 @@ def build_h_v2_train_plan(
     protocol.assert_hydrogen_contract(
         config,
         evaluation=False,
-        allow_incomplete_a1=payload_label == "pipeline-check" and science_config_identity is None,
+        allow_incomplete_a1=(
+            science_config_identity is None and payload_label in {None, "pipeline-check"}
+        ),
     )
     task_id = f"h-v2-train-{lineage}"
     result_dir = results / "attached" / task_id
