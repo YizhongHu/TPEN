@@ -21,17 +21,17 @@
     "killer": "test_cannon_submit_lint.py::test_home_staging_literal_rejected"
   },
   {
-    "id": "ignore-sbatch-export-directive",
+    "id": "uncanonicalized-staging-destination",
     "target": "scripts/cannon/submit-lint.sh",
-    "old": "if [[ \"$line\" =~ ^[[:space:]]*#SBATCH[[:space:]]+--export=(.*)$ ]]; then",
-    "new": "if false; then  # mutant: ignore-sbatch-export-directive",
-    "killer": "test_cannon_submit_lint.py::test_bare_reexport_after_sbatch_export_accepted"
+    "old": "      canon \"$canon_final${candidate#\"$canon_local\"}\"",
+    "new": "      printf '%s\\n' \"$canon_final${candidate#\"$canon_local\"}\"  # mutant: uncanonicalized-staging-destination",
+    "killer": "test_cannon_submit_lint.py::test_staging_sbatch_symlink_escape_rejected"
   },
   {
-    "id": "ignore-multiassign-self-default",
+    "id": "ignore-submit-helper-export",
     "target": "scripts/cannon/submit-lint.sh",
-    "old": "if [[ \"$val\" =~ ^\\$\\{\"$key\":-(.*)\\}$ ]]; then",
-    "new": "if false; then  # mutant: ignore-multiassign-self-default",
-    "killer": "test_cannon_submit_lint.py::test_multi_assignment_export_line_parsed_per_key"
+    "old": "  if [[ -n \"$HELPER_SPEC_RAW\" ]]; then",
+    "new": "  if false; then  # mutant: ignore-submit-helper-export",
+    "killer": "test_cannon_submit_lint.py::test_submit_helper_export_line_supplies_bare_reexports"
   }
 ]

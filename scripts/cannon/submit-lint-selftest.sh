@@ -376,5 +376,71 @@ expect "sbatch linted at a mapped local staging root is accepted" pass \
   --allowed-root "$BASE/final-stage" --shared-env-root "$BASE/shared-env" --home "$BASE/home" \
   --staging-root "$BASE/local-stage=$BASE/final-stage"
 
+# --- Round 2 (T1 review of PR #653). Each job below starts from a
+# `#SBATCH --export=` directive supplying all six values with DRY_RUN=0 and
+# is linted against REEXPORT_MANIFEST (DRY_RUN=0); only the body differs. ---
+R2_SPEC="HEAD_SHA=$SHA,JOB_NAME=tpen-verify-$SHORT,TASK_ROOT=$GOOD_TASK_ROOT,RUN_ROOT=$GOOD_RUN_ROOT,DRY_RUN=0,PYTHON=$GOOD_PYTHON"
+R2_REST="export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT PYTHON"
+r2_job() {  # NAME BODY: writes $BASE/stage/r2-NAME.sbatch
+  printf '#!/bin/bash\n#SBATCH --export=%s\n%s\n%s\n' "$R2_SPEC" "$2" "$R2_REST" > "$BASE/stage/r2-$1.sbatch"
+}
+STALE_DRY="critical export 'DRY_RUN' is stale: manifest='0' sbatch='1'"
+
+# Finding 1: re-exports and self-defaults resolve against the CURRENT value.
+r2_job bare $'export DRY_RUN=1\nexport DRY_RUN'
+expect_contains "bare re-export keeps the current value, not the directive's" fail "$STALE_DRY" lint "$BASE/stage/r2-bare.sbatch" "$REEXPORT_MANIFEST"
+r2_job default $'export DRY_RUN=1\nexport DRY_RUN="${DRY_RUN:-0}"'
+expect_contains "self-default uses the current value, not the directive's" fail "$STALE_DRY" lint "$BASE/stage/r2-default.sbatch" "$REEXPORT_MANIFEST"
+r2_job plain $'export DRY_RUN\nDRY_RUN=1'
+expect_contains "plain assignment after export updates the value" fail "$STALE_DRY" lint "$BASE/stage/r2-plain.sbatch" "$REEXPORT_MANIFEST"
+r2_job prefix $'DRY_RUN=1 python run.py | tee log\nexport DRY_RUN'
+expect "command-prefix assignment leaves the job environment alone" pass lint "$BASE/stage/r2-prefix.sbatch" "$REEXPORT_MANIFEST"
+
+# Finding 2: quote provenance and comments.
+r2_job squote "export DRY_RUN='\${DRY_RUN:-0}' NOTE='x y=z'"
+expect_contains "single-quoted value is never expanded" fail "sbatch='\${DRY_RUN:-0}'" lint "$BASE/stage/r2-squote.sbatch" "$REEXPORT_MANIFEST"
+r2_job comment "export DRY_RUN=1 # DRY_RUN=0"
+expect_contains "unquoted comment ends the export statement" fail "$STALE_DRY" lint "$BASE/stage/r2-comment.sbatch" "$REEXPORT_MANIFEST"
+r2_job literal "export NOTE='x y=z' OTHER=\"a b=c\" DRY_RUN=0"
+expect "literal quoted spaces and '=' are accepted" pass lint "$BASE/stage/r2-literal.sbatch" "$REEXPORT_MANIFEST"
+r2_job cmdsub 'export DRY_RUN="$(echo 0)"'
+expect_contains "command substitution in a critical value is rejected" fail "will not guess its value" lint "$BASE/stage/r2-cmdsub.sbatch" "$REEXPORT_MANIFEST"
+r2_job cmdsubok $'export PATH="$(pwd)/bin:$PATH"\nexport DRY_RUN'
+expect "command substitution in a non-critical value is tolerated" pass lint "$BASE/stage/r2-cmdsubok.sbatch" "$REEXPORT_MANIFEST"
+
+# Finding 3: the WHOLE mapped destination is canonicalized (FINAL/link -> HOME).
+mkdir -p "$BASE/r2-local/link" "$BASE/r2-final"
+ln -s "$BASE/home" "$BASE/r2-final/link"
+r2_staged() {  # SBATCH TASK_ROOT RUN_ROOT
+  write_manifest "$1.manifest" "$SHA" "tpen-verify-$SHORT" "$2" "$3" 0 "$GOOD_PYTHON"
+  write_sbatch "$1" "$SHA" "tpen-verify-$SHORT" "$2" "$3" 0 "$GOOD_PYTHON"
+  "$LINTER" --sbatch "$1" --manifest "$1.manifest" --allowed-root "$BASE/r2-final" \
+    --shared-env-root "$BASE/shared-env" --home "$BASE/home" --staging-root "$BASE/r2-local=$BASE/r2-final"
+}
+expect_contains "mapped TASK_ROOT through FINAL/link -> HOME is rejected" fail "TASK_ROOT resolves under" r2_staged "$BASE/r2-local/t.sbatch" "$BASE/r2-local/link/x" "$BASE/r2-final/run"
+expect_contains "mapped RUN_ROOT through FINAL/link -> HOME is rejected" fail "RUN_ROOT resolves under" r2_staged "$BASE/r2-local/r.sbatch" "$BASE/r2-final/task" "$BASE/r2-local/link/x"
+expect_contains "mapped sbatch path through FINAL/link -> HOME is rejected" fail "sbatch path escapes" r2_staged "$BASE/r2-local/link/s.sbatch" "$BASE/r2-final/task" "$BASE/r2-final/run"
+
+# Finding 4: the submit helper's own `sbatch --export=... <job>` line.
+CLI_SBATCH="$BASE/stage/cli-job.sbatch"
+printf '#!/bin/bash\n#SBATCH --job-name=tpen-verify-%s\nexport HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON\n' "$SHORT" > "$CLI_SBATCH"
+CLI_HELPER="$BASE/stage/cli-submit.sh"
+printf '#!/bin/bash\njobid=$(sbatch --parsable --export=%s %s)\n' "$R2_SPEC" "$CLI_SBATCH" > "$CLI_HELPER"
+expect "helper sbatch --export= line supplies bare re-exports" pass lint "$CLI_SBATCH" "$REEXPORT_MANIFEST" --submit-helper "$CLI_HELPER"
+CLI_HELPER_BAD="$BASE/stage/cli-submit-bad.sh"
+printf '#!/bin/bash\njobid=$(sbatch --parsable --export=%s %s)\n' "${R2_SPEC/DRY_RUN=0/DRY_RUN=1}" "$CLI_SBATCH" > "$CLI_HELPER_BAD"
+expect_contains "helper sbatch --export= line with a wrong value is rejected" fail "$STALE_DRY" lint "$CLI_SBATCH" "$REEXPORT_MANIFEST" --submit-helper "$CLI_HELPER_BAD"
+CLI_HELPER_EXP="$BASE/stage/cli-submit-exp.sh"
+printf '#!/bin/bash\nsbatch --export="HEAD_SHA=$SHA,DRY_RUN=0" %s\n' "$CLI_SBATCH" > "$CLI_HELPER_EXP"
+expect_contains "helper --export with shell expansion is rejected" fail "unsupported --export value" lint "$CLI_SBATCH" "$REEXPORT_MANIFEST" --submit-helper "$CLI_HELPER_EXP"
+
+# Cannon job 59624204: `((i++))` with i=0 aborts under set -e on bash >= 4
+# but not on macOS bash 3.2. Statically forbid ((...)) increments and
+# assignments outside `for ((...))` headers in the linter.
+arith_offenders() {
+  grep -nE '(^|[^$[:alnum:]_])\(\([^()]*(\+\+|--|[^<>=!]=[^=])[^()]*\)\)' "$LINTER" | grep -vE '^[0-9]+:[[:space:]]*(#|for[[:space:]]*\(\()' || true
+}
+expect_contains "no errexit-unsafe ((...)) statements in the linter" pass "" bash -c '[[ -z "$1" ]] || { printf "%s\n" "$1"; exit 1; }' _ "$(arith_offenders)"
+
 printf 'SELFTEST pass=%s fail=%s\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

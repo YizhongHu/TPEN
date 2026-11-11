@@ -147,8 +147,11 @@ scripts/cannon/submit-lint.sh \
 
 `--staging-root LOCAL=FINAL` declares that a path canonically under `LOCAL`
 is, for containment purposes only, the same path it will be once staged
-(e.g. rsynced) under `FINAL`: checks 3 and 6 substitute the `LOCAL` prefix
-for `FINAL` before testing containment against `--allowed-root`, so a
+(e.g. rsynced) under `FINAL`: checks 3, 5 and 6 substitute the `LOCAL`
+prefix for `FINAL` and canonicalize the WHOLE mapped destination (so a
+symlink such as `FINAL/link -> $HOME` that exists where the linter runs is
+resolved; a symlink that exists only on the remote side cannot be seen)
+before testing `$HOME` and containment against `--allowed-root`, so a
 sbatch script linted in place at its local staging location (before rsync to
 the facility) is validated as if it already sat at its eventual facility
 path. The substitution never widens scope: a mapped path still must land
@@ -167,7 +170,7 @@ Checks performed (exit 0 on `LINT_PASS`, non-zero on `LINT_FAIL`):
 | 1 | `HEAD_SHA` is exactly 40 hex characters |
 | 2 | `JOB_NAME` contains `HEAD_SHA[:12]` |
 | 3 | sbatch path is absolute, canonical, and inside a declared `--allowed-root` |
-| 4 | critical exports (`HEAD_SHA`, `JOB_NAME`, `TASK_ROOT`, `RUN_ROOT`, `DRY_RUN`, `PYTHON`) match exactly between the manifest and the sbatch script's effective export values — no stale, missing, or extra values; `HEAD_SHA`/`JOB_NAME`/`TASK_ROOT`/`RUN_ROOT`/`DRY_RUN` must additionally be present and nonempty in both files (a field absent from both passes the match test but is still rejected), and `PYTHON` is required the same way whenever `DRY_RUN=1`. The sbatch script's effective value for a key is resolved, in file order, from: a literal `export KEY=VALUE` line; one token of a multi-assignment `export KEY=VALUE KEY2=VALUE2 ...` line (each token is parsed independently, so one key's value can never swallow a sibling assignment on the same line); a bare re-export (`export KEY`, no `=`) or a self-referential default expansion (`export KEY="${KEY:-DEFAULT}"`), both of which resolve to the value `sbatch --export=...,KEY=VALUE,...` supplied (falling back to `DEFAULT` for the expansion form only when `--export` did not supply the key) |
+| 4 | critical exports (`HEAD_SHA`, `JOB_NAME`, `TASK_ROOT`, `RUN_ROOT`, `DRY_RUN`, `PYTHON`) match exactly between the manifest and the job's effective exported environment — no stale, missing, or extra values; `HEAD_SHA`/`JOB_NAME`/`TASK_ROOT`/`RUN_ROOT`/`DRY_RUN` must additionally be present and nonempty in both files (a field absent from both passes the match test but is still rejected), and `PYTHON` is required the same way whenever `DRY_RUN=1`. The effective environment is computed by a deliberately narrow shell subset (documented in full at the top of the parser in `submit-lint.sh`), never by running anything and never from the manifest: it is SEEDED from the submit helper's own `sbatch ... --export=SPEC <job>` line when `--submit-helper` has one (a command-line option overrides the directive, as in Slurm), else from the last `#SBATCH --export=SPEC` directive in the leading comment block; SPEC must be literal `NAME=VALUE,...` (a bare `NAME` there is unknown). Then `export` and plain `NAME=VALUE` statements apply in file order: a bare `export NAME` keeps NAME's CURRENT value; `$NAME`/`${NAME}`/`${NAME:-DEFAULT}` expand against the current value; single quotes are literal; an unquoted `#` starts a comment; a `NAME=VALUE cmd` prefix does not change the job environment. Unsupported syntax (command substitution, other expansions, unquoted globs/tilde/operators, an unterminated quote, `unset`/`declare` on a critical key) is a LINT_FAIL when the statement could set a critical key, and a critical key exported with a value the linter cannot determine is a LINT_FAIL; it never guesses. Not modelled: control flow, functions, heredoc bodies, `source` |
 | 5 | `TASK_ROOT`/`RUN_ROOT` are not staged under `$HOME`, literally or after canonicalization (catches a symlink into `$HOME`) |
 | 6 | `TASK_ROOT`/`RUN_ROOT` stay inside a declared `--allowed-root` (facility-root escape) |
 | 7 | when `DRY_RUN=1`, `PYTHON` resolves under `--shared-env-root` |
