@@ -105,7 +105,9 @@ def test_r6_indexless_checkpoint_is_repaired_by_checkpoint_owner(tmp_path):
     newest = _save(root, 2)
     (newest.parent / PUBLICATION_CATALOG_FILENAME).unlink()
     (newest.parent / "latest.json").unlink()
-    selected = _committed_checkpoint(root)
+    # The owning allocation explicitly authorizes the repair (H1: discovery
+    # defaults to read-only; see test_s15_resume_predecessor_leaf_measurement.py).
+    selected = _committed_checkpoint(root, allow_reconcile=True)
     assert selected is not None and selected.checkpoint_dir == newest
     assert (newest.parent / PUBLICATION_CATALOG_FILENAME).is_file()
     assert (newest.parent / "latest.json").is_file()

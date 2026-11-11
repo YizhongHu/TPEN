@@ -518,48 +518,83 @@ def _run_status_artifact(output_path: Path) -> tuple[Path, dict[str, Any]] | Non
     return status_paths[0].parent, _read_json(status_paths[0])
 
 
-def _reconcile_unpublished_checkpoint(checkpoint_root: Path) -> CheckpointRef | None:
-    """Repair missing publication indexes for the latest committed directory."""
+def _latest_complete_checkpoint(checkpoint_root: Path) -> CheckpointRef | None:
+    """Return the newest complete checkpoint directory, performing no write.
+
+    Scans every COMPLETE checkpoint directory through ``CheckpointRef`` and
+    the train-resume manifest gate. Never touches the publication catalog,
+    ``latest.json``, or any receipt, so a leaf this call does not own -- for
+    example a predecessor's already-sealed leaf -- is left byte-identical
+    (H1: see ``_committed_checkpoint``'s ``allow_reconcile``).
+    """
 
     candidates = [CheckpointRef.from_directory(path) for path in list_complete_checkpoints(checkpoint_root)]
     if not candidates:
         return None
     ref = max(candidates, key=lambda candidate: candidate.next_iteration)
-    # Gate the full-state payload before publishing any execution completion
-    # evidence. The checkpoint package owns every non-destructive index write.
+    # Gate the full-state payload before treating it as selectable evidence.
     read_manifest(ref.checkpoint_dir / "manifest.json", mode="train_resume")
+    return ref
+
+
+def _reconcile_unpublished_checkpoint(checkpoint_root: Path) -> CheckpointRef | None:
+    """Repair missing publication indexes for the latest committed directory.
+
+    Writes the publication catalog, ``latest.json``, and the publication
+    receipt. Call only through ``_committed_checkpoint(..., allow_reconcile=True)``
+    from the allocation that still owns ``checkpoint_root`` -- never against a
+    predecessor's sealed leaf.
+    """
+
+    ref = _latest_complete_checkpoint(checkpoint_root)
+    if ref is None:
+        return None
+    # The checkpoint package owns every non-destructive index write.
     return reconcile_publication(checkpoint_root, ref.checkpoint_dir)
 
 
-def _committed_checkpoint(run_dir: Path) -> CheckpointRef | None:
-    """Read the latest committed full-state checkpoint through checkpoint APIs."""
+def _committed_checkpoint(run_dir: Path, *, allow_reconcile: bool = False) -> CheckpointRef | None:
+    """Read the latest committed full-state checkpoint through checkpoint APIs.
+
+    ``allow_reconcile`` defaults to ``False``: by default this is the
+    successor/restore discovery path, which (H1) must be strictly read-only
+    against a leaf it may not own -- an indexless or otherwise inconsistent
+    predecessor is selected from disk but never repaired in place. Only the
+    allocation that still owns ``run_dir`` (for example its own post-run
+    completion check in ``_core_outcome_from_artifacts``) may pass
+    ``allow_reconcile=True`` to backfill a missing publication index.
+    """
 
     checkpoint_root = run_dir / "checkpoints"
     if not checkpoint_root.is_dir():
         return None
+
+    select = _reconcile_unpublished_checkpoint if allow_reconcile else _latest_complete_checkpoint
 
     catalog_path = checkpoint_root / PUBLICATION_CATALOG_FILENAME
     if catalog_path.is_file():
         publications = read_publications(catalog_path)
         # A readable catalog is an index, not the authority over newer
         # committed checkpoint directories.  Scan all complete directories
-        # through CheckpointRef and the train-resume manifest gate, then let
-        # the checkpoint package reconcile any missing publication indexes.
-        # Keep the catalog read above outside the fallback so a corrupt
-        # catalog still refuses instead of silently falling back.
-        ref = _reconcile_unpublished_checkpoint(checkpoint_root)
+        # through CheckpointRef and the train-resume manifest gate, then
+        # (only when authorized) let the checkpoint package reconcile any
+        # missing publication indexes.  Keep the catalog read above outside
+        # the fallback so a corrupt catalog still refuses instead of silently
+        # falling back.
+        ref = select(checkpoint_root)
         if ref is None and publications:
             ref = max(publications, key=lambda candidate: candidate.next_iteration)
     elif not (checkpoint_root / LATEST_JSON).is_file():
         # A COMPLETE directory may have landed before either publication
-        # index. Reconcile it instead of resolving the root as a checkpoint.
-        ref = _reconcile_unpublished_checkpoint(checkpoint_root)
+        # index. Select it directly instead of resolving the root as a
+        # checkpoint (reconciling it is authorized only when owned).
+        ref = select(checkpoint_root)
     else:
         # ``latest.json`` is the checkpoint package's durable convenience
         # pointer.  The resolver also requires the COMPLETE marker, so a
         # temporary or half-written directory cannot become completion facts.
         pointer_ref = CheckpointRef.from_directory(resolve_checkpoint_dir(checkpoint_root))
-        candidate = _reconcile_unpublished_checkpoint(checkpoint_root)
+        candidate = select(checkpoint_root)
         ref = (
             candidate
             if candidate is not None and candidate.next_iteration > pointer_ref.next_iteration
@@ -615,7 +650,11 @@ def _core_outcome_from_artifacts(
         )
 
     try:
-        ref = _committed_checkpoint(run_dir)
+        # This allocation still owns ``run_dir``: it is reading back the
+        # checkpoint its own ``run_once`` call just produced, not discovering
+        # a predecessor's sealed leaf, so backfilling a missing publication
+        # index here is authorized (H1).
+        ref = _committed_checkpoint(run_dir, allow_reconcile=True)
     except OSError as exc:
         return CoreOutcomeFacts(
             status=CoreStatus.UNKNOWN,

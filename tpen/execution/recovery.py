@@ -15,7 +15,7 @@ from enum import Enum
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, ClassVar
 
 from ._codec import decode_fields
 
@@ -556,6 +556,38 @@ def _raw_manifest_refusal(raw_manifest: Any) -> RecoveryRefusal | None:
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class OperationalRestoreRequest:
+    """Closed, versioned operational-start request carrying an E1 decision.
+
+    Carries only an already-selected full-state ``train_resume``
+    :class:`RecoveryDecision`; it holds no mutable config dictionary and
+    authorizes no configuration change beyond the restore load it names.
+    ``tpen.run.run_from_config`` consumes this at the existing ``Train``
+    restore boundary (the constructor's ``load`` argument) and refuses a
+    concrete configured ``runner.load`` that conflicts with it, rather than
+    guessing precedence between the two.
+    """
+
+    SCHEMA: ClassVar[str] = "tpen.execution/operational-restore-request-v1"
+
+    decision: RecoveryDecision
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.decision, RecoveryDecision):
+            raise TypeError("decision must be a RecoveryDecision")
+        if self.decision.refusal is not None:
+            raise ValueError("OperationalRestoreRequest requires a non-refused recovery decision")
+        if self.decision.load is None or dict(self.decision.load).get("mode") != "train_resume":
+            raise ValueError("OperationalRestoreRequest requires a train_resume load decision")
+
+    @property
+    def load(self) -> dict[str, str]:
+        """Return the decision's existing configured-run ``train_resume`` load shape."""
+
+        return dict(self.decision.load)
+
+
 def _refused(
     intent: ScienceIntent,
     phase: RecoveryPhase,
@@ -576,6 +608,7 @@ def _refused(
 
 __all__ = [
     "CheckpointEvidence",
+    "OperationalRestoreRequest",
     "RecoveryDecision",
     "RecoveryOutcome",
     "RecoveryPhase",
