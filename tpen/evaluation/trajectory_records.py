@@ -220,7 +220,7 @@ class TrajectoryRecordArtifact:
     observable_values_content_id: str
     csv_sha256: str
     byte_count: int
-    atomic_configuration: AtomicConfiguration
+    atomic_configuration: AtomicConfiguration | None
     final_draw: TrajectoryRecordBatch
 
     @property
@@ -246,8 +246,9 @@ class TrajectoryRecordArtifact:
             raise ValueError("trajectory record term_names must be non-empty and unique")
         if any(not name.strip() for name in self.term_names):
             raise ValueError("trajectory record term_names must not contain blanks")
-        self.atomic_configuration.validate()
-        if self.atomic_configuration.spatial_dim != self.spatial_dim:
+        if self.atomic_configuration is not None:
+            self.atomic_configuration.validate()
+        if self.atomic_configuration is not None and self.atomic_configuration.spatial_dim != self.spatial_dim:
             raise ValueError("trajectory record geometry dimension disagrees with coordinates")
         final_draw = self.final_draw.validate()
         if final_draw.retained_draw_index != self.n_draws - 1:
@@ -319,6 +320,10 @@ class TrajectoryRecordArtifact:
         if not torch.equal(positions, self.final_draw.positions[:n_rows]):
             raise ValueError("generated snapshot is not the final retained trajectory draw")
         atoms = flat.atomic_configuration
+        if self.atomic_configuration is None:
+            if atoms is not None:
+                raise ValueError("generated snapshot unexpectedly carries nuclear geometry")
+            return n_rows
         if atoms is None or atoms.content_id() != self.atomic_configuration.content_id():
             raise ValueError("generated snapshot atomic geometry disagrees with trajectory records")
         return n_rows
@@ -349,8 +354,8 @@ class TrajectoryRecordArtifact:
             "observable_values_content_id": self.observable_values_content_id,
             "csv_sha256": self.csv_sha256,
             "byte_count": self.byte_count,
-            "atomic_configuration_id": atoms.content_id(),
-            "atomic_configuration": _atomic_geometry_payload(atoms),
+            "atomic_configuration_id": None if atoms is None else atoms.content_id(),
+            "atomic_configuration": None if atoms is None else _atomic_geometry_payload(atoms),
         }
         declared_keys = set(TRAJECTORY_RECORD_METADATA_KEYS)
         if expected_scalars.keys() != declared_keys:
@@ -385,7 +390,7 @@ class TrajectoryRecordStreamWriter:
         n_draws: int,
         n_walkers: int,
         term_names: tuple[str, ...],
-        atomic_configuration: AtomicConfiguration,
+        atomic_configuration: AtomicConfiguration | None,
         first_draw: TrajectoryRecordBatch,
     ) -> None:
         self.path = Path(path)
@@ -399,7 +404,7 @@ class TrajectoryRecordStreamWriter:
             raise ValueError("first trajectory record draw must contain every walker")
         if tuple(first_draw.term_energies) != self.term_names:
             raise ValueError("first trajectory record draw terms disagree with configured terms")
-        if self.atomic_configuration.spatial_dim != first_draw.spatial_dim:
+        if self.atomic_configuration is not None and self.atomic_configuration.spatial_dim != first_draw.spatial_dim:
             raise ValueError("trajectory record coordinates disagree with AtomicConfiguration")
 
         self.n_electrons = first_draw.n_electrons
@@ -577,7 +582,6 @@ class TrajectoryRecordStreamWriter:
 
 
 def _write_metadata(artifact: TrajectoryRecordArtifact) -> None:
-    atoms = artifact.atomic_configuration
     metadata = {
         "schema": TRAJECTORY_RECORD_SCHEMA,
         "row_semantics": TRAJECTORY_RECORD_ROW_SEMANTICS,
@@ -598,8 +602,16 @@ def _write_metadata(artifact: TrajectoryRecordArtifact) -> None:
         "observable_values_content_id": artifact.observable_values_content_id,
         "csv_sha256": artifact.csv_sha256,
         "byte_count": artifact.byte_count,
-        "atomic_configuration_id": atoms.content_id(),
-        "atomic_configuration": _atomic_geometry_payload(atoms),
+            "atomic_configuration_id": (
+                None
+                if artifact.atomic_configuration is None
+                else artifact.atomic_configuration.content_id()
+            ),
+            "atomic_configuration": (
+                None
+                if artifact.atomic_configuration is None
+                else _atomic_geometry_payload(artifact.atomic_configuration)
+            ),
     }
     with artifact.metadata_path.open("x", encoding="utf-8") as handle:
         json.dump(metadata, handle, sort_keys=True, indent=2, allow_nan=False)

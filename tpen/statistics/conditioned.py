@@ -859,6 +859,11 @@ def produce_conditioned_local_energy_statistics(
             "typed retained trajectory; terminal snapshots are not accepted"
         )
     artifact.validate()
+    if artifact.atomic_configuration is None:
+        raise ValueError(
+            "conditioned local-energy statistics require nuclear geometry; "
+            "trajectory records explicitly declare nucleus-free geometry as absent"
+        )
     partitions = _coerce_range_partitions(range_edges)
     strata = _coerce_joint_strata(joint_strata)
     probabilities = _coerce_probabilities(quantiles)
@@ -1483,6 +1488,11 @@ def _parse_chunk(
     }
     logabs = torch.tensor([_parse_float(row["logabs"]) for row in rows], dtype=torch.float64)
     sign = torch.tensor([_parse_float(row["sign"]) for row in rows], dtype=torch.float64)
+    if artifact.atomic_configuration is None:
+        raise ValueError(
+            "trajectory CSV geometry quantities require nuclear geometry; "
+            "the record declares atomic_configuration as absent"
+        )
     atoms = artifact.atomic_configuration.to(device="cpu", dtype=torch.float64)
     batch = ElectronBatch(
         positions=positions,

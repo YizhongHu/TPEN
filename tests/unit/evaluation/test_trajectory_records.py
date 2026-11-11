@@ -19,14 +19,22 @@ from tpen.evaluation.trajectory_records import (
 from tpen.statistics.trajectory import ObservableTrajectory
 
 
-def _artifact(tmp_path: Path, values: torch.Tensor, *, name: str = "trajectory.csv") -> TrajectoryRecordArtifact:
+def _artifact(
+    tmp_path: Path,
+    values: torch.Tensor,
+    *,
+    name: str = "trajectory.csv",
+    atomic_configuration: AtomicConfiguration | None = None,
+) -> TrajectoryRecordArtifact:
     values = values.to(torch.float64)
     n_draws, n_walkers = values.shape
     positions = torch.zeros(n_draws, n_walkers, 1, 3, dtype=torch.float64)
-    atoms = AtomicConfiguration(
-        positions=torch.zeros(1, 3, dtype=torch.float64),
-        charges=torch.tensor([1.0], dtype=torch.float64),
-    )
+    atoms = atomic_configuration
+    if atoms is None and name != "nucleus-free.csv":
+        atoms = AtomicConfiguration(
+            positions=torch.zeros(1, 3, dtype=torch.float64),
+            charges=torch.tensor([1.0], dtype=torch.float64),
+        )
 
     def record(draw: int) -> TrajectoryRecordBatch:
         return TrajectoryRecordBatch(
@@ -102,6 +110,30 @@ EXPECTED_METADATA_KEYS = (
 def test_freshly_written_artifact_validates(tmp_path: Path) -> None:
     artifact = _artifact(tmp_path, torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
     artifact.validate()
+
+
+def test_nucleus_free_artifact_round_trips_with_explicit_absence(tmp_path: Path) -> None:
+    artifact = _artifact(tmp_path, FINITE, name="nucleus-free.csv")
+
+    assert artifact.atomic_configuration is None
+    metadata = _read_metadata(artifact)
+    assert metadata["atomic_configuration_id"] is None
+    assert metadata["atomic_configuration"] is None
+    artifact.validate()
+
+
+def test_nucleus_record_bytes_remain_stable(tmp_path: Path) -> None:
+    first = _artifact(tmp_path, FINITE, name="first.csv")
+    second = _artifact(tmp_path, FINITE, name="second.csv")
+
+    # The filenames are intentionally normalized before comparison: all other
+    # CSV and sidecar bytes must remain identical for an existing atom record.
+    first_csv = first.path.read_bytes().replace(b"first.csv", b"second.csv")
+    assert first_csv == second.path.read_bytes()
+    first_metadata = _read_metadata(first)
+    second_metadata = _read_metadata(second)
+    first_metadata["csv_filename"] = second_metadata["csv_filename"]
+    assert first_metadata == second_metadata
 
 
 def test_sidecar_key_set_equals_declared_constant(tmp_path: Path) -> None:

@@ -166,11 +166,6 @@ class TrajectoryMCMCGenerator:
                     )
                     if record_stream is None:
                         atoms = walkers.atomic_configuration
-                        if atoms is None:
-                            raise ValueError(
-                                "trajectory records require Walkers.atomic_configuration "
-                                "so geometry is retained once as a typed reference"
-                            )
                         if self.max_samples is not None and self.max_samples < walkers.batch_size:
                             raise ValueError(
                                 "TrajectoryMCMCGenerator max_samples would truncate the final "
