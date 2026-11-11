@@ -9,7 +9,11 @@ import pytest
 import torch
 
 from tpen.data.atomic_configuration import AtomicConfiguration
+from tpen.data.batch import ElectronBatch, WavefunctionOutput
+from tpen.data.batch.walkers import Walkers
 from tpen.evaluation import trajectory_records
+from tpen.evaluation.generators import TrajectoryMCMCGenerator
+from tpen.evaluation.protocols import EvaluationContext
 from tpen.evaluation.trajectory_records import (
     TRAJECTORY_RECORD_METADATA_KEYS,
     TrajectoryRecordArtifact,
@@ -17,6 +21,9 @@ from tpen.evaluation.trajectory_records import (
     TrajectoryRecordStreamWriter,
 )
 from tpen.statistics.trajectory import ObservableTrajectory
+from tpen.physics.kinetic import KineticEnergy
+from tpen.physics.potential import ElectronNucleusInteraction, HarmonicTrap
+from tpen.sampling.stats import SamplerStats
 
 
 def _artifact(
@@ -135,6 +142,54 @@ def test_nucleus_record_bytes_remain_stable(tmp_path: Path) -> None:
     second_metadata = _read_metadata(second)
     first_metadata["csv_filename"] = second_metadata["csv_filename"]
     assert first_metadata == second_metadata
+
+
+def test_nucleus_free_generator_writes_and_validates_records(tmp_path: Path) -> None:
+    class OneElectronGaussian(torch.nn.Module):
+        def forward(self, batch: ElectronBatch) -> WavefunctionOutput:
+            logabs = -0.5 * batch.positions.square().sum(dim=(-2, -1))
+            return WavefunctionOutput(logabs=logabs, sign=torch.ones_like(logabs))
+
+    class TinySampler:
+        def __init__(self) -> None:
+            self.positions = torch.tensor(
+                [[[0.4, 0.0, 0.0]], [[0.0, 0.4, 0.0]]], dtype=torch.float64
+            )
+
+        def collect_samples(self, model, *, reset=False, device=None):
+            self.positions = self.positions + 0.01
+            return Walkers(positions=self.positions.clone()), SamplerStats(1.0, 2, 0, 1, 0.1)
+
+    context = EvaluationContext(
+        namespace="eval/hooke1",
+        artifact_level="records",
+        task_failure_policy="fail_fast",
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+        seed=0,
+        run_dir=tmp_path,
+        task_output_dir=tmp_path,
+        metadata={},
+    )
+    generated = TrajectoryMCMCGenerator(
+        sampler=TinySampler(),
+        hamiltonian_terms=(KineticEnergy(), HarmonicTrap(omega=1.0)),
+        n_draws=2,
+    ).generate(model=OneElectronGaussian(), context=context)
+
+    artifact = generated.trajectory_records
+    assert artifact is not None
+    assert artifact.atomic_configuration is None
+    artifact.validate()
+    artifact.validate_snapshot_batch(generated.batch)
+    assert (tmp_path / "sampled_eval_table.csv").is_file()
+
+    with pytest.raises(ValueError, match="cannot omit nuclear geometry"):
+        TrajectoryMCMCGenerator(
+            sampler=TinySampler(),
+            hamiltonian_terms=(ElectronNucleusInteraction(),),
+            n_draws=1,
+        ).generate(model=OneElectronGaussian(), context=context)
 
 
 def test_sidecar_key_set_equals_declared_constant(tmp_path: Path) -> None:
