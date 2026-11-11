@@ -97,12 +97,12 @@ def test_science_training_config_matches_a1_field_by_field(lineage: str, index: 
     assert set(identity) == {"lineage", "lineage_index", "overlay_sha256", "base_train_sha256", "contract_inputs_sha256"}
 
 
-def test_science_config_inherits_logging_fields_unchanged_from_train_yaml() -> None:
-    pipeline = protocol.training_config()
+def test_science_config_carries_the_complete_a1_logging_cadence() -> None:
     science, _ = protocol.science_training_config("L1", 0)
-    assert science["trainer"]["log_every_n_steps"] == pipeline["trainer"]["log_every_n_steps"]
-    assert science["callbacks"] == pipeline["callbacks"]
-    assert science["loggers"] == pipeline["loggers"]
+    assert science["trainer"]["log_every_n_steps"] == protocol.PILOT_A1_CADENCE
+    for callback in science["callbacks"]:
+        if callback["_target_"] in {"tpen.callback.DataIntegrity", "tpen.callback.GradientStats"}:
+            assert callback["every_n_steps"] == protocol.PILOT_A1_CADENCE
 
 
 def test_science_config_carries_no_pipeline_default_values() -> None:
