@@ -978,8 +978,8 @@ def _assert_a1_callbacks(config: Mapping[str, Any]) -> None:
 
     callbacks = [entry for entry in config.get("callbacks", ()) if isinstance(entry, Mapping)]
     present = [entry.get("_target_") for entry in callbacks]
-    appended = set(present) - set(_A1_CANDIDATES_PRESENT_IN_BASE_CONFIG)
-    if not appended:
+    configured_a1 = set(present) & set(A1_TRAINING_MODULE_CANDIDATES)
+    if not configured_a1:
         return
     missing = set(A1_TRAINING_MODULE_CANDIDATES) - set(present)
     if missing:
