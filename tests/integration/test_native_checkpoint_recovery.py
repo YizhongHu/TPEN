@@ -891,14 +891,18 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         assert result[channel] is False, limb
 
         if limb == "optimizer":
+            result["trainer_cursor"] = disabled_first_cursor == resume_cursor
             assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
         elif limb == "process_rng":
+            result["trainer_cursor"] = disabled_first_cursor == resume_cursor
             assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
             for unaffected in ("model_logabs", "optimizer_update", "sampler_proposal"):
                 assert result[unaffected] is True, (limb, unaffected)
         elif limb == "model":
+            result["trainer_cursor"] = disabled_first_cursor == resume_cursor
             assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
         elif limb == "sampler_mcmc":
+            result["trainer_cursor"] = disabled_first_cursor == resume_cursor
             assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
 
     assert set(results) == {spec.limb for spec in E5_CHANNEL_MAP}
@@ -957,6 +961,11 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     # attributed to model_logabs.  The first channel assertion must reject
     # that attribution before a later channel can accidentally mask it.
     for actual_limb, actual_trace in disabled_traces.items():
+        if actual_limb == "trainer_cursor":
+            # No measured channel vector exists to misattribute: the typed
+            # restore refusal (asserted above) replaces the measurement for
+            # this arm entirely.
+            continue
         wrong_limb = next(
             spec.limb for spec in E5_CHANNEL_MAP if spec.limb != actual_limb
         )
@@ -989,6 +998,12 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             disabled_limbs=tuple(spec.limb for spec in E5_CHANNEL_MAP),
             expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
         )
+    # trainer_cursor is excluded from this combined-omission run: disabling
+    # it now refuses before fit (R2.3), which would leave no measured
+    # channel vector for any of the other four limbs' combined mismatch to
+    # be checked against. Its own omission is covered by the typed-refusal
+    # assertion above.
+    non_cursor_limbs = tuple(spec.limb for spec in E5_CHANNEL_MAP if spec.limb != "trainer_cursor")
     all_disabled_path = tmp_path / "channel-all-disabled.trace.json"
     all_disabled = _launch(
         root=tmp_path,
@@ -1002,13 +1017,13 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         evidence=evidence_path,
         trace=all_disabled_path,
         resume_step=resume_cursor,
-        disable_limbs=tuple(spec.limb for spec in E5_CHANNEL_MAP),
+        disable_limbs=non_cursor_limbs,
     )
     all_disabled.wait(timeout=180)
     assert all_disabled.returncode == 0
     compare_channel_parity(
         reference_trace, _trace(all_disabled_path), resume_step=resume_cursor - 1,
-        disabled_limbs=tuple(spec.limb for spec in E5_CHANNEL_MAP),
+        disabled_limbs=non_cursor_limbs,
         expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
     )
     with pytest.raises(ChannelParityError, match="channel"):
