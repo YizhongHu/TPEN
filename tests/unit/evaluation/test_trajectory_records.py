@@ -232,7 +232,13 @@ def test_nucleus_free_conditioned_statistics_refuse_absent_geometry(tmp_path: Pa
 
 def test_present_geometry_dimension_mismatch_is_refused(tmp_path: Path) -> None:
     artifact = _artifact(tmp_path, FINITE)
-    mismatched = replace(artifact, spatial_dim=artifact.spatial_dim - 1)
+    mismatched = replace(
+        artifact,
+        atomic_configuration=AtomicConfiguration(
+            positions=torch.zeros(1, artifact.spatial_dim - 1, dtype=torch.float64),
+            charges=torch.tensor([1.0], dtype=torch.float64),
+        ),
+    )
     with pytest.raises(ValueError, match="geometry dimension disagrees"):
         mismatched.validate(check_files=False)
 
