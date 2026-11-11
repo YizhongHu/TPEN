@@ -445,6 +445,8 @@ def build_h_v2_train_plan(
     config["runtime"]["seed"] = seed
     config["sampler"]["n_walkers"] = n_walkers
     config["trainer"]["max_steps"] = max_steps
+    if science_config_identity is not None and payload_label == "pipeline-check":
+        raise ValueError("science payload cannot select the pipeline-check incomplete-A1 marker")
     protocol.assert_hydrogen_contract(
         config,
         evaluation=False,
@@ -960,7 +962,12 @@ def activate_h_v2_run(
         resolved = _resolve_bound_config(
             _merge_config_with_overrides(prepared.effective_config, prepared.overrides)
         )
-        protocol.assert_hydrogen_contract(resolved, allow_incomplete_a1=False)
+        try:
+            protocol._assert_a1_callbacks(resolved, allow_incomplete=False)
+        except ValueError as error:
+            reason = str(error)
+            _fail("incomplete-a1-callback-set", reason)
+            raise ActivationRefusal("incomplete-a1-callback-set", reason) from error
         configured = set(protocol.reconcile_enabled_modules(resolved))
         required = set(protocol.A1_TRAINING_MODULE_CANDIDATES)
         if configured != required:
