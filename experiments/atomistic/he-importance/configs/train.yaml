@@ -1,9 +1,10 @@
 # Helium-importance CONTROL training configuration.
 #
 # This file is the compliant counterpart to the frozen historical fixture at
-# `experiments/atomistic/he-v1/configs/train.yaml`. That file carries
-# `system.reference_energy` and is preserved as a record; this one declares the
-# closed HI train schema and therefore cannot carry a reference at all.
+# `experiments/atomistic/he-v1/configs/historical/he-v1-train-2026.yaml`. That
+# historical file carries `system.reference_energy` and is preserved as a
+# record; the live He-v1 `configs/train.yaml` is reference-free. This one
+# declares the closed HI train schema and therefore cannot carry a reference.
 #
 # THE REFERENCE LIVES IN `../manifests/evaluation.yaml` AND NOWHERE ELSE. It is
 # loaded by a separate process, after training is over.

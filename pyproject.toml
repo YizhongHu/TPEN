@@ -68,6 +68,7 @@ dev = [
   "h5py==3.11.0",
   "matplotlib>=3.10.9",
   "pytest",
+  "pytest-xdist",
   "typeguard>=4",
 ]
 docs = [
@@ -150,6 +151,7 @@ markers = [
   "integration: end-to-end tests that exercise entrypoints, configs, or generated artifacts",
   "h_v2_pipeline: contract-scale H-v2 pipeline-check run (part e); skipped by default via experiments/atomistic/h-v2/conftest.py unless --run-h-v2-pipeline is passed",
   "h_v2_sampler_tail_qualification: full radial/local-energy survival-curve sampler qualification; skipped by default via experiments/atomistic/h-v2/conftest.py unless --run-h-v2-sampler-tail-qualification is passed",
+  "requires_typeguard: assertion needs the typeguard pytest plugin instrumenting tpen to raise TypeCheckError; skipped by tests/conftest.py when --typeguard-packages does not include tpen (e.g. a runner disabling typeguard via -o addopts=)",
 ]
 addopts = "--typeguard-packages=tpen"
 norecursedirs = [
@@ -159,4 +161,5 @@ norecursedirs = [
   "experiments/hooke/pair_validation",
   "experiments/hooke/pair_stability_small",
   "executor",
+  "scripts",  # facility-specific runner scripts and their own tests live here, run explicitly
 ]

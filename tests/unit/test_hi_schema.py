@@ -126,15 +126,18 @@ class TestScope:
     def test_the_frozen_he_v1_train_fixture_is_left_alone(self) -> None:
         """The historical fixture is noncompliant BY RECORD and must stay loadable.
 
-        ``experiments/atomistic/he-v1/configs/train.yaml`` carries
-        ``system.reference_energy``. The plan of record designates it a
-        historical implementation fixture to be preserved, not edited. It
-        declares no schema, so the firewall must not touch it -- and it must
-        also be genuinely noncompliant, or this test would pass for the wrong
-        reason and stop protecting anything.
+        ``experiments/atomistic/he-v1/configs/historical/he-v1-train-2026.yaml``
+        carries ``system.reference_energy``. The operator decision on 2026-11-10
+        preserves that historical implementation fixture while keeping the
+        live ``train.yaml`` reference-free. It declares no schema, so the
+        firewall must not touch it -- and it must also be genuinely
+        noncompliant, or this test would pass for the wrong reason and stop
+        protecting anything.
         """
 
-        cfg = OmegaConf.load("experiments/atomistic/he-v1/configs/train.yaml")
+        cfg = OmegaConf.load(
+            "experiments/atomistic/he-v1/configs/historical/he-v1-train-2026.yaml"
+        )
         _validate(cfg)
 
         # Red arm: opting the same content in must reject it.
@@ -212,7 +215,9 @@ class TestOmittingTheSchemaKeyIsLoud:
     def test_the_frozen_he_v1_fixture_needs_no_exemption_entry(self) -> None:
         """It survives by NOT being in the family, not by being listed."""
 
-        cfg = OmegaConf.load("experiments/atomistic/he-v1/configs/train.yaml")
+        cfg = OmegaConf.load(
+            "experiments/atomistic/he-v1/configs/historical/he-v1-train-2026.yaml"
+        )
         assert not is_hi_family(cfg)
         _validate(cfg)
 

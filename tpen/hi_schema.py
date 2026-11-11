@@ -24,10 +24,11 @@ measurement behind that choice, and for the residual hole it leaves.
 
 A configuration outside the family passes through untouched. That is how the
 frozen historical fixtures survive without an exemption list:
-``experiments/atomistic/he-v1/configs/train.yaml`` carries a
-``reference_energy`` in its ``system`` block and the plan of record designates
-it preserved rather than edited -- and it is ``tpen_he_v1``, so it is simply not
-this family.
+``experiments/atomistic/he-v1/configs/historical/he-v1-train-2026.yaml`` carries
+a ``reference_energy`` in its ``system`` block. The operator decision on
+2026-11-10 preserves that historical record; the live
+``experiments/atomistic/he-v1/configs/train.yaml`` is reference-free. The
+historical file is ``tpen_he_v1``, so it is simply not this family.
 
 Why a training configuration may not hold a reference
 -----------------------------------------------------
