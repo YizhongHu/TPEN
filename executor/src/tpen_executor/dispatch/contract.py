@@ -23,9 +23,21 @@ from .._codec import digest
 from ..contracts import ReadyGroup
 from ..environments import PreparedPythonEnvironment
 from ..lifecycle.attached import AttachedAllocation
-from ..results import RunManifest, SciencePlacementReceipt, SciencePlacementReceiptV2
+from ..gpu_sampler import (
+    GPU_SAMPLER_OUTPUT_ENV,
+    LAUNCH_ROLE_ENV,
+    QUARANTINE_IDENTITY_KEYS,
+    SLOT_QUARANTINE_ENV,
+    ensure_slot_clean,
+    read_sampler_evidence,
+    slot_fence_key,
+    slot_quarantine_dir,
+)
+from ..gpu_telemetry import not_sampled_sampler
+from ..results import RunManifest, SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3
 from ..placement import (
     BindingError,
+    ChildPlacementObservation,
     PLACEMENT_OUTPUT_ENV,
     PLACEMENT_RECEIPT_VERSION_ENV,
     PLACEMENT_REFUSAL_ENV,
@@ -187,11 +199,18 @@ def _with_child_placement(
     enforcement is enabled only by the explicit sidecar output path.
 
     CPU-only slots intentionally retain an empty declared-device field.
+
+    A declared-GPU v2-placement slot also receives a worker-only GPU sampler
+    evidence path and the slot's durable quarantine directory in the attempt
+    store; any inherited value is discarded so only the controller decides
+    which slots are sampled.
     """
 
     if not isinstance(environment, PreparedPythonEnvironment):
         return environment
     values = dict(environment.env)
+    for key in (GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, LAUNCH_ROLE_ENV):
+        values.pop(key, None)
     facts = getattr(allocation, "facts", {})
     v2_requested = _placement_v2_requested(allocation, values)
     scheduler_metadata = facts.get("scheduler", facts.get("scheduler_host_map")) if isinstance(facts, Mapping) else None
@@ -216,7 +235,11 @@ def _with_child_placement(
         if len(slots) != 1:
             # A local worker with no slot is a legacy path; a multi-slot
             # allocation must be resolved by the backend worker (Parsl).
-            return environment
+            # Neither is sampled, even with an inherited evidence path.  This
+            # is still a SCIENCE launch: stripping its worker-only keys never
+            # makes it an inspection, so a carried TPEN_SLOT_ID is still
+            # checked against the quarantine by the worker (delta-4 D4-1).
+            return _without_gpu_sampler(environment)
         slot = slots[0]
         slot_id, host, cpus = slot.slot_id, slot.node, ",".join(str(cpu) for cpu in slot.cpus)
         devices = ",".join(slot.devices)
@@ -278,10 +301,69 @@ def _with_child_placement(
     if v2_requested:
         placement_values[PLACEMENT_RECEIPT_VERSION_ENV] = "2"
         placement_values["TPEN_PLACEMENT_HOST_STATUS"] = "mapped" if scheduler_metadata is not None else "declared"
+        if devices:
+            # The worker that owns the child samples it for its lifetime and
+            # quarantines its physical slot durably in this attempt store.
+            placement_values[GPU_SAMPLER_OUTPUT_ENV] = os.path.join(fence.output_dir, "gpu-sampler.json")
+            # Keyed by allocation, backend job, physical host, and slot.
+            quarantine_dir = slot_quarantine_dir(fence.root, placement_values)
+            if quarantine_dir is not None:
+                placement_values[SLOT_QUARANTINE_ENV] = quarantine_dir
     if controller_refusal is not None:
         placement_values[PLACEMENT_REFUSAL_ENV] = json.dumps(controller_refusal, sort_keys=True)
     values = placement_environment(values, **placement_values)
     return PreparedPythonEnvironment(environment.python, environment.setup, values)
+
+
+def _without_gpu_sampler(environment: Any) -> Any:
+    """Return ``environment`` without any worker-only sampling or role key.
+
+    Used for the legacy/no-unique-slot science fallback of
+    :func:`_with_child_placement` and for the environment handed to the
+    member inspection; neither starts a second sampler.  It grants NO launch
+    role and never marks a launch as an inspection: the quarantine exemption
+    is the typed ``LaunchPurpose.INSPECTION`` worker argument, passed only by
+    :meth:`tpen_executor.runners.TPENEvidence.read` (review delta-4 D4-1).
+    The retired environment role key is scrubbed so a descriptor cannot
+    carry it into any launch.
+    """
+
+    if not isinstance(environment, PreparedPythonEnvironment):
+        return environment
+    values = {
+        key: value
+        for key, value in environment.env.items()
+        if key not in (GPU_SAMPLER_OUTPUT_ENV, SLOT_QUARANTINE_ENV, LAUNCH_ROLE_ENV)
+    }
+    return PreparedPythonEnvironment(environment.python, environment.setup, values)
+
+
+def _admit_slot(environment: Any, fence: Any) -> None:
+    """Dispatch admission: refuse a member whose physical slot is quarantined.
+
+    Every placed science launch consults the in-process slot quarantine and
+    the durable markers in this attempt store, sampled or not, so a
+    restarted controller that reuses the store refuses a slot whose earlier
+    sampled launch never confirmed cleanup.  This assumes one controller per
+    allocation: markers in a different store, or held by a concurrently
+    running independent controller, are not seen (follow-up item 0aa73edd).
+
+    Raises
+    ------
+    SlotQuarantined
+        If the slot is still quarantined; no child is launched.
+    """
+
+    if not isinstance(environment, PreparedPythonEnvironment):
+        return
+    values = environment.env
+    if any(not values.get(key) for key in QUARANTINE_IDENTITY_KEYS):
+        # Legacy launches without a placed physical slot are not admitted here;
+        # the worker still consults the in-process quarantine by slot id.
+        return
+    quarantine_dir = slot_quarantine_dir(fence.root, values)
+    # The in-process key matches the worker's: owner environment then descriptor.
+    ensure_slot_clean(slot_fence_key({**os.environ, **values}), quarantine_dir)
 
 
 def _placement_refusal_from_environment(environment: Any) -> PlacementRefusal | None:
@@ -542,6 +624,52 @@ def _placement_receipt_v2(
             "warning": warning,
         },
     )
+
+
+def _placement_receipt_v3(
+    observation: ChildPlacementObservation,
+    allocation: Any,
+    fence: Any,
+    group: ReadyGroup,
+    member: Any,
+    configured: ConfiguredRun,
+    environment: Any,
+    process_outcome: Any = None,
+) -> SciencePlacementReceiptV3:
+    """Layer the worker's lifetime GPU sampler evidence over the L1a verdict.
+
+    Parameters
+    ----------
+    observation : ChildPlacementObservation
+        Unchanged L1a child sidecar read after process quiescence.
+    allocation, fence, group, member, configured, environment, process_outcome
+        Controller context, exactly as for :func:`_placement_receipt_v2`.
+        A declared-GPU slot carries the worker evidence path in
+        ``environment``; a slot without one is intentionally ``not-sampled``.
+
+    Returns
+    -------
+    SciencePlacementReceiptV3
+        Receipt whose device verdict is derived from the lifetime aggregate.
+        Observed but unusable telemetry (no exact-PID row, foreign rows only,
+        or an unresolved entitlement) is a typed ``telemetry-failed`` receipt
+        with the retained samples preserved; missing or invalid worker
+        evidence is typed ``sampler-evidence-invalid`` failed evidence.
+
+    Raises
+    ------
+    PlacementRefusal, TypeError, ValueError
+        Only from the unchanged L1a host/affinity builder or a CPU-only slot
+        carrying attempted sampler evidence; the dispatcher then records a
+        typed refusal receipt.
+    """
+
+    l1a = _placement_receipt_v2(
+        observation, allocation, fence, group, member, configured, environment, process_outcome
+    )
+    path = environment.env.get(GPU_SAMPLER_OUTPUT_ENV) if isinstance(environment, PreparedPythonEnvironment) else None
+    sampler = not_sampled_sampler() if path is None else read_sampler_evidence(path)
+    return SciencePlacementReceiptV3.from_l1a(l1a, sampler)
 
 
 def _placement_refusal_receipt(
@@ -908,6 +1036,7 @@ class DispatcherContract:
                 placement_refusal = _placement_refusal_from_environment(environment)
                 if placement_refusal is not None:
                     raise placement_refusal
+                _admit_slot(environment, fence)
                 process = materialized["process"]
                 materialized["runner"]
                 evidence = materialized["evidence"]
@@ -1021,9 +1150,11 @@ class DispatcherContract:
                 output_dir, core_dir, _stdout, _stderr, evidence_stdout, evidence_stderr = _member_paths(fence)
                 if not callable(getattr(evidence, "read", None)):
                     raise TypeError("materialized worker evidence reader lacks read()")
+                # The reader itself launches with LaunchPurpose.INSPECTION; the
+                # environment only drops the worker-only sampling keys.
                 decoded = evidence.read(
                     process,
-                    environment,
+                    _without_gpu_sampler(environment),
                     core_dir,
                     cwd=output_dir,
                     stdout_path=evidence_stdout,
@@ -1082,7 +1213,9 @@ class DispatcherContract:
                 if requested_refusal is not None:
                     raise requested_refusal
                 observation = read_child_placement(placement_path)
-                receipt_builder = _placement_receipt_v2 if environment.env.get(PLACEMENT_RECEIPT_VERSION_ENV) == "2" else _placement_receipt
+                # v2 placement gets the sampler-bearing v3 receipt; legacy
+                # placement keeps the v1 receipt.
+                receipt_builder = _placement_receipt_v3 if environment.env.get(PLACEMENT_RECEIPT_VERSION_ENV) == "2" else _placement_receipt
                 receipt = receipt_builder(
                     observation, lifecycle.allocation, fence, group, member, configured, environment, outcome,
                 )

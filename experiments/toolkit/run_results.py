@@ -24,10 +24,68 @@ RUN_MANIFEST_V3 = "tpen-executor/run-manifest-v3"
 ACCEPTED_SEGMENT_SCHEMA = "tpen-executor/accepted-segment-v1"
 SCIENCE_PLACEMENT_RECEIPT_SCHEMA = "tpen-executor/science-placement-receipt-v1"
 SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2 = "tpen-executor/science-placement-receipt-v2"
+SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V3 = "tpen-executor/science-placement-receipt-v3"
 OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed"})
 PLACEMENT_COMPARISON_STATES = frozenset({"matched", "mismatch", "unavailable", "refused"})
 _HEX_DIGITS = frozenset(string.hexdigits.lower())
 _GPU_UUID = re.compile(r"^GPU-[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$")
+# Independent mirror of the executor placement vocabulary.  These strings are
+# deliberately duplicated rather than imported: the toolkit never imports the
+# executor, and the real producer-to-reader tests prove the two sides agree.
+PLACEMENT_UNQUALIFIED_MESSAGE = "GPU PLACEMENT UNQUALIFIED: placement mismatch/refusal requires science review."
+PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE = (
+    "GPU PLACEMENT UNQUALIFIED: attempted GPU telemetry failed or placement mismatch/refusal requires science review."
+)
+PLACEMENT_NOT_SAMPLED_MESSAGE = (
+    "GPU PLACEMENT NOT-SAMPLED: L1a intentionally does not sample devices; H-v2 performs its own delivered-GPU check."
+)
+PLACEMENT_V3_WARNINGS = {
+    "qualified": "GPU PLACEMENT QUALIFIED: live PID UUID telemetry matched the declared physical slot.",
+    "mismatch": "GPU PLACEMENT UNQUALIFIED: physical placement evidence requires review.",
+    "refused": "GPU PLACEMENT UNQUALIFIED: physical placement evidence requires review.",
+    "telemetry-failed": "GPU PLACEMENT UNQUALIFIED: attempted GPU telemetry failed; science acceptance is blocked.",
+}
+_L1A_UNQUALIFIED_WARNING = "GPU PLACEMENT UNQUALIFIED: physical placement evidence requires review."
+GPU_SAMPLER_METHOD = "nvidia-smi-pid-uuid-v1"
+GPU_SAMPLER_KEYS = frozenset({
+    "status", "reason", "method", "version", "attempted", "failure", "cadence_seconds", "count",
+    "monotonic_start", "monotonic_end", "samples", "command_pids", "survivors", "elapsed_seconds",
+    "join_timeout_seconds", "quiescent", "target_pid", "aggregate", "executable", "gaps",
+})
+GPU_SAMPLER_AGGREGATE_KEYS = frozenset({"samples_taken", "exact_pid_gpus", "outside_use_seen", "entitlement_unresolved_seen"})
+GPU_SAMPLER_MAX_SAMPLES = 16
+GPU_SAMPLER_CADENCE_BOUNDS = (0.01, 60.0)
+GPU_SAMPLER_MAX_JOIN_TIMEOUT = 60.0
+# Gap budget block (mirrors the executor's gpu_telemetry): only transient
+# command/read failures may be forgiven, and either budget is capped on the wire.
+GPU_SAMPLER_GAP_KEYS = frozenset({"max_consecutive_allowed", "max_total_allowed", "count", "max_consecutive", "total_seconds", "events"})
+GPU_SAMPLER_GAP_EVENT_KEYS = frozenset({"code", "monotonic_start", "monotonic_end", "consecutive"})
+GPU_SAMPLER_GAP_CODES = frozenset({"command-failed", "command-timeout", "read-failed"})
+GPU_SAMPLER_GAP_BUDGET_CAP = 16
+GPU_SAMPLER_FAILURE_CODES = frozenset({
+    "launch-failed", "command-failed", "command-timeout", "read-failed", "malformed-output",
+    "cleanup-unconfirmed", "no-sample", "sampler-cancelled", "sampler-join-expired",
+    "sampler-unfinalized", "sampler-error", "sampler-evidence-invalid", "mig-unsupported", "gap-budget-exceeded",
+})
+GPU_DEVICE_DECISIONS = {
+    "matched": ("matched", "live science PID used only GPU UUIDs inside its physical slot entitlement"),
+    "out-of-entitlement": ("mismatch", "live science PID used a GPU UUID outside its physical slot entitlement"),
+    "sampler-failed": ("unavailable", "attempted GPU sampler failed"),
+    "entitlement-unresolved": ("unavailable", "declared GPU entitlement is absent from a sampled inventory"),
+    "no-exact-pid-row": ("unavailable", "no sampled row names the live science PID"),
+    "sampler-not-run": ("unavailable", "declared GPU slot was not sampled"),
+    "cpu-only": ("unavailable", "CPU-only slot has no GPU entitlement"),
+}
+_GPU_NOT_SAMPLED = {
+    "status": "unavailable", "reason": "not-sampled", "method": GPU_SAMPLER_METHOD,
+    "version": None, "attempted": False, "failure": None, "cadence_seconds": 0.0,
+    "count": 0, "monotonic_start": None, "monotonic_end": None, "samples": [],
+    "command_pids": [], "survivors": [], "elapsed_seconds": 0.0,
+    "join_timeout_seconds": 30.0, "quiescent": True, "target_pid": None,
+    "aggregate": {"samples_taken": 0, "exact_pid_gpus": [], "outside_use_seen": False, "entitlement_unresolved_seen": False},
+    "executable": None,
+    "gaps": {"max_consecutive_allowed": 0, "max_total_allowed": 0, "count": 0, "max_consecutive": 0, "total_seconds": 0.0, "events": []},
+}
 
 
 class ManifestRefusal(ValueError):
@@ -338,11 +396,394 @@ def _placement_v2_verdict(value: Any, declared: Mapping[str, Any]) -> dict[str, 
     return record
 
 
+def _sampler_refusal(reason: str) -> ManifestRefusal:
+    return ManifestRefusal("malformed-record", f"placement gpu sampler {reason}")
+
+
+def _sampler_number(value: Any, name: str) -> float:
+    if type(value) not in {int, float} or not math.isfinite(value):
+        raise _sampler_refusal(f"{name} must be a finite number")
+    return float(value)
+
+
+def _sampler_positive_int(value: Any, name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise _sampler_refusal(f"{name} must be a positive integer")
+    return value
+
+
+def _sampler_list(value: Any, name: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise _sampler_refusal(f"{name} must be a sequence")
+    return value
+
+
+def _placement_v3_aggregate(record: Mapping[str, Any], retained: list[tuple[str, str]], pci_by_uuid: Mapping[str, str]) -> None:
+    """Mirror the executor's lifetime-aggregate check against retained samples."""
+
+    aggregate = _fields(record["aggregate"], set(GPU_SAMPLER_AGGREGATE_KEYS), "placement gpu sampler aggregate")
+    taken = aggregate["samples_taken"]
+    if type(taken) is not int or taken < record["count"] or (taken == 0) != (record["count"] == 0):
+        raise _sampler_refusal("aggregate sample total disagrees with its retained samples")
+    if type(aggregate["outside_use_seen"]) is not bool or type(aggregate["entitlement_unresolved_seen"]) is not bool:
+        raise _sampler_refusal("aggregate flags must be booleans")
+    if taken and record["target_pid"] is None:
+        raise _sampler_refusal("samples require a target PID")
+    union: list[tuple[str, str]] = []
+    for item in _sampler_list(aggregate["exact_pid_gpus"], "aggregate exact_pid_gpus"):
+        item = _fields(item, {"uuid", "pci.bus_id"}, "placement gpu sampler aggregate GPU")
+        uuid = _gpu_uuid(item["uuid"], "placement gpu sampler aggregate uuid")
+        pci = _text(item["pci.bus_id"], "placement gpu sampler aggregate pci.bus_id")
+        if uuid in {seen for seen, _ in union} or pci_by_uuid.get(uuid, pci) != pci:
+            raise _sampler_refusal("aggregate GPU row is inconsistent")
+        union.append((uuid, pci))
+    if not set(retained) <= set(union):
+        raise _sampler_refusal("aggregate omits a retained exact-target GPU")
+    if taken == record["count"] and union != retained:
+        raise _sampler_refusal("aggregate differs from its complete retained samples")
+
+
+def _placement_v3_gaps(record: Mapping[str, Any], start: float | None, end: float | None) -> None:
+    """Mirror the executor's gap-budget check (manager ruling Q1).
+
+    Every recorded gap must be a forgivable transient failure, ordered inside
+    the outer interval, with consistent run numbering and counters; sampling
+    must stop at the first budget excess, and ``gap-budget-exceeded`` must be
+    the failure exactly when a budget was exceeded.
+
+    The attempt timeline must be coherent (review delta-3 F3): no gap
+    overlaps a retained successful sample, a run never continues across a
+    retained sample, every reset after the first gap needs a successful
+    sample in between, and resets with no retained sample in between are
+    accepted only while enough samples were dropped to justify them (none
+    with complete history).  No event before the last may exceed a budget.
+
+    A dropped success witnesses a reset only inside its possible eviction
+    window (review delta-4 D4-2): before the always-retained newest sample
+    and, when two or more samples are retained (so the first is pinned),
+    after the first retained sample; each reset needs its own dropped
+    success.  No successful sample follows the attempt that exceeded a
+    budget.
+    """
+
+    gaps = _fields(record["gaps"], set(GPU_SAMPLER_GAP_KEYS), "placement gpu sampler gaps")
+    counters = ("max_consecutive_allowed", "max_total_allowed", "count", "max_consecutive")
+    if any(type(gaps[key]) is not int or gaps[key] < 0 for key in counters):
+        raise _sampler_refusal("gap counters must be non-negative integers")
+    allowed_consecutive, allowed_total = gaps["max_consecutive_allowed"], gaps["max_total_allowed"]
+    if allowed_consecutive > GPU_SAMPLER_GAP_BUDGET_CAP or allowed_total > GPU_SAMPLER_GAP_BUDGET_CAP:
+        raise _sampler_refusal("gap budget exceeds its wire cap")
+    events = _sampler_list(gaps["events"], "gap events")
+    if gaps["count"] != len(events):
+        raise _sampler_refusal("gap count disagrees with its events")
+    # Retained successful attempts (validated) and the count of dropped ones.
+    successes = [(float(sample["monotonic_start"]), float(sample["monotonic_end"])) for sample in record["samples"]]
+    dropped = record["aggregate"]["samples_taken"] - record["count"]
+    # Eviction window of a dropped success: before the newest retained sample
+    # and, with two or more retained (first pinned), after the first.
+    newest_start = successes[-1][0] if successes else None
+    first_end = successes[0][1] if len(successes) > 1 else None
+    previous_end, run, longest, summed, unproven_resets = start, 0, 0, 0.0, 0
+    for index, event in enumerate(events):
+        event = _fields(event, set(GPU_SAMPLER_GAP_EVENT_KEYS), "placement gpu sampler gap event")
+        if event["code"] not in GPU_SAMPLER_GAP_CODES:
+            raise _sampler_refusal("gap event is not a forgivable transient failure")
+        event_start = _sampler_number(event["monotonic_start"], "gap start")
+        event_end = _sampler_number(event["monotonic_end"], "gap end")
+        consecutive = _sampler_positive_int(event["consecutive"], "gap consecutive run")
+        if start is None or event_end < event_start or event_start < previous_end or event_end > end:
+            raise _sampler_refusal("gap interval is not ordered inside the outer interval")
+        if consecutive not in (1, run + 1):
+            raise _sampler_refusal("gap consecutive run numbering is inconsistent")
+        # A failed attempt never overlaps a successful one.
+        if any(event_start < success_end and success_start < event_end for success_start, success_end in successes):
+            raise _sampler_refusal("gap overlaps a retained successful sample")
+        if index:
+            succeeded_between = any(
+                previous_end <= success_start and success_end <= event_start for success_start, success_end in successes
+            )
+            if succeeded_between and consecutive != 1:
+                raise _sampler_refusal("gap run continues across a retained successful sample")
+            if consecutive == 1 and not succeeded_between:
+                # Only a dropped sample inside the eviction window can have reset this run.
+                if newest_start is None or event_end > newest_start or (first_end is not None and previous_end < first_end):
+                    raise _sampler_refusal("gap run resets where no dropped successful sample can lie")
+                unproven_resets += 1
+        # The first excess ends sampling: no earlier event may exceed a budget.
+        if index < len(events) - 1 and (index + 1 > allowed_total or consecutive > allowed_consecutive):
+            raise _sampler_refusal("gaps continue past the first budget excess")
+        previous_end, run = event_end, consecutive
+        longest = max(longest, consecutive)
+        summed += event_end - event_start
+    if unproven_resets > dropped:
+        raise _sampler_refusal("gap run resets without an intervening successful sample")
+    if gaps["max_consecutive"] != longest:
+        raise _sampler_refusal("gap max_consecutive disagrees with its events")
+    if abs(_sampler_number(gaps["total_seconds"], "gap total_seconds") - summed) > 1e-6:
+        raise _sampler_refusal("gap total_seconds disagrees with its events")
+    if len(events) > allowed_total + 1 or longest > allowed_consecutive + 1:
+        raise _sampler_refusal("gaps continue past the first budget excess")
+    exceeded = len(events) > allowed_total or longest > allowed_consecutive
+    # The excess attempt is the last attempt: no success may follow it.
+    if exceeded and any(success_start >= previous_end for success_start, _success_end in successes):
+        raise _sampler_refusal("gap budget excess is followed by a successful sample")
+    failure = record["failure"]
+    if exceeded != (failure is not None and failure["code"] == "gap-budget-exceeded"):
+        raise _sampler_refusal("gap budget excess and gap-budget-exceeded failure disagree")
+
+
+def _placement_v3_sampler(value: Any) -> dict[str, Any]:
+    """Mirror the executor's closed ``gpu_sampler`` validator.
+
+    Rejects unknown keys, inconsistent status/reason/attempted labels,
+    untyped failures, observation without confirmed quiescence or a
+    resolved executable, survivors under a quiescent label, unordered or
+    uncontained sample intervals, PID rows absent from their own sample's
+    inventory, a lifetime aggregate that disagrees with the retained samples,
+    and a gap block that disagrees with its budget or failure code.
+    """
+
+    record = dict(_fields(value, set(GPU_SAMPLER_KEYS), "placement gpu sampler"))
+    if record["method"] != GPU_SAMPLER_METHOD:
+        raise _sampler_refusal("method is invalid")
+    status, reason = record["status"], record["reason"]
+    if (status, reason) not in {("observed", "observed"), ("unavailable", "telemetry-failed"), ("unavailable", "not-sampled")}:
+        raise _sampler_refusal("status/reason pair is invalid")
+    if type(record["attempted"]) is not bool or type(record["quiescent"]) is not bool:
+        raise _sampler_refusal("attempted/quiescent must be booleans")
+    if (reason == "not-sampled") != (not record["attempted"]):
+        raise _sampler_refusal("not-sampled must be exactly the unattempted state")
+    if reason == "not-sampled":
+        if record != _GPU_NOT_SAMPLED:
+            raise _sampler_refusal("not-sampled record must carry no sampler evidence")
+        return record
+    failure = record["failure"]
+    if reason == "observed":
+        if failure is not None:
+            raise _sampler_refusal("observed record cannot carry a failure")
+    else:
+        failure = dict(_fields(failure, {"code", "detail"}, "placement gpu sampler failure"))
+        if failure["code"] not in GPU_SAMPLER_FAILURE_CODES:
+            raise _sampler_refusal("failure code is unknown")
+        _text(failure["detail"], "placement.gpu_sampler.failure.detail")
+    version = record["version"]
+    if version is not None:
+        _text(version, "placement.gpu_sampler.version")
+    executable = record["executable"]
+    if executable is not None:
+        _text(executable, "placement.gpu_sampler.executable")
+    cadence = _sampler_number(record["cadence_seconds"], "cadence_seconds")
+    if cadence != 0.0 and not GPU_SAMPLER_CADENCE_BOUNDS[0] <= cadence <= GPU_SAMPLER_CADENCE_BOUNDS[1]:
+        raise _sampler_refusal("cadence is outside its bound")
+    if not 0.0 < _sampler_number(record["join_timeout_seconds"], "join_timeout_seconds") <= GPU_SAMPLER_MAX_JOIN_TIMEOUT:
+        raise _sampler_refusal("join timeout is outside its bound")
+    elapsed = _sampler_number(record["elapsed_seconds"], "elapsed_seconds")
+    samples = _sampler_list(record["samples"], "samples")
+    count = record["count"]
+    if type(count) is not int or not 0 <= count <= GPU_SAMPLER_MAX_SAMPLES or count != len(samples):
+        raise _sampler_refusal("count disagrees with its samples")
+    command_pids = [_sampler_positive_int(pid, "command PID") for pid in _sampler_list(record["command_pids"], "command_pids")]
+    survivors = [_sampler_positive_int(pid, "survivor") for pid in _sampler_list(record["survivors"], "survivors")]
+    if len(set(command_pids)) != len(command_pids) or len(set(survivors)) != len(survivors):
+        raise _sampler_refusal("PIDs repeat")
+    if not set(survivors) <= set(command_pids):
+        raise _sampler_refusal("survivor was never launched")
+    if record["quiescent"] and survivors:
+        raise _sampler_refusal("quiescent record cannot report survivors")
+    target = record["target_pid"]
+    if target is not None:
+        _sampler_positive_int(target, "target PID")
+    start, end = record["monotonic_start"], record["monotonic_end"]
+    if start is None:
+        if end is not None or count or elapsed != 0.0:
+            raise _sampler_refusal("record without an outer interval cannot carry samples")
+    else:
+        start, end = _sampler_number(start, "monotonic_start"), _sampler_number(end, "monotonic_end")
+        if end < start or abs(elapsed - (end - start)) > 1e-6:
+            raise _sampler_refusal("outer interval disagrees with elapsed time")
+    if status == "observed" and (
+        not record["quiescent"] or version is None or executable is None or start is None
+        or count < 1 or not command_pids
+    ):
+        raise _sampler_refusal("observed record requires quiescent, complete, versioned samples from a resolved executable")
+    previous_end = start
+    pci_by_uuid: dict[str, str] = {}
+    retained: list[tuple[str, str]] = []
+    for sample in samples:
+        sample = _fields(sample, {"monotonic_start", "monotonic_end", "inventory", "pid_rows"}, "placement gpu sample")
+        sample_start = _sampler_number(sample["monotonic_start"], "sample start")
+        sample_end = _sampler_number(sample["monotonic_end"], "sample end")
+        if sample_end < sample_start or sample_start < previous_end or sample_end > end:
+            raise _sampler_refusal("sample interval is not ordered inside the outer interval")
+        previous_end = sample_end
+        inventory: set[str] = set()
+        for item in _sampler_list(sample["inventory"], "inventory"):
+            item = _fields(item, {"uuid", "pci.bus_id"}, "placement gpu sample inventory")
+            uuid = _gpu_uuid(item["uuid"], "placement gpu sample inventory uuid")
+            pci = _text(item["pci.bus_id"], "placement gpu sample inventory pci.bus_id")
+            if uuid in inventory or pci_by_uuid.setdefault(uuid, pci) != pci:
+                raise _sampler_refusal("inventory row is inconsistent")
+            inventory.add(uuid)
+        if not inventory:
+            raise _sampler_refusal("sample inventory is empty")
+        for item in _sampler_list(sample["pid_rows"], "pid_rows"):
+            item = _fields(item, {"pid", "gpu_uuid"}, "placement gpu sample PID row")
+            pid = _sampler_positive_int(item["pid"], "row PID")
+            uuid = _gpu_uuid(item["gpu_uuid"], "placement gpu sample PID uuid")
+            if uuid not in inventory:
+                raise _sampler_refusal("PID row is absent from its sample inventory")
+            if pid == target and uuid not in {seen for seen, _ in retained}:
+                retained.append((uuid, pci_by_uuid[uuid]))
+    _placement_v3_aggregate(record, retained, pci_by_uuid)
+    _placement_v3_gaps(record, start, end)
+    return record
+
+
+def _placement_v3_device(sampler: Mapping[str, Any], child_pid: int, declared_devices: list[str]) -> tuple[str, list[str], list[str]]:
+    """Mirror the executor device decision over the lifetime aggregate."""
+
+    declared = [_gpu_uuid(device, "placement.declared.devices") for device in declared_devices]
+    if len(set(declared)) != len(declared):
+        raise ManifestRefusal("malformed-record", "declared GPU entitlement repeats a UUID")
+    if not declared:
+        if sampler["reason"] != "not-sampled":
+            raise ManifestRefusal("malformed-record", "CPU-only slot cannot carry attempted GPU sampler evidence")
+        return "cpu-only", [], []
+    if sampler["reason"] == "not-sampled":
+        return "sampler-not-run", [], []
+    if sampler["target_pid"] is not None and sampler["target_pid"] != child_pid:
+        raise ManifestRefusal("malformed-record", "placement gpu sampler watched a PID other than the science child")
+    aggregate = sampler["aggregate"]
+    active = [item["uuid"] for item in aggregate["exact_pid_gpus"]]
+    active_pci = [item["pci.bus_id"] for item in aggregate["exact_pid_gpus"]]
+    if aggregate["outside_use_seen"] != any(uuid not in declared for uuid in active):
+        raise ManifestRefusal("malformed-record", "placement gpu sampler outside-use flag contradicts its exact-PID GPUs")
+    unresolved = any(not set(declared) <= {item["uuid"] for item in sample["inventory"]} for sample in sampler["samples"])
+    if unresolved and not aggregate["entitlement_unresolved_seen"]:
+        raise ManifestRefusal("malformed-record", "placement gpu sampler aggregate hides an unresolved entitlement")
+    if aggregate["samples_taken"] == sampler["count"] and aggregate["entitlement_unresolved_seen"] != unresolved:
+        raise ManifestRefusal("malformed-record", "placement gpu sampler unresolved flag differs from its complete samples")
+    # Out-of-entitlement use in any sample, retained or not, dominates.
+    if aggregate["outside_use_seen"]:
+        return "out-of-entitlement", active, active_pci
+    if sampler["reason"] == "telemetry-failed":
+        return "sampler-failed", [], []
+    if aggregate["entitlement_unresolved_seen"]:
+        return "entitlement-unresolved", [], []
+    if not active:
+        return "no-exact-pid-row", [], []
+    return "matched", active, active_pci
+
+
+def _placement_receipt_v3(value: Any, attempt: Mapping[str, Any], start: Mapping[str, Any], group_digest: str) -> dict[str, Any]:
+    """Decode a closed sampler-bearing v3 receipt and re-derive its verdict.
+
+    Host, affinity, and refusal evidence is decoded through the unchanged L1a
+    v2 reader as a shadow record; the device verdict, ``gpu`` block, device
+    comparison, warning, and science acceptance must equal the derivation.
+    """
+
+    record = dict(_fields(
+        value,
+        {
+            "schema", "task_id", "attempt_id", "group_digest", "allocation_id",
+            "backend_job_id", "slot_id", "payload_digest", "output_dir", "child",
+            "declared", "gpu", "comparison", "refusal", "host_mapping", "gpu_sampler", "verdict",
+        },
+        "placement receipt v3",
+    ))
+    verdict = dict(_fields(
+        record["verdict"],
+        {"host", "device", "qualification", "reason_class", "reason", "science_acceptance", "warning"},
+        "placement verdict v3",
+    ))
+    if any(type(item) is not str for item in verdict.values()):
+        raise ManifestRefusal("malformed-record", "placement verdict v3 values must be text")
+    reason_class = verdict["reason_class"]
+    if reason_class not in {"qualified", "mismatch", "telemetry-failed", "not-sampled", "refused"}:
+        raise ManifestRefusal("malformed-record", "placement verdict v3 reason class is invalid")
+    base = {key: item for key, item in record.items() if key not in {"host_mapping", "gpu_sampler", "verdict"}}
+    base["schema"] = SCIENCE_PLACEMENT_RECEIPT_SCHEMA
+    base = _placement_receipt(base, attempt, start, group_digest)
+    # The L1a class is forced by evidence; only the matched-host class is
+    # refined by device telemetry.
+    if reason_class == "refused":
+        l1a_class = "refused"
+    elif reason_class == "mismatch" and base["refusal"] is not None:
+        l1a_class = "mismatch"
+    else:
+        l1a_class = "not-sampled"
+    declares_devices = bool(base["declared"]["devices"])
+    shadow = {key: item for key, item in record.items() if key not in {"gpu_sampler"}}
+    shadow["schema"] = SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2
+    shadow["gpu"] = {
+        "status": "unavailable", "reason": "not-sampled", "method": "not-sampled",
+        "started_at_utc": base["gpu"]["started_at_utc"], "finished_at_utc": base["gpu"]["finished_at_utc"],
+        "samples": [], "active_uuids": [], "active_pci": [],
+    }
+    shadow["comparison"] = dict(base["comparison"], device="unavailable")
+    shadow["verdict"] = {
+        "host": verdict["host"], "device": "unavailable", "qualification": "unqualified",
+        "reason_class": l1a_class, "reason": verdict["reason"],
+        "science_acceptance": "accepted" if l1a_class == "not-sampled" else "not-accepted",
+        "warning": (PLACEMENT_NOT_SAMPLED_MESSAGE if l1a_class == "not-sampled" else _L1A_UNQUALIFIED_WARNING) if declares_devices else "",
+    }
+    shadow = _placement_receipt(shadow, attempt, start, group_digest)
+    sampler = _placement_v3_sampler(record["gpu_sampler"])
+    code, active, active_pci = _placement_v3_device(sampler, base["child"]["pid"], base["declared"]["devices"])
+    device, text = GPU_DEVICE_DECISIONS[code]
+    if l1a_class in {"refused", "mismatch"}:
+        expected_class, expected_reason = l1a_class, verdict["reason"]
+    elif device == "matched":
+        expected_class, expected_reason = "qualified", f"qualified: {text}"
+    elif device == "mismatch":
+        expected_class, expected_reason = "mismatch", f"mismatch: {text}"
+    elif code == "cpu-only":
+        expected_class, expected_reason = "not-sampled", f"not-sampled: {text}"
+    else:
+        expected_class, expected_reason = "telemetry-failed", f"telemetry-failed: {text}"
+        if code == "sampler-failed":
+            expected_reason = f"{expected_reason} ({sampler['failure']['code']})"
+    qualified = expected_class == "qualified"
+    shows_devices = device in {"matched", "mismatch"}
+    expected_gpu = {
+        "status": "qualified" if qualified else "unavailable",
+        "reason": code,
+        "method": "not-sampled" if sampler["reason"] == "not-sampled" else GPU_SAMPLER_METHOD,
+        "samples": [],
+        "active_uuids": active if shows_devices else [],
+        "active_pci": active_pci if shows_devices else [],
+    }
+    expected_verdict = {
+        "host": shadow["verdict"]["host"],
+        "device": device,
+        "qualification": "qualified" if qualified else "unqualified",
+        "reason_class": expected_class,
+        "reason": expected_reason,
+        "science_acceptance": "accepted" if expected_class in {"qualified", "not-sampled"} else "not-accepted",
+        "warning": PLACEMENT_V3_WARNINGS.get(expected_class, "") if declares_devices else "",
+    }
+    if verdict != expected_verdict:
+        raise ManifestRefusal("malformed-record", "placement verdict v3 is not derived from its host and sampler evidence")
+    if any(base["gpu"][key] != item for key, item in expected_gpu.items()):
+        raise ManifestRefusal("malformed-record", "placement gpu evidence v3 is not derived from its sampler evidence")
+    if base["comparison"]["device"] != device:
+        raise ManifestRefusal("malformed-record", "placement device comparison v3 is not derived from its sampler evidence")
+    record.update({
+        "child": base["child"], "declared": base["declared"], "gpu": base["gpu"],
+        "comparison": base["comparison"], "refusal": base["refusal"],
+        "host_mapping": shadow["host_mapping"], "gpu_sampler": sampler, "verdict": verdict,
+    })
+    return record
+
+
 def _placement_receipt(value: Any, attempt: Mapping[str, Any], start: Mapping[str, Any], group_digest: str) -> dict[str, Any]:
-    """Decode an optional v1/v2 placement receipt with closed schemas."""
+    """Decode an optional v1/v2/v3 placement receipt with closed schemas."""
 
     _validate_json(value)
     schema = value.get("schema") if isinstance(value, dict) else None
+    if schema == SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V3:
+        return _placement_receipt_v3(value, attempt, start, group_digest)
     if schema == SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2:
         record = dict(_fields(
             value,
@@ -653,9 +1094,10 @@ def _manifest(path: Path) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], t
         )
         for attempt in attempts
         if attempt["placement_receipt"] is not None
-        and attempt["placement_receipt"]["schema"] == SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2
+        and attempt["placement_receipt"]["schema"] in {SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2, SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V3}
         and attempt["placement_receipt"]["declared"]["devices"]
-        and attempt["placement_receipt"]["verdict"]["reason_class"] in {"mismatch", "refused"}
+        and attempt["placement_receipt"]["verdict"]["qualification"] == "unqualified"
+        and attempt["placement_receipt"]["verdict"]["reason_class"] in {"mismatch", "refused", "telemetry-failed"}
     }
     actual_not_sampled = {
         (
@@ -666,7 +1108,7 @@ def _manifest(path: Path) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], t
         )
         for attempt in attempts
         if attempt["placement_receipt"] is not None
-        and attempt["placement_receipt"]["schema"] == SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2
+        and attempt["placement_receipt"]["schema"] in {SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2, SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V3}
         and attempt["placement_receipt"]["declared"]["devices"]
         and attempt["placement_receipt"]["verdict"]["reason_class"] == "not-sampled"
     }
@@ -677,12 +1119,16 @@ def _manifest(path: Path) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], t
         expected_keys = {"status", "science_acceptance", "message", "unqualified_gpu_segments"}
         expected_status = "unqualified"
         expected_acceptance = "not-accepted"
-        expected_message = "GPU PLACEMENT UNQUALIFIED: placement mismatch/refusal requires science review."
+        expected_message = (
+            PLACEMENT_TELEMETRY_UNQUALIFIED_MESSAGE
+            if any(entry[2] == "telemetry-failed" for entry in actual_blocking)
+            else PLACEMENT_UNQUALIFIED_MESSAGE
+        )
         if not has_blocking:
             expected_keys = {"status", "science_acceptance", "message", "not_sampled_gpu_segments"}
             expected_status = "not-sampled"
             expected_acceptance = "accepted"
-            expected_message = "GPU PLACEMENT NOT-SAMPLED: L1a intentionally does not sample devices; H-v2 performs its own delivered-GPU check."
+            expected_message = PLACEMENT_NOT_SAMPLED_MESSAGE
         elif actual_not_sampled:
             expected_keys.add("not_sampled_gpu_segments")
         if set(placement_verdict) != expected_keys:
@@ -709,7 +1155,10 @@ def _manifest(path: Path) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], t
             return result
 
         if has_blocking:
-            advertised_blocking = _entries(placement_verdict["unqualified_gpu_segments"], "manifest unqualified GPU segment", {"mismatch", "refused"})
+            advertised_blocking = _entries(
+                placement_verdict["unqualified_gpu_segments"], "manifest unqualified GPU segment",
+                {"mismatch", "refused", "telemetry-failed"},
+            )
         else:
             advertised_blocking = set()
         advertised_not_sampled = (
@@ -879,6 +1328,7 @@ __all__ = [
     "RUN_MANIFEST_V3",
     "SCIENCE_PLACEMENT_RECEIPT_SCHEMA",
     "SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V2",
+    "SCIENCE_PLACEMENT_RECEIPT_SCHEMA_V3",
     "ResultSet",
     "read",
 ]
