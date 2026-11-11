@@ -169,6 +169,13 @@ def test_endq_candidate_carries_quantiles_not_output_path() -> None:
 
 def test_h_v2_logging_builders_pin_cadences_and_groups() -> None:
     groups = {name: list(paths) for name, paths in protocol.module_norm_groups().items()}
+    assert groups == {
+        "embedding": ["embedding"],
+        "readout": ["readout"],
+        "factors": ["factors"],
+        "layer_0_mixing": ["stack.layers.0.mixing"],
+        "layer_0_path_aggregation": ["stack.layers.0.path_aggregation"],
+    }
     norms = protocol._build_candidate_callback("tpen.callback.ModuleNorms")
     optimizer = protocol._build_candidate_callback("tpen.callback.OptimizerState")
     recorder = protocol._build_candidate_callback("tpen.callback.RawTrainingBatchRecorder")
