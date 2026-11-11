@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import csv
+from dataclasses import replace
 from pathlib import Path
 from shutil import copyfile
 
@@ -22,6 +24,8 @@ from tpen.evaluation.trajectory_records import (
     TrajectoryRecordStreamWriter,
 )
 from tpen.statistics.trajectory import ObservableTrajectory
+from tpen.statistics.conditioned import produce_conditioned_local_energy_statistics
+from tpen.statistics import conditioned as conditioned_statistics
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.potential import ElectronNucleusInteraction, HarmonicTrap
 from tpen.sampling.stats import SamplerStats
@@ -208,6 +212,29 @@ def test_nucleus_free_generator_writes_and_validates_records(tmp_path: Path) -> 
             hamiltonian_terms=(ElectronNucleusInteraction(),),
             n_draws=1,
         ).generate(model=OneElectronGaussian(), context=context)
+
+
+def test_nucleus_free_conditioned_statistics_refuse_absent_geometry(tmp_path: Path) -> None:
+    artifact = _artifact(tmp_path, FINITE, name="nucleus-free.csv", nucleus_free=True)
+    with pytest.raises(ValueError, match="require nuclear geometry"):
+        produce_conditioned_local_energy_statistics(
+            artifact,
+            range_edges={},
+            quantile_seed=0,
+            deviation_ccdf_thresholds=(1.0,),
+        )
+
+    with artifact.path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    with pytest.raises(ValueError, match="require nuclear geometry"):
+        conditioned_statistics._parse_chunk(artifact, rows[:1], row_offset=0)
+
+
+def test_present_geometry_dimension_mismatch_is_refused(tmp_path: Path) -> None:
+    artifact = _artifact(tmp_path, FINITE)
+    mismatched = replace(artifact, spatial_dim=artifact.spatial_dim - 1)
+    with pytest.raises(ValueError, match="geometry dimension disagrees"):
+        mismatched.validate(check_files=False)
 
 
 def test_sidecar_key_set_equals_declared_constant(tmp_path: Path) -> None:
