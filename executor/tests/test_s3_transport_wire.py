@@ -88,7 +88,7 @@ S3A_MUTANT_TABLE = (
     },
     {
         "id": "R3", "target": TRANSPORT,
-        "old": "    if science is not None and child_refusal is None:\n        phases.append(\"inspection\")\n",
+        "old": "    if science is not None and child_refusal is None and not _cancel_requested(request):\n        phases.append(\"inspection\")\n",
         "new": "    if False:\n        phases.append(\"inspection\")\n",
         "killer": "test_real_serialized_leaf_runs_science_then_inspection_on_the_worker",
         "suite": "executor", "assertion": "public inspection runs in the leaf after science, not in the controller after the leaf returns",

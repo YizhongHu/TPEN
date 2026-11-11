@@ -1,8 +1,17 @@
-"""S3 Layer C bounded remote teardown and quiescence contract tests."""
+"""S3 Layer C bounded remote teardown and quiescence contract tests.
+
+``S3C_MUTANT_TABLE`` lists the contract mutants M1-M6 for bounded remote
+teardown and quiescence.  M1-M4 live inside ``ParslDispatcher._cancel_slot_pool``
+itself: their killers must drive real cancellation through ``ParslDispatcher``
+with a transport double, not call ``_RemoteLeaf`` methods directly (a prior
+round's killers did the latter and could never observe these mutants).
+"""
 
 from __future__ import annotations
 
+import ast
 from concurrent.futures import Future
+import dataclasses
 import os
 from pathlib import Path
 import sys
@@ -12,11 +21,83 @@ import pytest
 
 import time
 
+from tpen_executor.contracts import AllocationId, BackendJobId
+from tpen_executor.dispatch import parsl as parsl_dispatch
 from tpen_executor.dispatch.parsl import _RemoteLeaf
 from tpen_executor.dispatch.transport import LeafResultRejected, LeafTeardownReceipt, validate_leaf_result
+from tpen_executor.lifecycle import AttachedAllocation
+from tpen_executor.placement import AllocationSlot
+from tpen_executor.storage import DirectoryStore
+from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.workers import SubprocessWorker
 
+from test_s3_transport_parsl import BINDING, _Parsl, _group, _lifecycle, _runs, _transport, _worker, fake_parsl
 from test_s3_transport_wire import _request, _synthetic_result
+
+
+PARSL_MODULE = "executor/src/tpen_executor/dispatch/parsl.py"
+WORKERS_MODULE = "executor/src/tpen_executor/workers.py"
+
+
+S3C_MUTANT_TABLE = (
+    {
+        "id": "M1", "target": PARSL_MODULE,
+        "old": "            record[\"handle\"].request_cancel()\n",
+        "new": "            os.killpg(os.getpid(), 0)\n",
+        "killer": "test_dispatcher_cancel_never_signals_a_remote_process_group",
+        "suite": "executor", "assertion": "the controller cancels a remote leaf only by requesting its marker; it never killpgs a remote process itself",
+    },
+    {
+        "id": "M2", "target": PARSL_MODULE,
+        "old": "                    status = \"failed\" if acknowledged else \"remote-quiescence-unconfirmed\"\n",
+        "new": "                    status = \"completed\"\n",
+        "killer": "test_dispatcher_cancel_with_no_ack_is_remote_quiescence_unconfirmed",
+        "suite": "executor", "assertion": "a cancelled remote leaf is never published completed before its teardown ack",
+    },
+    {
+        "id": "M3", "target": PARSL_MODULE,
+        "old": "                acknowledged = handle.wait_for_teardown(max(remote_deadline - time.monotonic(), 0))\n",
+        "new": "                acknowledged = handle.wait_for_teardown(float(getattr(self.transport, \"teardown_timeout\", 30)))\n",
+        "killer": "test_dispatcher_cancel_waits_one_shared_deadline_across_remote_leaves",
+        "suite": "executor", "assertion": "every live remote leaf waits against one shared deadline, never its own fresh bound, so DFK cleanup is bounded by one timeout regardless of how many leaves are live",
+    },
+    {
+        "id": "M4", "target": PARSL_MODULE,
+        "old": "                    status = \"failed\" if acknowledged else \"remote-quiescence-unconfirmed\"\n",
+        "new": "                    status = \"failed\" if acknowledged else \"completed\"\n",
+        "killer": "test_dispatcher_cancel_with_no_ack_is_remote_quiescence_unconfirmed",
+        "suite": "executor", "assertion": "worker loss during cancellation is never published as completed",
+    },
+    {
+        "id": "M5", "target": PARSL_MODULE,
+        "old": "            payload = self.future.result(None)\n            result = validate_leaf_result(self.request, LeafResult.decode(payload))\n",
+        "new": "            payload = self.future.result(None)\n            result = LeafResult.decode(payload)\n",
+        "killer": "test_remote_leaf_rejects_well_formed_crossed_reply_as_no_quiescence_ack",
+        "suite": "executor", "assertion": "a stale task/attempt/allocation reply is rejected on identity; it is never accepted as a quiescence ack merely because it decodes",
+    },
+    {
+        "id": "M6", "target": WORKERS_MODULE,
+        "old": "                watcher = threading.Thread(target=watch_cancel_marker, daemon=True)\n                watcher.start()\n",
+        "new": "                watcher = None\n",
+        "killer": "test_cancel_during_science_reaps_local_child_group",
+        "suite": "executor", "assertion": "the leaf actually watches for its cancel marker; a leaf that never does so ignores cancellation and keeps running past the bound",
+    },
+)
+
+
+def test_s3c_mutant_table_targets_unique_executable_anchors() -> None:
+    """Every Layer C mutant names a unique executable anchor, parses, and has a killer."""
+
+    root = Path(__file__).parents[2]
+    module = Path(__file__).read_text(encoding="utf-8")
+    assert [row["id"] for row in S3C_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M5", "M6"]
+    for row in S3C_MUTANT_TABLE:
+        source = (root / row["target"]).read_text(encoding="utf-8")
+        assert source.count(row["old"]) == 1, row
+        assert row["old"] != row["new"] and row["suite"] == "executor" and row["assertion"]
+        assert not row["old"].strip().startswith(("#", '"""', "'"))
+        ast.parse(source.replace(row["old"], row["new"]))
+        assert f"def {row['killer'].split('[')[0]}(" in module, row
 
 
 def test_leaf_teardown_receipt_is_versioned_and_bound_to_all_identities(tmp_path: Path) -> None:
@@ -27,9 +108,12 @@ def test_leaf_teardown_receipt_is_versioned_and_bound_to_all_identities(tmp_path
 
     result = _synthetic_result(request, teardown=receipt.to_dict())
     assert validate_leaf_result(request, result) is result
-    crossed = dict(receipt.to_dict(), attempt_id="crossed-attempt")
-    with pytest.raises(ValueError, match="invalid leaf teardown facts"):
-        LeafTeardownReceipt.from_mapping(crossed)
+    # A well-formed but cross-attempt teardown receipt is rejected by the
+    # controller's identity check, not merely by LeafTeardownReceipt's own
+    # (purely syntactic) construction gate.
+    crossed = dataclasses.replace(result, teardown={**receipt.to_dict(), "attempt_id": "crossed-attempt"})
+    with pytest.raises(LeafResultRejected, match="teardown"):
+        validate_leaf_result(request, crossed)
 
 
 def test_remote_leaf_wait_accepts_only_leaf_ack(tmp_path: Path) -> None:
@@ -74,7 +158,9 @@ def test_remote_leaf_rejects_well_formed_crossed_reply_as_no_quiescence_ack(tmp_
     future: Future[bytes] = Future()
     handle.bind_future(future)
     crossed = _synthetic_result(request, **{field: "crossed-" + field})
-    with pytest.raises(LeafResultRejected, match=field):
+    # validate_leaf_result's rejection message names the short check (e.g.
+    # "task"), not the LeafResult field name (e.g. "task_id").
+    with pytest.raises(LeafResultRejected, match=field.removesuffix("_id")):
         validate_leaf_result(request, crossed)
     future.set_result(crossed.encode())
     assert handle.wait_for_teardown(0.1) is False
@@ -148,3 +234,112 @@ def test_remote_leaf_never_signals_a_remote_process_group(tmp_path: Path, monkey
     handle.request_cancel()
     assert calls == []
 
+
+
+# ------------------------------------------------- dispatcher-level M1-M4
+
+
+def _never_acknowledging_leaf(_index, _function, _args, _kwargs):
+    """A remote leaf hook that never returns: the controller sees it as still live."""
+
+    threading.Event().wait()
+
+
+def _two_slot_lifecycle(tmp_path: Path) -> AttachedAllocation:
+    slots = [AllocationSlot(f"slot-{index}", "node-a", (), (index,), (), ()).to_dict() for index in range(2)]
+    facts = {"slots": {"schema": "tpen-executor/allocation-slots-v1", "slots": slots}}
+    root = tmp_path / "s3c-store"
+    root.mkdir()
+    return AttachedAllocation(
+        ConfiguredAllocation(AllocationId("s3c-allocation"), BackendJobId("job-s3c"), facts), DirectoryStore(root),
+    )
+
+
+def _interrupt_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Raise KeyboardInterrupt on the controller's first poll, as a real owner cancellation would."""
+
+    first = {"value": True}
+
+    def interrupting_sleep(seconds: float) -> None:
+        if first["value"]:
+            first["value"] = False
+            raise KeyboardInterrupt("S3C cancellation")
+        time.sleep(seconds)
+
+    monkeypatch.setattr("tpen_executor.dispatch.parsl._poll_sleep", interrupting_sleep)
+
+
+def test_dispatcher_cancel_never_signals_a_remote_process_group(
+    tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M1 killer: real cancellation through ParslDispatcher never killpgs a remote process.
+
+    A prior round's killer (``test_remote_leaf_never_signals_a_remote_process_group``)
+    calls ``_RemoteLeaf.request_cancel`` directly, which never had a killpg
+    call to remove; it cannot observe a mutation inside
+    ``ParslDispatcher._cancel_slot_pool``.  This one drives the real
+    cancellation path.
+    """
+
+    fake_parsl.hooks["run_leaf"] = _never_acknowledging_leaf
+    calls: list[tuple] = []
+    monkeypatch.setattr("tpen_executor.dispatch.parsl.os.killpg", lambda *args: calls.append(args))
+    _interrupt_once(monkeypatch)
+    dispatcher = parsl_dispatch.ParslDispatcher(
+        _worker(tmp_path), binding=BINDING, transport=_transport(teardown_timeout=0.1),
+    )
+    group = _group("s3c-cancel-m1", "member")
+    lifecycle = _lifecycle(tmp_path)
+    with pytest.raises(KeyboardInterrupt, match="S3C cancellation"):
+        dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
+    assert calls == []
+    attempt = lifecycle.store.manifest(group).attempts[0]
+    assert attempt.outcome_receipt.status == "remote-quiescence-unconfirmed"
+
+
+def test_dispatcher_cancel_with_no_ack_is_remote_quiescence_unconfirmed(
+    tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M2/M4 killer: a live remote leaf that never acks is never published completed."""
+
+    fake_parsl.hooks["run_leaf"] = _never_acknowledging_leaf
+    _interrupt_once(monkeypatch)
+    dispatcher = parsl_dispatch.ParslDispatcher(
+        _worker(tmp_path), binding=BINDING, transport=_transport(teardown_timeout=0.1),
+    )
+    group = _group("s3c-cancel-m2m4", "member")
+    lifecycle = _lifecycle(tmp_path)
+    with pytest.raises(KeyboardInterrupt, match="S3C cancellation"):
+        dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
+    manifest = lifecycle.store.manifest(group)
+    attempt = manifest.attempts[0]
+    assert attempt.outcome_receipt.status == "remote-quiescence-unconfirmed"
+    assert manifest.segments == ()
+
+
+def test_dispatcher_cancel_waits_one_shared_deadline_across_remote_leaves(
+    tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M3 killer: two live remote leaves wait against one shared bound, not one each.
+
+    This also bounds the DFK cleanup that follows ``_cancel_slot_pool`` in
+    ``ParslDispatcher.run``'s ``finally``: cleanup cannot start until every
+    live leaf's wait has resolved, so the one-shared-deadline property is
+    exactly what keeps that cleanup from being delayed per live leaf.
+    """
+
+    fake_parsl.hooks["run_leaf"] = _never_acknowledging_leaf
+    _interrupt_once(monkeypatch)
+    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), transport=_transport(teardown_timeout=0.3))
+    group = _group("s3c-cancel-m3", "first", "second")
+    lifecycle = _two_slot_lifecycle(tmp_path)
+    started = time.monotonic()
+    with pytest.raises(KeyboardInterrupt, match="S3C cancellation"):
+        dispatcher.run(group, _runs(tmp_path, "first", "second"), lifecycle, timeout=60)
+    elapsed = time.monotonic() - started
+    # One shared 0.3s deadline for both live leaves costs ~0.3s total; a
+    # per-record bound (the mutant) costs ~0.3s per remote record, ~0.6s here.
+    assert elapsed < 0.5
+    manifest = lifecycle.store.manifest(group)
+    assert {attempt.outcome_receipt.status for attempt in manifest.attempts} == {"remote-quiescence-unconfirmed"}
+    assert manifest.segments == ()
