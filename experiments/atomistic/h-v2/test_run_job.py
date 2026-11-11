@@ -41,6 +41,7 @@ def _module(name: str):
 
 attached = _module("attached")
 run_job = _module("run_job")
+launch_config = _module("launch_config")
 
 
 def _real_cli_allocation_and_worker(tmp_path: Path, *, science_python: str, placeholder_config: str) -> tuple[Path, Path]:
@@ -269,3 +270,105 @@ def test_science_pipeline_check_train_dispatch_reaches_real_store_reservation(
     )
     assert sibling_dispatch.manifest is not None
     assert sibling_store.is_dir()
+
+
+def test_pilot_payload_train_dispatch_reaches_real_store_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TO 118c4e9b: the PILOT-payload TRAIN path's ``_reserve_store_parent``
+    call site (``run_job.py`` ~:350, inside the ``pilot_payload is not None``
+    branch) must run before dispatch, exercised through the public
+    ``run_job.run(..., pilot_payload=...)`` entry point against a genuinely
+    fresh, empty run root -- mirroring
+    ``test_science_pipeline_check_train_dispatch_reaches_real_store_reservation``
+    above (the science/pipeline-check call site), per the verifier finding on
+    ``tip-verification-c24b7e34`` (TO 8d9a31b3): no existing test drove this
+    call to real dispatch, since
+    ``test_run_job_pilot_payload_builds_config_and_probes_module_admission``
+    (``test_pilot_payloads.py``) stops the pilot path early, BEFORE
+    ``_reserve_store_parent`` even runs (``run_job.py``'s pilot branch calls
+    it at line 350, before ``build_h_v2_train_plan`` at line 364).
+
+    ``check_identity`` is stubbed to a no-op (host/GPU/CUDA stratum
+    assertion, orthogonal to store-parent creation; this facility is
+    CPU-only). ``attached.probe_admitted_a1_modules`` is stubbed to skip
+    every candidate without subprocessing the science interpreter (mirrors
+    ``test_pilot_payloads.py``'s own stub of this call), returning the same
+    ``(enabled, skipped)`` shape the real function returns.
+    ``attached.build_h_v2_train_plan`` is stubbed to capture its kwargs for
+    assertion, then delegate to the REAL function with ``n_walkers``/
+    ``max_steps`` overridden to tiny values (the pilot payload's own config
+    runs up to 20000 steps, far too slow for a unit test) -- so the plan,
+    overrides, and config returned downstream are genuinely real-shaped, not
+    fabricated. ``attached.activate_h_v2_run`` is replaced with a thin
+    wrapper that still dispatches through the real, installed
+    ``tpen_executor`` CLI (not mocked) and skips only the separate,
+    already-tracked resolved-config-identity reader fence (#618), exactly as
+    the science-path test above does. Fake compute, real store reservation.
+    """
+
+    science_python, executor_python = _require_real_cli_env()
+    run_root = tmp_path / "fresh_pilot_run_root"
+    assert not run_root.exists()
+    payload = "capacity-pilot"
+    lineage = launch_config.PILOT_PAYLOAD_LINEAGES[payload]
+    task_id = run_job._pilot_train_task_id(payload)
+    store = run_root / "attached" / "store" / task_id
+    assert not store.parent.exists()
+
+    monkeypatch.setattr(run_job, "check_identity", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        attached,
+        "probe_admitted_a1_modules",
+        lambda config, candidates, **kwargs: ([], list(candidates)),
+    )
+
+    real_build_h_v2_train_plan = attached.build_h_v2_train_plan
+    build_kwargs_captured: dict[str, object] = {}
+
+    def _stub_build_h_v2_train_plan(**kwargs):
+        build_kwargs_captured.update(kwargs)
+        kwargs["n_walkers"] = 4
+        kwargs["max_steps"] = 2
+        return real_build_h_v2_train_plan(**kwargs)
+
+    monkeypatch.setattr(attached, "build_h_v2_train_plan", _stub_build_h_v2_train_plan)
+
+    real_run_executor_cli = attached.run_executor_cli
+    captured: dict[str, object] = {}
+
+    def _stub_activate(prepared, *, store, **_kwargs):
+        store_path = Path(store)
+        assert not store_path.exists(), "store must still be absent when activation begins -- the fix must not pre-create it"
+        allocation_path, worker_path = _real_cli_allocation_and_worker(
+            tmp_path, science_python=science_python, placeholder_config=prepared.effective_config
+        )
+        dispatch = real_run_executor_cli(
+            executor_python,
+            prepared.handoff,
+            allocation=allocation_path,
+            worker_config=worker_path,
+            store=store_path,
+            dispatcher="local",
+            timeout=180.0,
+        )
+        captured["dispatch"] = dispatch
+
+    monkeypatch.setattr(attached, "activate_h_v2_run", _stub_activate)
+    monkeypatch.setenv("RUN", str(run_root))
+    monkeypatch.setenv("SHA", "f" * 40)
+    monkeypatch.setenv("SCIENCE_PYTHON", science_python)
+    monkeypatch.setenv("EXECUTOR_PY", executor_python)
+
+    run_job.run("train", lineage, pilot_payload=payload)
+
+    assert build_kwargs_captured["lineage"] == payload
+    assert build_kwargs_captured["payload_label"] == payload
+
+    dispatch = captured["dispatch"]
+    assert dispatch.returncode == 0, (dispatch.returncode, dispatch.stdout, dispatch.stderr)
+    assert dispatch.manifest is not None
+    # The acceptance assertion: the executor's own non-recursive store.mkdir()
+    # reservation succeeded against store's REAL, fix-created parent -- the
+    # store was reserved by the executor, not pre-created by this test.
+    assert store.is_dir()
