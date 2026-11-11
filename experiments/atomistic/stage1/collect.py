@@ -23,7 +23,7 @@ from experiments.baselines.statistics import blocking_stderr
 from experiments.atomistic.stage1.protocol import SYSTEM_IDS
 
 TRAJECTORY_RECORD_SCHEMA = "trajectory_records/v1"
-ROW_SEMANTICS = "complete_draw_by_walker_grid"
+ROW_SEMANTICS = "complete_draw_walker_grid"
 
 
 class CollectionError(ValueError):

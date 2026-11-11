@@ -23,7 +23,7 @@ def test_incomplete_grid_is_rejected(tmp_path) -> None:
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     (tmp_path / "sampled_eval_table.metadata.json").write_text(json.dumps({
         "schema": "trajectory_records/v1",
-        "row_semantics": "complete_draw_by_walker_grid",
+        "row_semantics": "complete_draw_walker_grid",
         "walker_count": 1,
         "draw_count": 2,
         "row_count": 2,
@@ -43,7 +43,7 @@ def test_real_table_reports_short_draw_floor(tmp_path) -> None:
         for draw in range(2):
             writer.writerow({"draw_index": draw, "walker_index": 0, "local_energy": 1.0 + draw, "finite": "True"})
     (tmp_path / "sampled_eval_table.metadata.json").write_text(json.dumps({
-        "schema": "trajectory_records/v1", "row_semantics": "complete_draw_by_walker_grid",
+        "schema": "trajectory_records/v1", "row_semantics": "complete_draw_walker_grid",
         "walker_count": 1, "draw_count": 2, "row_count": 2, "nonfinite_count": 0,
         "csv_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }), encoding="utf-8")

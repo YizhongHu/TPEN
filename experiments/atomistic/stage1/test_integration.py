@@ -80,6 +80,10 @@ def test_tiny_train_eval_collect_uses_real_artifact(system: str, tmp_path: Path,
     assert eval_status in (0, 1)
     eval_dir = _run_dir(tmp_path / "eval", "eval")
     trajectory = eval_dir / "mcmc_energy"
+    if system == "hooke1" and not (trajectory / "sampled_eval_table.csv").is_file():
+        print("Hooke eval artifacts:", sorted(str(path.relative_to(eval_dir)) for path in eval_dir.rglob("*")))
+        for error_path in eval_dir.rglob("error.json"):
+            print(error_path.read_text(encoding="utf-8"))
     assert (trajectory / "sampled_eval_table.csv").is_file()
     registry = {"systems": [{"id": "he_atom", "reference_energy_hartree": -2.903724377034119598},
                               {"id": "hooke_one_electron_omega0.5", "reference_energy_hartree": 0.75}]}
