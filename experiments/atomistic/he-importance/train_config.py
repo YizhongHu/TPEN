@@ -438,6 +438,30 @@ def _consumed_context(manifest: Mapping[str, Any]) -> str:
     raise AssertionError("unreachable context validation branch")
 
 
+def _reject_bracket_override_path(path: object) -> None:
+    """Reject override paths that use bracket segments.
+
+    Parameters
+    ----------
+    path : object
+        Candidate override path to validate.
+
+    Raises
+    ------
+    TrainConfigResolutionError
+        If *path* is an exact string containing a bracket character.
+    """
+
+    # Use structural checks on an exact str so caller subclasses cannot override the decision.
+    if type(path) is str and (
+        str.__contains__(path, "[") or str.__contains__(path, "]")
+    ):
+        raise TrainConfigResolutionError(
+            f"override path {path!r} contains a bracket segment; use dotted segments "
+            "(e.g. 'run.root', 'loggers.0.path')"
+        )
+
+
 def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple[str, Any], ...]:
     """Flatten mapping or Hydra dotlist overrides into explicit leaf updates."""
 
@@ -447,6 +471,9 @@ def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple
         except Exception as exc:
             raise TrainConfigResolutionError("overrides must be a valid mapping") from exc
     elif isinstance(overrides, Sequence) and not isinstance(overrides, (str, bytes, bytearray)):
+        for override in overrides:
+            path, _, _ = str(override).partition("=")
+            _reject_bracket_override_path(path)
         try:
             raw = OmegaConf.to_container(OmegaConf.from_dotlist(list(overrides)), resolve=False)
         except Exception as exc:
@@ -459,7 +486,9 @@ def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple
     def visit(value: Any, path: str) -> None:
         if isinstance(value, Mapping):
             for key, child in value.items():
-                visit(child, f"{path}.{key}" if path else str(key))
+                child_path = f"{path}.{key}" if path else str(key)
+                _reject_bracket_override_path(child_path)
+                visit(child, child_path)
         else:
             items.append((path, value))
 
