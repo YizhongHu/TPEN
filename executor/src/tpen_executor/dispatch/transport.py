@@ -44,6 +44,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import math
 import os
+from pathlib import Path
 import socket
 import sys
 from types import MappingProxyType
@@ -96,6 +97,7 @@ _TEARDOWN_KEYS = {
     "backend_job_id", "child_group_reaped", "inspection",
 }
 _TEARDOWN_INSPECTIONS = frozenset({"complete", "not-run"})
+_CANCEL_MARKER = "cancel.json"
 _PHASES = ((), ("science",), ("science", "inspection"))
 INSPECTION_STATES = frozenset({"not-run", "evidence", "unavailable", "error"})
 # Typed placement refusals a leaf reports, before science, for the CPUs of its
@@ -161,9 +163,9 @@ class LeafTeardownReceipt:
             raise ValueError("invalid leaf teardown facts")
 
     @classmethod
-    def for_request(cls, request: "LeafRequest", *, inspection: str) -> "LeafTeardownReceipt":
+    def for_request(cls, request: "LeafRequest", *, inspection: str, child_group_reaped: bool) -> "LeafTeardownReceipt":
         return cls(request.group_digest, request.task_id, request.attempt_id,
-                   request.allocation_id, request.backend_job_id, True, inspection)
+                   request.allocation_id, request.backend_job_id, child_group_reaped, inspection)
 
     def to_dict(self) -> dict[str, Any]:
         return {"schema": self.schema, "group_digest": self.group_digest,
@@ -273,6 +275,24 @@ def _error_fact(error: BaseException) -> dict[str, str]:
     """Return the plain type/message fact recorded for one leaf-side error."""
 
     return {"type": type(error).__name__, "message": str(error)}
+
+
+def _cancel_path(request: "LeafRequest") -> str:
+    return os.path.join(request.output_dir, _CANCEL_MARKER)
+
+
+def _cancel_identity(request: "LeafRequest") -> dict[str, str]:
+    return {"schema": "tpen-executor/leaf-cancel-v1",
+            **{name: getattr(request, name) for name in
+               ("group_digest", "task_id", "attempt_id", "allocation_id", "backend_job_id")}}
+
+
+def _cancel_requested(request: "LeafRequest") -> bool:
+    try:
+        marker = decode_json(Path(_cancel_path(request)).read_bytes())
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return False
+    return isinstance(marker, Mapping) and all(marker.get(key) == value for key, value in _cancel_identity(request).items())
 
 
 @frozen_record
@@ -1029,9 +1049,14 @@ def run_leaf(payload: bytes) -> bytes:
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             timeout=request.timeout,
+            cancel_path=_cancel_path(request),
+            cancel_identity=_cancel_identity(request),
         )
     except BaseException as error:
-        # Same classification as a local launch error: a launch failure fact.
+        # The cancellation marker is intentionally handled inside the leaf's
+        # worker, which reaps its group before returning.  Catching the
+        # cancellation here lets that leaf author the required teardown ack;
+        # it is not a controller-side conversion of an arbitrary interrupt.
         launch_error = _error_fact(error)
     else:
         phases.append("science")
@@ -1049,7 +1074,7 @@ def run_leaf(payload: bytes) -> bytes:
         refusal = _child_precore_refusal(environment, outcome)
         if refusal is not None:
             child_refusal = refusal.to_dict()
-    if science is not None and child_refusal is None:
+    if science is not None and child_refusal is None and not _cancel_requested(request):
         phases.append("inspection")
         try:
             # The reader launches with LaunchPurpose.INSPECTION; the
@@ -1062,6 +1087,8 @@ def run_leaf(payload: bytes) -> bytes:
                 stdout_path=evidence_stdout,
                 stderr_path=evidence_stderr,
                 timeout=request.timeout,
+                cancel_path=_cancel_path(request),
+                cancel_identity=_cancel_identity(request),
             )
         except EvidenceUnavailable as error:
             inspection, inspection_error = "unavailable", _error_fact(error)
@@ -1082,7 +1109,10 @@ def run_leaf(payload: bytes) -> bytes:
         inspection,
         evidence,
         inspection_error,
-        LeafTeardownReceipt.for_request(request, inspection=inspection).to_dict(),
+        LeafTeardownReceipt.for_request(
+            request, inspection=inspection,
+            child_group_reaped=science is None or science["pid"] is None or science["returncode"] is not None,
+        ).to_dict(),
     )
     return result.encode()
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import enum
 import math
 import os
@@ -10,8 +10,10 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import threading
 from typing import Any
 
+from ._codec import decode_json
 from ._records import frozen_record
 from .environments import PreparedPythonEnvironment
 from .gpu_sampler import (
@@ -154,6 +156,8 @@ class SubprocessWorker:
         process_handle: Any = None,
         pre_spawn_guard: Callable[[], bool] | None = None,
         purpose: LaunchPurpose = LaunchPurpose.SCIENCE,
+        cancel_path: str | os.PathLike[str] | None = None,
+        cancel_identity: Mapping[str, str] | None = None,
     ) -> ProcessOutcome:
         """Run the prepared interpreter with exact argument boundaries.
 
@@ -206,6 +210,8 @@ class SubprocessWorker:
             raise TypeError("args must be a sequence of strings")
         if pre_spawn_guard is not None and not callable(pre_spawn_guard):
             raise TypeError("pre_spawn_guard must be callable or None")
+        if cancel_path is not None and not isinstance(cancel_identity, Mapping):
+            raise TypeError("cancel_identity is required with cancel_path")
         if type(purpose) is not LaunchPurpose:
             # A bare string such as "inspection" never grants the exemption.
             raise TypeError("purpose must be a LaunchPurpose")
@@ -267,6 +273,14 @@ class SubprocessWorker:
                     **{key: child_env.get(key) for key in QUARANTINE_IDENTITY_KEYS},
                     "evidence_path": sampler_output, "owner_pid": os.getpid(), "owner_host": socket.gethostname(),
                 })
+            if cancel_path is not None:
+                try:
+                    marker = decode_json(Path(os.fspath(cancel_path)).read_bytes())
+                except (FileNotFoundError, OSError, ValueError, TypeError):
+                    marker = None
+                if isinstance(marker, dict) and all(marker.get(key) == value for key, value in (cancel_identity or {}).items()):
+                    settle_slot_lease(lease, None)
+                    return ProcessOutcome(logical_argv, None, stdout_name, stderr_name, timed_out)
             try:
                 process = subprocess.Popen(
                     command,
@@ -287,6 +301,31 @@ class SubprocessWorker:
             spawned_pid = process.pid
             spawned_ticks = _proc_start_ticks(spawned_pid)
             sampler = None
+            cancel_stop = threading.Event()
+            watcher: threading.Thread | None = None
+            if cancel_path is not None:
+                marker_path = os.fspath(cancel_path)
+                expected_marker = dict(cancel_identity or {})
+
+                def watch_cancel_marker() -> None:
+                    """Let the leaf, never the controller, reap its group."""
+                    while not cancel_stop.wait(0.01):
+                        try:
+                            marker = decode_json(Path(marker_path).read_bytes())
+                        except (FileNotFoundError, OSError, ValueError, TypeError):
+                            continue
+                        if not isinstance(marker, dict) or any(marker.get(key) != value for key, value in expected_marker.items()):
+                            continue
+                        if process.poll() is not None:
+                            return
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        return
+
+                watcher = threading.Thread(target=watch_cancel_marker, daemon=True)
+                watcher.start()
             try:
                 if process_handle is not None:
                     process_handle.attach(process)
@@ -331,6 +370,9 @@ class SubprocessWorker:
                     original.add_note(f"cleanup wait interruption: {cleanup_error!r}")
                 raise
             finally:
+                cancel_stop.set()
+                if watcher is not None:
+                    watcher.join(timeout=1)
                 if process_handle is not None:
                     process_handle.clear(process)
         # Normal exit and worker timeout: the child is reaped; finish the

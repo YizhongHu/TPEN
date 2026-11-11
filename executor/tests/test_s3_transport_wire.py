@@ -302,7 +302,7 @@ def _synthetic_result(request: LeafRequest, **changes) -> LeafResult:
             "checkpoint": {"checkpoint_dir": core_dir + "/checkpoint", "schema_version": 1, "next_iteration": 1, "completed_updates": 1},
             "refusal": None, "resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
         },
-        None, LeafTeardownReceipt.for_request(request, inspection="complete").to_dict(),
+        None, LeafTeardownReceipt.for_request(request, inspection="complete", child_group_reaped=True).to_dict(),
     )
     return dataclasses.replace(result, **changes) if changes else result
 

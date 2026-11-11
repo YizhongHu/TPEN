@@ -34,6 +34,7 @@ from ..environments import PreparedPythonEnvironment, SourceScript
 from ..placement import BindingError, PlacementRefusal, WorkerBinding, bindings_from_allocation, physical_slots_from_allocation, slots_from_allocation
 from ..programs import WorkerProgram
 from .._records import frozen_record
+from .._codec import canonical_bytes
 from ..results import RunManifest
 from ..contracts import ReadyGroup
 from ..lifecycle.attached import AttachedAllocation
@@ -411,9 +412,23 @@ class _RemoteLeaf:
         self.request_cancel()
 
     def request_cancel(self) -> None:
-        """Send the transport cancellation request (never ``killpg``)."""
+        """Create the identity-bound marker observed by the remote leaf."""
 
-        return None
+        path = os.path.join(self.request.output_dir, "cancel.json")
+        payload = canonical_bytes({"schema": "tpen-executor/leaf-cancel-v1",
+                                   "group_digest": self.request.group_digest,
+                                   "task_id": self.request.task_id,
+                                   "attempt_id": self.request.attempt_id,
+                                   "allocation_id": self.request.allocation_id,
+                                   "backend_job_id": self.request.backend_job_id})
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
 
     def bind_future(self, future: Any) -> None:
         self.future = future
@@ -1052,18 +1067,22 @@ class ParslDispatcher(DispatcherContract):
     def _cancel_slot_pool(self, active: Mapping[Any, Mapping[str, Any]], lifecycle: AttachedAllocation, cancellation: BaseException) -> None:
         """Kill and reap every started child before failed cancellation finishes."""
 
+        remote_records = [record for record in active.values() if isinstance(record["handle"], _RemoteLeaf)]
+        for record in remote_records:
+            record["handle"].request_cancel()
+        remote_deadline = time.monotonic() + (
+            float(getattr(self.transport, "teardown_timeout", 30)) if remote_records else 0
+        )
         for record in active.values():
-            record["handle"].request_kill()
+            if not isinstance(record["handle"], _RemoteLeaf):
+                record["handle"].request_kill()
         for future, record in active.items():
             if isinstance(record["handle"], _RemoteLeaf):
                 # A remote leaf is neither signalled nor awaited here; its
                 # attempt is finished failed and never accepted.  Bounded
                 # remote teardown acknowledgement is S3 Layer C.
                 handle = record["handle"]
-                handle.request_cancel()
-                transport = self.transport
-                bound = float(getattr(transport, "teardown_timeout", 30)) if transport is not None else 30.0
-                acknowledged = handle.wait_for_teardown(bound)
+                acknowledged = handle.wait_for_teardown(max(remote_deadline - time.monotonic(), 0))
                 try:
                     status = "failed" if acknowledged else "remote-quiescence-unconfirmed"
                     lifecycle.finish(record["fence"], status, self._utc_now(), None)
