@@ -109,6 +109,40 @@ def test_no_load_decision_passes_no_restore_request(monkeypatch, tmp_path: Path)
     assert captured_kwargs["restore_request"] is None
 
 
+def test_model_only_decision_reaches_runner_via_legacy_overlay_with_no_restore_request(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """S2 non-goal: a ``model_only`` load decision is out of scope for
+    ``OperationalRestoreRequest`` (which hard-requires ``train_resume``).
+    ``run_configured_once`` must route it through dev's unchanged pre-S2
+    config-overlay path instead of refusing it."""
+
+    decision = RecoveryDecision(
+        phase=RecoveryPhase.RECOVERY,
+        outcome=RecoveryOutcome.RECOVERY,
+        target_iterations=8,
+        load={"mode": "model_only", "path": "/somewhere"},
+    )
+    cfg = OmegaConf.create(
+        {
+            "run": {"root": "ignored"},
+            "load": {"mode": "none"},
+            "runner": {"_target_": "x", "load": {"mode": "none"}},
+        }
+    )
+    captured_cfg, captured_kwargs = _call(monkeypatch, cfg, decision, tmp_path)
+
+    assert OmegaConf.to_container(captured_cfg.runner.load, resolve=True) == {
+        "mode": "model_only",
+        "path": "/somewhere",
+    }
+    assert OmegaConf.to_container(captured_cfg.load, resolve=True) == {
+        "mode": "model_only",
+        "path": "/somewhere",
+    }
+    assert "restore_request" not in captured_kwargs or captured_kwargs["restore_request"] is None
+
+
 def test_conflicting_concrete_configured_load_is_refused_through_the_real_boundary(
     monkeypatch, tmp_path: Path
 ) -> None:

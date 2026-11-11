@@ -1157,9 +1157,23 @@ def run_configured_once(cfg: Any, *, decision: RecoveryDecision, output_path: Pa
     from .recovery import OperationalRestoreRequest
 
     worker_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    if decision.load is not None and dict(decision.load).get("mode") == "train_resume":
+        OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
+        return run_from_config(worker_cfg, restore_request=OperationalRestoreRequest(decision), **kwargs)
+
+    # Unchanged legacy path (c3815d0e) for any load mode outside S2's scope
+    # (e.g. model_only): no typed restore request, plain config overlay.
+    if decision.load is not None:
+        OmegaConf.update(worker_cfg, "runner.load", decision.load, merge=False, force_add=True)
+        if "load" in worker_cfg:
+            OmegaConf.update(worker_cfg, "load", decision.load, merge=False)
+        effective_runner_load = OmegaConf.select(worker_cfg, "runner.load", default=None)
+        if OmegaConf.is_config(effective_runner_load):
+            effective_runner_load = OmegaConf.to_container(effective_runner_load, resolve=True)
+        if effective_runner_load != decision.load:
+            raise ValueError("worker overlay did not reach the configured runner.load")
     OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
-    restore_request = OperationalRestoreRequest(decision) if decision.load is not None else None
-    return run_from_config(worker_cfg, restore_request=restore_request, **kwargs)
+    return run_from_config(worker_cfg, **kwargs)
 
 
 __all__ = [
