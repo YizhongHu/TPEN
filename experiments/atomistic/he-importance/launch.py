@@ -417,7 +417,11 @@ def prepare_train_launch(
 
     facts = execution_topology_facts(topology) if topology is not None else {}
     cell = populate_execution_topology(source, facts)
-    config = _TRAIN_CONFIG.resolve_train_config(cell, overrides=overrides)
+    # Preserve the default call shape for existing callers and test doubles.
+    if overrides is None:
+        config = _TRAIN_CONFIG.resolve_train_config(cell)
+    else:
+        config = _TRAIN_CONFIG.resolve_train_config(cell, overrides=overrides)
     return LaunchPlan(cell=cell, config=config, topology=cell.manifest[_STAGE_API.TOPOLOGY_KEY])
 
 
