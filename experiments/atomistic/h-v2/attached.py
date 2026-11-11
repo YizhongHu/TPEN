@@ -954,7 +954,14 @@ def activate_h_v2_run(
     # no non-pipeline TRAIN payload may cross this final dispatch boundary
     # without the complete A1 history set.
     if stage == TRAIN_STAGE and prepared.payload != "pipeline-check":
-        configured = set(protocol.reconcile_enabled_modules(prepared.config))
+        # Rebuild the exact resolved composition sent through the handoff.  The
+        # prepared snapshot is the caller's builder result and may be stale
+        # when a later override replaces callbacks or trainer scalars.
+        resolved = _resolve_bound_config(
+            _merge_config_with_overrides(prepared.effective_config, prepared.overrides)
+        )
+        protocol.assert_hydrogen_contract(resolved, allow_incomplete_a1=False)
+        configured = set(protocol.reconcile_enabled_modules(resolved))
         required = set(protocol.A1_TRAINING_MODULE_CANDIDATES)
         if configured != required:
             missing = sorted(required - configured)
