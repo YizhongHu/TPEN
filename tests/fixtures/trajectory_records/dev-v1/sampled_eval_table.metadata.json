@@ -1,0 +1,36 @@
+{
+  "atomic_configuration": {
+    "charges": [
+      1.0
+    ],
+    "positions": [
+      [
+        0.0,
+        0.0,
+        0.0
+      ]
+    ]
+  },
+  "atomic_configuration_id": "079d6b76b52dbad35705548c70b7aa1dca33dd4a0d67a9fe08b73570592374be",
+  "burn_in_draws": 0,
+  "byte_count": 323,
+  "csv_filename": "sampled_eval_table.csv",
+  "csv_sha256": "f45be53e7c9a246c6860c6f1df8e44b2849c59cc9493355a4d89ea1f13ec6f44",
+  "draw_count": 2,
+  "draw_stride": 1,
+  "finite_count": 4,
+  "mean": 2.5,
+  "n_electrons": 1,
+  "nonfinite_count": 0,
+  "observable": "local_energy",
+  "observable_values_content_id": "c0d9022fc0dbc0634ce35d14ce173101cfff10573b18c4cbd95a7a4a0f6890d7",
+  "row_count": 4,
+  "row_semantics": "complete_draw_walker_grid",
+  "schema": "trajectory_records/v1",
+  "spatial_dim": 3,
+  "term_names": [
+    "kinetic"
+  ],
+  "variance": 1.25,
+  "walker_count": 2
+}

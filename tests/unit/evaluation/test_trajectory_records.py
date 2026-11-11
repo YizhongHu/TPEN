@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from shutil import copyfile
 
 import pytest
 import torch
@@ -142,6 +143,23 @@ def test_nucleus_record_bytes_remain_stable(tmp_path: Path) -> None:
     second_metadata = _read_metadata(second)
     first_metadata["csv_filename"] = second_metadata["csv_filename"]
     assert first_metadata == second_metadata
+
+
+def test_nucleus_record_matches_dev_golden_bytes(tmp_path: Path) -> None:
+    artifact = _artifact(tmp_path, FINITE, name="sampled_eval_table.csv")
+    fixture = Path(__file__).parents[2] / "fixtures" / "trajectory_records" / "dev-v1"
+    assert artifact.path.read_bytes() == (fixture / "sampled_eval_table.csv").read_bytes()
+    assert artifact.metadata_path.read_bytes() == (
+        fixture / "sampled_eval_table.metadata.json"
+    ).read_bytes()
+
+
+def test_old_dev_record_fixture_still_validates(tmp_path: Path) -> None:
+    artifact = _artifact(tmp_path, FINITE, name="sampled_eval_table.csv")
+    fixture = Path(__file__).parents[2] / "fixtures" / "trajectory_records" / "dev-v1"
+    copyfile(fixture / "sampled_eval_table.csv", artifact.path)
+    copyfile(fixture / "sampled_eval_table.metadata.json", artifact.metadata_path)
+    artifact.validate()
 
 
 def test_nucleus_free_generator_writes_and_validates_records(tmp_path: Path) -> None:
