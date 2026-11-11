@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import copy
 import json
+import math
+import re
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import yaml
 
@@ -459,6 +461,420 @@ def evaluation_config(checkpoint: Path, *, stream: int = 0, root: Path | None = 
     return config
 
 
+#: TO 8a5e926f (item E, design target section A2): the evaluation-side scale
+#: overlay, applied onto ``eval.yaml`` the same explicit dotted-path way
+#: :func:`science_training_config` applies :data:`SCIENCE_SCALE_OVERLAY_PATH`
+#: onto ``train.yaml``. The model architecture keys here MUST equal
+#: :data:`SCIENCE_SCALE_OVERLAY_KEYS`'s own values: this config restores a
+#: checkpoint trained at those widths, so a drifted channel count here would
+#: fail checkpoint restore, not merely evaluate a different model silently.
+EVAL_SCALE_OVERLAY_PATH = ROOT / "configs" / "eval_scale_overlay.yaml"
+EVAL_SCALE_OVERLAY_KEYS = frozenset(
+    {
+        "runtime.device",
+        "sampler.n_walkers",
+        "sampler.burn_in",
+        "evaluator.tasks.0.generator.n_draws",
+        "evaluator.tasks.0.summaries.0.max_samples",
+        "model.embedding.out_channels",
+        "model.embedding.hidden_channels",
+        "model.layers.0.mixing.channels",
+        "model.layers.0.path_aggregation.channels",
+        "model.readout.channels",
+    }
+)
+
+#: Design target D8: the science-scale evaluation config must never carry a
+#: ``reference_energy`` key anywhere -- the hydrogen exact ground state is an
+#: instrument control, never a training or evaluation input.
+EVAL_FORBIDDEN_KEYS: tuple[str, ...] = ("reference_energy",)
+
+#: ``tpen.nn.readout.pfaffian.PfaffianReadout``'s own default floor
+#: (amendment r4 E5), restated here as the readout-trajectory generator's
+#: expected ``readout_eps`` -- the generator's own internal floor check
+#: (``ReadoutTrajectoryMCMCGenerator.generate``) refuses at runtime if the
+#: RESTORED model's actual eps disagrees. F1 (review r1): this constant is
+#: never written into a TRAIN or EVAL config's ``model.readout.eps`` --
+#: doing so would change the model mapping core hashes for restore identity,
+#: so an earlier TRAIN checkpoint (whose receipt's authenticated mapping has
+#: no explicit ``eps``) would fail to restore against a later EVAL config
+#: that added one, even though the value is numerically identical to the
+#: class's own constructor default. The model mapping used for restore is
+#: always the TRAIN receipt's own, untouched; only the generator's
+#: *expected* floor is supplied here.
+READOUT_EPS = 1.0e-12
+
+#: Orchestrator decision 2(a) (TO 8a5e926f): enabled for every eval payload
+#: (science, pilot, part g), so phase B measures its added cost.
+READOUT_TRAJECTORY_GENERATOR_TARGET = (
+    "tpen.evaluation.generators.readout_trajectory.ReadoutTrajectoryMCMCGenerator"
+)
+
+
+def _assert_no_forbidden_keys(node: Any, *, path: str = "") -> None:
+    """Recursively refuse any :data:`EVAL_FORBIDDEN_KEYS` leaf anywhere in *node*."""
+
+    if isinstance(node, Mapping):
+        for key, value in node.items():
+            dotted = f"{path}.{key}" if path else str(key)
+            if key in EVAL_FORBIDDEN_KEYS:
+                raise ValueError(f"science evaluation config carries forbidden key {dotted!r} (design target D8)")
+            _assert_no_forbidden_keys(value, path=dotted)
+    elif isinstance(node, (list, tuple)):
+        for index, value in enumerate(node):
+            _assert_no_forbidden_keys(value, path=f"{path}.{index}")
+
+
+def enable_readout_trajectory_generator(config: dict[str, Any]) -> None:
+    """Append a readout-trajectory evaluator task onto *config* in place.
+
+    F1 (review r1, fix): the generator's ``readout_eps`` is set from the
+    frozen :data:`READOUT_EPS` constant, but ``config["model"]["readout"]``
+    is never touched here -- the model mapping stays exactly whatever the
+    TRAIN receipt's authenticated config carries (restore identity depends
+    on it matching bit-for-bit), and the generator's own runtime floor check
+    (``ReadoutTrajectoryMCMCGenerator.generate``) is what actually confirms
+    the restored model's real eps agrees with the expected floor supplied
+    here, not a config-level mutation performed in advance.
+    """
+
+    base_task = config["evaluator"]["tasks"][0]
+    readout_task = copy.deepcopy(base_task)
+    readout_task["name"] = "readout_trajectory"
+    readout_task["namespace"] = "readout_trajectory"
+    readout_task["output_dir"] = "${run.dir}/readout_trajectory"
+    readout_task["generator"] = {
+        **base_task["generator"],
+        "_target_": READOUT_TRAJECTORY_GENERATOR_TARGET,
+        "readout_eps": READOUT_EPS,
+        "replay_chunk_size": base_task["generator"]["chunk_size"],
+    }
+    config["evaluator"]["tasks"].append(readout_task)
+
+
+def science_evaluation_config(
+    checkpoint: Path,
+    *,
+    seed: int,
+    root: Path | None = None,
+    enable_readout_trajectory: bool = True,
+) -> dict[str, Any]:
+    """Return one science-scale fresh-evaluation config (design target A2).
+
+    Builds ``eval.yaml`` plus :data:`EVAL_SCALE_OVERLAY_PATH` (model
+    architecture and sampler scale matching :func:`science_training_config`'s
+    own overlay), restores *checkpoint*, and sets the frozen per-generation
+    *seed* -- never invented here; the caller computes it from
+    :func:`science_eval_seed`, :func:`pilot_eval_seed`, or
+    :func:`gpu_route_g_eval_seed`.
+
+    Parameters
+    ----------
+    checkpoint : pathlib.Path
+        Absolute checkpoint directory. Never globbed for: the caller
+        resolves it from a verified checkpoint-inventory entry
+        (:mod:`eval_job`).
+    seed : int
+        The frozen seed for this exact generation.
+    root : pathlib.Path, optional
+        Overrides ``run.root``; the caller sets ``run.run_id`` separately
+        (mirrors :func:`attached.build_h_v2_eval_plan`).
+    enable_readout_trajectory : bool, default=True
+        Whether to append the readout-trajectory generator task
+        (:func:`enable_readout_trajectory_generator`). Orchestrator decision
+        2(a) enables it for every eval payload; a caller that probed the
+        class absent on its own base passes ``False`` and records the
+        deviation instead of silently omitting it.
+
+    Raises
+    ------
+    ValueError
+        If the overlay's key set has drifted from :data:`EVAL_SCALE_OVERLAY_KEYS`,
+        or the resolved config carries a forbidden key (:data:`EVAL_FORBIDDEN_KEYS`).
+    """
+
+    config = load_yaml(ROOT / "configs" / "eval.yaml")
+    overlay = load_yaml(EVAL_SCALE_OVERLAY_PATH)
+    if set(overlay) != EVAL_SCALE_OVERLAY_KEYS:
+        raise ValueError(
+            f"eval scale overlay key set {set(overlay)!r} does not match the allowlist "
+            f"{set(EVAL_SCALE_OVERLAY_KEYS)!r}"
+        )
+    for dotted, value in overlay.items():
+        _set_by_dotted_path(config, dotted, value)
+    config["load"]["path"] = str(checkpoint)
+    config["runtime"]["seed"] = seed
+    if root is not None:
+        config["run"]["root"] = str(root)
+    if enable_readout_trajectory:
+        enable_readout_trajectory_generator(config)
+    _assert_no_forbidden_keys(config)
+    return config
+
+
+#: D8: science eval seeds must be READ from ``contract_inputs.json``'s own
+#: ``measurement.seed_roster.evaluation_stream_seed_formula`` field at
+#: runtime, never a hard-coded literal with no CI tie (the way
+#: ``pilot_eval_seed``/``gpu_route_g_eval_seed`` are already checked against
+#: their own roster fields) -- a drifted formula must change this function's
+#: output, not be silently ignored.
+_SCIENCE_EVAL_SEED_FORMULA_PATTERN = re.compile(
+    r"(\d+)\s*\+\s*(\d+)\*lineage_index\s*\+\s*(\d+)\*evaluated_checkpoint_ordinal\s*\+\s*stream_index"
+)
+
+
+def science_eval_seed(lineage_index: int, checkpoint_ordinal: int, stream_index: int) -> int:
+    """Return one science evaluation generation's seed, read from CI (design target C2).
+
+    Raises
+    ------
+    ValueError
+        If ``contract_inputs.json``'s ``evaluation_stream_seed_formula`` does
+        not match the expected ``base + a*lineage_index + b*evaluated_checkpoint_ordinal
+        + stream_index`` shape.
+    """
+
+    payload = json.loads(CONTRACT_INPUTS_PATH.read_text(encoding="utf-8"))
+    formula = payload["measurement"]["seed_roster"]["evaluation_stream_seed_formula"]
+    match = _SCIENCE_EVAL_SEED_FORMULA_PATTERN.search(formula)
+    if match is None:
+        raise ValueError(f"evaluation_stream_seed_formula {formula!r} does not match the expected shape")
+    base, lineage_coeff, ordinal_coeff = (int(group) for group in match.groups())
+    return base + lineage_coeff * lineage_index + ordinal_coeff * checkpoint_ordinal + stream_index
+
+
+def science_evaluated_checkpoint_updates() -> tuple[int, ...]:
+    """Return the 27 contract-frozen evaluated-checkpoint update counts, in order."""
+
+    payload = json.loads(CONTRACT_INPUTS_PATH.read_text(encoding="utf-8"))
+    return tuple(payload["measurement"]["evaluated_checkpoints"]["updates"])
+
+
+def pilot_eval_seed(ordinal: int, stream: int) -> int:
+    """Return one pilot evaluation generation's seed (amendment r3/r4 E1/E2).
+
+    Formula ``996000 + 10*ordinal + stream``; every value is read-checked
+    against ``contract_inputs.json``'s frozen ``capacity_pilot.evaluation``
+    roster -- never a seed literal outside it.
+
+    Raises
+    ------
+    ValueError
+        If the computed seed is not in the CI roster.
+    """
+
+    seed = 996000 + 10 * ordinal + stream
+    roster = _non_science_seed_namespace("capacity_pilot")["evaluation"]
+    if seed not in roster:
+        raise ValueError(
+            f"pilot evaluation seed {seed} (ordinal={ordinal}, stream={stream}) is not in the CI roster"
+        )
+    return seed
+
+
+def gpu_route_g_eval_seed() -> int:
+    """Return part (g)'s single fresh-evaluation seed (999004, CI frozen)."""
+
+    namespace = _non_science_seed_namespace("pipeline_gpu_smoke_g")
+    (seed,) = namespace["evaluation"]
+    return seed
+
+
+#: Pilot two-stage grid (pilot-plan-r3-20261110 (a), amendment r3/r4 E1):
+#: stage 1 is stream 0 at every checkpoint ordinal 0..20 (updates 0..20000).
+PILOT_STAGE1_ORDINALS: tuple[int, ...] = tuple(range(0, 21))
+PILOT_STAGE1_STREAM = 0
+
+
+def pilot_stage1_grid() -> tuple[tuple[int, int], ...]:
+    """Return stage 1's ``(ordinal, stream)`` pairs: stream 0 at ordinals 0..20."""
+
+    return tuple((ordinal, PILOT_STAGE1_STREAM) for ordinal in PILOT_STAGE1_ORDINALS)
+
+
+def pilot_stage2_window(c1: int) -> tuple[int, ...]:
+    """Return stage 2's 5-checkpoint stream-1 window around *c1* (r3 (a)).
+
+    ``lo = min(max(c1 - 2, 1), 16)``; the window is ``lo..lo+4`` inclusive.
+
+    Raises
+    ------
+    ValueError
+        If *c1* is outside ``3..19``.
+    """
+
+    if not 3 <= c1 <= 19:
+        raise ValueError(f"c1 must be in 3..19, got {c1}")
+    lo = min(max(c1 - 2, 1), 16)
+    return tuple(range(lo, lo + 5))
+
+
+def pilot_stage2_grid(c1: int, *, core: bool = False) -> tuple[tuple[int, int], ...]:
+    """Return stage 2's ``(ordinal, stream)`` pairs, given SEL's basin ordinal *c1*.
+
+    Stream 1 at the 5-checkpoint window around *c1* (:func:`pilot_stage2_window`);
+    streams 2 and 3 at *c1*; streams 1-3 at ordinals 0 and 20. ``core``
+    (``--pilot-stage 2-core``) drops ONLY ordinal 20's three entries -- "the
+    same as stage 2 without ordinal 20" (amendment r3/r4 E1) -- never
+    ordinal 0's. A pair already covered by stage 1 (any ordinal, stream 0)
+    never appears here; a pair this function would otherwise repeat (for
+    example *c1* already inside its own window) appears exactly once.
+    """
+
+    pairs: list[tuple[int, int]] = [(ordinal, 1) for ordinal in pilot_stage2_window(c1)]
+    pairs.append((c1, 2))
+    pairs.append((c1, 3))
+    edge_ordinals = (0,) if core else (0, 20)
+    for ordinal in edge_ordinals:
+        for stream in (1, 2, 3):
+            pairs.append((ordinal, stream))
+    seen: set[tuple[int, int]] = set()
+    deduped: list[tuple[int, int]] = []
+    for pair in pairs:
+        if pair not in seen:
+            seen.add(pair)
+            deduped.append(pair)
+    return tuple(deduped)
+
+
+def _nearest_rank_p999(deviations: Sequence[float]) -> float:
+    """Return the order statistic at index ``ceil(0.999*N)`` (1-based), no interpolation.
+
+    Shared by :func:`w_statistic` (one stream's own deviations) and
+    :func:`pooled_w_statistic` (several streams' deviations pooled after
+    each is centered about its own median) -- the nearest-rank step itself
+    never re-centers.
+
+    Raises
+    ------
+    ValueError
+        If *deviations* is empty.
+    """
+
+    values = sorted(deviations)
+    n = len(values)
+    if n == 0:
+        raise ValueError("W requires at least one local energy")
+    index = min(math.ceil(0.999 * n), n) - 1
+    return values[index]
+
+
+def _deviations_about_own_median(local_energies: Sequence[float]) -> list[float]:
+    values = sorted(local_energies)
+    n = len(values)
+    if n == 0:
+        raise ValueError("W requires at least one local energy")
+    median = values[n // 2] if n % 2 else 0.5 * (values[n // 2 - 1] + values[n // 2])
+    return [abs(value - median) for value in local_energies]
+
+
+def w_statistic(local_energies: Sequence[float]) -> float:
+    """Return ``W = P99.9(abs(E_L - median(E_L)))`` (the instrument's estimator).
+
+    ``contract_inputs.json``'s ``measurement.fresh_evaluation.estimator``:
+    the order statistic at index ``ceil(0.999*N)`` (1-based) of the sorted
+    absolute deviations from the stream's own median, no interpolation.
+
+    Raises
+    ------
+    ValueError
+        If *local_energies* is empty.
+    """
+
+    return _nearest_rank_p999(_deviations_about_own_median(local_energies))
+
+
+def pooled_w_statistic(streams: Sequence[Sequence[float]]) -> float:
+    """Return the pooled ``W`` across several streams (D1, review r2 delta).
+
+    ``contract_inputs.json``'s ``measurement.fresh_evaluation.estimator``:
+    "median: computed independently per stream". Each stream's absolute
+    deviations are computed about ITS OWN median, then pooled across
+    streams, then the nearest-rank P99.9 order statistic is taken over the
+    pooled deviations -- never re-centered after pooling. A location shift
+    applied to one stream alone (its deviations unchanged) must not change
+    the result.
+
+    Raises
+    ------
+    ValueError
+        If any stream in *streams* is empty.
+    """
+
+    pooled: list[float] = []
+    for stream in streams:
+        pooled.extend(_deviations_about_own_median(stream))
+    return _nearest_rank_p999(pooled)
+
+
+def is_interior_minimum(c1: int) -> bool:
+    """Return whether *c1* sits strictly inside the pilot window, not at its edge.
+
+    Operator ruling (operator-rulings-pilot-20261110-1900, item 3): a basin
+    center at the window edge (``c1`` of 3 or 19) never had a full
+    neighboring triple on both sides, so it must never be reported as an
+    interior minimum.
+
+    Raises
+    ------
+    ValueError
+        If *c1* is outside ``3..19``.
+    """
+
+    if not 3 <= c1 <= 19:
+        raise ValueError(f"c1 must be in 3..19, got {c1}")
+    return c1 not in (3, 19)
+
+
+def select_pilot_basin_ordinal(stream0_w_by_ordinal: Mapping[int, float]) -> tuple[int, dict[int, float]]:
+    """Return ``(c1, triple_means)`` -- the SEL step (pilot-plan-r3-20261110 (a)).
+
+    *c1* is the center (ordinal 3..19) of the stream-0 triple with the
+    smallest mean W; the EARLIEST (lowest-ordinal) tie wins, never the
+    latest.
+
+    Raises
+    ------
+    ValueError
+        If *stream0_w_by_ordinal* is missing any ordinal a candidate triple needs.
+    """
+
+    centers = range(3, 20)
+    missing = sorted({o for c in centers for o in (c - 1, c, c + 1) if o not in stream0_w_by_ordinal})
+    if missing:
+        raise ValueError(f"stream-0 W is missing for ordinals {missing!r}")
+    triple_means = {
+        c: (stream0_w_by_ordinal[c - 1] + stream0_w_by_ordinal[c] + stream0_w_by_ordinal[c + 1]) / 3.0
+        for c in centers
+    }
+    c1 = min(triple_means, key=lambda c: (triple_means[c], c))
+    return c1, triple_means
+
+
+def select_final_basin_ordinal(c1: int, pooled01_w_by_ordinal: Mapping[int, float]) -> int:
+    """Return ``c*``, the final basin ordinal (pilot-plan-r3 (a)).
+
+    Candidates are the three centers ``{c1-1, c1, c1+1}`` clipped to
+    ``3..19``; *c1* is always among them. Pools streams 0 and 1; the
+    earliest tie wins.
+
+    Raises
+    ------
+    ValueError
+        If *pooled01_w_by_ordinal* is missing any ordinal a candidate triple needs.
+    """
+
+    candidates = sorted({c for c in (c1 - 1, c1, c1 + 1) if 3 <= c <= 19} | {c1})
+    missing = sorted({o for c in candidates for o in (c - 1, c, c + 1) if o not in pooled01_w_by_ordinal})
+    if missing:
+        raise ValueError(f"pooled stream-0/1 W is missing for ordinals {missing!r}")
+    means = {
+        c: (pooled01_w_by_ordinal[c - 1] + pooled01_w_by_ordinal[c] + pooled01_w_by_ordinal[c + 1]) / 3.0
+        for c in candidates
+    }
+    return min(means, key=lambda c: (means[c], c))
+
+
 def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False) -> None:
     """Refuse configs that drift from one-electron, charge-one hydrogen."""
 
@@ -541,9 +957,16 @@ __all__ = [
     "CONTRACT_NUCLEAR_LAW",
     "ENDQ_A1_QUANTILES",
     "EVALUATION_SEEDS",
+    "EVAL_FORBIDDEN_KEYS",
+    "EVAL_SCALE_OVERLAY_KEYS",
+    "EVAL_SCALE_OVERLAY_PATH",
     "PILOT_A1_CADENCE",
     "PILOT_PAYLOAD_OVERLAY_KEYS",
     "PILOT_PAYLOADS",
+    "PILOT_STAGE1_ORDINALS",
+    "PILOT_STAGE1_STREAM",
+    "READOUT_EPS",
+    "READOUT_TRAJECTORY_GENERATOR_TARGET",
     "ROOT",
     "SAMPLER_SEED",
     "SCIENCE_SCALE_OVERLAY_KEYS",
@@ -555,12 +978,26 @@ __all__ = [
     "assert_amplitude_risk_thresholds",
     "assert_hydrogen_contract",
     "candidate_modules_to_append",
+    "enable_readout_trajectory_generator",
     "evaluation_config",
+    "gpu_route_g_eval_seed",
+    "is_interior_minimum",
     "load_yaml",
+    "pilot_eval_seed",
+    "pilot_stage1_grid",
+    "pilot_stage2_grid",
+    "pilot_stage2_window",
     "pilot_training_config",
+    "pooled_w_statistic",
     "reconcile_enabled_modules",
     "remove_candidate_module",
+    "science_eval_seed",
+    "science_evaluated_checkpoint_updates",
+    "science_evaluation_config",
     "science_training_config",
+    "select_final_basin_ordinal",
+    "select_pilot_basin_ordinal",
     "training_config",
     "unspecified_modules",
+    "w_statistic",
 ]

@@ -766,7 +766,7 @@ def test_main_requires_run_root_prefix_for_a_pilot_payload(tmp_path: Path, monke
 
 def test_main_requires_explicit_stage_train_for_a_pilot_payload(tmp_path: Path) -> None:
     run_root = tmp_path / "runs" / "h-v2" / "gpu-route-g" / "G"
-    with pytest.raises(launch.LaunchError, match="--stage train is required"):
+    with pytest.raises(launch.LaunchError, match="--stage train or --stage eval is required"):
         launch.main(
             [
                 "--run-root",

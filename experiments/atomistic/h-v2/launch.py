@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import base64
 import importlib.util
+import json
 import os
 import shlex
 import subprocess
@@ -542,6 +543,196 @@ def build_sbatch_command(
     return command
 
 
+def _wrap_eval_fanout_command(
+    payload: str,
+    *,
+    lineage: str | None,
+    pilot_stage: str | None,
+    expected_train_commit: str,
+    checkout_root: Path,
+    science_python: str,
+    executor_python: str,
+) -> str:
+    """Return the wrapper body for ``run_job.py eval-fanout ...`` (item E).
+
+    TO 8a5e926f amendment r4 E6: pilot/g eval-fanout jobs reuse the pilot
+    TRAIN jobs' GPU sidecar (:func:`_gpu_sidecar_wrap_lines`); science's
+    wrapper stays the plain ``exec`` form (no sidecar), matching #629's own
+    wrapper.
+    """
+
+    job_script = checkout_root / launch_config.JOB_SCRIPT_RELATIVE
+    argv = [science_python, str(job_script), "eval-fanout", payload]
+    if payload == "science":
+        assert lineage is not None
+        argv.append(lineage)
+    argv += ["--expected-train-commit", expected_train_commit]
+    if pilot_stage is not None:
+        argv += ["--pilot-stage", pilot_stage]
+    checkout_quoted = shlex.quote(str(checkout_root))
+    payload_command = shlex.join(argv)
+    if payload in PILOT_PAYLOADS:
+        statements = _gpu_sidecar_wrap_lines(
+            checkout_quoted=checkout_quoted,
+            science_python=science_python,
+            executor_python=executor_python,
+            payload_command=payload_command,
+        )
+        body = statements[0]
+        for statement in statements[1:]:
+            body += statement if body.endswith("&") else f"; {statement}"
+        return body
+    return (
+        f"cd {checkout_quoted} && "
+        f"CHECKOUT={checkout_quoted} && "
+        'PYTHONPATH="$CHECKOUT${PYTHONPATH:+:$PYTHONPATH}" '
+        f"SCIENCE_PYTHON={shlex.quote(science_python)} "
+        f"EXECUTOR_PY={shlex.quote(executor_python)} "
+        f"exec {payload_command}"
+    )
+
+
+def build_eval_fanout_sbatch_command(
+    payload: str,
+    *,
+    lineage: str | None = None,
+    pilot_stage: str | None = None,
+    expected_train_commit: str,
+    science_python: str,
+    executor_python: str,
+    run_root: Path,
+    checkout_root: Path,
+    time_value: str,
+    dependency: str | None,
+    commit: str,
+    resources: launch_config.JobResources,
+) -> list[str]:
+    """Return the exact ``sbatch`` argv for one EVAL fan-out job (item E).
+
+    Unlike :func:`build_sbatch_command` (the single-generation TRAIN/EVAL
+    route), this submits ``run_job.py eval-fanout <payload> ...`` -- the
+    checkpoint-verified, direct-dispatch fan-out
+    (:mod:`experiments.atomistic.h-v2.eval_job`), never the TRAIN-only
+    executor route that refuses EVAL unconditionally.
+
+    Parameters
+    ----------
+    payload : {"science", "pipeline-check", "gpu-route-g", "capacity-pilot"}
+    lineage : str, optional
+        Required for ``payload == "science"``; ignored (the payload's own
+        fixed label is used) for every other payload.
+    pilot_stage : {"1", "2", "2-core"}, optional
+        Required for ``payload == "capacity-pilot"``; refused for any other
+        payload by the caller before this function is reached.
+    expected_train_commit : str
+        The TRAIN commit this EVAL job's receipt must have been written at
+        (bound into the in-job argv, never guessed).
+    commit : str
+        This job's OWN expected checkout commit (bound as ``SHA``, the same
+        way :func:`build_sbatch_command` does) -- may differ from
+        *expected_train_commit* for an EVAL-only submission against an
+        earlier TRAIN commit.
+
+    Returns
+    -------
+    list of str
+        The full ``sbatch`` argv, ``--wrap=...`` last.
+
+    Raises
+    ------
+    LaunchError
+        If *payload* is not recognized, or *payload == "science"* with an
+        unapproved *lineage*.
+    """
+
+    _validate_payload(payload)
+    if payload in PILOT_PAYLOADS:
+        job_lineage = launch_config.PILOT_PAYLOAD_LINEAGES[payload]
+    else:
+        _validate_science_lineage(payload, lineage or "")
+        job_lineage = lineage
+    run_root = Path(run_root)
+    checkout_root = Path(checkout_root)
+    label = _run_job_module().PIPELINE_CHECK_LABEL if payload == "pipeline-check" else payload
+    stage_label = f"eval-{pilot_stage}" if pilot_stage else "eval"
+    job_name = f"h-v2-{label}-{job_lineage}-{stage_label}"
+    command = [
+        "sbatch",
+        "--parsable",
+        f"--job-name={job_name}",
+        f"--partition={resources.partition}",
+    ]
+    if resources.constraint:
+        command.append(f"--constraint={resources.constraint}")
+    gres = f"gpu:{resources.gpu_model}:{resources.gpus}" if resources.gpu_model else f"gpu:{resources.gpus}"
+    command += [
+        f"--gres={gres}",
+        f"--nodes={resources.nodes}",
+        f"--ntasks={resources.ntasks}",
+        f"--cpus-per-task={resources.cpus_per_task}",
+        f"--mem={resources.mem}",
+        f"--time={time_value}",
+    ]
+    if resources.no_requeue:
+        command.append("--no-requeue")
+    command.append("--export=" + ",".join(["ALL", f"RUN={run_root}", f"SHA={commit}"]))
+    command += [
+        f"--output={run_root / 'logs' / '%x-%j.out'}",
+        f"--error={run_root / 'logs' / '%x-%j.err'}",
+    ]
+    if dependency:
+        command.append(f"--dependency={dependency}")
+    command.append(
+        "--wrap="
+        + _wrap_eval_fanout_command(
+            payload,
+            lineage=lineage if payload == "science" else None,
+            pilot_stage=pilot_stage,
+            expected_train_commit=expected_train_commit,
+            checkout_root=checkout_root,
+            science_python=science_python,
+            executor_python=executor_python,
+        )
+    )
+    return command
+
+
+def _validate_pilot_stage2_ready(run_root: Path, *, pilot_stage: str) -> None:
+    """Refuse pilot ``--pilot-stage 2``/``2-core`` before any ``sbatch`` call.
+
+    TO 8a5e926f (orchestrator round-1 correction): reads the SEL selection
+    record item E's ``sel`` subcommand already wrote, and defensively
+    re-validates ``c1`` (never trusts a possibly-stale or tampered file
+    blind) -- the real gate is still ``run_job.py``'s own
+    ``eval_job.verify_selection_record``, run in-job; this is an early,
+    cheap client-side refusal before spending a GPU allocation on a doomed
+    submission.
+
+    Raises
+    ------
+    LaunchError
+        If the selection record is missing, unreadable, or carries a
+        ``c1`` outside ``3..19``.
+    """
+
+    selection_path = run_root / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
+    if not selection_path.is_file():
+        raise LaunchError(
+            f"no SEL selection record at {selection_path}; run `run_job.py sel capacity-pilot` "
+            f"before --pilot-stage {pilot_stage}"
+        )
+    try:
+        selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise LaunchError(f"selection record {selection_path} is not valid JSON: {error}") from error
+    c1 = selection.get("c1")
+    if not isinstance(c1, int) or isinstance(c1, bool) or not 3 <= c1 <= 19:
+        raise LaunchError(
+            f"selection record {selection_path} carries c1={c1!r}, not an int in 3..19; "
+            "refusing before any sbatch call"
+        )
+
+
 def _submit(command: Sequence[str], *, runner: Runner) -> str:
     """Run one ``sbatch`` command and return its parsed job id.
 
@@ -628,6 +819,37 @@ def _validate_wall_budget(t_wall: str, e_wall: str) -> None:
         )
 
 
+def _validate_single_stage_wall_seconds(time_value: str, *, label: str) -> None:
+    """F5: refuse a single-stage (TRAIN-only or EVAL-only) submission's own time budget.
+
+    :func:`_validate_wall_budget` only runs for the chained ``--stage
+    both``/omitted science route, where both ``T_WALL`` and ``E_WALL`` are
+    known together. A single-stage submission supplies only one side, but it
+    still must not alone exceed the per-job ceiling or the whole per-lineage
+    budget (review r1 F5: a standalone 33-hour request already exceeds the
+    32-hour total lineage allowance and was accepted).
+
+    Raises
+    ------
+    LaunchError
+        If *time_value* exceeds :data:`launch_config.MAX_JOB_WALL_SECONDS` or
+        :data:`launch_config.MAX_LINEAGE_WALL_SECONDS`.
+    """
+
+    seconds = _parse_wall_seconds(time_value)
+    if seconds > launch_config.MAX_JOB_WALL_SECONDS:
+        raise LaunchError(
+            f"{label} must be at most {launch_config.MAX_JOB_WALL_SECONDS}s (2 days, the seas_gpu "
+            f"ceiling); got {time_value!r} ({seconds}s)"
+        )
+    if seconds > launch_config.MAX_LINEAGE_WALL_SECONDS:
+        raise LaunchError(
+            f"{label} must be at most the per-lineage wall budget "
+            f"{launch_config.MAX_LINEAGE_WALL_SECONDS}s (32 hours, design target section C3) even alone; "
+            f"got {time_value!r} ({seconds}s)"
+        )
+
+
 def submit_lineage(
     lineage: str,
     *,
@@ -676,9 +898,30 @@ def submit_lineage(
         dependency=None,
         commit=commit,
     )
-    if dry_run:
-        print(shlex.join(train_command))
-        placeholder_eval = build_sbatch_command(
+
+    def _eval_command(*, dependency: str | None, expected_commit: str) -> list[str]:
+        # TO 8a5e926f (item E): 'science' chains the checkpoint-verified
+        # direct-dispatch fan-out (never the TRAIN-only executor route,
+        # which refuses EVAL unconditionally for it). 'pipeline-check'
+        # keeps the pre-existing single-generation route BYTE-IDENTICAL --
+        # item E's fan-out is science-scale only (eval_job.py has no
+        # pipeline-check grid); that route's own EVAL refusal is unchanged,
+        # pre-existing, and out of this item's scope.
+        if payload == "science":
+            return build_eval_fanout_sbatch_command(
+                payload,
+                lineage=lineage,
+                expected_train_commit=expected_commit,
+                science_python=science_python,
+                executor_python=executor_python,
+                run_root=run_root,
+                checkout_root=checkout_root,
+                time_value=e_wall,
+                dependency=dependency,
+                commit=expected_commit,
+                resources=launch_config.RESOURCES,
+            )
+        return build_sbatch_command(
             "eval",
             lineage,
             payload=payload,
@@ -687,25 +930,20 @@ def submit_lineage(
             run_root=run_root,
             checkout_root=checkout_root,
             time_value=e_wall,
-            dependency="afterok:<train job id>",
+            dependency=dependency,
             commit=commit,
         )
+
+    if dry_run:
+        print(shlex.join(train_command))
+        placeholder_eval = _eval_command(dependency="afterok:<train job id>", expected_commit=commit or "<commit>")
         print(shlex.join(placeholder_eval))
         return None, None
 
     train_id = _submit(train_command, runner=runner)
-    eval_command = build_sbatch_command(
-        "eval",
-        lineage,
-        payload=payload,
-        science_python=science_python,
-        executor_python=executor_python,
-        run_root=run_root,
-        checkout_root=checkout_root,
-        time_value=e_wall,
-        dependency=f"afterok:{train_id}",
-        commit=commit,
-    )
+    # Submitted ONLY after the train job id exists, chained on it via
+    # afterok -- never auto-submitted ahead of or without that dependency.
+    eval_command = _eval_command(dependency=f"afterok:{train_id}", expected_commit=commit or "")
     eval_id = _submit(eval_command, runner=runner)
     return train_id, eval_id
 
@@ -716,30 +954,34 @@ def submit_lineage(
 _PILOT_RUN_ROOT_STUDY_SEGMENT = "h-v2"
 
 
-def _validate_run_root_prefix(run_root: Path, run_root_prefix: str, *, payload: str, lineage: str) -> None:
-    """Refuse a run root outside its payload/lineage's own durable location.
+def _validate_run_root_prefix(
+    run_root: Path, run_root_prefix: str, *, payload: str, lineage: str | None = None
+) -> None:
+    """Refuse a run root outside its payload's own durable location.
 
-    Run-root amendment (harness r3 addendum3): pilot/part-(g) run roots must
-    live under a persistent, lifecycle-governed prefix, in the exact shape
-    ``<prefix>/h-v2/<payload>/<lineage>`` (or a child of it, for example an
-    attempt subdirectory) -- not merely anywhere under the broad prefix
-    (review r1 F5: a caller-supplied prefix ending in ``runs`` otherwise
-    accepted any sibling payload's or an unrelated root). The exact facility
-    path is never hardcoded here (``netscratch-never-referenced-from-repo``);
-    the caller supplies the prefix
-    (:data:`launch_config.PILOT_RUN_ROOT_PREFIX_ENV`).
+    Run-root amendment (harness r3 addendum3): every H-v2 run root -- pilot,
+    part-(g), and science -- must live under a persistent, lifecycle-governed
+    prefix, in the shape ``<prefix>/h-v2/<payload>`` (or, with *lineage*
+    given, the narrower ``<prefix>/h-v2/<payload>/<lineage>``), or a child of
+    it (for example an attempt subdirectory) -- not merely anywhere under the
+    broad prefix (review r1 F5: a caller-supplied prefix ending in ``runs``
+    otherwise accepted any sibling payload's or an unrelated root). The exact
+    facility path is never hardcoded here
+    (``netscratch-never-referenced-from-repo``); the caller supplies the
+    prefix (:data:`launch_config.PILOT_RUN_ROOT_PREFIX_ENV`).
 
     Raises
     ------
     LaunchError
-        If ``run_root_prefix`` is not absolute, or ``run_root`` is not
-        ``<run_root_prefix>/h-v2/<payload>/<lineage>`` or a descendant of it.
+        If ``run_root_prefix`` is not absolute, or ``run_root`` is not the
+        expected directory or a descendant of it.
     """
 
     prefix = Path(run_root_prefix)
     if not prefix.is_absolute():
         raise LaunchError(f"{launch_config.PILOT_RUN_ROOT_PREFIX_ENV} must be an absolute path, got {run_root_prefix!r}")
-    expected_root = (prefix / _PILOT_RUN_ROOT_STUDY_SEGMENT / payload / lineage).resolve()
+    segments = (_PILOT_RUN_ROOT_STUDY_SEGMENT, payload) + ((lineage,) if lineage is not None else ())
+    expected_root = prefix.joinpath(*segments).resolve()
     try:
         run_root.resolve().relative_to(expected_root)
     except ValueError:
@@ -916,12 +1158,44 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=("train", "eval"),
+        choices=("train", "eval", "both"),
         default=None,
         help=(
-            "Required, and must be 'train', for a pilot payload (TO 63690220; eval for "
-            "these is item E's scope, not this script). Omitted for 'science'/"
-            "'pipeline-check', which always submit both stages chained."
+            "'train'/'eval' submits only that stage (TO 8a5e926f); 'eval' requires "
+            "--expected-train-commit and --time, and (for payload=capacity-pilot) "
+            "--pilot-stage. Omitted or 'both' (equivalent) submits science/"
+            "pipeline-check's train then eval, chained by afterok -- unchanged shape "
+            "(exactly one sbatch line per stage per lineage). Required, and must be "
+            "'train' or 'eval', for a pilot payload (TO 63690220); never 'both' for "
+            "those (a pilot payload never chains train and eval in one submission)."
+        ),
+    )
+    parser.add_argument(
+        "--pilot-stage",
+        choices=("1", "2", "2-core"),
+        default=None,
+        help=(
+            "Required with --payload capacity-pilot --stage eval (TO 8a5e926f amendment "
+            "r3/r4 E1): each stage is a SEPARATE sbatch submission, never auto-chained. "
+            "'2'/'2-core' refuse before any sbatch call unless the SEL selection record "
+            "(run_job.py sel capacity-pilot) already exists with c1 in 3..19."
+        ),
+    )
+    parser.add_argument(
+        "--expected-train-commit",
+        default=None,
+        help=(
+            "Required with --stage eval (TO 8a5e926f): the TRAIN commit this EVAL job's "
+            "receipt must have been written at. May differ from --commit (this job's own "
+            "checkout commit) for an EVAL-only submission against an earlier TRAIN commit."
+        ),
+    )
+    parser.add_argument(
+        "--time",
+        default=None,
+        help=(
+            "Required with --stage eval (any payload): the exact Slurm --time value. No "
+            "default -- T_WALL/E_WALL govern only the --stage train/both science route."
         ),
     )
     parser.add_argument(
@@ -975,35 +1249,157 @@ def main(argv: Sequence[str] | None = None) -> int:
     science_python = _validate_interpreter(args.science_python, label="--science-python")
     executor_python = _validate_interpreter(args.executor_python, label="--executor-python")
     if args.payload in PILOT_PAYLOADS:
-        if args.stage != "train":
+        if args.stage not in ("train", "eval"):
             raise LaunchError(
-                f"--stage train is required for payload {args.payload!r} "
-                "(TO 63690220; eval is item E's scope, not this script)"
+                f"--stage train or --stage eval is required for payload {args.payload!r} "
+                "(TO 63690220/8a5e926f); a pilot payload never submits 'both'"
             )
-        run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
-        if not run_root_prefix:
+        if args.stage == "train":
+            if args.pilot_stage is not None:
+                raise LaunchError("--pilot-stage is only valid with --stage eval")
+            run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
+            if not run_root_prefix:
+                raise LaunchError(
+                    f"--run-root-prefix or {launch_config.PILOT_RUN_ROOT_PREFIX_ENV} is required for "
+                    f"payload {args.payload!r}"
+                )
+            # F6: an explicit, smaller TRAIN wall time is honored (via
+            # :func:`submit_pilot_payload`'s own cap check), not silently
+            # replaced by the payload's maximum.
+            train_id = submit_pilot_payload(
+                args.payload,
+                science_python=science_python,
+                executor_python=executor_python,
+                run_root=run_root,
+                checkout_root=checkout_root,
+                run_root_prefix=run_root_prefix,
+                t_wall=os.environ.get("T_WALL"),
+                commit=args.commit,
+                dry_run=args.dry_run,
+            )
+            print(f"[h-v2] {launch_config.PILOT_PAYLOAD_LINEAGES[args.payload]}: train={train_id}")
+            return 0
+        # --stage eval (TO 8a5e926f): standalone EVAL-fanout submission, one
+        # sbatch call, never auto-chained after another stage.
+        if not args.expected_train_commit:
+            raise LaunchError("--expected-train-commit is required for --stage eval")
+        if not args.time:
+            raise LaunchError("--time is required for --stage eval")
+        # F5/D6 (review r2 delta): the pilot/part-(g) EVAL route must pass
+        # the same run-root containment guard --stage train already
+        # enforces, on EVERY submission path, before any sbatch call -- an
+        # omitted prefix is refused rather than silently admitting a
+        # disposable root (the guard is never optional).
+        pilot_run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
+        if not pilot_run_root_prefix:
             raise LaunchError(
                 f"--run-root-prefix or {launch_config.PILOT_RUN_ROOT_PREFIX_ENV} is required for "
-                f"payload {args.payload!r}"
+                f"payload {args.payload!r} --stage eval"
             )
-        # F6: an explicit, smaller TRAIN wall time is honored (via
-        # :func:`submit_pilot_payload`'s own cap check), not silently
-        # replaced by the payload's maximum.
-        train_id = submit_pilot_payload(
+        _validate_run_root_prefix(
+            run_root, pilot_run_root_prefix, payload=args.payload,
+            lineage=launch_config.PILOT_PAYLOAD_LINEAGES[args.payload],
+        )
+        if args.payload == "capacity-pilot":
+            if args.pilot_stage is None:
+                raise LaunchError("--pilot-stage {1,2,2-core} is required for capacity-pilot --stage eval")
+            if args.pilot_stage in ("2", "2-core"):
+                _validate_pilot_stage2_ready(run_root, pilot_stage=args.pilot_stage)
+        elif args.pilot_stage is not None:
+            raise LaunchError(f"--pilot-stage is not supported for payload {args.payload!r}")
+        eval_command = build_eval_fanout_sbatch_command(
             args.payload,
+            pilot_stage=args.pilot_stage,
+            expected_train_commit=args.expected_train_commit,
             science_python=science_python,
             executor_python=executor_python,
             run_root=run_root,
             checkout_root=checkout_root,
-            run_root_prefix=run_root_prefix,
-            t_wall=os.environ.get("T_WALL"),
+            time_value=args.time,
+            dependency=None,
             commit=args.commit,
-            dry_run=args.dry_run,
+            resources=launch_config.PILOT_PAYLOAD_RESOURCES[args.payload],
         )
-        print(f"[h-v2] {launch_config.PILOT_PAYLOAD_LINEAGES[args.payload]}: train={train_id}")
+        if args.dry_run:
+            print(shlex.join(eval_command))
+            return 0
+        eval_id = _submit(eval_command, runner=_default_runner)
+        print(f"[h-v2] {launch_config.PILOT_PAYLOAD_LINEAGES[args.payload]}: eval={eval_id}")
         return 0
-    if args.stage is not None:
-        raise LaunchError(f"--stage is not supported for payload {args.payload!r}")
+
+    # science / pipeline-check
+    if args.stage == "train":
+        if args.pilot_stage is not None:
+            raise LaunchError(f"--pilot-stage is not supported for payload {args.payload!r}")
+        t_wall = os.environ.get("T_WALL")
+        if not t_wall:
+            raise LaunchError("T_WALL environment variable is required")
+        # F5: a single-stage TRAIN-only submission bypassed the chained
+        # route's wall-budget check; it alone must still fit the per-lineage
+        # budget.
+        _validate_single_stage_wall_seconds(t_wall, label="T_WALL")
+        # D6 (review r2 delta): the guard is REQUIRED on every submission
+        # path, never optional just because this is a single-stage route.
+        science_run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
+        if not science_run_root_prefix:
+            raise LaunchError(
+                f"--run-root-prefix or {launch_config.PILOT_RUN_ROOT_PREFIX_ENV} is required for "
+                f"payload {args.payload!r} --stage train"
+            )
+        _validate_run_root_prefix(run_root, science_run_root_prefix, payload=args.payload)
+        for lineage in launch_config.LINEAGES:
+            _validate_science_lineage(args.payload, lineage)
+        for lineage in launch_config.LINEAGES:
+            command = build_sbatch_command(
+                "train", lineage, payload=args.payload, science_python=science_python,
+                executor_python=executor_python, run_root=run_root, checkout_root=checkout_root,
+                time_value=t_wall, dependency=None, commit=args.commit,
+            )
+            if args.dry_run:
+                print(shlex.join(command))
+                continue
+            job_id = _submit(command, runner=_default_runner)
+            print(f"[h-v2] {lineage}: train={job_id}")
+        return 0
+    if args.stage == "eval":
+        if args.pilot_stage is not None:
+            raise LaunchError(f"--pilot-stage is not supported for payload {args.payload!r}")
+        if not args.expected_train_commit:
+            raise LaunchError("--expected-train-commit is required for --stage eval")
+        if not args.time:
+            raise LaunchError("--time is required for --stage eval")
+        # F5/D6: same single-stage wall-budget and MANDATORY run-root
+        # containment checks as --stage train, applied to the standalone
+        # EVAL route.
+        _validate_single_stage_wall_seconds(args.time, label="--time")
+        science_run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
+        if not science_run_root_prefix:
+            raise LaunchError(
+                f"--run-root-prefix or {launch_config.PILOT_RUN_ROOT_PREFIX_ENV} is required for "
+                f"payload {args.payload!r} --stage eval"
+            )
+        _validate_run_root_prefix(run_root, science_run_root_prefix, payload=args.payload)
+        for lineage in launch_config.LINEAGES:
+            _validate_science_lineage(args.payload, lineage)
+        for lineage in launch_config.LINEAGES:
+            command = build_eval_fanout_sbatch_command(
+                args.payload, lineage=lineage, expected_train_commit=args.expected_train_commit,
+                science_python=science_python, executor_python=executor_python, run_root=run_root,
+                checkout_root=checkout_root, time_value=args.time, dependency=None, commit=args.commit,
+                resources=launch_config.RESOURCES,
+            )
+            if args.dry_run:
+                print(shlex.join(command))
+                continue
+            job_id = _submit(command, runner=_default_runner)
+            print(f"[h-v2] {lineage}: eval={job_id}")
+        return 0
+
+    # --stage omitted or "both": UNCHANGED shape -- exactly one train line and
+    # one chained-afterok eval line per lineage (B3: the science dry run
+    # stays exactly 6 lines for 3 lineages).
+    if args.pilot_stage is not None:
+        raise LaunchError(f"--pilot-stage is not supported for payload {args.payload!r}")
     # K3: required unconditionally, dry-run included -- _validate_wall_budget
     # cannot parse the prior placeholder values ("<T_WALL>"/"<E_WALL>"), so a
     # dry run without both set always raised "malformed wall-time value"
@@ -1012,6 +1408,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     e_wall = os.environ.get("E_WALL")
     if not t_wall or not e_wall:
         raise LaunchError("T_WALL and E_WALL environment variables are required")
+    # D6 (review r2 delta): F5's run-root guard reached every OTHER
+    # submission path but never this chained one -- the worst gap, since it
+    # is the default route (``--stage`` omitted). Required and enforced
+    # here too, before any sbatch call.
+    chained_run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
+    if not chained_run_root_prefix:
+        raise LaunchError(
+            f"--run-root-prefix or {launch_config.PILOT_RUN_ROOT_PREFIX_ENV} is required for "
+            f"payload {args.payload!r}"
+        )
+    _validate_run_root_prefix(run_root, chained_run_root_prefix, payload=args.payload)
     results = submit_all(
         payload=args.payload,
         science_python=science_python,

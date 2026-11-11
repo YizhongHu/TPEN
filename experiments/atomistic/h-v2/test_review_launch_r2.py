@@ -110,8 +110,10 @@ def test_g1_science_payload_submits_through_main_for_the_approved_roster(
     monkeypatch.setattr(launch.subprocess, "run", _fake_run)
     monkeypatch.setenv("T_WALL", "08:00:00")
     monkeypatch.setenv("E_WALL", "24:00:00")
+    # D6 (review r2 delta): the run-root guard is now required on every path.
     exit_code = launch.main([
-        "--run-root", str(tmp_path),
+        "--run-root", str(tmp_path / "runs" / "h-v2" / "science"),
+        "--run-root-prefix", str(tmp_path / "runs"),
         "--commit", SHA,
         "--payload", "science",
         "--science-python", sys.executable,
