@@ -4,7 +4,7 @@ import csv
 
 import pytest
 
-from collect import CollectionError, collect_table, reference_energy
+from experiments.atomistic.stage1.collect import CollectionError, collect_table, reference_energy
 
 
 def test_missing_reference_key_is_an_explicit_error() -> None:

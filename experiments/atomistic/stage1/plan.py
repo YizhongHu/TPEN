@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from protocol import Protocol, build_manifest, manifest_hash
+from experiments.atomistic.stage1.protocol import Protocol, build_manifest, manifest_hash
 
 
 def main() -> int:

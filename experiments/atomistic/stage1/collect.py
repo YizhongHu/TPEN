@@ -11,7 +11,7 @@ from typing import Any, Mapping
 import yaml
 from experiments.baselines.statistics import blocking_stderr
 
-from protocol import SYSTEM_IDS
+from experiments.atomistic.stage1.protocol import SYSTEM_IDS
 
 
 class CollectionError(ValueError):

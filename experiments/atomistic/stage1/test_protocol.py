@@ -1,6 +1,6 @@
 """Contract tests for the system-neutral Stage-1 manifest."""
 
-from protocol import Protocol, ProtocolError, build_manifest, manifest_hash
+from experiments.atomistic.stage1.protocol import Protocol, ProtocolError, build_manifest, manifest_hash
 
 
 def test_manifest_has_three_systems_and_four_fresh_streams() -> None:

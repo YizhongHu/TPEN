@@ -2,7 +2,7 @@
 
 import pytest
 
-from launch import render
+from experiments.atomistic.stage1.launch import render
 
 
 def test_template_is_partition_and_allocation_guarded() -> None:
