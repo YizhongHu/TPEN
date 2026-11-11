@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -611,13 +612,35 @@ def science_evaluation_config(
     return config
 
 
-#: Design target C2's frozen seed formula (contract_inputs.json
-#: ``measurement.seed_roster.evaluation_stream_seed_formula``), restated as
-#: code rather than a second literal copy.
-def science_eval_seed(lineage_index: int, checkpoint_ordinal: int, stream_index: int) -> int:
-    """Return one science evaluation generation's frozen seed (design target C2)."""
+#: D8: science eval seeds must be READ from ``contract_inputs.json``'s own
+#: ``measurement.seed_roster.evaluation_stream_seed_formula`` field at
+#: runtime, never a hard-coded literal with no CI tie (the way
+#: ``pilot_eval_seed``/``gpu_route_g_eval_seed`` are already checked against
+#: their own roster fields) -- a drifted formula must change this function's
+#: output, not be silently ignored.
+_SCIENCE_EVAL_SEED_FORMULA_PATTERN = re.compile(
+    r"(\d+)\s*\+\s*(\d+)\*lineage_index\s*\+\s*(\d+)\*evaluated_checkpoint_ordinal\s*\+\s*stream_index"
+)
 
-    return 1_000_000 + 10_000 * lineage_index + 10 * checkpoint_ordinal + stream_index
+
+def science_eval_seed(lineage_index: int, checkpoint_ordinal: int, stream_index: int) -> int:
+    """Return one science evaluation generation's seed, read from CI (design target C2).
+
+    Raises
+    ------
+    ValueError
+        If ``contract_inputs.json``'s ``evaluation_stream_seed_formula`` does
+        not match the expected ``base + a*lineage_index + b*evaluated_checkpoint_ordinal
+        + stream_index`` shape.
+    """
+
+    payload = json.loads(CONTRACT_INPUTS_PATH.read_text(encoding="utf-8"))
+    formula = payload["measurement"]["seed_roster"]["evaluation_stream_seed_formula"]
+    match = _SCIENCE_EVAL_SEED_FORMULA_PATTERN.search(formula)
+    if match is None:
+        raise ValueError(f"evaluation_stream_seed_formula {formula!r} does not match the expected shape")
+    base, lineage_coeff, ordinal_coeff = (int(group) for group in match.groups())
+    return base + lineage_coeff * lineage_index + ordinal_coeff * checkpoint_ordinal + stream_index
 
 
 def science_evaluated_checkpoint_updates() -> tuple[int, ...]:
@@ -714,6 +737,37 @@ def pilot_stage2_grid(c1: int, *, core: bool = False) -> tuple[tuple[int, int], 
     return tuple(deduped)
 
 
+def _nearest_rank_p999(deviations: Sequence[float]) -> float:
+    """Return the order statistic at index ``ceil(0.999*N)`` (1-based), no interpolation.
+
+    Shared by :func:`w_statistic` (one stream's own deviations) and
+    :func:`pooled_w_statistic` (several streams' deviations pooled after
+    each is centered about its own median) -- the nearest-rank step itself
+    never re-centers.
+
+    Raises
+    ------
+    ValueError
+        If *deviations* is empty.
+    """
+
+    values = sorted(deviations)
+    n = len(values)
+    if n == 0:
+        raise ValueError("W requires at least one local energy")
+    index = min(math.ceil(0.999 * n), n) - 1
+    return values[index]
+
+
+def _deviations_about_own_median(local_energies: Sequence[float]) -> list[float]:
+    values = sorted(local_energies)
+    n = len(values)
+    if n == 0:
+        raise ValueError("W requires at least one local energy")
+    median = values[n // 2] if n % 2 else 0.5 * (values[n // 2 - 1] + values[n // 2])
+    return [abs(value - median) for value in local_energies]
+
+
 def w_statistic(local_energies: Sequence[float]) -> float:
     """Return ``W = P99.9(abs(E_L - median(E_L)))`` (the instrument's estimator).
 
@@ -727,14 +781,30 @@ def w_statistic(local_energies: Sequence[float]) -> float:
         If *local_energies* is empty.
     """
 
-    values = sorted(local_energies)
-    n = len(values)
-    if n == 0:
-        raise ValueError("W requires at least one local energy")
-    median = values[n // 2] if n % 2 else 0.5 * (values[n // 2 - 1] + values[n // 2])
-    deviations = sorted(abs(value - median) for value in local_energies)
-    index = min(math.ceil(0.999 * n), n) - 1
-    return deviations[index]
+    return _nearest_rank_p999(_deviations_about_own_median(local_energies))
+
+
+def pooled_w_statistic(streams: Sequence[Sequence[float]]) -> float:
+    """Return the pooled ``W`` across several streams (D1, review r2 delta).
+
+    ``contract_inputs.json``'s ``measurement.fresh_evaluation.estimator``:
+    "median: computed independently per stream". Each stream's absolute
+    deviations are computed about ITS OWN median, then pooled across
+    streams, then the nearest-rank P99.9 order statistic is taken over the
+    pooled deviations -- never re-centered after pooling. A location shift
+    applied to one stream alone (its deviations unchanged) must not change
+    the result.
+
+    Raises
+    ------
+    ValueError
+        If any stream in *streams* is empty.
+    """
+
+    pooled: list[float] = []
+    for stream in streams:
+        pooled.extend(_deviations_about_own_median(stream))
+    return _nearest_rank_p999(pooled)
 
 
 def is_interior_minimum(c1: int) -> bool:
@@ -918,6 +988,7 @@ __all__ = [
     "pilot_stage2_grid",
     "pilot_stage2_window",
     "pilot_training_config",
+    "pooled_w_statistic",
     "reconcile_enabled_modules",
     "remove_candidate_module",
     "science_eval_seed",
