@@ -22,10 +22,24 @@ indexless fixtures used by ``tests/unit/execution/test_r6_phase_a_publication.py
     repair.
 
 Every case asserts the predecessor leaf's file set, content hashes, and
-mtimes are unchanged by discovery. Case (b) is measured RED: reconciliation
-creates the missing index files, mutating the predecessor leaf. It is kept
-failing (``xfail(strict=True)``) as the measured evidence for H1, not fixed
-here -- product-code changes are out of scope for this slice.
+mtimes are unchanged by discovery. Measured on FASRC Cannon (job 59737433,
+partition ``test``, quick mode, head b73d686f2bc7e8b4973ac0d9c77e43ebe46a472f):
+cases (a) and (b) are RED, case (c) is GREEN.
+
+- (a) healthy, fully-indexed leaf: ``_committed_checkpoint`` still
+  unconditionally rewrites ``checkpoints/latest.json`` (new mtime/inode;
+  measured content hash was unchanged on this run, but the write is not
+  conditioned on any comparison that this test can rely on being a no-op).
+- (b) indexless leaf (indexes missing, modeling an allocation interrupted
+  before its index write landed): reconciliation creates the missing
+  ``publications.jsonl``, ``latest.json``, and publication receipt files.
+- (c) corrupt catalog: ``read_publications`` raises ``ValueError`` before
+  ``reconcile_publication`` is ever reached, so the leaf is untouched while
+  refusing.
+
+(a) and (b) are kept failing (``xfail(strict=True)``) as the measured
+evidence for H1, not fixed here -- product-code changes are out of scope for
+this slice.
 """
 
 from __future__ import annotations
@@ -79,6 +93,14 @@ def _snapshot_leaf(run_dir: Path) -> dict[Path, tuple[str, int]]:
     }
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "H1 measured: successor discovery rewrites checkpoints/latest.json "
+        "in a sealed predecessor leaf even when the leaf is already fully "
+        "indexed (new mtime/inode on every discovery call); fix in S2 (item TBD)"
+    ),
+)
 def test_s15_healthy_predecessor_leaf_is_byte_identical_after_discovery(tmp_path):
     """Case (a): a fully-indexed sealed leaf. Discovery must not rewrite it."""
 
