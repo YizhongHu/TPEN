@@ -91,6 +91,7 @@ def test_resolved_handoff_matches_every_a1_nonlogging_leaf(tmp_path, lineage, in
     for callback in base["callbacks"]:
         if callback["_target_"] in {"tpen.callback.DataIntegrity", "tpen.callback.GradientStats"}:
             callback["every_n_steps"] = protocol.PILOT_A1_CADENCE
+    base["trainer"]["log_every_n_steps"] = protocol.PILOT_A1_CADENCE
     assert config["callbacks"] == base["callbacks"]
     assert config["loggers"] == base["loggers"]
     assert config["trainer"]["log_every_n_steps"] == base["trainer"]["log_every_n_steps"]
