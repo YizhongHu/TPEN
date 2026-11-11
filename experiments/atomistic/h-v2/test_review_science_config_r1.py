@@ -88,6 +88,10 @@ def test_resolved_handoff_matches_every_a1_nonlogging_leaf(tmp_path, lineage, in
     assert actual == expected
 
     base = protocol.training_config()
+    for callback in base["callbacks"]:
+        if callback["_target_"] in {"tpen.callback.DataIntegrity", "tpen.callback.GradientStats"}:
+            callback["every_n_steps"] = protocol.PILOT_A1_CADENCE
+    base["trainer"]["log_every_n_steps"] = protocol.PILOT_A1_CADENCE
     assert config["callbacks"] == base["callbacks"]
     assert config["loggers"] == base["loggers"]
     assert config["trainer"]["log_every_n_steps"] == base["trainer"]["log_every_n_steps"]
@@ -198,10 +202,18 @@ def real_science_receipt(tmp_path_factory):
     config["runtime"]["device"] = "cpu"
     config["sampler"].update(n_walkers=4, burn_in=1, n_steps=1)
     config["trainer"]["max_steps"] = 2
+    enabled, skipped = attached.probe_admitted_a1_modules(
+        config,
+        protocol.candidate_modules_to_append(),
+        science_python=science_python,
+        probe_config_path=root / "handoff" / "h-v2-train-L1.probe.yaml",
+        cwd=REPO_ROOT,
+    )
     plan, overrides, config = attached.build_h_v2_train_plan(
         output_dir=root / "handoff", results_root=root / "results",
         lineage="L1", config=config, science_config_identity=identity,
     )
+    enabled = protocol.reconcile_enabled_modules(config)
     prepared = attached.prepare_h_v2_run(plan, overrides, config, output_dir=root / "handoff")
     allocation, worker = job.write_local_allocation_and_worker(
         root / "allocation", science_python=science_python,
@@ -216,6 +228,8 @@ def real_science_receipt(tmp_path_factory):
         allocation=allocation, worker_config=worker, store=root / "store",
         activation_receipt_path=root / "activation.json", h_v2_receipt_path=receipt_path,
         expected_source_commit=source_sha, dispatcher="local", timeout=180.0, cwd=REPO_ROOT,
+        enabled_modules=enabled, skipped_not_admitted=skipped,
+        skipped_unspecified=protocol.unspecified_modules(),
     )
     return json.loads(receipt_path.read_text()), prepared
 

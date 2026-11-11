@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 import yaml
+from omegaconf import OmegaConf
 
 HERE = Path(__file__).parent
 
@@ -150,9 +151,11 @@ def test_candidate_modules_to_append_excludes_base_config_leaves() -> None:
     assert "tpen.callback.InitialCheckpoint" in candidates
     assert "tpen.callback.ParameterActivity" in candidates
     assert "tpen.callback.ElectronNucleusDistanceQuantiles" in candidates
-    # Amendment r4 rule 2: ModuleNorms is NEVER a probed/appended candidate.
-    assert "tpen.callback.ModuleNorms" not in candidates
-    assert "tpen.callback.ModuleNorms" not in protocol.A1_TRAINING_MODULE_CANDIDATES
+    assert "tpen.callback.ModuleNorms" in candidates
+    assert "tpen.callback.OptimizerState" in candidates
+    assert "tpen.callback.SamplerHealth" in candidates
+    assert "tpen.callback.FactorScalars" in candidates
+    assert "tpen.callback.RawTrainingBatchRecorder" in candidates
 
 
 def test_endq_candidate_carries_quantiles_not_output_path() -> None:
@@ -164,11 +167,85 @@ def test_endq_candidate_carries_quantiles_not_output_path() -> None:
     assert entry["every_n_steps"] == protocol.PILOT_A1_CADENCE
 
 
-def test_unspecified_modules_names_module_norms_with_reason() -> None:
-    """Mutant: ModuleNorms appended with placeholder groups."""
+def test_h_v2_logging_builders_pin_cadences_and_groups() -> None:
+    groups = {name: list(paths) for name, paths in protocol.module_norm_groups().items()}
+    assert groups == {
+        "embedding": ["embedding"],
+        "readout": ["readout"],
+        "factors": ["factors"],
+        "layer_0_mixing": ["stack.layers.0.mixing"],
+        "layer_0_path_aggregation": ["stack.layers.0.path_aggregation"],
+    }
+    norms = protocol._build_candidate_callback("tpen.callback.ModuleNorms")
+    optimizer = protocol._build_candidate_callback("tpen.callback.OptimizerState")
+    recorder = protocol._build_candidate_callback("tpen.callback.RawTrainingBatchRecorder")
+    assert norms["groups"] == optimizer["groups"] == groups
+    assert norms["every_n_steps"] == protocol.HEALTH_CALLBACK_CADENCE == 1
+    assert recorder["every_n_steps"] == protocol.TRAINING_BATCH_RECORDER_CADENCE == 50
+    assert recorder["partition_size_steps"] == protocol.TRAINING_HISTORY_PARTITION_SIZE == 1000
+    assert protocol.unspecified_modules() == []
 
-    unspecified = protocol.unspecified_modules()
-    assert unspecified == [{"target": "tpen.callback.ModuleNorms", "reason": "6c29fe1d"}]
+
+def test_health_and_abort_callbacks_precede_checkpoint() -> None:
+    config, _ = protocol.pilot_training_config("gpu-route-g")
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
+    protocol.assert_hydrogen_contract(config)
+    targets = [entry["_target_"] for entry in config["callbacks"]]
+    checkpoint = targets.index("tpen.callback.Checkpoint")
+    for target in {
+        "tpen.callback.DataIntegrity",
+        "tpen.callback.GradientStats",
+        "tpen.callback.SamplerHealth",
+        "tpen.callback.FactorScalars",
+        "tpen.callback.RawTrainingBatchRecorder",
+    }:
+        assert targets.index(target) < checkpoint
+
+
+def test_contract_rejects_logging_mutants() -> None:
+    config, _ = protocol.pilot_training_config("gpu-route-g")
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
+    for entry in config["callbacks"]:
+        if entry["_target_"] == "tpen.callback.RawTrainingBatchRecorder":
+            entry["every_n_steps"] = 10
+    with pytest.raises(ValueError, match="cadence"):
+        protocol.assert_hydrogen_contract(config)
+
+
+def test_short_run_from_config_writes_logging_outputs(tmp_path: Path) -> None:
+    """Exercise the enabled callbacks through the real configured route."""
+
+    from tpen.run import run_from_config
+
+    config = protocol.training_config()
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
+    config["run"].update(root=str(tmp_path / "runs"), run_id="h-v2-log-check")
+    config["runtime"].update(device="cpu")
+    config["sampler"].update(n_walkers=4, burn_in=1, n_steps=1)
+    config["trainer"].update(max_steps=2, log_every_n_steps=1)
+    for entry in config["callbacks"]:
+        if entry["_target_"] == "tpen.callback.RawTrainingBatchRecorder":
+            entry["every_n_steps"] = 1
+            entry["partition_size_steps"] = 2
+
+    assert run_from_config(OmegaConf.create(config), command="h-v2 logging check", raise_exceptions=True) == 0
+    metrics_path = next((tmp_path / "runs").rglob("metrics.jsonl"))
+    run_dir = metrics_path.parent
+    metrics = metrics_path.read_text(encoding="utf-8")
+    for namespace in (
+        "checks/sampler",
+        "train/factors",
+        "train/module_norms/embedding",
+        "train/optimizer_state/embedding",
+    ):
+        assert namespace in metrics
+    history = run_dir / "training_history"
+    assert (history / "manifest.json").exists()
+    assert list(history.glob("partition-*.npz"))
+    assert (run_dir / "checkpoints" / "step_000000" / "COMPLETE").exists()
 
 
 def test_append_and_remove_candidate_module_round_trips() -> None:

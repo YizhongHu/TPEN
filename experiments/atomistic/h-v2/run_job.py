@@ -702,6 +702,8 @@ def run(
 
     science_config = None
     science_config_identity = None
+    enabled_modules: list[str] | None = None
+    skipped_not_admitted: list[str] | None = None
     if stage == "train":
         if pipeline_check:
             build_lineage = f"{PIPELINE_CHECK_LABEL}-{lineage}"
@@ -718,6 +720,14 @@ def run(
             build_lineage = lineage
             lineage_index = launch_config.LINEAGES.index(lineage)
             science_config, science_config_identity = protocol.science_training_config(lineage, lineage_index)
+            probe_path = run_root / "attached" / "handoff" / f"h-v2-train-{lineage}.probe.yaml"
+            enabled_modules, skipped_not_admitted = attached.probe_admitted_a1_modules(
+                science_config,
+                protocol.candidate_modules_to_append(),
+                science_python=science_python,
+                probe_config_path=probe_path,
+                cwd=run_root / "checkout",
+            )
         task_id = _train_task_id(lineage, pipeline_check=pipeline_check)
     elif stage == "eval":
         build_lineage = lineage
@@ -747,6 +757,7 @@ def run(
             config=science_config,
             science_config_identity=science_config_identity,
         )
+        enabled_modules = protocol.reconcile_enabled_modules(config)
     else:
         checkpoint_dir = checkpoint_dir_for_eval(run_root, lineage, pipeline_check=pipeline_check)
         plan, overrides, config = attached.build_h_v2_eval_plan(
@@ -777,6 +788,9 @@ def run(
         expected_source_commit=expected_commit,
         dispatcher="local",
         cwd=run_root / "checkout",
+        enabled_modules=enabled_modules,
+        skipped_not_admitted=skipped_not_admitted,
+        skipped_unspecified=protocol.unspecified_modules(),
     )
     print(f"[h-v2] {task_id}: accepted")
 

@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 import yaml
 
 HERE = Path(__file__).resolve().parent
@@ -474,6 +475,17 @@ def test_real_eval_restores_p_and_e_checkpoints(tmp_path, monkeypatch, explicit_
     train["runtime"]["device"] = "cpu"
     train["sampler"].update(n_walkers=4, burn_in=1, n_steps=1)
     train["trainer"]["max_steps"] = 1
+    # Mirror the production pilot TRAIN assembly: candidate callbacks are
+    # admitted against the exact science interpreter before the final plan is
+    # activated.  Building directly from the pre-candidate pilot config would
+    # exercise the completeness gate with an intentionally incomplete payload.
+    job.attached.probe_admitted_a1_modules(
+        train,
+        protocol.candidate_modules_to_append(),
+        science_python=science_python,
+        probe_config_path=tmp_path / "handoff" / "h-v2-train-gpu-route-g.probe.yaml",
+        cwd=REPO,
+    )
     plan, overrides, train = job.attached.build_h_v2_train_plan(
         output_dir=tmp_path / "handoff", results_root=tmp_path / "results", lineage="gpu-route-g",
         config=train, science_config_identity=identity, payload_label="gpu-route-g")
@@ -490,6 +502,17 @@ def test_real_eval_restores_p_and_e_checkpoints(tmp_path, monkeypatch, explicit_
         expected_source_commit=commit, dispatcher="local", timeout=180, cwd=REPO)
     receipt, train_sha = ev.load_train_receipt(train_path)
     checkpoint = ev.resolve_checkpoint(receipt, update=1)
+    if not explicit_eps:
+        resolved_config = yaml.safe_load(
+            Path(receipt["segments"][0]["artifacts"]["resolved_config"]["path"]).read_text()
+        )
+        assert "eps" not in resolved_config["model"]["readout"], (
+            "P historical model mapping must omit model.readout.eps"
+        )
+        model_state = torch.load(checkpoint / "model.pt", map_location="cpu", weights_only=False)
+        assert not any("model.readout.eps" in key for key in model_state), (
+            "P checkpoint model state must not contain model.readout.eps"
+        )
     evaluation = protocol.science_evaluation_config(checkpoint, seed=999004)
     evaluation["runtime"]["device"] = "cpu"
     evaluation["sampler"].update(n_walkers=4, burn_in=1, n_steps=1)

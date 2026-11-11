@@ -29,7 +29,9 @@ PAYLOADS = [("gpu-route-g", "G", "pipeline_gpu_smoke_g", 1000),
             ("capacity-pilot", "P", "capacity_pilot", 20000)]
 BASE_MODULES = {"tpen.callback.DataIntegrity", "tpen.callback.GradientStats"}
 OPTIONAL_MODULES = {"tpen.callback.InitialCheckpoint", "tpen.callback.ParameterActivity",
-                    "tpen.callback.ElectronNucleusDistanceQuantiles"}
+                    "tpen.callback.ElectronNucleusDistanceQuantiles", "tpen.callback.SamplerHealth",
+                    "tpen.callback.FactorScalars", "tpen.callback.ModuleNorms",
+                    "tpen.callback.OptimizerState", "tpen.callback.RawTrainingBatchRecorder"}
 
 
 def _module(name):
@@ -112,6 +114,117 @@ def test_endq_levels_are_the_frozen_a1_values():
     }
 
 
+def test_science_branch_materializes_all_required_training_modules_before_activation(
+    tmp_path, monkeypatch
+):
+    """The science route must not activate a lineage with diagnostic history missing."""
+
+    for name, value in {
+        "RUN": str(tmp_path),
+        "SHA": "a" * 40,
+        "SCIENCE_PYTHON": sys.executable,
+        "EXECUTOR_PY": sys.executable,
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(job, "check_identity", lambda *args, **kwargs: None)
+    monkeypatch.setattr(attached, "check_profile", lambda *args, **kwargs: None)
+    monkeypatch.setattr(attached, "assert_candidate_instantiates", lambda *args, **kwargs: None)
+    captured = {}
+
+    def capture(prepared, **kwargs):
+        captured["config"] = yaml.safe_load(Path(prepared.effective_config).read_text())
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(attached, "activate_h_v2_run", capture)
+    job.run("train", "L1")
+
+    configured = {entry["_target_"] for entry in captured["config"]["callbacks"]}
+    assert set(protocol.A1_TRAINING_MODULE_CANDIDATES) <= configured
+
+
+def test_contract_rejects_fully_assembled_config_with_all_new_logging_modules_removed():
+    """Legacy callbacks alone must not bypass the complete A1 set check."""
+
+    config, _ = protocol.pilot_training_config("capacity-pilot")
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
+    for target in {
+        "tpen.callback.SamplerHealth",
+        "tpen.callback.FactorScalars",
+        "tpen.callback.ModuleNorms",
+        "tpen.callback.OptimizerState",
+        "tpen.callback.RawTrainingBatchRecorder",
+    }:
+        protocol.remove_candidate_module(config, target)
+
+    with pytest.raises(ValueError, match="missing"):
+        protocol.assert_hydrogen_contract(config)
+
+
+def test_final_train_dispatch_refuses_an_incomplete_a1_set(tmp_path):
+    """An intermediate bare config cannot cross the final TRAIN boundary."""
+
+    config, identity = protocol.pilot_training_config("capacity-pilot")
+    plan, overrides, config = attached.build_h_v2_train_plan(
+        output_dir=tmp_path / "handoff", results_root=tmp_path / "results",
+        lineage="capacity-pilot", config=config, science_config_identity=identity,
+        payload_label="capacity-pilot",
+    )
+    prepared = attached.prepare_h_v2_run(plan, overrides, config, output_dir=tmp_path / "handoff")
+    with pytest.raises(attached.ActivationRefusal) as caught:
+        attached.activate_h_v2_run(
+            prepared,
+            science_python=sys.executable,
+            executor_python=sys.executable,
+            allocation=tmp_path / "allocation.json",
+            worker_config=tmp_path / "worker.json",
+            store=tmp_path / "store",
+            activation_receipt_path=tmp_path / "activation.json",
+            h_v2_receipt_path=tmp_path / "h-v2.json",
+            expected_source_commit="a" * 40,
+        )
+    assert caught.value.code == "incomplete-a1-callback-set"
+
+
+def _fully_assembled_capacity_config():
+    config, _ = protocol.pilot_training_config("capacity-pilot")
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
+    return config
+
+
+def test_fully_assembled_capacity_config_is_a_valid_contract_control():
+    protocol.assert_hydrogen_contract(_fully_assembled_capacity_config())
+
+
+@pytest.mark.parametrize(
+    "target, mutation, message",
+    [
+        ("tpen.callback.SamplerHealth", lambda entry: entry.update(every_n_steps=10), "cadence"),
+        ("tpen.callback.FactorScalars", lambda entry: entry.update(every_n_steps=10), "cadence"),
+        (
+            "tpen.callback.ElectronNucleusDistanceQuantiles",
+            lambda entry: entry.update(quantiles=[0.0, 0.01, 0.5, 0.99]),
+            "quantile",
+        ),
+        (
+            "tpen.callback.RawTrainingBatchRecorder",
+            lambda entry: entry.update(start_step=1),
+            "recorder",
+        ),
+    ],
+)
+def test_contract_rejects_logging_cadence_and_sampling_mutants(target, mutation, message):
+    """Every contract cadence, quantile, and recorder-start mutation needs refusal."""
+
+    config = _fully_assembled_capacity_config()
+    entry = next(callback for callback in config["callbacks"] if callback["_target_"] == target)
+    mutation(entry)
+
+    with pytest.raises(ValueError, match="cadence|quantile|recorder|drifted"):
+        protocol.assert_hydrogen_contract(config)
+
+
 @pytest.mark.parametrize("code", ["profile-unavailable", "profile-mismatch", "malformed-json"])
 def test_probe_propagates_checker_failures(tmp_path, monkeypatch, code):
     """F3: kill treating checker failure as a supported refusal/optional skip."""
@@ -159,8 +272,8 @@ def test_job_module_lists_partition_actual_config(tmp_path, monkeypatch, admit_o
     assert enabled == BASE_MODULES | (OPTIONAL_MODULES if admit_optional else set())
     assert skipped == (set() if admit_optional else OPTIONAL_MODULES)
     assert not (enabled & skipped)
-    assert captured["skipped_unspecified"] == [{"target": "tpen.callback.ModuleNorms", "reason": "6c29fe1d"}]
-    assert "tpen.callback.ModuleNorms" not in configured
+    assert captured["skipped_unspecified"] == []
+    assert ("tpen.callback.ModuleNorms" in configured) is admit_optional
 
 
 def _checkpoint(root, iteration, updates):

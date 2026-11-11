@@ -163,8 +163,11 @@ def test_real_train_receipt_passes_eval_identity_gate(tmp_path, monkeypatch):
         receipt, digest = original(path)
         seen.append(receipt)
         commit = receipt["segments"][0]["source_commit"]
-        ev.verify_train_receipt_identity(receipt, expected_commit=commit,
-                                         expected_lineage="G", expected_payload="gpu-route-g")
+        identity = receipt["science_config_identity"]
+        assert identity["materialized_config_sha256"] != receipt["segments"][0]["resolved_config_sha256"]
+        assert ev.verify_train_receipt_identity(
+            receipt, expected_commit=commit, expected_lineage="G", expected_payload="gpu-route-g"
+        ) is None
         return receipt, digest
 
     monkeypatch.setattr(ev, "load_train_receipt", validate_produced_receipt)

@@ -237,6 +237,17 @@ if node is None:
     raise SystemExit(1)
 try:
     instantiate(node)
+    if target in {"tpen.callback.ModuleNorms", "tpen.callback.OptimizerState"}:
+        model = instantiate(config.model)
+        module_paths = {path for path, _ in model.named_modules()}
+        missing = sorted(
+            spec
+            for specs in node["groups"].values()
+            for spec in specs
+            if spec not in module_paths
+        )
+        if missing:
+            raise ValueError(f"group path(s) are not present on the model: {missing}")
 except Exception as error:  # noqa: BLE001 - reported to the caller, never swallowed
     print(f"INSTANTIATION_FAILED:{type(error).__name__}:{error}")
     raise SystemExit(1)
@@ -434,7 +445,15 @@ def build_h_v2_train_plan(
     config["runtime"]["seed"] = seed
     config["sampler"]["n_walkers"] = n_walkers
     config["trainer"]["max_steps"] = max_steps
-    protocol.assert_hydrogen_contract(config, evaluation=False)
+    if science_config_identity is not None and payload_label == "pipeline-check":
+        raise ValueError("science payload cannot select the pipeline-check incomplete-A1 marker")
+    protocol.assert_hydrogen_contract(
+        config,
+        evaluation=False,
+        allow_incomplete_a1=(
+            science_config_identity is None and payload_label in {None, "pipeline-check"}
+        ),
+    )
     task_id = f"h-v2-train-{lineage}"
     result_dir = results / "attached" / task_id
     config["run"]["root"] = str(result_dir.parent)
@@ -805,7 +824,11 @@ def prepare_h_v2_run(
     overrides = tuple(str(item) for item in overrides_by_task[task.logical_task_id])
     merged = _merge_config_with_overrides(effective_config, overrides)
     resolved = _resolve_bound_config(merged)
-    protocol.assert_hydrogen_contract(resolved, evaluation=(task.stage == EVAL_STAGE))
+    protocol.assert_hydrogen_contract(
+        resolved,
+        evaluation=(task.stage == EVAL_STAGE),
+        allow_incomplete_a1=task.metadata.get("payload") == "pipeline-check",
+    )
     unresolved = _unresolved_bound_config(merged)
     artifact_declarations = _derive_artifact_declarations(unresolved, stage=task.stage)
     handoff = write_attached_handoff(
@@ -928,6 +951,32 @@ def activate_h_v2_run(
     if stage == EVAL_STAGE:
         _fail(EVAL_ROUTE_UNSUPPORTED_CODE, EVAL_ROUTE_UNSUPPORTED_REASON)
         raise ActivationRefusal(EVAL_ROUTE_UNSUPPORTED_CODE, EVAL_ROUTE_UNSUPPORTED_REASON)
+
+    # Probe configs may be incomplete while candidates are being tested, but
+    # no non-pipeline TRAIN payload may cross this final dispatch boundary
+    # without the complete A1 history set.
+    if stage == TRAIN_STAGE and prepared.payload != "pipeline-check":
+        # Rebuild the exact resolved composition sent through the handoff.  The
+        # prepared snapshot is the caller's builder result and may be stale
+        # when a later override replaces callbacks or trainer scalars.
+        resolved = _resolve_bound_config(
+            _merge_config_with_overrides(prepared.effective_config, prepared.overrides)
+        )
+        try:
+            protocol._assert_a1_callbacks(resolved, allow_incomplete=False)
+        except ValueError as error:
+            reason = str(error)
+            _fail("incomplete-a1-callback-set", reason)
+            raise ActivationRefusal(
+                "incomplete-a1-callback-set", f"incomplete-a1-callback-set: {reason}"
+            ) from error
+        configured = set(protocol.reconcile_enabled_modules(resolved))
+        required = set(protocol.A1_TRAINING_MODULE_CANDIDATES)
+        if configured != required:
+            missing = sorted(required - configured)
+            reason = f"incomplete-a1-callback-set: final TRAIN config is missing {missing!r}"
+            _fail("incomplete-a1-callback-set", reason)
+            raise ActivationRefusal("incomplete-a1-callback-set", reason)
 
     try:
         profile = check_profile(science_python, prepared.effective_config, overrides=prepared.overrides, cwd=cwd)
