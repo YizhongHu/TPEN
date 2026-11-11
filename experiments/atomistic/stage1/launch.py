@@ -6,14 +6,17 @@ import argparse
 from pathlib import Path
 
 
-def render(*, driver: str, config: str, python: str, job_root: str) -> str:
+def render(*, driver: str, config: str, python: str, job_root: str,
+           partition: str = "test", allowlist: tuple[str, ...] = ("test", "gpu_test")) -> str:
     """Render a test/gpu_test-only script with explicit runtime bindings."""
 
     if not Path(python).is_absolute():
         raise ValueError("--python must be an absolute interpreter path")
+    if partition not in allowlist:
+        raise ValueError(f"partition {partition!r} is not in the explicit allowlist {allowlist!r}")
     return f'''#!/usr/bin/env bash
 # Stage-1 generated script; no production partition is permitted.
-#SBATCH --partition=test
+#SBATCH --partition={partition}
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
@@ -23,8 +26,9 @@ JOB_ROOT={job_root!r}
 PYTHON={python!r}
 DRIVER={driver!r}
 CONFIG={config!r}
+REQUESTED_PARTITION={partition!r}
 trap 'rm -rf -- "$JOB_ROOT"' EXIT
-if [[ "${{SLURM_JOB_PARTITION:-}}" != "test" && "${{SLURM_JOB_PARTITION:-}}" != "gpu_test" ]]; then exit 2; fi
+if [[ "${{SLURM_JOB_PARTITION:-}}" != "$REQUESTED_PARTITION" ]]; then exit 2; fi
 : "${{SLURM_JOB_ID:?must run inside Slurm}}"
 mkdir -p "$JOB_ROOT"
 exec "$PYTHON" "$DRIVER" --config "$CONFIG"
@@ -40,9 +44,10 @@ def main() -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--python", required=True)
     parser.add_argument("--job-root", required=True)
+    parser.add_argument("--partition", default="test")
     args = parser.parse_args()
     args.output.write_text(render(driver=args.driver, config=args.config, python=args.python,
-                                  job_root=args.job_root), encoding="utf-8")
+                                  job_root=args.job_root, partition=args.partition), encoding="utf-8")
     args.output.chmod(0o750)
     return 0
 
