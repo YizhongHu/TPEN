@@ -93,6 +93,12 @@ class ProcessOutcome:
     proc_start_ticks : int or None
         Linux ``/proc/<pid>/stat`` start token captured while the child was
         live, or ``None`` when it could not be observed.
+    group_reaped : bool
+        Whether this worker confirmed its own reap of the launch: either no
+        child was spawned, or the blocking wait for the session leader
+        returned a return code.  ``True`` by default for every call site that
+        actually returns a :class:`ProcessOutcome`; a caller that cannot
+        confirm reaping never constructs one.
     """
 
     argv: tuple[str, ...]
@@ -102,6 +108,7 @@ class ProcessOutcome:
     timed_out: bool
     pid: int | None = None
     proc_start_ticks: int | None = None
+    group_reaped: bool = True
 
 
 @frozen_record

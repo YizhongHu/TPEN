@@ -175,7 +175,7 @@ class LeafTeardownReceipt:
 
     @classmethod
     def from_mapping(cls, data: Any) -> "LeafTeardownReceipt":
-        fields(data, _TEARDOWN_KEYS, cls.schema, "LeafTeardownReceipt")
+        fields(data, _TEARDOWN_KEYS, cls.schema, "leaf teardown receipt")
         return cls(*(data[name] for name in (
             "group_digest", "task_id", "attempt_id", "allocation_id", "backend_job_id",
             "child_group_reaped", "inspection")))
@@ -982,6 +982,36 @@ def _require_worker_cpus(environment: PreparedPythonEnvironment) -> None:
         )
 
 
+class _ReapObserver:
+    """Aggregate the worker-observed group-reaped fact across one leaf's launches.
+
+    The teardown receipt's ``child_group_reaped`` must reflect what the
+    worker actually confirmed, for every launch it ran (science and, when it
+    ran, inspection) -- not a heuristic derived from the science outcome's
+    pid or return code alone.
+    """
+
+    def __init__(self) -> None:
+        self.confirmed = True
+
+    def record(self, outcome: Any) -> None:
+        if not outcome.group_reaped:
+            self.confirmed = False
+
+
+class _ReapObservingWorker:
+    """Wrap a :class:`SubprocessWorker` to feed every launch to a :class:`_ReapObserver`."""
+
+    def __init__(self, inner: SubprocessWorker, observer: _ReapObserver) -> None:
+        self._inner = inner
+        self._observer = observer
+
+    def run(self, *args: Any, **kwargs: Any) -> Any:
+        outcome = self._inner.run(*args, **kwargs)
+        self._observer.record(outcome)
+        return outcome
+
+
 def run_leaf(payload: bytes) -> bytes:
     """Run one fenced member on this worker and return plain result bytes.
 
@@ -1023,7 +1053,8 @@ def run_leaf(payload: bytes) -> bytes:
     request = LeafRequest.decode(payload)
     environment = request.environment
     output_dir, core_dir, stdout_path, stderr_path, evidence_stdout, evidence_stderr = request.paths()
-    worker = SubprocessWorker()
+    reap_observer = _ReapObserver()
+    worker = _ReapObservingWorker(SubprocessWorker(), reap_observer)
     phases: list[str] = []
     science: dict[str, Any] | None = None
     launch_error: dict[str, str] | None = None
@@ -1110,8 +1141,11 @@ def run_leaf(payload: bytes) -> bytes:
         evidence,
         inspection_error,
         LeafTeardownReceipt.for_request(
-            request, inspection=inspection,
-            child_group_reaped=science is None or science["pid"] is None or science["returncode"] is not None,
+            request, inspection="not-run" if inspection == "not-run" else "complete",
+            # An observed fact from the worker's own reap of every launch it
+            # ran (science and, when it ran, inspection) -- not derived from
+            # the science outcome's pid or return code alone.
+            child_group_reaped=science is None or reap_observer.confirmed,
         ).to_dict(),
     )
     return result.encode()
