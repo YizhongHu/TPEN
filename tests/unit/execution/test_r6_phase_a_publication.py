@@ -157,6 +157,74 @@ def test_r6_empty_catalog_is_a_separate_green_control(tmp_path):
     assert selected is not None and selected.checkpoint_dir == newest
 
 
+def test_r6_read_only_discovery_refuses_empty_catalog_with_intact_pointer(tmp_path):
+    """An empty catalog with ``latest.json`` intact is distinct from the
+    indexless case above: the stale-index iteration comparison alone would
+    pass (the pointer still names the newest directory), so this exercises
+    the catalog-row cross-check itself (review-r2-decisions R2.1)."""
+
+    from tpen.checkpoint.catalog import PUBLICATION_CATALOG_FILENAME
+    from tpen.execution.invocation import PredecessorDiscoveryRefusal, _committed_checkpoint
+    from tests.unit.execution.test_s15_resume_predecessor_leaf_measurement import _snapshot_leaf
+
+    root = tmp_path / "run"
+    _save(root, 1)
+    newest = _save(root, 2)
+    (newest.parent / PUBLICATION_CATALOG_FILENAME).write_text("", encoding="utf-8")
+    before = _snapshot_leaf(root)
+    with pytest.raises(PredecessorDiscoveryRefusal):
+        _committed_checkpoint(root)
+    after = _snapshot_leaf(root)
+    assert after == before, "refused discovery mutated the sealed predecessor leaf"
+
+
+def test_r6_read_only_discovery_refuses_catalog_missing_selected_row(tmp_path):
+    """The pointer and newest directory agree on step 2, but the catalog was
+    rolled back to only the older row: the row-identity cross-check must
+    still refuse even though the stale-index iteration comparison would pass
+    (review-r2-decisions R2.1)."""
+
+    from tpen.checkpoint.catalog import PUBLICATION_CATALOG_FILENAME
+    from tpen.execution.invocation import PredecessorDiscoveryRefusal, _committed_checkpoint
+    from tests.unit.execution.test_s15_resume_predecessor_leaf_measurement import _snapshot_leaf
+
+    root = tmp_path / "run"
+    old = _save(root, 1)
+    catalog = old.parent / PUBLICATION_CATALOG_FILENAME
+    old_catalog = catalog.read_bytes()
+    new = _save(root, 2)
+    catalog.write_bytes(old_catalog)
+    before = _snapshot_leaf(root)
+    with pytest.raises(PredecessorDiscoveryRefusal):
+        _committed_checkpoint(root)
+    after = _snapshot_leaf(root)
+    assert after == before, "refused discovery mutated the sealed predecessor leaf"
+    assert old.exists() and new.exists()
+
+
+def test_r6_read_only_discovery_refuses_payload_identity_mismatch_against_catalog_row(tmp_path):
+    """The selected directory's payload no longer matches its own catalog
+    row's content identity (its model bytes were replaced in place by
+    another structurally valid payload at the same step): the cross-check
+    must refuse rather than trust the directory name and step number alone
+    (review-r2-decisions R2.1)."""
+
+    from tpen.execution.invocation import PredecessorDiscoveryRefusal, _committed_checkpoint
+    from tests.unit.execution.test_s15_resume_predecessor_leaf_measurement import _snapshot_leaf
+
+    root = tmp_path / "run"
+    checkpoint = _save(root, 2)
+    model_path = checkpoint / "model.pt"
+    mutated = bytearray(model_path.read_bytes())
+    mutated[0] ^= 0xFF
+    model_path.write_bytes(bytes(mutated))
+    before = _snapshot_leaf(root)
+    with pytest.raises(PredecessorDiscoveryRefusal):
+        _committed_checkpoint(root)
+    after = _snapshot_leaf(root)
+    assert after == before, "refused discovery mutated the sealed predecessor leaf"
+
+
 def test_r6_committed_corrupt_catalog_refuses_instead_of_falling_back(tmp_path):
     from tpen.checkpoint.catalog import PUBLICATION_CATALOG_FILENAME
     from tpen.execution.invocation import _committed_checkpoint

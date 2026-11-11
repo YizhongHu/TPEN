@@ -602,6 +602,17 @@ class OperationalRestoreRequest:
         ref = self.decision.checkpoint
         if not isinstance(ref, CheckpointRef):
             raise TypeError("decision must carry a validated CheckpointRef")
+        valid_phase_outcome = (
+            (self.decision.phase is RecoveryPhase.INITIAL and self.decision.outcome is RecoveryOutcome.INITIAL_CHECKPOINT)
+            or (self.decision.phase is RecoveryPhase.RECOVERY and self.decision.outcome is RecoveryOutcome.RECOVERY)
+        )
+        if not valid_phase_outcome:
+            raise ValueError(
+                "OperationalRestoreRequest requires phase/outcome "
+                f"{(RecoveryPhase.INITIAL, RecoveryOutcome.INITIAL_CHECKPOINT)!r} or "
+                f"{(RecoveryPhase.RECOVERY, RecoveryOutcome.RECOVERY)!r}; got "
+                f"({self.decision.phase!r}, {self.decision.outcome!r})"
+            )
         # Revalidate the exact reference (not whatever ``decision.load`` claims)
         # before binding, so a request can never be built from a path the
         # decision's own checkpoint reference does not identify.
@@ -611,6 +622,26 @@ class OperationalRestoreRequest:
         if closed_load["path"] != configured_load["path"]:
             raise ValueError(
                 "decision load path does not match decision.checkpoint's reference"
+            )
+        # The decision's counters are a copy made at selection time; require
+        # them to still agree with the ref's own counters, and the ref to
+        # remain within the fixed horizon (mirrors E1's gate at
+        # ``_checkpoint_refusal``, recovery.py:517-521) rather than trusting
+        # a decision whose counters could have been altered after selection.
+        if self.decision.next_iteration != ref.next_iteration:
+            raise ValueError(
+                "decision.next_iteration does not match its checkpoint reference "
+                f"({self.decision.next_iteration!r} != {ref.next_iteration!r})"
+            )
+        if self.decision.completed_updates != ref.completed_updates:
+            raise ValueError(
+                "decision.completed_updates does not match its checkpoint reference "
+                f"({self.decision.completed_updates!r} != {ref.completed_updates!r})"
+            )
+        if ref.next_iteration > self.decision.target_iterations:
+            raise ValueError(
+                "checkpoint reference exceeds the fixed total target horizon "
+                f"({ref.next_iteration!r} > {self.decision.target_iterations!r})"
             )
         object.__setattr__(self, "ref", ref)
         object.__setattr__(

@@ -607,10 +607,13 @@ def _discover_published_checkpoint(checkpoint_root: Path) -> CheckpointRef | Non
 
     Refuses, with :class:`PredecessorDiscoveryRefusal`, when the publication
     catalog or ``latest.json`` is missing while a complete checkpoint exists
-    (an indexless predecessor), or when the published pointer does not yet
+    (an indexless predecessor), when the published pointer does not yet
     reflect the newest complete checkpoint directory (a stale predecessor
-    index). A corrupt catalog still raises ``ValueError`` from
-    ``read_publications`` before either check runs. Never writes.
+    index), or when the selected pointer has no corresponding row in the
+    catalog -- whether the catalog is empty or merely does not name this
+    checkpoint's content identity (an inconsistent predecessor; H1 addendum).
+    A corrupt catalog still raises ``ValueError`` from ``read_publications``
+    before any of these checks run. Never writes.
     """
 
     catalog_path = checkpoint_root / PUBLICATION_CATALOG_FILENAME
@@ -624,7 +627,7 @@ def _discover_published_checkpoint(checkpoint_root: Path) -> CheckpointRef | Non
             f"predecessor checkpoint index missing under {checkpoint_root}; "
             "refusing read-only successor discovery"
         )
-    read_publications(catalog_path)  # Validates; raises ValueError on a corrupt catalog.
+    publications = read_publications(catalog_path)  # Validates; raises ValueError on a corrupt catalog.
     pointer_ref = CheckpointRef.from_directory(resolve_checkpoint_dir(checkpoint_root))
     newest = _latest_complete_checkpoint(checkpoint_root)
     if newest is not None and newest.next_iteration > pointer_ref.next_iteration:
@@ -633,6 +636,12 @@ def _discover_published_checkpoint(checkpoint_root: Path) -> CheckpointRef | Non
             f"(published pointer is at iteration {pointer_ref.next_iteration}, "
             f"newest complete checkpoint is at iteration {newest.next_iteration}); "
             "refusing read-only successor discovery"
+        )
+    if not any(row.content_id == pointer_ref.content_id for row in publications):
+        raise PredecessorDiscoveryRefusal(
+            f"selected checkpoint {pointer_ref.checkpoint_dir} under {checkpoint_root} "
+            "has no matching row in the publication catalog; refusing read-only "
+            "successor discovery"
         )
     return pointer_ref
 

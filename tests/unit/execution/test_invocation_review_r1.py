@@ -122,7 +122,11 @@ def test_conflicting_concrete_configured_load_is_refused_through_the_real_bounda
 
     from tpen import run as run_module
 
-    ref = _save_checkpoint(tmp_path, target_iterations=2)
+    # R2.2 requires ref.next_iteration <= target_iterations, so this fixture
+    # uses an admissible cursor (step == target_iterations) rather than the
+    # step-4/H-2 cursor that would now be refused by OperationalRestoreRequest
+    # construction before this test's conflict check is ever reached.
+    ref = _save_checkpoint(tmp_path, step=2, target_iterations=2)
     decision = _decision(ref, target_iterations=2)
     fixture = Path("tests/integration/artifacts/training/vmc_smoke.yaml")
     cfg = OmegaConf.load(fixture)
