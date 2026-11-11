@@ -237,6 +237,17 @@ if node is None:
     raise SystemExit(1)
 try:
     instantiate(node)
+    if target in {"tpen.callback.ModuleNorms", "tpen.callback.OptimizerState"}:
+        model = instantiate(config.model)
+        module_paths = {path for path, _ in model.named_modules()}
+        missing = sorted(
+            spec
+            for specs in node["groups"].values()
+            for spec in specs
+            if spec not in module_paths
+        )
+        if missing:
+            raise ValueError(f"group path(s) are not present on the model: {missing}")
 except Exception as error:  # noqa: BLE001 - reported to the caller, never swallowed
     print(f"INSTANTIATION_FAILED:{type(error).__name__}:{error}")
     raise SystemExit(1)

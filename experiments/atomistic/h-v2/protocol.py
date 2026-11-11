@@ -75,6 +75,10 @@ PILOT_PAYLOAD_OVERLAY_KEYS = frozenset(
 #: GradientStats every 1").
 PILOT_A1_CADENCE = 1
 
+HEALTH_CALLBACK_CADENCE = 1
+TRAINING_BATCH_RECORDER_CADENCE = 50
+TRAINING_HISTORY_PARTITION_SIZE = 1000
+
 #: TO 63690220 amendment r3: every "A1 training-side logging module"
 #: candidate the pilot tries to enable at A1 cadence. Admission is decided
 #: per candidate, never as a block, by probing the runtime recovery profile
@@ -82,24 +86,32 @@ PILOT_A1_CADENCE = 1
 #: assumed from the branch. ``DataIntegrity``/``GradientStats`` are already
 #: present leaves in ``train.yaml`` (cadence set by the payload overlay
 #: above); the rest are appended fresh by :func:`append_measurement_callbacks`.
-#: Amendment r4: ``ModuleNorms`` is deliberately NOT a candidate here. Its
-#: required ``groups`` mapping names model-structure paths that are not yet
-#: frozen (placeholders until 6c29fe1d/69c5a5a6), so there is no value this
-#: module could honestly supply; appending it with a placeholder would pass
-#: profile admission (a syntax-only check) and then fail at instantiation.
-#: It is recorded separately, always, under :data:`UNSPECIFIED_MODULES`.
+#: The study slice freezes the remaining diagnostic candidates below. Grouped
+#: callbacks receive paths from :func:`module_norm_groups`, and attached.py
+#: checks those paths against the instantiated model before dispatch.
 A1_TRAINING_MODULE_CANDIDATES: tuple[str, ...] = (
     "tpen.callback.DataIntegrity",
     "tpen.callback.GradientStats",
+    "tpen.callback.SamplerHealth",
+    "tpen.callback.FactorScalars",
+    "tpen.callback.ModuleNorms",
+    "tpen.callback.OptimizerState",
+    "tpen.callback.RawTrainingBatchRecorder",
     "tpen.callback.InitialCheckpoint",
     "tpen.callback.ParameterActivity",
     "tpen.callback.ElectronNucleusDistanceQuantiles",
 )
 
-#: Amendment r4 rule 2: module candidates never probed or appended, recorded
-#: unconditionally on the TRAIN receipt's ``skipped_unspecified`` list with
-#: their reason (the TO item whose merge would specify them).
-UNSPECIFIED_MODULES: dict[str, str] = {"tpen.callback.ModuleNorms": "6c29fe1d"}
+#: No H-v2 training modules are unspecified after this slice.
+UNSPECIFIED_MODULES: dict[str, str] = {}
+
+#: Frozen H-v2 module-group paths. ``attached.py`` resolves these against the
+#: instantiated model before enabling grouped callbacks.
+MODULE_NORM_GROUPS: dict[str, tuple[str, ...]] = {
+    "embedding": ("embedding",),
+    "readout": ("readout",),
+    "factors": ("factors",),
+}
 
 #: Candidates already present as leaves in the base ``train.yaml`` callbacks
 #: list; never appended again by :func:`append_candidate_module`.
@@ -275,6 +287,23 @@ def _build_candidate_callback(target: str) -> dict[str, Any]:
         If *target* is not one of :data:`A1_TRAINING_MODULE_CANDIDATES`.
     """
 
+    if target in {"tpen.callback.ModuleNorms", "tpen.callback.OptimizerState"}:
+        return {
+            "_target_": target,
+            "every_n_steps": HEALTH_CALLBACK_CADENCE,
+            "groups": {name: list(paths) for name, paths in module_norm_groups().items()},
+        }
+    if target == "tpen.callback.SamplerHealth":
+        return {"_target_": target, "every_n_steps": HEALTH_CALLBACK_CADENCE, "fail_fast": False}
+    if target == "tpen.callback.FactorScalars":
+        return {"_target_": target, "every_n_steps": HEALTH_CALLBACK_CADENCE, "fail_fast": False}
+    if target == "tpen.callback.RawTrainingBatchRecorder":
+        return {
+            "_target_": target,
+            "path": "${run.dir}/training_history",
+            "every_n_steps": TRAINING_BATCH_RECORDER_CADENCE,
+            "partition_size_steps": TRAINING_HISTORY_PARTITION_SIZE,
+        }
     if target == "tpen.callback.InitialCheckpoint":
         # No cadence field: it fires exactly once, at the pre-sampling
         # zero-update boundary.
@@ -296,6 +325,17 @@ def _build_candidate_callback(target: str) -> dict[str, Any]:
     raise ValueError(f"no candidate-callback builder for A1 training-side module {target!r}")
 
 
+def module_norm_groups(config: Mapping[str, Any] | None = None) -> dict[str, tuple[str, ...]]:
+    """Return frozen H-v2 groups for the configured model's module paths."""
+
+    model = (config or training_config()).get("model", {})
+    groups = dict(MODULE_NORM_GROUPS)
+    for index in range(len(model.get("layers", ()) or ())):
+        groups[f"layer_{index}_mixing"] = (f"stack.layers.{index}.mixing",)
+        groups[f"layer_{index}_path_aggregation"] = (f"stack.layers.{index}.path_aggregation",)
+    return groups
+
+
 def candidate_modules_to_append() -> tuple[str, ...]:
     """Return the A1 training-side module candidates not already in ``train.yaml``."""
 
@@ -309,7 +349,13 @@ def candidate_modules_to_append() -> tuple[str, ...]:
 def append_candidate_module(config: dict[str, Any], target: str) -> None:
     """Append one candidate module's callback entry onto *config* in place."""
 
-    config["callbacks"].append(_build_candidate_callback(target))
+    entry = _build_candidate_callback(target)
+    checkpoint_index = next(
+        (index for index, callback in enumerate(config["callbacks"])
+         if callback.get("_target_") == "tpen.callback.Checkpoint"),
+        len(config["callbacks"]),
+    )
+    config["callbacks"].insert(checkpoint_index, entry)
 
 
 def remove_candidate_module(config: dict[str, Any], target: str) -> None:
@@ -506,7 +552,43 @@ def assert_hydrogen_contract(config: dict[str, Any], *, evaluation: bool = False
             raise ValueError("fresh evaluation must request model-only restore")
         if "optimizer" in config or "trainer" in config:
             raise ValueError("fresh evaluation must not carry training state")
+    else:
+        _assert_a1_callbacks(config)
     assert_amplitude_risk_thresholds(config)
+
+
+def _assert_a1_callbacks(config: Mapping[str, Any]) -> None:
+    """Validate the complete appended A1 callback set and its ordering."""
+
+    callbacks = [entry for entry in config.get("callbacks", ()) if isinstance(entry, Mapping)]
+    present = [entry.get("_target_") for entry in callbacks]
+    appended = set(present) - set(_A1_CANDIDATES_PRESENT_IN_BASE_CONFIG)
+    if not appended:
+        return
+    missing = set(A1_TRAINING_MODULE_CANDIDATES) - set(present)
+    if missing:
+        raise ValueError(f"H-v2 A1 callback set is missing {sorted(missing)!r}")
+    checkpoint = present.index("tpen.callback.Checkpoint")
+    health = {
+        "tpen.callback.DataIntegrity",
+        "tpen.callback.GradientStats",
+        "tpen.callback.SamplerHealth",
+        "tpen.callback.FactorScalars",
+        "tpen.callback.RawTrainingBatchRecorder",
+    }
+    late = [target for index, target in enumerate(present) if target in health and index > checkpoint]
+    if late:
+        raise ValueError(f"H-v2 health callbacks must precede Checkpoint: {late!r}")
+    expected_groups = {name: list(paths) for name, paths in module_norm_groups(config).items()}
+    for entry in callbacks:
+        if entry.get("_target_") in {"tpen.callback.ModuleNorms", "tpen.callback.OptimizerState"}:
+            if entry.get("every_n_steps") != HEALTH_CALLBACK_CADENCE or entry.get("groups") != expected_groups:
+                raise ValueError("H-v2 grouped callback cadence or groups drifted")
+        if entry.get("_target_") == "tpen.callback.RawTrainingBatchRecorder":
+            if entry.get("every_n_steps") != TRAINING_BATCH_RECORDER_CADENCE:
+                raise ValueError("H-v2 training recorder cadence must be 50 iterations")
+            if entry.get("partition_size_steps") != TRAINING_HISTORY_PARTITION_SIZE:
+                raise ValueError("H-v2 training history partitions must be 1000 iterations")
 
 
 def assert_amplitude_risk_thresholds(config: dict[str, Any]) -> None:
@@ -541,6 +623,8 @@ __all__ = [
     "CONTRACT_NUCLEAR_LAW",
     "ENDQ_A1_QUANTILES",
     "EVALUATION_SEEDS",
+    "HEALTH_CALLBACK_CADENCE",
+    "MODULE_NORM_GROUPS",
     "PILOT_A1_CADENCE",
     "PILOT_PAYLOAD_OVERLAY_KEYS",
     "PILOT_PAYLOADS",
@@ -549,6 +633,8 @@ __all__ = [
     "SCIENCE_SCALE_OVERLAY_KEYS",
     "SCIENCE_SCALE_OVERLAY_PATH",
     "TRAINING_SEED",
+    "TRAINING_BATCH_RECORDER_CADENCE",
+    "TRAINING_HISTORY_PARTITION_SIZE",
     "UNSPECIFIED_MODULES",
     "append_candidate_module",
     "append_measurement_callbacks",
@@ -557,6 +643,7 @@ __all__ = [
     "candidate_modules_to_append",
     "evaluation_config",
     "load_yaml",
+    "module_norm_groups",
     "pilot_training_config",
     "reconcile_enabled_modules",
     "remove_candidate_module",
