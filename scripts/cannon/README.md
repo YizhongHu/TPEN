@@ -107,19 +107,30 @@ explicitly with `uv run pytest scripts/cannon/tests`.
 
 ## submit-lint.sh — pre-submit submission-contract linter
 
-`submit-lint.sh` is a generic, facility-neutral linter intended to be run on
-the generated sbatch script and manifest before a submission wrapper calls
-`sbatch`, so a recurring staging/argument mistake fails before an allocation
-is consumed. **Wiring is PENDING**: no Cannon submission wrapper exists in
-this repo today, and whether invoking the linter is mandatory for every
-submission is an open operator question (see the Cannon TO note
-`submit-lint-pre-submit-gate-20261110` on item `3541fe33`) — this section
-documents the call contract a future wrapper is expected to use, not a
-caller that exists yet. It never runs `verify.sh`'s own semantics (exact-SHA
-clone, mutant testing, JUnit verdicts) — it only validates the generated
-sbatch script and manifest that a wrapper would be about to submit. All
-facility paths (stage root, shared-env root, `$HOME`) arrive by CLI; the
-script hardcodes none.
+`submit-lint.sh` is a generic, facility-neutral linter run on the generated
+sbatch script and manifest before a submission wrapper calls `sbatch`, so a
+recurring staging/argument mistake fails before an allocation is consumed. It
+never runs `verify.sh`'s own semantics (exact-SHA clone, mutant testing,
+JUnit verdicts) — it only validates the generated sbatch script and manifest
+that a wrapper is about to submit. All facility paths (stage root, shared-env
+root, `$HOME`) arrive by CLI; the script hardcodes none.
+
+**Soft requirement (operator ruling `operator-ruling-q1-lint-20261110` on TO
+item `ef480b65`, after #639 merged):** a submitting wrapper runs
+`submit-lint.sh` on the generated sbatch script and manifest, records the
+result (`LINT_PASS`/`LINT_FAIL`) in its receipt, and may still submit on a
+`LINT_FAIL` only by recording an explicit bypass reason alongside that
+result. The linter itself never softens its own verdict — "soft" describes
+whether the *caller* blocks on `LINT_FAIL`, not what the linter reports. A
+formal mandatory-vs-soft decision is deferred to an operator review 3 days
+after the #639 merge (trial evidence: TO note `linter-trial-log` on
+`ef480b65`). `scripts/cannon/verify.sh` (this directory's sole exact-SHA
+executor) does not itself call `sbatch` — it runs inside an already-granted
+Slurm allocation (`SLURM_JOB_ID` is a required precondition) — so it is not
+the call site for this linter; the call site is whatever Cannon submission
+wrapper generates the sbatch script and manifest and invokes `sbatch` on
+them. No such wrapper exists in this repo as of this writing; this section
+documents the call contract that wrapper is expected to use.
 
 ```
 scripts/cannon/submit-lint.sh \
@@ -129,9 +140,25 @@ scripts/cannon/submit-lint.sh \
   --shared-env-root <facility shared-env root> \
   [--home "$HOME"] \
   [--submit-helper /path/to/the/sbatch-invoking/helper] \
+  [--staging-root <local staging prefix>=<final facility prefix> ...] \
   [--real-env /path/to/real-run.env --dry-env /path/to/dry-run.env \
    --dry-only-keys DRY_RUN]
 ```
+
+`--staging-root LOCAL=FINAL` declares that a path canonically under `LOCAL`
+is, for containment purposes only, the same path it will be once staged
+(e.g. rsynced) under `FINAL`: checks 3, 5 and 6 substitute the `LOCAL`
+prefix for `FINAL` and canonicalize the WHOLE mapped destination (so a
+symlink such as `FINAL/link -> $HOME` that exists where the linter runs is
+resolved; a symlink that exists only on the remote side cannot be seen)
+before testing `$HOME` and containment against `--allowed-root`, so a
+sbatch script linted in place at its local staging location (before rsync to
+the facility) is validated as if it already sat at its eventual facility
+path. The substitution never widens scope: a mapped path still must land
+inside a declared `--allowed-root`, and a path outside every declared
+`LOCAL` prefix is checked unchanged. Omit this flag entirely when linting a
+sbatch script already staged at its final root (the common case); use it
+only for the local-staging-then-rsync workflow.
 
 The manifest is a `KEY=VALUE` file the wrapper generates alongside the
 sbatch script, carrying the same critical values it exported into the
@@ -143,7 +170,7 @@ Checks performed (exit 0 on `LINT_PASS`, non-zero on `LINT_FAIL`):
 | 1 | `HEAD_SHA` is exactly 40 hex characters |
 | 2 | `JOB_NAME` contains `HEAD_SHA[:12]` |
 | 3 | sbatch path is absolute, canonical, and inside a declared `--allowed-root` |
-| 4 | critical exports (`HEAD_SHA`, `JOB_NAME`, `TASK_ROOT`, `RUN_ROOT`, `DRY_RUN`, `PYTHON`) match exactly between the manifest and the sbatch script's `export` lines — no stale, missing, or extra values; `HEAD_SHA`/`JOB_NAME`/`TASK_ROOT`/`RUN_ROOT`/`DRY_RUN` must additionally be present and nonempty in both files (a field absent from both passes the match test but is still rejected), and `PYTHON` is required the same way whenever `DRY_RUN=1` |
+| 4 | critical exports (`HEAD_SHA`, `JOB_NAME`, `TASK_ROOT`, `RUN_ROOT`, `DRY_RUN`, `PYTHON`) match exactly between the manifest and the job's effective exported environment — no stale, missing, or extra values; `HEAD_SHA`/`JOB_NAME`/`TASK_ROOT`/`RUN_ROOT`/`DRY_RUN` must additionally be present and nonempty in both files (a field absent from both passes the match test but is still rejected), and `PYTHON` is required the same way whenever `DRY_RUN=1`. The effective environment is computed by a deliberately narrow shell subset (documented in full at the top of the parser in `submit-lint.sh`), never by running anything and never from the manifest: it is SEEDED from the submit helper's own `sbatch ... --export=SPEC <job>` line when `--submit-helper` has one (a command-line option overrides the directive, as in Slurm), else from the last `#SBATCH --export=SPEC` directive in the leading comment block; SPEC must be literal `NAME=VALUE,...` (a bare `NAME` there is unknown). Then `export` and plain `NAME=VALUE` statements apply in file order: a bare `export NAME` keeps NAME's CURRENT value; `$NAME`/`${NAME}`/`${NAME:-DEFAULT}` expand against the current value; single quotes are literal; an unquoted `#` starts a comment; a `NAME=VALUE cmd` prefix does not change the job environment. Unsupported syntax (command substitution, other expansions, unquoted globs/tilde/operators, an unterminated quote, `unset`/`declare` on a critical key) is a LINT_FAIL when the statement could set a critical key, and a critical key exported with a value the linter cannot determine is a LINT_FAIL; it never guesses. Not modelled: control flow, functions, heredoc bodies, `source` |
 | 5 | `TASK_ROOT`/`RUN_ROOT` are not staged under `$HOME`, literally or after canonicalization (catches a symlink into `$HOME`) |
 | 6 | `TASK_ROOT`/`RUN_ROOT` stay inside a declared `--allowed-root` (facility-root escape) |
 | 7 | when `DRY_RUN=1`, `PYTHON` resolves under `--shared-env-root` |
@@ -165,5 +192,5 @@ since it uses the repo's `uv`-managed interpreter) via
 `uv run pytest scripts/cannon/tests`; its directory also carries
 `mutant-spec.json`, deliberate linter mutants (including
 `accept-relative-sbatch`, `omit-job-sha-check`, `allow-home-staging`,
-`accept-fields-missing-from-both`, and `accept-ssh-second-command-no-batchmode`)
+`ignore-sbatch-export-directive`, and `ignore-multiassign-self-default`)
 for `verify.sh --mutants`.

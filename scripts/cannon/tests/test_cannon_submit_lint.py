@@ -523,6 +523,174 @@ def test_realpath_without_dash_m_support_fails_clearly(fixture_root: Path, tmp_p
     assert "GNU coreutils realpath is required" in result.stderr
 
 
+def test_bare_reexport_after_sbatch_export_accepted(fixture_root: Path) -> None:
+    """False block (ef480b65 linter-trial-log, job 59534855): the harness
+    passes critical values via `#SBATCH --export=K=V,...` and only
+    bare-re-exports them in the body (`export A B C`, no '='). The old
+    single-pattern grep (`export KEY=`) never saw these as present at all."""
+    base = fixture_root
+    task_root = base / "stage" / "task"
+    run_root = base / "stage" / "run"
+    python = base / "shared-env" / "bin" / "python"
+    manifest = base / "stage" / "reexport.manifest"
+    sbatch = base / "stage" / "reexport.sbatch"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    sbatch.write_text(
+        "#!/bin/bash\n"
+        f"#SBATCH --job-name={JOB_NAME}\n"
+        f"#SBATCH --export=HEAD_SHA={SHA},JOB_NAME={JOB_NAME},TASK_ROOT={task_root},"
+        f"RUN_ROOT={run_root},DRY_RUN=0,PYTHON={python}\n"
+        "export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON\n"
+    )
+    result = run_lint(base, sbatch, manifest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "LINT_PASS" in result.stdout
+
+
+def test_bare_reexport_not_in_export_list_still_missing(fixture_root: Path) -> None:
+    """A bare re-export name that --export never supplied must still be
+    caught as missing, not silently accepted."""
+    base = fixture_root
+    task_root = base / "stage" / "task"
+    run_root = base / "stage" / "run"
+    python = base / "shared-env" / "bin" / "python"
+    manifest = base / "stage" / "reexport-partial.manifest"
+    sbatch = base / "stage" / "reexport-partial.sbatch"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    sbatch.write_text(
+        "#!/bin/bash\n"
+        f"#SBATCH --export=HEAD_SHA={SHA},JOB_NAME={JOB_NAME}\n"
+        "export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON\n"
+    )
+    result = run_lint(base, sbatch, manifest)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "missing from sbatch script" in result.stdout
+
+
+def test_multi_assignment_export_line_parsed_per_key(fixture_root: Path) -> None:
+    """False block / linter bug (ef480b65 linter-trial-log, job 59534855): a
+    multi-assignment export line (`export DRY_RUN="${DRY_RUN:-0}"
+    DRY_NODE_TMP="${DRY_NODE_TMP:-}"`) made the old single-key extractor
+    swallow the rest of the line into DRY_RUN's value, reporting a false
+    'stale' critical export. DRY_RUN's self-referential default expansion
+    must resolve from the sbatch --export list, and DRY_NODE_TMP (not a
+    critical key) must not corrupt that parse."""
+    base = fixture_root
+    task_root = base / "stage" / "task"
+    run_root = base / "stage" / "run"
+    python = base / "shared-env" / "bin" / "python"
+    manifest = base / "stage" / "multiassign.manifest"
+    sbatch = base / "stage" / "multiassign.sbatch"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    sbatch.write_text(
+        "#!/bin/bash\n"
+        f"#SBATCH --job-name={JOB_NAME}\n"
+        f"#SBATCH --export=HEAD_SHA={SHA},JOB_NAME={JOB_NAME},TASK_ROOT={task_root},"
+        f"RUN_ROOT={run_root},DRY_RUN=0,PYTHON={python}\n"
+        'export DRY_RUN="${DRY_RUN:-0}" DRY_NODE_TMP="${DRY_NODE_TMP:-}"\n'
+        "export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT PYTHON\n"
+    )
+    result = run_lint(base, sbatch, manifest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "LINT_PASS" in result.stdout
+
+
+def test_multi_assignment_export_line_second_key_not_swallowed(fixture_root: Path) -> None:
+    """The second assignment on a multi-assignment line must parse to its
+    own literal value, not get absorbed into the first key's value."""
+    base = fixture_root
+    task_root = base / "stage" / "task"
+    run_root = base / "stage" / "run"
+    python = base / "shared-env" / "bin" / "python"
+    manifest = base / "stage" / "multiassign2.manifest"
+    sbatch = base / "stage" / "multiassign2.sbatch"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    stale_run_root = run_root.parent / "run-stale"
+    sbatch.write_text(
+        "#!/bin/bash\n"
+        f"export HEAD_SHA={SHA} JOB_NAME={JOB_NAME}\n"
+        f"export TASK_ROOT={task_root} RUN_ROOT={stale_run_root}\n"
+        f"export DRY_RUN=0 PYTHON={python}\n"
+    )
+    result = run_lint(base, sbatch, manifest)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'RUN_ROOT' is stale" in result.stdout
+
+
+def test_staging_root_mapping_accepts_sbatch_linted_at_local_root(fixture_root: Path) -> None:
+    """False block (ef480b65 linter-trial-log, job 59534855): check 3 fired
+    on the local staging path before rsync, because the linter assumed the
+    sbatch script was already linted in place at its final root. With
+    `--staging-root LOCAL=FINAL`, a sbatch script physically staged under
+    LOCAL is validated for containment as if it already sat under FINAL."""
+    base = fixture_root
+    local_root = base / "local-stage"
+    final_root = base / "final-stage"
+    local_root.mkdir()
+    task_root = final_root / "task"
+    run_root = final_root / "run"
+    python = base / "shared-env" / "bin" / "python"
+    manifest = local_root / "staged.manifest"
+    sbatch = local_root / "staged.sbatch"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    write_sbatch(sbatch, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    cmd = [
+        "bash",
+        str(LINTER),
+        "--sbatch",
+        str(sbatch),
+        "--manifest",
+        str(manifest),
+        "--allowed-root",
+        str(final_root),
+        "--shared-env-root",
+        str(base / "shared-env"),
+        "--home",
+        str(base / "home"),
+        "--staging-root",
+        f"{local_root}={final_root}",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "LINT_PASS" in result.stdout
+
+
+def test_staging_root_mapping_does_not_relax_true_escape(fixture_root: Path) -> None:
+    """A `--staging-root` mapping must never widen containment: a path that
+    escapes the final root even after mapping stays rejected."""
+    base = fixture_root
+    local_root = base / "local-stage2"
+    final_root = base / "final-stage2"
+    other_root = base / "other-root"
+    local_root.mkdir()
+    task_root = other_root / "task"
+    run_root = final_root / "run"
+    python = base / "shared-env" / "bin" / "python"
+    manifest = local_root / "escape.manifest"
+    sbatch = local_root / "escape.sbatch"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    write_sbatch(sbatch, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    cmd = [
+        "bash",
+        str(LINTER),
+        "--sbatch",
+        str(sbatch),
+        "--manifest",
+        str(manifest),
+        "--allowed-root",
+        str(final_root),
+        "--shared-env-root",
+        str(base / "shared-env"),
+        "--home",
+        str(base / "home"),
+        "--staging-root",
+        f"{local_root}={final_root}",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "escapes every declared allowed root" in result.stdout
+
+
 def test_real_vs_dry_delta_on_undocumented_key_rejected(fixture_root: Path) -> None:
     base = fixture_root
     sbatch, manifest, task_root, *_ = good_fixture(base)
@@ -533,3 +701,224 @@ def test_real_vs_dry_delta_on_undocumented_key_rejected(fixture_root: Path) -> N
     result = run_lint(base, sbatch, manifest, "--real-env", str(real_env), "--dry-env", str(dry_env), "--dry-only-keys", "DRY_RUN")
     assert result.returncode != 0
     assert "real-vs-dry export delta" in result.stdout
+
+
+# --- Round 2 (T1 review of PR #653): effective environment, quoting,
+# mapped-destination symlinks, and the submit helper's `sbatch --export=`.
+
+
+def stage_paths(base: Path) -> tuple[Path, Path, Path]:
+    return base / "stage" / "task", base / "stage" / "run", base / "shared-env" / "bin" / "python"
+
+
+def export_spec(base: Path, *, dry_run: str = "0") -> str:
+    task_root, run_root, python = stage_paths(base)
+    return (
+        f"HEAD_SHA={SHA},JOB_NAME={JOB_NAME},TASK_ROOT={task_root},"
+        f"RUN_ROOT={run_root},DRY_RUN={dry_run},PYTHON={python}"
+    )
+
+
+def lint_body(base: Path, name: str, body: str, *extra: str, directive: bool = True) -> subprocess.CompletedProcess[str]:
+    """Lints a job whose `#SBATCH --export=` directive supplies all six
+    critical values (DRY_RUN=0) followed by BODY, against a manifest with
+    DRY_RUN=0. Only BODY decides whether the effective values still match."""
+    task_root, run_root, python = stage_paths(base)
+    manifest = base / "stage" / f"{name}.manifest"
+    sbatch = base / "stage" / f"{name}.sbatch"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    header = "#!/bin/bash\n" + (f"#SBATCH --export={export_spec(base)}\n" if directive else "")
+    sbatch.write_text(header + body)
+    return run_lint(base, sbatch, manifest, *extra)
+
+
+REEXPORT_REST = "export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT PYTHON\n"
+
+
+def test_bare_reexport_keeps_current_value_not_directive_value(fixture_root: Path) -> None:
+    """Finding 1: `export DRY_RUN=1` then a bare `export DRY_RUN` leaves the
+    job with DRY_RUN=1; resolving the bare name from the directive table
+    (DRY_RUN=0) passed a stale value."""
+    result = lint_body(fixture_root, "f1-bare", "export DRY_RUN=1\nexport DRY_RUN\n" + REEXPORT_REST)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'DRY_RUN' is stale: manifest='0' sbatch='1'" in result.stdout
+
+
+def test_self_default_uses_current_value_not_directive_value(fixture_root: Path) -> None:
+    result = lint_body(fixture_root, "f1-default", 'export DRY_RUN=1\nexport DRY_RUN="${DRY_RUN:-0}"\n' + REEXPORT_REST)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'DRY_RUN' is stale: manifest='0' sbatch='1'" in result.stdout
+
+
+def test_plain_assignment_after_export_updates_effective_value(fixture_root: Path) -> None:
+    """A plain `DRY_RUN=1` changes an already-exported variable in place."""
+    result = lint_body(fixture_root, "f1-plain", "export DRY_RUN\nDRY_RUN=1\n" + REEXPORT_REST)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'DRY_RUN' is stale: manifest='0' sbatch='1'" in result.stdout
+
+
+def test_command_prefix_assignment_does_not_change_job_environment(fixture_root: Path) -> None:
+    result = lint_body(fixture_root, "f1-prefix", "DRY_RUN=1 python run.py | tee log\nexport DRY_RUN\n" + REEXPORT_REST)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_single_quoted_value_is_never_expanded(fixture_root: Path) -> None:
+    """Finding 2 (reviewer negative): bash keeps the literal `${DRY_RUN:-0}`
+    inside single quotes; the old tokenizer expanded it to 0."""
+    result = lint_body(fixture_root, "f2-squote", "export DRY_RUN='${DRY_RUN:-0}' NOTE='x y=z'\n" + REEXPORT_REST)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'DRY_RUN' is stale: manifest='0' sbatch='${DRY_RUN:-0}'" in result.stdout
+
+
+def test_unquoted_comment_ends_export_statement(fixture_root: Path) -> None:
+    """Finding 2 (reviewer negative): `# DRY_RUN=0` is a comment, not an assignment."""
+    result = lint_body(fixture_root, "f2-comment", "export DRY_RUN=1 # DRY_RUN=0\n" + REEXPORT_REST)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'DRY_RUN' is stale: manifest='0' sbatch='1'" in result.stdout
+
+
+def test_literal_quoted_spaces_and_equals_accepted(fixture_root: Path) -> None:
+    """Positive control: quoted spaces and '=' stay inside their own value."""
+    result = lint_body(fixture_root, "f2-literal", "export NOTE='x y=z' OTHER=\"a b=c\" DRY_RUN=0\n" + REEXPORT_REST)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_command_substitution_in_critical_value_rejected(fixture_root: Path) -> None:
+    result = lint_body(fixture_root, "f2-cmdsub", 'export DRY_RUN="$(echo 0)"\n' + REEXPORT_REST)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "will not guess its value" in result.stdout
+
+
+def test_command_substitution_in_noncritical_value_tolerated(fixture_root: Path) -> None:
+    result = lint_body(fixture_root, "f2-cmdsub-ok", 'export PATH="$(pwd)/bin:$PATH"\nexport DRY_RUN\n' + REEXPORT_REST)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def staging_symlink_fixture(base: Path) -> tuple[Path, Path]:
+    """LOCAL/link is a real local directory; FINAL/link -> HOME, so every
+    path under LOCAL/link maps to a FINAL path that resolves into HOME."""
+    local_root = base / "local-stage"
+    final_root = base / "final-stage"
+    (local_root / "link").mkdir(parents=True)
+    final_root.mkdir()
+    (final_root / "link").symlink_to(base / "home")
+    return local_root, final_root
+
+
+def lint_staged(base: Path, sbatch: Path, task_root: Path, run_root: Path, local_root: Path, final_root: Path) -> subprocess.CompletedProcess[str]:
+    python = base / "shared-env" / "bin" / "python"
+    manifest = Path(f"{sbatch}.manifest")
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    write_sbatch(sbatch, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    cmd = [
+        "bash", str(LINTER),
+        "--sbatch", str(sbatch), "--manifest", str(manifest),
+        "--allowed-root", str(final_root),
+        "--shared-env-root", str(base / "shared-env"),
+        "--home", str(base / "home"),
+        "--staging-root", f"{local_root}={final_root}",
+    ]
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+
+@pytest.mark.parametrize("key", ["TASK_ROOT", "RUN_ROOT"])
+def test_staging_mapped_root_symlink_escape_rejected(fixture_root: Path, key: str) -> None:
+    """Finding 3: LOCAL/link/x maps to FINAL/link/x, which resolves to
+    HOME/x; the raw mapped string looked contained."""
+    local_root, final_root = staging_symlink_fixture(fixture_root)
+    escaped = local_root / "link" / "x"
+    task_root = escaped if key == "TASK_ROOT" else final_root / "task"
+    run_root = escaped if key == "RUN_ROOT" else final_root / "run"
+    result = lint_staged(fixture_root, local_root / "job.sbatch", task_root, run_root, local_root, final_root)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert f"{key} resolves under $HOME" in result.stdout
+    assert f"{key} escapes every declared allowed root" in result.stdout
+
+
+def test_staging_sbatch_symlink_escape_rejected(fixture_root: Path) -> None:
+    """Finding 3, sbatch path: LOCAL/link/job.sbatch maps to FINAL/link/job.sbatch -> HOME."""
+    local_root, final_root = staging_symlink_fixture(fixture_root)
+    result = lint_staged(fixture_root, local_root / "link" / "job.sbatch", final_root / "task", final_root / "run", local_root, final_root)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "sbatch path escapes every declared stage root" in result.stdout
+
+
+def helper_fixture(base: Path, *, dry_run: str) -> tuple[Path, Path, Path]:
+    """Real CLI shape: the job holds only bare re-exports; the submit helper's
+    own `sbatch --export=... <job>` line supplies all six values."""
+    task_root, run_root, python = stage_paths(base)
+    manifest = base / "stage" / "cli.manifest"
+    sbatch = base / "stage" / "cli-job.sbatch"
+    helper = base / "stage" / "cli-submit.sh"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    sbatch.write_text(
+        "#!/bin/bash\n"
+        f"#SBATCH --job-name={JOB_NAME}\n"
+        "export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON\n"
+    )
+    helper.write_text(
+        "#!/bin/bash\nset -euo pipefail\n"
+        f"jobid=$(sbatch --parsable --export={export_spec(base, dry_run=dry_run)} {sbatch})\n"
+        'echo "$jobid"\n'
+    )
+    return sbatch, manifest, helper
+
+
+def test_submit_helper_export_line_supplies_bare_reexports(fixture_root: Path) -> None:
+    """Finding 4 (trial-log false block): values arrive on the helper's
+    command line, not in a `#SBATCH` directive."""
+    sbatch, manifest, helper = helper_fixture(fixture_root, dry_run="0")
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "LINT_PASS" in result.stdout
+
+
+def test_submit_helper_export_line_wrong_value_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, helper = helper_fixture(fixture_root, dry_run="1")
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'DRY_RUN' is stale: manifest='0' sbatch='1'" in result.stdout
+
+
+def test_submit_helper_export_overrides_directive(fixture_root: Path) -> None:
+    """A command-line --export replaces the script's directive, as in Slurm."""
+    sbatch, manifest, helper = helper_fixture(fixture_root, dry_run="1")
+    sbatch.write_text(
+        "#!/bin/bash\n"
+        f"#SBATCH --export={export_spec(fixture_root, dry_run='0')}\n"
+        "export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON\n"
+    )
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'DRY_RUN' is stale: manifest='0' sbatch='1'" in result.stdout
+
+
+def test_submit_helper_export_with_shell_expansion_rejected(fixture_root: Path) -> None:
+    """Values the linter cannot evaluate are rejected, never inferred (and
+    never taken from the manifest)."""
+    sbatch, manifest, helper = helper_fixture(fixture_root, dry_run="0")
+    helper.write_text(f'#!/bin/bash\nsbatch --export="HEAD_SHA=$SHA,DRY_RUN=0" {sbatch}\n')
+    result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "unsupported --export value" in result.stdout
+
+
+def test_no_errexit_unsafe_arithmetic_statements() -> None:
+    """Cannon job 59624204: under `set -e`, bash >= 4 aborts on an `((...))`
+    command that evaluates to 0 (e.g. `((i++))` with i=0); bash 3.2 does
+    not, so local runs masked it. Increments/assignments must use
+    `x=$((...))`; `for ((...))` headers and tested conditions are safe."""
+    import re
+
+    risky = re.compile(r"(?<![$\w])\(\((?P<expr>[^()]*)\)\)")
+    offenders = []
+    for script in sorted(LINTER.parent.glob("*.sh")):
+        for lineno, line in enumerate(script.read_text().splitlines(), 1):
+            code = line.split(" #", 1)[0]
+            if re.match(r"\s*#", code) or re.search(r"\bfor\s*\(\(", code):
+                continue
+            for match in risky.finditer(code):
+                expr = match.group("expr")
+                if re.search(r"\+\+|--|(?<![<>=!])=(?!=)", expr):
+                    offenders.append(f"{script.name}:{lineno}: {line.strip()}")
+    assert not offenders, "\n".join(offenders)
