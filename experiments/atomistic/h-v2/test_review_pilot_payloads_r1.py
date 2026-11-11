@@ -171,7 +171,7 @@ def test_final_train_dispatch_refuses_an_incomplete_a1_set(tmp_path):
         payload_label="capacity-pilot",
     )
     prepared = attached.prepare_h_v2_run(plan, overrides, config, output_dir=tmp_path / "handoff")
-    with pytest.raises(attached.ActivationRefusal, match="incomplete-a1-callback-set"):
+    with pytest.raises(attached.ActivationRefusal) as caught:
         attached.activate_h_v2_run(
             prepared,
             science_python=sys.executable,
@@ -183,6 +183,7 @@ def test_final_train_dispatch_refuses_an_incomplete_a1_set(tmp_path):
             h_v2_receipt_path=tmp_path / "h-v2.json",
             expected_source_commit="a" * 40,
         )
+    assert caught.value.code == "incomplete-a1-callback-set"
 
 
 def _fully_assembled_capacity_config():

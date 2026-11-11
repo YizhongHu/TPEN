@@ -236,6 +236,11 @@ def test_run_job_train_refuses_unapproved_lineage(
     monkeypatch.setenv("SHA", "deadbeef")
     monkeypatch.setenv("SCIENCE_PYTHON", sys.executable)
     monkeypatch.setenv("EXECUTOR_PY", sys.executable)
+    monkeypatch.setattr(
+        attached,
+        "probe_admitted_a1_modules",
+        lambda config, candidates, **kwargs: ([], []),
+    )
 
     class _MustNotBeCalled(AssertionError):
         pass
@@ -258,6 +263,11 @@ def test_run_job_train_builds_science_config_for_approved_lineage(
     monkeypatch.setenv("SHA", "deadbeef")
     monkeypatch.setenv("SCIENCE_PYTHON", sys.executable)
     monkeypatch.setenv("EXECUTOR_PY", sys.executable)
+    monkeypatch.setattr(
+        attached,
+        "probe_admitted_a1_modules",
+        lambda config, candidates, **kwargs: ([], []),
+    )
 
     captured: dict[str, Any] = {}
 
