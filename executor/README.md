@@ -184,6 +184,34 @@ codes are:
 * `4`: unexpected dispatch or publication failure after admission;
 * `130`: cancellation after an attempt began.
 
+## Remote-leaf wire (S3 Layer A)
+
+`tpen_executor.dispatch.transport` defines the versioned wire between a
+dispatch controller and a leaf that may run in another process or node.
+`LeafRequest` (`tpen-executor/leaf-request-v1`) is built by the controller
+for one begun attempt. It binds the group, task, attempt, allocation,
+backend job and slot identities, the configured payload and its digest, the
+fenced output paths, and the prepared science environment. It holds only
+exact plain values, so a lock, future, process handle or controller callback
+is refused at construction. Its payload digest and any placement identity
+in the environment must name the same attempt. Only canonical JSON bytes
+cross the wire.
+
+`run_leaf(payload: bytes) -> bytes` reconstructs the prepared environment,
+refuses a fence that is not visible or not fresh (a replay), and runs science
+once through `SubprocessWorker` with the exact `RUN_SHIM` arguments. It then
+runs public inspection in the same leaf, under the same conditions as a
+local completion. It returns `LeafResult` (`tpen-executor/leaf-result-v1`)
+facts: the reaped process outcome, a launch error or pre-core refusal, the
+inspection state and decoded evidence, and `{"leaders_reaped": true}`. The
+leaf never begins, finishes, accepts or publishes anything. The controller
+checks every echoed field with `validate_leaf_result` and publishes from
+`LeafResult.status()`, `result_digest()` and `core_evidence()`. The GPU
+sampler and slot quarantine are unchanged because the leaf launches through
+the same worker. Layer A wires no dispatcher, so local and ThreadPool dispatch
+are unchanged. Remote submission and cancellation acknowledgement belong to
+later S3 layers.
+
 ## Local dispatch
 
 `LocalDispatcher` is the attached-allocation baseline. It admits an exact
