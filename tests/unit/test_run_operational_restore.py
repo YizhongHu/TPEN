@@ -195,6 +195,30 @@ def test_request_rejects_a_decision_without_a_checkpoint_ref():
         OperationalRestoreRequest(decision=bare)
 
 
+def test_request_revalidates_checkpoint_bytes_mutated_after_the_ref_was_built(tmp_path):
+    """Construction must call ``ref.validate()``, not just ``read_manifest``.
+
+    ``read_manifest`` alone re-reads the manifest file but never cross-checks
+    it against the ref's cached hash fields, so it would accept a checkpoint
+    whose ``model.pt`` bytes changed out from under an already-selected ref
+    (a TOCTOU-shaped gap between E1 selection and request construction).
+    """
+
+    ref = _save_checkpoint(tmp_path)
+    decision = _recovery_decision(tmp_path, ref=ref)
+
+    # Green control: untouched bytes still construct successfully.
+    OperationalRestoreRequest(decision=decision)
+
+    model_path = ref.checkpoint_dir / "model.pt"
+    mutated = bytearray(model_path.read_bytes())
+    mutated[0] ^= 0xFF
+    model_path.write_bytes(bytes(mutated))
+
+    with pytest.raises(ValueError, match="no longer match"):
+        OperationalRestoreRequest(decision=decision)
+
+
 # ---------------------------------------------------------------------------
 # tpen.run._apply_operational_restore
 # ---------------------------------------------------------------------------
