@@ -59,12 +59,12 @@ evaluation_sampler:
   # require a typed geometry reference. Preserve that empty geometry explicitly.
   nuclear_positions:
     _target_: torch.zeros
+    _convert_: all
     size: [0, 3]
-    dtype: ${runtime.dtype}
   nuclear_charges:
     _target_: torch.zeros
+    _convert_: all
     size: [0]
-    dtype: ${runtime.dtype}
   dtype: ${runtime.dtype}
 
 load:
