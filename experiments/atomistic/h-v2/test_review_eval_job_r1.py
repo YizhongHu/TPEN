@@ -474,6 +474,17 @@ def test_real_eval_restores_p_and_e_checkpoints(tmp_path, monkeypatch, explicit_
     train["runtime"]["device"] = "cpu"
     train["sampler"].update(n_walkers=4, burn_in=1, n_steps=1)
     train["trainer"]["max_steps"] = 1
+    # Mirror the production pilot TRAIN assembly: candidate callbacks are
+    # admitted against the exact science interpreter before the final plan is
+    # activated.  Building directly from the pre-candidate pilot config would
+    # exercise the completeness gate with an intentionally incomplete payload.
+    job.attached.probe_admitted_a1_modules(
+        train,
+        protocol.candidate_modules_to_append(),
+        science_python=science_python,
+        probe_config_path=tmp_path / "handoff" / "h-v2-train-gpu-route-g.probe.yaml",
+        cwd=REPO,
+    )
     plan, overrides, train = job.attached.build_h_v2_train_plan(
         output_dir=tmp_path / "handoff", results_root=tmp_path / "results", lineage="gpu-route-g",
         config=train, science_config_identity=identity, payload_label="gpu-route-g")
