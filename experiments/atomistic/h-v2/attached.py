@@ -967,7 +967,9 @@ def activate_h_v2_run(
         except ValueError as error:
             reason = str(error)
             _fail("incomplete-a1-callback-set", reason)
-            raise ActivationRefusal("incomplete-a1-callback-set", reason) from error
+            raise ActivationRefusal(
+                "incomplete-a1-callback-set", f"incomplete-a1-callback-set: {reason}"
+            ) from error
         configured = set(protocol.reconcile_enabled_modules(resolved))
         required = set(protocol.A1_TRAINING_MODULE_CANDIDATES)
         if configured != required:
