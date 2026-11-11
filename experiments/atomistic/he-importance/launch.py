@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from tpen.run import run_from_config
 
@@ -396,6 +396,35 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
         raise LaunchValidationError(str(error)) from error
 
 
+def _validate_override_topology_agreement(
+    config: DictConfig, topology: Mapping[str, Any]
+) -> None:
+    """Refuse resolved placement that contradicts bound launcher facts.
+
+    ``runtime.device`` is consumed by ``tpen.artifacts.build_run_metadata`` and
+    ultimately by the runner's module placement, while ``topology.device`` is
+    retained as the independently supplied launch fact.  The resolver may
+    accept operational overrides, so the launcher must reconcile this one
+    topology-derived path after resolution and before dispatch.  Device
+    indices are launcher details; agreement is on the device kind (``cuda``
+    in ``cuda:0``), which also matches the config's usual spelling.
+    """
+
+    configured = OmegaConf.select(config, "runtime.device", default=None)
+    bound = topology.get("device")
+    if type(configured) is not str or type(bound) is not str:
+        raise LaunchValidationError(
+            "runtime.device and topology.device must both be exact strings"
+        )
+    configured_kind = configured.partition(":")[0]
+    bound_kind = bound.partition(":")[0]
+    if str.__eq__(configured_kind, bound_kind) is not True:
+        raise LaunchValidationError(
+            "override path 'runtime.device' disagrees with bound topology.device: "
+            f"resolved={configured!r}, bound={bound!r}"
+        )
+
+
 def prepare_train_launch(
     source: Any,
     topology: object | None = None,
@@ -422,6 +451,7 @@ def prepare_train_launch(
         config = _TRAIN_CONFIG.resolve_train_config(cell)
     else:
         config = _TRAIN_CONFIG.resolve_train_config(cell, overrides=overrides)
+        _validate_override_topology_agreement(config, facts)
     return LaunchPlan(cell=cell, config=config, topology=cell.manifest[_STAGE_API.TOPOLOGY_KEY])
 
 

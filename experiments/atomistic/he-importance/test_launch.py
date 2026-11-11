@@ -354,6 +354,55 @@ def test_launch_forwards_pre_resolve_overrides_to_runner(tmp_path: Path) -> None
     assert received[0].runner.trainer.max_steps == 7
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [{"runtime": {"device": "cpu"}}, ["runtime.device=cpu"]],
+)
+def test_launch_rejects_device_override_conflicting_with_topology(
+    tmp_path: Path, overrides: Mapping[str, object] | Sequence[str]
+) -> None:
+    cell = _cell(tmp_path)
+    calls: list[object] = []
+
+    with pytest.raises(launch.LaunchValidationError, match="runtime.device"):
+        launch.prepare_train_launch(cell, _topology(device="cuda:0"), overrides=overrides)
+    with pytest.raises(launch.LaunchValidationError, match="runtime.device"):
+        launch.launch_train(
+            cell,
+            _topology(device="cuda:0"),
+            runner=lambda config: calls.append(config) or 0,
+            overrides=overrides,
+        )
+    assert calls == []
+
+
+def test_launch_accepts_matching_device_and_operational_overrides(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    topology = _topology(device="cpu")
+    expected_hash = cell.content_hash
+    received: list[tuple[object, object]] = []
+
+    plan = launch.prepare_train_launch(
+        cell, topology, overrides={"runtime": {"device": "cpu"}}
+    )
+    assert plan.config.runtime.device == "cpu"
+    assert plan.cell.content_hash == expected_hash
+    assert plan.cell.manifest["topology"]["device"] == "cpu"
+
+    assert launch.launch_train(
+        cell,
+        topology,
+        runner=lambda config, *, topology: received.append((config, topology)) or 0,
+        overrides=["trainer.max_steps=7"],
+    ) == 0
+    received_config, received_topology = received[0]
+    assert received_config.runner.trainer.max_steps == 7
+    assert received_config.runtime.device == "cpu"
+    assert received_topology["device"] == "cpu"
+    assert plan.config.run.run_id == expected_hash
+    assert received_config.run.run_id == expected_hash
+
+
 def test_launch_forwards_resolver_owned_override_refusal(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
 
