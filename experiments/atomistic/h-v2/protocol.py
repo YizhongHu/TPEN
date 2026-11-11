@@ -573,8 +573,6 @@ def assert_hydrogen_contract(
         if "optimizer" in config or "trainer" in config:
             raise ValueError("fresh evaluation must not carry training state")
     else:
-        if config.get("trainer", {}).get("log_every_n_steps") != PILOT_A1_CADENCE:
-            raise ValueError("H-v2 trainer scalar logging must be every update")
         _assert_a1_callbacks(config, allow_incomplete=allow_incomplete_a1)
     assert_amplitude_risk_thresholds(config)
 
@@ -592,6 +590,8 @@ def _assert_a1_callbacks(config: Mapping[str, Any], *, allow_incomplete: bool = 
     # all refused, must be rejected rather than mistaken for a bare config.
     if not configured_a1:
         return
+    if config.get("trainer", {}).get("log_every_n_steps") != PILOT_A1_CADENCE:
+        raise ValueError("H-v2 trainer scalar logging must be every update")
     if allow_incomplete:
         return
     missing = set(A1_TRAINING_MODULE_CANDIDATES) - set(present)
