@@ -393,7 +393,7 @@ def test_launch_accepts_matching_device_and_operational_overrides(tmp_path: Path
         cell,
         topology,
         runner=lambda config, *, topology: received.append((config, topology)) or 0,
-        overrides=["trainer.max_steps=7"],
+        overrides=["trainer.max_steps=7", "runtime.device=cpu"],
     ) == 0
     received_config, received_topology = received[0]
     assert received_config.runner.trainer.max_steps == 7
@@ -403,22 +403,38 @@ def test_launch_accepts_matching_device_and_operational_overrides(tmp_path: Path
     assert received_config.run.run_id == expected_hash
 
 
-def test_prepare_launch_accepts_operational_override_without_topology(tmp_path: Path) -> None:
+def test_launch_accepts_device_override_matching_topology_device_kind(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    topology = _topology(device="cuda:0")
+
     plan = launch.prepare_train_launch(
-        _cell(tmp_path), overrides=["trainer.max_steps=7"]
+        cell, topology, overrides=["runtime.device=cuda"]
     )
 
-    assert plan.config.runner.trainer.max_steps == 7
+    assert plan.config.runtime.device == "cuda"
+    assert plan.cell.manifest["topology"]["device"] == "cuda:0"
 
 
-def test_prepare_launch_rejects_device_override_without_topology(tmp_path: Path) -> None:
-    with pytest.raises(
-        launch.LaunchValidationError,
-        match="runtime.device override requires bound topology",
-    ):
-        launch.prepare_train_launch(
-            _cell(tmp_path), overrides=["runtime.device=cpu"]
-        )
+def test_launch_accepts_operational_override_leaving_device_untouched(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    topology = _topology(device="cpu")
+    expected_hash = cell.content_hash
+    received: list[tuple[object, object]] = []
+
+    assert launch.launch_train(
+        cell,
+        topology,
+        runner=lambda config, *, topology: received.append((config, topology)) or 0,
+        overrides=["trainer.max_steps=7"],
+    ) == 0
+    received_config, received_topology = received[0]
+    assert received_config.runner.trainer.max_steps == 7
+    assert received_topology["device"] == "cpu"
+    assert received_config.run.run_id == expected_hash
 
 
 def test_launch_forwards_resolver_owned_override_refusal(tmp_path: Path) -> None:

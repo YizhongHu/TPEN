@@ -420,11 +420,12 @@ def _validate_override_topology_agreement(
         return
 
     bound = topology.get("device")
-    if type(bound) is not str:
-        raise LaunchValidationError("runtime.device override requires bound topology")
     configured = OmegaConf.select(config, "runtime.device", default=None)
-    if type(configured) is not str:
-        raise LaunchValidationError("runtime.device override must resolve to an exact string")
+    if type(bound) is not str or type(configured) is not str:
+        raise LaunchValidationError(
+            "runtime.device override requires bound topology and must resolve "
+            "to an exact string"
+        )
     configured_kind = configured.partition(":")[0]
     bound_kind = bound.partition(":")[0]
     if str.__eq__(configured_kind, bound_kind) is not True:

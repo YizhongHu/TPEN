@@ -82,16 +82,16 @@ EXPECTED_TEST_INVENTORY = {
     ("test_launch.py", 21, "tpen.runner"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 940, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 956, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 972, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 988, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 1018, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 1034, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
-    ("test_launch.py", 1220, "tpen.run"): InventoryEntry(
+    ("test_launch.py", 1236, "tpen.run"): InventoryEntry(
         "item 0df7f0cd: test-only crossing retained as an explicit follow-up entry."
     ),
     ("test_train_config.py", 300, "tpen.hi_schema"): InventoryEntry(
