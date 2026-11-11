@@ -40,8 +40,12 @@ b73d686f2bc7e8b4973ac0d9c77e43ebe46a472f): cases (a) and (b) were RED, case
 
 S2 (item 4023abbb) fixes (a) and (b): ``_committed_checkpoint`` defaults to a
 strictly read-only selection (``allow_reconcile=False``); only a caller that
-still owns the leaf may pass ``allow_reconcile=True`` to reconcile. Cases (a)
-and (b) below are no longer ``xfail``.
+still owns the leaf may pass ``allow_reconcile=True`` to reconcile. Case (a)
+below is no longer ``xfail``. Per the H1 addendum, read-only discovery must
+refuse rather than silently accept an indexless predecessor, so case (b) is
+no longer ``xfail`` either, but now asserts a typed
+``PredecessorDiscoveryRefusal`` instead of acceptance; the owning allocation
+may still repair it via ``allow_reconcile=True``.
 """
 
 from __future__ import annotations
@@ -114,24 +118,24 @@ def test_s15_healthy_predecessor_leaf_is_byte_identical_after_discovery(tmp_path
 
 def test_s15_indexless_predecessor_leaf_is_byte_identical_after_discovery(tmp_path):
     """Case (b): a committed checkpoint whose indexes never landed (an
-    allocation interrupted before publication). Discovery reconciles -- and
-    in doing so writes into the sealed leaf.
+    allocation interrupted before publication). Read-only discovery must
+    refuse with a typed outcome, touching nothing in the sealed leaf.
     """
 
     from tpen.checkpoint.catalog import PUBLICATION_CATALOG_FILENAME
-    from tpen.execution.invocation import _committed_checkpoint
+    from tpen.execution.invocation import PredecessorDiscoveryRefusal, _committed_checkpoint
 
     root = tmp_path / "predecessor-run"
-    newest = _save(root, 2)
-    (newest.parent / PUBLICATION_CATALOG_FILENAME).unlink()
-    (newest.parent / "latest.json").unlink()
+    committed = _save(root, 2)
+    (committed.parent / PUBLICATION_CATALOG_FILENAME).unlink()
+    (committed.parent / "latest.json").unlink()
 
     before = _snapshot_leaf(root)
-    selected = _committed_checkpoint(root)
+    with pytest.raises(PredecessorDiscoveryRefusal):
+        _committed_checkpoint(root)
     after = _snapshot_leaf(root)
 
-    assert selected is not None and selected.checkpoint_dir == newest
-    assert after == before, "discovery mutated an indexless sealed predecessor leaf"
+    assert after == before, "refused discovery mutated an indexless sealed predecessor leaf"
 
 
 def test_s15_corrupt_predecessor_catalog_refuses_without_mutation(tmp_path):
