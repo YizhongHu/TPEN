@@ -24,9 +24,7 @@ commit hash; the hash/PR list is the complete census for the range.
 - **Checkpoint publication is no longer task-owned cleanup** (#450). The
   checkpoint stream retains all checkpoints and stops TPEN-initiated deletion,
   changing retention and storage expectations for existing runs.
-- **The HI `tpen.hi.train.v1` import facade is removed** (#517), and the
-  supported execution boundary now refuses unsupported Python interpreters
-  (#518).
+- **The HI `tpen.hi.train.v1` import facade is removed** (#517).
 - **VMC training now uses the native SR/minSR engine and explicit method
   state** (#472, #476), with a declared non-finite estimator policy (#483)
   and foreign optimizer-carrier rejection at both binding boundaries (#537).
@@ -72,6 +70,8 @@ commit hash; the hash/PR list is the complete census for the range.
   (#618 x #628), and callback output slots are classified as operational
   (#635), preventing observational artifacts from changing scientific config
   identity.
+- **The repository edit guard refuses unsupported Python interpreters**
+  (#518).
 - **Training configs no longer carry reference energies** for He-v1/H2-v1
   (#638); the historical He configuration remains documented separately.
 - **The H-v2 executor path records child placement evidence** (#605), resolves
