@@ -298,9 +298,12 @@ def test_pilot_payload_train_dispatch_reaches_real_store_reservation(
     ``attached.build_h_v2_train_plan`` is stubbed to capture its kwargs for
     assertion, then delegate to the REAL function with ``n_walkers``/
     ``max_steps`` overridden to tiny values (the pilot payload's own config
-    runs up to 20000 steps, far too slow for a unit test) -- so the plan,
-    overrides, and config returned downstream are genuinely real-shaped, not
-    fabricated. ``attached.activate_h_v2_run`` is replaced with a thin
+    runs up to 20000 steps, far too slow for a unit test) and
+    ``config["runtime"]["device"]`` forced to ``"cpu"`` (the pilot config
+    inherits ``runtime.device: cuda`` from the shared
+    ``science_scale_overlay.yaml``, and this facility is CPU-only) -- so the
+    plan, overrides, and config returned downstream are genuinely real-shaped,
+    not fabricated. ``attached.activate_h_v2_run`` is replaced with a thin
     wrapper that still dispatches through the real, installed
     ``tpen_executor`` CLI (not mocked) and skips only the separate,
     already-tracked resolved-config-identity reader fence (#618), exactly as
@@ -330,6 +333,15 @@ def test_pilot_payload_train_dispatch_reaches_real_store_reservation(
         build_kwargs_captured.update(kwargs)
         kwargs["n_walkers"] = 4
         kwargs["max_steps"] = 2
+        # The pilot payload's own config carries `runtime.device: cuda` from
+        # the shared science_scale_overlay.yaml (science_scale_overlay.yaml,
+        # also applied to pilot payloads); this facility is CPU-only, so this
+        # override forces the real training run onto CPU rather than hitting
+        # torch's "not compiled with CUDA enabled" assertion on the first
+        # `module.to(device=...)` call. Orthogonal to store-parent creation.
+        kwargs["config"] = dict(kwargs["config"])
+        kwargs["config"]["runtime"] = dict(kwargs["config"]["runtime"])
+        kwargs["config"]["runtime"]["device"] = "cpu"
         return real_build_h_v2_train_plan(**kwargs)
 
     monkeypatch.setattr(attached, "build_h_v2_train_plan", _stub_build_h_v2_train_plan)
