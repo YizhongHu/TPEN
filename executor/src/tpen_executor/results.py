@@ -11,7 +11,10 @@ from .contracts import AllocationId, AttemptId, BackendJobId
 from .gpu_telemetry import SAMPLER_METHOD, DeviceDecision, derive_device_decision, validate_sampler_wire
 from ._records import frozen_record
 
-OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed"})
+# A remote attempt whose leaf teardown acknowledgement is absent is terminal
+# operational failure, never a completed/retryable attempt and never eligible
+# for an accepted manifest segment.
+OUTCOME_STATUSES = frozenset({"completed", "failed", "timed_out", "launch_failed", "remote-quiescence-unconfirmed"})
 PLACEMENT_COMPARISON_STATES = frozenset({"matched", "mismatch", "unavailable", "refused"})
 _SEGMENT_FIELDS = {
     "schema", "task_id", "attempt_id", "predecessor_checkpoint", "checkpoint_dir",

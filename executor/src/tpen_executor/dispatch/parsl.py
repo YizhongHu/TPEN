@@ -155,6 +155,7 @@ class AttachedTransportSpec:
     mpiexec_bind_cmd: str = "--bind-to"
     mpiexec_overrides: str = ""
     preflight_timeout: int | float = 120
+    teardown_timeout: int | float = 30
 
     def __post_init__(self) -> None:
         for name in ("executor", "provider", "launcher", "label", "worker_init", "mpiexec_bind_cmd", "mpiexec_overrides"):
@@ -173,9 +174,10 @@ class AttachedTransportSpec:
                 raise ValueError(f"{name} must be a positive integer")
         if self.address is not None and (type(self.address) is not str or not self.address):
             raise TypeError("address must be a non-empty string or None")
-        timeout = self.preflight_timeout
-        if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("preflight_timeout must be finite and positive")
+        for name in ("preflight_timeout", "teardown_timeout"):
+            timeout = getattr(self, name)
+            if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError(f"{name} must be finite and positive")
 
     @property
     def workers(self) -> int:
@@ -396,9 +398,40 @@ class _RemoteLeaf:
 
     def __init__(self, request: LeafRequest) -> None:
         self.request = request
+        self.future: Any = None
 
     def request_kill(self) -> None:
-        """Do nothing; a remote PID is not a local process group."""
+        """Request leaf-owned cancellation without signalling a remote PID.
+
+        Parsl does not expose a portable remote-PID signal operation.  The
+        attached transport therefore treats this as a transport cancellation
+        request; only the leaf's returned teardown receipt can settle it.
+        """
+
+        self.request_cancel()
+
+    def request_cancel(self) -> None:
+        """Send the transport cancellation request (never ``killpg``)."""
+
+        return None
+
+    def bind_future(self, future: Any) -> None:
+        self.future = future
+
+    def wait_for_teardown(self, bound: float) -> bool:
+        """Wait for a leaf result and accept only its validated teardown ack."""
+
+        deadline = time.monotonic() + bound
+        while self.future is not None and not self.future.done() and time.monotonic() < deadline:
+            _poll_sleep(min(0.01, max(deadline - time.monotonic(), 0)))
+        if self.future is None or not self.future.done():
+            return False
+        try:
+            payload = self.future.result(None)
+            result = validate_leaf_result(self.request, LeafResult.decode(payload))
+        except BaseException:
+            return False
+        return result.teardown.get("child_group_reaped") is True
 
     def resolve(self, payload: Any) -> tuple[ProcessOutcome, dict[str, Any]]:
         """Validate the returned bytes and adapt them to the completion path.
@@ -1026,12 +1059,14 @@ class ParslDispatcher(DispatcherContract):
                 # A remote leaf is neither signalled nor awaited here; its
                 # attempt is finished failed and never accepted.  Bounded
                 # remote teardown acknowledgement is S3 Layer C.
+                handle = record["handle"]
+                handle.request_cancel()
+                transport = self.transport
+                bound = float(getattr(transport, "teardown_timeout", 30)) if transport is not None else 30.0
+                acknowledged = handle.wait_for_teardown(bound)
                 try:
-                    cancellation.add_note(f"slot {record['member'].task_id} remote quiescence unconfirmed")
-                except BaseException:
-                    pass
-                try:
-                    lifecycle.finish(record["fence"], "failed", self._utc_now(), None)
+                    status = "failed" if acknowledged else "remote-quiescence-unconfirmed"
+                    lifecycle.finish(record["fence"], status, self._utc_now(), None)
                 except BaseException as error:
                     try:
                         cancellation.add_note(f"slot {record['member'].task_id} finish unresolved: {error!r}")
@@ -1219,7 +1254,10 @@ class ParslDispatcher(DispatcherContract):
             cache=False,
             executors=list(self._active_executor_labels),
         )(run_leaf)
-        return app(request.encode()), _RemoteLeaf(request)
+        handle = _RemoteLeaf(request)
+        future = app(request.encode())
+        handle.bind_future(future)
+        return future, handle
 
     def _validate_executor_config(self, config: Any, required_threads: int | None = None) -> tuple[str, ...]:
         """Refuse non-ThreadPool Parsl configs before any lifecycle begin."""

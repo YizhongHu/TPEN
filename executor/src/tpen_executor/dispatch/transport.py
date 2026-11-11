@@ -90,7 +90,12 @@ _REQUEST_PLAIN_FIELDS = (
 )
 _SCIENCE_KEYS = {"argv", "returncode", "timed_out", "pid", "proc_start_ticks", "stdout_path", "stderr_path"}
 _ERROR_KEYS = {"type", "message"}
-_TEARDOWN_KEYS = {"leaders_reaped"}
+TEARDOWN_SCHEMA = "tpen-executor/leaf-teardown-v1"
+_TEARDOWN_KEYS = {
+    "schema", "group_digest", "task_id", "attempt_id", "allocation_id",
+    "backend_job_id", "child_group_reaped", "inspection",
+}
+_TEARDOWN_INSPECTIONS = frozenset({"complete", "not-run"})
 _PHASES = ((), ("science",), ("science", "inspection"))
 INSPECTION_STATES = frozenset({"not-run", "evidence", "unavailable", "error"})
 # Typed placement refusals a leaf reports, before science, for the CPUs of its
@@ -130,6 +135,48 @@ class LeafPlacementRefused(LeafRefused):
 
 class LeafResultRejected(ValueError):
     """Raised by the controller when a leaf result does not answer its request."""
+
+
+@frozen_record
+class LeafTeardownReceipt:
+    """Leaf-authored proof that its child group is quiescent.
+
+    This is deliberately plain data.  A controller future, scheduler state,
+    worker exit, or DFK cleanup can never manufacture this acknowledgement.
+    """
+
+    schema: ClassVar[str] = TEARDOWN_SCHEMA
+    group_digest: str
+    task_id: str
+    attempt_id: str
+    allocation_id: str
+    backend_job_id: str
+    child_group_reaped: bool
+    inspection: str
+
+    def __post_init__(self) -> None:
+        for name in ("group_digest", "task_id", "attempt_id", "allocation_id", "backend_job_id"):
+            _text(getattr(self, name), name)
+        if type(self.child_group_reaped) is not bool or self.inspection not in _TEARDOWN_INSPECTIONS:
+            raise ValueError("invalid leaf teardown facts")
+
+    @classmethod
+    def for_request(cls, request: "LeafRequest", *, inspection: str) -> "LeafTeardownReceipt":
+        return cls(request.group_digest, request.task_id, request.attempt_id,
+                   request.allocation_id, request.backend_job_id, True, inspection)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"schema": self.schema, "group_digest": self.group_digest,
+                "task_id": self.task_id, "attempt_id": self.attempt_id,
+                "allocation_id": self.allocation_id, "backend_job_id": self.backend_job_id,
+                "child_group_reaped": self.child_group_reaped, "inspection": self.inspection}
+
+    @classmethod
+    def from_mapping(cls, data: Any) -> "LeafTeardownReceipt":
+        fields(data, _TEARDOWN_KEYS, cls.schema, "LeafTeardownReceipt")
+        return cls(*(data[name] for name in (
+            "group_digest", "task_id", "attempt_id", "allocation_id", "backend_job_id",
+            "child_group_reaped", "inspection")))
 
 
 def _require_plain(value: Any, path: str) -> None:
@@ -576,10 +623,9 @@ class LeafResult:
     inspection_error : mapping or None
         ``{"type", "message"}`` for ``unavailable`` or ``error`` inspection.
     teardown : mapping
-        ``{"leaders_reaped": bool}``.  The leaf returns a result only after
-        every worker launch returned or raised, and the worker reaps its child
-        leader before either; this is not a remote-cancellation
-        acknowledgement (Layer C).
+        Versioned, identity-bound :class:`LeafTeardownReceipt` facts authored
+        by the leaf after child-group reaping and inspection completion (or
+        explicit non-execution).
 
     Raises
     ------
@@ -635,8 +681,9 @@ class LeafResult:
             except EvidenceUnavailable as error:
                 raise ValueError(f"evidence is not valid public core evidence: {error}") from error
             object.__setattr__(self, "evidence", _freeze(self.evidence, "evidence"))
-        if not isinstance(self.teardown, Mapping) or set(self.teardown) != _TEARDOWN_KEYS or type(self.teardown["leaders_reaped"]) is not bool:
-            raise ValueError("teardown must be {'leaders_reaped': bool}")
+        if not isinstance(self.teardown, Mapping):
+            raise ValueError("teardown must be a leaf teardown receipt")
+        LeafTeardownReceipt.from_mapping(thaw(self.teardown))
         object.__setattr__(self, "teardown", _freeze(self.teardown, "teardown"))
         # Freezing keeps builtin subclasses at any depth; every retained key
         # and leaf must be exact wire data.
@@ -844,7 +891,15 @@ def validate_leaf_result(request: LeafRequest, result: LeafResult) -> LeafResult
         checks["evidence"] = os.path.realpath(result.evidence["run_dir"]) == real_core and (
             checkpoint is None or _inside(real_core, os.path.realpath(checkpoint["checkpoint_dir"]))
         )
-    checks["teardown"] = result.teardown["leaders_reaped"] is True
+    teardown = LeafTeardownReceipt.from_mapping(thaw(result.teardown))
+    checks["teardown"] = (
+        teardown.group_digest == request.group_digest
+        and teardown.task_id == request.task_id
+        and teardown.attempt_id == request.attempt_id
+        and teardown.allocation_id == request.allocation_id
+        and teardown.backend_job_id == request.backend_job_id
+        and teardown.child_group_reaped
+    )
     failed = [name for name, passed in checks.items() if not passed]
     if failed:
         raise LeafResultRejected(f"leaf result crosses its request: {','.join(failed)}")
@@ -975,7 +1030,7 @@ def run_leaf(payload: bytes) -> bytes:
             stderr_path=stderr_path,
             timeout=request.timeout,
         )
-    except Exception as error:
+    except BaseException as error:
         # Same classification as a local launch error: a launch failure fact.
         launch_error = _error_fact(error)
     else:
@@ -1010,7 +1065,7 @@ def run_leaf(payload: bytes) -> bytes:
             )
         except EvidenceUnavailable as error:
             inspection, inspection_error = "unavailable", _error_fact(error)
-        except Exception as error:
+        except BaseException as error:
             inspection, inspection_error = "error", _error_fact(error)
         else:
             inspection, evidence = "evidence", _evidence_payload(decoded)
@@ -1027,7 +1082,7 @@ def run_leaf(payload: bytes) -> bytes:
         inspection,
         evidence,
         inspection_error,
-        {"leaders_reaped": True},
+        LeafTeardownReceipt.for_request(request, inspection=inspection).to_dict(),
     )
     return result.encode()
 
@@ -1036,11 +1091,13 @@ __all__ = [
     "INSPECTION_STATES",
     "LEAF_REQUEST_SCHEMA",
     "LEAF_RESULT_SCHEMA",
+    "TEARDOWN_SCHEMA",
     "LeafPlacementRefused",
     "LeafRefused",
     "LeafRequest",
     "LeafResult",
     "LeafResultRejected",
+    "LeafTeardownReceipt",
     "run_leaf",
     "validate_leaf_result",
     "WORKER_AFFINITY_REFUSAL_CODES",

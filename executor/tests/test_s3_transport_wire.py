@@ -44,6 +44,7 @@ from tpen_executor.dispatch.transport import (
     LEAF_RESULT_SCHEMA,
     LeafRequest,
     LeafResult,
+    LeafTeardownReceipt,
     LeafResultRejected,
     run_leaf,
     validate_leaf_result,
@@ -301,7 +302,7 @@ def _synthetic_result(request: LeafRequest, **changes) -> LeafResult:
             "checkpoint": {"checkpoint_dir": core_dir + "/checkpoint", "schema_version": 1, "next_iteration": 1, "completed_updates": 1},
             "refusal": None, "resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "a" * 64},
         },
-        None, {"leaders_reaped": True},
+        None, LeafTeardownReceipt.for_request(request, inspection="complete").to_dict(),
     )
     return dataclasses.replace(result, **changes) if changes else result
 
@@ -562,7 +563,7 @@ def test_result_round_trips_and_rejects_non_primitive_or_inconsistent_facts(tmp_
     with pytest.raises(ValueError, match="valid public core evidence"):
         dataclasses.replace(result, evidence={**dict(result.evidence), "verdict": "accepted"})
     with pytest.raises(ValueError, match="teardown"):
-        dataclasses.replace(result, teardown={"leaders_reaped": True, "pid": 1})
+        dataclasses.replace(result, teardown={**dict(result.teardown), "pid": 1})
 
 
 @pytest.mark.parametrize(
@@ -578,7 +579,7 @@ def test_result_round_trips_and_rejects_non_primitive_or_inconsistent_facts(tmp_
         ("payload", lambda r, q: {"payload_digest": "e" * 64}),
         ("argv", lambda r, q: {"science": {**dict(r.science), "argv": [q.environment.python, "-m", "tpen.run"]}}),
         ("logs", lambda r, q: {"science": {**dict(r.science), "stdout_path": q.root + "/stdout.log"}}),
-        ("teardown", lambda r, q: {"teardown": {"leaders_reaped": False}}),
+        ("teardown", lambda r, q: {"teardown": {**dict(r.teardown), "child_group_reaped": False}}),
         ("evidence", lambda r, q: {"evidence": {**dict(r.evidence), "run_dir": q.root + "/foreign/core"}}),
         ("evidence", lambda r, q: {"evidence": {
             **dict(r.evidence), "checkpoint": {**dict(r.evidence["checkpoint"]), "checkpoint_dir": q.root + "/foreign/checkpoint"},
