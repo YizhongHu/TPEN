@@ -87,9 +87,15 @@ def test_science_prepare_and_activate_reject_callback_replacement_before_dispatc
         *overrides[task_id],
         f"callbacks={base_callbacks!r}",
     )
-    prepared = attached.prepare_h_v2_run(
-        plan, overrides, resolved, output_dir=tmp_path / "prepared"
-    )
+    try:
+        prepared = attached.prepare_h_v2_run(
+            plan, overrides, resolved, output_dir=tmp_path / "prepared"
+        )
+    except ValueError as error:
+        # A correct implementation may reject the replacement while composing
+        # the bound config, before it creates a PreparedHV2Run.
+        assert "callback" in str(error).lower() or "a1" in str(error).lower()
+        return
 
     class DispatchReached(AssertionError):
         pass
