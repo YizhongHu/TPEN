@@ -25,12 +25,15 @@ import pytest
 from omegaconf import OmegaConf
 
 from tpen.execution.recovery import (
+    CheckpointEvidence,
     OperationalRestoreRequest,
     RecoveryDecision,
     RecoveryOutcome,
     RecoveryPhase,
     RecoveryRefusal,
     RefusalCode,
+    capture_science_intent,
+    select_recovery,
     train_resume_load_overlay,
 )
 from tpen.run import _apply_operational_restore
@@ -216,6 +219,85 @@ def test_request_revalidates_checkpoint_bytes_mutated_after_the_ref_was_built(tm
     model_path.write_bytes(bytes(mutated))
 
     with pytest.raises(ValueError, match="no longer match"):
+        OperationalRestoreRequest(decision=decision)
+
+
+def _select_recovery_decision(tmp_path: Path, *, ref=None) -> RecoveryDecision:
+    """Build a decision through the real E1 ``select_recovery`` selection path."""
+
+    ref = ref if ref is not None else _save_checkpoint(tmp_path)
+    intent = capture_science_intent({"study": "s2-restore"}, target_iterations=_TARGET_ITERATIONS)
+    evidence = CheckpointEvidence.from_ref(
+        ref,
+        science_input_digest=intent.science_input_digest,
+        target_iterations=_TARGET_ITERATIONS,
+    )
+    return select_recovery(intent, phase=RecoveryPhase.RECOVERY, evidence=evidence)
+
+
+def test_request_accepts_an_unmodified_select_recovery_result(tmp_path):
+    """Green control: a real, untouched E1 selection must still construct."""
+
+    decision = _select_recovery_decision(tmp_path)
+    request = OperationalRestoreRequest(decision=decision)
+    assert request.next_iteration == decision.next_iteration
+    assert request.completed_updates == decision.completed_updates
+
+
+@pytest.mark.parametrize("field", ["next_iteration", "completed_updates"])
+def test_request_rejects_decision_counters_disagreeing_with_their_ref(tmp_path, field):
+    """R2.2: a decision counter altered after selection must refuse, not be
+    silently frozen -- construction previously only checked nonnegativity."""
+
+    decision = _select_recovery_decision(tmp_path)
+    from dataclasses import replace
+
+    tampered = replace(decision, **{field: getattr(decision, field) + 1})
+    with pytest.raises(ValueError, match=field):
+        OperationalRestoreRequest(decision=tampered)
+
+
+def test_request_rejects_a_checkpoint_beyond_the_target_horizon(tmp_path):
+    """R2.2: ref.next_iteration must not exceed target_iterations, mirroring
+    E1's own gate at ``_checkpoint_refusal`` (recovery.py:517-521)."""
+
+    ref = _save_checkpoint(tmp_path, step=_TARGET_ITERATIONS + 1)
+    decision = RecoveryDecision(
+        phase=RecoveryPhase.RECOVERY,
+        outcome=RecoveryOutcome.RECOVERY,
+        target_iterations=_TARGET_ITERATIONS,
+        next_iteration=ref.next_iteration,
+        completed_updates=ref.completed_updates,
+        checkpoint=ref,
+        load=train_resume_load_overlay(ref),
+    )
+    with pytest.raises(ValueError, match="horizon"):
+        OperationalRestoreRequest(decision=decision)
+
+
+@pytest.mark.parametrize(
+    ("phase", "outcome"),
+    [
+        (RecoveryPhase.RECOVERY, RecoveryOutcome.INITIAL_CHECKPOINT),
+        (RecoveryPhase.INITIAL, RecoveryOutcome.RECOVERY),
+        (RecoveryPhase.RECOVERY, RecoveryOutcome.NO_CHECKPOINT),
+    ],
+)
+def test_request_rejects_an_invalid_phase_outcome_combination(tmp_path, phase, outcome):
+    """R2.2: only (INITIAL, INITIAL_CHECKPOINT) and (RECOVERY, RECOVERY) are
+    valid selected-checkpoint combinations."""
+
+    ref = _save_checkpoint(tmp_path)
+    decision = RecoveryDecision(
+        phase=phase,
+        outcome=outcome,
+        target_iterations=_TARGET_ITERATIONS,
+        next_iteration=ref.next_iteration,
+        completed_updates=ref.completed_updates,
+        checkpoint=ref,
+        load=train_resume_load_overlay(ref),
+    )
+    with pytest.raises(ValueError, match="phase/outcome"):
         OperationalRestoreRequest(decision=decision)
 
 

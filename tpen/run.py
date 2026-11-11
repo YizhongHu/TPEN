@@ -641,6 +641,14 @@ def _apply_operational_restore(cfg: DictConfig, runner: Runner, restore_request:
             "operational restore request conflicts with a concrete configured runner.load"
         )
     runner.load = decision_load
+    # Carry the full validated request to the live restore boundary, not just
+    # its closed load shape (R2.3): ``Train.run`` uses this to revalidate the
+    # selected ref immediately before restore and to bind restored progress
+    # to the request's counters before `fit`, so a checkpoint replaced after
+    # request construction -- or one whose restored counters merely disagree
+    # -- cannot reach training. Additive: a runner that never reads
+    # ``restore_binding`` behaves exactly as before.
+    runner.restore_binding = restore_request
     return runner
 
 

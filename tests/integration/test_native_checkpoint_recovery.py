@@ -307,6 +307,29 @@ def _trace(path: Path) -> ProcessEvidence:
     )
 
 
+def _trace_refusal(path: Path) -> dict | None:
+    """Read the specific typed restore refusal recorded in a worker's trace, if any.
+
+    Set only by ``tests.helpers.native_chain_resume_trace.install_native_trace``'s
+    ``Train.run`` wrapper, which captures the real R2.3 pre-fit refusal at its
+    raise site (the worker's own exception handling classifies it as a
+    generic parked outcome and does not retain the message).
+    """
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload.get("refusal")
+
+
+def _snapshot_leaf(root: Path) -> dict[Path, tuple[str, int]]:
+    """Snapshot every file under a leaf: relative path -> (sha256, mtime_ns)."""
+
+    return {
+        path.relative_to(root): (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
 def _run_dir(output_path: Path) -> Path:
     statuses = list(output_path.rglob("status.json"))
     assert len(statuses) == 1, statuses
@@ -796,6 +819,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     for limb in sorted({spec.limb for spec in E5_CHANNEL_MAP}):
         label = f"channel-disabled-{limb}"
         trace_path = tmp_path / f"{label}.trace.json"
+        leaf_before = _snapshot_leaf(prefix_run_dir) if limb == "trainer_cursor" else None
         worker = _launch(
             root=tmp_path,
             batch_path=batch_path,
@@ -816,6 +840,30 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         disabled_traces[limb] = disabled_trace
         assert disabled_trace.pid != reference_trace.pid
         assert disabled_trace.seed == reference_trace.seed
+
+        if limb == "trainer_cursor":
+            # R2.3's post-restore counter check (tpen/runner/train.py) now
+            # refuses before fit once the trainer-cursor restore is omitted
+            # (orchestrator decision decision-r23-vs-native-omission-20261111
+            # on item 4023abbb): the typed refusal IS the observed channel
+            # effect for this arm, not a silently empty trace. Assert the
+            # specific counter-mismatch refusal was recorded (captured at its
+            # real raise site by tests/helpers/native_chain_resume_trace.py's
+            # Train.run wrapper, since the worker's own exception handling
+            # classifies it as a generic parked outcome), that it produced
+            # zero fit/model-evaluation events, and that the predecessor leaf
+            # this run read from -- never written to -- is unchanged.
+            refusal = _trace_refusal(trace_path)
+            assert refusal is not None, "trainer_cursor omission did not produce a typed restore refusal"
+            assert refusal["exception_type"] == "ValueError"
+            assert "restored live trainer counters" in refusal["message"]
+            assert disabled_trace.events == ()
+            assert _snapshot_leaf(prefix_run_dir) == leaf_before, (
+                "trainer_cursor refusal mutated the predecessor leaf"
+            )
+            results[limb] = {spec.channel: False for spec in E5_CHANNEL_MAP}
+            continue
+
         # The pure core comparator intentionally raises when one arm changes
         # a downstream observable.  This test needs the complete measured
         # vector first so it can distinguish a named omission from a causal
@@ -826,8 +874,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
                     reference_trace, spec, resume_step=resume_cursor - 1
                 ).value
                 == first_subsequent_event(
-                    disabled_trace, spec,
-                    resume_step=-1 if limb == "trainer_cursor" else resume_cursor - 1,
+                    disabled_trace, spec, resume_step=resume_cursor - 1
                 ).value
             )
             for spec in E5_CHANNEL_MAP
@@ -837,13 +884,10 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         disabled_first_cursor = next(
             event.step for event in disabled_trace.events if event.channel == "trainer_cursor"
         )
-        if limb == "trainer_cursor":
-            result[channel] = disabled_first_cursor == resume_cursor
-        else:
-            # Recompute the unaffected cursor from the actual first event in
-            # each fresh process; the generic channel comparison is not a
-            # sufficient cursor observation for another limb's omission.
-            result["trainer_cursor"] = disabled_first_cursor == resume_cursor
+        # The unaffected cursor is recomputed from the actual first event in
+        # each fresh process; the generic channel comparison is not a
+        # sufficient cursor observation for another limb's omission.
+        result["trainer_cursor"] = disabled_first_cursor == resume_cursor
         assert result[channel] is False, limb
 
         if limb == "optimizer":
@@ -917,6 +961,11 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     # attributed to model_logabs.  The first channel assertion must reject
     # that attribution before a later channel can accidentally mask it.
     for actual_limb, actual_trace in disabled_traces.items():
+        if actual_limb == "trainer_cursor":
+            # No measured channel vector exists to misattribute: the typed
+            # restore refusal (asserted above) replaces the measurement for
+            # this arm entirely.
+            continue
         wrong_limb = next(
             spec.limb for spec in E5_CHANNEL_MAP if spec.limb != actual_limb
         )
@@ -949,6 +998,12 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             disabled_limbs=tuple(spec.limb for spec in E5_CHANNEL_MAP),
             expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
         )
+    # trainer_cursor is excluded from this combined-omission run: disabling
+    # it now refuses before fit (R2.3), which would leave no measured
+    # channel vector for any of the other four limbs' combined mismatch to
+    # be checked against. Its own omission is covered by the typed-refusal
+    # assertion above.
+    non_cursor_limbs = tuple(spec.limb for spec in E5_CHANNEL_MAP if spec.limb != "trainer_cursor")
     all_disabled_path = tmp_path / "channel-all-disabled.trace.json"
     all_disabled = _launch(
         root=tmp_path,
@@ -962,13 +1017,13 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
         evidence=evidence_path,
         trace=all_disabled_path,
         resume_step=resume_cursor,
-        disable_limbs=tuple(spec.limb for spec in E5_CHANNEL_MAP),
+        disable_limbs=non_cursor_limbs,
     )
     all_disabled.wait(timeout=180)
     assert all_disabled.returncode == 0
     compare_channel_parity(
         reference_trace, _trace(all_disabled_path), resume_step=resume_cursor - 1,
-        disabled_limbs=tuple(spec.limb for spec in E5_CHANNEL_MAP),
+        disabled_limbs=non_cursor_limbs,
         expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
     )
     with pytest.raises(ChannelParityError, match="channel"):

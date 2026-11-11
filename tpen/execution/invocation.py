@@ -603,14 +603,22 @@ def _owner_committed_checkpoint(checkpoint_root: Path) -> CheckpointRef | None:
 
 
 def _discover_published_checkpoint(checkpoint_root: Path) -> CheckpointRef | None:
-    """Read-only successor/restore discovery: trust only an already-published index.
+    """Read-only successor/restore discovery: select the newest PUBLISHED checkpoint.
 
-    Refuses, with :class:`PredecessorDiscoveryRefusal`, when the publication
-    catalog or ``latest.json`` is missing while a complete checkpoint exists
-    (an indexless predecessor), or when the published pointer does not yet
-    reflect the newest complete checkpoint directory (a stale predecessor
-    index). A corrupt catalog still raises ``ValueError`` from
-    ``read_publications`` before either check runs. Never writes.
+    A newer complete-but-unpublished directory (a predecessor allocation
+    killed between its directory rename and its catalog/``latest.json``
+    write -- a normal crash/timeout state, not corruption) is deliberately
+    IGNORED here: not selected, not repaired, nothing written. Refusing it
+    would strand the lineage forever, since read-only discovery can never
+    publish it either (orchestrator decision
+    ``decision-unpublished-newer-dir-20261111``, item 4023abbb, refining the
+    H1 addendum). Only genuine inconsistency is refused, with
+    :class:`PredecessorDiscoveryRefusal`: nothing was ever published while a
+    complete checkpoint exists (an indexless predecessor), the published
+    pointer has no corresponding row in the catalog -- whether the catalog is
+    empty or merely does not name this checkpoint's content identity (an
+    inconsistent predecessor). A corrupt catalog still raises ``ValueError``
+    from ``read_publications`` before either check runs. Never writes.
     """
 
     catalog_path = checkpoint_root / PUBLICATION_CATALOG_FILENAME
@@ -624,15 +632,13 @@ def _discover_published_checkpoint(checkpoint_root: Path) -> CheckpointRef | Non
             f"predecessor checkpoint index missing under {checkpoint_root}; "
             "refusing read-only successor discovery"
         )
-    read_publications(catalog_path)  # Validates; raises ValueError on a corrupt catalog.
+    publications = read_publications(catalog_path)  # Validates; raises ValueError on a corrupt catalog.
     pointer_ref = CheckpointRef.from_directory(resolve_checkpoint_dir(checkpoint_root))
-    newest = _latest_complete_checkpoint(checkpoint_root)
-    if newest is not None and newest.next_iteration > pointer_ref.next_iteration:
+    if not any(row.content_id == pointer_ref.content_id for row in publications):
         raise PredecessorDiscoveryRefusal(
-            f"predecessor checkpoint index under {checkpoint_root} is stale "
-            f"(published pointer is at iteration {pointer_ref.next_iteration}, "
-            f"newest complete checkpoint is at iteration {newest.next_iteration}); "
-            "refusing read-only successor discovery"
+            f"selected checkpoint {pointer_ref.checkpoint_dir} under {checkpoint_root} "
+            "has no matching row in the publication catalog; refusing read-only "
+            "successor discovery"
         )
     return pointer_ref
 
