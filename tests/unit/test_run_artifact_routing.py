@@ -175,18 +175,29 @@ def test_bind_refuses_a_path_outside_the_logical_run_dir(tmp_path: Path) -> None
 
 
 def test_bind_refuses_an_escape_through_a_symlink(tmp_path: Path) -> None:
-    """Mutant (5): a path-traversal/symlink escape is refused, not followed."""
+    """Mutant (5): a path-traversal/symlink escape is refused, not followed.
+
+    A symlink under the LOGICAL tree is already caught by the first check:
+    ``Path.resolve()`` follows it before ``relative_to`` ever runs, so a sink
+    path through it simply does not fall under ``logical_root`` (the "unknown
+    destination" refusal). The second, independent check exists for a symlink
+    planted inside the PHYSICAL destination itself -- for example a residue
+    from a prior occupant of the claimed leaf -- where the sink path computed
+    from the clean logical tree is innocent, but joining it onto the physical
+    root and resolving it walks through that planted symlink and lands
+    outside the claimed root.
+    """
 
     logical_run_dir = tmp_path / "logical" / "run"
-    logical_run_dir.mkdir(parents=True)
+    physical_root = tmp_path / "physical"
+    physical_root.mkdir(parents=True)
     outside = tmp_path / "outside"
     outside.mkdir()
-    escape_link = logical_run_dir / "escape"
-    escape_link.symlink_to(outside)
-    destination = ArtifactDestination(physical_root=tmp_path / "physical")
+    (physical_root / "checkpoints").symlink_to(outside)
+    destination = ArtifactDestination(physical_root=physical_root)
 
     with pytest.raises(ArtifactRoutingError):
-        destination.bind(logical_run_dir, escape_link / "payload.json")
+        destination.bind(logical_run_dir, logical_run_dir / "checkpoints" / "payload.json")
 
 
 def test_bind_maps_a_nested_sink_to_the_same_relative_physical_path(tmp_path: Path) -> None:
