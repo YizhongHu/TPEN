@@ -442,11 +442,24 @@ def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple
     """Flatten mapping or Hydra dotlist overrides into explicit leaf updates."""
 
     if isinstance(overrides, Mapping):
+        for key in overrides:
+            if isinstance(key, str) and ("[" in key or "]" in key):
+                raise TrainConfigResolutionError(
+                    f"override path {key!r} contains a bracket segment; use dotted segments "
+                    "(e.g. 'run.root', 'loggers.0.path')"
+                )
         try:
             raw = OmegaConf.to_container(OmegaConf.create(overrides), resolve=False)
         except Exception as exc:
             raise TrainConfigResolutionError("overrides must be a valid mapping") from exc
     elif isinstance(overrides, Sequence) and not isinstance(overrides, (str, bytes, bytearray)):
+        for override in overrides:
+            path, _, _ = str(override).partition("=")
+            if "[" in path or "]" in path:
+                raise TrainConfigResolutionError(
+                    f"override path {path!r} contains a bracket segment; use dotted segments "
+                    "(e.g. 'run.root', 'loggers.0.path')"
+                )
         try:
             raw = OmegaConf.to_container(OmegaConf.from_dotlist(list(overrides)), resolve=False)
         except Exception as exc:
@@ -459,8 +472,19 @@ def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple
     def visit(value: Any, path: str) -> None:
         if isinstance(value, Mapping):
             for key, child in value.items():
-                visit(child, f"{path}.{key}" if path else str(key))
+                child_path = f"{path}.{key}" if path else str(key)
+                if "[" in child_path or "]" in child_path:
+                    raise TrainConfigResolutionError(
+                        f"override path {child_path!r} contains a bracket segment; use dotted segments "
+                        "(e.g. 'run.root', 'loggers.0.path')"
+                    )
+                visit(child, child_path)
         else:
+            if "[" in path or "]" in path:
+                raise TrainConfigResolutionError(
+                    f"override path {path!r} contains a bracket segment; use dotted segments "
+                    "(e.g. 'run.root', 'loggers.0.path')"
+                )
             items.append((path, value))
 
     visit(raw, "")
