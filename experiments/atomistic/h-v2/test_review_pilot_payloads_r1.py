@@ -161,6 +161,30 @@ def test_contract_rejects_fully_assembled_config_with_all_new_logging_modules_re
         protocol.assert_hydrogen_contract(config)
 
 
+def test_final_train_dispatch_refuses_an_incomplete_a1_set(tmp_path):
+    """An intermediate bare config cannot cross the final TRAIN boundary."""
+
+    config, identity = protocol.pilot_training_config("capacity-pilot")
+    plan, overrides, config = attached.build_h_v2_train_plan(
+        output_dir=tmp_path / "handoff", results_root=tmp_path / "results",
+        lineage="capacity-pilot", config=config, science_config_identity=identity,
+        payload_label="capacity-pilot",
+    )
+    prepared = attached.prepare_h_v2_run(plan, overrides, config, output_dir=tmp_path / "handoff")
+    with pytest.raises(attached.ActivationRefusal, match="incomplete-a1-callback-set"):
+        attached.activate_h_v2_run(
+            prepared,
+            science_python=sys.executable,
+            executor_python=sys.executable,
+            allocation=tmp_path / "allocation.json",
+            worker_config=tmp_path / "worker.json",
+            store=tmp_path / "store",
+            activation_receipt_path=tmp_path / "activation.json",
+            h_v2_receipt_path=tmp_path / "h-v2.json",
+            expected_source_commit="a" * 40,
+        )
+
+
 def _fully_assembled_capacity_config():
     config, _ = protocol.pilot_training_config("capacity-pilot")
     for target in protocol.candidate_modules_to_append():
