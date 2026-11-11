@@ -59,11 +59,21 @@ load:
   allow_protocol_mismatch: false
   replay_semantics:
     record_schema_version: 1
-    source_git_sha: stage1-launch
+    source_git_sha: ${oc.env:TPEN_SOURCE_SHA,6a45bc0ce8bebacdd80427ab9a14c414f56e51c3}
     source_tpen_version: stage1-launch
     checkpoint_schema_version: 1
     checkpoint_kind: model_only
     checkpoint_model_sha256: supplied-by-collector
+    evaluation_config_sha256: supplied-by-collector
+    runtime_dtype: ${runtime.dtype}
+    cusp_distance:
+      electron_electron_distance_form: sqrt_squared_distance_plus_eps_squared
+      electron_electron_distance_eps: 1.0e-12
+      electron_electron_range_offset_form: softplus_plus_eps
+      electron_electron_range_offset_eps: 1.0e-12
+      electron_nucleus_coulomb_distance_form: euclidean_norm_clamp_min_eps
+      electron_nucleus_coulomb_distance_eps: 0.0
+    reference_energy_qualification: h2_molecule_r1.4
 
 runner:
   _target_: tpen.runner.Evaluate

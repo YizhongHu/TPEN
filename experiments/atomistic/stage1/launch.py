@@ -54,6 +54,8 @@ trap 'rm -rf -- "$JOB_ROOT"' EXIT
 if [[ "${{SLURM_JOB_PARTITION:-}}" != "$REQUESTED_PARTITION" ]]; then exit 2; fi
 : "${{SLURM_JOB_ID:?must run inside Slurm}}"
 : "${{HEAD_SHA:?head SHA is required}}"
+export HEAD_SHA
+export TPEN_SOURCE_SHA="$HEAD_SHA"
 [[ "$JOB_ROOT" == "/scratch/$USER/$SLURM_JOB_ID" ]]
 mkdir -p "$JOB_ROOT"
 set +e

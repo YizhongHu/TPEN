@@ -33,7 +33,7 @@ def _run_dir(root: Path, run_id: str) -> Path:
 
 
 @pytest.mark.parametrize("system", ["he", "hooke1"])
-def test_tiny_train_eval_collect_uses_real_artifact(system: str, tmp_path: Path) -> None:
+def test_tiny_train_eval_collect_uses_real_artifact(system: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Exercise both supported Stage-1 atom routes through ``run_from_config``."""
 
     train_cfg = OmegaConf.load(HERE / "configs" / system / "train.yaml")
@@ -48,6 +48,7 @@ def test_tiny_train_eval_collect_uses_real_artifact(system: str, tmp_path: Path)
     _checkpoint_callback(train_cfg)
     assert run_from_config(train_cfg, command=f"stage1 {system} tiny train", raise_exceptions=True) == 0
     train_dir = _run_dir(tmp_path / "train", "train")
+    monkeypatch.setenv("TPEN_SOURCE_SHA", json.loads((train_dir / "metadata.json").read_text(encoding="utf-8"))["git_commit"])
     checkpoint = train_dir / "checkpoints" / "step_000001"
     assert (checkpoint / "COMPLETE").is_file()
 

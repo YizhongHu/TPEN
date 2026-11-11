@@ -88,7 +88,7 @@ load:
   # without changing its existing parameters.
   replay_semantics:
     record_schema_version: 1
-    source_git_sha: stage1-launch
+    source_git_sha: ${oc.env:TPEN_SOURCE_SHA,6a45bc0ce8bebacdd80427ab9a14c414f56e51c3}
     source_tpen_version: stage1-launch
     checkpoint_schema_version: 1
     checkpoint_kind: model_only
