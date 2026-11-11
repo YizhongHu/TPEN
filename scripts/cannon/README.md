@@ -105,6 +105,58 @@ excludes `scripts` via `norecursedirs`, so a bare `pytest`/`uv run pytest` from
 the repository root never collects facility-specific tests; run them
 explicitly with `uv run pytest scripts/cannon/tests`.
 
+## build-shared-env.sh — capped builder for shared immutable uv environments
+
+`build-shared-env.sh` builds, or reuses if already complete, one immutable
+shared `uv` environment under a facility env root (all facility paths arrive
+by `--envs-root`/`--checkout`, never hardcoded here), named deterministically:
+
+```
+<project>-<sha256(uv.lock)[:12]>-<extra>-py<X.Y>
+```
+
+```
+scripts/cannon/build-shared-env.sh \
+  --envs-root /absolute/canonical/facility/env/root \
+  --checkout /absolute/path/to/an/exact-SHA/clean/checkout \
+  --project tpen --extra cpu --python 3.12 \
+  --uv-bin /absolute/path/to/uv
+```
+
+`UV_CACHE_DIR` must be set by the caller. The `--checkout` must be a clean
+git work tree (its `HEAD` is recorded in the manifest below).
+
+The committed cap in `scripts/cannon/shared-env-policy.json`
+(`MAX_SHARED_ENV_DIRS`) is read only from that file in the exact verified
+checkout, and only from there — no CLI flag, environment variable, or
+default can override it. Under one root-level `flock`, the builder counts
+**every** one-level directory entry beneath `--envs-root` (dot-dirs,
+malformed or partial names, symlinked directories — not only directories
+carrying a `.complete` manifest), so a cap cannot be evaded by an
+unfinished or oddly-named directory. Decision order, all before any
+`mkdir`/`uv sync`:
+
+1. the target (`<env-name>`) already exists and carries a `.complete`
+   manifest -> reuse, exit 0 (checked even if the root is otherwise at cap,
+   since the target itself is one of the counted entries);
+2. the target exists without `.complete` -> hard refuse: partial build,
+   needs an explicit disposition, never auto-cleaned;
+3. the one-level directory count is at or above the committed cap -> hard
+   refuse, printing the observed count, the requested path, the cap, the
+   policy file path, and the checkout's exact `HEAD`;
+4. otherwise, `mkdir`, then `UV_PROJECT_ENVIRONMENT=<env> uv sync --locked
+   --no-install-project --extra <extra> --python <X.Y>` under the checkout,
+   then write a `.complete` manifest recording `HEAD`, the full `uv.lock`
+   sha256, the `uv` version, the Python version, and the UTC build time.
+
+Raising the cap requires a reviewed PR that changes the committed policy
+file and its hard-refusal test together, visible in Git/GitHub — there is
+no automatic GC, override flag, or separate environment-management project.
+This builder only builds/reuses one environment per invocation; it does not
+itself decide which jobs consume which shared env, migrate consumers, or
+dispose of any existing environment (see the Holystore envs plan,
+Task Orchestrator item `05803194`, for those later slices).
+
 ## submit-lint.sh — pre-submit submission-contract linter
 
 `submit-lint.sh` is a generic, facility-neutral linter run on the generated
