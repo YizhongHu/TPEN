@@ -14,6 +14,7 @@ from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.events import DomainState, Ended, Occurrence, Started
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.potential import ElectronElectronInteraction, HarmonicTrap
+from tpen.physics.hamiltonian import LocalEnergyResult
 from tpen.sampling import SamplerStats
 from tpen.training.events import (
     Backward,
@@ -30,7 +31,7 @@ from tpen.training.events import (
     UpdateSkipped,
 )
 from tpen.training.state import TrainerState
-from tpen.training.trainer import VMCTrainer, _parameter_norm
+from tpen.training.trainer import VMCTrainer, _detach_local_energy_result, _parameter_norm
 from tests.helpers.hooke_models import build_tiny_sampler, build_tiny_spenn
 
 
@@ -152,6 +153,39 @@ def _occurrence_labels(occurrences: list[Occurrence[Any]]) -> list[tuple[str, ty
         else:
             labels.append(("event", type(event)))
     return labels
+
+
+def test_local_energy_result_is_detached_without_dropping_diagnostics() -> None:
+    """The trainer's handoff keeps values but releases every graph-bearing field."""
+
+    source = torch.tensor([1.0, 2.0], dtype=torch.float64, requires_grad=True)
+    output = WavefunctionOutput(
+        logabs=source,
+        sign=torch.ones_like(source),
+        aux={"captured": source * 2.0, "label": "kept"},
+    )
+    detached = _detach_local_energy_result(
+        LocalEnergyResult(
+            total=source + 1.0,
+            terms={"first": source * 3.0, "second": source * 4.0},
+            wavefunction_output=output,
+            per_electron_kinetic=source[:, None] * 5.0,
+        )
+    )
+
+    assert list(detached.terms) == ["first", "second"]
+    assert torch.equal(detached.total, source.detach() + 1.0)
+    assert torch.equal(detached.terms["first"], source.detach() * 3.0)
+    assert torch.equal(detached.per_electron_kinetic, source.detach()[:, None] * 5.0)
+    assert detached.wavefunction_output is not None
+    assert torch.equal(detached.wavefunction_output.logabs, source.detach())
+    assert torch.equal(detached.wavefunction_output.aux["captured"], source.detach() * 2.0)
+    assert detached.wavefunction_output.aux["label"] == "kept"
+    assert not detached.total.requires_grad
+    assert all(not value.requires_grad for value in detached.terms.values())
+    assert not detached.per_electron_kinetic.requires_grad
+    assert not detached.wavefunction_output.logabs.requires_grad
+    assert not detached.wavefunction_output.aux["captured"].requires_grad
 
 
 def _record_legacy(context: _StubContext):
@@ -389,7 +423,9 @@ def test_skipped_update_advances_next_iteration_but_not_completed_updates() -> N
 
     assert trainer.next_iteration == 2
     assert trainer.completed_updates == 0
-    assert trainer.state_dict() == {"next_iteration": 2, "completed_updates": 0}
+    assert trainer.state_dict()["next_iteration"] == 2
+    assert trainer.state_dict()["completed_updates"] == 0
+    assert "parameter_layout" in trainer.state_dict()
 
 
 def test_skipped_update_emits_update_skipped_without_an_optimizer_scope() -> None:
@@ -436,7 +472,34 @@ def test_param_norm_describes_the_pre_update_model() -> None:
     assert metrics["param_norm"] != optimizer.norm_after_step
     # Moving the computation earlier must not move the key: CSV/JSONL readers
     # and anyone diffing records see the same column order as before.
-    assert list(metrics)[-4:] == ["grad_norm", "param_norm", "loss_has_grad", "optimizer_step"]
+    #
+    # Expressed as a CONTIGUOUS RUN rather than as "the last four keys". The
+    # `[-4:]` form this started as was never the invariant it appeared to be:
+    # a method that reports diagnostics has always had them merged in after
+    # `optimizer_step`, so the proxy held only on the legacy path, which
+    # happened to report nothing. The legacy adapter now reports an explicit
+    # minimal record too, so the proxy holds nowhere and the property it stood
+    # for has to be stated directly. This is a strengthening: it pins the
+    # trainer-owned columns' order AND what may follow them.
+    keys = list(metrics)
+    start = keys.index("grad_norm")
+    assert keys[start : start + 4] == [
+        "grad_norm",
+        "param_norm",
+        "loss_has_grad",
+        "optimizer_step",
+    ]
+    # Everything after that run is the attempt's own reporting: the trainer's
+    # generic reason, then the method-owned record. Appended, never
+    # interleaved, so the trainer-owned columns keep their positions.
+    assert keys[start + 4 :] == [
+        "update_reason",
+        "update_record_method",
+        "update_record_applied",
+        "update_record_reason",
+        "update_record_step",
+        "update_record_grad_norm",
+    ]
 
 
 def test_skipped_update_logs_the_same_train_record_shape() -> None:
@@ -511,7 +574,24 @@ def test_load_state_dict_round_trips_both_progress_counters() -> None:
 
     assert trainer.next_iteration == 4
     assert trainer.completed_updates == 3
-    assert trainer.state_dict() == {"next_iteration": 4, "completed_updates": 3}
+    state = trainer.state_dict()
+    # No model/update authority is resolved in this counter-only test, so no
+    # parameter layout is available; the exact key set still pins this schema.
+    assert set(state) == {
+        "next_iteration",
+        "completed_updates",
+        "nonfinite_local_energy_policy",
+    }
+    # `nonfinite_local_energy_policy` records the ACTIVE estimator beside the
+    # progress counters. Exact equality is kept rather than loosened to a
+    # subset check: an unexpected new key in trainer state is precisely what
+    # these tests should catch, so weakening the assertion to accommodate a
+    # change would remove the guard to fit the thing it guards against.
+    assert state == {
+        "next_iteration": 4,
+        "completed_updates": 3,
+        "nonfinite_local_energy_policy": "mask",
+    }
 
 
 def test_load_state_dict_rejects_legacy_trainer_state() -> None:
@@ -524,7 +604,11 @@ def test_load_state_dict_rejects_legacy_trainer_state() -> None:
     with pytest.raises(KeyError, match="completed_updates"):
         trainer.load_state_dict({"next_iteration": 3})
 
-    assert trainer.state_dict() == {"next_iteration": 0, "completed_updates": 0}
+    assert trainer.state_dict() == {
+        "next_iteration": 0,
+        "completed_updates": 0,
+        "nonfinite_local_energy_policy": "mask",
+    }
 
 
 def test_load_state_dict_leaves_trainer_unmutated_on_a_non_integer_value() -> None:
@@ -538,4 +622,8 @@ def test_load_state_dict_leaves_trainer_unmutated_on_a_non_integer_value() -> No
     with pytest.raises(ValueError):
         trainer.load_state_dict({"next_iteration": 5, "completed_updates": "x"})
 
-    assert trainer.state_dict() == {"next_iteration": 4, "completed_updates": 3}
+    assert trainer.state_dict() == {
+        "next_iteration": 4,
+        "completed_updates": 3,
+        "nonfinite_local_energy_policy": "mask",
+    }

@@ -163,8 +163,14 @@ class ElectronBasis(EquivariantMap):
         *,
         name: str,
         provenance: Mapping[str, JsonScalar] | None = None,
+        pair: torch.Tensor | None = None,
     ) -> ElectronBasisFeatures:
-        """Assemble the typed features and record provenance metadata."""
+        """Assemble the typed features and record provenance metadata.
+
+        ``pair`` is optional and defaults to ``None``, which is the historical
+        behaviour: every basis that does not produce pair features emits none,
+        and downstream code sees exactly what it saw before.
+        """
 
         one_body = self._one_body(coordinate_features, batch)
         metadata: dict[str, JsonScalar] = {
@@ -175,7 +181,7 @@ class ElectronBasis(EquivariantMap):
         }
         if provenance is not None:
             metadata.update(provenance)
-        features = ElectronBasisFeatures(one_body=one_body, metadata=metadata)
+        features = ElectronBasisFeatures(one_body=one_body, pair=pair, metadata=metadata)
         self.trace("features", features)
         return features
 
@@ -675,9 +681,162 @@ def _product_hermite_features(
 
 
 __all__ = [
+    "BoundedDistanceBasis",
+    "bounded_distance",
     "ElectronBasis",
     "ElectronBasisFeatures",
     "HookeHermiteBasis",
     "HookeOrbitalBasis",
     "RawCoordinateBasis",
 ]
+
+
+def bounded_distance(squared_distance: torch.Tensor, length: float) -> torch.Tensor:
+    r"""Return the bounded distance feature ``q = r^2 / (l^2 + r^2)``.
+
+    Parameters
+    ----------
+    squared_distance : torch.Tensor
+        ``r^2``, of any shape. Squared distance rather than distance is the
+        input ON PURPOSE -- see the note below.
+    length : float
+        The length scale ``l`` in bohr. Must be positive.
+
+    Returns
+    -------
+    torch.Tensor
+        ``q`` with the same shape as `squared_distance`, valued in ``[0, 1)``.
+
+    Notes
+    -----
+    **Why the argument is ``r^2`` and not ``r``.** The authority specifies
+    computing this "directly from squared distances", and the reason is a
+    derivative rather than a convenience: ``r = sqrt(sum x_k^2)`` has an
+    infinite gradient at the origin, so a chain rule through ``sqrt`` produces a
+    NaN exactly where two particles coincide or an electron sits on the nucleus.
+    Those are the configurations a wavefunction most needs to be well behaved
+    at. Taking ``r^2`` keeps the whole expression polynomial in the
+    coordinates and smooth everywhere, including at zero.
+
+    ``q`` is bounded in ``[0, 1)``, equals 0 at coincidence, and approaches 1
+    far away -- so it adds no exponential tail slope, which is what makes it
+    safe to append beside the existing Cartesian features.
+    """
+
+    if not length > 0.0:
+        raise ValueError(f"length must be positive, got {length}")
+    length_squared = length * length
+    return squared_distance / (length_squared + squared_distance)
+
+
+class BoundedDistanceBasis(ElectronBasis):
+    r"""Augment an inner basis with bounded distances, and emit ordered pairs.
+
+    This is the ``B1_`` half of the minimal B coordinate: "raw plus bounded
+    distances". It appends ``q_i`` to electron ``i``'s one-body input and emits
+    ``(q_i, q_j, q_ij)`` on the ordered ``(i, j)`` pair channel, with
+
+    .. math::
+
+        q(r) = \frac{r^2}{\ell^2 + r^2}, \qquad
+        r_i = |R_i|, \qquad r_{ij} = |R_i - R_j|.
+
+    Parameters
+    ----------
+    inner : ElectronBasis
+        The basis whose one-body features are preserved and extended. Its
+        spin handling is used; this wrapper adds none of its own.
+    length : float, optional
+        ``l`` in bohr. The study fixes 1.0.
+    **kwargs : object
+        Runtime-check options forwarded to :class:`EquivariantMap`.
+
+    Notes
+    -----
+    **The pair channel is typed, not broadcast.** The authority forbids
+    broadcasting pair information into one-body channels "as an undocumented
+    substitute for typed pair ingress", so ``q_ij`` appears ONLY on the pair
+    tensor. Only ``q_i``, a genuine one-body quantity, is appended to the
+    one-body vector.
+
+    **Ordered pairs, and the exchange law.** Entry ``(i, j)`` is
+    ``(q_i, q_j, q_ij)`` and is NOT symmetrised: exchanging the two electrons
+    maps it to ``(q_j, q_i, q_ij)``. Keeping the ordering explicit is what lets
+    a consumer implement a symmetric function deliberately rather than inherit
+    one by accident.
+
+    **The diagonal needs no special case.** ``r_ii = 0`` gives ``q_ii = 0``, so
+    entry ``(i, i)`` is ``(q_i, q_i, 0)``. It is a well-defined value rather
+    than a hole, which is what keeps callers free of branching.
+
+    **Distances are measured from the ORIGIN**, matching the authority's
+    ``r_i = |R_i|``. The literal control places the nucleus at the origin, so
+    the two coincide for this study. A study that moved the atom would change
+    this feature's meaning rather than translate it; see the same caveat on the
+    A8 Gaussian gate.
+    """
+
+    def __init__(self, *, inner: ElectronBasis, length: float = 1.0, **kwargs) -> None:
+        # include_spin=False because the INNER basis already owns the spin
+        # channel and its output is preserved verbatim. Setting it True here
+        # would append a second spin column, which would not fail loudly -- it
+        # would just silently widen the embedding input by one and duplicate a
+        # feature. The base class then makes `out_features` equal
+        # `coordinate_features`, so no override is needed here; adding one
+        # would only create something that can drift from the base.
+        super().__init__(
+            spatial_dim=inner.spatial_dim,
+            include_spin=False,
+            **kwargs,
+        )
+        if not length > 0.0:
+            raise ValueError(f"length must be positive, got {length}")
+        self.inner = inner
+        self.length = float(length)
+
+    @property
+    def coordinate_features(self) -> int:
+        """Return the inner width plus the single appended ``q_i`` column."""
+
+        return self.inner.out_features + 1
+
+    @property
+    def pair_features(self) -> int:
+        """Return the ordered-pair channel width: ``q_i``, ``q_j``, ``q_ij``."""
+
+        return 3
+
+    def forward_impl(self, batch: ElectronBatch) -> ElectronBasisFeatures:
+        """Return inner features plus ``q_i``, with the ordered pair channel."""
+
+        inner = self.inner(batch)
+        positions = batch.positions
+
+        # r_i^2 = |R_i|^2, kept squared throughout: see bounded_distance.
+        radius_squared = positions.square().sum(dim=-1)
+        q_single = bounded_distance(radius_squared, self.length)
+
+        one_body = torch.cat([inner.one_body, q_single.unsqueeze(-1)], dim=-1)
+
+        # r_ij^2 via an explicit difference rather than the expanded
+        # |R_i|^2 + |R_j|^2 - 2 R_i.R_j, which loses precision by cancellation
+        # exactly where the electrons are close and the feature matters most.
+        separation = positions.unsqueeze(-2) - positions.unsqueeze(-3)
+        q_pair = bounded_distance(separation.square().sum(dim=-1), self.length)
+
+        n_electrons = positions.shape[-2]
+        q_i = q_single.unsqueeze(-1).expand(*q_single.shape, n_electrons)
+        q_j = q_single.unsqueeze(-2).expand(*q_single.shape[:-1], n_electrons, n_electrons)
+        pair = torch.stack([q_i, q_j, q_pair], dim=-1)
+
+        return self._features(
+            one_body,
+            batch,
+            name="bounded_distance",
+            provenance={
+                "inner_basis": type(self.inner).__name__,
+                "length": self.length,
+                "pair_features": self.pair_features,
+            },
+            pair=pair,
+        )

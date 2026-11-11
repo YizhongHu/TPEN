@@ -125,28 +125,48 @@ for module_name in list(sys.modules):
         del sys.modules[module_name]
 
 
-def _load_script(name: str, *, bind_direct: bool = False) -> ModuleType:
+def _load_script(name: str) -> ModuleType:
     path = STUDY_DIR / f"{name}.py"
     spec = importlib.util.spec_from_file_location(f"tpen_pair_scan_v1_{name}", path)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    if bind_direct:
-        sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
 
-from utils import io as json_io  # noqa: E402
-from utils import layout  # noqa: E402
-launch = _load_script("launch", bind_direct=True)
+# Siblings are loaded study-scoped, not by bare import: experiments/ has several
+# same-named modules and the first study loaded would otherwise own the bare name
+# for every study after it. See experiments/toolkit/study_imports.py.
+#
+# The loader is reached BY PATH rather than by putting the repository root on
+# sys.path. A study directory that mutates sys.path is the mechanism behind the
+# very defect this import exists to fix, and he-cutover's gateway test forbids it
+# outright -- so the fix must not reintroduce it in order to install itself.
+import importlib.util as _tpen_importlib  # noqa: E402
+import sys as _tpen_sys  # noqa: E402
+from pathlib import Path as _TpenPath  # noqa: E402
+
+if "_tpen_study_imports" not in _tpen_sys.modules:
+    _tpen_spec = _tpen_importlib.spec_from_file_location(
+        "_tpen_study_imports",
+        _TpenPath(__file__).resolve().parents[3] / "experiments" / "toolkit" / "study_imports.py",
+    )
+    _tpen_module = _tpen_importlib.module_from_spec(_tpen_spec)
+    _tpen_sys.modules["_tpen_study_imports"] = _tpen_module
+    _tpen_spec.loader.exec_module(_tpen_module)
+sibling = _tpen_sys.modules["_tpen_study_imports"].sibling
+
+json_io = sibling(__file__, 'utils.io')
+layout = sibling(__file__, 'utils.layout')
+launch = _load_script("launch")
 plan = _load_script("plan")
 train = _load_script("train")
 collect = _load_script("collect")
 select_champions = _load_script("select_champions")
 final_plan = _load_script("final_plan")
-final_train = _load_script("final_train", bind_direct=True)
+final_train = _load_script("final_train")
 final_eval = _load_script("final_eval")
 final_collect = _load_script("final_collect")
 final_report = _load_script("final_report")
@@ -2139,21 +2159,22 @@ def test_train_config_writes_only_the_terminal_checkpoint() -> None:
     entries = _callback_entries("train.yaml")
     checkpoints = [entry for entry in entries if entry["_target_"] == "tpen.callback.Checkpoint"]
 
-    # One entry owns both writes, and it must carry no `every_n_steps`: the
-    # cadence gate is shared with the terminal write, so a cadence suppresses the
-    # terminal checkpoint whenever max_steps is not a multiple of it. Periodic
-    # writes are therefore off and the terminal write is unconditional -- the
-    # opposite of v3, which kept a periodic entry alongside the final one.
+    # One composed entry owns both writes. Its explicit TerminalOnly schedule
+    # leaves periodic writes off and always admits the terminal boundary.
     assert len(checkpoints) == 1
     checkpoint = checkpoints[0]
     assert checkpoint["periodic"] == "${checkpoint.periodic}"
     assert checkpoint["terminal"] == "${checkpoint.terminal}"
+    assert checkpoint["schedule"] == "${checkpoint.schedule}"
+    assert checkpoint["payload"] == "${checkpoint.payload}"
     assert checkpoint["keep_last"] == "${checkpoint.keep_last}"
     assert "every_n_steps" not in checkpoint
 
     config = OmegaConf.load(CONFIGS / "train.yaml")
     assert config.checkpoint.periodic is False
     assert config.checkpoint.terminal is True
+    assert config.checkpoint.schedule["_target_"] == "tpen.checkpoint.TerminalOnly"
+    assert config.checkpoint.payload["_target_"] == "tpen.checkpoint.TrainResume"
 
 
 def test_validation_config_wires_profiling_callbacks() -> None:

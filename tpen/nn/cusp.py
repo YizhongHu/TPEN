@@ -12,6 +12,12 @@ curvature term carries the electron-nucleus counterpart of
 `ElectronElectronCusp`'s trainable ``range_parameter``; its outer-tail
 consequence is stated on the class and is executable through
 `CurvatureElectronNucleusCuspLaw.outer_tail_slope`.
+
+`TailSafeElectronNucleusCuspLaw` is the same functional form under a different
+coordinate system, ``c = d (Z - kappa)``, chosen so the outer radial slope is
+``-kappa < 0`` for EVERY nucleus rather than only where a caller remembers to
+keep ``c/d < Z``. The two laws store disjoint parameter names on purpose, so a
+checkpoint written by one cannot be reinterpreted by the other.
 """
 
 from __future__ import annotations
@@ -285,9 +291,19 @@ class CurvatureElectronNucleusCuspLaw(nn.Module, ElectronNucleusCuspLaw):
       so outer-tail tolerances calibrated against the pure ``-Z r`` law
       must not be applied unchanged to a trained curvature law.
     - A decaying (normalizable) tail needs a negative slope, i.e.
-      ``c / d < Z_A``. This class does not enforce that bound; a caller that
-      trains ``c`` and ``d`` owns choosing an initialization, and if needed a
-      constraint, that keeps ``c / d`` well below the nuclear charge.
+      ``c / d < Z_A``. **THIS CLASS DOES NOT ENFORCE THAT BOUND, so its tail is
+      unbounded and training can walk across the sign change into a growing,
+      non-normalizable tail with nothing raising.** A caller that trains ``c``
+      and ``d`` owns choosing an initialization, and if needed a constraint,
+      that keeps ``c / d`` well below the nuclear charge.
+
+      If you do not specifically need this law's unconstrained sign, prefer
+      `TailSafeElectronNucleusCuspLaw`, which coordinates the same functional
+      form as ``c = d (Z - kappa)`` so the outer slope is ``-kappa < 0`` for
+      every nucleus by construction. The bound there is structural rather than
+      a caller's responsibility. Stated here, at the point of use, because a
+      reader who lands on this class should learn its limit without opening
+      anything else.
 
     Gradient reachability, which matters when enabling training from a config:
     ``d`` enters the value only through ``w_A``, so at exactly ``c = 0`` the
@@ -429,6 +445,395 @@ class CurvatureElectronNucleusCuspLaw(nn.Module, ElectronNucleusCuspLaw):
         if self.trainable:
             scalars["raw_curvature_coefficient"] = float(self.raw_curvature_coefficient.item())
             scalars["raw_curvature_range"] = float(self.raw_curvature_range.item())
+        return scalars
+
+
+class TailSafeElectronNucleusCuspLaw(nn.Module, ElectronNucleusCuspLaw):
+    r"""Curved Kato law whose outer tail is guaranteed decaying, for every nucleus.
+
+    NAME STATES THE PROPERTY, NOT THE VERSION. What distinguishes this from
+    `CurvatureElectronNucleusCuspLaw` is not that it is newer -- it is that its
+    asymptotic slope cannot come out non-decaying, whatever the optimizer does
+    and whatever the nuclear charge is. Choose between the two on that fact
+    alone; neither name needs a changelog to disambiguate.
+
+    Same functional form as `CurvatureElectronNucleusCuspLaw`,
+    ``v_A(r) = -Z_A r + c_A r^2 / (1 + d r)``, but coordinated differently:
+
+    .. math::
+
+        d      &= \varepsilon + \mathrm{softplus}(\tilde{d}) \\
+        \kappa &= m + \mathrm{softplus}(\tilde{\kappa}) \\
+        c_A    &= d \, (Z_A - \kappa)
+
+    with ``eps = 1e-12`` and margin ``m = 0.1`` by default. Both ``d`` and
+    ``kappa`` are trainable; ``c`` is DERIVED and is never stored.
+
+    **Why the tail is safe.** The old law's outer slope is ``-Z_A + c/d``,
+    which is negative only while ``c/d < Z_A`` -- a bound that law records but
+    does not enforce, so training can walk across it and produce a
+    non-normalizable, growing tail. Substituting ``c_A = d (Z_A - kappa)``
+    gives ``c_A / d = Z_A - kappa`` and therefore
+
+        outer slope = ``-Z_A + (Z_A - kappa)`` = ``-kappa``
+
+    identically. Since ``kappa >= m > 0`` by construction, the slope is
+    strictly negative for EVERY nucleus regardless of its charge, at every
+    point in training. The bound is structural, not a constraint a caller has
+    to remember.
+
+    **Why ``c`` is derived per charge rather than stored.** ``kappa = Z - c/d``
+    depends on the charge, so a single stored ``c`` can only be tail-safe for
+    one ``Z``. The consolidated authority's expression for helium is
+    ``c = d (2 - kappa)``, where the ``2`` is the NUCLEAR CHARGE and not a
+    literal -- see ``theory-report-2026-08-31``, "Let kappa = Z - c/d".
+    Hardcoding it would ship a helium-only law that silently mis-scales on any
+    other atom. `curvature_coefficient` therefore takes ``charges``, and every
+    caller that already receives charges gets the right ``c`` for free.
+
+    **The margin ``m`` is a design choice, not a measurement.** It is a
+    conservative positive floor keeping ``kappa`` away from zero, chosen by the
+    designer. It is NOT a learned physical decay constant and must not be
+    reported as one; the learned quantity is ``kappa`` itself, which is free
+    above the floor.
+
+    **Identifiability of the range parameter.** Differentiating the value with
+    respect to ``d`` gives, after the two terms combine,
+
+    .. math::
+
+        \frac{\partial v_A}{\partial d}
+            = (Z_A - \kappa) \frac{r^2}{(1 + d r)^2}
+            = \frac{c_A}{d} \frac{r^2}{(1 + d r)^2},
+
+    since ``c_A = d (Z_A - kappa)`` by definition. Every path by which ``d``
+    reaches the value carries that factor, so **the gradient on the range
+    parameter is proportional to** ``c/d``.
+
+    This is an IDENTIFIABILITY LIMIT, not a defect and not a property of any
+    particular ``kappa``. As ``c -> 0`` the term ``c r^2 / (1 + d r)`` vanishes
+    and ``d`` is shaping something that is not there, so a small curvature
+    coefficient and a well-conditioned range cannot be had at the same time --
+    in this parametrization or in the ``(c, d)`` one, which is the same
+    function. Anything that "fixes" the conditioning by moving ``kappa`` has
+    moved ``c``, because they are the same fact.
+
+    Concretely, the he-importance control level sits at ``c/d = 0.01``, so
+    ``d``'s gradient there is a hundredth of its value at ``c/d = 1``. That
+    factor is exact. What it implies for LEARNABILITY is a separate and
+    unmeasured question: `torch.optim.Adam` divides by ``sqrt(v)`` and is
+    scale-invariant per parameter in the deterministic limit, so a uniformly
+    smaller gradient does not give a proportionally smaller step. The real
+    exposure is signal-to-noise -- a suppressed signal against unchanged
+    sampling noise makes ``d`` random-walk rather than descend -- and no
+    measurement here establishes where that boundary lies.
+
+    **Migration is refused, structurally.** This class stores ``raw_range`` and
+    ``raw_kappa``. `CurvatureElectronNucleusCuspLaw` stores
+    ``raw_curvature_coefficient`` and ``raw_curvature_range``. The key sets are
+    DISJOINT and the class names differ, so an old checkpoint cannot be
+    reinterpreted in the new coordinates by accident -- there is no version tag
+    for a reader to overlook. `_load_from_state_dict` additionally raises a
+    named error when it sees the old keys, so the failure explains the
+    migration instead of surfacing as an opaque unexpected-key list.
+
+    That disjointness is what makes the refusal reliable. The old law
+    contributes NOTHING to the state dict when ``trainable=False`` (its
+    coordinates are non-persistent buffers), so absence of keys is not evidence
+    of format, and any scheme that tried to tell the two apart by inspecting
+    stored bytes alone would be undecidable for the frozen case.
+
+    Parameters
+    ----------
+    curvature_range : float, optional
+        Initial ``d``. Must be positive.
+    tail_slope : float, optional
+        Initial ``kappa``, the magnitude of the outer radial slope. Must exceed
+        `tail_slope_margin`. The resulting outer slope is ``-tail_slope``.
+    trainable : bool, optional
+        Whether ``d`` and ``kappa`` are optimized. When ``False`` they are
+        fixed non-persistent buffers and this module contributes no checkpoint
+        state.
+    range_eps : float, optional
+        Positivity offset for ``d``.
+    tail_slope_margin : float, optional
+        The floor ``m`` below which ``kappa`` cannot fall. Positive.
+
+    See Also
+    --------
+    CurvatureElectronNucleusCuspLaw : the unconstrained-sign predecessor, whose
+        tail is NOT bounded.
+    """
+
+    def __init__(
+        self,
+        curvature_range: float = 1.0,
+        tail_slope: float = 1.0,
+        trainable: bool = True,
+        range_eps: float = 1e-12,
+        tail_slope_margin: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if curvature_range <= 0.0:
+            raise ValueError(f"curvature_range must be positive, got {curvature_range}")
+        if tail_slope_margin <= 0.0:
+            raise ValueError(f"tail_slope_margin must be positive, got {tail_slope_margin}")
+        if tail_slope <= tail_slope_margin:
+            raise ValueError(
+                f"tail_slope must exceed tail_slope_margin, got {tail_slope} <= {tail_slope_margin}. "
+                "The margin is the floor the parametrization enforces, so a requested value at or "
+                "below it is not representable and is refused rather than silently clamped"
+            )
+        self.trainable = bool(trainable)
+        self.range_eps = float(range_eps)
+        self.tail_slope_margin = float(tail_slope_margin)
+        if self.trainable:
+            self.raw_range = nn.Parameter(_inverse_softplus(float(curvature_range) - self.range_eps))
+            self.raw_kappa = nn.Parameter(_inverse_softplus(float(tail_slope) - self.tail_slope_margin))
+        else:
+            self.register_buffer(
+                "_range",
+                torch.tensor(float(curvature_range), dtype=torch.float64),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_kappa",
+                torch.tensor(float(tail_slope), dtype=torch.float64),
+                persistent=False,
+            )
+
+    @classmethod
+    def from_curvature_coefficient(
+        cls,
+        curvature_coefficient: float,
+        curvature_range: float,
+        charge: float,
+        **kwargs: object,
+    ) -> "TailSafeElectronNucleusCuspLaw":
+        """Build the law by INVERTING a requested ``(c, d)`` at a given charge.
+
+        The migration path for a caller that thinks in the old coordinates.
+        ``kappa = Z - c / d`` is the exact inverse of the forward map, so the
+        constructed law reproduces the requested ``c`` at that charge.
+
+        Parameters
+        ----------
+        curvature_coefficient : float
+            The requested ``c``.
+        curvature_range : float
+            The requested ``d``. Must be positive.
+        charge : float
+            The nuclear charge ``Z`` at which ``c`` was specified. REQUIRED,
+            because ``c`` alone does not determine ``kappa``.
+        **kwargs : object
+            Forwarded to ``__init__`` (``trainable``, ``range_eps``,
+            ``tail_slope_margin``).
+
+        Returns
+        -------
+        TailSafeElectronNucleusCuspLaw
+
+        Raises
+        ------
+        ValueError
+            When the request is not representable, i.e. ``Z - c/d`` does not
+            exceed the margin. That is exactly the region the old law permitted
+            and this one forbids -- a tail that decays too slowly or not at
+            all. It RAISES rather than clamping, because silently returning a
+            different law than the one asked for is how a mis-migrated
+            checkpoint would go unnoticed.
+        """
+
+        if curvature_range <= 0.0:
+            raise ValueError(f"curvature_range must be positive, got {curvature_range}")
+        tail_slope = float(charge) - float(curvature_coefficient) / float(curvature_range)
+        margin = float(kwargs.get("tail_slope_margin", 0.1))
+        if tail_slope <= margin:
+            raise ValueError(
+                f"c={curvature_coefficient} and d={curvature_range} at Z={charge} give "
+                f"kappa = Z - c/d = {tail_slope}, which does not exceed the margin {margin}. "
+                "That request is not tail-safe: the old law permitted it, this law refuses it. "
+                "Choose a smaller c/d ratio rather than lowering the margin"
+            )
+        return cls(curvature_range=curvature_range, tail_slope=tail_slope, **kwargs)  # type: ignore[arg-type]
+
+    @property
+    def curvature_range(self) -> torch.Tensor:
+        """Return the positive range parameter ``d``."""
+
+        if self.trainable:
+            return F.softplus(self.raw_range) + self.range_eps
+        return self._range
+
+    @property
+    def tail_slope_magnitude(self) -> torch.Tensor:
+        """Return ``kappa``, the magnitude of the outer radial slope."""
+
+        if self.trainable:
+            return F.softplus(self.raw_kappa) + self.tail_slope_margin
+        return self._kappa
+
+    def curvature_coefficient(self, charges: torch.Tensor | float) -> torch.Tensor:
+        """Return ``c_A = d (Z_A - kappa)``, one value per charge.
+
+        Unlike `CurvatureElectronNucleusCuspLaw.curvature_coefficient`, this is
+        a METHOD taking charges rather than a stored property, because ``c``
+        depends on the charge. That difference is deliberate and is what stops
+        the law being helium-only.
+
+        Parameters
+        ----------
+        charges : torch.Tensor or float
+            Nuclear charges ``Z``.
+
+        Returns
+        -------
+        torch.Tensor
+            ``c`` with the shape of `charges`.
+        """
+
+        charge_tensor = torch.as_tensor(charges)
+        if not torch.is_floating_point(charge_tensor):
+            charge_tensor = charge_tensor.to(dtype=torch.get_default_dtype())
+        range_parameter = self.curvature_range.to(
+            device=charge_tensor.device, dtype=charge_tensor.dtype
+        )
+        kappa = self.tail_slope_magnitude.to(
+            device=charge_tensor.device, dtype=charge_tensor.dtype
+        )
+        return range_parameter * (charge_tensor - kappa)
+
+    def outer_tail_slope(self, charges: torch.Tensor | float) -> torch.Tensor:
+        """Return the large-``r`` limit of ``d/dr v_A``, which is ``-kappa``.
+
+        Charge-INDEPENDENT by construction, which is the whole point: the
+        predecessor's ``-Z + c/d`` varies with the nucleus and can change sign,
+        while this is ``-kappa < 0`` for every nucleus in the system.
+
+        Computed through `curvature_coefficient` rather than by returning
+        ``-kappa`` directly, so the identity ``-Z + c/d == -kappa`` is
+        EXERCISED on the real code path instead of asserted in a docstring. A
+        future edit that broke the relation would show up here rather than
+        remaining hidden behind a shortcut.
+
+        Parameters
+        ----------
+        charges : torch.Tensor or float
+            Nuclear charges ``Z``.
+
+        Returns
+        -------
+        torch.Tensor
+            Asymptotic radial slope with the shape of `charges`.
+        """
+
+        charge_tensor = torch.as_tensor(charges)
+        if not torch.is_floating_point(charge_tensor):
+            charge_tensor = charge_tensor.to(dtype=torch.get_default_dtype())
+        coefficient = self.curvature_coefficient(charge_tensor)
+        range_parameter = self.curvature_range.to(
+            device=charge_tensor.device, dtype=charge_tensor.dtype
+        )
+        return -charge_tensor + coefficient / range_parameter
+
+    def value(self, distance: torch.Tensor, charges: torch.Tensor) -> torch.Tensor:
+        """Return ``-Z r + c(Z) r^2 / (1 + d r)`` broadcast to `distance`."""
+
+        linear = -charges * distance
+        coefficient = self.curvature_coefficient(charges).to(
+            device=distance.device, dtype=distance.dtype
+        )
+        range_parameter = self.curvature_range.to(device=distance.device, dtype=distance.dtype)
+        curvature = coefficient * distance.square() / (1.0 + range_parameter * distance)
+        return linear + curvature
+
+    def analytic_terms(self, distance: torch.Tensor, charges: torch.Tensor):
+        """Return closed-form radial derivatives and the cancelled residual."""
+
+        coefficient = self.curvature_coefficient(charges).to(
+            device=distance.device, dtype=distance.dtype
+        )
+        range_parameter = self.curvature_range.to(device=distance.device, dtype=distance.dtype)
+        denominator = 1.0 + range_parameter * distance
+        value = self.value(distance, charges)
+        first = -charges + coefficient * distance * (2.0 + range_parameter * distance) / denominator.square()
+        second = 2.0 * coefficient / denominator.pow(3)
+        # This is deliberately algebraically cancelled; never form (first + Z) / r.
+        residual = coefficient * (2.0 + range_parameter * distance) / denominator.square()
+        return value, first, second, residual
+
+    def origin_radial_slope(self, charges: torch.Tensor) -> torch.Tensor:
+        """Return the charge-fixed slope independently of the value expression.
+
+        Unchanged from the predecessor: the curvature term still contributes
+        only from second order, so ``d/dr v_A(0) = -Z_A`` exactly, for any
+        ``d`` and ``kappa``.
+        """
+
+        return -charges
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        """Refuse an old-coordinate checkpoint by name rather than by symptom.
+
+        Raises unconditionally when legacy keys are present, INCLUDING under
+        ``strict=False``, where the default behaviour would be to ignore them
+        silently and leave this law at its freshly initialized values. A
+        wavefunction quietly restored to the wrong parameters is precisely the
+        ambiguous migration this slice exists to prevent, and it would produce
+        plausible numbers rather than an error.
+        """
+
+        legacy = [
+            name
+            for name in ("raw_curvature_coefficient", "raw_curvature_range")
+            if prefix + name in state_dict
+        ]
+        if legacy:
+            raise RuntimeError(
+                f"{type(self).__name__} at prefix {prefix!r} was given "
+                f"{sorted(legacy)}, which belong to CurvatureElectronNucleusCuspLaw. "
+                "The two laws use different coordinates: this one stores 'raw_range' and "
+                "'raw_kappa' and derives c = d * (Z - kappa) per charge, so the old raw "
+                "values have no meaning here and are refused rather than reinterpreted. "
+                "To carry an old checkpoint forward, rebuild the law with "
+                "TailSafeElectronNucleusCuspLaw.from_curvature_coefficient(c, d, charge), "
+                "which inverts the request exactly and raises if it was never tail-safe"
+            )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def scalar_diagnostics(self) -> dict[str, float]:
+        """Return the constrained coordinates with their raws beside them.
+
+        ``c`` is deliberately ABSENT: it is charge-dependent, so there is no
+        single value to report here, and emitting one would reintroduce the
+        helium-only reading this parametrization removes. Read it through
+        `curvature_coefficient` with the charges in hand.
+        """
+
+        scalars = {
+            "curvature_range": float(self.curvature_range.item()),
+            "tail_slope_magnitude": float(self.tail_slope_magnitude.item()),
+        }
+        if self.trainable:
+            scalars["raw_range"] = float(self.raw_range.item())
+            scalars["raw_kappa"] = float(self.raw_kappa.item())
         return scalars
 
 
@@ -676,5 +1081,6 @@ __all__ = [
     "ElectronNucleusCuspLaw",
     "LinearElectronNucleusCuspLaw",
     "CurvatureElectronNucleusCuspLaw",
+    "TailSafeElectronNucleusCuspLaw",
     "rational_pair_cusp",
 ]

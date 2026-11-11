@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from tpen.artifacts import RunContext
+from tpen.durable_append import append_record
 from tpen.evaluation.events import ComponentFailed, EvaluationTaskRun
 from tpen.evaluation.state import EvaluationRunState
 from tpen.events import DomainState, Ended
@@ -182,10 +183,7 @@ class FailureLog(Callback):
         self._append(context, event.failure.to_dict())
 
     def _append(self, context: RunContext, failure: dict[str, Any]) -> None:
-        path = self._path(context)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(failure, sort_keys=True) + "\n")
+        append_record(self._path(context), json.dumps(failure, sort_keys=True))
 
     def _path(self, context: RunContext) -> Path:
         if self.path is not None:

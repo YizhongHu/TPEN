@@ -10,6 +10,7 @@ import torch
 from tpen.data.batch import WavefunctionOutput
 from tpen.events import TrainingTiming, TrainingTimingState
 from tpen.sampling.stats import SamplerStats
+from tpen.training.update import VMCUpdateState
 
 
 @dataclass
@@ -44,7 +45,11 @@ class TrainerState(TrainingTimingState):
     model : Any, optional
         Wavefunction model being optimized.
     optimizer : Any, optional
-        Optimizer driving the model parameters.
+        Compatibility reference to the optimizer in ``update_state``.
+    update_state : VMCUpdateState or None, optional
+        The single typed update-state authority used by the trainer.  The
+        compatibility ``optimizer`` field is always the same object when this
+        field is populated.
     trainer : Any, optional
         Trainer object owning train-loop progress state.
     sampler : Any, optional
@@ -55,6 +60,9 @@ class TrainerState(TrainingTimingState):
         Most recent electron batch.
     local_energy : Any, optional
         Most recent per-sample local energy (detached).
+    local_energy_terms : mapping of str to Any or None, optional
+        Per-term local energies from the same evaluation as ``local_energy``.
+        ``None`` means the trainer was not configured to return terms.
     loss : torch.Tensor or None, optional
         Most recent surrogate loss (detached).
     wavefunction_output : WavefunctionOutput or None, optional
@@ -78,11 +86,13 @@ class TrainerState(TrainingTimingState):
     optimizer_step: bool = False
     model: Any = None
     optimizer: Any = None
+    update_state: VMCUpdateState | None = None
     trainer: Any = None
     sampler: Any = None
     samples: Any = None
     batch: Any = None
     local_energy: Any = None
+    local_energy_terms: dict[str, Any] | None = None
     loss: torch.Tensor | None = None
     wavefunction_output: WavefunctionOutput | None = None
     sampler_stats: SamplerStats | None = None

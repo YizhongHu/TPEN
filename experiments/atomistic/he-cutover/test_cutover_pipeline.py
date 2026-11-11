@@ -6,8 +6,30 @@ from pathlib import Path
 
 import pytest
 
-import cutover_plan
-import pipeline
+# Siblings are loaded study-scoped, not by bare import: experiments/ has several
+# same-named modules and the first study loaded would otherwise own the bare name
+# for every study after it. See experiments/toolkit/study_imports.py.
+#
+# The loader is reached BY PATH rather than by putting the repository root on
+# sys.path. A study directory that mutates sys.path is the mechanism behind the
+# very defect this import exists to fix, and he-cutover's gateway test forbids it
+# outright -- so the fix must not reintroduce it in order to install itself.
+import importlib.util as _tpen_importlib  # noqa: E402
+import sys as _tpen_sys  # noqa: E402
+from pathlib import Path as _TpenPath  # noqa: E402
+
+if "_tpen_study_imports" not in _tpen_sys.modules:
+    _tpen_spec = _tpen_importlib.spec_from_file_location(
+        "_tpen_study_imports",
+        _TpenPath(__file__).resolve().parents[3] / "experiments" / "toolkit" / "study_imports.py",
+    )
+    _tpen_module = _tpen_importlib.module_from_spec(_tpen_spec)
+    _tpen_sys.modules["_tpen_study_imports"] = _tpen_module
+    _tpen_spec.loader.exec_module(_tpen_module)
+sibling = _tpen_sys.modules["_tpen_study_imports"].sibling
+
+cutover_plan = sibling(__file__, 'cutover_plan')
+pipeline = sibling(__file__, 'pipeline')
 from experiments.toolkit.dispatch import DispatchRecord
 from experiments.toolkit.parsl_attach import validate_pbs_nodefile
 
@@ -132,6 +154,8 @@ def test_pipeline_orders_probe_train_barrier_eval_and_verification_matches_exit(
     assert (code, verification["exit_code"], verification["complete"]) == (0, 0, True)
     assert (tmp_path / "launch/02_train/dispatch_specs.jsonl").is_file()
     assert (tmp_path / "launch/03_eval/dispatch_specs.jsonl").is_file()
+    assert json.loads((tmp_path / "launch/02_train/executor_input.json").read_text())["schema"] == "tpen-executor/ready-group-v1"
+    assert json.loads((tmp_path / "launch/03_eval/executor_input.json").read_text())["schema"] == "tpen-executor/ready-group-v1"
 
 
 def test_preflight_failure_prevents_all_science_and_is_truthful(tmp_path: Path) -> None:

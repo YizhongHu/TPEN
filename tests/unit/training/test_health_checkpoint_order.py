@@ -48,6 +48,8 @@ from typing import Any
 import pytest
 import torch
 import yaml
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
 from torch import nn
 
 from tpen.callback import Checkpoint, DataIntegrity
@@ -73,7 +75,7 @@ _DATA_INTEGRITY = "tpen.callback.DataIntegrity"
 _CHECKPOINT = "tpen.callback.Checkpoint"
 
 # The failing loop step and the durable counters it carries. `completed_updates`
-# is a multiple of the config's `every_n_steps: 5`, so the periodic write is
+# is a multiple of the config's `schedule.every_n: 5`, so the periodic write is
 # genuinely eligible -- without that this test would pass for the wrong reason.
 FAILING_STEP = 4
 NEXT_ITERATION = 5
@@ -176,6 +178,8 @@ def _callbacks(
         data_integrity["max_nonfinite_logabs_fraction"] = -1.0
     checkpoint = dict(entries[_CHECKPOINT])
     checkpoint["output_dir"] = checkpoint_dir
+    checkpoint["schedule"] = instantiate(OmegaConf.create(checkpoint["schedule"]))
+    checkpoint["payload"] = instantiate(OmegaConf.create(checkpoint["payload"]))
 
     build = {
         _DATA_INTEGRITY: lambda: DataIntegrity(**data_integrity),

@@ -1,8 +1,8 @@
 # Fixture for the durable `events.jsonl` boundary-sequence test.
 #
-# Deliberately minimal in its callback battery: the only wired callbacks are the
-# two `Checkpoint` writers, and they are here solely to produce the checkpoints
-# the resume run and the evaluation run restore from. `events.jsonl` is written
+# Deliberately minimal in its callback battery: the only wired callback is one
+# composed `Checkpoint` stream, solely to produce the checkpoints the resume run
+# and the evaluation run restore from. `events.jsonl` is written
 # by `RunContext.emit_event` itself, not by any callback, so the asserted event
 # sequence stays independent of whichever callbacks a real run configures.
 #
@@ -70,13 +70,14 @@ trainer:
   log_every_n_steps: 1
   return_terms: false
 callbacks:
-# Cadence 2 over applied updates writes one mid-run checkpoint, at
-# `next_iteration == 2`; the terminal writer adds `next_iteration == 3`. The
-# resume run restores the mid-run one so it still has an iteration left to run.
+# One composed stream uses cadence 2 for periodic publication and always writes
+# its terminal boundary. It writes one mid-run checkpoint at `next_iteration ==
+# 2` and its terminal checkpoint at `next_iteration == 3`. The resume run
+# restores the mid-run one so it still has an iteration left to run.
 - _target_: tpen.callback.Checkpoint
-  terminal: false
-  every_n_steps: 2
-  output_dir: ${run.dir}/checkpoints
-- _target_: tpen.callback.Checkpoint
-  periodic: false
+  schedule:
+    _target_: tpen.checkpoint.EveryNUpdates
+    every_n: 2
+  payload:
+    _target_: tpen.checkpoint.TrainResume
   output_dir: ${run.dir}/checkpoints

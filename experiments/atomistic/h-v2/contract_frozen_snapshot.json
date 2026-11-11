@@ -1,0 +1,956 @@
+{
+  "schema": "tpen.h-v2.scientific-contract/v2",
+  "study": {
+    "name": "H-v2",
+    "system": "atomic hydrogen",
+    "electron_count": 1,
+    "nuclear_charge": 1,
+    "exact_ground_energy_hartree": -0.5,
+    "excluded_systems": [
+      "molecular hydrogen",
+      "Hooke's atom"
+    ]
+  },
+  "source_identity": {
+    "comparison_commit": "67beab2095cc987eb044abceeecfdb549a5793fb",
+    "comparison_paths": [
+      "experiments/atomistic/he-v1/README.md",
+      "experiments/atomistic/he-v1/configs/production_grid.yaml",
+      "experiments/atomistic/he-v1/collect.py",
+      "experiments/atomistic/he-v1/report.py"
+    ],
+    "historical_evidence": [
+      {
+        "path": "/Users/yizhonghu/he-v1-independent-report-20260823/REPORT.md",
+        "kind": "historical training and collection report"
+      },
+      {
+        "path": "/Users/yizhonghu/he-v1-independent-report-20260823/data/block_statistics.csv",
+        "kind": "historical 5k-block training statistics"
+      },
+      {
+        "path": "TO:7e47ec15 corrected He-v1 collection receipt",
+        "kind": "immutable run identity"
+      },
+      {
+        "path": "TO:2421a447 diagnosis-results",
+        "kind": "historical onset summary"
+      },
+      {
+        "path": "TO:fcc7c2c7 authorized-tail-curvature-result-2026-08-31",
+        "kind": "historical fresh-evaluation tail evidence"
+      },
+      {
+        "path": "TO:97f9d143 tail-class-gate-unsettles-the-founding-claim-2026-09-01",
+        "kind": "historical correction"
+      },
+      {
+        "path": "TO:30c6b2cf tail-index-domain-and-fork-addendum-2026-08-31",
+        "kind": "historical correction"
+      }
+    ],
+    "current_grid_warning": "The production_grid.yaml at 67beab2095cc987eb044abceeecfdb549a5793fb names a current 100k/200k/300k plan; it is not the executed historical 25k/50k plan.",
+    "historical_identifiers": {
+      "training_run": {
+        "value": "train-seed0000",
+        "source": "REPORT.md line 5",
+        "independently_checked": true
+      },
+      "training_slurm_job": {
+        "value": "40907434",
+        "source": "REPORT.md line 5",
+        "independently_checked": true
+      },
+      "training_source_commit": {
+        "value": "418accf153368aab45586dc2a2cc97c18472691c",
+        "source": "REPORT.md line 5",
+        "independently_checked": true
+      },
+      "checkpoint_50k_sha256": {
+        "value": "9a8acc0e6f2ca86c405880ce5a43c322bfddb4352315c692e257aced7b0d07d7",
+        "source": "REPORT.md lines 44,313",
+        "independently_checked": true
+      },
+      "evaluation_run": {
+        "value": "tpen-f4-eval42-78152c40-20260826T194602--0400",
+        "source": "TO:2421a447 diagnosis-results/cannon-execution, mechanically extracted by MCP query_notes",
+        "independently_checked": true
+      },
+      "collection_run": {
+        "value": "f4-collect-20260828T0100--0400",
+        "source": "TO:0e471630 acceptance-contract/implementation-receipt, mechanically extracted by MCP query_notes",
+        "independently_checked": true
+      },
+      "diagnosis_report_sha256": {
+        "value": "4ce7c166f4c9777019c948bed0b3ae22150106c6ea8bb376048f65eec2f5275a",
+        "source": "TO:2421a447 diagnosis-results, mechanically extracted by MCP query_notes",
+        "independently_checked": true
+      }
+    }
+  },
+  "measurement": {
+    "estimand": "tail-sensitive local-energy dispersion profile over complete draw-by-walker records from a fresh evaluation of a frozen checkpoint",
+    "primary_statistic": "W = the 99.9th percentile of A = abs(E_L - median(E_L)), computed on the complete retained draw-by-walker grid",
+    "primary_dispersion": [
+      "W_99_9",
+      "high_quantiles",
+      "exceedance_probabilities",
+      "positive_and_negative_survival_curves"
+    ],
+    "secondary_dispersion": [
+      "median_absolute_deviation",
+      "median",
+      "IQR",
+      "sample_variance"
+    ],
+    "fixed_exceedance_thresholds_hartree": [
+      0.01,
+      0.05,
+      0.1,
+      0.5,
+      1
+    ],
+    "energy_error_profile": "Also report quantiles and exceedance probabilities for abs(E_L + 0.5 Ha) and the signed median energy error.",
+    "complete_record_rule": "Every planned draw-by-walker record appears exactly once with finite coordinates and local energy, reconciled source/checkpoint/config/schema identities, and no clipping, filtering, replacement, final-draw shortcut, or pooled partial window.",
+    "checkpoint_retention": {
+      "status": "decided",
+      "decided_by": "operator-decisions-logging-module-checkpoints-20261106d, 2026-11-06, quoted '27 makes sense. especially if evaluation is expensive' (confirming the 51-retained/27-evaluated split)",
+      "updates": "0 and every 1000 completed optimizer updates through 50000 inclusive",
+      "count_per_lineage": 51,
+      "payload": "full available resume payload and committed publication identity; retention does not authorize resume, retry, or reselection",
+      "historical_basis": "TO:bfb2247e operator-recommendations-accepted-and-horizon-2026-09-04 is evidence for the 1000-update target, not a fresh operator quote"
+    },
+    "evaluated_checkpoints": {
+      "status": "decided",
+      "decided_by": "operator-decisions-logging-module-checkpoints-20261106d, 2026-11-06, quoted '27 makes sense. especially if evaluation is expensive'",
+      "updates": [
+        0,
+        1000,
+        2000,
+        3000,
+        4000,
+        5000,
+        6000,
+        7000,
+        8000,
+        9000,
+        10000,
+        11000,
+        12000,
+        13000,
+        14000,
+        15000,
+        16000,
+        17000,
+        18000,
+        19000,
+        20000,
+        25000,
+        30000,
+        35000,
+        40000,
+        45000,
+        50000
+      ],
+      "count_per_lineage": 27,
+      "distinction": "The evaluated set is a subset of the retained set; unevaluated retained checkpoints are not post-result primary selections."
+    },
+    "tail_rule": {
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 item 2 on fffc313a ('same as above', delegated), lane decision primary-measure-and-margins-decision-20261107 on 8a67671f: beta/xi are held-out context diagnostics, never gating",
+      "diagnostic": "Direct W, quantile, and exceedance profiles are primary. Held-out beta survival-slope curvature and calibrated generalized-Pareto xi are interpretation diagnostics, never replaced by a Hill class declaration.",
+      "tail_fractions": [
+        0.1,
+        0.05,
+        0.02,
+        0.01,
+        0.005,
+        0.002,
+        0.001
+      ],
+      "prefixes": [
+        0.25,
+        0.5,
+        1
+      ],
+      "admissibility": "At least 200 held-out exceedances from 50 distinct walkers, finite ordered thresholds, complete identities, and qualified dependence; three adjacent supported intervals at half/full prefixes and common shallower support at quarter prefix.",
+      "stability": "Proposed relative beta drift <= 0.20 and absolute xi drift <= 0.10 with compatible whole-walker uncertainty intervals.",
+      "hill": "context_only",
+      "absence_or_inconclusive": "an absent or inconclusive gating diagnostic is never a pass",
+      "gating": {
+        "statistics": [
+          "W_99_9",
+          "high_quantiles",
+          "exceedance_probabilities"
+        ],
+        "admissibility": "complete records plus qualified dependence check"
+      },
+      "non_gating_interpretation": {
+        "statistics": [
+          "beta survival-slope curvature",
+          "generalized-Pareto xi",
+          "Hill"
+        ],
+        "drift_axis": "across held-out ordered draw prefixes 0.25, 0.5 and 1.0 and adjacent supported tail-fraction intervals",
+        "status": "interpretation only; an unresolved ultimate tail class does not by itself make the trajectory label unresolved"
+      }
+    },
+    "seed_roster": {
+      "training_initialization_seeds": [
+        73001,
+        73002,
+        73003
+      ],
+      "training_sampler_seeds": [
+        83001,
+        83002,
+        83003
+      ],
+      "evaluation_stream_seed_formula": "1000000 + 10000*lineage_index + 10*evaluated_checkpoint_ordinal + stream_index, with indices 0..2, 0..26, 0..3",
+      "disjointness": "Pilot/check seeds are excluded from science; no training, sampler, evaluation, or pilot seed may be reused across namespaces.",
+      "non_science_seed_namespaces": {
+        "pipeline_cpu_learned_e": {
+          "training": [
+            910001
+          ],
+          "sampler": [
+            910002
+          ],
+          "evaluation": [
+            910003,
+            910004
+          ]
+        },
+        "pipeline_gpu_smoke_g": {
+          "training": [
+            999002
+          ],
+          "sampler": [
+            999003
+          ],
+          "evaluation": [
+            999004
+          ]
+        },
+        "capacity_pilot": {
+          "training": [
+            999001
+          ],
+          "sampler": [
+            999005
+          ],
+          "evaluation_formula": "996000 + 10*pilot_checkpoint_ordinal + stream_index, with pilot_checkpoint_ordinal 0..20 (the 21 contract-evaluated checkpoints at or below 20,000 updates, measurement.evaluated_checkpoints.updates filtered <=20000) and stream_index 0..3 (measurement.fresh_evaluation.streams_per_checkpoint); disjoint from every other namespace and from the science evaluation_stream_seed_formula. Decided 2026-11-07, round-3 pre-review finding H2, accepted 2026-11-07, so the capacity_pilot.evaluation roster can seed every checkpoint x stream pair the pilot fresh-evaluates up to 20,000 updates (admission.pilot.length_updates_target), not only one basin triple.",
+          "evaluation": [
+            996000, 996001, 996002, 996003,
+            996010, 996011, 996012, 996013,
+            996020, 996021, 996022, 996023,
+            996030, 996031, 996032, 996033,
+            996040, 996041, 996042, 996043,
+            996050, 996051, 996052, 996053,
+            996060, 996061, 996062, 996063,
+            996070, 996071, 996072, 996073,
+            996080, 996081, 996082, 996083,
+            996090, 996091, 996092, 996093,
+            996100, 996101, 996102, 996103,
+            996110, 996111, 996112, 996113,
+            996120, 996121, 996122, 996123,
+            996130, 996131, 996132, 996133,
+            996140, 996141, 996142, 996143,
+            996150, 996151, 996152, 996153,
+            996160, 996161, 996162, 996163,
+            996170, 996171, 996172, 996173,
+            996180, 996181, 996182, 996183,
+            996190, 996191, 996192, 996193,
+            996200, 996201, 996202, 996203
+          ]
+        },
+        "sampler_tail_qualification": {
+          "sampler": [
+            940001,
+            940002
+          ],
+          "evaluation": [
+            940003,
+            940004
+          ]
+        },
+        "exact_canary": {
+          "evaluation": [
+            950001
+          ],
+          "note": "F6, operator-added scope on PR 600 2026-11-07: the exact-hydrogen evaluation canary (experiments/atomistic/h-v2/test_hydrogen_exact_canary.py and tests/integration/evaluation/test_hydrogen_exact_evaluation.py, configs exact_canary_eval.yaml and tests/integration/artifacts/hydrogen/exact_eval.yaml) previously reused non_science_seed_namespaces.pipeline_cpu_learned_e.evaluation[0] (910003) as a deliberate instrument-control replay. F6 gives it its own disjoint evaluation seed instead."
+        }
+      },
+      "consumed_outside_roster": [
+        {
+          "range": [910001, 910002],
+          "source": "amplitude-risk-spike-receipt on fa3c35a8",
+          "note": "deliberate replay of non_science_seed_namespaces.pipeline_cpu_learned_e, part (e) of the pipeline check; not a fresh collision"
+        },
+        {
+          "range": [910101, 910102],
+          "source": "amplitude-risk-spike-receipt on fa3c35a8"
+        },
+        {
+          "range": [920000, 920031],
+          "source": "amplitude-risk-spike-receipt on fa3c35a8"
+        },
+        {
+          "range": [930000, 930131],
+          "source": "amplitude-risk-spike-receipt on fa3c35a8"
+        }
+      ]
+    },
+    "fresh_evaluation": {
+      "streams_per_checkpoint": 4,
+      "walkers": 4096,
+      "draws_per_stream": 256,
+      "burn_in": 1000,
+      "stride": 20,
+      "stream_roles": {
+        "selection": [
+          0,
+          1
+        ],
+        "confirmation": [
+          2,
+          3
+        ]
+      },
+      "stream_design_decision": {
+        "status": "decided_2026-11-07",
+        "decided_by": "operator-review-contract-proposals-20261107 item 8 on fffc313a",
+        "decision": "Keep the four-stream select/confirm design above (streams 0/1 select the basin, streams 2/3 confirm it). The operator, quoted: '1 if it is not too difficult. it is ok to be a little scrappy since we are likely only doing this once. 2 otherwise. in that case I would do 5 streams for better data.'",
+        "fallback": "A two-stream pick-and-confirm design is permitted ONLY if the four-stream design proves too difficult to implement. If the fallback is used, the operator added 'I would do 5 streams for better data'; its exact layout must be confirmed with the operator through the manager before use, and is not predecided by this contract.",
+        "contract_text_unaffected": "This decision records the choice; it does not change streams_per_checkpoint, stream_roles, or any other numeric field above."
+      },
+      "estimator": {
+        "quantity": "W = P99.9(abs(E_L - per-stream median(E_L)))",
+        "grid": "each stream's full 4096 by 256 draw-by-walker grid",
+        "median": "computed independently per stream",
+        "order_statistic": "index ceil(0.999*N) of sorted deviations, no interpolation"
+      },
+      "uncertainty": {
+        "resampling_unit": "whole walker",
+        "minimum_resamples": 2000,
+        "simultaneous_band_level": 0.95
+      },
+      "zero_event_bound": "one-sided 97.5% Clopper-Pearson upper bound for the walker-level indicator that a walker has at least one exceedance, with n=4096 times the number of streams used"
+    },
+    "normalizability_gate": {
+      "outer_slope": "-1 + c/d",
+      "kappa_min": 0.5,
+      "condition": "outer slope <= -kappa_min at every checkpoint",
+      "violation": "checkpoint is unresolved; no records are filtered",
+      "exact_hydrogen_answer": "c=0"
+    },
+    "hydrogen_equivalent_tail_threshold": {
+      "status": "to_be_frozen_at_pilot",
+      "decided_by": "round-1 pre-review of operator-review-contract-proposals-20261107, finding F4, accepted 2026-11-07, option (B)",
+      "freeze_rule": "Quantile-matched at the pilot, before science, so the pilot's basin-window exceedance probability at this threshold is about 0.003, matching He-v1's p(>0.5 Ha) = 0.003 at its 25k fresh evaluation, its earliest fresh-evaluated checkpoint. Frozen once; never retuned after science outcomes are seen. If the pilot gate fails at this threshold, the F5 stop rule applies (decision has to return to the lane and the operator with the measured value as evidence); a failure is never grounds to retune the threshold, its margin, or its quantile after the number is seen.",
+      "margin_hartree": 0.002,
+      "role": "a third tail threshold in decision_rules.recurrence rule (i), alongside the fixed 0.5 Ha and 1 Ha tail thresholds",
+      "considered_alternative": "option (A), making rule (i) an active contradiction only (a tail-threshold decrease of at least its margin while W rises) -- not chosen because He-v1's own bulk exceedances fell while its W rose, which would make He-v1 itself unresolved under (A), the exact failure the directional rule was meant to fix"
+    },
+    "analytic_controls": {
+      "source": "independently coded standard-library scalar oracle",
+      "alpha_1_2": {
+        "pointwise_local_energy": "-alpha^2/2 + (alpha-1)/r",
+        "born_mean_hartree": -0.48,
+        "variance_hartree2": 0.0576,
+        "median_local_energy_hartree": -0.540498,
+        "w_p99_9_hartree": 2.339741,
+        "exceedance_probability_abs_deviation_gt_1_hartree": 0.008304,
+        "exceedance_probability_abs_deviation_gt_0_01_hartree": 0.926514
+      },
+      "alpha_1": {
+        "pointwise_local_energy_hartree": -0.5,
+        "w_p99_9_hartree": 0,
+        "all_fixed_threshold_exceedance_probabilities": 0
+      },
+      "instrument_requirement": "independent Gamma draws must reproduce W_exact within its own band; bootstrap must exercise the alpha=1 zero-event bound"
+    },
+    "amplitude_risk": {
+      "status": "definition_and_thresholds_decided",
+      "definition": "the fraction of samples whose logabs falls below the median of the finite logabs values minus a threshold, computed per training batch and per fresh-evaluation draw separately, plus the nonfinite-logabs count and the invalid-sign count",
+      "naming_rule": "never called a Pfaffian floor or a readout floor unless the pre-floor readout amplitude is itself deliberately measured",
+      "interpretation": "descriptive only; introduces no alarm and no science gate",
+      "decided_by": [
+        "operator-decision-amplitude-risk-threshold-20261106",
+        "amplitude-risk-decision-20261106",
+        "amplitude-risk-call-20261106"
+      ],
+      "thresholds": {
+        "frozen_tau": [-3, -4, -5, -7, -10],
+        "primary": -5,
+        "labels": {
+          "-3": "resolved sensitivity",
+          "-4": "resolved sensitivity",
+          "-5": "primary descriptive scale",
+          "-7": "marginal resolution at the spike's evaluation scale (4096 x 64 rows per stream, 17 of 20 streams resolved); unmeasured at the contract's 4096 x 256",
+          "-10": "rare or unresolved; a zero is not a healthy zero"
+        }
+      },
+      "evidence": {
+        "spike_receipt": "amplitude-risk-spike-receipt on fa3c35a8",
+        "spike_branch": "agent/h-v2-amplitude-spike",
+        "spike_sha": "39135fda1388ef319c2325c8ad934de3b3c513db",
+        "cannon_jobs": [58383577, 58388053, 58388109]
+      },
+      "must_fix_before_science": "no gate: thresholds are frozen descriptive labels, not a science admission criterion; independent verification happens when slice fa3c35a8 is implemented and verified",
+      "blocks": "layer fa3c35a8 (amplitude-risk fraction module); the definition and frozen thresholds are decided, implementation and independent verification remain",
+      "source": "operator-decision-amplitude-risk-threshold-20261106: 'Tell the orchestrator to make a call that makes sense from previous runs of exact models and trained models. If it needs to spike something so be it.'; amplitude-risk-decision-20261106: the orchestrator's accepted definition; amplitude-risk-call-20261106: the frozen threshold list"
+    }
+  },
+  "decision_rules": {
+    "categories": [
+      "recurrence",
+      "bounded_null",
+      "unresolved"
+    ],
+    "recurrence": "Complete records and qualified uncertainty exist. Streams 0/1 select the smallest-mean-W consecutive triple centered at 3000..19000 (earliest tie); streams 2/3 re-measure early, basin and late W, and each confirmation stream independently must show early W exceeds basin W by >=2x and >=0.01 Ha, with at least two of 40000/45000/50000 exceeding it by both margins with simultaneous confidence bounds. At least 2 of 3 lineages pass. If two lineages pass and the third is incomplete, the study-level label is unresolved; report recurrence in the two complete lineages only. Tail exceedance safeguards must not contradict the W result, evaluated over the TAIL thresholds only (0.5 Ha, 1 Ha, and the pilot-frozen hydrogen-equivalent threshold in measurement.hydrogen_equivalent_tail_threshold); the tail-threshold safeguard pools streams 2 and 3, n=8192 walkers: a contradiction is (i) W meets the rise rule while none of the three tail thresholds shows an increase of at least its own margin in decision_rules.parameters.exceedance_margins_hartree, where an 'increase of at least its margin' means the simultaneous LOWER confidence bound of the increase reaches the margin, or (ii) W fails the rise rule, or the bounded-null band excludes it, while some fixed exceedance threshold shows an increase of at least its own margin. A bulk-threshold (0.01/0.05/0.1 Ha) decrease that accompanies a W rise is expected, as He-v1's own 25k-to-50k contrast shows, and is not a contradiction; a bulk-threshold exceedance that fails to confirm a W rise is reported as a qualification, never as a contradiction. Directional wording and evidence: operator-review-contract-proposals-20261107 items 1-2 on fffc313a, decided in primary-measure-and-margins-decision-20261107 on 8a67671f from analysis primary-measure-and-margins-analysis-20261107 (FASRC Cannon job 58568904); the tail-threshold restriction and the simultaneous-lower-bound reading are round-1 pre-review findings F4/F5, accepted 2026-11-07.",
+    "bounded_null": "All 3 lineages are complete and pass instrument/sampling gates; simultaneous inference over every predeclared basin, checkpoint, threshold, and window search excludes the W decrease/rise rule. For every reference checkpoint k in bounded_null_reference_updates (the 21 evaluated checkpoints at or below 20,000 updates), the simultaneous band excludes W at bounded_null_late_count or more late checkpoints reaching max(2 W(k), W(k) + 0.01 Ha). Fixed-threshold exceedance bands use all four streams pooled (n=16384 walkers) and the pilot gate; for every reference checkpoint k in bounded_null_reference_updates (the same 21 evaluated checkpoints at or below 20,000 updates) and every late checkpoint, they also exclude an absolute increase from k to that late checkpoint, at every threshold including the pilot-frozen hydrogen-equivalent threshold, of at least that threshold's own margin in decision_rules.parameters.exceedance_margins_hartree (0.002 Ha at the tail thresholds 0.5, 1 Ha and the pilot-frozen hydrogen-equivalent threshold; 0.01 Ha at the bulk thresholds 0.01, 0.05 and 0.1 Ha, where the pilot gate's half-width <= half-margin requirement is otherwise unreachable), where an 'increase of at least its margin' means the simultaneous LOWER confidence bound of the increase reaches the margin. A flat MAD or nonsignificance alone is not equivalence.",
+    "unresolved": "Any required record, identity, instrument, dependence/uncertainty qualification, tail safeguard, operator decision, or horizon is absent or inconclusive; a partial lineage result, conflicting streams, unsupported margins, or a tail-only change outside the declared instrument is unresolved.",
+    "parameters": {
+      "w_factor_margin": 2,
+      "w_absolute_margin_hartree": 0.01,
+      "exceedance_margins_hartree": {
+        "0.01": 0.01,
+        "0.05": 0.01,
+        "0.1": 0.01,
+        "0.5": 0.002,
+        "1": 0.002
+      },
+      "basin_center_updates": [
+        3000,
+        4000,
+        5000,
+        6000,
+        7000,
+        8000,
+        9000,
+        10000,
+        11000,
+        12000,
+        13000,
+        14000,
+        15000,
+        16000,
+        17000,
+        18000,
+        19000
+      ],
+      "early_updates": [
+        0,
+        1000
+      ],
+      "late_updates": [
+        40000,
+        45000,
+        50000
+      ],
+      "late_required_count": 2,
+      "bounded_null_reference_updates": [
+        0,
+        1000,
+        2000,
+        3000,
+        4000,
+        5000,
+        6000,
+        7000,
+        8000,
+        9000,
+        10000,
+        11000,
+        12000,
+        13000,
+        14000,
+        15000,
+        16000,
+        17000,
+        18000,
+        19000,
+        20000
+      ],
+      "bounded_null_late_count": 2,
+      "selection_streams": [
+        0,
+        1
+      ],
+      "confirmation_streams": [
+        2,
+        3
+      ],
+      "lineages_required_for_recurrence": 2,
+      "confirmation_mode": "each confirmation stream passes independently; streams 2 and 3 are not pooled",
+      "bounded_null_streams": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "pilot_gate": "science admission requires pilot simultaneous-band half-width <= half of every exceedance margin",
+      "zero_event_bound_pooling": {
+        "status": "decided_2026-11-07",
+        "decided_by": "round-1 pre-review of operator-review-contract-proposals-20261107, finding F5(b)/(c), accepted 2026-11-07; family_k correction accepted 2026-11-07 (round-2 correction: K is the explicit count of exceedance-safeguard comparisons each rule evaluates, not the evaluated-checkpoint count)",
+        "recurrence_confirmation_pooled_n": 8192,
+        "recurrence_confirmation_streams": [2, 3],
+        "bounded_null_pooled_n": 16384,
+        "bounded_null_streams": [0, 1, 2, 3],
+        "family_k_recurrence": 9,
+        "family_k_recurrence_formula": "len(tail thresholds {0.5 Ha, 1 Ha, hydrogen_equivalent_tail_threshold}) * len(decision_rules.parameters.late_updates) = 3 * 3, the tail thresholds times the late-checkpoint comparisons the recurrence rule makes against the basin",
+        "family_k_bounded_null": 378,
+        "family_k_bounded_null_formula": "(len(measurement.fixed_exceedance_thresholds_hartree) + 1) * len(decision_rules.parameters.bounded_null_reference_updates) * len(decision_rules.parameters.late_updates) = 6 * 21 * 3, the five fixed exceedance thresholds plus the pilot-frozen hydrogen-equivalent threshold the bounded_null exceedance sentence now names, times every reference-checkpoint/late-checkpoint comparison the bounded-null rule makes, mirroring the W clause's own reference-checkpoint x late-checkpoint structure",
+        "computed_U": {
+          "recurrence_confirmation_n_8192": 0.0007182604858808617,
+          "bounded_null_n_16384": 0.0005872160495568046,
+          "formula": "U = 1 - (0.025 / family_k) ** (1 / n), the one-sided 97.5% Clopper-Pearson upper bound family-adjusted by the rule's own family_k (family_k_recurrence or family_k_bounded_null), computed mechanically by script, not copied",
+          "pilot_gate_result": "both U values are <= 0.001, half of the tightest exceedance margin (0.002 Ha at the tail thresholds); PASS, not loosened"
+        }
+      },
+      "operator_alternative": "retain absolute 0.002 only at 0.1, 0.5 and 1 Ha and use a relative margin at 0.01 and 0.05 Ha",
+      "operator_alternative_disposition": "decided 2026-11-07 in an extended form, not the original alternative verbatim: exceedance_margins_hartree uses absolute 0.01 Ha at 0.01, 0.05 AND 0.1 Ha (the alternative's 0.1 Ha stayed at 0.002, which analysis found fails the pilot gate whenever p(0.1 Ha) is in the bulk) and absolute 0.002 Ha at 0.5 and 1 Ha; no relative-margin form was adopted. Source: operator-review-contract-proposals-20261107 item 2 ('same as above', delegated), decided in primary-measure-and-margins-decision-20261107, evidence primary-measure-and-margins-analysis-20261107 (Cannon job 58568904, He-v1 analysis half-widths 0.0010-0.0022 Ha at the bulk thresholds under a 6-member Bonferroni family -- narrower than this contract's family, about 1.4x -- against the previous 0.001 requirement; no H pilot has run).",
+      "zero_event_bound": "one-sided 97.5% Clopper-Pearson upper bound on walker-level any-exceedance indicator"
+    }
+  },
+  "lane_proposals": [
+    {
+      "id": "helium_reference_model_and_primary_statistic",
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 item 1 on fffc313a ('how much does it matter? decide based on He-v1 analysis', delegated to the lane), lane decision primary-measure-and-margins-decision-20261107 on 8a67671f",
+      "proposal": "Use the historical He training basin only as context: 5k-block median of within-batch variance on a changing model, about 0.00173 Ha^2; s10=26570 and s90=44982 are definition-dependent onset summaries whose definition is only in the unopened Netscratch report, not basin-departure points. Use W, the 99.9th percentile of the absolute deviation from the median, as the primary statistic for H, with fixed exceedance probabilities as safeguards (see decision_rules for the directional-contradiction rule and decision_rules.parameters.exceedance_margins_hartree for the per-threshold margins).",
+      "rationale": "W detects rare-event frequency defects that MAD can hide; no fresh He basin checkpoint exists for a common-estimand threshold. Evidence (primary-measure-and-margins-analysis-20261107, Cannon job 58568904): He-v1's own 25k-to-50k fresh-evaluation contrast is a 22-25x W rise, detected identically by W and by the tail exceedance thresholds (0.5, 1 Ha), while the bulk exceedance thresholds (0.01, 0.05, 0.1 Ha) FALL at the same transition -- an exceedance-primary rule on the bulk thresholds would have called He-v1's broken checkpoint an improvement. For an He-v1-sized effect the choice of primary statistic does not change the outcome; for moderate tail-onset versus uniform-broadening effects it does, which is why the primary stays a ratio statistic (W) rather than a threshold in hartree.",
+      "alternatives": [
+        "make exceedance probability the primary axis instead of percentile W",
+        "use a separately approved recomputed He fresh-evaluation reference"
+      ]
+    },
+    {
+      "id": "horizon_and_checkpoints",
+      "status": "decided_2026-11-07",
+      "decided_by": "checkpoint counts decided 2026-11-06 (operator-decisions-logging-module-checkpoints-20261106d, '27 makes sense. especially if evaluation is expensive'); horizon decided 2026-11-07 (operator-review-contract-proposals-20261107 item 6, 'you already decided')",
+      "proposal": "50,000 updates, retain 0..50000 every 1000, evaluate the explicit 27-checkpoint set",
+      "rationale": "Dense retention prevents loss of an early basin while the smaller evaluated set controls fresh-evaluation cost.",
+      "alternatives": [
+        "use a 100,000-update horizon or a sparse 15-point evaluation set"
+      ]
+    },
+    {
+      "id": "independent_lineages",
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 item 4 on fffc313a, quoted '3'",
+      "proposal": "Three fresh lineages with seeds 73001..73003 and sampler seeds 83001..83003; require two of three for recurrence",
+      "rationale": "Three is a bounded first recurrence experiment with independent training identities.",
+      "alternatives": [
+        "one exploratory lineage, which cannot support replicated recurrence",
+        "five lineages for more replication at about 67 percent more cost"
+      ]
+    },
+    {
+      "id": "walkers_evaluation_and_uncertainty",
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 item 6 on fffc313a, quoted 'you already decided', consistent with the 2026-11-06 logging and storage decisions",
+      "proposal": "4096 training walkers; four fresh streams per evaluated checkpoint, 4096 walkers x 256 draws, burn-in 1000 and stride 20; whole-walker resampling with at least 2000 resamples and simultaneous 95 percent bands",
+      "rationale": "Separate stream replication, complete histories, and conservative zero-event bounds protect against dependence and rare-event overclaiming.",
+      "alternatives": [
+        "1024 walkers x 1024 draws",
+        "two streams, accepting weaker basin-selection/confirmation power"
+      ]
+    },
+    {
+      "id": "tail_diagnostic_and_margins",
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 item 2 on fffc313a ('same as above', delegated), lane decision primary-measure-and-margins-decision-20261107 on 8a67671f",
+      "proposal": "Use direct W plus exceedance safeguards; beta/xi are held-out context diagnostics. Use factor-2 and 0.01 Ha W margins (unchanged). Use the per-threshold exceedance margins in decision_rules.parameters.exceedance_margins_hartree: 0.002 Ha absolute at the tail thresholds 0.5 and 1 Ha, and 0.01 Ha absolute at the bulk thresholds 0.01, 0.05 and 0.1 Ha, together with the directional-contradiction wording in decision_rules.recurrence.",
+      "rationale": "The decision remains distributional without claiming an ultimate tail class or population variance. Evidence (primary-measure-and-margins-analysis-20261107, Cannon job 58568904): the W margins of factor 2 and 0.01 Ha are never approached by the measured noise ceiling (worst null-pair ratio 1.04-1.15) and are unchanged. The original single 0.002 Ha exceedance margin fails the contract's own pilot gate (band half-width <= half the margin) at the bulk thresholds, where measured pilot half-widths are 0.0010-0.0022 Ha; 0.01 Ha passes it there with margin, while 0.002 Ha remains correct and achievable at the tail thresholds.",
+      "alternatives": [
+        "make event probability primary",
+        "require all three seeds or use a tenfold effect threshold",
+        "exceedance primary at one pre-chosen tail threshold (0.05 or 0.1 Ha) with a 0.002 Ha margin",
+        "a noise-scaled exceedance margin delta(t) = max(0.002, 0.02*sqrt(p_ref*(1-p_ref)))",
+        "option (A): make the directional rule (i) an active contradiction only (a tail-threshold decrease of at least its margin while W rises) -- see measurement.hydrogen_equivalent_tail_threshold.considered_alternative for the He-v1 reason it was not chosen"
+      ]
+    },
+    {
+      "id": "science_venue_and_ceiling",
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 item 7 on fffc313a, quoted 'cannon with long jobs'",
+      "proposal": "FASRC Cannon, one full A100 per lineage (--constraint=a100), at most 32 GPU-hours per lineage and 96 total; pilot must project the complete unchanged plan. Submit to both FASRC Cannon production GPU partitions in one job, kozinsky_gpu (wall limit 7-00:00:00, gpu:nvidia_a100-sxm4-80gb:4) and seas_gpu (wall limit 2-00:00:00, mixed gpu:nvidia_h200:4 and gpu:nvidia_a100-sxm4-80gb:4), per the cluster-access partition-naming policy (naming fewer needs a stated reason; 32 GPU-hours per lineage fits well inside even the 2-day seas_gpu ceiling). Polaris is not used for H-v2 science; the one-electron pipeline check's excluded-seed Polaris GPU smoke (slice 406194c5) is a non-science route check, not a science venue.",
+      "rationale": "A single-card Cannon stratum is simpler before multi-GPU placement is qualified. Facts cited from the Cannon GPU hardware note (gpu-hardware-strata-and-constraint-rule-2026-08-15 on item 3541fe33, as of 2026-08-15 -- node counts drift; re-measure with sinfo rather than citing this date): kozinsky_gpu is 2 nodes of 4x A100-SXM4-80GB at a 7-day wall limit as of that date; seas_gpu mixes A100-SXM4-80GB and H200 nodes at a 2-day wall limit and requires --constraint pinning for a comparable stratum across lineages.",
+      "alternatives": [
+        "efficiently packed Polaris node after placement and utilization qualification",
+        "a revised lower-cost plan with lost timing or replication power stated"
+      ]
+    },
+    {
+      "id": "one_electron_pipeline_check",
+      "status": "proposed_by_lane_admitted_non_science_scope",
+      "proposal": "Admit the bounded non-science check under the operator's 2026-11-05 direction: parts (a)-(f) on Cannon CPU in slice 5cfcca3e; part (g) as an excluded-seed Polaris GPU smoke in slice 406194c5; exact integrated rerun in slice 2f1b2921.",
+      "rationale": "The first one-electron route must prove physics, learning, fresh restore, sampler, and collection wiring before any science lineage.",
+      "alternatives": [
+        "a smaller CPU wiring check and GPU-only learning check, with weaker CPU qualification",
+        "put the complete GPU route check inside the excluded-seed capacity pilot"
+      ]
+    },
+    {
+      "id": "learned_model_optimizer_and_training_sampler",
+      "status": "decided_2026-11-07",
+      "decided_by": "operator-review-contract-proposals-20261107 items 3 and 5 on fffc313a, quoted 'whatever He-v1 did we do in Hydrogen experiment' (item 3, correcting an earlier 'trainable' answer) and 'whatever He-v1 did' (item 5)",
+      "proposal": "Match He-v1 exactly, adapted only where the one-electron system forces a deviation. Primary source: the He-v1 resolved config of the executed run train-seed0000 itself (/Users/yizhonghu/he-v1-independent-report-20260823/receipts/resolved_config.yaml, sha256 b9234c469ceadb36291833a2f8ef8a02f29feeba73cdd330949eebbd90d2e8c1, listed in BUNDLE_MANIFEST.json); it agrees with experiments/atomistic/he-v1/configs/train.yaml at the executed He-v1 training source commit 418accf153368aab45586dc2a2cc97c18472691c (REPORT.md line 5 names this as the commit of record for train-seed0000/Cannon job 40907434) for the model, optimizer and sampler blocks, and records an executed horizon of 50,000 updates, which differs from the 300,000 in train.yaml and from the production_grid.yaml plan. As resolved there: one TPENLayer, Embedding max_order=2/out_channels=32/hidden_channels=128/num_hidden_layers=1/include_spins=true (lines 110-117), EquivariantMixing and PathAggregation both max_order=2/max_virtual_order=2/channels=32/initial_weight=0.5/implementation=vectorized/SiLU (lines 118-135), ResidualUpdater (line 137), training runtime dtype=float64; post-readout factors are ElectronElectronCusp(trainable_range=true) plus ElectronNucleusCusp with CurvatureElectronNucleusCuspLaw(curvature_coefficient=0.01, curvature_range=1.0, trainable=true) (lines 188-197); PfaffianReadout(channels=32, trainable=true) (lines 198-227); optimizer torch.optim.Adam(lr=0.005) (lines 277-280); training sampler MetropolisSampler(n_walkers=4096, burn_in=100, n_steps=10, proposal_scale=0.5) (lines 249-260): burn-in 100, 10 Metropolis steps per update, proposal scale 0.5 bohr. The full model, optimizer, sampler and runtime blocks of the resolved config govern, apart from the one-electron-forced deviations recorded below; the enumeration above is illustrative, not exhaustive. Nuclear curvature law: c (curvature_coefficient) = 0.01, d (curvature_range) = 1.0, both trainable -- this already matches the contract's normalizability_gate notation (outer slope -1 + c/d, exact_hydrogen_answer c=0) and required no numeric change. One-electron-forced deviations from He-v1, recorded because H has one electron where He has two: (1) ElectronElectronCusp is omitted from the H-v2 model configuration: no electron pair exists to carry same-spin or opposite-spin range gradient, so the one-electron system forces its omission (it is not retained for parsed-config agreement; its channel would be structurally inert if present, not frozen by training as He's same-spin channel is for a singlet); (2) spin configuration is n_up=1, n_down=0 (He-v1: n_up=1, n_down=1); (3) nuclear_charge is 1 (He-v1: 2), per study.nuclear_charge; (4) the PfaffianReadout's odd-electron border is retained as a readout device rather than a second electron, as already documented in README.md.",
+      "rationale": "A concrete model/optimizer/sampler proposal makes the pipeline and science plan reviewable without silently choosing unreviewed hyperparameters; c=0 is the exact hydrogen answer and c/d drift is a reportable normalizability signal. Matching He-v1 exactly (rather than re-deriving hyperparameters) is now an operator decision, not a lane proposal, so comparability between the He-v1 and H-v2 wavefunction families is by construction wherever the one-electron system does not force a difference.",
+      "alternatives": [
+        "fixed linear nuclear factor -r",
+        "constrained decaying nuclear law",
+        "a revised architecture or optimizer with changed recurrence and resource implications stated"
+      ]
+    }
+  ],
+  "admission": {
+    "pipeline_check": {
+      "scope": "non_science_one_electron_pipeline_check",
+      "status": "admitted_by_operator_direction_2026-11-05",
+      "parts": [
+        {
+          "id": "a",
+          "description": "construct one-electron charge-one H with raw -1/r, -1/2 Laplacian, no electron-electron term/factor, intended cusp, and geometry agreement",
+          "pass_criteria": {
+            "geometry": "model, sampler and Hamiltonian agree",
+            "potential": "raw -1/r",
+            "laplacian": "-1/2"
+          }
+        },
+        {
+          "id": "b",
+          "description": "independent exact-state scalar instrument with component closure and explicit radius-zero refusal",
+          "pass_criteria": {
+            "ordinary_radii_bohr": [
+              0.001,
+              0.01,
+              0.1,
+              0.5,
+              1,
+              2,
+              4,
+              8
+            ],
+            "ordinary_total_energy_abs_error_hartree": 1e-08,
+            "stress_radii_bohr": [
+              1e-08,
+              1e-06,
+              0.0001
+            ],
+            "stress_bound": "max(1e-9, 128*eps64*(abs(K)+abs(V)))",
+            "radius_zero": "reject or invalid; never regularize"
+          }
+        },
+        {
+          "id": "c",
+          "description": "reject exact-energy stubs with imperfect alpha=1.2 state and wrong Hamiltonian mutants",
+          "pass_criteria": {
+            "imperfect_state": "exp(-1.2*r)",
+            "born_mean_hartree": -0.48,
+            "variance_hartree2": 0.0576
+          }
+        },
+        {
+          "id": "d",
+          "description": "independent radial sampler control from three rate-two exponentials and uniform directions",
+          "pass_criteria": {
+            "radial_density": "4*r^2*exp(-2*r)",
+            "compare_starts": "narrow and diffuse",
+            "predeclare": "simultaneous radial distribution and tail bands"
+          }
+        },
+        {
+          "id": "e",
+          "description": "briefly train the learned route, restore model-only into two fresh evaluations, and collect complete records",
+          "pass_criteria": {
+            "channels": 8,
+            "hidden_width": 32,
+            "updates": 1000,
+            "energy_abs_error_hartree": 0.02,
+            "median_abs_error_improvement": 0.25,
+            "dynamic_range_rule": "if initial error <=0.02, report little learning dynamic range and require imperfect learned-state/gradient control",
+            "training_sampler": {
+              "walkers": 256,
+              "burn_in": 100,
+              "metropolis_steps_per_update": 10,
+              "proposal_scale_bohr": 0.5
+            },
+            "fresh_evaluation": {
+              "walkers": 1024,
+              "draws_per_stream": 64,
+              "streams": 2,
+              "burn_in": 1000,
+              "stride": 20
+            }
+          }
+        },
+        {
+          "id": "f",
+          "description": "reconcile complete initial and terminal populations and refuse integrity defects",
+          "pass_criteria": {
+            "refusals": [
+              "missing draw",
+              "duplicate walker record",
+              "altered source/checkpoint/config identity",
+              "missing checkpoint commit marker",
+              "nonfinite data",
+              "uncommitted tail",
+              "training-state restore request"
+            ]
+          }
+        },
+        {
+          "id": "g",
+          "description": "excluded-seed FASRC Cannon gpu_test full-model GPU smoke with complete fresh stream",
+          "pass_criteria": {
+            "walkers": 4096,
+            "updates_max": 1000,
+            "fresh_stream": "4096 walkers by 256 draws",
+            "energy_abs_error_hartree": 0.02,
+            "ceiling": "one GPU-hour on the allocated device, setup included",
+            "record": "actual placement/device/precision and all artifacts"
+          }
+        }
+      ],
+      "placements": {
+        "a-f": "slice 5cfcca3e on Cannon CPU",
+        "g": "part (g), excluded-seed GPU route smoke, at its current update cap (1,000 updates), capped at one GPU-hour on the allocated device, setup included; runs first. Facility restated 2026-11-07 (D5/D6, operator-decisions-pilot-geometry-design-target-20261107 and operator-answers-design-target-d1-d6-20261107 on fffc313a, superseding the 2026-10-30 Polaris-for-smokes split for this part): D5, operator quoted, 'Gpu test goes on cannon' -- runs on FASRC Cannon's gpu_test partition (a MIG slice) -- the partition and 'a MIG slice' are the manager's D5 restatement, to which the operator answered 'Yes' (quoted as typed: '5. Yes'). D6, the manager's restatement, to which the operator answered 'Yes' (quoted as typed: '6. Yes'): 'the contract text for part (g) is restated at the next PR 587 touch: Cannon, with a cap of one GPU-hour on the allocated device, setup included.'",
+        "406194c5_cannon_pilot": "slice 406194c5's Cannon capacity-and-freeze pilot (admission.pilot, a separate part from (g)): one A100 (--constraint=a100), runs after part (g) and after qualification; own ceiling of 16 GPU-hours including setup, checkpoint writes and fresh evaluation, flagged as the lane's proposal for operator review of this pull request, separate from and not counted against the 96 GPU-hour science ceiling; if exceeded the pilot stops and reports, the ceiling is not extended",
+        "integrated_rerun": "slice 2f1b2921"
+      },
+      "placements_note": "Slice 406194c5 has two parts with separate placements, facilities and ceilings; see placements.g and placements.406194c5_cannon_pilot above and admission.pilot below. Decided 2026-11-07, round-3 pre-review finding H1, accepted 2026-11-07.",
+      "nuclear_law_note": "The pipeline check (parts a-g, including the integrated rerun 2f1b2921) runs the science model's nuclear law, CurvatureElectronNucleusCuspLaw(curvature_coefficient=0.01, curvature_range=1.0, trainable=true), with scale-only overrides, following He-v1's 'the smoke is this same file with scale-only overrides' rule; PR 590's configs are adapted to this at its rebase onto this amendment. Decided 2026-11-07, round-1 pre-review finding F8.",
+      "science_result": false
+    },
+    "pilot": {
+      "status": "decided_2026-11-07",
+      "decided_by": "round-2 pre-review of operator-review-contract-proposals-20261107, finding G3, accepted 2026-11-07; split into its own placement and ceiling, separate from pipeline_check part (g), by round-3 pre-review finding H1, accepted 2026-11-07; length extended to 20,000 updates and freeze basin selection clarified by round-3 pre-review finding H3, accepted 2026-11-07",
+      "facility": "FASRC Cannon",
+      "constraint": "--constraint=a100",
+      "gpu_count": 1,
+      "order": "runs after admission.pipeline_check.parts[g] (the Cannon gpu_test GPU route smoke, D5/D6) and after qualification; part (g) runs first",
+      "seeds": "the excluded non_science_seed_namespaces.capacity_pilot seeds, never a science seed",
+      "shape": "the science model (lane_proposals.learned_model_optimizer_and_training_sampler) and the science training sampler, run at the contract's fresh-evaluation shape (measurement.fresh_evaluation)",
+      "length_updates_min": 4000,
+      "length_updates_target": 20000,
+      "length_rationale": "runs through 20,000 updates, within the 16 GPU-hour ceiling, so the pilot's own basin search covers the same centers (decision_rules.parameters.basin_center_updates, 3000..19000) that the science recurrence rule searches; the 4,000-update hard minimum remains so at least one basin-window triple exists even if the ceiling stops the pilot early, in which case the shortfall against the 20,000-update target is reported",
+      "evaluation": "fresh-evaluates the contract's evaluated checkpoints (measurement.evaluated_checkpoints.updates) up to the updates actually reached, at most 20,000, at the contract shape (measurement.fresh_evaluation); seeded from non_science_seed_namespaces.capacity_pilot.evaluation (evaluation_formula)",
+      "freeze_basin_selection": "the freeze uses the pilot's own smallest-mean-W consecutive triple over the centers it reached, chosen by the recurrence rule's selection (decision_rules.parameters.basin_center_updates); this is the same search the science recurrence rule performs, not necessarily the earliest triple. Decided 2026-11-07, round-3 pre-review finding H3, accepted 2026-11-07.",
+      "gpu_hour_ceiling": {
+        "value_gpu_hours": 16,
+        "includes": "setup, checkpoint writes, fresh evaluation",
+        "status": "lane_proposal_flagged_for_operator_review",
+        "separate_from": "the 96 GPU-hour science ceiling (lane_proposals science venue, item 7); does not count against it",
+        "on_exceed": "stop and report; the ceiling is not extended"
+      },
+      "outputs": [
+        "the frozen measurement.hydrogen_equivalent_tail_threshold (freeze_rule)",
+        "the pilot_gate simultaneous-band half-widths at all six exceedance margins in decision_rules.parameters.exceedance_margins_hartree"
+      ],
+      "implemented_by": "slice 406194c5, the Cannon capacity-and-freeze pilot part (separate from part (g), the Cannon gpu_test route smoke, D5/D6); the contract defines the run, the slice implements it",
+      "on_failure": "if the pilot gate fails at the hydrogen-equivalent threshold, the F5 stop rule applies (measurement.hydrogen_equivalent_tail_threshold); see decision_rules.parameters.zero_event_bound_pooling and the G5 no-retune rule below"
+    },
+    "science_lineages": {
+      "scope": "three 50000-update scientific training lineages and their fresh evaluations",
+      "status": "prohibited_until_operator_reviews_science_plan",
+      "required_review": "operator review of all lane_proposals with explicit approval",
+      "current_status": "prohibited",
+      "operator_review_20261107_disposition": "operator-review-contract-proposals-20261107 settled items 1, 2 and 8 on fffc313a (the primary measure/margins and the four-stream design), and all other lane_proposals are now decided; this amendment records that settlement. current_status stays 'prohibited': admission still awaits (a) this amendment's own Cannon verification and human merge of this pull request, (b) the remaining pipeline-check (slice 5cfcca3e), excluded-seed Cannon gpu_test smoke (slice 406194c5, D5/D6) and integrated-rerun (slice 2f1b2921) gates already named in this admission block, and (c) the hydrogen-equivalent threshold frozen and the pilot gate passed at all six margins (admission.pilot), none of which this amendment closes."
+    }
+  },
+  "logging": {
+    "status": "decided",
+    "decided_by": "operator-decisions-logging-and-560-20261106, -storage-cadence-20261106b, -560-logging-20261106c, -logging-module-checkpoints-20261106d, 2026-11-06",
+    "observation_classes": {
+      "training_history": "diagnostic only, drawn from a changing model; never pooled with fresh evaluation",
+      "fresh_evaluation": "the primary evidence surface, a new model-only sampler run from one frozen checkpoint"
+    },
+    "design_rule": "every new measurement is an optional module that a run's configuration adds, following the existing callback/logger pattern (a callback class listed under callbacks: with an every_n_steps cadence, writing through context.log to the configured loggers:); core does not compute or log any of them unconditionally",
+    "design_rule_source": "operator-decisions-logging-module-checkpoints-20261106d: 'remember it is added as a module not a core metric that always gets logged. This is an old, established design.'",
+    "modules": [
+      {"name": "module_parameter_gradient_norm_callback", "layer": "6c29fe1d", "kind": "training_callback"},
+      {"name": "optimizer_state_summary_callback", "layer": "5d61a6c9", "kind": "training_callback"},
+      {"name": "training_batch_radius_quantile_callback", "layer": "8476456e", "kind": "training_callback"},
+      {"name": "raw_training_batch_recorder", "layer": "7f884e4d", "kind": "training_callback"},
+      {"name": "initial_checkpoint_callback", "layer": "5cfad8d2", "kind": "one_shot_callback"},
+      {"name": "parameter_activity_callback", "layer": "52ead353", "kind": "training_callback"},
+      {"name": "readout_trajectory_generator", "layer": "c8fedd84", "kind": "evaluation_generator"},
+      {"name": "amplitude_risk_fraction", "layer": "fa3c35a8", "status": "thresholds_frozen_implementation_pending", "kind": "training_callback"}
+    ],
+    "cadence": {
+      "scalar_diagnostics": "every completed update",
+      "raw_training_batches": {
+        "capture_coordinate": "iteration_step",
+        "every_n_steps": 50,
+        "includes_step_zero": true,
+        "partition_size_steps": 1000,
+        "format": "numpy_column_bundle_with_json_integrity_sidecar",
+        "cadence_source": "operator-decisions-logging-storage-cadence-20261106b: '50 makes more sense here.'",
+        "out_of_memory_checks": [
+          "bounded-memory test in the training-batch recorder layer (7f884e4d)",
+          "logging-on measurement in the full-card pilot 406194c5"
+        ],
+        "format_source": "operator-decisions-560-logging-20261106c: 'numpy seems to make more sense as long as it does not cause OOM events.'"
+      }
+    },
+    "capture_semantics": {
+      "sample": "pre-update",
+      "coordinate": "iteration_step, the same coordinate as the raw-batch cadence and partition ranges",
+      "row_fields": [
+        "iteration_step",
+        "completed_updates_after",
+        "update_applied"
+      ],
+      "skipped_updates": "recorded, not dropped"
+    },
+    "design_rule_scope": "the callback/every_n_steps/context.log sentence describes training_callback modules; evaluation_generator modules run during fresh evaluation and one_shot_callback modules fire once, not on a cadence",
+    "core_logs_unconditionally": false,
+    "checkpoints": {
+      "retained_per_lineage": 51,
+      "evaluated_per_lineage": 27,
+      "status": "decided"
+    },
+    "storage_lifecycle": {
+      "working_location": "Cannon netscratch, not scratch",
+      "purge_window_days": 90,
+      "holystore_set": "chosen retroactively after the analysis; about 26 to 28 GiB is acceptable for now",
+      "holystore_excludes": "the checkpoints themselves",
+      "hpss_scope": "the whole run, checkpoints included, compressed",
+      "lifecycle_source": "operator-decisions-logging-storage-cadence-20261106b: \"'leading up to the conclusion' is usually retroactive after all the analysis is done. 26G is acceptable for now. netscratch; not scratch.\"; operator-decisions-logging-and-560-20261106: 'archive everything leading up to the conclusion except the checkpoints themselves into holystore, archived ... The whole thing gets compressed and archived the HPSS.'",
+      "procedures": ["archive-experiment skill", "backup-experiment-cannon skill"],
+      "related_items": ["10d766be", "6bb4f4ea", "8433b0be", "b0ff32b6", "c3c8a012"],
+      "removal_rule": "nothing on netscratch is removed without a Task Orchestrator lifecycle disposition naming the exact paths and a passed recovery verification of the archive"
+    },
+    "storage_figures": {
+      "scale": {"lineages": 3, "training_walkers": 4096},
+      "fresh_evaluation": {
+        "formula": "3 lineages x 27 evaluated checkpoints x 4 streams x 4096 walkers x 256 draws",
+        "rows": 339738624,
+        "compact_gib": 28.1,
+        "bytes_per_row_compact": 89,
+        "bytes_per_row_source": "training-batch-storage-proposal: 89 bytes, the conservative envelope"
+      },
+      "raw_training_batches": {
+        "formula": "3 lineages x 1001 captured batches (every_n_steps=50, iteration step 0 through 50000 inclusive) x 4096 walkers",
+        "batches_per_lineage": 1001,
+        "rows": 12300288,
+        "compact_gib": 0.928,
+        "bytes_per_row_compact": 81,
+        "bytes_per_row_source": "training-batch-storage-proposal: 81 primitive bytes",
+        "partitions_per_lineage": 51,
+        "data_objects_total": 153,
+        "partition_note": "20 batches per 1000-step partition gives 50 full partitions plus one single-batch partition (step 50000) per lineage; 3 lineages x 51 partitions = 153 data objects, not the 150 the storage proposal costed"
+      },
+      "compression_ratio": "unmeasured; a pilot block must measure it before a Holystore budget promises it"
+    }
+  },
+  "tail_characterization": {
+    "status": "decided",
+    "decided_by": "lane scientific call responding to operator-decisions-560-logging-20261106c: \"only a few percentile values may not be enough was my point about logging\"",
+    "science_measurement": {
+      "primary_evidence": "the full positive and negative survival and exceedance curves computed from the retained raw rows, on the same level grid as sampler_tail_qualification down to its supported depth",
+      "never_substitutes": "no reported percentile, W, variance, MAD, IQR, or fitted tail index replaces the raw rows"
+    },
+    "sampler_tail_qualification": {
+      "layer": "028867dc (H-v2: qualify the sampler over full radial and local-energy survival curves)",
+      "targets": {
+        "alpha_1": {
+          "description": "exact state alpha=1",
+          "radius_distribution": "Gamma(shape=3, rate=2)",
+          "local_energy_hartree": -0.5
+        },
+        "alpha_1_2": {
+          "description": "imperfect state alpha=1.2 sampled from its own |psi|^2",
+          "radius_distribution": "Gamma(shape=3, rate=2.4)",
+          "local_energy_hartree": "-0.72 + 0.2/r",
+          "tail_origin": "the large positive local-energy tail comes from the inner radial tail (small r), not the outer radial tail"
+        }
+      },
+      "superseded_stub": "the prior stub check compared the CDF only up to r=3 (about the 94th percentile of the outer radius) and never examined the inner tail that drives W",
+      "superseded_stub_fields": {
+        "max_radius_checked": 3.0,
+        "band": 0.02
+      },
+      "radial_levels": [0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001],
+      "radial_sides": ["lower_tail_cdf", "upper_tail_survival"],
+      "radial_applies_to": ["alpha_1", "alpha_1_2"],
+      "median_reported_not_gated": true,
+      "alpha_1_2_only": {
+        "fixed_exceedance_thresholds_hartree": [0.01, 0.05, 0.1, 0.5, 1],
+        "exceedance_levels": [0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.0002, 0.0001],
+        "w_level": 0.001
+      },
+      "support_rule": {
+        "minimum_expected_count_per_stream": 100,
+        "fresh_evaluation_rows_per_stream": 1048576,
+        "fresh_evaluation_rows_per_stream_formula": "4096 walkers x 256 retained draws",
+        "deepest_gated_level": 0.0001,
+        "deepest_gated_level_expected_count": 105,
+        "note": "deeper levels are reported, never gated"
+      },
+      "band": {
+        "statistic": "z = (log(S_hat) - log(S_exact)) / se",
+        "centering": "per-stream sample median of E_L, as in measurement.fresh_evaluation.estimator",
+        "se_method": "whole-walker bootstrap standard error of log(S_hat), at least 2000 resamples; the median is recomputed inside every whole-walker resample",
+        "exact_value_centering_note": "S_exact at the fixed thresholds is the oracle value centred on the exact median -0.540498, not the per-stream sample median",
+        "zero_count_rule": "a zero count at a gated level fails",
+        "family_wise_false_fail_rate": 0.001,
+        "k_definition": "the number of gated comparisons implied by radial_levels x radial_sides x 2 alphas, plus alpha_1_2_only.fixed_exceedance_thresholds_hartree, plus alpha_1_2_only.exceedance_levels, multiplied by shape_and_seeds.fresh_evaluation_sampler.streams",
+        "k_value": 122,
+        "c_formula": "inverse_normal_cdf(1 - family_wise_false_fail_rate / (2*K))",
+        "c_value": 4.45998023125495,
+        "pass_rule": "qualification passes only if max(|z|) over every gated comparison in both streams is at most c"
+      },
+      "shape_and_seeds": {
+        "fresh_evaluation_sampler": {"burn_in": 1000, "stride": 20, "walkers": 4096, "draws_per_stream": 256, "streams": 2},
+        "seed_namespace": "sampler_tail_qualification"
+      }
+    }
+  },
+  "pr_560_incorporation": {
+    "status": "decided",
+    "decided_by": "operator-decisions-560-logging-20261106c: 'the others look good to incorporate'",
+    "preserved_tip": "0da2b23d628a15b18ac2031ff5f72dff0c010280",
+    "preserved_tip_locations": [
+      "refs/preserved/codex-one-electron-variance-20261028-0da2b23d (local ref only, in the main checkout)",
+      "refs/pull/560/head (GitHub)"
+    ],
+    "findings": [
+      {"finding": 1, "description": "tail-calibrated sampler bands", "layer": "028867dc"},
+      {"finding": 2, "description": "science-collector integrity checks carried from analysis.py", "layer": "372ef393"},
+      {"finding": 3, "description": "InitialCheckpoint callback for the update-zero checkpoint", "layer": "5cfad8d2"},
+      {"finding": 4, "description": "ParameterActivity callback recording first-update gradient state", "layer": "52ead353"},
+      {"finding": 5, "description": "ReadoutTrajectoryMCMCGenerator for the pre-floor readout channel sum", "layer": "c8fedd84"},
+      {"finding": 6, "description": "stricter trajectory-record metadata validation", "layer": "bef1fe2c"},
+      {"finding": 7, "description": "moment-band calibration of the imperfect state and the CUDA exact canary", "layer": "f5068c1a"}
+    ],
+    "hooke_only_handed_to_manager": [
+      "nucleus-free trajectory_records v2 and allow_nucleus_free_records",
+      "OneElectronGaussian",
+      "Hooke one-electron facts (omega 0.5, E 0.75, imperfect alpha 0.6 formulas)",
+      "GaussianConfinement.scalar_diagnostics"
+    ]
+  },
+  "experiment_boundary": {
+    "status": "decided",
+    "rule": "experiments reach core only through configuration, tpen.run.run_from_config, or the installed tpen command; an integration test that needs core internals for fixtures or mutation hooks lives in the core tests/ tree",
+    "rule_source": "root note operator-decisions-20261106-imports-mirflow-readonly, rows 1 and 2",
+    "allowed_core_surfaces": [
+      "configuration",
+      "tpen.run.run_from_config",
+      "the installed tpen command"
+    ],
+    "run_module_trap": "python -m tpen.run exits 0 and does nothing: tpen/run.py has no if __name__ == '__main__' guard, and operator policy 2026-11-06 will not add one; experiment code must use the installed tpen entrypoint or call tpen.run.run_from_config explicitly"
+  },
+  "controls": [
+    "exact hydrogen energy -1/2 Ha",
+    "independently coded scalar local-energy oracle",
+    "known-imperfect alpha=1.2 state rejection",
+    "sampler target and mutation rejection",
+    "strict no-regularization rule at radius zero",
+    "source and resolved-input identity checks"
+  ]
+}

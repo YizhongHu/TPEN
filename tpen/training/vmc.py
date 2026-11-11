@@ -35,11 +35,91 @@ class VMCObjectiveResult:
     metrics: dict[str, float | int]
 
 
+#: The two admissible ways to treat a non-finite local-energy row.
+#:
+#: ``"fail"`` refuses the step. ``"mask"`` excludes those rows and reports the
+#: count, which is the historical behaviour.
+#:
+#: WHY THIS IS A CHOICE AND NOT A DEFAULT. Masking is NOT a random subsample.
+#: Non-finite local energies do not occur uniformly -- they occur where the
+#: local energy is pathological: near nodes, at coalescence, in the tail,
+#: wherever the wavefunction misbehaves. Those are precisely the regions
+#: carrying the physics being measured. Dropping them is therefore a
+#: SYSTEMATICALLY SELECTED subsample, and the resulting energy estimator is
+#: biased in a direction nobody has characterised.
+#:
+#: ``local_energy_nonfinite_count`` tells you HOW MANY rows were dropped. It
+#: does not tell you WHAT BIAS dropping them introduced, and there is no way to
+#: recover that from the count. So "not silently accepted, it is counted" is
+#: true and insufficient: **a biased estimator with a diagnostic attached is
+#: still a biased estimator**, and it produces a plausible number rather than a
+#: crash, which is the expensive kind of error.
+#:
+#: A scientist choosing ``"mask"`` should be choosing a known-biased estimator
+#: on purpose. That is why it is reachable only by explicit declaration, and
+#: why the helium-importance closed schema requires the declaration to be
+#: present rather than inherited.
+#:
+#: THIS POLICY DOES NOT COVER EVERY ROW-DROPPING PATH. It governs rows whose
+#: LOCAL ENERGY is non-finite. `tpen.training.sr.StochasticReconfigurationUpdate`
+#: has a SECOND, unconditional drop -- rows whose parameter SCORES are
+#: non-finite -- in the same expression that consults this policy. That drop
+#: carries the same selection-bias character and is NOT governed here.
+#:
+#: It is not simply an oversight, which is why it is an open decision rather
+#: than a gap: a non-finite score row would poison the ENTIRE QGT through the
+#: outer product, so the cost of NOT dropping it is categorically different
+#: from the local-energy case -- one bad local energy biases a mean, one bad
+#: score can destroy the solve. "Refuse the step" versus "protect the solve" is
+#: therefore a real question with a different answer available.
+#:
+#: Tracked as item ``02859027-7dbf-492d-8538-2ef7e28d1cee``. Named here because
+#: a reader of this policy would otherwise reasonably conclude it covers
+#: "non-finite rows" in general, and it does not.
+NONFINITE_LOCAL_ENERGY_POLICIES = ("fail", "mask")
+
+#: Historical default, kept so existing non-HI callers are unchanged by the
+#: introduction of the policy. The helium-importance schema does not rely on
+#: this default: it REQUIRES the policy to be declared, so an HI configuration
+#: cannot reach masking by omission.
+DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY = "mask"
+
+
+def resolve_nonfinite_local_energy_policy(policy: object) -> str:
+    """Validate and normalize a non-finite local-energy policy name.
+
+    Parameters
+    ----------
+    policy : object
+        Candidate policy name.
+
+    Returns
+    -------
+    str
+        One of `NONFINITE_LOCAL_ENERGY_POLICIES`.
+
+    Raises
+    ------
+    ValueError
+        If `policy` is not an admissible name. Refused rather than defaulted,
+        because a typo silently falling back to ``"mask"`` would reintroduce
+        exactly the unchosen-estimator failure the policy exists to prevent.
+    """
+
+    if not isinstance(policy, str) or policy not in NONFINITE_LOCAL_ENERGY_POLICIES:
+        raise ValueError(
+            f"nonfinite local-energy policy must be one of "
+            f"{list(NONFINITE_LOCAL_ENERGY_POLICIES)}, got {policy!r}"
+        )
+    return policy
+
+
 def compute_vmc_objective(
     logabs: torch.Tensor,
     local_energy: torch.Tensor,
     *,
     scale_factor: float = 2.0,
+    nonfinite_policy: str = DEFAULT_NONFINITE_LOCAL_ENERGY_POLICY,
 ) -> VMCObjectiveResult:
     """Compute the VMC score-function objective and training metrics.
 
@@ -92,10 +172,25 @@ def compute_vmc_objective(
             f"got {tuple(logabs.shape)} and {tuple(local_energy.shape)}"
         )
 
+    resolved_policy = resolve_nonfinite_local_energy_policy(nonfinite_policy)
+
     finite_mask = torch.isfinite(local_energy)
     n_total = int(local_energy.numel())
     n_finite = int(finite_mask.sum().item())
 
+    if resolved_policy == "fail" and n_finite != n_total:
+        raise ValueError(
+            "cannot compute VMC objective: "
+            f"{n_total - n_finite} of {n_total} local-energy samples are non-finite and "
+            "the active policy is 'fail'. Masking them would drop a systematically "
+            "selected subsample -- non-finite rows occur where the local energy is "
+            "pathological -- so the resulting estimator would be biased by an "
+            "uncharacterised amount. Declare 'mask' explicitly to accept that "
+            "known-biased estimator"
+        )
+
+    # Retained under EVERY policy: with no finite row there is no estimator at
+    # all, biased or otherwise, so this is not a policy question.
     if n_finite == 0:
         raise ValueError("cannot compute VMC objective: no finite local-energy samples")
 

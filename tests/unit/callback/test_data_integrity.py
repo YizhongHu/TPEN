@@ -190,3 +190,34 @@ def test_cadence_gates_on_the_durable_step_not_the_occurrence_count() -> None:
         deliver_completed_iteration(callback, context, state, step=step, count=1)
 
     assert [r["step"] for r in context.by_namespace("checks/data_integrity")] == [0, 5, 10]
+
+
+def test_every_n_steps_only_abort_decision_is_stable_across_restart() -> None:
+    """A durable-only cadence sees the same bad step before and after restore."""
+
+    bad_state = _finite_state()
+    bad_state.local_energy = torch.tensor([1.0, float("nan"), 3.0, 4.0], dtype=torch.float64)
+
+    uninterrupted = DataIntegrity(every_n_steps=1, fail_fast=True)
+    _handle(uninterrupted, _finite_state())
+    with pytest.raises(RuntimeError, match="local_energy_nonfinite_fraction"):
+        _handle(uninterrupted, bad_state)
+
+    resumed = DataIntegrity(every_n_steps=1, fail_fast=True)
+    with pytest.raises(RuntimeError, match="local_energy_nonfinite_fraction"):
+        _handle(resumed, bad_state)
+
+
+def test_unrestored_max_calls_would_change_the_abort_decision() -> None:
+    """The refused cadence demonstrates why the admission rule is required."""
+
+    bad_state = _finite_state()
+    bad_state.local_energy = torch.tensor([1.0, float("nan"), 3.0, 4.0], dtype=torch.float64)
+
+    uninterrupted = DataIntegrity(every_n_steps=1, max_calls=1, fail_fast=True)
+    _handle(uninterrupted, _finite_state())
+    _handle(uninterrupted, bad_state)
+
+    resumed = DataIntegrity(every_n_steps=1, max_calls=1, fail_fast=True)
+    with pytest.raises(RuntimeError, match="local_energy_nonfinite_fraction"):
+        _handle(resumed, bad_state)

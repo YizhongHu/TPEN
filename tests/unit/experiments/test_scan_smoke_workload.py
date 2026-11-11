@@ -4,24 +4,12 @@ One property, asserted behaviourally rather than by arithmetic: after the smoke'
 ``training.max_steps`` iterations, the run has actually written a terminal
 checkpoint.
 
-Why it needs a test at all. ``Checkpoint`` shares ONE ``StepCadenceGate`` between
-its periodic and its terminal write, and ``_write_terminal`` consults it with the
-final iteration index (``tpen/callback/checkpoint.py:190,218``). So a config that
-sets ``every_n_steps: N`` writes NO terminal checkpoint unless ``max_steps``
-happens to be an exact multiple of N, and it fails silently: training completes,
-``status.json`` says ``completed``, the checkpoints directory is empty, and the
-validation stage then dies on a missing COMPLETE marker. A 60-step smoke against
-``every_n_steps: 100`` reproduced exactly that during layer 4 of this stack. The
-scan's 288 validation rows would otherwise depend on that arithmetic coincidence.
-
-The fix in ``configs/train.yaml`` is to register ``Checkpoint`` with
-``periodic: false`` and no cadence kwarg at all, which leaves the gate's
-``every_n`` at 1 so the terminal write fires for ANY ``max_steps``. This test
-drives the real callback built from the real composed config -- the smoke's static
-overrides applied exactly as the launcher applies them -- and checks the
-checkpoint directory is on disk. ``experiments/hooke/tpen-pair-scan-v1/test_scan_grid.py``
-carries the complementary config-level invariant, that no smoke override may
-introduce a checkpoint cadence that fails to divide the step budget.
+Why it needs a test at all. The scan's checkpoint stream is explicitly composed
+with ``TerminalOnly``, so the terminal boundary cannot be suppressed by a
+periodic cadence. This test drives the real callback built from the real composed
+config -- the smoke's static overrides applied exactly as the launcher applies
+them -- and checks the checkpoint directory is on disk. The config-surface test
+also pins the absence of a legacy checkpoint cadence override.
 
 The workload is replayed rather than trained: the point is the callback contract
 at the smoke's step budget, and running the real trainer would need a GPU and
@@ -41,6 +29,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from tpen.artifacts import RunContext
 from tpen.callback import Checkpoint
+from tpen.checkpoint import TerminalOnly, TrainResume
 from tpen.events import Occurrence
 from tpen.training.events import (
     TrainingCompleted,
@@ -238,12 +227,11 @@ def test_the_smoke_budget_writes_a_terminal_checkpoint(tmp_path: Path, stage: st
 def test_the_terminal_write_is_ungated_so_any_step_budget_is_safe(
     tmp_path: Path, stage: str
 ) -> None:
-    """The gate's window is 1, which is what makes the budget a free choice.
+    """``TerminalOnly`` is what makes the budget a free choice.
 
     The timing probe owns ``max_steps`` for the production grid. Pinning the
-    mechanism -- not just the outcome at one budget -- is what stops a later
-    ``every_n_steps`` from reintroducing a suppression that only shows up as an
-    empty directory.
+    semantic schedule, not just one outcome, prevents a later cadence from
+    suppressing the artifact.
     """
 
     cfg = _train_config(stage, tmp_path / stage)
@@ -251,11 +239,11 @@ def test_the_terminal_write_is_ungated_so_any_step_budget_is_safe(
 
     assert callback.terminal is True
     assert callback.periodic is False
-    assert callback._steps.cadence.every_n == 1
-    assert callback._steps.cadence.max_calls is None
+    assert callback.schedule == TerminalOnly()
+    assert callback.payload == TrainResume()
     # Every budget an operator could pick, including the awkward ones.
     for max_steps in (1, 3, 4, 7, 60, 97, 500):
-        assert callback._steps.should_run(max_steps) is True
+        assert callback.schedule.should_run(max_steps, terminal=True) is True
 
 
 def test_the_smoke_reduces_the_train_budget_it_claims_to_reduce() -> None:

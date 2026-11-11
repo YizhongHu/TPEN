@@ -69,13 +69,16 @@ def _he_reference() -> float:
     return float(helium["reference_energy_hartree"])
 
 
-def _assert_he_system(config: dict) -> None:
+def _assert_he_system(config: dict, *, include_reference_energy: bool = True) -> None:
     system = config["system"]
     assert system["id"] == "he_atom"
     assert system["n_particles"] == 2
     assert system["spin"] == {"n_up": 1, "n_down": 1}
     assert system["nuclei"] == {"positions": [[0.0, 0.0, 0.0]], "charges": [2.0]}
-    assert float(system["reference_energy"]) == _he_reference()
+    if include_reference_energy:
+        assert float(system["reference_energy"]) == _he_reference()
+    else:
+        assert "reference_energy" not in system
 
 
 def _assert_factorized_model(config: dict) -> None:
@@ -94,7 +97,7 @@ def _assert_factorized_model(config: dict) -> None:
 
 def test_he_train_config_owns_batch_nuclear_context_and_coulomb_terms() -> None:
     config = _load(TRAIN)
-    _assert_he_system(config)
+    _assert_he_system(config, include_reference_energy=False)
     _assert_factorized_model(config)
     sampler = config["sampler"]
     assert sampler["nuclear_positions"] == {
@@ -367,7 +370,7 @@ def test_positional_override_indices_hold_the_class_the_job_scripts_assume(
     and the override retunes sampler-health reporting instead, the run completes
     cleanly, and the pilot produces NO SCALAR TRACE AND NO ERROR -- on the exact
     measurement the zero-gradient-trap check depends on. The same shape applies
-    to ``summaries.4.max_samples`` and to the checkpoint cadence at 9.
+    to ``summaries.4.max_samples`` and to the checkpoint schedule at 9.
 
     Asserted against the imported CLASS rather than the dotted string, so
     renaming or relocating the class fails here too instead of leaving a string
@@ -795,10 +798,25 @@ def test_trainable_law_breaks_strict_restore_in_both_directions() -> None:
         trainable.load_state_dict(linear.state_dict(), strict=True)
 
 
+def test_he_train_enables_canonical_host_wall_cost_callback_at_config_root() -> None:
+    """Compose the concrete resource callback in the training config."""
+
+    train_callbacks = _load(TRAIN)["callbacks"]
+    concrete_target = "tpen.callback.ResourceUsage"
+    assert sum(entry["_target_"] == concrete_target for entry in train_callbacks) == 1
+    resource_usage = next(entry for entry in train_callbacks if entry["_target_"] == concrete_target)
+    assert resource_usage["allocator_probe"] == {
+        "_target_": "tpen.accelerator.TorchAllocatorPeakProbe",
+        "device": "${runtime.device}",
+    }
+
+
 def test_he_eval_enables_canonical_host_wall_cost_callbacks_at_config_root() -> None:
     """Use typed evaluation boundaries without claiming broken device sync."""
 
     config = _load(EVAL)
+    concrete_target = "tpen.callback.ResourceUsage"
+    assert sum(entry["_target_"] == concrete_target for entry in config["callbacks"]) == 1
     callbacks = {
         entry["_target_"]: entry
         for entry in config["callbacks"]
@@ -809,5 +827,9 @@ def test_he_eval_enables_canonical_host_wall_cost_callbacks_at_config_root() -> 
         "tpen.callback.DiagnosticTiming",
     ):
         assert callbacks[target]["accelerator_synchronize"] is False
-    assert "tpen.callback.ResourceUsage" in callbacks
+    resource_usage = callbacks[concrete_target]
+    assert resource_usage["allocator_probe"] == {
+        "_target_": "tpen.accelerator.TorchAllocatorPeakProbe",
+        "device": "${runtime.device}",
+    }
     assert "callbacks" not in config["runner"]

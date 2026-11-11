@@ -10,11 +10,37 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from experiments.toolkit.dispatch import AllocationContext, DispatchSpec, StagePlanV2, write_dispatch_records
+from experiments.toolkit.executor_inputs import ready_group, write_additive_ready_group
 from experiments.toolkit.parsl_attach import ParslAttachExecutor
 
-from admission import admit_plan, write_dispatch_specs
-import hev1
-from run_train_row import require_allocation
+# Siblings are loaded study-scoped, not by bare import: experiments/ has several
+# same-named modules and the first study loaded would otherwise own the bare name
+# for every study after it. See experiments/toolkit/study_imports.py.
+#
+# The loader is reached BY PATH rather than by putting the repository root on
+# sys.path. A study directory that mutates sys.path is the mechanism behind the
+# very defect this import exists to fix, and he-cutover's gateway test forbids it
+# outright -- so the fix must not reintroduce it in order to install itself.
+import importlib.util as _tpen_importlib  # noqa: E402
+import sys as _tpen_sys  # noqa: E402
+from pathlib import Path as _TpenPath  # noqa: E402
+
+if "_tpen_study_imports" not in _tpen_sys.modules:
+    _tpen_spec = _tpen_importlib.spec_from_file_location(
+        "_tpen_study_imports",
+        _TpenPath(__file__).resolve().parents[3] / "experiments" / "toolkit" / "study_imports.py",
+    )
+    _tpen_module = _tpen_importlib.module_from_spec(_tpen_spec)
+    _tpen_sys.modules["_tpen_study_imports"] = _tpen_module
+    _tpen_spec.loader.exec_module(_tpen_module)
+sibling = _tpen_sys.modules["_tpen_study_imports"].sibling
+
+_tpen_admission = sibling(__file__, 'admission')
+admit_plan = _tpen_admission.admit_plan
+write_dispatch_specs = _tpen_admission.write_dispatch_specs
+hev1 = sibling(__file__, 'hev1')
+_tpen_run_train_row = sibling(__file__, 'run_train_row')
+require_allocation = _tpen_run_train_row.require_allocation
 
 
 def allocation_context(*, facility: str, run_root: str | Path, environ: Mapping[str, str] | None = None, deadline: str | float | None = None) -> AllocationContext:
@@ -48,11 +74,34 @@ def preflight_dispatch(*, context: AllocationContext, cwd: str | Path, admission
     return DispatchSpec("preflight", admission_id, f"{admission_id}:preflight", "01_preflight", "preflight", (python, "-c", code), str(context.run_root), runtime, str(cwd), completion=CompletionSpec(policy="none"))
 
 
+def executor_inputs(train_plan: StagePlanV2, eval_plan: StagePlanV2) -> tuple[dict[str, object], dict[str, object]]:
+    """Emit both executor input mappings without changing the legacy route.
+
+    Parameters
+    ----------
+    train_plan, eval_plan : StagePlanV2
+        Validated training and evaluation plans.
+
+    Returns
+    -------
+    tuple of dict
+        Training and evaluation ``ReadyGroup`` wire mappings, respectively.
+    """
+
+    return ready_group(train_plan, script_slot=1), ready_group(eval_plan, script_slot=1)
+
+
 def run_pipeline(*, train_plan: StagePlanV2, eval_plan: StagePlanV2, facility: str, launch_dir: str | Path, admission_id: str, executor=None, environ: Mapping[str, str] | None = None) -> int:
     """Run probe, training, completion barrier, then evaluation; exit code is truth."""
 
     launch = Path(launch_dir)
     launch.mkdir(parents=True, exist_ok=True)
+    write_additive_ready_group(
+        launch / "02_train" / "executor_input.json", train_plan, script_slot=1
+    )
+    write_additive_ready_group(
+        launch / "03_eval" / "executor_input.json", eval_plan, script_slot=1
+    )
     context = allocation_context(facility=facility, run_root=launch, environ=environ)
     executor = executor or ParslAttachExecutor()
     records = []

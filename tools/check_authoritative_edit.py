@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Fail-closed launch check for authoritative TPEN repository edits."""
+"""Fail-closed launch check for authoritative TPEN repository edits.
+
+Python 3.7 and 3.8 receive a structured interpreter refusal before any guard
+precondition is evaluated. Python <=3.6 raises ``SyntaxError`` while parsing
+``from __future__ import annotations`` before this gate can run; that residual
+limitation is intentional.
+"""
 
 from __future__ import annotations
 
@@ -17,10 +23,41 @@ DEFAULT_API_URL = "http://127.0.0.1:3001"
 DEFAULT_PROJECT_ROOT_ID = "58348558-a4c8-4ed7-8f7b-829ef8163145"
 EXPECTED_REMOTE_PATH = "/YizhongHu/TPEN"
 EXPECTED_ITEM_TYPE = "implementation-slice"
+MINIMUM_PYTHON = (3, 9)  # str.removesuffix requires Python 3.9+.
 
 
 class GuardFailure(RuntimeError):
     """An authoritative-edit precondition was not satisfied."""
+
+
+class UnsupportedInterpreter(GuardFailure):
+    """The running Python interpreter is too old to evaluate the guard."""
+
+
+def _require_supported_interpreter(version_info=None) -> None:
+    """Require an interpreter new enough to evaluate the guard safely.
+
+    Parameters
+    ----------
+    version_info : sequence of int, optional
+        Version tuple to validate. Defaults to :data:`sys.version_info`; the
+        injectable parameter keeps both sides of the version boundary
+        testable without monkeypatching.
+
+    Raises
+    ------
+    UnsupportedInterpreter
+        If ``version_info`` is older than Python 3.9.
+    """
+    version_info = sys.version_info if version_info is None else version_info
+    if tuple(version_info[:2]) < MINIMUM_PYTHON:
+        running_version = ".".join(str(part) for part in version_info[:3])
+        raise UnsupportedInterpreter(
+            f"Python {running_version} is unsupported; this guard requires Python 3.9+ "
+            "for a Python 3.9-only feature; no guard precondition was evaluated. "
+            "Rerun as `uv run --no-project python tools/check_authoritative_edit.py "
+            "--item <full-uuid>` or under an explicitly named 3.9+ interpreter."
+        )
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -132,6 +169,7 @@ def _validate_item(api_url: str, item_id: str, project_root_id: str) -> None:
 def check_launch(cwd: Path, item_id: str, api_url: str, project_root_id: str) -> dict[str, str]:
     """Validate the repository lane and Task Orchestrator work contract."""
 
+    _require_supported_interpreter()
     validated_url = _validated_api_url(api_url)
     top_level, branch, head = _validate_repository(cwd.resolve())
     _validate_item(validated_url, item_id, project_root_id)
@@ -164,8 +202,9 @@ def _fail(message: str) -> NoReturn:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
     try:
+        _require_supported_interpreter()
+        args = _parser().parse_args(argv)
         receipt = check_launch(args.cwd, args.item, args.api_url, args.project_root_id)
     except GuardFailure as error:
         _fail(str(error))

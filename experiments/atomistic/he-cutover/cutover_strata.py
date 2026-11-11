@@ -4,6 +4,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Siblings are loaded study-scoped, not by bare import: experiments/ has several
+# same-named modules and the first study loaded would otherwise own the bare name
+# for every study after it. See experiments/toolkit/study_imports.py.
+import importlib.util as _tpen_importlib
+import sys as _tpen_sys
+from pathlib import Path as _TpenPath
+
+if "_tpen_study_imports" not in _tpen_sys.modules:
+    _tpen_spec = _tpen_importlib.spec_from_file_location(
+        "_tpen_study_imports",
+        _TpenPath(__file__).resolve().parents[3] / "experiments" / "toolkit" / "study_imports.py",
+    )
+    _tpen_module = _tpen_importlib.module_from_spec(_tpen_spec)
+    _tpen_sys.modules["_tpen_study_imports"] = _tpen_module
+    _tpen_spec.loader.exec_module(_tpen_module)
+sibling = _tpen_sys.modules["_tpen_study_imports"].sibling
+
 
 
 @dataclass(frozen=True)
@@ -23,7 +40,7 @@ def validate_placement(*, facility: str, partition: str, stratum: str, timeout_m
     """Validate a Cannon or Polaris placement without weakening either policy."""
 
     if facility == "cannon":
-        import hev1
+        hev1 = sibling(__file__, "hev1")
 
         return hev1.strata.validate_canary_gpu_placement(
             partition=partition, stratum_name=stratum, timeout_min=timeout_min
@@ -47,7 +64,7 @@ def check_delivered_device(*, facility: str, stratum: str, delivered: str | None
     """Fail unless the allocation delivered the requested device stratum."""
 
     if facility == "cannon":
-        import hev1
+        hev1 = sibling(__file__, "hev1")
 
         hev1.strata.check_delivered_device(stratum_name=stratum, delivered=delivered)
         return

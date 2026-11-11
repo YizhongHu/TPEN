@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -96,60 +95,6 @@ def list_complete_checkpoints(checkpoint_root: str | Path) -> list[Path]:
     root = Path(checkpoint_root)
     checkpoints = [path for path in root.glob("step_*") if is_complete_checkpoint_dir(path)]
     return sorted(checkpoints, key=_checkpoint_sort_key)
-
-
-def prune_old_checkpoints(checkpoint_root: str | Path, *, keep_last: int | None) -> None:
-    """Remove older complete checkpoint directories when `keep_last` is set.
-
-    The directory `latest.json` points at is always spared, even when it falls
-    outside the newest `keep_last`. `latest.json` is the pointer every resume
-    path resolves through, so deleting its target would leave the run
-    unresumable through its own pointer. The pointer target is spared *in
-    addition* to the newest `keep_last`; the keep window itself is unchanged.
-
-    Parameters
-    ----------
-    checkpoint_root : str or pathlib.Path
-        Checkpoint root holding ``step_*`` directories and ``latest.json``.
-    keep_last : int or None
-        Number of newest complete checkpoints to keep. ``None`` disables
-        pruning entirely.
-
-    Raises
-    ------
-    ValueError
-        If `keep_last` is set but not positive.
-    """
-
-    if keep_last is None:
-        return
-    keep = int(keep_last)
-    if keep < 1:
-        raise ValueError(f"keep_last must be positive when set, got {keep_last}")
-    root = Path(checkpoint_root)
-    checkpoints = list_complete_checkpoints(root)
-    pointer_target = _latest_pointer_target(root)
-    for checkpoint_dir in checkpoints[:-keep]:
-        if checkpoint_dir == pointer_target:
-            continue
-        shutil.rmtree(checkpoint_dir)
-
-
-def _latest_pointer_target(checkpoint_root: Path) -> Path | None:
-    """Return the directory `latest.json` points at, or ``None``.
-
-    Pruning runs at the tail of a checkpoint write that has already been
-    committed, so a missing or unreadable pointer must not raise here: it
-    returns ``None`` and pruning proceeds without a spared target. An
-    unreadable pointer already cannot resolve a resume, so nothing usable is
-    protected by refusing to prune.
-    """
-
-    try:
-        pointer = read_latest(checkpoint_root)
-    except (FileNotFoundError, ValueError):
-        return None
-    return checkpoint_root / str(pointer["checkpoint_dir"])
 
 
 def _checkpoint_sort_key(path: Path) -> tuple[int, str]:

@@ -661,20 +661,11 @@ def test_accelerator_synchronize_defaults_false_and_flips_from_one_path(stage: s
             assert entry.accelerator_synchronize is expected, f"{entry._target_} ignored the knob"
 
 
-def test_the_terminal_checkpoint_is_not_cadence_gated() -> None:
-    """Validation must be able to restore whatever `max_steps` the probe picks.
+def test_the_terminal_checkpoint_uses_an_explicit_terminal_only_schedule() -> None:
+    """Validation can restore whatever ``max_steps`` the probe picks.
 
-    `Checkpoint` shares ONE `StepCadenceGate` between its periodic and its
-    terminal write (``callback/checkpoint.py:190,218``), and ``_write_terminal``
-    consults that gate with the final iteration index. An `every_n_steps: N`
-    therefore suppresses the terminal checkpoint whenever ``max_steps`` is not a
-    multiple of N — silently: training reports ``completed``, and the checkpoints
-    directory is empty. A 60-step smoke against ``every_n_steps: 100`` reproduced
-    it, and validation died on the missing COMPLETE marker.
-
-    Since the P0-e probe owns ``max_steps``, no arithmetic relationship between
-    two independently-chosen numbers is acceptable here. The gate is left at its
-    default window instead, so the terminal write always fires.
+    The stream declares ``TerminalOnly`` explicitly, so no periodic cadence can
+    suppress the terminal boundary.
     """
 
     checkpoint = [
@@ -685,9 +676,10 @@ def test_the_terminal_checkpoint_is_not_cadence_gated() -> None:
 
     assert len(checkpoint) == 1
     assert checkpoint[0].terminal is True
+    assert checkpoint[0].schedule._target_ == "tpen.checkpoint.TerminalOnly"
+    assert checkpoint[0].payload._target_ == "tpen.checkpoint.TrainResume"
     assert "every_n_steps" not in checkpoint[0], (
-        "every_n_steps on Checkpoint gates the TERMINAL write too, so validation "
-        "silently has nothing to restore unless max_steps divides it"
+        "legacy every_n_steps must not replace the explicit terminal-only schedule"
     )
     assert "every_n_steps" not in _raw("train").checkpoint
 

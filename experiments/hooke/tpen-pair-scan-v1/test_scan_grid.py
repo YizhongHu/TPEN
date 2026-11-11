@@ -87,8 +87,31 @@ def _load_script(name: str) -> ModuleType:
 
 plan = _load_script("plan")
 select_champions = _load_script("select_champions")
-from utils import layout  # noqa: E402
-from utils.config import load_composed_config  # noqa: E402
+# Siblings are loaded study-scoped, not by bare import: experiments/ has several
+# same-named modules and the first study loaded would otherwise own the bare name
+# for every study after it. See experiments/toolkit/study_imports.py.
+#
+# The loader is reached BY PATH rather than by putting the repository root on
+# sys.path. A study directory that mutates sys.path is the mechanism behind the
+# very defect this import exists to fix, and he-cutover's gateway test forbids it
+# outright -- so the fix must not reintroduce it in order to install itself.
+import importlib.util as _tpen_importlib  # noqa: E402
+import sys as _tpen_sys  # noqa: E402
+from pathlib import Path as _TpenPath  # noqa: E402
+
+if "_tpen_study_imports" not in _tpen_sys.modules:
+    _tpen_spec = _tpen_importlib.spec_from_file_location(
+        "_tpen_study_imports",
+        _TpenPath(__file__).resolve().parents[3] / "experiments" / "toolkit" / "study_imports.py",
+    )
+    _tpen_module = _tpen_importlib.module_from_spec(_tpen_spec)
+    _tpen_sys.modules["_tpen_study_imports"] = _tpen_module
+    _tpen_spec.loader.exec_module(_tpen_module)
+sibling = _tpen_sys.modules["_tpen_study_imports"].sibling
+
+layout = sibling(__file__, 'utils.layout')
+_tpen_utils_config = sibling(__file__, 'utils.config')
+load_composed_config = _tpen_utils_config.load_composed_config
 
 
 @pytest.fixture(autouse=True)
@@ -870,29 +893,21 @@ def test_the_selector_never_ranks_on_the_non_variational_mean_or_on_wall_time() 
 # ---------------------------------------------------------------------------
 # 7. The smoke's terminal checkpoint, at the config level
 # ---------------------------------------------------------------------------
-def test_the_smoke_declares_no_checkpoint_cadence_that_could_gate_the_terminal_write() -> None:
-    """``Checkpoint`` shares ONE gate between its periodic and terminal writes.
+def test_the_smoke_declares_a_terminal_only_checkpoint_stream() -> None:
+    """The scan's checkpoint selection policy is explicit and ungated.
 
-    ``_write_terminal`` consults the same ``StepCadenceGate`` with the final
-    iteration index (``callback/checkpoint.py:190,218``), so ``every_n_steps: N``
-    suppresses the terminal checkpoint unless ``max_steps`` is an exact multiple of
-    N -- silently: training completes, ``status.json`` says ``completed``, the
-    checkpoints directory is empty, and validation dies on the missing COMPLETE
-    marker. A 60-step run against ``every_n_steps: 100`` reproduced exactly that.
-
-    So the smoke must either declare no checkpoint cadence at all, or declare one
-    that divides its own ``max_steps``. The behavioural check that the write
-    actually happens is in ``tests/unit/experiments/test_scan_smoke_workload.py``;
-    this one exists so the arithmetic can never be reached by accident.
+    The scan's checkpoint stream is explicitly ``TerminalOnly`` in ``train.yaml``
+    and therefore has no checkpoint cadence to divide the smoke budget. The
+    behavioural check that the write actually happens is in
+    ``tests/unit/experiments/test_scan_smoke_workload.py``; this one keeps the
+    static override surface from creating a legacy cadence key.
     """
 
     static = _grid_data(SMOKE)["static_overrides"]
     for stage, overrides in static.items():
         max_steps = overrides.get("training.max_steps")
         assert isinstance(max_steps, int) and max_steps > 0, stage
-        cadence = overrides.get("checkpoint.every_n_steps")
-        if cadence is not None:
-            assert max_steps % int(cadence) == 0, (stage, max_steps, cadence)
+        assert "checkpoint.every_n_steps" not in overrides
         # Every other cadence in the stage must also divide the budget, or the
         # smoke silently exercises fewer windows than it claims.
         for path in ("checks.every_n_steps", "status.every_n_steps", "training.log_every_n_steps"):

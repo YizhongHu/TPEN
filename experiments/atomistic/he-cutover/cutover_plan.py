@@ -11,10 +11,33 @@ from typing import Any, Mapping, Sequence
 import yaml
 
 from experiments.toolkit.dispatch import LogicalTaskSpec, StagePlanV2, logical_task_id_from_parts
+from experiments.toolkit.executor_inputs import ready_group, write_additive_ready_group
 from experiments.toolkit.resources import ResourceSpec
 from experiments.toolkit.specs import CompletionSpec
 
-import cutover_strata
+# Siblings are loaded study-scoped, not by bare import: experiments/ has several
+# same-named modules and the first study loaded would otherwise own the bare name
+# for every study after it. See experiments/toolkit/study_imports.py.
+#
+# The loader is reached BY PATH rather than by putting the repository root on
+# sys.path. A study directory that mutates sys.path is the mechanism behind the
+# very defect this import exists to fix, and he-cutover's gateway test forbids it
+# outright -- so the fix must not reintroduce it in order to install itself.
+import importlib.util as _tpen_importlib  # noqa: E402
+import sys as _tpen_sys  # noqa: E402
+from pathlib import Path as _TpenPath  # noqa: E402
+
+if "_tpen_study_imports" not in _tpen_sys.modules:
+    _tpen_spec = _tpen_importlib.spec_from_file_location(
+        "_tpen_study_imports",
+        _TpenPath(__file__).resolve().parents[3] / "experiments" / "toolkit" / "study_imports.py",
+    )
+    _tpen_module = _tpen_importlib.module_from_spec(_tpen_spec)
+    _tpen_sys.modules["_tpen_study_imports"] = _tpen_module
+    _tpen_spec.loader.exec_module(_tpen_module)
+sibling = _tpen_sys.modules["_tpen_study_imports"].sibling
+
+cutover_strata = sibling(__file__, 'cutover_strata')
 
 SMOKE_SCHEMA = "he-cutover-smoke-grid/v1"
 PROOF_SCHEMA = "he-cutover-proof-grid/v1"
@@ -143,6 +166,7 @@ def build_plans(grid: Mapping[str, Any], *, facility: str, results_root: str | P
 
     rows = expand_rows(grid, facility=facility, results_root=results_root)
     tasks: list[LogicalTaskSpec] = []
+    manifest_rows: list[dict[str, Any]] = []
     for row in rows:
         result = Path(row["result_dir"])
         status = result / "status.json"
@@ -151,20 +175,44 @@ def build_plans(grid: Mapping[str, Any], *, facility: str, results_root: str | P
         script = "run_train_row.py" if row["kind"] == "train" else "run_eval_row.py"
         command = ("{python}", str(Path(__file__).resolve().parent / script), "--row-json", json.dumps(row, sort_keys=True), "--plan-attempt-id", plan_id)
         logical_id = logical_task_id_from_parts(stage=row["stage"], run_id=row["row_id"], plan_id=plan_id)
+        manifest_rows.append({**row, "logical_task_id": logical_id})
         train_run_id = row["row_id"] if row["kind"] == "train" else f"seed-{int(row['row_id'].split('-')[1]):03d}"
         dependencies = () if row["kind"] == "train" else (logical_task_id_from_parts(stage="02_train", run_id=train_run_id, plan_id=plan_id),)
         resources = row["resources"]
         tasks.append(LogicalTaskSpec(logical_task_id=logical_id, stage=row["stage"], run_id=row["row_id"], command=command, result_dir=str(result), logs=(str(status),), params=dict(row), resources=ResourceSpec(profile="cuda", device="cuda", partition=resources["partition"], threads=resources["cpus"], mem_gb=resources["mem_gb"], gpus=resources["gpus"], timeout_min=resources["timeout_min"], metadata={"stratum": resources["stratum"]}), dependencies=dependencies, completion=completion, metadata={"facility": facility, "runtime": row["runtime"]}))
     train_plan = StagePlanV2(STUDY, "02_train", plan_id, str(results_root), tuple(task for task in tasks if task.stage == "02_train")).validate()
     eval_plan = StagePlanV2(STUDY, "03_eval", plan_id, str(results_root), tuple(task for task in tasks if task.stage == "03_eval")).validate()
-    manifest = {"schema": "he-cutover-plan/v1", "study": STUDY, "facility": facility, "plan_id": plan_id, "results_root": str(Path(results_root).resolve()), "rows": list(rows), "stages": {"02_train": "02_train", "03_eval": "03_eval"}}
+    manifest = {"schema": "he-cutover-plan/v1", "study": STUDY, "facility": facility, "plan_id": plan_id, "results_root": str(Path(results_root).resolve()), "rows": manifest_rows, "stages": {"02_train": "02_train", "03_eval": "03_eval"}}
     return train_plan, eval_plan, manifest
+
+
+def executor_inputs(train_plan: StagePlanV2, eval_plan: StagePlanV2) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Emit executor inputs for both plans without activating execution.
+
+    Parameters
+    ----------
+    train_plan, eval_plan : StagePlanV2
+        Validated training and evaluation plans.
+
+    Returns
+    -------
+    tuple of dict
+        Training and evaluation ``ReadyGroup`` wire mappings, respectively.
+    """
+
+    return ready_group(train_plan, script_slot=1), ready_group(eval_plan, script_slot=1)
 
 
 def write_plans(output_dir: str | Path, train_plan: StagePlanV2, eval_plan: StagePlanV2, manifest: Mapping[str, Any]) -> Path:
     output = Path(output_dir)
     train_plan.write(output / "02_train")
     eval_plan.write(output / "03_eval")
+    write_additive_ready_group(
+        output / "02_train" / "executor_input.json", train_plan, script_slot=1
+    )
+    write_additive_ready_group(
+        output / "03_eval" / "executor_input.json", eval_plan, script_slot=1
+    )
     output.mkdir(parents=True, exist_ok=True)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     with (output / "rows.csv").open("w", encoding="utf-8", newline="") as handle:

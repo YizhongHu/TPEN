@@ -1,0 +1,99 @@
+{
+  "source": {
+    "document": "2026-09-04-tpen-helium-importance-scan-consolidated.md",
+    "sections": ["2.7", "2.8"]
+  },
+  "notes": [
+    "Section 2.7 states a bound C as ||Delta theta||_2^2 <= C (squared Euclidean update-norm bound), not ||Delta theta||_2 <= C. The earlier 'step cap' phrasing is called underspecified and is not used here. This applies to every 'squared_update_norm_bound' level below, for SR and SPRING.",
+    "Section 2.7's 120-cell total (112 VMC-specialized cells, eight Adam cells) replaces the old 128-cell menu by removing RAdam.",
+    "Family names below spell HI_METHOD_ROSTER's method vocabulary exactly: adam, sr, kfac, spring, linear_method.",
+    "Adam's fixed 'parameter_groups': 1 and 'schedule': 'constant' are stated literally in section 2.3 ('one group, constant schedule') and are reinforced by section 2.7's 'no schedules or parameter-group policies are crossed'. They are transcribed, not invented."
+  ],
+  "families": [
+    {
+      "family": "adam",
+      "varied": {
+        "lr": [0.0005, 0.0015, 0.005, 0.015],
+        "beta2": [0.99, 0.999]
+      },
+      "fixed": {
+        "beta1": 0.9,
+        "epsilon": 1e-8,
+        "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant"
+      },
+      "declared_cells": 8
+    },
+    {
+      "family": "sr",
+      "varied": {
+        "eta": [0.003, 0.01, 0.03, 0.1],
+        "relative_damping": [1e-4, 1e-3, 1e-2, 0.1],
+        "squared_update_norm_bound": [1e-4, 1e-3]
+      },
+      "fixed": {},
+      "declared_cells": 32
+    },
+    {
+      "family": "kfac",
+      "varied": {
+        "eta": [0.01, 0.03, 0.05, 0.1],
+        "relative_damping": [1e-4, 1e-3, 1e-2, 0.1],
+        "factor_ema": [0.95, 0.99]
+      },
+      "fixed": {
+        "curvature_factor_update_interval": 1,
+        "inverse_refresh_interval": 10,
+        "separate_momentum": false,
+        "predicted_kl_cap": 1e-3
+      },
+      "declared_cells": 32
+    },
+    {
+      "family": "spring",
+      "varied": {
+        "eta": [0.002, 0.006, 0.02, 0.06],
+        "relative_damping": [1e-4, 1e-3],
+        "history_mu": [0.98, 0.99],
+        "squared_update_norm_bound": [1e-4, 1e-3]
+      },
+      "fixed": {
+        "initial_history": 0.0
+      },
+      "declared_cells": 32
+    },
+    {
+      "family": "linear_method",
+      "varied": {
+        "derivative_block_shift": [1e-4, 1e-3, 1e-2, 0.1],
+        "overlap_metric_trust_radius": [0.01, 0.03, 0.1, 0.3]
+      },
+      "fixed": {},
+      "units": {
+        "derivative_block_shift": "hartree"
+      },
+      "declared_cells": 16
+    }
+  ],
+  "contexts": [
+    {
+      "name": "O-raw",
+      "overrides": {
+        "input_features": "B00",
+        "feature_update": "residual"
+      },
+      "unspecified_coordinates": "every coordinate not named here is the section-2.3 literal control protocol"
+    },
+    {
+      "name": "O-composite",
+      "overrides": {
+        "producer_policy": "hybrid/coordinate-neighbor",
+        "aggregation_activation": "channel-MLP at both activation sites",
+        "input_features": "B11",
+        "feature_update": "residual"
+      },
+      "unspecified_coordinates": "every coordinate not named here is the section-2.3 literal control protocol"
+    }
+  ]
+}

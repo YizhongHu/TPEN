@@ -1,0 +1,37 @@
+# THE ONLY REFERENCE HOLDER IN THE HELIUM-IMPORTANCE STUDY.
+#
+# This file is loaded by the evaluation and analysis processes, after training
+# has finished. It is NOT loaded on the training path, and that is enforced
+# rather than asserted: `tpen.hi_schema` (the train firewall) does not import
+# `tpen.hi_manifest` (this file's loader), `tpen.run` does not import it either,
+# and `tests/unit/test_hi_reference_separation.py` checks the import graph.
+#
+# WHY THE SEPARATION IS A FILE BOUNDARY AND NOT A CONVENTION. A reference
+# reachable during training is an arm-selection hazard: any quantity that can be
+# compared against it mid-run can be used to choose between arms on accuracy,
+# and the person doing it need not intend to. Making the value physically
+# absent from the training process means the comparison cannot happen early,
+# whatever anyone intends.
+
+schema: tpen.hi.evaluation.v1
+
+reference:
+  # Infinite-nuclear-mass, nonrelativistic 1 1S helium ground state.
+  # Same literal as the historical he-v1 record, kept coupled to the canonical
+  # baseline registry test rather than retyped from a paper.
+  energy: -2.903724377034119598
+  qualification: infinite_mass_nonrelativistic
+  units: hartree
+  system_id: he_atom
+
+# The set of checkpoints the study will evaluate, FIXED BEFORE THE RUN.
+#
+# Checkpoints outside this set exist for crash salvage and post-hoc description
+# only. Evaluating one after seeing the primary result is arm selection on
+# energy laundered through a file that happened to be on disk. The training
+# config writes dense checkpoints every 1000 updates precisely so that a crash
+# at 99k leaves a usable artifact -- write cadence and evaluated set are
+# deliberately different things.
+evaluated_checkpoints:
+  policy: declared_horizon_only
+  updates: [100000]

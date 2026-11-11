@@ -343,6 +343,22 @@ loss_has_grad                           |
 optimizer_step                          |
 ```
 
+`train/electron_nucleus_distance` — optional `ElectronNucleusDistanceQuantiles`
+callback, one record per configured cadence:
+
+```text
+electron_<index>_nucleus_distance_min
+electron_<index>_nucleus_distance_q<level>
+```
+
+The callback reads the `ElectronBatch` used by the completed iteration. For
+each electron, it first takes the minimum distance over nuclei for every
+configuration, then summarizes those distances across the whole training
+batch. Quantile levels are supplied by the run configuration; core supplies no
+default levels. Quantiles use PyTorch's `linear` interpolation, and labels use
+the energy-diagnostic convention (`q001`, `q01`, `q50`, `q99`, `q999`, or a
+percent label such as `q25`).
+
 `train/sampler` — `SamplerStats.as_metrics`:
 
 ```text
@@ -529,6 +545,13 @@ binds these together.
 
 ## CSV logging
 
+`ModuleNorms` (an optional callback, not an always-on trainer metric) writes
+one namespace per configured group under `train/module_norms/<group>`. Its
+`parameter_*` values are post-update model values; its `gradient_*` values are
+the clipped gradients consumed by that update. `n_no_gradient_parameters` is
+separate from zero gradients, and `gradient_nonfinite_count` is excluded from
+the finite gradient norm reconciliation.
+
 CSV uses long-form scalar records:
 
 ```csv
@@ -539,6 +562,17 @@ step,namespace,key,value
 1,checks/data_integrity,passed,true
 1,checks/equivariance/full_model,max_abs_error,0.0
 ```
+
+`OptimizerState` is an optional callback, not an always-on trainer metric. It
+writes one namespace per configured group under
+`train/optimizer_state/<group>` with `step`, `step_min`, `step_max`, and
+`step_mismatch`; `exp_avg_l2`, `exp_avg_rms`, `exp_avg_max_abs`;
+`exp_avg_sq_l2`, `exp_avg_sq_rms`, `exp_avg_sq_max_abs`; and
+`exp_avg_nonfinite_count`, `exp_avg_sq_nonfinite_count`, and
+`n_no_optimizer_state`. The nonfinite counts cover all entries before the
+finite reductions; when a moment has no finite entries, its three reductions
+are `null` rather than an uninformative zero. A mismatched step is represented by `step = null` and
+the explicit `step_mismatch = true` flag rather than by averaging steps.
 
 The metric identity is:
 
@@ -1029,10 +1063,10 @@ resumable, but `train_resume` refuses it anyway, for the reason above. Re-train,
 or restore it with `model_only`. There is deliberately no migration path.
 
 `latest.json` is deliberately minimal and unchanged: a `checkpoint_dir`
-pointer, its `step` number, and a timestamp. Pruning (`keep_last`) never
-deletes the directory `latest.json` points at — a defence-in-depth guarantee
-rather than a live one, since `write_latest` runs before `prune_old_checkpoints`
-and so the pointer always targets the newest directory in practice.
+pointer, its `step` number, and a timestamp. TPEN retains every committed
+checkpoint; `keep_last` remains accepted as an ignored compatibility input.
+The pointer is only a resume convenience, not a retention or storage
+disposition policy. Storage disposition lives outside TPEN.
 
 ### Checkpoint cadence counts completed updates
 

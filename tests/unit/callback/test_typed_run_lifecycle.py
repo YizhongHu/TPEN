@@ -193,7 +193,7 @@ def test_run_timing_reports_failed_exactly_once_per_failed_run(tmp_path: Path) -
     }
 
 
-def test_resource_usage_resets_at_the_start_and_reports_at_either_end(tmp_path: Path) -> None:
+def test_resource_usage_resets_at_the_start_and_reports_once_at_the_first_end(tmp_path: Path) -> None:
     logger = RecordingLogger()
     callback = ResourceUsage(peak_rss_mb_reader=lambda: 512.0)
     context = make_run_context(tmp_path, callbacks=[callback], loggers=[logger])
@@ -205,8 +205,9 @@ def test_resource_usage_resets_at_the_start_and_reports_at_either_end(tmp_path: 
     assert logger.latest("runtime")["peak_memory_mb"] == 512.0
 
     context.emit(_failure())
-    # One record per terminal boundary; the failure path is no longer doubled.
-    assert len(logger.by_namespace("runtime")) == 2
+    # One report per logical run: a second terminal boundary on the same
+    # context (contract #9) does not produce a second record.
+    assert len(logger.by_namespace("runtime")) == 1
 
 
 def test_evaluation_timing_reports_failed_off_the_typed_run_event(tmp_path: Path) -> None:
@@ -256,6 +257,30 @@ class _NoopRunner(Runner):
     def run(self, context: RunContext) -> RunResult:
         del context
         return RunResult(status="completed")
+
+
+class _CompletionCallbackThatFails(Callback):
+    """Subscriber that turns a clean `RunCompleted` into a harness failure.
+
+    Writer-authored for contract #9 (R1-repair item 003dada1): models the
+    one logical run that reaches `RunCompleted` and is then reported as
+    `RunFailed` because a later subscriber blew up while handling it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            typed_groups=(
+                SubscriptionGroup(selectors=(Subscription.of(RunStarted),)),
+                SubscriptionGroup(selectors=(Subscription.of(RunCompleted),)),
+            )
+        )
+
+    def handle_occurrence_impl(
+        self, occurrence: Occurrence[Any], context: RunContext
+    ) -> None:
+        del context
+        if isinstance(occurrence.event, RunCompleted):
+            raise RuntimeError("completion callback exploded")
 
 
 class _RaisingRunner(Runner):
@@ -354,6 +379,80 @@ def test_the_harness_emits_run_started_exactly_once(tmp_path: Path) -> None:
     names = [record["event"] for record in _occurrences(_run_dir(tmp_path))]
     assert names.count("tpen.run_events.RunStarted") == 1
     assert names.count("tpen.run_events.RunCompleted") == 1
+
+
+def test_resource_usage_reports_once_per_run_when_a_later_callback_fails_after_completion(
+    tmp_path: Path,
+) -> None:
+    """Contract #9 (R1-repair item 003dada1): one logical run, one report.
+
+    `RunCompleted` fires and `ResourceUsage` answers it; a later subscriber
+    then blows up handling that same event, so the harness reports the run as
+    `RunFailed` on top of the completion that already happened. Scoped to
+    what R1 can assert directly: `metrics.jsonl`, and to `ResourceUsage`
+    alone -- `cfg.callbacks` carries only `ResourceUsage` and the failing
+    subscriber, not the default `RunTiming`, which has its own unfixed,
+    unreviewed double-report on this same `RunCompleted`/`RunFailed` pair.
+    Mixing it in would make this test depend on a fix this item does not
+    own. The per-rank `profiles/.../resources.jsonl` artifact is R3's
+    launcher/rank-writer surface, which does not exist at this layer
+    either -- that assertion belongs to R3, not here.
+    """
+
+    cfg = _cfg(tmp_path, f"{__name__}._NoopRunner")
+    cfg.callbacks = [
+        {"_target_": "tpen.callback.ResourceUsage"},
+        {"_target_": f"{__name__}._CompletionCallbackThatFails"},
+    ]
+
+    assert run_from_config(cfg, config_path="x", command="pytest") == 1
+
+    run_dir = _run_dir(tmp_path)
+    metrics = [
+        json.loads(line)
+        for line in (run_dir / "metrics.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert len([record for record in metrics if record.get("namespace") == "runtime"]) == 1
+    assert len([record for record in metrics if record.get("namespace") == "process"]) == 1
+
+
+def test_resource_usage_writes_exactly_one_device_and_process_profile_line_once_when_completion_callback_fails(
+    tmp_path: Path,
+) -> None:
+    """Writer-authored for contract #9 (ruling `ruling-contract-9-test-disposed`).
+
+    The reviewer's own version of this cross-layer check (22b47d28) asserted
+    `profiles/rank-00000/resources.jsonl` through `_cfg()`'s DEFAULT callback
+    list, which also carries `RunTiming`. `RunTiming` logs to the same
+    `runtime` namespace as `ResourceUsage` on its own (see
+    `test_the_harness_emits_run_failed_once_and_records_the_failure` above),
+    so the reviewer's `runtime`-count-of-1 assertion is unsatisfiable under
+    that callback set regardless of any fix -- disposed rather than adopted.
+    This test isolates the callback list to `[ResourceUsage,
+    _CompletionCallbackThatFails]`, exactly as R1's sibling test above does,
+    and asserts the property the reviewer was reaching for at the layer
+    where the rank-local artifact actually exists: one logical run that
+    reaches `RunCompleted` and is then reported `RunFailed` by a later
+    subscriber still writes exactly one device profile record and one
+    process profile record, not two of each.
+    """
+
+    cfg = _cfg(tmp_path, f"{__name__}._NoopRunner")
+    cfg.callbacks = [
+        {"_target_": "tpen.callback.ResourceUsage"},
+        {"_target_": f"{__name__}._CompletionCallbackThatFails"},
+    ]
+
+    assert run_from_config(cfg, config_path="x", command="pytest") == 1
+
+    run_dir = _run_dir(tmp_path)
+    profile_lines = [
+        json.loads(line)
+        for line in (run_dir / "profiles" / "rank-00000" / "resources.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert [line["scope"] for line in profile_lines] == ["device", "process"]
 
 
 def test_the_harness_emits_run_failed_once_and_records_the_failure(tmp_path: Path) -> None:

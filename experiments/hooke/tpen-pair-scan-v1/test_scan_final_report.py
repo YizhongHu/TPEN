@@ -50,7 +50,6 @@ def _load_script(name: str) -> ModuleType:
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 

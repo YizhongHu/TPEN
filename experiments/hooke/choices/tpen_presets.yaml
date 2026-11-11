@@ -1,0 +1,235 @@
+# =============================================================================
+# TPEN activation and interaction choice library
+# =============================================================================
+#
+# This is a CONFIG FRAGMENT, not a runnable config. It follows the existing
+# `experiments/hooke/choices/basis_levels.yaml` convention: merge this file
+# with a host config before passing the result to `tpen.run`.
+#
+# The activation choice is deliberately written twice, once for each generic
+# operator slot. The tensor axes are different at those boundaries:
+# EquivariantMixing receives [B, C, P, N^m], while PathAggregation receives
+# [B, C, N^m]. Hydra recursively instantiates each interpolation at its
+# consumer, so the two occurrences are independent eager modules.
+#
+# The interaction choices spell out concrete producers and static layouts. The
+# `mode` scalar is a resolved boundary label for metadata; it is not consumed
+# by a Python dispatcher. The producer list itself is the selected architecture,
+# and the immutable PathLayout is passed directly to each consumer.
+
+choices:
+  activation:
+    channel_mlp:
+      mixing:
+        _target_: tpen.nn.ChannelPreservingMLPActivation
+        layout:
+          _target_: tpen.nn.OrderMLPLayout
+          _recursive_: true
+          _convert_: object
+          axes:
+            _target_: tpen.nn.ChannelActivationAxes
+            channel_axis: 1
+            tuple_axes_start: 3
+          specs:
+            - _target_: tpen.nn.OrderMLPSpec
+              order: 1
+              channels: 2
+              hidden_channels: 4
+              num_hidden_layers: 1
+              activation:
+                _target_: torch.nn.Tanh
+              bias: true
+            - _target_: tpen.nn.OrderMLPSpec
+              order: 2
+              channels: 2
+              hidden_channels: 4
+              num_hidden_layers: 1
+              activation:
+                _target_: torch.nn.Tanh
+              bias: true
+        initializer:
+          _target_: tpen.nn.TorchInitializer
+          seed: 701
+
+      aggregation:
+        _target_: tpen.nn.ChannelPreservingMLPActivation
+        layout:
+          _target_: tpen.nn.OrderMLPLayout
+          _recursive_: true
+          _convert_: object
+          axes:
+            _target_: tpen.nn.ChannelActivationAxes
+            channel_axis: 1
+            tuple_axes_start: 2
+          specs:
+            - _target_: tpen.nn.OrderMLPSpec
+              order: 1
+              channels: 2
+              hidden_channels: 4
+              num_hidden_layers: 1
+              activation:
+                _target_: torch.nn.Tanh
+              bias: true
+            - _target_: tpen.nn.OrderMLPSpec
+              order: 2
+              channels: 2
+              hidden_channels: 4
+              num_hidden_layers: 1
+              activation:
+                _target_: torch.nn.Tanh
+              bias: true
+        initializer:
+          _target_: tpen.nn.TorchInitializer
+          seed: 702
+
+  interaction:
+    linear:
+      mode: linear
+      linear_metadata:
+        _target_: tpen.data.paths.LinearPathMetadata.generate
+        max_order: 2
+      layout:
+        _target_: tpen.data.paths.compose_path_layout
+        linear: ${choices.interaction.linear.linear_metadata}
+        tensor_product: null
+        input_orders:
+          _target_: tpen.data.paths.NormalizedOrders
+          values: [1, 2]
+        output_orders:
+          _target_: tpen.data.paths.NormalizedOrders
+          values: [1, 2]
+        input_channels:
+          _target_: tpen.data.paths.NormalizedChannels
+          values: [[1, 2], [2, 2]]
+        output_channels:
+          _target_: tpen.data.paths.NormalizedChannels
+          values: [[1, 2], [2, 2]]
+      mixing:
+        _target_: tpen.nn.CompositeMixing
+        layout: ${choices.interaction.linear.layout}
+        producers:
+          - _target_: tpen.nn.LinearEquivariantMixing
+            max_order: 2
+            channels: 2
+            metadata: ${choices.interaction.linear.linear_metadata}
+            implementation: vectorized
+        activation: ${choices.activation.channel_mlp.mixing}
+      path_aggregation:
+        _target_: tpen.nn.PathAggregation
+        max_order: 2
+        channels: 2
+        layout: ${choices.interaction.linear.layout}
+        activation: ${choices.activation.channel_mlp.aggregation}
+      layer:
+        _target_: tpen.nn.TPENLayer
+        mixing: ${choices.interaction.linear.mixing}
+        path_aggregation: ${choices.interaction.linear.path_aggregation}
+        update:
+          _target_: tpen.nn.ResidualUpdater
+        layout: ${choices.interaction.linear.layout}
+
+    hybrid:
+      mode: hybrid
+      linear_metadata:
+        _target_: tpen.data.paths.LinearPathMetadata.generate
+        max_order: 2
+      tensor_product_metadata:
+        _target_: tpen.data.paths.PathMetadata.generate
+        max_order: 2
+        max_virtual_order: 2
+        output_embedding: canonical
+      layout:
+        _target_: tpen.data.paths.compose_path_layout
+        linear: ${choices.interaction.hybrid.linear_metadata}
+        tensor_product: ${choices.interaction.hybrid.tensor_product_metadata}
+        input_orders:
+          _target_: tpen.data.paths.NormalizedOrders
+          values: [1, 2]
+        output_orders:
+          _target_: tpen.data.paths.NormalizedOrders
+          values: [1, 2]
+        input_channels:
+          _target_: tpen.data.paths.NormalizedChannels
+          values: [[1, 2], [2, 2]]
+        output_channels:
+          _target_: tpen.data.paths.NormalizedChannels
+          values: [[1, 2], [2, 2]]
+      mixing:
+        _target_: tpen.nn.CompositeMixing
+        layout: ${choices.interaction.hybrid.layout}
+        producers:
+          - _target_: tpen.nn.LinearEquivariantMixing
+            max_order: 2
+            channels: 2
+            metadata: ${choices.interaction.hybrid.linear_metadata}
+            implementation: vectorized
+          - _target_: tpen.nn.EquivariantMixing
+            max_order: 2
+            max_virtual_order: 2
+            channels: 2
+            paths: ${choices.interaction.hybrid.tensor_product_metadata}
+            implementation: vectorized
+            activation: null
+        activation: ${choices.activation.channel_mlp.mixing}
+      path_aggregation:
+        _target_: tpen.nn.PathAggregation
+        max_order: 2
+        channels: 2
+        layout: ${choices.interaction.hybrid.layout}
+        activation: ${choices.activation.channel_mlp.aggregation}
+      layer:
+        _target_: tpen.nn.TPENLayer
+        mixing: ${choices.interaction.hybrid.mixing}
+        path_aggregation: ${choices.interaction.hybrid.path_aggregation}
+        update:
+          _target_: tpen.nn.ResidualUpdater
+        layout: ${choices.interaction.hybrid.layout}
+
+    tensor_product:
+      mode: tensor_product
+      tensor_product_metadata:
+        _target_: tpen.data.paths.PathMetadata.generate
+        max_order: 2
+        max_virtual_order: 2
+        output_embedding: canonical
+      layout:
+        _target_: tpen.data.paths.compose_path_layout
+        linear: null
+        tensor_product: ${choices.interaction.tensor_product.tensor_product_metadata}
+        input_orders:
+          _target_: tpen.data.paths.NormalizedOrders
+          values: [1, 2]
+        output_orders:
+          _target_: tpen.data.paths.NormalizedOrders
+          values: [1, 2]
+        input_channels:
+          _target_: tpen.data.paths.NormalizedChannels
+          values: [[1, 2], [2, 2]]
+        output_channels:
+          _target_: tpen.data.paths.NormalizedChannels
+          values: [[1, 2], [2, 2]]
+      mixing:
+        _target_: tpen.nn.CompositeMixing
+        layout: ${choices.interaction.tensor_product.layout}
+        producers:
+          - _target_: tpen.nn.EquivariantMixing
+            max_order: 2
+            max_virtual_order: 2
+            channels: 2
+            paths: ${choices.interaction.tensor_product.tensor_product_metadata}
+            implementation: vectorized
+            activation: null
+        activation: ${choices.activation.channel_mlp.mixing}
+      path_aggregation:
+        _target_: tpen.nn.PathAggregation
+        max_order: 2
+        channels: 2
+        layout: ${choices.interaction.tensor_product.layout}
+        activation: ${choices.activation.channel_mlp.aggregation}
+      layer:
+        _target_: tpen.nn.TPENLayer
+        mixing: ${choices.interaction.tensor_product.mixing}
+        path_aggregation: ${choices.interaction.tensor_product.path_aggregation}
+        update:
+          _target_: tpen.nn.ResidualUpdater
+        layout: ${choices.interaction.tensor_product.layout}

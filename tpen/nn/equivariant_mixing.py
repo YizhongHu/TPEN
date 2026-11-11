@@ -5,13 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Literal
 
-from tpen.data.indices import (
-    flatten_tuple_indices,
-    ordered_tuple_tensor,
-    ordered_tuples,
-    select_tuple,
-    select_tuple_tensor,
-)
 from tpen.data.real import (
     Feature,
     Interaction,
@@ -23,13 +16,16 @@ from tpen.data.real import (
 from tpen.dependencies import require_torch, require_torch_nn
 from tpen.equivariance import EquivariantMap
 from tpen.data.paths import PathMetadata, VirtualPath, load_default_path_metadata
+from tpen.nn.mixing_kernel import (
+    Aggregation,
+    MixingImplementation,
+    execute_binary,
+    normalize_aggregation,
+    normalize_implementation,
+)
 
 torch = require_torch(feature="TPEN equivariant mixing")
 nn = require_torch_nn(feature="TPEN equivariant mixing")
-
-
-Aggregation = Literal["sum", "completion_mean"]
-MixingImplementation = Literal["slow", "vectorized"]
 
 
 class EquivariantMixing(EquivariantMap):
@@ -81,13 +77,17 @@ class EquivariantMixing(EquivariantMap):
         ``"vectorized"`` batches virtual tuples path-by-path and should match
         the slow reference exactly.
     activation : torch.nn.Module, callable, or None, optional
-        Owned pointwise activation ``Gamma`` applied to every positive-order
-        output block after the bilinear contraction (TPEN layer contract,
-        MIG-TPEN-000 section 2.2). ``None`` keeps the identity and preserves
-        the pre-TPEN behavior exactly. The activation is applied to the full
-        block, including non-distinct tuple entries that mixing never writes,
-        so a ``Gamma(0) != 0`` choice writes an invariant constant onto those
-        entries; it never mixes channels, paths, or particle indices.
+        Owned shape-preserving activation ``Gamma`` applied to every
+        positive-order output block after the bilinear contraction (TPEN layer
+        contract, MIG-TPEN-000 section 2.2). ``None`` keeps the identity and
+        preserves the pre-TPEN behavior exactly. Pointwise choices transform
+        each entry independently; the opt-in
+        :class:`ChannelPreservingMLPActivation` may mix channels at each fixed
+        path and tuple position while preserving the channel width. The
+        activation is applied to the full block, including non-distinct tuple
+        entries that mixing never writes, so a ``Gamma(0) != 0`` choice writes
+        an invariant constant onto those entries. The activation never mixes
+        paths or particle indices.
     **kwargs : object
         Runtime-check options forwarded to :class:`EquivariantMap`.
     """
@@ -99,13 +99,13 @@ class EquivariantMixing(EquivariantMap):
         max_virtual_order: int | None = None,
         paths: PathMetadata | tuple[VirtualPath, ...] | None = None,
         output_embedding: Literal["canonical", "full"] = "canonical",
-        aggregation: Aggregation = "sum",
+        aggregation: str | Aggregation = Aggregation.SUM,
         channels: int | Mapping[int, int],
         left_channels: int | Mapping[int, int] | None = None,
         right_channels: int | Mapping[int, int] | None = None,
         out_channels: int | Mapping[int, int] | None = None,
         initial_weight: float = 1.0,
-        implementation: MixingImplementation = "slow",
+        implementation: str | MixingImplementation = MixingImplementation.SLOW,
         activation: "nn.Module | Callable[[torch.Tensor], torch.Tensor] | None" = None,
         **kwargs,
     ) -> None:
@@ -117,12 +117,8 @@ class EquivariantMixing(EquivariantMap):
             raise ValueError(f"max_order must be positive, got {self.max_order}")
         if self.max_virtual_order <= 0:
             raise ValueError(f"max_virtual_order must be positive, got {self.max_virtual_order}")
-        if aggregation not in {"sum", "completion_mean"}:
-            raise ValueError(f"Unsupported aggregation {aggregation!r}")
-        if implementation not in {"slow", "vectorized"}:
-            raise ValueError(f"Unsupported mixing implementation {implementation!r}")
-        self.aggregation: Aggregation = aggregation
-        self.implementation: MixingImplementation = implementation
+        self.aggregation = normalize_aggregation(aggregation)
+        self.implementation = normalize_implementation(implementation)
         self.output_embedding = output_embedding
         self.initial_weight = float(initial_weight)
         self.left_channels = _normalize_channels(
@@ -159,6 +155,18 @@ class EquivariantMixing(EquivariantMap):
     def forward_impl(self, x1: Feature, x2: Feature | None = None) -> Interaction:
         """Mix one or two real feature states into path-resolved interactions."""
 
+        return self._forward_impl(x1, x2, apply_activation=True)
+
+    def forward_pre_activation(self, x1: Feature, x2: Feature | None = None) -> Interaction:
+        """Return raw paths for :class:`CompositeMixing` before common Gamma."""
+
+        return self._forward_impl(x1, x2, apply_activation=False)
+
+    def _forward_impl(
+        self, x1: Feature, x2: Feature | None, *, apply_activation: bool
+    ) -> Interaction:
+        """Run the TP contraction with an explicitly selected activation boundary."""
+
         x2 = x1 if x2 is None else x2
         x1.validate()
         x2.validate()
@@ -183,117 +191,31 @@ class EquivariantMixing(EquivariantMap):
             # J that collapse to a fixed output tuple I for a path p. This is a
             # normalized variant of the same sum in main.typ, useful when
             # different I have different completion counts near small n.
-            counts = (
-                torch.zeros((len(active_paths), *((n_particles,) * order)), device=device, dtype=dtype)
-                if self.aggregation == "completion_mean"
-                else None
+            weights = tuple(
+                self._weight_for(path, x1=x1, x2=x2, out_channels=out_channels)
+                for path in active_paths
             )
-            if self.implementation == "slow":
-                self._mix_order_slow(
-                    block,
-                    counts,
-                    active_paths,
-                    x1=x1,
-                    x2=x2,
-                    n_particles=n_particles,
-                    out_channels=out_channels,
-                )
-            else:
-                self._mix_order_vectorized(
-                    block,
-                    counts,
-                    active_paths,
-                    x1=x1,
-                    x2=x2,
-                    n_particles=n_particles,
-                    out_channels=out_channels,
-                )
-            if counts is not None:
-                block = block / counts.clamp_min(1).unsqueeze(0).unsqueeze(0)
-            # Owned pointwise Gamma on the full block (TPEN contract). Applied
-            # after completion averaging so Gamma sees the final mixed values.
-            if self.activation is not None:
+            block = execute_binary(
+                tuple(active_paths),
+                weights,
+                tuple(x1.blocks[path.m1] for path in active_paths),
+                tuple(x2.blocks[path.m2] for path in active_paths),
+                n_particles=n_particles,
+                output_order=order,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+                output_channels=out_channels,
+                aggregation=self.aggregation,
+                implementation=self.implementation,
+            )
+            # Owned shape-preserving Gamma on the full block (TPEN contract).
+            # Applied after completion averaging so Gamma sees the final mixed
+            # values; a channel-preserving MLP may mix only the channel axis.
+            if apply_activation and self.activation is not None:
                 block = self.activation(block)
             output_blocks.append(block)
         return Interaction(output_blocks)
-
-    def _mix_order_slow(
-        self,
-        block: torch.Tensor,
-        counts: torch.Tensor | None,
-        active_paths: list[VirtualPath],
-        *,
-        x1: Feature,
-        x2: Feature,
-        n_particles: int,
-        out_channels: int,
-    ) -> None:
-        for path_index, path in enumerate(active_paths):
-            weight = self._weight_for(path, x1=x1, x2=x2, out_channels=out_channels)
-            left = x1.blocks[path.m1]
-            right = x2.blocks[path.m2]
-            # Literal form of main.typ's sum over virtual supports J. For each
-            # ordered distinct s-tuple J, tau/tau1/tau2 turn it into the output
-            # and input tuples used by the bilinear path.
-            # virtual_tuple is J;
-            for virtual_tuple in ordered_tuples(n_particles, path.s, distinct=True):
-                # output_tuple is I = J o tau;
-                output_tuple = select_tuple(virtual_tuple, path.tau)
-                # left_tuple is J o tau1;
-                left_tuple = select_tuple(virtual_tuple, path.tau1)
-                # right_tuple is J o tau2.
-                right_tuple = select_tuple(virtual_tuple, path.tau2)
-                # left_value is x1^{c}_{J o tau1}, shape [batch, c, 1].
-                left_value = left[(slice(None), slice(None), *left_tuple)]
-                # right_value is x2^{d}_{J o tau2}, shape [batch, d, 1].
-                right_value = right[(slice(None), slice(None), *right_tuple)]
-                # W_p^{o<-cd} x1^{c}_{J o tau1} x2^{d}_{J o tau2}.
-                # Channels c,d are contracted; output channel o survives.
-                contribution = torch.einsum("ocd,bc,bd->bo", weight, left_value, right_value)
-                block[(slice(None), slice(None), path_index, *output_tuple)] += contribution
-                if counts is not None:
-                    counts[(path_index, *output_tuple)] += 1
-
-    def _mix_order_vectorized(
-        self,
-        block: torch.Tensor,
-        counts: torch.Tensor | None,
-        active_paths: list[VirtualPath],
-        *,
-        x1: Feature,
-        x2: Feature,
-        n_particles: int,
-        out_channels: int,
-    ) -> None:
-        block_flat = block.reshape(*block.shape[:3], -1)
-        for path_index, path in enumerate(active_paths):
-            weight = self._weight_for(path, x1=x1, x2=x2, out_channels=out_channels)
-            # Same contraction as _mix_order_slow, but with v indexing all
-            # virtual tuples J for this path. Multiple J may map to the same I,
-            # so the final write is a scatter-add over flattened output tuples.
-            virtual_tuples = ordered_tuple_tensor(n_particles, path.s, distinct=True, device=block.device)
-            output_indices = select_tuple_tensor(virtual_tuples, path.tau)
-            left_indices = select_tuple_tensor(virtual_tuples, path.tau1)
-            right_indices = select_tuple_tensor(virtual_tuples, path.tau2)
-
-            left = x1.blocks[path.m1][(slice(None), slice(None), *left_indices.unbind(dim=1))]
-            right = x2.blocks[path.m2][(slice(None), slice(None), *right_indices.unbind(dim=1))]
-            contribution = torch.einsum("ocd,bcv,bdv->bov", weight, left, right)
-            flat_output_indices = flatten_tuple_indices(output_indices, n_particles)
-            scatter_index = flat_output_indices.reshape(1, 1, -1).expand(
-                block.shape[0],
-                out_channels,
-                -1,
-            )
-            block_flat[:, :, path_index].scatter_add_(2, scatter_index, contribution)
-
-            if counts is not None:
-                counts_flat = counts[path_index].reshape(-1)
-                counts_flat.scatter_add_(
-                    0,
-                    flat_output_indices,
-                    torch.ones_like(flat_output_indices, dtype=counts.dtype),
-                )
 
     def _paths_for_order(self, order: int, *, x1: Feature, x2: Feature) -> list[VirtualPath]:
         return [

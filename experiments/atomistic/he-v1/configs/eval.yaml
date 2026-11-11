@@ -653,6 +653,9 @@ callbacks:
   - _target_: tpen.callback.DiagnosticTiming
     accelerator_synchronize: false
   - _target_: tpen.callback.ResourceUsage
+    allocator_probe:
+      _target_: tpen.accelerator.TorchAllocatorPeakProbe
+      device: ${runtime.device}
 
 loggers:
   - _target_: tpen.logging.CSV

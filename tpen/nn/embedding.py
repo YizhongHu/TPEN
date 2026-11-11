@@ -18,6 +18,9 @@ torch = require_torch(feature="TPEN embedding modules")
 nn = require_torch_nn(feature="TPEN embedding modules")
 
 
+_PAIR_ORDER = 2
+
+
 class Embedding(EquivariantMap):
     """Encode raw non-repeating particle-vector tuples with per-order MLPs.
 
@@ -86,6 +89,7 @@ class Embedding(EquivariantMap):
         include_spins: bool = True,
         aux_feature_channels: Mapping[str, int] | None = None,
         in_features: int | None = None,
+        pair_input_channels: int = 0,
         initializer: TorchInitializer | None = None,
         embedding_envelope: nn.Module | None = None,
         embedding_normalization: nn.Module | None = None,
@@ -116,6 +120,17 @@ class Embedding(EquivariantMap):
         else:
             self.particle_input_channels = derived_channels
         self.in_features = None if in_features is None else int(in_features)
+        # Ordered-pair ingress width. 0 (the default) means this embedding
+        # consumes no pair channel, which is every historical configuration.
+        self.pair_input_channels = int(pair_input_channels)
+        if self.pair_input_channels < 0:
+            raise ValueError(f"pair_input_channels must be non-negative, got {pair_input_channels}")
+        if self.pair_input_channels and self.max_order < _PAIR_ORDER:
+            raise ValueError(
+                f"pair_input_channels={self.pair_input_channels} requires max_order >= "
+                f"{_PAIR_ORDER}; an ordered pair has no tuple to enter at order "
+                f"{self.max_order}"
+            )
         self.embedding_envelope = embedding_envelope
         self.embedding_normalization = embedding_normalization
         self.order_mlps = nn.ModuleDict()
@@ -125,7 +140,7 @@ class Embedding(EquivariantMap):
             module = supplied.get(order)
             if module is None:
                 module = MLP(
-                    in_channels=order * self.particle_input_channels,
+                    in_channels=self._order_in_channels(order),
                     out_channels=order_out_channels,
                     hidden_channels=hidden_channels,
                     num_hidden_layers=num_hidden_layers,
@@ -175,6 +190,13 @@ class Embedding(EquivariantMap):
         blocks = [zero_block(batch_size=batch_size, device=device, dtype=dtype)]
         for order in range(1, self.max_order + 1):
             tuple_inputs = tuple_particle_inputs(particle_vectors, order)
+            tuple_inputs = self._pair_tuple_inputs(
+                tuple_inputs,
+                inputs,
+                order=order,
+                batch_size=batch_size,
+                n_electrons=n_electrons,
+            )
             block = self.order_mlps[str(order)](tuple_inputs).movedim(-1, 1)
             block = block * no_repeated_particle_mask(n_electrons, order, device=device).reshape(
                 1,
@@ -190,6 +212,64 @@ class Embedding(EquivariantMap):
                 raise ValueError("embedding_envelope requires a TPENForwardContext")
             features = self.embedding_envelope(features, context)
         return features
+
+    def _order_in_channels(self, order: int) -> int:
+        """Return the MLP input width for one tuple order.
+
+        Pair channels are added ONLY at order 2, because that is the only order
+        whose tuple IS an ordered pair. The authority defines pair features and
+        nothing wider, so orders above 2 receive no invented triple analogue.
+        """
+
+        width = order * self.particle_input_channels
+        if order == _PAIR_ORDER:
+            width += self.pair_input_channels
+        return width
+
+    def _pair_tuple_inputs(
+        self,
+        tuple_inputs: "torch.Tensor",
+        inputs: ElectronBatch | ElectronBasisFeatures,
+        *,
+        order: int,
+        batch_size: int,
+        n_electrons: int,
+    ) -> "torch.Tensor":
+        """Append the ordered-pair channel to order-2 tuple inputs.
+
+        Raises rather than silently proceeding in BOTH mismatch directions. A
+        configured pair width with no pair tensor would otherwise fail later as
+        a confusing shape error; an unconsumed pair tensor would silently drop
+        typed features that a caller went to the trouble of producing, which is
+        the same class of defect as broadcasting them in undocumented -- just
+        inverted.
+        """
+
+        pair = getattr(inputs, "pair", None)
+
+        if order != _PAIR_ORDER:
+            return tuple_inputs
+        if not self.pair_input_channels:
+            if pair is not None:
+                raise ValueError(
+                    "ElectronBasisFeatures carries a pair channel but this Embedding has "
+                    "pair_input_channels=0, so the pair features would be silently "
+                    "discarded. Set pair_input_channels to consume them"
+                )
+            return tuple_inputs
+        if pair is None:
+            raise ValueError(
+                f"Embedding has pair_input_channels={self.pair_input_channels} but the "
+                "inputs carry no pair channel; a basis producing ordered pairs is required"
+            )
+
+        flat = pair.reshape(batch_size, n_electrons, n_electrons, -1)
+        if flat.shape[-1] != self.pair_input_channels:
+            raise ValueError(
+                f"Embedding expected pair width {self.pair_input_channels}, "
+                f"got {flat.shape[-1]}"
+            )
+        return torch.cat([tuple_inputs, flat.to(dtype=tuple_inputs.dtype)], dim=-1)
 
     def _out_channels(self, order: int) -> int:
         if isinstance(self.out_channels, dict):
@@ -250,4 +330,135 @@ def _normalize_aux_feature_channels(value: Mapping[str, int]) -> dict[str, int]:
     return normalized
 
 
-__all__ = ["Embedding"]
+__all__ = [
+    "matched_start_embedding",
+    "transplant_raw_input_columns",
+    "Embedding",
+]
+
+
+def matched_start_embedding(*, raw: "Embedding", augmented: "Embedding") -> "Embedding":
+    r"""Return ``augmented`` after constructing a matched raw-feature start.
+
+    Parameters
+    ----------
+    raw : Embedding
+        The same-seed control embedding consuming only the raw per-particle
+        features.
+    augmented : Embedding
+        The wider embedding consuming raw features plus bounded-distance
+        features. Its added columns remain trainable after they are zeroed.
+
+    Returns
+    -------
+    Embedding
+        The ``augmented`` instance, after its shared parameters have been
+        copied from ``raw`` and its added input columns have been zeroed.
+
+    Raises
+    ------
+    TypeError
+        If either argument is not an :class:`Embedding`.
+    """
+
+    if not isinstance(raw, Embedding) or not isinstance(augmented, Embedding):
+        raise TypeError("matched_start_embedding expects two constructed Embedding instances")
+    transplant_raw_input_columns(raw, augmented)
+    return augmented
+
+
+def transplant_raw_input_columns(source: "Embedding", target: "Embedding") -> None:
+    r"""Copy `source`'s weights into `target`, zeroing `target`'s added columns.
+
+    Implements the matched-B-seed rule: "copy shared raw-input weights exactly
+    and set added input columns to zero", so that a bounded-distance embedding
+    starts as the SAME FUNCTION as its raw counterpart. With the added columns
+    zeroed, the two cells differ only in what they can learn, not in where they
+    start -- which is what removes initial-function change as the first
+    explanation for any difference between them.
+
+    Parameters
+    ----------
+    source : Embedding
+        The narrower embedding, consuming raw features only.
+    target : Embedding
+        The wider embedding, consuming the same raw features plus appended
+        columns. Modified in place.
+
+    Raises
+    ------
+    ValueError
+        If the two do not differ only by appended input columns.
+
+    Notes
+    -----
+    **The added columns are NOT contiguous, and that is the whole difficulty.**
+    Order 2's input is ``[v_i, v_j, pair]``, so appending one column per
+    particle inserts a zero at the END OF EACH PARTICLE BLOCK, not at the end
+    of the row:
+
+    .. code-block:: text
+
+        source order 2 : [ v_i(w0) | v_j(w0) ]
+        target order 2 : [ v_i(w0) 0 | v_j(w0) 0 | pair(p) ]
+
+    A "zero the last k columns" implementation would therefore be wrong for
+    every order above 1, while looking right for order 1 and passing any test
+    that only checked widths. The mapping below is written per particle block,
+    and the accompanying test checks FUNCTION EQUALITY rather than column
+    positions, so an index error cannot pass by agreeing with the same
+    reasoning that produced it.
+
+    Parameters other than each order's first layer are copied verbatim: only
+    the first layer's input width differs, so every later layer already has
+    matching shapes.
+    """
+
+    added = target.particle_input_channels - source.particle_input_channels
+    if added < 0:
+        raise ValueError(
+            "transplant target must be at least as wide as the source: "
+            f"{target.particle_input_channels} < {source.particle_input_channels}"
+        )
+    if source.pair_input_channels:
+        raise ValueError(
+            "transplant source must consume no pair channel; it is the raw-feature "
+            f"cell, but it declares pair_input_channels={source.pair_input_channels}"
+        )
+    if source.max_order != target.max_order:
+        raise ValueError(
+            f"transplant needs equal max_order, got {source.max_order} and {target.max_order}"
+        )
+
+    source_width = source.particle_input_channels
+    target_width = target.particle_input_channels
+
+    with torch.no_grad():
+        for order_key, source_mlp in source.order_mlps.items():
+            target_mlp = target.order_mlps[order_key]
+            order = int(order_key)
+
+            source_params = dict(source_mlp.named_parameters())
+            for name, target_param in target_mlp.named_parameters():
+                source_param = source_params[name]
+                if source_param.shape == target_param.shape:
+                    target_param.copy_(source_param)
+                    continue
+
+                # The only legitimate shape difference is the first layer's
+                # input width. Anything else means these are not the same
+                # architecture and silently proceeding would produce a model
+                # that trains but is not the one anybody described.
+                if target_param.ndim != 2 or source_param.shape[0] != target_param.shape[0]:
+                    raise ValueError(
+                        f"cannot transplant parameter {name!r} of order {order}: "
+                        f"{tuple(source_param.shape)} vs {tuple(target_param.shape)}"
+                    )
+
+                target_param.zero_()
+                for particle in range(order):
+                    source_start = particle * source_width
+                    target_start = particle * target_width
+                    target_param[:, target_start : target_start + source_width].copy_(
+                        source_param[:, source_start : source_start + source_width]
+                    )

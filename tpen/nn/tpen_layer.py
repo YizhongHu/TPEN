@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tpen.data.real import Feature
+from tpen.data.paths import PathLayout
 from tpen.dependencies import require_torch_nn
 from tpen.equivariance import EquivariantMap
 from tpen.nn.context import TPENForwardContext
@@ -36,6 +37,9 @@ class TPENLayer(EquivariantMap):
         matching normalization.
     bilinear_mixing : bool, optional
         If ``True``, call ``mixing(x, x)``. Otherwise call ``mixing(x)``.
+    layout : PathLayout or None, optional
+        Immutable layout identity shared by the mixing and aggregation modules.
+        When supplied, both modules must expose the same fingerprint.
     **kwargs : object
         Runtime-check options forwarded to :class:`EquivariantMap`.
     """
@@ -51,6 +55,7 @@ class TPENLayer(EquivariantMap):
         feature_envelope: nn.Module | None = None,
         feature_normalization: nn.Module | None = None,
         bilinear_mixing: bool = False,
+        layout: PathLayout | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -62,6 +67,16 @@ class TPENLayer(EquivariantMap):
         self.feature_envelope = feature_envelope
         self.feature_normalization = feature_normalization
         self.bilinear_mixing = bool(bilinear_mixing)
+        self.layout = layout
+        if layout is not None:
+            mixing_layout = mixing.layout
+            aggregation_layout = path_aggregation.layout
+            if mixing_layout is None or aggregation_layout is None:
+                raise ValueError("layout requires mixing and path_aggregation to own the same layout")
+            if mixing_layout.fingerprint != layout.fingerprint:
+                raise ValueError("mixing layout does not match TPENLayer layout")
+            if aggregation_layout.fingerprint != layout.fingerprint:
+                raise ValueError("path aggregation layout does not match TPENLayer layout")
 
     def forward_impl(
         self,

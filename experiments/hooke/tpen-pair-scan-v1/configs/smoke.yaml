@@ -149,22 +149,11 @@ final_seed_sequences:
 #
 # READ THIS BEFORE CHANGING `training.max_steps`.
 #
-# `Checkpoint` shares ONE `StepCadenceGate` between its periodic and its terminal
-# write (`callback/checkpoint.py:190,218`), and `_write_terminal` consults it with
-# the final iteration index. A config that sets `checkpoint.every_n_steps: N`
-# therefore writes NO terminal checkpoint unless `max_steps` is an exact multiple
-# of N — and it fails SILENTLY: training completes, `status.json` says
-# `completed`, the checkpoints directory is empty, and validation then dies on
-# "checkpoint directory lacks COMPLETE marker". A 60-step smoke against
-# `every_n_steps: 100` reproduced exactly that.
-#
-# So `checkpoint.every_n_steps` is absent here and MUST STAY ABSENT. `train.yaml`
-# registers `Checkpoint` with `periodic: false` and no cadence kwarg, which leaves
-# the gate's `every_n` at 1, and the terminal write then fires for ANY
-# `max_steps`. Note that `checkpoint.every_n_steps` is not even a key the base
-# config reads, so adding it here would not throttle anything — it would only
-# create an inert key and, if it were ever wired up, suppress the one artifact the
-# next stage needs.
+# `Checkpoint` uses the root `checkpoint.schedule: TerminalOnly`, so no periodic
+# cadence can suppress the terminal boundary. `checkpoint.every_n_steps` is
+# absent here and MUST STAY ABSENT: the stream's semantic schedule is the only
+# checkpoint selection policy, and this smoke must always leave the artifact the
+# next stage needs for any selected `max_steps`.
 #
 # `tests/unit/experiments/test_scan_smoke_workload.py` asserts the terminal write
 # fires at this exact `max_steps`, driving the real `Checkpoint` gate rather than

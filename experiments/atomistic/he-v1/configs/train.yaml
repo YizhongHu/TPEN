@@ -70,9 +70,6 @@ system:
   nuclei:
     positions: [[0.0, 0.0, 0.0]]
     charges: [2.0]
-  # Infinite-nuclear-mass, nonrelativistic 1 1S reference from the canonical
-  # baseline registry. Keep this literal coupled to the registry test.
-  reference_energy: -2.903724377034119598
 
 # Sole typed nuclear-geometry authority (A5): one declarative `atoms` source
 # consumed by the wavefunction's post-readout ElectronNucleusCusp factor AND
@@ -380,25 +377,25 @@ callbacks:
   # laundered through a file that happened to be on disk, and is a
   # `production-grid-v0` violation rather than a judgement call.
   #
-  # RETENTION IS DECLARED EXPLICITLY, not left to the default. `keep_last: null`
-  # keeps every checkpoint. Pruning is the nastier sibling of the
-  # multiple-of-cadence hazard above: a pruned checkpoint IS written, satisfies
-  # every existence check at the moment it is written, and is deleted later --
-  # so a test asserting "the checkpoint was written" passes while the artifact
-  # is gone by evaluation time. At `keep_last: 3` this run would finish holding
-  # 250k/275k/300k and the 24 eval rows for 100k and 200k would restore
-  # directories deleted DURING the run that created them, after all 300,000
-  # updates had been paid for, three times over.
-  # Retaining the evaluated set requires
-  #     keep_last is null  or  keep_last >= (max_steps - min(evaluated))/cadence + 1
-  # which is 9 here. A test derives that rather than restating the 9.
-  # "Nobody set it" and "we decided not to prune" look identical in a config;
-  # only the second survives review.
+  # Keep-all is the checkpoint policy: every committed checkpoint remains
+  # available for evaluation and crash salvage. `keep_last: null` is retained
+  # as an explicit compatibility declaration; non-null values are also
+  # accepted but ignored by TPEN.
   - _target_: tpen.callback.Checkpoint
     terminal: false
-    every_n_steps: 25000
+    schedule:
+      _target_: tpen.checkpoint.EveryNUpdates
+      every_n: 25000
+    payload:
+      _target_: tpen.checkpoint.TrainResume
     keep_last: null
     output_dir: ${run.dir}/checkpoints
+  # Compose the concrete configured-device probe at the config boundary. The
+  # callback remains RunContext-owned; Hydra supplies its exact runtime device.
+  - _target_: tpen.callback.ResourceUsage
+    allocator_probe:
+      _target_: tpen.accelerator.TorchAllocatorPeakProbe
+      device: ${runtime.device}
 
 loggers:
   - _target_: tpen.logging.CSV

@@ -20,6 +20,10 @@ def __getattr__(name: str) -> object:
     a module with `ArtifactIndex`, so it is loaded lazily with it.
     """
 
+    if name == "AmplitudeRiskFraction":
+        from .amplitude_risk import AmplitudeRiskFraction
+
+        return AmplitudeRiskFraction
     if name == "ArtifactIndex":
         from .evaluation import ArtifactIndex
 
@@ -28,6 +32,22 @@ def __getattr__(name: str) -> object:
         from .checkpoint import Checkpoint
 
         return Checkpoint
+    if name == "InitialCheckpoint":
+        from .initial_checkpoint import InitialCheckpoint
+
+        return InitialCheckpoint
+    if name == "ModuleNorms":
+        from .module_norms import ModuleNorms
+
+        return ModuleNorms
+    if name == "OptimizerState":
+        from .optimizer_state import OptimizerState
+
+        return OptimizerState
+    if name == "ParameterActivity":
+        from .parameter_activity import ParameterActivity
+
+        return ParameterActivity
     if name == "Status":
         from .status import Status
 
@@ -56,6 +76,10 @@ def __getattr__(name: str) -> object:
         from .factor_scalars import FactorScalars
 
         return FactorScalars
+    if name == "ElectronNucleusDistanceQuantiles":
+        from .electron_nucleus_distance import ElectronNucleusDistanceQuantiles
+
+        return ElectronNucleusDistanceQuantiles
     if name == "DiagnosticTiming":
         from .timing import DiagnosticTiming
 
@@ -72,6 +96,10 @@ def __getattr__(name: str) -> object:
         from .resource_usage import ResourceUsage
 
         return ResourceUsage
+    if name in {"RawTrainingBatchRecorder", "TrainingBatchRecorder"}:
+        from .raw_training_batch_recorder import RawTrainingBatchRecorder
+
+        return RawTrainingBatchRecorder
     if name == "RunTiming":
         from .timing import RunTiming
 
@@ -87,6 +115,7 @@ def __getattr__(name: str) -> object:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
+    "AmplitudeRiskFraction",
     "ArtifactIndex",
     "Cadence",
     "CadenceGate",
@@ -97,10 +126,16 @@ __all__ = [
     "DiagnosticTiming",
     "EvaluationComponentTiming",
     "EvaluationTiming",
+    "ElectronNucleusDistanceQuantiles",
     "FailureLog",
     "FactorScalars",
     "GradientStats",
+    "InitialCheckpoint",
     "Metadata",
+    "ModuleNorms",
+    "OptimizerState",
+    "ParameterActivity",
+    "RawTrainingBatchRecorder",
     "ResolvedConfigSnapshot",
     "ResourceUsage",
     "RunTiming",
@@ -113,5 +148,6 @@ __all__ = [
     "SubscriptionGroup",
     "TrainPhaseTiming",
     "TrainStepTiming",
+    "TrainingBatchRecorder",
     "configure_terminal_logging",
 ]

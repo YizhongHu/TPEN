@@ -1,0 +1,19 @@
+# Legacy Adam updater -- THE DEFAULT.
+#
+# This is the historical TPEN behaviour and remains what runs when a config
+# specifies no `trainer.update_method` at all. The block is written out here so
+# an experiment can state its updater explicitly rather than relying on the
+# default, and so switching to and from an SR preset is a symmetric edit.
+#
+# `trainer.update_method: null` is not a placeholder for "unset": it is the
+# value that selects LegacyAutogradUpdate, which the trainer constructs around
+# the optimizer below. Adam owns the whole update here; there is no
+# preconditioner.
+
+optimizer:
+  _target_: torch.optim.Adam
+  _partial_: true
+  lr: 0.005
+
+trainer:
+  update_method: null

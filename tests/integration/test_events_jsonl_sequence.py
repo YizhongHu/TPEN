@@ -70,13 +70,14 @@ BOUNDARY_NAMES = frozenset(
     }
 )
 
-# The fixture's periodic writer has cadence 2 over applied updates, so it writes
+# The fixture's composed stream has cadence 2 over applied updates, so it writes
 # exactly one mid-run checkpoint, whose `next_iteration` is 2. A checkpoint is
 # named by that cursor, and `fit` resumes at it, so the two are one constant:
 # resuming from `step_000002` leaves exactly trainer step 2 to run.
 RESUMED_STEP = 2
 RESUME_FROM = f"step_{RESUMED_STEP:06d}"
-# The terminal writer names the resume cursor of a completed `MAX_STEPS` run.
+# The composed stream's terminal path names the resume cursor of a completed
+# `MAX_STEPS` run.
 TERMINAL_CHECKPOINT = f"step_{MAX_STEPS:06d}"
 
 

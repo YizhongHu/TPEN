@@ -1,0 +1,53 @@
+# Stochastic reconfiguration, parameter-space route.
+#
+# Forms the P x P quantum geometric tensor S = A^T A and solves
+# (S + lambda I) delta = g. Prefer this when there are fewer PARAMETERS than
+# samples; otherwise prefer `minsr.yaml`, or set `solve_space: auto` to let the
+# method pick the smaller matrix. Both routes compute the same vector.
+#
+# The optimizer MUST be plain SGD. The update method writes its preconditioned
+# direction into `.grad` and steps, so momentum, dampening, weight decay,
+# Nesterov or `maximize` would silently change the update; each is rejected at
+# construction, as is any non-SGD optimizer.
+
+optimizer:
+  _target_: torch.optim.SGD
+  _partial_: true
+  lr: 0.01
+
+trainer:
+  update_method:
+    _target_: tpen.training.sr.StochasticReconfigurationUpdate
+    _partial_: true
+    policy:
+      _target_: tpen.training.sr.SRPolicy
+      solve_space: parameter
+      # Must equal the optimizer lr above; the method checks this rather than
+      # trusting it, because two disagreeing learning rates would make every
+      # reported step size wrong.
+      learning_rate: 0.01
+      damping:
+        _target_: tpen.training.qgt.DampingPolicy
+        # Relative to trace(S)/P, so the regularization tracks the scale of the
+        # scores instead of needing to be retuned whenever they change.
+        relative: 0.001
+        absolute: 0.0
+        # A strictly positive floor keeps the solve well posed on a step whose
+        # score spectrum collapses.
+        minimum: 1.0e-12
+      # 0.0 keeps every eigenmode. Raise it to discard modes below a relative
+      # fraction of the largest eigenvalue on ill-conditioned problems.
+      rank_cutoff: 0.0
+      # Caps the Euclidean norm of the applied displacement lr * delta. null
+      # disables the cap. A cap rescales the direction; it never clips
+      # per-coordinate, so it cannot turn the step.
+      max_update_norm: null
+      # Sample chunking for the score-bearing forward. null lets the model
+      # choose. Set it when the [B, P] score block dominates memory.
+      score_chunk_size: null
+    conventions:
+      _target_: tpen.training.score_geometry.ScoreConventions
+      # float64 for the solve: the QGT is a Gram matrix and squares the
+      # condition number of the scores, so this is the one place where the
+      # extra precision is load-bearing rather than defensive.
+      solve_dtype: float64

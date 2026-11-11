@@ -14,6 +14,7 @@ import json
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
+from tpen.durable_append import append_record
 from tpen.statistics.receipt import (
     TrajectoryStatisticsIdentity,
     TrajectoryStatisticsReceipt,
@@ -131,6 +132,16 @@ class TrajectoryStatisticsSidecar:
         the batch -- before anything is written, so a duplicate inside the batch
         cannot leave the sidecar half-updated.
 
+        Each receipt is written by its own
+        :func:`tpen.durable_append.append_record` call, so every row gets the
+        single-write, torn-tail and short-write guarantees rather than only the
+        batch as a whole.  That matters because this sidecar is structurally the
+        same object as the checkpoint publication catalog -- append-only JSONL,
+        :meth:`read` raises on a malformed row, and :meth:`extend` reads the
+        file before it writes -- so ONE torn row would block every later append,
+        not merely lose itself.  A batch of N costs N opens; the production path
+        is :meth:`append`, where N is 1.
+
         Parameters
         ----------
         receipts : iterable of TrajectoryStatisticsReceipt
@@ -156,11 +167,8 @@ class TrajectoryStatisticsSidecar:
                 )
             seen.add(key)
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
-            for receipt in pending:
-                handle.write(json.dumps(receipt.to_dict(), sort_keys=True))
-                handle.write("\n")
+        for receipt in pending:
+            append_record(self.path, json.dumps(receipt.to_dict(), sort_keys=True))
 
     def __iter__(self) -> Iterator[TrajectoryStatisticsReceipt]:
         return iter(self.read())

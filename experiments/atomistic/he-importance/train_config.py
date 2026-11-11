@@ -1,0 +1,736 @@
+"""Resolve one materialized HI train row into a runnable Hydra config.
+
+The resolver is deliberately a checkout-boundary adapter.  The HI experiment
+modules live under ``experiments/`` and are not included by the package build,
+so callers must run from a source checkout with its repository root on
+``sys.path``.  The precondition is checked explicitly rather than hidden in a
+fallback importer.
+
+This module only composes and validates configuration.  It does not launch a
+process, instantiate a torch object, create a run directory, or read the
+evaluation manifest.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from importlib import import_module
+import json
+from pathlib import Path
+import sys
+from typing import Any
+
+from hydra import compose, initialize_config_dir
+from omegaconf import DictConfig, OmegaConf
+
+
+_CONFIG_PATH = Path(__file__).with_name("configs") / "train.yaml"
+_STAGE_MODULE = "experiments.atomistic.he-importance.stage_coordinate"
+_CONTEXT_MAPPING_MODULE = "experiments.atomistic.he-importance.context_mapping"
+
+
+class TrainConfigResolutionError(ValueError):
+    """A materialized train row cannot become a runnable configuration."""
+
+
+class CheckoutPreconditionError(TrainConfigResolutionError):
+    """The source checkout root is absent from ``sys.path``."""
+
+
+class UnavailableOptimizerError(TrainConfigResolutionError):
+    """A row names an optimizer cell that the build-time roster refuses."""
+
+
+class OptimizerLevelResolutionError(TrainConfigResolutionError):
+    """A row's declared optimizer levels cannot be consumed by the resolver."""
+
+
+class ContextResolutionError(TrainConfigResolutionError):
+    """A row declares a model context that this resolver does not consume."""
+
+
+_AB_CONTEXT_KEYS = frozenset(
+    {
+        "producer_path",
+        "activation",
+        "channels",
+        "embedding",
+        "update",
+        "producer_initialization",
+        "electron_electron",
+        "electron_nucleus",
+        "readout_initialization",
+    }
+)
+
+
+def _require_checkout_root() -> Path:
+    """Require the repository root on ``sys.path`` before loading experiment code.
+
+    Returns
+    -------
+    pathlib.Path
+        The resolved repository root.
+
+    Raises
+    ------
+    CheckoutPreconditionError
+        If no ``sys.path`` entry resolves to the checkout root.
+    """
+
+    repo_root = Path(__file__).resolve().parents[3]
+    candidates: set[Path] = set()
+    for entry in sys.path:
+        try:
+            candidates.add(Path(entry or Path.cwd()).resolve())
+        except (OSError, RuntimeError, TypeError):
+            continue
+    if repo_root not in candidates:
+        raise CheckoutPreconditionError(
+            "HI train resolver requires the repository checkout root on sys.path; "
+            f"expected {repo_root}"
+        )
+    return repo_root
+
+
+def _stage_api() -> Any:
+    """Load the stage-coordinate API only after the checkout precondition."""
+
+    _require_checkout_root()
+    return import_module(_STAGE_MODULE)
+
+
+def _context_mapping_api() -> Any:
+    """Load the literal context mapper only after the checkout precondition."""
+
+    _require_checkout_root()
+    return import_module(_CONTEXT_MAPPING_MODULE)
+
+
+def _compose_base_config() -> DictConfig:
+    """Compose the committed HI train configuration without launch side effects."""
+
+    if not _CONFIG_PATH.is_file():
+        raise TrainConfigResolutionError(f"missing committed HI train config: {_CONFIG_PATH}")
+    with initialize_config_dir(version_base=None, config_dir=str(_CONFIG_PATH.parent.resolve())):
+        return compose(config_name=_CONFIG_PATH.stem)
+
+
+def _cell_from_source(source: Any) -> tuple[Any, str]:
+    """Extract a materialized cell from a cell or a training packet."""
+
+    cell = getattr(source, "cell", source)
+    required = ("manifest", "content_hash", "output_path", "seed_streams")
+    if any(not hasattr(cell, name) for name in required):
+        raise TrainConfigResolutionError(
+            "source must be a MaterializedCell or TrainingPacket with a complete cell"
+        )
+    content_hash = cell.content_hash
+    if type(content_hash) is not str:
+        raise TrainConfigResolutionError("source content_hash must be an exact str")
+    return cell, content_hash
+
+
+def _mapping(value: Any, label: str) -> Mapping[str, Any]:
+    """Require a mapping at a materialized-manifest boundary."""
+
+    if not isinstance(value, Mapping):
+        raise TrainConfigResolutionError(f"{label} must be a mapping")
+    return value
+
+
+def _scheduler_paths(value: Any, path: str = "") -> tuple[str, ...]:
+    """Find every non-null scheduler declaration in a composed config tree."""
+
+    found: list[str] = []
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            child = f"{path}.{key}" if path else str(key)
+            if key in {"scheduler", "lr_scheduler"} and nested is not None:
+                found.append(child)
+            found.extend(_scheduler_paths(nested, child))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, nested in enumerate(value):
+            found.extend(_scheduler_paths(nested, f"{path}.{index}" if path else str(index)))
+    return tuple(found)
+
+
+def _integer_seed(streams: Mapping[str, Any], name: str) -> int:
+    """Return one explicit seed stream, refusing implicit RNG fallback."""
+
+    value = streams.get(name)
+    if type(value) is not int or value < 0:
+        raise TrainConfigResolutionError(f"seed stream {name!r} must be a non-negative integer")
+    return value
+
+
+def _initializer_paths(value: Any, path: str = "") -> tuple[str, ...]:
+    """Find every named initializer block in a Hydra configuration."""
+
+    found: list[str] = []
+    if isinstance(value, Mapping):
+        initializer = value.get("initializer")
+        if isinstance(initializer, Mapping):
+            found.append(f"{path}.initializer" if path else "initializer")
+        for key, nested in value.items():
+            child = f"{path}.{key}" if path else str(key)
+            found.extend(_initializer_paths(nested, child))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, nested in enumerate(value):
+            found.extend(_initializer_paths(nested, f"{path}.{index}" if path else str(index)))
+    return tuple(found)
+
+
+def _set_named_initializer_seeds(cfg: DictConfig, seed: int) -> None:
+    """Bind every declared initializer to the shared model-init seed."""
+
+    # ``runner.model`` interpolates the same model block.  Traverse the
+    # canonical model declaration once; walking the alias produces a second
+    # path whose relative interpolation does not expose the named stream.
+    paths = _initializer_paths(cfg.model, "model")
+    if not paths:
+        raise TrainConfigResolutionError("HI train config declares no named initializer")
+    for path in paths:
+        initializer = OmegaConf.select(cfg, path)
+        if not isinstance(initializer, Mapping) or not initializer.get("stream"):
+            raise TrainConfigResolutionError(f"initializer {path!r} must declare a named stream")
+        OmegaConf.update(cfg, f"{path}.seed", seed, merge=False, force_add=True)
+
+
+def _set_optional_execution_seeds(cfg: DictConfig, streams: Mapping[str, Any]) -> None:
+    """Bind existing sampler and diagnostic seed fields when their domains exist."""
+
+    if OmegaConf.select(cfg, "sampler.seed", default=None) is not None:
+        sampler_seed = _integer_seed(streams, "training_sampler")
+        OmegaConf.update(cfg, "sampler.seed", sampler_seed, merge=False)
+
+    diagnostic_seed = streams.get("diagnostic")
+    if type(diagnostic_seed) is int and diagnostic_seed >= 0:
+        callbacks = OmegaConf.select(cfg, "callbacks", default=[])
+        for index, callback in enumerate(callbacks):
+            if not isinstance(callback, Mapping):
+                continue
+            checkers = callback.get("checkers")
+            if not isinstance(checkers, Sequence) or isinstance(checkers, (str, bytes, bytearray)):
+                continue
+            for checker_index, checker in enumerate(checkers):
+                if isinstance(checker, Mapping) and "seed" in checker:
+                    OmegaConf.update(
+                        cfg,
+                        f"callbacks.{index}.checkers.{checker_index}.seed",
+                        diagnostic_seed,
+                        merge=False,
+                    )
+
+
+def _optimizer_entry(manifest: Mapping[str, Any]) -> Any:
+    """Resolve the cell's optimizer through the live build-time roster."""
+
+    identity = _mapping(manifest.get("scientific_identity"), "scientific_identity")
+    optimizer_cell = _mapping(identity.get("optimizer_cell"), "scientific_identity.optimizer_cell")
+    method = optimizer_cell.get("method")
+    status = optimizer_cell.get("status")
+    if not isinstance(method, str) or not method:
+        raise TrainConfigResolutionError("optimizer cell must declare a method")
+    if status not in {"available", "unavailable"}:
+        raise TrainConfigResolutionError("optimizer cell must declare an availability status")
+
+    schema = import_module("tpen.hi_schema")
+    roster = tuple(schema.HI_METHOD_ROSTER)
+    by_method = {entry.method: entry for entry in roster}
+    entry = by_method.get(method)
+    if entry is None:
+        unavailable_reason = optimizer_cell.get("unavailable_reason")
+        status_is_unavailable = {"available": False, "unavailable": True}.get(status, False)
+        if status_is_unavailable and unavailable_reason:
+            raise UnavailableOptimizerError(
+                f"optimizer method {method!r} is unavailable: {unavailable_reason}"
+            )
+        raise UnavailableOptimizerError(f"optimizer method {method!r} is absent from the HI roster")
+    if not entry.admitted or status != "available" or not entry.target:
+        reason = (
+            optimizer_cell.get("reason")
+            or "not admitted by HI_METHOD_ROSTER"
+        )
+        raise UnavailableOptimizerError(
+            f"optimizer method {method!r} is unavailable: {reason}"
+        )
+    return entry
+
+
+def _authority_adam_levels() -> Mapping[str, Any]:
+    """Load Adam's complete level vocabulary from the committed authority."""
+
+    authority_path = _CONFIG_PATH.parent.parent / "optimizer_grid_authority.json"
+    try:
+        authority = json.loads(authority_path.read_text(encoding="utf-8"))
+        family = next(item for item in authority["families"] if item["family"] == "adam")
+    except (OSError, KeyError, StopIteration, TypeError, json.JSONDecodeError) as error:
+        raise TrainConfigResolutionError(
+            f"cannot load Adam level authority from {authority_path}"
+        ) from error
+    levels = dict(family["fixed"])
+    levels.update(family["varied"])
+    return levels
+
+
+def _declared_adam_levels(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Validate and return one row's explicit Adam constructor coordinates.
+
+    The authority's fixed and varied keys form one closed set.  Fixed keys are
+    checked here as well as the scan coordinates so a resolver cannot silently
+    reintroduce an optimizer default or accept an unowned coordinate.
+    """
+
+    identity = _mapping(manifest.get("scientific_identity"), "scientific_identity")
+    optimizer = _mapping(identity.get("optimizer"), "scientific_identity.optimizer")
+    if set(optimizer) != {"method", "levels"}:
+        raise OptimizerLevelResolutionError(
+            "scientific_identity.optimizer must contain exactly method and levels"
+        )
+    method = optimizer.get("method")
+    if method != "adam":
+        raise OptimizerLevelResolutionError(
+            f"scientific_identity.optimizer.method must be 'adam', got {method!r}"
+        )
+    levels = _mapping(optimizer.get("levels"), "scientific_identity.optimizer.levels")
+    expected = _authority_adam_levels()
+    if set(levels) != set(expected):
+        missing = sorted(set(expected) - set(levels))
+        extra = sorted(set(levels) - set(expected))
+        details = []
+        if missing:
+            details.append(f"missing level key(s) {missing!r}")
+        if extra:
+            details.append(f"extra level key(s) {extra!r}")
+        raise OptimizerLevelResolutionError(
+            "scientific_identity.optimizer.levels: " + "; ".join(details)
+        )
+
+    numeric_fields = ("lr", "beta1", "beta2", "epsilon", "weight_decay")
+    for field in numeric_fields:
+        value = levels[field]
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise OptimizerLevelResolutionError(
+                f"scientific_identity.optimizer.levels.{field} must be numeric"
+            )
+    if type(levels["parameter_groups"]) is not int:
+        raise OptimizerLevelResolutionError(
+            "scientific_identity.optimizer.levels.parameter_groups must be an integer"
+        )
+    if levels["parameter_groups"] != expected["parameter_groups"]:
+        raise OptimizerLevelResolutionError(
+            "scientific_identity.optimizer.levels.parameter_groups must equal 1"
+        )
+    if levels["schedule"] != expected["schedule"]:
+        raise OptimizerLevelResolutionError(
+            "scientific_identity.optimizer.levels.schedule must be 'constant'"
+        )
+    return levels
+
+
+def _consumed_context(manifest: Mapping[str, Any]) -> str:
+    """Validate and return the resolver-consumed context family.
+
+    A/B rows use the AB-4a literal package vocabulary.  The accepted shape is
+    ``{"axis": "A" or "B", "literal_configuration": {...}}``; the
+    configuration is checked as a closed set here; no control expansion is
+    performed.  O rows retain their pre-existing named ``overrides`` shape so
+    their resolved configuration remains unchanged.
+
+    Returns
+    -------
+    str
+        ``"O-raw"``, ``"O-composite"``, ``"A"``, or ``"B"``.
+
+    Raises
+    ------
+    ContextResolutionError
+        If the context is not one of the closed scientific vocabularies.
+    """
+
+    identity = _mapping(manifest.get("scientific_identity"), "scientific_identity")
+    context = _mapping(identity.get("context"), "scientific_identity.context")
+    expected = {
+        "O-raw": {
+            "name": "O-raw",
+            "overrides": {"input_features": "B00", "feature_update": "residual"},
+        },
+        "O-composite": {
+            "name": "O-composite",
+            "overrides": {
+                "producer_policy": "hybrid/coordinate-neighbor",
+                "aggregation_activation": "channel-MLP at both activation sites",
+                "input_features": "B11",
+                "feature_update": "residual",
+            },
+        },
+    }
+    for name, literal in expected.items():
+        if dict(context) == literal:
+            return name
+
+    context_keys = frozenset(context)
+    if context_keys.intersection({"axis", "literal_configuration"}):
+        if context_keys.symmetric_difference({"axis", "literal_configuration"}):
+            raise ContextResolutionError(
+                "scientific_identity.context A/B shape must have exactly the keys "
+                "['axis', 'literal_configuration']; "
+                f"declared keys={sorted(context_keys)!r}"
+            )
+        axis = context.get("axis")
+        literal = context.get("literal_configuration")
+        axis_name = {"A": "A", "B": "B"}.get(axis) if type(axis) is str else None
+        if axis_name is None:
+            raise ContextResolutionError(
+                f"scientific_identity.context A/B shape has unknown axis {axis!r}"
+            )
+        if not isinstance(literal, Mapping):
+            raise ContextResolutionError(
+                "scientific_identity.context A/B shape requires "
+                f"literal_configuration to be a mapping, got {type(literal).__name__}"
+            )
+        labels = dict(literal)
+        expected_keys = set(_AB_CONTEXT_KEYS)
+        if {"A": False, "B": True}.get(axis_name, False):
+            expected_keys.add("package")
+        label_keys = frozenset(labels)
+        key_differences = label_keys.symmetric_difference(expected_keys)
+        if key_differences:
+            missing = sorted(expected_keys - label_keys)
+            extra = sorted(label_keys - expected_keys)
+            details = []
+            if missing:
+                details.append(f"missing coordinate(s) {missing!r}")
+            if extra:
+                details.append(f"extra coordinate(s) {extra!r}")
+            raise ContextResolutionError(
+                f"scientific_identity.context.literal_configuration for {axis} must be closed: "
+                + "; ".join(details)
+            )
+        invalid_coordinate = next(
+            (coordinate for coordinate, value in labels.items() if type(value) is not str),
+            None,
+        )
+        if invalid_coordinate is not None:
+            raise ContextResolutionError(
+                "scientific_identity.context.literal_configuration coordinate "
+                f"{invalid_coordinate!r} must be an exact str label"
+            )
+        return axis_name
+
+    if dict(context) not in expected.values():
+        differences = []
+        declared_name = context.get("name")
+        declared = expected.get(declared_name, {})
+        for field in sorted(set(context) | set(declared)):
+            if context.get(field) != declared.get(field):
+                differences.append(
+                    f"{field} declared={context.get(field)!r} consumed={declared.get(field)!r}"
+                )
+        raise ContextResolutionError(
+            "scientific_identity.context must be exactly the authority's O-raw or "
+            f"O-composite literal; declared={dict(context)!r}; "
+            + "; ".join(differences)
+            + "; run_stage_q retains the O-composite refusal (item dd964863)"
+        )
+
+    raise AssertionError("unreachable context validation branch")
+
+
+def _override_items(overrides: Mapping[str, Any] | Sequence[str]) -> tuple[tuple[str, Any], ...]:
+    """Flatten mapping or Hydra dotlist overrides into explicit leaf updates."""
+
+    if isinstance(overrides, Mapping):
+        try:
+            raw = OmegaConf.to_container(OmegaConf.create(overrides), resolve=False)
+        except Exception as exc:
+            raise TrainConfigResolutionError("overrides must be a valid mapping") from exc
+    elif isinstance(overrides, Sequence) and not isinstance(overrides, (str, bytes, bytearray)):
+        try:
+            raw = OmegaConf.to_container(OmegaConf.from_dotlist(list(overrides)), resolve=False)
+        except Exception as exc:
+            raise TrainConfigResolutionError("overrides must be a valid Hydra dotlist") from exc
+    else:
+        raise TrainConfigResolutionError("overrides must be a mapping or Hydra dotlist")
+
+    items: list[tuple[str, Any]] = []
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                visit(child, f"{path}.{key}" if path else str(key))
+        else:
+            items.append((path, value))
+
+    visit(raw, "")
+    return tuple(items)
+
+
+_RESOLVER_OWNED_SEED_PATHS = frozenset({"runtime.seed", "sampler.seed"})
+_RESOLVER_OWNED_SEED_SUFFIXES = (".initializer.seed",)
+_RESOLVER_OWNED_CHECKER_PREFIX = "callbacks."
+_RESOLVER_OWNED_CHECKER_MARKER = ".checkers."
+_RESOLVER_OWNED_SEED_SUFFIX = ".seed"
+_RESOLVER_OWNED_OVERRIDE_PATHS = frozenset(
+    {"run.root", "run.dir", "run.run_id", "run.layout", "sampler.n_walkers"}
+)
+_OVERRIDE_MISSING = object()
+
+
+def _is_resolver_owned_seed_path(path: str) -> bool:
+    """Return whether *path* belongs to a resolver-owned seed stream."""
+
+    if path in _RESOLVER_OWNED_SEED_PATHS:
+        return True
+    if any(
+        path[len(path) - len(suffix) :] == suffix
+        for suffix in _RESOLVER_OWNED_SEED_SUFFIXES
+        if len(path) >= len(suffix)
+    ):
+        return True
+    prefix = _RESOLVER_OWNED_CHECKER_PREFIX
+    marker = _RESOLVER_OWNED_CHECKER_MARKER
+    suffix = _RESOLVER_OWNED_SEED_SUFFIX
+    return (
+        len(path) >= len(prefix)
+        and path[: len(prefix)] == prefix
+        and marker in path
+        and len(path) >= len(suffix)
+        and path[len(path) - len(suffix) :] == suffix
+    )
+
+
+def _reject_resolver_owned_seed_overrides(items: Sequence[tuple[str, Any]]) -> None:
+    """Refuse seed paths whose values are owned by manifest seed streams."""
+
+    owned = {path for path, _ in items if _is_resolver_owned_seed_path(path)}
+    if owned:
+        raise TrainConfigResolutionError(
+            "resolver-owned seed overrides are not permitted: " + ", ".join(sorted(owned))
+        )
+
+
+def _reject_resolver_owned_overrides(items: Sequence[tuple[str, Any]]) -> None:
+    """Refuse paths whose values are written by this resolver after overlays."""
+
+    for path, _ in items:
+        if path in _RESOLVER_OWNED_OVERRIDE_PATHS:
+            raise TrainConfigResolutionError(
+                f"resolver-owned override path is not permitted: {path}"
+            )
+        if str.__eq__(path, "runner") is True or path.startswith("runner."):
+            raise TrainConfigResolutionError(
+                "runner override paths are not permitted; top-level path: runner"
+            )
+
+
+def _ab_context_labels(manifest: Mapping[str, Any], axis: str) -> dict[str, str]:
+    """Return complete AB-4a labels after closed-schema context validation.
+
+    Parameters
+    ----------
+    manifest
+        Frozen materialized training manifest.
+    axis
+        The already validated ``"A"`` or ``"B"`` context family.
+
+    Returns
+    -------
+    dict[str, str]
+        Complete labels accepted by
+        :func:`context_mapping.compose_architecture_package`.
+    """
+
+    context = _mapping(manifest["scientific_identity"].get("context"), "scientific_identity.context")
+    literal = _mapping(
+        context.get("literal_configuration"),
+        "scientific_identity.context.literal_configuration",
+    )
+    return dict(literal)
+
+
+def resolve_train_config(
+    source: Any, *, overrides: Mapping[str, Any] | Sequence[str] | None = None
+) -> DictConfig:
+    """Resolve one materialized cell or training packet into a Hydra config.
+
+    Parameters
+    ----------
+    source
+        A ``MaterializedCell`` or a ``TrainingPacket`` wrapping one.  The
+        structural boundary is intentional so a packet imported through the
+        checkout's real ``tpen.hi.train.v1`` namespace is accepted without
+        duplicating the stage-coordinate classes here.
+    overrides
+        Optional mapping or Hydra dotlist of operational overlays. They are
+        applied to the composed tree before any interpolation is resolved, so
+        copied runner, shared-leaf, and sink consumers read the same values.
+
+    Returns
+    -------
+    omegaconf.DictConfig
+        A resolved, schema-validated configuration with row-specific identity,
+        paths, horizon, optimizer, and explicit seed streams.
+
+    Raises
+    ------
+    TrainConfigResolutionError
+        If the row is malformed, unavailable, or has no train horizon.
+    tpen.config_schema.ClosedSchemaError
+        If the composed configuration fails the HI schema firewall.
+    """
+
+    cell, source_hash = _cell_from_source(source)
+    stage_api = _stage_api()
+    # Own one frozen manifest before any resolver consumer can read it again.
+    # Validation, hashing, and config composition then use identical bytes.
+    source_manifest = _mapping(cell.manifest, "cell.manifest")
+    manifest = stage_api._freeze(stage_api._thaw(source_manifest))
+    stage_api.validate_materialized_manifest(manifest)
+    if stage_api.content_hash(manifest) != source_hash:
+        raise TrainConfigResolutionError("cell content hash does not bind its manifest")
+
+    stage = stage_api.stage_definition(manifest["stage"])
+    if stage.updates is None:
+        raise TrainConfigResolutionError(
+            f"stage {stage.code!r} has no fixed training horizon"
+        )
+    output_path = Path(cell.output_path)
+    if not output_path.is_absolute() or output_path.parent.parent == output_path:
+        raise TrainConfigResolutionError("cell output_path must be an absolute stage/hash path")
+    if (
+        type(output_path.name) is not str
+        or str.__eq__(output_path.name, source_hash) is not True
+        or type(output_path.parent.name) is not str
+        or str.__eq__(output_path.parent.name, manifest["stage"]) is not True
+    ):
+        raise TrainConfigResolutionError(
+            "cell output_path must bind its leaf hash and stage to the manifest"
+        )
+
+    optimizer_entry = _optimizer_entry(manifest)
+    context_name = _consumed_context(manifest)
+    levels = _declared_adam_levels(manifest)
+    optimizer_identity = _mapping(manifest["scientific_identity"].get("optimizer"), "scientific_identity.optimizer")
+    if optimizer_identity.get("method") != manifest["scientific_identity"]["optimizer_cell"].get("method"):
+        raise OptimizerLevelResolutionError(
+            "scientific_identity.optimizer.method does not match optimizer_cell.method"
+        )
+    streams = _mapping(cell.seed_streams, "cell.seed_streams")
+    model_seed = _integer_seed(streams, "model_initialization")
+
+    cfg = _compose_base_config()
+    override_items = _override_items(overrides) if overrides is not None else ()
+    _reject_resolver_owned_seed_overrides(override_items)
+    _reject_resolver_owned_overrides(override_items)
+    committed_walkers = stage_api.COMMITTED_WALKERS
+    composed_walkers = OmegaConf.select(cfg, "sampler.n_walkers", default=None)
+    # Exact-int plus int.__eq__ keeps this decision structural, not caller-overridable.
+    if type(composed_walkers) is not int or int.__eq__(composed_walkers, committed_walkers) is not True:
+        raise TrainConfigResolutionError(
+            "committed train config sampler.n_walkers must remain 4096"
+        )
+    walkers = stage_api.walker_count(manifest)
+    OmegaConf.update(cfg, "sampler.n_walkers", walkers, merge=False)
+    OmegaConf.update(cfg, "trainer.max_steps", stage.updates, merge=False)
+    OmegaConf.update(cfg, "run.root", str(output_path.parent.parent), merge=False)
+    OmegaConf.update(cfg, "run.run_id", source_hash, merge=False)
+    OmegaConf.update(cfg, "run.layout", "flat", merge=False, force_add=True)
+    OmegaConf.update(cfg, "run.dir", str(output_path), merge=False)
+    OmegaConf.update(cfg, "runtime.seed", model_seed, merge=False)
+    for path, value in override_items:
+        OmegaConf.update(cfg, path, value, merge=False)
+    OmegaConf.update(cfg, "optimizer._target_", optimizer_entry.target, merge=False)
+    # Every Adam coordinate is explicit in the resolved config; no torch
+    # constructor default is allowed to stand in for a declared level.
+    OmegaConf.update(cfg, "optimizer.lr", levels["lr"], merge=False, force_add=True)
+    OmegaConf.update(
+        cfg, "optimizer.betas", [levels["beta1"], levels["beta2"]], merge=False, force_add=True
+    )
+    OmegaConf.update(cfg, "optimizer.eps", levels["epsilon"], merge=False, force_add=True)
+    OmegaConf.update(
+        cfg, "optimizer.weight_decay", levels["weight_decay"], merge=False, force_add=True
+    )
+    if context_name == "O-composite":
+        context_mapping = _context_mapping_api()
+        # Splice the composed package back into the full root so its Hydra
+        # interpolations continue to resolve against system/runtime values.
+        cfg.model = context_mapping.compose_package(cfg.model, "B11")
+        cfg.model.layers[0] = OmegaConf.create(
+            context_mapping.context_fragment(
+                "hybrid/coordinate-neighbor",
+                activation="channel-MLP,channel-MLP",
+                seed=model_seed,
+            )
+        )
+    elif {"A": True, "B": True}.get(context_name, False):
+        context_mapping = _context_mapping_api()
+        labels = _ab_context_labels(manifest, context_name)
+        package = labels.pop("package", None)
+        # AB-3 owns architecture composition.  Assign the returned model at
+        # the full Hydra root so its relative interpolations resolve against
+        # ``cfg`` rather than against a detached model fragment.
+        try:
+            cfg.model = context_mapping.compose_architecture_package(
+                cfg.model,
+                package=package,
+                seed=model_seed,
+                **labels,
+            )
+        except Exception as error:
+            if isinstance(error, context_mapping.UnknownContextLabel):
+                raise ContextResolutionError(
+                    "scientific_identity.context contains an unknown A/B coordinate label: "
+                    f"{error}"
+                ) from error
+            raise
+    scheduler_paths = _scheduler_paths(OmegaConf.to_container(cfg, resolve=False))
+    if scheduler_paths:
+        raise OptimizerLevelResolutionError(
+            "composed config contains scheduler block(s) "
+            f"{scheduler_paths!r}; Adam schedule must be constant"
+        )
+    _set_named_initializer_seeds(cfg, model_seed)
+    _set_optional_execution_seeds(cfg, streams)
+    unresolved = OmegaConf.to_container(cfg, resolve=False)
+    for path, expected in override_items:
+        actual: Any = unresolved
+        for segment in path.split("."):
+            if isinstance(actual, Mapping):
+                actual = actual.get(segment, _OVERRIDE_MISSING)
+            elif isinstance(actual, Sequence) and not isinstance(actual, (str, bytes, bytearray)):
+                if not segment.isdigit() or int(segment) >= len(actual):
+                    actual = _OVERRIDE_MISSING
+                else:
+                    actual = actual[int(segment)]
+            else:
+                actual = _OVERRIDE_MISSING
+            if actual is _OVERRIDE_MISSING:
+                break
+        if actual != expected:
+            raise TrainConfigResolutionError(
+                f"override path {path!r} was not preserved before resolution"
+            )
+    try:
+        OmegaConf.resolve(cfg)
+    except Exception as exc:
+        raise TrainConfigResolutionError("configuration interpolation could not be resolved") from exc
+
+    schema = import_module("tpen.hi_schema")
+    schema.validate_hi_train_config(cfg)
+    return cfg
+
+
+resolve_training_config = resolve_train_config
+
+
+__all__ = [
+    "CheckoutPreconditionError",
+    "ContextResolutionError",
+    "OptimizerLevelResolutionError",
+    "TrainConfigResolutionError",
+    "UnavailableOptimizerError",
+    "resolve_train_config",
+    "resolve_training_config",
+]

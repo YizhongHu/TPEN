@@ -10,6 +10,31 @@
   action on Cannon, Polaris, Aurora, or Frontier, read and follow
   `cluster-access` and the current Task Orchestrator cluster notes. Do not infer
   facility policy from another cluster or an older receipt.
+- Every ssh/scp/rsync uses `ssh -o BatchMode=yes` (rsync: `-e 'ssh -o BatchMode=yes'`); on failure stop and never retry plain SSH.
+- Before any Paseo action - creating, staffing, messaging, or scheduling an
+  agent, or arming a heartbeat - read and follow the `paseo` skill. This is
+  mandatory, not advisory.
+- All TPEN tests are conducted on clusters. Use FASRC-cannon unless otherwise
+  specified.
+- Agents that did not finish their task are not allowed to go completely
+  idle (stop working or thinking) unless it is blocked by human decision or
+  some other process such as cluster job and other agents' work.
+- When blocked by another process, agents are strongly encouraged to use
+  `paseo-monitor` so that they can be woken up later by a monitoring daemon.
+  Since `paseo-monitor` is experimental, agents are encouraged to use heartbeats
+  as a failsafe. Heartbeat needs to be cancelled when agents return.
+
+## How agents should think
+Agents should try to critically evaluate information they receive and send with evidence. Think:
+- What would support this? What led to this conclusion?
+- What would falsify this? Is it worth verifying? Do I need more information?
+- What are the assumptions? What happens when a certain assumption is removed?
+When agents send messages (to the operator and other agents), they need to do due diligence
+to make sure that the information is trustworthy. Think:
+- How would I support my claims if someone asks? 
+- What would falsify my claims? Can someone misinterpret the scope of my claim?
+Do not assume malevolence. Assume that everyone (including yourself and the operator) 
+is willing to collaborate but can make mistakes.
 
 ## Orchestrators
 
@@ -20,13 +45,39 @@
   PR layer. Use `gh-stack` for stacks.
 - If a Paseo child must report back, tell it which events to report with
   `paseo-queue add <agent> "msg"` including completion.
-- For urgent messages, `paseo send "msg"` should be used instead.
-- For ongoing observation, use `monitor-with-subagent`. The monitoring child
-  stays active and reports declared events; the orchestrator owns only the
-  bounded failsafe heartbeat described by the skill.
+- Before messages are sent, there needs to be an urgency evaluation.
+  For urgent messages, `paseo send "msg"` should be used instead.
 - When blocked with no safe next action, record the blocker in Task
   Orchestrator, schedule a bounded heartbeat only when needed, then yield.
-  Delete the heartbeat when work resumes.
+  Delete the monitoring heartbeat when work resumes.
+- Keep a standing heartbeat that re-reads `CLAUDE.md` or `AGENTS.md` from start to finish every few
+  hours to refresh your memory. DO NOT take shortcuts such as running a diff.
+
+## Managers
+
+- Managers are marked with the Paseo agent name `[manager]`.
+- Managers coordinate the orchestrators in the operator's place, especially
+  when the operator is away. 
+- Managers take care of issues of inter-lane importance and are responsible for timely
+  completion of the long-term objectives assigned by the operator. 
+- Managers are expected to keep their context clear by
+  - delegating work
+  - reducing the number of agent messages
+  To that end managers have been given communication authority. They dictate when an orchestrator
+  can communicate to them. Think: is this communication essential for inter-lane coordination?
+  Does this need active communication from the subagent?
+  If it is not, it is outside of the manager's authority and should be handed to an orchestrator 
+  in charge. Managers are not obligated to send a message or respond to any request. Their only
+  objective is to progress towards the long-term goal.
+- Managers make sure that all the active orchestrator lanes are working as expected and resolve 
+  simple blockers that do not need the operator. Most of the time the manager should monitor
+  instead of intervene.
+- When the manager intervenes, the objective is to turn an inter-lane problem into an intra-lane 
+  problem as soon as possible. 
+- Managers are also expected to be flexible and weigh the costs and benefits to each decision. 
+  Think: does this work contribute to the current goal? Are there alternatives? Are blockers really
+  blockers or are there workarounds? Is this a problem we have encountered before? Should I trust
+  this information? etc.
 
 # Repo Instructions
 
@@ -89,78 +140,35 @@ and currently important information should not.
 
 Do not place helper functions wherever they are first needed. Put each helper in the module that owns the relevant concept.
 
-Examples:
-
-```text
-Permutation logic       -> tpen/data/permutation.py
-Tuple-index logic       -> tpen/data/indices.py
-Virtual path logic      -> tpen/data/paths.py
-Partition logic         -> tpen/data/partition.py
-Trainable modules       -> tpen/nn/
-```
-
-Bad:
-
-```python
-# tpen/nn/equivariant_mixing.py
-def ordered_tuples(...):
-    ...
-```
-
-Good:
-
-```python
-from tpen.data.indices import ordered_tuples
-```
-
 ### Prefer small PR steps
 
 For this project, correctness is more important than breadth. Prefer small changes with strong tests.
 
 Avoid large PRs that change multiple things at the same time.
 
-### Require an authoritative-edit launch receipt
+### Implementation worker lifecycle
 
-Before the first repository edit for any implementation slice, run:
+For each TO implementation slice:
 
-```bash
-uv run --no-project python tools/check_authoritative_edit.py --item <task-orchestrator-item-id>
-```
+1. Using the `paseo` skill, the orchestrator claims and advances to `work`, creates the worktree, dispatches, then releases its claim.
+2. The worker claims before editing with a short renewable TTL.
+3. The worker pushes the PR, records its full head, releases the claim, then finishes.
+4. The orchestrator confirms release and preserved work before worker archival.
+5. A separate verifier checks the current PR head with the `pr-verification` skill; archive only after its receipt. On a passing receipt, advance the item to `review`; this unblocks downstream slices with `unblockAt: review`.
+6. Run tiered review with the `pr-review-loop` skill; ready requires verification at the current head.
+7. Any new commit returns the PR to draft unless the new head's git tree equals the verified head's tree (record both SHAs and the tree hash).
+8. After confirmed merge, delete the merged branch and worktree; record both deletions in `pr-disposition`.
+9. Complete/cancel only after that disposition.
 
-Proceed only when it emits `"status": "ok"`. The guard requires a clean tracked
-tree on an agent-namespaced branch plus a claimed TPEN `implementation-slice`
-already in `work` with a non-empty `acceptance-contract`. Existing untracked
-research and run data are deliberately ignored and must remain untouched.
-
-**Run the guard outside the agent sandbox.** This is allowed and encouraged, not
-a workaround. The guard reads the Task Orchestrator HTTP API, and sandboxed
-coding agents deny outbound network, so it returns
-`{"status": "blocked"}` with `urlopen error [Errno 1] Operation not permitted`.
-The same sandboxes deny paths named `.git`, which breaks `uv` outright because
-`uv` writes a zero-byte `.git` marker into every cache directory on init;
-redirecting `UV_CACHE_DIR` does not help, because `uv` recreates the marker
-wherever it is pointed. Do not send a sandboxed agent at this guard and do not
-escalate sandbox permissions for it.
-
-Instead, an unsandboxed party — normally the orchestrator — runs it from the
-lane's own worktree, and records the output as an
-`authoritative-edit-launch-receipt` note on that lane's item. Invoking the
-script through an interpreter directly instead of `uv run --no-project` is
-acceptable here: the script performs no dependency resolution, and
-`uv run --no-project` resolves to the project interpreter anyway. Record both
-deviations in the receipt — interpreter-direct, and executed by someone other
-than the editing agent — together with what that does *not* establish: the
-editing agent did not confirm its own preconditions. The receipt is
-point-in-time, so the lane must not reset, rebase, or switch branches between
-the receipt and its first edit. One caution: an agent may run the guard
-successfully early in a session and be denied later, so an early success is not
-evidence the restriction is absent.
+Before spawning a worker, check for existing agents or workspaces associated with the item. Preserve workspaces containing uncommitted or unpushed work, and retain verification evidence before cleanup. Failed verification triggers the next round of implementation work starting at step 2.
 
 ## Branches
 
 ### Sectioning
 
-Coding agents may push only to agent-namespaced branches: Codex to `codex/**`, Claude to `claude/**`.
+Coding agents may push only to agent-namespaced branches `agent/**`. 
+
+They may also push to legacy `codex/**` and `claude/**` branches.
 
 Agents must not push to branches other than these mentioned above, such as `main`,
  merge PRs, or force-push unless the user explicitly asks. Feature branches open PRs against `dev`.

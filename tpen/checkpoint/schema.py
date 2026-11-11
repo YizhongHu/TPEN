@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from .manifest import (
     CHECKPOINT_KIND,
@@ -12,6 +14,7 @@ from .manifest import (
     LEGACY_CHECKPOINT_SCHEMA_VERSION,
     CheckpointManifest,
 )
+from .payload import CheckpointPayload, TRAIN_RESUME_PAYLOAD
 
 # Acceptance is mode-dependent, not global. ``model_only`` reads `model.pt` and
 # the config hashes, both of which a v1 manifest carries, so an archived
@@ -112,3 +115,28 @@ def validate_manifest_schema(
             f"{label}unsupported checkpoint kind {manifest.kind!r} for "
             f"schema_version {manifest.schema_version}; expected {expected_kind!r}"
         )
+    if manifest.payload is not None:
+        payload = CheckpointPayload.from_manifest(manifest.payload)
+        payload.validate_restore_intent(mode)
+        payload.validate_files(manifest.files)
+
+
+def validate_manifest_state(
+    manifest: CheckpointManifest, state: Mapping[str, Any], *, mode: str
+) -> None:
+    """Validate restore state against the manifest's mode-specific payload.
+
+    State validation is separate from manifest-file validation because the
+    trainer state lives in ``trainer.json`` rather than in ``manifest.json``.
+    Restore callers must invoke this after pre-reading that file and before
+    loading any mutable component.
+    """
+
+    if mode != "train_resume":
+        return
+    payload = (
+        TRAIN_RESUME_PAYLOAD
+        if manifest.payload is None
+        else CheckpointPayload.from_manifest(manifest.payload)
+    )
+    payload.validate_state(state)

@@ -1,0 +1,28 @@
+# H-v2 evaluation scale overlay (design target section A2, TO 8a5e926f).
+#
+# Scale-only overrides applied onto the frozen ``eval.yaml`` by EXPLICIT
+# dotted key path (``protocol._set_by_dotted_path``), the same mechanism
+# ``science_training_config`` uses for ``science_scale_overlay.yaml`` -- a
+# blind ``OmegaConf.merge`` would replace ``model.layers`` wholesale instead
+# of touching one nested leaf under ``model.layers.0``.
+#
+# Model architecture keys here MUST match ``science_scale_overlay.yaml``
+# exactly: this config restores a checkpoint TRAINED at those widths, so a
+# drifted channel count here would fail to load, not merely score wrong.
+#
+# ``runtime.seed`` is NOT here: eval seeds come from
+# ``contract_inputs.json``'s frozen seed roster, per generation, never a
+# second literal copy.
+#
+# This file's key set is pinned by ``protocol.EVAL_SCALE_OVERLAY_KEYS`` and
+# checked for exact equality before it is ever applied.
+runtime.device: cuda
+sampler.n_walkers: 4096
+sampler.burn_in: 1000
+evaluator.tasks.0.generator.n_draws: 256
+evaluator.tasks.0.summaries.0.max_samples: 1048576
+model.embedding.out_channels: 32
+model.embedding.hidden_channels: 128
+model.layers.0.mixing.channels: 32
+model.layers.0.path_aggregation.channels: 32
+model.readout.channels: 32

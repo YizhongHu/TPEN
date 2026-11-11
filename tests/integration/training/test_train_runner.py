@@ -18,6 +18,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from tpen.checkpoint import resolve_checkpoint_dir
+from tpen.checkpoint.hashing import file_sha256
 from tpen.run import run_from_config
 
 FIXTURE = Path(__file__).resolve().parents[1] / "artifacts" / "training" / "vmc_smoke.yaml"
@@ -95,7 +96,19 @@ def test_train_runner_writes_standard_artifacts(tmp_path) -> None:
 
     # Three attempted iterations, each of which applied its optimizer update.
     trainer_state = json.loads((run_dir / "checkpoints/step_000003/trainer.json").read_text())
-    assert trainer_state == {"next_iteration": 3, "completed_updates": 3}
+    assert set(trainer_state) == {
+        "next_iteration",
+        "completed_updates",
+        "parameter_layout",
+        "nonfinite_local_energy_policy",
+    }
+    assert trainer_state["next_iteration"] == 3
+    assert trainer_state["completed_updates"] == 3
+    # The ACTIVE estimator, recorded beside the numbers it produced. Pinned to
+    # the literal rather than to the module default: an assertion that reads
+    # the default and compares it to itself passes for ANY default, including
+    # one nobody chose -- which is the failure the policy key exists to catch.
+    assert trainer_state["nonfinite_local_energy_policy"] == "mask"
 
     # The v2 manifest names both counters instead of one ambiguous `step`, and
     # the directory the run wrote is the one `next_iteration` names.
@@ -201,7 +214,7 @@ def _equivalence_config(
 ) -> DictConfig:
     """Return the smoke config extended to a resumable ``max_steps=6`` run.
 
-    The fixture's periodic cadence (``every_n_steps: 2``) counts applied
+    The fixture's periodic cadence (``schedule.every_n: 2``) counts applied
     optimizer updates, so at ``max_steps=6`` it writes steps 2, 4 and 6 and
     never produces the mid-run checkpoint this test resumes from. Widening it to
     `RESUME_STEP` writes ``step_000003`` and ``step_000006`` instead. Nothing
@@ -214,9 +227,10 @@ def _equivalence_config(
         Restore config attached to the runner. ``None`` leaves the runner
         without one, which is ``mode: none``.
     save_rng : bool or None, optional
-        Override for both checkpoint callbacks. ``None`` keeps the default
-        ``True``. Checkpoint callbacks are not covered by any manifest hash, so
-        toggling this does not itself perturb restore admissibility.
+        Override for the checkpoint stream. ``None`` keeps the explicit
+        ``TrainResume`` payload and its default ``True``. A supplied value
+        selects the flag-owned component set so the negative arm can create a
+        deliberately partial checkpoint without conflicting with that profile.
     """
 
     cfg = OmegaConf.load(FIXTURE)
@@ -224,11 +238,12 @@ def _equivalence_config(
     for callback in cfg.callbacks:
         if callback.get("_target_") != "tpen.callback.Checkpoint":
             continue
-        # The periodic writer is the one that produces the resume source; the
-        # terminal writer (`periodic: false`) keeps its own unwindowed cadence.
+        # The composed stream produces the resume source on its periodic path;
+        # its terminal path remains unwindowed by the schedule.
         if callback.get("periodic", True):
-            callback.every_n_steps = RESUME_STEP
+            callback.schedule.every_n = RESUME_STEP
         if save_rng is not None:
+            callback.payload = None
             callback.save_rng = save_rng
     if load is not None:
         cfg.runner.load = load
@@ -323,7 +338,17 @@ def test_resume_reproduces_the_uninterrupted_run_bitwise(uninterrupted_run, tmp_
     }
     trainer_a = json.loads((final_a / "trainer.json").read_text())
     trainer_b = json.loads((final_b / "trainer.json").read_text())
-    assert trainer_a == trainer_b == expected_progress
+    expected_keys = {*expected_progress, "parameter_layout", "nonfinite_local_energy_policy"}
+    assert set(trainer_a) == expected_keys
+    assert set(trainer_b) == expected_keys
+    assert trainer_a == trainer_b
+    assert {key: trainer_a[key] for key in expected_progress} == expected_progress
+    # Both arms must have run under the SAME estimator, and under the one
+    # intended. `trainer_a == trainer_b` already forces agreement between the
+    # arms; this pins WHICH policy they agreed on, so a run that silently
+    # switched estimators cannot satisfy a bitwise-resume test by having both
+    # halves switch together.
+    assert trainer_a["nonfinite_local_energy_policy"] == "mask"
 
     # The resumed arm logs only the steps it actually ran, and every one of them
     # is byte-identical to the same step in the run that never stopped.
@@ -421,6 +446,10 @@ def test_resume_diverges_when_the_restored_sampler_stream_is_perturbed(
     generator.manual_seed(20260811)
     sampler_state["generator_state"] = generator.get_state()
     torch.save(sampler_state, perturbed / "sampler.pt")
+    manifest_path = perturbed / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["hashes"]["sampler_sha256"] = file_sha256(perturbed / "sampler.pt")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     resumed_run = _run(
         tmp_path / "diverged",

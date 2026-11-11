@@ -1,0 +1,69 @@
+defaults: []
+
+allocation:
+  _target_: tpen_executor.allocations.ConfiguredAllocation
+  allocation_id:
+    _target_: tpen_executor.contracts.AllocationId
+    value: configured-allocation
+  backend_job_id:
+    _target_: tpen_executor.contracts.BackendJobId
+    value: configured-backend-job
+  facts: {}
+
+store:
+  _target_: tpen_executor.storage.DirectoryStore
+  _recursive_: false
+  root: /prepared/executor-store
+
+task:
+  _target_: tpen_executor.tasks.ConfiguredRun
+  _recursive_: false
+  id: configured-task
+  config: /prepared/science/config.yaml
+  overrides: []
+
+lifecycle:
+  _target_: tpen_executor.lifecycle.AttachedAllocation
+  allocation: ${allocation}
+  store: ${store}
+
+program:
+  # A marker has named concrete payload slots. Nested program markers become
+  # process-local handles before all slots are instantiated. Program subtrees
+  # must not use resolver-argument key references or parent references into a
+  # nested marker; submitter-interpolated intermediate nodes on keys referenced
+  # by a program are not allowed. ${oc.env:NAME} is fine; env: values must be strings.
+  _target_: tpen_executor.programs.AllocationProgram
+  _recursive_: false
+  environment:
+    _target_: tpen_executor.environments.PreparedPythonEnvironment
+    python: ${paths.control_python}
+    setup:
+      _target_: tpen_executor.environments.SourceScript
+      path: ${paths.control_setup}
+  dispatcher:
+    # LocalDispatcher is the default attached backend. To select Parsl in an
+    # environment installed with the optional `parsl` extra, replace the target
+    # below with `tpen_executor.dispatch.ParslDispatcher`; its worker binding is
+    # resolved from allocation.facts before the first attempt fence.
+    _target_: tpen_executor.dispatch.LocalDispatcher
+    _recursive_: false
+    worker:
+      _target_: tpen_executor.programs.WorkerProgram
+      _recursive_: false
+      environment:
+        _target_: tpen_executor.environments.PreparedPythonEnvironment
+        python: ${paths.science_python}
+        setup:
+          _target_: tpen_executor.environments.SourceScript
+          path: ${paths.science_setup}
+      process:
+        _target_: tpen_executor.workers.SubprocessWorker
+        _recursive_: false
+      runner:
+        _target_: tpen_executor.runners.TPENCommand
+        _recursive_: false
+        config: /prepared/science/config.yaml
+      evidence:
+        _target_: tpen_executor.runners.TPENEvidence
+        _recursive_: false

@@ -9,13 +9,21 @@ protocol-only custom term unknown to TPEN core evaluates successfully.
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+import sys
+
 import pytest
 import torch
 from typeguard import TypeCheckError, suppress_type_checks
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
 
 from tpen.data import AtomicConfiguration
 from tpen.data.batch import ElectronBatch, FactorizedLocalEnergyInput, WavefunctionOutput
+from tpen.nn import Embedding, TPENWaveFunction
 from tpen.nn.cusp import CurvatureElectronNucleusCuspLaw, ElectronNucleusCusp
+from tpen.nn.readout import PfaffianReadout
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.potential import ElectronNucleusInteraction, ElectronNucleusPotential
 from tpen.physics.potential import HarmonicTrap
@@ -27,6 +35,16 @@ from tpen.physics.hamiltonian import (
     NaiveLocalEnergyEvaluator,
     local_energy,
 )
+
+
+_MAPPING_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_context_mapping_analytic_hessian",
+    Path(__file__).parents[3] / "experiments" / "atomistic" / "he-importance" / "context_mapping.py",
+)
+assert _MAPPING_SPEC is not None and _MAPPING_SPEC.loader is not None
+_MAPPING = importlib.util.module_from_spec(_MAPPING_SPEC)
+sys.modules[_MAPPING_SPEC.name] = _MAPPING
+_MAPPING_SPEC.loader.exec_module(_MAPPING)
 
 _DTYPE = torch.float64
 
@@ -155,6 +173,58 @@ def _analytic_setup(*, z=1.0, nuclear_position=None, eps=0.0, law=None):
         "electron_nucleus": ElectronNucleusPotential(atoms, eps=eps),
     }
     return atoms, wavefunction, batch, terms
+
+
+def _softplus_fragment_analytic_wavefunction() -> tuple[TPENWaveFunction, AtomicConfiguration]:
+    """Build the analytic evaluator model from the production layer fragment."""
+
+    atoms = AtomicConfiguration(
+        torch.zeros((1, 3), dtype=_DTYPE), torch.tensor([2.0], dtype=_DTYPE)
+    )
+    cusp = ElectronNucleusCusp(atoms)
+    fragment = _MAPPING.context_fragment(
+        "tensor", activation="Softplus beta2,Softplus beta2", channels=1
+    )
+    config = OmegaConf.create({"layer": fragment})
+    OmegaConf.resolve(config)
+    layer = instantiate(config.layer)
+    model = TPENWaveFunction(
+        embedding=Embedding(max_order=2, spatial_dim=3, out_channels=1, hidden_channels=4, num_hidden_layers=1),
+        layers=(layer,),
+        readout=PfaffianReadout(channels=1),
+        factors=(cusp,),
+        analytic_cusp_provider=cusp,
+        layout=layer.layout,
+    ).to(dtype=_DTYPE)
+    return model, atoms
+
+
+def test_analytic_hessian_softplus_fragment_batched_matches_loop() -> None:
+    model, atoms = _softplus_fragment_analytic_wavefunction()
+    batch = ElectronBatch(
+        positions=torch.tensor(
+            [
+                [[0.4, 0.1, 0.0], [-0.3, 0.2, 0.1]],
+                [[0.5, -0.2, 0.1], [-0.2, 0.3, -0.1]],
+            ],
+            dtype=_DTYPE,
+        ),
+        nuclear_positions=atoms.positions,
+        nuclear_charges=atoms.charges,
+        spins=torch.tensor([[1.0, -1.0], [1.0, -1.0]], dtype=_DTYPE),
+    )
+    terms = {
+        "kinetic": KineticEnergy(),
+        "electron_nucleus": ElectronNucleusPotential(atoms, eps=0.0),
+    }
+    context = AnalyticCuspContext(model, batch)
+    evaluator = AnalyticCuspEvaluator()
+    batched = evaluator.evaluate(terms, context)
+    loop = evaluator.evaluate_reference(terms, context)
+
+    assert torch.isfinite(batched).all()
+    assert torch.isfinite(loop).all()
+    torch.testing.assert_close(batched, loop, rtol=1.0e-11, atol=1.0e-11)
 
 
 def test_analytic_evaluator_fuses_hydrogen_and_returns_full_output() -> None:

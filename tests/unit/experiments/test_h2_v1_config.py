@@ -31,13 +31,16 @@ def _h2_reference() -> float:
     return float(h2["reference_energy_hartree"])
 
 
-def _assert_h2_system(config: dict) -> None:
+def _assert_h2_system(config: dict, *, include_reference_energy: bool = True) -> None:
     system = config["system"]
     assert system["id"] == "h2_molecule"
     assert system["n_particles"] == 2
     assert system["spin"] == {"n_up": 1, "n_down": 1}
     assert system["nuclei"] == {"positions": [[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0]], "charges": [1.0, 1.0]}
-    assert float(system["reference_energy"]) == _h2_reference()
+    if include_reference_energy:
+        assert float(system["reference_energy"]) == _h2_reference()
+    else:
+        assert "reference_energy" not in system
 
 
 def _assert_factorized_model(config: dict) -> None:
@@ -56,7 +59,7 @@ def _assert_factorized_model(config: dict) -> None:
 
 def test_h2_train_config_owns_batch_nuclear_context_and_coulomb_terms() -> None:
     config = _load(TRAIN)
-    _assert_h2_system(config)
+    _assert_h2_system(config, include_reference_energy=False)
     _assert_factorized_model(config)
     sampler = config["sampler"]
     assert sampler["nuclear_positions"] == {

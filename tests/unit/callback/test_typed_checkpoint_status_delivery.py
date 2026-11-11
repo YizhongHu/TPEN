@@ -28,6 +28,7 @@ import pytest
 import torch
 
 from tpen.callback import Checkpoint, Status
+from tpen.checkpoint import ModelOnly
 from tpen.runner import Train
 from tpen.training.events import (
     TrainingCompleted,
@@ -107,6 +108,28 @@ def test_checkpoint_receives_state_at_the_training_completed_boundary(tmp_path) 
     )
 
     assert (checkpoint_dir / "step_000007" / "COMPLETE").exists()
+
+
+def test_independent_root_checkpoint_streams_publish_at_one_boundary(tmp_path) -> None:
+    """Root-owned streams write independently when their roots are distinct."""
+
+    first_dir = tmp_path / "model-checkpoints"
+    second_dir = tmp_path / "resume-checkpoints"
+    callbacks = [
+        Checkpoint(output_dir=first_dir, payload=ModelOnly(), periodic=False),
+        Checkpoint(output_dir=second_dir, payload=ModelOnly(), periodic=False),
+    ]
+    context = make_run_context(tmp_path, callbacks=callbacks)
+
+    context.emit(
+        TrainingCompleted(),
+        state=_savable_state(step=-1, next_iteration=7, completed_updates=7),
+    )
+
+    assert (first_dir / "step_000007" / "COMPLETE").exists()
+    assert (second_dir / "step_000007" / "COMPLETE").exists()
+    assert len((first_dir / "publications.jsonl").read_text().splitlines()) == 1
+    assert len((second_dir / "publications.jsonl").read_text().splitlines()) == 1
 
 
 def test_status_receives_state_at_the_completed_iteration_boundary(

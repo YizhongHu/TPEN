@@ -359,4 +359,32 @@ def _permute_aux_value(value: Any, *, permutation: Permutation, n_electrons: int
     return permute_particle_axis(value, permutation, axis=-2)
 
 
-__all__ = ["ElectronBatch"]
+def slice_flat_batch(batch: ElectronBatch, start: int, end: int) -> ElectronBatch:
+    """Slice a flattened electron batch along its sample axis."""
+
+    positions = batch.positions[start:end]
+    spins = None if batch.spins is None else batch.spins[start:end]
+    nuclear_positions = batch.nuclear_positions
+    if nuclear_positions is not None and nuclear_positions.ndim == 3 and nuclear_positions.shape[0] == batch.batch_size:
+        nuclear_positions = nuclear_positions[start:end]
+    nuclear_charges = batch.nuclear_charges
+    if nuclear_charges is not None and nuclear_charges.ndim == 2 and nuclear_charges.shape[0] == batch.batch_size:
+        nuclear_charges = nuclear_charges[start:end]
+    aux: dict[str, Any] = {}
+    for key, value in batch.aux.items():
+        if isinstance(value, torch.Tensor) and value.shape[:1] == (batch.batch_size,):
+            aux[key] = value[start:end]
+        else:
+            aux[key] = value
+    return ElectronBatch(
+        positions=positions,
+        system=batch.system,
+        nuclear_positions=nuclear_positions,
+        nuclear_charges=nuclear_charges,
+        atomic_configuration=batch.atomic_configuration,
+        spins=spins,
+        aux=aux,
+    )
+
+
+__all__ = ["ElectronBatch", "slice_flat_batch"]

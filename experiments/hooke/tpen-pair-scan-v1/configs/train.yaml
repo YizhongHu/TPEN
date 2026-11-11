@@ -292,25 +292,18 @@ load:
   strict: true
   allow_protocol_mismatch: false
 
-# ONE terminal checkpoint per run, and deliberately NOT cadence-gated.
-#
-# `Checkpoint` shares a single `StepCadenceGate` between its periodic and its
-# terminal write (`callback/checkpoint.py:190,218`), and `_write_terminal`
-# consults it with the final iteration index. So a config that sets
-# `every_n_steps: N` writes NO terminal checkpoint unless `max_steps` happens to
-# be a multiple of N — and it fails silently: training completes, `status.json`
-# says `completed`, and the checkpoints directory is empty. A 60-step smoke
-# against `every_n_steps: 100` reproduced exactly that, and validation then died
-# on "checkpoint directory lacks COMPLETE marker".
-#
-# With `periodic: false` and no `every_n_steps`, the gate's `every_n` is 1 and
-# the terminal write always fires, for ANY `max_steps`. That matters because the
-# P0-e probe owns `max_steps`: no value it can pick is able to break validation.
-# Validation restores the final model under `model_only`, so intermediate
-# checkpoints are not part of this study's contract.
+# ONE terminal checkpoint per run, and deliberately NOT cadence-gated. The
+# composed schedule makes that policy explicit: `TerminalOnly` selects no
+# periodic boundaries and always admits the terminal boundary. Validation
+# restores the final model under `model_only`, so intermediate checkpoints are
+# not part of this study's contract.
 checkpoint:
   periodic: false
   terminal: true
+  schedule:
+    _target_: tpen.checkpoint.TerminalOnly
+  payload:
+    _target_: tpen.checkpoint.TrainResume
   keep_last: 1
   save_optimizer: true
   save_trainer: true
@@ -529,11 +522,13 @@ callbacks:
   - _target_: tpen.callback.TrainPhaseTiming
     every_n_steps: ${timing.every_n_steps}
     accelerator_synchronize: ${run_parameters.accelerator_synchronize}
-  # No `every_n_steps` here: it would gate the TERMINAL write as well. See the
-  # `checkpoint` block above for the silent-empty-directory failure that causes.
+  # The composed schedule and payload are owned by the root `checkpoint` block;
+  # this callback only wires that stream into the root-owned callback list.
   - _target_: tpen.callback.Checkpoint
     periodic: ${checkpoint.periodic}
     terminal: ${checkpoint.terminal}
+    schedule: ${checkpoint.schedule}
+    payload: ${checkpoint.payload}
     keep_last: ${checkpoint.keep_last}
     save_optimizer: ${checkpoint.save_optimizer}
     save_trainer: ${checkpoint.save_trainer}

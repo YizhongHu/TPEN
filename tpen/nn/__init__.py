@@ -1,6 +1,13 @@
 """Neural-network component namespace for TPEN."""
 
-from tpen.nn.activation import GaussianActivation
+from tpen.nn.activation import (
+    ChannelActivationAxes,
+    ChannelPreservingMLPActivation,
+    GaussianActivation,
+    OrderMLPLayout,
+    OrderMLPSpec,
+    SoftplusBeta,
+)
 from tpen.nn.basis import (
     ElectronBasis,
     ElectronBasisFeatures,
@@ -21,6 +28,7 @@ from tpen.nn.cusp import (
     ElectronNucleusCuspLaw,
     LinearElectronNucleusCuspLaw,
     CurvatureElectronNucleusCuspLaw,
+    TailSafeElectronNucleusCuspLaw,
 )
 from tpen.nn.embedding import Embedding
 from tpen.nn.envelope import (
@@ -30,20 +38,43 @@ from tpen.nn.envelope import (
     HookeGaussianConfinement,
 )
 from tpen.nn.equivariant_mixing import EquivariantMixing
+from tpen.nn.composite_mixing import CompositeMixing
+from tpen.nn.linear_equivariant_mixing import LinearEquivariantMixing
+from tpen.nn.mixing_kernel import execute_binary, execute_unary
 from tpen.nn.factor import AdditiveCusp, LogAmplitudeFactor
+from tpen.nn.forward import (
+    CoordinateGradientRequest,
+    CoordinateGradientProvider,
+    MaterializedParameterScoreRequest,
+    ParameterScoreRequest,
+    ParameterScoreProvider,
+    WavefunctionForwardRequest,
+    WavefunctionRequestProvider,
+)
 from tpen.nn.initialization import SeededLinear, TorchInitializer
+from tpen.nn.interaction_config import (
+    InteractionMode,
+    ProducerFamily,
+    ResolvedInteractionConfig,
+    normalize_interaction_mode,
+    normalize_producer_order,
+)
 from tpen.nn.mlp import MLP
 from tpen.nn.normalization import RMSNorm
 from tpen.nn.path_aggregation import PathAggregation
 from tpen.nn.tpen_layer import TPENLayer
 from tpen.nn.tpen_wave_function import TPENWaveFunction
 from tpen.nn.tpen_stack import TPENStack
-from tpen.nn.update import ResidualUpdater, Updater
+from tpen.nn.update import ReplaceUpdater, ResidualUpdater, Updater
 
 __all__ = [
     "AdditiveCusp",
     "AdditiveEnvelope",
+    "ChannelActivationAxes",
+    "ChannelPreservingMLPActivation",
     "CoordinateEnvelope",
+    "CoordinateGradientRequest",
+    "CoordinateGradientProvider",
     "ElectronBasis",
     "ElectronBasisFeatures",
     "ElectronElectronCusp",
@@ -53,6 +84,10 @@ __all__ = [
     "Embedding",
     "Envelope",
     "EquivariantMixing",
+    "CompositeMixing",
+    "LinearEquivariantMixing",
+    "execute_binary",
+    "execute_unary",
     "GaussianActivation",
     "GaussianCoordinateEnvelope",
     "GaussianDecayGate",
@@ -63,9 +98,16 @@ __all__ = [
     "LinearElectronNucleusCuspLaw",
     "LogAmplitudeFactor",
     "MLP",
+    "MaterializedParameterScoreRequest",
+    "OrderMLPLayout",
+    "OrderMLPSpec",
+    "SoftplusBeta",
+    "ParameterScoreRequest",
+    "ParameterScoreProvider",
     "PathAggregation",
     "RawCoordinateBasis",
     "RMSNorm",
+    "ReplaceUpdater",
     "ResidualUpdater",
     "SeededLinear",
     "TPENForwardContext",
@@ -74,5 +116,13 @@ __all__ = [
     "TPENStack",
     "TorchInitializer",
     "CurvatureElectronNucleusCuspLaw",
+    "TailSafeElectronNucleusCuspLaw",
     "Updater",
+    "WavefunctionForwardRequest",
+    "WavefunctionRequestProvider",
+    "ProducerFamily",
+    "InteractionMode",
+    "ResolvedInteractionConfig",
+    "normalize_interaction_mode",
+    "normalize_producer_order",
 ]

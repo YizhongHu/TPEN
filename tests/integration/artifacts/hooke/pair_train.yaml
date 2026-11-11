@@ -141,7 +141,11 @@ callbacks:
     rtol: 1.0e-06
 - _target_: tpen.callback.Checkpoint
   terminal: false
-  every_n_steps: 1
+  schedule:
+    _target_: tpen.checkpoint.EveryNUpdates
+    every_n: 1
+  payload:
+    _target_: tpen.checkpoint.TrainResume
   output_dir: ${run.dir}/checkpoints
 loggers:
 - _target_: tpen.logging.CSV

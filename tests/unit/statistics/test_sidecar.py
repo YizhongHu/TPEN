@@ -8,6 +8,8 @@ from tpen.statistics.receipt import (
     TrajectoryStatisticsIdentity,
     TrajectoryStatisticsReceipt,
 )
+from pathlib import Path
+
 from tpen.statistics.sidecar import DuplicateReceiptError, TrajectoryStatisticsSidecar
 
 from .test_receipt import _receipt
@@ -186,3 +188,109 @@ def test_jsonl_keys_are_sorted_and_views_agree_with_read(tmp_path) -> None:
     assert sidecar.identities() == tuple(receipt.identity.as_key() for receipt in sidecar.read())
     assert tuple(sidecar) == sidecar.read()
     assert len(sidecar) == len(sidecar.read())
+
+
+def test_append_does_not_join_onto_an_unterminated_last_line(tmp_path) -> None:
+    """The sidecar is structurally the checkpoint publication catalog.
+
+    Append-only JSONL; :meth:`read` raises on a malformed row; :meth:`extend`
+    reads the file before it writes. So ONE torn row blocks every later append
+    rather than merely losing itself -- the same amplification that makes the
+    publication catalog the most consequential instance of this exposure, but
+    with no typed diagnosis and no repair recipe.
+
+    This writer was very nearly left tearing: the census that scoped the
+    torn-append fix classified it as a batch writer from the shape of the loop
+    in ``extend``, when its production call path is ``append`` ->
+    ``extend((receipt,))`` -- one record per open.
+    """
+
+    path = tmp_path / "trajectory_statistics.jsonl"
+    path.write_text('{"torn": ', encoding="utf-8")
+    sidecar = TrajectoryStatisticsSidecar(path)
+
+    with pytest.raises(ValueError):
+        sidecar.read()
+
+    # This exercises the PRIMITIVE directly, not ``sidecar.append``, and that
+    # is forced rather than chosen: ``extend`` calls ``identities()`` ->
+    # ``read()`` before writing, so on a torn file ``append`` raises and can
+    # never reach its write. That fail-loud behaviour is the point. The
+    # consequence is that this test alone cannot detect a sidecar that stopped
+    # routing through the primitive -- see
+    # ``test_append_routes_one_receipt_through_the_shared_primitive``, which
+    # pins the mechanism.
+    sidecar.path.write_text('{"torn": ', encoding="utf-8")
+    receipt = _stored_receipt()
+    from tpen.durable_append import append_record
+    append_record(path, json.dumps(receipt.to_dict(), sort_keys=True))
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == '{"torn": ', "the torn bytes must keep their own line"
+    # Exact round trip: the line was produced by json.dumps of this very
+    # mapping, so comparing the whole dict depends on no key name.
+    assert json.loads(lines[1]) == receipt.to_dict()
+
+
+def test_append_routes_one_receipt_through_the_shared_primitive(
+    monkeypatch, tmp_path
+) -> None:
+    """Mechanism pin: ``append`` must reach ``append_record`` exactly once.
+
+    Without this, a sidecar that went back to opening its own append handle
+    would keep every behavioural test in this file green, because on a clean
+    file a hand-rolled body-then-newline loop produces identical bytes. The
+    torn-tail test above cannot catch it either, since ``append`` raises on a
+    torn file before it writes. Measured: a mutant using ``open(mode="a")``
+    bypassed the primitive with the whole suite still green.
+    """
+
+    calls: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        "tpen.statistics.sidecar.append_record",
+        lambda path, record: calls.append((Path(path), record)),
+    )
+    receipt = _stored_receipt()
+    path = tmp_path / "trajectory_statistics.jsonl"
+
+    TrajectoryStatisticsSidecar(path).append(receipt)
+
+    assert calls == [(path, json.dumps(receipt.to_dict(), sort_keys=True))]
+
+
+def test_a_receipt_appended_after_a_clean_row_adds_no_blank_line(tmp_path) -> None:
+    """Routing through the primitive must not perturb the normal path."""
+
+    sidecar = TrajectoryStatisticsSidecar(tmp_path / "trajectory_statistics.jsonl")
+    sidecar.append(_stored_receipt())
+    sidecar.append(_stored_receipt(evaluator_id="local_energy/v2"))
+
+    text = sidecar.path.read_text(encoding="utf-8")
+    assert text.endswith("\n")
+    assert "\n\n" not in text
+    assert len(sidecar.read()) == 2
+
+
+def test_the_sidecar_emits_ascii_only_bytes(tmp_path) -> None:
+    """The sidecar calls ``json.dumps`` itself, so it needs its own pin.
+
+    ``tpen.durable_append``'s docstring states the ASCII invariant is pinned by
+    a test. That test lives in the primitive's own (torch-free) file and can
+    only reach the writers importable there -- MEASURED: setting
+    ``ensure_ascii=False`` here left the entire 2154-test suite green, while the
+    same mutation in ``artifacts.py`` was killed. The instrument worked; the
+    coverage did not reach.
+
+    This matters most here of all six writers: the sidecar writes
+    ``trajectory_statistics.jsonl``, which ``experiments/atomistic/he-v1/
+    collect.py:926`` reads as UTF-8 text. A torn write splitting a multi-byte
+    character raises ``UnicodeDecodeError`` out of the file iteration itself,
+    bypassing the torn-row diagnosis entirely.
+    """
+
+    path = tmp_path / "trajectory_statistics.jsonl"
+
+    TrajectoryStatisticsSidecar(path).append(_stored_receipt(run_id="run-\u00e9\u4e2d"))
+
+    raw = path.read_bytes()
+    assert raw.isascii(), f"sidecar emitted non-ASCII bytes: {raw!r}"

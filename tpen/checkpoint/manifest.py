@@ -50,6 +50,10 @@ class CheckpointManifest:
         Device/dtype/torch metadata for the writing process.
     provenance : dict
         Run, git, host, and package-version metadata.
+    payload : dict or None, optional
+        Canonical :class:`CheckpointPayload` manifest describing the files and
+        restore intents this artifact supports.  ``None`` is retained when
+        reading older manifests that predate payload profiles.
     """
 
     schema_version: int
@@ -61,6 +65,7 @@ class CheckpointManifest:
     hashes: dict[str, str | None]
     runtime: dict[str, Any]
     provenance: dict[str, Any]
+    payload: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable manifest mapping.
@@ -73,7 +78,7 @@ class CheckpointManifest:
             other.
         """
 
-        return {
+        data = {
             "schema_version": int(self.schema_version),
             "kind": self.kind,
             "next_iteration": int(self.next_iteration),
@@ -86,6 +91,9 @@ class CheckpointManifest:
             "runtime": dict(self.runtime),
             "provenance": dict(self.provenance),
         }
+        if self.payload is not None:
+            data["payload"] = dict(self.payload)
+        return data
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "CheckpointManifest":
@@ -138,6 +146,7 @@ class CheckpointManifest:
             hashes={str(key): value for key, value in dict(data.get("hashes", {})).items()},
             runtime=dict(data.get("runtime", {})),
             provenance=dict(data.get("provenance", {})),
+            payload=(None if data.get("payload") is None else dict(data["payload"])),
         )
 
     def write(self, path: str | Path) -> None:

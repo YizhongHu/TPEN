@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from tpen.durable_append import append_record
+
 from .base import LogRecord, Logger
 
 
@@ -23,15 +25,14 @@ class JSONL(Logger):
     def log(self, record: LogRecord) -> None:
         """Append one JSON object."""
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "step": record.step,
             "namespace": record.namespace,
             "metrics": record.metrics,
         }
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True, allow_nan=False))
-            handle.write("\n")
+        append_record(
+            self.path, json.dumps(payload, sort_keys=True, allow_nan=False)
+        )
 
 
 

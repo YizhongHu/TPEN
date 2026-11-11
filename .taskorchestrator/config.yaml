@@ -2,24 +2,24 @@ project:
   rootId: 58348558-a4c8-4ed7-8f7b-829ef8163145
   name: TPEN
 
-traits:
-  artifact-lifecycle:
-    notes:
-      - key: artifact-policy
-        role: queue
-        required: true
-        description: "Artifact retention, recovery, and disposition policy."
-        guidance: "Define the artifact lifecycle policy, including retention, recovery expectations, and disposition boundaries."
-      - key: artifact-inventory
-        role: work
-        required: true
-        description: "Inventory of artifacts covered by the lifecycle decision."
-        guidance: "Inventory the artifacts and identify what is retained, backed up to Holystore, archived to HPSS, or eligible for lifecycle-gated cleanup."
-      - key: artifact-disposition-summary
-        role: review
-        required: true
-        description: "Summary of the final artifact disposition."
-        guidance: "Summarize exact output paths, disposition child IDs, and any directly retained paths."
+# traits:
+#   artifact-lifecycle:
+#     notes:
+#       - key: artifact-policy
+#         role: queue
+#         required: true
+#         description: "Artifact retention, recovery, and disposition policy."
+#         guidance: "Define the artifact lifecycle policy, including retention, recovery expectations, and disposition boundaries."
+#       - key: artifact-inventory
+#         role: work
+#         required: true
+#         description: "Inventory of artifacts covered by the lifecycle decision."
+#         guidance: "Inventory the artifacts and identify what is retained, backed up to Holystore, archived to HPSS, or eligible for lifecycle-gated cleanup."
+#       - key: artifact-disposition-summary
+#         role: review
+#         required: true
+#         description: "Summary of the final artifact disposition."
+#         guidance: "Summarize exact output paths, disposition child IDs, and any directly retained paths."
 
 work_item_schemas:
   implementation-slice:
@@ -28,37 +28,77 @@ work_item_schemas:
       - key: acceptance-contract
         role: queue
         required: true
-        description: "Scope, non-goals, and observable completion criteria."
-        guidance: "Define one reviewable PR layer before work starts. For a stacked layer, record its immediate predecessor item and branch; the bottom layer records dev. TPEN sets no stack-depth cap, but every layer must remain in one acyclic linear gh-stack chain."
+        description: "Planner: scope, non-goals, and acceptance criteria."
+        guidance: "Define one reviewable PR layer. For stacks, identify the immediate predecessor task orchestrator item and/or branch; otherwise base on dev."
         maxLength: 3000
+
+      - key: review-tier
+        role: queue
+        required: true
+        description: "Review tier and reason."
+        guidance: "Use the tier list in the `pr-review-loop` skill. Record T0, T1 or T2 with a one-line reason and post the same line on the PR. When unsure, use the higher tier."
+        maxLength: 300
+
+      - key: implementation-worker-initialization
+        role: work
+        required: true
+        description: "Orchestrator: spawn an isolated implementation worker."
+        guidance: "Use the `paseo` skill. Before dispatch, the orchestrator claims and advances the item, creates the isolated worktree, spawns the worker, then releases its claim. The worker claims before any edit with a short renewable TTL; record worker, claimRef, TTL, workspace and branch."
+        maxLength: 1000
+
       - key: implementation-receipt
         role: work
         required: true
-        description: "Implemented surfaces, deviations, branch topology, and current branch tip."
-        guidance: "Record files and behavior changed, deviations from the acceptance contract, branch, PR URL and base, immediate predecessor, full head SHA, gh stack view --json linearity result, and verification still outstanding. A partial or red result is not completion. An open or draft PR remains work/awaiting merge."
+        description: "Worker: implementation handoff."
+        guidance: "Record changes, pushed branch, PR URL, full head SHA, and worker-claim release before finishing."
         maxLength: 4000
-      - key: tip-verification
-        role: review
-        required: true
-        description: "Independent clean verification bound to the exact final SHA."
-        guidance: "Verify the exact full head SHA from a clean environment. Record verifier identity, commands, exit codes, pass/fail/skip counts, job ID when applicable, durable log locations, and the verified PR base/predecessor. Confirm every gh-stack layer is linear and needsRebase is false. Any changed SHA, moved predecessor, failing check, or unexecuted required check keeps the item in work or blocked. Human-confirmed merge is required before terminalization."
-        skill: clean-final-verifier
-        maxLength: 4000
-  artifact-disposition:
-    lifecycle: auto
-    notes:
-      - key: disposition-contract
-        role: queue
-        required: true
-        description: "Contract for artifact disposition and recovery."
-        guidance: "Define retain, Holystore backup, HPSS archive, recovery proof, and lifecycle-gated cleanup criteria."
-      - key: disposition-receipt
+
+      - key: implementation-worker-archival
         role: work
         required: true
-        description: "Receipt for artifact disposition actions."
-        guidance: "Record retain, Holystore backup, HPSS archive, recovery proof, and lifecycle-gated cleanup evidence."
-      - key: disposition-verification
+        description: "Orchestrator: dispose of the implementation worker and workspace."
+        guidance: "Use the `paseo` skill. Confirm the worker finished, its changes are pushed, no unpreserved work remains, and its claim is released before archiving the workspace."
+        maxLength: 1000
+
+      - key: tip-verification
+        role: work
+        required: true
+        description: "Verifier: independent test results."
+        guidance: "Use the `pr-verification` skill. A separate clean verifier tests the current full PR head and writes the receipt that skill defines, then its workspace is archived through Paseo."
+        maxLength: 4000
+
+      - key: reviewer-initialization
         role: review
         required: true
-        description: "Verification of artifact disposition and recovery."
-        guidance: "Verify retain, Holystore backup, HPSS archive, recovery proof, and lifecycle-gated cleanup."
+        description: "Orchestrator: initiate independent PR review."
+        guidance: "Use the `pr-review-loop` and `paseo` skills. Read `review-tier`: T0 records no agent review; T1 uses one round; T2 uses one full round and at most one delta round. Record tier, reviewer/workspace IDs when used, and PR link."
+        maxLength: 1000
+
+      - key: reviewer-archival
+        role: review
+        required: true
+        description: "Orchestrator: archive reviewer and review-owned workspaces."
+        guidance: "Use the `paseo` skill. Confirm review handoff and safe cleanup of test branches/workspaces. Archive the reviewer with Paseo; record outcome or recovery blocker."
+        maxLength: 1000
+
+      - key: review-summary
+        role: review
+        required: true
+        description: "Orchestrator: summarize automated PR review."
+        guidance: "Link review rounds and explicit dispositions of findings and tests, including green tests. Confirm accepted fixes/tests are integrated and verification passes before marking ready for human review."
+        maxLength: 2000
+
+      - key: pr-disposition
+        role: review
+        required: true
+        description: "Orchestrator: record final PR disposition."
+        guidance: "Record human outcome and PR link. After confirmed merge, delete this PR's merged branch and its worktree, record both results, and only then complete. Record cancellation for an abandoned PR."
+        maxLength: 1000
+
+  # review-slice:
+  #   lifecycle: auto
+  #   notes:
+  #     - key: review-scope
+  #       role: queue
+  #       required: True
+  #     - key: re

@@ -64,6 +64,21 @@ class TorchInitializer:
             tensor.copy_(values.mul_(float(high) - float(low)).add_(float(low)))
         return tensor
 
+    def normal_(self, tensor: torch.Tensor, mean: float = 0.0, std: float = 1.0) -> torch.Tensor:
+        """Fill ``tensor`` with normal values without touching global RNG state."""
+
+        if tensor.numel() == 0:
+            return tensor
+        values = torch.randn(
+            tensor.shape,
+            device=tensor.device,
+            dtype=tensor.dtype,
+            generator=self.generator(device=tensor.device),
+        )
+        with torch.no_grad():
+            tensor.copy_(values.mul_(float(std)).add_(float(mean)))
+        return tensor
+
     def xavier_uniform_(self, tensor: torch.Tensor, *, gain: float = 1.0) -> torch.Tensor:
         """Fill ``tensor`` with Xavier uniform initialization."""
 

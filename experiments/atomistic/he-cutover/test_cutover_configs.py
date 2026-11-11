@@ -2,15 +2,47 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 
+import pytest
 import yaml
 from omegaconf import OmegaConf
 
-import run_train_row
+# Siblings are loaded study-scoped, not by bare import: experiments/ has several
+# same-named modules and the first study loaded would otherwise own the bare name
+# for every study after it. See experiments/toolkit/study_imports.py.
+#
+# The loader is reached BY PATH rather than by putting the repository root on
+# sys.path. A study directory that mutates sys.path is the mechanism behind the
+# very defect this import exists to fix, and he-cutover's gateway test forbids it
+# outright -- so the fix must not reintroduce it in order to install itself.
+import importlib.util as _tpen_importlib  # noqa: E402
+import sys as _tpen_sys  # noqa: E402
+from pathlib import Path as _TpenPath  # noqa: E402
+
+if "_tpen_study_imports" not in _tpen_sys.modules:
+    _tpen_spec = _tpen_importlib.spec_from_file_location(
+        "_tpen_study_imports",
+        _TpenPath(__file__).resolve().parents[3] / "experiments" / "toolkit" / "study_imports.py",
+    )
+    _tpen_module = _tpen_importlib.module_from_spec(_tpen_spec)
+    _tpen_sys.modules["_tpen_study_imports"] = _tpen_module
+    _tpen_spec.loader.exec_module(_tpen_module)
+sibling = _tpen_sys.modules["_tpen_study_imports"].sibling
+
+from experiments.toolkit.ast_bindings import sys_module_names  # noqa: E402
+from experiments.toolkit import executor_inputs as emit  # noqa: E402
+from experiments.toolkit.executor_inputs import canonical_bytes  # noqa: E402
+
+run_train_row = sibling(__file__, 'run_train_row')
+cutover_plan = sibling(__file__, 'cutover_plan')
 
 
 ROOT = Path(__file__).resolve().parents[3]
 HEV1_BARE_MODULES = {"layout", "strata", "plan", "driver", "eval", "collect", "canary", "launch"}
+P9_HE_FIXTURE = ROOT / "executor/tests/fixtures/p9/he_cutover.json"
 
 
 def _differences(before, after, prefix=""):
@@ -33,7 +65,7 @@ def test_smoke_training_diff_is_exactly_three_scale_fields() -> None:
     before = OmegaConf.to_container(cfg, resolve=False)
     run_train_row.configure_smoke_training(cfg, {"max_steps": 25, "n_walkers": 16})
     after = OmegaConf.to_container(cfg, resolve=False)
-    assert _differences(before, after) == {"trainer.max_steps", "sampler.n_walkers", "callbacks.tpen.callback.Checkpoint.every_n_steps"}
+    assert _differences(before, after) == {"trainer.max_steps", "sampler.n_walkers", "callbacks.tpen.callback.Checkpoint.schedule.every_n"}
 
 
 def test_smoke_training_finds_checkpoint_by_target_when_not_last() -> None:
@@ -44,7 +76,7 @@ def test_smoke_training_finds_checkpoint_by_target_when_not_last() -> None:
 
     run_train_row.configure_smoke_training(cfg, {"max_steps": 25, "n_walkers": 16})
 
-    assert checkpoint.every_n_steps == 25
+    assert checkpoint.schedule.every_n == 25
     assert cfg.callbacks[-1].every_n_steps == 999
 
 
@@ -55,7 +87,7 @@ def test_production_training_preserves_frozen_checkpoint_cadence() -> None:
     run_train_row.configure_training(
         cfg, {"scale": "production", "max_steps": 300000, "n_walkers": 4096}
     )
-    assert checkpoint.every_n_steps == 25000
+    assert checkpoint.schedule.every_n == 25000
 
 
 def test_profiles_contain_policy_but_no_filesystem_roots() -> None:
@@ -77,12 +109,194 @@ def test_profiles_contain_policy_but_no_filesystem_roots() -> None:
                 assert not value.startswith("/")
 
 
+def test_he_cutover_emits_the_executor_golden_without_resolving_config() -> None:
+    grid = cutover_plan.load_grid(Path(__file__).with_name("smoke_grid.yaml"))
+    train, evaluation, _ = cutover_plan.build_plans(
+        grid, facility="polaris", results_root="/p9/he", plan_id="p9-fixture"
+    )
+    emitted, _ = cutover_plan.executor_inputs(train, evaluation)
+    assert canonical_bytes(emitted) == P9_HE_FIXTURE.read_bytes().rstrip(b"\n")
+    assert emitted["members"][0]["program"]["config_ref"]["config"] == {
+        "root": "repo",
+        "path": "experiments/atomistic/he-v1/configs/train.yaml",
+    }
+
+
+def test_he_cutover_emission_is_identical_from_two_checkout_roots(tmp_path: Path) -> None:
+    """The real producer must not hash its checkout's absolute ``__file__``."""
+
+    script = """
+from pathlib import Path
+import sys
+from experiments.toolkit.study_imports import load_study_module
+from experiments.toolkit.executor_inputs import canonical_bytes
+
+root = Path.cwd()
+module = load_study_module(root / "experiments/atomistic/he-cutover", "cutover_plan")
+grid = module.load_grid(root / "experiments/atomistic/he-cutover/smoke_grid.yaml")
+train, _, _ = module.build_plans(grid, facility="polaris", results_root="/p9/he", plan_id="p9-fixture")
+Path(sys.argv[1]).write_bytes(canonical_bytes(module.executor_inputs(train, train)[0]))
+"""
+    copies = []
+    outputs = []
+    for index in ("a", "b"):
+        checkout = tmp_path / f"checkout-{index}"
+        shutil.copytree(
+            ROOT,
+            checkout,
+            ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__", ".pytest_cache"),
+        )
+        output = tmp_path / f"emission-{index}.json"
+        subprocess.run(
+            [sys.executable, "-c", script, str(output)],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        copies.append(checkout)
+        outputs.append(output)
+    assert outputs[0].read_bytes() == outputs[1].read_bytes()
+    assert copies[0] != copies[1]
+
+
+def test_t2_he_program_reference_retains_each_row_science_input() -> None:
+    grid = cutover_plan.load_grid(Path(__file__).with_name("production_grid.yaml"))
+    train, evaluation, _ = cutover_plan.build_plans(
+        grid, facility="polaris", results_root="/p9/he", plan_id="p9-production"
+    )
+    train_wire, eval_wire = cutover_plan.executor_inputs(train, evaluation)
+    train_refs = {canonical_bytes(member["program"]["config_ref"]) for member in train_wire["members"]}
+    eval_refs = {canonical_bytes(member["program"]["config_ref"]) for member in eval_wire["members"]}
+    assert len(train_refs) == 3
+    assert len(eval_refs) == 36
+    assert all("seed" in member["program"]["config_ref"]["overrides"] for member in train_wire["members"])
+    assert all("checkpoint" in member["program"]["config_ref"]["overrides"] for member in eval_wire["members"])
+
+
+@pytest.mark.parametrize("kind", ["plain", "omegaconf"])
+def test_t3_program_reference_preserves_unresolved_mapping(kind: str) -> None:
+    raw = {"runtime": {"seed": 7}, "seed": "${runtime.seed}", "label": "λ"}
+    source = raw if kind == "plain" else OmegaConf.create(raw)
+    actual = emit.program_spec_ref(source)
+    assert actual["config_ref"] == raw
+    assert actual["content_digest"] != emit.payload_digest({**raw, "seed": 7})
+
+
+def _imports_executor_inputs(source: str) -> bool:
+    """Classify both supported executor-input import syntaxes in one place."""
+
+    tree = ast.parse(source)
+    return any(
+        (
+            isinstance(node, ast.ImportFrom)
+            and (
+                node.module == "experiments.toolkit.executor_inputs"
+                or (
+                    node.module == "experiments.toolkit"
+                    and any(alias.name == "executor_inputs" for alias in node.names)
+                )
+            )
+        )
+        or (
+            isinstance(node, ast.Import)
+            and any(alias.name == "experiments.toolkit.executor_inputs" for alias in node.names)
+        )
+        for node in ast.walk(tree)
+    )
+
+
+def _emitter_importers(paths: set[Path]) -> set[Path]:
+    return {
+        path
+        for path in paths
+        if _imports_executor_inputs(path.read_text(encoding="utf-8"))
+    }
+
+
+def test_p9_executor_boundary_is_six_named_producers_without_activation() -> None:
+    producers = {
+        ROOT / "experiments/atomistic/he-cutover/admission.py",
+        ROOT / "experiments/atomistic/he-cutover/cutover_plan.py",
+        ROOT / "experiments/atomistic/he-cutover/pipeline.py",
+        ROOT / "experiments/baselines/pipeline.py",
+        ROOT / "experiments/baselines/plan.py",
+        ROOT / "experiments/baselines/rungs/rung_makeplan.py",
+    }
+    forbidden_imports = []
+    forbidden_activation = []
+    experiment_files = {
+        path for path in (ROOT / "experiments").rglob("*.py") if not path.name.startswith("test_")
+    }
+    for path in experiment_files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if "tpen_executor" in module:
+                    forbidden_imports.append(path)
+            elif isinstance(node, ast.Import):
+                if any("tpen_executor" in alias.name for alias in node.names):
+                    forbidden_imports.append(path)
+            elif isinstance(node, (ast.Name, ast.Attribute)):
+                name = node.id if isinstance(node, ast.Name) else node.attr
+                if name in {"LocalDispatcher", "ParslDispatcher", "DirectoryStore"}:
+                    forbidden_activation.append((path, name))
+    assert _emitter_importers(experiment_files) == producers
+    assert forbidden_imports == []
+    assert forbidden_activation == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import experiments.toolkit.executor_inputs as inputs\n",
+        "from experiments.toolkit import executor_inputs\n",
+    ],
+)
+def test_t10_six_only_guard_refuses_each_seventh_import_form(tmp_path: Path, source: str) -> None:
+    seventh = tmp_path / "seventh.py"
+    seventh.write_text(source, encoding="utf-8")
+    producers = {
+        ROOT / "experiments/atomistic/he-cutover/admission.py",
+        ROOT / "experiments/atomistic/he-cutover/cutover_plan.py",
+        ROOT / "experiments/atomistic/he-cutover/pipeline.py",
+        ROOT / "experiments/baselines/pipeline.py",
+        ROOT / "experiments/baselines/plan.py",
+        ROOT / "experiments/baselines/rungs/rung_makeplan.py",
+    }
+    assert _imports_executor_inputs(source)
+    assert _emitter_importers(producers | {seventh}) != producers
+
+
+# Binding analysis has ONE owner. This rule and the sys.modules rule in
+# tests/unit/experiments/test_study_module_identity.py had a copy each, and the
+# copies were wrong in the same way at the same time -- the duplication shape
+# that produced two of this slice's own defects.
 def _cross_study_violations(study: Path) -> set[str]:
+    """Return gateway violations for the he-cutover study directory.
+
+    THE SUPPORTED OPERATION SET, stated exactly rather than implied: a CALL to
+    ``sys.path.insert``, ``.append`` or ``.extend``, where the ``sys`` binding
+    is resolved by ``experiments.toolkit.ast_bindings.sys_module_names``.
+
+    Other ways to change the same list are NOT detected, each MEASURED against a
+    running mutant rather than assumed: ``sys.path += [...]`` (augmented
+    assignment), ``sys.path = [...]`` (whole-list replacement),
+    ``sys.path.remove(...)``, and ``sys.path[:0] = [...]`` (slice assignment).
+    See ``sys_module_names`` for the binding forms that also evade it.
+
+    Deliberately narrow. The realistic case is a study author reaching for a
+    sibling the ordinary way; an author routing around the guard is not the
+    threat model, and no guard of this shape would stop one.
+    """
+
     violations = set()
     for path in study.glob("*.py"):
         if path.name == "hev1.py":
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        sys_aliases = sys_module_names(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.Import) and any(alias.name.split(".", 1)[0] in HEV1_BARE_MODULES for alias in node.names):
                 violations.add(f"{path.name}:bare-import")
@@ -98,7 +312,7 @@ def _cross_study_violations(study: Path) -> set[str]:
                 and isinstance(owner, ast.Attribute)
                 and owner.attr == "path"
                 and isinstance(owner.value, ast.Name)
-                and owner.value.id == "sys"
+                and owner.value.id in sys_aliases
             ):
                 violations.add(f"{path.name}:sys-path-{node.func.attr}")
     return violations
@@ -109,3 +323,64 @@ def test_hev1_is_the_only_cross_study_accessor_and_import_gateway() -> None:
     assert _cross_study_violations(study) == set()
     assert not (study / "configs").exists()
     assert not ({path.stem for path in study.glob("*.py")} & HEV1_BARE_MODULES)
+
+
+def test_sys_path_rule_resolves_aliases_not_spellings(tmp_path: Path) -> None:
+    """An aliased ``sys`` must not evade the sys.path rule.
+
+    Matching ``owner.value.id == "sys"`` matched a spelling. Ordinary code in
+    this repository imports ``sys`` under an alias, so the literal match was
+    already evadable by practice rather than only in principle -- the study
+    bootstrap is the existence proof.
+    """
+
+    (tmp_path / "aliased.py").write_text(
+        "import sys as _s\nfrom pathlib import Path\n_s.path.insert(0, str(Path('/tmp')))\n",
+        encoding="utf-8",
+    )
+
+    assert _cross_study_violations(tmp_path) == {"aliased.py:sys-path-insert"}
+
+
+def test_sys_path_rule_ignores_an_unrelated_path_attribute(tmp_path: Path) -> None:
+    """``.path.insert`` on something that is not the sys module is not a violation."""
+
+    (tmp_path / "unrelated.py").write_text(
+        "class Cfg:\n    def __init__(self):\n        self.path = []\n"
+        "cfg = Cfg()\ncfg.path.insert(0, 'x')\n",
+        encoding="utf-8",
+    )
+
+    assert _cross_study_violations(tmp_path) == set()
+
+
+def test_sys_path_rule_does_not_accuse_a_rebound_alias(tmp_path: Path) -> None:
+    """FALSE POSITIVE, measured: a rebound name must not be treated as ``sys``.
+
+    An over-restrictive rule passes every test written for it and surfaces only
+    when it refuses somebody's legitimate code, so this direction needs its own
+    exhibit rather than trust.
+    """
+
+    (tmp_path / "entry.py").write_text(
+        "import sys as s\n"
+        "class Cfg:\n    def __init__(self):\n        self.path = []\n"
+        "s = Cfg()\n"
+        "s.path.append('x')\n",
+        encoding="utf-8",
+    )
+
+    assert _cross_study_violations(tmp_path) == set()
+
+
+def test_sys_path_rule_does_not_accuse_a_locally_shadowed_name(tmp_path: Path) -> None:
+    """FALSE POSITIVE, measured: a function-local shadow is not the sys module."""
+
+    (tmp_path / "entry.py").write_text(
+        "import sys\n"
+        "def go(sys):\n"
+        "    sys.path.append('x')\n",
+        encoding="utf-8",
+    )
+
+    assert _cross_study_violations(tmp_path) == set()

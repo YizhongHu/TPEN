@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from experiments.baselines import pipeline
+from experiments.baselines.plan import build_plan
 from experiments.baselines.pipeline import accelerator_bindings, allocation_context
 from experiments.toolkit.parsl_attach import validate_accelerator_tiling
 from experiments.toolkit.dispatch import DispatchRecord, LogicalTaskSpec, StagePlanV2
@@ -82,6 +84,59 @@ def test_one_plan_dispatches_uniform_one_gpu_rows_and_writes_records(tmp_path: P
     records = (tmp_path / "launch" / "dispatch_records.jsonl").read_text().splitlines()
     assert len(records) == 2
     assert json.loads((tmp_path / "launch" / "verification.json").read_text())["complete"] is True
+    assert json.loads((tmp_path / "launch" / "executor_input.json").read_text())["schema"] == "tpen-executor/ready-group-v1"
+
+
+@pytest.mark.parametrize(
+    ("steps", "expected_horizon", "has_unrepresentable"),
+    [("100", 100, False), ("100.5", 0, True)],
+)
+def test_horizon_encoding_keeps_legacy_dispatch_compatible(
+    tmp_path: Path, steps: str, expected_horizon: int, has_unrepresentable: bool
+) -> None:
+    """Wire coercion or metadata must never block the old dispatch route."""
+
+    plan = build_plan(
+        {
+            "code": ("ferminet",),
+            "ansatz": ("default",),
+            "system": ("he",),
+            "seed": (0,),
+            "steps": (steps,),
+            "batch_size": (32,),
+        },
+        command=("runner",),
+        results_root=tmp_path / "results",
+        plan_id="horizon-compat",
+    )
+    plan = replace(
+        plan,
+        tasks=tuple(
+            replace(task, metadata={**task.metadata, "runtime": "ferminet"})
+            for task in plan.tasks
+        ),
+    )
+    executor = RecordingExecutor()
+    assert pipeline.run_pipeline(
+        plan=plan,
+        facility="polaris",
+        launch_dir=tmp_path / "launch",
+        admission_id="horizon-compat",
+        executor=executor,
+        environ={"PBS_JOBID": "horizon.server"},
+    ) == 0
+    input_path = tmp_path / "launch" / "executor_input.json"
+    diagnostic_path = tmp_path / "launch" / "executor_input_diagnostics.json"
+    if has_unrepresentable:
+        assert not input_path.exists()
+        payload = json.loads(diagnostic_path.read_text())
+        assert payload["schema"] == "tpen-experiments/executor-input-diagnostics-v1"
+        assert payload["unrepresentable"][0]["field"] == "steps"
+    else:
+        payload = json.loads(input_path.read_text())
+        assert payload["members"][0]["target_horizon"] == expected_horizon
+        assert not diagnostic_path.exists()
+    assert len(executor.dispatches) == 1
 
 
 def test_four_gpu_rows_use_one_parsl_worker_each(tmp_path: Path) -> None:

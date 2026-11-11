@@ -1,0 +1,1299 @@
+"""Tests for the production HI train-config resolver."""
+
+from __future__ import annotations
+
+import builtins
+from dataclasses import replace
+import io
+import importlib.util
+import json
+import os
+import random
+import re
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+import subprocess
+import sys
+import types
+
+import pytest
+import torch
+from hydra.utils import instantiate
+from omegaconf import DictConfig, OmegaConf
+
+
+# Pre-change resolver: dev commit 1ae776c9, state before #573, blob 7ede61e8.
+# The former pre-change pin was orphaned by the squash merge.
+_PRECHANGE_PIN = "1ae776c98c661a02aaa53e7f76d8aacf91b1a15d"
+_PRECHANGE_BLOB = "7ede61e86383c68db55eb4ea13214857fdebdd28"
+
+
+_STAGE_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_stage_coordinate_for_train_config",
+    Path(__file__).with_name("stage_coordinate.py"),
+)
+assert _STAGE_SPEC is not None and _STAGE_SPEC.loader is not None
+stage_coordinate = importlib.util.module_from_spec(_STAGE_SPEC)
+sys.modules[_STAGE_SPEC.name] = stage_coordinate
+_STAGE_SPEC.loader.exec_module(stage_coordinate)
+
+_GRID_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_optimizer_grid_for_train_config",
+    Path(__file__).with_name("optimizer_grid.py"),
+)
+assert _GRID_SPEC is not None and _GRID_SPEC.loader is not None
+optimizer_grid = importlib.util.module_from_spec(_GRID_SPEC)
+sys.modules[_GRID_SPEC.name] = optimizer_grid
+_GRID_SPEC.loader.exec_module(optimizer_grid)
+
+_RESOLVER_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_train_config",
+    Path(__file__).with_name("train_config.py"),
+)
+assert _RESOLVER_SPEC is not None and _RESOLVER_SPEC.loader is not None
+train_config = importlib.util.module_from_spec(_RESOLVER_SPEC)
+sys.modules[_RESOLVER_SPEC.name] = train_config
+_RESOLVER_SPEC.loader.exec_module(train_config)
+
+_CONTEXT_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_context_mapping_for_train_config",
+    Path(__file__).with_name("context_mapping.py"),
+)
+assert _CONTEXT_SPEC is not None and _CONTEXT_SPEC.loader is not None
+context_mapping = importlib.util.module_from_spec(_CONTEXT_SPEC)
+sys.modules[_CONTEXT_SPEC.name] = context_mapping
+_CONTEXT_SPEC.loader.exec_module(context_mapping)
+
+_AB_SPEC = importlib.util.spec_from_file_location(
+    "he_importance_ab_universe_for_train_config",
+    Path(__file__).with_name("ab_universe.py"),
+)
+assert _AB_SPEC is not None and _AB_SPEC.loader is not None
+ab_universe = importlib.util.module_from_spec(_AB_SPEC)
+sys.modules[_AB_SPEC.name] = ab_universe
+_AB_SPEC.loader.exec_module(ab_universe)
+
+
+def _walker_refusal_pattern(stage: str, value: object, declared: object) -> str:
+    return (
+        rf"scientific_identity\.walkers={re.escape(repr(value))} is not declared for stage "
+        rf"{re.escape(repr(stage))}; declared n_walkers={re.escape(repr(declared))}"
+    )
+
+
+def _no_walker_override_pattern(stage: str) -> str:
+    return rf"stage {re.escape(repr(stage))} declares no n_walkers mechanics override"
+
+
+def _cell(
+    tmp_path: Path,
+    *,
+    stage: str = "O1",
+    method: str = "adam",
+    status: str = "available",
+) -> object:
+    reason = None if status == "available" else "qualification pending"
+    levels = {
+        "lr": 0.005,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "epsilon": 1e-8,
+        "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
+    }
+    return stage_coordinate.materialize_stage(
+        stage,
+        [
+            {
+                "scientific_identity": {
+                    "context": {
+                        "name": "O-raw",
+                        "overrides": {"input_features": "B00", "feature_update": "residual"},
+                    },
+                    "optimizer": {"method": method, "levels": levels},
+                },
+                "payload": {"updates": stage_coordinate.stage_definition(stage).updates},  # stage horizon
+                "topology": {},
+            }
+        ],
+        stage_coordinate.OptimizerCell(method, status, reason),
+        tmp_path,
+    )[0]
+
+
+def _callback_checkers(cfg: object) -> list[object]:
+    return [
+        checker
+        for callback in cfg.callbacks
+        for checker in callback.get("checkers", [])
+    ]
+
+
+def _he_batch() -> object:
+    """Build the fixed helium batch through a Hydra target only."""
+
+    return instantiate(
+        {
+            "_target_": "tpen.data.batch.ElectronBatch",
+            "positions": torch.tensor(
+                [[[0.7, 0.1, -0.2], [-0.4, 0.3, 0.5]]], dtype=torch.float64
+            ),
+            "nuclear_positions": torch.zeros((1, 3), dtype=torch.float64),
+            "nuclear_charges": torch.tensor([2.0], dtype=torch.float64),
+            "spins": torch.tensor([[1.0, -1.0]], dtype=torch.float64),
+        }
+    )
+
+
+def _context_cell(tmp_path: Path, name: str = "O-composite") -> object:
+    return next(cell for cell in _q_adam_cells(tmp_path, name) if cell.manifest["scientific_identity"]["optimizer"]["levels"]["lr"] == 0.005)
+
+
+def _ab_cell(tmp_path: Path, package: Mapping[str, object], axis: str) -> object:
+    """Materialize one AB-4a package in the resolver's closed context shape."""
+
+    adam = next(slot for slot in package["optimizer_slots"] if slot["method"] == "adam")
+    return stage_coordinate.materialize_stage(
+        axis,
+        [
+            {
+                "scientific_identity": {
+                    "context": {
+                        "axis": axis,
+                        "literal_configuration": package["literal_configuration"],
+                    },
+                    "optimizer": {
+                        "method": adam["method"],
+                        "levels": dict(adam["levels"]),
+                    },
+                },
+                "payload": {"updates": stage_coordinate.stage_definition(axis).updates},
+                "topology": {},
+            }
+        ],
+        stage_coordinate.OptimizerCell(adam["method"], adam["status"]),
+        tmp_path,
+    )[0]
+
+
+def _load_prechange_resolver() -> types.ModuleType:
+    """Load the pre-change resolver source for byte comparison."""
+
+    test_dir = Path(__file__).resolve().parent
+    actual_blob = subprocess.run(
+        [
+            "git",
+            "rev-parse",
+            f"{_PRECHANGE_PIN}:experiments/atomistic/he-importance/train_config.py",
+        ],
+        cwd=test_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert actual_blob == _PRECHANGE_BLOB, (
+        f"pre-change pin {_PRECHANGE_PIN} resolves to blob {actual_blob}; "
+        f"expected {_PRECHANGE_BLOB}"
+    )
+    source = subprocess.run(
+        [
+            "git",
+            "show",
+            f"{_PRECHANGE_PIN}:"
+            "experiments/atomistic/he-importance/train_config.py",
+        ],
+        cwd=test_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    module = types.ModuleType("he_importance_train_config_prechange")
+    module.__file__ = train_config.__file__
+    exec(compile(source, module.__file__, "exec"), module.__dict__)
+    return module
+
+
+def _canonical_resolved_config(config: object) -> str:
+    """Serialize one resolved config with a stable, sorted-key encoding."""
+
+    return json.dumps(
+        OmegaConf.to_container(config, resolve=True),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _assert_matches_prechange(
+    cells: Sequence[object], resolver: object, prechange: types.ModuleType
+) -> None:
+    """Compare current output or refusal with the mechanically loaded oracle."""
+
+    for cell in cells:
+        try:
+            expected = prechange.resolve_train_config(cell)
+        except Exception as expected_error:  # noqa: BLE001 - refusal is part of the oracle
+            try:
+                resolver(cell)
+            except Exception as observed_error:  # noqa: BLE001 - compare oracle refusals
+                assert type(observed_error).__name__ == type(expected_error).__name__
+                assert str(observed_error) == str(expected_error)
+            else:
+                raise AssertionError("current resolver accepted a prechange-refused cell")
+        else:
+            observed = resolver(cell)
+            assert _canonical_resolved_config(observed) == _canonical_resolved_config(expected)
+
+
+def _independent_initializer_paths(value: object, path: str = "") -> set[str]:
+    """Find TorchInitializer targets without using the production walker."""
+
+    found: set[str] = set()
+    if isinstance(value, Mapping):
+        target = value.get("_target_")
+        if isinstance(target, str) and target.endswith("TorchInitializer"):
+            found.add(path)
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            found.update(_independent_initializer_paths(child, child_path))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for index, child in enumerate(value):
+            found.update(_independent_initializer_paths(child, f"{path}.{index}" if path else str(index)))
+    return found
+
+
+def _q_adam_cells(tmp_path: Path, context: str) -> list[object]:
+    """Materialize the sixteen Stage-Q Adam cells for one model context."""
+
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path, availability=optimizer_grid.roster_availability(), stages=("Q",)
+    )
+    return [
+        cell
+        for cell in cells
+        if cell.manifest["stage"] == "Q"
+        and cell.manifest["scientific_identity"]["context"]["name"] == context
+        and cell.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+    ]
+
+
+def _authority_adam_levels() -> dict[str, object]:
+    """Read expected Adam levels independently from the committed authority."""
+
+    authority = json.loads(
+        Path(train_config.__file__).with_name("optimizer_grid_authority.json").read_text()
+    )
+    family = next(row for row in authority["families"] if row["family"] == "adam")
+    levels = dict(family["fixed"])
+    return {**levels, "lr": None, "beta2": None}
+
+
+def _assert_q_adam_grid_outputs(cells: list[object]) -> None:
+    """Assert the independent level oracle against both consumed config views."""
+
+    authority = _authority_adam_levels()
+    resolved_blocks: set[tuple[object, ...]] = set()
+    for cell in cells:
+        declared = cell.manifest["scientific_identity"]["optimizer"]["levels"]
+        expected = {**authority, "lr": declared["lr"], "beta2": declared["beta2"]}
+        resolved = train_config.resolve_train_config(cell)
+        import tpen.hi_schema as schema
+
+        schema.validate_hi_train_config(resolved)
+        for path in ("optimizer", "runner.optimizer"):
+            block = getattr(resolved, path.replace(".", "_"), None)
+            if block is None:
+                block = OmegaConf.select(resolved, path)
+            assert {
+                "lr": block.lr,
+                "betas": list(block.betas),
+                "eps": block.eps,
+                "weight_decay": block.weight_decay,
+            } == {
+                "lr": expected["lr"],
+                "betas": [expected["beta1"], expected["beta2"]],
+                "eps": expected["epsilon"],
+                "weight_decay": expected["weight_decay"],
+            }
+        observed = OmegaConf.select(resolved, "optimizer")
+        resolved_blocks.add(
+            (observed.lr, observed.betas[0], observed.betas[1], observed.eps, observed.weight_decay)
+        )
+    assert len(cells) == 16
+    assert len(resolved_blocks) == 8
+
+
+@pytest.mark.parametrize("stage_code", ("O1", "Q"))
+def test_resolve_maps_stage_horizon_to_trainer_max_steps(
+    tmp_path: Path, stage_code: str
+) -> None:
+    cell = _cell(tmp_path, stage=stage_code)
+    resolved = train_config.resolve_train_config(cell)
+    authority = stage_coordinate.stage_definition(stage_code)
+
+    assert authority.updates is not None
+    assert resolved.trainer.max_steps == authority.updates
+    if stage_code == "Q":
+        assert authority.updates == 2_000
+
+
+def test_resolve_consumes_q_mechanics_and_committed_walker_counts(tmp_path: Path) -> None:
+    committed = _cell(tmp_path / "committed", stage="Q")
+    mechanics = stage_coordinate.with_q_mechanics_walkers(committed)
+
+    committed_config = train_config.resolve_train_config(committed)
+    mechanics_config = train_config.resolve_train_config(mechanics)
+
+    assert committed_config.sampler.n_walkers == stage_coordinate.COMMITTED_WALKERS
+    assert committed_config.runner.sampler.n_walkers == stage_coordinate.COMMITTED_WALKERS
+    assert mechanics_config.sampler.n_walkers == stage_coordinate.Q_MECHANICS_WALKERS
+    assert mechanics_config.runner.sampler.n_walkers == stage_coordinate.Q_MECHANICS_WALKERS
+
+
+def test_hi_schema_admits_runner_load_train_resume_shape(tmp_path: Path) -> None:
+    """Pin the executed HI schema outcome for the resume-load shape (A9)."""
+
+    config = train_config.resolve_train_config(_cell(tmp_path, stage="Q"))
+    OmegaConf.update(
+        config,
+        "runner.load",
+        {"mode": "train_resume", "path": str(tmp_path / "checkpoint")},
+        force_add=True,
+    )
+    import tpen.hi_schema as schema
+
+    schema.validate_hi_train_config(config, env={})
+
+
+def test_resolve_refuses_drifted_composed_walker_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path, stage="Q")
+    original = train_config._compose_base_config
+
+    def drifted_config() -> DictConfig:
+        config = original()
+        config.sampler.n_walkers = 123
+        return config
+
+    monkeypatch.setattr(train_config, "_compose_base_config", drifted_config)
+    with pytest.raises(train_config.TrainConfigResolutionError, match="must remain 4096"):
+        train_config.resolve_train_config(cell)
+
+
+def test_resolve_refuses_hand_built_inadmissible_walker_identity(tmp_path: Path) -> None:
+    cell = _cell(tmp_path, stage="Q")
+    manifest = stage_coordinate._thaw(cell.manifest)
+    manifest["scientific_identity"]["walkers"] = 1_000
+    rebuilt = replace(
+        cell,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=stage_coordinate.content_hash(manifest),
+    )
+    with pytest.raises(
+        Exception, match=_walker_refusal_pattern("Q", 1_000, (2_048,))
+    ):
+        train_config.resolve_train_config(rebuilt)
+
+
+def test_resolve_binds_content_hash_to_run_identity(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    resolved = train_config.resolve_train_config(cell)
+
+    assert resolved.run.run_id == cell.content_hash
+
+
+def test_resolve_direct_rejects_non_exact_hashes_and_preserves_provenance(
+    tmp_path: Path,
+) -> None:
+    cell = _cell(tmp_path)
+    honest = train_config.resolve_train_config(cell)
+    assert honest.run.run_id == cell.content_hash
+
+    class LyingHash(str):
+        def __str__(self) -> str:
+            return "forged-run-id"
+
+    class LyingNonStringHash:
+        def __ne__(self, other: object) -> bool:
+            return False
+
+        def __str__(self) -> str:
+            return "forged-run-id"
+
+    for value in (LyingHash(cell.content_hash), LyingNonStringHash()):
+        with pytest.raises(train_config.TrainConfigResolutionError, match="exact str"):
+            train_config.resolve_train_config(replace(cell, content_hash=value))
+
+
+def test_resolve_direct_owns_manifest_before_hash_and_composition(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    original = cell.manifest
+
+    class DivergentManifest(dict[str, object]):
+        reads = 0
+
+        def items(self):
+            self.reads += 1
+            if self.reads > 1:
+                changed = dict(original)
+                changed["scientific_identity"] = {"architecture": "forged"}
+                return changed.items()
+            return super().items()
+
+    manifest = DivergentManifest(original)
+    resolved = train_config.resolve_train_config(replace(cell, manifest=manifest))
+    assert manifest.reads == 1
+    assert resolved.run.run_id == cell.content_hash
+
+
+def test_resolve_binds_output_path_to_run_root_and_dir(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    resolved = train_config.resolve_train_config(cell)
+
+    assert resolved.run.root == str(cell.output_path.parent.parent)
+    assert resolved.run.layout == "flat"
+    assert resolved.run.dir == str(cell.output_path)
+
+
+def test_resolve_applies_operational_overrides_before_resolution(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    resolved = train_config.resolve_train_config(
+        cell,
+        overrides=[
+            "trainer.max_steps=7",
+            "runtime.device=cpu",
+        ],
+    )
+
+    assert resolved.trainer.max_steps == 7
+    assert resolved.runner.trainer.max_steps == 7
+    assert resolved.runtime.device == "cpu"
+    assert resolved.callbacks[10].allocator_probe.device == "cpu"
+
+
+def test_resolve_refuses_resolver_owned_seed_overrides(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    for path in ("runtime.seed", "sampler.seed", "model.embedding.initializer.seed"):
+        with pytest.raises(train_config.TrainConfigResolutionError, match="resolver-owned seed"):
+            train_config.resolve_train_config(cell, overrides={path: 123})
+
+
+def test_resolve_overlay_mechanism_pin_after_resolution(tmp_path: Path) -> None:
+    resolved = train_config.resolve_train_config(_cell(tmp_path))
+    OmegaConf.update(resolved, "runtime.dtype", "float32", merge=False)
+    assert resolved.sampler.dtype != "float32"
+
+
+def test_resolve_refuses_output_path_not_bound_to_identity_digest(tmp_path: Path) -> None:
+    committed = _cell(tmp_path, stage="Q")
+    mechanics = stage_coordinate.with_q_mechanics_walkers(committed)
+    broken = replace(mechanics, output_path=committed.output_path)
+
+    with pytest.raises(train_config.TrainConfigResolutionError, match="bind"):
+        train_config.resolve_train_config(broken)
+
+
+def test_q_gates_refuse_overridable_stage_subclass_in_builder_and_resolver(tmp_path: Path) -> None:
+    class Stage(str):
+        def __ne__(self, other: object) -> bool:
+            return False
+
+    source = _cell(tmp_path, stage="O1")
+    manifest = stage_coordinate._thaw(source.manifest)
+    manifest["stage"] = Stage("O1")
+    with pytest.raises(
+        stage_coordinate.MaterializationError, match=_no_walker_override_pattern("O1")
+    ):
+        stage_coordinate.with_q_mechanics_walkers(replace(source, manifest=stage_coordinate._freeze(manifest)))
+
+    manifest["scientific_identity"]["walkers"] = 2_048
+    digest = stage_coordinate.content_hash(manifest)
+    forged = replace(
+        source,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=digest,
+        output_path=source.output_path.parent / digest,
+    )
+    with pytest.raises(
+        ValueError, match=_walker_refusal_pattern("O1", 2_048, ())
+    ):
+        train_config.resolve_train_config(forged)
+
+
+def test_resolve_binds_seed_streams_to_runtime_and_named_initializers(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    resolved = train_config.resolve_train_config(cell)
+    streams = cell.seed_streams
+
+    assert resolved.runtime.seed == streams["model_initialization"]
+    assert resolved.sampler.seed == streams["training_sampler"]
+    assert resolved.model.embedding.initializer.seed == streams["model_initialization"]
+    assert resolved.model.embedding.initializer.stream == "embedding"
+    assert resolved.model.layers[0].path_aggregation.initializer.seed == streams["model_initialization"]
+    assert resolved.model.layers[0].path_aggregation.initializer.stream == "layer0/path_aggregation"
+    assert all(checker.seed == streams["diagnostic"] for checker in _callback_checkers(resolved))
+
+
+def test_resolve_accepts_training_packet_wrapping_a_cell(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    packet = stage_coordinate.TrainingPacket(
+        cell=cell,
+        checkpoint_cadence=stage_coordinate.CheckpointCadence(1_000, (1_000,)),
+        ddp_provenance={"launcher": "test"},
+    )
+
+    resolved = train_config.resolve_train_config(packet)
+
+    assert resolved.run.run_id == cell.content_hash
+
+
+def test_resolve_refuses_a_source_without_a_materialized_cell() -> None:
+    with pytest.raises(train_config.TrainConfigResolutionError, match="source"):
+        train_config.resolve_train_config(object())
+
+
+def test_resolve_refuses_a_hash_that_does_not_bind_the_manifest(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    broken = replace(cell, content_hash="0" * 64)
+
+    with pytest.raises(train_config.TrainConfigResolutionError, match="content hash"):
+        train_config.resolve_train_config(broken)
+
+
+def test_resolve_refuses_a_non_absolute_output_path(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    broken = replace(cell, output_path=Path("relative-output"))
+
+    with pytest.raises(train_config.TrainConfigResolutionError, match="absolute"):
+        train_config.resolve_train_config(broken)
+
+
+def test_resolve_refuses_missing_model_initialization_seed(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    streams = dict(cell.seed_streams)
+    del streams["model_initialization"]
+    broken = replace(cell, seed_streams=streams)
+
+    with pytest.raises(train_config.TrainConfigResolutionError, match="model_initialization"):
+        train_config.resolve_train_config(broken)
+
+
+def test_resolve_refuses_an_unnamed_initializer_from_the_production_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path)
+    original_compose = train_config._compose_base_config
+
+    def malformed_config() -> object:
+        config = original_compose()
+        config.model.embedding.initializer.stream = None
+        return config
+
+    monkeypatch.setattr(train_config, "_compose_base_config", malformed_config)
+    with pytest.raises(train_config.TrainConfigResolutionError, match="named stream"):
+        train_config.resolve_train_config(cell)
+
+
+def test_resolve_binds_admitted_optimizer_cell_through_live_roster(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    resolved = train_config.resolve_train_config(cell)
+    from tpen.hi_schema import HI_METHOD_ROSTER
+
+    method = cell.manifest["scientific_identity"]["optimizer_cell"]["method"]
+    entry = {candidate.method: candidate for candidate in HI_METHOD_ROSTER}[method]
+    assert entry.admitted
+    assert resolved.optimizer._target_ == entry.target
+
+
+def test_resolve_consumes_every_declared_adam_level_explicitly(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    resolved = train_config.resolve_train_config(cell)
+
+    assert resolved.optimizer.lr == 0.005
+    assert list(resolved.optimizer.betas) == [0.9, 0.999]
+    assert resolved.optimizer.eps == 1e-8
+    assert resolved.optimizer.weight_decay == 0.0
+    assert "scheduler" not in resolved.optimizer
+
+
+def test_resolve_consumes_all_q_adam_levels_in_both_optimizer_views(tmp_path: Path) -> None:
+    """All sixteen O-raw cells match an independent authority oracle."""
+
+    _assert_q_adam_grid_outputs(_q_adam_cells(tmp_path, "O-raw"))
+
+
+def test_resolve_consumes_all_q_adam_o_composite_cells(tmp_path: Path) -> None:
+    """Every O-composite Adam cell resolves through the literal context route."""
+
+    cells = _q_adam_cells(tmp_path, "O-composite")
+    assert len(cells) == 16
+    for cell in cells:
+        resolved = train_config.resolve_train_config(cell)
+        assert resolved.model.layers[0]["update"]["_target_"] == "tpen.nn.ResidualUpdater"
+        assert resolved.model.layers[0].layout.linear.explicit[0].tau_in == [0]
+        assert resolved.model.embedding._target_ == "tpen.nn.embedding.matched_start_embedding"
+        assert resolved.model.basis._target_ == "tpen.nn.basis.BoundedDistanceBasis"
+        assert resolved.model.basis.length == 1.0
+        assert "basis" not in resolved.model.embedding.augmented
+        assert resolved.model.factors[-1]._target_ == "tpen.nn.jastrow.BoundedTwoCoefficientJastrow"
+
+
+def test_o_raw_model_is_byte_equal_to_the_committed_control(tmp_path: Path) -> None:
+    cell = _context_cell(tmp_path, "O-raw")
+    resolved = train_config.resolve_train_config(cell)
+    control = train_config._compose_base_config()
+    OmegaConf.update(control, "runtime.seed", cell.seed_streams["model_initialization"], merge=False)
+    OmegaConf.resolve(control)
+    assert OmegaConf.to_container(resolved.model, resolve=False) == OmegaConf.to_container(
+        control.model, resolve=False
+    )
+
+
+def test_o_composite_preserves_control_factors_and_declares_complete_mapping(
+    tmp_path: Path,
+) -> None:
+    cell = _context_cell(tmp_path)
+    resolved = train_config.resolve_train_config(cell)
+    control = train_config._compose_base_config()
+    OmegaConf.resolve(control)
+    assert OmegaConf.to_container(OmegaConf.create(resolved.model.factors[:2]), resolve=True) == OmegaConf.to_container(
+        control.model.factors, resolve=True
+    )
+    assert list(resolved.model.factors)[-1]._target_ == "tpen.nn.jastrow.BoundedTwoCoefficientJastrow"
+    layer = resolved.model.layers[0]
+    assert layer.mixing.producers[0]._target_ == "tpen.nn.LinearEquivariantMixing"
+    assert all(path.tau_in and len(path.tau_in) <= 2 for path in layer.layout.linear.explicit)
+    assert layer.mixing.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
+    assert layer.path_aggregation.activation._target_ == "tpen.nn.ChannelPreservingMLPActivation"
+    assert resolved.model.basis._target_ == "tpen.nn.basis.BoundedDistanceBasis"
+    assert resolved.model.basis.length == 1.0
+    assert "basis" not in resolved.model.embedding.augmented
+
+
+def test_o_composite_trap_negatives_are_observable(tmp_path: Path) -> None:
+    cell = _context_cell(tmp_path)
+    base = train_config._compose_base_config()
+    fragment, factor = context_mapping.package_fragment("B11")
+    unstructured_model = OmegaConf.create(OmegaConf.to_container(base.model, resolve=False))
+    naive = OmegaConf.merge(unstructured_model, OmegaConf.create({**fragment, "factors": [factor]}))
+    assert OmegaConf.to_container(naive.factors, resolve=True) == [factor]
+    assert len(base.model.factors) == 2
+
+    standalone = OmegaConf.create(context_mapping.compose_package(base.model, "B11"))
+    with pytest.raises(Exception, match="Interpolation key"):
+        OmegaConf.to_container(standalone, resolve=True)
+
+    direct = OmegaConf.load(Path(train_config.__file__).with_name("configs") / "train.yaml")
+    direct.model = OmegaConf.merge(
+        direct.model, OmegaConf.create({**fragment, "factors": [*direct.model.factors, factor]})
+    )
+    OmegaConf.update(direct, "runtime.seed", cell.seed_streams["model_initialization"], merge=False)
+    OmegaConf.resolve(direct)
+    direct_model = instantiate(direct.model).to(dtype=torch.float64)
+    b01 = train_config._compose_base_config()
+    b01.model = context_mapping.compose_package(b01.model, "B01")
+    b01.model.layers[0] = context_mapping.context_fragment(
+        "hybrid/coordinate-neighbor",
+        activation="channel-MLP,channel-MLP",
+        seed=cell.seed_streams["model_initialization"],
+    )
+    OmegaConf.update(b01, "runtime.seed", cell.seed_streams["model_initialization"], merge=False)
+    OmegaConf.resolve(b01)
+    composed_model = instantiate(b01.model).to(dtype=torch.float64)
+    assert not hasattr(direct_model.embedding, "raw")
+    assert not torch.equal(direct_model(_he_batch()).logabs, composed_model(_he_batch()).logabs)
+
+
+def test_o_composite_binds_every_initializer_including_both_embeddings(tmp_path: Path) -> None:
+    cell = _context_cell(tmp_path)
+    resolved = train_config.resolve_train_config(cell)
+    model_container = OmegaConf.to_container(resolved.model, resolve=False)
+    paths = _independent_initializer_paths(model_container)
+    expected = {
+        "embedding.raw.initializer",
+        "embedding.augmented.initializer",
+        "layers.0.path_aggregation.initializer",
+        "layers.0.mixing.activation.initializer",
+        "layers.0.path_aggregation.activation.initializer",
+    }
+    assert paths == expected
+    assert {
+        path for path in train_config._initializer_paths(resolved.model, "model")
+    } == {f"model.{path}" for path in expected}
+    assert all(
+        OmegaConf.select(resolved, f"model.{path}").seed
+        == cell.seed_streams["model_initialization"]
+        for path in paths
+    )
+    changed = replace(cell, seed_streams={**cell.seed_streams, "model_initialization": cell.seed_streams["model_initialization"] + 1})
+    changed_config = train_config.resolve_train_config(changed)
+    assert all(
+        OmegaConf.select(changed_config, f"model.{path}").seed
+        != OmegaConf.select(resolved, f"model.{path}").seed
+        for path in paths
+    )
+
+
+def test_o_composite_instantiates_finitely_and_trains_added_parameters(tmp_path: Path) -> None:
+    cell = _context_cell(tmp_path)
+    composite = train_config.resolve_train_config(cell)
+    instantiate(
+        {
+            "_target_": "tpen.hi_schema.validate_hi_train_config",
+            "_recursive_": False,
+            "cfg": composite,
+            "env": {},
+        }
+    )
+    b10 = train_config._compose_base_config()
+    b10.model = context_mapping.compose_package(b10.model, "B10")
+    b10.model.layers[0] = context_mapping.context_fragment(
+        "hybrid/coordinate-neighbor",
+        activation="channel-MLP,channel-MLP",
+        seed=cell.seed_streams["model_initialization"],
+    )
+    OmegaConf.update(b10, "runtime.seed", cell.seed_streams["model_initialization"], merge=False)
+    OmegaConf.resolve(b10)
+    model = instantiate(composite.model).to(dtype=torch.float64)
+    control_model = instantiate(b10.model).to(dtype=torch.float64)
+    batch = _he_batch()
+    output = model(batch)
+    control_output = control_model(batch)
+    assert torch.isfinite(output.logabs).all()
+    assert torch.equal(output.logabs, control_output.logabs)
+    output.logabs.square().sum().backward()
+    factor = model.factors[-1]
+    assert torch.any(factor.theta_s.grad != 0)
+    assert torch.any(factor.theta_t.grad != 0)
+    assert type(model.embedding).__name__ == "Embedding"
+    for order, columns in ((1, [4]), (2, [4, 9, 10, 11, 12])):
+        weight = model.embedding.order_mlps[str(order)].layers[0].weight
+        assert torch.any(weight.grad[:, columns] != 0)
+
+
+@pytest.mark.parametrize("axis", ("A", "B"))
+def test_every_ab4a_fixed_adam_package_resolves_and_instantiates(
+    tmp_path: Path, axis: str
+) -> None:
+    """Every AB-4a package uses the AB-3 composition entry point."""
+
+    packages = ab_universe.render_ab_universe()[axis]
+    for index, package in enumerate(packages):
+        cell = _ab_cell(tmp_path / axis / str(index), package, axis)
+        resolved = train_config.resolve_train_config(cell)
+        model = instantiate(resolved.model).to(dtype=torch.float64)
+        assert model is not None
+
+
+def test_q_and_o1_outputs_match_mechanical_prechange_oracle(tmp_path: Path) -> None:
+    """Every existing Q/O1 row remains byte-identical to the pinned resolver."""
+
+    cells = stage_coordinate.materialize_intended_configurations(
+        tmp_path / "materialized",
+        availability=optimizer_grid.roster_availability(),
+        stages=("Q", "O1"),
+    )
+    prechange = _load_prechange_resolver()
+    _assert_matches_prechange(cells, train_config.resolve_train_config, prechange)
+
+
+def test_changed_o_raw_resolution_fails_mechanical_prechange_oracle(tmp_path: Path) -> None:
+    """The oracle control must detect a deliberately changed O-raw result."""
+
+    cell = _q_adam_cells(tmp_path, "O-raw")[0]
+    prechange = _load_prechange_resolver()
+
+    def mutant(source: object) -> DictConfig:
+        resolved = train_config.resolve_train_config(source)
+        resolved.model.trace_name = "deliberate-o-raw-mutant"
+        return resolved
+
+    with pytest.raises(AssertionError):
+        _assert_matches_prechange((cell,), mutant, prechange)
+
+
+def test_ab_o_star_refusal_names_pending_reason_and_control_resolves(tmp_path: Path) -> None:
+    """An AB O* slot is refused; the fixed-Adam slot is the control."""
+
+    package = ab_universe.render_a_packages()[0]
+    o_star = next(slot for slot in package["optimizer_slots"] if slot["method"] == "O*")
+    fixed = _ab_cell(tmp_path / "fixed", package, "A")
+    resolved = train_config.resolve_train_config(fixed)
+    assert resolved.optimizer._target_ == "torch.optim.Adam"
+
+    pending = stage_coordinate.materialize_stage(
+        "A",
+        [
+            {
+                "scientific_identity": {
+                    "context": fixed.manifest["scientific_identity"]["context"],
+                    "optimizer": {"method": o_star["method"], "levels": None},
+                },
+                "payload": {"updates": stage_coordinate.stage_definition("A").updates},
+                "topology": {},
+            }
+        ],
+        stage_coordinate.OptimizerCell(
+            o_star["method"], o_star["status"], o_star["unavailable_reason"]
+        ),
+        tmp_path / "pending",
+    )[0]
+    with pytest.raises(
+        train_config.UnavailableOptimizerError,
+        match=re.escape(o_star["unavailable_reason"]),
+    ):
+        train_config.resolve_train_config(pending)
+
+
+@pytest.mark.parametrize(
+    "contamination",
+    (stage_coordinate._REFERENCE_ENERGY, {"nested": stage_coordinate._REFERENCE_ENERGY}),
+)
+def test_ab_reference_packet_is_rejected_before_model_construction(
+    tmp_path: Path, contamination: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AB reference-bearing packets fail before the model composer is called."""
+
+    package = ab_universe.render_a_packages()[0]
+    clean = _ab_cell(tmp_path / "clean", package, "A")
+    assert train_config.resolve_train_config(clean).model is not None
+
+    manifest = stage_coordinate._thaw(clean.manifest)
+    if isinstance(contamination, Mapping):
+        manifest["payload"]["configuration"]["nested"] = contamination
+    else:
+        manifest["scientific_identity"]["reference_energy"] = contamination
+    contaminated = replace(
+        clean,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=stage_coordinate.content_hash(manifest),
+        output_path=clean.output_path.parent / stage_coordinate.content_hash(manifest),
+    )
+    monkeypatch.setattr(
+        train_config,
+        "_compose_base_config",
+        lambda: pytest.fail("reference-bearing packet reached model construction"),
+    )
+    with pytest.raises(Exception, match="reference|evaluation reference"):
+        train_config.resolve_train_config(contaminated)
+
+
+@pytest.mark.parametrize("mutation", ("extra", "near_miss", "axis"))
+def test_ab_context_is_closed_and_rejects_mutant_coordinates(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Unconsumed, near-miss, and misspelled AB coordinates fail closed."""
+
+    package = ab_universe.render_a_packages()[0]
+    cell = _ab_cell(tmp_path, package, "A")
+    manifest = stage_coordinate._thaw(cell.manifest)
+    context = manifest["scientific_identity"]["context"]
+    if mutation == "extra":
+        context["unconsumed_coordinate"] = "unexpected"
+    elif mutation == "near_miss":
+        context["literal_configuration"]["activation"] = "SiLU,SiLU "
+    else:
+        context["axis"] = "a"
+    rebuilt = replace(
+        cell,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=stage_coordinate.content_hash(manifest),
+        output_path=cell.output_path.parent / stage_coordinate.content_hash(manifest),
+    )
+    with pytest.raises(train_config.ContextResolutionError):
+        train_config.resolve_train_config(rebuilt)
+
+
+@pytest.mark.parametrize("field", ("name", "producer_policy", "aggregation_activation", "input_features", "feature_update"))
+@pytest.mark.parametrize("remove", (False, True))
+def test_o_composite_literal_is_closed_over_each_field(
+    tmp_path: Path, field: str, remove: bool
+) -> None:
+    cell = _context_cell(tmp_path)
+    manifest = stage_coordinate._thaw(cell.manifest)
+    context = manifest["scientific_identity"]["context"]
+    if field == "name":
+        context[field] = "O-raw"
+    elif remove:
+        context["overrides"].pop(field, None)
+    else:
+        context["overrides"][field] = "wrong"
+    rebuilt_manifest = stage_coordinate._freeze(manifest)
+    rebuilt = replace(
+        cell,
+        manifest=rebuilt_manifest,
+        content_hash=stage_coordinate.content_hash(manifest),
+        output_path=cell.output_path.parent / stage_coordinate.content_hash(manifest),
+    )
+    with pytest.raises(train_config.ContextResolutionError, match=field):
+        train_config.resolve_train_config(rebuilt)
+
+
+def test_level_mapping_mutant_turns_grid_oracle_red(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid constant-output mapping mutant fails equality/distinctness."""
+
+    fixed = {
+        "lr": 0.005,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "epsilon": 1e-8,
+        "weight_decay": 0.0,
+        "parameter_groups": 1,
+        "schedule": "constant",
+    }
+    original = train_config._declared_adam_levels
+
+    def validation_preserving_mutant(manifest: object) -> dict[str, object]:
+        original(manifest)
+        return fixed
+
+    monkeypatch.setattr(train_config, "_declared_adam_levels", validation_preserving_mutant)
+    with pytest.raises(AssertionError):
+        _assert_q_adam_grid_outputs(_q_adam_cells(tmp_path, "O-raw"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("missing", None, "missing level key"),
+        ("extra", 1.0, "extra level key"),
+        ("lr", True, "lr must be numeric"),
+        ("beta2", "0.999", "beta2 must be numeric"),
+        ("parameter_groups", 2, "parameter_groups must equal 1"),
+        ("schedule", "cosine", "schedule must be 'constant'"),
+    ),
+)
+def test_resolve_refuses_each_malformed_adam_level(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    cell = _cell(tmp_path)
+    manifest = stage_coordinate._thaw(cell.manifest)
+    levels = manifest["scientific_identity"]["optimizer"]["levels"]
+    if field == "missing":
+        del levels["lr"]
+    elif field == "extra":
+        levels["unexpected"] = value
+    else:
+        levels[field] = value
+    rebuilt = replace(
+        cell,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=stage_coordinate.content_hash(manifest),
+        output_path=cell.output_path.parent / stage_coordinate.content_hash(manifest),
+    )
+    with pytest.raises(train_config.OptimizerLevelResolutionError, match=message):
+        train_config.resolve_train_config(rebuilt)
+
+
+def test_resolve_refuses_non_o_raw_context(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    manifest = stage_coordinate._thaw(cell.manifest)
+    manifest["scientific_identity"]["context"] = {
+        "name": "O-other",
+        "overrides": {
+            "input_features": "B00",
+            "feature_update": "replacement",
+        },
+    }
+    rebuilt = replace(
+        cell,
+        manifest=stage_coordinate._freeze(manifest),
+        content_hash=stage_coordinate.content_hash(manifest),
+        output_path=cell.output_path.parent / stage_coordinate.content_hash(manifest),
+    )
+    with pytest.raises(train_config.ContextResolutionError, match="exactly the authority"):
+        train_config.resolve_train_config(rebuilt)
+
+
+@pytest.mark.parametrize("path", ("scheduler", "optimizer.scheduler", "runner.lr_scheduler", "trainer.scheduler"))
+def test_resolve_refuses_any_composed_scheduler_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    cell = _cell(tmp_path)
+    original = train_config._compose_base_config
+
+    def scheduled_config() -> DictConfig:
+        config = original()
+        OmegaConf.update(
+            config,
+            path,
+            {},
+            merge=False,
+            force_add=True,
+        )
+        return config
+
+    monkeypatch.setattr(train_config, "_compose_base_config", scheduled_config)
+    with pytest.raises(train_config.OptimizerLevelResolutionError, match="scheduler block"):
+        train_config.resolve_train_config(cell)
+
+
+def test_resolve_refuses_available_optimizer_when_roster_entry_is_not_admitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path, method="adam", status="available")
+    import tpen.hi_schema as schema
+
+    original_roster = schema.HI_METHOD_ROSTER
+    original_entry = next(entry for entry in original_roster if entry.method == "adam")
+    assert original_entry.admitted
+    assert original_entry.target is not None
+    monkeypatch.setattr(
+        schema,
+        "HI_METHOD_ROSTER",
+        tuple(
+            replace(entry, admitted=False) if entry.method == "adam" else entry
+            for entry in original_roster
+        ),
+    )
+
+    optimizer_cell = cell.manifest["scientific_identity"]["optimizer_cell"]
+    assert optimizer_cell["status"] == "available"
+    patched_entry = next(entry for entry in schema.HI_METHOD_ROSTER if entry.method == "adam")
+    assert not patched_entry.admitted
+    assert patched_entry.target == original_entry.target
+
+    with pytest.raises(train_config.UnavailableOptimizerError, match="unavailable"):
+        train_config.resolve_train_config(cell)
+
+
+def test_resolve_refuses_unavailable_optimizer_cell_without_adam_substitution(tmp_path: Path) -> None:
+    cell = _cell(tmp_path, method="linear_method", status="unavailable")
+
+    with pytest.raises(train_config.UnavailableOptimizerError, match="unavailable"):
+        train_config.resolve_train_config(cell)
+
+    assert cell.manifest["scientific_identity"]["optimizer_cell"]["status"] == "unavailable"
+
+
+def test_resolve_refuses_stage_without_fixed_training_horizon(tmp_path: Path) -> None:
+    cell = stage_coordinate.materialize_stage(
+        "F",
+        [
+            {
+                "scientific_identity": {"architecture": "control", "optimizer": "adam"},
+                "payload": {"updates": 50_000},
+                "topology": {},
+            }
+        ],
+        stage_coordinate.OptimizerCell("adam", "available"),
+        tmp_path,
+    )[0]
+
+    with pytest.raises(train_config.TrainConfigResolutionError, match="no fixed training horizon"):
+        train_config.resolve_train_config(cell)
+
+
+def _contains_reference_energy_number(value: object) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            _contains_reference_energy_number(key)
+            or _contains_reference_energy_number(nested)
+            for key, nested in value.items()
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_contains_reference_energy_number(nested) for nested in value)
+    return stage_coordinate._is_reference_energy_representation(value)
+
+
+def test_resolved_config_passes_hi_schema_and_contains_no_reference_energy(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    resolved = train_config.resolve_train_config(cell)
+    resolved_tree = OmegaConf.to_container(resolved, resolve=True)
+    serialized = json.dumps(resolved_tree, sort_keys=True)
+
+    assert "-2.903724377034119598" not in serialized
+    assert "reference_energy" not in serialized
+    assert "evaluation.yaml" not in serialized
+    assert not _contains_reference_energy_number(resolved_tree)
+
+
+@pytest.mark.parametrize(
+    "contamination",
+    (
+        stage_coordinate._REFERENCE_ENERGY,
+        {"nested": stage_coordinate._REFERENCE_ENERGY},
+        stage_coordinate._REFERENCE_ENERGY_TEXT,
+        "-2.9037243770341195",
+    ),
+)
+def test_reference_energy_detector_is_live(contamination: object) -> None:
+    assert _contains_reference_energy_number({"nested": [contamination]})
+
+
+def test_resolver_routes_schema_validation_through_production(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _cell(tmp_path)
+    schema = __import__("tpen.hi_schema", fromlist=["validate_hi_train_config"])
+    original = schema.validate_hi_train_config
+    called: list[object] = []
+
+    def recording_validator(config: object) -> None:
+        called.append(config)
+        original(config)
+
+    monkeypatch.setattr(schema, "validate_hi_train_config", recording_validator)
+    train_config.resolve_train_config(cell)
+
+    assert called and called[0] is not None
+
+
+def test_resolver_does_not_read_evaluation_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guard four Python-level file-opening entry points after construction.
+
+    This is a direct-call detector, not a transitive filesystem monitor. It
+    covers builtins.open, pathlib.Path.open, io.open, and os.open, including
+    bytes paths for builtins.open, io.open, and os.open normalized with
+    os.fsdecode (Path.open does not accept bytes). It does not intercept
+    already-open handles, aliases captured before patching, alternate paths,
+    native or C I/O, importlib internals, cached or earlier reads, symlinked
+    paths, or loader reads through unpatched APIs. The explicit opener arms
+    prove the detector is live on routes that could otherwise bypass it.
+    """
+    cell = _cell(tmp_path)
+    original_open = builtins.open
+    original_path_open = Path.open
+    original_io_open = io.open
+    original_os_open = os.open
+    train_config_path = Path(train_config._CONFIG_PATH).resolve()
+    train_config_reads = 0
+
+    def decoded_path(file: object) -> str:
+        try:
+            return os.fsdecode(os.fspath(file))
+        except TypeError:
+            return str(file)
+
+    def is_evaluation_manifest(file: object) -> bool:
+        return decoded_path(file).endswith("manifests/evaluation.yaml")
+
+    def record_train_config_read(file: object) -> None:
+        nonlocal train_config_reads
+        if Path(decoded_path(file)).resolve() == train_config_path:
+            train_config_reads += 1
+
+    def guarded_open(file: object, *args: object, **kwargs: object) -> object:
+        record_train_config_read(file)
+        if is_evaluation_manifest(file):
+            raise AssertionError("resolver read the evaluation manifest")
+        return original_open(file, *args, **kwargs)
+
+    def guarded_path_open(path: Path, *args: object, **kwargs: object) -> object:
+        record_train_config_read(path)
+        if is_evaluation_manifest(path):
+            raise AssertionError("resolver read the evaluation manifest")
+        return original_path_open(path, *args, **kwargs)
+
+    def guarded_io_open(file: object, *args: object, **kwargs: object) -> object:
+        record_train_config_read(file)
+        if is_evaluation_manifest(file):
+            raise AssertionError("resolver read the evaluation manifest")
+        return original_io_open(file, *args, **kwargs)
+
+    def guarded_os_open(file: object, *args: object, **kwargs: object) -> int:
+        record_train_config_read(file)
+        if is_evaluation_manifest(file):
+            raise AssertionError("resolver read the evaluation manifest")
+        return original_os_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    monkeypatch.setattr(Path, "open", guarded_path_open)
+    monkeypatch.setattr(io, "open", guarded_io_open)
+    monkeypatch.setattr(os, "open", guarded_os_open)
+
+    evaluation_manifest = Path(train_config.__file__).parent / "manifests" / "evaluation.yaml"
+    encoded_manifest = os.fsencode(evaluation_manifest)
+    for opener in (builtins.open, io.open):
+        with pytest.raises(AssertionError, match="evaluation manifest"):
+            with opener(evaluation_manifest, "r", encoding="utf-8") as handle:
+                handle.read(1800)
+    with pytest.raises(AssertionError, match="evaluation manifest"):
+        with evaluation_manifest.open("r", encoding="utf-8") as handle:
+            handle.read(1800)
+    for manifest_path in (evaluation_manifest, encoded_manifest):
+        with pytest.raises(AssertionError, match="evaluation manifest"):
+            descriptor = os.open(manifest_path, os.O_RDONLY)
+            try:
+                os.read(descriptor, 1800)
+            finally:
+                os.close(descriptor)
+    for manifest_path in (encoded_manifest,):
+        for opener in (builtins.open, io.open):
+            with pytest.raises(AssertionError, match="evaluation manifest"):
+                with opener(manifest_path, "r", encoding="utf-8") as handle:
+                    handle.read(1800)
+
+    resolved = train_config.resolve_train_config(cell)
+    assert isinstance(resolved, DictConfig)
+    assert resolved.trainer.max_steps == stage_coordinate.stage_definition("O1").updates
+    assert train_config_reads > 0
+
+
+def test_resolve_does_not_draw_from_global_rng(tmp_path: Path) -> None:
+    numpy = pytest.importorskip("numpy")
+    torch = pytest.importorskip("torch")
+    cell = _cell(tmp_path)
+    before_python = random.getstate()
+    before_numpy = numpy.random.get_state()
+    before_torch = torch.get_rng_state().clone()
+
+    resolved = train_config.resolve_train_config(cell)
+
+    assert random.getstate() == before_python
+    after_numpy = numpy.random.get_state()
+    assert after_numpy[0] == before_numpy[0]
+    assert numpy.array_equal(after_numpy[1], before_numpy[1])
+    assert after_numpy[2:] == before_numpy[2:]
+    assert torch.equal(torch.get_rng_state(), before_torch)
+    assert resolved.runtime.seed == cell.seed_streams["model_initialization"]
+
+
+def test_resolver_requires_repo_root_on_sys_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cell = _cell(tmp_path)
+    repo_root = Path(train_config.__file__).resolve().parents[3]
+    monkeypatch.setattr(
+        sys,
+        "path",
+        [entry for entry in sys.path if Path(entry or Path.cwd()).resolve() != repo_root],
+    )
+
+    with pytest.raises(train_config.CheckoutPreconditionError, match="checkout root"):
+        train_config.resolve_train_config(cell)
+
+
+# Pre-change pin guard ---------------------------------------------------------
+def test_prechange_pin_guard_names_pin_and_both_blobs_on_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pin whose train_config.py blob is not the recorded one fails before any oracle load."""
+
+    recorded_blob = _PRECHANGE_BLOB
+    wrong_blob = "0" * 40
+    monkeypatch.setitem(globals(), "_PRECHANGE_BLOB", wrong_blob)
+
+    with pytest.raises(AssertionError) as info:
+        _load_prechange_resolver()
+
+    message = str(info.value)
+    assert _PRECHANGE_PIN in message
+    assert recorded_blob in message
+    assert wrong_blob in message
+
+
+def test_prechange_pin_guard_fails_loudly_when_the_pin_object_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable pin is a CalledProcessError from rev-parse, never a quiet oracle mismatch."""
+
+    monkeypatch.setitem(globals(), "_PRECHANGE_PIN", "0" * 40)
+
+    with pytest.raises(subprocess.CalledProcessError) as info:
+        _load_prechange_resolver()
+
+    assert info.value.returncode != 0

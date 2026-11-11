@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,14 +14,14 @@ from omegaconf import OmegaConf
 from tpen.accelerator import canonical_device
 
 from .artifact import resolve_checkpoint_dir
-from .hashing import checkpoint_hashes
+from .hashing import checkpoint_hashes, file_sha256
 from .replay import (
     CheckpointReplaySemantics,
     coerce_checkpoint_replay_semantics,
     verify_checkpoint_replay_semantics,
 )
 from .rng import apply_rng_state, require_restorable_rng_state, runtime_device
-from .schema import read_manifest
+from .schema import read_manifest, validate_manifest_state
 
 RESTORE_MODES = ("none", "model_only", "train_resume")
 
@@ -142,6 +143,12 @@ def restore_checkpoint(
             checkpoint_dir,
             allow_mismatch=allow_mismatch,
         )
+        _validate_component_files(
+            checkpoint_dir,
+            manifest.files,
+            manifest.hashes,
+            components=("model",),
+        )
         _load_model(checkpoint_dir, manifest.files, model, strict=strict_load, context=context)
         return RestoreReport(
             mode=mode,
@@ -168,6 +175,17 @@ def restore_checkpoint(
             allow_mismatch=(hash_name == "hamiltonian_config" and allow_mismatch),
         )
 
+    # Validate every serialized component before the first mutable load.  New
+    # manifests carry namespaced content digests in the existing ``hashes``
+    # mapping; older v1/v2 artifacts may not, so their presence check remains
+    # the compatibility floor while current artifacts get byte validation.
+    _validate_component_files(
+        checkpoint_dir,
+        manifest.files,
+        manifest.hashes,
+        components=("model", "optimizer", "trainer", "sampler", "rng"),
+    )
+
     # The RNG payload is read and validated before anything is restored. A
     # refused resume must leave the process unmutated, and `_load_sampler` is
     # itself destructive: `MetropolisSampler.load_mcmc_state_dict` recreates its
@@ -177,10 +195,15 @@ def restore_checkpoint(
     device = runtime_device(context)
     rng_state = _read_rng_state(checkpoint_dir, manifest.files)
     require_restorable_rng_state(rng_state, device, checkpoint_dir)
+    # Read and validate trainer progress before loading any mutable component.
+    # A permissive trainer must not turn a malformed payload into a partially
+    # restored live run.
+    trainer_state = _read_trainer_state(checkpoint_dir, manifest.files)
+    validate_manifest_state(manifest, trainer_state, mode=mode)
 
     _load_model(checkpoint_dir, manifest.files, model, strict=strict_load, context=context)
     _load_optimizer(checkpoint_dir, manifest.files, optimizer)
-    _load_trainer(checkpoint_dir, manifest.files, trainer)
+    _load_trainer(trainer, trainer_state)
     _load_sampler(checkpoint_dir, manifest.files, sampler, context)
     apply_rng_state(rng_state, device)
     return RestoreReport(
@@ -271,6 +294,31 @@ def _verify_hash(
         )
 
 
+def _validate_component_files(
+    checkpoint_dir: Path,
+    files: dict[str, str],
+    hashes: dict[str, str | None],
+    *,
+    components: tuple[str, ...],
+) -> None:
+    """Validate required component bytes before any consumer is mutated."""
+
+    for component in components:
+        path = _required_file(checkpoint_dir, files, component)
+        expected = hashes.get(f"{component}_sha256")
+        if expected is None:
+            # Archived manifests predate component-content digests.  Keep their
+            # existing restore behavior while enforcing the stronger check on
+            # every manifest written by the current saver.
+            continue
+        actual = file_sha256(path)
+        if actual != expected:
+            raise ValueError(
+                f"{checkpoint_dir}: {component} checkpoint file digest mismatch "
+                f"(manifest {expected}, actual {actual})"
+            )
+
+
 def _load_model(
     checkpoint_dir: Path,
     files: dict[str, str],
@@ -297,16 +345,22 @@ def _load_optimizer(checkpoint_dir: Path, files: dict[str, str], optimizer: Any)
     optimizer.load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
 
 
-def _load_trainer(checkpoint_dir: Path, files: dict[str, str], trainer: Any) -> None:
+def _load_trainer(trainer: Any, state: Mapping[str, Any]) -> None:
     if trainer is None:
         raise ValueError("train_resume restore requires a trainer")
     load_state_dict = getattr(trainer, "load_state_dict", None)
     if not callable(load_state_dict):
         raise TypeError("trainer must expose load_state_dict() for train_resume restore")
+
+    load_state_dict(state)
+
+
+def _read_trainer_state(checkpoint_dir: Path, files: dict[str, str]) -> dict[str, Any]:
+    """Read trainer progress without applying it to the live trainer."""
+
     path = _required_file(checkpoint_dir, files, "trainer")
     with path.open("r", encoding="utf-8") as handle:
-        state = json.load(handle)
-    load_state_dict(state)
+        return json.load(handle)
 
 
 def _load_sampler(checkpoint_dir: Path, files: dict[str, str], sampler: Any, context: Any) -> None:

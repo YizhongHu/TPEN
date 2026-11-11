@@ -66,11 +66,11 @@ callbacks:
 - _target_: tpen.callback.Status
   output_path: ${run.dir}/status.json
 - _target_: tpen.callback.Checkpoint
-  terminal: false
-  every_n_steps: 2
-  output_dir: ${run.dir}/checkpoints
-- _target_: tpen.callback.Checkpoint
-  periodic: false
+  schedule:
+    _target_: tpen.checkpoint.EveryNUpdates
+    every_n: 2
+  payload:
+    _target_: tpen.checkpoint.TrainResume
   output_dir: ${run.dir}/checkpoints
 loggers:
 - _target_: tpen.logging.CSV

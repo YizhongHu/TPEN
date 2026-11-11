@@ -376,7 +376,7 @@ class TestArmIsTheMeasuredOne:
         checkpoint = next(
             entry for entry in callbacks if entry["_target_"] == "tpen.callback.Checkpoint"
         )
-        cadence = int(checkpoint["every_n_steps"])
+        cadence = int(checkpoint["schedule"]["every_n"])
         intermediate = [s for s in grid["checkpoint_steps"] if s != max(grid["checkpoint_steps"])]
         assert intermediate, "no non-terminal evaluated checkpoint; this test would be vacuous"
         for step in grid["checkpoint_steps"]:
@@ -385,45 +385,14 @@ class TestArmIsTheMeasuredOne:
                 f"{cadence}, so it is never written and its eval rows restore nothing"
             )
 
-    def test_retention_policy_cannot_prune_an_evaluated_checkpoint(self, grid: dict) -> None:
-        """`keep_last` pruning deletes evidence instead of failing loudly.
-
-        This is the nastier sibling of the multiple-of-cadence hazard. A step
-        that is never written at least fails at restore having discarded
-        nothing. A PRUNED checkpoint is written, satisfies every existence check
-        at the moment it is written, and is removed later -- so a test asserting
-        "the checkpoint was written" passes and the artifact is gone by
-        evaluation time.
-
-        The bound is derived, so it stays correct when the cadence, the
-        evaluated set or the budget changes.
-        """
-
-        callbacks = _yaml(TRAIN)["callbacks"]
-        checkpoint = next(
-            entry for entry in callbacks if entry["_target_"] == "tpen.callback.Checkpoint"
-        )
-        keep_last = checkpoint.get("keep_last")
-        if keep_last is None:
-            return
-        cadence = int(checkpoint["every_n_steps"])
-        max_steps = max(grid["checkpoint_steps"])
-        required = (max_steps - min(grid["checkpoint_steps"])) // cadence + 1
-        assert int(keep_last) >= required, (
-            f"keep_last={keep_last} prunes below the earliest evaluated checkpoint "
-            f"{min(grid['checkpoint_steps'])}; at cadence {cadence} and budget {max_steps} "
-            f"the evaluated set survives only if keep_last >= {required}"
-        )
-
-    def test_retention_is_declared_rather_than_defaulted(self) -> None:
-        # "Nobody set it" and "we decided not to prune" look identical in a
-        # config, and only the second survives review. The key must be present
-        # even when its value is null.
+    def test_keep_all_is_explicitly_configured(self) -> None:
+        # Keep the compatibility key present even though TPEN ignores it.
         callbacks = _yaml(TRAIN)["callbacks"]
         checkpoint = next(
             entry for entry in callbacks if entry["_target_"] == "tpen.callback.Checkpoint"
         )
         assert "keep_last" in checkpoint
+        assert checkpoint["keep_last"] is None
 
     def test_written_checkpoints_are_a_superset_kept_for_salvage(self, grid: dict) -> None:
         # The point of the finer cadence: a run that dies mid-budget leaves a
@@ -433,7 +402,7 @@ class TestArmIsTheMeasuredOne:
         checkpoint = next(
             entry for entry in callbacks if entry["_target_"] == "tpen.callback.Checkpoint"
         )
-        cadence = int(checkpoint["every_n_steps"])
+        cadence = int(checkpoint["schedule"]["every_n"])
         written = max(grid["checkpoint_steps"]) // cadence
         assert written > len(grid["checkpoint_steps"])
 

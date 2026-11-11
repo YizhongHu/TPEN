@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import logging
 import random
 import sys
@@ -15,21 +16,28 @@ from hydra.utils import instantiate
 from hydra.errors import InstantiationException
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-from tpen.accelerator import seed_all as accelerator_seed_all
+from tpen.accelerator import TorchAllocatorPeakProbe, seed_all as accelerator_seed_all
 from tpen.artifacts import (
     ArtifactManager,
     RunContext,
     RunResult,
     build_run_metadata,
-    generate_run_id,
     resolve_run_clock,
+    resolve_run_id,
     write_error_artifact,
     write_run_start_artifact,
 )
+from tpen.distributed import (
+    ExecutionTopology,
+    RankLocalJSONLWriter,
+    execution_topology_from_facts,
+)
 from tpen.callback import configure_terminal_logging
+from tpen.checkpoint.hashing import populate_resolved_config_defaults
 from tpen.config import register_resolvers
 from tpen.dependencies import OptionalDependencyError, require_torch
 from tpen.events import Event as TypedEvent
+from tpen.hi_schema import validate_hi_train_config
 from tpen.run_events import RunCompleted, RunFailed, RunStarted
 from tpen.runner import Runner
 
@@ -107,19 +115,41 @@ def prepare_run_context(
     config_path: str | None = None,
     command: str | None = None,
     bootstrap: _BootstrapState | None = None,
+    topology: ExecutionTopology | None = None,
 ) -> RunContext:
     """Resolve run metadata, artifact paths, callbacks, and loggers.
 
     Callbacks and loggers are configured at the config root and owned by the
     `RunContext`; runners dispatch into ``context.callbacks`` and log through
     ``context.log``.
+
+    Raises
+    ------
+    tpen.config_schema.ClosedSchemaError
+        When `cfg` declares a closed schema and violates it. Raised before any
+        directory, logger or callback exists.
     """
 
+    # PRECONSTRUCTION FIREWALL, ENTRY-POINT-INDEPENDENT COPY. `run_from_config`
+    # runs the same check, but a check that lives ONLY there is a property of
+    # one entry point rather than of the construction path: a programmatic
+    # caller reaching `prepare_run_context` directly -- a script, a notebook, a
+    # test harness, another runner -- would walk straight past it and still get
+    # a run directory, every configured logger and callback, and a run-start
+    # artifact on disk. Everything this function constructs happens below this
+    # line, so a refusal here leaves nothing behind.
+    #
+    # The duplication is deliberate and cheap: `validate_hi_train_config` is a
+    # pure function of `cfg` with no side effects, so running it twice on the
+    # `run_from_config` path costs one extra sweep and removes the possibility
+    # that the two paths ever disagree about what is admissible.
+    validate_hi_train_config(cfg)
+
     run_clock = resolve_run_clock(cfg)
-    source_cfg = _rerunnable_config(cfg)
-    OmegaConf.update(source_cfg, "run.timezone", run_clock.timezone, merge=False, force_add=True)
-    resolved_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
-    OmegaConf.update(resolved_cfg, "run.timezone", run_clock.timezone, merge=False, force_add=True)
+    source_cfg = _rerunnable_config(
+        OmegaConf.create(populate_resolved_config_defaults(cfg, timezone=run_clock.timezone))
+    )
+    resolved_cfg = OmegaConf.create(populate_resolved_config_defaults(cfg, timezone=run_clock.timezone))
     experiment_name = _nonempty_text(OmegaConf.select(resolved_cfg, "experiment.name"))
     run_name = (
         _nonempty_text(OmegaConf.select(resolved_cfg, "experiment.run_name"))
@@ -127,9 +157,30 @@ def prepare_run_context(
         or "tpen_run"
     )
     OmegaConf.update(resolved_cfg, "experiment.run_name", run_name, merge=False, force_add=True)
-    run_id = OmegaConf.select(resolved_cfg, "run.run_id", default=None)
-    if run_id is None:
-        run_id = generate_run_id(run_name, clock=run_clock)
+    # Run identity is AGREED wherever a launch declares itself, rather than
+    # generated per process. `generate_run_id` is process-local, so a
+    # distributed launch derived a different id on every rank and wrote to its
+    # own artifact root instead of one converged run root.
+    #
+    # HONEST SCOPE, because the comment would otherwise overclaim: nothing in
+    # `tpen/` yet initializes a process group or supplies a multi-rank
+    # `ExecutionTopology`, so on the launches TPEN can perform TODAY this still
+    # resolves through the serial branch. The agreement is the mechanism the
+    # distributed runtime will use, tested against real multi-rank process
+    # groups; it is not yet reached by a production caller.
+    #
+    # `resolve_run_id` is reached unconditionally, including when the id is
+    # already explicit, and that is load-bearing rather than tidiness: a
+    # resolution entered only on the null branch would leave a rank whose config
+    # carries an explicit id outside the collective, so its peers would block
+    # until the process-group timeout. Reaching it on every path also means the
+    # ranks' explicit ids are checked for agreement instead of being trusted.
+    #
+    # It runs here, above every construction below, so a disagreeing launch is
+    # refused while the run directory still does not exist.
+    configured_run_id = OmegaConf.select(resolved_cfg, "run.run_id", default=None)
+    run_id = resolve_run_id(configured_run_id, run_name, clock=run_clock, topology=topology)
+    if configured_run_id is None:
         OmegaConf.update(resolved_cfg, "run.run_id", run_id, merge=False, force_add=True)
     experiment_name = experiment_name or "experiment"
     sector = str(OmegaConf.select(resolved_cfg, "experiment.sector", default="default"))
@@ -150,6 +201,16 @@ def prepare_run_context(
     _validate_callbacks(callbacks)
     _validate_loggers(loggers)
     metadata = build_run_metadata(resolved_cfg, command=command, config_path=config_path, clock=run_clock)
+    if topology is None:
+        try:
+            device_identity = TorchAllocatorPeakProbe(metadata.device).identity()
+        except RuntimeError:
+            # Identity is optional telemetry: torch-free, malformed-device, and
+            # ancient-torch environments still need to prepare their context.
+            device_identity = None
+        topology = ExecutionTopology.single_process(
+            device=metadata.device, device_identity=device_identity
+        )
     context = RunContext(
         cfg=resolved_cfg,
         source_cfg=source_cfg,
@@ -158,6 +219,12 @@ def prepare_run_context(
         clock=run_clock,
         callbacks=callbacks,
         loggers=loggers,
+        topology=topology,
+        profile_writer=(
+            None
+            if topology.global_rank is None
+            else RankLocalJSONLWriter(artifact_manager.run_dir, topology)
+        ),
     )
     write_run_start_artifact(context)
     return context
@@ -169,6 +236,8 @@ def run_from_config(
     config_path: str | None = None,
     command: str | None = None,
     raise_exceptions: bool = False,
+    topology: ExecutionTopology | Mapping[str, object] | None = None,
+    runtime_callbacks: Sequence[object] = (),
 ) -> int:
     """Instantiate and execute the configured runner.
 
@@ -183,6 +252,16 @@ def run_from_config(
         exception event, and logger teardown. The default ``False`` preserves
         CLI-style ``return 1`` behavior; tests and debugging can set ``True`` to
         surface the original traceback.
+    topology : ExecutionTopology or mapping or None, optional
+        Launcher-supplied execution topology forwarded to the context consumer
+        for this call. Mapping facts are normalized to ``ExecutionTopology``
+        before context construction. When omitted, ``prepare_run_context``
+        applies its normal single-process fallback.
+    runtime_callbacks : sequence of objects, optional
+        Operational observers appended after configured callbacks. They are
+        supplied by the launcher, outside the immutable science configuration;
+        for example, a bounded prefix can stop after a published checkpoint
+        without changing the trainer configuration that restore validates.
 
     Returns
     -------
@@ -201,7 +280,41 @@ def run_from_config(
     context: RunContext | None = None
     runner: Runner | None = None
     try:
-        context = prepare_run_context(cfg, config_path=config_path, command=command, bootstrap=bootstrap)
+        # PRECONSTRUCTION FIREWALL. This is the first statement in the try on
+        # purpose: `prepare_run_context` below already creates the run
+        # directory and instantiates every logger and callback, so a check
+        # placed after it would be enforcing a rule against a run that had
+        # already begun to exist. Nothing above this line constructs anything,
+        # so a refusal here leaves no directory, no callback and no model.
+        #
+        # A configuration that declares no HI schema passes straight through --
+        # see `tpen.hi_schema` on why the firewall is opt-in.
+        #
+        # `prepare_run_context` enforces the same rule for callers that bypass
+        # this entry point. Keeping the check here as well means a refusal is
+        # reported through this function's own failure path (status update,
+        # exception event, logger teardown, `return 1`) rather than escaping as
+        # a bare exception from a helper.
+        validate_hi_train_config(cfg)
+        if topology is not None:
+            topology = execution_topology_from_facts(topology)
+        if topology is None:
+            context = prepare_run_context(
+                cfg,
+                config_path=config_path,
+                command=command,
+                bootstrap=bootstrap,
+            )
+        else:
+            context = prepare_run_context(
+                cfg,
+                config_path=config_path,
+                command=command,
+                bootstrap=bootstrap,
+                topology=topology,
+            )
+        _validate_callbacks(list(runtime_callbacks))
+        context.callbacks.extend(runtime_callbacks)
         _seed_runtime_rngs(context.cfg)
         context.emit(RunStarted())
         runner = _instantiate_runner(context)
