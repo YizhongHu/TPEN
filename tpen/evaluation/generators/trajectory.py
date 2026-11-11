@@ -156,6 +156,8 @@ class TrajectoryMCMCGenerator:
             nonlocal evaluation_index, final_walkers, record_stream
             retained_draw = evaluation_index - self.discard_draws
             evaluation_index += 1
+            if context.artifact_level == "records":
+                self._validate_record_geometry(walkers)
             result = self._local_energy_per_walker(model=model, walkers=walkers)
             if retained_draw >= 0:
                 final_walkers = walkers.clone().detach()
@@ -167,16 +169,6 @@ class TrajectoryMCMCGenerator:
                     )
                     if record_stream is None:
                         atoms = walkers.atomic_configuration
-                        if atoms is None and any(
-                            getattr(term, "operator_id", None)
-                            in (ELECTRON_NUCLEUS_COULOMB, NUCLEUS_NUCLEUS_COULOMB)
-                            or getattr(term, "declared_nuclear_geometry", lambda: None)() is not None
-                            for term in self.hamiltonian_terms.values()
-                        ):
-                            raise ValueError(
-                                "trajectory records cannot omit nuclear geometry for a "
-                                "Hamiltonian carrying nuclear terms or declared atoms"
-                            )
                         if self.max_samples is not None and self.max_samples < walkers.batch_size:
                             raise ValueError(
                                 "TrajectoryMCMCGenerator max_samples would truncate the final "
@@ -243,6 +235,22 @@ class TrajectoryMCMCGenerator:
             metadata=metadata,
             trajectory_records=trajectory_records,
         )
+
+    def _validate_record_geometry(self, walkers: Walkers) -> None:
+        """Keep absent geometry explicit and reject incompatible nuclear terms."""
+
+        if walkers.atomic_configuration is not None:
+            return
+        if any(
+            getattr(term, "operator_id", None)
+            in (ELECTRON_NUCLEUS_COULOMB, NUCLEUS_NUCLEUS_COULOMB)
+            or getattr(term, "declared_nuclear_geometry", lambda: None)() is not None
+            for term in self.hamiltonian_terms.values()
+        ):
+            raise ValueError(
+                "trajectory records cannot omit nuclear geometry for a "
+                "Hamiltonian carrying nuclear terms or declared atoms"
+            )
 
     def _local_energy_per_walker(
         self,
