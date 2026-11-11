@@ -46,6 +46,22 @@ class NativeTrace:
         self.suppress_channels = frozenset(suppress_channels)
         self._seen: set[tuple[str, int]] = set()
         self.events: list[ChannelEvent] = []
+        self.refusal: dict[str, str] | None = None
+
+    def record_refusal(self, exc: BaseException) -> None:
+        """Capture the first typed refusal raised by the real restore boundary.
+
+        ``tpen.run._apply_operational_restore``/``Train.run`` refuse before
+        ``fit`` on a restore-binding mismatch; the worker's own exception
+        handling (``tpen.execution.invocation.WorkerStartGateway.start``)
+        classifies that as a generic parked outcome rather than surfacing the
+        specific message. Capturing it here, at the real raise site, keeps
+        this refusal distinguishable from "nothing ran" without touching that
+        production classification.
+        """
+
+        if self.refusal is None:
+            self.refusal = {"exception_type": type(exc).__name__, "message": str(exc)}
 
     def begin_step(self) -> None:
         """Record the first process-RNG draw and cursor event for a step."""
@@ -104,6 +120,7 @@ class NativeTrace:
             "seed": self.seed,
             "seed_source": self.seed_source,
             "command": list(self.command),
+            "refusal": self.refusal,
             "events": [
                 {
                     "record": "channel_event",
@@ -132,6 +149,7 @@ def install_native_trace(trace: NativeTrace) -> ExitStack:
     """
 
     from tests.helpers.trainable_wavefunctions import TrainableHookeSingletAnsatz
+    from tpen.runner.train import Train
     from tpen.sampling.metropolis import MetropolisSampler
     from tpen.training.trainer import VMCTrainer
 
@@ -141,6 +159,7 @@ def install_native_trace(trace: NativeTrace) -> ExitStack:
     original_forward = TrainableHookeSingletAnsatz.forward
     original_step = torch.optim.Adam.step
     original_fit = VMCTrainer.fit
+    original_train_run = Train.run
     import tpen.checkpoint.restore as restore
     original_apply_rng = restore.apply_rng_state
 
@@ -185,11 +204,25 @@ def install_native_trace(trace: NativeTrace) -> ExitStack:
         trace.trainer = self
         return original_fit(self, *args, **kwargs)
 
+    def train_run(self, context):
+        try:
+            return original_train_run(self, context)
+        except ValueError as exc:
+            # The real pre-fit restore-binding refusal (R2.3): a selected
+            # checkpoint replaced after request construction, or restored
+            # live trainer counters disagreeing with the request, both raise
+            # here before any fit/model-evaluation event. Record it so the
+            # omission test can assert the specific typed refusal instead of
+            # reading an empty trace as an unmeasured arm.
+            trace.record_refusal(exc)
+            raise
+
     MetropolisSampler._propose = propose
     MetropolisSampler.collect_samples = collect_samples
     TrainableHookeSingletAnsatz.forward = forward
     torch.optim.Adam.step = optimizer_step
     VMCTrainer.fit = fit
+    Train.run = train_run
     restore.apply_rng_state = apply_rng
 
     def undo() -> None:
@@ -198,6 +231,7 @@ def install_native_trace(trace: NativeTrace) -> ExitStack:
         TrainableHookeSingletAnsatz.forward = original_forward
         torch.optim.Adam.step = original_step
         VMCTrainer.fit = original_fit
+        Train.run = original_train_run
         restore.apply_rng_state = original_apply_rng
 
     stack.callback(undo)
