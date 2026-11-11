@@ -403,6 +403,24 @@ def test_launch_accepts_matching_device_and_operational_overrides(tmp_path: Path
     assert received_config.run.run_id == expected_hash
 
 
+def test_prepare_launch_accepts_operational_override_without_topology(tmp_path: Path) -> None:
+    plan = launch.prepare_train_launch(
+        _cell(tmp_path), overrides=["trainer.max_steps=7"]
+    )
+
+    assert plan.config.runner.trainer.max_steps == 7
+
+
+def test_prepare_launch_rejects_device_override_without_topology(tmp_path: Path) -> None:
+    with pytest.raises(
+        launch.LaunchValidationError,
+        match="runtime.device override requires bound topology",
+    ):
+        launch.prepare_train_launch(
+            _cell(tmp_path), overrides=["runtime.device=cpu"]
+        )
+
+
 def test_launch_forwards_resolver_owned_override_refusal(tmp_path: Path) -> None:
     cell = _cell(tmp_path)
 

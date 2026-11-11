@@ -397,7 +397,9 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
 
 
 def _validate_override_topology_agreement(
-    config: DictConfig, topology: Mapping[str, Any]
+    config: DictConfig,
+    topology: Mapping[str, Any],
+    override_items: Sequence[tuple[str, Any]],
 ) -> None:
     """Refuse resolved placement that contradicts bound launcher facts.
 
@@ -410,12 +412,19 @@ def _validate_override_topology_agreement(
     in ``cuda:0``), which also matches the config's usual spelling.
     """
 
-    configured = OmegaConf.select(config, "runtime.device", default=None)
+    device_override = any(
+        type(path) is str and str.__eq__(path, "runtime.device") is True
+        for path, _ in override_items
+    )
+    if device_override is not True:
+        return
+
     bound = topology.get("device")
-    if type(configured) is not str or type(bound) is not str:
-        raise LaunchValidationError(
-            "runtime.device and topology.device must both be exact strings"
-        )
+    if type(bound) is not str:
+        raise LaunchValidationError("runtime.device override requires bound topology")
+    configured = OmegaConf.select(config, "runtime.device", default=None)
+    if type(configured) is not str:
+        raise LaunchValidationError("runtime.device override must resolve to an exact string")
     configured_kind = configured.partition(":")[0]
     bound_kind = bound.partition(":")[0]
     if str.__eq__(configured_kind, bound_kind) is not True:
@@ -450,8 +459,9 @@ def prepare_train_launch(
     if overrides is None:
         config = _TRAIN_CONFIG.resolve_train_config(cell)
     else:
+        override_items = _TRAIN_CONFIG._override_items(overrides)
         config = _TRAIN_CONFIG.resolve_train_config(cell, overrides=overrides)
-        _validate_override_topology_agreement(config, facts)
+        _validate_override_topology_agreement(config, facts, override_items)
     return LaunchPlan(cell=cell, config=config, topology=cell.manifest[_STAGE_API.TOPOLOGY_KEY])
 
 
