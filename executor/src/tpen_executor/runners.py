@@ -11,7 +11,7 @@ from typing import Any, ClassVar, Mapping
 from ._codec import canonical_bytes, decode_json
 from .environments import PreparedPythonEnvironment
 from ._records import frozen_record
-from .workers import SubprocessWorker
+from .workers import LaunchPurpose, SubprocessWorker
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
 RUN_EVIDENCE_SCHEMA_V2 = "tpen.run-evidence/v2"
@@ -345,6 +345,12 @@ class TPENEvidence:
         The worker applies the owner environment, then the descriptor overlay,
         then the setup script; setup is the last writer. The timeout covers the
         worker's complete process group.
+
+        This is the only trusted inspection call site: it launches with
+        ``purpose=LaunchPurpose.INSPECTION``, which exempts the read-only
+        inspection of a member's own output from the slot quarantine and
+        from GPU sampling.  The argument is a correctness guard against
+        accidental slot reuse, not a security boundary (review delta-4 D4-1).
         """
 
         try:
@@ -355,6 +361,7 @@ class TPENEvidence:
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
                 timeout=timeout,
+                purpose=LaunchPurpose.INSPECTION,
             )
         except OSError as exc:
             raise EvidenceUnavailable("inspection process could not be launched") from exc

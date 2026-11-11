@@ -21,6 +21,7 @@ from ..workers import ProcessOutcome, SubprocessWorker
 from .contract import (
     DispatcherContract,
     _member_paths,
+    _admit_slot,
     _placement_refusal_from_environment,
     _with_child_context_keys,
     _with_child_placement,
@@ -372,6 +373,7 @@ class ParslDispatcher(DispatcherContract):
                         finish_error = completion_error
                     available.append(binding)
                     return
+                _admit_slot(environment, fence)
                 process = materialized["process"]
                 materialized["runner"]
                 evidence = materialized["evidence"]

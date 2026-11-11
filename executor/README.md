@@ -48,8 +48,97 @@ The L1a v2 placement receipt reports an explicit reason class: `not-sampled`,
 sampler: declared-device evidence is `device=unavailable` with the loud
 reason `not-sampled`. This is operationally advisory, so a completed segment
 may remain accepted and dispatch may return `0`; the manifest records that H-v2
-must perform its own delivered-GPU check. L1b adds attempted GPU telemetry and
-its separate failure reason; H-v2 does not wait for L1b.
+must perform its own delivered-GPU check. H-v2 does not wait for L1b.
+
+L1b adds an `nvidia-smi` PID-to-UUID sampler and a separate closed wire,
+`science-placement-receipt-v3`; `v2` keeps its L1a meaning and `v1` is
+unchanged. The sampler lives in the worker that launches and owns the science
+child (`SubprocessWorker`), not in the child, so `RUN_SHIM` is unchanged from
+L1a. For a declared-GPU v2-placement slot the controller assigns a
+worker-only evidence path; the worker claims it with an attempted,
+unfinalized record before spawn, samples the exact child PID immediately and
+then every cadence (default 2 s, bounded to 0.01-60 s) for the child's whole
+lifetime, and takes a final sample once it has observed the exit. At most 16
+samples are retained; a closed lifetime aggregate records every GPU the
+exact PID ever used and whether out-of-entitlement use or an unresolved
+entitlement was ever seen, including in samples that were not retained.
+Only the explicit prepared descriptor opts a launch into sampling; an
+inherited owner-environment value of the evidence key is ignored and the key
+is never passed to the child. The worker holds the sampler before starting
+it, so an interruption during or right after startup cannot lose its cleanup.
+`nvidia-smi` is resolved once through the `PATH` of the worker's prepared
+child environment (the descriptor's setup script is not applied to it); the
+resolved path and its reported version are recorded.
+Each command runs in its own session. On every path, including a worker
+timeout or cancellation of the science child, the worker SIGKILLs, drains,
+reaps, and confirms every command group empty (ESRCH from `killpg(pgid, 0)`)
+under one shared deadline before it returns. The deadline is derived from the
+command bounds: at most one attempt in progress plus one final attempt, each
+of at most three commands bounded by a 5 s read plus a 2 s cleanup, plus a
+3 s cancel reserve (`2 * 3 * (5 + 2) + 3 = 45` s). If a launch or a group
+cleanup is still outstanding at the deadline, the record is not quiescent and
+keeps the surviving group ids.
+
+Slot quarantine. Before it spawns a sampled child, the worker quarantines the
+slot: an in-process lease plus a durable marker in the attempt store under
+`<store root>/slot-quarantine/<sha256 of allocation id, backend job id,
+physical host, slot id>/`. The lease is settled on every exit, including an
+interrupted or failed evidence write, and released (marker removed) only once
+the child is reaped and every sampler command group is confirmed empty.
+Until then every science launch on that slot fails with `SlotQuarantined`
+before spawning, sampled or not: the worker checks the in-process lease by
+`TPEN_SLOT_ID`, and dispatch admission also checks the durable markers, so a
+restarted controller that reuses the same attempt store refuses the slot too.
+Only the member's own inspection is exempt. The exemption is the typed worker
+argument `purpose=LaunchPurpose.INSPECTION`, passed only by
+`TPENEvidence.read`; no environment value grants it, and the retired
+`TPEN_EXECUTOR_LAUNCH_ROLE` key is scrubbed from every launch environment. An
+unsampled launch, including the legacy/no-unique-slot science fallback, is
+never treated as an inspection. This argument is a correctness guard against
+accidental slot reuse, not a security boundary: any caller that controls the
+worker invocation can pass it.
+
+Quarantine release (decided: no in-allocation release; manager ruling
+2026-11-10, Task Orchestrator item 08eeff51 note
+`manager-ruling-quarantine-release-20261110`). A marker whose owner died is
+not released by another process, and no operator release command exists. The
+slot stays quarantined for the rest of the allocation, and allocation teardown
+is the release (a new allocation has a new allocation and backend job
+identity, so it does not see the old marker). The marker is kept as evidence
+until a separate disposition authorizes removing it. A supervised release
+command, which must prove that all possibly-launched work is gone, is a future
+follow-up.
+
+Assumption: one controller per allocation. Every dispatcher runs its workers
+in the controller process (Parsl is ThreadPool-only), so the in-process lease
+sees every launch, and the durable marker covers a controller restart on the
+same store. Markers in a different attempt store, and concurrent independent
+controllers on one allocation, are not detected; cross-store leases are
+deferred to follow-up item `0aa73edd`.
+
+Telemetry quality is kept separate from the operational outcome: a worker
+timeout or cancellation of the science child still finishes the sampler, so
+usable, quiescent observations taken before it survive. Only a sampler that
+is itself cancelled (a command still in flight at the deadline) or never
+finalized is `telemetry-failed`. Transient command failures (non-zero exit,
+read timeout, read error) are bounded by a recorded gap budget: one isolated
+failed attempt is skipped, while two in a row or a fourth over the lifetime
+is the terminal `gap-budget-exceeded` failure. Every gap is recorded (count,
+longest consecutive run, total seconds, and each event) together with the
+budget in force. Outside use, malformed or contradictory output, and
+unconfirmed cleanup are never forgiven. MIG device identifiers are
+unsupported and fail with the distinct `mig-unsupported` code. The timeout
+and gap-budget values are unmeasured defaults to be calibrated on a real-GPU
+run.
+
+The v3 verdict is derived, never trusted: out-of-entitlement use by the exact
+science PID at any time is `mismatch`; an attempted sampler failure, an
+unresolved entitlement, or no row for the exact PID during the whole
+lifetime is `telemetry-failed`; `qualified` requires quiescent evidence with
+every active UUID inside the slot entitlement. A GPU child that never creates
+a CUDA context is therefore `telemetry-failed` and science-blocking.
+`not-sampled` (intentionally unattempted, for example a CPU-only slot) is not
+science-blocking; `telemetry-failed` is. Both stay operationally advisory.
 
 Post-launch host or affinity mismatch is also advisory: the segment remains
 accepted, dispatch returns `0`, and the receipt is unqualified for placement.
