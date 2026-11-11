@@ -67,14 +67,38 @@ def _arrange_stale_indexes(root: Path, *, keep_catalog: bool):
 
 
 @pytest.mark.parametrize("keep_catalog", [True, False], ids=["old-catalog", "old-latest-no-catalog"])
+def test_r6_read_only_discovery_refuses_stale_predecessor_index(tmp_path, keep_catalog):
+    """A predecessor's stale index (pointer behind the newest complete
+    checkpoint) must refuse on the read-only successor-discovery path, not
+    silently select the uncatalogued directory (H1 addendum F1)."""
+
+    from tpen.execution.invocation import PredecessorDiscoveryRefusal, _committed_checkpoint
+
+    root = tmp_path / "run"
+    old, new = _arrange_stale_indexes(root, keep_catalog=keep_catalog)
+    before = _payload_hashes(new)
+    old_before = _payload_hashes(old)
+    with pytest.raises(PredecessorDiscoveryRefusal):
+        _committed_checkpoint(root)
+    after = _payload_hashes(new)
+    old_after = _payload_hashes(old)
+    assert after == before, "refused discovery changed immutable checkpoint payload bytes"
+    assert old_after == old_before, "refused discovery changed the older immutable payload bytes"
+    assert old.exists() and new.exists()
+
+
+@pytest.mark.parametrize("keep_catalog", [True, False], ids=["old-catalog", "old-latest-no-catalog"])
 def test_r6_committed_checkpoint_reconciles_newest_unindexed_state(tmp_path, keep_catalog):
+    """The owning allocation explicitly authorizes repair of its own stale
+    index (H1: discovery defaults to read-only; see the refusal test above)."""
+
     from tpen.execution.invocation import _committed_checkpoint
 
     root = tmp_path / "run"
     old, new = _arrange_stale_indexes(root, keep_catalog=keep_catalog)
     before = _payload_hashes(new)
     old_before = _payload_hashes(old)
-    selected = _committed_checkpoint(root)
+    selected = _committed_checkpoint(root, allow_reconcile=True)
     assert selected is not None
     assert selected.next_iteration == 2
     assert selected.checkpoint_dir == new
@@ -82,6 +106,7 @@ def test_r6_committed_checkpoint_reconciles_newest_unindexed_state(tmp_path, kee
     old_after = _payload_hashes(old)
     assert after == before, "reconciliation changed immutable checkpoint payload bytes"
     assert old_after == old_before, "reconciliation changed the older immutable payload bytes"
+    # The index is now consistent, so read-only discovery accepts it too.
     again = _committed_checkpoint(root)
     assert again is not None and again.content_id == selected.content_id
     assert old.exists()
@@ -114,15 +139,21 @@ def test_r6_indexless_checkpoint_is_repaired_by_checkpoint_owner(tmp_path):
 
 
 def test_r6_empty_catalog_is_a_separate_green_control(tmp_path):
+    """An empty catalog plus a missing ``latest.json`` is still an indexless
+    predecessor for read-only discovery; the owning allocation may still
+    repair it (H1 addendum)."""
+
     from tpen.checkpoint.catalog import PUBLICATION_CATALOG_FILENAME
-    from tpen.execution.invocation import _committed_checkpoint
+    from tpen.execution.invocation import PredecessorDiscoveryRefusal, _committed_checkpoint
 
     root = tmp_path / "run"
     newest = _save(root, 2)
     catalog = newest.parent / PUBLICATION_CATALOG_FILENAME
     catalog.write_text("", encoding="utf-8")
     (newest.parent / "latest.json").unlink()
-    selected = _committed_checkpoint(root)
+    with pytest.raises(PredecessorDiscoveryRefusal):
+        _committed_checkpoint(root)
+    selected = _committed_checkpoint(root, allow_reconcile=True)
     assert selected is not None and selected.checkpoint_dir == newest
 
 

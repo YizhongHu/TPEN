@@ -553,53 +553,112 @@ def _reconcile_unpublished_checkpoint(checkpoint_root: Path) -> CheckpointRef | 
     return reconcile_publication(checkpoint_root, ref.checkpoint_dir)
 
 
-def _committed_checkpoint(run_dir: Path, *, allow_reconcile: bool = False) -> CheckpointRef | None:
-    """Read the latest committed full-state checkpoint through checkpoint APIs.
+class PredecessorDiscoveryRefusal(ValueError):
+    """Typed refusal for the read-only successor/restore discovery path.
 
-    ``allow_reconcile`` defaults to ``False``: by default this is the
-    successor/restore discovery path, which (H1) must be strictly read-only
-    against a leaf it may not own -- an indexless or otherwise inconsistent
-    predecessor is selected from disk but never repaired in place. Only the
-    allocation that still owns ``run_dir`` (for example its own post-run
-    completion check in ``_core_outcome_from_artifacts``) may pass
-    ``allow_reconcile=True`` to backfill a missing publication index.
+    Raised instead of silently returning a candidate when a predecessor leaf's
+    publication index is missing, or does not yet reflect the newest complete
+    checkpoint directory (a stale index).  Discovery against a leaf it may not
+    own never repairs the index in place -- that remains ``allow_reconcile``'s
+    sole authority (H1 addendum) -- so the only outcomes here are "accept the
+    leaf's already-published state" or "refuse".
     """
 
-    checkpoint_root = run_dir / "checkpoints"
-    if not checkpoint_root.is_dir():
-        return None
 
-    select = _reconcile_unpublished_checkpoint if allow_reconcile else _latest_complete_checkpoint
+def _owner_committed_checkpoint(checkpoint_root: Path) -> CheckpointRef | None:
+    """Select, repairing a missing publication index where authorized.
+
+    Call only for an allocation that still owns ``checkpoint_root`` -- its own
+    post-run completion check, or an explicit owner-reconciliation request.
+    """
 
     catalog_path = checkpoint_root / PUBLICATION_CATALOG_FILENAME
     if catalog_path.is_file():
         publications = read_publications(catalog_path)
         # A readable catalog is an index, not the authority over newer
         # committed checkpoint directories.  Scan all complete directories
-        # through CheckpointRef and the train-resume manifest gate, then
-        # (only when authorized) let the checkpoint package reconcile any
-        # missing publication indexes.  Keep the catalog read above outside
-        # the fallback so a corrupt catalog still refuses instead of silently
-        # falling back.
-        ref = select(checkpoint_root)
+        # through CheckpointRef and the train-resume manifest gate, then let
+        # the checkpoint package reconcile any missing publication indexes.
+        # Keep the catalog read above outside the fallback so a corrupt
+        # catalog still refuses instead of silently falling back.
+        ref = _reconcile_unpublished_checkpoint(checkpoint_root)
         if ref is None and publications:
             ref = max(publications, key=lambda candidate: candidate.next_iteration)
     elif not (checkpoint_root / LATEST_JSON).is_file():
         # A COMPLETE directory may have landed before either publication
-        # index. Select it directly instead of resolving the root as a
-        # checkpoint (reconciling it is authorized only when owned).
-        ref = select(checkpoint_root)
+        # index. Select and reconcile it directly.
+        ref = _reconcile_unpublished_checkpoint(checkpoint_root)
     else:
         # ``latest.json`` is the checkpoint package's durable convenience
         # pointer.  The resolver also requires the COMPLETE marker, so a
         # temporary or half-written directory cannot become completion facts.
         pointer_ref = CheckpointRef.from_directory(resolve_checkpoint_dir(checkpoint_root))
-        candidate = select(checkpoint_root)
+        candidate = _reconcile_unpublished_checkpoint(checkpoint_root)
         ref = (
             candidate
             if candidate is not None and candidate.next_iteration > pointer_ref.next_iteration
             else pointer_ref
         )
+    return ref
+
+
+def _discover_published_checkpoint(checkpoint_root: Path) -> CheckpointRef | None:
+    """Read-only successor/restore discovery: trust only an already-published index.
+
+    Refuses, with :class:`PredecessorDiscoveryRefusal`, when the publication
+    catalog or ``latest.json`` is missing while a complete checkpoint exists
+    (an indexless predecessor), or when the published pointer does not yet
+    reflect the newest complete checkpoint directory (a stale predecessor
+    index). A corrupt catalog still raises ``ValueError`` from
+    ``read_publications`` before either check runs. Never writes.
+    """
+
+    catalog_path = checkpoint_root / PUBLICATION_CATALOG_FILENAME
+    latest_path = checkpoint_root / LATEST_JSON
+    if not catalog_path.is_file() or not latest_path.is_file():
+        if not list_complete_checkpoints(checkpoint_root):
+            # No committed checkpoint exists yet: a legitimate "nothing to
+            # discover" outcome, not an indexless predecessor to refuse.
+            return None
+        raise PredecessorDiscoveryRefusal(
+            f"predecessor checkpoint index missing under {checkpoint_root}; "
+            "refusing read-only successor discovery"
+        )
+    read_publications(catalog_path)  # Validates; raises ValueError on a corrupt catalog.
+    pointer_ref = CheckpointRef.from_directory(resolve_checkpoint_dir(checkpoint_root))
+    newest = _latest_complete_checkpoint(checkpoint_root)
+    if newest is not None and newest.next_iteration > pointer_ref.next_iteration:
+        raise PredecessorDiscoveryRefusal(
+            f"predecessor checkpoint index under {checkpoint_root} is stale "
+            f"(published pointer is at iteration {pointer_ref.next_iteration}, "
+            f"newest complete checkpoint is at iteration {newest.next_iteration}); "
+            "refusing read-only successor discovery"
+        )
+    return pointer_ref
+
+
+def _committed_checkpoint(run_dir: Path, *, allow_reconcile: bool = False) -> CheckpointRef | None:
+    """Read the latest committed full-state checkpoint through checkpoint APIs.
+
+    ``allow_reconcile`` defaults to ``False``: by default this is the
+    successor/restore discovery path, which (H1) must be strictly read-only
+    against a leaf it may not own -- an indexless or otherwise stale
+    predecessor index is refused with a typed :class:`PredecessorDiscoveryRefusal`,
+    never repaired in place. Only the allocation that still owns ``run_dir``
+    (for example its own post-run completion check in
+    ``_core_outcome_from_artifacts``) may pass ``allow_reconcile=True`` to
+    backfill a missing publication index.
+    """
+
+    checkpoint_root = run_dir / "checkpoints"
+    if not checkpoint_root.is_dir():
+        return None
+
+    ref = (
+        _owner_committed_checkpoint(checkpoint_root)
+        if allow_reconcile
+        else _discover_published_checkpoint(checkpoint_root)
+    )
 
     if ref is None:
         return None
@@ -1075,32 +1134,26 @@ _MISSING_CONFIG_VALUE = object()
 
 
 def run_configured_once(cfg: Any, *, decision: RecoveryDecision, output_path: Path, **kwargs: Any) -> Any:
-    """Call legacy ``run_from_config`` once with a worker-local overlay.
+    """Call ``tpen.run.run_from_config`` once with a worker-local output root.
 
     The import is intentionally lazy: importing ``tpen.execution`` does not
-    import Hydra, torch, or arbitrary science constructors.  The copied config
-    receives the E1 load overlay and unique output root only for this worker;
-    callers using :func:`tpen.run.run_from_config` directly are unchanged.
+    import Hydra, torch, or arbitrary science constructors for callers that
+    never select a checkpoint.  A selected E1 decision is passed through as a
+    typed, immutable ``OperationalRestoreRequest`` -- not rewritten into the
+    copied config -- so ``run_from_config``'s own conflict refusal and
+    revalidated-ref binding govern it; this adapter owns only the output
+    routing the worker-start gateway already authorizes.
     """
 
     from omegaconf import OmegaConf
     from tpen.run import run_from_config
 
+    from .recovery import OperationalRestoreRequest
+
     worker_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
-    if decision.load is not None:
-        # The configured runner consumes ``runner.load``.  Keep the
-        # top-level mirror for callers whose config exposes it, but never let
-        # a concrete runner value shadow the selected E1 overlay.
-        OmegaConf.update(worker_cfg, "runner.load", decision.load, merge=False, force_add=True)
-        if "load" in worker_cfg:
-            OmegaConf.update(worker_cfg, "load", decision.load, merge=False)
-        effective_runner_load = OmegaConf.select(worker_cfg, "runner.load", default=None)
-        if OmegaConf.is_config(effective_runner_load):
-            effective_runner_load = OmegaConf.to_container(effective_runner_load, resolve=True)
-        if effective_runner_load != decision.load:
-            raise ValueError("worker overlay did not reach the configured runner.load")
     OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
-    return run_from_config(worker_cfg, **kwargs)
+    restore_request = OperationalRestoreRequest(decision) if decision.load is not None else None
+    return run_from_config(worker_cfg, restore_request=restore_request, **kwargs)
 
 
 __all__ = [

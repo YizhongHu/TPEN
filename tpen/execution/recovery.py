@@ -558,11 +558,18 @@ def _raw_manifest_refusal(raw_manifest: Any) -> RecoveryRefusal | None:
 
 @dataclass(frozen=True, slots=True)
 class OperationalRestoreRequest:
-    """Closed, versioned operational-start request carrying an E1 decision.
+    """Closed, versioned, immutable snapshot binding an E1 decision.
 
-    Carries only an already-selected full-state ``train_resume``
-    :class:`RecoveryDecision`; it holds no mutable config dictionary and
-    authorizes no configuration change beyond the restore load it names.
+    Carries an already-selected full-state ``train_resume``
+    :class:`RecoveryDecision`.  Construction freezes a validated snapshot of
+    the decision's checkpoint reference and counters, derives the closed
+    ``train_resume`` load shape directly from that reference (never trusting
+    ``decision.load`` as a mutable dictionary), and revalidates the exact
+    reference. Later mutation of the originating ``decision`` (for example
+    ``decision.load["mode"] = "none"``) cannot change what this request
+    carries, since every field consumed by :attr:`load` and :attr:`ref` is
+    copied at construction time, not re-read from ``decision``.
+
     ``tpen.run.run_from_config`` consumes this at the existing ``Train``
     restore boundary (the constructor's ``load`` argument) and refuses a
     concrete configured ``runner.load`` that conflicts with it, rather than
@@ -572,20 +579,59 @@ class OperationalRestoreRequest:
     SCHEMA: ClassVar[str] = "tpen.execution/operational-restore-request-v1"
 
     decision: RecoveryDecision
+    ref: CheckpointRef = field(init=False)
+    target_iterations: int = field(init=False)
+    next_iteration: int = field(init=False)
+    completed_updates: int = field(init=False)
+    _load: Mapping[str, str] = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.decision, RecoveryDecision):
             raise TypeError("decision must be a RecoveryDecision")
         if self.decision.refusal is not None:
             raise ValueError("OperationalRestoreRequest requires a non-refused recovery decision")
-        if self.decision.load is None or dict(self.decision.load).get("mode") != "train_resume":
+        configured_load = self.decision.load
+        if configured_load is None or dict(configured_load).get("mode") != "train_resume":
             raise ValueError("OperationalRestoreRequest requires a train_resume load decision")
+        configured_load = dict(configured_load)
+        if set(configured_load) != {"mode", "path"}:
+            raise ValueError(
+                "OperationalRestoreRequest rejects restore options beyond the "
+                f"closed train_resume load shape: {sorted(configured_load)!r}"
+            )
+        ref = self.decision.checkpoint
+        if not isinstance(ref, CheckpointRef):
+            raise TypeError("decision must carry a validated CheckpointRef")
+        # Revalidate the exact reference (not whatever ``decision.load`` claims)
+        # before binding, so a request can never be built from a path the
+        # decision's own checkpoint reference does not identify.
+        ref.validate()
+        read_manifest(ref.checkpoint_dir / "manifest.json", mode="train_resume")
+        closed_load = train_resume_load_overlay(ref)
+        if closed_load["path"] != configured_load["path"]:
+            raise ValueError(
+                "decision load path does not match decision.checkpoint's reference"
+            )
+        object.__setattr__(self, "ref", ref)
+        object.__setattr__(
+            self, "target_iterations",
+            _require_nonnegative_int(self.decision.target_iterations, "target_iterations"),
+        )
+        object.__setattr__(
+            self, "next_iteration",
+            _require_nonnegative_int(self.decision.next_iteration, "next_iteration"),
+        )
+        object.__setattr__(
+            self, "completed_updates",
+            _require_nonnegative_int(self.decision.completed_updates, "completed_updates"),
+        )
+        object.__setattr__(self, "_load", MappingProxyType(dict(closed_load)))
 
     @property
     def load(self) -> dict[str, str]:
-        """Return the decision's existing configured-run ``train_resume`` load shape."""
+        """Return the closed ``train_resume`` load shape bound at construction."""
 
-        return dict(self.decision.load)
+        return dict(self._load)
 
 
 def _refused(
