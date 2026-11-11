@@ -529,6 +529,11 @@ def run_pilot_final_sel(run_root: Path) -> None:
         "b1_eval_receipt_sha256": stage1_sha256,
         "stage2_eval_receipt_sha256": hashlib.sha256(stage2_path.read_bytes()).hexdigest(),
         "pooled01_w_by_ordinal": {str(ordinal): w for ordinal, w in pooled01_w_by_ordinal.items()},
+        # K4 (final-verify finding on operator-rulings-pilot-20261110-1900,
+        # item 3): carried from the SEL record's own c1, not recomputed from
+        # c_star -- the edge condition this ruling targets is "c1 had no full
+        # neighboring triple", not a property of the final pick.
+        "interior_minimum": protocol.is_interior_minimum(c1),
     }
     final_path = run_root / "attached" / "receipts" / "h-v2-eval-capacity-pilot-final-selection.json"
     final_path.parent.mkdir(parents=True, exist_ok=True)

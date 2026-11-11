@@ -507,3 +507,99 @@ def test_real_eval_restores_p_and_e_checkpoints(tmp_path, monkeypatch, explicit_
     assert len(read_back["generations"]) == 1
     for artifact in read_back["generations"][0]["artifacts"].values():
         assert _sha(artifact["path"]) == artifact["sha256"]
+
+
+def test_k3_production_wiring_loads_from_the_verified_snapshot(tmp_path, monkeypatch):
+    """K3 (final-verify finding, mutant M1 at run_job.py:386-388): kill dropping
+    the ``snapshot_dir`` kwarg from the PRODUCTION ``resolve_checkpoint`` call
+    site. Drives the real eval fan-out path (``job.run_eval_fanout``, not the
+    unit-level ``resolve_checkpoint`` helper test in test_eval_job.py), spies
+    on the checkpoint directory core actually receives, and then corrupts the
+    original checkpoint AFTER the run to prove core never re-reads it.
+    """
+    train, _ = _train(tmp_path, payload="gpu-route-g", updates=(1000,))
+    entry = train["checkpoint_inventory"][0]
+    original_checkpoint_dir = Path(entry["path"])
+    _fake_compute(monkeypatch)
+
+    captured_dirs = []
+    original_science_evaluation_config = protocol.science_evaluation_config
+
+    def spy(checkpoint_dir, **kwargs):
+        captured_dirs.append(Path(checkpoint_dir))
+        return original_science_evaluation_config(checkpoint_dir, **kwargs)
+
+    monkeypatch.setattr(protocol, "science_evaluation_config", spy)
+
+    job.run_eval_fanout(run_root=tmp_path, expected_commit=EVAL_SHA,
+                        science_python=sys.executable, payload="gpu-route-g", lineage="G",
+                        expected_train_commit=TRAIN_SHA)
+
+    assert len(captured_dirs) == 1
+    loaded_dir = captured_dirs[0]
+    assert loaded_dir != original_checkpoint_dir, (
+        "core was pointed at the original checkpoint directory, not a job-local snapshot"
+    )
+    assert str(loaded_dir).startswith(str(tmp_path / "attached" / "checkpoint-snapshots")), (
+        f"loaded checkpoint dir {loaded_dir} is not under this job's own snapshot root"
+    )
+    for relative, expected_sha256 in entry["files"].items():
+        assert _sha(loaded_dir / relative) == expected_sha256
+
+    # Corrupt the ORIGINAL directory after the run; the snapshot core actually
+    # loaded from is a private copy and must be unaffected -- the production
+    # call site, not just the unit-level helper, must close the check/use
+    # window.
+    (original_checkpoint_dir / "model.pt").write_bytes(b"corrupted after verification")
+    for relative, expected_sha256 in entry["files"].items():
+        assert _sha(loaded_dir / relative) == expected_sha256
+
+
+@pytest.mark.parametrize("center,expected_interior", [(3, False), (10, True), (19, False)])
+def test_k4_interior_minimum_flag_on_sel_and_final_sel_records(tmp_path, center, expected_interior):
+    """K4 (operator-rulings-pilot-20261110-1900, item 3): kill a mutant that
+    always reports ``interior_minimum=True``. A basin center at the window
+    edge (``c1`` of 3 or 19) never had a full neighboring triple on both
+    sides and must be flagged ``False`` in both the SEL selection record and
+    the final-SEL ``c*`` record; ``c1=10`` is the ordinary interior case and
+    must stay ``True``. Stage 2 still runs in every case (the window is
+    defined even at the edge).
+    """
+    narrow = {center - 1, center, center + 1}
+    generations = []
+    for ordinal in range(21):
+        width = 1 if ordinal in narrow else 10
+        path = tmp_path / f"b1-{center}-{ordinal}.csv"
+        path.write_text(f"local_energy\n{-width}\n0\n{width}\n")
+        generations.append({"ordinal": ordinal, "update": ordinal * 1000, "stream": 0,
+                            "seed": 996000 + 10 * ordinal,
+                            "artifacts": {"trajectory_csv": {"path": str(path), "sha256": _sha(path)}}})
+    stage1_path = job._eval_receipt_path(tmp_path, "h-v2-eval-capacity-pilot-stage1")
+    ev.write_eval_receipt(stage1_path, eval_commit=EVAL_SHA, train_commit=TRAIN_SHA,
+                         train_receipt_path=tmp_path / "train.json", train_receipt_sha256="c" * 64,
+                         payload="capacity-pilot", generations=generations, readout_generator_enabled=True)
+
+    job.run_pilot_sel(tmp_path)
+    selection_path = tmp_path / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    assert selection["c1"] == center, "the narrow-triple fixture must pick the intended center"
+    assert selection["interior_minimum"] is expected_interior
+
+    candidates = sorted({c for c in (center - 1, center, center + 1) if 3 <= c <= 19} | {center})
+    needed = sorted({o for c in candidates for o in (c - 1, c, c + 1)})
+    stage2_generations = []
+    for ordinal in needed:
+        path = tmp_path / f"b2-{center}-{ordinal}.csv"
+        path.write_text("local_energy\n-1\n0\n1\n")
+        stage2_generations.append({"ordinal": ordinal, "update": ordinal * 1000, "stream": 1, "seed": 1,
+                                   "artifacts": {"trajectory_csv": {"path": str(path), "sha256": _sha(path)}}})
+    stage2_path = job._eval_receipt_path(tmp_path, "h-v2-eval-capacity-pilot-stage2")
+    ev.write_eval_receipt(stage2_path, eval_commit=EVAL_SHA, train_commit=TRAIN_SHA,
+                         train_receipt_path=tmp_path / "train.json", train_receipt_sha256="c" * 64,
+                         payload="capacity-pilot", generations=stage2_generations, readout_generator_enabled=True)
+
+    job.run_pilot_final_sel(tmp_path)
+    final_path = tmp_path / "attached" / "receipts" / "h-v2-eval-capacity-pilot-final-selection.json"
+    final_record = json.loads(final_path.read_text(encoding="utf-8"))
+    assert final_record["c1"] == center
+    assert final_record["interior_minimum"] is expected_interior

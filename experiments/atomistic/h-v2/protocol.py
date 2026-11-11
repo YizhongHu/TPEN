@@ -737,6 +737,25 @@ def w_statistic(local_energies: Sequence[float]) -> float:
     return deviations[index]
 
 
+def is_interior_minimum(c1: int) -> bool:
+    """Return whether *c1* sits strictly inside the pilot window, not at its edge.
+
+    Operator ruling (operator-rulings-pilot-20261110-1900, item 3): a basin
+    center at the window edge (``c1`` of 3 or 19) never had a full
+    neighboring triple on both sides, so it must never be reported as an
+    interior minimum.
+
+    Raises
+    ------
+    ValueError
+        If *c1* is outside ``3..19``.
+    """
+
+    if not 3 <= c1 <= 19:
+        raise ValueError(f"c1 must be in 3..19, got {c1}")
+    return c1 not in (3, 19)
+
+
 def select_pilot_basin_ordinal(stream0_w_by_ordinal: Mapping[int, float]) -> tuple[int, dict[int, float]]:
     """Return ``(c1, triple_means)`` -- the SEL step (pilot-plan-r3-20261110 (a)).
 
@@ -892,6 +911,7 @@ __all__ = [
     "enable_readout_trajectory_generator",
     "evaluation_config",
     "gpu_route_g_eval_seed",
+    "is_interior_minimum",
     "load_yaml",
     "pilot_eval_seed",
     "pilot_stage1_grid",

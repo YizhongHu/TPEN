@@ -849,6 +849,11 @@ def build_selection_record(
     Stage 2 refuses unless its own B1 receipt sha256 matches this record's
     ``b1_eval_receipt_sha256`` and ``3 <= c1 <= 19``
     (:func:`verify_selection_record`).
+
+    Operator ruling (operator-rulings-pilot-20261110-1900, item 3):
+    ``interior_minimum`` is ``False`` when *c1* is at the window edge (3 or
+    19) -- there is no full neighboring triple on both sides, so stage 2
+    still runs (the window is defined) but the record itself says so.
     """
 
     if not 3 <= c1 <= 19:
@@ -857,6 +862,7 @@ def build_selection_record(
         "c1": c1,
         "triple_means": {str(center): mean for center, mean in triple_means.items()},
         "b1_eval_receipt_sha256": b1_eval_receipt_sha256,
+        "interior_minimum": protocol.is_interior_minimum(c1),
     }
 
 
