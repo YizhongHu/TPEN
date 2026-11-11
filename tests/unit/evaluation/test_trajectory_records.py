@@ -24,13 +24,14 @@ def _artifact(
     values: torch.Tensor,
     *,
     name: str = "trajectory.csv",
+    nucleus_free: bool = False,
     atomic_configuration: AtomicConfiguration | None = None,
 ) -> TrajectoryRecordArtifact:
     values = values.to(torch.float64)
     n_draws, n_walkers = values.shape
     positions = torch.zeros(n_draws, n_walkers, 1, 3, dtype=torch.float64)
     atoms = atomic_configuration
-    if atoms is None and name != "nucleus-free.csv":
+    if atoms is None and not nucleus_free:
         atoms = AtomicConfiguration(
             positions=torch.zeros(1, 3, dtype=torch.float64),
             charges=torch.tensor([1.0], dtype=torch.float64),
@@ -113,7 +114,7 @@ def test_freshly_written_artifact_validates(tmp_path: Path) -> None:
 
 
 def test_nucleus_free_artifact_round_trips_with_explicit_absence(tmp_path: Path) -> None:
-    artifact = _artifact(tmp_path, FINITE, name="nucleus-free.csv")
+    artifact = _artifact(tmp_path, FINITE, name="nucleus-free.csv", nucleus_free=True)
 
     assert artifact.atomic_configuration is None
     metadata = _read_metadata(artifact)

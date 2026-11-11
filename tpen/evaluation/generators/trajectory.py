@@ -41,6 +41,7 @@ from tpen.evaluation.trajectory_records import (
     TrajectoryRecordStreamWriter,
 )
 from tpen.physics.hamiltonian import HamiltonianTerm, LocalEnergyResult, normalize_hamiltonian_terms
+from tpen.physics.operators import ELECTRON_NUCLEUS_COULOMB, NUCLEUS_NUCLEUS_COULOMB
 from tpen.sampling.trajectory import collect_observable_trajectory_with_diagnostics
 
 TRAJECTORY_METADATA_KEY = "observable_trajectory"
@@ -166,6 +167,16 @@ class TrajectoryMCMCGenerator:
                     )
                     if record_stream is None:
                         atoms = walkers.atomic_configuration
+                        if atoms is None and any(
+                            getattr(term, "operator_id", None)
+                            in (ELECTRON_NUCLEUS_COULOMB, NUCLEUS_NUCLEUS_COULOMB)
+                            or getattr(term, "declared_nuclear_geometry", lambda: None)() is not None
+                            for term in self.hamiltonian_terms.values()
+                        ):
+                            raise ValueError(
+                                "trajectory records cannot omit nuclear geometry for a "
+                                "Hamiltonian carrying nuclear terms or declared atoms"
+                            )
                         if self.max_samples is not None and self.max_samples < walkers.batch_size:
                             raise ValueError(
                                 "TrajectoryMCMCGenerator max_samples would truncate the final "
