@@ -322,6 +322,50 @@ def test_launch_calls_injected_runner_with_l1_resolved_config(tmp_path: Path) ->
     assert inspect.signature(launch.launch_train).parameters["runner"].default is run_from_config
 
 
+def test_launch_override_defaults_match_direct_resolution(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+
+    expected = launch._TRAIN_CONFIG.resolve_train_config(cell)
+    plan = launch.prepare_train_launch(cell, _topology(), overrides=None)
+
+    assert OmegaConf.to_container(plan.config, resolve=True) == OmegaConf.to_container(
+        expected, resolve=True
+    )
+
+
+def test_launch_forwards_pre_resolve_overrides_to_runner(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+    received: list[object] = []
+
+    def recording_runner(config: object) -> int:
+        received.append(config)
+        return 0
+
+    plan = launch.prepare_train_launch(
+        cell, _topology(), overrides=["trainer.max_steps=7"]
+    )
+    assert plan.config.runner.trainer.max_steps == 7
+    assert launch.launch_train(
+        cell,
+        _topology(),
+        runner=recording_runner,
+        overrides=["trainer.max_steps=7"],
+    ) == 0
+    assert received[0].runner.trainer.max_steps == 7
+
+
+def test_launch_forwards_resolver_owned_override_refusal(tmp_path: Path) -> None:
+    cell = _cell(tmp_path)
+
+    with pytest.raises(launch._TRAIN_CONFIG.TrainConfigResolutionError):
+        launch.launch_train(
+            cell,
+            _topology(),
+            runner=lambda _: 0,
+            overrides=["run.root=/tmp/refused"],
+        )
+
+
 @pytest.mark.parametrize(
     "shape",
     [

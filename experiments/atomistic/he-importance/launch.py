@@ -399,12 +399,25 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
 def prepare_train_launch(
     source: Any,
     topology: object | None = None,
+    *,
+    overrides: Mapping[str, Any] | Sequence[str] | None = None,
 ) -> LaunchPlan:
-    """Populate topology and resolve one source row through L1."""
+    """Populate topology and resolve one source row through L1.
+
+    Parameters
+    ----------
+    source : Any
+        Materialized HI cell or compatible launch source.
+    topology : object, optional
+        Runtime execution topology supplied by the caller.
+    overrides : mapping or sequence of str, optional
+        Operational overlays applied by the resolver before configuration
+        readback. ``None`` preserves the default resolved configuration.
+    """
 
     facts = execution_topology_facts(topology) if topology is not None else {}
     cell = populate_execution_topology(source, facts)
-    config = _TRAIN_CONFIG.resolve_train_config(cell)
+    config = _TRAIN_CONFIG.resolve_train_config(cell, overrides=overrides)
     return LaunchPlan(cell=cell, config=config, topology=cell.manifest[_STAGE_API.TOPOLOGY_KEY])
 
 
@@ -422,6 +435,7 @@ def launch_train(
     *,
     runner: Callable[..., object] = run_from_config,
     runtime_callbacks: Sequence[object] = (),
+    overrides: Mapping[str, Any] | Sequence[str] | None = None,
 ) -> int:
     """Resolve one topology-bound row and execute TPEN's production runner.
 
@@ -444,6 +458,9 @@ def launch_train(
     runtime_callbacks : sequence of object, optional
         Operational observers appended after configured callbacks. A non-empty
         sequence is refused when the runner cannot accept this keyword.
+    overrides : mapping or sequence of str, optional
+        Operational overlays applied by the resolver before configuration
+        readback. ``None`` preserves the default resolved configuration.
 
     Returns
     -------
@@ -457,7 +474,7 @@ def launch_train(
     """
 
     facts = execution_topology_facts(topology) if topology is not None else {}
-    plan = prepare_train_launch(source, facts)
+    plan = prepare_train_launch(source, facts, overrides=overrides)
     if topology is not None:
         # Topology is caller-open, so config-only runners retain extra facts.
         # Strict key rejection remains below when the mapping crosses into TPEN.
