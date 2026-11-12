@@ -1029,6 +1029,53 @@ def _config_leaves(value: Any, prefix: str = "") -> dict[str, Any]:
     return {prefix: value}
 
 
+def _select_container_path(container: Any, path: str) -> Any:
+    """Walk ``path`` (dotted) through a plain mapping, or a missing sentinel."""
+
+    node = container
+    for part in path.split("."):
+        if not isinstance(node, Mapping) or part not in node:
+            return _MISSING_CONFIG_VALUE
+        node = node[part]
+    return node
+
+
+def _overlay_node_is_identity(existing: Any, declared: Any) -> bool:
+    """Type-sensitive, node-complete comparison for overlay admission (R3.3).
+
+    An overlay is a no-op only when its declared value is identical to the
+    value it would replace -- not merely ``==`` to it. Two defects in a
+    plain ``==``/flattened-leaf comparison are closed here:
+
+    - ``_config_leaves`` drops empty mappings entirely (nothing to recurse
+      into), so ``declared_overlays={"trainer.max_steps": {}}`` produced no
+      leaves at all and bypassed a flattened-leaf guard outright, while still
+      being applied verbatim -- replacing a scalar with an empty mapping, a
+      real config change. Comparing whole nodes, mapping identity included,
+      catches this: an empty mapping is identical only to another empty
+      mapping, never to a non-mapping existing value.
+    - Python's ``==`` treats ``5 == 5.0`` and ``False == 0`` as true, but
+      replacing an int leaf with an equal float (or a bool with an equal
+      int) still changes the serialized, type-tagged configuration. Both are
+      refused here even though a bare ``==`` would have called them
+      identical.
+    """
+
+    if isinstance(existing, Mapping) or isinstance(declared, Mapping):
+        if not isinstance(existing, Mapping) or not isinstance(declared, Mapping):
+            return False
+        if set(existing) != set(declared):
+            return False
+        return all(
+            _overlay_node_is_identity(existing[key], declared[key]) for key in existing
+        )
+    if isinstance(existing, bool) != isinstance(declared, bool):
+        return False
+    if type(existing) is not type(declared):
+        return False
+    return existing == declared
+
+
 def _is_config_path(path: str, prefixes: frozenset[str]) -> bool:
     """Return whether a leaf is a named path or one of its descendants."""
 
@@ -1096,21 +1143,31 @@ def _materialize_configured_worker_config(
     overlay_values = _config_leaves(overlays)
     source_values = _config_leaves(source)
     supplied_values = _config_leaves(supplied)
-    if artifact_destination is not None and overlay_values:
-        # (C) review-r2 R2.4: in routed mode, ANY declared overlay that would
-        # actually change a leaf's value is refused before construction --
-        # not only the automatic `run.root` overlay this gateway itself used
-        # to apply. `tpen.run`'s own closed artifact routing binds the
+    if artifact_destination is not None and overlays:
+        # (C) review-r2 R2.4, type-sensitive and node-complete (review-r3
+        # R3.3): in routed mode, ANY declared overlay that would actually
+        # change the existing node it targets is refused before construction
+        # -- not only the automatic `run.root` overlay this gateway itself
+        # used to apply. `tpen.run`'s own closed artifact routing binds the
         # physical destination; a declared overlay changing `run.root` or
-        # `trainer.max_steps` here would still change C. An overlay whose
-        # value already equals the leaf it would overwrite is a no-op and
-        # stays permitted.
-        nonidentity = {
-            path: value
-            for path, value in overlay_values.items()
-            if source_values.get(path, supplied_values.get(path, _MISSING_CONFIG_VALUE))
-            != value
-        }
+        # `trainer.max_steps` here would still change C. Each declared
+        # overlay is compared as a WHOLE node (not flattened leaves, which
+        # silently drop empty mappings) against the existing node at the
+        # same path, so an empty-mapping overlay or an int-to-float/bool
+        # replacement is refused even though a flattened, bare-`==` leaf
+        # comparison would have missed or accepted it (see
+        # :func:`_overlay_node_is_identity`). An overlay whose node already
+        # equals the one it would overwrite is a genuine no-op and stays
+        # permitted.
+        nonidentity: dict[str, Any] = {}
+        for path, declared_value in overlays.items():
+            existing = _select_container_path(source, path)
+            if existing is _MISSING_CONFIG_VALUE:
+                existing = _select_container_path(supplied, path)
+            if existing is _MISSING_CONFIG_VALUE or not _overlay_node_is_identity(
+                existing, declared_value
+            ):
+                nonidentity[path] = declared_value
         if nonidentity:
             raise ReceiptBindingError(
                 "routed configured run refuses nonidentity declared_overlays "

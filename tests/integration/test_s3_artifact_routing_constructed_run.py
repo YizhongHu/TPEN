@@ -129,6 +129,19 @@ def test_real_constructed_routed_run_preserves_c_and_resumes_byte_identically(
             if isinstance(occurrence.event, CheckpointRestored):
                 reports.append(occurrence.event.report)
 
+    # (R3.1) review-r3: runtime-sink admission is by EXACT type only, with no
+    # attribute-probe inference. `_Readback` is a test double with no
+    # production registry entry, so it must be explicitly admitted the same
+    # way a real sink-free type is -- membership in the closed registry --
+    # rather than relying on it merely lacking an output-path-shaped
+    # attribute.
+    import tpen.run as run_module
+
+    qualified_readback = f"{_Readback.__module__}.{_Readback.__qualname__}"
+    monkeypatch.setattr(
+        run_module, "_SINK_FREE_TYPES", run_module._SINK_FREE_TYPES | {qualified_readback}
+    )
+
     assert (
         run_from_config(
             second_cfg,

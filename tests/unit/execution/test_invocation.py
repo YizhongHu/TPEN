@@ -487,6 +487,87 @@ def test_c_an_identity_overlay_is_a_no_op_and_stays_permitted_when_routed(tmp_pa
     assert worker_cfg["run"]["root"] == "original"
 
 
+def test_r3_3_an_empty_mapping_overlay_is_refused_when_routed(tmp_path: Path) -> None:
+    """(R3.3) review-r3: `_config_leaves` drops empty mappings entirely, so a
+    declared overlay of `{}` produced no flattened leaves and bypassed the
+    (C) guard outright while still being applied verbatim -- replacing a
+    scalar `trainer.max_steps` with an empty mapping. Node-complete
+    comparison refuses it instead."""
+
+    from tpen.artifacts import ArtifactDestination
+    from tpen.execution.invocation import ReceiptBindingError, _materialize_configured_worker_config
+
+    intent = capture_science_intent(
+        {"system": "hooke", "electrons": 2},
+        target_iterations=3,
+        source_config={"run": {"root": "original"}, "trainer": {"max_steps": 5}, "runner": {}},
+    )
+    decision = RecoveryDecision(phase=RecoveryPhase.INITIAL, outcome="initial", target_iterations=3)
+    destination = ArtifactDestination(physical_root=tmp_path / "fresh")
+
+    with pytest.raises(ReceiptBindingError, match="nonidentity declared_overlays"):
+        _materialize_configured_worker_config(
+            {"run": {"root": "original"}, "trainer": {"max_steps": 5}, "runner": {}},
+            intent=intent,
+            decision=decision,
+            output_path=tmp_path / "fresh",
+            declared_overlays={"trainer.max_steps": {}},
+            artifact_destination=destination,
+        )
+
+
+def test_r3_3_an_int_to_float_overlay_is_refused_when_routed(tmp_path: Path) -> None:
+    """(R3.3) review-r3: Python treats `5 == 5.0`, but replacing an int leaf
+    with an equal float still changes the serialized, type-tagged config."""
+
+    from tpen.artifacts import ArtifactDestination
+    from tpen.execution.invocation import ReceiptBindingError, _materialize_configured_worker_config
+
+    intent = capture_science_intent(
+        {"system": "hooke", "electrons": 2},
+        target_iterations=3,
+        source_config={"run": {"root": "original"}, "trainer": {"max_steps": 5}, "runner": {}},
+    )
+    decision = RecoveryDecision(phase=RecoveryPhase.INITIAL, outcome="initial", target_iterations=3)
+    destination = ArtifactDestination(physical_root=tmp_path / "fresh")
+
+    with pytest.raises(ReceiptBindingError, match="nonidentity declared_overlays"):
+        _materialize_configured_worker_config(
+            {"run": {"root": "original"}, "trainer": {"max_steps": 5}, "runner": {}},
+            intent=intent,
+            decision=decision,
+            output_path=tmp_path / "fresh",
+            declared_overlays={"trainer.max_steps": 5.0},
+            artifact_destination=destination,
+        )
+
+
+def test_r3_3_a_bool_for_int_overlay_is_refused_when_routed(tmp_path: Path) -> None:
+    """(R3.3) review-r3: `True == 1` in Python, but replacing an int leaf
+    with an equal bool still changes the serialized, type-tagged config."""
+
+    from tpen.artifacts import ArtifactDestination
+    from tpen.execution.invocation import ReceiptBindingError, _materialize_configured_worker_config
+
+    intent = capture_science_intent(
+        {"system": "hooke", "electrons": 2},
+        target_iterations=3,
+        source_config={"run": {"root": "original"}, "trainer": {"max_steps": 1}, "runner": {}},
+    )
+    decision = RecoveryDecision(phase=RecoveryPhase.INITIAL, outcome="initial", target_iterations=3)
+    destination = ArtifactDestination(physical_root=tmp_path / "fresh")
+
+    with pytest.raises(ReceiptBindingError, match="nonidentity declared_overlays"):
+        _materialize_configured_worker_config(
+            {"run": {"root": "original"}, "trainer": {"max_steps": 1}, "runner": {}},
+            intent=intent,
+            decision=decision,
+            output_path=tmp_path / "fresh",
+            declared_overlays={"trainer.max_steps": True},
+            artifact_destination=destination,
+        )
+
+
 def test_c_a_nonidentity_overlay_is_still_permitted_without_a_destination(tmp_path: Path) -> None:
     """(C) negative: the new routed-only refusal does not touch legacy callers."""
 

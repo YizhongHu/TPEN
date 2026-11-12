@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
-from tpen.artifacts import RunContext, write_json
+from tpen.artifacts import ArtifactRoutingError, RunContext, write_json
 from tpen.events import DomainState
 from tpen.events import Event as TypedEvent
 from tpen.events import Occurrence, Subscription
@@ -222,9 +222,31 @@ def _write_equivariance_artifact(
     step: int,
     artifact: Mapping[str, Any],
 ) -> Path:
-    """Write a failure artifact under ``root/<checker_name>/step_<step>/failure.json``."""
+    """Write a failure artifact under ``root/<checker_name>/step_<step>/failure.json``.
+
+    ``checker_name`` is derived from a checker's own, caller-controlled
+    ``name`` attribute (``_checker_base_name``), not from anything this
+    callback validates. An absolute or traversal name (for example
+    ``name="/absolute/predecessor/checks"`` or one containing ``..``) would
+    otherwise discard or escape ``root`` through plain ``Path`` joining
+    (review-r3 R3.2): a registered callback could then overwrite a file
+    outside the artifact destination without ever writing through
+    ``ArtifactManager``. The joined path is therefore checked to resolve
+    beneath ``root`` before anything is written, refusing both unsafe names
+    unconditionally -- this is a safety floor, not a routed-mode-only
+    strictness, so it applies whether or not a destination is bound.
+    """
 
     path = root / checker_name / f"step_{int(step):06d}" / "failure.json"
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ArtifactRoutingError(
+            f"RuntimeEquivariance checker name {checker_name!r} would write "
+            f"to {resolved_path!s}, outside artifact_dir {root!s}; refusing"
+        ) from exc
     write_json(path, dict(artifact))
     return path
 
