@@ -38,6 +38,7 @@ def _module(name: str):
 job = _module("run_job")
 eval_job = job.eval_job
 protocol = eval_job.protocol
+launch = _module("launch")
 
 EVAL_SHA = "e" * 40
 TRAIN_SHA = "t" * 40
@@ -150,6 +151,13 @@ def test_packed_comparator_accepts_finite_identical_pair() -> None:
         {"seed": 7, "checkpoint": 1, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5, "variance": 0.1},
         tolerance={"energy_abs": 0.0, "variance_relative": 0.0},
     )
+
+
+def test_packed_time_formula_is_derived_or_refused_when_short() -> None:
+    assert launch.derive_packed_eval_time(6) == "01:45:00"
+    assert launch.resolve_packed_eval_time(None, pack_k=6) == "01:45:00"
+    with pytest.raises(launch.LaunchError, match="shorter"):
+        launch.resolve_packed_eval_time("01:44:59", pack_k=6)
 
 
 def test_run_eval_fanout_pack_k2_publishes_overlapping_siblings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
