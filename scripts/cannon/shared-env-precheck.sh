@@ -11,30 +11,36 @@ fi
 fail() { echo "PRECHECK_FAILED $*" >&2; exit 2; }
 command -v realpath >/dev/null 2>&1 || fail "realpath required for path containment checks"
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=./shared-env-manifest.sh
+source "$SCRIPT_DIR/shared-env-manifest.sh"
+
 usage() {
   cat >&2 <<'USAGE'
 usage: shared-env-precheck.sh paths --shared-env-prefix PATH \
-         --facility-run-prefix PATH --run-root PATH
+         --facility-run-prefix PATH --run-root PATH --work-root PATH
        shared-env-precheck.sh resolve --shared-env-prefix PATH \
          --project NAME --extra NAME --python X.Y --lock-sha256 SHA256
 
 "paths": refuses if --shared-env-prefix and --facility-run-prefix are equal
-or either contains the other, or if --run-root is not inside
---facility-run-prefix, or if --run-root is inside --shared-env-prefix.
+or either contains the other, if --run-root is not inside
+--facility-run-prefix, if --run-root is inside --shared-env-prefix, or if
+--work-root is equal to or nested either way with --shared-env-prefix (a
+job's writable/deleted scratch root must never overlap the reuse-only
+shared prefix).
 
 "resolve": computes the expected reuse-only env path
 <--shared-env-prefix>/<project>-<lock-sha256[:12]>-<extra>-py<X.Y> (same
 naming as build-shared-env.sh) and refuses unless it is a real directory
 (not a symlink) whose canonical parent is exactly --shared-env-prefix, has a
-.complete manifest recording the exact --lock-sha256, and an executable
+.complete manifest recording the exact --lock-sha256 (and otherwise meeting
+the same six-field contract build-shared-env.sh writes), and an executable
 bin/python. On success prints the resolved path to stdout.
 USAGE
 }
 
 canon() { realpath -m -- "$1"; }
 canon_exist() { realpath -- "$1"; }
-
-NAME_COMPONENT_RE='^[A-Za-z0-9][A-Za-z0-9._+]*$'
 
 MODE="${1:-}"
 [[ -n "$MODE" ]] && shift || true
@@ -47,35 +53,43 @@ check_shared_env_prefix() {
   canon_prefix="$(canon_exist "$prefix")"
   [[ "$canon_prefix" == "$prefix" ]] ||
     fail "--shared-env-prefix must be canonical: given=$prefix canonical=$canon_prefix"
+  [[ "$canon_prefix" != "/" ]] ||
+    fail "--shared-env-prefix must not be the filesystem root: $prefix"
   printf '%s' "$canon_prefix"
 }
 
 case "$MODE" in
   paths)
-    SHARED_ENV_PREFIX="" FACILITY_RUN_PREFIX="" RUN_ROOT=""
+    SHARED_ENV_PREFIX="" FACILITY_RUN_PREFIX="" RUN_ROOT="" WORK_ROOT=""
     while (($#)); do
       case "$1" in
         --shared-env-prefix) SHARED_ENV_PREFIX="${2:?missing path}"; shift 2 ;;
         --facility-run-prefix) FACILITY_RUN_PREFIX="${2:?missing path}"; shift 2 ;;
         --run-root) RUN_ROOT="${2:?missing path}"; shift 2 ;;
+        --work-root) WORK_ROOT="${2:?missing path}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown argument: $1" ;;
       esac
     done
-    [[ -n "$SHARED_ENV_PREFIX" && -n "$FACILITY_RUN_PREFIX" && -n "$RUN_ROOT" ]] ||
-      fail "--shared-env-prefix, --facility-run-prefix, and --run-root are all required"
+    [[ -n "$SHARED_ENV_PREFIX" && -n "$FACILITY_RUN_PREFIX" && -n "$RUN_ROOT" && -n "$WORK_ROOT" ]] ||
+      fail "--shared-env-prefix, --facility-run-prefix, --run-root, and --work-root are all required"
     CANON_SHARED="$(check_shared_env_prefix "$SHARED_ENV_PREFIX")"
     CANON_FACILITY="$(canon "$FACILITY_RUN_PREFIX")"
     CANON_RUN_ROOT="$(canon "$RUN_ROOT")"
-    if [[ "$CANON_SHARED" == "$CANON_FACILITY" ||
-          "$CANON_SHARED" == "$CANON_FACILITY"/* ||
-          "$CANON_FACILITY" == "$CANON_SHARED"/* ]]; then
+    CANON_WORK_ROOT="$(canon "$WORK_ROOT")"
+    [[ "$CANON_FACILITY" != "/" ]] ||
+      fail "--facility-run-prefix must not be the filesystem root: $FACILITY_RUN_PREFIX"
+    if path_contains "$CANON_SHARED" "$CANON_FACILITY" || path_contains "$CANON_FACILITY" "$CANON_SHARED"; then
       fail "--shared-env-prefix and --facility-run-prefix must be disjoint: shared=$CANON_SHARED facility=$CANON_FACILITY"
     fi
-    [[ "$CANON_RUN_ROOT" == "$CANON_FACILITY" || "$CANON_RUN_ROOT" == "$CANON_FACILITY"/* ]] ||
+    path_contains "$CANON_FACILITY" "$CANON_RUN_ROOT" ||
       fail "--run-root must stay under --facility-run-prefix: run-root=$CANON_RUN_ROOT facility=$CANON_FACILITY"
-    [[ "$CANON_RUN_ROOT" != "$CANON_SHARED" && "$CANON_RUN_ROOT" != "$CANON_SHARED"/* ]] ||
+    if path_contains "$CANON_SHARED" "$CANON_RUN_ROOT"; then
       fail "--run-root must not be under --shared-env-prefix: run-root=$CANON_RUN_ROOT shared=$CANON_SHARED"
+    fi
+    if path_contains "$CANON_SHARED" "$CANON_WORK_ROOT" || path_contains "$CANON_WORK_ROOT" "$CANON_SHARED"; then
+      fail "--work-root and --shared-env-prefix must be disjoint: work-root=$CANON_WORK_ROOT shared=$CANON_SHARED"
+    fi
     exit 0
     ;;
   resolve)
@@ -100,7 +114,7 @@ case "$MODE" in
     [[ "$PYTHON_VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || fail "--python must be X.Y"
     [[ "$LOCK_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "--lock-sha256 must be 64 lowercase hex characters"
     CANON_SHARED="$(check_shared_env_prefix "$SHARED_ENV_PREFIX")"
-    ENV_NAME="${PROJECT}-${LOCK_SHA256:0:12}-${EXTRA}-py${PYTHON_VERSION}"
+    ENV_NAME="$(compute_shared_env_name "$PROJECT" "$LOCK_SHA256" "$EXTRA" "$PYTHON_VERSION")"
     TARGET="$CANON_SHARED/$ENV_NAME"
     [[ ! -L "$TARGET" ]] ||
       fail "shared env is a symlink, refusing to reuse through it: $TARGET"
@@ -112,11 +126,19 @@ case "$MODE" in
     MANIFEST="$TARGET/.complete"
     [[ -f "$MANIFEST" ]] ||
       fail "shared env has no .complete manifest, build it with build-shared-env.sh first: $TARGET"
-    MANIFEST_LOCK_LINE="$(grep -m1 '^uv_lock_sha256=' -- "$MANIFEST" || true)"
-    [[ "$MANIFEST_LOCK_LINE" =~ ^uv_lock_sha256=[0-9a-f]{64}$ ]] ||
-      fail "shared env .complete manifest has no well-formed uv_lock_sha256 field: $MANIFEST"
-    [[ "${MANIFEST_LOCK_LINE#uv_lock_sha256=}" == "$LOCK_SHA256" ]] ||
-      fail "shared env uv.lock sha256 does not match the clone's: manifest=${MANIFEST_LOCK_LINE#uv_lock_sha256=} clone=$LOCK_SHA256 path=$TARGET"
+    # Full six-field contract (manifest_is_valid, shared with the builder):
+    # catches a truncated/partial/malformed manifest the builder itself would
+    # never have published, not only a lock-hash mismatch.
+    if ! manifest_is_valid "$MANIFEST" "$LOCK_SHA256"; then
+      MANIFEST_LOCK_LINE="$(grep -m1 '^uv_lock_sha256=' -- "$MANIFEST" || true)"
+      if [[ ! "$MANIFEST_LOCK_LINE" =~ ^uv_lock_sha256=[0-9a-f]{64}$ ]]; then
+        fail "shared env .complete manifest has no well-formed uv_lock_sha256 field: $MANIFEST"
+      fi
+      if [[ "${MANIFEST_LOCK_LINE#uv_lock_sha256=}" != "$LOCK_SHA256" ]]; then
+        fail "shared env uv.lock sha256 does not match the clone's: manifest=${MANIFEST_LOCK_LINE#uv_lock_sha256=} clone=$LOCK_SHA256 path=$TARGET"
+      fi
+      fail "shared env .complete manifest is malformed or incomplete, build it with build-shared-env.sh first: $MANIFEST"
+    fi
     [[ -x "$TARGET/bin/python" ]] ||
       fail "shared env has no executable bin/python: $TARGET"
     printf '%s\n' "$TARGET"

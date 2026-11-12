@@ -88,7 +88,7 @@ CANON_JOB_SCRATCH="$(canon "/scratch/$USER/$SLURM_JOB_ID")"
 # writes there -- see shared-env-precheck.sh, called once the clone's exact
 # uv.lock sha256 is known, below).
 "$SCRIPT_DIR/shared-env-precheck.sh" paths --shared-env-prefix "$SHARED_ENV_PREFIX" \
-  --facility-run-prefix "$FACILITY_RUN_PREFIX" --run-root "$RUN_ROOT"
+  --facility-run-prefix "$FACILITY_RUN_PREFIX" --run-root "$RUN_ROOT" --work-root "$WORK_ROOT"
 
 assert_write_path() {
   local candidate canon_candidate root
@@ -186,7 +186,12 @@ for name in ("tpen", "torch", "pytest"):
     print(f"{name}={os.path.realpath(module.__file__)}")
 assert os.path.realpath(importlib.import_module("tpen").__file__).startswith(clone + os.sep)
 PYCHECK
-env -u PYTHONPATH "$PYTHON" -I - "$CLONE" >> "$RUN_ROOT/evidence/interpreter-identity.txt" 2>&1 <<'PYCHECK'
+# -I ignores PYTHONDONTWRITEBYTECODE (exported above); -B is required on
+# every isolated invocation that imports from the shared, reuse-only env, or
+# a writable/stale shared env gets __pycache__/.pyc writes during this probe
+# that assert_write_path cannot intercept (interpreter-internal writes, not
+# shell redirects).
+env -u PYTHONPATH "$PYTHON" -I -B - "$CLONE" >> "$RUN_ROOT/evidence/interpreter-identity.txt" 2>&1 <<'PYCHECK'
 import importlib, os, sys
 clone = os.path.realpath(sys.argv[1])
 for name in ("tpen", "torch", "pytest"):

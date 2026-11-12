@@ -115,25 +115,45 @@ prefix) and delegates resolution/validation to
 `scripts/cannon/shared-env-precheck.sh`, in two steps:
 
 1. **`paths`** (before any write): refuses if `SHARED_ENV_PREFIX` and
-   `FACILITY_RUN_PREFIX` are equal or either contains the other, or if
-   `RUN_ROOT` is not inside `FACILITY_RUN_PREFIX`, or if `RUN_ROOT` is inside
-   `SHARED_ENV_PREFIX`. A shared, reuse-only env root must never overlap a
-   run's own writable area.
+   `FACILITY_RUN_PREFIX` are equal or either contains the other, if
+   `RUN_ROOT` is not inside `FACILITY_RUN_PREFIX`, if `RUN_ROOT` is inside
+   `SHARED_ENV_PREFIX`, or if `WORK_ROOT` (the job's own writable/deleted
+   scratch root) is equal to or nested either way with `SHARED_ENV_PREFIX`.
+   A shared, reuse-only env root must never overlap a run's own writable
+   area, in either direction, including the area the job's `EXIT` trap
+   recursively deletes. `SHARED_ENV_PREFIX` is also refused outright if it
+   canonicalizes to the filesystem root (`/`), and every containment check
+   here uses one root-aware helper so a literal `/` on the other side of a
+   comparison can't defeat it either.
 2. **`resolve`** (once the clone's exact `uv.lock` sha256 is known): computes
    the expected env path
    `SHARED_ENV_PREFIX/<project>-<sha256(uv.lock)[:12]>-<extra>-py<X.Y>` — the
-   same deterministic naming `build-shared-env.sh` uses — and refuses unless
+   same deterministic naming `build-shared-env.sh` uses, via a helper shared
+   between the two scripts (`shared-env-manifest.sh`) — and refuses unless
    it is a real directory (not a symlink) whose canonical parent is exactly
-   `SHARED_ENV_PREFIX`, carries a `.complete` manifest whose `uv_lock_sha256`
-   field equals the clone's full sha256, and has an executable `bin/python`.
-   On any refusal the message names the missing/invalid path and tells the
-   operator to build it first with `build-shared-env.sh`.
+   `SHARED_ENV_PREFIX`, carries a `.complete` manifest matching the same
+   six-field contract `build-shared-env.sh` writes (not just a matching
+   `uv_lock_sha256` line) whose hash equals the clone's full sha256, and has
+   an executable `bin/python`. On any refusal the message names the
+   missing/invalid path and tells the operator to build it first with
+   `build-shared-env.sh`.
 
 On success, the resolved path and a copy of its `.complete` manifest are
 recorded into evidence (`shared-env-path.txt`, `shared-env-manifest.txt`); the
 job-local overlay's `.pth` then points at that path's `site-packages`, same as
 before. `SHARED_ENV_PREFIX` is never added to `verify.sh`'s own write-path
-containment roots — this script has no write access there at all.
+containment roots — this script has no write access there at all. The one
+isolated (`-I`) Python invocation that imports from the shared env also
+passes `-B`: `-I` ignores `PYTHONDONTWRITEBYTECODE`, so without `-B` a
+writable or cold shared env would get `__pycache__`/`.pyc` writes during that
+probe that `assert_write_path` cannot see (they are interpreter-internal, not
+shell redirects).
+
+`shared-env-manifest.sh` holds the naming (`compute_shared_env_name`) and
+manifest-validation (`manifest_is_valid`) logic both `build-shared-env.sh` and
+`shared-env-precheck.sh` need; each sources it from its own `SCRIPT_DIR`
+(never from the target clone under verification), so the two scripts cannot
+drift into accepting or naming environments differently.
 
 ## build-shared-env.sh — capped builder for shared immutable uv environments
 
