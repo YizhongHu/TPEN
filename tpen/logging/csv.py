@@ -20,6 +20,19 @@ class CSV(Logger):
         self.path = Path(path)
         self._wrote_header = self.path.exists() and self.path.stat().st_size > 0
 
+    def rebind_path(self, path: str | Path) -> None:
+        """Rebind this logger's physical output path and header state.
+
+        A plain ``setattr`` of ``path`` after construction would leave
+        ``_wrote_header`` bound to the OLD file: if that file is a populated
+        predecessor metrics file, the new, empty physical file would then
+        have its header silently omitted. This re-derives both from the
+        new path.
+        """
+
+        self.path = Path(path)
+        self._wrote_header = self.path.exists() and self.path.stat().st_size > 0
+
     def log(self, record: LogRecord) -> None:
         """Append one row per scalar metric."""
 
