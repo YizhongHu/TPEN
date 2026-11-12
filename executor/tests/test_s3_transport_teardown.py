@@ -63,10 +63,15 @@ S3C_MUTANT_TABLE = (
     },
     {
         "id": "M3", "target": PARSL_MODULE,
-        "old": "                    acknowledged = handle.wait_for_teardown(max(remote_deadline - time.monotonic(), 0))\n",
-        "new": "                    acknowledged = handle.wait_for_teardown(float(getattr(self.transport, \"teardown_timeout\", 30)))\n",
+        "old": "            self._cancel_slot_pool(active, lifecycle, cancellation)\n            raise\n",
+        "new": (
+            "            if self._active_dfk is not None:\n"
+            "                self._active_dfk.cleanup()\n"
+            "            self._cancel_slot_pool(active, lifecycle, cancellation)\n"
+            "            raise\n"
+        ),
         "killer": "test_dispatcher_cancel_settles_every_leaf_before_dfk_cleanup",
-        "suite": "executor", "assertion": "every live remote leaf waits against one shared deadline, never its own fresh bound; proven by event-controlled finish/cleanup ordering, not only a wall-clock bound",
+        "suite": "executor", "assertion": "DFK cleanup never starts before every live remote leaf (ack inside the bound or bounded-unconfirmed) is settled; proven by event-controlled finish/cleanup ordering, not a wall-clock bound that an early-but-still-waiting cleanup could still pass",
     },
     {
         "id": "M4", "target": PARSL_MODULE,
@@ -97,6 +102,13 @@ S3C_MUTANT_TABLE = (
         "killer": "test_cancel_during_science_reaps_local_child_group",
         "suite": "executor", "assertion": "the leaf actually watches for its cancel marker; a leaf that never does so ignores cancellation and keeps running past the bound",
     },
+    {
+        "id": "M7", "target": PARSL_MODULE,
+        "old": "                    acknowledged = handle.wait_for_teardown(max(remote_deadline - time.monotonic(), 0))\n",
+        "new": "                    acknowledged = handle.wait_for_teardown(float(getattr(self.transport, \"teardown_timeout\", 30)))\n",
+        "killer": "test_dispatcher_cancel_waits_one_shared_deadline_across_remote_leaves",
+        "suite": "executor", "assertion": "every live remote leaf waits against one shared deadline, never its own fresh bound (timing control, kept per review alongside the M3 ordering control)",
+    },
 )
 
 
@@ -105,7 +117,7 @@ def test_s3c_mutant_table_targets_unique_executable_anchors() -> None:
 
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
-    assert [row["id"] for row in S3C_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M5", "M6"]
+    assert [row["id"] for row in S3C_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M5", "M6", "M7"]
     for row in S3C_MUTANT_TABLE:
         source = (root / row["target"]).read_text(encoding="utf-8")
         assert source.count(row["old"]) == 1, row
@@ -403,11 +415,16 @@ def test_dispatcher_cancel_settles_every_leaf_before_dfk_cleanup(
 
     ack_gate = threading.Event()
 
-    def dispatching_hook(_index, function, args, kwargs):
+    def dispatching_hook(_index, _function, args, _kwargs):
         request = LeafRequest.decode(args[0])
         if request.task_id == "acking":
             ack_gate.wait(5)
-            return function(*args, **kwargs)
+            # A synthetic, already-valid result: real run_leaf would race
+            # the marker request_cancel() writes against this hook's own
+            # release timing (whether it sees the marker before/after
+            # spawning science is nondeterministic and not what this test
+            # is about -- only finish/cleanup ORDER is).
+            return _synthetic_result(request).encode()
         threading.Event().wait()  # "stuck": never acks
 
     fake_parsl.hooks["run_leaf"] = dispatching_hook
