@@ -67,6 +67,7 @@ from .balsam import (
 
 from .recovery import (
     CheckpointEvidence,
+    OperationalRestoreRequest,
     RecoveryDecision,
     RecoveryOutcome,
     RecoveryPhase,
@@ -113,6 +114,7 @@ __all__ = [
     "EXECUTION_CONFIG_SCHEMA",
     "ExecutionConfig",
     "InvocationReceipt",
+    "OperationalRestoreRequest",
     "READY_BATCH_SCHEMA",
     "RecoveryDecision",
     "RecoveryOutcome",

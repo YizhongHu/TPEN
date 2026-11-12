@@ -61,6 +61,13 @@ class Train(Runner):
         self.optimizer = optimizer
         self.trainer = trainer
         self.load = load
+        # Set only by ``tpen.run._apply_operational_restore`` (an
+        # ``OperationalRestoreRequest``, never configured directly): when
+        # present, ``run`` revalidates its selected checkpoint reference
+        # immediately before restore and binds the restored live trainer
+        # counters to it before `fit`. Absent for every configured run that
+        # does not pass a typed restore request.
+        self.restore_binding = None
 
     def run(self, context: RunContext) -> RunResult:
         """Build the optimizer and run the configured VMC training loop."""
@@ -119,6 +126,13 @@ class Train(Runner):
         if mode == "model_only":
             raise ValueError("Train rejects load.mode='model_only'; use train_resume")
         if mode == "train_resume":
+            if self.restore_binding is not None:
+                # Revalidate the exact selected checkpoint immediately before
+                # mutable restore: a compatible replacement landing after
+                # request construction would otherwise pass this restore
+                # unnoticed, since the loader below only checks the bytes
+                # currently on disk (R2.3).
+                self.restore_binding.ref.validate()
             report = restore_checkpoint_with_events(
                 load=self.load,
                 model=self.model,
@@ -134,6 +148,25 @@ class Train(Runner):
                 # direct updater binding against these live model parameters
                 # before exposing the successful restore or entering fit.
                 rebuild_update_state(model=self.model)
+            if self.restore_binding is not None:
+                # Bind restored live progress to the selected request before
+                # `fit`: the manifest-derived report alone cannot establish
+                # that the actual restored trainer counters -- which is what
+                # `fit` steps from -- agree with the selected checkpoint.
+                live_next_iteration = getattr(self.trainer, "next_iteration", None)
+                live_completed_updates = getattr(self.trainer, "completed_updates", None)
+                if (
+                    live_next_iteration != self.restore_binding.next_iteration
+                    or live_completed_updates != self.restore_binding.completed_updates
+                ):
+                    raise ValueError(
+                        "restored live trainer counters "
+                        f"(next_iteration={live_next_iteration!r}, "
+                        f"completed_updates={live_completed_updates!r}) do not match "
+                        "the selected operational restore request "
+                        f"(next_iteration={self.restore_binding.next_iteration!r}, "
+                        f"completed_updates={self.restore_binding.completed_updates!r})"
+                    )
             context.emit(CheckpointRestored(report=report))
 
         context.emit(TrainingStarted())

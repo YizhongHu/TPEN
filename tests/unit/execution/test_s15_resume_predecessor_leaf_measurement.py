@@ -22,24 +22,30 @@ indexless fixtures used by ``tests/unit/execution/test_r6_phase_a_publication.py
     repair.
 
 Every case asserts the predecessor leaf's file set, content hashes, and
-mtimes are unchanged by discovery. Measured on FASRC Cannon (job 59737433,
-partition ``test``, quick mode, head b73d686f2bc7e8b4973ac0d9c77e43ebe46a472f):
-cases (a) and (b) are RED, case (c) is GREEN.
+mtimes are unchanged by discovery. Originally measured on FASRC Cannon (job
+59737433, partition ``test``, quick mode, head
+b73d686f2bc7e8b4973ac0d9c77e43ebe46a472f): cases (a) and (b) were RED, case
+(c) was GREEN.
 
-- (a) healthy, fully-indexed leaf: ``_committed_checkpoint`` still
-  unconditionally rewrites ``checkpoints/latest.json`` (new mtime/inode;
-  measured content hash was unchanged on this run, but the write is not
-  conditioned on any comparison that this test can rely on being a no-op).
+- (a) healthy, fully-indexed leaf: ``_committed_checkpoint`` used to
+  unconditionally rewrite ``checkpoints/latest.json`` (new mtime/inode;
+  measured content hash was unchanged on this run, but the write was not
+  conditioned on any comparison that this test could rely on being a no-op).
 - (b) indexless leaf (indexes missing, modeling an allocation interrupted
-  before its index write landed): reconciliation creates the missing
+  before its index write landed): reconciliation used to create the missing
   ``publications.jsonl``, ``latest.json``, and publication receipt files.
 - (c) corrupt catalog: ``read_publications`` raises ``ValueError`` before
   ``reconcile_publication`` is ever reached, so the leaf is untouched while
   refusing.
 
-(a) and (b) are kept failing (``xfail(strict=True)``) as the measured
-evidence for H1, not fixed here -- product-code changes are out of scope for
-this slice.
+S2 (item 4023abbb) fixes (a) and (b): ``_committed_checkpoint`` defaults to a
+strictly read-only selection (``allow_reconcile=False``); only a caller that
+still owns the leaf may pass ``allow_reconcile=True`` to reconcile. Case (a)
+below is no longer ``xfail``. Per the H1 addendum, read-only discovery must
+refuse rather than silently accept an indexless predecessor, so case (b) is
+no longer ``xfail`` either, but now asserts a typed
+``PredecessorDiscoveryRefusal`` instead of acceptance; the owning allocation
+may still repair it via ``allow_reconcile=True``.
 """
 
 from __future__ import annotations
@@ -93,14 +99,6 @@ def _snapshot_leaf(run_dir: Path) -> dict[Path, tuple[str, int]]:
     }
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "H1 measured: successor discovery rewrites checkpoints/latest.json "
-        "in a sealed predecessor leaf even when the leaf is already fully "
-        "indexed (new mtime/inode on every discovery call); fix in S2 (item TBD)"
-    ),
-)
 def test_s15_healthy_predecessor_leaf_is_byte_identical_after_discovery(tmp_path):
     """Case (a): a fully-indexed sealed leaf. Discovery must not rewrite it."""
 
@@ -118,34 +116,26 @@ def test_s15_healthy_predecessor_leaf_is_byte_identical_after_discovery(tmp_path
     assert after == before, "discovery mutated a fully-indexed sealed predecessor leaf"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "H1 measured: successor discovery writes into predecessor leaf "
-        "(reconcile_publication backfills the missing catalog/latest/receipt "
-        "when pointed at an indexless sealed leaf); fix in S2 (item TBD)"
-    ),
-)
 def test_s15_indexless_predecessor_leaf_is_byte_identical_after_discovery(tmp_path):
     """Case (b): a committed checkpoint whose indexes never landed (an
-    allocation interrupted before publication). Discovery reconciles -- and
-    in doing so writes into the sealed leaf.
+    allocation interrupted before publication). Read-only discovery must
+    refuse with a typed outcome, touching nothing in the sealed leaf.
     """
 
     from tpen.checkpoint.catalog import PUBLICATION_CATALOG_FILENAME
-    from tpen.execution.invocation import _committed_checkpoint
+    from tpen.execution.invocation import PredecessorDiscoveryRefusal, _committed_checkpoint
 
     root = tmp_path / "predecessor-run"
-    newest = _save(root, 2)
-    (newest.parent / PUBLICATION_CATALOG_FILENAME).unlink()
-    (newest.parent / "latest.json").unlink()
+    committed = _save(root, 2)
+    (committed.parent / PUBLICATION_CATALOG_FILENAME).unlink()
+    (committed.parent / "latest.json").unlink()
 
     before = _snapshot_leaf(root)
-    selected = _committed_checkpoint(root)
+    with pytest.raises(PredecessorDiscoveryRefusal):
+        _committed_checkpoint(root)
     after = _snapshot_leaf(root)
 
-    assert selected is not None and selected.checkpoint_dir == newest
-    assert after == before, "discovery mutated an indexless sealed predecessor leaf"
+    assert after == before, "refused discovery mutated an indexless sealed predecessor leaf"
 
 
 def test_s15_corrupt_predecessor_catalog_refuses_without_mutation(tmp_path):

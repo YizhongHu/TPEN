@@ -329,8 +329,10 @@ def test_run_configured_once_keeps_legacy_return_and_applies_only_worker_overlay
     assert run_configured_once(cfg, decision=decision, output_path=tmp_path / "fresh", command="worker") == 17
     assert len(calls) == 1
     assert calls[0][0].run.root == str(tmp_path / "fresh")
+    # An INITIAL decision carries no load: cfg.runner.load is left exactly as
+    # configured (no config-patch), and no restore request is passed through.
     assert calls[0][0].runner.load is None
-    assert calls[0][1] == {"command": "worker"}
+    assert calls[0][1] == {"command": "worker", "restore_request": None}
 
 
 def _write_core_completion_artifacts(output_path: Path, *, next_iteration: int = 3, completed_updates: int = 3) -> None:
