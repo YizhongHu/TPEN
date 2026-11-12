@@ -422,6 +422,49 @@ def test_recording_accepts_matching_particle_context() -> None:
     assert result.receipt.system_id == descriptor.system_id()
 
 
+def test_recording_rejects_wrong_particles_in_delegate_context() -> None:
+    # review-r3 narrow-check RED test: test_recording_rejects_particle_context_mismatch
+    # above only exercises the wrapper's own make_context boundary. A context
+    # built directly from the delegate's make_context -- the exact calling
+    # pattern test_recording_adapter_preserves_naive_arithmetic_bit_identical
+    # below already uses -- must still be rejected by evaluate() when its
+    # batch disagrees with the bound SystemDescriptor's particle.
+    delegate = NaiveLocalEnergyEvaluator()
+    evaluator = RecordingLocalEnergyEvaluator(delegate, system=_descriptor())  # 1e descriptor
+    batch = ElectronBatch(positions=torch.ones(2, 2, 3, dtype=_DTYPE))  # 2e batch
+    context = delegate.make_context(GaussianOutputModel(alpha=0.5), batch)
+
+    with pytest.raises(ValueError):
+        evaluator.evaluate(_terms(), context, return_terms=True)
+
+
+def test_recording_accepts_permuted_singlet_spin_sector() -> None:
+    # review-r3 narrow-check GREEN companion: spin sector is a per-configuration
+    # up/down *count*, not a fixed electron ordering. ElectronBatch.permute
+    # jointly permutes positions and spins, so [-1, +1] is the same singlet
+    # sector as [+1, -1] and must be accepted; [+1, +1] must still be rejected.
+    particle = ParticleSpec(n_electrons=2, n_spin_up=1, n_spin_down=1, spatial_dim=3)
+    terms = {"kinetic": KineticEnergy(), "electron_electron": ElectronElectronInteraction()}
+    descriptor = build_system_descriptor(particle, terms)
+    evaluator = RecordingLocalEnergyEvaluator(NaiveLocalEnergyEvaluator(), system=descriptor)
+
+    reordered = ElectronBatch(
+        positions=torch.ones(2, 2, 3, dtype=_DTYPE),
+        spins=torch.tensor([[-1.0, 1.0], [-1.0, 1.0]], dtype=_DTYPE),
+    )
+    context = evaluator.make_context(GaussianOutputModel(alpha=0.5), reordered)
+    result = evaluator.evaluate(terms, context, return_terms=True)
+    assert isinstance(result, LocalEnergyResult)
+    assert result.receipt is not None
+
+    triplet_like = ElectronBatch(
+        positions=torch.ones(2, 2, 3, dtype=_DTYPE),
+        spins=torch.tensor([[1.0, 1.0], [1.0, 1.0]], dtype=_DTYPE),
+    )
+    with pytest.raises(ValueError):
+        evaluator.make_context(GaussianOutputModel(alpha=0.5), triplet_like)
+
+
 def test_recording_adapter_preserves_naive_arithmetic_bit_identical() -> None:
     terms = _terms()
     model = GaussianOutputModel(alpha=0.5)
