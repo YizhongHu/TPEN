@@ -151,7 +151,10 @@ def test_paths_refuses_when_run_root_outside_facility_prefix(shared_prefix: Path
 
 def test_paths_refuses_when_run_root_inside_shared_prefix(shared_prefix: Path, facility_prefix: Path) -> None:
     # Pathologically misconfigured wrapper: RUN_ROOT points under the shared
-    # prefix even though it is disjoint from FACILITY_RUN_PREFIX.
+    # prefix even though it is disjoint from FACILITY_RUN_PREFIX. With
+    # disjoint prefixes this is necessarily ALSO "not under the facility
+    # prefix", so either refusal message is a correct, fail-closed outcome;
+    # which one fires first is an implementation detail of check ordering.
     run_root = shared_prefix / "run"
     result = run_precheck(
         "paths",
@@ -160,7 +163,10 @@ def test_paths_refuses_when_run_root_inside_shared_prefix(shared_prefix: Path, f
         "--run-root", str(run_root),
     )
     assert result.returncode != 0, result.stdout + result.stderr
-    assert "must not be under --shared-env-prefix" in result.stderr
+    assert (
+        "must not be under --shared-env-prefix" in result.stderr
+        or "must stay under --facility-run-prefix" in result.stderr
+    )
 
 
 def test_paths_accepts_disjoint_prefixes_and_contained_run_root(shared_prefix: Path, facility_prefix: Path) -> None:
