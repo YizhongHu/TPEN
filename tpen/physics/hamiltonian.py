@@ -23,6 +23,7 @@ import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclasses_replace
 from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
 import torch
@@ -37,6 +38,7 @@ from tpen.physics.operators import (
     declared_operator_geometry,
     is_registered_operator,
 )
+from tpen.physics.receipt import ExecutionReceipt
 
 
 @dataclass
@@ -60,12 +62,19 @@ class LocalEnergyResult:
         [batch, n_electrons]. The aggregate evaluator permits at most one
         producing term and carries it alongside the wavefunction output so
         diagnostics reuse the same differentiated model evaluation.
+    receipt : ExecutionReceipt or None, optional
+        The declared execution receipt of the evaluator that actually
+        produced this result, when that evaluator implements
+        `DeclaresExecutionReceipt` and was wrapped by
+        `RecordingLocalEnergyEvaluator`. ``None`` for an evaluator that does
+        not record a receipt.
     """
 
     total: torch.Tensor
     terms: dict[str, torch.Tensor] = field(default_factory=dict)
     wavefunction_output: WavefunctionOutput | None = None
     per_electron_kinetic: torch.Tensor | None = None
+    receipt: ExecutionReceipt | None = None
 
 
 def normalize_hamiltonian_terms(
@@ -294,6 +303,115 @@ class NaiveLocalEnergyEvaluator(LocalEnergyEvaluator[NaiveLocalEnergyContext]):
                 per_electron_kinetic=per_electron_kinetic,
             )
         return total
+
+    def describe_execution_receipt(
+        self,
+        terms: Mapping[Any, Any] | Sequence[Any],
+        system_id: str,
+    ) -> ExecutionReceipt:
+        """Declare the naive reference's execution receipt for ``terms``.
+
+        Every normalized term with a declared `OperatorId` owns its own
+        single-term contribution in the manifest; a term with no declared
+        identity (an unregistered, protocol-only term) is excluded from the
+        manifest, matching this evaluator's open term protocol.
+        """
+
+        normalized = normalize_hamiltonian_terms(terms)
+        manifest: dict[OperatorId, list[str]] = {}
+        for name, term in normalized.items():
+            operator_id = _declared_operator_id(term)
+            if operator_id is None:
+                continue
+            manifest.setdefault(operator_id, []).append(name)
+        if not manifest:
+            raise ValueError(
+                "naive local-energy execution receipt requires at least one term with a "
+                "declared OperatorId"
+            )
+        return ExecutionReceipt(
+            system_id=system_id,
+            implementation=f"{type(self).__module__}.{type(self).__qualname__}",
+            version=1,
+            numerical_policy={
+                "term_order": "configured_declaration_order",
+                "accumulation": "sequential_sum",
+            },
+            manifest={operator_id: tuple(names) for operator_id, names in manifest.items()},
+        )
+
+
+@runtime_checkable
+class DeclaresExecutionReceipt(Protocol):
+    """Protocol for an evaluator that can declare its own execution receipt.
+
+    Declared, never inferred: `RecordingLocalEnergyEvaluator` requires this
+    capability on its delegate, so a requested evaluator that cannot declare
+    a receipt fails loudly at wrap time instead of silently being given
+    another evaluator's receipt.
+    """
+
+    def describe_execution_receipt(
+        self,
+        terms: Mapping[Any, Any] | Sequence[Any],
+        system_id: str,
+    ) -> ExecutionReceipt:
+        """Return this evaluator's declared execution receipt for ``terms``."""
+        ...
+
+
+class RecordingLocalEnergyEvaluator(LocalEnergyEvaluator[ContextT]):
+    """Narrow adapter: delegate evaluation unchanged, then attach a receipt.
+
+    Wraps one evaluator that also implements `DeclaresExecutionReceipt`.
+    `make_context`, `validate_for_generator`, and `evaluate` are pure
+    pass-throughs to the delegate; arithmetic, tensor ordering, and
+    decomposition are exactly the delegate's. The only added behavior is
+    binding the delegate's declared `ExecutionReceipt` to a decomposed
+    result. A scalar-tensor result (``return_terms=False``) has no typed
+    place to carry a receipt and is returned unchanged.
+    """
+
+    def __init__(self, delegate: LocalEnergyEvaluator[ContextT], *, system_id: str) -> None:
+        if not isinstance(delegate, DeclaresExecutionReceipt):
+            raise TypeError(
+                f"{type(delegate).__name__} does not implement DeclaresExecutionReceipt; "
+                "a requested evaluator that cannot declare its own execution receipt is "
+                "never wrapped to silently receive another evaluator's receipt"
+            )
+        if not system_id or not system_id.strip():
+            raise ValueError("RecordingLocalEnergyEvaluator requires a non-empty system_id")
+        self._delegate = delegate
+        self._system_id = system_id
+
+    def make_context(self, wavefunction: object, batch: ElectronBatch) -> ContextT:
+        return self._delegate.make_context(wavefunction, batch)
+
+    def validate_for_generator(
+        self,
+        terms: Mapping[Any, Any] | Sequence[Any],
+        wavefunction: object,
+        generator: object,
+    ) -> None:
+        self._delegate.validate_for_generator(terms, wavefunction, generator)
+
+    def evaluate(
+        self,
+        terms: Mapping[Any, Any] | Sequence[Any],
+        context: ContextT,
+        *,
+        return_terms: bool = False,
+    ) -> torch.Tensor | LocalEnergyResult:
+        result = self._delegate.evaluate(terms, context, return_terms=return_terms)
+        if not return_terms:
+            return result
+        if not isinstance(result, LocalEnergyResult):
+            raise TypeError(
+                f"{type(self._delegate).__name__}.evaluate(return_terms=True) must return "
+                "LocalEnergyResult"
+            )
+        receipt = self._delegate.describe_execution_receipt(terms, self._system_id)
+        return dataclasses_replace(result, receipt=receipt)
 
 
 class AnalyticCuspEvaluator(LocalEnergyEvaluator[AnalyticCuspContext]):
@@ -712,6 +830,8 @@ def evaluate_local_energy_in_chunks(
     term_order: tuple[str, ...] | None = None
     captured_wavefunction = False
     captured_per_electron_kinetic = False
+    captured_receipt: ExecutionReceipt | None = None
+    receipt_captured = False
     selected_evaluator = _NAIVE_EVALUATOR if evaluator is None else evaluator
     for start in range(0, batch_size, size):
         chunk = slice_flat_batch(flat, start, min(start + size, batch_size))
@@ -744,6 +864,14 @@ def evaluate_local_energy_in_chunks(
                 captured_per_electron_kinetic = True
                 per_electron_kinetic_chunks.append(
                     result.per_electron_kinetic.detach()
+                )
+            if not receipt_captured:
+                captured_receipt = result.receipt
+                receipt_captured = True
+            elif result.receipt != captured_receipt:
+                raise ValueError(
+                    "chunked local-energy execution receipt disagreed between chunks: "
+                    f"{captured_receipt!r} != {result.receipt!r}"
                 )
         else:
             if not isinstance(result, torch.Tensor):
@@ -782,6 +910,7 @@ def evaluate_local_energy_in_chunks(
         terms={name: torch.cat(chunks, dim=0) for name, chunks in term_chunks.items()},
         wavefunction_output=wavefunction_output,
         per_electron_kinetic=per_electron_kinetic,
+        receipt=captured_receipt,
     )
 
 
@@ -940,12 +1069,14 @@ def _summarize_values(prefix: str, values: torch.Tensor) -> dict[str, Any]:
 
 __all__ = [
     "HamiltonianTerm",
+    "DeclaresExecutionReceipt",
     "LocalEnergyEvaluator",
     "LocalEnergyResult",
     "AnalyticCuspContext",
     "AnalyticCuspEvaluator",
     "NaiveLocalEnergyContext",
     "NaiveLocalEnergyEvaluator",
+    "RecordingLocalEnergyEvaluator",
     "evaluate_local_energy_in_chunks",
     "local_energy",
     "normalize_hamiltonian_terms",
