@@ -463,14 +463,18 @@ def test_verify_sh_every_isolated_invocation_passes_dash_b() -> None:
         assert "-B" in line, f"isolated invocation missing -B (bytecode writes into shared env possible): {line}"
 
 
+ISOLATED_IMPORT_SNIPPET = "import sys; sys.path.insert(0, sys.argv[1]); import coldmod"
+
+
 def test_isolated_cold_import_without_dash_b_writes_bytecode(tmp_path: Path) -> None:
-    # Establishes the failure mode -B fixes: red without it.
+    # Establishes the failure mode -B fixes: red without it. -I disables
+    # PYTHONPATH too, so the site-packages dir is injected via sys.path in
+    # the snippet itself rather than cwd/PYTHONPATH (both ignored under -I).
     site_packages = tmp_path / "site-packages"
     site_packages.mkdir()
     (site_packages / "coldmod.py").write_text("VALUE = 1\n")
     result = subprocess.run(
-        ["python3", "-I", "-c", "import coldmod"],
-        cwd=site_packages,
+        ["python3", "-I", "-c", ISOLATED_IMPORT_SNIPPET, str(site_packages)],
         env={"PATH": os.environ["PATH"], "PYTHONDONTWRITEBYTECODE": "1"},
         capture_output=True,
         text=True,
@@ -489,8 +493,7 @@ def test_isolated_cold_import_with_dash_b_writes_no_bytecode(tmp_path: Path) -> 
     site_packages.mkdir()
     (site_packages / "coldmod.py").write_text("VALUE = 1\n")
     result = subprocess.run(
-        ["python3", "-I", "-B", "-c", "import coldmod"],
-        cwd=site_packages,
+        ["python3", "-I", "-B", "-c", ISOLATED_IMPORT_SNIPPET, str(site_packages)],
         env={"PATH": os.environ["PATH"], "PYTHONDONTWRITEBYTECODE": "1"},
         capture_output=True,
         text=True,
