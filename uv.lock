@@ -2430,7 +2430,7 @@ wheels = [
 
 [[package]]
 name = "tpen"
-version = "0.5.0"
+version = "0.5.1"
 source = { editable = "." }
 dependencies = [
     { name = "hydra-core" },
