@@ -22,7 +22,7 @@ UV_BIN="${UV_BIN:-}"
 FACILITY_RUN_PREFIX="${FACILITY_RUN_PREFIX:-}"
 MUTANT_SPEC="${MUTANT_SPEC:-}"
 MODE="${MODE:-quick}"
-TYPECHECK="${TYPECHECK:-off}"
+TYPECHECK="${TYPECHECK:-on}"
 PARALLEL="${PARALLEL:-serial}"
 FULL_SUITE="${FULL_SUITE:-0}"
 TEST_PATHS=()
@@ -37,6 +37,7 @@ SHARED_ENV_PREFIX, UV_BIN, FACILITY_RUN_PREFIX
 options: --sha SHA --test PATH --run-root PATH --mutants PATH
          --mode quick|measure --typecheck on|off --parallel serial|xdist
          --full-suite
+         type checking defaults to on; use --typecheck off explicitly when justified
 USAGE
 }
 while (($#)); do
