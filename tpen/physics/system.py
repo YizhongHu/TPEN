@@ -44,7 +44,7 @@ import hashlib
 import math
 import struct
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import InitVar, dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
@@ -201,9 +201,13 @@ class HamiltonianTermDescriptor:
         The actual typed resource payload identified by `resource_id` (for
         example the construction-time nuclear geometry). Must be provided
         together with `resource_id`, and its `AtomicConfiguration.content_id`
-        must equal `resource_id`. Carried so `SystemDescriptor.resources` can
-        publish the real resource content, not merely its hash; excluded from
-        `canonical_bytes` (`resource_id` already determines identity).
+        must equal `resource_id`. Snapshotted into an independently-owned
+        copy at construction (never the caller's own object), and excluded
+        from `canonical_bytes` (`resource_id` already determines identity).
+        Reading the `resource` attribute returns a fresh clone of that
+        snapshot on every access (copy-on-read): mutating a previously
+        returned payload in place can never change what this descriptor, or
+        `SystemDescriptor.resources`, publish.
     version : int, optional
         Declaration version for this operator's description. Bump when the
         meaning of `parameters` changes for a given `operator_id`.
@@ -220,10 +224,17 @@ class HamiltonianTermDescriptor:
     slot: str
     parameters: Mapping[str, JsonScalar] = field(default_factory=dict)
     resource_id: str | None = None
-    resource: AtomicConfiguration | None = None
     version: int = 1
+    #: Constructor-only: snapshotted into `_resource` by `__post_init__`, then
+    #: never read again. `resource` is declared as an `InitVar` (not a plain
+    #: field) specifically so the `resource` *attribute* can be a copy-on-read
+    #: property (defined right after this class) instead of a stored
+    #: reference to whatever object the caller passed in.
+    resource: InitVar[AtomicConfiguration | None] = None
+    #: Private, independently-owned snapshot backing the `resource` property.
+    _resource: AtomicConfiguration | None = field(default=None, init=False, repr=False, compare=False)
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, resource: AtomicConfiguration | None) -> None:
         if not isinstance(self.operator_id, OperatorId):
             raise TypeError("HamiltonianTermDescriptor.operator_id must be an OperatorId")
         if not self.slot or not self.slot.strip():
@@ -232,17 +243,25 @@ class HamiltonianTermDescriptor:
             raise TypeError("HamiltonianTermDescriptor.resource_id must be a string or None")
         if self.resource_id is not None and not self.resource_id.strip():
             raise ValueError("HamiltonianTermDescriptor.resource_id must be non-empty when provided")
-        if (self.resource_id is None) != (self.resource is None):
+        if (self.resource_id is None) != (resource is None):
             raise ValueError(
                 "HamiltonianTermDescriptor.resource_id and resource must be provided together"
             )
-        if self.resource is not None:
-            if not isinstance(self.resource, AtomicConfiguration):
+        if resource is not None:
+            if not isinstance(resource, AtomicConfiguration):
                 raise TypeError("HamiltonianTermDescriptor.resource must be an AtomicConfiguration")
-            if self.resource.content_id() != self.resource_id:
+            # Snapshot now, before validating: `AtomicConfiguration.__post_init__`
+            # clones and detaches `positions`/`charges`, so `snapshot` is already
+            # independent of `resource` (and of whatever the caller does to its
+            # own object afterward). Validating the snapshot's own content id --
+            # not the caller's live object's -- is what the owned payload will
+            # actually be identified by from here on.
+            snapshot = AtomicConfiguration(resource.positions, resource.charges)
+            if snapshot.content_id() != self.resource_id:
                 raise ValueError(
                     "HamiltonianTermDescriptor.resource_id must equal resource.content_id()"
                 )
+            object.__setattr__(self, "_resource", snapshot)
         object.__setattr__(self, "parameters", _canonical_parameters(self.parameters))
 
     def canonical_bytes(self) -> bytes:
@@ -269,6 +288,23 @@ class HamiltonianTermDescriptor:
             digest.update(b"\x01")
             digest.update(_encode_length_prefixed(self.resource_id.encode("utf-8")))
         return digest.digest()
+
+
+def _hamiltonian_term_descriptor_resource(self: HamiltonianTermDescriptor) -> AtomicConfiguration | None:
+    """Return a fresh, independently-owned clone of this term's resource, or ``None``."""
+
+    if self._resource is None:
+        return None
+    return AtomicConfiguration(self._resource.positions, self._resource.charges)
+
+
+# Attached after `@dataclass` has already built `HamiltonianTermDescriptor`
+# (not as a class-body `@property`): a class-body property literally named
+# `resource` would shadow the `resource: InitVar[...] = None` default that
+# `@dataclass` reads at decoration time, breaking the constructor's default
+# value. Assigning the property here, once the class already exists, avoids
+# that collision while still making `.resource` a normal attribute to callers.
+HamiltonianTermDescriptor.resource = property(_hamiltonian_term_descriptor_resource)
 
 
 @runtime_checkable
@@ -315,16 +351,20 @@ class SystemDescriptor:
 
     `resources` is derived, not supplied by the caller: for every distinct
     `HamiltonianTermDescriptor.resource_id` declared by `terms`, it holds one
-    independently-cloned `AtomicConfiguration` snapshot (so later mutation of
+    independently-owned `AtomicConfiguration` snapshot (so later mutation of
     a term's own resource cannot change the published payload). Two terms
     sharing one `resource_id` (e.g. an electron-nucleus and a nucleus-nucleus
-    term over the same geometry) resolve to the same single entry.
+    term over the same geometry) resolve to the same single entry. Reading
+    `resources` returns a fresh `Mapping` of fresh clones on every access
+    (copy-on-read): mutating a tensor obtained from one access can never
+    change what a later access, or another term's `resource`, observe.
     """
 
     particle: ParticleSpec
     units: str
     terms: tuple[HamiltonianTermDescriptor, ...]
-    resources: Mapping[str, AtomicConfiguration] = field(default_factory=dict, init=False, repr=False)
+    #: Private, independently-owned snapshots backing the `resources` property.
+    _resources: Mapping[str, AtomicConfiguration] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.particle, ParticleSpec):
@@ -347,10 +387,25 @@ class SystemDescriptor:
         for term in terms:
             if term.resource_id is None:
                 continue
+            # `term.resource` is a copy-on-read property: this is already a
+            # fresh, independently-owned clone, decoupled from the term's own
+            # `_resource` snapshot and from whatever object the original
+            # caller passed in.
             resource = term.resource
             if resource is None:
                 raise ValueError(
                     f"term declaring operator {term.operator_id} has a resource_id but no resource payload"
+                )
+            # Defense in depth: `HamiltonianTermDescriptor.__post_init__`
+            # already validated this at its own construction time, but a
+            # cached/reused term declaration's resource must still match the
+            # id it is being aggregated under here, not just at some earlier
+            # moment.
+            if resource.content_id() != term.resource_id:
+                raise ValueError(
+                    f"term declaring operator {term.operator_id} resource payload does not match "
+                    f"its declared resource_id {term.resource_id!r} "
+                    f"(resource content id {resource.content_id()!r})"
                 )
             if resource.spatial_dim != self.particle.spatial_dim:
                 raise ValueError(
@@ -360,12 +415,32 @@ class SystemDescriptor:
                 )
             existing = resources.get(term.resource_id)
             if existing is None:
-                resources[term.resource_id] = AtomicConfiguration(resource.positions, resource.charges)
+                resources[term.resource_id] = resource
             elif existing.content_id() != resource.content_id():
                 raise ValueError(
                     f"resource_id {term.resource_id!r} resolves to two different resource payloads"
                 )
-        object.__setattr__(self, "resources", MappingProxyType(resources))
+        object.__setattr__(self, "_resources", resources)
+
+    @property
+    def resources(self) -> Mapping[str, AtomicConfiguration]:
+        """Return a fresh `Mapping` of fresh resource clones (copy-on-read).
+
+        Returns
+        -------
+        Mapping[str, AtomicConfiguration]
+            One independently-owned `AtomicConfiguration` clone per distinct
+            resource id declared by `terms`, freshly cloned on every access
+            so a caller mutating a previously returned payload cannot change
+            what a later access observes.
+        """
+
+        return MappingProxyType(
+            {
+                resource_id: AtomicConfiguration(resource.positions, resource.charges)
+                for resource_id, resource in self._resources.items()
+            }
+        )
 
     def system_id(self) -> str:
         """Return the canonical, deterministic content identity of this system.
@@ -465,7 +540,20 @@ def build_system_descriptor(
                 f"operator {term_type.operator_id}"
             )
         if descriptor.slot != name:
-            descriptor = replace(descriptor, slot=name)
+            # `dataclasses.replace` cannot be used here: `resource` is an
+            # `InitVar` (see `HamiltonianTermDescriptor`), so `replace` would
+            # silently fall back to its default (`None`) instead of carrying
+            # the original resource forward. Reconstruct explicitly, passing
+            # `descriptor.resource` (an already-independent, copy-on-read
+            # clone) through.
+            descriptor = HamiltonianTermDescriptor(
+                operator_id=descriptor.operator_id,
+                slot=name,
+                parameters=descriptor.parameters,
+                resource_id=descriptor.resource_id,
+                version=descriptor.version,
+                resource=descriptor.resource,
+            )
         descriptors.append(descriptor)
     return SystemDescriptor(particle=particle, units=units, terms=tuple(descriptors))
 
