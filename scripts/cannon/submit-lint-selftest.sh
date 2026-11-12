@@ -453,7 +453,10 @@ expect_contains "--shared-env-prefix nested inside a --staging-root FINAL is rej
 
 # Check 10: manifest SHARED_ENV_PREFIX/SHARED_ENV_PATH keys must stay
 # consistent with --shared-env-prefix and never resolve under an allowed root.
+# Since SHARED_ENV_PREFIX is now a critical key (Check 4, T1/F1), its own
+# sbatch fixture must export a matching value too.
 SENV10_MANIFEST="$BASE/stage/senv10.manifest"
+SENV10_SBATCH="$BASE/stage/senv10.sbatch"
 cat > "$SENV10_MANIFEST" <<EOF
 HEAD_SHA=$SHA
 JOB_NAME=tpen-verify-$SHORT
@@ -463,8 +466,20 @@ DRY_RUN=0
 PYTHON=$GOOD_PYTHON
 SHARED_ENV_PREFIX=$BASE/shared-env
 EOF
-expect "manifest SHARED_ENV_PREFIX matching the CLI value is accepted" pass lint "$GOOD_SBATCH" "$SENV10_MANIFEST"
+cat > "$SENV10_SBATCH" <<EOF
+#!/bin/bash
+#SBATCH --job-name=tpen-verify-$SHORT
+export HEAD_SHA=$SHA
+export JOB_NAME=tpen-verify-$SHORT
+export TASK_ROOT=$GOOD_TASK_ROOT
+export RUN_ROOT=$GOOD_RUN_ROOT
+export DRY_RUN=0
+export PYTHON=$GOOD_PYTHON
+export SHARED_ENV_PREFIX=$BASE/shared-env
+EOF
+expect "manifest SHARED_ENV_PREFIX matching the CLI value is accepted" pass lint "$SENV10_SBATCH" "$SENV10_MANIFEST"
 SENV10B_MANIFEST="$BASE/stage/senv10b.manifest"
+SENV10B_SBATCH="$BASE/stage/senv10b.sbatch"
 cat > "$SENV10B_MANIFEST" <<EOF
 HEAD_SHA=$SHA
 JOB_NAME=tpen-verify-$SHORT
@@ -474,7 +489,18 @@ DRY_RUN=0
 PYTHON=$GOOD_PYTHON
 SHARED_ENV_PREFIX=$BASE/other-root
 EOF
-expect_contains "manifest SHARED_ENV_PREFIX not matching the CLI value is rejected" fail "does not match" lint "$GOOD_SBATCH" "$SENV10B_MANIFEST"
+cat > "$SENV10B_SBATCH" <<EOF
+#!/bin/bash
+#SBATCH --job-name=tpen-verify-$SHORT
+export HEAD_SHA=$SHA
+export JOB_NAME=tpen-verify-$SHORT
+export TASK_ROOT=$GOOD_TASK_ROOT
+export RUN_ROOT=$GOOD_RUN_ROOT
+export DRY_RUN=0
+export PYTHON=$GOOD_PYTHON
+export SHARED_ENV_PREFIX=$BASE/other-root
+EOF
+expect_contains "manifest SHARED_ENV_PREFIX not matching the CLI value is rejected" fail "does not match" lint "$SENV10B_SBATCH" "$SENV10B_MANIFEST"
 SENV10C_MANIFEST="$BASE/stage/senv10c.manifest"
 cat > "$SENV10C_MANIFEST" <<EOF
 HEAD_SHA=$SHA
@@ -508,15 +534,99 @@ expect_contains "TASK_ROOT under --shared-env-prefix is rejected" fail "resolves
   "$LINTER" --sbatch "$SENV11_SBATCH" --manifest "$SENV11_MANIFEST" --allowed-root "$BASE/stage" --allowed-root "$BASE/shared-env" \
   --shared-env-prefix "$BASE/shared-env" --home "$BASE/home"
 
-# Check 7 (updated): a dry-run PYTHON under an allowed root (the job overlay's
-# facility-run root, not the shared-env prefix itself) must still be accepted.
+# Check 7 (T3, review-round-1 F3): a dry-run PYTHON under an allowed root but
+# NOT under --shared-env-prefix (e.g. a previous job's overlay) must be
+# rejected -- the allowed-root exception is removed; only the shared-env
+# prefix itself identifies a trusted interpreter.
 OVERLAY_PYTHON="$BASE/stage/run/overlay/bin/python"
 mkdir -p "$(dirname -- "$OVERLAY_PYTHON")"; touch "$OVERLAY_PYTHON"; chmod +x "$OVERLAY_PYTHON"
-GOOD7B_MANIFEST="$BASE/stage/good7b.manifest"
-GOOD7B_SBATCH="$BASE/stage/good7b.sbatch"
-write_manifest "$GOOD7B_MANIFEST" "$SHA" "tpen-verify-$SHORT" "$GOOD_TASK_ROOT" "$GOOD_RUN_ROOT" 1 "$OVERLAY_PYTHON"
-write_sbatch "$GOOD7B_SBATCH" "$SHA" "tpen-verify-$SHORT" "$GOOD_TASK_ROOT" "$GOOD_RUN_ROOT" 1 "$OVERLAY_PYTHON"
-expect "dry-run python under an allowed root (job overlay) is accepted" pass lint "$GOOD7B_SBATCH" "$GOOD7B_MANIFEST"
+BAD7B_MANIFEST="$BASE/stage/bad7b.manifest"
+BAD7B_SBATCH="$BASE/stage/bad7b.sbatch"
+write_manifest "$BAD7B_MANIFEST" "$SHA" "tpen-verify-$SHORT" "$GOOD_TASK_ROOT" "$GOOD_RUN_ROOT" 1 "$OVERLAY_PYTHON"
+write_sbatch "$BAD7B_SBATCH" "$SHA" "tpen-verify-$SHORT" "$GOOD_TASK_ROOT" "$GOOD_RUN_ROOT" 1 "$OVERLAY_PYTHON"
+expect_contains "dry-run python under an allowed root but outside --shared-env-prefix is rejected" fail "is not under --shared-env-prefix" lint "$BAD7B_SBATCH" "$BAD7B_MANIFEST"
+
+# Check 4 (T1, review-round-1 F1): job-exported SHARED_ENV_PREFIX must
+# reconcile with the manifest's (and transitively, via Check 10, the CLI
+# prefix) -- stale, missing, or extra values are rejected like any other
+# critical export.
+SENV_PREFIX_MANIFEST="$BASE/stage/senv-prefix-match.manifest"
+SENV_PREFIX_SBATCH_GOOD="$BASE/stage/senv-prefix-match-good.sbatch"
+SENV_PREFIX_SBATCH_STALE="$BASE/stage/senv-prefix-match-stale.sbatch"
+SENV_PREFIX_SBATCH_MISSING="$BASE/stage/senv-prefix-match-missing.sbatch"
+cat > "$SENV_PREFIX_MANIFEST" <<EOF
+HEAD_SHA=$SHA
+JOB_NAME=tpen-verify-$SHORT
+TASK_ROOT=$GOOD_TASK_ROOT
+RUN_ROOT=$GOOD_RUN_ROOT
+DRY_RUN=0
+PYTHON=$GOOD_PYTHON
+SHARED_ENV_PREFIX=$BASE/shared-env
+EOF
+cat > "$SENV_PREFIX_SBATCH_GOOD" <<EOF
+#!/bin/bash
+#SBATCH --job-name=tpen-verify-$SHORT
+export HEAD_SHA=$SHA
+export JOB_NAME=tpen-verify-$SHORT
+export TASK_ROOT=$GOOD_TASK_ROOT
+export RUN_ROOT=$GOOD_RUN_ROOT
+export DRY_RUN=0
+export PYTHON=$GOOD_PYTHON
+export SHARED_ENV_PREFIX=$BASE/shared-env
+EOF
+expect "job-exported SHARED_ENV_PREFIX matching the manifest/CLI is accepted" pass lint "$SENV_PREFIX_SBATCH_GOOD" "$SENV_PREFIX_MANIFEST"
+cat > "$SENV_PREFIX_SBATCH_STALE" <<EOF
+#!/bin/bash
+#SBATCH --job-name=tpen-verify-$SHORT
+export HEAD_SHA=$SHA
+export JOB_NAME=tpen-verify-$SHORT
+export TASK_ROOT=$GOOD_TASK_ROOT
+export RUN_ROOT=$GOOD_RUN_ROOT
+export DRY_RUN=0
+export PYTHON=$GOOD_PYTHON
+export SHARED_ENV_PREFIX=$BASE/other-root
+EOF
+expect_contains "job-exported SHARED_ENV_PREFIX disagreeing with the manifest is rejected" fail "critical export 'SHARED_ENV_PREFIX' is stale" lint "$SENV_PREFIX_SBATCH_STALE" "$SENV_PREFIX_MANIFEST"
+cat > "$SENV_PREFIX_SBATCH_MISSING" <<EOF
+#!/bin/bash
+#SBATCH --job-name=tpen-verify-$SHORT
+export HEAD_SHA=$SHA
+export JOB_NAME=tpen-verify-$SHORT
+export TASK_ROOT=$GOOD_TASK_ROOT
+export RUN_ROOT=$GOOD_RUN_ROOT
+export DRY_RUN=0
+export PYTHON=$GOOD_PYTHON
+EOF
+expect_contains "manifest SHARED_ENV_PREFIX missing from the job export is rejected" fail "critical export 'SHARED_ENV_PREFIX' missing from sbatch script" lint "$SENV_PREFIX_SBATCH_MISSING" "$SENV_PREFIX_MANIFEST"
+expect_contains "job-exported SHARED_ENV_PREFIX with no manifest counterpart is rejected" fail "critical export 'SHARED_ENV_PREFIX' present in sbatch script but not in manifest" lint "$SENV_PREFIX_SBATCH_GOOD" "$GOOD_MANIFEST"
+
+# Check 10 (T2, review-round-1 F2): --shared-env-prefix and the manifest's
+# mirrored keys must already be spelled canonically (no trailing slash,
+# `.`/`..`, relative path, or unresolved symlink) -- comparing only the
+# canonicalized values is not enough, since a deterministic submission
+# failure can still occur downstream on the raw spelling.
+expect_contains "--shared-env-prefix with a trailing slash is rejected" fail "--shared-env-prefix is not canonical" \
+  "$LINTER" --sbatch "$GOOD_SBATCH" --manifest "$GOOD_MANIFEST" --allowed-root "$BASE/stage" \
+  --shared-env-prefix "$BASE/shared-env/" --home "$BASE/home"
+expect_contains "relative --shared-env-prefix is rejected" fail "--shared-env-prefix is not absolute" \
+  "$LINTER" --sbatch "$GOOD_SBATCH" --manifest "$GOOD_MANIFEST" --allowed-root "$BASE/stage" \
+  --shared-env-prefix "shared-env" --home "$BASE/home"
+SENV_SYMLINK="$BASE/shared-env-alias"
+ln -s "$BASE/shared-env" "$SENV_SYMLINK"
+expect_contains "a symlink alias for --shared-env-prefix is rejected (resolves to a different spelling)" fail "--shared-env-prefix is not canonical" \
+  "$LINTER" --sbatch "$GOOD_SBATCH" --manifest "$GOOD_MANIFEST" --allowed-root "$BASE/stage" \
+  --shared-env-prefix "$SENV_SYMLINK" --home "$BASE/home"
+SENV10E_MANIFEST="$BASE/stage/senv10e.manifest"
+cat > "$SENV10E_MANIFEST" <<EOF
+HEAD_SHA=$SHA
+JOB_NAME=tpen-verify-$SHORT
+TASK_ROOT=$GOOD_TASK_ROOT
+RUN_ROOT=$GOOD_RUN_ROOT
+DRY_RUN=0
+PYTHON=$GOOD_PYTHON
+SHARED_ENV_PREFIX=$BASE/shared-env/
+EOF
+expect_contains "manifest SHARED_ENV_PREFIX with a trailing slash is rejected" fail "manifest SHARED_ENV_PREFIX is not canonical" lint "$GOOD_SBATCH" "$SENV10E_MANIFEST"
 
 # Cannon job 59624204: `((i++))` with i=0 aborts under set -e on bash >= 4
 # but not on macOS bash 3.2. Statically forbid ((...)) increments and

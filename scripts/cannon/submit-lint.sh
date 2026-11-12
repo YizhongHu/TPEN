@@ -73,7 +73,7 @@ realpath -m -- "$PWD" >/dev/null 2>&1 || {
   exit 2
 }
 
-CRITICAL_KEYS=(HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON)
+CRITICAL_KEYS=(HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT DRY_RUN PYTHON SHARED_ENV_PREFIX)
 US=$'\x1f'  # unit separator; macOS/BSD awk's -F does not expand \x1f itself
 FAILED=0
 fail() { printf 'FAIL: %s\n' "$*"; FAILED=1; }
@@ -86,6 +86,11 @@ canon() { realpath -m -- "$1"; }
 # shared-env-manifest.sh) is root-aware, so a literal '/' on either side
 # can't defeat this either.
 CANON_SHARED_ENV_PREFIX="$(canon "$SHARED_ENV_PREFIX")"
+if [[ "$SHARED_ENV_PREFIX" != /* ]]; then
+  fail "--shared-env-prefix is not absolute: '$SHARED_ENV_PREFIX'"
+elif [[ "$SHARED_ENV_PREFIX" != "$CANON_SHARED_ENV_PREFIX" ]]; then
+  fail "--shared-env-prefix is not canonical: '$SHARED_ENV_PREFIX' -> '$CANON_SHARED_ENV_PREFIX'"
+fi
 for _root in "${ALLOWED_ROOTS[@]}"; do
   _canon_root="$(canon "$_root")"
   if path_contains "$CANON_SHARED_ENV_PREFIX" "$_canon_root" || path_contains "$_canon_root" "$CANON_SHARED_ENV_PREFIX"; then
@@ -755,18 +760,18 @@ for key in TASK_ROOT RUN_ROOT; do
 done
 
 # Check 7: in a dry run, the interpreter must resolve under the declared
-# shared-env prefix (an env dir inside it, reused directly) or under any
-# declared allowed root (the job overlay verify.sh builds lives under its
-# WORK_ROOT, which this linter never sees directly, but which always sits
-# under an allowed/facility run root in the real submission path) -- never a
-# system/ad-hoc python.
+# shared-env prefix (an env dir inside it, reused directly) -- never a
+# system/ad-hoc python, and never merely any allowed/facility run root (that
+# would admit an unrelated interpreter left over from a previous job's run
+# root without identifying the actual job overlay). Overlay acceptance is
+# deferred until the verifier's work-root contract can be modelled explicitly.
 IFS=$'\x1f' read -r dry_has dry_run <<< "$(kv_get "$MANIFEST" DRY_RUN)"
 IFS=$'\x1f' read -r py_has py_val <<< "$(kv_get "$MANIFEST" PYTHON)"
 [[ "$dry_has" == 1 ]] || dry_run=0
 if [[ "$dry_run" == 1 && "$py_has" == 1 ]]; then
   canon_python="$(canon "$py_val")"
-  if ! path_contains "$CANON_SHARED_ENV_PREFIX" "$canon_python" && ! under_any_root "$canon_python"; then
-    fail "dry-run PYTHON is not under --shared-env-prefix or any --allowed-root: '$py_val' -> '$canon_python'"
+  if ! path_contains "$CANON_SHARED_ENV_PREFIX" "$canon_python"; then
+    fail "dry-run PYTHON is not under --shared-env-prefix: '$py_val' -> '$canon_python'"
   fi
 fi
 
@@ -781,6 +786,11 @@ IFS=$'\x1f' read -r m_senv_prefix_has m_senv_prefix <<< "$(kv_get "$MANIFEST" SH
 if [[ "$m_senv_prefix_has" == 1 ]]; then
   canon_m_senv_prefix="$(canon "$m_senv_prefix")"
   mapped_m_senv_prefix="$(map_staging_to_final "$canon_m_senv_prefix")"
+  if [[ "$m_senv_prefix" != /* ]]; then
+    fail "manifest SHARED_ENV_PREFIX is not absolute: '$m_senv_prefix'"
+  elif [[ "$m_senv_prefix" != "$canon_m_senv_prefix" ]]; then
+    fail "manifest SHARED_ENV_PREFIX is not canonical: '$m_senv_prefix' -> '$canon_m_senv_prefix'"
+  fi
   if [[ "$canon_m_senv_prefix" != "$CANON_SHARED_ENV_PREFIX" ]]; then
     fail "manifest SHARED_ENV_PREFIX does not match --shared-env-prefix: manifest='$m_senv_prefix' -> '$canon_m_senv_prefix' cli='$SHARED_ENV_PREFIX' -> '$CANON_SHARED_ENV_PREFIX'"
   fi
@@ -792,6 +802,11 @@ if [[ "$m_senv_path_has" == 1 ]]; then
   canon_m_senv_path="$(canon "$m_senv_path")"
   mapped_m_senv_path="$(map_staging_to_final "$canon_m_senv_path")"
   canon_m_senv_path_parent="$(canon "$(dirname -- "$canon_m_senv_path")")"
+  if [[ "$m_senv_path" != /* ]]; then
+    fail "manifest SHARED_ENV_PATH is not absolute: '$m_senv_path'"
+  elif [[ "$m_senv_path" != "$canon_m_senv_path" ]]; then
+    fail "manifest SHARED_ENV_PATH is not canonical: '$m_senv_path' -> '$canon_m_senv_path'"
+  fi
   [[ "$canon_m_senv_path_parent" == "$CANON_SHARED_ENV_PREFIX" ]] ||
     fail "manifest SHARED_ENV_PATH is not a direct child of --shared-env-prefix: manifest='$m_senv_path' -> '$canon_m_senv_path' prefix='$CANON_SHARED_ENV_PREFIX'"
   under_any_root "$mapped_m_senv_path" &&

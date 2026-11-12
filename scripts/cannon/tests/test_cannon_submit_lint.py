@@ -971,7 +971,9 @@ def test_manifest_shared_env_prefix_matching_cli_accepted(fixture_root: Path) ->
     sbatch, manifest, *_ = good_fixture(fixture_root)
     manifest2 = fixture_root / "stage" / "senv-match.manifest"
     manifest2.write_text(manifest.read_text() + f"SHARED_ENV_PREFIX={fixture_root / 'shared-env'}\n")
-    result = run_lint(fixture_root, sbatch, manifest2)
+    sbatch2 = fixture_root / "stage" / "senv-match.sbatch"
+    sbatch2.write_text(sbatch.read_text() + f"export SHARED_ENV_PREFIX={fixture_root / 'shared-env'}\n")
+    result = run_lint(fixture_root, sbatch2, manifest2)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -979,9 +981,109 @@ def test_manifest_shared_env_prefix_mismatch_rejected(fixture_root: Path) -> Non
     sbatch, manifest, *_ = good_fixture(fixture_root)
     manifest2 = fixture_root / "stage" / "senv-mismatch.manifest"
     manifest2.write_text(manifest.read_text() + f"SHARED_ENV_PREFIX={fixture_root / 'other-root'}\n")
-    result = run_lint(fixture_root, sbatch, manifest2)
+    sbatch2 = fixture_root / "stage" / "senv-mismatch.sbatch"
+    sbatch2.write_text(sbatch.read_text() + f"export SHARED_ENV_PREFIX={fixture_root / 'other-root'}\n")
+    result = run_lint(fixture_root, sbatch2, manifest2)
     assert result.returncode != 0, result.stdout + result.stderr
     assert "does not match --shared-env-prefix" in result.stdout
+
+
+# --- Check 4 (T1, review-round-1 F1): SHARED_ENV_PREFIX is a critical key,
+# reconciled between the manifest and the job's own effective export. --------
+
+
+def test_job_exported_shared_env_prefix_stale_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    manifest2 = fixture_root / "stage" / "senv-prefix-stale.manifest"
+    manifest2.write_text(manifest.read_text() + f"SHARED_ENV_PREFIX={fixture_root / 'shared-env'}\n")
+    sbatch2 = fixture_root / "stage" / "senv-prefix-stale.sbatch"
+    sbatch2.write_text(sbatch.read_text() + f"export SHARED_ENV_PREFIX={fixture_root / 'other-root'}\n")
+    result = run_lint(fixture_root, sbatch2, manifest2)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'SHARED_ENV_PREFIX' is stale" in result.stdout
+
+
+def test_job_exported_shared_env_prefix_missing_from_manifest_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    sbatch2 = fixture_root / "stage" / "senv-prefix-extra.sbatch"
+    sbatch2.write_text(sbatch.read_text() + f"export SHARED_ENV_PREFIX={fixture_root / 'shared-env'}\n")
+    result = run_lint(fixture_root, sbatch2, manifest)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'SHARED_ENV_PREFIX' present in sbatch script but not in manifest" in result.stdout
+
+
+def test_manifest_shared_env_prefix_missing_from_job_export_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    manifest2 = fixture_root / "stage" / "senv-prefix-missing.manifest"
+    manifest2.write_text(manifest.read_text() + f"SHARED_ENV_PREFIX={fixture_root / 'shared-env'}\n")
+    result = run_lint(fixture_root, sbatch, manifest2)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'SHARED_ENV_PREFIX' missing from sbatch script" in result.stdout
+
+
+# --- Check 10 (T2, review-round-1 F2): --shared-env-prefix and its mirrored
+# manifest keys must already be spelled canonically. -------------------------
+
+
+def test_cli_shared_env_prefix_trailing_slash_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    result = subprocess.run(
+        [
+            "bash", str(LINTER),
+            "--sbatch", str(sbatch), "--manifest", str(manifest),
+            "--allowed-root", str(fixture_root / "stage"),
+            "--shared-env-prefix", str(fixture_root / "shared-env") + "/",
+            "--home", str(fixture_root / "home"),
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "--shared-env-prefix is not canonical" in result.stdout
+
+
+def test_cli_shared_env_prefix_relative_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    result = subprocess.run(
+        [
+            "bash", str(LINTER),
+            "--sbatch", str(sbatch), "--manifest", str(manifest),
+            "--allowed-root", str(fixture_root / "stage"),
+            "--shared-env-prefix", "shared-env",
+            "--home", str(fixture_root / "home"),
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "--shared-env-prefix is not absolute" in result.stdout
+
+
+def test_cli_shared_env_prefix_symlink_alias_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    alias = fixture_root / "shared-env-alias"
+    alias.symlink_to(fixture_root / "shared-env")
+    result = subprocess.run(
+        [
+            "bash", str(LINTER),
+            "--sbatch", str(sbatch), "--manifest", str(manifest),
+            "--allowed-root", str(fixture_root / "stage"),
+            "--shared-env-prefix", str(alias),
+            "--home", str(fixture_root / "home"),
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "--shared-env-prefix is not canonical" in result.stdout
+
+
+def test_manifest_shared_env_prefix_trailing_slash_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    manifest2 = fixture_root / "stage" / "senv-prefix-slash.manifest"
+    manifest2.write_text(manifest.read_text() + f"SHARED_ENV_PREFIX={fixture_root / 'shared-env'}/\n")
+    sbatch2 = fixture_root / "stage" / "senv-prefix-slash.sbatch"
+    sbatch2.write_text(sbatch.read_text() + f"export SHARED_ENV_PREFIX={fixture_root / 'shared-env'}/\n")
+    result = run_lint(fixture_root, sbatch2, manifest2)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "manifest SHARED_ENV_PREFIX is not canonical" in result.stdout
 
 
 def test_manifest_shared_env_path_direct_child_accepted(fixture_root: Path) -> None:
@@ -1036,11 +1138,12 @@ def test_run_root_under_shared_env_prefix_rejected(fixture_root: Path) -> None:
     assert "resolves under --shared-env-prefix" in result.stdout
 
 
-# --- Check 7 (updated): PYTHON under an allowed root (the job overlay, not
-# the shared-env prefix itself) must also be accepted in a dry run. ---------
+# --- Check 7 (T3, review-round-1 F3): the allowed-root interpreter exception
+# is removed; PYTHON under an allowed root but outside --shared-env-prefix
+# (e.g. a previous job's overlay) must be rejected in a dry run. ------------
 
 
-def test_dry_run_python_under_allowed_root_not_shared_env_accepted(fixture_root: Path) -> None:
+def test_dry_run_python_under_allowed_root_not_shared_env_rejected(fixture_root: Path) -> None:
     base = fixture_root
     task_root = base / "stage" / "task"
     run_root = base / "stage" / "run"
@@ -1053,7 +1156,8 @@ def test_dry_run_python_under_allowed_root_not_shared_env_accepted(fixture_root:
     write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=1, python=overlay_python)
     write_sbatch(sbatch, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=1, python=overlay_python)
     result = run_lint(base, sbatch, manifest)
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "dry-run PYTHON is not under --shared-env-prefix" in result.stdout
 
 
 def test_no_errexit_unsafe_arithmetic_statements() -> None:
