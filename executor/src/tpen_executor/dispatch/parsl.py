@@ -868,6 +868,10 @@ class ParslDispatcher(DispatcherContract):
         active: dict[Any, dict[str, Any]] = {}
         begin_error: Exception | None = None
         finish_error: Exception | None = None
+        # B1: a remote loss or crossed reply closes admission for the whole
+        # run, not just its own slot -- never admit another queued member
+        # once set, even into a different, healthy binding.
+        admission_closed = False
 
         def launch(member: Any, binding: WorkerBinding) -> None:
             nonlocal begin_error, finish_error
@@ -958,6 +962,8 @@ class ParslDispatcher(DispatcherContract):
             active[future] = {"member": member, "configured": configured, "fence": fence, "materialized": materialized, "environment": environment, "binding": binding, "handle": handle}
 
         def fill() -> None:
+            if admission_closed:
+                return
             while available:
                 try:
                     member = next(queued)
@@ -1041,11 +1047,21 @@ class ParslDispatcher(DispatcherContract):
                         # child group was ever reaped.  Close admission and
                         # never recycle this slot's binding (review P1-2).
                         remote_unconfirmed = True
+                        admission_closed = True
                         try:
                             lifecycle.finish(record["fence"], "remote-quiescence-unconfirmed", self._utc_now(), None)
                         except BaseException as finish_write_error:
                             if finish_error is None:
                                 finish_error = finish_write_error
+                        # B1: closing admission is not enough on its own --
+                        # every other still-live record (remote or local)
+                        # must be cancelled and bounded-settled under one
+                        # shared deadline too, before anything else runs,
+                        # exactly as an owner cancellation would.  _active
+                        # no longer holds this record (already popped
+                        # above); every remaining entry is swept.
+                        self._cancel_slot_pool(active, lifecycle, error)
+                        active.clear()
                     else:
                         completion_error = self._complete_member(
                             group,

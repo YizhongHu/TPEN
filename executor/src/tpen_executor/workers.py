@@ -53,17 +53,23 @@ def _proc_start_ticks(pid: int) -> int | None:
 
 
 def _group_quiescent(pid: int, *, bound: float = 1.0, interval: float = 0.02) -> bool:
-    """Bounded, observed check that no process remains in ``pid``'s group.
+    """Terminate, then bounded-observe, that no process remains in ``pid``'s group.
 
     ``start_new_session=True`` makes this worker's process group id equal to
-    the session leader's pid.  Signal 0 to that process group raises
-    ``ProcessLookupError`` only once every member has exited; a live
-    same-group descendant the leader spawned and left behind keeps the
-    group non-empty even after the leader itself has been reaped.  This is
-    the only group-level fact this worker can confirm: it never discovers
-    or signals a process outside the group it itself started.
+    the session leader's pid, so this worker owns that group whether or not
+    the leader itself is still alive: it first ``killpg``\\ s it (review
+    P1-1 residual -- a same-group descendant the leader spawned and left
+    behind must be terminated, not merely observed), then probes with
+    signal 0 within the bound.  ``ProcessLookupError`` is returned only
+    once every member has actually exited; this is the only group-level
+    fact this worker can confirm, since it never discovers or signals a
+    process outside the group it itself started.
     """
 
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
     deadline = time.monotonic() + bound
     while True:
         try:
@@ -321,7 +327,7 @@ class SubprocessWorker:
                 except (FileNotFoundError, OSError, ValueError, TypeError):
                     marker = None
                 if isinstance(marker, dict) and all(marker.get(key) == value for key, value in (cancel_identity or {}).items()):
-                    settle_slot_lease(lease, None)
+                    settle_slot_lease(lease, None, group_reaped=True)
                     return ProcessOutcome(logical_argv, None, stdout_name, stderr_name, timed_out)
             try:
                 process = subprocess.Popen(
@@ -334,13 +340,13 @@ class SubprocessWorker:
                 )
             except OSError as error:
                 # Popen raised from the launch itself: no child exists.
-                settle_slot_lease(lease, None)
+                settle_slot_lease(lease, None, group_reaped=True)
                 error.group_reaped = True
                 raise
             except BaseException:
                 # An interrupted spawn may have left a child no one owns:
                 # genuinely uncertain, not tagged.
-                settle_slot_lease(lease, None, child_known=False)
+                settle_slot_lease(lease, None, child_known=False, group_reaped=False)
                 raise
             spawned_pid = process.pid
             spawned_ticks = _proc_start_ticks(spawned_pid)
@@ -413,9 +419,14 @@ class SubprocessWorker:
                 # The cancelled child is reaped; drain the sampler's command
                 # groups and settle the lease before the cancellation leaves
                 # this worker.  A further interruption of that finalizer is
-                # recorded on the original, which still propagates.
+                # recorded on the original, which still propagates.  The
+                # science group itself is terminated and observed BEFORE the
+                # lease settles (review B2): a sampler whose own commands are
+                # clean must never release the quarantine marker while a
+                # science descendant could still be alive.
+                group_reaped = _group_quiescent(spawned_pid)
                 try:
-                    cleanup_errors.extend(finish_gpu_sampler(sampler, sampler_output, lease))
+                    cleanup_errors.extend(finish_gpu_sampler(sampler, sampler_output, lease, group_reaped=group_reaped))
                 except BaseException as finish_error:
                     cleanup_errors.append(finish_error)
                 for cleanup_error in cleanup_errors:
@@ -427,16 +438,15 @@ class SubprocessWorker:
                     watcher.join(timeout=1)
                 if process_handle is not None:
                     process_handle.clear(process)
-        # Normal exit and worker timeout: the leader is reaped; finish the
-        # sampler and settle the lease, which stays quarantined if cleanup is
-        # still unconfirmed.
-        interruptions = finish_gpu_sampler(sampler, sampler_output, lease)
+        # Normal exit and worker timeout: the leader is reaped.  An observed,
+        # bounded fact, not a default: terminate and confirm no process
+        # remains in this launch's group BEFORE the sampler/lease settle
+        # (review P1-1, B2) -- a clean sampler must never release the
+        # quarantine marker while a science descendant could still be alive.
+        group_reaped = _group_quiescent(spawned_pid)
+        interruptions = finish_gpu_sampler(sampler, sampler_output, lease, group_reaped=group_reaped)
         if interruptions:
             raise interruptions[0]
-        # An observed, bounded fact, not a default: confirm no process
-        # remains in this launch's group before reporting it reaped
-        # (review P1-1).
-        group_reaped = _group_quiescent(spawned_pid)
         return ProcessOutcome(
             logical_argv, returncode, stdout_name, stderr_name, timed_out, spawned_pid, spawned_ticks, group_reaped,
         )
