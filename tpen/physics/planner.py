@@ -30,6 +30,7 @@ from tpen.physics.operators import (
     OperatorId,
     is_registered_operator,
 )
+from tpen.physics.receipt import ExecutionReceipt
 
 
 type EnergyContribution = object
@@ -487,6 +488,54 @@ def _context_key_descriptor(key: ContextKey[object]) -> list[str]:
     return [key.name, _type_sort_key(key.value_type)]
 
 
+def emit_receipt(plan: LocalEnergyPlan, system_id: str) -> ExecutionReceipt:
+    """Return the `ExecutionReceipt` declared by a planned, executable plan.
+
+    Narrow adapter from `LocalEnergyPlan` to `ExecutionReceipt` (S1-E
+    review-r1 finding 5): `plan.manifest` maps `OperatorId` to the planned
+    *kernel object* itself, not to a contribution-name tuple, and fused names
+    need not match any `normalize_hamiltonian_terms` input name -- so the
+    manifest cannot be copied in directly. `plan.identity` is retained
+    unchanged in `numerical_policy`: it already hashes every method-affecting
+    setting this plan carries (operators, kernel/lowering classes, context
+    requirements, and provider graph; see `_plan_identity`), so two plans
+    with different identities always produce different receipts and no
+    further settings need to be added here.
+
+    Every kernel gets one stable, non-stringified result-column name --
+    its position in `plan.kernels` -- shared by every `OperatorId` it claims,
+    so a fused kernel claiming several operators reports one column under
+    all of them rather than inventing a column per operator.
+
+    Parameters
+    ----------
+    plan : LocalEnergyPlan
+        A plan returned by `LocalEnergyPlanner.plan`.
+    system_id : str
+        The physical system identity this plan was executed against, as
+        returned by `tpen.physics.system.SystemDescriptor.system_id`.
+
+    Returns
+    -------
+    ExecutionReceipt
+        Declares `plan.identity` as the method-affecting setting and one
+        stable per-kernel column name per claimed `OperatorId`.
+    """
+
+    manifest: dict[OperatorId, list[str]] = {}
+    for index, kernel in enumerate(plan.kernels):
+        column = f"kernel_{index}"
+        for operator_id in kernel.claimed_operator_ids:
+            manifest.setdefault(operator_id, []).append(column)
+    return ExecutionReceipt(
+        system_id=system_id,
+        implementation=f"{__name__}.{LocalEnergyPlan.__qualname__}",
+        version=1,
+        numerical_policy={"plan_identity": plan.identity},
+        manifest={operator_id: tuple(names) for operator_id, names in manifest.items()},
+    )
+
+
 __all__ = [
     "EnergyContribution",
     "LocalEnergyPlan",
@@ -494,4 +543,5 @@ __all__ = [
     "OperatorKernel",
     "OperatorLowering",
     "OperatorLoweringRegistry",
+    "emit_receipt",
 ]
