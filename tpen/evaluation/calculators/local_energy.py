@@ -97,12 +97,14 @@ class LocalEnergyCalculator:
             evaluator=self.evaluator,
         )
         total, term_energies = split_local_energy_result(result)
+        receipt = result.receipt if isinstance(result, LocalEnergyResult) else None
         total = total.detach()
         terms = None if term_energies is None else {name: value.detach() for name, value in term_energies.items()}
         local = LocalEnergyValues(
             local_energy=total,
             finite_mask=torch.isfinite(total),
             term_energies=terms,
+            receipt=receipt,
         )
         return replace(bundle, local_energy=local)
 
