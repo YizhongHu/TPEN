@@ -44,8 +44,10 @@ def _write_v1_artifact(
     values = values.to(torch.float64)
     n_draws, n_walkers = values.shape
     positions = torch.zeros(n_draws, n_walkers, n_electrons, 3, dtype=torch.float64)
+    nuclear_positions = torch.zeros(n_nuclei, 3, dtype=torch.float64)
+    nuclear_positions[:, 0] = torch.arange(n_nuclei, dtype=torch.float64)
     atoms = AtomicConfiguration(
-        positions=torch.zeros(n_nuclei, 3, dtype=torch.float64),
+        positions=nuclear_positions,
         charges=torch.full((n_nuclei,), float(n_nuclei), dtype=torch.float64),
     )
 
