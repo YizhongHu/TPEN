@@ -115,8 +115,12 @@ def test_r2_t3_real_worker_kills_owned_group_and_reaps_before_propagation(tmp_pa
 
     def killpg(pid, sig):
         assert processes and pid == processes[0].pid
-        assert sig == signal.SIGKILL
-        calls.append("killpg")
+        # review P1-1 residual: after reaping, the worker also terminates
+        # and bounded-probes its own group (killpg(SIGKILL) then
+        # killpg(0)), so a kill signal and a signal-0 probe are both
+        # legitimate here now.
+        assert sig in (signal.SIGKILL, 0)
+        calls.append("killpg" if sig == signal.SIGKILL else "probe")
         return original_killpg(pid, sig)
 
     with monkeypatch.context() as patch:
@@ -125,7 +129,11 @@ def test_r2_t3_real_worker_kills_owned_group_and_reaps_before_propagation(tmp_pa
         with pytest.raises(error_type) as observed:
             SubprocessWorker().run(environment, args, cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err", timeout=8)
     assert observed.value is cancellation
-    assert calls == ["wait", "killpg", "wait", "reaped"], calls
+    # "killpg" (the owned-group kill), "reaped", then the post-reap
+    # terminate+probe (killpg(SIGKILL) again, now a no-op since the group
+    # is already gone, then the signal-0 probe) that confirms quiescence
+    # before this worker call propagates.
+    assert calls == ["wait", "killpg", "wait", "reaped", "killpg", "probe"], calls
     assert processes[0].returncode == -signal.SIGKILL
     time.sleep(1.8)
     assert not late.exists(), "owned descendant must not survive to write after cancellation"
@@ -152,13 +160,22 @@ def test_r2_t4_interrupted_cleanup_wait_cannot_return_without_reaping(tmp_path, 
             return -9
 
     child = Child()
+
+    def killpg(pid, sig):
+        # The first SIGKILL is the real, owned-group kill; every call
+        # after that (review P1-1 residual's own terminate-then-probe)
+        # finds nothing left, exactly as a real reaped group would.
+        kills.append((pid, sig))
+        if len(kills) > 1:
+            raise ProcessLookupError()
+
     with monkeypatch.context() as patch:
         patch.setattr(subprocess, "Popen", lambda *args, **kw: child)
-        patch.setattr(os, "killpg", lambda pid, sig: kills.append((pid, sig)))
+        patch.setattr(os, "killpg", killpg)
         with pytest.raises(KeyboardInterrupt) as observed:
             SubprocessWorker().run(PreparedPythonEnvironment(sys.executable), ("-c", "pass"), cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
     assert observed.value is cancellation
-    assert kills == [(child.pid, signal.SIGKILL)]
+    assert kills == [(child.pid, signal.SIGKILL), (child.pid, signal.SIGKILL), (child.pid, 0)]
     assert child.returncode is not None, ("cleanup returned without confirmed reap", waits, kills)
 
 

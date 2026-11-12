@@ -116,10 +116,10 @@ S3C_MUTANT_TABLE = (
     },
     {
         "id": "M8", "target": PARSL_MODULE,
-        "old": "                        admission_closed = True\n",
+        "old": "                        self._cancel_slot_pool(active, lifecycle, error)\n                        active.clear()\n",
         "new": "                        pass\n",
         "killer": "test_dispatcher_remote_loss_closes_admission_globally",
-        "suite": "executor", "assertion": "a remote loss or crossed reply closes admission for the WHOLE run, not just its own slot: a queued member is never admitted into a different, healthy binding afterward (review B1)",
+        "suite": "executor", "assertion": "a remote loss or crossed reply bounded-settles every other still-live record immediately, before anything else runs; without the sweep a sibling leaf would resolve only through the ordinary path later and be published completed instead of failed (review B1)",
     },
 )
 

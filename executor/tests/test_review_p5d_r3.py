@@ -40,15 +40,23 @@ def test_r3_t1_repeated_cleanup_interruptions_are_visible_on_original_exception(
             return -9
 
     child = Child()
+
+    def killpg(pid, sig):
+        kills.append((pid, sig))
+        if len(kills) > 1:
+            raise ProcessLookupError()
+
     with monkeypatch.context() as patch:
         patch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
-        patch.setattr(os, "killpg", lambda pid, sig: kills.append((pid, sig)))
+        patch.setattr(os, "killpg", killpg)
         with pytest.raises(original_type) as observed:
             SubprocessWorker().run(PreparedPythonEnvironment(sys.executable), ("-c", "pass"), cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
     assert observed.value is original
     assert child.returncode == -9
     assert waits == [0, 1, 2, 3, 4]
-    assert kills == [(child.pid, signal.SIGKILL)]
+    # The first SIGKILL is the owned-group kill; the rest is review P1-1
+    # residual's own terminate-then-probe, finding nothing left.
+    assert kills == [(child.pid, signal.SIGKILL), (child.pid, signal.SIGKILL), (child.pid, 0)]
     notes = "\n".join(getattr(original, "__notes__", ()))
     for error in later:
         assert type(error).__name__ in notes and str(error) in notes, (error, notes)
@@ -116,4 +124,6 @@ def test_r3_t3_already_reaped_leader_does_not_require_another_wait(tmp_path, mon
     assert observed.value is original
     assert child.returncode == -9
     assert len(waits) == 1
-    assert kills == [(child.pid, signal.SIGKILL)]
+    # The owned-group kill, then review P1-1 residual's own
+    # terminate-then-probe (both find nothing left, like this fake).
+    assert kills == [(child.pid, signal.SIGKILL), (child.pid, signal.SIGKILL), (child.pid, 0)]
