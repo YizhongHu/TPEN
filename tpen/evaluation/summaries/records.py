@@ -14,7 +14,7 @@ from tpen.evaluation.bundle import EvaluationBundle
 from tpen.evaluation.generators.trajectory import TRAJECTORY_METADATA_KEY
 from tpen.evaluation.protocols import EvaluationContext
 from tpen.evaluation.results import ArtifactRecord, SummaryResult
-from tpen.evaluation.trajectory_records import TrajectoryRecordArtifact
+from tpen.evaluation.trajectory_records import TrajectoryRecordArtifact, TrajectoryRecordArtifactV2
 from tpen.statistics import ObservableTrajectory
 
 
@@ -149,7 +149,7 @@ class SampledRecordWriter:
         *,
         bundle: EvaluationBundle,
         context: EvaluationContext,
-        trajectory: TrajectoryRecordArtifact,
+        trajectory: TrajectoryRecordArtifact | TrajectoryRecordArtifactV2,
     ) -> SummaryResult:
         """Publish a complete streamed grid or fail loudly on a short bound."""
 
@@ -199,6 +199,10 @@ class SampledRecordWriter:
                 expected.term_energies[name][:n_rows],
             )
 
+        if isinstance(trajectory, TrajectoryRecordArtifactV2):
+            identity_metadata = {"system_id": trajectory.system_descriptor.system_id()}
+        else:
+            identity_metadata = {"atomic_configuration_id": trajectory.atomic_configuration.content_id()}
         return SummaryResult(
             metrics={},
             artifacts=(
@@ -216,7 +220,7 @@ class SampledRecordWriter:
                         "selection": "complete_draw_walker_grid",
                         "content_id": trajectory.csv_sha256,
                         "observable_content_id": trajectory.observable_values_content_id,
-                        "atomic_configuration_id": trajectory.atomic_configuration.content_id(),
+                        **identity_metadata,
                         "metadata_path": str(trajectory.metadata_path),
                         "bytes": trajectory.byte_count,
                     },
