@@ -78,6 +78,47 @@ def test_science_both_default_dry_run_is_exactly_six_lines(tmp_path: Path, capsy
     assert result.stdout.count("--dependency=afterok:") == 3, result.stdout
 
 
+def test_packed_eval_scales_host_resources_and_passes_pack_k(tmp_path: Path) -> None:
+    """Packing is explicit and requests one CPU/memory slice per stream."""
+
+    command = launch.build_eval_fanout_sbatch_command(
+        "science",
+        lineage="L1",
+        expected_train_commit=TRAIN_SHA,
+        science_python=sys.executable,
+        executor_python=sys.executable,
+        run_root=tmp_path / "runs" / "h-v2" / "science",
+        checkout_root=tmp_path / "checkout",
+        time_value="04:00:00",
+        dependency=None,
+        commit=SHA,
+        resources=launch_config.RESOURCES,
+        pack_k=3,
+    )
+    assert "--cpus-per-task=12" in command
+    assert "--mem=96G" in command
+    assert "--gres=gpu:1" in command
+    assert "--pack-k 3" in next(flag for flag in command if flag.startswith("--wrap="))
+
+
+def test_packed_eval_rejects_out_of_range_pack_k(tmp_path: Path) -> None:
+    with pytest.raises(launch.LaunchError, match="between 1 and 6"):
+        launch.build_eval_fanout_sbatch_command(
+            "science",
+            lineage="L1",
+            expected_train_commit=TRAIN_SHA,
+            science_python=sys.executable,
+            executor_python=sys.executable,
+            run_root=tmp_path,
+            checkout_root=tmp_path / "checkout",
+            time_value="04:00:00",
+            dependency=None,
+            commit=SHA,
+            resources=launch_config.RESOURCES,
+            pack_k=7,
+        )
+
+
 def test_science_stage_train_dry_run_is_exactly_three_lines_no_eval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

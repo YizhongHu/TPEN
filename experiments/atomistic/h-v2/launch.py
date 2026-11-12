@@ -559,6 +559,7 @@ def _wrap_eval_fanout_command(
     checkout_root: Path,
     science_python: str,
     executor_python: str,
+    pack_k: int = 1,
 ) -> str:
     """Return the wrapper body for ``run_job.py eval-fanout ...`` (item E).
 
@@ -574,6 +575,8 @@ def _wrap_eval_fanout_command(
         assert lineage is not None
         argv.append(lineage)
     argv += ["--expected-train-commit", expected_train_commit]
+    if pack_k != 1:
+        argv += ["--pack-k", str(pack_k)]
     if pilot_stage is not None:
         argv += ["--pilot-stage", pilot_stage]
     checkout_quoted = shlex.quote(str(checkout_root))
@@ -613,6 +616,7 @@ def build_eval_fanout_sbatch_command(
     dependency: str | None,
     commit: str,
     resources: launch_config.JobResources,
+    pack_k: int = 1,
 ) -> list[str]:
     """Return the exact ``sbatch`` argv for one EVAL fan-out job (item E).
 
@@ -653,6 +657,10 @@ def build_eval_fanout_sbatch_command(
     """
 
     _validate_payload(payload)
+    try:
+        resources = launch_config.packed_eval_resources(resources, pack_k)
+    except ValueError as error:
+        raise LaunchError(str(error)) from error
     if payload in PILOT_PAYLOADS:
         job_lineage = launch_config.PILOT_PAYLOAD_LINEAGES[payload]
     else:
@@ -699,6 +707,7 @@ def build_eval_fanout_sbatch_command(
             checkout_root=checkout_root,
             science_python=science_python,
             executor_python=executor_python,
+            pack_k=pack_k,
         )
     )
     return command
@@ -870,6 +879,7 @@ def submit_lineage(
     commit: str | None = None,
     runner: Runner = _default_runner,
     dry_run: bool = False,
+    pack_k: int = 1,
 ) -> tuple[str | None, str | None]:
     """Submit one lineage's train job, then its eval job chained on it.
 
@@ -927,6 +937,7 @@ def submit_lineage(
                 dependency=dependency,
                 commit=expected_commit,
                 resources=launch_config.RESOURCES,
+                pack_k=pack_k,
             )
         return build_sbatch_command(
             "eval",
@@ -1101,6 +1112,7 @@ def submit_all(
     lineages: Sequence[str] = launch_config.LINEAGES,
     runner: Runner = _default_runner,
     dry_run: bool = False,
+    pack_k: int = 1,
 ) -> dict[str, tuple[str | None, str | None]]:
     """Submit every lineage's two jobs in order; abort on the first failure.
 
@@ -1139,6 +1151,7 @@ def submit_all(
             commit=commit,
             runner=runner,
             dry_run=dry_run,
+            pack_k=pack_k,
         )
     return results
 
@@ -1187,6 +1200,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "'2'/'2-core' refuse before any sbatch call unless the SEL selection record "
             "(run_job.py sel capacity-pilot) already exists with c1 in 3..19."
         ),
+    )
+    parser.add_argument(
+        "--pack-k",
+        type=int,
+        default=1,
+        help="Concurrent EVAL generations per GPU job, 1..6; default 1 preserves single-stream behavior.",
     )
     parser.add_argument(
         "--expected-train-commit",
@@ -1328,6 +1347,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dependency=None,
             commit=args.commit,
             resources=launch_config.PILOT_PAYLOAD_RESOURCES[args.payload],
+            pack_k=args.pack_k,
         )
         if args.dry_run:
             print(shlex.join(eval_command))
@@ -1396,6 +1416,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 science_python=science_python, executor_python=executor_python, run_root=run_root,
                 checkout_root=checkout_root, time_value=args.time, dependency=None, commit=args.commit,
                 resources=launch_config.RESOURCES,
+                pack_k=args.pack_k,
             )
             if args.dry_run:
                 print(shlex.join(command))
@@ -1438,6 +1459,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         e_wall=e_wall,
         commit=args.commit,
         dry_run=args.dry_run,
+        pack_k=args.pack_k,
     )
     for lineage, (train_id, eval_id) in results.items():
         print(f"[h-v2] {lineage}: train={train_id} eval={eval_id}")

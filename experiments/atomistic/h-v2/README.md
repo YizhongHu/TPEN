@@ -10,6 +10,24 @@ Hydra configurations, an independent standard-library scalar oracle, strict
 record collection, and tests beside those sources. It does not contain a
 science launcher, science output, or qualification result.
 
+## Packed evaluation validation
+
+The eval-fanout route accepts ``--pack-k 1..6``. ``1`` is the original
+single-stream path; values above one run independent ``run_from_config``
+subprocesses concurrently in one GPU allocation. Each generation has its own
+seed, run directory, verified checkpoint snapshot, and append-on-completion
+receipt entry. A failed generation is isolated, but the job exits non-zero
+after all siblings settle.
+
+For GPU validation, run the same checkpoint/seed roster once with
+``--pack-k 1`` and once with the selected packed value. Compare each pair with
+``eval_job.compare_packed_single_stream``. First derive tolerances from at
+least two single-stream repeats using
+``derive_packed_validation_tolerance``: energy is bounded by ``3 x SE`` and
+variance by ``3 x SE / |mean variance|``. Record the repeat measurements,
+derived tolerances, GPU model, and both job IDs in the validation receipt;
+this is validation evidence, not science admission.
+
 The executable route is the normal TPEN entrypoint (the ``tpen`` console
 script, or ``tpen.run.run_from_config`` from a test). Do not use
 ``python -m tpen.run``: that module has no ``__main__`` guard.

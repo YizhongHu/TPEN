@@ -34,6 +34,7 @@ import json
 import math
 import subprocess
 import sys
+import statistics
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -80,6 +81,50 @@ class EvalJobRefusal(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
+
+
+def derive_packed_validation_tolerance(single_stream_repeats: Sequence[Mapping[str, float]]) -> dict[str, float]:
+    """Derive comparison tolerances from repeated single-stream measurements.
+
+    The returned energy tolerance is ``3 * SE`` and the variance tolerance is
+    ``3 * SE / |mean variance|``.  This keeps GPU validation tied to measured
+    repeat noise rather than an arbitrary decimal threshold.
+    """
+
+    if len(single_stream_repeats) < 2:
+        raise ValueError("at least two single-stream repeats are required")
+    energies = [float(row["energy"]) for row in single_stream_repeats]
+    variances = [float(row["variance"]) for row in single_stream_repeats]
+    energy_se = statistics.stdev(energies) / len(energies) ** 0.5
+    variance_se = statistics.stdev(variances) / len(variances) ** 0.5
+    mean_variance = abs(statistics.mean(variances))
+    if mean_variance == 0:
+        raise ValueError("single-stream repeat variance mean must be non-zero")
+    return {"energy_abs": 3.0 * energy_se, "variance_relative": 3.0 * variance_se / mean_variance}
+
+
+def compare_packed_single_stream(
+    packed: Mapping[str, float], single_stream: Mapping[str, float], *, tolerance: Mapping[str, float]
+) -> None:
+    """Validate one packed result against the same-seed single-stream result.
+
+    Raises
+    ------
+    EvalJobRefusal
+        Code ``packed-validation-mismatch`` when either metric exceeds the
+        tolerance derived by :func:`derive_packed_validation_tolerance`.
+    """
+
+    if packed.get("seed") != single_stream.get("seed") or packed.get("checkpoint") != single_stream.get("checkpoint"):
+        raise EvalJobRefusal("packed-validation-identity", "packed and single-stream records are not same-seed/checkpoint")
+    energy_delta = abs(float(packed["energy"]) - float(single_stream["energy"]))
+    variance = abs(float(single_stream["variance"]))
+    variance_delta = abs(float(packed["variance"]) - float(single_stream["variance"])) / max(variance, 1e-300)
+    if energy_delta > float(tolerance["energy_abs"]) or variance_delta > float(tolerance["variance_relative"]):
+        raise EvalJobRefusal(
+            "packed-validation-mismatch",
+            f"energy delta={energy_delta:g}, variance relative delta={variance_delta:g}, tolerance={dict(tolerance)!r}",
+        )
 
 
 def _sha256_file(path: Path) -> str:
