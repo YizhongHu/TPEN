@@ -52,6 +52,12 @@ done
 
 [[ -n "$ENVS_ROOT" && -n "$CHECKOUT" && -n "$PROJECT" && -n "$EXTRA" && -n "$PYTHON_VERSION" && -n "$UV_BIN" ]] ||
   fail_precheck "--envs-root, --checkout, --project, --extra, --python, and --uv-bin are all required"
+# --project/--extra feed into the computed target directory name. Restrict
+# each to a single path component (no '/', no leading '.' so ".." is
+# rejected outright) so neither can make the target escape --envs-root.
+NAME_COMPONENT_RE='^[A-Za-z0-9][A-Za-z0-9._+]*$'
+[[ "$PROJECT" =~ $NAME_COMPONENT_RE ]] || fail_precheck "--project must be a single path component matching $NAME_COMPONENT_RE"
+[[ "$EXTRA" =~ $NAME_COMPONENT_RE ]] || fail_precheck "--extra must be a single path component matching $NAME_COMPONENT_RE"
 [[ "$PYTHON_VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || fail_precheck "--python must be X.Y"
 [[ -x "$UV_BIN" && "$UV_BIN" == /* ]] || fail_precheck "--uv-bin must be an executable absolute path"
 [[ -n "${UV_CACHE_DIR:-}" ]] || fail_precheck "UV_CACHE_DIR must be set by the caller"
@@ -76,14 +82,15 @@ HEAD_SHA="$(git -C "$CANON_CHECKOUT" rev-parse HEAD)"
 
 POLICY_FILE="$CANON_CHECKOUT/scripts/cannon/shared-env-policy.json"
 [[ -f "$POLICY_FILE" ]] || fail "policy file missing: $POLICY_FILE"
-# Capture the WHOLE value token up to the next JSON delimiter (comma or
-# closing brace) so "3.5", "-1", or a quoted string are rejected outright
-# rather than having only their leading digits accepted.
-CAP_LINE="$(grep -oE '"MAX_SHARED_ENV_DIRS"[[:space:]]*:[[:space:]]*[^,}]*' -- "$POLICY_FILE" | head -n1 || true)"
-CAP_VALUE="${CAP_LINE#*:}"
-CAP_VALUE="$(printf '%s' "$CAP_VALUE" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
-[[ "$CAP_VALUE" =~ ^[0-9]+$ ]] || fail "policy MAX_SHARED_ENV_DIRS missing or not a non-negative integer: $POLICY_FILE"
-CAP="$CAP_VALUE"
+# Whole-document match, not a substring grep: the committed policy must be
+# exactly one top-level object holding exactly one key, with a plain
+# (non-leading-zero, <=3 digit) integer value. This rejects truncated
+# documents, trailing garbage, duplicate/nested keys, quoted numbers,
+# booleans, negatives, and floats -- not just their leading characters.
+POLICY_CONTENT="$(cat -- "$POLICY_FILE")"
+POLICY_RE='^[[:space:]]*\{[[:space:]]*"MAX_SHARED_ENV_DIRS"[[:space:]]*:[[:space:]]*(0|[1-9][0-9]{0,2})[[:space:]]*\}[[:space:]]*$'
+[[ "$POLICY_CONTENT" =~ $POLICY_RE ]] || fail "policy MAX_SHARED_ENV_DIRS missing or not a non-negative integer: $POLICY_FILE"
+CAP="${BASH_REMATCH[1]}"
 
 UV_LOCK="$CANON_CHECKOUT/uv.lock"
 [[ -f "$UV_LOCK" ]] || fail_precheck "uv.lock missing in checkout: $UV_LOCK"
@@ -91,28 +98,63 @@ LOCK_SHA256="$(sha256sum -- "$UV_LOCK" | cut -d' ' -f1)"
 LOCK_HASH12="${LOCK_SHA256:0:12}"
 ENV_NAME="${PROJECT}-${LOCK_HASH12}-${EXTRA}-py${PYTHON_VERSION}"
 TARGET="$CANON_ENVS_ROOT/$ENV_NAME"
+# Defense in depth: ENV_NAME can contain no '/' (enforced by
+# NAME_COMPONENT_RE above), so TARGET's parent is always CANON_ENVS_ROOT --
+# but assert it explicitly under the lock in case that invariant is ever
+# weakened.
+TARGET_PARENT="$(realpath -m -- "$(dirname -- "$TARGET")")"
+[[ "$TARGET_PARENT" == "$CANON_ENVS_ROOT" ]] || fail_precheck "computed target escapes --envs-root: $TARGET"
+
+# A manifest is trusted for reuse only if every field is present and its
+# recorded lock hash matches the CURRENT checkout's uv.lock. The build HEAD
+# may differ from the requesting HEAD (dependencies, not history, define
+# identity); an empty, truncated, or mismatched manifest is not trusted.
+manifest_is_valid() {
+  local manifest="$1"
+  [[ -s "$manifest" ]] || return 1
+  local head_line lock_line uv_line py_line built_line
+  head_line="$(grep -m1 -E '^head=.+' -- "$manifest" || true)"
+  lock_line="$(grep -m1 -E '^uv_lock_sha256=.+' -- "$manifest" || true)"
+  uv_line="$(grep -m1 -E '^uv_version=.+' -- "$manifest" || true)"
+  py_line="$(grep -m1 -E '^python_version=.+' -- "$manifest" || true)"
+  built_line="$(grep -m1 -E '^built_utc=.+' -- "$manifest" || true)"
+  [[ -n "$head_line" && -n "$lock_line" && -n "$uv_line" && -n "$py_line" && -n "$built_line" ]] || return 1
+  [[ "${lock_line#uv_lock_sha256=}" == "$LOCK_SHA256" ]] || return 1
+  return 0
+}
 
 LOCKFILE="$CANON_ENVS_ROOT/.build-shared-env.lock"
 exec 200>"$LOCKFILE"
 flock -x 200
 
-# Count ALL one-level directory entries under the root under the lock:
-# dotglob includes dot-dirs, nullglob drops the pattern if nothing matches,
-# and the trailing slash matches directories only (symlinks to directories
-# included). "." and ".." are never matched by a glob. No .complete filter
-# and no recursion: malformed, partial, and unfinished names all count.
+# Count ALL one-level directory entries under the root under the lock.
+# `set +f` and an explicit GLOBIGNORE reset neutralize an inherited
+# SHELLOPTS=noglob (or GLOBIGNORE) that would otherwise silently leave the
+# glob unexpanded and the census wrong; dotglob includes dot-dirs, nullglob
+# drops the pattern if nothing matches, and the trailing slash matches
+# directories only (symlinks to directories included). "." and ".." are
+# never matched by a glob. No .complete filter and no recursion: malformed,
+# partial, and unfinished names all count.
+set +f
+unset GLOBIGNORE
 shopt -s nullglob dotglob
 ENTRIES=("$CANON_ENVS_ROOT"/*/)
 shopt -u nullglob dotglob
+for ENTRY in "${ENTRIES[@]+"${ENTRIES[@]}"}"; do
+  [[ "$ENTRY" == *'*'* ]] && fail_precheck "directory census failed: pathname expansion is disabled"
+done
 COUNT="${#ENTRIES[@]}"
 
-if [[ -f "$TARGET/.complete" ]]; then
-  echo "REUSE count=$COUNT path=$TARGET cap=$CAP policy=$POLICY_FILE head=$HEAD_SHA"
-  exit 0
+if [[ -L "$TARGET" ]]; then
+  fail "target is a symlink, refusing to reuse or create through it: count=$COUNT path=$TARGET cap=$CAP policy=$POLICY_FILE head=$HEAD_SHA"
 fi
 
 if [[ -e "$TARGET" ]]; then
-  fail "partial env exists without .complete, needs disposition: count=$COUNT path=$TARGET cap=$CAP policy=$POLICY_FILE head=$HEAD_SHA"
+  if [[ -f "$TARGET/.complete" ]] && manifest_is_valid "$TARGET/.complete"; then
+    echo "REUSE count=$COUNT path=$TARGET cap=$CAP policy=$POLICY_FILE head=$HEAD_SHA"
+    exit 0
+  fi
+  fail "partial or invalid env exists without a valid .complete, needs disposition: count=$COUNT path=$TARGET cap=$CAP policy=$POLICY_FILE head=$HEAD_SHA"
 fi
 
 if ((COUNT >= CAP)); then
@@ -123,12 +165,22 @@ mkdir -- "$TARGET"
 (cd "$CANON_CHECKOUT" && UV_PROJECT_ENVIRONMENT="$TARGET" "$UV_BIN" sync --locked --no-install-project --extra "$EXTRA" --python "$PYTHON_VERSION")
 
 UV_VERSION="$("$UV_BIN" --version)"
-cat > "$TARGET/.complete" <<MANIFEST
+# Record the interpreter actually built, not just the selector requested;
+# a query failure must block publication (the dir is left partial, counted,
+# and undeleted for disposition -- same as any other failed build).
+PY_VERSION_OUTPUT="$("$TARGET/bin/python" --version 2>&1)" || fail "interpreter version query failed, needs disposition: path=$TARGET"
+PY_FULL_VERSION="${PY_VERSION_OUTPUT#Python }"
+[[ -n "$PY_FULL_VERSION" ]] || fail "interpreter reported no version, needs disposition: path=$TARGET"
+
+TMP_MANIFEST="$TARGET/.complete.tmp.$$"
+cat > "$TMP_MANIFEST" <<MANIFEST
 head=$HEAD_SHA
 uv_lock_sha256=$LOCK_SHA256
 uv_version=$UV_VERSION
-python_version=$PYTHON_VERSION
+python_version=$PY_FULL_VERSION
+python_request=$PYTHON_VERSION
 built_utc=$(date -u +%FT%TZ)
 MANIFEST
+mv -f -- "$TMP_MANIFEST" "$TARGET/.complete"
 
 echo "BUILT count=$COUNT path=$TARGET cap=$CAP policy=$POLICY_FILE head=$HEAD_SHA"

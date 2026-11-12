@@ -124,30 +124,49 @@ scripts/cannon/build-shared-env.sh \
 ```
 
 `UV_CACHE_DIR` must be set by the caller. The `--checkout` must be a clean
-git work tree (its `HEAD` is recorded in the manifest below).
+git work tree (its `HEAD` is recorded in the manifest below). `--project` and
+`--extra` must each be a single path component (`^[A-Za-z0-9][A-Za-z0-9._+]*$`,
+no `/`, no leading `.` so `..` is rejected) — the computed target's canonical
+parent is also asserted to equal the canonical `--envs-root` under the lock,
+so neither flag, nor a weakened name check, can make the target escape the
+counted root.
 
 The committed cap in `scripts/cannon/shared-env-policy.json`
-(`MAX_SHARED_ENV_DIRS`) is read only from that file in the exact verified
-checkout, and only from there — no CLI flag, environment variable, or
-default can override it. Under one root-level `flock`, the builder counts
+(`MAX_SHARED_ENV_DIRS`) is read only from that file via a whole-document
+match (one top-level object, one key, a plain non-leading-zero integer up to
+3 digits) in the exact verified checkout, and only from there — no CLI flag,
+environment variable, or default can override it. Truncated, duplicated,
+nested, or trailing-garbage policy documents refuse rather than having a
+substring accepted. Under one root-level `flock`, with pathname expansion
+explicitly re-enabled (`set +f`, `GLOBIGNORE` unset) so an inherited
+`SHELLOPTS=noglob` cannot silently empty the census, the builder counts
 **every** one-level directory entry beneath `--envs-root` (dot-dirs,
 malformed or partial names, symlinked directories — not only directories
 carrying a `.complete` manifest), so a cap cannot be evaded by an
 unfinished or oddly-named directory. Decision order, all before any
 `mkdir`/`uv sync`:
 
-1. the target (`<env-name>`) already exists and carries a `.complete`
-   manifest -> reuse, exit 0 (checked even if the root is otherwise at cap,
-   since the target itself is one of the counted entries);
-2. the target exists without `.complete` -> hard refuse: partial build,
-   needs an explicit disposition, never auto-cleaned;
-3. the one-level directory count is at or above the committed cap -> hard
+1. the target (`<env-name>`) is a symlink -> hard refuse, never reused or
+   created through;
+2. the target already exists and carries a `.complete` manifest whose
+   recorded `uv.lock` sha256 matches the current checkout's (the build
+   `HEAD` may differ — dependency identity, not history, governs reuse) ->
+   reuse, exit 0 (checked even if the root is otherwise at cap, since the
+   target itself is one of the counted entries);
+3. the target exists without a valid `.complete` -> hard refuse: partial or
+   invalid build, needs an explicit disposition, never auto-cleaned;
+4. the one-level directory count is at or above the committed cap -> hard
    refuse, printing the observed count, the requested path, the cap, the
    policy file path, and the checkout's exact `HEAD`;
-4. otherwise, `mkdir`, then `UV_PROJECT_ENVIRONMENT=<env> uv sync --locked
+5. otherwise, `mkdir`, then `UV_PROJECT_ENVIRONMENT=<env> uv sync --locked
    --no-install-project --extra <extra> --python <X.Y>` under the checkout,
-   then write a `.complete` manifest recording `HEAD`, the full `uv.lock`
-   sha256, the `uv` version, the Python version, and the UTC build time.
+   then query `<env>/bin/python --version` (a query failure refuses and
+   leaves the build partial, counted, undeleted) and write a `.complete`
+   manifest — via a temp file in the same directory, published by one
+   same-directory atomic `mv` — recording `HEAD`, the full `uv.lock`
+   sha256, the `uv` version, the actual built Python version
+   (`python_version`) plus the requested selector (`python_request`), and
+   the UTC build time.
 
 Raising the cap requires a reviewed PR that changes the committed policy
 file and its hard-refusal test together, visible in Git/GitHub — there is
