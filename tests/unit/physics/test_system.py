@@ -85,15 +85,22 @@ def test_hooke_1e_builds_with_no_nuclear_resource() -> None:
     assert descriptor.particle.n_electrons == 1
     assert len(descriptor.terms) == 2
     assert all(term.resource_id is None for term in descriptor.terms)
+    assert descriptor.resources == {}
 
 
 # --- Golden, pinned content ids (cross-process stability evidence) ---------
 
 
+#: r1 fix bumped the canonical encoding to v2 (versioned length/count
+#: framing; see `tpen.physics.system._DESCRIPTOR_SCHEMA_VERSION`), so every
+#: v1 golden value above is stale. Placeholders below are deliberately wrong;
+#: `test_golden_system_ids_are_pinned`'s failure message reports the real v2
+#: values, which then replace these placeholders (same two-step discovery
+#: used to pin the original v1 goldens).
 GOLDEN_SYSTEM_IDS = {
-    "hooke_1e_omega_0.5": "d8408fa70440c94c7f1a5826891917aff82651a1cab041a44268655682cb27e0",
-    "helium": "8d41df68cc4e3285ff5e2fda1b09f8050430ac593a1c25b3abb56b1ba2d0ea8a",
-    "h2_r1.4": "8daa15da651c797bdb3b91c6bfd61c5645f18d798944df9ae671a7ed585d86a3",
+    "hooke_1e_omega_0.5": "0" * 64,
+    "helium": "0" * 64,
+    "h2_r1.4": "0" * 64,
 }
 
 
@@ -171,6 +178,191 @@ def test_h2_with_and_without_nuclear_repulsion_discriminates() -> None:
 
     assert with_repulsion.system_id() != without_repulsion.system_id()
     assert len(with_repulsion.terms) == len(without_repulsion.terms) + 1
+
+
+# --- Framing: variable-length parameter fields must not collide ------------
+
+
+def _string_param_term(custom_id: OperatorId, params: dict) -> HamiltonianTermDescriptor:
+    class _StringParamTerm:
+        name = "string_param"
+
+        def local_energy(self, wavefunction, batch):  # pragma: no cover - never reached
+            raise AssertionError("local_energy is not exercised by this descriptor-only test")
+
+    registered = register_operator(custom_id)(_StringParamTerm)
+    term = registered()
+    return HamiltonianTermDescriptor(operator_id=term.operator_id, slot=term.name, parameters=params)
+
+
+def test_unframed_parameter_boundaries_no_longer_collide() -> None:
+    """r1 regression: ``{"a": "bs", "b": ""}`` vs ``{"a": "", "b": "bs"}``.
+
+    Under the v1 encoding these two distinct parameter maps both serialized
+    to ``b"asbsbs"`` (no boundary between a key's bytes and its value's
+    bytes, and no boundary between successive key/value pairs), so they
+    hashed to the same `HamiltonianTermDescriptor.canonical_bytes`. The v2
+    length-framed encoding (`_encode_length_prefixed`) must distinguish them.
+    """
+
+    left = _string_param_term(OperatorId("test.system", "framing_left"), {"a": "bs", "b": ""})
+    right = _string_param_term(OperatorId("test.system", "framing_left"), {"a": "", "b": "bs"})
+
+    assert left.canonical_bytes() != right.canonical_bytes()
+
+
+def test_reversed_parameter_insertion_order_is_still_equal() -> None:
+    """Sorting by key (not insertion order) keeps this green, unlike the collision above."""
+
+    custom_id = OperatorId("test.system", "framing_order")
+    forward = _string_param_term(custom_id, {"a": "bs", "b": "cs"})
+    reversed_insertion = HamiltonianTermDescriptor(
+        operator_id=forward.operator_id, slot=forward.slot, parameters={"b": "cs", "a": "bs"}
+    )
+
+    assert forward.canonical_bytes() == reversed_insertion.canonical_bytes()
+
+
+# --- Resource payloads: immutable typed snapshots, deduplicated by reference -
+
+
+def test_resource_payload_survives_input_mutation() -> None:
+    positions = torch.tensor([[0.0, 0.0, 0.0]])
+    charges = torch.tensor([2.0])
+    atoms = AtomicConfiguration(positions, charges)
+    descriptor = build_system_descriptor(
+        ParticleSpec(1, 1, 0, 3),
+        {"kinetic": KineticEnergy(), "electron_nucleus": ElectronNucleusPotential(atoms)},
+    )
+    resource_id = atoms.content_id()
+    before = descriptor.resources[resource_id].positions.clone()
+
+    # Mutate the term's own geometry object's tensor in place, after the
+    # descriptor exists. `atoms.positions` is itself an owned clone (never
+    # the caller's original tensor), so this exercises the *second*,
+    # descriptor-level clone: `SystemDescriptor.resources` must not alias
+    # `atoms.positions` either.
+    atoms.positions.add_(100.0)
+
+    assert torch.equal(descriptor.resources[resource_id].positions, before)
+    assert not torch.equal(atoms.positions, before)
+
+
+def test_shared_en_nn_resource_references_resolve_to_one_payload() -> None:
+    atoms = _h2_atoms()
+    descriptor = build_system_descriptor(
+        _h2_particle(),
+        {
+            "kinetic": KineticEnergy(),
+            "electron_nucleus": ElectronNucleusPotential(atoms),
+            "nucleus_nucleus": NucleusNucleusPotential(atoms),
+        },
+    )
+
+    en_term = next(t for t in descriptor.terms if t.slot == "electron_nucleus")
+    nn_term = next(t for t in descriptor.terms if t.slot == "nucleus_nucleus")
+    assert en_term.resource_id == nn_term.resource_id
+    assert len(descriptor.resources) == 1
+    assert descriptor.resources[en_term.resource_id].positions.shape == atoms.positions.shape
+
+
+def test_nn_only_geometry_discriminates() -> None:
+    """`NucleusNucleusPotential` alone, varying only separation."""
+
+    equilibrium = build_system_descriptor(_h2_particle(), {"nucleus_nucleus": NucleusNucleusPotential(_h2_atoms(1.4))})
+    stretched = build_system_descriptor(_h2_particle(), {"nucleus_nucleus": NucleusNucleusPotential(_h2_atoms(2.0))})
+
+    assert equilibrium.system_id() != stretched.system_id()
+
+
+def test_en_and_nn_distinct_resources_stay_distinct() -> None:
+    atoms_a = _h2_atoms(1.4)
+    atoms_b = _h2_atoms(2.0)
+    descriptor = build_system_descriptor(
+        _h2_particle(),
+        {
+            "kinetic": KineticEnergy(),
+            "electron_nucleus": ElectronNucleusPotential(atoms_a),
+            "nucleus_nucleus": NucleusNucleusPotential(atoms_b),
+        },
+    )
+
+    en_term = next(t for t in descriptor.terms if t.slot == "electron_nucleus")
+    nn_term = next(t for t in descriptor.terms if t.slot == "nucleus_nucleus")
+    assert en_term.resource_id != nn_term.resource_id
+    assert len(descriptor.resources) == 2
+
+
+# --- Slot normalization: slot is the resolved execution name ---------------
+
+
+def test_mapping_slot_is_the_configured_key_not_the_term_label() -> None:
+    descriptor = build_system_descriptor(_hooke_1e_particle(), {"trap_energy": HarmonicTrap(omega=0.5)})
+
+    assert [term.slot for term in descriptor.terms] == ["trap_energy"]
+
+
+def test_sequence_slot_is_the_normalized_class_name() -> None:
+    descriptor = build_system_descriptor(_hooke_1e_particle(), [KineticEnergy()])
+
+    assert [term.slot for term in descriptor.terms] == ["kinetic_energy"]
+
+
+def test_renamed_slot_preserves_system_id() -> None:
+    renamed = build_system_descriptor(_hooke_1e_particle(), {"trap_energy": HarmonicTrap(omega=0.5)})
+    original = build_system_descriptor(_hooke_1e_particle(), {"harmonic_trap": HarmonicTrap(omega=0.5)})
+
+    assert renamed.system_id() == original.system_id()
+    assert renamed.terms[0].slot != original.terms[0].slot
+
+
+# --- Finite parameters and signed-zero canonicalization ---------------------
+
+
+@pytest.mark.parametrize("bad_omega", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_trap_parameter_is_rejected(bad_omega: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        HarmonicTrap(omega=bad_omega).describe_physical_operator()
+
+
+def test_signed_zero_eps_is_canonicalized_for_electron_electron() -> None:
+    positive = build_system_descriptor(_hooke_1e_particle(), {"electron_electron": ElectronElectronInteraction(eps=0.0)})
+    negative = build_system_descriptor(_hooke_1e_particle(), {"electron_electron": ElectronElectronInteraction(eps=-0.0)})
+
+    assert positive.system_id() == negative.system_id()
+
+
+def test_signed_zero_eps_is_canonicalized_for_electron_nucleus() -> None:
+    atoms = _helium_atoms()
+    positive = build_system_descriptor(
+        _helium_particle(), {"electron_nucleus": ElectronNucleusPotential(atoms, eps=0.0)}
+    )
+    negative = build_system_descriptor(
+        _helium_particle(), {"electron_nucleus": ElectronNucleusPotential(atoms, eps=-0.0)}
+    )
+
+    assert positive.system_id() == negative.system_id()
+
+
+def test_eps_discriminates_independently_for_electron_electron() -> None:
+    zero = build_system_descriptor(_hooke_1e_particle(), {"electron_electron": ElectronElectronInteraction(eps=0.0)})
+    nonzero = build_system_descriptor(
+        _hooke_1e_particle(), {"electron_electron": ElectronElectronInteraction(eps=1e-4)}
+    )
+
+    assert zero.system_id() != nonzero.system_id()
+
+
+def test_eps_discriminates_independently_for_electron_nucleus() -> None:
+    atoms = _helium_atoms()
+    zero = build_system_descriptor(
+        _helium_particle(), {"electron_nucleus": ElectronNucleusPotential(atoms, eps=0.0)}
+    )
+    nonzero = build_system_descriptor(
+        _helium_particle(), {"electron_nucleus": ElectronNucleusPotential(atoms, eps=1e-4)}
+    )
+
+    assert zero.system_id() != nonzero.system_id()
 
 
 # --- Compositional: trap-plus-nuclei ----------------------------------------

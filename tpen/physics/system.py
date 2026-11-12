@@ -22,7 +22,11 @@ Three values compose the contract:
     The immutable aggregate of a ``ParticleSpec`` and the ordered term
     declarations actually constructed for one Hamiltonian. Its
     :meth:`SystemDescriptor.system_id` is the canonical content identity
-    published through :data:`SYSTEM_DESCRIPTOR_KEY`.
+    published through :data:`SYSTEM_DESCRIPTOR_KEY`. Its
+    :attr:`SystemDescriptor.resources` carries one immutable, deduplicated
+    `AtomicConfiguration` snapshot per distinct resource reference declared by
+    its terms (for example a shared nuclear geometry referenced by both an
+    electron-nucleus and a nucleus-nucleus term).
 
 External context is compositional: a system may declare zero, one, or several
 external-potential terms (a harmonic trap, nuclei, or both at once); absence
@@ -37,12 +41,14 @@ separate slices that consume ``system_id`` as an opaque value.
 from __future__ import annotations
 
 import hashlib
+import math
 import struct
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
+from tpen.data.atomic_configuration import AtomicConfiguration
 from tpen.physics.context import ContextKey, ContextRequirements, ReadOnlyContext, requirements
 from tpen.physics.hamiltonian import normalize_hamiltonian_terms
 from tpen.physics.operators import OperatorId, is_registered_operator
@@ -53,15 +59,36 @@ from tpen.physics.operators import OperatorId, is_registered_operator
 #: shipped today (trap frequency, distance floor, nuclear-geometry id).
 JsonScalar = bool | int | float | str
 
-_DESCRIPTOR_SCHEMA_VERSION = 1
+#: v2 (r1 fix): every variable-length field (operator namespace/name, string
+#: parameter values, parameter count, resource id) is now framed with an
+#: explicit big-endian length/count prefix; see `_encode_length_prefixed`.
+#: Under v1, two fields concatenated without a boundary could produce
+#: identical bytes for different content -- e.g. parameters
+#: ``{"a": "bs", "b": ""}`` and ``{"a": "", "b": "bs"}`` both encoded to
+#: ``b"asbsbs"`` and therefore hashed to the same `system_id`.
+_DESCRIPTOR_SCHEMA_VERSION = 2
+
+
+def _encode_length_prefixed(data: bytes) -> bytes:
+    """Return `data` framed with an explicit 8-byte big-endian length prefix.
+
+    Concatenating unframed variable-length byte strings is ambiguous: the
+    boundary between two fields can move without changing the overall bytes
+    (see the v1->v2 note on `_DESCRIPTOR_SCHEMA_VERSION`). A length prefix
+    fixes the boundary so canonical encoding is injective in each field.
+    """
+
+    return struct.pack(">Q", len(data)) + data
 
 
 def _encode_scalar(value: JsonScalar) -> bytes:
-    """Return a type-tagged, deterministic byte encoding of one scalar.
+    """Return a type-tagged, deterministic, length-framed byte encoding.
 
     The type tag keeps ``1`` (int) and ``1.0`` (float) from colliding, and
     keeps ``True`` (bool) from colliding with ``1`` (int): Python's ``bool``
-    is an ``int`` subclass, so the ``bool`` check must run first.
+    is an ``int`` subclass, so the ``bool`` check must run first. The ``str``
+    case is length-framed (see `_encode_length_prefixed`); the other cases
+    are fixed-width and need no framing.
     """
 
     if isinstance(value, bool):
@@ -71,12 +98,19 @@ def _encode_scalar(value: JsonScalar) -> bytes:
     if isinstance(value, float):
         return b"f" + struct.pack(">d", value)
     if isinstance(value, str):
-        return b"s" + value.encode("utf-8")
+        return b"s" + _encode_length_prefixed(value.encode("utf-8"))
     raise TypeError(f"term parameter values must be bool, int, float, or str; got {type(value).__name__}")
 
 
 def _canonical_parameters(parameters: Mapping[str, JsonScalar]) -> MappingProxyType[str, JsonScalar]:
-    """Validate and freeze a parameter mapping, failing loudly on bad input."""
+    """Validate and freeze a parameter mapping, failing loudly on bad input.
+
+    Rejects non-finite floats (NaN, +inf, -inf): a canonical content id must
+    be a deterministic function of the declared physics, and a non-finite
+    value is both unphysical for every parameter shipped today and not
+    representable by strict JSON. Canonicalizes ``-0.0`` to ``0.0`` so that
+    physically-equivalent signed zero does not change `system_id`.
+    """
 
     validated: dict[str, JsonScalar] = {}
     for key, value in parameters.items():
@@ -86,6 +120,11 @@ def _canonical_parameters(parameters: Mapping[str, JsonScalar]) -> MappingProxyT
             raise TypeError(
                 f"term parameter {key!r} must be bool, int, float, or str; got {type(value).__name__}"
             )
+        if isinstance(value, float) and not isinstance(value, bool):
+            if not math.isfinite(value):
+                raise ValueError(f"term parameter {key!r} must be finite, got {value!r}")
+            if value == 0.0:
+                value = 0.0
         validated[key] = value
     return MappingProxyType(validated)
 
@@ -158,6 +197,13 @@ class HamiltonianTermDescriptor:
         Content identity of a typed fixed resource this operator references
         (for example `AtomicConfiguration.content_id`). ``None`` when the
         operator references no resource.
+    resource : AtomicConfiguration or None, optional
+        The actual typed resource payload identified by `resource_id` (for
+        example the construction-time nuclear geometry). Must be provided
+        together with `resource_id`, and its `AtomicConfiguration.content_id`
+        must equal `resource_id`. Carried so `SystemDescriptor.resources` can
+        publish the real resource content, not merely its hash; excluded from
+        `canonical_bytes` (`resource_id` already determines identity).
     version : int, optional
         Declaration version for this operator's description. Bump when the
         meaning of `parameters` changes for a given `operator_id`.
@@ -174,6 +220,7 @@ class HamiltonianTermDescriptor:
     slot: str
     parameters: Mapping[str, JsonScalar] = field(default_factory=dict)
     resource_id: str | None = None
+    resource: AtomicConfiguration | None = None
     version: int = 1
 
     def __post_init__(self) -> None:
@@ -185,25 +232,42 @@ class HamiltonianTermDescriptor:
             raise TypeError("HamiltonianTermDescriptor.resource_id must be a string or None")
         if self.resource_id is not None and not self.resource_id.strip():
             raise ValueError("HamiltonianTermDescriptor.resource_id must be non-empty when provided")
+        if (self.resource_id is None) != (self.resource is None):
+            raise ValueError(
+                "HamiltonianTermDescriptor.resource_id and resource must be provided together"
+            )
+        if self.resource is not None:
+            if not isinstance(self.resource, AtomicConfiguration):
+                raise TypeError("HamiltonianTermDescriptor.resource must be an AtomicConfiguration")
+            if self.resource.content_id() != self.resource_id:
+                raise ValueError(
+                    "HamiltonianTermDescriptor.resource_id must equal resource.content_id()"
+                )
         object.__setattr__(self, "parameters", _canonical_parameters(self.parameters))
 
     def canonical_bytes(self) -> bytes:
         """Return the deterministic byte encoding used by `SystemDescriptor.system_id`.
 
         Physical identity is canonicalized by `operator_id`; it deliberately
-        excludes `slot` (an execution/record-binding label, not physics).
+        excludes `slot` (an execution/record-binding label, not physics) and
+        `resource` (the actual payload; `resource_id` already determines
+        identity and is itself a content hash of that payload).
         """
 
         digest = hashlib.sha256()
-        digest.update(self.operator_id.namespace.encode("utf-8"))
-        digest.update(b"\x00")
-        digest.update(self.operator_id.name.encode("utf-8"))
-        digest.update(b"\x00")
+        digest.update(_encode_length_prefixed(self.operator_id.namespace.encode("utf-8")))
+        digest.update(_encode_length_prefixed(self.operator_id.name.encode("utf-8")))
         digest.update(struct.pack(">q", self.version))
-        for key, value in sorted(self.parameters.items()):
-            digest.update(key.encode("utf-8"))
+        items = sorted(self.parameters.items())
+        digest.update(struct.pack(">Q", len(items)))
+        for key, value in items:
+            digest.update(_encode_length_prefixed(key.encode("utf-8")))
             digest.update(_encode_scalar(value))
-        digest.update((self.resource_id or "").encode("utf-8"))
+        if self.resource_id is None:
+            digest.update(b"\x00")
+        else:
+            digest.update(b"\x01")
+            digest.update(_encode_length_prefixed(self.resource_id.encode("utf-8")))
         return digest.digest()
 
 
@@ -248,11 +312,19 @@ class SystemDescriptor:
     is not representable by today's planner's exactly-once manifest, and a
     system description must not advertise an identity the rest of the design
     cannot execute.
+
+    `resources` is derived, not supplied by the caller: for every distinct
+    `HamiltonianTermDescriptor.resource_id` declared by `terms`, it holds one
+    independently-cloned `AtomicConfiguration` snapshot (so later mutation of
+    a term's own resource cannot change the published payload). Two terms
+    sharing one `resource_id` (e.g. an electron-nucleus and a nucleus-nucleus
+    term over the same geometry) resolve to the same single entry.
     """
 
     particle: ParticleSpec
     units: str
     terms: tuple[HamiltonianTermDescriptor, ...]
+    resources: Mapping[str, AtomicConfiguration] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.particle, ParticleSpec):
@@ -271,6 +343,30 @@ class SystemDescriptor:
             seen.add(term.operator_id)
         object.__setattr__(self, "terms", terms)
 
+        resources: dict[str, AtomicConfiguration] = {}
+        for term in terms:
+            if term.resource_id is None:
+                continue
+            resource = term.resource
+            if resource is None:
+                raise ValueError(
+                    f"term declaring operator {term.operator_id} has a resource_id but no resource payload"
+                )
+            if resource.spatial_dim != self.particle.spatial_dim:
+                raise ValueError(
+                    f"resource for operator {term.operator_id} has spatial_dim "
+                    f"{resource.spatial_dim}, which disagrees with particle.spatial_dim "
+                    f"{self.particle.spatial_dim}"
+                )
+            existing = resources.get(term.resource_id)
+            if existing is None:
+                resources[term.resource_id] = AtomicConfiguration(resource.positions, resource.charges)
+            elif existing.content_id() != resource.content_id():
+                raise ValueError(
+                    f"resource_id {term.resource_id!r} resolves to two different resource payloads"
+                )
+        object.__setattr__(self, "resources", MappingProxyType(resources))
+
     def system_id(self) -> str:
         """Return the canonical, deterministic content identity of this system.
 
@@ -280,15 +376,18 @@ class SystemDescriptor:
             Hex SHA-256 digest. Deterministic across processes, independent
             of the order terms were constructed in (terms are canonicalized
             by `OperatorId` before hashing), and depends only on
-            `particle`, `units`, and each term's `HamiltonianTermDescriptor`.
+            `particle`, `units`, and each term's `HamiltonianTermDescriptor`
+            (`resources` is not separately hashed: every resource's content
+            is already captured by its `resource_id`, which is part of the
+            owning term's `canonical_bytes`).
         """
 
         digest = hashlib.sha256()
         digest.update(f"tpen.physics.system.SystemDescriptor.v{_DESCRIPTOR_SCHEMA_VERSION}".encode("utf-8"))
         digest.update(self.particle.canonical_bytes())
-        digest.update(self.units.encode("utf-8"))
+        digest.update(_encode_length_prefixed(self.units.encode("utf-8")))
         canonical_terms = sorted(self.terms, key=lambda term: (term.operator_id.namespace, term.operator_id.name))
-        digest.update(struct.pack(">q", len(canonical_terms)))
+        digest.update(struct.pack(">Q", len(canonical_terms)))
         for term in canonical_terms:
             digest.update(term.canonical_bytes())
         return digest.hexdigest()
@@ -326,6 +425,15 @@ def build_system_descriptor(
         `DescribesPhysicalOperator`, or declares an `operator_id` mismatched
         with its class registration. The error names the offending term
         before any `SystemDescriptor`, content id, or record is produced.
+
+    Notes
+    -----
+    Each resulting `HamiltonianTermDescriptor.slot` is the name
+    `normalize_hamiltonian_terms` resolved for that term here -- the same
+    key execution/record binding uses -- not whatever `describe_physical_operator`
+    happened to set. This keeps slot one authoritative value instead of two
+    that a reviewer could let drift apart (e.g. a term named ``"trap_energy"``
+    in the configured dict must not silently report slot ``"harmonic_trap"``).
     """
 
     normalized = normalize_hamiltonian_terms(terms)
@@ -356,6 +464,8 @@ def build_system_descriptor(
                 f"declared {descriptor.operator_id}, which disagrees with its registered "
                 f"operator {term_type.operator_id}"
             )
+        if descriptor.slot != name:
+            descriptor = replace(descriptor, slot=name)
         descriptors.append(descriptor)
     return SystemDescriptor(particle=particle, units=units, terms=tuple(descriptors))
 
