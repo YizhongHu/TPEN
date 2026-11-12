@@ -19,6 +19,14 @@ from tpen.checkpoint import (
 from tpen.checkpoint.manifest import CheckpointManifest
 from tpen.checkpoint.schema import validate_manifest_schema
 from tpen.checkpoint.hashing import RESOLVED_CONFIG_IDENTITY_SCHEMA, resolved_config_identity
+from tpen.evaluation.trajectory_records import (
+    TRAJECTORY_RECORD_INSPECTION_SCHEMA,
+    TamperedTrajectoryRecordError,
+    TrajectoryPhysicalContext,
+    TrajectoryRecordInspection,
+    UnsupportedTrajectoryRecordSchemaError,
+    inspect_trajectory_record,
+)
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
 RUN_EVIDENCE_SCHEMA_V2 = "tpen.run-evidence/v2"
@@ -375,7 +383,13 @@ if __name__ == "__main__":  # pragma: no cover - exercised by CLI tests
 __all__ = [
     "RUN_EVIDENCE_SCHEMA",
     "RUN_EVIDENCE_SCHEMA_V2",
+    "TRAJECTORY_RECORD_INSPECTION_SCHEMA",
     "RunEvidence",
+    "TamperedTrajectoryRecordError",
+    "TrajectoryPhysicalContext",
+    "TrajectoryRecordInspection",
+    "UnsupportedTrajectoryRecordSchemaError",
     "inspect_run",
+    "inspect_trajectory_record",
     "resolved_config_identity",
 ]
