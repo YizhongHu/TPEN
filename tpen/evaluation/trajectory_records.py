@@ -6,11 +6,11 @@ import csv
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -54,6 +54,35 @@ TRAJECTORY_RECORD_METADATA_KEYS: tuple[str, ...] = (
 
 TRAJECTORY_RECORD_ROW_SEMANTICS = "complete_draw_walker_grid"
 """Row-ordering convention shared by the writer and the metadata validator."""
+
+
+def _trajectory_record_fieldnames(
+    *, n_electrons: int, spatial_dim: int, term_names: Sequence[str]
+) -> list[str]:
+    """Return the exact CSV column set for one trajectory-record schema shape.
+
+    Shared by the writer (:meth:`TrajectoryRecordStreamWriter._build_fieldnames`)
+    and the strict v1 reader, so a sidecar's declared ``n_electrons``,
+    ``spatial_dim``, and ``term_names`` are bound to the CSV's actual columns
+    rather than only to the metadata key set.
+    """
+
+    coordinates = [
+        f"position/electron_{electron}/axis_{axis}"
+        for electron in range(n_electrons)
+        for axis in range(spatial_dim)
+    ]
+    return [
+        "sample_index",
+        "draw_index",
+        "walker_index",
+        "local_energy",
+        *(f"term/{name}" for name in term_names),
+        "logabs",
+        "sign",
+        "finite",
+        *coordinates,
+    ]
 
 
 @dataclass(frozen=True)
@@ -739,6 +768,8 @@ def _inspect_v1(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
             f"trajectory record row_semantics disagrees with {TRAJECTORY_RECORD_ROW_SEMANTICS!r}"
         )
 
+    scalars = _validate_v1_scalar_types(metadata)
+
     csv_path = metadata_path.parent / str(metadata["csv_filename"])
     if not csv_path.is_file():
         raise TamperedTrajectoryRecordError(f"trajectory record CSV not found: {csv_path}")
@@ -749,27 +780,56 @@ def _inspect_v1(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
             f"trajectory record csv_sha256 disagrees with {csv_path}: "
             f"declared={declared_sha256!r}, actual={actual_sha256!r}"
         )
+    actual_byte_count = csv_path.stat().st_size
+    if actual_byte_count != scalars.byte_count:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record byte_count disagrees with {csv_path}: "
+            f"declared={scalars.byte_count}, actual={actual_byte_count}"
+        )
 
-    draw_count = int(metadata["draw_count"])
-    walker_count = int(metadata["walker_count"])
-    row_count = int(metadata["row_count"])
-    grid_row_count, recomputed_mean, recomputed_variance = _scan_complete_grid(
-        csv_path, draw_count=draw_count, walker_count=walker_count
+    atoms = _decode_v1_atomic_configuration(metadata)
+    declared_atomic_configuration_id = metadata["atomic_configuration_id"]
+    if atoms.content_id() != declared_atomic_configuration_id:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record atomic_configuration_id disagrees with its atomic_configuration payload"
+        )
+    if atoms.spatial_dim != scalars.spatial_dim:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record atomic_configuration dimension disagrees with spatial_dim"
+        )
+
+    scan = _scan_v1_csv(
+        csv_path,
+        draw_count=scalars.draw_count,
+        walker_count=scalars.walker_count,
+        n_electrons=scalars.n_electrons,
+        spatial_dim=scalars.spatial_dim,
+        term_names=scalars.term_names,
     )
-    if grid_row_count != row_count:
+    if scan.row_count != scalars.row_count:
         raise TamperedTrajectoryRecordError(
             f"trajectory record row_count disagrees with its CSV grid: "
-            f"declared={row_count}, actual={grid_row_count}"
+            f"declared={scalars.row_count}, actual={scan.row_count}"
+        )
+    if scan.finite_count != scalars.finite_count:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record finite_count disagrees with its CSV: "
+            f"declared={scalars.finite_count}, actual={scan.finite_count}"
+        )
+    declared_values_content_id = metadata["observable_values_content_id"]
+    if scan.values_content_id != declared_values_content_id:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record observable_values_content_id disagrees with its CSV"
         )
     declared_mean = _as_float(metadata["mean"])
     declared_variance = _as_float(metadata["variance"])
-    if not _close_or_same_nonfinite(recomputed_mean, declared_mean) or not _close_or_same_nonfinite(
-        recomputed_variance, declared_variance
+    if not _close_or_same_nonfinite(scan.mean, declared_mean) or not _close_or_same_nonfinite(
+        scan.variance, declared_variance
     ):
         raise TamperedTrajectoryRecordError(
             "trajectory record mean/variance disagrees with its CSV: "
             f"declared=({declared_mean!r}, {declared_variance!r}), "
-            f"recomputed=({recomputed_mean!r}, {recomputed_variance!r})"
+            f"recomputed=({scan.mean!r}, {scan.variance!r})"
         )
 
     return TrajectoryRecordInspection(
@@ -777,39 +837,225 @@ def _inspect_v1(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
         path=csv_path,
         metadata_path=metadata_path,
         observable=str(metadata["observable"]),
-        draw_count=draw_count,
-        walker_count=walker_count,
-        row_count=row_count,
+        draw_count=scalars.draw_count,
+        walker_count=scalars.walker_count,
+        row_count=scalars.row_count,
         mean=declared_mean,
         variance=declared_variance,
         csv_sha256=declared_sha256,
-        atomic_configuration_id=str(metadata["atomic_configuration_id"]),
+        atomic_configuration_id=str(declared_atomic_configuration_id),
         physical_context=_V1_PHYSICAL_CONTEXT_UNAVAILABLE,
     )
 
 
-def _scan_complete_grid(path: Path, *, draw_count: int, walker_count: int) -> tuple[int, float, float]:
-    """Scan a v1 CSV for a complete, non-duplicated draw/walker grid.
+class _V1ScalarMetadata(NamedTuple):
+    """Type/domain-validated scalar fields of a ``trajectory_records/v1`` sidecar."""
 
-    Returns the row count plus the local-energy mean/variance recomputed
-    directly from the CSV, so a caller can cross-check them against the
-    sidecar's own ``mean``/``variance`` without trusting either file alone.
+    draw_count: int
+    walker_count: int
+    draw_stride: int
+    burn_in_draws: int
+    n_electrons: int
+    spatial_dim: int
+    row_count: int
+    finite_count: int
+    byte_count: int
+    term_names: tuple[str, ...]
+
+
+def _require_v1_int(metadata: dict[str, Any], key: str, *, minimum: int) -> int:
+    value = metadata[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TamperedTrajectoryRecordError(f"trajectory record {key!r} must be an integer")
+    if value < minimum:
+        raise TamperedTrajectoryRecordError(f"trajectory record {key!r} must be >= {minimum}")
+    return value
+
+
+def _validate_v1_scalar_types(metadata: dict[str, Any]) -> _V1ScalarMetadata:
+    """Validate every v1 scalar field's type/domain and cross-field bindings.
+
+    Catches the exact gaps the strict v1 decoder previously missed: a
+    fractional ``draw_count`` silently truncated by ``int()``, out-of-range
+    ``finite_count``/``nonfinite_count``, and an ``observable``/``term_names``
+    that are not well-formed strings. Row/CSV-grid bindings (geometry, byte
+    count, finite mask, value digest, coordinate/term columns) are checked
+    separately once the CSV has been scanned.
     """
 
-    if draw_count < 1 or walker_count < 1:
-        raise TamperedTrajectoryRecordError("trajectory record draw_count/walker_count must be positive")
-    seen: set[tuple[int, int]] = set()
-    energies: list[float] = []
-    row_count = 0
+    draw_count = _require_v1_int(metadata, "draw_count", minimum=1)
+    walker_count = _require_v1_int(metadata, "walker_count", minimum=1)
+    draw_stride = _require_v1_int(metadata, "draw_stride", minimum=1)
+    burn_in_draws = _require_v1_int(metadata, "burn_in_draws", minimum=0)
+    n_electrons = _require_v1_int(metadata, "n_electrons", minimum=1)
+    spatial_dim = _require_v1_int(metadata, "spatial_dim", minimum=1)
+    row_count = _require_v1_int(metadata, "row_count", minimum=0)
+    finite_count = _require_v1_int(metadata, "finite_count", minimum=0)
+    nonfinite_count = _require_v1_int(metadata, "nonfinite_count", minimum=0)
+    byte_count = _require_v1_int(metadata, "byte_count", minimum=1)
+
+    if row_count != draw_count * walker_count:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record row_count disagrees with draw_count*walker_count"
+        )
+    if finite_count > row_count:
+        raise TamperedTrajectoryRecordError("trajectory record finite_count exceeds row_count")
+    if nonfinite_count != row_count - finite_count:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record nonfinite_count disagrees with row_count - finite_count"
+        )
+
+    observable = metadata["observable"]
+    if not isinstance(observable, str) or not observable.strip():
+        raise TamperedTrajectoryRecordError("trajectory record observable must be a non-empty string")
+
+    term_names = metadata["term_names"]
+    if (
+        not isinstance(term_names, list)
+        or not term_names
+        or not all(isinstance(name, str) and name.strip() for name in term_names)
+        or len(set(term_names)) != len(term_names)
+    ):
+        raise TamperedTrajectoryRecordError(
+            "trajectory record term_names must be a non-empty list of unique, non-blank strings"
+        )
+
+    for key in ("observable_values_content_id", "atomic_configuration_id"):
+        value = metadata[key]
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise TamperedTrajectoryRecordError(
+                f"trajectory record {key!r} must be a lowercase sha256 digest"
+            )
+
+    return _V1ScalarMetadata(
+        draw_count=draw_count,
+        walker_count=walker_count,
+        draw_stride=draw_stride,
+        burn_in_draws=burn_in_draws,
+        n_electrons=n_electrons,
+        spatial_dim=spatial_dim,
+        row_count=row_count,
+        finite_count=finite_count,
+        byte_count=byte_count,
+        term_names=tuple(term_names),
+    )
+
+
+def _decode_v1_atomic_configuration(metadata: dict[str, Any]) -> AtomicConfiguration:
+    """Decode and validate the sidecar's nuclear-geometry payload.
+
+    Never infers an identity from the payload beyond what
+    :class:`AtomicConfiguration` itself validates; the caller is responsible
+    for binding the result's ``content_id()`` back to the declared
+    ``atomic_configuration_id``.
+    """
+
+    payload = metadata["atomic_configuration"]
+    if not isinstance(payload, dict) or set(payload) != {"positions", "charges"}:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record atomic_configuration must be a {'positions', 'charges'} payload"
+        )
+    try:
+        positions = torch.tensor(payload["positions"], dtype=torch.float64)
+        charges = torch.tensor(payload["charges"], dtype=torch.float64)
+        return AtomicConfiguration(positions=positions, charges=charges)
+    except (TypeError, ValueError) as exc:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record atomic_configuration is not a valid nuclear geometry: {exc}"
+        ) from exc
+
+
+class _V1CsvScan(NamedTuple):
+    """Values independently recomputed from a v1 CSV's complete grid."""
+
+    row_count: int
+    finite_count: int
+    mean: float
+    variance: float
+    values_content_id: str
+
+
+def _scan_v1_csv(
+    path: Path,
+    *,
+    draw_count: int,
+    walker_count: int,
+    n_electrons: int,
+    spatial_dim: int,
+    term_names: Sequence[str],
+) -> _V1CsvScan:
+    """Scan a v1 CSV for a complete, non-duplicated draw/walker grid.
+
+    Validates that the header is exactly the column set implied by
+    ``n_electrons``/``spatial_dim``/``term_names`` (binding the declared
+    coordinate/term schema to the actual CSV columns, and rejecting
+    duplicate headers or ragged rows), that every row's ``finite`` flag
+    agrees with its own ``local_energy``, and that ``sample_index`` matches
+    the original ``draw*walker_count + walker`` sample/grid semantics.
+    Returns the row/finite counts plus the local-energy mean, variance, and
+    values-content-id recomputed directly from the CSV using the writer's
+    own per-draw-then-total reduction order, so a caller can cross-check
+    them against the sidecar's declared values without trusting either file
+    alone. Unlike an exact-summation baseline, this reduction order
+    reproduces (rather than crashes on) the writer's own mixed-infinity
+    semantics.
+    """
+
+    expected_fieldnames = _trajectory_record_fieldnames(
+        n_electrons=n_electrons, spatial_dim=spatial_dim, term_names=term_names
+    )
+    expected_fieldname_set = set(expected_fieldnames)
+
     with path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
+        header = next(csv.reader(handle), None)
+    if header is None:
+        raise TamperedTrajectoryRecordError("trajectory record CSV has no header row")
+    if len(set(header)) != len(header):
+        raise TamperedTrajectoryRecordError("trajectory record CSV header has duplicate column names")
+    if set(header) != expected_fieldname_set:
+        missing = sorted(expected_fieldname_set - set(header))
+        extra = sorted(set(header) - expected_fieldname_set)
+        raise TamperedTrajectoryRecordError(
+            "trajectory record CSV header disagrees with its declared coordinate/term schema: "
+            f"missing={missing}, extra={extra}"
+        )
+
+    extra_sentinel = "__trajectory_record_extra_columns__"
+    seen: set[tuple[int, int]] = set()
+    row_count = 0
+    finite_count = 0
+    draw_sums: dict[int, float] = {}
+    draw_square_sums: dict[int, float] = {}
+    draw_values: dict[int, dict[int, float]] = {draw: {} for draw in range(draw_count)}
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, restkey=extra_sentinel, restval=None)
         for row in reader:
+            if row.get(extra_sentinel) is not None:
+                raise TamperedTrajectoryRecordError("trajectory record CSV row has extra columns")
+            if any(row.get(key) is None for key in expected_fieldnames):
+                raise TamperedTrajectoryRecordError("trajectory record CSV row is missing column values")
             try:
                 draw = int(row["draw_index"])
                 walker = int(row["walker_index"])
-                energy = float(row["local_energy"])
+                sample_index = int(row["sample_index"])
+                energy = _parse_v1_csv_energy(row["local_energy"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise TamperedTrajectoryRecordError(f"malformed trajectory record row: {row!r}") from exc
+            if row["finite"] not in ("True", "False"):
+                raise TamperedTrajectoryRecordError(
+                    f"trajectory record row (draw={draw}, walker={walker}) has a malformed finite flag"
+                )
+            declared_finite = row["finite"] == "True"
+            if declared_finite != math.isfinite(energy):
+                raise TamperedTrajectoryRecordError(
+                    f"trajectory record row (draw={draw}, walker={walker}) finite flag "
+                    "disagrees with its local_energy"
+                )
             if not 0 <= draw < draw_count or not 0 <= walker < walker_count:
                 raise TamperedTrajectoryRecordError(
                     f"trajectory record row (draw={draw}, walker={walker}) is outside the declared grid"
@@ -818,25 +1064,54 @@ def _scan_complete_grid(path: Path, *, draw_count: int, walker_count: int) -> tu
             if key in seen:
                 raise TamperedTrajectoryRecordError(f"duplicate trajectory record row (draw={draw}, walker={walker})")
             seen.add(key)
-            # Match the writer's reconciliation sum semantics: every row
-            # contributes, finite or not, so a non-finite row propagates
-            # nan/inf into mean/variance rather than being dropped.
-            energies.append(energy)
+            if sample_index != draw * walker_count + walker:
+                raise TamperedTrajectoryRecordError(
+                    f"trajectory record row (draw={draw}, walker={walker}) sample_index "
+                    "disagrees with the original sample/grid semantics"
+                )
+
+            # Per-draw-then-total reduction, matching the writer's own
+            # draw_sums/draw_square_sums reconciliation: plain float addition
+            # propagates +/-inf into nan rather than raising, unlike an
+            # exact-summation baseline such as `math.fsum`.
+            draw_sums[draw] = draw_sums.get(draw, 0.0) + energy
+            draw_square_sums[draw] = draw_square_sums.get(draw, 0.0) + energy * energy
+            if declared_finite:
+                finite_count += 1
+            draw_values[draw][walker] = energy
             row_count += 1
+
     expected_rows = draw_count * walker_count
     if row_count != expected_rows:
         raise TamperedTrajectoryRecordError(
             f"trajectory record grid is incomplete: expected {expected_rows} rows, found {row_count}"
         )
-    # `math.fsum` (exact summation) is the most trustworthy independent
-    # baseline; the tolerance in `_close_or_same_nonfinite` absorbs the
-    # writer's own torch-reduction rounding rather than requiring bit-exact
-    # agreement with this recomputation.
-    mean = math.fsum(energies) / row_count
-    variance = math.fsum(value * value for value in energies) / row_count - mean * mean
+
+    total = 0.0
+    total_square = 0.0
+    for draw in range(draw_count):
+        total += draw_sums.get(draw, 0.0)
+        total_square += draw_square_sums.get(draw, 0.0)
+    mean = total / row_count
+    variance = total_square / row_count - mean * mean
     if math.isfinite(variance) and variance < 0.0:
         variance = 0.0
-    return row_count, mean, variance
+
+    values_digest = hashlib.sha256()
+    values_digest.update(str((draw_count, walker_count)).encode("utf-8"))
+    for draw in range(draw_count):
+        ordered = torch.tensor(
+            [draw_values[draw][walker] for walker in range(walker_count)], dtype=torch.float64
+        )
+        values_digest.update(ordered.contiguous().numpy().astype("<f8", copy=False).tobytes())
+
+    return _V1CsvScan(
+        row_count=row_count,
+        finite_count=finite_count,
+        mean=mean,
+        variance=variance,
+        values_content_id=values_digest.hexdigest(),
+    )
 
 
 def _as_float(value: object) -> float:
@@ -851,6 +1126,23 @@ def _as_float(value: object) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     raise TamperedTrajectoryRecordError(f"trajectory record numeric field has unexpected type {type(value).__name__}")
+
+
+def _parse_v1_csv_energy(text: str) -> float:
+    """Parse one v1 CSV ``local_energy``/term cell, written by `_float_or_text`.
+
+    Unlike `_as_float` (which only ever sees JSON-typed metadata scalars:
+    a finite ``int``/``float`` or one of the three non-finite sentinel
+    strings), every CSV cell is plain text, including finite values such as
+    ``"1.0"``.
+    """
+
+    if text in ("inf", "-inf", "nan"):
+        return _as_float(text)
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise TamperedTrajectoryRecordError(f"trajectory record CSV field is not numeric: {text!r}") from exc
 
 
 def _write_metadata(artifact: TrajectoryRecordArtifact) -> None:

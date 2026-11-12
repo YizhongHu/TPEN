@@ -8,25 +8,37 @@ the new historical reader, so the checked-in bytes are independent evidence
 that the reader decodes genuine writer output rather than a format the
 reader itself invented.
 
-``tpen/evaluation/trajectory_records.py`` is unmodified by S1-F (frozen v1
-writer), so this script additionally records whether the running checkout's
-blob of that file is byte-identical to ``origin/main``'s current blob, giving
-each fixture a verifiable link to the frozen-main writer even when generated
-from a stacked feature branch whose other files differ from ``main``.
+Unlike comparing whole-file git blobs (which disagrees once a later slice,
+e.g. S1-F's own reader, appends unrelated code to this same module), this
+script hashes the *executed* writer classes' source directly via
+``inspect.getsource`` on the live imported objects, and compares that digest
+to the same classes' source as they existed at the fixed, named
+``_FROZEN_WRITER_COMMIT`` -- so the provenance attests to code this process
+actually ran, not an inferred historical blob.
 
-Usage (inside a Cannon ``test``-partition allocation)::
+Usage (inside a Cannon ``test``-partition allocation, exactly this
+invocation -- also recorded verbatim as each fixture's
+``generation_command``)::
 
     uv run --extra cpu python \\
         tests/integration/artifacts/trajectory_records/generate_v1_fixtures.py <output_dir>
 
 The script is deterministic: identical inputs always produce identical
-output bytes, so re-running it is itself a provenance check (acceptance
-contract item 4 on TO item S1-F).
+output bytes, so re-running it from a clean checkout of the recorded
+``generating_commit`` is itself a provenance check (acceptance contract item
+4 on TO item S1-F) -- a replay that reproduces the committed CSV, metadata,
+and provenance fields byte-for-byte is positive evidence; a replay that does
+not must regenerate the checked-in fixtures rather than paper over the
+mismatch.
 """
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import inspect
 import json
+import platform
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -34,6 +46,7 @@ from pathlib import Path
 
 import torch
 
+import tpen.evaluation.trajectory_records as trajectory_records_module
 from tpen.data.atomic_configuration import AtomicConfiguration
 from tpen.evaluation.trajectory_records import (
     TrajectoryRecordBatch,
@@ -43,6 +56,20 @@ from tpen.statistics.trajectory import ObservableTrajectory
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _WRITER_PATH = "tpen/evaluation/trajectory_records.py"
+_GENERATOR_PATH = "tests/integration/artifacts/trajectory_records/generate_v1_fixtures.py"
+_GENERATION_COMMAND = (
+    "uv run --extra cpu python "
+    "tests/integration/artifacts/trajectory_records/generate_v1_fixtures.py <output_dir>"
+)
+
+#: Fixed, named reference commit for the frozen v1 writer classes, predating
+#: any S1-F reader code in this same module. Deliberately NOT inferred from
+#: `git log` at generation time (a moving "history[1]" pointer silently
+#: tracks whichever commit is currently second-to-last, which drifted once
+#: this file kept gaining new, unrelated commits -- the exact gap review r1
+#: flagged).
+_FROZEN_WRITER_COMMIT = "2630ea7b30dcb23db5df6aae3be1b55c5e7778cd"
+_FROZEN_WRITER_SYMBOLS = ("TrajectoryRecordBatch", "TrajectoryRecordStreamWriter")
 
 #: Small, deterministic draw/walker grid shared by both fixtures (few draws
 #: by few walkers, per the S1-F acceptance contract).
@@ -137,45 +164,103 @@ def _write_fixture(
     }
 
 
-def _frozen_writer_commit() -> str | None:
-    """Return the last commit to touch the writer module BEFORE this slice.
+def _extract_symbol_sources(file_text: str, names: tuple[str, ...]) -> dict[str, str]:
+    """Return the exact source text of each top-level class/function in `names`."""
 
-    S1-F appends a new reader to the same file as the frozen v1 writer
-    (``TrajectoryRecordStreamWriter``/``TrajectoryRecordArtifact``), so
-    comparing the writer module's blob at ``HEAD`` to ``origin/main`` would
-    always disagree once the reader exists there too, even though the
-    writer code itself is untouched. The correct comparison is against the
-    blob at the last commit that changed this file before S1-F's own
-    commits -- i.e. the second entry of its linear history from ``HEAD``.
+    tree = ast.parse(file_text)
+    found: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names:
+            segment = ast.get_source_segment(file_text, node)
+            if segment is not None:
+                found[node.name] = segment
+    return found
+
+
+def _symbols_source_sha256(sources: dict[str, str], names: tuple[str, ...]) -> str | None:
+    if set(names) - set(sources):
+        return None
+    digest = hashlib.sha256()
+    for name in names:
+        digest.update(sources[name].encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _executed_writer_source_sha256() -> str:
+    """Hash the source of the writer classes this process actually imported and ran.
+
+    Uses `inspect.getsource` on the live objects `_write_fixture` calls, so
+    the digest attests to code that executed in this process -- not a blob
+    picked out of git history.
     """
 
-    history = _git("log", "--format=%H", "--", _WRITER_PATH)
-    if not history:
+    sources = {name: inspect.getsource(getattr(trajectory_records_module, name)) for name in _FROZEN_WRITER_SYMBOLS}
+    digest = _symbols_source_sha256(sources, _FROZEN_WRITER_SYMBOLS)
+    assert digest is not None  # the live module always defines both symbols
+    return digest
+
+
+def _frozen_commit_writer_source_sha256(commit: str) -> str | None:
+    """Hash the same writer classes' source as they existed at `commit`."""
+
+    blob = _git("show", f"{commit}:{_WRITER_PATH}")
+    if blob is None:
         return None
-    commits = history.splitlines()
-    return commits[1] if len(commits) > 1 else commits[0]
+    sources = _extract_symbol_sources(blob, _FROZEN_WRITER_SYMBOLS)
+    return _symbols_source_sha256(sources, _FROZEN_WRITER_SYMBOLS)
+
+
+def _config_hash(*, n_draws: int, n_walkers: int, n_electrons: int, nuclear_charge: float) -> str:
+    """Hash the deterministic generation parameters and running environment.
+
+    Lets a replay detect environment drift (Python/torch version) alongside
+    byte-for-byte output comparison, rather than assuming two runs are
+    equivalent just because their output happens to match.
+    """
+
+    config = {
+        "n_draws": n_draws,
+        "n_walkers": n_walkers,
+        "n_electrons": n_electrons,
+        "nuclear_charge": nuclear_charge,
+        "python_version": platform.python_version(),
+        "torch_version": torch.__version__,
+    }
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _write_provenance(out_dir: Path, fixture_payload: dict[str, object]) -> None:
     generating_commit = _git("rev-parse", "HEAD")
-    frozen_writer_commit = _frozen_writer_commit()
-    writer_blob = (
-        _git("rev-parse", f"{frozen_writer_commit}:{_WRITER_PATH}") if frozen_writer_commit else None
+    generator_source_sha256 = hashlib.sha256(
+        (_REPO_ROOT / _GENERATOR_PATH).read_bytes()
+    ).hexdigest()
+    executed_writer_source_sha256 = _executed_writer_source_sha256()
+    frozen_commit_writer_source_sha256 = _frozen_commit_writer_source_sha256(_FROZEN_WRITER_COMMIT)
+    writer_matches_frozen_commit = (
+        None
+        if frozen_commit_writer_source_sha256 is None
+        else executed_writer_source_sha256 == frozen_commit_writer_source_sha256
     )
-    main_commit = _git("rev-parse", "origin/main")
-    main_blob = _git("rev-parse", f"origin/main:{_WRITER_PATH}") if main_commit else None
+    metadata_path = out_dir / "sampled_eval_table.metadata.json"
+    metadata_sha256 = hashlib.sha256(metadata_path.read_bytes()).hexdigest()
     provenance = {
-        "generated_by": "tests/integration/artifacts/trajectory_records/generate_v1_fixtures.py",
+        "generated_by": _GENERATOR_PATH,
+        "generator_source_sha256": generator_source_sha256,
+        "generation_command": _GENERATION_COMMAND,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "generating_commit": generating_commit,
-        "writer_module_path": _WRITER_PATH,
-        "frozen_writer_commit": frozen_writer_commit,
-        "writer_module_blob_sha1": writer_blob,
-        "origin_main_commit": main_commit,
-        "origin_main_writer_module_blob_sha1": main_blob,
-        "writer_blob_matches_origin_main": (
-            None if writer_blob is None or main_blob is None else writer_blob == main_blob
+        "config_hash": _config_hash(
+            n_draws=int(fixture_payload["n_draws"]),
+            n_walkers=int(fixture_payload["n_walkers"]),
+            n_electrons=int(fixture_payload["n_electrons"]),
+            nuclear_charge=float(fixture_payload["nuclear_charge"]),
         ),
+        "writer_module_path": _WRITER_PATH,
+        "frozen_writer_commit": _FROZEN_WRITER_COMMIT,
+        "executed_writer_source_sha256": executed_writer_source_sha256,
+        "frozen_commit_writer_source_sha256": frozen_commit_writer_source_sha256,
+        "writer_matches_frozen_commit": writer_matches_frozen_commit,
+        "metadata_sha256": metadata_sha256,
         **fixture_payload,
     }
     (out_dir / "PROVENANCE.json").write_text(
