@@ -22,10 +22,11 @@ from tpen.physics.operators import (
     ELECTRON_NUCLEUS_COULOMB,
     HARMONIC_TRAP,
     KINETIC_ENERGY,
+    OperatorId,
 )
 from tpen.physics.potential import ElectronElectronInteraction, ElectronNucleusPotential, HarmonicTrap
 from tpen.physics.receipt import DiagnosticDeclaration, ExecutionReceipt, require_matching_system
-from tpen.physics.system import ParticleSpec, build_system_descriptor
+from tpen.physics.system import ParticleSpec, SystemDescriptor, build_system_descriptor
 
 _DTYPE = torch.float64
 
@@ -47,6 +48,11 @@ def _terms() -> dict:
 def _batch(n_walkers: int = 5) -> ElectronBatch:
     generator = torch.Generator().manual_seed(7)
     return ElectronBatch(positions=torch.randn(n_walkers, 1, 3, generator=generator, dtype=_DTYPE))
+
+
+def _descriptor() -> SystemDescriptor:
+    particle = ParticleSpec(n_electrons=1, n_spin_up=1, n_spin_down=0, spatial_dim=3)
+    return build_system_descriptor(particle, _terms())
 
 
 def _receipt(**overrides) -> ExecutionReceipt:
@@ -129,6 +135,50 @@ def test_method_id_manifest_names_boundary_shift_no_longer_collides() -> None:
     assert left.method_id() != right.method_id()
 
 
+def test_manifest_identity_preserves_operator_component_boundaries() -> None:
+    # review-r1 finding 3 RED test: str(OperatorId) flattens namespace and
+    # name onto one ':'-joined string, so OperatorId("plugin:x", "y") and
+    # OperatorId("plugin", "x:y") used to stringify (and therefore hash)
+    # identically. v3 encodes namespace/name as two independently
+    # length-framed fields and sorts by the (namespace, name) tuple, so
+    # swapping which of the two ids claims which contribution now changes
+    # method_id, while mere insertion-order reversal of an unchanged
+    # manifest does not.
+    a, b = OperatorId("plugin:x", "y"), OperatorId("plugin", "x:y")
+    original = _receipt(manifest={a: ("left",), b: ("right",)})
+    reordered = _receipt(manifest={b: ("right",), a: ("left",)})
+    swapped = _receipt(manifest={b: ("left",), a: ("right",)})
+    assert original.method_id() == reordered.method_id()
+    assert original.method_id() != swapped.method_id()
+
+
+def test_method_id_distinct_for_same_operator_ids_fresh_process() -> None:
+    # review-r1 finding 3: a literal method-id golden, exercised in a fresh
+    # subprocess so no interpreter-local hash randomization (there is none
+    # here -- method_id is SHA-256 over explicit bytes -- but this is the
+    # cross-process reproducibility check the review asked for) can hide a
+    # regression to the v2 str(OperatorId) encoding.
+    import subprocess
+    import sys
+
+    script = (
+        "from tpen.physics.operators import OperatorId\n"
+        "from tpen.physics.receipt import ExecutionReceipt\n"
+        "r = ExecutionReceipt(\n"
+        "    system_id='sys-a',\n"
+        "    implementation='tpen.physics.hamiltonian.NaiveLocalEnergyEvaluator',\n"
+        "    version=1,\n"
+        "    numerical_policy={'term_order': 'configured_declaration_order'},\n"
+        "    manifest={OperatorId('plugin', 'x'): ('left',)},\n"
+        ")\n"
+        "print(r.method_id())\n"
+    )
+    output = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
+    golden = output.stdout.strip()
+    expected = _receipt(manifest={OperatorId("plugin", "x"): ("left",)}).method_id()
+    assert golden == expected
+
+
 def test_method_id_reproducible_across_independent_instances() -> None:
     # Stands in for "stable across processes": two independently constructed
     # receipts, from independently constructed (but equal) inputs, agree.
@@ -183,6 +233,65 @@ def test_naive_describe_execution_receipt_identical_settings_identical() -> None
     assert left.method_id() == right.method_id()
 
 
+def test_naive_method_id_binds_configured_order() -> None:
+    # review-r1 finding 1 RED test: the manifest is grouped/canonicalized by
+    # OperatorId for method_id, so reordering distinct named operators left
+    # method_id unchanged even though float64 accumulation is order-sensitive
+    # (see test_naive_evaluate_total_is_sensitive_to_addition_order below).
+    terms = _terms()
+    evaluator = NaiveLocalEnergyEvaluator()
+    forward = evaluator.describe_execution_receipt(terms, "same-system")
+    reverse = evaluator.describe_execution_receipt(
+        dict(reversed(tuple(terms.items()))), "same-system"
+    )
+    assert forward.method_id() != reverse.method_id()
+
+
+class _ConstantContribution:
+    """Test-only term: a constant local energy, arithmetic probe only.
+
+    Not a registered operator (no `register_operator`/`describe_physical_operator`):
+    this is purely an arithmetic probe of `NaiveLocalEnergyEvaluator.evaluate`'s
+    accumulation order, not a `SystemDescriptor`/receipt-manifest fixture.
+    """
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def local_energy(self, wavefunction, batch: ElectronBatch) -> LocalEnergyResult:
+        del wavefunction
+        batch_size = batch.flatten_samples().batch_size
+        total = torch.full((batch_size,), self.value, dtype=_DTYPE)
+        return LocalEnergyResult(total=total)
+
+
+def _cancellation_terms() -> dict:
+    # float64: (1e16 + -1e16) + 1.0 == 1.0 exactly (the first pair cancels to
+    # 0.0 before 1.0 is added), but 1e16 + (-1e16 + 1.0) == 0.0 (1.0 is far
+    # below 1e16's ULP, so -1e16 + 1.0 rounds back to -1e16). Keeping the
+    # declared key order fixed and varying only the addition order therefore
+    # changes the total -- the GREEN control for acceptance item 1.
+    return {
+        "a": _ConstantContribution(1e16),
+        "b": _ConstantContribution(-1e16),
+        "c": _ConstantContribution(1.0),
+    }
+
+
+def test_naive_evaluate_total_is_sensitive_to_addition_order() -> None:
+    naive = NaiveLocalEnergyEvaluator()
+    terms = _cancellation_terms()
+    context = naive.make_context(GaussianOutputModel(alpha=0.5), _batch(n_walkers=2))
+
+    result = naive.evaluate(terms, context, return_terms=True)
+
+    assert torch.equal(result.terms["a"], torch.full((2,), 1e16, dtype=_DTYPE))
+    assert torch.equal(result.terms["b"], torch.full((2,), -1e16, dtype=_DTYPE))
+    assert torch.equal(result.terms["c"], torch.full((2,), 1.0, dtype=_DTYPE))
+    # Sequential sum in declared order (a, b, c): (1e16 + -1e16) + 1.0 == 1.0.
+    assert torch.equal(result.total, torch.full((2,), 1.0, dtype=_DTYPE))
+
+
 # --- RecordingLocalEnergyEvaluator: narrow adapter ---------------------------
 
 
@@ -203,12 +312,30 @@ def test_recording_adapter_rejects_delegate_without_receipt_capability() -> None
 
     assert not isinstance(NoReceiptEvaluator(), DeclaresExecutionReceipt)
     with pytest.raises(TypeError):
-        RecordingLocalEnergyEvaluator(NoReceiptEvaluator(), system_id="sys-xyz")
+        RecordingLocalEnergyEvaluator(NoReceiptEvaluator(), system=_descriptor())
 
 
-def test_recording_adapter_requires_non_empty_system_id() -> None:
-    with pytest.raises(ValueError):
-        RecordingLocalEnergyEvaluator(NaiveLocalEnergyEvaluator(), system_id="")
+def test_recording_adapter_requires_system_descriptor() -> None:
+    # review-r1 finding 2: a bare string proves nothing about the physics
+    # actually evaluated, so the adapter now requires the typed descriptor.
+    with pytest.raises(TypeError):
+        RecordingLocalEnergyEvaluator(NaiveLocalEnergyEvaluator(), system="sys-xyz")
+
+
+def test_recording_rejects_changed_trap_after_descriptor_binding() -> None:
+    # review-r1 finding 2 RED test: a valid-looking receipt must not label
+    # energy from a different physical system. Bind a descriptor, then
+    # mutate the actually-evaluated term before calling evaluate().
+    terms = _terms()
+    descriptor = _descriptor()
+    naive = NaiveLocalEnergyEvaluator()
+    evaluator = RecordingLocalEnergyEvaluator(naive, system=descriptor)
+    context = naive.make_context(GaussianOutputModel(alpha=0.5), _batch())
+
+    terms["harmonic_trap"].omega = 1.0
+
+    with pytest.raises(ValueError, match="do not match"):
+        evaluator.evaluate(terms, context, return_terms=True)
 
 
 def test_recording_adapter_preserves_naive_arithmetic_bit_identical() -> None:
@@ -217,9 +344,10 @@ def test_recording_adapter_preserves_naive_arithmetic_bit_identical() -> None:
     batch = _batch()
     naive = NaiveLocalEnergyEvaluator()
     context = naive.make_context(model, batch)
+    descriptor = _descriptor()
 
     plain = naive.evaluate(terms, context, return_terms=True)
-    wrapped_evaluator = RecordingLocalEnergyEvaluator(naive, system_id="sys-xyz")
+    wrapped_evaluator = RecordingLocalEnergyEvaluator(naive, system=descriptor)
     recorded = wrapped_evaluator.evaluate(terms, context, return_terms=True)
 
     assert isinstance(plain, LocalEnergyResult)
@@ -230,7 +358,7 @@ def test_recording_adapter_preserves_naive_arithmetic_bit_identical() -> None:
         assert torch.equal(plain.terms[name], recorded.terms[name])
     assert plain.receipt is None
     assert recorded.receipt is not None
-    assert recorded.receipt.system_id == "sys-xyz"
+    assert recorded.receipt.system_id == descriptor.system_id()
 
 
 def test_recording_adapter_scalar_result_unaffected() -> None:
@@ -241,7 +369,7 @@ def test_recording_adapter_scalar_result_unaffected() -> None:
     context = naive.make_context(model, batch)
 
     plain_total = naive.evaluate(terms, context, return_terms=False)
-    wrapped_evaluator = RecordingLocalEnergyEvaluator(naive, system_id="sys-xyz")
+    wrapped_evaluator = RecordingLocalEnergyEvaluator(naive, system=_descriptor())
     recorded_total = wrapped_evaluator.evaluate(terms, context, return_terms=False)
 
     assert isinstance(recorded_total, torch.Tensor)
@@ -287,7 +415,7 @@ def test_fused_stub_manifest_covers_both_ids_without_fabricated_diagnostics() ->
     batch = _batch()
     stub = _StubFusedEvaluator()
     context = stub.make_context(model, batch)
-    adapter = RecordingLocalEnergyEvaluator(stub, system_id="sys-fused")
+    adapter = RecordingLocalEnergyEvaluator(stub, system=_descriptor())
 
     result = adapter.evaluate(terms, context, return_terms=True)
 
@@ -308,7 +436,8 @@ def test_chunked_evaluation_carries_one_receipt() -> None:
     model = GaussianOutputModel(alpha=0.5)
     batch = _batch(n_walkers=8)
     naive = NaiveLocalEnergyEvaluator()
-    adapter = RecordingLocalEnergyEvaluator(naive, system_id="sys-chunked")
+    descriptor = _descriptor()
+    adapter = RecordingLocalEnergyEvaluator(naive, system=descriptor)
 
     result = evaluate_local_energy_in_chunks(
         terms,
@@ -321,7 +450,7 @@ def test_chunked_evaluation_carries_one_receipt() -> None:
 
     assert isinstance(result, LocalEnergyResult)
     assert result.receipt is not None
-    assert result.receipt.system_id == "sys-chunked"
+    assert result.receipt.system_id == descriptor.system_id()
 
 
 class _AlternatingReceiptEvaluator(NaiveLocalEnergyEvaluator):
@@ -347,7 +476,53 @@ def test_chunked_evaluation_raises_on_receipt_disagreement() -> None:
     model = GaussianOutputModel(alpha=0.5)
     batch = _batch(n_walkers=8)
     unstable = _AlternatingReceiptEvaluator()
-    adapter = RecordingLocalEnergyEvaluator(unstable, system_id="sys-unstable")
+    adapter = RecordingLocalEnergyEvaluator(unstable, system=_descriptor())
+
+    with pytest.raises(ValueError, match="disagreed between chunks"):
+        evaluate_local_energy_in_chunks(
+            terms,
+            model,
+            batch,
+            return_terms=True,
+            chunk_size=3,
+            evaluator=adapter,
+        )
+
+
+class _TypeDriftingReceiptEvaluator(NaiveLocalEnergyEvaluator):
+    """Declares an otherwise-identical receipt whose policy value type drifts."""
+
+    def __init__(self) -> None:
+        self._calls = 0
+
+    def describe_execution_receipt(self, terms, system_id):
+        del terms
+        self._calls += 1
+        return ExecutionReceipt(
+            system_id=system_id,
+            implementation="tests.stub.TypeDriftingReceiptEvaluator",
+            version=1,
+            numerical_policy={"variant": 1 if self._calls == 1 else 1.0},
+            manifest={KINETIC_ENERGY: ("kinetic",)},
+        )
+
+
+def test_chunks_reject_type_distinct_policy_identity() -> None:
+    # review-r1 finding 4 RED test: `ExecutionReceipt.__eq__` (generated
+    # dataclass equality) considers numerical_policy values 1 and 1.0 equal,
+    # while `method_id`'s own `_encode_scalar` gives int and float distinct
+    # type tags. A chunk disagreement guard built on dataclass equality would
+    # silently aggregate chunks whose declared method identity actually
+    # differs.
+    left = _receipt(numerical_policy={"variant": 1})
+    right = _receipt(numerical_policy={"variant": 1.0})
+    assert left.method_id() != right.method_id()  # GREEN control
+
+    terms = _terms()
+    model = GaussianOutputModel(alpha=0.5)
+    batch = _batch(n_walkers=8)
+    drifting = _TypeDriftingReceiptEvaluator()
+    adapter = RecordingLocalEnergyEvaluator(drifting, system=_descriptor())
 
     with pytest.raises(ValueError, match="disagreed between chunks"):
         evaluate_local_energy_in_chunks(
@@ -383,7 +558,7 @@ def test_receipt_system_id_and_manifest_match_real_hooke_descriptor() -> None:
 
     naive = NaiveLocalEnergyEvaluator()
     context = naive.make_context(GaussianOutputModel(alpha=0.5), _batch_with_electrons(1))
-    adapter = RecordingLocalEnergyEvaluator(naive, system_id=descriptor.system_id())
+    adapter = RecordingLocalEnergyEvaluator(naive, system=descriptor)
     result = adapter.evaluate(terms, context, return_terms=True)
 
     assert result.receipt.system_id == descriptor.system_id()
@@ -410,7 +585,7 @@ def test_receipt_system_id_and_manifest_match_real_helium_descriptor() -> None:
 
     naive = NaiveLocalEnergyEvaluator()
     context = naive.make_context(GaussianOutputModel(alpha=0.5), _batch_with_electrons(2))
-    adapter = RecordingLocalEnergyEvaluator(naive, system_id=descriptor.system_id())
+    adapter = RecordingLocalEnergyEvaluator(naive, system=descriptor)
     result = adapter.evaluate(terms, context, return_terms=True)
 
     assert result.receipt.system_id == descriptor.system_id()

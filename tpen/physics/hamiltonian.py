@@ -24,7 +24,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclasses_replace
-from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, runtime_checkable
 
 import torch
 
@@ -38,7 +38,13 @@ from tpen.physics.operators import (
     declared_operator_geometry,
     is_registered_operator,
 )
-from tpen.physics.receipt import ExecutionReceipt
+from tpen.physics.receipt import ExecutionReceipt, encode_ordered_contribution_sequence
+
+if TYPE_CHECKING:
+    # tpen.physics.system imports normalize_hamiltonian_terms from this module at
+    # load time; importing it back here at module scope would be circular. See
+    # RecordingLocalEnergyEvaluator, which imports it locally at call time instead.
+    from tpen.physics.system import SystemDescriptor
 
 
 @dataclass
@@ -332,10 +338,17 @@ class NaiveLocalEnergyEvaluator(LocalEnergyEvaluator[NaiveLocalEnergyContext]):
         return ExecutionReceipt(
             system_id=system_id,
             implementation=f"{type(self).__module__}.{type(self).__qualname__}",
-            version=1,
+            version=2,
             numerical_policy={
                 "term_order": "configured_declaration_order",
                 "accumulation": "sequential_sum",
+                # review-r1 finding 1: the manifest above is canonicalized by
+                # OperatorId for method_id, so it cannot carry the actual
+                # evaluated accumulation order -- two Hamiltonians whose terms
+                # are declared in a different order (and therefore accumulate
+                # float64 sums in a different, non-associative order) would
+                # otherwise share a method_id. Bind the real order here.
+                "contribution_order": encode_ordered_contribution_sequence(tuple(normalized)),
             },
             manifest={operator_id: tuple(names) for operator_id, names in manifest.items()},
         )
@@ -370,19 +383,37 @@ class RecordingLocalEnergyEvaluator(LocalEnergyEvaluator[ContextT]):
     binding the delegate's declared `ExecutionReceipt` to a decomposed
     result. A scalar-tensor result (``return_terms=False``) has no typed
     place to carry a receipt and is returned unchanged.
+
+    `system` binds this adapter to one `SystemDescriptor` for its lifetime
+    (review-r1 finding 2): a bare caller-supplied ``system_id`` string proved
+    nothing about the physics actually evaluated, so a receipt stamped with
+    the right-looking id could still describe a different system (e.g. a
+    harmonic trap whose frequency had since changed). Every `evaluate` call
+    rebuilds a descriptor from the *actual* `terms` it was given and rejects
+    the result before emitting a complete receipt if that descriptor's
+    content id disagrees with the bound one -- a changed, missing, or
+    undeclared contribution is therefore never silently stamped with the
+    bound system's id.
     """
 
-    def __init__(self, delegate: LocalEnergyEvaluator[ContextT], *, system_id: str) -> None:
+    def __init__(self, delegate: LocalEnergyEvaluator[ContextT], *, system: SystemDescriptor) -> None:
+        # Local import: tpen.physics.system imports normalize_hamiltonian_terms
+        # from this module at load time, so importing it back at module scope
+        # would be circular.
+        from tpen.physics.system import SystemDescriptor as _SystemDescriptor
+
         if not isinstance(delegate, DeclaresExecutionReceipt):
             raise TypeError(
                 f"{type(delegate).__name__} does not implement DeclaresExecutionReceipt; "
                 "a requested evaluator that cannot declare its own execution receipt is "
                 "never wrapped to silently receive another evaluator's receipt"
             )
-        if not system_id or not system_id.strip():
-            raise ValueError("RecordingLocalEnergyEvaluator requires a non-empty system_id")
+        if not isinstance(system, _SystemDescriptor):
+            raise TypeError(
+                f"RecordingLocalEnergyEvaluator requires a SystemDescriptor, got {type(system).__name__}"
+            )
         self._delegate = delegate
-        self._system_id = system_id
+        self._system = system
 
     def make_context(self, wavefunction: object, batch: ElectronBatch) -> ContextT:
         return self._delegate.make_context(wavefunction, batch)
@@ -410,7 +441,18 @@ class RecordingLocalEnergyEvaluator(LocalEnergyEvaluator[ContextT]):
                 f"{type(self._delegate).__name__}.evaluate(return_terms=True) must return "
                 "LocalEnergyResult"
             )
-        receipt = self._delegate.describe_execution_receipt(terms, self._system_id)
+        from tpen.physics.system import build_system_descriptor
+
+        expected_id = self._system.system_id()
+        actual = build_system_descriptor(self._system.particle, terms, units=self._system.units)
+        if actual.system_id() != expected_id:
+            raise ValueError(
+                "RecordingLocalEnergyEvaluator: the terms actually evaluated do not match the "
+                f"bound SystemDescriptor (expected system_id {expected_id!r}, got "
+                f"{actual.system_id()!r}); a changed, missing, or undeclared contribution is "
+                "never stamped with the bound system's id"
+            )
+        receipt = self._delegate.describe_execution_receipt(terms, expected_id)
         return dataclasses_replace(result, receipt=receipt)
 
 
@@ -728,6 +770,28 @@ class AnalyticCuspEvaluator(LocalEnergyEvaluator[AnalyticCuspContext]):
         return total
 
 
+def _receipts_disagree(left: ExecutionReceipt | None, right: ExecutionReceipt | None) -> bool:
+    """Return whether two chunk receipts declare a different method.
+
+    Compares canonical `method_id()` and `system_id` rather than dataclass
+    equality (review-r1 finding 4): `ExecutionReceipt.numerical_policy`
+    values are typed `JsonScalar` (`bool | int | float | str`), and Python
+    considers ``1``, ``1.0``, and ``True`` equal to each other even though
+    `method_id`'s own `_encode_scalar` gives each a distinct type tag. A
+    producer whose declared policy drifted between these equal-but-distinct
+    types across chunks would therefore pass a dataclass-equality check while
+    actually declaring two different method identities. `None` versus a
+    receipt is still a disagreement, matching the legacy (no fallback)
+    rejection.
+    """
+
+    if (left is None) != (right is None):
+        return True
+    if left is None or right is None:
+        return False
+    return left.method_id() != right.method_id() or left.system_id != right.system_id or left.diagnostics != right.diagnostics
+
+
 _NAIVE_EVALUATOR = NaiveLocalEnergyEvaluator()
 
 
@@ -868,7 +932,7 @@ def evaluate_local_energy_in_chunks(
             if not receipt_captured:
                 captured_receipt = result.receipt
                 receipt_captured = True
-            elif result.receipt != captured_receipt:
+            elif _receipts_disagree(captured_receipt, result.receipt):
                 raise ValueError(
                     "chunked local-energy execution receipt disagreed between chunks: "
                     f"{captured_receipt!r} != {result.receipt!r}"
