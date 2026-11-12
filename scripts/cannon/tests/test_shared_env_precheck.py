@@ -278,6 +278,8 @@ def test_paths_accepts_work_root_disjoint_from_shared_prefix(
 def test_t6_precheck_containment_is_case_sensitive_under_nocasematch(
     shared_prefix: Path, facility_prefix: Path, tmp_path: Path
 ) -> None:
+    # These are genuinely disjoint siblings.  With nocasematch inherited,
+    # the old glob match incorrectly treated the case variant as contained.
     case_variant = shared_prefix.with_name("SHARED-ENVS")
     case_variant.mkdir()
     alias = tmp_path / "scratch-alias"
@@ -287,6 +289,33 @@ def test_t6_precheck_containment_is_case_sensitive_under_nocasematch(
         facility_prefix=facility_prefix,
         run_root=facility_prefix / "job-123",
         work_root=alias,
+        extra_env={"BASHOPTS": "nocasematch"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # This path would look contained only under case-insensitive matching:
+    # SHARED-ENVS/job is a sibling of shared-envs, not its child.
+    case_variant_child = case_variant / "job"
+    case_variant_child.mkdir()
+    child_alias = tmp_path / "scratch-alias-child"
+    child_alias.symlink_to(case_variant_child, target_is_directory=True)
+    result = run_paths(
+        shared_prefix=shared_prefix,
+        facility_prefix=facility_prefix,
+        run_root=facility_prefix / "job-123",
+        work_root=child_alias,
+        extra_env={"BASHOPTS": "nocasematch"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    # Actual containment remains forbidden even with the guard enabled.
+    contained_alias = tmp_path / "contained-alias"
+    contained_alias.symlink_to(shared_prefix, target_is_directory=True)
+    result = run_paths(
+        shared_prefix=shared_prefix,
+        facility_prefix=facility_prefix,
+        run_root=facility_prefix / "job-123",
+        work_root=contained_alias,
         extra_env={"BASHOPTS": "nocasematch"},
     )
     assert result.returncode != 0, result.stdout + result.stderr

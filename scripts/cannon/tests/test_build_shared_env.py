@@ -203,6 +203,7 @@ def run_builder(
     project_dir: str | None = None,
     extra_env: dict[str, str] | None = None,
     extra_args: list[str] | None = None,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["UV_CACHE_DIR"] = str(cache_dir)
@@ -220,7 +221,7 @@ def run_builder(
         *(["--project-dir", project_dir] if project_dir is not None else []),
         *(extra_args or []),
     ]
-    return subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
+    return subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd, check=False)
 
 
 @pytest.fixture()
@@ -1160,10 +1161,15 @@ def test_t3_publisher_requires_seven_newline_terminated_fields(tmp_path: Path) -
 def test_t4_project_dir_glob_literals_are_rejected(tmp_path: Path, envs_root: Path, cache_dir: Path, bad_project_dir: str) -> None:
     checkout = make_checkout(tmp_path)
     add_subproject(checkout, bad_project_dir)
+    collision_name = {"bad?": "bad1", "bad*": "bad_evil", "bad[ab]": "bada"}[bad_project_dir]
+    collision_cwd = tmp_path / "glob-collision-cwd"
+    collision_cwd.mkdir()
+    (collision_cwd / collision_name).write_text("collision\n")
     uv_bin, uv_log = make_uv_stub(tmp_path)
     result = run_builder(
         envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir,
         project_dir=bad_project_dir,
+        cwd=collision_cwd,
     )
     assert result.returncode == 2, result.stdout + result.stderr
     assert "--project-dir" in result.stderr
