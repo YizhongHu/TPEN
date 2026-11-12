@@ -341,6 +341,7 @@ class ElectronNucleusPotential:
             slot=self.name,
             parameters={"eps": float(self.eps)},
             resource_id=self.atoms.content_id(),
+            resource=self.atoms,
         )
 
 
@@ -397,6 +398,7 @@ class NucleusNucleusPotential:
             operator_id=self.operator_id,
             slot=self.name,
             resource_id=self.atoms.content_id(),
+            resource=self.atoms,
         )
 
 
