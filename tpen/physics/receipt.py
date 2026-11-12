@@ -30,15 +30,37 @@ from tpen.physics.operators import OperatorId
 #: canonical content id must encode every accepted value deterministically.
 JsonScalar = bool | int | float | str
 
-_RECEIPT_SCHEMA_VERSION = 1
+#: v2 (pending-fixes-before-verification item 1): every variable-length
+#: field (string scalar values, numerical-policy key/value pairs, manifest
+#: operator ids and contribution names) is now framed with an explicit
+#: big-endian length/count prefix; see `_encode_length_prefixed`. Under v1,
+#: two fields concatenated without a boundary could produce identical bytes
+#: for different content -- e.g. ``numerical_policy`` ``{"a": "sb"}`` and
+#: ``{"as": "b"}`` both encoded to the same bytes and therefore hashed to
+#: the same `method_id`.
+_RECEIPT_SCHEMA_VERSION = 2
+
+
+def _encode_length_prefixed(data: bytes) -> bytes:
+    """Return `data` framed with an explicit 8-byte big-endian length prefix.
+
+    Concatenating unframed variable-length byte strings is ambiguous: the
+    boundary between two fields can move without changing the overall bytes
+    (see the v1->v2 note on `_RECEIPT_SCHEMA_VERSION`). A length prefix
+    fixes the boundary so canonical encoding is injective in each field.
+    """
+
+    return struct.pack(">Q", len(data)) + data
 
 
 def _encode_scalar(value: JsonScalar) -> bytes:
-    """Return a type-tagged, deterministic byte encoding of one scalar.
+    """Return a type-tagged, deterministic, length-framed byte encoding of one scalar.
 
     The type tag keeps ``1`` (int) and ``1.0`` (float) from colliding, and
     keeps ``True`` (bool) from colliding with ``1`` (int); ``bool`` is an
-    ``int`` subclass in Python, so that check must run first.
+    ``int`` subclass in Python, so that check must run first. The ``str``
+    case is length-framed (see `_encode_length_prefixed`); the other cases
+    are fixed-width and need no framing.
     """
 
     if isinstance(value, bool):
@@ -48,7 +70,7 @@ def _encode_scalar(value: JsonScalar) -> bytes:
     if isinstance(value, float):
         return b"f" + struct.pack(">d", value)
     if isinstance(value, str):
-        return b"s" + value.encode("utf-8")
+        return b"s" + _encode_length_prefixed(value.encode("utf-8"))
     raise TypeError(f"numerical policy values must be bool, int, float, or str; got {type(value).__name__}")
 
 
@@ -213,17 +235,21 @@ class ExecutionReceipt:
 
         digest = hashlib.sha256()
         digest.update(f"tpen.physics.receipt.ExecutionReceipt.v{_RECEIPT_SCHEMA_VERSION}".encode("utf-8"))
-        digest.update(self.implementation.encode("utf-8"))
+        digest.update(_encode_length_prefixed(self.implementation.encode("utf-8")))
         digest.update(struct.pack(">q", self.version))
-        for key in sorted(self.numerical_policy):
-            digest.update(key.encode("utf-8"))
+        policy_keys = sorted(self.numerical_policy)
+        digest.update(struct.pack(">Q", len(policy_keys)))
+        for key in policy_keys:
+            digest.update(_encode_length_prefixed(key.encode("utf-8")))
             digest.update(_encode_scalar(self.numerical_policy[key]))
-        for operator_id in sorted(self.manifest, key=str):
-            digest.update(str(operator_id).encode("utf-8"))
-            for name in self.manifest[operator_id]:
-                digest.update(b"\x00")
-                digest.update(name.encode("utf-8"))
-            digest.update(b"\xff")
+        operator_ids = sorted(self.manifest, key=str)
+        digest.update(struct.pack(">Q", len(operator_ids)))
+        for operator_id in operator_ids:
+            digest.update(_encode_length_prefixed(str(operator_id).encode("utf-8")))
+            names = self.manifest[operator_id]
+            digest.update(struct.pack(">Q", len(names)))
+            for name in names:
+                digest.update(_encode_length_prefixed(name.encode("utf-8")))
         return digest.hexdigest()
 
 
