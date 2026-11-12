@@ -253,7 +253,7 @@ def test_submit_all_forwards_pack_k_on_each_submitted_eval_line(tmp_path: Path) 
 
     calls: list[list[str]] = []
     result = launch.submit_all(
-        "science",
+        payload="science",
         science_python=sys.executable,
         executor_python=sys.executable,
         run_root=tmp_path,
