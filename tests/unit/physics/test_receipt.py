@@ -152,12 +152,26 @@ def test_manifest_identity_preserves_operator_component_boundaries() -> None:
     assert original.method_id() != swapped.method_id()
 
 
+#: review-r2 finding 3: computing "expected" from the same current-process
+#: implementation as the subprocess output proves cross-process
+#: *consistency*, not that the encoding itself matches an audited v3
+#: schema -- a deterministic-encoding regression (e.g. dropping the schema
+#: version domain separator) would still pass that comparison because both
+#: sides regress together. This is an independently captured literal for
+#: the exact fixture below (OperatorId("plugin", "x"), manifest name
+#: "left", the declared naive numerical_policy, version 1), computed once
+#: from `_RECEIPT_SCHEMA_VERSION = 3`'s encoding and pinned here so either
+#: side drifting from the audited schema fails this assertion.
+PINNED_V3_METHOD_ID = "7b121ba84be80af94e73d2383b0aa60cafc1196677d9683133e80119c4922b77"
+
+
 def test_method_id_distinct_for_same_operator_ids_fresh_process() -> None:
-    # review-r1 finding 3: a literal method-id golden, exercised in a fresh
-    # subprocess so no interpreter-local hash randomization (there is none
-    # here -- method_id is SHA-256 over explicit bytes -- but this is the
-    # cross-process reproducibility check the review asked for) can hide a
-    # regression to the v2 str(OperatorId) encoding.
+    # review-r1 finding 3 (refined by review-r2 finding 3): a literal
+    # method-id golden, exercised in a fresh subprocess so no
+    # interpreter-local state can hide a regression to the v2
+    # str(OperatorId) encoding, and pinned against an independently
+    # captured constant (PINNED_V3_METHOD_ID) rather than against the
+    # current process's own method_id() output.
     import subprocess
     import sys
 
@@ -174,9 +188,8 @@ def test_method_id_distinct_for_same_operator_ids_fresh_process() -> None:
         "print(r.method_id())\n"
     )
     output = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
-    golden = output.stdout.strip()
-    expected = _receipt(manifest={OperatorId("plugin", "x"): ("left",)}).method_id()
-    assert golden == expected
+    assert output.stdout.strip() == PINNED_V3_METHOD_ID
+    assert _receipt(manifest={OperatorId("plugin", "x"): ("left",)}).method_id() == PINNED_V3_METHOD_ID
 
 
 def test_method_id_reproducible_across_independent_instances() -> None:
@@ -370,6 +383,43 @@ def test_recording_rejects_changed_trap_after_descriptor_binding() -> None:
 
     with pytest.raises(ValueError, match="do not match"):
         evaluator.evaluate(terms, context, return_terms=True)
+
+
+@pytest.mark.parametrize("electrons, dim, spin", [(2, 3, 1), (1, 2, 1), (1, 3, -1)])
+def test_recording_rejects_particle_context_mismatch(electrons, dim, spin) -> None:
+    # review-r2 finding 2 RED test: test_recording_rejects_changed_trap_...
+    # above validates declared term *parameters*; it does not validate the
+    # actual batch's particle metadata. A batch shaped for a different
+    # electron count, spatial dimension, or spin sector must be rejected at
+    # the receipt-producing boundary (make_context), never silently
+    # evaluated and stamped with the bound descriptor's system id.
+    evaluator = RecordingLocalEnergyEvaluator(NaiveLocalEnergyEvaluator(), system=_descriptor())
+    batch = ElectronBatch(
+        positions=torch.ones(2, electrons, dim, dtype=_DTYPE),
+        spins=torch.full((2, electrons), float(spin), dtype=_DTYPE),
+    )
+
+    with pytest.raises(ValueError):
+        evaluator.make_context(GaussianOutputModel(alpha=0.5), batch)
+
+
+def test_recording_accepts_matching_particle_context() -> None:
+    # GREEN companion: a batch whose actual particle metadata (electron
+    # count, spatial dimension, spin sector) matches the bound descriptor is
+    # accepted; energy and receipt are produced as usual.
+    descriptor = _descriptor()
+    evaluator = RecordingLocalEnergyEvaluator(NaiveLocalEnergyEvaluator(), system=descriptor)
+    batch = ElectronBatch(
+        positions=torch.ones(2, 1, 3, dtype=_DTYPE),
+        spins=torch.full((2, 1), 1.0, dtype=_DTYPE),
+    )
+
+    context = evaluator.make_context(GaussianOutputModel(alpha=0.5), batch)
+    result = evaluator.evaluate(_terms(), context, return_terms=True)
+
+    assert isinstance(result, LocalEnergyResult)
+    assert result.receipt is not None
+    assert result.receipt.system_id == descriptor.system_id()
 
 
 def test_recording_adapter_preserves_naive_arithmetic_bit_identical() -> None:
