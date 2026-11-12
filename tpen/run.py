@@ -140,13 +140,16 @@ def prepare_run_context(
         other callers see stays logically unchanged -- see
         :func:`_route_artifact_sinks`.
     runtime_callbacks : sequence of objects, optional
-        Operational observers appended after configured callbacks, before
-        this context is returned. Routed (when `artifact_destination` is
-        supplied) and refused on an unsupported sink exactly like configured
-        callbacks -- see :func:`run_from_config`, whose docstring describes
-        this argument's purpose; this parameter exists so a launcher-supplied
-        observer is bound and validated before `RunStarted` is ever emitted,
-        not appended afterward.
+        Operational observers. In routed mode (`artifact_destination`
+        supplied), they are admitted, routed, validated, and appended into
+        ``context.callbacks`` here, before this context is returned, so a
+        launcher-supplied observer is bound before `RunStarted` is ever
+        emitted (F4) -- see :func:`run_from_config`, whose docstring
+        describes this argument's purpose. Without a destination, they are
+        NOT appended here (review-r3 R3.4, restoring the original legacy
+        ordering): `run_from_config` validates and appends them itself,
+        after this context already exists, so a failing legacy list appends
+        none of them rather than all of them regardless of outcome.
 
     Raises
     ------
@@ -271,25 +274,35 @@ def prepare_run_context(
     callbacks = _instantiate_sequence(
         OmegaConf.select(resolved_cfg, "callbacks", default=[]), routed=routed
     )
+    # CONFIGURED validation is unconditional and happens here, before this
+    # context (or anything else below) is constructed (review-r3 R3.4,
+    # restoring the original pre-S3 legacy ordering): fail-loud interface
+    # validation only, confirming these objects expose the lifecycle methods
+    # without invoking any behavior (no handle/log/finish). A refusal here
+    # leaves no `RunContext` bound at all, so `run_from_config`'s `finally`
+    # teardown (which calls `logger.finish()` on every context logger) can
+    # never reach an invalid configured logger -- gating this validation on
+    # `routed`, or deferring it until after the context existed, let exactly
+    # that AttributeError mask the original, already-handled refusal.
+    _validate_callbacks(callbacks)
+    _validate_loggers(loggers)
     runtime_callbacks_list = list(runtime_callbacks)
     if routed:
         # Runtime callbacks have no `_target_` to resolve ahead of
         # construction -- they already exist -- so admission checks their
-        # exact type instead (F3/F4).
+        # exact type instead (F3/F4). In routed mode only, runtime callbacks
+        # must also be validated and merged here, strictly before
+        # `RunStarted` (F4): legacy (no-destination) runtime validation and
+        # merging is restored to `run_from_config` instead (E/R3.4) -- see
+        # its docstring -- so a legacy runtime-callback failure appends none
+        # of them, rather than merging first and validating after.
         for runtime_callback in runtime_callbacks_list:
             _admit_runtime_sink(runtime_callback)
-        # Fail-loud interface validation only: confirm the configured objects
-        # expose the lifecycle methods, without invoking any behavior (no
-        # handle/log/finish). In routed mode this must happen before
-        # `RunStarted` (F4), so it stays here; legacy ordering is restored in
-        # `run_from_config` instead (E) -- see its docstring.
-        _validate_callbacks(callbacks)
         _validate_callbacks(runtime_callbacks_list)
-        _validate_loggers(loggers)
-    # Runtime callbacks join the list -- and are routed along with every
-    # configured callback (F4) -- before this context, and therefore
-    # `RunStarted`, exists at all.
-    callbacks = [*callbacks, *runtime_callbacks_list]
+        # Runtime callbacks join the list -- and are routed along with every
+        # configured callback (F4) -- before this context, and therefore
+        # `RunStarted`, exists at all.
+        callbacks = [*callbacks, *runtime_callbacks_list]
     routed_sinks: dict[str, str] = {}
     if routed:
         routed_sinks = _route_artifact_sinks(
@@ -444,17 +457,20 @@ def run_from_config(
                 runtime_callbacks=runtime_callbacks,
             )
         if artifact_destination is None:
-            # (E) review-r2 legacy failure lifecycle: without a destination,
-            # `prepare_run_context` skips this validation (routed mode needs
-            # it before `RunStarted`, see its body) so a bad legacy callback
-            # or logger is checked only once this context already exists --
-            # restoring the previous ordering, so a refusal here still runs
-            # through the `except` branch below with `context` bound: the
-            # failure artifact is written and every logger's `finish()` still
-            # runs in the `finally` clause, instead of escaping with the
-            # context only half-reported.
-            _validate_callbacks(context.callbacks)
-            _validate_loggers(context.loggers)
+            # (E)/(R3.4) legacy runtime-callback phase: configured callbacks
+            # and loggers were already validated inside `prepare_run_context`
+            # (unconditionally, before `context` existed). Runtime callbacks
+            # are validated here instead -- restoring the original ordering --
+            # and merged into `context.callbacks` only once validation
+            # succeeds, so a failing runtime-callback list appends NONE of
+            # them, rather than all of them having already been merged inside
+            # `prepare_run_context` regardless of outcome. A refusal here
+            # still runs through the `except` branch below with `context`
+            # bound: the failure artifact is written and every logger's
+            # `finish()` still runs in the `finally` clause, instead of
+            # escaping with the context only half-reported.
+            _validate_callbacks(list(runtime_callbacks))
+            context.callbacks.extend(runtime_callbacks)
         _seed_runtime_rngs(context.cfg)
         context.emit(RunStarted())
         runner = _instantiate_runner(context)
@@ -567,12 +583,13 @@ def _validate_loggers(loggers: list[object]) -> None:
 #: Keyed by the defining module's qualified class name -- the same shape as
 #: `tpen.checkpoint.hashing._CALLBACK_OUTPUT_FIELDS`, which independently
 #: excludes these same slots from the science-identity hash because they are
-#: operational rather than scientific. Matching walks a sink's MRO (see
-#: `_registered_sink_fields`), so a SUBCLASS of one of these is routed exactly
-#: like its registered ancestor, rather than silently skipped by an exact-name
-#: lookup. core-owned writes that instead go through `RunContext.path`/
-#: `ArtifactManager.path` are already physical because `ArtifactManager.run_dir`
-#: itself is bound to the destination.
+#: operational rather than scientific. Matching is by EXACT qualified type
+#: name only (review-r3 R3.1): a subclass of one of these registered writers
+#: is refused, not silently admitted through its ancestor, because a subclass
+#: can add its own unaudited constructor- or method-side write that this
+#: registry's field list would never see. core-owned writes that instead go
+#: through `RunContext.path`/`ArtifactManager.path` are already physical
+#: because `ArtifactManager.run_dir` itself is bound to the destination.
 _ARTIFACT_SINK_FIELDS: dict[str, tuple[str, ...]] = {
     "tpen.callback.snapshot.ConfigSnapshot": ("output_path",),
     "tpen.callback.snapshot.ResolvedConfigSnapshot": ("output_path",),
@@ -619,34 +636,28 @@ _SINK_FREE_TYPES: frozenset[str] = frozenset(
 
 
 def _registered_sink_fields(sink: object) -> tuple[str, ...] | None:
-    """Return the registered output fields for ``sink``'s nearest registered type.
+    """Return the registered output fields for ``sink``'s EXACT type, if any.
 
-    Walks the MRO so a subclass of a registered writer is matched through its
-    registered ancestor, rather than only an exact-name match on ``type(sink)``.
+    Matched by exact qualified type name only (review-r3 R3.1): no MRO walk,
+    so a subclass of a registered writer is not matched through its ancestor.
     """
 
-    for klass in type(sink).__mro__:
-        qualified = f"{klass.__module__}.{klass.__qualname__}"
-        fields = _ARTIFACT_SINK_FIELDS.get(qualified)
-        if fields is not None:
-            return fields
-    return None
+    qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
+    return _ARTIFACT_SINK_FIELDS.get(qualified)
 
 
 def _class_is_admitted_sink(klass: type) -> bool:
-    """Return whether ``klass`` (or an ancestor) is a closed-admission sink.
+    """Return whether ``klass`` is an EXACT closed-admission sink type.
 
-    A registered routed writer is matched through its MRO -- a subclass of a
-    registered writer is routed exactly like its ancestor (F3's existing,
-    intentional behavior). A sink-free type is matched by EXACT name only.
+    Both the registered-writer registry and the sink-free allowlist are
+    matched by EXACT qualified type name only (review-r3 R3.1): a subclass
+    of either -- which might add its own unaudited constructor- or
+    method-side write this check cannot see -- is refused, not silently
+    admitted through its ancestor.
     """
 
-    for ancestor in klass.__mro__:
-        qualified = f"{ancestor.__module__}.{ancestor.__qualname__}"
-        if qualified in _ARTIFACT_SINK_FIELDS:
-            return True
     qualified = f"{klass.__module__}.{klass.__qualname__}"
-    return qualified in _SINK_FREE_TYPES
+    return qualified in _ARTIFACT_SINK_FIELDS or qualified in _SINK_FREE_TYPES
 
 
 def _admit_configured_target(target: str) -> None:
@@ -654,9 +665,10 @@ def _admit_configured_target(target: str) -> None:
 
     Resolves ``target`` (a configured ``_target_`` dotted path) to its class
     without instantiating it, and admits it only when
-    :func:`_class_is_admitted_sink` accepts that class. An unregistered type,
-    or an unregistered subclass of a sink-free type, is refused here --
-    before construction can write anything to its logical destination.
+    :func:`_class_is_admitted_sink` accepts that EXACT class. An unregistered
+    type, or an unregistered subclass of a registered or sink-free type, is
+    refused here -- before construction can write anything to its logical
+    destination.
     """
 
     klass = get_class(target)
@@ -667,48 +679,27 @@ def _admit_configured_target(target: str) -> None:
         )
 
 
-#: Attribute names conventionally used, across callbacks and loggers in this
-#: codebase, to hold an output destination. A RUNTIME callback (already
-#: constructed, supplied by the launcher or a test -- never configured
-#: through `cfg`, so there is no `_target_` to resolve against the closed
-#: registries ahead of time) exposing none of these is accepted as
-#: genuinely sink-free without needing a static listing: an ad hoc observer
-#: with no output-path-shaped attribute has nothing to route and nothing to
-#: escape through. This is narrower than the heuristic the configured-sink
-#: path replaced (B): it never ADMITS an output-bearing object past this
-#: probe, it only widens what counts as sink-free for objects the registries
-#: cannot possibly enumerate in advance.
-_RUNTIME_SINK_PROBE_FIELDS: tuple[str, ...] = (
-    "output_path",
-    "output_dir",
-    "path",
-    "artifact_dir",
-    "dir",
-)
-
-
 def _admit_runtime_sink(sink: object) -> None:
-    """Refuse an unregistered, output-bearing, already-constructed runtime sink (F3/F4).
+    """Refuse an unregistered, already-constructed runtime sink (F3/F4/R3.1).
 
-    Runtime callbacks have no ``_target_`` to resolve ahead of construction.
-    A registered writer or sink-free type is matched by the sink's EXACT
-    type -- never by MRO: an unregistered subclass of a registered writer or
-    sink-free type is not exempted by this first check, consistent with
-    "checked by exact type" (review-r2 B). Anything else is admitted only
-    when it exposes none of `_RUNTIME_SINK_PROBE_FIELDS` -- a genuinely
-    sink-free runtime observer (e.g. a test's bare readback probe) -- and
-    refused otherwise.
+    Runtime callbacks have no ``_target_`` to resolve ahead of construction,
+    so admission is checked against the sink's EXACT type instead: a
+    registered-writer type or a sink-free type, matched by exact qualified
+    name only, with no MRO/subclass admission and no inference from the
+    presence or absence of an output-path-shaped attribute (review-r3 R3.1
+    rejects both as open sink admission). A genuinely sink-free runtime
+    observer must be an exact member of one of the two closed registries --
+    for example a registered sink-free callback type -- not merely an ad hoc
+    object lacking a path attribute.
     """
 
     qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
     if qualified in _ARTIFACT_SINK_FIELDS or qualified in _SINK_FREE_TYPES:
         return
-    if any(getattr(sink, probe, None) is not None for probe in _RUNTIME_SINK_PROBE_FIELDS):
-        raise ArtifactRoutingError(
-            f"{qualified} is not a registered routed writer or a known "
-            "sink-free type, but exposes an output-path-shaped attribute; "
-            "refusing to admit it to a routed run"
-        )
+    raise ArtifactRoutingError(
+        f"{qualified} is not a registered routed writer or a known sink-free "
+        "type; refusing to admit it to a routed run"
+    )
 
 
 def _route_artifact_sinks(
@@ -728,16 +719,15 @@ def _route_artifact_sinks(
     claimed physical root (an escape).
 
     CLOSED SINK CONTRACT (F3, closed by construction-side admission per
-    review-r2 B): by the time a sink reaches here, every configured sink
-    already passed :func:`_admit_configured_target` before it was
-    constructed, and every runtime sink already passed
-    :func:`_admit_runtime_sink`. This function's own check -- a sink whose
-    type is not in `_ARTIFACT_SINK_FIELDS` by MRO is admitted only when it
-    is an exact member of `_SINK_FREE_TYPES` or exposes none of
-    `_RUNTIME_SINK_PROBE_FIELDS` -- is therefore a second, cheap
-    confirmation rather than the admission's first line of defense; it
-    exists so this function stays correct for any direct caller that
-    bypasses those gates (as several unit tests do).
+    review-r2 B, exact-type only per review-r3 R3.1): by the time a sink
+    reaches here, every configured sink already passed
+    :func:`_admit_configured_target` before it was constructed, and every
+    runtime sink already passed :func:`_admit_runtime_sink`. This function's
+    own check -- a sink whose EXACT type is not in `_ARTIFACT_SINK_FIELDS` is
+    admitted only when it is an exact member of `_SINK_FREE_TYPES` -- is
+    therefore a second, cheap confirmation rather than the admission's first
+    line of defense; it exists so this function stays correct for any direct
+    caller that bypasses those gates (as several unit tests do).
 
     A field whose registered writer exposes an owner-defined
     ``rebind_<field>`` method (for example `tpen.logging.csv.CSV.rebind_path`,
@@ -753,8 +743,8 @@ def _route_artifact_sinks(
     Raises
     ------
     tpen.artifacts.ArtifactRoutingError
-        When a sink is not a registered routed writer (by MRO) and is not a
-        known sink-free object.
+        When a sink's exact type is not a registered routed writer and is
+        not a known sink-free type.
     """
 
     routed: dict[str, str] = {}
@@ -762,14 +752,11 @@ def _route_artifact_sinks(
         qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
         fields = _registered_sink_fields(sink)
         if fields is None:
-            if qualified not in _SINK_FREE_TYPES and any(
-                getattr(sink, probe, None) is not None for probe in _RUNTIME_SINK_PROBE_FIELDS
-            ):
+            if qualified not in _SINK_FREE_TYPES:
                 raise ArtifactRoutingError(
                     f"{qualified} is not a registered routed writer or a known "
-                    "sink-free type, but exposes an output-path-shaped attribute; "
-                    "refusing to admit it to a routed run before it can write "
-                    "outside the claimed physical destination"
+                    "sink-free type; refusing to admit it to a routed run before "
+                    "it can write outside the claimed physical destination"
                 )
             continue
         for field in fields:

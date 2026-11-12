@@ -461,11 +461,14 @@ def test_f3_a_sink_free_object_with_no_output_attribute_passes_through(tmp_path:
     assert routed == {}
 
 
-def test_f3_a_subclass_of_a_registered_writer_is_routed_through_its_ancestor(
+def test_r3_1_a_subclass_of_a_registered_writer_is_refused_not_routed(
     tmp_path: Path,
 ) -> None:
-    """A subclass of a registered writer is matched and routed, not skipped
-    by an exact-name lookup."""
+    """(R3.1) review-r3: admission is by EXACT type only, no MRO/subclass
+    admission. A subclass of a registered writer is refused by
+    `_route_artifact_sinks`'s own backstop check, not silently routed
+    through its ancestor's registered fields -- a subclass can add its own
+    unaudited output path this registry's field list would never see."""
 
     from tpen.run import _route_artifact_sinks
 
@@ -477,10 +480,48 @@ def test_f3_a_subclass_of_a_registered_writer_is_routed_through_its_ancestor(
     destination = ArtifactDestination(physical_root=physical_root)
     sink = _SubclassOfCSV(path=logical_run_dir / "metrics.csv")
 
-    routed = _route_artifact_sinks([sink], logical_run_dir=logical_run_dir, destination=destination)
+    with pytest.raises(ArtifactRoutingError):
+        _route_artifact_sinks([sink], logical_run_dir=logical_run_dir, destination=destination)
 
-    assert sink.path == physical_root / "metrics.csv"
-    assert routed
+
+def test_r3_1_a_configured_writer_subclass_with_a_constructor_write_is_refused_before_construction(
+    tmp_path: Path,
+) -> None:
+    """(R3.1) regression: a configured CSV subclass that writes an
+    additional, unaudited path in its constructor must be refused before
+    `instantiate()` ever runs it -- not merely matched and routed through its
+    registered ancestor's `path` field, which never sees this side write."""
+
+    from tpen.run import _instantiate_sequence
+
+    logical_root = tmp_path / "logical"
+    side_write_path = logical_root / "side_write.bin"
+
+    item = OmegaConf.create(
+        {
+            "_target_": "tests.unit.test_run_artifact_routing._CSVSubclassWithConstructorWrite",
+            "path": str(logical_root / "metrics.csv"),
+            "side_write": str(side_write_path),
+        }
+    )
+
+    with pytest.raises(ArtifactRoutingError):
+        _instantiate_sequence([item], routed=True)
+
+    assert not side_write_path.exists()
+
+
+class _CSVSubclassWithConstructorWrite(CSV):
+    """Module-level subclass so Hydra's `_target_` can resolve it by path.
+
+    Writes `side_write` from its constructor -- the vector R3.1 describes: an
+    admitted-by-MRO subclass could write an additional, unaudited path before
+    its inherited `path` field is ever rebound."""
+
+    def __init__(self, *, path: Path, side_write: str | Path, **kwargs: object) -> None:
+        Path(side_write).parent.mkdir(parents=True, exist_ok=True)
+        Path(side_write).write_text("unaudited constructor write")
+        super().__init__(path=path, **kwargs)
 
 
 def test_f4_runtime_callbacks_are_routed_and_present_before_the_context_returns(
@@ -543,36 +584,103 @@ def test_f4_an_unregistered_runtime_callback_is_refused_in_routed_mode(tmp_path:
         )
 
 
-def test_f4_a_sink_free_runtime_callback_is_admitted_in_routed_mode(tmp_path: Path) -> None:
-    """Negative for the above: a runtime observer with NO output-path-shaped
-    attribute -- an ordinary test readback probe, never configured through
-    `cfg` and so never enumerable in the closed registries ahead of time --
-    has nothing to route and nothing to escape through, and must be
-    admitted, not refused."""
+def test_r3_1_an_explicitly_admitted_runtime_observer_is_admitted_in_routed_mode(
+    tmp_path: Path,
+) -> None:
+    """(R3.1) review-r3: admission by exact type only, never inferred from
+    the absence of an output-path-shaped attribute. A runtime observer is
+    admitted only when its EXACT type is a member of the closed sink-free
+    registry (here `RunTiming`, also used as a configured sink-free type
+    elsewhere in this file) -- an ad hoc class with no path attribute is no
+    longer, by itself, sufficient."""
 
-    class _ReadbackProbe:
-        def __init__(self) -> None:
-            self.seen: list[object] = []
-
-        def handle_occurrence(self, occurrence: object, context: object) -> None:
-            self.seen.append(occurrence)
+    from tpen.callback.timing.run_timing import RunTiming
 
     logical_root = tmp_path / "logical"
     physical_root = tmp_path / "allocation-1"
     physical_root.mkdir()
     destination = ArtifactDestination(physical_root=physical_root)
     cfg = _routed_cfg(logical_root)
-    probe = _ReadbackProbe()
+    observer = RunTiming()
 
     context = prepare_run_context(
         cfg,
         config_path="test.yaml",
         command="pytest",
         artifact_destination=destination,
-        runtime_callbacks=[probe],
+        runtime_callbacks=[observer],
     )
 
-    assert probe in context.callbacks
+    assert observer in context.callbacks
+
+
+def test_r3_1_an_ad_hoc_runtime_observer_with_no_output_attribute_is_still_refused(
+    tmp_path: Path,
+) -> None:
+    """(R3.1) negative-of-the-negative: an ad hoc observer that merely lacks
+    an output-path-shaped attribute is NOT, by itself, admitted -- only exact
+    membership in the closed registries is. This is the regression the old
+    attribute-probe inference would have passed."""
+
+    class _AdHocObserverNoPathAttribute:
+        def handle_occurrence(self, occurrence: object, context: object) -> None:
+            pass
+
+    logical_root = tmp_path / "logical"
+    physical_root = tmp_path / "allocation-1"
+    physical_root.mkdir()
+    destination = ArtifactDestination(physical_root=physical_root)
+    cfg = _routed_cfg(logical_root)
+
+    with pytest.raises(ArtifactRoutingError):
+        prepare_run_context(
+            cfg,
+            config_path="test.yaml",
+            command="pytest",
+            artifact_destination=destination,
+            runtime_callbacks=[_AdHocObserverNoPathAttribute()],
+        )
+
+
+def test_r3_1_a_runtime_filename_writer_with_an_event_write_spy_is_refused_before_any_write(
+    tmp_path: Path,
+) -> None:
+    """(R3.1) regression: an unregistered runtime callback that stores its
+    destination as `filename` (not one of the conventional probe names the
+    old heuristic checked) must be refused before any write -- exact-type
+    admission refuses every unregistered type uniformly, with no attribute
+    name able to let one slip through."""
+
+    class _RuntimeFilenameWriter:
+        def __init__(self, filename: Path) -> None:
+            self.filename = filename
+            self.wrote: list[object] = []
+
+        def handle_occurrence(self, occurrence: object, context: object) -> None:
+            Path(self.filename).write_text("leak")
+            self.wrote.append(occurrence)
+
+    logical_root = tmp_path / "logical"
+    physical_root = tmp_path / "allocation-1"
+    physical_root.mkdir()
+    destination = ArtifactDestination(physical_root=physical_root)
+    cfg = _routed_cfg(logical_root)
+
+    probe = prepare_run_context(cfg, config_path="test.yaml", command="pytest")
+    logical_run_dir = probe.artifact_manager.logical_run_dir
+    bad = _RuntimeFilenameWriter(filename=logical_run_dir / "custom.bin")
+
+    with pytest.raises(ArtifactRoutingError):
+        prepare_run_context(
+            cfg,
+            config_path="test.yaml",
+            command="pytest",
+            artifact_destination=destination,
+            runtime_callbacks=[bad],
+        )
+
+    assert bad.wrote == []
+    assert not (logical_run_dir / "custom.bin").exists()
 
 
 def test_f6_rebinding_a_populated_csv_logger_does_not_omit_the_new_files_header(
@@ -746,11 +854,13 @@ def test_b_an_unregistered_configured_logger_is_unaffected_without_a_destination
     assert len(context.loggers) == 3
 
 
-def test_b_a_registered_writer_subclass_is_still_admitted_before_construction(
+def test_r3_1_a_registered_writer_subclass_is_refused_before_construction(
     tmp_path: Path,
 ) -> None:
-    """(B) negative: admission still walks the MRO for registered writers --
-    this closed gate does not regress F3's intentional subclass support."""
+    """(R3.1) review-r3 supersedes (B)'s old MRO admission: a subclass of a
+    registered writer is refused, by EXACT type only, before
+    `instantiate()` ever runs it -- not matched and admitted through its
+    registered ancestor."""
 
     from tpen.run import _instantiate_sequence
 
@@ -762,7 +872,28 @@ def test_b_a_registered_writer_subclass_is_still_admitted_before_construction(
         }
     )
 
-    (instance,) = _instantiate_sequence([item], routed=True)
+    with pytest.raises(ArtifactRoutingError):
+        _instantiate_sequence([item], routed=True)
+
+
+def test_r3_1_a_registered_writer_subclass_is_unaffected_without_a_destination(
+    tmp_path: Path,
+) -> None:
+    """(R3.1) negative: the exact-type admission gate is routed-only -- a
+    legacy (no-destination) caller's custom writer subclass is unaffected,
+    unchanged from before this round's fix."""
+
+    from tpen.run import _instantiate_sequence
+
+    logical_root = tmp_path / "logical"
+    item = OmegaConf.create(
+        {
+            "_target_": "tests.unit.test_run_artifact_routing._SubclassOfCSVModule",
+            "path": str(logical_root / "metrics.csv"),
+        }
+    )
+
+    (instance,) = _instantiate_sequence([item], routed=False)
 
     assert isinstance(instance, _SubclassOfCSVModule)
 
@@ -803,3 +934,101 @@ def test_e_without_a_destination_an_invalid_callback_still_writes_failure_artifa
     logical_run_dir = tmp_path / "logical" / "routing" / "unit" / "fixed-run-id"
     assert (logical_run_dir / "run_start.json").exists()
     assert (logical_run_dir / "error.json").exists()
+
+
+def test_r3_4_a_missing_finish_configured_logger_fails_handled_without_masking(
+    tmp_path: Path,
+) -> None:
+    """(R3.4) regression: an invalid configured logger refuses inside
+    `prepare_run_context`, before any `RunContext` exists -- so
+    `run_from_config`'s unconditional `finally` loop (`logger.finish()` on
+    every context logger) never reaches it. Moving this validation past
+    context construction (the intervening, now-fixed S3 state) let that
+    `AttributeError` mask this handled failure instead of a clean `return 1`.
+    """
+
+    from tpen.run import run_from_config
+
+    logical_root = tmp_path / "logical"
+    cfg = _routed_cfg(logical_root)
+    OmegaConf.set_struct(cfg, False)
+    cfg.loggers.append({"_target_": "builtins.object"})
+
+    rc = run_from_config(cfg, config_path="test.yaml", command="pytest")
+
+    assert rc == 1
+
+
+def test_r3_4_a_missing_finish_configured_logger_raises_the_original_error_when_raising(
+    tmp_path: Path,
+) -> None:
+    """(R3.4) negative-of-the-above in raising mode: the original `TypeError`
+    from `_validate_loggers` propagates, not an `AttributeError` from a
+    `finally`-loop call to `finish()` on an invalid logger that was never
+    bound into any context."""
+
+    from tpen.run import run_from_config
+
+    logical_root = tmp_path / "logical"
+    cfg = _routed_cfg(logical_root)
+    OmegaConf.set_struct(cfg, False)
+    cfg.loggers.append({"_target_": "builtins.object"})
+
+    with pytest.raises(TypeError, match="log"):
+        run_from_config(cfg, config_path="test.yaml", command="pytest", raise_exceptions=True)
+
+
+def test_r3_4_direct_preparation_with_an_invalid_configured_callback_raises_before_any_context(
+    tmp_path: Path,
+) -> None:
+    """(R3.4) regression: `prepare_run_context` itself validates configured
+    callbacks unconditionally, before constructing anything -- a direct
+    caller (bypassing `run_from_config`) gets the same refusal, with no
+    context, directory, or callback left behind."""
+
+    logical_root = tmp_path / "logical"
+    cfg = _routed_cfg(logical_root)
+    OmegaConf.set_struct(cfg, False)
+    cfg.callbacks.append({"_target_": "builtins.object"})
+
+    with pytest.raises(TypeError, match="handle_occurrence"):
+        prepare_run_context(cfg, config_path="test.yaml", command="pytest")
+
+
+def test_r3_4_a_failed_runtime_list_appends_no_runtime_callback_without_a_destination(
+    tmp_path: Path,
+) -> None:
+    """(R3.4) regression: with runtime callbacks `[valid_observer,
+    invalid_observer]` and no destination, a failing list appends NEITHER
+    runtime observer -- restoring the original behavior where the whole
+    list is validated before any of it is merged into `context.callbacks`.
+    In the intervening, now-fixed S3 state, both runtime callbacks had
+    already been merged inside `prepare_run_context` regardless of
+    validation outcome, so the valid observer would have received
+    `RunStarted`/`RunFailed` despite the list failing admission."""
+
+    from tpen.run import run_from_config
+
+    class _ValidObserver:
+        def __init__(self) -> None:
+            self.occurrences: list[object] = []
+
+        def handle_occurrence(self, occurrence: object, context: object) -> None:
+            self.occurrences.append(occurrence)
+
+    class _InvalidObserver:
+        """Missing `handle_occurrence` -- fails `_validate_callbacks`."""
+
+    logical_root = tmp_path / "logical"
+    cfg = _routed_cfg(logical_root)
+    valid = _ValidObserver()
+
+    rc = run_from_config(
+        cfg,
+        config_path="test.yaml",
+        command="pytest",
+        runtime_callbacks=[valid, _InvalidObserver()],
+    )
+
+    assert rc == 1
+    assert valid.occurrences == []
