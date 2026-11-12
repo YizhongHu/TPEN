@@ -276,6 +276,100 @@ def test_nn_only_geometry_discriminates() -> None:
     assert equilibrium.system_id() != stretched.system_id()
 
 
+def test_term_resource_survives_input_mutation() -> None:
+    """r2 regression: `HamiltonianTermDescriptor.resource` must not alias its input.
+
+    The r1 fix decoupled `SystemDescriptor.resources` from the caller's
+    atoms (see `test_resource_payload_survives_input_mutation`), but
+    `HamiltonianTermDescriptor.resource` itself still held the caller's own
+    `AtomicConfiguration` object: mutating `atoms` after construction changed
+    what `term.resource` reported, even though the `resources` table stayed
+    correct (the two access paths disagreed about the same resource_id).
+    """
+
+    positions = torch.tensor([[0.0, 0.0, 0.0]])
+    charges = torch.tensor([2.0])
+    atoms = AtomicConfiguration(positions, charges)
+    descriptor = build_system_descriptor(
+        ParticleSpec(1, 1, 0, 3),
+        {"kinetic": KineticEnergy(), "electron_nucleus": ElectronNucleusPotential(atoms)},
+    )
+    resource_id = atoms.content_id()
+    term = next(t for t in descriptor.terms if t.slot == "electron_nucleus")
+
+    atoms.positions.add_(100.0)
+    atoms.charges.add_(1.0)
+
+    assert term.resource.content_id() == resource_id
+    assert descriptor.resources[resource_id].content_id() == resource_id
+
+
+def test_exposed_table_resource_mutation_does_not_persist() -> None:
+    """Mutating a tensor obtained from `d.resources[rid]` must not corrupt later reads."""
+
+    atoms = AtomicConfiguration(torch.tensor([[0.0, 0.0, 0.0]]), torch.tensor([2.0]))
+    descriptor = build_system_descriptor(
+        ParticleSpec(1, 1, 0, 3),
+        {"kinetic": KineticEnergy(), "electron_nucleus": ElectronNucleusPotential(atoms)},
+    )
+    resource_id = atoms.content_id()
+
+    exposed = descriptor.resources[resource_id]
+    exposed.positions.add_(100.0)
+    exposed.charges.add_(1.0)
+
+    assert descriptor.resources[resource_id].content_id() == resource_id
+    assert descriptor.system_id() == build_system_descriptor(
+        ParticleSpec(1, 1, 0, 3),
+        {"kinetic": KineticEnergy(), "electron_nucleus": ElectronNucleusPotential(atoms)},
+    ).system_id()
+
+
+def test_exposed_term_resource_mutation_does_not_persist() -> None:
+    """Mutating a tensor obtained from `term.resource` must not corrupt later reads."""
+
+    atoms = AtomicConfiguration(torch.tensor([[0.0, 0.0, 0.0]]), torch.tensor([2.0]))
+    descriptor = build_system_descriptor(
+        ParticleSpec(1, 1, 0, 3),
+        {"kinetic": KineticEnergy(), "electron_nucleus": ElectronNucleusPotential(atoms)},
+    )
+    resource_id = atoms.content_id()
+    term = next(t for t in descriptor.terms if t.slot == "electron_nucleus")
+
+    exposed = term.resource
+    exposed.positions.add_(100.0)
+    exposed.charges.add_(1.0)
+
+    assert term.resource.content_id() == resource_id
+    assert descriptor.resources[resource_id].content_id() == resource_id
+
+
+def test_stale_term_declaration_does_not_leak_into_aggregated_resource() -> None:
+    """A term's declaration is snapshotted at its own construction, not re-read live.
+
+    Declare a term, then mutate its source atoms *before* the declaration is
+    aggregated into a `SystemDescriptor`: the aggregated payload must still
+    match the resource_id the term declared, not the atoms' current (changed)
+    content.
+    """
+
+    atoms = AtomicConfiguration(torch.tensor([[0.0, 0.0, 0.0]]), torch.tensor([2.0]))
+    term_obj = ElectronNucleusPotential(atoms)
+    declaration = term_obj.describe_physical_operator()
+    resource_id = declaration.resource_id
+
+    atoms.positions.add_(100.0)
+    atoms.charges.add_(1.0)
+
+    system = SystemDescriptor(
+        particle=ParticleSpec(1, 1, 0, 3),
+        units="atomic_units",
+        terms=(declaration,),
+    )
+
+    assert system.resources[resource_id].content_id() == resource_id
+
+
 def test_en_and_nn_distinct_resources_stay_distinct() -> None:
     atoms_a = _h2_atoms(1.4)
     atoms_b = _h2_atoms(2.0)
