@@ -18,6 +18,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 BUILDER = REPO_ROOT / "scripts" / "cannon" / "build-shared-env.sh"
+PRECHECK = REPO_ROOT / "scripts" / "cannon" / "shared-env-precheck.sh"
 REAL_POLICY_FILE = REPO_ROOT / "scripts" / "cannon" / "shared-env-policy.json"
 
 PROJECT = "tpen"
@@ -146,6 +147,16 @@ def make_valid_manifest(
     if project_dir is not None:
         body += f"project_dir={project_dir}\n"
     return body
+
+
+def run_manifest_publish_validator(
+    manifest: Path, lock_sha256: str, project_dir: str,
+) -> subprocess.CompletedProcess[str]:
+    script = (
+        f'source "{REPO_ROOT / "scripts/cannon/shared-env-manifest.sh"}"; '
+        f'manifest_is_valid_for_publish "{manifest}" "{lock_sha256}" "{project_dir}"'
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
 
 
 def add_subproject(
@@ -1083,3 +1094,116 @@ def test_old_six_field_manifest_still_reused(tmp_path: Path, envs_root: Path, ca
     assert not uv_log.exists() or uv_log.read_text() == ""
     # Reuse never rewrites the pre-existing manifest.
     assert (target_dir / ".complete").read_text() == six_field_manifest
+
+
+@pytest.mark.parametrize("extra", ["none", "parsl"])
+def test_t1_hyphenated_project_name_builds(tmp_path: Path, envs_root: Path, cache_dir: Path, extra: str) -> None:
+    checkout = make_checkout(tmp_path)
+    add_subproject(checkout, "executor")
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout, project="tpen-executor", extra=extra, project_dir="executor")
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir,
+        project="tpen-executor", extra=extra, project_dir="executor",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (envs_root / target / ".complete").is_file()
+    assert "project_dir=executor\n" in (envs_root / target / ".complete").read_text()
+    assert f"CWD={checkout / 'executor'}" in uv_log.read_text()
+    lock_sha256 = hashlib.sha256((checkout / "executor" / "uv.lock").read_bytes()).hexdigest()
+    precheck = subprocess.run(
+        [
+            "bash", str(PRECHECK), "resolve",
+            "--shared-env-prefix", str(envs_root),
+            "--project", "tpen-executor", "--extra", extra,
+            "--python", PYTHON_VERSION, "--lock-sha256", lock_sha256,
+        ], capture_output=True, text=True, check=False,
+    )
+    assert precheck.returncode == 0, precheck.stdout + precheck.stderr
+    assert precheck.stdout.strip() == str(envs_root / target)
+
+
+def test_t2_hyphenated_extra_is_rejected_before_uv(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir,
+        project="a", extra="b-c",
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "--extra must be a single path component" in result.stderr
+    assert not uv_log.exists()
+    assert list(envs_root.iterdir()) == []
+
+
+def test_t3_publisher_requires_seven_newline_terminated_fields(tmp_path: Path) -> None:
+    lock_sha256 = "a" * 64
+    manifest = tmp_path / ".complete.tmp"
+    six_fields = (
+        "head=" + "d" * 40 + "\n"
+        f"uv_lock_sha256={lock_sha256}\n"
+        "uv_version=uv 9.9.9-stub\n"
+        "python_version=3.12.7\n"
+        "python_request=3.12\n"
+        "built_utc=2026-01-01T00:00:00Z\n"
+    )
+    manifest.write_text(six_fields)
+    result = run_manifest_publish_validator(manifest, lock_sha256, ".")
+    assert result.returncode != 0
+
+    manifest.write_bytes((six_fields + "project_dir=.").encode())
+    result = run_manifest_publish_validator(manifest, lock_sha256, ".")
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize("bad_project_dir", ["bad?", "bad*", "bad[ab]"])
+def test_t4_project_dir_glob_literals_are_rejected(tmp_path: Path, envs_root: Path, cache_dir: Path, bad_project_dir: str) -> None:
+    checkout = make_checkout(tmp_path)
+    add_subproject(checkout, bad_project_dir)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir,
+        project_dir=bad_project_dir,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "--project-dir" in result.stderr
+    assert not uv_log.exists()
+    assert len(list(envs_root.iterdir())) == 0
+
+
+def test_t5_project_dir_component_check_rejects_existing_traversal(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    add_subproject(checkout, "a")
+    add_subproject(checkout, "b")
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir,
+        project_dir="a/../b",
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "--project-dir" in result.stderr
+    assert not uv_log.exists()
+    assert list(envs_root.iterdir()) == []
+
+
+def test_t6_containment_is_case_sensitive_under_nocasematch(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    outside = tmp_path / "CHECKOUT"
+    outside.mkdir()
+    (outside / "pyproject.toml").write_text('[project]\nname = "outside"\n')
+    (outside / "uv.lock").write_bytes(b"outside-lock\n")
+    link = checkout / "escape_link"
+    link.symlink_to(outside, target_is_directory=True)
+    env = dict(os.environ)
+    env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = "test"
+    env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = "test@example.com"
+    subprocess.run(["git", "add", "-A"], cwd=checkout, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "add case escape"], cwd=checkout, check=True, env=env)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir,
+        project_dir="escape_link", extra_env={"BASHOPTS": "nocasematch"},
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "escapes" in result.stderr
+    assert not uv_log.exists()

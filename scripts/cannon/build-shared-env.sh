@@ -70,13 +70,10 @@ done
 
 [[ -n "$ENVS_ROOT" && -n "$CHECKOUT" && -n "$PROJECT" && -n "$EXTRA" && -n "$PYTHON_VERSION" && -n "$UV_BIN" ]] ||
   fail_precheck "--envs-root, --checkout, --project, --extra, --python, and --uv-bin are all required"
-# --project/--extra feed into the computed target directory name. Restrict
-# each to a single path component (no '/', no leading '.' so ".." is
-# rejected outright) so neither can make the target escape --envs-root.
-# NAME_COMPONENT_RE comes from shared-env-manifest.sh (shared with the
-# reuse-only precheck).
-[[ "$PROJECT" =~ $NAME_COMPONENT_RE ]] || fail_precheck "--project must be a single path component matching $NAME_COMPONENT_RE"
-[[ "$EXTRA" =~ $NAME_COMPONENT_RE ]] || fail_precheck "--extra must be a single path component matching $NAME_COMPONENT_RE"
+# --project/--extra feed into the computed target directory name. Keep their
+# grammars separate: hyphens are allowed in projects, but not extras.
+[[ "$PROJECT" =~ $PROJECT_NAME_RE ]] || fail_precheck "--project must be a single path component matching $PROJECT_NAME_RE"
+[[ "$EXTRA" =~ $EXTRA_NAME_RE ]] || fail_precheck "--extra must be a single path component matching $EXTRA_NAME_RE"
 [[ "$PYTHON_VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || fail_precheck "--python must be X.Y"
 [[ -x "$UV_BIN" && "$UV_BIN" == /* ]] || fail_precheck "--uv-bin must be an executable absolute path"
 [[ -n "${UV_CACHE_DIR:-}" ]] || fail_precheck "UV_CACHE_DIR must be set by the caller"
@@ -138,15 +135,15 @@ TARGET="$CANON_ENVS_ROOT/$ENV_NAME"
 # checkout-root project dir), with the recorded lock hash matching the
 # CURRENT project dir's uv.lock. The build HEAD may differ from the
 # requesting HEAD (dependencies, not history, define identity); an empty,
-# truncated (even late, even without a final field, even missing only a
-# trailing newline), malformed, or mismatched manifest is not trusted.
+# truncated, malformed, or mismatched manifest is not trusted.
 
 LOCKFILE="$CANON_ENVS_ROOT/.build-shared-env.lock"
 exec 200>"$LOCKFILE"
 flock -x 200
 
 # Defense in depth: ENV_NAME can contain no '/' (enforced by
-# NAME_COMPONENT_RE above), so TARGET's parent is always CANON_ENVS_ROOT --
+# project/extra component checks above), so TARGET's parent is always
+# CANON_ENVS_ROOT --
 # but assert it explicitly under the lock in case that invariant is ever
 # weakened.
 TARGET_PARENT="$(realpath -m -- "$(dirname -- "$TARGET")")"
@@ -223,7 +220,8 @@ MANIFEST
 # Validate the temp file with the same strict function used for reuse,
 # before the rename -- a build that produced a malformed manifest must not
 # be published, even though uv sync itself succeeded.
-manifest_is_valid "$TMP_MANIFEST" "$LOCK_SHA256" || fail "failed to produce a well-formed completion manifest, needs disposition: path=$TARGET"
+manifest_is_valid_for_publish "$TMP_MANIFEST" "$LOCK_SHA256" "$PROJECT_DIR" ||
+  fail "failed to produce a well-formed completion manifest, needs disposition: path=$TARGET"
 mv -f -- "$TMP_MANIFEST" "$TARGET/.complete"
 
 echo "BUILT count=$COUNT path=$TARGET cap=$CAP policy=$POLICY_FILE head=$HEAD_SHA"

@@ -112,13 +112,19 @@ def run_paths(
     facility_prefix: Path,
     run_root: Path,
     work_root: Path,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return run_precheck(
-        "paths",
-        "--shared-env-prefix", str(shared_prefix),
-        "--facility-run-prefix", str(facility_prefix),
-        "--run-root", str(run_root),
-        "--work-root", str(work_root),
+    env = dict(os.environ)
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [
+            "bash", str(PRECHECK), "paths",
+            "--shared-env-prefix", str(shared_prefix),
+            "--facility-run-prefix", str(facility_prefix),
+            "--run-root", str(run_root),
+            "--work-root", str(work_root),
+        ], capture_output=True, text=True, env=env, check=False,
     )
 
 
@@ -267,6 +273,24 @@ def test_paths_accepts_work_root_disjoint_from_shared_prefix(
         work_root=work_root,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_t6_precheck_containment_is_case_sensitive_under_nocasematch(
+    shared_prefix: Path, facility_prefix: Path, tmp_path: Path
+) -> None:
+    case_variant = shared_prefix.with_name("SHARED-ENVS")
+    case_variant.mkdir()
+    alias = tmp_path / "scratch-alias"
+    alias.symlink_to(case_variant, target_is_directory=True)
+    result = run_paths(
+        shared_prefix=shared_prefix,
+        facility_prefix=facility_prefix,
+        run_root=facility_prefix / "job-123",
+        work_root=alias,
+        extra_env={"BASHOPTS": "nocasematch"},
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "--work-root" in result.stderr and "disjoint" in result.stderr
 
 
 def test_paths_refuses_when_work_root_is_a_symlink_alias_into_shared_prefix(

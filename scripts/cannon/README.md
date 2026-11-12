@@ -177,9 +177,10 @@ scripts/cannon/build-shared-env.sh \
 ```
 
 `UV_CACHE_DIR` must be set by the caller. The `--checkout` must be a clean
-git work tree (its `HEAD` is recorded in the manifest below). `--project` and
-`--extra` must each be a single path component (`^[A-Za-z0-9][A-Za-z0-9._+]*$`,
-no `/`, no leading `.` so `..` is rejected) — the computed target's canonical
+git work tree (its `HEAD` is recorded in the manifest below). `--project` must
+be a single path component (`^[A-Za-z0-9][A-Za-z0-9._+-]*$`), while `--extra`
+uses the hyphen-free grammar (`^[A-Za-z0-9][A-Za-z0-9._+]*$`); neither permits
+`/` or a leading `.` so `..` is rejected — the computed target's canonical
 parent is also asserted to equal the canonical `--envs-root` under the lock,
 so neither flag, nor a weakened name check, can make the target escape the
 counted root. `--extra none` omits the `--extra` flag from `uv sync` entirely
@@ -189,9 +190,10 @@ env name, distinct from any ordinary extra.
 `--project-dir REL` (default `.`, the checkout root) names the subdirectory
 whose own `pyproject.toml`/`uv.lock` define the env — e.g. a monorepo
 sub-package such as an executor with its own lockfile. `REL` must be `.` or
-one-or-more path components matching the same single-component pattern as
-`--project`/`--extra`, joined by `/` (no leading `/`, no `..`, no empty or
-doubled separator). It is resolved through any symlinks and refused before
+one-or-more path components matching the project-dir component grammar
+(hyphen-free), joined by `/` (no leading `/`, no `..`, no empty or doubled
+separator, and literal `*`, `?`, or `[` are rejected without pathname
+expansion). It is resolved through any symlinks and refused before
 any `mkdir`/`uv` call if the result escapes `--checkout`, does not exist, or
 is missing `pyproject.toml` or `uv.lock`. The env's `uv.lock` sha256 (and so
 the computed name and `uv sync`'s working directory) always come from
@@ -243,13 +245,15 @@ pattern itself. Decision order, all before any `mkdir`/`uv sync`:
    `uv_version`, `X.Y.Z` `python_version`, `X.Y` `python_request`, full
    `YYYY-MM-DDTHH:MM:SSZ` `built_utc`, and `project_dir=<REL>`) before
    publishing by one same-directory atomic `mv`, so a late-truncated or
-   malformed write is never published. The same strict check governs reuse,
+   malformed write is never published. Reuse applies the same field syntax,
    and also accepts the six-field form written by any build from before
    `--project-dir` existed (implying a checkout-root project dir) so an
    already-built shared env, such as the existing
-   `tpen-a0d83e31a6a2-cpu-py3.12`, stays reusable unchanged: a
-   producer/consumer manifest truncated even past every nominal field is
-   rejected, not just an empty or early-truncated one.
+   `tpen-a0d83e31a6a2-cpu-py3.12`, stays reusable unchanged. A newly produced
+   manifest must have exactly seven newline-terminated fields and the requested
+   `project_dir`; deleting a complete seventh line from a published manifest is
+   indistinguishable from the accepted legacy form, so the compatibility reader
+   cannot detect that particular truncation.
 
 Raising the cap requires a reviewed PR that changes the committed policy
 file and its hard-refusal test together, visible in Git/GitHub — there is

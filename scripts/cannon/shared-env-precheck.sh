@@ -34,7 +34,7 @@ shared prefix).
 naming as build-shared-env.sh) and refuses unless it is a real directory
 (not a symlink) whose canonical parent is exactly --shared-env-prefix, has a
 .complete manifest recording the exact --lock-sha256 (and otherwise meeting
-the same six-field contract build-shared-env.sh writes), and an executable
+the six/seven-field compatibility contract build-shared-env.sh reads), and an executable
 bin/python. On success prints the resolved path to stdout.
 USAGE
 }
@@ -109,8 +109,8 @@ case "$MODE" in
       fail "--shared-env-prefix, --project, --extra, --python, and --lock-sha256 are all required"
     # --project/--extra feed into the resolved target directory name; restrict
     # each to a single path component so neither can escape --shared-env-prefix.
-    [[ "$PROJECT" =~ $NAME_COMPONENT_RE ]] || fail "--project must be a single path component matching $NAME_COMPONENT_RE"
-    [[ "$EXTRA" =~ $NAME_COMPONENT_RE ]] || fail "--extra must be a single path component matching $NAME_COMPONENT_RE"
+    [[ "$PROJECT" =~ $PROJECT_NAME_RE ]] || fail "--project must be a single path component matching $PROJECT_NAME_RE"
+    [[ "$EXTRA" =~ $EXTRA_NAME_RE ]] || fail "--extra must be a single path component matching $EXTRA_NAME_RE"
     [[ "$PYTHON_VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || fail "--python must be X.Y"
     [[ "$LOCK_SHA256" =~ ^[0-9a-f]{64}$ ]] || fail "--lock-sha256 must be 64 lowercase hex characters"
     CANON_SHARED="$(check_shared_env_prefix "$SHARED_ENV_PREFIX")"

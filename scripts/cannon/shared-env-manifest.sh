@@ -6,7 +6,15 @@
 # exactly one naming scheme and one manifest contract. No facility absolute
 # paths here: every path/value arrives from the caller.
 
-NAME_COMPONENT_RE='^[A-Za-z0-9][A-Za-z0-9._+]*$'
+# Project names may contain hyphens; extras stay hyphen-free so the generated
+# name remains unambiguous when parsed from the right.
+PROJECT_NAME_RE='^[A-Za-z0-9][A-Za-z0-9._+-]*$'
+EXTRA_NAME_RE='^[A-Za-z0-9][A-Za-z0-9._+]*$'
+PROJECT_DIR_COMPONENT_RE='^[A-Za-z0-9][A-Za-z0-9._+]*$'
+
+# Containment must reflect the case-sensitive filesystem, not inherited shell
+# options. This also protects callers that source this helper.
+shopt -u nocasematch
 
 # <project>-<lock-sha256[:12]>-<extra>-py<X.Y>, the one env-name scheme both
 # the builder and the consumer compute.
@@ -16,7 +24,7 @@ compute_shared_env_name() {
 }
 
 # A --project-dir value is either "." (the checkout root itself) or one-or-
-# more path components, each matching NAME_COMPONENT_RE (which requires a
+# more path components, each matching PROJECT_DIR_COMPONENT_RE (which requires a
 # leading alnum and so already rejects a ".." component), joined by single
 # '/' separators -- no leading '/', no trailing '/', no empty segment.
 is_valid_project_dir_rel() {
@@ -26,10 +34,14 @@ is_valid_project_dir_rel() {
   [[ "$rel" != /* ]] || return 1
   [[ "$rel" != */ ]] || return 1
   [[ "$rel" != *//* ]] || return 1
+  case "$rel" in
+    *'*'*|*'?'*|*'['*) return 1 ;;
+  esac
+  local -a parts
   local part
-  local IFS='/'
-  for part in $rel; do
-    [[ "$part" =~ $NAME_COMPONENT_RE ]] || return 1
+  IFS='/' read -r -a parts <<< "$rel"
+  for part in "${parts[@]}"; do
+    [[ "$part" =~ $PROJECT_DIR_COMPONENT_RE ]] || return 1
   done
   return 0
 }
@@ -41,12 +53,15 @@ is_valid_project_dir_rel() {
 # build from here on), in order, each strictly formatted, with the recorded
 # lock hash matching the caller-supplied expected hash. The build HEAD may
 # differ from the requesting HEAD (dependencies, not history, define
-# identity); an empty, truncated (even late, even without a final field,
-# even missing only a trailing newline), malformed, or mismatched manifest
-# is not trusted.
+# identity); an empty, truncated, malformed, or mismatched manifest is not
+# trusted. A complete manifest must end with a newline; six fields remain
+# accepted only for reuse of pre-project-dir environments.
 manifest_is_valid() {
   local manifest="$1" expected_lock_sha256="$2"
   [[ -s "$manifest" ]] || return 1
+  local final_byte
+  final_byte="$(tail -c 1 -- "$manifest" | od -An -t x1)"
+  [[ "$final_byte" == *0a* ]] || return 1
   local -a lines
   mapfile -t lines < "$manifest"
   local n="${#lines[@]}"
@@ -62,6 +77,18 @@ manifest_is_valid() {
     [[ "${lines[6]}" =~ ^project_dir=.+$ ]] || return 1
     is_valid_project_dir_rel "${lines[6]#project_dir=}" || return 1
   fi
+  return 0
+}
+
+# The builder uses this stricter contract before publishing a new manifest.
+# Reuse remains compatible with the historical six-field form above.
+manifest_is_valid_for_publish() {
+  local manifest="$1" expected_lock_sha256="$2" expected_project_dir="$3"
+  manifest_is_valid "$manifest" "$expected_lock_sha256" || return 1
+  local -a lines
+  mapfile -t lines < "$manifest"
+  ((${#lines[@]} == 7)) || return 1
+  [[ "${lines[6]}" == "project_dir=$expected_project_dir" ]] || return 1
   return 0
 }
 
