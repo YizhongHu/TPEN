@@ -98,28 +98,26 @@ LOCK_SHA256="$(sha256sum -- "$UV_LOCK" | cut -d' ' -f1)"
 LOCK_HASH12="${LOCK_SHA256:0:12}"
 ENV_NAME="${PROJECT}-${LOCK_HASH12}-${EXTRA}-py${PYTHON_VERSION}"
 TARGET="$CANON_ENVS_ROOT/$ENV_NAME"
-# Defense in depth: ENV_NAME can contain no '/' (enforced by
-# NAME_COMPONENT_RE above), so TARGET's parent is always CANON_ENVS_ROOT --
-# but assert it explicitly under the lock in case that invariant is ever
-# weakened.
-TARGET_PARENT="$(realpath -m -- "$(dirname -- "$TARGET")")"
-[[ "$TARGET_PARENT" == "$CANON_ENVS_ROOT" ]] || fail_precheck "computed target escapes --envs-root: $TARGET"
 
-# A manifest is trusted for reuse only if every field is present and its
-# recorded lock hash matches the CURRENT checkout's uv.lock. The build HEAD
-# may differ from the requesting HEAD (dependencies, not history, define
-# identity); an empty, truncated, or mismatched manifest is not trusted.
+# A manifest is trusted for reuse only if it is exactly the six fields this
+# script writes, in order, each strictly formatted, with the recorded lock
+# hash matching the CURRENT checkout's uv.lock. The build HEAD may differ
+# from the requesting HEAD (dependencies, not history, define identity); an
+# empty, truncated (even late, even without a final field, even missing only
+# a trailing newline), malformed, or mismatched manifest is not trusted.
 manifest_is_valid() {
   local manifest="$1"
   [[ -s "$manifest" ]] || return 1
-  local head_line lock_line uv_line py_line built_line
-  head_line="$(grep -m1 -E '^head=.+' -- "$manifest" || true)"
-  lock_line="$(grep -m1 -E '^uv_lock_sha256=.+' -- "$manifest" || true)"
-  uv_line="$(grep -m1 -E '^uv_version=.+' -- "$manifest" || true)"
-  py_line="$(grep -m1 -E '^python_version=.+' -- "$manifest" || true)"
-  built_line="$(grep -m1 -E '^built_utc=.+' -- "$manifest" || true)"
-  [[ -n "$head_line" && -n "$lock_line" && -n "$uv_line" && -n "$py_line" && -n "$built_line" ]] || return 1
-  [[ "${lock_line#uv_lock_sha256=}" == "$LOCK_SHA256" ]] || return 1
+  local -a lines
+  mapfile -t lines < "$manifest"
+  ((${#lines[@]} == 6)) || return 1
+  [[ "${lines[0]}" =~ ^head=[0-9a-f]{40}$ ]] || return 1
+  [[ "${lines[1]}" =~ ^uv_lock_sha256=[0-9a-f]{64}$ ]] || return 1
+  [[ "${lines[1]#uv_lock_sha256=}" == "$LOCK_SHA256" ]] || return 1
+  [[ "${lines[2]}" =~ ^uv_version=.+$ ]] || return 1
+  [[ "${lines[3]}" =~ ^python_version=[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [[ "${lines[4]}" =~ ^python_request=[0-9]+\.[0-9]+$ ]] || return 1
+  [[ "${lines[5]}" =~ ^built_utc=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
   return 0
 }
 
@@ -127,22 +125,32 @@ LOCKFILE="$CANON_ENVS_ROOT/.build-shared-env.lock"
 exec 200>"$LOCKFILE"
 flock -x 200
 
+# Defense in depth: ENV_NAME can contain no '/' (enforced by
+# NAME_COMPONENT_RE above), so TARGET's parent is always CANON_ENVS_ROOT --
+# but assert it explicitly under the lock in case that invariant is ever
+# weakened.
+TARGET_PARENT="$(realpath -m -- "$(dirname -- "$TARGET")")"
+[[ "$TARGET_PARENT" == "$CANON_ENVS_ROOT" ]] || fail_precheck "computed target escapes --envs-root: $TARGET"
+
 # Count ALL one-level directory entries under the root under the lock.
-# `set +f` and an explicit GLOBIGNORE reset neutralize an inherited
-# SHELLOPTS=noglob (or GLOBIGNORE) that would otherwise silently leave the
-# glob unexpanded and the census wrong; dotglob includes dot-dirs, nullglob
-# drops the pattern if nothing matches, and the trailing slash matches
-# directories only (symlinks to directories included). "." and ".." are
-# never matched by a glob. No .complete filter and no recursion: malformed,
-# partial, and unfinished names all count.
+# Establish the complete intended glob state first: `set +f` and an explicit
+# GLOBIGNORE reset neutralize an inherited SHELLOPTS=noglob/GLOBIGNORE;
+# dotglob includes dot-dirs; nullglob drops the pattern if nothing matches;
+# failglob (if inherited) is unset so an empty root does not error out; the
+# trailing slash matches directories only (symlinks to directories
+# included). "." and ".." are never matched by a glob. No .complete filter
+# and no recursion: malformed, partial, and unfinished names all count --
+# including a directory literally named '*'. Only an actually-unexpanded
+# pattern (no real directory matches it) is a census failure.
 set +f
 unset GLOBIGNORE
+shopt -u failglob nocaseglob globasciiranges 2>/dev/null || true
 shopt -s nullglob dotglob
 ENTRIES=("$CANON_ENVS_ROOT"/*/)
 shopt -u nullglob dotglob
-for ENTRY in "${ENTRIES[@]+"${ENTRIES[@]}"}"; do
-  [[ "$ENTRY" == *'*'* ]] && fail_precheck "directory census failed: pathname expansion is disabled"
-done
+if ((${#ENTRIES[@]} == 1)) && [[ "${ENTRIES[0]}" == "$CANON_ENVS_ROOT/*/" ]] && [[ ! -d "$CANON_ENVS_ROOT"/'*' ]]; then
+  fail_precheck "directory census failed: pathname expansion is disabled"
+fi
 COUNT="${#ENTRIES[@]}"
 
 if [[ -L "$TARGET" ]]; then
@@ -164,13 +172,19 @@ fi
 mkdir -- "$TARGET"
 (cd "$CANON_CHECKOUT" && UV_PROJECT_ENVIRONMENT="$TARGET" "$UV_BIN" sync --locked --no-install-project --extra "$EXTRA" --python "$PYTHON_VERSION")
 
-UV_VERSION="$("$UV_BIN" --version)"
-# Record the interpreter actually built, not just the selector requested;
-# a query failure must block publication (the dir is left partial, counted,
-# and undeleted for disposition -- same as any other failed build).
+# Every manifest field is collected into a variable with a checked exit
+# status before any write; a failure here must block publication (the dir
+# is left partial, counted, and undeleted for disposition -- same as any
+# other failed build), not be silently masked by an otherwise-successful
+# heredoc write.
+UV_VERSION="$("$UV_BIN" --version)" || fail "uv --version query failed, needs disposition: path=$TARGET"
+[[ -n "$UV_VERSION" ]] || fail "uv --version produced no output, needs disposition: path=$TARGET"
+# Record the interpreter actually built, not just the selector requested.
 PY_VERSION_OUTPUT="$("$TARGET/bin/python" --version 2>&1)" || fail "interpreter version query failed, needs disposition: path=$TARGET"
 PY_FULL_VERSION="${PY_VERSION_OUTPUT#Python }"
 [[ -n "$PY_FULL_VERSION" ]] || fail "interpreter reported no version, needs disposition: path=$TARGET"
+BUILT_UTC="$(date -u +%FT%TZ)" || fail "build timestamp query failed, needs disposition: path=$TARGET"
+[[ -n "$BUILT_UTC" ]] || fail "build timestamp query produced no output, needs disposition: path=$TARGET"
 
 TMP_MANIFEST="$TARGET/.complete.tmp.$$"
 cat > "$TMP_MANIFEST" <<MANIFEST
@@ -179,8 +193,12 @@ uv_lock_sha256=$LOCK_SHA256
 uv_version=$UV_VERSION
 python_version=$PY_FULL_VERSION
 python_request=$PYTHON_VERSION
-built_utc=$(date -u +%FT%TZ)
+built_utc=$BUILT_UTC
 MANIFEST
+# Validate the temp file with the same strict function used for reuse,
+# before the rename -- a build that produced a malformed manifest must not
+# be published, even though uv sync itself succeeded.
+manifest_is_valid "$TMP_MANIFEST" || fail "failed to produce a well-formed completion manifest, needs disposition: path=$TARGET"
 mv -f -- "$TMP_MANIFEST" "$TARGET/.complete"
 
 echo "BUILT count=$COUNT path=$TARGET cap=$CAP policy=$POLICY_FILE head=$HEAD_SHA"

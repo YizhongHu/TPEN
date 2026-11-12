@@ -138,13 +138,16 @@ match (one top-level object, one key, a plain non-leading-zero integer up to
 environment variable, or default can override it. Truncated, duplicated,
 nested, or trailing-garbage policy documents refuse rather than having a
 substring accepted. Under one root-level `flock`, with pathname expansion
-explicitly re-enabled (`set +f`, `GLOBIGNORE` unset) so an inherited
-`SHELLOPTS=noglob` cannot silently empty the census, the builder counts
-**every** one-level directory entry beneath `--envs-root` (dot-dirs,
-malformed or partial names, symlinked directories — not only directories
-carrying a `.complete` manifest), so a cap cannot be evaded by an
-unfinished or oddly-named directory. Decision order, all before any
-`mkdir`/`uv sync`:
+explicitly re-enabled (`set +f`, `GLOBIGNORE` unset, `failglob` disabled) so
+an inherited `SHELLOPTS=noglob`/`BASHOPTS=failglob` cannot silently empty the
+census or break an empty-root first build, the builder counts **every**
+one-level directory entry beneath `--envs-root` (dot-dirs, malformed or
+partial names, symlinked directories, even a directory literally named
+`*` — not only directories carrying a `.complete` manifest), so a cap
+cannot be evaded by an unfinished or oddly-named directory. A directory
+census is only ever treated as a glob-expansion failure (rather than a real
+entry) when the one and only result is the still-literal, unexpanded `*`
+pattern itself. Decision order, all before any `mkdir`/`uv sync`:
 
 1. the target (`<env-name>`) is a symlink -> hard refuse, never reused or
    created through;
@@ -160,13 +163,18 @@ unfinished or oddly-named directory. Decision order, all before any
    policy file path, and the checkout's exact `HEAD`;
 5. otherwise, `mkdir`, then `UV_PROJECT_ENVIRONMENT=<env> uv sync --locked
    --no-install-project --extra <extra> --python <X.Y>` under the checkout,
-   then query `<env>/bin/python --version` (a query failure refuses and
-   leaves the build partial, counted, undeleted) and write a `.complete`
-   manifest — via a temp file in the same directory, published by one
-   same-directory atomic `mv` — recording `HEAD`, the full `uv.lock`
-   sha256, the `uv` version, the actual built Python version
-   (`python_version`) plus the requested selector (`python_request`), and
-   the UTC build time.
+   then query `<env>/bin/python --version`, `uv --version`, and the UTC
+   build time into checked variables (any query failure refuses and leaves
+   the build partial, counted, undeleted — never masked by an otherwise
+   successful write), and write a `.complete` manifest — via a temp file in
+   the same directory, strictly re-validated (exactly six fields, in order,
+   each format-checked — a 40-hex `head`, a 64-hex `uv_lock_sha256` equal to
+   the checkout's, non-empty `uv_version`, `X.Y.Z` `python_version`, `X.Y`
+   `python_request`, full `YYYY-MM-DDTHH:MM:SSZ` `built_utc`) before
+   publishing by one same-directory atomic `mv`, so a late-truncated or
+   malformed write is never published. The same strict check governs reuse:
+   a producer/consumer manifest truncated even past every nominal field is
+   rejected, not just an empty or early-truncated one.
 
 Raising the cap requires a reviewed PR that changes the committed policy
 file and its hard-refusal test together, visible in Git/GitHub — there is

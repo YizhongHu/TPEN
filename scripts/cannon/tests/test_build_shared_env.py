@@ -635,3 +635,201 @@ def test_symlink_filler_counts_toward_cap(tmp_path: Path, envs_root: Path, cache
     assert "count=20" in result.stderr
     assert not (envs_root / target).exists()
     assert not uv_log.exists()
+
+
+# --- DT1 (D1: literal '*' in real directory names must count, never abort,
+#         and inherited failglob must not break an empty-root first build) --
+
+
+def test_literal_asterisk_directory_names_count_not_abort(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout)
+    make_filler_dirs(envs_root, 17)
+    (envs_root / "old*partial").mkdir()
+    (envs_root / "*").mkdir()
+    # 17 ordinary fillers + 2 asterisk-containing real dirs == 19; a new build succeeds.
+    result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "BUILT" in result.stdout
+    assert (envs_root / target / ".complete").is_file()
+    dirs = {p.name for p in envs_root.iterdir() if p.is_dir()}
+    assert dirs == {f"filler-{i}" for i in range(17)} | {"old*partial", "*", target}
+
+
+def test_literal_asterisk_directory_names_at_cap_give_normal_diagnostic(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    make_filler_dirs(envs_root, 18)
+    (envs_root / "old*partial").mkdir()
+    (envs_root / "*").mkdir()
+    # 18 ordinary fillers + 2 asterisk-containing real dirs == cap (20).
+    result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "cap reached" in result.stderr
+    assert "count=20" in result.stderr
+    assert "cap=20" in result.stderr
+    assert not uv_log.exists()
+
+
+def test_valid_target_reused_despite_asterisk_sibling(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target_name = env_name_for(checkout)
+    make_filler_dirs(envs_root, 18)
+    (envs_root / "old*partial").mkdir()
+    target_dir = envs_root / target_name
+    target_dir.mkdir()
+    (target_dir / ".complete").write_text(make_valid_manifest(checkout))
+    # 18 fillers + asterisk dir + the valid target == cap (20); must still reuse.
+    result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "REUSE" in result.stdout
+    assert not uv_log.exists() or uv_log.read_text() == ""
+
+
+def test_empty_root_with_inherited_failglob_still_builds(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout)
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir,
+        extra_env={"BASHOPTS": "failglob"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (envs_root / target / ".complete").is_file()
+    assert "sync" in uv_log.read_text()
+
+
+def test_empty_root_without_failglob_control_still_builds(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout)
+    result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (envs_root / target / ".complete").is_file()
+
+
+# --- DT2 (D2: a real producer/consumer manifest late-truncated even past
+#         every field must be rejected; round-trip reuse control) ----------
+
+
+def test_real_manifest_round_trips_unchanged_on_reuse(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout)
+    result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest_path = envs_root / target / ".complete"
+    original_bytes = manifest_path.read_bytes()
+    calls_before = uv_log.read_text()
+
+    result2 = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result2.returncode == 0, result2.stdout + result2.stderr
+    assert "REUSE" in result2.stdout
+    assert manifest_path.read_bytes() == original_bytes
+    assert uv_log.read_text() == calls_before
+
+
+@pytest.mark.parametrize("trailing_newline", [True, False])
+def test_real_manifest_late_truncated_at_built_utc_refuses(
+    tmp_path: Path, envs_root: Path, cache_dir: Path, trailing_newline: bool,
+) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout)
+    result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest_path = envs_root / target / ".complete"
+    lines = manifest_path.read_text().splitlines()
+    assert lines[-1].startswith("built_utc=")
+    truncated = "\n".join(lines[:-1] + ["built_utc=2"])
+    if trailing_newline:
+        truncated += "\n"
+    manifest_path.write_text(truncated)
+    calls_before = uv_log.read_text()
+
+    result2 = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result2.returncode != 0, result2.stdout + result2.stderr
+    assert "REFUSE" in result2.stderr
+    assert "needs disposition" in result2.stderr
+    assert uv_log.read_text() == calls_before
+
+
+# --- DT3 (m7: a writer that fails after a partial manifest write must not
+#         publish -- the real temp+rename contract, not just final content) --
+
+
+def test_manifest_write_failure_leaves_no_complete_and_blocks_reuse(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    """A ``cat`` that forwards the policy-file read unchanged but truncates
+    the manifest heredoc write at ``built_utc=2`` and exits nonzero must
+    leave no ``.complete`` under the current temp+rename implementation; a
+    direct-write implementation would instead publish the truncated
+    receipt and make it reusable."""
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout)
+
+    fake_bin = tmp_path / "fake-bin-cat"
+    fake_bin.mkdir()
+    fake_cat = fake_bin / "cat"
+    fake_cat.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "--" ]]; then exec /bin/cat "$@"; fi\n'
+        'input="$(/bin/cat)"\n'
+        'printf \'%s\\n\' "${input%%built_utc=*}built_utc=2"\n'
+        "exit 1\n"
+    )
+    fake_cat.chmod(fake_cat.stat().st_mode | stat.S_IEXEC)
+
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir,
+        extra_env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    target_dir = envs_root / target
+    assert target_dir.is_dir()
+    assert not (target_dir / ".complete").exists()
+    assert "sync" in uv_log.read_text()
+
+    calls_before = uv_log.read_text()
+    result2 = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result2.returncode != 0, result2.stdout + result2.stderr
+    assert "needs disposition" in result2.stderr
+    assert uv_log.read_text() == calls_before
+
+
+# --- DT4 (D2: a failed metadata query (timestamp) must block publication,
+#         not be masked by an otherwise-successful manifest write) --------
+
+
+def test_timestamp_query_failure_blocks_publication(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout)
+
+    fake_bin = tmp_path / "fake-bin-date"
+    fake_bin.mkdir()
+    fake_date = fake_bin / "date"
+    fake_date.write_text("#!/usr/bin/env bash\nexit 1\n")
+    fake_date.chmod(fake_date.stat().st_mode | stat.S_IEXEC)
+
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir,
+        extra_env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "REFUSE" in result.stderr
+    target_dir = envs_root / target
+    assert target_dir.is_dir()
+    assert not (target_dir / ".complete").exists()
+    assert "sync" in uv_log.read_text()
+
+
+def test_timestamp_query_success_control_still_builds(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout)
+    result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (envs_root / target / ".complete").is_file()
