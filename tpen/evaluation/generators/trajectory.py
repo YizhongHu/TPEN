@@ -40,7 +40,15 @@ from tpen.evaluation.trajectory_records import (
     TrajectoryRecordBatch,
     TrajectoryRecordStreamWriter,
 )
-from tpen.physics.hamiltonian import HamiltonianTerm, LocalEnergyResult, normalize_hamiltonian_terms
+from tpen.physics.hamiltonian import (
+    HamiltonianTerm,
+    LocalEnergyEvaluator,
+    LocalEnergyResult,
+    NaiveLocalEnergyEvaluator,
+    RecordingLocalEnergyEvaluator,
+    normalize_hamiltonian_terms,
+)
+from tpen.physics.system import SystemDescriptor
 from tpen.sampling.trajectory import collect_observable_trajectory_with_diagnostics
 
 TRAJECTORY_METADATA_KEY = "observable_trajectory"
@@ -86,6 +94,21 @@ class TrajectoryMCMCGenerator:
         Force a fresh, re-burned-in chain before the first draw.
     verify_model_unchanged : bool, optional
         Fingerprint parameters before and after collection. Defaults to ``True``.
+    system : SystemDescriptor or None, optional
+        Explicit opt-in to ``trajectory_records/v2``. When ``None`` (the
+        default), the legacy ``trajectory_records/v1`` path is used unchanged
+        and `Walkers.atomic_configuration` is required, exactly as before this
+        parameter existed. When supplied, `evaluator` is wrapped in
+        `~tpen.physics.hamiltonian.RecordingLocalEnergyEvaluator` bound to
+        `system`, and a complete-grid record requires no nuclear resource at
+        all unless a term actually declares one (see
+        ``system-context-records-design-r3.md``, "Explicit selection reaches
+        the producer").
+    evaluator : LocalEnergyEvaluator or None, optional
+        Evaluator applied to every per-draw local-energy evaluation; defaults
+        to the naive reference. Ignored unless it is the delegate wrapped when
+        `system` is supplied -- selection never silently falls back to naive
+        for an explicitly requested evaluator.
 
     Raises
     ------
@@ -109,6 +132,8 @@ class TrajectoryMCMCGenerator:
         record_filename: str = TRAJECTORY_RECORD_FILENAME,
         reset: bool = False,
         verify_model_unchanged: bool = True,
+        system: SystemDescriptor | None = None,
+        evaluator: LocalEnergyEvaluator | None = None,
     ) -> None:
         self.sampler = sampler
         self.hamiltonian_terms = normalize_hamiltonian_terms(hamiltonian_terms)
@@ -129,6 +154,15 @@ class TrajectoryMCMCGenerator:
             raise ValueError("record_filename must be non-empty")
         self.reset = bool(reset)
         self.verify_model_unchanged = bool(verify_model_unchanged)
+        self.system = system
+        raw_evaluator: LocalEnergyEvaluator = (
+            NaiveLocalEnergyEvaluator() if evaluator is None else evaluator
+        )
+        self._evaluator: LocalEnergyEvaluator = (
+            raw_evaluator
+            if self.system is None
+            else RecordingLocalEnergyEvaluator(raw_evaluator, system=self.system)
+        )
 
     def generate(
         self,
@@ -165,27 +199,44 @@ class TrajectoryMCMCGenerator:
                         draw_index=retained_draw,
                     )
                     if record_stream is None:
-                        atoms = walkers.atomic_configuration
-                        if atoms is None:
-                            raise ValueError(
-                                "trajectory records require Walkers.atomic_configuration "
-                                "so geometry is retained once as a typed reference"
-                            )
                         if self.max_samples is not None and self.max_samples < walkers.batch_size:
                             raise ValueError(
                                 "TrajectoryMCMCGenerator max_samples would truncate the final "
                                 "retained draw required by trajectory records: "
                                 f"capacity={self.max_samples}, required={walkers.batch_size}"
                             )
-                        record_stream = TrajectoryRecordStreamWriter(
-                            context.task_output_dir / self.record_filename,
-                            observable=self.observable_name,
-                            n_draws=self.n_draws,
-                            n_walkers=walkers.batch_size,
-                            term_names=tuple(self.hamiltonian_terms),
-                            atomic_configuration=atoms,
-                            first_draw=record,
-                        )
+                        if self.system is None:
+                            atoms = walkers.atomic_configuration
+                            if atoms is None:
+                                raise ValueError(
+                                    "trajectory records require Walkers.atomic_configuration "
+                                    "so geometry is retained once as a typed reference"
+                                )
+                            record_stream = TrajectoryRecordStreamWriter(
+                                context.task_output_dir / self.record_filename,
+                                observable=self.observable_name,
+                                n_draws=self.n_draws,
+                                n_walkers=walkers.batch_size,
+                                term_names=tuple(self.hamiltonian_terms),
+                                atomic_configuration=atoms,
+                                first_draw=record,
+                            )
+                        else:
+                            if result.receipt is None:
+                                raise ValueError(
+                                    "trajectory_records/v2 requires an execution receipt; "
+                                    "the bound evaluator did not declare one"
+                                )
+                            record_stream = TrajectoryRecordStreamWriter(
+                                context.task_output_dir / self.record_filename,
+                                observable=self.observable_name,
+                                n_draws=self.n_draws,
+                                n_walkers=walkers.batch_size,
+                                term_names=tuple(self.hamiltonian_terms),
+                                system_descriptor=self.system,
+                                execution_receipt=result.receipt,
+                                first_draw=record,
+                            )
                     else:
                         record_stream.append(record)
             return result.total
@@ -253,6 +304,7 @@ class TrajectoryMCMCGenerator:
             batch,
             return_terms=True,
             chunk_size=self.chunk_size,
+            evaluator=self._evaluator,
         )
         if not isinstance(result, LocalEnergyResult):
             raise TypeError("trajectory local-energy evaluation must return LocalEnergyResult")
