@@ -1,10 +1,12 @@
 """S3 Layer C bounded remote teardown and quiescence contract tests.
 
-``S3C_MUTANT_TABLE`` lists the contract mutants M1-M6 for bounded remote
-teardown and quiescence.  M1-M4 live inside ``ParslDispatcher._cancel_slot_pool``
-itself: their killers must drive real cancellation through ``ParslDispatcher``
-with a transport double, not call ``_RemoteLeaf`` methods directly (a prior
+``S3C_MUTANT_TABLE`` lists the contract mutants M1-M8 for bounded remote
+teardown and quiescence.  M1-M4 and M8 live inside
+``ParslDispatcher._cancel_slot_pool``/``_run_slot_pool`` itself: their
+killers must drive real cancellation/loss through ``ParslDispatcher`` with
+a transport double, not call ``_RemoteLeaf`` methods directly (a prior
 round's killers did the latter and could never observe these mutants).
+M8 (review B1) is the global-admission-closure mutant.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from concurrent.futures import Future
 import dataclasses
 import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 
@@ -77,11 +80,13 @@ S3C_MUTANT_TABLE = (
         "id": "M4", "target": PARSL_MODULE,
         "old": (
             "                        remote_unconfirmed = True\n"
+            "                        admission_closed = True\n"
             "                        try:\n"
             "                            lifecycle.finish(record[\"fence\"], \"remote-quiescence-unconfirmed\", self._utc_now(), None)\n"
         ),
         "new": (
             "                        remote_unconfirmed = True\n"
+            "                        admission_closed = True\n"
             "                        try:\n"
             "                            lifecycle.finish(record[\"fence\"], \"completed\", self._utc_now(), None)\n"
         ),
@@ -109,6 +114,13 @@ S3C_MUTANT_TABLE = (
         "killer": "test_dispatcher_cancel_waits_one_shared_deadline_across_remote_leaves",
         "suite": "executor", "assertion": "every live remote leaf waits against one shared deadline, never its own fresh bound (timing control, kept per review alongside the M3 ordering control)",
     },
+    {
+        "id": "M8", "target": PARSL_MODULE,
+        "old": "                        admission_closed = True\n",
+        "new": "                        pass\n",
+        "killer": "test_dispatcher_remote_loss_closes_admission_globally",
+        "suite": "executor", "assertion": "a remote loss or crossed reply closes admission for the WHOLE run, not just its own slot: a queued member is never admitted into a different, healthy binding afterward (review B1)",
+    },
 )
 
 
@@ -117,7 +129,7 @@ def test_s3c_mutant_table_targets_unique_executable_anchors() -> None:
 
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
-    assert [row["id"] for row in S3C_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M5", "M6", "M7"]
+    assert [row["id"] for row in S3C_MUTANT_TABLE] == ["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8"]
     for row in S3C_MUTANT_TABLE:
         source = (root / row["target"]).read_text(encoding="utf-8")
         assert source.count(row["old"]) == 1, row
@@ -205,10 +217,15 @@ def test_cancel_during_science_reaps_local_child_group(tmp_path: Path) -> None:
     request, _ = _request(tmp_path, timeout=5)
     output, _core, stdout, stderr, _ev_stdout, _ev_stderr = request.paths()
     result: list = []
+    # Event-driven, not a fixed sleep (review P2/M6: a fixed sleep before
+    # spawn can miss the anchor under load): wait for the child's own
+    # evidence that it has actually started before requesting cancellation.
+    started = Path(output) / "started.marker"
 
     def run_child() -> None:
         result.append(SubprocessWorker().run(
-            request.environment, ("-c", "import time; time.sleep(60)"),
+            request.environment,
+            ("-c", f"import pathlib, time; pathlib.Path({str(started)!r}).write_text('1'); time.sleep(60)"),
             cwd=output, stdout_path=stdout, stderr_path=stderr, timeout=5,
             cancel_path=Path(output) / "cancel.json",
             cancel_identity={"schema": "tpen-executor/leaf-cancel-v1", "group_digest": request.group_digest,
@@ -218,7 +235,10 @@ def test_cancel_during_science_reaps_local_child_group(tmp_path: Path) -> None:
 
     thread = threading.Thread(target=run_child)
     thread.start()
-    time.sleep(0.05)
+    deadline = time.monotonic() + 5
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.exists()
     _RemoteLeaf(request).request_cancel()
     thread.join(2)
     assert not thread.is_alive() and result and result[0].pid is not None
@@ -418,7 +438,12 @@ def test_dispatcher_cancel_settles_every_leaf_before_dfk_cleanup(
     def dispatching_hook(_index, _function, args, _kwargs):
         request = LeafRequest.decode(args[0])
         if request.task_id == "acking":
-            ack_gate.wait(5)
+            # Review P2 (M3 determinism): check the wait's own return value
+            # instead of ignoring it -- the gate is opened synchronously
+            # from inside the interrupt below, so it is always set well
+            # before this 5s bound; a False return here would mean the
+            # test's own setup is broken, not a real scheduling race.
+            assert ack_gate.wait(5) is True
             # A synthetic, already-valid result: real run_leaf would race
             # the marker request_cancel() writes against this hook's own
             # release timing (whether it sees the marker before/after
@@ -428,7 +453,11 @@ def test_dispatcher_cancel_settles_every_leaf_before_dfk_cleanup(
         threading.Event().wait()  # "stuck": never acks
 
     fake_parsl.hooks["run_leaf"] = dispatching_hook
-    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), transport=_transport(teardown_timeout=0.3))
+    # A generous bound (not the tight 0.3s used elsewhere): this test's
+    # oracle is event ORDER (finish before cleanup), never a wall-clock
+    # measurement, so the bound only needs to comfortably outlast the
+    # synthetic hook's own scheduling, not stay tight (review P2/M3).
+    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), transport=_transport(teardown_timeout=1.0))
     group = _group("s3c-dfk-order", "acking", "stuck")
     lifecycle = _two_slot_lifecycle(tmp_path)
 
@@ -507,3 +536,198 @@ def test_dispatcher_terminal_remote_failure_never_refills_slot_or_publishes_comp
     assert manifest.attempts[0].outcome_receipt.status == "remote-quiescence-unconfirmed"
     assert manifest.segments == ()
     assert fake_parsl.calls.get("run_leaf", 0) == 1
+
+
+# ------------------------------------------------------- P1-1 residual
+
+
+def test_group_quiescent_terminates_a_surviving_descendant(tmp_path: Path) -> None:
+    """P1-1 residual killer: a same-group descendant that outlives its
+    leader is TERMINATED by the worker's own group probe, not merely
+    observed (the leaf owns the group it started with start_new_session).
+    """
+
+    request, _parts = _request(tmp_path, timeout=5)
+    output, _core, stdout, stderr, _ev_stdout, _ev_stderr = request.paths()
+    descendant_pid_file = Path(output) / "descendant.pid"
+    script = (
+        "import subprocess, sys\n"
+        "child = subprocess.Popen(['sleep', '30'])\n"
+        f"open({str(descendant_pid_file)!r}, 'w').write(str(child.pid))\n"
+        "sys.exit(0)\n"
+    )
+    outcome = SubprocessWorker().run(
+        request.environment, ("-c", script), cwd=output,
+        stdout_path=stdout, stderr_path=stderr, timeout=5,
+    )
+    assert outcome.returncode == 0 and outcome.group_reaped is True
+    descendant_pid = int(descendant_pid_file.read_text().strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(descendant_pid, 0)
+
+
+def test_watcher_start_failure_reaps_the_child_as_an_uncertain_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-1 residual killer: a watcher-thread start failure still reaps the
+    spawned child (an uncertain exit, never a silently-true ack) -- the
+    exception propagates and the child is confirmed dead.
+    """
+
+    request, _parts = _request(tmp_path, timeout=5)
+    output, _core, stdout, stderr, _ev_stdout, _ev_stderr = request.paths()
+    captured: dict[str, int] = {}
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        captured["pid"] = process.pid
+        return process
+
+    monkeypatch.setattr("tpen_executor.workers.subprocess.Popen", recording_popen)
+
+    def failing_start(self):
+        raise RuntimeError("thread start refused")
+
+    monkeypatch.setattr(threading.Thread, "start", failing_start)
+
+    with pytest.raises(RuntimeError, match="thread start refused"):
+        SubprocessWorker().run(
+            request.environment, ("-c", "import time; time.sleep(30)"), cwd=output,
+            stdout_path=stdout, stderr_path=stderr, timeout=5,
+            cancel_path=Path(output) / "cancel.json",
+            cancel_identity={"schema": "tpen-executor/leaf-cancel-v1", "group_digest": request.group_digest,
+                             "task_id": request.task_id, "attempt_id": request.attempt_id,
+                             "allocation_id": request.allocation_id, "backend_job_id": request.backend_job_id},
+        )
+    assert "pid" in captured
+    with pytest.raises(ProcessLookupError):
+        os.kill(captured["pid"], 0)
+
+
+# ------------------------------------------------------------ P2-4 gap
+
+
+def test_wait_for_teardown_accepts_a_real_during_science_cancellation_ack(tmp_path: Path) -> None:
+    """P2-4 gap killer: a real DURING-SCIENCE cancellation (not only a
+    pre-spawn one) also produces an uninspected teardown ack that the
+    controller's own check accepts, using real run_leaf producer bytes.
+    """
+
+    request, _parts = _request(tmp_path, timeout=5, mode="sleep")
+    handle = _RemoteLeaf(request)
+    encoded: list[bytes] = []
+
+    def run_in_thread() -> None:
+        encoded.append(run_leaf(request.encode()))
+
+    thread = threading.Thread(target=run_in_thread)
+    thread.start()
+    # The fake core's "sleep" mode blocks for 4s with no earlier file
+    # write to poll; 0.3s is ample margin for the science child to exist
+    # and be mid-sleep before cancelling.
+    time.sleep(0.3)
+    handle.request_cancel()
+    thread.join(10)
+    assert not thread.is_alive()
+    [payload] = encoded
+    result = LeafResult.decode(payload)
+    assert result.phases == ("science",) and result.inspection == "not-run"
+
+    with pytest.raises(LeafResultRejected, match="inspection"):
+        validate_leaf_result(request, result)
+
+    future: Future[bytes] = Future()
+    handle.bind_future(future)
+    future.set_result(payload)
+    assert handle.wait_for_teardown(1.0) is True
+
+
+# ------------------------------------------------------------------ B1
+
+
+def test_dispatcher_remote_loss_closes_admission_globally(
+    tmp_path: Path, fake_parsl: _Parsl,
+) -> None:
+    """B1 killer: a worker loss on one of two active slots closes
+    admission for the WHOLE run, not just its own slot: a healthy
+    completion on the other slot still settles (through the cancellation
+    sweep, never published completed), but a third queued member is
+    never admitted.
+    """
+
+    calls: list[str] = []
+
+    def hook(_index, function, args, kwargs):
+        request = LeafRequest.decode(args[0])
+        calls.append(request.task_id)
+        if request.task_id == "A":
+            raise RuntimeError("worker lost")
+        # "B": a deliberate delay so A's near-instant failure is reliably
+        # processed first (the main loop polls every 0.01s).
+        time.sleep(0.2)
+        return _synthetic_result(request).encode()
+
+    fake_parsl.hooks["run_leaf"] = hook
+    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), transport=_transport(teardown_timeout=1.0))
+    group = _group("s3c-b1-admission", "A", "B", "C")
+    lifecycle = _two_slot_lifecycle(tmp_path)
+    manifest = dispatcher.run(group, _runs(tmp_path, "A", "B", "C"), lifecycle, timeout=60)
+
+    assert "C" not in calls
+    assert "C" not in [attempt.task_id for attempt in manifest.attempts]
+    statuses = {attempt.task_id: attempt.outcome_receipt.status for attempt in manifest.attempts}
+    assert statuses["A"] == "remote-quiescence-unconfirmed"
+    assert statuses["B"] == "failed"
+    assert manifest.segments == ()
+
+
+def test_cancel_slot_pool_isolates_one_records_request_cancel_failure(
+    tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1-3 killer: one record's injected request_cancel() failure must
+    not stop cancellation and settlement of every other live record under
+    the same shared deadline.
+    """
+
+    real_request_cancel = parsl_dispatch._RemoteLeaf.request_cancel
+
+    def failing_request_cancel(self):
+        if self.request.task_id == "A":
+            raise OSError("injected marker write failure")
+        return real_request_cancel(self)
+
+    monkeypatch.setattr(parsl_dispatch._RemoteLeaf, "request_cancel", failing_request_cancel)
+
+    b_gate = threading.Event()
+
+    def dispatching_hook(_index, _function, args, _kwargs):
+        request = LeafRequest.decode(args[0])
+        if request.task_id == "B":
+            b_gate.wait(5)
+            return _synthetic_result(request).encode()
+        threading.Event().wait()  # "A": never acks; its own cancel request also fails
+
+    fake_parsl.hooks["run_leaf"] = dispatching_hook
+
+    first = {"value": True}
+
+    def interrupting_sleep(seconds: float) -> None:
+        if first["value"]:
+            first["value"] = False
+            b_gate.set()
+            raise KeyboardInterrupt("S3C cancellation")
+        time.sleep(seconds)
+
+    monkeypatch.setattr("tpen_executor.dispatch.parsl._poll_sleep", interrupting_sleep)
+
+    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), transport=_transport(teardown_timeout=1.0))
+    group = _group("s3c-p1-3-isolation", "A", "B")
+    lifecycle = _two_slot_lifecycle(tmp_path)
+    with pytest.raises(KeyboardInterrupt, match="S3C cancellation"):
+        dispatcher.run(group, _runs(tmp_path, "A", "B"), lifecycle, timeout=60)
+    manifest = lifecycle.store.manifest(group)
+    statuses = {attempt.task_id: attempt.outcome_receipt.status for attempt in manifest.attempts}
+    assert statuses["A"] == "remote-quiescence-unconfirmed"
+    assert statuses["B"] == "failed"
+    assert manifest.segments == ()

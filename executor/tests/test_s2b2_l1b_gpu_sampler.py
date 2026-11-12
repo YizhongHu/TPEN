@@ -86,6 +86,7 @@ from tpen_executor.results import (
 from tpen_executor.runners import CoreRunEvidence, EvidenceUnavailable, RUN_SHIM, TPENEvidence
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.tasks import ConfiguredRun
+from tpen_executor import workers as workers_module
 from tpen_executor.workers import LaunchPurpose, ProcessOutcome, SubprocessWorker
 
 GPU_A = "GPU-12345678-1234-1234-1234-123456789ABC"
@@ -134,6 +135,13 @@ L1B_MUTANT_TABLE = (
         "killer": "test_decoder_checks_a_coherent_gap_timeline",
         "suite": "executor", "assertion": "no successful sample follows the attempt that exceeded a gap budget (delta-4 D4-2)",
     },
+    {
+        "id": "L1", "target": "executor/src/tpen_executor/workers.py",
+        "old": "        group_reaped = _group_quiescent(spawned_pid)\n        interruptions = finish_gpu_sampler(sampler, sampler_output, lease, group_reaped=group_reaped)",
+        "new": "        group_reaped = True\n        interruptions = finish_gpu_sampler(sampler, sampler_output, lease, group_reaped=group_reaped)",
+        "killer": "test_group_quiescence_unconfirmed_retains_quarantine_and_refuses_fresh_admission",
+        "suite": "executor", "assertion": "the quarantine marker is never released on a sampler's own clean command cleanup alone; science-group quiescence must be independently observed before settling the lease (review B2)",
+    },
 )
 
 
@@ -142,7 +150,7 @@ def test_l1b_mutant_table_targets_unique_executable_anchors() -> None:
 
     root = Path(__file__).parents[2]
     module = Path(__file__).read_text(encoding="utf-8")
-    assert [row["id"] for row in L1B_MUTANT_TABLE] == ["J1", "J2", "K1", "K2", "K3"]
+    assert [row["id"] for row in L1B_MUTANT_TABLE] == ["J1", "J2", "K1", "K2", "K3", "L1"]
     for row in L1B_MUTANT_TABLE:
         source = (root / row["target"]).read_text(encoding="utf-8")
         assert source.count(row["old"]) == 1, row
@@ -1417,7 +1425,10 @@ def test_legacy_science_fallback_is_refused_on_a_held_slot(tmp_path: Path, descr
         )
         assert outcome.returncode == 0 and inspected.exists() and not lease.settled
     finally:
-        gs.settle_slot_lease(lease, None)
+        # This lease is a standalone test fixture with no real science
+        # child; group_reaped=True is the trivially-correct value (review
+        # B2 made settle_slot_lease's default conservative/unreleased).
+        gs.settle_slot_lease(lease, None, group_reaped=True)
     # Later-clean-reuse control: once the lease is released the same fallback runs.
     assert slot not in gs._FENCED
     outcome = SubprocessWorker().run(
@@ -2194,3 +2205,72 @@ def test_checked_in_v3_reader_fixture_is_executor_valid() -> None:
         decoded = RunManifest.decode(json.dumps(manifest))
         assert decoded.to_dict() == manifest, name
         assert isinstance(decoded.attempts[0].placement_receipt, SciencePlacementReceiptV3), name
+
+
+# -------------------------------------------- B2: science quiescence gate
+
+
+@POSIX_GROUPS
+def test_group_quiescence_confirmed_releases_quarantine_before_next_admission(
+    tmp_path: Path, pid_files: list[Path],
+) -> None:
+    """B2 clean control: with science-group quiescence OBSERVED (the real,
+    unmocked ``_group_quiescent`` probe), the sampler's own clean command
+    cleanup releases the marker, and a fresh same-allocation controller
+    admits the slot again.
+    """
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _fake(bin_dir, "nvidia-smi", _OK_BODY)
+    store = tmp_path / "store"
+    slot = "slot-b2-control"
+    values = _slot_values(_worker_env(tmp_path, bin_dir), store, slot)
+    quarantine = values[gs.SLOT_QUARANTINE_ENV]
+
+    outcome = SubprocessWorker().run(
+        PreparedPythonEnvironment(sys.executable, None, values), ("-c", "pass"),
+        cwd=tmp_path, stdout_path=tmp_path / "out.log", stderr_path=tmp_path / "err.log",
+    )
+    assert outcome.returncode == 0 and outcome.group_reaped is True
+    assert _markers(quarantine) == []
+    gs.ensure_slot_clean(slot, quarantine)  # does not raise: a fresh controller is admitted
+
+
+@POSIX_GROUPS
+def test_group_quiescence_unconfirmed_retains_quarantine_and_refuses_fresh_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_files: list[Path],
+) -> None:
+    """B2 killer: workers.py:433 (pre-fix) settled the sampler/lease BEFORE
+    the group probe at :439, so a clean sampler could release the marker
+    while the science group's quiescence was never checked at all.  With
+    an observed-NEGATIVE science-group fact, the marker must be retained
+    even though the sampler's own command cleanup is clean, and a fresh
+    same-allocation/store controller must refuse the slot.
+
+    ``_group_quiescent`` is monkeypatched to return the negative fact
+    directly: a same-group test descendant cannot be made to survive
+    SIGKILL (the real worker always kills then probes its own group, see
+    the P1-1 residual fix), so this represents what the probe would
+    observe for a genuinely cross-session-detached descendant -- the one
+    case ``_group_quiescent`` cannot reach by design (it only ever
+    discovers or signals a process inside the group it itself started).
+    """
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _fake(bin_dir, "nvidia-smi", _OK_BODY)
+    store = tmp_path / "store"
+    slot = "slot-b2-retained"
+    values = _slot_values(_worker_env(tmp_path, bin_dir), store, slot)
+    quarantine = values[gs.SLOT_QUARANTINE_ENV]
+
+    monkeypatch.setattr(workers_module, "_group_quiescent", lambda pid, **kwargs: False)
+    outcome = SubprocessWorker().run(
+        PreparedPythonEnvironment(sys.executable, None, values), ("-c", "pass"),
+        cwd=tmp_path, stdout_path=tmp_path / "out.log", stderr_path=tmp_path / "err.log",
+    )
+    assert outcome.returncode == 0 and outcome.group_reaped is False
+    assert len(_markers(quarantine)) == 1
+    with pytest.raises(gs.SlotQuarantined, match="science process group"):
+        gs.ensure_slot_clean(slot, quarantine)
