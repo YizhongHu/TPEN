@@ -292,6 +292,40 @@ def test_naive_evaluate_total_is_sensitive_to_addition_order() -> None:
     assert torch.equal(result.total, torch.full((2,), 1.0, dtype=_DTYPE))
 
 
+def test_naive_evaluate_matches_dev_golden_fixed_inputs() -> None:
+    # Acceptance item 1: fixed-input real-physics golden for total and
+    # per-term float64 bits, generated from origin/dev SOURCE (not this
+    # branch) at commit 28fdca246b7f83d6fe2942d42585955de8c6e19b, via a
+    # Cannon `test`-partition job (holystore shared env
+    # tpen-a0d83e31a6a2-cpu-py3.12), on the exact `_terms()`/`_batch()`
+    # fixtures used throughout this file. Guards against any accidental
+    # arithmetic change anywhere in this stack, independent of this file's
+    # own same-evaluator self-comparison tests.
+    naive = NaiveLocalEnergyEvaluator()
+    terms = _terms()
+    model = GaussianOutputModel(alpha=0.5)
+    batch = _batch()
+    context = naive.make_context(model, batch)
+
+    result = naive.evaluate(terms, context, return_terms=True)
+
+    expected_total = torch.tensor(
+        [0.9239857119445509, -0.3379690427055322, 0.8758741988587457, 0.3943691443562175, 0.7409987729714366],
+        dtype=_DTYPE,
+    )
+    expected_kinetic = torch.tensor(
+        [0.7319809492594012, -0.9506253902740429, 0.6678322651449944, 0.025825525808290006, 0.4879983639619154],
+        dtype=_DTYPE,
+    )
+    expected_harmonic_trap = torch.tensor(
+        [0.1920047626851497, 0.6126563475685107, 0.2080419337137514, 0.3685436185479275, 0.25300040900952114],
+        dtype=_DTYPE,
+    )
+    assert torch.equal(result.total, expected_total)
+    assert torch.equal(result.terms["kinetic"], expected_kinetic)
+    assert torch.equal(result.terms["harmonic_trap"], expected_harmonic_trap)
+
+
 # --- RecordingLocalEnergyEvaluator: narrow adapter ---------------------------
 
 
