@@ -24,7 +24,14 @@ import time
 from tpen_executor.contracts import AllocationId, BackendJobId
 from tpen_executor.dispatch import parsl as parsl_dispatch
 from tpen_executor.dispatch.parsl import _RemoteLeaf
-from tpen_executor.dispatch.transport import LeafResultRejected, LeafTeardownReceipt, validate_leaf_result
+from tpen_executor.dispatch.transport import (
+    LeafRequest,
+    LeafResult,
+    LeafResultRejected,
+    LeafTeardownReceipt,
+    run_leaf,
+    validate_leaf_result,
+)
 from tpen_executor.lifecycle import AttachedAllocation
 from tpen_executor.placement import AllocationSlot
 from tpen_executor.storage import DirectoryStore
@@ -42,43 +49,51 @@ WORKERS_MODULE = "executor/src/tpen_executor/workers.py"
 S3C_MUTANT_TABLE = (
     {
         "id": "M1", "target": PARSL_MODULE,
-        "old": "            record[\"handle\"].request_cancel()\n",
-        "new": "            os.killpg(os.getpid(), 0)\n",
+        "old": "                record[\"handle\"].request_cancel()\n",
+        "new": "                os.killpg(os.getpid(), 0)\n",
         "killer": "test_dispatcher_cancel_never_signals_a_remote_process_group",
         "suite": "executor", "assertion": "the controller cancels a remote leaf only by requesting its marker; it never killpgs a remote process itself",
     },
     {
         "id": "M2", "target": PARSL_MODULE,
-        "old": "                    status = \"failed\" if acknowledged else \"remote-quiescence-unconfirmed\"\n",
-        "new": "                    status = \"completed\"\n",
+        "old": "                    acknowledged = handle.wait_for_teardown(max(remote_deadline - time.monotonic(), 0))\n",
+        "new": "                    acknowledged = True\n",
         "killer": "test_dispatcher_cancel_with_no_ack_is_remote_quiescence_unconfirmed",
-        "suite": "executor", "assertion": "a cancelled remote leaf is never published completed before its teardown ack",
+        "suite": "executor", "assertion": "status is decided only after actually waiting for the ack, never published as settled without any wait at all",
     },
     {
         "id": "M3", "target": PARSL_MODULE,
-        "old": "                acknowledged = handle.wait_for_teardown(max(remote_deadline - time.monotonic(), 0))\n",
-        "new": "                acknowledged = handle.wait_for_teardown(float(getattr(self.transport, \"teardown_timeout\", 30)))\n",
-        "killer": "test_dispatcher_cancel_waits_one_shared_deadline_across_remote_leaves",
-        "suite": "executor", "assertion": "every live remote leaf waits against one shared deadline, never its own fresh bound, so DFK cleanup is bounded by one timeout regardless of how many leaves are live",
+        "old": "                    acknowledged = handle.wait_for_teardown(max(remote_deadline - time.monotonic(), 0))\n",
+        "new": "                    acknowledged = handle.wait_for_teardown(float(getattr(self.transport, \"teardown_timeout\", 30)))\n",
+        "killer": "test_dispatcher_cancel_settles_every_leaf_before_dfk_cleanup",
+        "suite": "executor", "assertion": "every live remote leaf waits against one shared deadline, never its own fresh bound; proven by event-controlled finish/cleanup ordering, not only a wall-clock bound",
     },
     {
         "id": "M4", "target": PARSL_MODULE,
-        "old": "                    status = \"failed\" if acknowledged else \"remote-quiescence-unconfirmed\"\n",
-        "new": "                    status = \"failed\" if acknowledged else \"completed\"\n",
-        "killer": "test_dispatcher_cancel_with_no_ack_is_remote_quiescence_unconfirmed",
-        "suite": "executor", "assertion": "worker loss during cancellation is never published as completed",
+        "old": (
+            "                        remote_unconfirmed = True\n"
+            "                        try:\n"
+            "                            lifecycle.finish(record[\"fence\"], \"remote-quiescence-unconfirmed\", self._utc_now(), None)\n"
+        ),
+        "new": (
+            "                        remote_unconfirmed = True\n"
+            "                        try:\n"
+            "                            lifecycle.finish(record[\"fence\"], \"completed\", self._utc_now(), None)\n"
+        ),
+        "killer": "test_dispatcher_terminal_remote_failure_never_refills_slot_or_publishes_completed",
+        "suite": "executor", "assertion": "a terminal worker-loss/crossed-reply future during ordinary polling (no owner cancellation) is never published completed",
     },
     {
         "id": "M5", "target": PARSL_MODULE,
-        "old": "            payload = self.future.result(None)\n            result = validate_leaf_result(self.request, LeafResult.decode(payload))\n",
-        "new": "            payload = self.future.result(None)\n            result = LeafResult.decode(payload)\n",
+        "old": "            result = validate_leaf_result(self.request, LeafResult.decode(payload), cancellation_expected=True)\n",
+        "new": "            result = LeafResult.decode(payload)\n",
         "killer": "test_remote_leaf_rejects_well_formed_crossed_reply_as_no_quiescence_ack",
         "suite": "executor", "assertion": "a stale task/attempt/allocation reply is rejected on identity; it is never accepted as a quiescence ack merely because it decodes",
     },
     {
         "id": "M6", "target": WORKERS_MODULE,
-        "old": "                watcher = threading.Thread(target=watch_cancel_marker, daemon=True)\n                watcher.start()\n",
-        "new": "                watcher = None\n",
+        "old": "                    watcher.start()\n                    watcher_started = True\n",
+        "new": "                    watcher_started = False\n",
         "killer": "test_cancel_during_science_reaps_local_child_group",
         "suite": "executor", "assertion": "the leaf actually watches for its cancel marker; a leaf that never does so ignores cancellation and keeps running past the bound",
     },
@@ -235,6 +250,37 @@ def test_remote_leaf_never_signals_a_remote_process_group(tmp_path: Path, monkey
     assert calls == []
 
 
+def test_wait_for_teardown_accepts_a_real_cancelled_leafs_uninspected_ack(tmp_path: Path) -> None:
+    """P2-4 killer: a real cancellation's uninspected teardown ack is accepted
+    by the controller's own ack check, without weakening ordinary completion
+    acceptance (real producer-to-controller bytes, not a synthetic result).
+    """
+
+    request, _parts = _request(tmp_path, timeout=5)
+    handle = _RemoteLeaf(request)
+    handle.request_cancel()
+    # A real pre-spawn cancellation: run_leaf itself sees the marker already
+    # in place (the leaf never distinguishes pre-spawn from during-science
+    # cancellation at the result-shape level: both produce phases=("science",)
+    # with inspection skipped).
+    encoded = run_leaf(request.encode())
+    result = LeafResult.decode(encoded)
+    assert result.phases == ("science",) and result.inspection == "not-run"
+
+    # Negative control: the ordinary completion path (no
+    # cancellation_expected) still refuses to publish this as a
+    # segment-worthy outcome -- it still requires inspection.
+    with pytest.raises(LeafResultRejected, match="inspection"):
+        validate_leaf_result(request, result)
+
+    # The controller's own teardown-ack check accepts it: this exact
+    # controller requested this exact cancellation.
+    future: Future[bytes] = Future()
+    handle.bind_future(future)
+    future.set_result(encoded)
+    assert handle.wait_for_teardown(1.0) is True
+
+
 
 # ------------------------------------------------- dispatcher-level M1-M4
 
@@ -343,3 +389,88 @@ def test_dispatcher_cancel_waits_one_shared_deadline_across_remote_leaves(
     manifest = lifecycle.store.manifest(group)
     assert {attempt.outcome_receipt.status for attempt in manifest.attempts} == {"remote-quiescence-unconfirmed"}
     assert manifest.segments == ()
+
+
+def test_dispatcher_cancel_settles_every_leaf_before_dfk_cleanup(
+    tmp_path: Path, fake_parsl: _Parsl, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M3 killer (restored, event-controlled ordering, not only a wall-clock
+    bound): DFK cleanup must never start before every live remote leaf --
+    whether it acks inside the shared bound or is never acknowledged -- is
+    settled. An early ``dfk.cleanup()`` call followed by the same waits
+    would still pass a wall-clock-only check; this one catches it by order.
+    """
+
+    ack_gate = threading.Event()
+
+    def dispatching_hook(_index, function, args, kwargs):
+        request = LeafRequest.decode(args[0])
+        if request.task_id == "acking":
+            ack_gate.wait(5)
+            return function(*args, **kwargs)
+        threading.Event().wait()  # "stuck": never acks
+
+    fake_parsl.hooks["run_leaf"] = dispatching_hook
+    _interrupt_once(monkeypatch)
+    dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), transport=_transport(teardown_timeout=0.3))
+    group = _group("s3c-dfk-order", "acking", "stuck")
+    lifecycle = _two_slot_lifecycle(tmp_path)
+
+    real_finish = lifecycle.finish
+
+    def spying_finish(fence, status, *args, **kwargs):
+        fake_parsl.events.append(("finish", fence.task_id, status))
+        return real_finish(fence, status, *args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "finish", spying_finish)
+
+    def release_ack_shortly() -> None:
+        time.sleep(0.05)
+        ack_gate.set()
+
+    threading.Thread(target=release_ack_shortly, daemon=True).start()
+
+    with pytest.raises(KeyboardInterrupt, match="S3C cancellation"):
+        dispatcher.run(group, _runs(tmp_path, "acking", "stuck"), lifecycle, timeout=60)
+
+    finish_events = [event for event in fake_parsl.events if event[0] == "finish"]
+    cleanup_events = [event for event in fake_parsl.events if event[0] == "cleanup"]
+    assert len(finish_events) == 2 and len(cleanup_events) == 1
+    # Both settlements -- the in-bound ack and the bounded-unconfirmed leaf
+    # -- appear in event order strictly before DFK cleanup.
+    assert max(fake_parsl.events.index(event) for event in finish_events) < fake_parsl.events.index(cleanup_events[0])
+    assert {task_id: status for (_tag, task_id, status) in finish_events} == {
+        "acking": "failed", "stuck": "remote-quiescence-unconfirmed",
+    }
+
+
+@pytest.mark.parametrize("case", ["worker-lost", "crossed-reply"])
+def test_dispatcher_terminal_remote_failure_never_refills_slot_or_publishes_completed(
+    tmp_path: Path, fake_parsl: _Parsl, case: str,
+) -> None:
+    """P1-2/M4 killer: a terminal remote future during ORDINARY polling (no
+    owner cancellation at all) settles unconfirmed and never recycles its
+    slot binding; a queued second member is never admitted to it.
+    """
+
+    def terminal_first(_index, function, args, kwargs):
+        request = LeafRequest.decode(args[0])
+        if request.task_id != "first":
+            return function(*args, **kwargs)
+        if case == "worker-lost":
+            raise RuntimeError("worker lost")
+        # A well-formed but crossed reply: real bytes that fail identity.
+        result = LeafResult.decode(function(*args, **kwargs))
+        return dataclasses.replace(result, attempt_id="another-attempt").encode()
+
+    fake_parsl.hooks["run_leaf"] = terminal_first
+    dispatcher = parsl_dispatch.ParslDispatcher(
+        _worker(tmp_path), binding=BINDING, transport=_transport(teardown_timeout=0.1),
+    )
+    group = _group(f"s3c-worker-loss-{case}", "first", "second")
+    lifecycle = _lifecycle(tmp_path)
+    manifest = dispatcher.run(group, _runs(tmp_path, "first", "second"), lifecycle, timeout=60)
+    assert [attempt.task_id for attempt in manifest.attempts] == ["first"]
+    assert manifest.attempts[0].outcome_receipt.status == "remote-quiescence-unconfirmed"
+    assert manifest.segments == ()
+    assert fake_parsl.calls.get("run_leaf", 0) == 1

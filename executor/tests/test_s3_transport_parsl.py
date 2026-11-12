@@ -110,7 +110,8 @@ S3B_MUTANT_TABLE = (
 # table at five rows.  It was the weakest control: its killer failed only
 # through the duplicate retries check in _validate_attached_config, not by
 # observing a retry.  test_a_failed_remote_submission_is_not_retried still
-# asserts one leaf call and one launch_failed attempt.
+# asserts one leaf call and one durable remote-quiescence-unconfirmed
+# attempt (S3 Layer C review P1-2: worker loss is never launch_failed).
 
 
 def test_s3b_mutant_table_targets_unique_executable_anchors() -> None:
@@ -622,7 +623,11 @@ def test_each_attached_run_uses_a_fresh_dfk(tmp_path: Path, fake_parsl: _Parsl) 
 
 
 def test_a_failed_remote_submission_is_not_retried(tmp_path: Path, fake_parsl: _Parsl) -> None:
-    """M5 killer: a lost leaf is one durable launch failure, never resubmitted."""
+    """A lost leaf is one durable remote-quiescence-unconfirmed outcome, never
+    retried and never published completed/accepted (S3 Layer C review P1-2:
+    worker loss is never an ordinary launch failure, because there is no
+    leaf ack proving no live work remains).
+    """
 
     def lost(_index, _function, _args, _kwargs):
         raise RuntimeError("worker lost")
@@ -634,7 +639,7 @@ def test_a_failed_remote_submission_is_not_retried(tmp_path: Path, fake_parsl: _
     manifest = dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
 
     assert fake_parsl.calls["run_leaf"] == 1
-    assert _summary(manifest) == {"member": ("launch_failed", True)}
+    assert _summary(manifest) == {"member": ("remote-quiescence-unconfirmed", True)}
     assert len(manifest.attempts) == 1 and manifest.segments == ()
 
 
@@ -654,7 +659,11 @@ def test_attached_outcomes_match_local_dispatch(tmp_path: Path, fake_parsl: _Par
 
 @pytest.mark.parametrize("case", ["not-bytes", "not-canonical", "crossed-attempt", "leaf-refusal"])
 def test_leaf_results_are_validated_before_publication(tmp_path: Path, fake_parsl: _Parsl, case: str) -> None:
-    """A result that does not answer its request, or a leaf refusal, is a launch failure."""
+    """A validated leaf refusal is a launch failure; anything that cannot
+    even be trusted to answer its request (non-bytes, non-canonical, or a
+    well-formed but crossed identity) settles remote-quiescence-unconfirmed
+    instead (S3 Layer C review P1-2).
+    """
 
     def tamper(_index, function, args, kwargs):
         if case == "not-bytes":
@@ -674,7 +683,8 @@ def test_leaf_results_are_validated_before_publication(tmp_path: Path, fake_pars
     lifecycle = _lifecycle(tmp_path)
     dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), binding=BINDING, transport=_transport())
     manifest = dispatcher.run(group, _runs(tmp_path, "member"), lifecycle, timeout=60)
-    assert _summary(manifest) == {"member": ("launch_failed", True)}
+    expected_status = "launch_failed" if case == "leaf-refusal" else "remote-quiescence-unconfirmed"
+    assert _summary(manifest) == {"member": (expected_status, True)}
     assert manifest.segments == ()
 
 
