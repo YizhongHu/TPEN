@@ -667,21 +667,47 @@ def _admit_configured_target(target: str) -> None:
         )
 
 
-def _admit_runtime_sink(sink: object) -> None:
-    """Refuse an unregistered already-constructed runtime sink (F3/F4).
+#: Attribute names conventionally used, across callbacks and loggers in this
+#: codebase, to hold an output destination. A RUNTIME callback (already
+#: constructed, supplied by the launcher or a test -- never configured
+#: through `cfg`, so there is no `_target_` to resolve against the closed
+#: registries ahead of time) exposing none of these is accepted as
+#: genuinely sink-free without needing a static listing: an ad hoc observer
+#: with no output-path-shaped attribute has nothing to route and nothing to
+#: escape through. This is narrower than the heuristic the configured-sink
+#: path replaced (B): it never ADMITS an output-bearing object past this
+#: probe, it only widens what counts as sink-free for objects the registries
+#: cannot possibly enumerate in advance.
+_RUNTIME_SINK_PROBE_FIELDS: tuple[str, ...] = (
+    "output_path",
+    "output_dir",
+    "path",
+    "artifact_dir",
+    "dir",
+)
 
-    Runtime callbacks have no ``_target_`` to resolve ahead of construction,
-    so admission is checked by the sink's EXACT type -- never by MRO: a
-    runtime caller handing in an unregistered subclass of a registered
-    writer or sink-free type is refused, consistent with "checked by exact
-    type" (review-r2 B).
+
+def _admit_runtime_sink(sink: object) -> None:
+    """Refuse an unregistered, output-bearing, already-constructed runtime sink (F3/F4).
+
+    Runtime callbacks have no ``_target_`` to resolve ahead of construction.
+    A registered writer or sink-free type is matched by the sink's EXACT
+    type -- never by MRO: an unregistered subclass of a registered writer or
+    sink-free type is not exempted by this first check, consistent with
+    "checked by exact type" (review-r2 B). Anything else is admitted only
+    when it exposes none of `_RUNTIME_SINK_PROBE_FIELDS` -- a genuinely
+    sink-free runtime observer (e.g. a test's bare readback probe) -- and
+    refused otherwise.
     """
 
     qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
-    if qualified not in _ARTIFACT_SINK_FIELDS and qualified not in _SINK_FREE_TYPES:
+    if qualified in _ARTIFACT_SINK_FIELDS or qualified in _SINK_FREE_TYPES:
+        return
+    if any(getattr(sink, probe, None) is not None for probe in _RUNTIME_SINK_PROBE_FIELDS):
         raise ArtifactRoutingError(
             f"{qualified} is not a registered routed writer or a known "
-            "sink-free type; refusing to admit it to a routed run"
+            "sink-free type, but exposes an output-path-shaped attribute; "
+            "refusing to admit it to a routed run"
         )
 
 
@@ -706,11 +732,12 @@ def _route_artifact_sinks(
     already passed :func:`_admit_configured_target` before it was
     constructed, and every runtime sink already passed
     :func:`_admit_runtime_sink`. This function's own check -- a sink whose
-    type is not in `_ARTIFACT_SINK_FIELDS` by MRO must be an exact member of
-    `_SINK_FREE_TYPES` -- is therefore a second, cheap confirmation rather
-    than the admission's first line of defense; it exists so this function
-    stays correct for any direct caller that bypasses those gates (as
-    several unit tests do).
+    type is not in `_ARTIFACT_SINK_FIELDS` by MRO is admitted only when it
+    is an exact member of `_SINK_FREE_TYPES` or exposes none of
+    `_RUNTIME_SINK_PROBE_FIELDS` -- is therefore a second, cheap
+    confirmation rather than the admission's first line of defense; it
+    exists so this function stays correct for any direct caller that
+    bypasses those gates (as several unit tests do).
 
     A field whose registered writer exposes an owner-defined
     ``rebind_<field>`` method (for example `tpen.logging.csv.CSV.rebind_path`,
@@ -735,11 +762,14 @@ def _route_artifact_sinks(
         qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
         fields = _registered_sink_fields(sink)
         if fields is None:
-            if qualified not in _SINK_FREE_TYPES:
+            if qualified not in _SINK_FREE_TYPES and any(
+                getattr(sink, probe, None) is not None for probe in _RUNTIME_SINK_PROBE_FIELDS
+            ):
                 raise ArtifactRoutingError(
                     f"{qualified} is not a registered routed writer or a known "
-                    "sink-free type; refusing to admit it to a routed run before "
-                    "it can write outside the claimed physical destination"
+                    "sink-free type, but exposes an output-path-shaped attribute; "
+                    "refusing to admit it to a routed run before it can write "
+                    "outside the claimed physical destination"
                 )
             continue
         for field in fields:
