@@ -289,8 +289,15 @@ def _pilot_train_task_id(payload: str) -> str:
 
 #: TO 8a5e926f (item E): every eval-fanout payload's own TRAIN task id and
 #: fixed lineage label (science's lineage is caller-supplied, checked
-#: against ``launch_config.LINEAGES``).
-_EVAL_FANOUT_PAYLOADS = ("science", "capacity-pilot", "gpu-route-g")
+#: against ``launch_config.LINEAGES``). ``capacity-pilot-100k`` (amendment
+#: 20261112-r1) only ever runs its generalized stage 1; it never has a
+#: stage 2.
+_EVAL_FANOUT_PAYLOADS = ("science", "capacity-pilot", "capacity-pilot-100k", "gpu-route-g")
+
+#: Pilot payloads whose eval-fanout dispatches through the stage-1/SEL path
+#: (amendment 20261112-r1). ``capacity-pilot`` additionally supports stage
+#: 2/2-core; ``capacity-pilot-100k`` supports only stage 1.
+_PILOT_STAGE_PAYLOADS = ("capacity-pilot", "capacity-pilot-100k")
 
 
 def _eval_receipt_path(run_root: Path, task_label: str) -> Path:
@@ -343,23 +350,25 @@ def run_eval_fanout(
         resolved_lineage_index = launch_config.LINEAGES.index(lineage) if lineage_index is None else lineage_index
         generations = eval_job.science_fanout(lineage_index=resolved_lineage_index)
         task_label = f"h-v2-eval-science-{lineage}"
-    elif payload == "capacity-pilot":
+    elif payload in _PILOT_STAGE_PAYLOADS:
         train_task_id = _pilot_train_task_id(payload)
         expected_lineage = launch_config.PILOT_PAYLOAD_LINEAGES[payload]
         if pilot_stage is None:
-            raise JobError("capacity-pilot eval fan-out requires --pilot-stage")
+            raise JobError(f"{payload} eval fan-out requires --pilot-stage")
+        if payload != "capacity-pilot" and pilot_stage != "1":
+            raise JobError(f"{payload} eval fan-out only supports --pilot-stage 1")
         task_label = f"h-v2-eval-{payload}-stage{pilot_stage}"
         if pilot_stage == "1":
-            generations = eval_job.pilot_fanout("1")
+            generations = eval_job.pilot_fanout("1", payload=payload)
         else:
-            selection_path = run_root / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
+            selection_path = run_root / "attached" / "receipts" / f"h-v2-eval-{payload}-selection.json"
             if not selection_path.is_file():
                 raise JobError(f"no SEL selection record at {selection_path}; run the SEL step first")
             selection = json.loads(selection_path.read_text(encoding="utf-8"))
             stage1_receipt_path = _eval_receipt_path(run_root, f"h-v2-eval-{payload}-stage1")
             _, stage1_sha256 = eval_job.load_train_receipt(stage1_receipt_path)
-            c1 = eval_job.verify_selection_record(selection, b1_eval_receipt_sha256=stage1_sha256)
-            generations = eval_job.pilot_fanout(pilot_stage, c1=c1)
+            c1 = eval_job.verify_selection_record(selection, b1_eval_receipt_sha256=stage1_sha256, payload=payload)
+            generations = eval_job.pilot_fanout(pilot_stage, c1=c1, payload=payload)
             # F6: stage 2/2-core's receipt retains the SEL record it actually
             # executed, bound by the selection FILE's own sha256 -- never
             # left null for a consumer with no way to recover which
@@ -441,12 +450,14 @@ def run_eval_fanout(
     print(f"[h-v2] {task_label}: {len(records)} generation(s) accepted (readout_generator={readout_available})")
 
 
-def run_pilot_sel(run_root: Path) -> None:
+def run_pilot_sel(run_root: Path, *, payload: str = "capacity-pilot") -> None:
     """Compute and write the pilot SEL selection record (amendment r3/r4 E1).
 
-    Reads the completed capacity-pilot stage-1 eval receipt, computes the
+    Reads the completed stage-1 eval receipt for *payload*, computes the
     stream-0 ``W`` per ordinal, and writes the selection record
-    (:func:`eval_job.build_selection_record`) stage 2 verifies against.
+    (:func:`eval_job.build_selection_record`) stage 2 verifies against
+    (``capacity-pilot`` only; amendment 20261112-r1's ``capacity-pilot-100k``
+    has no stage 2).
 
     Raises
     ------
@@ -454,19 +465,20 @@ def run_pilot_sel(run_root: Path) -> None:
         If the stage-1 eval receipt is missing or incomplete.
     """
 
-    stage1_path = _eval_receipt_path(run_root, "h-v2-eval-capacity-pilot-stage1")
+    stage1_path = _eval_receipt_path(run_root, f"h-v2-eval-{payload}-stage1")
     if not stage1_path.is_file():
-        raise JobError(f"no capacity-pilot stage-1 eval receipt at {stage1_path}; stage 1 must complete before SEL")
+        raise JobError(f"no {payload} stage-1 eval receipt at {stage1_path}; stage 1 must complete before SEL")
     # D5 (review r2 delta): hash the EXACT bytes parsed, not a later re-read
     # of the file (which an atomic replacement mid-computation could race).
     stage1_receipt, stage1_sha256 = eval_job.read_eval_receipt_with_hash(stage1_path)
-    selection_core = eval_job.compute_pilot_selection(stage1_receipt)
+    selection_core = eval_job.compute_pilot_selection(stage1_receipt, payload=payload)
     record = eval_job.build_selection_record(
         c1=selection_core["c1"],
         triple_means=selection_core["triple_means"],
         b1_eval_receipt_sha256=stage1_sha256,
+        payload=payload,
     )
-    selection_path = run_root / "attached" / "receipts" / "h-v2-eval-capacity-pilot-selection.json"
+    selection_path = run_root / "attached" / "receipts" / f"h-v2-eval-{payload}-selection.json"
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     selection_path.write_text(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     print(f"[h-v2] SEL: c1={record['c1']}")
@@ -816,10 +828,10 @@ def _main_eval_fanout(argv: list[str]) -> int:
     else:
         lineage = launch_config.PILOT_PAYLOAD_LINEAGES[args.payload]
         expected_stratum = launch_config.PILOT_PAYLOAD_GPU_STRATA[args.payload]
-        if args.payload == "capacity-pilot" and args.pilot_stage is None:
+        if args.payload in _PILOT_STAGE_PAYLOADS and args.pilot_stage is None:
             print(
-                "usage: run_job.py eval-fanout capacity-pilot --pilot-stage {1,2,2-core} "
-                "--expected-train-commit <sha>",
+                f"usage: run_job.py eval-fanout {args.payload} --pilot-stage "
+                "{1,2,2-core} --expected-train-commit <sha>",
                 file=sys.stderr,
             )
             return 2
@@ -845,14 +857,14 @@ def _main_eval_fanout(argv: list[str]) -> int:
 
 
 def _main_sel(argv: list[str]) -> int:
-    """Parse and dispatch ``run_job.py sel capacity-pilot``."""
+    """Parse and dispatch ``run_job.py sel {capacity-pilot|capacity-pilot-100k}``."""
 
-    if argv != ["capacity-pilot"]:
-        print("usage: run_job.py sel capacity-pilot", file=sys.stderr)
+    if len(argv) != 1 or argv[0] not in _PILOT_STAGE_PAYLOADS:
+        print("usage: run_job.py sel {capacity-pilot|capacity-pilot-100k}", file=sys.stderr)
         return 2
     run_root = Path(_require_env("RUN")).resolve()
     try:
-        run_pilot_sel(run_root)
+        run_pilot_sel(run_root, payload=argv[0])
     except Exception as error:  # noqa: BLE001 - this is the job's own top-level boundary
         print(f"[h-v2] job failed: {error}", file=sys.stderr)
         return 1

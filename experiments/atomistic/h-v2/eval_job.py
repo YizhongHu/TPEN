@@ -400,7 +400,9 @@ def science_fanout(*, lineage_index: int) -> tuple[dict[str, Any], ...]:
     )
 
 
-def pilot_fanout(stage: str, *, c1: int | None = None) -> tuple[dict[str, Any], ...]:
+def pilot_fanout(
+    stage: str, *, c1: int | None = None, payload: str = "capacity-pilot"
+) -> tuple[dict[str, Any], ...]:
     """Return one pilot stage's fan-out generations (amendment r3/r4 E1).
 
     Parameters
@@ -409,6 +411,13 @@ def pilot_fanout(stage: str, *, c1: int | None = None) -> tuple[dict[str, Any], 
     c1 : int, optional
         Required for stage 2/2-core: the SEL basin ordinal
         (:func:`select_pilot_basin_ordinal`).
+    payload : str, default="capacity-pilot"
+        Stage-1 ordinal sweep source (amendment 20261112-r1:
+        :func:`protocol.pilot_stage1_grid`). Stage 2/2-core has no
+        generalized form -- it remains ``capacity-pilot``'s own fixed
+        5-checkpoint window and is never reached for another payload (the
+        caller refuses ``--pilot-stage 2``/``2-core`` for any other payload
+        before this function is called).
 
     Raises
     ------
@@ -417,7 +426,7 @@ def pilot_fanout(stage: str, *, c1: int | None = None) -> tuple[dict[str, Any], 
     """
 
     if stage == "1":
-        pairs = protocol.pilot_stage1_grid()
+        pairs = protocol.pilot_stage1_grid(payload)
     elif stage in ("2", "2-core"):
         if c1 is None:
             raise EvalJobRefusal("pilot-stage2-needs-c1", f"--pilot-stage {stage} requires c1 from the SEL step")
@@ -859,7 +868,9 @@ def read_verified_stream_local_energies(generation: Mapping[str, Any]) -> list[f
     return read_stream_local_energies(path)
 
 
-def compute_pilot_selection(stage1_receipt: Mapping[str, Any]) -> dict[str, Any]:
+def compute_pilot_selection(
+    stage1_receipt: Mapping[str, Any], *, payload: str = "capacity-pilot"
+) -> dict[str, Any]:
     """Compute the SEL step from a completed pilot stage-1 eval receipt.
 
     Reads every stage-1 generation's trajectory CSV, computes
@@ -872,26 +883,34 @@ def compute_pilot_selection(stage1_receipt: Mapping[str, Any]) -> dict[str, Any]
     against the receipt's OWN recorded ``trajectory_csv`` sha256 before its
     bytes are read for ``W`` (:func:`read_verified_stream_local_energies`)
     -- a CSV replaced on disk without updating the receipt it is bound to is
-    refused, never silently included. Stage 1 must carry all 21 stream-0
-    generations (ordinals 0..20); a receipt missing any of them refuses even
-    if the missing ordinals fall outside every candidate triple
+    refused, never silently included. Stage 1 must carry every one of
+    *payload*'s stream-0 generations (:func:`protocol.pilot_stage1_ordinals`,
+    ``0..20`` for ``capacity-pilot``); a receipt missing any of them refuses
+    even if the missing ordinals fall outside every candidate triple
     ``select_pilot_basin_ordinal`` happens to need.
 
     D5 (review r2 delta): an ordinal appearing MORE THAN ONCE among stream-0
     generations is refused (never silently overwritten); each generation's
     recorded seed must equal :func:`protocol.pilot_eval_seed`'s own formula
     for its ordinal; every local-energy sample must be finite (not NaN/inf)
-    -- none of this is implied by "all 21 ordinals present with matching
+    -- none of this is implied by "all ordinals present with matching
     hashes".
+
+    Parameters
+    ----------
+    payload : str, default="capacity-pilot"
+        Amendment 20261112-r1: selects the expected stage-1 ordinal set
+        (:func:`protocol.pilot_stage1_ordinals`) and SEL window
+        (:func:`protocol.pilot_sel_window_hi`).
 
     Raises
     ------
     EvalJobRefusal
-        Code ``sel-incomplete-stage1``, if stage 1 is missing any stream-0
-        ordinal in ``0..20``; code ``sel-duplicate-ordinal``, ``sel-wrong-seed``,
-        or ``sel-nonfinite-energy``; code ``sel-trajectory-hash-mismatch``, if
-        a trajectory CSV's current bytes do not match the receipt's own
-        recorded hash for it.
+        Code ``sel-incomplete-stage1``, if stage 1 is missing any of
+        *payload*'s stream-0 ordinals; code ``sel-duplicate-ordinal``,
+        ``sel-wrong-seed``, or ``sel-nonfinite-energy``; code
+        ``sel-trajectory-hash-mismatch``, if a trajectory CSV's current
+        bytes do not match the receipt's own recorded hash for it.
     """
 
     w_by_ordinal: dict[int, float] = {}
@@ -918,12 +937,12 @@ def compute_pilot_selection(stage1_receipt: Mapping[str, Any]) -> dict[str, Any]
                 "sel-nonfinite-energy", f"B1 generation for ordinal {ordinal} has a non-finite local_energy sample"
             )
         w_by_ordinal[ordinal] = protocol.w_statistic(energies)
-    missing = sorted(set(protocol.PILOT_STAGE1_ORDINALS) - seen_ordinals)
+    missing = sorted(set(protocol.pilot_stage1_ordinals(payload)) - seen_ordinals)
     if missing:
         raise EvalJobRefusal(
             "sel-incomplete-stage1", f"B1 receipt is missing stream-0 generations for ordinals {missing!r}"
         )
-    c1, triple_means = protocol.select_pilot_basin_ordinal(w_by_ordinal)
+    c1, triple_means = protocol.select_pilot_basin_ordinal(w_by_ordinal, hi=protocol.pilot_sel_window_hi(payload))
     return {"c1": c1, "triple_means": triple_means}
 
 
@@ -932,30 +951,36 @@ def build_selection_record(
     c1: int,
     triple_means: Mapping[int, float],
     b1_eval_receipt_sha256: str,
+    payload: str = "capacity-pilot",
 ) -> dict[str, Any]:
     """Return the SEL step's selection record (amendment r3/r4 E1).
 
     Stage 2 refuses unless its own B1 receipt sha256 matches this record's
-    ``b1_eval_receipt_sha256`` and ``3 <= c1 <= 19``
+    ``b1_eval_receipt_sha256`` and ``3 <= c1 <= hi``
     (:func:`verify_selection_record`).
 
     Operator ruling (operator-rulings-pilot-20261110-1900, item 3):
     ``interior_minimum`` is ``False`` when *c1* is at the window edge (3 or
-    19) -- there is no full neighboring triple on both sides, so stage 2
-    still runs (the window is defined) but the record itself says so.
+    *hi*) -- there is no full neighboring triple on both sides, so stage 2
+    still runs (the window is defined) but the record itself says so. *hi*
+    is :func:`protocol.pilot_sel_window_hi` (amendment 20261112-r1), keyed
+    by *payload*.
     """
 
-    if not 3 <= c1 <= 19:
-        raise EvalJobRefusal("sel-c1-out-of-range", f"c1 must be in 3..19, got {c1}")
+    hi = protocol.pilot_sel_window_hi(payload)
+    if not 3 <= c1 <= hi:
+        raise EvalJobRefusal("sel-c1-out-of-range", f"c1 must be in 3..{hi}, got {c1}")
     return {
         "c1": c1,
         "triple_means": {str(center): mean for center, mean in triple_means.items()},
         "b1_eval_receipt_sha256": b1_eval_receipt_sha256,
-        "interior_minimum": protocol.is_interior_minimum(c1),
+        "interior_minimum": protocol.is_interior_minimum(c1, hi=hi),
     }
 
 
-def verify_selection_record(selection: Mapping[str, Any], *, b1_eval_receipt_sha256: str) -> int:
+def verify_selection_record(
+    selection: Mapping[str, Any], *, b1_eval_receipt_sha256: str, payload: str = "capacity-pilot"
+) -> int:
     """Return ``c1`` from *selection*, refusing a mismatched or out-of-range record.
 
     Raises
@@ -970,9 +995,10 @@ def verify_selection_record(selection: Mapping[str, Any], *, b1_eval_receipt_sha
             f"selection record b1_eval_receipt_sha256 {selection.get('b1_eval_receipt_sha256')!r} "
             f"does not match the B1 receipt {b1_eval_receipt_sha256!r}",
         )
+    hi = protocol.pilot_sel_window_hi(payload)
     c1 = selection.get("c1")
-    if not isinstance(c1, int) or not 3 <= c1 <= 19:
-        raise EvalJobRefusal("sel-c1-out-of-range", f"selection record c1 {c1!r} is not an int in 3..19")
+    if not isinstance(c1, int) or not 3 <= c1 <= hi:
+        raise EvalJobRefusal("sel-c1-out-of-range", f"selection record c1 {c1!r} is not an int in 3..{hi}")
     return c1
 
 

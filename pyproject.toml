@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tpen"
-version = "0.5.0"
+version = "0.5.1"
 description = "Specht-module equivariant neural network fermionic wavefunctions."
 readme = "README.md"
 requires-python = ">=3.12"

@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from tpen.run import run_from_config
 
@@ -396,15 +396,73 @@ def populate_execution_topology(source: Any, topology: Mapping[str, Any]) -> Any
         raise LaunchValidationError(str(error)) from error
 
 
+def _validate_override_topology_agreement(
+    config: DictConfig,
+    topology: Mapping[str, Any],
+    override_items: Sequence[tuple[str, Any]],
+) -> None:
+    """Refuse resolved placement that contradicts bound launcher facts.
+
+    ``runtime.device`` is consumed by ``tpen.artifacts.build_run_metadata`` and
+    ultimately by the runner's module placement, while ``topology.device`` is
+    retained as the independently supplied launch fact.  The resolver may
+    accept operational overrides, so the launcher must reconcile this one
+    topology-derived path after resolution and before dispatch.  Device
+    indices are launcher details; agreement is on the device kind (``cuda``
+    in ``cuda:0``), which also matches the config's usual spelling.
+    """
+
+    device_override = any(
+        type(path) is str and str.__eq__(path, "runtime.device") is True
+        for path, _ in override_items
+    )
+    if device_override is not True:
+        return
+
+    bound = topology.get("device")
+    configured = OmegaConf.select(config, "runtime.device", default=None)
+    if type(bound) is not str or type(configured) is not str:
+        raise LaunchValidationError(
+            "runtime.device override requires bound topology and must resolve "
+            "to an exact string"
+        )
+    configured_kind = configured.partition(":")[0]
+    bound_kind = bound.partition(":")[0]
+    if str.__eq__(configured_kind, bound_kind) is not True:
+        raise LaunchValidationError(
+            "override path 'runtime.device' disagrees with bound topology.device: "
+            f"resolved={configured!r}, bound={bound!r}"
+        )
+
+
 def prepare_train_launch(
     source: Any,
     topology: object | None = None,
+    *,
+    overrides: Mapping[str, Any] | Sequence[str] | None = None,
 ) -> LaunchPlan:
-    """Populate topology and resolve one source row through L1."""
+    """Populate topology and resolve one source row through L1.
+
+    Parameters
+    ----------
+    source : Any
+        Materialized HI cell or compatible launch source.
+    topology : object, optional
+        Runtime execution topology supplied by the caller.
+    overrides : mapping or sequence of str, optional
+        Operational overlays applied by the resolver before configuration
+        readback. ``None`` preserves the default resolved configuration.
+    """
 
     facts = execution_topology_facts(topology) if topology is not None else {}
     cell = populate_execution_topology(source, facts)
-    config = _TRAIN_CONFIG.resolve_train_config(cell)
+    # Preserve the default call shape for existing callers and test doubles.
+    if overrides is None:
+        config = _TRAIN_CONFIG.resolve_train_config(cell)
+    else:
+        override_items = _TRAIN_CONFIG._override_items(overrides)
+        config = _TRAIN_CONFIG.resolve_train_config(cell, overrides=overrides)
+        _validate_override_topology_agreement(config, facts, override_items)
     return LaunchPlan(cell=cell, config=config, topology=cell.manifest[_STAGE_API.TOPOLOGY_KEY])
 
 
@@ -422,6 +480,7 @@ def launch_train(
     *,
     runner: Callable[..., object] = run_from_config,
     runtime_callbacks: Sequence[object] = (),
+    overrides: Mapping[str, Any] | Sequence[str] | None = None,
 ) -> int:
     """Resolve one topology-bound row and execute TPEN's production runner.
 
@@ -444,6 +503,9 @@ def launch_train(
     runtime_callbacks : sequence of object, optional
         Operational observers appended after configured callbacks. A non-empty
         sequence is refused when the runner cannot accept this keyword.
+    overrides : mapping or sequence of str, optional
+        Operational overlays applied by the resolver before configuration
+        readback. ``None`` preserves the default resolved configuration.
 
     Returns
     -------
@@ -457,7 +519,7 @@ def launch_train(
     """
 
     facts = execution_topology_facts(topology) if topology is not None else {}
-    plan = prepare_train_launch(source, facts)
+    plan = prepare_train_launch(source, facts, overrides=overrides)
     if topology is not None:
         # Topology is caller-open, so config-only runners retain extra facts.
         # Strict key rejection remains below when the mapping crosses into TPEN.

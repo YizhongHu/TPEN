@@ -10,7 +10,7 @@ import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from hydra.utils import instantiate
 from hydra.errors import InstantiationException
@@ -238,6 +238,7 @@ def run_from_config(
     raise_exceptions: bool = False,
     topology: ExecutionTopology | Mapping[str, object] | None = None,
     runtime_callbacks: Sequence[object] = (),
+    restore_request: Any = None,
 ) -> int:
     """Instantiate and execute the configured runner.
 
@@ -262,6 +263,17 @@ def run_from_config(
         supplied by the launcher, outside the immutable science configuration;
         for example, a bounded prefix can stop after a published checkpoint
         without changing the trainer configuration that restore validates.
+    restore_request : tpen.execution.recovery.OperationalRestoreRequest or None, optional
+        Closed, versioned operational-start request carrying an E1-validated
+        full-state restore decision, supplied by the launcher outside ``cfg``.
+        When present, it is injected at the already-existing ``Train`` restore
+        boundary (the runner's ``load`` argument) after construction and
+        before ``fit``; ``cfg`` and its resolved ``run.dir``/``trainer.max_steps``
+        are unchanged. A concrete configured ``runner.load`` that disagrees
+        with the request's decision is refused rather than silently shadowed
+        or silently preferred. Typed only as ``Any`` here so that importing
+        ``tpen.run`` never pulls in ``tpen.execution`` (and its backend
+        adapters) for callers that never pass this argument.
 
     Returns
     -------
@@ -318,6 +330,8 @@ def run_from_config(
         _seed_runtime_rngs(context.cfg)
         context.emit(RunStarted())
         runner = _instantiate_runner(context)
+        if restore_request is not None:
+            runner = _apply_operational_restore(context.cfg, runner, restore_request)
         result = runner.run(context)
         # The harness owns the whole run lifecycle, including this boundary,
         # which the runners emitted the ``run_end`` string for. See
@@ -472,6 +486,74 @@ def _instantiate_runner(context: RunContext) -> Runner:
     if not isinstance(runner, Runner):
         raise TypeError(f"runner must instantiate to tpen.runner.Runner, got {type(runner)!r}")
     return runner
+
+
+def _apply_operational_restore(cfg: DictConfig, runner: Runner, restore_request: Any) -> Runner:
+    """Inject an E1-validated restore decision at the runner's existing load boundary.
+
+    This does not construct, resolve, or mutate ``cfg``: it only checks the
+    already-resolved ``runner.load`` leaf for a concrete conflict and then
+    sets the live runner's ``load`` attribute, the same boundary a configured
+    ``runner.load`` already reaches (``tpen.runner.train.Train.__init__``).
+    Also refuses, before any restore or ``fit``, a live constructed
+    ``runner.trainer.max_steps`` that disagrees with the request's fixed
+    target horizon -- the constructed trainer object, not a hashed config
+    section, is what ``VMCTrainer.fit`` actually steps against.
+    """
+
+    # Lazy import: ``tpen.execution`` pulls in backend adapters (for example
+    # Balsam) that ordinary configured runs -- the overwhelming majority of
+    # callers, which never pass ``restore_request`` -- must not be made to
+    # import.
+    from tpen.execution.recovery import OperationalRestoreRequest
+
+    if not isinstance(restore_request, OperationalRestoreRequest):
+        raise TypeError("restore_request must be an OperationalRestoreRequest")
+    if not hasattr(runner, "load"):
+        raise TypeError(
+            f"runner {type(runner).__name__} does not support operational restore injection"
+        )
+    live_max_steps = getattr(getattr(runner, "trainer", None), "max_steps", None)
+    if live_max_steps != restore_request.target_iterations:
+        raise ValueError(
+            "operational restore request's fixed target horizon "
+            f"(target_iterations={restore_request.target_iterations}) does not match "
+            f"the live runner's trainer.max_steps={live_max_steps!r}"
+        )
+    configured_load = OmegaConf.select(cfg, "runner.load", default=None)
+    if OmegaConf.is_config(configured_load):
+        configured_load = OmegaConf.to_container(configured_load, resolve=True)
+    if _is_unconfigured_load(configured_load):
+        configured_load = None
+    decision_load = restore_request.load
+    if configured_load is not None and dict(configured_load) != decision_load:
+        raise ValueError(
+            "operational restore request conflicts with a concrete configured runner.load"
+        )
+    runner.load = decision_load
+    # Carry the full validated request to the live restore boundary, not just
+    # its closed load shape (R2.3): ``Train.run`` uses this to revalidate the
+    # selected ref immediately before restore and to bind restored progress
+    # to the request's counters before `fit`, so a checkpoint replaced after
+    # request construction -- or one whose restored counters merely disagree
+    # -- cannot reach training. Additive: a runner that never reads
+    # ``restore_binding`` behaves exactly as before.
+    runner.restore_binding = restore_request
+    return runner
+
+
+def _is_unconfigured_load(configured_load: Any) -> bool:
+    """Treat the supported no-load form ``{mode: none, path: None}`` as unset.
+
+    ``${load}`` resolving to this shape (``tpen/execution/invocation.py``'s
+    ``_has_concrete_config_path``) is an existing supported representation of
+    "no configured load", not a concrete competing load, so it must not
+    refuse an otherwise admissible operational restore request.
+    """
+
+    if not isinstance(configured_load, Mapping):
+        return False
+    return configured_load.get("path") is None and configured_load.get("mode") in (None, "none")
 
 
 def _configure_terminal_logging(cfg: DictConfig) -> None:

@@ -210,8 +210,8 @@ def test_sel_binds_the_receipt_bytes_it_parsed(tmp_path, monkeypatch):
     old_sha = helpers._sha(path)
     original = ev.compute_pilot_selection
 
-    def replace_after_read(parsed):
-        result = original(parsed)
+    def replace_after_read(parsed, *, payload="capacity-pilot"):
+        result = original(parsed, payload=payload)
         replacement = copy.deepcopy(receipt)
         replacement["eval_commit"] = "d" * 40
         helpers._json(path, replacement)

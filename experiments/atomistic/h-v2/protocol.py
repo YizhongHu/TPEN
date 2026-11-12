@@ -55,6 +55,23 @@ PILOT_PAYLOADS: dict[str, dict[str, Any]] = {
         "overlay_path": ROOT / "configs" / "capacity_pilot_overlay.yaml",
         "seed_namespace": "capacity_pilot",
     },
+    #: Acceptance-contract amendment 20261112-r1: a fresh 0->100,000-update
+    #: lineage P, same config/seeds/module set as ``capacity-pilot`` (same
+    #: ``seed_namespace``, deliberately reused rather than a new one), its own
+    #: overlay (only ``trainer.max_steps`` differs), a fresh run root, and a
+    #: generalized stage-1/SEL ordinal window (see
+    #: :data:`PILOT_PAYLOAD_STAGE1_ORDINAL_COUNT`). Chain-resume from the
+    #: existing ``capacity-pilot`` checkpoint was dropped: core's
+    #: ``train_resume`` restore refuses an extended ``trainer.max_steps``
+    #: (the whole ``trainer`` config section is hashed verbatim for identity,
+    #: with no exclusion for ``max_steps`` -- TO note
+    #: ``blocker-core-resume-horizon-20261112``), so this is an independent
+    #: fresh lineage instead.
+    "capacity-pilot-100k": {
+        "lineage": "P",
+        "overlay_path": ROOT / "configs" / "capacity_pilot_100k_overlay.yaml",
+        "seed_namespace": "capacity_pilot",
+    },
 }
 
 #: Allowlist for both pilot payload overlays (A1/TO 63690220):
@@ -749,11 +766,46 @@ def gpu_route_g_eval_seed() -> int:
 PILOT_STAGE1_ORDINALS: tuple[int, ...] = tuple(range(0, 21))
 PILOT_STAGE1_STREAM = 0
 
+#: Acceptance-contract amendment 20261112-r1: each stage-1-capable payload's
+#: own ordinal sweep length (ordinals ``0..count-1``, one checkpoint per
+#: 1,000 updates). ``capacity-pilot``'s entry reproduces
+#: :data:`PILOT_STAGE1_ORDINALS` exactly (21 ordinals, 0..20); ``gpu-route-g``
+#: has no stage-1 sweep (it is TRAIN-only, one fixed fresh evaluation) and is
+#: deliberately absent here.
+PILOT_PAYLOAD_STAGE1_ORDINAL_COUNT: dict[str, int] = {
+    "capacity-pilot": len(PILOT_STAGE1_ORDINALS),
+    "capacity-pilot-100k": 101,
+}
 
-def pilot_stage1_grid() -> tuple[tuple[int, int], ...]:
-    """Return stage 1's ``(ordinal, stream)`` pairs: stream 0 at ordinals 0..20."""
 
-    return tuple((ordinal, PILOT_STAGE1_STREAM) for ordinal in PILOT_STAGE1_ORDINALS)
+def pilot_stage1_ordinals(payload: str = "capacity-pilot") -> tuple[int, ...]:
+    """Return *payload*'s stage-1 ordinal sweep: ``0..count-1`` inclusive.
+
+    Raises
+    ------
+    KeyError
+        If *payload* has no entry in :data:`PILOT_PAYLOAD_STAGE1_ORDINAL_COUNT`.
+    """
+
+    return tuple(range(PILOT_PAYLOAD_STAGE1_ORDINAL_COUNT[payload]))
+
+
+def pilot_sel_window_hi(payload: str = "capacity-pilot") -> int:
+    """Return *payload*'s SEL window inclusive upper bound (the window is ``3..hi``).
+
+    The window excludes the last two ordinals of the stage-1 sweep (a basin
+    candidate triple needs both neighbors present), matching
+    ``capacity-pilot``'s historical ``3..19`` window for its 21-ordinal sweep
+    (``hi = 21 - 2 = 19``).
+    """
+
+    return PILOT_PAYLOAD_STAGE1_ORDINAL_COUNT[payload] - 2
+
+
+def pilot_stage1_grid(payload: str = "capacity-pilot") -> tuple[tuple[int, int], ...]:
+    """Return *payload*'s stage-1 ``(ordinal, stream)`` pairs: stream 0 at every ordinal."""
+
+    return tuple((ordinal, PILOT_STAGE1_STREAM) for ordinal in pilot_stage1_ordinals(payload))
 
 
 def pilot_stage2_window(c1: int) -> tuple[int, ...]:
@@ -871,31 +923,38 @@ def pooled_w_statistic(streams: Sequence[Sequence[float]]) -> float:
     return _nearest_rank_p999(pooled)
 
 
-def is_interior_minimum(c1: int) -> bool:
+def is_interior_minimum(c1: int, *, hi: int = 19) -> bool:
     """Return whether *c1* sits strictly inside the pilot window, not at its edge.
 
     Operator ruling (operator-rulings-pilot-20261110-1900, item 3): a basin
-    center at the window edge (``c1`` of 3 or 19) never had a full
+    center at the window edge (``c1`` of 3 or *hi*) never had a full
     neighboring triple on both sides, so it must never be reported as an
-    interior minimum.
+    interior minimum. *hi* defaults to 19 (``capacity-pilot``'s historical
+    window); amendment 20261112-r1 generalizes it via
+    :func:`pilot_sel_window_hi` for a payload with a different stage-1 sweep
+    length (``capacity-pilot-100k``'s window is ``3..99``, ``hi=99``).
 
     Raises
     ------
     ValueError
-        If *c1* is outside ``3..19``.
+        If *c1* is outside ``3..hi``.
     """
 
-    if not 3 <= c1 <= 19:
-        raise ValueError(f"c1 must be in 3..19, got {c1}")
-    return c1 not in (3, 19)
+    if not 3 <= c1 <= hi:
+        raise ValueError(f"c1 must be in 3..{hi}, got {c1}")
+    return c1 not in (3, hi)
 
 
-def select_pilot_basin_ordinal(stream0_w_by_ordinal: Mapping[int, float]) -> tuple[int, dict[int, float]]:
+def select_pilot_basin_ordinal(
+    stream0_w_by_ordinal: Mapping[int, float], *, hi: int = 19
+) -> tuple[int, dict[int, float]]:
     """Return ``(c1, triple_means)`` -- the SEL step (pilot-plan-r3-20261110 (a)).
 
-    *c1* is the center (ordinal 3..19) of the stream-0 triple with the
+    *c1* is the center (ordinal ``3..hi``) of the stream-0 triple with the
     smallest mean W; the EARLIEST (lowest-ordinal) tie wins, never the
-    latest.
+    latest. *hi* defaults to 19 (``capacity-pilot``'s historical window);
+    amendment 20261112-r1 generalizes it via :func:`pilot_sel_window_hi` for
+    a payload with a different stage-1 sweep length.
 
     Raises
     ------
@@ -903,7 +962,7 @@ def select_pilot_basin_ordinal(stream0_w_by_ordinal: Mapping[int, float]) -> tup
         If *stream0_w_by_ordinal* is missing any ordinal a candidate triple needs.
     """
 
-    centers = range(3, 20)
+    centers = range(3, hi + 1)
     missing = sorted({o for c in centers for o in (c - 1, c, c + 1) if o not in stream0_w_by_ordinal})
     if missing:
         raise ValueError(f"stream-0 W is missing for ordinals {missing!r}")
@@ -1090,6 +1149,7 @@ __all__ = [
     "MODULE_NORM_GROUPS",
     "PILOT_A1_CADENCE",
     "PILOT_PAYLOAD_OVERLAY_KEYS",
+    "PILOT_PAYLOAD_STAGE1_ORDINAL_COUNT",
     "PILOT_PAYLOADS",
     "PILOT_STAGE1_ORDINALS",
     "PILOT_STAGE1_STREAM",
@@ -1114,7 +1174,9 @@ __all__ = [
     "is_interior_minimum",
     "load_yaml",
     "pilot_eval_seed",
+    "pilot_sel_window_hi",
     "pilot_stage1_grid",
+    "pilot_stage1_ordinals",
     "pilot_stage2_grid",
     "pilot_stage2_window",
     "module_norm_groups",

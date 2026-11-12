@@ -15,7 +15,7 @@ from enum import Enum
 from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, ClassVar
 
 from ._codec import decode_fields
 
@@ -556,6 +556,120 @@ def _raw_manifest_refusal(raw_manifest: Any) -> RecoveryRefusal | None:
     return None
 
 
+@dataclass(frozen=True, slots=True)
+class OperationalRestoreRequest:
+    """Closed, versioned, immutable snapshot binding an E1 decision.
+
+    Carries an already-selected full-state ``train_resume``
+    :class:`RecoveryDecision`.  Construction freezes a validated snapshot of
+    the decision's checkpoint reference and counters, derives the closed
+    ``train_resume`` load shape directly from that reference (never trusting
+    ``decision.load`` as a mutable dictionary), and revalidates the exact
+    reference. Later mutation of the originating ``decision`` (for example
+    ``decision.load["mode"] = "none"``) cannot change what this request
+    carries, since every field consumed by :attr:`load` and :attr:`ref` is
+    copied at construction time, not re-read from ``decision``.
+
+    ``tpen.run.run_from_config`` consumes this at the existing ``Train``
+    restore boundary (the constructor's ``load`` argument) and refuses a
+    concrete configured ``runner.load`` that conflicts with it, rather than
+    guessing precedence between the two.
+    """
+
+    SCHEMA: ClassVar[str] = "tpen.execution/operational-restore-request-v1"
+
+    decision: RecoveryDecision
+    ref: CheckpointRef = field(init=False)
+    target_iterations: int = field(init=False)
+    next_iteration: int = field(init=False)
+    completed_updates: int = field(init=False)
+    _load: Mapping[str, str] = field(init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.decision, RecoveryDecision):
+            raise TypeError("decision must be a RecoveryDecision")
+        if self.decision.refusal is not None:
+            raise ValueError("OperationalRestoreRequest requires a non-refused recovery decision")
+        configured_load = self.decision.load
+        if configured_load is None or dict(configured_load).get("mode") != "train_resume":
+            raise ValueError("OperationalRestoreRequest requires a train_resume load decision")
+        configured_load = dict(configured_load)
+        if set(configured_load) != {"mode", "path"}:
+            raise ValueError(
+                "OperationalRestoreRequest rejects restore options beyond the "
+                f"closed train_resume load shape: {sorted(configured_load)!r}"
+            )
+        ref = self.decision.checkpoint
+        if not isinstance(ref, CheckpointRef):
+            raise TypeError("decision must carry a validated CheckpointRef")
+        valid_phase_outcome = (
+            (self.decision.phase is RecoveryPhase.INITIAL and self.decision.outcome is RecoveryOutcome.INITIAL_CHECKPOINT)
+            or (self.decision.phase is RecoveryPhase.RECOVERY and self.decision.outcome is RecoveryOutcome.RECOVERY)
+        )
+        if not valid_phase_outcome:
+            raise ValueError(
+                "OperationalRestoreRequest requires phase/outcome "
+                f"{(RecoveryPhase.INITIAL, RecoveryOutcome.INITIAL_CHECKPOINT)!r} or "
+                f"{(RecoveryPhase.RECOVERY, RecoveryOutcome.RECOVERY)!r}; got "
+                f"({self.decision.phase!r}, {self.decision.outcome!r})"
+            )
+        # Revalidate the exact reference (not whatever ``decision.load`` claims)
+        # before binding, so a request can never be built from a path the
+        # decision's own checkpoint reference does not identify.
+        ref.validate()
+        read_manifest(ref.checkpoint_dir / "manifest.json", mode="train_resume")
+        closed_load = train_resume_load_overlay(ref)
+        if closed_load["path"] != configured_load["path"]:
+            raise ValueError(
+                "decision load path does not match decision.checkpoint's reference"
+            )
+        # The decision's counters are a copy made at selection time; require
+        # them to still agree with the ref's own counters, and the ref to
+        # remain within the fixed horizon (mirrors E1's gate at
+        # ``_checkpoint_refusal``, recovery.py:517-521) rather than trusting
+        # a decision whose counters could have been altered after selection.
+        if self.decision.next_iteration != ref.next_iteration:
+            raise ValueError(
+                "decision.next_iteration does not match its checkpoint reference "
+                f"({self.decision.next_iteration!r} != {ref.next_iteration!r})"
+            )
+        if self.decision.completed_updates != ref.completed_updates:
+            raise ValueError(
+                "decision.completed_updates does not match its checkpoint reference "
+                f"({self.decision.completed_updates!r} != {ref.completed_updates!r})"
+            )
+        if ref.next_iteration > self.decision.target_iterations:
+            raise ValueError(
+                "checkpoint reference exceeds the fixed total target horizon "
+                f"({ref.next_iteration!r} > {self.decision.target_iterations!r})"
+            )
+        if ref.completed_updates > self.decision.target_iterations:
+            raise ValueError(
+                "checkpoint reference exceeds the fixed total target horizon "
+                f"({ref.completed_updates!r} > {self.decision.target_iterations!r})"
+            )
+        object.__setattr__(self, "ref", ref)
+        object.__setattr__(
+            self, "target_iterations",
+            _require_nonnegative_int(self.decision.target_iterations, "target_iterations"),
+        )
+        object.__setattr__(
+            self, "next_iteration",
+            _require_nonnegative_int(self.decision.next_iteration, "next_iteration"),
+        )
+        object.__setattr__(
+            self, "completed_updates",
+            _require_nonnegative_int(self.decision.completed_updates, "completed_updates"),
+        )
+        object.__setattr__(self, "_load", MappingProxyType(dict(closed_load)))
+
+    @property
+    def load(self) -> dict[str, str]:
+        """Return the closed ``train_resume`` load shape bound at construction."""
+
+        return dict(self._load)
+
+
 def _refused(
     intent: ScienceIntent,
     phase: RecoveryPhase,
@@ -576,6 +690,7 @@ def _refused(
 
 __all__ = [
     "CheckpointEvidence",
+    "OperationalRestoreRequest",
     "RecoveryDecision",
     "RecoveryOutcome",
     "RecoveryPhase",

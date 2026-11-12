@@ -130,7 +130,14 @@ def _default_runner(command: Sequence[str]) -> subprocess.CompletedProcess:
 #: TO 63690220: the two non-science, TRAIN-only pilot/part-(g) payloads
 #: (acceptance-contract). Each dispatches exactly one lineage, refuses any
 #: other lineage or stage, and never chains an EVAL job (item E's scope).
-PILOT_PAYLOADS = ("gpu-route-g", "capacity-pilot")
+#: ``capacity-pilot-100k`` (acceptance-contract amendment 20261112-r1): a
+#: fresh 0->100,000-update lineage, TRAIN-only like its siblings; its
+#: ``--stage eval`` only ever uses ``--pilot-stage 1`` (no stage 2).
+PILOT_PAYLOADS = ("gpu-route-g", "capacity-pilot", "capacity-pilot-100k")
+
+#: Pilot payloads whose ``--stage eval`` requires ``--pilot-stage``
+#: (amendment 20261112-r1). ``capacity-pilot-100k`` only ever uses stage 1.
+_PILOT_STAGE_PAYLOADS = ("capacity-pilot", "capacity-pilot-100k")
 
 
 def _validate_payload(payload: str) -> None:
@@ -1300,10 +1307,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_root, pilot_run_root_prefix, payload=args.payload,
             lineage=launch_config.PILOT_PAYLOAD_LINEAGES[args.payload],
         )
-        if args.payload == "capacity-pilot":
+        if args.payload in _PILOT_STAGE_PAYLOADS:
             if args.pilot_stage is None:
-                raise LaunchError("--pilot-stage {1,2,2-core} is required for capacity-pilot --stage eval")
-            if args.pilot_stage in ("2", "2-core"):
+                raise LaunchError(f"--pilot-stage {{1,2,2-core}} is required for {args.payload} --stage eval")
+            if args.payload != "capacity-pilot" and args.pilot_stage != "1":
+                raise LaunchError(f"--pilot-stage must be '1' for payload {args.payload!r}")
+            if args.payload == "capacity-pilot" and args.pilot_stage in ("2", "2-core"):
                 _validate_pilot_stage2_ready(run_root, pilot_stage=args.pilot_stage)
         elif args.pilot_stage is not None:
             raise LaunchError(f"--pilot-stage is not supported for payload {args.payload!r}")

@@ -64,7 +64,9 @@ class StopAfterCheckpoint:
         if isinstance(occurrence.event, TrainingIterationCompleted):
             # Runtime observers run after the configured checkpoint callback,
             # so admission waits for the same published ref E3 resolves.
-            checkpoint = _committed_checkpoint(context.artifact_manager.run_dir)
+            # This worker still owns its own run directory, so backfilling a
+            # missing publication index here is authorized (H1).
+            checkpoint = _committed_checkpoint(context.artifact_manager.run_dir, allow_reconcile=True)
             if checkpoint is not None and checkpoint.next_iteration >= self.next_iteration:
                 raise PrefixCheckpointReached("bounded prefix checkpoint is published")
 
@@ -182,7 +184,12 @@ def run_attempt(*, job_id: int | str, job_data: Mapping[str, Any]) -> int:
             return 2
         run_dir = Path(result.invocation.start.output_path)
         status_result = _run_status_artifact(run_dir)
-        checkpoint = None if status_result is None else _committed_checkpoint(status_result[0])
+        # The prefix worker still owns its own just-finished output here.
+        checkpoint = (
+            None
+            if status_result is None
+            else _committed_checkpoint(status_result[0], allow_reconcile=True)
+        )
         if checkpoint is None or checkpoint.next_iteration >= batch.target_iterations:
             _record_application(root, "prefix-application.json", {"status": "no-prefix-checkpoint", "job_id": str(job_id)})
             return 3
