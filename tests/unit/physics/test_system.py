@@ -6,6 +6,7 @@ import dataclasses
 
 import pytest
 import torch
+from typeguard import TypeCheckError
 
 from tpen.data.atomic_configuration import AtomicConfiguration
 from tpen.physics.context import ReadOnlyContext
@@ -665,7 +666,7 @@ def test_particle_spec_rejects_invalid_values(bad_particle_kwargs: dict) -> None
 
 
 def test_term_parameters_reject_non_scalar_values() -> None:
-    with pytest.raises(TypeError):
+    with pytest.raises((TypeError, TypeCheckError)):
         HamiltonianTermDescriptor(
             operator_id=OperatorId("test.system", "bad_params"),
             slot="bad",
