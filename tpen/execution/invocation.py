@@ -1063,6 +1063,7 @@ def _materialize_configured_worker_config(
     decision: RecoveryDecision,
     output_path: Path,
     declared_overlays: Mapping[str, Any] | None,
+    artifact_destination: Any | None = None,
 ) -> Any:
     """Build a runner config from captured intent plus explicit worker overlays.
 
@@ -1144,7 +1145,8 @@ def _materialize_configured_worker_config(
             OmegaConf.update(worker_cfg, path, value, merge=False, force_add=True)
     for path, value in overlays.items():
         OmegaConf.update(worker_cfg, path, value, merge=False, force_add=True)
-    OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
+    if artifact_destination is None:
+        OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
     return worker_cfg
 
 
@@ -1155,6 +1157,7 @@ def run_bound_configured_once(
     decision: RecoveryDecision,
     output_path: Path,
     declared_overlays: Mapping[str, Any] | None = None,
+    artifact_destination: Any | None = None,
     **kwargs: Any,
 ) -> CoreOutcomeFacts:
     """Run a configured adapter callback through the gateway's intent binding.
@@ -1162,16 +1165,31 @@ def run_bound_configured_once(
     Call this from the ``run_once`` seam of a worker-start gateway, after its
     durable start receipt. Backend adapters share this materialization with
     ``start_configured`` without importing or constructing a science object.
+
+    Parameters
+    ----------
+    artifact_destination : tpen.artifacts.ArtifactDestination or None, optional
+        When supplied (F5), neither this materialization nor
+        `run_configured_once` overlays ``run.root`` with ``output_path``:
+        constant C is preserved and `tpen.run.run_from_config`'s own closed
+        artifact-routing binds the physical leaf instead. ``None`` (the
+        default) preserves the legacy ``run.root`` overlay unchanged.
     """
 
     worker_cfg = _materialize_configured_worker_config(
         cfg, intent=intent, decision=decision, output_path=output_path,
-        declared_overlays=declared_overlays,
+        declared_overlays=declared_overlays, artifact_destination=artifact_destination,
     )
     # The legacy direct entry retains its default; adapter calls must retain
     # the actual core exception for deterministic refusal classification.
     kwargs["raise_exceptions"] = True
-    run_configured_once(worker_cfg, decision=decision, output_path=output_path, **kwargs)
+    run_configured_once(
+        worker_cfg,
+        decision=decision,
+        output_path=output_path,
+        artifact_destination=artifact_destination,
+        **kwargs,
+    )
     return _core_outcome_from_artifacts(output_path, decision=decision)
 
 
@@ -1195,12 +1213,22 @@ def run_configured_once(cfg: Any, *, decision: RecoveryDecision, output_path: Pa
 
     from .recovery import OperationalRestoreRequest
 
+    # F5: in routed mode (an `artifact_destination` kwarg forwarded to
+    # `run_from_config` below), skip the `run.root` overlay entirely -- it
+    # would otherwise change C on every allocation. `run_from_config`'s own
+    # closed artifact-routing binds the physical write location instead, from
+    # the unchanged, constant `run.root`/`run.dir`. Legacy callers (no
+    # destination) are unaffected: they keep overlaying `run.root` exactly as
+    # before.
+    routed = kwargs.get("artifact_destination") is not None
     worker_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
     if decision.load is None:
-        OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
+        if not routed:
+            OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
         return run_from_config(worker_cfg, restore_request=None, **kwargs)
     if dict(decision.load).get("mode") == "train_resume":
-        OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
+        if not routed:
+            OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
         return run_from_config(worker_cfg, restore_request=OperationalRestoreRequest(decision), **kwargs)
 
     # Unchanged legacy path (c3815d0e) for any load mode outside S2's scope
@@ -1214,7 +1242,8 @@ def run_configured_once(cfg: Any, *, decision: RecoveryDecision, output_path: Pa
             effective_runner_load = OmegaConf.to_container(effective_runner_load, resolve=True)
         if effective_runner_load != decision.load:
             raise ValueError("worker overlay did not reach the configured runner.load")
-    OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
+    if not routed:
+        OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
     return run_from_config(worker_cfg, **kwargs)
 
 

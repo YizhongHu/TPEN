@@ -335,6 +335,74 @@ def test_run_configured_once_keeps_legacy_return_and_applies_only_worker_overlay
     assert calls[0][1] == {"command": "worker", "restore_request": None}
 
 
+def test_f5_run_configured_once_skips_the_run_root_overlay_when_routed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """F5: an `artifact_destination` kwarg means C stays constant -- the
+    `run.root` overlay that would otherwise change it on every allocation is
+    skipped, and the destination is forwarded to `run_from_config` unchanged."""
+
+    from tpen import run as run_module
+    from tpen.artifacts import ArtifactDestination
+
+    calls = []
+
+    def fake_run(cfg, **kwargs):
+        calls.append((cfg, kwargs))
+        return 0
+
+    monkeypatch.setattr(run_module, "run_from_config", fake_run)
+    cfg = OmegaConf.create({"run": {"root": "original"}, "runner": {"load": None}})
+    decision = RecoveryDecision(
+        phase=RecoveryPhase.INITIAL,
+        outcome="initial",
+        target_iterations=3,
+    )
+    destination = ArtifactDestination(physical_root=tmp_path / "fresh")
+
+    run_configured_once(
+        cfg,
+        decision=decision,
+        output_path=tmp_path / "fresh",
+        artifact_destination=destination,
+    )
+
+    assert len(calls) == 1
+    # run.root is UNCHANGED -- never overlaid with output_path.
+    assert calls[0][0].run.root == "original"
+    assert calls[0][1]["artifact_destination"] is destination
+
+
+def test_f5_materialize_configured_worker_config_skips_the_run_root_overlay_when_routed(
+    tmp_path: Path,
+) -> None:
+    from tpen.artifacts import ArtifactDestination
+    from tpen.execution.invocation import _materialize_configured_worker_config
+
+    intent = capture_science_intent(
+        {"system": "hooke", "electrons": 2},
+        target_iterations=3,
+        source_config={"run": {"root": "original"}, "runner": {}},
+    )
+    decision = RecoveryDecision(
+        phase=RecoveryPhase.INITIAL,
+        outcome="initial",
+        target_iterations=3,
+    )
+    destination = ArtifactDestination(physical_root=tmp_path / "fresh")
+
+    worker_cfg = _materialize_configured_worker_config(
+        {"run": {"root": "original"}, "runner": {}},
+        intent=intent,
+        decision=decision,
+        output_path=tmp_path / "fresh",
+        declared_overlays=None,
+        artifact_destination=destination,
+    )
+
+    assert worker_cfg["run"]["root"] == "original"
+
+
 def _write_core_completion_artifacts(output_path: Path, *, next_iteration: int = 3, completed_updates: int = 3) -> None:
     """Write the core-owned status and checkpoint shape used by gateway tests."""
 

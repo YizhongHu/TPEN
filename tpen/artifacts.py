@@ -162,6 +162,16 @@ class ArtifactManager:
         ``root/experiment/sector/run_id`` tree, while :attr:`logical_run_dir`
         still reports the untouched logical path for science-identity
         purposes. ``None`` (the default) preserves the plain logical layout.
+    logical_run_dir : pathlib.Path or None, optional
+        Override for :attr:`logical_run_dir`, used only in routed mode. HI
+        eagerly resolves ``${run.dir}`` into every sink before this manager
+        is ever constructed; recomputing ``root/experiment/sector/run_id``
+        from scratch can disagree with that already-admitted value (for
+        example a ``flat`` layout with an intermediate path segment). When
+        supplied, this exact path is used as the logical directory instead
+        of the computed one, so the destination binds against the value
+        every eagerly-resolved sink already carries. ``None`` (the default)
+        preserves the computed logical path.
     """
 
     def __init__(
@@ -173,6 +183,7 @@ class ArtifactManager:
         *,
         layout: str = "nested",
         destination: ArtifactDestination | None = None,
+        logical_run_dir: Path | None = None,
     ) -> None:
         root_path = Path(root)
         self.root = root_path if root_path.is_absolute() else ROOT / root_path
@@ -183,6 +194,9 @@ class ArtifactManager:
         if self.layout not in {"nested", "flat"}:
             raise ValueError(f"unsupported artifact layout {self.layout!r}; expected 'nested' or 'flat'")
         self.destination = destination
+        self._logical_run_dir_override = (
+            None if logical_run_dir is None else Path(logical_run_dir)
+        )
 
     @property
     def logical_run_dir(self) -> Path:
@@ -192,9 +206,13 @@ class ArtifactManager:
         identically from ``root``/``experiment``/``sector``/``run_id`` -- the
         value recorded in the resolved science config and the one every
         ``${run.dir}``-derived sink was already baked against before
-        ``run_from_config`` runs.
+        ``run_from_config`` runs. When this manager was constructed with an
+        explicit ``logical_run_dir`` override, that admitted value is
+        returned unchanged instead of being recomputed.
         """
 
+        if self._logical_run_dir_override is not None:
+            return self._logical_run_dir_override
         if self.layout == "flat":
             return self.root / self.run_id
         return self.root / self.experiment / self.sector / self.run_id
@@ -220,9 +238,30 @@ class ArtifactManager:
             self.path(name).mkdir(parents=True, exist_ok=True)
 
     def path(self, *parts: str) -> Path:
-        """Return a path under this run directory."""
+        """Return a path under this run directory.
 
-        return self.run_dir.joinpath(*parts)
+        When a destination is bound, the full joined path -- not only the
+        run-directory root -- is checked to resolve beneath the claimed
+        physical root, including through a symlink planted inside the
+        destination. Every manager-owned write (run-start, snapshot,
+        occurrence/event, failure, and profile artifacts) goes through this
+        method or :attr:`run_dir`, so this is the one choke point that keeps
+        all of them from escaping through a child path the root-only bind
+        in :attr:`run_dir` does not see.
+        """
+
+        candidate = self.run_dir.joinpath(*parts)
+        if self.destination is not None:
+            resolved = candidate.resolve()
+            physical_root = self.destination.physical_root.resolve()
+            try:
+                resolved.relative_to(physical_root)
+            except ValueError as exc:
+                raise ArtifactRoutingError(
+                    f"artifact path {candidate!s} would resolve to {resolved!s}, "
+                    f"outside the claimed physical destination {physical_root!s}"
+                ) from exc
+        return candidate
 
 
 @dataclass
@@ -948,11 +987,16 @@ def write_error_artifact(
         run_id = target.metadata.run_id
         command = target.metadata.command if command is None else command
         config_path = target.metadata.config_path if config_path is None else config_path
+        # Route through the manager, not a bare join: a bound destination's
+        # full-path containment check (see `ArtifactManager.path`) must cover
+        # this failure artifact exactly as it covers every other
+        # manager-owned write.
+        path = target.path("error.json")
     else:
         run_dir = Path(target)
         now = datetime.now(UTC).isoformat()
         run_id = None
-    path = run_dir / "error.json"
+        path = run_dir / "error.json"
     write_json(
         path,
         {

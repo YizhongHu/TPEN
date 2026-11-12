@@ -18,6 +18,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from tpen.artifacts import ArtifactDestination, ArtifactRoutingError
+from tpen.logging.csv import CSV
 from tpen.run import prepare_run_context
 
 
@@ -241,3 +242,274 @@ def test_changing_run_root_alone_does_not_route_an_already_baked_sink(tmp_path: 
     # the byte-identity problem this slice avoids by never touching run.root.
     assert context_a.run_dir != context_b.run_dir
     assert context_a.cfg.run.dir != context_b.cfg.run.dir
+
+
+# ---------------------------------------------------------------------------
+# T2 round 1 review fixes (F1-F6)
+# ---------------------------------------------------------------------------
+
+
+def test_f1_admitted_run_dir_with_an_extra_segment_is_preserved_not_recomputed(
+    tmp_path: Path,
+) -> None:
+    """A flat-layout admitted run.dir with an intermediate segment -- the real
+    HI shape, root/stage/hash -- must be the binding base, not a bare
+    root/run_id recompute that drops the segment.
+    """
+
+    root = tmp_path / "root"
+    admitted_run_dir = root / "Q" / "cellhash"
+    cfg = OmegaConf.create(
+        {
+            "experiment": {"name": "routing", "sector": "unit", "run_name": "routing_unit"},
+            "run": {
+                "root": str(root),
+                "run_id": "cellhash",
+                "layout": "flat",
+                "dir": str(admitted_run_dir),
+            },
+            "runtime": {"device": "cpu", "dtype": "float64"},
+            "callbacks": [
+                {
+                    "_target_": "tpen.callback.snapshot.ResolvedConfigSnapshot",
+                    "output_path": str(admitted_run_dir / "resolved_config.yaml"),
+                },
+            ],
+            "loggers": [],
+        }
+    )
+    physical_root = tmp_path / "allocation-1"
+    physical_root.mkdir()
+    destination = ArtifactDestination(physical_root=physical_root)
+
+    context = prepare_run_context(
+        cfg, config_path="test.yaml", command="pytest", artifact_destination=destination
+    )
+
+    # The bare recompute (flat layout -> root/run_id) would have been
+    # root/"cellhash", losing the "Q" segment -- and every eagerly-baked sink
+    # path would then fail containment against it instead of routing.
+    assert context.cfg.run.dir == str(admitted_run_dir)
+    (snapshot_cb,) = context.callbacks
+    assert snapshot_cb.output_path == physical_root / "resolved_config.yaml"
+
+
+def test_f1_legacy_mode_still_recomputes_the_logical_dir_unchanged(tmp_path: Path) -> None:
+    """Without a destination, an admitted run.dir in cfg is still OVERWRITTEN
+    by the recomputed value -- unaffected legacy behavior (non-goal)."""
+
+    root = tmp_path / "root"
+    admitted_run_dir = root / "Q" / "cellhash"
+    cfg = OmegaConf.create(
+        {
+            "experiment": {"name": "routing", "sector": "unit", "run_name": "routing_unit"},
+            "run": {
+                "root": str(root),
+                "run_id": "cellhash",
+                "layout": "flat",
+                "dir": str(admitted_run_dir),
+            },
+            "runtime": {"device": "cpu", "dtype": "float64"},
+        }
+    )
+
+    context = prepare_run_context(cfg, config_path="test.yaml", command="pytest")
+
+    assert context.cfg.run.dir == str(root / "cellhash")
+    assert context.cfg.run.dir != str(admitted_run_dir)
+
+
+def test_f2_a_destination_side_symlink_escape_on_run_start_is_refused(tmp_path: Path) -> None:
+    """A symlink planted inside the DESTINATION (not the logical tree) must be
+    caught for every manager-owned write, not only the root-level bind."""
+
+    logical_root = tmp_path / "logical"
+    physical_root = tmp_path / "allocation-1"
+    physical_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "run_start.json").write_text("predecessor evidence\n")
+    (physical_root / "run_start.json").symlink_to(outside / "run_start.json")
+    destination = ArtifactDestination(physical_root=physical_root)
+
+    cfg = _routed_cfg(logical_root)
+    with pytest.raises(ArtifactRoutingError):
+        prepare_run_context(
+            cfg, config_path="test.yaml", command="pytest", artifact_destination=destination
+        )
+
+    assert (outside / "run_start.json").read_text() == "predecessor evidence\n"
+
+
+def test_f2_a_required_subdirectory_symlink_escape_is_refused(tmp_path: Path) -> None:
+    """A symlinked ``checkpoints``/``checks``/``diagnostics`` child must be
+    refused during ``make_dirs``, before any write beneath it."""
+
+    logical_root = tmp_path / "logical"
+    physical_root = tmp_path / "allocation-1"
+    physical_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (physical_root / "checkpoints").symlink_to(outside)
+    destination = ArtifactDestination(physical_root=physical_root)
+
+    cfg = _routed_cfg(logical_root)
+    with pytest.raises(ArtifactRoutingError):
+        prepare_run_context(
+            cfg, config_path="test.yaml", command="pytest", artifact_destination=destination
+        )
+
+
+def test_f3_an_unregistered_sink_bearing_object_is_refused(tmp_path: Path) -> None:
+    """A core `WandB`-shaped logger (a ``dir`` attribute, unregistered type)
+    must be refused rather than silently passed through."""
+
+    from tpen.run import _route_artifact_sinks
+
+    class _UnregisteredDirLogger:
+        def __init__(self, directory: Path) -> None:
+            self.dir = directory
+
+        def log(self, record: object) -> None:  # pragma: no cover - not reached
+            raise AssertionError("must be refused before any write")
+
+        def finish(self) -> None:  # pragma: no cover - not reached
+            raise AssertionError("must be refused before any write")
+
+    logical_run_dir = tmp_path / "logical" / "fixed-run-id"
+    physical_root = tmp_path / "allocation-1"
+    destination = ArtifactDestination(physical_root=physical_root)
+    sink = _UnregisteredDirLogger(directory=logical_run_dir / "wandb")
+
+    with pytest.raises(ArtifactRoutingError):
+        _route_artifact_sinks([sink], logical_run_dir=logical_run_dir, destination=destination)
+
+
+def test_f3_a_sink_free_object_with_no_output_attribute_passes_through(tmp_path: Path) -> None:
+    """A callback that owns no output path at all stays unaffected."""
+
+    from tpen.run import _route_artifact_sinks
+
+    class _SinkFreeCallback:
+        def handle_occurrence(self, occurrence: object, context: object) -> None:
+            pass
+
+    logical_run_dir = tmp_path / "logical" / "fixed-run-id"
+    physical_root = tmp_path / "allocation-1"
+    destination = ArtifactDestination(physical_root=physical_root)
+    sink = _SinkFreeCallback()
+
+    routed = _route_artifact_sinks([sink], logical_run_dir=logical_run_dir, destination=destination)
+
+    assert routed == {}
+
+
+def test_f3_a_subclass_of_a_registered_writer_is_routed_through_its_ancestor(
+    tmp_path: Path,
+) -> None:
+    """A subclass of a registered writer is matched and routed, not skipped
+    by an exact-name lookup."""
+
+    from tpen.run import _route_artifact_sinks
+
+    class _SubclassOfCSV(CSV):
+        pass
+
+    logical_run_dir = tmp_path / "logical" / "fixed-run-id"
+    physical_root = tmp_path / "allocation-1"
+    destination = ArtifactDestination(physical_root=physical_root)
+    sink = _SubclassOfCSV(path=logical_run_dir / "metrics.csv")
+
+    routed = _route_artifact_sinks([sink], logical_run_dir=logical_run_dir, destination=destination)
+
+    assert sink.path == physical_root / "metrics.csv"
+    assert routed
+
+
+def test_f4_runtime_callbacks_are_routed_and_present_before_the_context_returns(
+    tmp_path: Path,
+) -> None:
+    """Runtime callbacks are routed/refused inside `prepare_run_context`,
+    strictly before `run_from_config` could ever emit `RunStarted`."""
+
+    from tpen.callback.snapshot import ResolvedConfigSnapshot
+
+    logical_root = tmp_path / "logical"
+    physical_root = tmp_path / "allocation-1"
+    physical_root.mkdir()
+    destination = ArtifactDestination(physical_root=physical_root)
+    cfg = _routed_cfg(logical_root)
+
+    probe = prepare_run_context(cfg, config_path="test.yaml", command="pytest")
+    logical_run_dir = probe.artifact_manager.logical_run_dir
+
+    runtime_snapshot = ResolvedConfigSnapshot(
+        output_path=logical_run_dir / "runtime_resolved_config.yaml"
+    )
+    context = prepare_run_context(
+        cfg,
+        config_path="test.yaml",
+        command="pytest",
+        artifact_destination=destination,
+        runtime_callbacks=[runtime_snapshot],
+    )
+
+    assert runtime_snapshot in context.callbacks
+    assert runtime_snapshot.output_path == physical_root / "runtime_resolved_config.yaml"
+
+
+def test_f4_an_unregistered_runtime_callback_is_refused_in_routed_mode(tmp_path: Path) -> None:
+    class _BadRuntimeObserver:
+        def __init__(self, output_dir: Path) -> None:
+            self.output_dir = output_dir
+
+        def handle_occurrence(self, occurrence: object, context: object) -> None:
+            pass
+
+    logical_root = tmp_path / "logical"
+    physical_root = tmp_path / "allocation-1"
+    physical_root.mkdir()
+    destination = ArtifactDestination(physical_root=physical_root)
+    cfg = _routed_cfg(logical_root)
+
+    probe = prepare_run_context(cfg, config_path="test.yaml", command="pytest")
+    logical_run_dir = probe.artifact_manager.logical_run_dir
+    bad = _BadRuntimeObserver(output_dir=logical_run_dir / "custom")
+
+    with pytest.raises(ArtifactRoutingError):
+        prepare_run_context(
+            cfg,
+            config_path="test.yaml",
+            command="pytest",
+            artifact_destination=destination,
+            runtime_callbacks=[bad],
+        )
+
+
+def test_f6_rebinding_a_populated_csv_logger_does_not_omit_the_new_files_header(
+    tmp_path: Path,
+) -> None:
+    from tpen.logging.base import LogRecord
+    from tpen.run import _route_artifact_sinks
+
+    logical_root = tmp_path / "logical"
+    logical_run_dir = logical_root / "fixed-run-id"
+    logical_run_dir.mkdir(parents=True)
+    logical_csv = logical_run_dir / "metrics.csv"
+    logical_csv.write_text("step,namespace,key,value\n0,run,loss,1.0\n")
+
+    physical_root = tmp_path / "allocation-1"
+    physical_root.mkdir()
+    destination = ArtifactDestination(physical_root=physical_root)
+
+    sink = CSV(path=logical_csv)
+    assert sink._wrote_header is True
+
+    _route_artifact_sinks([sink], logical_run_dir=logical_run_dir, destination=destination)
+    sink.log(LogRecord(step=1, namespace="run", metrics={"loss": 2.0}))
+
+    new_path = physical_root / "metrics.csv"
+    assert sink.path == new_path
+    assert new_path.read_text().startswith("step,namespace,key,value\n")
+    # The predecessor file is byte-identical to before rebinding.
+    assert logical_csv.read_text() == "step,namespace,key,value\n0,run,loss,1.0\n"
