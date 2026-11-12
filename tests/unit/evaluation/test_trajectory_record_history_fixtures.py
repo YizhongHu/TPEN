@@ -11,6 +11,7 @@ reader itself invented -- and that its bytes/values remain accepted unchanged
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -36,7 +37,11 @@ _EXPECTED_VARIANCE = sum(value * value for value in _VALUES) / _EXPECTED_ROW_COU
 def _fixture_dir(name: str) -> Path:
     directory = _FIXTURES_ROOT / name
     if not directory.is_dir():
-        pytest.skip(
+        # These fixtures are immutable, committed compatibility evidence
+        # (S1-F acceptance contract item 4): a missing fixture is a broken
+        # checkout, not an optional extra, so it must fail the suite rather
+        # than silently skip it.
+        pytest.fail(
             f"fixture {name!r} is not generated in this checkout; run "
             "generate_v1_fixtures.py inside an authorized Cannon allocation "
             "and commit its output (see tests/integration/artifacts/"
@@ -66,6 +71,14 @@ def test_frozen_fixture_decodes_with_original_values(name: str) -> None:
     assert result.physical_context.reason
 
 
+def _is_sha256_hex(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 @pytest.mark.parametrize("name", ["h_like_frozen_main", "he_like_frozen_main"])
 def test_frozen_fixture_provenance_matches_committed_bytes(name: str) -> None:
     directory = _fixture_dir(name)
@@ -74,15 +87,34 @@ def test_frozen_fixture_provenance_matches_committed_bytes(name: str) -> None:
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 
     assert provenance["generating_commit"], "fixture provenance must pin a generating commit"
-    assert provenance["writer_module_blob_sha1"], "fixture provenance must pin the writer module blob"
     assert provenance["csv_sha256"] == metadata["csv_sha256"]
     assert provenance["byte_count"] == metadata["byte_count"]
-    # Frozen-writer evidence: the writer module at its last pre-S1-F commit
-    # must be proven byte-identical to origin/main's writer blob at
-    # generation time, so these fixtures demonstrably came from the frozen
-    # v1 writer and not from a modified copy.
+
+    # Independent CSV + metadata digest pins (not just the csv_sha256 the
+    # metadata sidecar already carries about itself): a joint refresh of
+    # CSV/metadata/provenance cannot silently replace the intended
+    # compatibility oracle without also moving this independently-recorded
+    # metadata hash.
+    assert _is_sha256_hex(provenance.get("metadata_sha256"))
+    assert provenance["metadata_sha256"] == hashlib.sha256(metadata_path.read_bytes()).hexdigest()
+
+    # Reproducible generator/input pinning: source, exact command, and a
+    # config/environment hash, so a replay has everything needed to
+    # reproduce this fixture rather than trusting a bare commit string.
+    assert _is_sha256_hex(provenance.get("generator_source_sha256"))
+    assert provenance.get("generation_command")
+    assert _is_sha256_hex(provenance.get("config_hash"))
+
+    # Frozen-writer evidence: the writer classes actually executed by the
+    # generator (hashed via `inspect.getsource` on the live objects, not an
+    # inferred git blob) must match the same classes' source at the fixed,
+    # named frozen-writer commit -- proving these fixtures came from the
+    # frozen v1 writer and not from a modified copy.
     assert provenance["frozen_writer_commit"]
-    assert provenance["writer_blob_matches_origin_main"] is True
+    assert _is_sha256_hex(provenance.get("executed_writer_source_sha256"))
+    assert _is_sha256_hex(provenance.get("frozen_commit_writer_source_sha256"))
+    assert provenance["writer_matches_frozen_commit"] is True
+    assert provenance["executed_writer_source_sha256"] == provenance["frozen_commit_writer_source_sha256"]
 
 
 @pytest.mark.parametrize(

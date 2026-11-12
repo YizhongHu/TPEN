@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -257,4 +258,101 @@ def test_mean_variance_tamper_detected_even_with_consistent_grid(tmp_path: Path)
     metadata["mean"] = metadata["mean"] + 1.0
     _write_metadata(artifact, metadata)
     with pytest.raises(TamperedTrajectoryRecordError, match="mean/variance"):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
+# ---------------------------------------------------------------------------
+# Review r1: strict value/binding validation and nonfinite reduction
+
+
+@pytest.mark.parametrize(
+    ("key", "bad"),
+    [
+        ("atomic_configuration", None),
+        ("atomic_configuration_id", "0" * 64),
+        ("finite_count", 999),
+        ("nonfinite_count", 999),
+        ("byte_count", 1),
+        ("draw_count", 2.5),
+        ("term_names", ["absent"]),
+        ("n_electrons", 2),
+        ("observable_values_content_id", "0" * 64),
+    ],
+)
+def test_v1_content_bindings(tmp_path: Path, key: str, bad: object) -> None:
+    artifact = _write_v1_artifact(tmp_path, VALUES)
+    metadata = _read_metadata(artifact)
+    metadata[key] = bad
+    _write_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
+def test_v1_requires_complete_row_schema(tmp_path: Path) -> None:
+    artifact = _write_v1_artifact(tmp_path, VALUES)
+    keys = ["draw_index", "walker_index", "local_energy"]
+    with artifact.path.open("r", encoding="utf-8", newline="") as handle:
+        rows = [{k: row[k] for k in keys} for row in csv.DictReader(handle)]
+    _write_rows(artifact.path, keys, rows)
+    metadata = _read_metadata(artifact)
+    metadata["csv_sha256"] = trajectory_records._file_sha256(artifact.path)
+    metadata["byte_count"] = artifact.path.stat().st_size
+    _write_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
+def test_public_reader_accepts_v1_mixed_infinities(tmp_path: Path) -> None:
+    values = torch.tensor([[math.inf, -math.inf], [1.0, 2.0]], dtype=torch.float64)
+    artifact = _write_v1_artifact(tmp_path, values)
+    artifact.validate()  # positive control: legitimate original-v1 output
+    result = inspect_trajectory_record(artifact.metadata_path)
+    assert math.isnan(result.mean)
+    assert math.isnan(result.variance)
+    assert result.row_count == 4
+    assert result.physical_context.available is False
+
+
+def test_public_reader_accepts_v1_positive_infinity(tmp_path: Path) -> None:
+    values = torch.tensor([[math.inf, 1.0], [2.0, 3.0]], dtype=torch.float64)
+    artifact = _write_v1_artifact(tmp_path, values)
+    artifact.validate()
+    result = inspect_trajectory_record(artifact.metadata_path)
+    assert math.isinf(result.mean) and result.mean > 0
+    assert result.row_count == 4
+
+
+def test_public_reader_accepts_v1_negative_infinity(tmp_path: Path) -> None:
+    values = torch.tensor([[-math.inf, 1.0], [2.0, 3.0]], dtype=torch.float64)
+    artifact = _write_v1_artifact(tmp_path, values)
+    artifact.validate()
+    result = inspect_trajectory_record(artifact.metadata_path)
+    assert math.isinf(result.mean) and result.mean < 0
+    assert result.row_count == 4
+
+
+def test_public_reader_accepts_v1_nan(tmp_path: Path) -> None:
+    values = torch.tensor([[math.nan, 1.0], [2.0, 3.0]], dtype=torch.float64)
+    artifact = _write_v1_artifact(tmp_path, values)
+    artifact.validate()
+    result = inspect_trajectory_record(artifact.metadata_path)
+    assert math.isnan(result.mean)
+    assert result.row_count == 4
+
+
+def test_tampered_nonfinite_sentinel_is_still_rejected(tmp_path: Path) -> None:
+    values = torch.tensor([[math.inf, 1.0], [2.0, 3.0]], dtype=torch.float64)
+    artifact = _write_v1_artifact(tmp_path, values)
+    with artifact.path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    rows[0]["local_energy"] = "garbage"
+    rows[0]["finite"] = "False"
+    _write_rows(artifact.path, fieldnames, rows)
+    metadata = _read_metadata(artifact)
+    metadata["csv_sha256"] = trajectory_records._file_sha256(artifact.path)
+    metadata["byte_count"] = artifact.path.stat().st_size
+    _write_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError):
         inspect_trajectory_record(artifact.metadata_path)
