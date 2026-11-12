@@ -13,7 +13,9 @@ import torch
 from tpen.data.batch import slice_flat_batch
 from tpen.evaluation.bundle import EvaluationBundle, LocalEnergyValues
 from tpen.evaluation.protocols import EvaluationContext
+from tpen.evaluation.trajectory_records import TrajectoryRecordArtifactV2
 from tpen.physics.hamiltonian import (
+    DeclaresExecutionReceipt,
     HamiltonianTerm,
     LocalEnergyEvaluator,
     LocalEnergyResult,
@@ -64,6 +66,31 @@ class LocalEnergyCalculator:
                 raise ValueError(
                     "LocalEnergyCalculator terms disagree with streamed trajectory records"
                 )
+            receipt = None
+            if isinstance(records, TrajectoryRecordArtifactV2):
+                # Contract 4/5 (trajectory-record v2 writer and active-producer
+                # binding): final-draw reuse must bind the same execution
+                # receipt as the energy it reuses, and a calculator configured
+                # for a different declared method must reject reuse outright
+                # rather than silently relabeling another producer's energy as
+                # its own. `describe_execution_receipt` declares what *this*
+                # evaluator would have produced -- no re-evaluation needed.
+                if not isinstance(self.evaluator, DeclaresExecutionReceipt):
+                    raise ValueError(
+                        "reusing a trajectory_records/v2 final draw requires a receipt-capable "
+                        f"evaluator; {type(self.evaluator).__name__} does not implement "
+                        "DeclaresExecutionReceipt"
+                    )
+                requested_receipt = self.evaluator.describe_execution_receipt(
+                    self.hamiltonian_terms, records.system_descriptor.system_id()
+                )
+                if requested_receipt != records.execution_receipt:
+                    raise ValueError(
+                        "LocalEnergyCalculator requested a different execution method than the "
+                        "one that produced this trajectory record; reuse across a method "
+                        "mismatch is never silently accepted"
+                    )
+                receipt = records.execution_receipt
             flat = bundle.generated.batch.flatten_samples()
             n_rows = records.validate_snapshot_batch(flat)
             total = records.final_draw.local_energy[:n_rows].to(
@@ -85,6 +112,7 @@ class LocalEnergyCalculator:
                     local_energy=total,
                     finite_mask=torch.isfinite(total),
                     term_energies=terms,
+                    receipt=receipt,
                 ),
             )
 
