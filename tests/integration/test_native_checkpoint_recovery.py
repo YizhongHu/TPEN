@@ -815,6 +815,7 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
     assert cursor_control.returncode == 0
     cursor_control_trace = _trace(cursor_control_path)
     results: dict[str, dict[str, bool]] = {}
+    refusals: dict[str, dict] = {}
     disabled_traces: dict[str, ProcessEvidence] = {}
     for limb in sorted({spec.limb for spec in E5_CHANNEL_MAP}):
         label = f"channel-disabled-{limb}"
@@ -861,7 +862,11 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             assert _snapshot_leaf(prefix_run_dir) == leaf_before, (
                 "trainer_cursor refusal mutated the predecessor leaf"
             )
-            results[limb] = {spec.channel: False for spec in E5_CHANNEL_MAP}
+            # The refusal IS the observed outcome for this arm: it never
+            # reaches a channel measurement, so it is stored separately
+            # rather than as a (fabricated) parity/attribution result
+            # (review-r3-decisions R3.3).
+            refusals[limb] = refusal
             continue
 
         # The pure core comparator intentionally raises when one arm changes
@@ -905,7 +910,8 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             result["trainer_cursor"] = disabled_first_cursor == resume_cursor
             assert result["trainer_cursor"] is True, (limb, "trainer_cursor")
 
-    assert set(results) == {spec.limb for spec in E5_CHANNEL_MAP}
+    assert set(results) == {spec.limb for spec in E5_CHANNEL_MAP} - {"trainer_cursor"}
+    assert set(refusals) == {"trainer_cursor"}
     process_spec = next(spec for spec in E5_CHANNEL_MAP if spec.channel == "process_random")
     full_process = first_subsequent_event(full_trace, process_spec, resume_step=resume_cursor - 1)
     omitted_process = first_subsequent_event(
@@ -1035,22 +1041,41 @@ def test_real_restore_omission_channels_are_observed(tmp_path: Path) -> None:
             expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
         )
 
-    # Every declared arm above is collected and measured.  Keeping this
-    # explicit prevents a future unsupported hook from silently becoming a
-    # passing omission result.
+    # Every declared arm above is collected and either measured or recorded as
+    # a typed refusal.  Keeping this explicit prevents a future unsupported
+    # hook from silently becoming a passing omission result.
     unmeasured_arms = tuple(
-        sorted({spec.limb for spec in E5_CHANNEL_MAP} - set(results))
+        sorted({spec.limb for spec in E5_CHANNEL_MAP} - set(results) - set(refusals))
     )
     print(f"UNMEASURED_ARMS={unmeasured_arms}")
     assert unmeasured_arms == ()
     attribution = {
         "expected_mismatches": {limb: sorted(channels) for limb, channels in E5_NATIVE_EXPECTED_MISMATCHES.items()},
-        "correct_attribution_passed": sorted(disabled_traces),
+        # trainer_cursor is refused before fit (R2.3) and never reaches a
+        # channel measurement, so it is excluded here and carried only in
+        # ``refusals`` -- not serialized as measured parity/attribution
+        # (review-r3-decisions R3.3).
+        "correct_attribution_passed": sorted(limb for limb in disabled_traces if limb not in refusals),
         "observed_parity": results,
         "unmeasured_attribution": {},
+        "refusals": {
+            limb: {"exception_type": refusal["exception_type"], "message": refusal["message"]}
+            for limb, refusal in refusals.items()
+        },
     }
     (tmp_path / "attribution-receipt.json").write_text(json.dumps(attribution, sort_keys=True), encoding="utf-8")
     print("ATTRIBUTION_RECEIPT=" + json.dumps(attribution, sort_keys=True))
+
+    # Read back the produced receipt (not the in-memory dict) and assert the
+    # refused arm is recorded as a refusal, never as measured parity or
+    # attribution (review-r3-decisions R3.3).
+    produced = json.loads((tmp_path / "attribution-receipt.json").read_text(encoding="utf-8"))
+    assert "trainer_cursor" in produced["refusals"]
+    assert "trainer_cursor" not in produced["observed_parity"]
+    assert "trainer_cursor" not in produced["correct_attribution_passed"]
+    for limb in non_cursor_limbs:
+        assert limb in produced["observed_parity"]
+        assert limb in produced["correct_attribution_passed"]
 
 
 @pytest.mark.integration

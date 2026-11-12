@@ -260,3 +260,67 @@ def test_r6_committed_corrupt_catalog_refuses_instead_of_falling_back(tmp_path):
     )
     with pytest.raises(ValueError):
         _committed_checkpoint(root)
+
+
+def _rewrite_catalog_rows(catalog_path: Path, rows: list[dict]) -> None:
+    lines = [json.dumps(row) for row in rows]
+    catalog_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_r6_read_only_discovery_refuses_selected_row_naming_a_different_location(tmp_path):
+    """R3.1: ``content_id`` is deliberately path-independent (it excludes
+    ``checkpoint_dir``), so a matching content_id alone does not prove the
+    catalog agrees on *where* that content lives. Change only the selected
+    row's recorded location, leaving content_id, latest.json, and every
+    checkpoint byte intact: the row still deserializes and its content_id
+    still matches, but it now disagrees with the directory discovery actually
+    selected, and must be refused rather than silently trusted
+    (review-r3-decisions R3.1)."""
+
+    from tpen.checkpoint.catalog import PUBLICATION_CATALOG_FILENAME
+    from tpen.execution.invocation import PredecessorDiscoveryRefusal, _committed_checkpoint
+    from tests.unit.execution.test_s15_resume_predecessor_leaf_measurement import _snapshot_leaf
+
+    root = tmp_path / "run"
+    checkpoint = _save(root, 1)
+    catalog_path = checkpoint.parent / PUBLICATION_CATALOG_FILENAME
+    rows = [json.loads(line) for line in catalog_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 1
+    rows[0]["ref"]["checkpoint_dir"] = str(checkpoint.parent / "step_999999")
+    _rewrite_catalog_rows(catalog_path, rows)
+
+    before = _snapshot_leaf(root)
+    with pytest.raises(PredecessorDiscoveryRefusal):
+        _committed_checkpoint(root)
+    after = _snapshot_leaf(root)
+    assert after == before, "refused discovery mutated the sealed predecessor leaf"
+    assert checkpoint.exists()
+
+
+def test_r6_read_only_discovery_refuses_conflicting_same_content_id_locations(tmp_path):
+    """R3.1: two catalog rows sharing one content_id but naming different
+    locations are a conflict under the existing publisher's full-ref rule
+    (``CheckpointCatalog.publish``, catalog.py:71-100) rather than two valid
+    locations for one identity; discovery must refuse instead of picking
+    either one (review-r3-decisions R3.1)."""
+
+    from tpen.checkpoint.catalog import PUBLICATION_CATALOG_FILENAME
+    from tpen.execution.invocation import PredecessorDiscoveryRefusal, _committed_checkpoint
+    from tests.unit.execution.test_s15_resume_predecessor_leaf_measurement import _snapshot_leaf
+
+    root = tmp_path / "run"
+    checkpoint = _save(root, 1)
+    catalog_path = checkpoint.parent / PUBLICATION_CATALOG_FILENAME
+    rows = [json.loads(line) for line in catalog_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 1
+    conflicting = json.loads(json.dumps(rows[0]))
+    conflicting["ref"]["checkpoint_dir"] = str(checkpoint.parent / "step_999999")
+    rows.append(conflicting)
+    _rewrite_catalog_rows(catalog_path, rows)
+
+    before = _snapshot_leaf(root)
+    with pytest.raises(PredecessorDiscoveryRefusal):
+        _committed_checkpoint(root)
+    after = _snapshot_leaf(root)
+    assert after == before, "refused discovery mutated the sealed predecessor leaf"
+    assert checkpoint.exists()

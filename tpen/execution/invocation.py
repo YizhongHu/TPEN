@@ -634,13 +634,52 @@ def _discover_published_checkpoint(checkpoint_root: Path) -> CheckpointRef | Non
         )
     publications = read_publications(catalog_path)  # Validates; raises ValueError on a corrupt catalog.
     pointer_ref = CheckpointRef.from_directory(resolve_checkpoint_dir(checkpoint_root))
-    if not any(row.content_id == pointer_ref.content_id for row in publications):
+    matching_rows = [row for row in publications if row.content_id == pointer_ref.content_id]
+    if not matching_rows:
         raise PredecessorDiscoveryRefusal(
             f"selected checkpoint {pointer_ref.checkpoint_dir} under {checkpoint_root} "
             "has no matching row in the publication catalog; refusing read-only "
             "successor discovery"
         )
+    # content_id is path-independent (it deliberately excludes checkpoint_dir),
+    # so a matching content_id alone does not prove the catalog agrees on
+    # *where* that content lives. Compare the full binding: every matching
+    # row's recorded location, normalized relative to this leaf's checkpoint
+    # root (not raw string equality, since a leaf may have been copied under a
+    # different absolute prefix), must agree with each other and with the
+    # directory discovery actually selected.
+    pointer_location = _leaf_relative_checkpoint_location(checkpoint_root, pointer_ref.checkpoint_dir)
+    row_locations = {
+        _leaf_relative_checkpoint_location(checkpoint_root, row.checkpoint_dir) for row in matching_rows
+    }
+    if row_locations != {pointer_location}:
+        raise PredecessorDiscoveryRefusal(
+            f"selected checkpoint {pointer_ref.checkpoint_dir} under {checkpoint_root} "
+            f"conflicts with its publication catalog location(s) {sorted(row_locations)} "
+            f"for content_id {pointer_ref.content_id}; refusing read-only successor discovery"
+        )
     return pointer_ref
+
+
+def _leaf_relative_checkpoint_location(checkpoint_root: Path, checkpoint_dir: Path) -> str:
+    """Normalize a checkpoint directory relative to its leaf's checkpoint root.
+
+    A catalog row's ``checkpoint_dir`` is recorded as of publish time, which
+    may be an absolute path under a prefix that no longer matches this leaf
+    (for example after the run directory was copied elsewhere). Comparing raw
+    strings would then flag an unrelated relocation as a conflict, so this
+    compares the path relative to ``checkpoint_root`` instead. A location this
+    repo never produces -- outside the checkpoint root entirely -- falls back
+    to the resolved absolute path, which still compares equal only to an
+    identical out-of-root location.
+    """
+
+    resolved_root = checkpoint_root.resolve()
+    resolved_dir = checkpoint_dir.resolve()
+    try:
+        return str(resolved_dir.relative_to(resolved_root))
+    except ValueError:
+        return str(resolved_dir)
 
 
 def _committed_checkpoint(run_dir: Path, *, allow_reconcile: bool = False) -> CheckpointRef | None:
