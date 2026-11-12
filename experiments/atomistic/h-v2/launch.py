@@ -661,6 +661,9 @@ def build_eval_fanout_sbatch_command(
         resources = launch_config.packed_eval_resources(resources, pack_k)
     except ValueError as error:
         raise LaunchError(str(error)) from error
+    _validate_single_stage_wall_seconds(time_value, label="--time")
+    if pack_k > 1 and _parse_wall_seconds(time_value) < _parse_wall_seconds(derive_packed_eval_time(pack_k)):
+        raise LaunchError(f"--time={time_value} is shorter than packed formula {derive_packed_eval_time(pack_k)}")
     if payload in PILOT_PAYLOADS:
         job_lineage = launch_config.PILOT_PAYLOAD_LINEAGES[payload]
     else:
@@ -866,6 +869,32 @@ def _validate_single_stage_wall_seconds(time_value: str, *, label: str) -> None:
         )
 
 
+PACKED_EVAL_MINUTES_PER_ARM = 15
+PACKED_EVAL_MARGIN_MINUTES = 15
+
+
+def derive_packed_eval_time(pack_k: int) -> str:
+    """Return the documented packed-EVAL wall-time formula.
+
+    The estimate is one 15-minute arm per concurrent stream plus a 15-minute
+    orchestration margin. It is deliberately conservative and independently
+    validated against the facility caps by callers.
+    """
+
+    if not 1 <= pack_k <= 6:
+        raise LaunchError(f"--pack-k must be between 1 and 6, got {pack_k}")
+    return _format_wall_seconds((PACKED_EVAL_MINUTES_PER_ARM * pack_k + PACKED_EVAL_MARGIN_MINUTES) * 60)
+
+
+def resolve_packed_eval_time(time_value: str | None, *, pack_k: int) -> str:
+    """Derive a packed time when omitted, or refuse a shorter explicit value."""
+
+    derived = derive_packed_eval_time(pack_k)
+    if time_value is None:
+        return derived
+    if _parse_wall_seconds(time_value) < _parse_wall_seconds(derived):
+        raise LaunchError(f"--time={time_value} is shorter than packed formula {derived} for pack_k={pack_k}")
+    return time_value
 def submit_lineage(
     lineage: str,
     *,
@@ -1220,8 +1249,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--time",
         default=None,
         help=(
-            "Required with --stage eval (any payload): the exact Slurm --time value. No "
-            "default -- T_WALL/E_WALL govern only the --stage train/both science route."
+            "Optional with packed --stage eval: omitted time is derived as 15 minutes per "
+            "stream plus a 15-minute margin; an explicit value must meet that formula."
         ),
     )
     parser.add_argument(
@@ -1309,8 +1338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # sbatch call, never auto-chained after another stage.
         if not args.expected_train_commit:
             raise LaunchError("--expected-train-commit is required for --stage eval")
-        if not args.time:
-            raise LaunchError("--time is required for --stage eval")
+        eval_time = resolve_packed_eval_time(args.time, pack_k=args.pack_k)
         # F5/D6 (review r2 delta): the pilot/part-(g) EVAL route must pass
         # the same run-root containment guard --stage train already
         # enforces, on EVERY submission path, before any sbatch call -- an
@@ -1343,7 +1371,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             executor_python=executor_python,
             run_root=run_root,
             checkout_root=checkout_root,
-            time_value=args.time,
+            time_value=eval_time,
             dependency=None,
             commit=args.commit,
             resources=launch_config.PILOT_PAYLOAD_RESOURCES[args.payload],
@@ -1395,12 +1423,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise LaunchError(f"--pilot-stage is not supported for payload {args.payload!r}")
         if not args.expected_train_commit:
             raise LaunchError("--expected-train-commit is required for --stage eval")
-        if not args.time:
-            raise LaunchError("--time is required for --stage eval")
+        eval_time = resolve_packed_eval_time(args.time, pack_k=args.pack_k)
         # F5/D6: same single-stage wall-budget and MANDATORY run-root
         # containment checks as --stage train, applied to the standalone
         # EVAL route.
-        _validate_single_stage_wall_seconds(args.time, label="--time")
+        _validate_single_stage_wall_seconds(eval_time, label="--time")
         science_run_root_prefix = args.run_root_prefix or os.environ.get(launch_config.PILOT_RUN_ROOT_PREFIX_ENV)
         if not science_run_root_prefix:
             raise LaunchError(
@@ -1414,7 +1441,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             command = build_eval_fanout_sbatch_command(
                 args.payload, lineage=lineage, expected_train_commit=args.expected_train_commit,
                 science_python=science_python, executor_python=executor_python, run_root=run_root,
-                checkout_root=checkout_root, time_value=args.time, dependency=None, commit=args.commit,
+                checkout_root=checkout_root, time_value=eval_time, dependency=None, commit=args.commit,
                 resources=launch_config.RESOURCES,
                 pack_k=args.pack_k,
             )

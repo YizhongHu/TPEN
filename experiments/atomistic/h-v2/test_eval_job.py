@@ -50,23 +50,36 @@ def test_packed_validation_tolerance_is_derived_from_repeat_noise() -> None:
     assert tolerance["energy_abs"] > 0
     assert tolerance["variance_relative"] > 0
     eval_job.compare_packed_single_stream(
-        {"seed": 7, "checkpoint": 1000, "energy": -0.5005, "variance": 0.1005},
-        {"seed": 7, "checkpoint": 1000, "energy": -0.5000, "variance": 0.1000},
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5005, "variance": 0.1005},
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5000, "variance": 0.1000},
         tolerance=tolerance,
     )
+
+
+def test_packed_validation_paired_calibration_uses_difference_spread() -> None:
+    tolerance = eval_job.derive_packed_validation_tolerance(
+        [
+            {"energy_delta": -0.001, "variance_delta": 0.001, "variance": 0.100},
+            {"energy_delta": 0.001, "variance_delta": -0.001, "variance": 0.100},
+            {"energy_delta": 0.000, "variance_delta": 0.000, "variance": 0.100},
+        ],
+        paired=True,
+    )
+    assert tolerance["energy_abs"] == pytest.approx(0.003)
+    assert tolerance["variance_relative"] == pytest.approx(0.03)
 
 
 def test_packed_validation_refuses_identity_or_metric_mismatch() -> None:
     with pytest.raises(eval_job.EvalJobRefusal, match="packed-validation-identity"):
         eval_job.compare_packed_single_stream(
-            {"seed": 8, "checkpoint": 1000, "energy": -0.5, "variance": 0.1},
-            {"seed": 7, "checkpoint": 1000, "energy": -0.5, "variance": 0.1},
+            {"seed": 8, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5, "variance": 0.1},
+            {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5, "variance": 0.1},
             tolerance={"energy_abs": 1.0, "variance_relative": 1.0},
         )
     with pytest.raises(eval_job.EvalJobRefusal, match="packed-validation-mismatch"):
         eval_job.compare_packed_single_stream(
-            {"seed": 7, "checkpoint": 1000, "energy": -0.2, "variance": 0.1},
-            {"seed": 7, "checkpoint": 1000, "energy": -0.5, "variance": 0.1},
+            {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.2, "variance": 0.1},
+            {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5, "variance": 0.1},
             tolerance={"energy_abs": 0.01, "variance_relative": 1.0},
         )
 

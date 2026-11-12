@@ -22,11 +22,32 @@ after all siblings settle.
 For GPU validation, run the same checkpoint/seed roster once with
 ``--pack-k 1`` and once with the selected packed value. Compare each pair with
 ``eval_job.compare_packed_single_stream``. First derive tolerances from at
-least two single-stream repeats using
-``derive_packed_validation_tolerance``: energy is bounded by ``3 x SE`` and
-variance by ``3 x SE / |mean variance|``. Record the repeat measurements,
-derived tolerances, GPU model, and both job IDs in the validation receipt;
-this is validation evidence, not science admission.
+least three same-seed repeats using ``derive_packed_validation_tolerance``.
+For paired repeats, use the sample spread of the repeated packed-minus-single
+differences; for independent single-stream observations use ``sqrt(2) x s``.
+Use the same sample-variance denominator in both cases. Energy is bounded by
+``3 x spread`` and relative variance by ``3 x spread / |mean variance|``.
+Record the repeat measurements, derived tolerances, GPU model, and both job
+IDs in the validation receipt; this is validation evidence, not science
+admission.
+
+The executable validation roster is the following (each row has a distinct
+run root and extracts metrics only from that run's immutable trajectory CSV
+and metadata sidecar):
+
+| checkpoint | seeds | single-stream roots | packed root | extracted metrics |
+| --- | --- | --- | --- | --- |
+| 1,000 | the approved roster seed | `validation/ck001000/single/<seed>` | `validation/ck001000/packed` | energy and variance from `sampled_eval_table.csv` |
+| 50,000 | the approved roster seed | `validation/ck050000/single/<seed>` | `validation/ck050000/packed` | same CSV/sidecar extraction |
+| 100,000 | the approved roster seed | `validation/ck100000/single/<seed>` | `validation/ck100000/packed` | same CSV/sidecar extraction |
+
+Run the single-stream rows first, then the packed rows against the same
+checkpoint sha256, seed, and lineage. Do not glob checkpoints or reuse a run
+root. The packed wall-time request is derived by
+``launch.derive_packed_eval_time(k)``: ``15 minutes x k streams + 15 minutes
+margin``; ``launch.py`` derives it when omitted and refuses a shorter
+explicit ``--time``. Retain the Slurm job IDs, command lines, checkpoint and
+artifact hashes, process intervals, and comparator receipt for every row.
 
 The executable route is the normal TPEN entrypoint (the ``tpen`` console
 script, or ``tpen.run.run_from_config`` from a test). Do not use
