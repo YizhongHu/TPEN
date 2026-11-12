@@ -6,6 +6,10 @@ if ! shopt -s inherit_errexit 2>/dev/null; then
   [[ "${1:-}" == --help || "${1:-}" == -h ]] || { echo "PRECHECK_FAILED inherit_errexit unavailable" >&2; exit 2; }
 fi
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=./shared-env-manifest.sh
+source "$SCRIPT_DIR/shared-env-manifest.sh"
+
 ENVS_ROOT=""
 CHECKOUT=""
 PROJECT=""
@@ -55,7 +59,8 @@ done
 # --project/--extra feed into the computed target directory name. Restrict
 # each to a single path component (no '/', no leading '.' so ".." is
 # rejected outright) so neither can make the target escape --envs-root.
-NAME_COMPONENT_RE='^[A-Za-z0-9][A-Za-z0-9._+]*$'
+# NAME_COMPONENT_RE comes from shared-env-manifest.sh (shared with the
+# reuse-only precheck).
 [[ "$PROJECT" =~ $NAME_COMPONENT_RE ]] || fail_precheck "--project must be a single path component matching $NAME_COMPONENT_RE"
 [[ "$EXTRA" =~ $NAME_COMPONENT_RE ]] || fail_precheck "--extra must be a single path component matching $NAME_COMPONENT_RE"
 [[ "$PYTHON_VERSION" =~ ^[0-9]+\.[0-9]+$ ]] || fail_precheck "--python must be X.Y"
@@ -95,31 +100,16 @@ CAP="${BASH_REMATCH[1]}"
 UV_LOCK="$CANON_CHECKOUT/uv.lock"
 [[ -f "$UV_LOCK" ]] || fail_precheck "uv.lock missing in checkout: $UV_LOCK"
 LOCK_SHA256="$(sha256sum -- "$UV_LOCK" | cut -d' ' -f1)"
-LOCK_HASH12="${LOCK_SHA256:0:12}"
-ENV_NAME="${PROJECT}-${LOCK_HASH12}-${EXTRA}-py${PYTHON_VERSION}"
+ENV_NAME="$(compute_shared_env_name "$PROJECT" "$LOCK_SHA256" "$EXTRA" "$PYTHON_VERSION")"
 TARGET="$CANON_ENVS_ROOT/$ENV_NAME"
-
-# A manifest is trusted for reuse only if it is exactly the six fields this
-# script writes, in order, each strictly formatted, with the recorded lock
-# hash matching the CURRENT checkout's uv.lock. The build HEAD may differ
-# from the requesting HEAD (dependencies, not history, define identity); an
-# empty, truncated (even late, even without a final field, even missing only
-# a trailing newline), malformed, or mismatched manifest is not trusted.
-manifest_is_valid() {
-  local manifest="$1"
-  [[ -s "$manifest" ]] || return 1
-  local -a lines
-  mapfile -t lines < "$manifest"
-  ((${#lines[@]} == 6)) || return 1
-  [[ "${lines[0]}" =~ ^head=[0-9a-f]{40}$ ]] || return 1
-  [[ "${lines[1]}" =~ ^uv_lock_sha256=[0-9a-f]{64}$ ]] || return 1
-  [[ "${lines[1]#uv_lock_sha256=}" == "$LOCK_SHA256" ]] || return 1
-  [[ "${lines[2]}" =~ ^uv_version=.+$ ]] || return 1
-  [[ "${lines[3]}" =~ ^python_version=[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
-  [[ "${lines[4]}" =~ ^python_request=[0-9]+\.[0-9]+$ ]] || return 1
-  [[ "${lines[5]}" =~ ^built_utc=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
-  return 0
-}
+# manifest_is_valid (shared with the reuse-only precheck, see
+# shared-env-manifest.sh) trusts a manifest for reuse only if it is exactly
+# the six fields this script writes, in order, each strictly formatted, with
+# the recorded lock hash matching the CURRENT checkout's uv.lock. The build
+# HEAD may differ from the requesting HEAD (dependencies, not history,
+# define identity); an empty, truncated (even late, even without a final
+# field, even missing only a trailing newline), malformed, or mismatched
+# manifest is not trusted.
 
 LOCKFILE="$CANON_ENVS_ROOT/.build-shared-env.lock"
 exec 200>"$LOCKFILE"
@@ -158,7 +148,7 @@ if [[ -L "$TARGET" ]]; then
 fi
 
 if [[ -e "$TARGET" ]]; then
-  if [[ -f "$TARGET/.complete" ]] && manifest_is_valid "$TARGET/.complete"; then
+  if [[ -f "$TARGET/.complete" ]] && manifest_is_valid "$TARGET/.complete" "$LOCK_SHA256"; then
     echo "REUSE count=$COUNT path=$TARGET cap=$CAP policy=$POLICY_FILE head=$HEAD_SHA"
     exit 0
   fi
@@ -198,7 +188,7 @@ MANIFEST
 # Validate the temp file with the same strict function used for reuse,
 # before the rename -- a build that produced a malformed manifest must not
 # be published, even though uv sync itself succeeded.
-manifest_is_valid "$TMP_MANIFEST" || fail "failed to produce a well-formed completion manifest, needs disposition: path=$TARGET"
+manifest_is_valid "$TMP_MANIFEST" "$LOCK_SHA256" || fail "failed to produce a well-formed completion manifest, needs disposition: path=$TARGET"
 mv -f -- "$TMP_MANIFEST" "$TARGET/.complete"
 
 echo "BUILT count=$COUNT path=$TARGET cap=$CAP policy=$POLICY_FILE head=$HEAD_SHA"

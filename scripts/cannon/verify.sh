@@ -13,7 +13,7 @@ HEAD_SHA="${HEAD_SHA:-}"
 RUN_ROOT="${RUN_ROOT:-}"
 WORK_ROOT="${WORK_ROOT:-}"
 REPO_URL="${REPO_URL:-}"
-SHARED_ENV_ROOT="${SHARED_ENV_ROOT:-}"
+SHARED_ENV_PREFIX="${SHARED_ENV_PREFIX:-}"
 SHARED_ENV_PROJECT="${SHARED_ENV_PROJECT:-tpen}"
 SHARED_ENV_EXTRA="${SHARED_ENV_EXTRA:-cpu}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
@@ -33,7 +33,7 @@ usage() {
   cat >&2 <<'USAGE'
 usage: verify.sh --sha SHA --test PATH [--test PATH ...] [options]
 required env: SLURM_JOB_ID, USER, RUN_ROOT, WORK_ROOT, REPO_URL,
-SHARED_ENV_ROOT, UV_BIN, FACILITY_RUN_PREFIX
+SHARED_ENV_PREFIX, UV_BIN, FACILITY_RUN_PREFIX
 options: --sha SHA --test PATH --run-root PATH --mutants PATH
          --mode quick|measure --typecheck on|off --parallel serial|xdist
          --full-suite
@@ -64,7 +64,7 @@ fail_precheck() { echo "PRECHECK_FAILED $*" >&2; exit 2; }
 [[ "$TYPECHECK" == on || "$TYPECHECK" == off ]] || fail_precheck "invalid TYPECHECK"
 [[ "$PARALLEL" == serial || "$PARALLEL" == xdist ]] || fail_precheck "invalid PARALLEL"
 [[ -n "$RUN_ROOT" && -n "$WORK_ROOT" && -n "$REPO_URL" ]] || fail_precheck "missing required paths"
-[[ -n "$SHARED_ENV_ROOT" && -n "$FACILITY_RUN_PREFIX" ]] || fail_precheck "missing env prefix"
+[[ -n "$SHARED_ENV_PREFIX" && -n "$FACILITY_RUN_PREFIX" ]] || fail_precheck "missing env prefix"
 [[ -x "$UV_BIN" && "$UV_BIN" == /* ]] || fail_precheck "UV_BIN must be executable absolute path"
 [[ ${#TEST_PATHS[@]} -gt 0 || "$MODE" == measure ]] || fail_precheck "no test paths"
 [[ -f "$MUTANT_HELPER" ]] || fail_precheck "mutant helper missing"
@@ -78,20 +78,23 @@ command -v realpath >/dev/null 2>&1 || fail_precheck "realpath required for path
 canon() { realpath -m -- "$1"; }
 CANON_WORK_ROOT="$(canon "$WORK_ROOT")"
 CANON_RUN_ROOT="$(canon "$RUN_ROOT")"
-CANON_SHARED_ENV_ROOT="$(canon "$SHARED_ENV_ROOT")"
 CANON_FACILITY_RUN_PREFIX="$(canon "$FACILITY_RUN_PREFIX")"
 CANON_JOB_SCRATCH="$(canon "/scratch/$USER/$SLURM_JOB_ID")"
 [[ "$CANON_WORK_ROOT" == "$CANON_JOB_SCRATCH" ]] || fail_precheck "WORK_ROOT must be exact job scratch"
 [[ "$CANON_RUN_ROOT" == "$CANON_FACILITY_RUN_PREFIX" || "$CANON_RUN_ROOT" == "$CANON_FACILITY_RUN_PREFIX"/* ]] ||
   fail_precheck "RUN_ROOT outside facility prefix"
-[[ "$CANON_SHARED_ENV_ROOT" == "$CANON_FACILITY_RUN_PREFIX" || "$CANON_SHARED_ENV_ROOT" == "$CANON_FACILITY_RUN_PREFIX"/* ]] ||
-  fail_precheck "SHARED_ENV_ROOT outside facility prefix"
+# SHARED_ENV_PREFIX is a reuse-only, out-of-repo shared env root: it must sit
+# entirely outside FACILITY_RUN_PREFIX, never inside it (this script never
+# writes there -- see shared-env-precheck.sh, called once the clone's exact
+# uv.lock sha256 is known, below).
+"$SCRIPT_DIR/shared-env-precheck.sh" paths --shared-env-prefix "$SHARED_ENV_PREFIX" \
+  --facility-run-prefix "$FACILITY_RUN_PREFIX" --run-root "$RUN_ROOT" --work-root "$WORK_ROOT"
 
 assert_write_path() {
   local candidate canon_candidate root
   candidate="$1"
   canon_candidate="$(canon "$candidate")" || { echo "PREFIX_ASSERT_FAILED unresolvable: $candidate" >&2; return 1; }
-  for root in "$CANON_WORK_ROOT" "$CANON_RUN_ROOT" "$CANON_SHARED_ENV_ROOT" "$CANON_SHARED_ENV_ROOT.lock" "$CANON_FACILITY_RUN_PREFIX"; do
+  for root in "$CANON_WORK_ROOT" "$CANON_RUN_ROOT" "$CANON_FACILITY_RUN_PREFIX"; do
     if [[ "$canon_candidate" == "$root" || "$canon_candidate" == "$root"/* ]]; then
       return 0
     fi
@@ -132,29 +135,23 @@ git -C "$CLONE" fetch --tags --force >> "$RUN_ROOT/evidence/clone.log" 2>&1
 [[ "$(git -C "$CLONE" rev-parse --is-shallow-repository)" == false ]] || fail_precheck "clone is shallow"
 [[ -z "$(git -C "$CLONE" status --porcelain)" ]] || fail_precheck "clone is dirty"
 
-LOCK_HASH="$(sha256sum "$CLONE/uv.lock" | cut -c1-12)"
-SHARED_ENV_NAME="$(basename "$SHARED_ENV_ROOT")"
-[[ "$SHARED_ENV_NAME" == *"$SHARED_ENV_PROJECT"*"$LOCK_HASH"*"$SHARED_ENV_EXTRA"*py"$PYTHON_VERSION"* ]] ||
-  fail_precheck "shared env name must carry project, lock sha12, extra, and Python version"
-SHARED_LOCK="$SHARED_ENV_ROOT.lock"
-assert_write_path "$SHARED_LOCK"; assert_write_path "$RUN_ROOT/evidence/shared-env-build.log"
-safe_mkdir "$(dirname -- "$SHARED_ENV_ROOT")"
-flock -x "$SHARED_LOCK" bash -c '
-  set -Eeuo pipefail
-  root="$1"; clone="$2"; uv="$3"; extra="$4"; py="$5"; log="$6"; donefile="$7"
-  if [[ ! -x "$root/bin/python" || ! -f "$donefile" ]]; then
-    mkdir -p "$root"; export UV_PROJECT_ENVIRONMENT="$root"; cd "$clone"
-    "$uv" sync --locked --no-install-project --extra "$extra" --python "$py" > "$log" 2>&1
-    : > "$donefile"
-  fi
-  test -x "$root/bin/python"
-' bash "$SHARED_ENV_ROOT" "$CLONE" "$UV_BIN" "$SHARED_ENV_EXTRA" "$PYTHON_VERSION" \
-  "$RUN_ROOT/evidence/shared-env-build.log" "$SHARED_ENV_ROOT/.complete"
+LOCK_SHA256="$(sha256sum "$CLONE/uv.lock" | cut -d' ' -f1)"
+# verify.sh never builds or writes a shared env (slice B1): it only resolves
+# and validates an existing, complete one. shared-env-precheck.sh fails
+# closed, naming the missing/invalid path, if build-shared-env.sh has not
+# already produced it.
+SHARED_ENV_PATH="$("$SCRIPT_DIR/shared-env-precheck.sh" resolve \
+  --shared-env-prefix "$SHARED_ENV_PREFIX" --project "$SHARED_ENV_PROJECT" \
+  --extra "$SHARED_ENV_EXTRA" --python "$PYTHON_VERSION" --lock-sha256 "$LOCK_SHA256")"
+assert_write_path "$RUN_ROOT/evidence/shared-env-path.txt"
+assert_write_path "$RUN_ROOT/evidence/shared-env-manifest.txt"
+printf '%s\n' "$SHARED_ENV_PATH" > "$RUN_ROOT/evidence/shared-env-path.txt"
+cp -- "$SHARED_ENV_PATH/.complete" "$RUN_ROOT/evidence/shared-env-manifest.txt"
 
-BASE_SITE="$($SHARED_ENV_ROOT/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+BASE_SITE="$($SHARED_ENV_PATH/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 safe_mkdir "$OVERLAY"
 assert_write_path "$RUN_ROOT/evidence/overlay-build.log"
-$SHARED_ENV_ROOT/bin/python -m venv --without-pip "$OVERLAY" > "$RUN_ROOT/evidence/overlay-build.log" 2>&1
+$SHARED_ENV_PATH/bin/python -m venv --without-pip "$OVERLAY" > "$RUN_ROOT/evidence/overlay-build.log" 2>&1
 OVERLAY_SITE="$($OVERLAY/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 assert_write_path "$OVERLAY_SITE/_tpen_shared_env.pth"
 printf '%s\n' "$BASE_SITE" > "$OVERLAY_SITE/_tpen_shared_env.pth"
@@ -189,7 +186,12 @@ for name in ("tpen", "torch", "pytest"):
     print(f"{name}={os.path.realpath(module.__file__)}")
 assert os.path.realpath(importlib.import_module("tpen").__file__).startswith(clone + os.sep)
 PYCHECK
-env -u PYTHONPATH "$PYTHON" -I - "$CLONE" >> "$RUN_ROOT/evidence/interpreter-identity.txt" 2>&1 <<'PYCHECK'
+# -I ignores PYTHONDONTWRITEBYTECODE (exported above); -B is required on
+# every isolated invocation that imports from the shared, reuse-only env, or
+# a writable/stale shared env gets __pycache__/.pyc writes during this probe
+# that assert_write_path cannot intercept (interpreter-internal writes, not
+# shell redirects).
+env -u PYTHONPATH "$PYTHON" -I -B - "$CLONE" >> "$RUN_ROOT/evidence/interpreter-identity.txt" 2>&1 <<'PYCHECK'
 import importlib, os, sys
 clone = os.path.realpath(sys.argv[1])
 for name in ("tpen", "torch", "pytest"):
