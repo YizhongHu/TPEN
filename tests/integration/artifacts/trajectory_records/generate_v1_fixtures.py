@@ -10,9 +10,9 @@ reader itself invented.
 
 Unlike comparing whole-file git blobs (which disagrees once a later slice,
 e.g. S1-F's own reader, appends unrelated code to this same module), this
-script hashes the *executed* writer classes' source directly via
-``inspect.getsource`` on the live imported objects, and compares that digest
-to the same classes' source as they existed at the fixed, named
+script extracts the *executed* writer classes' source directly from the file
+backing the live imported module (``inspect.getsourcefile``), and compares
+that digest to the same classes' source as they existed at the fixed, named
 ``_FROZEN_WRITER_COMMIT`` -- so the provenance attests to code this process
 actually ran, not an inferred historical blob.
 
@@ -189,12 +189,19 @@ def _symbols_source_sha256(sources: dict[str, str], names: tuple[str, ...]) -> s
 def _executed_writer_source_sha256() -> str:
     """Hash the source of the writer classes this process actually imported and ran.
 
-    Uses `inspect.getsource` on the live objects `_write_fixture` calls, so
-    the digest attests to code that executed in this process -- not a blob
-    picked out of git history.
+    Reads the exact file backing the live, imported module
+    (`inspect.getsourcefile`, not a path assembled from `_WRITER_PATH`) and
+    extracts the same two class definitions the same way
+    `_frozen_commit_writer_source_sha256` does, so the two digests are
+    directly comparable. Using `inspect.getsource` on the class objects
+    instead would include their `@dataclass(...)` decorator lines while the
+    git-blob extraction below does not (`ast.get_source_segment` on a
+    `ClassDef` excludes decorators), producing a spurious mismatch between
+    two sources that are otherwise identical.
     """
 
-    sources = {name: inspect.getsource(getattr(trajectory_records_module, name)) for name in _FROZEN_WRITER_SYMBOLS}
+    module_file = Path(inspect.getsourcefile(trajectory_records_module) or trajectory_records_module.__file__)
+    sources = _extract_symbol_sources(module_file.read_text(encoding="utf-8"), _FROZEN_WRITER_SYMBOLS)
     digest = _symbols_source_sha256(sources, _FROZEN_WRITER_SYMBOLS)
     assert digest is not None  # the live module always defines both symbols
     return digest
