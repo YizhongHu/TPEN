@@ -35,7 +35,7 @@ from tpen.data.batch.geometry import electron_nuclear_displacements
 from tpen.data.equivariant_state import compare_tensor_blocks
 from tpen.data.indices import permutation_index, permute_particle_axis
 from tpen.data.permutation import Permutation
-from tpen.evaluation.trajectory_records import TrajectoryRecordArtifact
+from tpen.evaluation.trajectory_records import TrajectoryRecordArtifact, TrajectoryRecordArtifactV2
 from tpen.physics.receipt import ExecutionReceipt
 from tpen.trace import Trace
 
@@ -52,7 +52,7 @@ class GeneratedConfigurations:
 
     batch: ElectronBatch
     metadata: Mapping[str, Any]
-    trajectory_records: TrajectoryRecordArtifact | None = None
+    trajectory_records: TrajectoryRecordArtifact | TrajectoryRecordArtifactV2 | None = None
 
 
 @dataclass(frozen=True)
