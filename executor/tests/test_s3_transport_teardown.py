@@ -428,7 +428,6 @@ def test_dispatcher_cancel_settles_every_leaf_before_dfk_cleanup(
         threading.Event().wait()  # "stuck": never acks
 
     fake_parsl.hooks["run_leaf"] = dispatching_hook
-    _interrupt_once(monkeypatch)
     dispatcher = parsl_dispatch.ParslDispatcher(_worker(tmp_path), transport=_transport(teardown_timeout=0.3))
     group = _group("s3c-dfk-order", "acking", "stuck")
     lifecycle = _two_slot_lifecycle(tmp_path)
@@ -446,11 +445,23 @@ def test_dispatcher_cancel_settles_every_leaf_before_dfk_cleanup(
 
     monkeypatch.setattr(AttachedAllocation, "finish", spying_finish)
 
-    def release_ack_shortly() -> None:
-        time.sleep(0.05)
-        ack_gate.set()
+    # Open the ack gate from inside the interrupt itself -- synchronously,
+    # the same call that raises -- rather than racing a timed background
+    # thread against the interrupt. The main loop's current iteration is
+    # already abandoned by the time this raises (the exception unwinds
+    # straight to _cancel_slot_pool), so "acking" can never be settled by
+    # the ordinary polling loop no matter how the background hook thread
+    # is scheduled relative to this.
+    first = {"value": True}
 
-    threading.Thread(target=release_ack_shortly, daemon=True).start()
+    def interrupting_sleep(seconds: float) -> None:
+        if first["value"]:
+            first["value"] = False
+            ack_gate.set()
+            raise KeyboardInterrupt("S3C cancellation")
+        time.sleep(seconds)
+
+    monkeypatch.setattr("tpen_executor.dispatch.parsl._poll_sleep", interrupting_sleep)
 
     with pytest.raises(KeyboardInterrupt, match="S3C cancellation"):
         dispatcher.run(group, _runs(tmp_path, "acking", "stuck"), lifecycle, timeout=60)
