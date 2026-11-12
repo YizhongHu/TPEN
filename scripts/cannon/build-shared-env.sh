@@ -16,23 +16,36 @@ PROJECT=""
 EXTRA=""
 PYTHON_VERSION=""
 UV_BIN=""
+PROJECT_DIR="."
 
 usage() {
   cat >&2 <<'USAGE'
 usage: build-shared-env.sh --envs-root PATH --checkout PATH --project NAME \
-         --extra NAME --python X.Y --uv-bin PATH
+         --extra NAME --python X.Y --uv-bin PATH [--project-dir REL]
 
 Builds, or reuses if already complete, one immutable shared uv environment
 under --envs-root, named <project>-<uv.lock sha256[:12]>-<extra>-py<X.Y>.
 
+--project-dir REL (default ".") names a relative path inside --checkout
+(single or multi path component, no leading '/', no '..') whose own
+pyproject.toml/uv.lock define the env: the lock hash is computed from THAT
+directory's uv.lock and `uv sync` runs there. The cap policy is still read
+only from <checkout>/scripts/cannon/shared-env-policy.json at the checkout
+root, regardless of --project-dir.
+
+--extra none omits the `--extra` flag from `uv sync` entirely (base
+dependencies only); the literal "none" is still used in the env name.
+
 Refuses before any mkdir/uv call if: --envs-root is not an existing absolute
-canonical path; --checkout is not a clean git work tree; the committed cap
-policy at <checkout>/scripts/cannon/shared-env-policy.json is missing or does
-not hold a non-negative integer MAX_SHARED_ENV_DIRS; the target exists
-without a .complete manifest (partial, needs disposition); or the root's
-one-level directory count (every entry, not only complete ones) is at or
-above the committed cap. No CLI flag, environment variable, or default
-overrides the cap; raising it requires a reviewed PR to the policy file.
+canonical path; --checkout is not a clean git work tree; --project-dir does
+not resolve (even through symlinks) to a directory inside --checkout
+containing both pyproject.toml and uv.lock; the committed cap policy at
+<checkout>/scripts/cannon/shared-env-policy.json is missing or does not hold
+a non-negative integer MAX_SHARED_ENV_DIRS; the target exists without a
+.complete manifest (partial, needs disposition); or the root's one-level
+directory count (every entry, not only complete ones) is at or above the
+committed cap. No CLI flag, environment variable, or default overrides the
+cap; raising it requires a reviewed PR to the policy file.
 
 Requires UV_CACHE_DIR set by the caller.
 USAGE
@@ -49,6 +62,7 @@ while (($#)); do
     --extra) EXTRA="${2:?missing name}"; shift 2 ;;
     --python) PYTHON_VERSION="${2:?missing version}"; shift 2 ;;
     --uv-bin) UV_BIN="${2:?missing path}"; shift 2 ;;
+    --project-dir) PROJECT_DIR="${2:?missing path}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "PRECHECK_FAILED unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -85,6 +99,22 @@ git -C "$CANON_CHECKOUT" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
 [[ -z "$(git -C "$CANON_CHECKOUT" status --porcelain)" ]] || fail "checkout is dirty: $CANON_CHECKOUT"
 HEAD_SHA="$(git -C "$CANON_CHECKOUT" rev-parse HEAD)"
 
+# --project-dir selects the subdirectory (default the checkout root itself)
+# whose own pyproject.toml/uv.lock define the env being built. Validated as
+# a well-formed relative path first (format only, no filesystem touched),
+# then resolved through any symlinks and required to still land inside the
+# checkout -- a traversal or an escaping symlink is refused before any
+# mkdir/uv call, same as --project/--extra above.
+is_valid_project_dir_rel "$PROJECT_DIR" ||
+  fail_precheck "--project-dir must be '.' or a relative path with no '..' and no leading '/': $PROJECT_DIR"
+PROJECT_DIR_CANDIDATE="$CANON_CHECKOUT/$PROJECT_DIR"
+[[ -d "$PROJECT_DIR_CANDIDATE" ]] || fail_precheck "--project-dir does not exist as a directory: $PROJECT_DIR"
+CANON_PROJECT_DIR="$(realpath -- "$PROJECT_DIR_CANDIDATE")"
+path_contains "$CANON_CHECKOUT" "$CANON_PROJECT_DIR" ||
+  fail_precheck "--project-dir escapes --checkout: $PROJECT_DIR resolves to $CANON_PROJECT_DIR"
+[[ -f "$CANON_PROJECT_DIR/pyproject.toml" ]] || fail_precheck "--project-dir has no pyproject.toml: $CANON_PROJECT_DIR"
+[[ -f "$CANON_PROJECT_DIR/uv.lock" ]] || fail_precheck "--project-dir has no uv.lock: $CANON_PROJECT_DIR"
+
 POLICY_FILE="$CANON_CHECKOUT/scripts/cannon/shared-env-policy.json"
 [[ -f "$POLICY_FILE" ]] || fail "policy file missing: $POLICY_FILE"
 # Whole-document match, not a substring grep: the committed policy must be
@@ -97,19 +127,19 @@ POLICY_RE='^[[:space:]]*\{[[:space:]]*"MAX_SHARED_ENV_DIRS"[[:space:]]*:[[:space
 [[ "$POLICY_CONTENT" =~ $POLICY_RE ]] || fail "policy MAX_SHARED_ENV_DIRS missing or not a non-negative integer: $POLICY_FILE"
 CAP="${BASH_REMATCH[1]}"
 
-UV_LOCK="$CANON_CHECKOUT/uv.lock"
-[[ -f "$UV_LOCK" ]] || fail_precheck "uv.lock missing in checkout: $UV_LOCK"
+UV_LOCK="$CANON_PROJECT_DIR/uv.lock"
 LOCK_SHA256="$(sha256sum -- "$UV_LOCK" | cut -d' ' -f1)"
 ENV_NAME="$(compute_shared_env_name "$PROJECT" "$LOCK_SHA256" "$EXTRA" "$PYTHON_VERSION")"
 TARGET="$CANON_ENVS_ROOT/$ENV_NAME"
 # manifest_is_valid (shared with the reuse-only precheck, see
 # shared-env-manifest.sh) trusts a manifest for reuse only if it is exactly
-# the six fields this script writes, in order, each strictly formatted, with
-# the recorded lock hash matching the CURRENT checkout's uv.lock. The build
-# HEAD may differ from the requesting HEAD (dependencies, not history,
-# define identity); an empty, truncated (even late, even without a final
-# field, even missing only a trailing newline), malformed, or mismatched
-# manifest is not trusted.
+# the seven fields this script writes, in order, each strictly formatted (or
+# the six-field form written before --project-dir existed, implying a
+# checkout-root project dir), with the recorded lock hash matching the
+# CURRENT project dir's uv.lock. The build HEAD may differ from the
+# requesting HEAD (dependencies, not history, define identity); an empty,
+# truncated (even late, even without a final field, even missing only a
+# trailing newline), malformed, or mismatched manifest is not trusted.
 
 LOCKFILE="$CANON_ENVS_ROOT/.build-shared-env.lock"
 exec 200>"$LOCKFILE"
@@ -160,7 +190,11 @@ if ((COUNT >= CAP)); then
 fi
 
 mkdir -- "$TARGET"
-(cd "$CANON_CHECKOUT" && UV_PROJECT_ENVIRONMENT="$TARGET" "$UV_BIN" sync --locked --no-install-project --extra "$EXTRA" --python "$PYTHON_VERSION")
+# --extra none means base dependencies only: omit the --extra flag rather
+# than passing the literal word "none" to uv sync as an extra name.
+EXTRA_ARGS=()
+[[ "$EXTRA" == "none" ]] || EXTRA_ARGS=(--extra "$EXTRA")
+(cd "$CANON_PROJECT_DIR" && UV_PROJECT_ENVIRONMENT="$TARGET" "$UV_BIN" sync --locked --no-install-project "${EXTRA_ARGS[@]}" --python "$PYTHON_VERSION")
 
 # Every manifest field is collected into a variable with a checked exit
 # status before any write; a failure here must block publication (the dir
@@ -184,6 +218,7 @@ uv_version=$UV_VERSION
 python_version=$PY_FULL_VERSION
 python_request=$PYTHON_VERSION
 built_utc=$BUILT_UTC
+project_dir=$PROJECT_DIR
 MANIFEST
 # Validate the temp file with the same strict function used for reuse,
 # before the rename -- a build that produced a malformed manifest must not

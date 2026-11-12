@@ -37,6 +37,7 @@ def make_checkout(
     env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = "test"
     env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = "test@example.com"
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=env)
+    (repo / "pyproject.toml").write_text("[project]\nname = \"fixture\"\n")
     (repo / "uv.lock").write_text("locked-dependency-contents\n")
     (repo / "scripts" / "cannon").mkdir(parents=True)
     if policy_body is not None:
@@ -48,8 +49,15 @@ def make_checkout(
     return repo
 
 
-def env_name_for(checkout: Path, *, project: str = PROJECT, extra: str = EXTRA, python_version: str = PYTHON_VERSION) -> str:
-    lock_sha256 = hashlib.sha256((checkout / "uv.lock").read_bytes()).hexdigest()
+def env_name_for(
+    checkout: Path,
+    *,
+    project: str = PROJECT,
+    extra: str = EXTRA,
+    python_version: str = PYTHON_VERSION,
+    project_dir: str = ".",
+) -> str:
+    lock_sha256 = hashlib.sha256((checkout / project_dir / "uv.lock").read_bytes()).hexdigest()
     return f"{project}-{lock_sha256[:12]}-{extra}-py{python_version}"
 
 
@@ -77,7 +85,7 @@ def make_uv_stub(tmp_path: Path, *, python_version: str | None = PY_FULL_VERSION
     marker = "__PYVER__" if python_version is None else python_version
     uv.write_text(
         "#!/usr/bin/env bash\n"
-        f'echo "$@" >> "{log}"\n'
+        f'echo "CWD=$PWD ARGS=$*" >> "{log}"\n'
         'if [[ "$1" == "--version" ]]; then echo "uv 9.9.9-stub"; exit 0; fi\n'
         'if [[ "$1" == "sync" ]]; then\n'
         '  mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"\n'
@@ -115,15 +123,19 @@ def make_valid_manifest(
     *,
     head: str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
     lock_sha256: str | None = None,
+    project_dir: str | None = ".",
 ) -> str:
     """A ``.complete`` body the builder's manifest_is_valid accepts.
 
     ``head`` intentionally defaults to a value that need not equal the
     checkout's actual HEAD: dependency identity (the lock hash), not
-    history, is what reuse validates.
+    history, is what reuse validates. ``project_dir=None`` omits the
+    seventh field entirely, producing the six-field manifest shape written
+    before --project-dir existed (still required to be trusted for reuse).
     """
-    lock_sha256 = lock_sha256 or hashlib.sha256((checkout / "uv.lock").read_bytes()).hexdigest()
-    return (
+    lock_dir = checkout if project_dir is None else checkout / project_dir
+    lock_sha256 = lock_sha256 or hashlib.sha256((lock_dir / "uv.lock").read_bytes()).hexdigest()
+    body = (
         f"head={head}\n"
         f"uv_lock_sha256={lock_sha256}\n"
         "uv_version=uv 9.9.9-stub\n"
@@ -131,6 +143,34 @@ def make_valid_manifest(
         "python_request=3.12\n"
         "built_utc=2026-01-01T00:00:00Z\n"
     )
+    if project_dir is not None:
+        body += f"project_dir={project_dir}\n"
+    return body
+
+
+def add_subproject(
+    checkout: Path,
+    rel: str,
+    *,
+    lock_contents: bytes = b"sub-locked-dependency-contents\n",
+    include_pyproject: bool = True,
+    include_lock: bool = True,
+) -> Path:
+    """Add and commit a subdirectory with its own pyproject.toml/uv.lock,
+    for --project-dir tests. Committed (not left dirty) so the builder's
+    clean-checkout precheck still passes."""
+    sub = checkout / rel
+    sub.mkdir(parents=True, exist_ok=True)
+    if include_pyproject:
+        (sub / "pyproject.toml").write_text('[project]\nname = "sub"\n')
+    if include_lock:
+        (sub / "uv.lock").write_bytes(lock_contents)
+    env = dict(os.environ)
+    env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = "test"
+    env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = "test@example.com"
+    subprocess.run(["git", "add", "-A"], cwd=checkout, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "add subproject"], cwd=checkout, check=True, env=env)
+    return sub
 
 
 def make_filler_dirs(root: Path, count: int, *, names: list[str] | None = None) -> None:
@@ -149,6 +189,7 @@ def run_builder(
     project: str = PROJECT,
     extra: str = EXTRA,
     python_version: str = PYTHON_VERSION,
+    project_dir: str | None = None,
     extra_env: dict[str, str] | None = None,
     extra_args: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -165,6 +206,7 @@ def run_builder(
         "--extra", extra,
         "--python", python_version,
         "--uv-bin", str(uv_bin),
+        *(["--project-dir", project_dir] if project_dir is not None else []),
         *(extra_args or []),
     ]
     return subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
@@ -853,3 +895,189 @@ def test_timestamp_query_success_control_still_builds(tmp_path: Path, envs_root:
     result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
     assert result.returncode == 0, result.stdout + result.stderr
     assert (envs_root / target / ".complete").is_file()
+
+
+# --- A3 (--project-dir and --extra none) -----------------------------------
+
+
+def test_project_dir_hashes_subproject_lock_and_syncs_there(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    sub = add_subproject(checkout, "executor", lock_contents=b"executor-locked-contents\n")
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    root_target = env_name_for(checkout)
+    sub_target = env_name_for(checkout, project_dir="executor")
+    assert root_target != sub_target, "fixture sanity: root and sub lock hashes must differ"
+
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir="executor",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "BUILT" in result.stdout
+    manifest = (envs_root / sub_target / ".complete").read_text()
+    expected_lock_sha256 = hashlib.sha256((sub / "uv.lock").read_bytes()).hexdigest()
+    assert f"uv_lock_sha256={expected_lock_sha256}" in manifest
+    assert "project_dir=executor" in manifest
+    assert not (envs_root / root_target).exists()
+    log_text = uv_log.read_text()
+    assert "sync" in log_text
+    assert f"CWD={sub}" in log_text
+
+
+def test_project_dir_default_is_checkout_root(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout)
+    result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = (envs_root / target / ".complete").read_text()
+    assert "project_dir=.\n" in manifest
+    assert f"CWD={checkout}" in uv_log.read_text()
+
+
+@pytest.mark.parametrize("bad_project_dir", ["../escape", "..", "/abs", "a/../b", "a//b", "a/"])
+def test_project_dir_traversal_or_absolute_is_rejected(
+    tmp_path: Path, envs_root: Path, cache_dir: Path, bad_project_dir: str,
+) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    outside_before = {p.name for p in tmp_path.iterdir()}
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir=bad_project_dir,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "PRECHECK_FAILED" in result.stderr
+    assert not uv_log.exists()
+    assert {p.name for p in tmp_path.iterdir()} == outside_before
+    assert list(envs_root.iterdir()) == []
+
+
+def test_project_dir_symlink_escape_is_rejected(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    outside = tmp_path / "outside-of-checkout"
+    outside.mkdir()
+    (outside / "pyproject.toml").write_text('[project]\nname = "outside"\n')
+    (outside / "uv.lock").write_bytes(b"outside-lock\n")
+    link = checkout / "escape-link"
+    link.symlink_to(outside, target_is_directory=True)
+    env = dict(os.environ)
+    env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = "test"
+    env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = "test@example.com"
+    subprocess.run(["git", "add", "-A"], cwd=checkout, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "add escape symlink"], cwd=checkout, check=True, env=env)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir="escape-link",
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "PRECHECK_FAILED" in result.stderr
+    assert "escapes" in result.stderr
+    assert not uv_log.exists()
+    assert not (outside / "mutated-by-test").exists()
+
+
+def test_project_dir_missing_pyproject_refuses(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    add_subproject(checkout, "no-pyproject", include_pyproject=False)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir="no-pyproject",
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "PRECHECK_FAILED" in result.stderr
+    assert "pyproject.toml" in result.stderr
+    assert not uv_log.exists()
+
+
+def test_project_dir_missing_uv_lock_refuses(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    add_subproject(checkout, "no-lock", include_lock=False)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir="no-lock",
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "PRECHECK_FAILED" in result.stderr
+    assert "uv.lock" in result.stderr
+    assert not uv_log.exists()
+
+
+def test_project_dir_nonexistent_refuses(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir="does-not-exist",
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "PRECHECK_FAILED" in result.stderr
+    assert not uv_log.exists()
+
+
+def test_policy_still_read_from_checkout_root_with_project_dir(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    """A different (and invalid) policy file sitting inside the project dir
+    must never be consulted -- the cap always comes from
+    <checkout>/scripts/cannon/shared-env-policy.json."""
+    checkout = make_checkout(tmp_path)
+    sub = add_subproject(checkout, "executor")
+    (sub / "scripts").mkdir(parents=True)
+    (sub / "scripts" / "cannon").mkdir()
+    (sub / "scripts" / "cannon" / "shared-env-policy.json").write_text('{"MAX_SHARED_ENV_DIRS": "not-a-number"}\n')
+    env = dict(os.environ)
+    env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = "test"
+    env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = "test@example.com"
+    subprocess.run(["git", "add", "-A"], cwd=checkout, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "add decoy policy"], cwd=checkout, check=True, env=env)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    sub_target = env_name_for(checkout, project_dir="executor")
+
+    result = run_builder(
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir="executor",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "BUILT" in result.stdout
+    assert (envs_root / sub_target / ".complete").is_file()
+
+
+def test_extra_none_omits_extra_flag_from_uv_sync(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout, extra="none")
+    result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, extra="none")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "BUILT" in result.stdout
+    assert f"{PROJECT}-" in target and target.endswith("-none-py3.12")
+    assert (envs_root / target / ".complete").is_file()
+    sync_lines = [line for line in uv_log.read_text().splitlines() if "ARGS=sync" in line]
+    assert len(sync_lines) == 1, sync_lines
+    assert "--extra" not in sync_lines[0]
+
+
+def test_extra_named_none_is_distinct_from_ordinary_extra(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    none_target = env_name_for(checkout, extra="none")
+    cpu_target = env_name_for(checkout, extra=EXTRA)
+    assert none_target != cpu_target
+    result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, extra="none")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (envs_root / none_target / ".complete").is_file()
+    assert not (envs_root / cpu_target).exists()
+
+
+def test_old_six_field_manifest_still_reused(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    """The existing Holystore env's manifest (written before --project-dir
+    existed, six fields, no project_dir line) must stay reusable."""
+    checkout = make_checkout(tmp_path)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target_name = env_name_for(checkout)
+    target_dir = envs_root / target_name
+    target_dir.mkdir()
+    six_field_manifest = make_valid_manifest(checkout, project_dir=None)
+    assert len(six_field_manifest.splitlines()) == 6
+    (target_dir / ".complete").write_text(six_field_manifest)
+    result = run_builder(envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "REUSE" in result.stdout
+    assert not uv_log.exists() or uv_log.read_text() == ""
+    # Reuse never rewrites the pre-existing manifest.
+    assert (target_dir / ".complete").read_text() == six_field_manifest

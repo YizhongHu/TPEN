@@ -132,9 +132,11 @@ prefix) and delegates resolution/validation to
    between the two scripts (`shared-env-manifest.sh`) — and refuses unless
    it is a real directory (not a symlink) whose canonical parent is exactly
    `SHARED_ENV_PREFIX`, carries a `.complete` manifest matching the same
-   six-field contract `build-shared-env.sh` writes (not just a matching
-   `uv_lock_sha256` line) whose hash equals the clone's full sha256, and has
-   an executable `bin/python`. On any refusal the message names the
+   manifest contract `build-shared-env.sh` writes — the original six-field
+   form, or the seven-field form with a trailing `project_dir=<REL>` line
+   that every build-shared-env.sh build now writes (not just a matching
+   `uv_lock_sha256` line) — whose hash equals the clone's full sha256, and
+   has an executable `bin/python`. On any refusal the message names the
    missing/invalid path and tells the operator to build it first with
    `build-shared-env.sh`.
 
@@ -170,7 +172,8 @@ scripts/cannon/build-shared-env.sh \
   --envs-root /absolute/canonical/facility/env/root \
   --checkout /absolute/path/to/an/exact-SHA/clean/checkout \
   --project tpen --extra cpu --python 3.12 \
-  --uv-bin /absolute/path/to/uv
+  --uv-bin /absolute/path/to/uv \
+  [--project-dir REL]
 ```
 
 `UV_CACHE_DIR` must be set by the caller. The `--checkout` must be a clean
@@ -179,7 +182,23 @@ git work tree (its `HEAD` is recorded in the manifest below). `--project` and
 no `/`, no leading `.` so `..` is rejected) — the computed target's canonical
 parent is also asserted to equal the canonical `--envs-root` under the lock,
 so neither flag, nor a weakened name check, can make the target escape the
-counted root.
+counted root. `--extra none` omits the `--extra` flag from `uv sync` entirely
+(base dependencies only); the literal `none` is still used in the computed
+env name, distinct from any ordinary extra.
+
+`--project-dir REL` (default `.`, the checkout root) names the subdirectory
+whose own `pyproject.toml`/`uv.lock` define the env — e.g. a monorepo
+sub-package such as an executor with its own lockfile. `REL` must be `.` or
+one-or-more path components matching the same single-component pattern as
+`--project`/`--extra`, joined by `/` (no leading `/`, no `..`, no empty or
+doubled separator). It is resolved through any symlinks and refused before
+any `mkdir`/`uv` call if the result escapes `--checkout`, does not exist, or
+is missing `pyproject.toml` or `uv.lock`. The env's `uv.lock` sha256 (and so
+the computed name and `uv sync`'s working directory) always come from
+`--project-dir`, never the checkout root when the two differ. The cap policy
+is still read only from `<checkout>/scripts/cannon/shared-env-policy.json` at
+the checkout root regardless of `--project-dir` — a policy file sitting
+inside the project dir is never consulted.
 
 The committed cap in `scripts/cannon/shared-env-policy.json`
 (`MAX_SHARED_ENV_DIRS`) is read only from that file via a whole-document
@@ -212,18 +231,24 @@ pattern itself. Decision order, all before any `mkdir`/`uv sync`:
    refuse, printing the observed count, the requested path, the cap, the
    policy file path, and the checkout's exact `HEAD`;
 5. otherwise, `mkdir`, then `UV_PROJECT_ENVIRONMENT=<env> uv sync --locked
-   --no-install-project --extra <extra> --python <X.Y>` under the checkout,
-   then query `<env>/bin/python --version`, `uv --version`, and the UTC
-   build time into checked variables (any query failure refuses and leaves
-   the build partial, counted, undeleted — never masked by an otherwise
-   successful write), and write a `.complete` manifest — via a temp file in
-   the same directory, strictly re-validated (exactly six fields, in order,
-   each format-checked — a 40-hex `head`, a 64-hex `uv_lock_sha256` equal to
-   the checkout's, non-empty `uv_version`, `X.Y.Z` `python_version`, `X.Y`
-   `python_request`, full `YYYY-MM-DDTHH:MM:SSZ` `built_utc`) before
+   --no-install-project [--extra <extra>] --python <X.Y>` under
+   `--project-dir` (the `--extra` flag is omitted entirely when `--extra` is
+   the literal `none`), then query `<env>/bin/python --version`,
+   `uv --version`, and the UTC build time into checked variables (any query
+   failure refuses and leaves the build partial, counted, undeleted — never
+   masked by an otherwise successful write), and write a `.complete`
+   manifest — via a temp file in the same directory, strictly re-validated
+   (exactly seven fields, in order, each format-checked — a 40-hex `head`, a
+   64-hex `uv_lock_sha256` equal to `--project-dir`'s, non-empty
+   `uv_version`, `X.Y.Z` `python_version`, `X.Y` `python_request`, full
+   `YYYY-MM-DDTHH:MM:SSZ` `built_utc`, and `project_dir=<REL>`) before
    publishing by one same-directory atomic `mv`, so a late-truncated or
-   malformed write is never published. The same strict check governs reuse:
-   a producer/consumer manifest truncated even past every nominal field is
+   malformed write is never published. The same strict check governs reuse,
+   and also accepts the six-field form written by any build from before
+   `--project-dir` existed (implying a checkout-root project dir) so an
+   already-built shared env, such as the existing
+   `tpen-a0d83e31a6a2-cpu-py3.12`, stays reusable unchanged: a
+   producer/consumer manifest truncated even past every nominal field is
    rejected, not just an empty or early-truncated one.
 
 Raising the cap requires a reviewed PR that changes the committed policy
