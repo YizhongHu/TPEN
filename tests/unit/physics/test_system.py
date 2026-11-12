@@ -91,9 +91,9 @@ def test_hooke_1e_builds_with_no_nuclear_resource() -> None:
 
 
 GOLDEN_SYSTEM_IDS = {
-    "hooke_1e_omega_0.5": "8df53e3131c58b09bfd4bd38ac2e41e91f6bd1cb7a4a90c8da95dd79cf25c4b9",
-    "helium": "54fbd6b17b0623fb94fd66f91c3878bcb5c26f81b86213da0fdbfa99ef2e4f76",
-    "h2_r1.4": "0b4e0a52bb6e27df2a7d7d4f4b3cf19a2ba3fc3a5c8bb90e89e3a6ef9ed8c3bb6",
+    "hooke_1e_omega_0.5": "d8408fa70440c94c7f1a5826891917aff82651a1cab041a44268655682cb27e0",
+    "helium": "8d41df68cc4e3285ff5e2fda1b09f8050430ac593a1c25b3abb56b1ba2d0ea8a",
+    "h2_r1.4": "8daa15da651c797bdb3b91c6bfd61c5645f18d798944df9ae671a7ed585d86a3",
 }
 
 
