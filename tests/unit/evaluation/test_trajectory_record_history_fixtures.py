@@ -77,11 +77,12 @@ def test_frozen_fixture_provenance_matches_committed_bytes(name: str) -> None:
     assert provenance["writer_module_blob_sha1"], "fixture provenance must pin the writer module blob"
     assert provenance["csv_sha256"] == metadata["csv_sha256"]
     assert provenance["byte_count"] == metadata["byte_count"]
-    # Frozen-writer evidence: the pinned writer blob must either be proven
-    # byte-identical to origin/main's writer blob at generation time, or the
-    # comparison must be explicitly recorded as unavailable (never silently
-    # dropped).
-    assert "writer_blob_matches_origin_main" in provenance
+    # Frozen-writer evidence: the writer module at its last pre-S1-F commit
+    # must be proven byte-identical to origin/main's writer blob at
+    # generation time, so these fixtures demonstrably came from the frozen
+    # v1 writer and not from a modified copy.
+    assert provenance["frozen_writer_commit"]
+    assert provenance["writer_blob_matches_origin_main"] is True
 
 
 @pytest.mark.parametrize(
