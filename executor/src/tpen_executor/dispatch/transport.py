@@ -850,7 +850,7 @@ class LeafResult:
         return "completed" if self.science["returncode"] == 0 else "failed"
 
 
-def validate_leaf_result(request: LeafRequest, result: LeafResult) -> LeafResult:
+def validate_leaf_result(request: LeafRequest, result: LeafResult, *, cancellation_expected: bool = False) -> LeafResult:
     """Check on the controller that ``result`` answers exactly ``request``.
 
     Parameters
@@ -859,6 +859,17 @@ def validate_leaf_result(request: LeafRequest, result: LeafResult) -> LeafResult
         Request the controller sent for one begun attempt.
     result : LeafResult
         Decoded leaf result.
+    cancellation_expected : bool, optional
+        Only ``True`` for the controller's own teardown-ack check
+        (:meth:`~tpen_executor.dispatch.parsl._RemoteLeaf.wait_for_teardown`),
+        which is reached only after this same controller already requested
+        this attempt's cancellation.  A real cancellation (pre-spawn or
+        during science) skips inspection by design, so a result reporting
+        ``inspection == 'not-run'`` is accepted as an alternative to the
+        ordinary inspection-required rule below; every other check,
+        including the teardown reap fact, is unchanged.  Never set this for
+        the ordinary completion path: it must not relax what can be
+        published as a successful, segment-worthy outcome.
 
     Returns
     -------
@@ -873,9 +884,10 @@ def validate_leaf_result(request: LeafRequest, result: LeafResult) -> LeafResult
         If the request digest, any echoed identity, the science argv or log
         paths, or the evidence run or checkpoint directory cross the
         request; if a science outcome without a pre-core refusal lacks the
-        inspection phase; or if the leaf did not confirm its reaped children.
-        Every echoed field is compared; the request digest alone is not
-        trusted.
+        inspection phase (unless ``cancellation_expected`` and the result
+        reports ``not-run``); or if the leaf did not confirm its reaped
+        children. Every echoed field is compared; the request digest alone
+        is not trusted.
 
     Notes
     -----
@@ -900,10 +912,15 @@ def validate_leaf_result(request: LeafRequest, result: LeafResult) -> LeafResult
     if result.science is not None:
         checks["argv"] = tuple(result.science["argv"]) == (request.environment.python, *request.science_args())
         checks["logs"] = (result.science["stdout_path"], result.science["stderr_path"]) == (stdout_path, stderr_path)
-    # Every science outcome without a pre-core refusal is inspected in the
-    # leaf, as in a local completion; a result that skipped inspection is
-    # never published as that outcome.
-    checks["inspection"] = ("inspection" in result.phases) == (result.science is not None and result.child_refusal is None)
+    if cancellation_expected and result.inspection == "not-run":
+        # A genuine cancellation (requested by this same controller) never
+        # runs inspection; that is not a skipped-inspection forgery.
+        checks["inspection"] = True
+    else:
+        # Every science outcome without a pre-core refusal is inspected in
+        # the leaf, as in a local completion; a result that skipped
+        # inspection is never published as that outcome.
+        checks["inspection"] = ("inspection" in result.phases) == (result.science is not None and result.child_refusal is None)
     if result.evidence is not None:
         # Evidence must describe this attempt's core run, not a foreign one.
         real_core = os.path.realpath(core_dir)
@@ -988,7 +1005,10 @@ class _ReapObserver:
     The teardown receipt's ``child_group_reaped`` must reflect what the
     worker actually confirmed, for every launch it ran (science and, when it
     ran, inspection) -- not a heuristic derived from the science outcome's
-    pid or return code alone.
+    pid or return code alone.  Starts ``True`` (vacuously: nothing has been
+    attempted yet) and is ANDed down by every launch, including one that
+    never returned an outcome at all -- an uncertain exit is never silently
+    true.
     """
 
     def __init__(self) -> None:
@@ -997,6 +1017,11 @@ class _ReapObserver:
     def record(self, outcome: Any) -> None:
         if not outcome.group_reaped:
             self.confirmed = False
+
+    def record_uncertain(self) -> None:
+        """A launch that raised before returning any outcome: never a true ack."""
+
+        self.confirmed = False
 
 
 class _ReapObservingWorker:
@@ -1007,7 +1032,15 @@ class _ReapObservingWorker:
         self._observer = observer
 
     def run(self, *args: Any, **kwargs: Any) -> Any:
-        outcome = self._inner.run(*args, **kwargs)
+        try:
+            outcome = self._inner.run(*args, **kwargs)
+        except BaseException as error:
+            # A pre-spawn refusal (no child ever existed) tags itself
+            # ``group_reaped = True`` (trivially quiescent); anything else
+            # that escaped after a real spawn is a genuinely uncertain exit.
+            if not getattr(error, "group_reaped", False):
+                self._observer.record_uncertain()
+            raise
         self._observer.record(outcome)
         return outcome
 
@@ -1143,9 +1176,13 @@ def run_leaf(payload: bytes) -> bytes:
         LeafTeardownReceipt.for_request(
             request, inspection="not-run" if inspection == "not-run" else "complete",
             # An observed fact from the worker's own reap of every launch it
-            # ran (science and, when it ran, inspection) -- not derived from
-            # the science outcome's pid or return code alone.
-            child_group_reaped=science is None or reap_observer.confirmed,
+            # attempted (science and, when it ran, inspection) -- not
+            # derived from the science outcome's pid or return code alone.
+            # reap_observer starts True (nothing attempted yet, e.g. a
+            # pre-spawn refusal) and is ANDed down by every attempted
+            # launch, including one that raised before returning any
+            # outcome (review P1-1: an uncertain exit is never true).
+            child_group_reaped=reap_observer.confirmed,
         ).to_dict(),
     )
     return result.encode()

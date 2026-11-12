@@ -11,6 +11,7 @@ import signal
 import socket
 import subprocess
 import threading
+import time
 from typing import Any
 
 from ._codec import decode_json
@@ -49,6 +50,31 @@ def _proc_start_ticks(pid: int) -> int | None:
     except ValueError:
         return None
     return ticks if ticks >= 0 else None
+
+
+def _group_quiescent(pid: int, *, bound: float = 1.0, interval: float = 0.02) -> bool:
+    """Bounded, observed check that no process remains in ``pid``'s group.
+
+    ``start_new_session=True`` makes this worker's process group id equal to
+    the session leader's pid.  Signal 0 to that process group raises
+    ``ProcessLookupError`` only once every member has exited; a live
+    same-group descendant the leader spawned and left behind keeps the
+    group non-empty even after the leader itself has been reaped.  This is
+    the only group-level fact this worker can confirm: it never discovers
+    or signals a process outside the group it itself started.
+    """
+
+    deadline = time.monotonic() + bound
+    while True:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
 
 
 class LaunchPurpose(enum.Enum):
@@ -95,10 +121,11 @@ class ProcessOutcome:
         live, or ``None`` when it could not be observed.
     group_reaped : bool
         Whether this worker confirmed its own reap of the launch: either no
-        child was spawned, or the blocking wait for the session leader
-        returned a return code.  ``True`` by default for every call site that
-        actually returns a :class:`ProcessOutcome`; a caller that cannot
-        confirm reaping never constructs one.
+        child was spawned, or a bounded, observed check
+        (:func:`_group_quiescent`) found no process left in the child's
+        process group after the session leader was reaped.  A caller that
+        cannot confirm this (an uncertain exit) never constructs a
+        :class:`ProcessOutcome` at all, so there is no default to trust.
     """
 
     argv: tuple[str, ...]
@@ -267,7 +294,15 @@ class SubprocessWorker:
             # unsampled launch is never assumed to be one (review delta-3 F1,
             # delta-4 D4-1).
             if not inspector and (slot or sampler_output is not None):
-                ensure_slot_clean(slot, quarantine_dir)
+                try:
+                    ensure_slot_clean(slot, quarantine_dir)
+                except BaseException as error:
+                    # Refused before any child exists: trivially quiescent,
+                    # not an uncertain exit (review P1-1 scope: only a child
+                    # this worker actually spawned can leave its group
+                    # non-empty).
+                    error.group_reaped = True
+                    raise
             # Claim before spawn: a worker that dies later leaves attempted,
             # unfinalized evidence, never an absent or not-sampled record.
             if not claim_sampler_evidence(sampler_output):
@@ -297,12 +332,14 @@ class SubprocessWorker:
                     stderr=stderr,
                     start_new_session=True,
                 )
-            except OSError:
+            except OSError as error:
                 # Popen raised from the launch itself: no child exists.
                 settle_slot_lease(lease, None)
+                error.group_reaped = True
                 raise
             except BaseException:
-                # An interrupted spawn may have left a child no one owns.
+                # An interrupted spawn may have left a child no one owns:
+                # genuinely uncertain, not tagged.
                 settle_slot_lease(lease, None, child_known=False)
                 raise
             spawned_pid = process.pid
@@ -310,6 +347,7 @@ class SubprocessWorker:
             sampler = None
             cancel_stop = threading.Event()
             watcher: threading.Thread | None = None
+            watcher_started = False
             if cancel_path is not None:
                 marker_path = os.fspath(cancel_path)
                 expected_marker = dict(cancel_identity or {})
@@ -332,10 +370,17 @@ class SubprocessWorker:
                         return
 
                 watcher = threading.Thread(target=watch_cancel_marker, daemon=True)
-                watcher.start()
             try:
                 if process_handle is not None:
                     process_handle.attach(process)
+                if watcher is not None:
+                    # Starting the watcher from inside this try means a
+                    # failure to start it (e.g. thread creation refused) is
+                    # an uncertain exit like any other: reaped and
+                    # propagated below, never a silently-true ack (review
+                    # P1-1).
+                    watcher.start()
+                    watcher_started = True
                 if sampler_output is not None:
                     # Hold the sampler before any asynchronous work starts, so
                     # an interruption during or right after start() still
@@ -378,17 +423,23 @@ class SubprocessWorker:
                 raise
             finally:
                 cancel_stop.set()
-                if watcher is not None:
+                if watcher_started:
                     watcher.join(timeout=1)
                 if process_handle is not None:
                     process_handle.clear(process)
-        # Normal exit and worker timeout: the child is reaped; finish the
+        # Normal exit and worker timeout: the leader is reaped; finish the
         # sampler and settle the lease, which stays quarantined if cleanup is
         # still unconfirmed.
         interruptions = finish_gpu_sampler(sampler, sampler_output, lease)
         if interruptions:
             raise interruptions[0]
-        return ProcessOutcome(logical_argv, returncode, stdout_name, stderr_name, timed_out, spawned_pid, spawned_ticks)
+        # An observed, bounded fact, not a default: confirm no process
+        # remains in this launch's group before reporting it reaped
+        # (review P1-1).
+        group_reaped = _group_quiescent(spawned_pid)
+        return ProcessOutcome(
+            logical_argv, returncode, stdout_name, stderr_name, timed_out, spawned_pid, spawned_ticks, group_reaped,
+        )
 
 
 __all__ = ["LaunchPurpose", "ProcessOutcome", "SubprocessWorker"]
