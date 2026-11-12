@@ -7,6 +7,7 @@ import torch
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.physics.hamiltonian import LocalEnergyResult
 from tpen.physics.operators import KINETIC_ENERGY, register_operator
+from tpen.physics.system import HamiltonianTermDescriptor
 
 
 def _extract_logabs(output: WavefunctionOutput) -> torch.Tensor:
@@ -250,6 +251,11 @@ class KineticEnergy:
             wavefunction_output=output,
             per_electron_kinetic=per_electron,
         )
+
+    def describe_physical_operator(self) -> HamiltonianTermDescriptor:
+        """Declare the fixed-coefficient kinetic operator; no free parameters."""
+
+        return HamiltonianTermDescriptor(operator_id=self.operator_id, slot=self.name)
 
 
 __all__ = [
