@@ -334,3 +334,76 @@ def test_completed_updates_alone_disagreeing_is_refused_before_fit(tmp_path):
             run_from_config(target, restore_request=request, raise_exceptions=True)
     assert not fit_entries
     assert snapshot() == before_leaf
+
+
+def test_next_iteration_alone_disagreeing_is_refused_before_fit(tmp_path):
+    """Symmetric to ``test_completed_updates_alone_disagreeing_is_refused_before_fit``:
+    isolates the ``next_iteration`` clause of Train.run's post-restore
+    live-counter binding OR-check. Corrupts only ``next_iteration``, leaving
+    ``completed_updates`` matching the manifest."""
+
+    fixture = Path("tests/integration/artifacts/training/vmc_smoke.yaml")
+    source = OmegaConf.load(fixture)
+    source.run.root = str(tmp_path / "source")
+    source.run.run_id = "source"
+    source.trainer.max_steps = 2
+    source.sampler.n_walkers = 8
+    source.sampler.burn_in = 1
+    source.sampler.n_steps = 1
+    for callback in source.callbacks:
+        if callback.get("_target_") == "tpen.callback.Checkpoint":
+            callback.schedule.every_n = 1
+    assert run_from_config(source, raise_exceptions=True) == 0
+    checkpoint, = (tmp_path / "source").rglob("step_000001")
+    predecessor = checkpoint.parent.parent
+
+    # Corrupt next_iteration only, before anything selects the checkpoint,
+    # keeping completed_updates matching the manifest. Recompute trainer.json's
+    # own content digest so the component-file check still passes.
+    trainer_path = checkpoint / "trainer.json"
+    trainer_state = json.loads(trainer_path.read_text(encoding="utf-8"))
+    trainer_state["next_iteration"] += 1
+    trainer_path.write_text(json.dumps(trainer_state), encoding="utf-8")
+    manifest_path = checkpoint / "manifest.json"
+    manifest_state = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_state["hashes"]["trainer_sha256"] = hashlib.sha256(trainer_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(manifest_state), encoding="utf-8")
+
+    def snapshot():
+        return {
+            str(p.relative_to(predecessor)):
+                (hashlib.sha256(p.read_bytes()).hexdigest(), p.stat().st_mtime_ns)
+            for p in predecessor.rglob("*") if p.is_file()
+        }
+
+    before_leaf = snapshot()
+
+    intent = ScienceIntent({"fixture": "s2-vmc-smoke"}, target_iterations=2)
+    evidence = CheckpointEvidence.from_ref(
+        CheckpointRef.from_directory(checkpoint),
+        science_input_digest=intent.science_input_digest, target_iterations=2,
+    )
+    decision = select_recovery(intent, phase=RecoveryPhase.RECOVERY, evidence=evidence)
+    assert decision.refusal is None
+    request = OperationalRestoreRequest(decision)
+    assert request.completed_updates == trainer_state["completed_updates"]
+    assert request.next_iteration != trainer_state["next_iteration"]
+    target = OmegaConf.create(OmegaConf.to_container(source, resolve=False))
+    target.run.root = str(tmp_path / "successor")
+    target.run.run_id = "successor"
+
+    fit_entries = []
+    original_fit = VMCTrainer.fit
+
+    def observe_fit(self, **kwargs):
+        fit_entries.append(self.next_iteration)
+        return original_fit(self, **kwargs)
+
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(VMCTrainer, "fit", observe_fit)
+        with pytest.raises(ValueError, match="restored live trainer counters"):
+            run_from_config(target, restore_request=request, raise_exceptions=True)
+    assert not fit_entries
+    assert snapshot() == before_leaf
