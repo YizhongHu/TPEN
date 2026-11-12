@@ -105,6 +105,85 @@ excludes `scripts` via `norecursedirs`, so a bare `pytest`/`uv run pytest` from
 the repository root never collects facility-specific tests; run them
 explicitly with `uv run pytest scripts/cannon/tests`.
 
+## build-shared-env.sh — capped builder for shared immutable uv environments
+
+`build-shared-env.sh` builds, or reuses if already complete, one immutable
+shared `uv` environment under a facility env root (all facility paths arrive
+by `--envs-root`/`--checkout`, never hardcoded here), named deterministically:
+
+```
+<project>-<sha256(uv.lock)[:12]>-<extra>-py<X.Y>
+```
+
+```
+scripts/cannon/build-shared-env.sh \
+  --envs-root /absolute/canonical/facility/env/root \
+  --checkout /absolute/path/to/an/exact-SHA/clean/checkout \
+  --project tpen --extra cpu --python 3.12 \
+  --uv-bin /absolute/path/to/uv
+```
+
+`UV_CACHE_DIR` must be set by the caller. The `--checkout` must be a clean
+git work tree (its `HEAD` is recorded in the manifest below). `--project` and
+`--extra` must each be a single path component (`^[A-Za-z0-9][A-Za-z0-9._+]*$`,
+no `/`, no leading `.` so `..` is rejected) — the computed target's canonical
+parent is also asserted to equal the canonical `--envs-root` under the lock,
+so neither flag, nor a weakened name check, can make the target escape the
+counted root.
+
+The committed cap in `scripts/cannon/shared-env-policy.json`
+(`MAX_SHARED_ENV_DIRS`) is read only from that file via a whole-document
+match (one top-level object, one key, a plain non-leading-zero integer up to
+3 digits) in the exact verified checkout, and only from there — no CLI flag,
+environment variable, or default can override it. Truncated, duplicated,
+nested, or trailing-garbage policy documents refuse rather than having a
+substring accepted. Under one root-level `flock`, with pathname expansion
+explicitly re-enabled (`set +f`, `GLOBIGNORE` unset, `failglob` disabled) so
+an inherited `SHELLOPTS=noglob`/`BASHOPTS=failglob` cannot silently empty the
+census or break an empty-root first build, the builder counts **every**
+one-level directory entry beneath `--envs-root` (dot-dirs, malformed or
+partial names, symlinked directories, even a directory literally named
+`*` — not only directories carrying a `.complete` manifest), so a cap
+cannot be evaded by an unfinished or oddly-named directory. A directory
+census is only ever treated as a glob-expansion failure (rather than a real
+entry) when the one and only result is the still-literal, unexpanded `*`
+pattern itself. Decision order, all before any `mkdir`/`uv sync`:
+
+1. the target (`<env-name>`) is a symlink -> hard refuse, never reused or
+   created through;
+2. the target already exists and carries a `.complete` manifest whose
+   recorded `uv.lock` sha256 matches the current checkout's (the build
+   `HEAD` may differ — dependency identity, not history, governs reuse) ->
+   reuse, exit 0 (checked even if the root is otherwise at cap, since the
+   target itself is one of the counted entries);
+3. the target exists without a valid `.complete` -> hard refuse: partial or
+   invalid build, needs an explicit disposition, never auto-cleaned;
+4. the one-level directory count is at or above the committed cap -> hard
+   refuse, printing the observed count, the requested path, the cap, the
+   policy file path, and the checkout's exact `HEAD`;
+5. otherwise, `mkdir`, then `UV_PROJECT_ENVIRONMENT=<env> uv sync --locked
+   --no-install-project --extra <extra> --python <X.Y>` under the checkout,
+   then query `<env>/bin/python --version`, `uv --version`, and the UTC
+   build time into checked variables (any query failure refuses and leaves
+   the build partial, counted, undeleted — never masked by an otherwise
+   successful write), and write a `.complete` manifest — via a temp file in
+   the same directory, strictly re-validated (exactly six fields, in order,
+   each format-checked — a 40-hex `head`, a 64-hex `uv_lock_sha256` equal to
+   the checkout's, non-empty `uv_version`, `X.Y.Z` `python_version`, `X.Y`
+   `python_request`, full `YYYY-MM-DDTHH:MM:SSZ` `built_utc`) before
+   publishing by one same-directory atomic `mv`, so a late-truncated or
+   malformed write is never published. The same strict check governs reuse:
+   a producer/consumer manifest truncated even past every nominal field is
+   rejected, not just an empty or early-truncated one.
+
+Raising the cap requires a reviewed PR that changes the committed policy
+file and its hard-refusal test together, visible in Git/GitHub — there is
+no automatic GC, override flag, or separate environment-management project.
+This builder only builds/reuses one environment per invocation; it does not
+itself decide which jobs consume which shared env, migrate consumers, or
+dispose of any existing environment (see the Holystore envs plan,
+Task Orchestrator item `05803194`, for those later slices).
+
 ## submit-lint.sh — pre-submit submission-contract linter
 
 `submit-lint.sh` is a generic, facility-neutral linter run on the generated
