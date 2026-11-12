@@ -368,6 +368,103 @@ def test_capacity_pilot_stage_both_is_refused() -> None:
         launch.parse_args(["--payload", "capacity-pilot", "--stage", "bogus"])
 
 
+# --- capacity-pilot-100k: stage-1-only, no stage 2 (amendment 20261112-r1) --
+
+
+def test_capacity_pilot_100k_stage1_dry_run_is_one_line(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    code = launch.main(
+        [
+            "--run-root", str(tmp_path / "runs" / "h-v2" / "capacity-pilot-100k" / "P"),
+            "--run-root-prefix", str(tmp_path / "runs"),
+            "--commit", SHA,
+            "--payload", "capacity-pilot-100k",
+            "--stage", "eval",
+            "--pilot-stage", "1",
+            "--expected-train-commit", TRAIN_SHA,
+            "--time", "02:00:00",
+            "--science-python", sys.executable,
+            "--executor-python", sys.executable,
+            "--dry-run",
+        ]
+    )
+    assert code == 0
+    printed = capsys.readouterr().out
+    assert printed.count("sbatch --parsable") == 1
+    assert "eval-fanout capacity-pilot-100k" in printed
+    assert "--pilot-stage 1" in printed
+
+
+def test_capacity_pilot_100k_requires_pilot_stage(tmp_path: Path) -> None:
+    with pytest.raises(launch.LaunchError, match="--pilot-stage"):
+        launch.main(
+            [
+                "--run-root", str(tmp_path / "runs" / "h-v2" / "capacity-pilot-100k" / "P"),
+                "--run-root-prefix", str(tmp_path / "runs"),
+                "--commit", SHA,
+                "--payload", "capacity-pilot-100k",
+                "--stage", "eval",
+                "--expected-train-commit", TRAIN_SHA,
+                "--time", "02:00:00",
+                "--science-python", sys.executable,
+                "--executor-python", sys.executable,
+                "--dry-run",
+            ]
+        )
+
+
+@pytest.mark.parametrize("pilot_stage", ["2", "2-core"])
+def test_capacity_pilot_100k_refuses_pilot_stage_2_before_any_sbatch_call(
+    tmp_path: Path, pilot_stage: str
+) -> None:
+    """Mutant: the 100k payload has no stage 2 -- it must refuse client-side, never
+    silently run capacity-pilot's own stage-2/2-core route."""
+
+    with pytest.raises(launch.LaunchError, match="must be '1'"):
+        launch.main(
+            [
+                "--run-root", str(tmp_path / "runs" / "h-v2" / "capacity-pilot-100k" / "P"),
+                "--run-root-prefix", str(tmp_path / "runs"),
+                "--commit", SHA,
+                "--payload", "capacity-pilot-100k",
+                "--stage", "eval",
+                "--pilot-stage", pilot_stage,
+                "--expected-train-commit", TRAIN_SHA,
+                "--time", "02:00:00",
+                "--science-python", sys.executable,
+                "--executor-python", sys.executable,
+                "--dry-run",
+            ]
+        )
+    # Refused before any sbatch call: no selection-record read, no submission.
+    selection_path = (
+        tmp_path / "runs" / "h-v2" / "capacity-pilot-100k" / "P" / "attached" / "receipts"
+        / "h-v2-eval-capacity-pilot-100k-selection.json"
+    )
+    assert not selection_path.exists()
+
+
+def test_capacity_pilot_100k_refuses_a_run_root_outside_its_own_prefix(tmp_path: Path) -> None:
+    """The 100k payload's run root is its OWN prefix (``h-v2/capacity-pilot-100k/P``),
+    distinct from capacity-pilot's (``h-v2/capacity-pilot/P``)."""
+
+    with pytest.raises(launch.LaunchError, match="run root"):
+        launch.main(
+            [
+                "--run-root", str(tmp_path / "runs" / "h-v2" / "capacity-pilot" / "P"),
+                "--run-root-prefix", str(tmp_path / "runs"),
+                "--commit", SHA,
+                "--payload", "capacity-pilot-100k",
+                "--stage", "eval",
+                "--pilot-stage", "1",
+                "--expected-train-commit", TRAIN_SHA,
+                "--time", "02:00:00",
+                "--science-python", sys.executable,
+                "--executor-python", sys.executable,
+                "--dry-run",
+            ]
+        )
+
+
 def test_pilot_payload_never_submits_stage_both(tmp_path: Path) -> None:
     with pytest.raises(launch.LaunchError, match="never submits 'both'"):
         launch.main(

@@ -1,0 +1,7 @@
+# H-v2 capacity-pilot-100k payload overlay (acceptance-contract amendment
+# 20261112-r1). A fresh 0->100,000-update lineage, same config/seeds/module
+# set as `capacity_pilot_overlay.yaml`; only `trainer.max_steps` differs.
+trainer.max_steps: 100000
+trainer.log_every_n_steps: 1
+callbacks.4.every_n_steps: 1
+callbacks.5.every_n_steps: 1

@@ -55,7 +55,14 @@ _SCIENCE_SAMPLER_SEEDS = set(_SEED_ROSTER["training_sampler_seeds"])
 
 @pytest.mark.parametrize(
     "payload,max_steps,namespace",
-    [("gpu-route-g", 1000, "pipeline_gpu_smoke_g"), ("capacity-pilot", 20000, "capacity_pilot")],
+    [
+        ("gpu-route-g", 1000, "pipeline_gpu_smoke_g"),
+        ("capacity-pilot", 20000, "capacity_pilot"),
+        # Amendment 20261112-r1: a fresh 0->100,000-update lineage, same
+        # config and seeds (SAME namespace, reused, never a new one) as
+        # capacity-pilot.
+        ("capacity-pilot-100k", 100000, "capacity_pilot"),
+    ],
 )
 def test_pilot_training_config_matches_a1_field_by_field(payload: str, max_steps: int, namespace: str) -> None:
     config, identity = protocol.pilot_training_config(payload)
@@ -246,6 +253,42 @@ def test_short_run_from_config_writes_logging_outputs(tmp_path: Path) -> None:
     assert (history / "manifest.json").exists()
     assert list(history.glob("partition-*.npz"))
     assert (run_dir / "checkpoints" / "step_000000" / "COMPLETE").exists()
+
+
+def test_pilot_payload_100k_real_cpu_run_generalizes_the_checkpoint_inventory(tmp_path: Path) -> None:
+    """Acceptance (amendment 20261112-r1): 'a real CPU tiny-config run proving
+    the inventory ... generalization'.
+
+    Drives the real ``capacity-pilot-100k`` payload config (overlay,
+    A1 module set, full ``TrainResume`` checkpoint payload) through
+    ``run_from_config`` at a tiny scale, proving the SAME mechanism that
+    gives ``capacity-pilot`` 21 checkpoints (0..20000 every 1000)
+    generalizes to a different ordinal count at a different cadence --
+    never a synthetic directory fixture. Mutant: 'an inventory omitting the
+    final checkpoint' -- the asserted set includes update 6, the terminal
+    step.
+    """
+
+    from tpen.run import run_from_config
+
+    config, _ = protocol.pilot_training_config("capacity-pilot-100k")
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
+    config["run"].update(root=str(tmp_path / "runs"), run_id="h-v2-100k-inventory-check")
+    config["runtime"].update(device="cpu")
+    config["sampler"].update(n_walkers=4, burn_in=1, n_steps=1)
+    config["trainer"].update(max_steps=6, log_every_n_steps=1)
+    for entry in config["callbacks"]:
+        if entry["_target_"] == "tpen.callback.Checkpoint":
+            entry["schedule"]["every_n"] = 2
+        if entry["_target_"] == "tpen.callback.RawTrainingBatchRecorder":
+            entry["every_n_steps"] = 1
+            entry["partition_size_steps"] = 2
+
+    assert run_from_config(OmegaConf.create(config), command="h-v2 100k inventory check", raise_exceptions=True) == 0
+    run_dir = next((tmp_path / "runs").rglob("metrics.jsonl")).parent
+    inventory = attached.build_checkpoint_inventory(run_dir / "checkpoints")
+    assert [entry["update"] for entry in inventory] == [0, 2, 4, 6]
 
 
 def test_append_and_remove_candidate_module_round_trips() -> None:
@@ -723,12 +766,19 @@ def test_capacity_pilot_uses_the_approved_a100_resources() -> None:
     assert launch_config.PILOT_PAYLOAD_RESOURCES["capacity-pilot"] is launch_config.RESOURCES
 
 
+def test_capacity_pilot_100k_uses_the_approved_a100_resources_and_12_hour_cap() -> None:
+    assert launch_config.PILOT_PAYLOAD_RESOURCES["capacity-pilot-100k"] is launch_config.RESOURCES
+    assert launch_config.PILOT_PAYLOAD_LINEAGES["capacity-pilot-100k"] == "P"
+    assert launch_config.PILOT_PAYLOAD_GPU_STRATA["capacity-pilot-100k"] == launch_config.APPROVED_GPU_STRATUM
+    assert launch_config.PILOT_PAYLOAD_MAX_WALL_SECONDS["capacity-pilot-100k"] == 12 * 60 * 60
+
+
 # ---------------------------------------------------------------------------
 # launch.py dry-run / cap / run-root prefix
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("payload", ["gpu-route-g", "capacity-pilot"])
+@pytest.mark.parametrize("payload", ["gpu-route-g", "capacity-pilot", "capacity-pilot-100k"])
 def test_dry_run_prints_exactly_one_sbatch_line_with_expected_partition_gres_time(
     payload: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

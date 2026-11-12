@@ -97,18 +97,34 @@ APPROVED_GPU_TEST_STRATUM = "NVIDIA A100-SXM4-40GB MIG 3g.20gb"
 #: at one hour, pilot capped at eight). Neither payload submits an EVAL job
 #: here (item E owns that route); :func:`JobResources` carries no stage
 #: distinction because each of these payloads only ever runs TRAIN.
+#: Acceptance-contract amendment 20261112-r1: a fresh 0->100,000-update
+#: lineage, same resources/stratum/lineage label as ``capacity-pilot``, its
+#: own 12-hour TRAIN wall cap, and its own run root
+#: (``<prefix>/h-v2/capacity-pilot-100k/P``, via :data:`PILOT_PAYLOAD_LINEAGES`
+#: and :func:`launch._validate_run_root_prefix`). Chain-resume from the
+#: existing ``capacity-pilot`` checkpoint was dropped (core refuses an
+#: extended ``trainer.max_steps`` under ``train_resume``, TO note
+#: ``blocker-core-resume-horizon-20261112``); this is an independent fresh
+#: lineage instead.
 PILOT_PAYLOAD_RESOURCES: dict[str, JobResources] = {
     "gpu-route-g": GPU_TEST_RESOURCES,
     "capacity-pilot": RESOURCES,
+    "capacity-pilot-100k": RESOURCES,
 }
-PILOT_PAYLOAD_LINEAGES: dict[str, str] = {"gpu-route-g": "G", "capacity-pilot": "P"}
+PILOT_PAYLOAD_LINEAGES: dict[str, str] = {
+    "gpu-route-g": "G",
+    "capacity-pilot": "P",
+    "capacity-pilot-100k": "P",
+}
 PILOT_PAYLOAD_GPU_STRATA: dict[str, str] = {
     "gpu-route-g": APPROVED_GPU_TEST_STRATUM,
     "capacity-pilot": APPROVED_GPU_STRATUM,
+    "capacity-pilot-100k": APPROVED_GPU_STRATUM,
 }
 PILOT_PAYLOAD_MAX_WALL_SECONDS: dict[str, int] = {
     "gpu-route-g": 1 * 60 * 60,
     "capacity-pilot": 8 * 60 * 60,
+    "capacity-pilot-100k": 12 * 60 * 60,
 }
 
 #: Name of the environment variable the submitter must set to the durable,
