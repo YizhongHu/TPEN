@@ -543,6 +543,38 @@ def test_f4_an_unregistered_runtime_callback_is_refused_in_routed_mode(tmp_path:
         )
 
 
+def test_f4_a_sink_free_runtime_callback_is_admitted_in_routed_mode(tmp_path: Path) -> None:
+    """Negative for the above: a runtime observer with NO output-path-shaped
+    attribute -- an ordinary test readback probe, never configured through
+    `cfg` and so never enumerable in the closed registries ahead of time --
+    has nothing to route and nothing to escape through, and must be
+    admitted, not refused."""
+
+    class _ReadbackProbe:
+        def __init__(self) -> None:
+            self.seen: list[object] = []
+
+        def handle_occurrence(self, occurrence: object, context: object) -> None:
+            self.seen.append(occurrence)
+
+    logical_root = tmp_path / "logical"
+    physical_root = tmp_path / "allocation-1"
+    physical_root.mkdir()
+    destination = ArtifactDestination(physical_root=physical_root)
+    cfg = _routed_cfg(logical_root)
+    probe = _ReadbackProbe()
+
+    context = prepare_run_context(
+        cfg,
+        config_path="test.yaml",
+        command="pytest",
+        artifact_destination=destination,
+        runtime_callbacks=[probe],
+    )
+
+    assert probe in context.callbacks
+
+
 def test_f6_rebinding_a_populated_csv_logger_does_not_omit_the_new_files_header(
     tmp_path: Path,
 ) -> None:
