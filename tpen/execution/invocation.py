@@ -1096,6 +1096,26 @@ def _materialize_configured_worker_config(
     overlay_values = _config_leaves(overlays)
     source_values = _config_leaves(source)
     supplied_values = _config_leaves(supplied)
+    if artifact_destination is not None and overlay_values:
+        # (C) review-r2 R2.4: in routed mode, ANY declared overlay that would
+        # actually change a leaf's value is refused before construction --
+        # not only the automatic `run.root` overlay this gateway itself used
+        # to apply. `tpen.run`'s own closed artifact routing binds the
+        # physical destination; a declared overlay changing `run.root` or
+        # `trainer.max_steps` here would still change C. An overlay whose
+        # value already equals the leaf it would overwrite is a no-op and
+        # stays permitted.
+        nonidentity = {
+            path: value
+            for path, value in overlay_values.items()
+            if source_values.get(path, supplied_values.get(path, _MISSING_CONFIG_VALUE))
+            != value
+        }
+        if nonidentity:
+            raise ReceiptBindingError(
+                "routed configured run refuses nonidentity declared_overlays "
+                "before construction: " + ", ".join(sorted(nonidentity))
+            )
     missing_captured = [
         path
         for path in source_values

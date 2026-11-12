@@ -403,6 +403,114 @@ def test_f5_materialize_configured_worker_config_skips_the_run_root_overlay_when
     assert worker_cfg["run"]["root"] == "original"
 
 
+def test_c_a_nonidentity_run_root_overlay_is_refused_before_construction_when_routed(
+    tmp_path: Path,
+) -> None:
+    """(C) review-r2 R2.4: a DECLARED overlay that would change `run.root`
+    still changes C even though the automatic overlay is skipped (F5) -- it
+    must be refused too, before any construction, in routed mode."""
+
+    from tpen.artifacts import ArtifactDestination
+    from tpen.execution.invocation import ReceiptBindingError, _materialize_configured_worker_config
+
+    intent = capture_science_intent(
+        {"system": "hooke", "electrons": 2},
+        target_iterations=3,
+        source_config={"run": {"root": "original"}, "runner": {}},
+    )
+    decision = RecoveryDecision(phase=RecoveryPhase.INITIAL, outcome="initial", target_iterations=3)
+    destination = ArtifactDestination(physical_root=tmp_path / "fresh")
+
+    with pytest.raises(ReceiptBindingError, match="nonidentity declared_overlays"):
+        _materialize_configured_worker_config(
+            {"run": {"root": "original"}, "runner": {}},
+            intent=intent,
+            decision=decision,
+            output_path=tmp_path / "fresh",
+            declared_overlays={"run.root": "other-root"},
+            artifact_destination=destination,
+        )
+
+
+def test_c_a_nonidentity_max_steps_overlay_is_refused_before_construction_when_routed(
+    tmp_path: Path,
+) -> None:
+    """(C) review-r2 R2.4: the existing `trainer.max_steps` allowlist entry
+    can change H even when `run.root` is left alone -- refused too."""
+
+    from tpen.artifacts import ArtifactDestination
+    from tpen.execution.invocation import ReceiptBindingError, _materialize_configured_worker_config
+
+    intent = capture_science_intent(
+        {"system": "hooke", "electrons": 2},
+        target_iterations=3,
+        source_config={"run": {"root": "original"}, "trainer": {"max_steps": 5}, "runner": {}},
+    )
+    decision = RecoveryDecision(phase=RecoveryPhase.INITIAL, outcome="initial", target_iterations=3)
+    destination = ArtifactDestination(physical_root=tmp_path / "fresh")
+
+    with pytest.raises(ReceiptBindingError, match="nonidentity declared_overlays"):
+        _materialize_configured_worker_config(
+            {"run": {"root": "original"}, "trainer": {"max_steps": 5}, "runner": {}},
+            intent=intent,
+            decision=decision,
+            output_path=tmp_path / "fresh",
+            declared_overlays={"trainer.max_steps": 9},
+            artifact_destination=destination,
+        )
+
+
+def test_c_an_identity_overlay_is_a_no_op_and_stays_permitted_when_routed(tmp_path: Path) -> None:
+    """(C) negative: an overlay whose value already matches the existing leaf
+    is not a config change and must not be refused."""
+
+    from tpen.artifacts import ArtifactDestination
+    from tpen.execution.invocation import _materialize_configured_worker_config
+
+    intent = capture_science_intent(
+        {"system": "hooke", "electrons": 2},
+        target_iterations=3,
+        source_config={"run": {"root": "original"}, "runner": {}},
+    )
+    decision = RecoveryDecision(phase=RecoveryPhase.INITIAL, outcome="initial", target_iterations=3)
+    destination = ArtifactDestination(physical_root=tmp_path / "fresh")
+
+    worker_cfg = _materialize_configured_worker_config(
+        {"run": {"root": "original"}, "runner": {}},
+        intent=intent,
+        decision=decision,
+        output_path=tmp_path / "fresh",
+        declared_overlays={"run.root": "original"},
+        artifact_destination=destination,
+    )
+
+    assert worker_cfg["run"]["root"] == "original"
+
+
+def test_c_a_nonidentity_overlay_is_still_permitted_without_a_destination(tmp_path: Path) -> None:
+    """(C) negative: the new routed-only refusal does not touch legacy callers."""
+
+    from tpen.execution.invocation import _materialize_configured_worker_config
+
+    intent = capture_science_intent(
+        {"system": "hooke", "electrons": 2},
+        target_iterations=3,
+        source_config={"run": {"root": "original"}, "runner": {}},
+    )
+    decision = RecoveryDecision(phase=RecoveryPhase.INITIAL, outcome="initial", target_iterations=3)
+
+    worker_cfg = _materialize_configured_worker_config(
+        {"run": {"root": "original"}, "runner": {}},
+        intent=intent,
+        decision=decision,
+        output_path=tmp_path / "fresh",
+        declared_overlays={"run.root": "other-root"},
+        artifact_destination=None,
+    )
+
+    assert worker_cfg["run"]["root"] == str(tmp_path / "fresh")
+
+
 def _write_core_completion_artifacts(output_path: Path, *, next_iteration: int = 3, completed_updates: int = 3) -> None:
     """Write the core-owned status and checkpoint shape used by gateway tests."""
 
