@@ -344,9 +344,24 @@ def _project_readings(readings: tuple[tuple[str, object], ...]) -> tuple[ScalarM
 class RankLocalJSONLWriter:
     """Append profile records to ``profiles/rank-00000/resources.jsonl``."""
 
-    def __init__(self, run_dir: Path | str, topology: ExecutionTopology) -> None:
+    def __init__(
+        self,
+        run_dir: Path | str,
+        topology: ExecutionTopology,
+        *,
+        path: Path | None = None,
+    ) -> None:
         self.topology = topology
-        self.path = Path(run_dir) / "profiles" / topology.rank_path_component / "resources.jsonl"
+        # ``path``, when supplied, is the caller's already-validated full
+        # path (for example `ArtifactManager.path(...)`, which checks a
+        # bound destination's physical containment including through a
+        # symlink). Recomputing it here from `run_dir` alone would bypass
+        # that check for a profile writer specifically.
+        self.path = (
+            Path(path)
+            if path is not None
+            else Path(run_dir) / "profiles" / topology.rank_path_component / "resources.jsonl"
+        )
 
     def write(self, record: ProfileRecord) -> None:
         """Append one scalar-projected, topology-stamped JSON record."""

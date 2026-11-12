@@ -18,12 +18,15 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from tpen.accelerator import TorchAllocatorPeakProbe, seed_all as accelerator_seed_all
 from tpen.artifacts import (
+    ArtifactDestination,
     ArtifactManager,
+    ArtifactRoutingError,
     RunContext,
     RunResult,
     build_run_metadata,
     resolve_run_clock,
     resolve_run_id,
+    write_artifact_routing_receipt,
     write_error_artifact,
     write_run_start_artifact,
 )
@@ -116,12 +119,34 @@ def prepare_run_context(
     command: str | None = None,
     bootstrap: _BootstrapState | None = None,
     topology: ExecutionTopology | None = None,
+    artifact_destination: ArtifactDestination | None = None,
+    runtime_callbacks: Sequence[object] = (),
 ) -> RunContext:
     """Resolve run metadata, artifact paths, callbacks, and loggers.
 
     Callbacks and loggers are configured at the config root and owned by the
     `RunContext`; runners dispatch into ``context.callbacks`` and log through
     ``context.log``.
+
+    Parameters
+    ----------
+    artifact_destination : tpen.artifacts.ArtifactDestination or None, optional
+        Operational, launcher-supplied physical leaf this run's artifact
+        sinks must write beneath, outside ``cfg``. When ``None`` (the
+        default), sinks write under the logical ``run.root``/``run.dir`` tree
+        exactly as before. When supplied, the recorded ``run.dir`` and every
+        sink a known operational-slot registry covers are routed to the
+        claimed physical leaf while the resolved config `cfg` records and
+        other callers see stays logically unchanged -- see
+        :func:`_route_artifact_sinks`.
+    runtime_callbacks : sequence of objects, optional
+        Operational observers appended after configured callbacks, before
+        this context is returned. Routed (when `artifact_destination` is
+        supplied) and refused on an unsupported sink exactly like configured
+        callbacks -- see :func:`run_from_config`, whose docstring describes
+        this argument's purpose; this parameter exists so a launcher-supplied
+        observer is bound and validated before `RunStarted` is ever emitted,
+        not appended afterward.
 
     Raises
     ------
@@ -186,20 +211,60 @@ def prepare_run_context(
     sector = str(OmegaConf.select(resolved_cfg, "experiment.sector", default="default"))
     root = Path(str(OmegaConf.select(resolved_cfg, "run.root", default="outputs")))
     layout = str(OmegaConf.select(resolved_cfg, "run.layout", default="nested"))
-    artifact_manager = ArtifactManager(root, experiment_name, sector, str(run_id), layout=layout)
+    # The ADMITTED logical `run.dir`, read before anything below overwrites
+    # it. In routed mode only, this -- not a directory recomputed from
+    # root/experiment/sector/run_id -- is what every eagerly-resolved HI sink
+    # was already baked against (F1): HI can resolve a layout whose directory
+    # does not match what `root`/`experiment`/`sector`/`run_id` alone would
+    # recompute (for example an intermediate path segment under a `flat`
+    # layout). Legacy (no destination) behavior is unaffected: it always
+    # recomputes, exactly as before.
+    admitted_run_dir = _nonempty_text(OmegaConf.select(resolved_cfg, "run.dir", default=None))
+    artifact_manager = ArtifactManager(
+        root,
+        experiment_name,
+        sector,
+        str(run_id),
+        layout=layout,
+        destination=artifact_destination,
+        logical_run_dir=(
+            Path(admitted_run_dir)
+            if artifact_destination is not None and admitted_run_dir is not None
+            else None
+        ),
+    )
     if bootstrap is not None:
         bootstrap.run_dir = artifact_manager.run_dir
-    OmegaConf.update(resolved_cfg, "run.dir", str(artifact_manager.run_dir), merge=False, force_add=True)
+    # `run.dir` is recorded as the LOGICAL path, never the physical one, even
+    # when `artifact_destination` is supplied: several allocations of one
+    # scientific cell must record the same constant C. `artifact_manager.run_dir`
+    # (physical when a destination is bound) is reserved for actual disk writes
+    # below -- see `_route_artifact_sinks` for the already-instantiated sinks
+    # whose output paths were baked from this same logical value before this
+    # function ever ran (HI resolves its config eagerly).
+    logical_run_dir = artifact_manager.logical_run_dir
+    OmegaConf.update(resolved_cfg, "run.dir", str(logical_run_dir), merge=False, force_add=True)
     OmegaConf.resolve(resolved_cfg)
     artifact_manager.make_dirs()
     _configure_terminal_logging(resolved_cfg)
 
     loggers = _instantiate_sequence(OmegaConf.select(resolved_cfg, "loggers", default=[]))
     callbacks = _instantiate_sequence(OmegaConf.select(resolved_cfg, "callbacks", default=[]))
+    runtime_callbacks_list = list(runtime_callbacks)
     # Fail-loud interface validation only: confirm the configured objects expose
     # the lifecycle methods, without invoking any behavior (no handle/log/finish).
     _validate_callbacks(callbacks)
+    _validate_callbacks(runtime_callbacks_list)
     _validate_loggers(loggers)
+    # Runtime callbacks join the list -- and are routed/refused below along
+    # with every configured callback (F4) -- before this context, and
+    # therefore `RunStarted`, exists at all.
+    callbacks = [*callbacks, *runtime_callbacks_list]
+    routed_sinks: dict[str, str] = {}
+    if artifact_destination is not None:
+        routed_sinks = _route_artifact_sinks(
+            [*callbacks, *loggers], logical_run_dir=logical_run_dir, destination=artifact_destination
+        )
     metadata = build_run_metadata(resolved_cfg, command=command, config_path=config_path, clock=run_clock)
     if topology is None:
         try:
@@ -223,10 +288,23 @@ def prepare_run_context(
         profile_writer=(
             None
             if topology.global_rank is None
-            else RankLocalJSONLWriter(artifact_manager.run_dir, topology)
+            else RankLocalJSONLWriter(
+                artifact_manager.run_dir,
+                topology,
+                path=artifact_manager.path(
+                    "profiles", topology.rank_path_component, "resources.jsonl"
+                ),
+            )
         ),
     )
     write_run_start_artifact(context)
+    if artifact_destination is not None:
+        write_artifact_routing_receipt(
+            context,
+            destination=artifact_destination,
+            logical_run_dir=logical_run_dir,
+            routed=routed_sinks,
+        )
     return context
 
 
@@ -239,6 +317,7 @@ def run_from_config(
     topology: ExecutionTopology | Mapping[str, object] | None = None,
     runtime_callbacks: Sequence[object] = (),
     restore_request: Any = None,
+    artifact_destination: ArtifactDestination | None = None,
 ) -> int:
     """Instantiate and execute the configured runner.
 
@@ -274,6 +353,11 @@ def run_from_config(
         or silently preferred. Typed only as ``Any`` here so that importing
         ``tpen.run`` never pulls in ``tpen.execution`` (and its backend
         adapters) for callers that never pass this argument.
+    artifact_destination : tpen.artifacts.ArtifactDestination or None, optional
+        Operational, launcher-supplied physical leaf this run's artifact
+        sinks must write beneath, outside ``cfg``. Forwarded to
+        :func:`prepare_run_context`; see its docstring for the routing
+        contract. ``cfg`` and the recorded ``run.dir`` are unaffected.
 
     Returns
     -------
@@ -316,6 +400,8 @@ def run_from_config(
                 config_path=config_path,
                 command=command,
                 bootstrap=bootstrap,
+                artifact_destination=artifact_destination,
+                runtime_callbacks=runtime_callbacks,
             )
         else:
             context = prepare_run_context(
@@ -324,9 +410,9 @@ def run_from_config(
                 command=command,
                 bootstrap=bootstrap,
                 topology=topology,
+                artifact_destination=artifact_destination,
+                runtime_callbacks=runtime_callbacks,
             )
-        _validate_callbacks(list(runtime_callbacks))
-        context.callbacks.extend(runtime_callbacks)
         _seed_runtime_rngs(context.cfg)
         context.emit(RunStarted())
         runner = _instantiate_runner(context)
@@ -433,6 +519,131 @@ def _validate_loggers(loggers: list[object]) -> None:
             raise TypeError(
                 f"loggers[{index}]={type(logger).__name__} must expose callable finish()"
             )
+
+
+#: Closed registry of operational output-path fields a destination may rebind.
+#: Keyed by the defining module's qualified class name -- the same shape as
+#: `tpen.checkpoint.hashing._CALLBACK_OUTPUT_FIELDS`, which independently
+#: excludes these same slots from the science-identity hash because they are
+#: operational rather than scientific. Matching walks a sink's MRO (see
+#: `_registered_sink_fields`), so a SUBCLASS of one of these is routed exactly
+#: like its registered ancestor, rather than silently skipped by an exact-name
+#: lookup. core-owned writes that instead go through `RunContext.path`/
+#: `ArtifactManager.path` are already physical because `ArtifactManager.run_dir`
+#: itself is bound to the destination.
+_ARTIFACT_SINK_FIELDS: dict[str, tuple[str, ...]] = {
+    "tpen.callback.snapshot.ConfigSnapshot": ("output_path",),
+    "tpen.callback.snapshot.ResolvedConfigSnapshot": ("output_path",),
+    "tpen.callback.metadata.Metadata": ("output_path",),
+    "tpen.callback.status.Status": ("output_path",),
+    "tpen.callback.checkpoint.Checkpoint": ("output_dir",),
+    "tpen.callback.initial_checkpoint.InitialCheckpoint": ("output_dir",),
+    "tpen.callback.evaluation.ArtifactIndex": ("path",),
+    "tpen.callback.evaluation.FailureLog": ("path",),
+    "tpen.callback.parameter_activity.ParameterActivity": ("output_path",),
+    "tpen.callback.equivariance.RuntimeEquivariance": ("artifact_dir",),
+    "tpen.callback.raw_training_batch_recorder.RawTrainingBatchRecorder": ("path",),
+    "tpen.logging.csv.CSV": ("path",),
+    "tpen.logging.jsonl.JSONL": ("path",),
+}
+
+#: Attribute names conventionally used, across callbacks and loggers in this
+#: codebase, to hold an output destination. Used ONLY to recognize an
+#: unregistered output-bearing object so it can be refused (F3's closed sink
+#: contract) -- never to route anything: a name on this list but not in
+#: `_ARTIFACT_SINK_FIELDS` is exactly the unsupported case that must raise
+#: rather than pass through silently.
+_SINK_PROBE_FIELDS: tuple[str, ...] = (
+    "output_path",
+    "output_dir",
+    "path",
+    "artifact_dir",
+    "dir",
+)
+
+
+def _registered_sink_fields(sink: object) -> tuple[str, ...] | None:
+    """Return the registered output fields for ``sink``'s nearest registered type.
+
+    Walks the MRO so a subclass of a registered writer is matched through its
+    registered ancestor, rather than only an exact-name match on ``type(sink)``.
+    """
+
+    for klass in type(sink).__mro__:
+        qualified = f"{klass.__module__}.{klass.__qualname__}"
+        fields = _ARTIFACT_SINK_FIELDS.get(qualified)
+        if fields is not None:
+            return fields
+    return None
+
+
+def _route_artifact_sinks(
+    sinks: list[object],
+    *,
+    logical_run_dir: Path,
+    destination: ArtifactDestination,
+) -> dict[str, str]:
+    """Rebind every known concrete sink field from the logical leaf to the physical one.
+
+    A field is rebound only when it is currently set to a concrete value
+    falling under ``logical_run_dir`` -- exactly the shape HI's eager
+    ``${run.dir}`` resolution bakes into these constructors before
+    `run_from_config` ever runs. `ArtifactDestination.bind` refuses a value
+    that does not fall under ``logical_run_dir`` (an unsupported or unknown
+    destination) and refuses a mapped path that would not stay under the
+    claimed physical root (an escape).
+
+    CLOSED SINK CONTRACT (F3): a sink whose type (or an ancestor) is not in
+    `_ARTIFACT_SINK_FIELDS` is refused here, before it can write anything,
+    when it exposes ANY attribute in `_SINK_PROBE_FIELDS` with a non-``None``
+    value -- for example a core `WandB` logger's ``dir``. An object exposing
+    none of those attributes is a genuinely sink-free object (most callbacks:
+    no constructor-owned output path at all) and is passed through unchanged,
+    exactly as before.
+
+    A field whose registered writer exposes an owner-defined
+    ``rebind_<field>`` method (for example `tpen.logging.csv.CSV.rebind_path`,
+    which also resets destination-dependent header state, F6) is rebound
+    through that method instead of a bare ``setattr``.
+
+    Returns
+    -------
+    dict of str to str
+        ``"<qualified type name>.<field>"`` to the physical path it was
+        rebound to, for every field actually rebound.
+
+    Raises
+    ------
+    tpen.artifacts.ArtifactRoutingError
+        When a sink is not a registered routed writer (by MRO) and is not a
+        known sink-free object.
+    """
+
+    routed: dict[str, str] = {}
+    for sink in sinks:
+        qualified = f"{type(sink).__module__}.{type(sink).__qualname__}"
+        fields = _registered_sink_fields(sink)
+        if fields is None:
+            if any(getattr(sink, probe, None) is not None for probe in _SINK_PROBE_FIELDS):
+                raise ArtifactRoutingError(
+                    f"{qualified} is not a registered routed writer or a known "
+                    "sink-free object, but exposes an output-path-shaped "
+                    "attribute; refusing to admit it to a routed run before it "
+                    "can write outside the claimed physical destination"
+                )
+            continue
+        for field in fields:
+            current = getattr(sink, field, None)
+            if current is None:
+                continue
+            physical = destination.bind(logical_run_dir, Path(current))
+            rebind = getattr(sink, f"rebind_{field}", None)
+            if callable(rebind):
+                rebind(physical)
+            else:
+                setattr(sink, field, physical)
+            routed[f"{qualified}.{field}"] = str(physical)
+    return routed
 
 
 def _instantiate_sequence(items: ListConfig | list | tuple | None) -> list:
