@@ -937,6 +937,24 @@ def test_project_dir_hashes_subproject_lock_and_syncs_there(tmp_path: Path, envs
     assert f"CWD={sub}" in log_text
 
 
+def test_project_dir_multi_component_path_still_builds(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    sub = add_subproject(checkout, "packages/executor")
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout, project_dir="packages/executor")
+
+    result = run_builder(
+        envs_root=envs_root,
+        checkout=checkout,
+        uv_bin=uv_bin,
+        cache_dir=cache_dir,
+        project_dir="packages/executor",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (envs_root / target / ".complete").is_file()
+    assert f"CWD={sub}" in uv_log.read_text()
+
+
 def test_project_dir_default_is_checkout_root(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
     checkout = make_checkout(tmp_path)
     uv_bin, uv_log = make_uv_stub(tmp_path)
@@ -962,6 +980,46 @@ def test_project_dir_traversal_or_absolute_is_rejected(
     assert "PRECHECK_FAILED" in result.stderr
     assert not uv_log.exists()
     assert {p.name for p in tmp_path.iterdir()} == outside_before
+    assert list(envs_root.iterdir()) == []
+
+
+@pytest.mark.parametrize("bad_project_dir", ["line\nbreak", "line\rbreak", "line\tbreak"])
+def test_project_dir_control_characters_are_rejected_before_build(
+    tmp_path: Path, envs_root: Path, cache_dir: Path, bad_project_dir: str,
+) -> None:
+    checkout = make_checkout(tmp_path)
+    add_subproject(checkout, bad_project_dir)
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+
+    result = run_builder(
+        envs_root=envs_root,
+        checkout=checkout,
+        uv_bin=uv_bin,
+        cache_dir=cache_dir,
+        project_dir=bad_project_dir,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "PRECHECK_FAILED" in result.stderr
+    assert not uv_log.exists()
+    assert list(envs_root.iterdir()) == []
+
+
+def test_project_dir_newline_cannot_hide_traversal(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
+    checkout = make_checkout(tmp_path)
+    add_subproject(checkout, "a\n")
+    add_subproject(checkout, "executor")
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+
+    result = run_builder(
+        envs_root=envs_root,
+        checkout=checkout,
+        uv_bin=uv_bin,
+        cache_dir=cache_dir,
+        project_dir="a\n/../executor",
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "PRECHECK_FAILED" in result.stderr
+    assert not uv_log.exists()
     assert list(envs_root.iterdir()) == []
 
 
@@ -1155,6 +1213,55 @@ def test_t3_publisher_requires_seven_newline_terminated_fields(tmp_path: Path) -
     manifest.write_bytes((six_fields + "project_dir=.").encode())
     result = run_manifest_publish_validator(manifest, lock_sha256, ".")
     assert result.returncode != 0
+
+
+@pytest.mark.parametrize("rewrite", ["drop-seventh", "different-project-dir"])
+def test_dt2_real_builder_rejects_intercepted_invalid_manifest(
+    tmp_path: Path, envs_root: Path, cache_dir: Path, rewrite: str,
+) -> None:
+    """The producer's strict validator must guard the real manifest write.
+
+    The fake ``cat`` preserves policy-file reads but rewrites the builder's
+    heredoc output at the producer boundary. A compatibility-only reader
+    would accept either resulting manifest and incorrectly publish it.
+    """
+    checkout = make_checkout(tmp_path)
+    if rewrite == "different-project-dir":
+        add_subproject(checkout, "executor")
+    uv_bin, uv_log = make_uv_stub(tmp_path)
+    target = env_name_for(checkout)
+
+    fake_bin = tmp_path / "fake-bin-cat"
+    fake_bin.mkdir()
+    fake_cat = fake_bin / "cat"
+    fake_cat.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "--" ]]; then exec /bin/cat "$@"; fi\n'
+        'input="$(/bin/cat)"\n'
+        'if [[ "${FAKE_CAT_REWRITE:?}" == "drop-seventh" ]]; then\n'
+        '  input="${input%project_dir=*}"\n'
+        'else\n'
+        '  input="${input/project_dir=./project_dir=executor}"\n'
+        'fi\n'
+        'printf "%s\\n" "$input"\n'
+    )
+    fake_cat.chmod(fake_cat.stat().st_mode | stat.S_IEXEC)
+
+    result = run_builder(
+        envs_root=envs_root,
+        checkout=checkout,
+        uv_bin=uv_bin,
+        cache_dir=cache_dir,
+        extra_env={
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "FAKE_CAT_REWRITE": rewrite,
+        },
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "REFUSE" in result.stderr
+    assert (envs_root / target).is_dir()
+    assert not (envs_root / target / ".complete").exists()
+    assert "sync" in uv_log.read_text()
 
 
 @pytest.mark.parametrize("bad_project_dir", ["bad?", "bad*", "bad[ab]"])

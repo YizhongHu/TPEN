@@ -34,6 +34,9 @@ is_valid_project_dir_rel() {
   [[ "$rel" != /* ]] || return 1
   [[ "$rel" != */ ]] || return 1
   [[ "$rel" != *//* ]] || return 1
+  # Reject every control character before line-based splitting; otherwise a
+  # newline can hide an unchecked suffix from the component loop below.
+  [[ "$rel" != *[[:cntrl:]]* ]] || return 1
   case "$rel" in
     *'*'*|*'?'*|*'['*) return 1 ;;
   esac
