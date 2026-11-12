@@ -642,6 +642,25 @@ def test_r3_1_an_ad_hoc_runtime_observer_with_no_output_attribute_is_still_refus
         )
 
 
+def test_r3_1_admit_runtime_sink_itself_refuses_an_unregistered_ad_hoc_object(
+    tmp_path: Path,
+) -> None:
+    """(R3.1) direct, isolated unit test of `_admit_runtime_sink`: an
+    unregistered ad hoc object lacking any output-path-shaped attribute must
+    be refused by THIS function alone, with no inference from the absence of
+    such an attribute -- not merely refused somewhere downstream by
+    `_route_artifact_sinks`'s own, separate defense-in-depth check."""
+
+    from tpen.run import _admit_runtime_sink
+
+    class _AdHocObserverNoPathAttribute:
+        def handle_occurrence(self, occurrence: object, context: object) -> None:
+            pass
+
+    with pytest.raises(ArtifactRoutingError):
+        _admit_runtime_sink(_AdHocObserverNoPathAttribute())
+
+
 def test_r3_1_a_runtime_filename_writer_with_an_event_write_spy_is_refused_before_any_write(
     tmp_path: Path,
 ) -> None:
