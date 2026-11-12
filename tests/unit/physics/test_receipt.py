@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 from torch import nn
+from typeguard import TypeCheckError
 
 from tpen.data.atomic_configuration import AtomicConfiguration
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
@@ -76,7 +77,7 @@ def test_receipt_rejects_empty_manifest() -> None:
 
 
 def test_receipt_rejects_non_operator_id_manifest_key() -> None:
-    with pytest.raises(TypeError):
+    with pytest.raises((TypeError, TypeCheckError)):
         _receipt(manifest={"kinetic": ("kinetic",)})
 
 
@@ -365,7 +366,7 @@ def test_recording_adapter_rejects_delegate_without_receipt_capability() -> None
 def test_recording_adapter_requires_system_descriptor() -> None:
     # review-r1 finding 2: a bare string proves nothing about the physics
     # actually evaluated, so the adapter now requires the typed descriptor.
-    with pytest.raises(TypeError):
+    with pytest.raises((TypeError, TypeCheckError)):
         RecordingLocalEnergyEvaluator(NaiveLocalEnergyEvaluator(), system="sys-xyz")
 
 
