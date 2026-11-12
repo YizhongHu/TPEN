@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from tpen.data.atomic_configuration import AtomicConfiguration
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
 from tpen.physics.hamiltonian import (
     DeclaresExecutionReceipt,
@@ -16,9 +17,15 @@ from tpen.physics.hamiltonian import (
     evaluate_local_energy_in_chunks,
 )
 from tpen.physics.kinetic import KineticEnergy
-from tpen.physics.operators import HARMONIC_TRAP, KINETIC_ENERGY
-from tpen.physics.potential import HarmonicTrap
+from tpen.physics.operators import (
+    ELECTRON_ELECTRON_COULOMB,
+    ELECTRON_NUCLEUS_COULOMB,
+    HARMONIC_TRAP,
+    KINETIC_ENERGY,
+)
+from tpen.physics.potential import ElectronElectronInteraction, ElectronNucleusPotential, HarmonicTrap
 from tpen.physics.receipt import DiagnosticDeclaration, ExecutionReceipt, require_matching_system
+from tpen.physics.system import ParticleSpec, build_system_descriptor
 
 _DTYPE = torch.float64
 
@@ -93,6 +100,33 @@ def test_method_id_distinct_for_changed_numerical_policy() -> None:
 def test_method_id_distinct_for_changed_manifest() -> None:
     changed = _receipt(manifest={KINETIC_ENERGY: ("kinetic",), HARMONIC_TRAP: ("harmonic_trap",)})
     assert changed.method_id() != _receipt().method_id()
+
+
+def test_method_id_distinct_for_changed_version() -> None:
+    changed = _receipt(version=2)
+    assert changed.method_id() != _receipt().method_id()
+
+
+def test_method_id_numerical_policy_boundary_shift_no_longer_collides() -> None:
+    # Regression for the v1 collision found in review: concatenating an
+    # unframed key directly against an unframed string value let the
+    # key/value boundary shift without changing the overall bytes --
+    # {"a": "sb"} and {"as": "b"} both encoded to b"asb" under v1 and
+    # therefore hashed to the same method_id. v2's length-prefixed framing
+    # (see `_encode_length_prefixed`) makes the boundary unambiguous.
+    left = _receipt(numerical_policy={"a": "sb"})
+    right = _receipt(numerical_policy={"as": "b"})
+    assert left.method_id() != right.method_id()
+
+
+def test_method_id_manifest_names_boundary_shift_no_longer_collides() -> None:
+    # Analogous boundary-shift case for the manifest's per-operator
+    # contribution-name list: without a length prefix on each name, the
+    # boundary between adjacent names in the list can shift without
+    # changing the overall bytes.
+    left = _receipt(manifest={KINETIC_ENERGY: ("ab", "c")})
+    right = _receipt(manifest={KINETIC_ENERGY: ("a", "bc")})
+    assert left.method_id() != right.method_id()
 
 
 def test_method_id_reproducible_across_independent_instances() -> None:
@@ -324,3 +358,68 @@ def test_chunked_evaluation_raises_on_receipt_disagreement() -> None:
             chunk_size=3,
             evaluator=adapter,
         )
+
+
+# --- Integration: receipt bound to a real SystemDescriptor --------------------
+
+
+def _batch_with_electrons(n_electrons: int, n_walkers: int = 3) -> ElectronBatch:
+    generator = torch.Generator().manual_seed(11)
+    return ElectronBatch(positions=torch.randn(n_walkers, n_electrons, 3, generator=generator, dtype=_DTYPE))
+
+
+def _manifest_from_descriptor(descriptor) -> dict:
+    manifest: dict = {}
+    for term in descriptor.terms:
+        manifest.setdefault(term.operator_id, []).append(term.slot)
+    return {operator_id: tuple(names) for operator_id, names in manifest.items()}
+
+
+def test_receipt_system_id_and_manifest_match_real_hooke_descriptor() -> None:
+    particle = ParticleSpec(n_electrons=1, n_spin_up=1, n_spin_down=0, spatial_dim=3)
+    terms = {"kinetic": KineticEnergy(), "trap_energy": HarmonicTrap(omega=0.5)}
+    descriptor = build_system_descriptor(particle, terms)
+    assert [term.slot for term in descriptor.terms] == ["kinetic", "trap_energy"]
+
+    naive = NaiveLocalEnergyEvaluator()
+    context = naive.make_context(GaussianOutputModel(alpha=0.5), _batch_with_electrons(1))
+    adapter = RecordingLocalEnergyEvaluator(naive, system_id=descriptor.system_id())
+    result = adapter.evaluate(terms, context, return_terms=True)
+
+    assert result.receipt.system_id == descriptor.system_id()
+    assert dict(result.receipt.manifest) == _manifest_from_descriptor(descriptor)
+    require_matching_system(result.receipt, descriptor.system_id())
+    with pytest.raises(ValueError, match="does not match"):
+        require_matching_system(result.receipt, "a-different-system-id")
+
+
+def test_receipt_system_id_and_manifest_match_real_helium_descriptor() -> None:
+    atoms = AtomicConfiguration(torch.zeros(1, 3), torch.tensor([2.0]))
+    particle = ParticleSpec(n_electrons=2, n_spin_up=1, n_spin_down=1, spatial_dim=3)
+    terms = {
+        "kinetic": KineticEnergy(),
+        "electron_nucleus": ElectronNucleusPotential(atoms),
+        "electron_electron": ElectronElectronInteraction(),
+    }
+    descriptor = build_system_descriptor(particle, terms)
+    assert {term.operator_id for term in descriptor.terms} == {
+        KINETIC_ENERGY,
+        ELECTRON_NUCLEUS_COULOMB,
+        ELECTRON_ELECTRON_COULOMB,
+    }
+
+    naive = NaiveLocalEnergyEvaluator()
+    context = naive.make_context(GaussianOutputModel(alpha=0.5), _batch_with_electrons(2))
+    adapter = RecordingLocalEnergyEvaluator(naive, system_id=descriptor.system_id())
+    result = adapter.evaluate(terms, context, return_terms=True)
+
+    assert result.receipt.system_id == descriptor.system_id()
+    assert dict(result.receipt.manifest) == _manifest_from_descriptor(descriptor)
+    require_matching_system(result.receipt, descriptor.system_id())
+
+    other_descriptor = build_system_descriptor(
+        ParticleSpec(n_electrons=1, n_spin_up=1, n_spin_down=0, spatial_dim=3),
+        {"kinetic": KineticEnergy(), "harmonic_trap": HarmonicTrap(omega=0.5)},
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        require_matching_system(result.receipt, other_descriptor.system_id())
