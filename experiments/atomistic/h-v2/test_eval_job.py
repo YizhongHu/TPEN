@@ -282,6 +282,26 @@ def test_pilot_fanout_stage1_is_21_runs_stream0() -> None:
     assert seeds <= roster
 
 
+def test_pilot_fanout_stage1_is_101_runs_stream0_for_the_100k_payload() -> None:
+    """Amendment 20261112-r1: the 100k payload's generalized stage-1 sweep."""
+
+    generations = eval_job.pilot_fanout("1", payload="capacity-pilot-100k")
+    assert len(generations) == 101
+    assert {g["stream"] for g in generations} == {0}
+    assert sorted(g["ordinal"] for g in generations) == list(range(101))
+    seeds = {g["seed"] for g in generations}
+    roster = set(json.loads(protocol.CONTRACT_INPUTS_PATH.read_text())["measurement"]["seed_roster"][
+        "non_science_seed_namespaces"
+    ]["capacity_pilot"]["evaluation"])
+    assert seeds <= roster
+
+
+def test_pilot_fanout_stage1_default_payload_matches_explicit_capacity_pilot() -> None:
+    """Regression guard: the default argument must still mean capacity-pilot."""
+
+    assert eval_job.pilot_fanout("1") == eval_job.pilot_fanout("1", payload="capacity-pilot")
+
+
 def test_pilot_fanout_stage2_matches_protocol_grid_exactly() -> None:
     generations = eval_job.pilot_fanout("2", c1=10)
     pairs = {(g["ordinal"], g["stream"]) for g in generations}
@@ -335,6 +355,140 @@ def test_select_pilot_basin_ordinal_picks_the_smallest_triple_mean_earliest_tie(
 def test_select_pilot_basin_ordinal_refuses_missing_ordinals() -> None:
     with pytest.raises(ValueError):
         protocol.select_pilot_basin_ordinal({o: 1.0 for o in range(5)})
+
+
+# --- generalized stage-1/SEL window (amendment 20261112-r1) ----------------
+
+
+def test_pilot_payload_stage1_ordinal_count_and_sel_window_per_payload() -> None:
+    assert protocol.pilot_stage1_ordinals("capacity-pilot") == protocol.PILOT_STAGE1_ORDINALS == tuple(range(21))
+    assert protocol.pilot_stage1_ordinals("capacity-pilot-100k") == tuple(range(101))
+    assert protocol.pilot_sel_window_hi("capacity-pilot") == 19
+    assert protocol.pilot_sel_window_hi("capacity-pilot-100k") == 99
+
+
+def test_select_pilot_basin_ordinal_generalizes_to_a_wider_window() -> None:
+    """Mutant: 'the SEL window still 3..19 for the 100k payload'."""
+
+    w = {o: 10.0 for o in range(101)}
+    w[49] = w[50] = w[51] = 1.0  # a clear minimum triple centered at 50
+    c1, means = protocol.select_pilot_basin_ordinal(w, hi=99)
+    assert c1 == 50
+    assert set(means) == set(range(3, 100))  # window 3..99, not 3..19
+
+
+def test_select_pilot_basin_ordinal_default_hi_is_unchanged() -> None:
+    """Regression guard: default (no *hi*) still means capacity-pilot's 3..19."""
+
+    w = {o: 10.0 for o in range(21)}
+    w[9] = w[10] = w[11] = 1.0
+    c1, means = protocol.select_pilot_basin_ordinal(w)
+    assert c1 == 10
+    assert set(means) == set(range(3, 20))
+
+
+def test_is_interior_minimum_generalizes_with_hi() -> None:
+    """Mutant: 'the edge flag missing at 99'."""
+
+    assert protocol.is_interior_minimum(3, hi=99) is False
+    assert protocol.is_interior_minimum(99, hi=99) is False
+    assert protocol.is_interior_minimum(50, hi=99) is True
+    with pytest.raises(ValueError):
+        protocol.is_interior_minimum(100, hi=99)
+
+
+def test_is_interior_minimum_default_hi_is_unchanged() -> None:
+    """Regression guard: default (no *hi*) still means capacity-pilot's edges 3/19."""
+
+    assert protocol.is_interior_minimum(3) is False
+    assert protocol.is_interior_minimum(19) is False
+    assert protocol.is_interior_minimum(10) is True
+
+
+def _pilot_stage1_generation(tmp_path: Path, *, payload: str, ordinal: int, local_energies: list) -> dict:
+    """Return a synthetic stage-1 stream-0 generation record with a real trajectory CSV.
+
+    Mirrors the shape :func:`eval_job.generation_record` produces: a
+    ``trajectory_csv`` artifact whose recorded sha256 matches the file's
+    actual bytes (D5: ``compute_pilot_selection`` re-hashes it).
+    """
+
+    csv_path = tmp_path / f"traj-{payload}-{ordinal}.csv"
+    lines = ["local_energy", *(str(value) for value in local_energies)]
+    csv_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return {
+        "ordinal": ordinal,
+        "stream": 0,
+        "seed": protocol.pilot_eval_seed(ordinal, 0),
+        "artifacts": {"trajectory_csv": {"path": str(csv_path), "sha256": _sha256(csv_path.read_bytes())}},
+    }
+
+
+def test_compute_pilot_selection_generalizes_to_the_100k_window(tmp_path: Path) -> None:
+    """End-to-end SEL generalization: window 3..99 over a full 101-ordinal sweep."""
+
+    ordinals = protocol.pilot_stage1_ordinals("capacity-pilot-100k")
+    generations = []
+    for ordinal in ordinals:
+        # A clear minimum-W triple centered at ordinal 50; everything else flat and high.
+        energies = [0.0, 0.1, -0.1, 0.05] if ordinal in (49, 50, 51) else [0.0, 10.0, -10.0, 5.0]
+        generations.append(
+            _pilot_stage1_generation(tmp_path, payload="capacity-pilot-100k", ordinal=ordinal, local_energies=energies)
+        )
+    receipt = {"generations": generations}
+    selection = eval_job.compute_pilot_selection(receipt, payload="capacity-pilot-100k")
+    assert selection["c1"] == 50
+    record = eval_job.build_selection_record(
+        c1=selection["c1"],
+        triple_means=selection["triple_means"],
+        b1_eval_receipt_sha256="deadbeef",
+        payload="capacity-pilot-100k",
+    )
+    assert record["interior_minimum"] is True
+    c1 = eval_job.verify_selection_record(record, b1_eval_receipt_sha256="deadbeef", payload="capacity-pilot-100k")
+    assert c1 == 50
+
+
+def test_compute_pilot_selection_100k_refuses_an_incomplete_stage1(tmp_path: Path) -> None:
+    """Mutant: a stage-1 receipt shaped like capacity-pilot's 21 ordinals must not pass
+    as a complete capacity-pilot-100k sweep (window still 3..19 for the 100k payload)."""
+
+    generations = [
+        _pilot_stage1_generation(tmp_path, payload="capacity-pilot-100k", ordinal=ordinal, local_energies=[0.0, 1.0])
+        for ordinal in range(21)
+    ]
+    receipt = {"generations": generations}
+    with pytest.raises(eval_job.EvalJobRefusal) as excinfo:
+        eval_job.compute_pilot_selection(receipt, payload="capacity-pilot-100k")
+    assert excinfo.value.code == "sel-incomplete-stage1"
+
+
+def test_build_selection_record_100k_edge_flag_at_both_ends() -> None:
+    """Mutant: 'the edge flag missing at 99'."""
+
+    lo = eval_job.build_selection_record(c1=3, triple_means={}, b1_eval_receipt_sha256="x", payload="capacity-pilot-100k")
+    assert lo["interior_minimum"] is False
+    hi = eval_job.build_selection_record(c1=99, triple_means={}, b1_eval_receipt_sha256="x", payload="capacity-pilot-100k")
+    assert hi["interior_minimum"] is False
+    mid = eval_job.build_selection_record(c1=50, triple_means={}, b1_eval_receipt_sha256="x", payload="capacity-pilot-100k")
+    assert mid["interior_minimum"] is True
+
+
+def test_build_selection_record_100k_refuses_c1_outside_3_99() -> None:
+    with pytest.raises(eval_job.EvalJobRefusal) as excinfo:
+        eval_job.build_selection_record(c1=100, triple_means={}, b1_eval_receipt_sha256="x", payload="capacity-pilot-100k")
+    assert excinfo.value.code == "sel-c1-out-of-range"
+    with pytest.raises(eval_job.EvalJobRefusal):
+        eval_job.build_selection_record(c1=2, triple_means={}, b1_eval_receipt_sha256="x", payload="capacity-pilot-100k")
+
+
+def test_existing_capacity_pilot_sel_window_is_unchanged() -> None:
+    """Mutant: 'the existing capacity-pilot changed'."""
+
+    record = eval_job.build_selection_record(c1=19, triple_means={}, b1_eval_receipt_sha256="x")
+    assert record["interior_minimum"] is False
+    with pytest.raises(eval_job.EvalJobRefusal):
+        eval_job.build_selection_record(c1=20, triple_means={}, b1_eval_receipt_sha256="x")
 
 
 def test_build_and_verify_selection_record_round_trips() -> None:

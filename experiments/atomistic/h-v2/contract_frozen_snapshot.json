@@ -239,7 +239,7 @@
           "sampler": [
             999005
           ],
-          "evaluation_formula": "996000 + 10*pilot_checkpoint_ordinal + stream_index, with pilot_checkpoint_ordinal 0..20 (the 21 contract-evaluated checkpoints at or below 20,000 updates, measurement.evaluated_checkpoints.updates filtered <=20000) and stream_index 0..3 (measurement.fresh_evaluation.streams_per_checkpoint); disjoint from every other namespace and from the science evaluation_stream_seed_formula. Decided 2026-11-07, round-3 pre-review finding H2, accepted 2026-11-07, so the capacity_pilot.evaluation roster can seed every checkpoint x stream pair the pilot fresh-evaluates up to 20,000 updates (admission.pilot.length_updates_target), not only one basin triple.",
+          "evaluation_formula": "996000 + 10*pilot_checkpoint_ordinal + stream_index, with pilot_checkpoint_ordinal 0..20 (the 21 contract-evaluated checkpoints at or below 20,000 updates, measurement.evaluated_checkpoints.updates filtered <=20000) and stream_index 0..3 (measurement.fresh_evaluation.streams_per_checkpoint); disjoint from every other namespace and from the science evaluation_stream_seed_formula. Decided 2026-11-07, round-3 pre-review finding H2, accepted 2026-11-07, so the capacity_pilot.evaluation roster can seed every checkpoint x stream pair the pilot fresh-evaluates up to 20,000 updates (admission.pilot.length_updates_target), not only one basin triple. Acceptance-contract amendment 20261112-r1 extends this SAME formula and namespace (never a new one) to pilot_checkpoint_ordinal 21..100 at stream_index 0 only, for the capacity-pilot-100k payload's generalized stage-1 stream-0 sweep (0..100,000 updates every 1,000); the original 0..20/stream 0..3 entries are unchanged.",
           "evaluation": [
             996000, 996001, 996002, 996003,
             996010, 996011, 996012, 996013,
@@ -261,7 +261,27 @@
             996170, 996171, 996172, 996173,
             996180, 996181, 996182, 996183,
             996190, 996191, 996192, 996193,
-            996200, 996201, 996202, 996203
+            996200, 996201, 996202, 996203,
+            996210, 996220, 996230, 996240,
+            996250, 996260, 996270, 996280,
+            996290, 996300, 996310, 996320,
+            996330, 996340, 996350, 996360,
+            996370, 996380, 996390, 996400,
+            996410, 996420, 996430, 996440,
+            996450, 996460, 996470, 996480,
+            996490, 996500, 996510, 996520,
+            996530, 996540, 996550, 996560,
+            996570, 996580, 996590, 996600,
+            996610, 996620, 996630, 996640,
+            996650, 996660, 996670, 996680,
+            996690, 996700, 996710, 996720,
+            996730, 996740, 996750, 996760,
+            996770, 996780, 996790, 996800,
+            996810, 996820, 996830, 996840,
+            996850, 996860, 996870, 996880,
+            996890, 996900, 996910, 996920,
+            996930, 996940, 996950, 996960,
+            996970, 996980, 996990, 997000
           ]
         },
         "sampler_tail_qualification": {
