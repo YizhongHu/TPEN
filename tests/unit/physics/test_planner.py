@@ -6,7 +6,7 @@ import pytest
 
 from tpen.physics.context import ContextKey, ReadOnlyContext, requirements
 from tpen.physics.operators import OperatorId, register_operator
-from tpen.physics.planner import LocalEnergyPlanner, OperatorLoweringRegistry
+from tpen.physics.planner import LocalEnergyPlanner, OperatorLoweringRegistry, emit_receipt
 
 
 @register_operator(OperatorId("tests.planner", "first"))
@@ -228,3 +228,47 @@ def test_plan_manifest_and_provider_graph_are_immutable() -> None:
         plan.manifest[FIRST] = kernel  # type: ignore[index]
     with pytest.raises(TypeError):
         plan.provider_graph[key] = plan.providers[0]  # type: ignore[index]
+
+
+# --- S1-E review-r1 finding 5: planner-to-receipt handoff --------------------
+
+
+def test_emit_receipt_distinguishes_plans_by_identity_not_manifest_shape() -> None:
+    # Two lowering classes produce an identical manifest shape (same single
+    # kernel, same claimed operator) but a distinct plan.identity (S1-D's
+    # test_plan_identity_changes_when_lowering_class_changes already proves
+    # this at the plan level). A receipt recipe that only mirrored the
+    # manifest, without retaining plan.identity, could not tell these two
+    # lowerings apart.
+    kernel = Kernel(frozenset({FIRST}), value=1)
+    plans = [
+        LocalEnergyPlanner(OperatorLoweringRegistry([kind(FirstOperator, kernel)])).plan(
+            [FirstOperator()]
+        )
+        for kind in (Lowering, AlternateLowering)
+    ]
+    assert plans[0].identity != plans[1].identity
+
+    receipts = [emit_receipt(plan, system_id="same-system") for plan in plans]
+
+    assert receipts[0].method_id() != receipts[1].method_id()
+    assert emit_receipt(plans[0], system_id="same-system") == receipts[0]
+
+
+def test_emit_receipt_fused_kernel_shares_one_column_across_claimed_ids() -> None:
+    # GREEN companion: one kernel claiming two operators reports one stable
+    # column name under both ids, never a stringified kernel or an invented
+    # per-operator diagnostic.
+    kernel = Kernel(frozenset({FIRST, SECOND}), value=1)
+    plan = LocalEnergyPlanner(
+        OperatorLoweringRegistry(
+            [Lowering(FirstOperator, kernel), Lowering(SecondOperator, kernel)]
+        )
+    ).plan([FirstOperator(), SecondOperator()])
+
+    receipt = emit_receipt(plan, system_id="same-system")
+
+    assert receipt.manifest[FIRST] == receipt.manifest[SECOND]
+    assert len(receipt.manifest[FIRST]) == 1
+    assert receipt.manifest[FIRST][0] != str(kernel)
+    assert receipt.diagnostics == {}
