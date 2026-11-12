@@ -110,6 +110,42 @@ class ArtifactDestination:
             )
         object.__setattr__(self, "physical_root", root)
 
+    def require_fresh(self) -> None:
+        """Refuse a destination that is not a fresh, empty, non-symlinked directory.
+
+        Checked at preparation, before any sink is constructed or any write
+        happens. A pre-existing destination may hold planted links or stale
+        files from a prior occupant -- for example a bootstrap error write
+        following an `error.json` symlink, or a registered writer's default
+        filename (``diagnostics/index.json``, ``FailureLog``'s path) following
+        one planted beneath an already-populated directory (review-r2 R2.1,
+        R2.3). A destination that does not exist yet, or that is a real
+        directory with no entries, cannot hold either, so no per-writer
+        patching is required: this one check at the root closes both.
+        """
+
+        root = self.physical_root
+        if not root.exists():
+            return
+        if root.is_symlink():
+            raise ArtifactRoutingError(
+                f"artifact destination {root!s} is a symlink; refusing a routed "
+                "run against a destination that is not a real directory"
+            )
+        if not root.is_dir():
+            raise ArtifactRoutingError(
+                f"artifact destination {root!s} exists and is not a directory; "
+                "refusing to route a run beneath it"
+            )
+        try:
+            next(root.iterdir())
+        except StopIteration:
+            return
+        raise ArtifactRoutingError(
+            f"artifact destination {root!s} already exists and is not empty; "
+            "refusing a routed run against a non-fresh destination"
+        )
+
     def bind(self, logical_root: Path, path: Path) -> Path:
         """Map one logical sink path under ``logical_root`` to its physical path.
 
