@@ -93,14 +93,15 @@ def test_hooke_1e_builds_with_no_nuclear_resource() -> None:
 
 #: r1 fix bumped the canonical encoding to v2 (versioned length/count
 #: framing; see `tpen.physics.system._DESCRIPTOR_SCHEMA_VERSION`), so every
-#: v1 golden value above is stale. Placeholders below are deliberately wrong;
-#: `test_golden_system_ids_are_pinned`'s failure message reports the real v2
-#: values, which then replace these placeholders (same two-step discovery
-#: used to pin the original v1 goldens).
+#: v1 golden value above is stale. These v2 values were discovered by the
+#: same two-step process used to pin the original v1 goldens: commit
+#: deliberately-wrong placeholders, run on Cannon (`test` partition, job
+#: 59922776, SHA 6fe7dd1dda7af00a600c91d08d068accaa5ba934), and take the
+#: real computed values from the failing assertion's message.
 GOLDEN_SYSTEM_IDS = {
-    "hooke_1e_omega_0.5": "0" * 64,
-    "helium": "0" * 64,
-    "h2_r1.4": "0" * 64,
+    "hooke_1e_omega_0.5": "1ea17d39bfbf291f014d1e5f35cfc759ebe6a609ba8bc8f39ebde8c82b4eb62f",
+    "helium": "093086f1343c96add6ca23d7a2af404db274ba200cfa772dff6f1f68b6b27a18",
+    "h2_r1.4": "802be996a23facb3e1940cd8bca195131148f7c0b1d6f25de262356ddafbbe2d",
 }
 
 
