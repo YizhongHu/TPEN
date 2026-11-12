@@ -804,8 +804,10 @@ def test_real_manifest_late_truncated_at_built_utc_refuses(
     assert result.returncode == 0, result.stdout + result.stderr
     manifest_path = envs_root / target / ".complete"
     lines = manifest_path.read_text().splitlines()
-    assert lines[-1].startswith("built_utc=")
-    truncated = "\n".join(lines[:-1] + ["built_utc=2"])
+    built_utc_index = next(i for i, line in enumerate(lines) if line.startswith("built_utc="))
+    # Simulate a write that stopped mid-value for built_utc: everything after
+    # it (now including project_dir) was never written.
+    truncated = "\n".join(lines[:built_utc_index] + ["built_utc=2"])
     if trailing_newline:
         truncated += "\n"
     manifest_path.write_text(truncated)
@@ -957,7 +959,7 @@ def test_project_dir_symlink_escape_is_rejected(tmp_path: Path, envs_root: Path,
     outside.mkdir()
     (outside / "pyproject.toml").write_text('[project]\nname = "outside"\n')
     (outside / "uv.lock").write_bytes(b"outside-lock\n")
-    link = checkout / "escape-link"
+    link = checkout / "escape_link"
     link.symlink_to(outside, target_is_directory=True)
     env = dict(os.environ)
     env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = "test"
@@ -967,7 +969,7 @@ def test_project_dir_symlink_escape_is_rejected(tmp_path: Path, envs_root: Path,
     uv_bin, uv_log = make_uv_stub(tmp_path)
 
     result = run_builder(
-        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir="escape-link",
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir="escape_link",
     )
     assert result.returncode == 2, result.stdout + result.stderr
     assert "PRECHECK_FAILED" in result.stderr
@@ -978,10 +980,10 @@ def test_project_dir_symlink_escape_is_rejected(tmp_path: Path, envs_root: Path,
 
 def test_project_dir_missing_pyproject_refuses(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
     checkout = make_checkout(tmp_path)
-    add_subproject(checkout, "no-pyproject", include_pyproject=False)
+    add_subproject(checkout, "no_pyproject", include_pyproject=False)
     uv_bin, uv_log = make_uv_stub(tmp_path)
     result = run_builder(
-        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir="no-pyproject",
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir="no_pyproject",
     )
     assert result.returncode == 2, result.stdout + result.stderr
     assert "PRECHECK_FAILED" in result.stderr
@@ -991,10 +993,10 @@ def test_project_dir_missing_pyproject_refuses(tmp_path: Path, envs_root: Path, 
 
 def test_project_dir_missing_uv_lock_refuses(tmp_path: Path, envs_root: Path, cache_dir: Path) -> None:
     checkout = make_checkout(tmp_path)
-    add_subproject(checkout, "no-lock", include_lock=False)
+    add_subproject(checkout, "no_lock", include_lock=False)
     uv_bin, uv_log = make_uv_stub(tmp_path)
     result = run_builder(
-        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir="no-lock",
+        envs_root=envs_root, checkout=checkout, uv_bin=uv_bin, cache_dir=cache_dir, project_dir="no_lock",
     )
     assert result.returncode == 2, result.stdout + result.stderr
     assert "PRECHECK_FAILED" in result.stderr

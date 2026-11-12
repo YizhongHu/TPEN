@@ -541,6 +541,7 @@ def make_git_checkout(tmp_path: Path, *, name: str = "checkout", lock_contents: 
     env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = "test"
     env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = "test@example.com"
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=env)
+    (repo / "pyproject.toml").write_text('[project]\nname = "fixture"\n')
     (repo / "uv.lock").write_bytes(lock_contents)
     (repo / "scripts" / "cannon").mkdir(parents=True)
     (repo / "scripts" / "cannon" / "shared-env-policy.json").write_text('{"MAX_SHARED_ENV_DIRS": 20}\n')
