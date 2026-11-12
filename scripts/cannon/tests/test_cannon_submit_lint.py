@@ -8,6 +8,7 @@ checks for a local, pytest-free regression run).
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import subprocess
@@ -16,6 +17,7 @@ from pathlib import Path
 import pytest
 
 LINTER = Path(__file__).resolve().parents[3] / "scripts" / "cannon" / "submit-lint.sh"
+PRECHECK = Path(__file__).resolve().parents[3] / "scripts" / "cannon" / "shared-env-precheck.sh"
 SHA = "1111111111111111111111111111111111111111"
 SHORT_SHA = SHA[:12]
 JOB_NAME = f"tpen-verify-{SHORT_SHA}"
@@ -1021,6 +1023,93 @@ def test_manifest_shared_env_prefix_missing_from_job_export_rejected(fixture_roo
     assert "critical export 'SHARED_ENV_PREFIX' missing from sbatch script" in result.stdout
 
 
+# --- Check 4 (DT1, T2 delta review DF1): a bare `export SHARED_ENV_PREFIX`
+# with no prior assignment leaves it exported with an undetermined value
+# (state "unset"), which `eff_get` otherwise reports the same as "never
+# mentioned" -- Check 4 must not read that as "absent from both sides". -----
+
+
+def test_job_bare_exported_shared_env_prefix_no_manifest_rejected(fixture_root: Path) -> None:
+    """DF1 regression: no manifest key, no prior assignment, just a bare
+    re-export -- this must fail, not silently pass as mutually absent."""
+    result = lint_body(
+        fixture_root, "df1-bare-export",
+        "export SHARED_ENV_PREFIX\n" + REEXPORT_REST,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'SHARED_ENV_PREFIX' is exported with no determined value" in result.stdout
+
+
+def test_job_bare_exported_shared_env_prefix_ignores_inherited_real_value(fixture_root: Path) -> None:
+    """The linter is static/syntax-only; a bare `export NAME` records only
+    that NAME is exported, never the real process environment. An inherited,
+    mismatching real value in the *linter's own* environment must not change
+    the DT1 verdict above."""
+    task_root, run_root, python = stage_paths(fixture_root)
+    manifest = fixture_root / "stage" / "df1-inherited.manifest"
+    sbatch = fixture_root / "stage" / "df1-inherited.sbatch"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    sbatch.write_text(
+        "#!/bin/bash\n"
+        f"#SBATCH --export={export_spec(fixture_root)}\n"
+        "export SHARED_ENV_PREFIX\n" + REEXPORT_REST
+    )
+    env = dict(os.environ)
+    env["SHARED_ENV_PREFIX"] = str(fixture_root / "other-root")
+    cmd = [
+        "bash", str(LINTER),
+        "--sbatch", str(sbatch), "--manifest", str(manifest),
+        "--allowed-root", str(fixture_root / "stage"),
+        "--shared-env-prefix", str(fixture_root / "shared-env"),
+        "--home", str(fixture_root / "home"),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "critical export 'SHARED_ENV_PREFIX' is exported with no determined value" in result.stdout
+
+
+def test_both_files_omit_shared_env_prefix_accepted(fixture_root: Path) -> None:
+    """Green control: SHARED_ENV_PREFIX never mentioned anywhere (no
+    directive, no assignment, no manifest key) is genuinely absent on both
+    sides and must still pass."""
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    result = run_lint(fixture_root, sbatch, manifest)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_literal_assignment_plus_bare_reexport_matching_manifest_accepted(fixture_root: Path) -> None:
+    """Green control: a literal assignment followed by a bare re-export keeps
+    the already-known value (state stays "set", not "unset"), so normal
+    reconciliation against a matching manifest still passes."""
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    senv = fixture_root / "shared-env"
+    manifest2 = fixture_root / "stage" / "senv-literal-bare.manifest"
+    manifest2.write_text(manifest.read_text() + f"SHARED_ENV_PREFIX={senv}\n")
+    sbatch2 = fixture_root / "stage" / "senv-literal-bare.sbatch"
+    sbatch2.write_text(sbatch.read_text() + f"export SHARED_ENV_PREFIX={senv}\nexport SHARED_ENV_PREFIX\n")
+    result = run_lint(fixture_root, sbatch2, manifest2)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_directive_bare_shared_env_prefix_unknown_rejected(fixture_root: Path) -> None:
+    """Already-accepted T1 case, pinned under the SHARED_ENV_PREFIX name:
+    `#SBATCH --export=...,SHARED_ENV_PREFIX` (bare in the directive, no
+    literal value anywhere) is "unknown", not "unset", and already rejected
+    by the pre-existing generic unknown-export loop -- confirm DF1's new
+    check does not change or duplicate that outcome."""
+    task_root, run_root, python = stage_paths(fixture_root)
+    manifest = fixture_root / "stage" / "df1-directive-bare.manifest"
+    sbatch = fixture_root / "stage" / "df1-directive-bare.sbatch"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    sbatch.write_text(
+        "#!/bin/bash\n"
+        f"#SBATCH --export={export_spec(fixture_root)},SHARED_ENV_PREFIX\n" + REEXPORT_REST
+    )
+    result = run_lint(fixture_root, sbatch, manifest)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "has a value the linter cannot determine" in result.stdout
+
+
 # --- Check 10 (T2, review-round-1 F2): --shared-env-prefix and its mirrored
 # manifest keys must already be spelled canonically. -------------------------
 
@@ -1107,6 +1196,46 @@ def test_manifest_shared_env_path_two_levels_deep_rejected(fixture_root: Path) -
     assert "not a direct child" in result.stdout
 
 
+def test_manifest_shared_env_path_from_real_precheck_resolve_accepted(fixture_root: Path) -> None:
+    """DT2 (T2 delta review, completing accepted T4): feed the real stdout of
+    `shared-env-precheck.sh resolve` into the lint manifest's SHARED_ENV_PATH,
+    rather than a handcrafted string -- the actual producer/consumer pair."""
+    shared_prefix = fixture_root / "shared-env"
+    lock_sha256 = hashlib.sha256(b"dt2-lock-contents\n").hexdigest()
+    env_name = f"tpen-{lock_sha256[:12]}-cpu-py3.12"
+    target = shared_prefix / env_name
+    (target / "bin").mkdir(parents=True)
+    python = target / "bin" / "python"
+    python.write_text("#!/bin/sh\n")
+    python.chmod(python.stat().st_mode | stat.S_IEXEC)
+    (target / ".complete").write_text(
+        "head=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n"
+        f"uv_lock_sha256={lock_sha256}\n"
+        "uv_version=uv 9.9.9-stub\n"
+        "python_version=3.12.7\n"
+        "python_request=3.12\n"
+        "built_utc=2026-01-01T00:00:00Z\n"
+    )
+    resolve = subprocess.run(
+        [
+            "bash", str(PRECHECK), "resolve",
+            "--shared-env-prefix", str(shared_prefix),
+            "--project", "tpen", "--extra", "cpu", "--python", "3.12",
+            "--lock-sha256", lock_sha256,
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert resolve.returncode == 0, resolve.stdout + resolve.stderr
+    resolved_path = resolve.stdout.strip()
+    assert resolved_path == str(target)
+
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    manifest2 = fixture_root / "stage" / "senv-path-real-resolve.manifest"
+    manifest2.write_text(manifest.read_text() + f"SHARED_ENV_PATH={resolved_path}\n")
+    result = run_lint(fixture_root, sbatch, manifest2)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 # --- Check 11: TASK_ROOT/RUN_ROOT must not resolve under --shared-env-prefix.
 
 
@@ -1136,6 +1265,45 @@ def test_run_root_under_shared_env_prefix_rejected(fixture_root: Path) -> None:
     result = run_lint(base, sbatch, manifest)
     assert result.returncode != 0, result.stdout + result.stderr
     assert "resolves under --shared-env-prefix" in result.stdout
+
+
+def shared_env_staging_symlink_fixture(base: Path) -> tuple[Path, Path]:
+    """LOCAL/link is a real local directory; FINAL/link -> shared-env, so
+    every path under LOCAL/link maps to a FINAL path that resolves into the
+    reuse-only shared-env prefix -- the Check-11 analogue of
+    `staging_symlink_fixture`'s $HOME escape (DT2: shared-prefix, not HOME)."""
+    local_root = base / "local-stage-senv"
+    final_root = base / "final-stage-senv"
+    (local_root / "link").mkdir(parents=True)
+    final_root.mkdir()
+    (final_root / "link").symlink_to(base / "shared-env")
+    return local_root, final_root
+
+
+@pytest.mark.parametrize("key", ["TASK_ROOT", "RUN_ROOT"])
+def test_staging_mapped_root_shared_env_prefix_escape_rejected(fixture_root: Path, key: str) -> None:
+    """DT2: Check 11's staging-root mapping must catch a symlink escape into
+    --shared-env-prefix, not only the $HOME case Check 5 already covers."""
+    local_root, final_root = shared_env_staging_symlink_fixture(fixture_root)
+    escaped = local_root / "link" / "x"
+    task_root = escaped if key == "TASK_ROOT" else final_root / "task"
+    run_root = escaped if key == "RUN_ROOT" else final_root / "run"
+    result = lint_staged(fixture_root, local_root / "job.sbatch", task_root, run_root, local_root, final_root)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert f"{key} resolves under --shared-env-prefix" in result.stdout
+
+
+def test_staging_mapped_root_disjoint_from_shared_env_prefix_accepted(fixture_root: Path) -> None:
+    """Disjoint control for the escape test above: the same LOCAL=FINAL
+    staging mapping, but the mapped destination stays inside the allowed
+    root and disjoint from --shared-env-prefix, so it passes."""
+    local_root, final_root = shared_env_staging_symlink_fixture(fixture_root)
+    (local_root / "elsewhere").mkdir()
+    (final_root / "elsewhere").mkdir()
+    task_root = local_root / "elsewhere" / "task"
+    run_root = final_root / "run"
+    result = lint_staged(fixture_root, local_root / "job.sbatch", task_root, run_root, local_root, final_root)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 # --- Check 7 (T3, review-round-1 F3): the allowed-root interpreter exception

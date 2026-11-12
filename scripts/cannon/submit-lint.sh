@@ -665,6 +665,18 @@ for key in "${CRITICAL_KEYS[@]}"; do
   fi
 done
 
+# SHARED_ENV_PREFIX is optional in CRITICAL_KEYS (Check 4 only reconciles it
+# when present), but `eff_get` reports an exported-with-no-value name (bare
+# `export SHARED_ENV_PREFIX` with no prior assignment, state "unset") the
+# same as a name never touched at all — so an explicit, undetermined export
+# would otherwise sail through Check 4 as "absent from both sides". Reject it
+# before that happens; a job that never mentions SHARED_ENV_PREFIX at all
+# still reaches Check 4 as genuinely absent.
+eff_find SHARED_ENV_PREFIX
+if [[ "$EFF_IDX" != -1 && "${EFF_EXPORTED[EFF_IDX]}" == 1 && "${EFF_STATE[EFF_IDX]}" == unset ]]; then
+  fail "critical export 'SHARED_ENV_PREFIX' is exported with no determined value (bare export with no prior assignment) and cannot be reconciled with --shared-env-prefix"
+fi
+
 IFS=$'\x1f' read -r M_HEAD_SHA_HAS M_HEAD_SHA <<< "$(kv_get "$MANIFEST" HEAD_SHA)"
 IFS=$'\x1f' read -r M_JOB_NAME_HAS M_JOB_NAME <<< "$(kv_get "$MANIFEST" JOB_NAME)"
 

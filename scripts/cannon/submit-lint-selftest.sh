@@ -534,6 +534,34 @@ expect_contains "TASK_ROOT under --shared-env-prefix is rejected" fail "resolves
   "$LINTER" --sbatch "$SENV11_SBATCH" --manifest "$SENV11_MANIFEST" --allowed-root "$BASE/stage" --allowed-root "$BASE/shared-env" \
   --shared-env-prefix "$BASE/shared-env" --home "$BASE/home"
 
+# DT2 (T2 delta review): Check 11's staging-root mapping must also catch a
+# symlink escape into --shared-env-prefix, not only the $HOME case the
+# finding-3 r2-staged tests above already cover; a disjoint mapped
+# counterpart through the same staging machinery still passes.
+mkdir -p "$BASE/senv-local/link" "$BASE/senv-final"
+ln -s "$BASE/shared-env" "$BASE/senv-final/link"
+senv_staged() {  # SBATCH TASK_ROOT RUN_ROOT
+  write_manifest "$1.manifest" "$SHA" "tpen-verify-$SHORT" "$2" "$3" 0 "$GOOD_PYTHON"
+  write_sbatch "$1" "$SHA" "tpen-verify-$SHORT" "$2" "$3" 0 "$GOOD_PYTHON"
+  "$LINTER" --sbatch "$1" --manifest "$1.manifest" --allowed-root "$BASE/senv-final" \
+    --shared-env-prefix "$BASE/shared-env" --home "$BASE/home" --staging-root "$BASE/senv-local=$BASE/senv-final"
+}
+expect_contains "mapped TASK_ROOT through FINAL/link -> shared-env-prefix is rejected" fail "TASK_ROOT resolves under --shared-env-prefix" \
+  senv_staged "$BASE/senv-local/t.sbatch" "$BASE/senv-local/link/x" "$BASE/senv-final/run"
+expect_contains "mapped RUN_ROOT through FINAL/link -> shared-env-prefix is rejected" fail "RUN_ROOT resolves under --shared-env-prefix" \
+  senv_staged "$BASE/senv-local/r.sbatch" "$BASE/senv-final/task" "$BASE/senv-local/link/x"
+mkdir -p "$BASE/senv-local/elsewhere" "$BASE/senv-final/elsewhere"
+expect "mapped root disjoint from --shared-env-prefix (same staging machinery) is accepted" pass \
+  senv_staged "$BASE/senv-local/d.sbatch" "$BASE/senv-local/elsewhere/task" "$BASE/senv-final/run"
+
+# DT2's real `shared-env-precheck.sh resolve` producer/consumer control lives
+# in tests/test_cannon_submit_lint.py only, not here: shared-env-precheck.sh
+# itself requires bash >= 4.4 (`inherit_errexit`) and refuses to run at all
+# under bash 3.2, and this selftest script must keep running top-to-bottom
+# under bash 3.2 (a mid-script PRECHECK_FAILED would abort every later
+# case). pytest isolates one bash4-only test's failure from the rest of the
+# suite the way this single `set -euo pipefail` script cannot.
+
 # Check 7 (T3, review-round-1 F3): a dry-run PYTHON under an allowed root but
 # NOT under --shared-env-prefix (e.g. a previous job's overlay) must be
 # rejected -- the allowed-root exception is removed; only the shared-env
@@ -599,6 +627,78 @@ export PYTHON=$GOOD_PYTHON
 EOF
 expect_contains "manifest SHARED_ENV_PREFIX missing from the job export is rejected" fail "critical export 'SHARED_ENV_PREFIX' missing from sbatch script" lint "$SENV_PREFIX_SBATCH_MISSING" "$SENV_PREFIX_MANIFEST"
 expect_contains "job-exported SHARED_ENV_PREFIX with no manifest counterpart is rejected" fail "critical export 'SHARED_ENV_PREFIX' present in sbatch script but not in manifest" lint "$SENV_PREFIX_SBATCH_GOOD" "$GOOD_MANIFEST"
+
+# DT1 (T2 delta review DF1): a bare `export SHARED_ENV_PREFIX` with no prior
+# assignment leaves it exported with an undetermined value ("unset"), which
+# must not read as "absent from both sides" the way a truly unmentioned name
+# does (the "good fixture" baseline above is that both-omit green control).
+DF1_MANIFEST="$BASE/stage/df1-bare.manifest"
+DF1_SBATCH="$BASE/stage/df1-bare.sbatch"
+write_manifest "$DF1_MANIFEST" "$SHA" "tpen-verify-$SHORT" "$GOOD_TASK_ROOT" "$GOOD_RUN_ROOT" 0 "$GOOD_PYTHON"
+cat > "$DF1_SBATCH" <<EOF
+#!/bin/bash
+#SBATCH --export=HEAD_SHA=$SHA,JOB_NAME=tpen-verify-$SHORT,TASK_ROOT=$GOOD_TASK_ROOT,RUN_ROOT=$GOOD_RUN_ROOT,DRY_RUN=0,PYTHON=$GOOD_PYTHON
+export SHARED_ENV_PREFIX
+export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT PYTHON
+EOF
+expect_contains "bare-exported SHARED_ENV_PREFIX with no manifest counterpart is rejected" fail \
+  "critical export 'SHARED_ENV_PREFIX' is exported with no determined value" lint "$DF1_SBATCH" "$DF1_MANIFEST"
+
+# The linter is static/syntax-only; an inherited, mismatching real value in
+# the linter's OWN process environment must not change that verdict.
+DF1_ENV_OUT="$BASE/df1-env.out"
+DF1_ENV_RC=0
+SHARED_ENV_PREFIX="$BASE/other-root" "$LINTER" --sbatch "$DF1_SBATCH" --manifest "$DF1_MANIFEST" \
+  --allowed-root "$BASE/stage" --shared-env-prefix "$BASE/shared-env" --home "$BASE/home" \
+  >"$DF1_ENV_OUT" 2>&1 || DF1_ENV_RC=$?
+if [[ "$DF1_ENV_RC" != 0 ]] && grep -q "critical export 'SHARED_ENV_PREFIX' is exported with no determined value" "$DF1_ENV_OUT"; then
+  PASS=$((PASS + 1))
+else
+  FAIL=$((FAIL + 1))
+  printf 'SELFTEST FAILED: %s (rc=%s)\n%s\n' "inherited real SHARED_ENV_PREFIX in the linter's own environment does not change the DF1 verdict" "$DF1_ENV_RC" "$(cat "$DF1_ENV_OUT")" >&2
+fi
+
+# Green control: a literal assignment followed by a bare re-export keeps the
+# already-known value (state stays "set", not "unset"), so it still
+# reconciles normally against a matching manifest.
+DF1_LITBARE_MANIFEST="$BASE/stage/df1-litbare.manifest"
+DF1_LITBARE_SBATCH="$BASE/stage/df1-litbare.sbatch"
+cat > "$DF1_LITBARE_MANIFEST" <<EOF
+HEAD_SHA=$SHA
+JOB_NAME=tpen-verify-$SHORT
+TASK_ROOT=$GOOD_TASK_ROOT
+RUN_ROOT=$GOOD_RUN_ROOT
+DRY_RUN=0
+PYTHON=$GOOD_PYTHON
+SHARED_ENV_PREFIX=$BASE/shared-env
+EOF
+cat > "$DF1_LITBARE_SBATCH" <<EOF
+#!/bin/bash
+#SBATCH --job-name=tpen-verify-$SHORT
+export HEAD_SHA=$SHA
+export JOB_NAME=tpen-verify-$SHORT
+export TASK_ROOT=$GOOD_TASK_ROOT
+export RUN_ROOT=$GOOD_RUN_ROOT
+export DRY_RUN=0
+export PYTHON=$GOOD_PYTHON
+export SHARED_ENV_PREFIX=$BASE/shared-env
+export SHARED_ENV_PREFIX
+EOF
+expect "literal assignment plus a bare re-export still reconciles (state stays known)" pass lint "$DF1_LITBARE_SBATCH" "$DF1_LITBARE_MANIFEST"
+
+# Already-accepted T1 case, pinned under the SHARED_ENV_PREFIX name: a bare
+# NAME in the `#SBATCH --export=` directive itself is "unknown" (sbatch would
+# copy it from the submitting shell), not "unset", and already rejected by
+# the pre-existing generic unknown-export loop -- confirm DF1's new check
+# doesn't change or duplicate that outcome.
+DF1_UNKNOWN_SBATCH="$BASE/stage/df1-unknown.sbatch"
+cat > "$DF1_UNKNOWN_SBATCH" <<EOF
+#!/bin/bash
+#SBATCH --export=HEAD_SHA=$SHA,JOB_NAME=tpen-verify-$SHORT,TASK_ROOT=$GOOD_TASK_ROOT,RUN_ROOT=$GOOD_RUN_ROOT,DRY_RUN=0,PYTHON=$GOOD_PYTHON,SHARED_ENV_PREFIX
+export HEAD_SHA JOB_NAME TASK_ROOT RUN_ROOT PYTHON
+EOF
+expect_contains "directive-bare SHARED_ENV_PREFIX (unknown, not unset) is already rejected" fail \
+  "has a value the linter cannot determine" lint "$DF1_UNKNOWN_SBATCH" "$GOOD_MANIFEST"
 
 # Check 10 (T2, review-round-1 F2): --shared-env-prefix and the manifest's
 # mirrored keys must already be spelled canonically (no trailing slash,
