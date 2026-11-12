@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
@@ -30,6 +30,16 @@ from tpen.physics.operators import OperatorId
 #: canonical content id must encode every accepted value deterministically.
 JsonScalar = bool | int | float | str
 
+#: v3 (review-r1 finding 3): `OperatorId` is now encoded as its namespace and
+#: name, each independently length-framed, and the manifest is sorted by the
+#: `(namespace, name)` tuple rather than by `str(OperatorId)`. Under v2,
+#: `method_id()` hashed `str(operator_id)`, which flattens the namespace and
+#: name onto one `:`-joined string: `OperatorId("plugin:x", "y")` and
+#: `OperatorId("plugin", "x:y")` stringify identically, so swapping which
+#: kernel claims which of those two ids left `method_id()` unchanged, and
+#: merely reversing the insertion order of an otherwise-unchanged manifest
+#: could change the sorted-by-string order and therefore the digest.
+#:
 #: v2 (pending-fixes-before-verification item 1): every variable-length
 #: field (string scalar values, numerical-policy key/value pairs, manifest
 #: operator ids and contribution names) is now framed with an explicit
@@ -38,7 +48,7 @@ JsonScalar = bool | int | float | str
 #: for different content -- e.g. ``numerical_policy`` ``{"a": "sb"}`` and
 #: ``{"as": "b"}`` both encoded to the same bytes and therefore hashed to
 #: the same `method_id`.
-_RECEIPT_SCHEMA_VERSION = 2
+_RECEIPT_SCHEMA_VERSION = 3
 
 
 def _encode_length_prefixed(data: bytes) -> bytes:
@@ -242,15 +252,53 @@ class ExecutionReceipt:
         for key in policy_keys:
             digest.update(_encode_length_prefixed(key.encode("utf-8")))
             digest.update(_encode_scalar(self.numerical_policy[key]))
-        operator_ids = sorted(self.manifest, key=str)
+        operator_ids = sorted(self.manifest, key=lambda operator_id: (operator_id.namespace, operator_id.name))
         digest.update(struct.pack(">Q", len(operator_ids)))
         for operator_id in operator_ids:
-            digest.update(_encode_length_prefixed(str(operator_id).encode("utf-8")))
+            digest.update(_encode_length_prefixed(operator_id.namespace.encode("utf-8")))
+            digest.update(_encode_length_prefixed(operator_id.name.encode("utf-8")))
             names = self.manifest[operator_id]
             digest.update(struct.pack(">Q", len(names)))
             for name in names:
                 digest.update(_encode_length_prefixed(name.encode("utf-8")))
         return digest.hexdigest()
+
+
+def encode_ordered_contribution_sequence(names: Sequence[str]) -> str:
+    """Return a deterministic, boundary-safe hex encoding of an ordered name sequence.
+
+    For a producer whose declared method identity depends on an actual
+    execution order that `ExecutionReceipt.manifest` does not capture --
+    `manifest` is canonicalized by `OperatorId` for `method_id`, so it is
+    order-independent by design (see `_RECEIPT_SCHEMA_VERSION`'s v1-era
+    manifest/order confusion). Pack the result into
+    `ExecutionReceipt.numerical_policy` under a key such as
+    ``"contribution_order"``; `method_id` then length-frames it like any
+    other string value, so this encoding only needs to be injective in
+    `names`, not resistant to being embedded in a larger digest.
+
+    Parameters
+    ----------
+    names : Sequence[str]
+        The actual, ordered contribution names as evaluated -- not names
+        grouped or sorted by operator ownership.
+
+    Returns
+    -------
+    str
+        Hex-encoded bytes: an 8-byte count prefix followed by each name
+        length-framed in order. A plain delimiter (e.g. a comma join) would
+        not be injective: a name containing the delimiter could shift the
+        boundary between adjacent names without changing the joined string.
+    """
+
+    buf = bytearray()
+    buf += struct.pack(">Q", len(names))
+    for name in names:
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("ordered contribution sequence names must be non-empty strings")
+        buf += _encode_length_prefixed(name.encode("utf-8"))
+    return buf.hex()
 
 
 def require_matching_system(receipt: ExecutionReceipt, system_id: str) -> ExecutionReceipt:
@@ -282,5 +330,6 @@ __all__ = [
     "DiagnosticDeclaration",
     "ExecutionReceipt",
     "JsonScalar",
+    "encode_ordered_contribution_sequence",
     "require_matching_system",
 ]
