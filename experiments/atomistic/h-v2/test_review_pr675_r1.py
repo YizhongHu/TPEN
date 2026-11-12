@@ -284,7 +284,12 @@ def test_run_eval_fanout_pack_k2_real_cpu_pair(tmp_path: Path, monkeypatch: pyte
     expected_eval_commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
     ).strip()
-    original_science_evaluation_config = protocol.science_evaluation_config
+    # ``run_job`` owns the fan-out's protocol module.  Patch that exact
+    # consumer-boundary reference so the real child configs written by
+    # ``complete_generation`` are CPU configs; patching a separately loaded
+    # test-side module would leave the subprocesses on the science default
+    # (CUDA) even though the TRAIN fixture is CPU.
+    original_science_evaluation_config = job.protocol.science_evaluation_config
 
     def eval_config(checkpoint_dir: Path, *, seed: int, enable_readout_trajectory: bool = False):
         config = original_science_evaluation_config(
@@ -300,7 +305,7 @@ def test_run_eval_fanout_pack_k2_real_cpu_pair(tmp_path: Path, monkeypatch: pyte
         config["evaluator"]["tasks"][0]["summaries"][0]["max_samples"] = 8
         return config
 
-    monkeypatch.setattr(protocol, "science_evaluation_config", eval_config)
+    monkeypatch.setattr(job.protocol, "science_evaluation_config", eval_config)
     monkeypatch.setattr(eval_job, "probe_readout_trajectory_generator", lambda *_: False)
     monkeypatch.setattr(eval_job, "gpu_route_g_fanout", lambda: [
         {"ordinal": 0, "update": 1, "stream": 0, "seed": 7001},

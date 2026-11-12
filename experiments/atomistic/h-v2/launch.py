@@ -1338,6 +1338,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # sbatch call, never auto-chained after another stage.
         if not args.expected_train_commit:
             raise LaunchError("--expected-train-commit is required for --stage eval")
+        if not args.time:
+            raise LaunchError("--time is required for --stage eval")
         eval_time = resolve_packed_eval_time(args.time, pack_k=args.pack_k)
         # F5/D6 (review r2 delta): the pilot/part-(g) EVAL route must pass
         # the same run-root containment guard --stage train already
@@ -1423,6 +1425,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise LaunchError(f"--pilot-stage is not supported for payload {args.payload!r}")
         if not args.expected_train_commit:
             raise LaunchError("--expected-train-commit is required for --stage eval")
+        if not args.time:
+            raise LaunchError("--time is required for --stage eval")
         eval_time = resolve_packed_eval_time(args.time, pack_k=args.pack_k)
         # F5/D6: same single-stage wall-budget and MANDATORY run-root
         # containment checks as --stage train, applied to the standalone
