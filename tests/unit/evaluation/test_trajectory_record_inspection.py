@@ -240,41 +240,11 @@ def test_incomplete_grid_row_is_rejected(tmp_path: Path) -> None:
         inspect_trajectory_record(artifact.metadata_path)
 
 
-# ---------------------------------------------------------------------------
-# Immutable compatibility fixtures: frozen-main v1 writer output
-
-
-FIXTURES_ROOT = Path(__file__).resolve().parents[2] / "fixtures" / "trajectory_records" / "v1"
-
-
-@pytest.mark.parametrize(
-    "fixture_name,n_electrons,nuclear_charge",
-    [("h_like_frozen_main", 1, 1.0), ("he_like_frozen_main", 2, 2.0)],
-)
-def test_frozen_main_fixture_decodes_and_matches_provenance(
-    fixture_name: str, n_electrons: int, nuclear_charge: float
-) -> None:
-    fixture_dir = FIXTURES_ROOT / fixture_name
-    metadata_path = fixture_dir / "sampled_eval_table.metadata.json"
-    provenance = json.loads((fixture_dir / "PROVENANCE.json").read_text(encoding="utf-8"))
-
-    for filename, expected_sha256 in provenance["sha256"].items():
-        actual_path = fixture_dir / filename
-        digest = trajectory_records._file_sha256(actual_path)
-        assert digest == expected_sha256, f"{filename} no longer matches its recorded PROVENANCE.json hash"
-
-    result = inspect_trajectory_record(metadata_path)
-    assert result.record_schema == TRAJECTORY_RECORD_SCHEMA
-    assert result.draw_count == 2
-    assert result.walker_count == 3
-    assert result.row_count == 6
-    assert result.mean == pytest.approx(7.0)
-    assert result.variance == pytest.approx(25.66666666666667)
-    assert result.physical_context.available is False
-    assert result.physical_context.system_id is None
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert metadata["n_electrons"] == n_electrons
-    assert metadata["atomic_configuration"]["charges"] == [nuclear_charge]
+# Immutable frozen-main fixture compatibility coverage lives in
+# tests/unit/evaluation/test_trajectory_record_history_fixtures.py and
+# experiments/toolkit/test_trajectory_record_inspection_boundary.py, against
+# tests/integration/artifacts/trajectory_records/ (see
+# generate_v1_fixtures.py there) -- not duplicated in this file.
 
 
 def test_mean_variance_tamper_detected_even_with_consistent_grid(tmp_path: Path) -> None:
