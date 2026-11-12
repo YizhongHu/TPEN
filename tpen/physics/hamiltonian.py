@@ -387,10 +387,12 @@ def _validate_batch_matches_particle(batch: ElectronBatch, particle: object) -> 
     count, spatial dimension, or spin assignment would still be evaluated and
     stamped with the bound system's id.
 
-    Spin sector follows the same convention `tpen.sampling.metropolis`
-    constructs: the first `n_spin_up` electrons are spin-up (``+1``), the
-    remaining `n_spin_down` are spin-down (``-1``). A batch with no `spins`
-    declares no spin-sector claim and is not checked here.
+    Spin sector is checked per configuration by *count*, not by a fixed
+    electron ordering: `ElectronBatch.permute` (`electron_batch.py:319-345`)
+    jointly permutes positions and spins, so a batch with `n_spin_up`
+    electrons at `+1` and `n_spin_down` at `-1` is the same physical sector
+    regardless of which electron indices carry which label. A batch with no
+    `spins` declares no spin-sector claim and is not checked here.
     """
 
     flat = batch.flatten_samples()
@@ -407,17 +409,14 @@ def _validate_batch_matches_particle(batch: ElectronBatch, particle: object) -> 
             f"particle.spatial_dim={particle.spatial_dim}"
         )
     if flat.spins is not None:
-        expected_spins = torch.tensor(
-            [1.0] * particle.n_spin_up + [-1.0] * particle.n_spin_down,
-            device=flat.spins.device,
-            dtype=flat.spins.dtype,
-        )
-        if not torch.all(flat.spins == expected_spins):
+        n_up = torch.sum(flat.spins > 0, dim=-1)
+        n_down = torch.sum(flat.spins < 0, dim=-1)
+        if not torch.all(n_up == particle.n_spin_up) or not torch.all(n_down == particle.n_spin_down):
             raise ValueError(
                 "RecordingLocalEnergyEvaluator: batch spins disagree with the bound "
                 f"SystemDescriptor's particle spin sector (n_spin_up={particle.n_spin_up}, "
-                f"n_spin_down={particle.n_spin_down}; convention: the first n_spin_up "
-                "electrons are +1, the remainder are -1)"
+                f"n_spin_down={particle.n_spin_down} per configuration, counted irrespective "
+                "of electron ordering)"
             )
 
 
@@ -445,11 +444,22 @@ class RecordingLocalEnergyEvaluator(LocalEnergyEvaluator[ContextT]):
 
     review-r2 finding 2: the term-level check above validates *parameters*
     (for example a trap's declared frequency), not the *particle metadata*
-    an actual batch carries. `make_context` additionally validates the
-    batch's actual electron count, spatial dimension, and spin sector
-    against `system.particle` before the delegate ever builds a context from
-    it, so a batch shaped for a different system is rejected at the boundary
-    instead of being evaluated and stamped with this adapter's system id.
+    an actual batch carries. `make_context` validates the batch's actual
+    electron count, spatial dimension, and spin sector against
+    `system.particle` before the delegate ever builds a context from it, so a
+    batch shaped for a different system is rejected at the boundary instead
+    of being evaluated and stamped with this adapter's system id.
+
+    review-r3 narrow-check finding 2: `make_context` only validates a batch
+    routed through *this* adapter's `make_context`. A context built directly
+    from the delegate's own `make_context` (an already-supported calling
+    pattern, exercised by
+    `test_recording_adapter_preserves_naive_arithmetic_bit_identical`) bypassed
+    that check entirely. `evaluate` therefore re-validates the actual batch
+    carried by whatever context it is given -- every context type used with
+    this adapter exposes a `batch: ElectronBatch` attribute -- so a mismatched
+    batch is rejected for the context actually evaluated, not only for one
+    built through this adapter.
     """
 
     def __init__(self, delegate: LocalEnergyEvaluator[ContextT], *, system: SystemDescriptor) -> None:
@@ -490,6 +500,14 @@ class RecordingLocalEnergyEvaluator(LocalEnergyEvaluator[ContextT]):
         *,
         return_terms: bool = False,
     ) -> torch.Tensor | LocalEnergyResult:
+        batch = getattr(context, "batch", None)
+        if not isinstance(batch, ElectronBatch):
+            raise TypeError(
+                f"RecordingLocalEnergyEvaluator.evaluate requires a context exposing a "
+                f"`batch: ElectronBatch` attribute to validate against the bound "
+                f"SystemDescriptor; got {type(context).__name__}"
+            )
+        _validate_batch_matches_particle(batch, self._system.particle)
         result = self._delegate.evaluate(terms, context, return_terms=return_terms)
         if not return_terms:
             return result
