@@ -137,9 +137,31 @@ def _write_fixture(
     }
 
 
+def _frozen_writer_commit() -> str | None:
+    """Return the last commit to touch the writer module BEFORE this slice.
+
+    S1-F appends a new reader to the same file as the frozen v1 writer
+    (``TrajectoryRecordStreamWriter``/``TrajectoryRecordArtifact``), so
+    comparing the writer module's blob at ``HEAD`` to ``origin/main`` would
+    always disagree once the reader exists there too, even though the
+    writer code itself is untouched. The correct comparison is against the
+    blob at the last commit that changed this file before S1-F's own
+    commits -- i.e. the second entry of its linear history from ``HEAD``.
+    """
+
+    history = _git("log", "--format=%H", "--", _WRITER_PATH)
+    if not history:
+        return None
+    commits = history.splitlines()
+    return commits[1] if len(commits) > 1 else commits[0]
+
+
 def _write_provenance(out_dir: Path, fixture_payload: dict[str, object]) -> None:
     generating_commit = _git("rev-parse", "HEAD")
-    writer_blob = _git("rev-parse", f"HEAD:{_WRITER_PATH}")
+    frozen_writer_commit = _frozen_writer_commit()
+    writer_blob = (
+        _git("rev-parse", f"{frozen_writer_commit}:{_WRITER_PATH}") if frozen_writer_commit else None
+    )
     main_commit = _git("rev-parse", "origin/main")
     main_blob = _git("rev-parse", f"origin/main:{_WRITER_PATH}") if main_commit else None
     provenance = {
@@ -147,6 +169,7 @@ def _write_provenance(out_dir: Path, fixture_payload: dict[str, object]) -> None
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "generating_commit": generating_commit,
         "writer_module_path": _WRITER_PATH,
+        "frozen_writer_commit": frozen_writer_commit,
         "writer_module_blob_sha1": writer_blob,
         "origin_main_commit": main_commit,
         "origin_main_writer_module_blob_sha1": main_blob,
