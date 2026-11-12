@@ -416,13 +416,18 @@ def test_dispatcher_cancel_settles_every_leaf_before_dfk_cleanup(
     group = _group("s3c-dfk-order", "acking", "stuck")
     lifecycle = _two_slot_lifecycle(tmp_path)
 
-    real_finish = lifecycle.finish
+    # AttachedAllocation is a frozen record: patch the class method, not the
+    # instance attribute (monkeypatch.setattr on a frozen instance raises
+    # FrozenInstanceError both on apply and on its own teardown-time undo,
+    # which leaves other patches in this fixture -- notably _poll_sleep --
+    # stuck active for later tests).
+    real_finish = AttachedAllocation.finish
 
-    def spying_finish(fence, status, *args, **kwargs):
+    def spying_finish(self, fence, status, *args, **kwargs):
         fake_parsl.events.append(("finish", fence.task_id, status))
-        return real_finish(fence, status, *args, **kwargs)
+        return real_finish(self, fence, status, *args, **kwargs)
 
-    monkeypatch.setattr(lifecycle, "finish", spying_finish)
+    monkeypatch.setattr(AttachedAllocation, "finish", spying_finish)
 
     def release_ack_shortly() -> None:
         time.sleep(0.05)
