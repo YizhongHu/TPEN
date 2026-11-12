@@ -1,5 +1,50 @@
 # Release Notes
 
+## v0.5.1 - H-v2 100k pilot payload, shared Holystore environments, resume and executor layers
+
+33 commits since `v0.5.0` (`db001085`), merged into `dev` through 11 pull
+requests: #653, #656, #657, #659, #661, #664, #666, #670, #660, #671, #673.
+
+```
+git log --format='%H' db00108526b894f4f3dd4644bd25298cea91cc14..<release dev head> | wc -l
+```
+
+### Breaking
+
+- **`scripts/cannon/verify.sh` no longer builds environments** (#671). It
+  reuses only a complete shared environment under the new required
+  `SHARED_ENV_PREFIX` (the Holystore `envs/` root); the old `SHARED_ENV_ROOT`
+  input now fails with `PRECHECK_FAILED` (exit 2). Callers must pass the new
+  prefix and build an environment for a new `uv.lock` hash with the shared-env
+  builder first.
+
+### Added
+
+- **H-v2 100k capacity-pilot payload** (#673): a fresh 0-100,000-update
+  lineage payload with a generalized checkpoint inventory and stage-1/SEL
+  window. The released 20k pilot payload is unchanged.
+- **Capped shared-environment builder** (#670): immutable lock-scoped uv
+  environments on Holystore with a committed cap
+  (`scripts/cannon/shared-env-policy.json`) and hard refusal at the cap.
+- **Typed operational restore with read-only predecessor discovery** (#660)
+  and its measurement against a sealed predecessor leaf (#659).
+- **Executor S3 layers**: remote-leaf transport wire and worker-owned execution
+  (#661); attached HTEX transport selection and submit (#664).
+
+### Changed
+
+- **HI launch/resolver**: pre-resolve overrides are forwarded (#657) and
+  bracket-segment override paths are refused (#656).
+- **Cannon submit-lint** soft-requirement wiring and false-block fixes (#653).
+- **Design document** `main.typ` updated to the 2026-11-10 version with its
+  bibliography (#666).
+
+### Environment note
+
+The version bump changes `uv.lock` (sha12 `a0d83e31a6a2` -> `2d11a1c38872`).
+Shared environments are named by that hash, so CPU and GPU environments for
+`2d11a1c38872` must be built before lock-keyed jobs run at this release.
+
 ## v0.5.0 - Atomic hydrogen, checkpoint admissions, and durable execution
 
 186 commits since `origin/main` (`5d920226`). The release brings the H-v2
