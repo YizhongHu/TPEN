@@ -411,6 +411,25 @@ def test_renamed_slot_preserves_system_id() -> None:
     assert renamed.terms[0].slot != original.terms[0].slot
 
 
+def test_renamed_slot_on_resource_bearing_term_preserves_resource() -> None:
+    """The slot-rename path in `build_system_descriptor` must carry `resource` forward.
+
+    `dataclasses.replace` cannot be used for the rename (see the comment in
+    `build_system_descriptor`): it would fall back to `resource`'s `InitVar`
+    default (`None`) instead of the original payload.
+    """
+
+    atoms = _helium_atoms()
+    descriptor = build_system_descriptor(
+        _helium_particle(), {"nuclear_potential": ElectronNucleusPotential(atoms)}
+    )
+
+    term = next(t for t in descriptor.terms if t.slot == "nuclear_potential")
+    assert term.resource is not None
+    assert term.resource.content_id() == atoms.content_id()
+    assert descriptor.resources[term.resource_id].content_id() == atoms.content_id()
+
+
 # --- Finite parameters and signed-zero canonicalization ---------------------
 
 
