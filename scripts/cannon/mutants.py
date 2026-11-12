@@ -24,8 +24,8 @@ REQUIRED_KEYS = ("id", "target", "old", "new", "killer")
 def spec(path: Path) -> list[dict[str, str]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     rows = payload if isinstance(payload, list) else payload.get("mutants")
-    if not isinstance(rows, list) or not 3 <= len(rows) <= 5:
-        raise ValueError("mutant spec must contain 3-5 mutants")
+    if not isinstance(rows, list) or not 3 <= len(rows) <= 6:
+        raise ValueError("mutant spec must contain 3-6 mutants")
     result: list[dict[str, str]] = []
     seen: set[str] = set()
     for row in rows:

@@ -225,6 +225,52 @@ def test_science_both_chains_eval_via_afterok_on_the_just_submitted_train_id(tmp
     assert SHA in eval_wrap  # --expected-train-commit == this invocation's own commit
 
 
+def test_submit_lineage_forwards_pack_k_on_the_submitted_eval_line(tmp_path: Path) -> None:
+    """The production lineage submitter preserves packing on its EVAL command."""
+
+    calls: list[list[str]] = []
+    train_id, eval_id = launch.submit_lineage(
+        "L1",
+        payload="science",
+        science_python=sys.executable,
+        executor_python=sys.executable,
+        run_root=tmp_path,
+        checkout_root=tmp_path / "checkout",
+        t_wall="08:00:00",
+        e_wall="24:00:00",
+        commit=SHA,
+        pack_k=3,
+        runner=_runner(calls, ["train-1", "eval-1"]),
+    )
+
+    assert (train_id, eval_id) == ("train-1", "eval-1")
+    eval_wrap = next(flag for flag in calls[1] if flag.startswith("--wrap="))
+    assert "--pack-k 3" in eval_wrap
+
+
+def test_submit_all_forwards_pack_k_on_each_submitted_eval_line(tmp_path: Path) -> None:
+    """The production all-lineage submitter preserves packing on EVAL commands."""
+
+    calls: list[list[str]] = []
+    result = launch.submit_all(
+        "science",
+        science_python=sys.executable,
+        executor_python=sys.executable,
+        run_root=tmp_path,
+        checkout_root=tmp_path / "checkout",
+        t_wall="08:00:00",
+        e_wall="24:00:00",
+        commit=SHA,
+        lineages=("L1",),
+        pack_k=4,
+        runner=_runner(calls, ["train-1", "eval-1"]),
+    )
+
+    assert result == {"L1": ("train-1", "eval-1")}
+    eval_wrap = next(flag for flag in calls[1] if flag.startswith("--wrap="))
+    assert "--pack-k 4" in eval_wrap
+
+
 # --- part (g): standalone EVAL-only job -------------------------------------
 
 

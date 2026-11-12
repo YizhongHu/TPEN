@@ -63,6 +63,12 @@ def test_packed_validation_refuses_identity_or_metric_mismatch() -> None:
             {"seed": 7, "checkpoint": 1000, "energy": -0.5, "variance": 0.1},
             tolerance={"energy_abs": 1.0, "variance_relative": 1.0},
         )
+    with pytest.raises(eval_job.EvalJobRefusal, match="packed-validation-mismatch"):
+        eval_job.compare_packed_single_stream(
+            {"seed": 7, "checkpoint": 1000, "energy": -0.2, "variance": 0.1},
+            {"seed": 7, "checkpoint": 1000, "energy": -0.5, "variance": 0.1},
+            tolerance={"energy_abs": 0.01, "variance_relative": 1.0},
+        )
 
 
 def _checkpoint_entry(tmp_path: Path, *, update: int, content: bytes = b"model-bytes") -> dict:

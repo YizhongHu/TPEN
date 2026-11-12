@@ -27,7 +27,7 @@ read by these tests as "skip this check", so binding by discovery (not a
 hardcoded name) matters whenever a new `*_EXECUTOR_PYTHON`/`*_ROOT_PYTHON`
 caller is added.
 
-Use --mutants SPEC for a JSON object or list containing 3-5 rows with id,
+Use --mutants SPEC for a JSON object or list containing 3-6 rows with id,
 target, old, new, and **killer** — the exact pytest node id (or bare id with
 parametrizations matched as `killer[...]`) that is expected to fail under the
 mutation. A mutant is KILLED only when: the unmutated targeted run is green in
