@@ -7,10 +7,14 @@
 # runs unmodified under the self-test's local macOS bash.
 set -Eeuo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=./shared-env-manifest.sh
+source "$SCRIPT_DIR/shared-env-manifest.sh"
+
 SBATCH_PATH=""
 MANIFEST=""
 SUBMIT_HELPER=""
-SHARED_ENV_ROOT=""
+SHARED_ENV_PREFIX=""
 HOME_ROOT="${HOME:-}"
 REAL_ENV=""
 DRY_ENV=""
@@ -22,11 +26,14 @@ STAGING_FINAL_ROOTS=()
 usage() {
   cat >&2 <<'USAGE'
 usage: submit-lint.sh --sbatch PATH --manifest PATH --allowed-root PATH
-                       [--allowed-root PATH ...] --shared-env-root PATH
+                       [--allowed-root PATH ...] --shared-env-prefix PATH
                        [--submit-helper PATH] [--home PATH]
                        [--staging-root LOCAL=FINAL ...]
                        [--real-env PATH --dry-env PATH --dry-only-keys K1,K2]
 Validates the submission contract before sbatch is invoked. Exits 0 on PASS.
+--shared-env-prefix must be disjoint from every --allowed-root and every
+--staging-root FINAL (the reuse-only shared-envs tree must never overlap a
+stage or facility run root a wrapper writes or deletes).
 USAGE
 }
 
@@ -35,7 +42,7 @@ while (($#)); do
     --sbatch) SBATCH_PATH="${2:?missing sbatch path}"; shift 2 ;;
     --manifest) MANIFEST="${2:?missing manifest path}"; shift 2 ;;
     --allowed-root) ALLOWED_ROOTS+=("${2:?missing allowed root}"); shift 2 ;;
-    --shared-env-root) SHARED_ENV_ROOT="${2:?missing shared env root}"; shift 2 ;;
+    --shared-env-prefix) SHARED_ENV_PREFIX="${2:?missing shared env prefix}"; shift 2 ;;
     --submit-helper) SUBMIT_HELPER="${2:?missing submit helper path}"; shift 2 ;;
     --home) HOME_ROOT="${2:?missing home path}"; shift 2 ;;
     --staging-root)
@@ -52,7 +59,7 @@ while (($#)); do
   esac
 done
 
-[[ -n "$SBATCH_PATH" && -n "$MANIFEST" && -n "$SHARED_ENV_ROOT" ]] || { echo "LINT_FAIL missing required arguments" >&2; usage; exit 2; }
+[[ -n "$SBATCH_PATH" && -n "$MANIFEST" && -n "$SHARED_ENV_PREFIX" ]] || { echo "LINT_FAIL missing required arguments" >&2; usage; exit 2; }
 ((${#ALLOWED_ROOTS[@]} > 0)) || { echo "LINT_FAIL at least one --allowed-root required" >&2; exit 2; }
 [[ -f "$SBATCH_PATH" ]] || { echo "LINT_FAIL sbatch script not found: $SBATCH_PATH" >&2; exit 2; }
 [[ -f "$MANIFEST" ]] || { echo "LINT_FAIL manifest not found: $MANIFEST" >&2; exit 2; }
@@ -71,6 +78,26 @@ US=$'\x1f'  # unit separator; macOS/BSD awk's -F does not expand \x1f itself
 FAILED=0
 fail() { printf 'FAIL: %s\n' "$*"; FAILED=1; }
 canon() { realpath -m -- "$1"; }
+
+# --shared-env-prefix is a reuse-only, out-of-repo shared-envs root (same
+# contract verify.sh/shared-env-precheck.sh enforce): it must never overlap a
+# stage or facility run root this linter is validating, in either direction,
+# since a wrapper writes into and deletes those roots. path_contains (from
+# shared-env-manifest.sh) is root-aware, so a literal '/' on either side
+# can't defeat this either.
+CANON_SHARED_ENV_PREFIX="$(canon "$SHARED_ENV_PREFIX")"
+for _root in "${ALLOWED_ROOTS[@]}"; do
+  _canon_root="$(canon "$_root")"
+  if path_contains "$CANON_SHARED_ENV_PREFIX" "$_canon_root" || path_contains "$_canon_root" "$CANON_SHARED_ENV_PREFIX"; then
+    fail "--shared-env-prefix and --allowed-root must be disjoint: shared='$SHARED_ENV_PREFIX' -> '$CANON_SHARED_ENV_PREFIX' allowed-root='$_root' -> '$_canon_root'"
+  fi
+done
+for ((_i = 0; _i < ${#STAGING_FINAL_ROOTS[@]}; _i += 1)); do
+  _canon_staging_final="$(canon "${STAGING_FINAL_ROOTS[_i]}")"
+  if path_contains "$CANON_SHARED_ENV_PREFIX" "$_canon_staging_final" || path_contains "$_canon_staging_final" "$CANON_SHARED_ENV_PREFIX"; then
+    fail "--shared-env-prefix and --staging-root FINAL must be disjoint: shared='$SHARED_ENV_PREFIX' -> '$CANON_SHARED_ENV_PREFIX' staging-final='${STAGING_FINAL_ROOTS[_i]}' -> '$_canon_staging_final'"
+  fi
+done
 
 under_any_root() {
   local candidate="$1" root canon_root
@@ -728,16 +755,61 @@ for key in TASK_ROOT RUN_ROOT; do
 done
 
 # Check 7: in a dry run, the interpreter must resolve under the declared
-# shared-env root, never a system/ad-hoc python.
+# shared-env prefix (an env dir inside it, reused directly) or under any
+# declared allowed root (the job overlay verify.sh builds lives under its
+# WORK_ROOT, which this linter never sees directly, but which always sits
+# under an allowed/facility run root in the real submission path) -- never a
+# system/ad-hoc python.
 IFS=$'\x1f' read -r dry_has dry_run <<< "$(kv_get "$MANIFEST" DRY_RUN)"
 IFS=$'\x1f' read -r py_has py_val <<< "$(kv_get "$MANIFEST" PYTHON)"
 [[ "$dry_has" == 1 ]] || dry_run=0
 if [[ "$dry_run" == 1 && "$py_has" == 1 ]]; then
-  CANON_SHARED_ENV_ROOT="$(canon "$SHARED_ENV_ROOT")"
   canon_python="$(canon "$py_val")"
-  [[ "$canon_python" == "$CANON_SHARED_ENV_ROOT" || "$canon_python" == "$CANON_SHARED_ENV_ROOT"/* ]] ||
-    fail "dry-run PYTHON is not under the shared-env root: '$py_val' -> '$canon_python'"
+  if ! path_contains "$CANON_SHARED_ENV_PREFIX" "$canon_python" && ! under_any_root "$canon_python"; then
+    fail "dry-run PYTHON is not under --shared-env-prefix or any --allowed-root: '$py_val' -> '$canon_python'"
+  fi
 fi
+
+# Check 10: manifest keys naming the shared env (SHARED_ENV_PREFIX and/or
+# SHARED_ENV_PATH, whichever the wrapper mirrors from verify.sh's own
+# input/output) must stay consistent with the trusted CLI --shared-env-prefix
+# and must never resolve under a declared --allowed-root: the shared-envs
+# tree is reuse-only and must not alias into a stage/facility run root a
+# wrapper writes into or deletes. Neither key is required; each is checked
+# only when present.
+IFS=$'\x1f' read -r m_senv_prefix_has m_senv_prefix <<< "$(kv_get "$MANIFEST" SHARED_ENV_PREFIX)"
+if [[ "$m_senv_prefix_has" == 1 ]]; then
+  canon_m_senv_prefix="$(canon "$m_senv_prefix")"
+  mapped_m_senv_prefix="$(map_staging_to_final "$canon_m_senv_prefix")"
+  if [[ "$canon_m_senv_prefix" != "$CANON_SHARED_ENV_PREFIX" ]]; then
+    fail "manifest SHARED_ENV_PREFIX does not match --shared-env-prefix: manifest='$m_senv_prefix' -> '$canon_m_senv_prefix' cli='$SHARED_ENV_PREFIX' -> '$CANON_SHARED_ENV_PREFIX'"
+  fi
+  under_any_root "$mapped_m_senv_prefix" &&
+    fail "manifest SHARED_ENV_PREFIX resolves under a declared --allowed-root: '$m_senv_prefix' -> '$mapped_m_senv_prefix'"
+fi
+IFS=$'\x1f' read -r m_senv_path_has m_senv_path <<< "$(kv_get "$MANIFEST" SHARED_ENV_PATH)"
+if [[ "$m_senv_path_has" == 1 ]]; then
+  canon_m_senv_path="$(canon "$m_senv_path")"
+  mapped_m_senv_path="$(map_staging_to_final "$canon_m_senv_path")"
+  canon_m_senv_path_parent="$(canon "$(dirname -- "$canon_m_senv_path")")"
+  [[ "$canon_m_senv_path_parent" == "$CANON_SHARED_ENV_PREFIX" ]] ||
+    fail "manifest SHARED_ENV_PATH is not a direct child of --shared-env-prefix: manifest='$m_senv_path' -> '$canon_m_senv_path' prefix='$CANON_SHARED_ENV_PREFIX'"
+  under_any_root "$mapped_m_senv_path" &&
+    fail "manifest SHARED_ENV_PATH resolves under a declared --allowed-root: '$m_senv_path' -> '$mapped_m_senv_path'"
+fi
+
+# Check 11: TASK_ROOT/RUN_ROOT must not resolve under --shared-env-prefix
+# (alongside checks 5/6's $HOME and allowed-root checks): a run's own
+# writable/staged root must never alias into the reuse-only shared-envs tree.
+for key in TASK_ROOT RUN_ROOT; do
+  IFS=$'\x1f' read -r has val <<< "$(kv_get "$MANIFEST" "$key")"
+  [[ "$has" == 1 ]] || continue
+  canon_val="$(canon "$val")"
+  mapped_val="$(map_staging_to_final "$canon_val")"
+  if path_contains "$CANON_SHARED_ENV_PREFIX" "$canon_val" || path_contains "$CANON_SHARED_ENV_PREFIX" "$mapped_val"; then
+    fail "$key resolves under --shared-env-prefix: '$val' -> '$canon_val' (mapped to '$mapped_val')"
+  fi
+done
 
 # Check 8: any ssh/scp/rsync invocation in the submission helper must pass
 # -o BatchMode=yes (case-insensitive; for rsync this means `-e "ssh -o

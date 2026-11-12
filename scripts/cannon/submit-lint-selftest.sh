@@ -80,7 +80,7 @@ expect_contains() {
   fi
 }
 
-lint() { "$LINTER" --sbatch "$1" --manifest "$2" --allowed-root "$BASE/stage" --shared-env-root "$BASE/shared-env" --home "$BASE/home" "${@:3}"; }
+lint() { "$LINTER" --sbatch "$1" --manifest "$2" --allowed-root "$BASE/stage" --shared-env-prefix "$BASE/shared-env" --home "$BASE/home" "${@:3}"; }
 
 # --- Baseline: the shared good fixture must pass on its own. ---
 expect "good fixture" pass lint "$GOOD_SBATCH" "$GOOD_MANIFEST"
@@ -102,7 +102,7 @@ expect "JOB_NAME missing SHA[:12]" fail lint "$BAD2_SBATCH" "$BAD2_MANIFEST"
 # so the relative path actually resolves to a real file and the rejection is
 # the absolute-path check itself, not an earlier "file not found" exit.
 run_relative_sbatch() (
-  cd "$BASE" && "$LINTER" --sbatch "stage/good.sbatch" --manifest "$GOOD_MANIFEST" --allowed-root "$BASE/stage" --shared-env-root "$BASE/shared-env" --home "$BASE/home"
+  cd "$BASE" && "$LINTER" --sbatch "stage/good.sbatch" --manifest "$GOOD_MANIFEST" --allowed-root "$BASE/stage" --shared-env-prefix "$BASE/shared-env" --home "$BASE/home"
 )
 expect_contains "relative sbatch path (cwd=BASE)" fail "not absolute" run_relative_sbatch
 mkdir -p "$BASE/outside"
@@ -140,7 +140,7 @@ BAD5_SBATCH="$BASE/stage/bad5.sbatch"
 HOME_TASK="$BASE/home/staged-task"
 write_manifest "$BAD5_MANIFEST" "$SHA" "tpen-verify-$SHORT" "$HOME_TASK" "$GOOD_RUN_ROOT" 0 "$GOOD_PYTHON"
 write_sbatch "$BAD5_SBATCH" "$SHA" "tpen-verify-$SHORT" "$HOME_TASK" "$GOOD_RUN_ROOT" 0 "$GOOD_PYTHON"
-expect "literal \$HOME staging" fail "$LINTER" --sbatch "$BAD5_SBATCH" --manifest "$BAD5_MANIFEST" --allowed-root "$BASE/stage" --allowed-root "$BASE/home" --shared-env-root "$BASE/shared-env" --home "$BASE/home"
+expect "literal \$HOME staging" fail "$LINTER" --sbatch "$BAD5_SBATCH" --manifest "$BAD5_MANIFEST" --allowed-root "$BASE/stage" --allowed-root "$BASE/home" --shared-env-prefix "$BASE/shared-env" --home "$BASE/home"
 mkdir -p "$BASE/home/real-staged"
 ln -s "$BASE/home/real-staged" "$BASE/stage/home-symlink"
 SYMLINK_TASK="$BASE/stage/home-symlink/sub"
@@ -148,7 +148,7 @@ BAD5B_MANIFEST="$BASE/stage/bad5b.manifest"
 BAD5B_SBATCH="$BASE/stage/bad5b.sbatch"
 write_manifest "$BAD5B_MANIFEST" "$SHA" "tpen-verify-$SHORT" "$SYMLINK_TASK" "$GOOD_RUN_ROOT" 0 "$GOOD_PYTHON"
 write_sbatch "$BAD5B_SBATCH" "$SHA" "tpen-verify-$SHORT" "$SYMLINK_TASK" "$GOOD_RUN_ROOT" 0 "$GOOD_PYTHON"
-expect "resolved \$HOME staging via symlink" fail "$LINTER" --sbatch "$BAD5B_SBATCH" --manifest "$BAD5B_MANIFEST" --allowed-root "$BASE/stage" --allowed-root "$BASE/home" --shared-env-root "$BASE/shared-env" --home "$BASE/home"
+expect "resolved \$HOME staging via symlink" fail "$LINTER" --sbatch "$BAD5B_SBATCH" --manifest "$BAD5B_MANIFEST" --allowed-root "$BASE/stage" --allowed-root "$BASE/home" --shared-env-prefix "$BASE/shared-env" --home "$BASE/home"
 
 # --- Check 6: facility-root escape for TASK_ROOT/RUN_ROOT. ---
 BAD6_MANIFEST="$BASE/stage/bad6.manifest"
@@ -307,8 +307,8 @@ printf '#!/bin/bash\ncat /etc/sshd_config\nrotate rsync_log\n' > "$NO_MATCH_HELP
 expect "sshd_config/rsync_log substrings are not mistaken for the commands" pass lint "$GOOD_SBATCH" "$GOOD_MANIFEST" --submit-helper "$NO_MATCH_HELPER"
 
 # --- --real-env/--dry-env must be given together or not at all. ---
-expect_contains "orphan --real-env (no --dry-env) is LINT_FAIL" fail "must be given together" "$LINTER" --sbatch "$GOOD_SBATCH" --manifest "$GOOD_MANIFEST" --allowed-root "$BASE/stage" --shared-env-root "$BASE/shared-env" --home "$BASE/home" --real-env "$REAL_ENV"
-expect_contains "orphan --dry-env (no --real-env) is LINT_FAIL" fail "must be given together" "$LINTER" --sbatch "$GOOD_SBATCH" --manifest "$GOOD_MANIFEST" --allowed-root "$BASE/stage" --shared-env-root "$BASE/shared-env" --home "$BASE/home" --dry-env "$DRY_ENV_GOOD"
+expect_contains "orphan --real-env (no --dry-env) is LINT_FAIL" fail "must be given together" "$LINTER" --sbatch "$GOOD_SBATCH" --manifest "$GOOD_MANIFEST" --allowed-root "$BASE/stage" --shared-env-prefix "$BASE/shared-env" --home "$BASE/home" --real-env "$REAL_ENV"
+expect_contains "orphan --dry-env (no --real-env) is LINT_FAIL" fail "must be given together" "$LINTER" --sbatch "$GOOD_SBATCH" --manifest "$GOOD_MANIFEST" --allowed-root "$BASE/stage" --shared-env-prefix "$BASE/shared-env" --home "$BASE/home" --dry-env "$DRY_ENV_GOOD"
 
 # --- realpath -m support is probed up front with a clear LINT_FAIL. ---
 # This machine's normal PATH already carries GNU coreutils' realpath (the
@@ -373,7 +373,7 @@ write_manifest "$STAGING_MANIFEST" "$SHA" "tpen-verify-$SHORT" "$BASE/final-stag
 write_sbatch "$STAGING_SBATCH" "$SHA" "tpen-verify-$SHORT" "$BASE/final-stage/task" "$BASE/final-stage/run" 0 "$GOOD_PYTHON"
 expect "sbatch linted at a mapped local staging root is accepted" pass \
   "$LINTER" --sbatch "$STAGING_SBATCH" --manifest "$STAGING_MANIFEST" \
-  --allowed-root "$BASE/final-stage" --shared-env-root "$BASE/shared-env" --home "$BASE/home" \
+  --allowed-root "$BASE/final-stage" --shared-env-prefix "$BASE/shared-env" --home "$BASE/home" \
   --staging-root "$BASE/local-stage=$BASE/final-stage"
 
 # --- Round 2 (T1 review of PR #653). Each job below starts from a
@@ -415,7 +415,7 @@ r2_staged() {  # SBATCH TASK_ROOT RUN_ROOT
   write_manifest "$1.manifest" "$SHA" "tpen-verify-$SHORT" "$2" "$3" 0 "$GOOD_PYTHON"
   write_sbatch "$1" "$SHA" "tpen-verify-$SHORT" "$2" "$3" 0 "$GOOD_PYTHON"
   "$LINTER" --sbatch "$1" --manifest "$1.manifest" --allowed-root "$BASE/r2-final" \
-    --shared-env-root "$BASE/shared-env" --home "$BASE/home" --staging-root "$BASE/r2-local=$BASE/r2-final"
+    --shared-env-prefix "$BASE/shared-env" --home "$BASE/home" --staging-root "$BASE/r2-local=$BASE/r2-final"
 }
 expect_contains "mapped TASK_ROOT through FINAL/link -> HOME is rejected" fail "TASK_ROOT resolves under" r2_staged "$BASE/r2-local/t.sbatch" "$BASE/r2-local/link/x" "$BASE/r2-final/run"
 expect_contains "mapped RUN_ROOT through FINAL/link -> HOME is rejected" fail "RUN_ROOT resolves under" r2_staged "$BASE/r2-local/r.sbatch" "$BASE/r2-final/task" "$BASE/r2-local/link/x"
@@ -433,6 +433,90 @@ expect_contains "helper sbatch --export= line with a wrong value is rejected" fa
 CLI_HELPER_EXP="$BASE/stage/cli-submit-exp.sh"
 printf '#!/bin/bash\nsbatch --export="HEAD_SHA=$SHA,DRY_RUN=0" %s\n' "$CLI_SBATCH" > "$CLI_HELPER_EXP"
 expect_contains "helper --export with shell expansion is rejected" fail "unsupported --export value" lint "$CLI_SBATCH" "$REEXPORT_MANIFEST" --submit-helper "$CLI_HELPER_EXP"
+
+# --shared-env-prefix must be disjoint from --allowed-root / --staging-root
+# FINAL (the prefix split).
+NESTED_SHARED="$BASE/stage/shared-env-nested"
+mkdir -p "$NESTED_SHARED/bin"
+touch "$NESTED_SHARED/bin/python"; chmod +x "$NESTED_SHARED/bin/python"
+expect_contains "--shared-env-prefix nested inside --allowed-root is rejected" fail "disjoint" \
+  "$LINTER" --sbatch "$GOOD_SBATCH" --manifest "$GOOD_MANIFEST" --allowed-root "$BASE/stage" \
+  --shared-env-prefix "$NESTED_SHARED" --home "$BASE/home"
+expect_contains "--shared-env-prefix containing --allowed-root is rejected" fail "disjoint" \
+  "$LINTER" --sbatch "$GOOD_SBATCH" --manifest "$GOOD_MANIFEST" --allowed-root "$NESTED_SHARED/bin" \
+  --shared-env-prefix "$NESTED_SHARED" --home "$BASE/home"
+mkdir -p "$BASE/staging-final-shared/bin"
+expect_contains "--shared-env-prefix nested inside a --staging-root FINAL is rejected" fail "disjoint" \
+  "$LINTER" --sbatch "$STAGING_SBATCH" --manifest "$STAGING_MANIFEST" --allowed-root "$BASE/final-stage" \
+  --shared-env-prefix "$BASE/final-stage/shared-sub" --home "$BASE/home" \
+  --staging-root "$BASE/local-stage=$BASE/final-stage"
+
+# Check 10: manifest SHARED_ENV_PREFIX/SHARED_ENV_PATH keys must stay
+# consistent with --shared-env-prefix and never resolve under an allowed root.
+SENV10_MANIFEST="$BASE/stage/senv10.manifest"
+cat > "$SENV10_MANIFEST" <<EOF
+HEAD_SHA=$SHA
+JOB_NAME=tpen-verify-$SHORT
+TASK_ROOT=$GOOD_TASK_ROOT
+RUN_ROOT=$GOOD_RUN_ROOT
+DRY_RUN=0
+PYTHON=$GOOD_PYTHON
+SHARED_ENV_PREFIX=$BASE/shared-env
+EOF
+expect "manifest SHARED_ENV_PREFIX matching the CLI value is accepted" pass lint "$GOOD_SBATCH" "$SENV10_MANIFEST"
+SENV10B_MANIFEST="$BASE/stage/senv10b.manifest"
+cat > "$SENV10B_MANIFEST" <<EOF
+HEAD_SHA=$SHA
+JOB_NAME=tpen-verify-$SHORT
+TASK_ROOT=$GOOD_TASK_ROOT
+RUN_ROOT=$GOOD_RUN_ROOT
+DRY_RUN=0
+PYTHON=$GOOD_PYTHON
+SHARED_ENV_PREFIX=$BASE/other-root
+EOF
+expect_contains "manifest SHARED_ENV_PREFIX not matching the CLI value is rejected" fail "does not match" lint "$GOOD_SBATCH" "$SENV10B_MANIFEST"
+SENV10C_MANIFEST="$BASE/stage/senv10c.manifest"
+cat > "$SENV10C_MANIFEST" <<EOF
+HEAD_SHA=$SHA
+JOB_NAME=tpen-verify-$SHORT
+TASK_ROOT=$GOOD_TASK_ROOT
+RUN_ROOT=$GOOD_RUN_ROOT
+DRY_RUN=0
+PYTHON=$GOOD_PYTHON
+SHARED_ENV_PATH=$BASE/shared-env/tpen-abc123-cpu-py3.12
+EOF
+expect "manifest SHARED_ENV_PATH as a direct child of the CLI prefix is accepted" pass lint "$GOOD_SBATCH" "$SENV10C_MANIFEST"
+SENV10D_MANIFEST="$BASE/stage/senv10d.manifest"
+cat > "$SENV10D_MANIFEST" <<EOF
+HEAD_SHA=$SHA
+JOB_NAME=tpen-verify-$SHORT
+TASK_ROOT=$GOOD_TASK_ROOT
+RUN_ROOT=$GOOD_RUN_ROOT
+DRY_RUN=0
+PYTHON=$GOOD_PYTHON
+SHARED_ENV_PATH=$BASE/shared-env/sub/tpen-abc123-cpu-py3.12
+EOF
+expect_contains "manifest SHARED_ENV_PATH two levels deep is rejected" fail "not a direct child" lint "$GOOD_SBATCH" "$SENV10D_MANIFEST"
+
+# Check 11: TASK_ROOT/RUN_ROOT must not resolve under --shared-env-prefix.
+SENV11_MANIFEST="$BASE/stage/senv11.manifest"
+SENV11_SBATCH="$BASE/stage/senv11.sbatch"
+SENV11_TASK="$BASE/shared-env/task"
+write_manifest "$SENV11_MANIFEST" "$SHA" "tpen-verify-$SHORT" "$SENV11_TASK" "$GOOD_RUN_ROOT" 0 "$GOOD_PYTHON"
+write_sbatch "$SENV11_SBATCH" "$SHA" "tpen-verify-$SHORT" "$SENV11_TASK" "$GOOD_RUN_ROOT" 0 "$GOOD_PYTHON"
+expect_contains "TASK_ROOT under --shared-env-prefix is rejected" fail "resolves under --shared-env-prefix" \
+  "$LINTER" --sbatch "$SENV11_SBATCH" --manifest "$SENV11_MANIFEST" --allowed-root "$BASE/stage" --allowed-root "$BASE/shared-env" \
+  --shared-env-prefix "$BASE/shared-env" --home "$BASE/home"
+
+# Check 7 (updated): a dry-run PYTHON under an allowed root (the job overlay's
+# facility-run root, not the shared-env prefix itself) must still be accepted.
+OVERLAY_PYTHON="$BASE/stage/run/overlay/bin/python"
+mkdir -p "$(dirname -- "$OVERLAY_PYTHON")"; touch "$OVERLAY_PYTHON"; chmod +x "$OVERLAY_PYTHON"
+GOOD7B_MANIFEST="$BASE/stage/good7b.manifest"
+GOOD7B_SBATCH="$BASE/stage/good7b.sbatch"
+write_manifest "$GOOD7B_MANIFEST" "$SHA" "tpen-verify-$SHORT" "$GOOD_TASK_ROOT" "$GOOD_RUN_ROOT" 1 "$OVERLAY_PYTHON"
+write_sbatch "$GOOD7B_SBATCH" "$SHA" "tpen-verify-$SHORT" "$GOOD_TASK_ROOT" "$GOOD_RUN_ROOT" 1 "$OVERLAY_PYTHON"
+expect "dry-run python under an allowed root (job overlay) is accepted" pass lint "$GOOD7B_SBATCH" "$GOOD7B_MANIFEST"
 
 # Cannon job 59624204: `((i++))` with i=0 aborts under set -e on bash >= 4
 # but not on macOS bash 3.2. Statically forbid ((...)) increments and

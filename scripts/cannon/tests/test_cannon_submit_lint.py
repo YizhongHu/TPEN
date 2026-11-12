@@ -71,7 +71,7 @@ def run_lint(base: Path, sbatch: Path, manifest: Path, *extra: str) -> subproces
         str(manifest),
         "--allowed-root",
         str(base / "stage"),
-        "--shared-env-root",
+        "--shared-env-prefix",
         str(base / "shared-env"),
         "--home",
         str(base / "home"),
@@ -124,7 +124,7 @@ def test_relative_sbatch_path_rejected(fixture_root: Path) -> None:
         str(manifest),
         "--allowed-root",
         str(fixture_root / "stage"),
-        "--shared-env-root",
+        "--shared-env-prefix",
         str(fixture_root / "shared-env"),
         "--home",
         str(fixture_root / "home"),
@@ -206,7 +206,7 @@ def test_home_staging_literal_rejected(fixture_root: Path) -> None:
         str(base / "stage"),
         "--allowed-root",
         str(base / "home"),
-        "--shared-env-root",
+        "--shared-env-prefix",
         str(base / "shared-env"),
         "--home",
         str(base / "home"),
@@ -240,7 +240,7 @@ def test_home_staging_via_symlink_rejected(fixture_root: Path) -> None:
         str(base / "stage"),
         "--allowed-root",
         str(base / "home"),
-        "--shared-env-root",
+        "--shared-env-prefix",
         str(base / "shared-env"),
         "--home",
         str(base / "home"),
@@ -514,7 +514,7 @@ def test_realpath_without_dash_m_support_fails_clearly(fixture_root: Path, tmp_p
             "bash", str(LINTER),
             "--sbatch", str(sbatch), "--manifest", str(manifest),
             "--allowed-root", str(fixture_root / "stage"),
-            "--shared-env-root", str(fixture_root / "shared-env"),
+            "--shared-env-prefix", str(fixture_root / "shared-env"),
             "--home", str(fixture_root / "home"),
         ],
         capture_output=True, text=True, check=False, env=env,
@@ -643,7 +643,7 @@ def test_staging_root_mapping_accepts_sbatch_linted_at_local_root(fixture_root: 
         str(manifest),
         "--allowed-root",
         str(final_root),
-        "--shared-env-root",
+        "--shared-env-prefix",
         str(base / "shared-env"),
         "--home",
         str(base / "home"),
@@ -679,7 +679,7 @@ def test_staging_root_mapping_does_not_relax_true_escape(fixture_root: Path) -> 
         str(manifest),
         "--allowed-root",
         str(final_root),
-        "--shared-env-root",
+        "--shared-env-prefix",
         str(base / "shared-env"),
         "--home",
         str(base / "home"),
@@ -814,7 +814,7 @@ def lint_staged(base: Path, sbatch: Path, task_root: Path, run_root: Path, local
         "bash", str(LINTER),
         "--sbatch", str(sbatch), "--manifest", str(manifest),
         "--allowed-root", str(final_root),
-        "--shared-env-root", str(base / "shared-env"),
+        "--shared-env-prefix", str(base / "shared-env"),
         "--home", str(base / "home"),
         "--staging-root", f"{local_root}={final_root}",
     ]
@@ -901,6 +901,159 @@ def test_submit_helper_export_with_shell_expansion_rejected(fixture_root: Path) 
     result = run_lint(fixture_root, sbatch, manifest, "--submit-helper", str(helper))
     assert result.returncode != 0, result.stdout + result.stderr
     assert "unsupported --export value" in result.stdout
+
+
+# --- --shared-env-prefix: the prefix split (disjoint from every
+# --allowed-root and every --staging-root FINAL). ---------------------------
+
+
+def test_shared_env_prefix_nested_in_allowed_root_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    nested_shared = fixture_root / "stage" / "shared-env-nested"
+    (nested_shared / "bin").mkdir(parents=True)
+    result = subprocess.run(
+        [
+            "bash", str(LINTER),
+            "--sbatch", str(sbatch), "--manifest", str(manifest),
+            "--allowed-root", str(fixture_root / "stage"),
+            "--shared-env-prefix", str(nested_shared),
+            "--home", str(fixture_root / "home"),
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "disjoint" in result.stdout
+
+
+def test_shared_env_prefix_containing_allowed_root_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    inner_allowed = fixture_root / "shared-env" / "bin"
+    result = subprocess.run(
+        [
+            "bash", str(LINTER),
+            "--sbatch", str(sbatch), "--manifest", str(manifest),
+            "--allowed-root", str(inner_allowed),
+            "--shared-env-prefix", str(fixture_root / "shared-env"),
+            "--home", str(fixture_root / "home"),
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "disjoint" in result.stdout
+
+
+def test_shared_env_prefix_nested_in_staging_root_final_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    local_stage = fixture_root / "local-stage"
+    final_stage = fixture_root / "final-stage"
+    local_stage.mkdir()
+    final_stage.mkdir()
+    result = subprocess.run(
+        [
+            "bash", str(LINTER),
+            "--sbatch", str(sbatch), "--manifest", str(manifest),
+            "--allowed-root", str(fixture_root / "stage"),
+            "--shared-env-prefix", str(final_stage / "shared-sub"),
+            "--home", str(fixture_root / "home"),
+            "--staging-root", f"{local_stage}={final_stage}",
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "disjoint" in result.stdout
+
+
+# --- Check 10: manifest SHARED_ENV_PREFIX/SHARED_ENV_PATH keys must stay
+# consistent with --shared-env-prefix. ---------------------------------------
+
+
+def test_manifest_shared_env_prefix_matching_cli_accepted(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    manifest2 = fixture_root / "stage" / "senv-match.manifest"
+    manifest2.write_text(manifest.read_text() + f"SHARED_ENV_PREFIX={fixture_root / 'shared-env'}\n")
+    result = run_lint(fixture_root, sbatch, manifest2)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_manifest_shared_env_prefix_mismatch_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    manifest2 = fixture_root / "stage" / "senv-mismatch.manifest"
+    manifest2.write_text(manifest.read_text() + f"SHARED_ENV_PREFIX={fixture_root / 'other-root'}\n")
+    result = run_lint(fixture_root, sbatch, manifest2)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "does not match --shared-env-prefix" in result.stdout
+
+
+def test_manifest_shared_env_path_direct_child_accepted(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    manifest2 = fixture_root / "stage" / "senv-path-good.manifest"
+    manifest2.write_text(
+        manifest.read_text() + f"SHARED_ENV_PATH={fixture_root / 'shared-env' / 'tpen-abc123-cpu-py3.12'}\n"
+    )
+    result = run_lint(fixture_root, sbatch, manifest2)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_manifest_shared_env_path_two_levels_deep_rejected(fixture_root: Path) -> None:
+    sbatch, manifest, *_ = good_fixture(fixture_root)
+    manifest2 = fixture_root / "stage" / "senv-path-bad.manifest"
+    manifest2.write_text(
+        manifest.read_text() + f"SHARED_ENV_PATH={fixture_root / 'shared-env' / 'sub' / 'tpen-abc123-cpu-py3.12'}\n"
+    )
+    result = run_lint(fixture_root, sbatch, manifest2)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "not a direct child" in result.stdout
+
+
+# --- Check 11: TASK_ROOT/RUN_ROOT must not resolve under --shared-env-prefix.
+
+
+def test_task_root_under_shared_env_prefix_rejected(fixture_root: Path) -> None:
+    base = fixture_root
+    task_root = base / "shared-env" / "task"
+    run_root = base / "stage" / "run"
+    python = base / "shared-env" / "bin" / "python"
+    manifest = base / "stage" / "senv11-task.manifest"
+    sbatch = base / "stage" / "senv11-task.sbatch"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    write_sbatch(sbatch, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    result = run_lint(base, sbatch, manifest)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "resolves under --shared-env-prefix" in result.stdout
+
+
+def test_run_root_under_shared_env_prefix_rejected(fixture_root: Path) -> None:
+    base = fixture_root
+    task_root = base / "stage" / "task"
+    run_root = base / "shared-env" / "run"
+    python = base / "shared-env" / "bin" / "python"
+    manifest = base / "stage" / "senv11-run.manifest"
+    sbatch = base / "stage" / "senv11-run.sbatch"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    write_sbatch(sbatch, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=0, python=python)
+    result = run_lint(base, sbatch, manifest)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "resolves under --shared-env-prefix" in result.stdout
+
+
+# --- Check 7 (updated): PYTHON under an allowed root (the job overlay, not
+# the shared-env prefix itself) must also be accepted in a dry run. ---------
+
+
+def test_dry_run_python_under_allowed_root_not_shared_env_accepted(fixture_root: Path) -> None:
+    base = fixture_root
+    task_root = base / "stage" / "task"
+    run_root = base / "stage" / "run"
+    overlay_python = base / "stage" / "run" / "overlay" / "bin" / "python"
+    overlay_python.parent.mkdir(parents=True)
+    overlay_python.write_text("#!/bin/sh\n")
+    overlay_python.chmod(overlay_python.stat().st_mode | stat.S_IEXEC)
+    manifest = base / "stage" / "goodpy2.manifest"
+    sbatch = base / "stage" / "goodpy2.sbatch"
+    write_manifest(manifest, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=1, python=overlay_python)
+    write_sbatch(sbatch, sha=SHA, job_name=JOB_NAME, task_root=task_root, run_root=run_root, dry_run=1, python=overlay_python)
+    result = run_lint(base, sbatch, manifest)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_no_errexit_unsafe_arithmetic_statements() -> None:
