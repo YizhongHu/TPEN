@@ -1,0 +1,7 @@
+sample_index,draw_index,walker_index,local_energy,term/kinetic,logabs,sign,finite,position/electron_0/axis_0,position/electron_0/axis_1,position/electron_0/axis_2,position/electron_1/axis_0,position/electron_1/axis_1,position/electron_1/axis_2
+0,0,0,1.0,1.0,-1.5,1.0,True,0.11,0.0,0.0,0.111,0.0,0.0
+1,0,1,2.0,2.0,-1.5,1.0,True,0.12000000000000001,0.0,0.0,0.12100000000000001,0.0,0.0
+2,0,2,3.0,3.0,-1.5,1.0,True,0.13,0.0,0.0,0.131,0.0,0.0
+3,1,0,11.0,11.0,-1.5,1.0,True,0.21000000000000002,0.0,0.0,0.21100000000000002,0.0,0.0
+4,1,1,12.0,12.0,-1.5,1.0,True,0.22,0.0,0.0,0.221,0.0,0.0
+5,1,2,13.0,13.0,-1.5,1.0,True,0.23,0.0,0.0,0.231,0.0,0.0
