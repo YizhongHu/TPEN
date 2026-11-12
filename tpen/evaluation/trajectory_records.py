@@ -576,6 +576,283 @@ class TrajectoryRecordStreamWriter:
         return row
 
 
+TRAJECTORY_RECORD_INSPECTION_SCHEMA = "tpen.trajectory-record-inspection/v1"
+"""Schema identifier for the version-aware historical-reader result below.
+
+This is the inspection *result's* own schema, distinct from the
+``schema`` field recorded inside a trajectory-record sidecar
+(``TRAJECTORY_RECORD_SCHEMA`` and friends, e.g. ``trajectory_records/v1``).
+A new inspection-result field would bump this identifier; a new sidecar
+schema (e.g. a future ``trajectory_records/v2``) is handled by adding a
+branch to :func:`inspect_trajectory_record` without changing this one.
+"""
+
+
+class UnsupportedTrajectoryRecordSchemaError(ValueError):
+    """Raised when a sidecar declares a schema this reader does not decode."""
+
+
+class TamperedTrajectoryRecordError(ValueError):
+    """Raised when a sidecar or CSV fails an integrity check against itself."""
+
+
+@dataclass(frozen=True, slots=True)
+class TrajectoryPhysicalContext:
+    """Physical-system identity and method provenance, or its documented absence.
+
+    Historical ``trajectory_records/v1`` sidecars never recorded a physical
+    descriptor or an evaluation-method declaration (see
+    ``system-context-records-design-r1.md`` section 5). Decoding such a
+    sidecar must state that fact explicitly rather than inventing a
+    ``system_id`` from ``atomic_configuration_id`` or from geometry: the two
+    identities are never aliases of one another.
+
+    Parameters
+    ----------
+    available : bool
+        Whether this record carries a verified physical-system identity.
+    system_id : str or None
+        The recorded system content ID, required when ``available`` is
+        true and forbidden otherwise.
+    reason : str or None
+        Human-readable explanation, required when ``available`` is false
+        and forbidden otherwise.
+    """
+
+    available: bool
+    system_id: str | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.available:
+            if self.system_id is None:
+                raise ValueError("available physical context requires a system_id")
+            if self.reason is not None:
+                raise ValueError("available physical context must not carry a reason")
+        else:
+            if self.system_id is not None:
+                raise ValueError("unavailable physical context must not carry a system_id")
+            if self.reason is None:
+                raise ValueError("unavailable physical context requires a reason")
+
+
+_V1_PHYSICAL_CONTEXT_UNAVAILABLE = TrajectoryPhysicalContext(
+    available=False,
+    reason=(
+        "trajectory_records/v1 sidecars record nuclear geometry only; they contain no "
+        "physical-system descriptor and no evaluation-method declaration"
+    ),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TrajectoryRecordInspection:
+    """Version-normalized, read-only view of one trajectory-record artifact.
+
+    Returned by :func:`inspect_trajectory_record` for every supported
+    sidecar schema. ``physical_context`` is the single place a caller must
+    check before trusting a ``system_id``; a geometry-only legacy record
+    reports it as unavailable rather than silently omitting the field.
+    """
+
+    record_schema: str
+    path: Path
+    metadata_path: Path
+    observable: str
+    draw_count: int
+    walker_count: int
+    row_count: int
+    mean: float
+    variance: float
+    csv_sha256: str
+    atomic_configuration_id: str | None
+    physical_context: TrajectoryPhysicalContext
+    schema: str = TRAJECTORY_RECORD_INSPECTION_SCHEMA
+
+
+def inspect_trajectory_record(metadata_path: str | Path) -> TrajectoryRecordInspection:
+    """Decode one trajectory-record sidecar under its own declared schema.
+
+    Parameters
+    ----------
+    metadata_path : str or pathlib.Path
+        Path to a ``*.metadata.json`` sidecar written by a trajectory-record
+        writer (any supported schema).
+
+    Returns
+    -------
+    TrajectoryRecordInspection
+        A version-normalized view. For ``trajectory_records/v1`` sidecars,
+        ``physical_context.available`` is always false.
+
+    Raises
+    ------
+    UnsupportedTrajectoryRecordSchemaError
+        The sidecar's ``schema`` field is missing or not a schema this
+        reader decodes.
+    TamperedTrajectoryRecordError
+        The sidecar's key set, the CSV hash, or the draw/walker grid
+        disagrees with what the declared schema requires.
+
+    Notes
+    -----
+    This function never infers a physical-system identity from
+    ``atomic_configuration_id`` or from recorded geometry: a v1 sidecar's
+    nuclear positions describe a resource consumed by some term, not a
+    verified complete Hamiltonian. Experiments reach this function only
+    through the read-only ``tpen.inspection`` boundary
+    (``experiments/README.md``), never by importing this module directly.
+    """
+
+    metadata_path = Path(metadata_path)
+    try:
+        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise TamperedTrajectoryRecordError(f"cannot read trajectory record sidecar: {exc}") from exc
+    except ValueError as exc:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record sidecar is not valid JSON: {metadata_path}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise TamperedTrajectoryRecordError("trajectory record sidecar must be a JSON object")
+
+    record_schema = raw.get("schema")
+    if record_schema == TRAJECTORY_RECORD_SCHEMA:
+        return _inspect_v1(metadata_path, raw)
+    raise UnsupportedTrajectoryRecordSchemaError(
+        f"unsupported trajectory record schema {record_schema!r} in {metadata_path}"
+    )
+
+
+def _inspect_v1(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryRecordInspection:
+    declared_keys = set(TRAJECTORY_RECORD_METADATA_KEYS)
+    actual_keys = set(metadata)
+    if actual_keys != declared_keys:
+        missing = sorted(declared_keys - actual_keys)
+        extra = sorted(actual_keys - declared_keys)
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record sidecar key set disagrees with {TRAJECTORY_RECORD_SCHEMA!r}: "
+            f"missing={missing}, extra={extra}"
+        )
+    if metadata.get("row_semantics") != TRAJECTORY_RECORD_ROW_SEMANTICS:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record row_semantics disagrees with {TRAJECTORY_RECORD_ROW_SEMANTICS!r}"
+        )
+
+    csv_path = metadata_path.parent / str(metadata["csv_filename"])
+    if not csv_path.is_file():
+        raise TamperedTrajectoryRecordError(f"trajectory record CSV not found: {csv_path}")
+    declared_sha256 = metadata["csv_sha256"]
+    actual_sha256 = _file_sha256(csv_path)
+    if actual_sha256 != declared_sha256:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record csv_sha256 disagrees with {csv_path}: "
+            f"declared={declared_sha256!r}, actual={actual_sha256!r}"
+        )
+
+    draw_count = int(metadata["draw_count"])
+    walker_count = int(metadata["walker_count"])
+    row_count = int(metadata["row_count"])
+    grid_row_count, recomputed_mean, recomputed_variance = _scan_complete_grid(
+        csv_path, draw_count=draw_count, walker_count=walker_count
+    )
+    if grid_row_count != row_count:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record row_count disagrees with its CSV grid: "
+            f"declared={row_count}, actual={grid_row_count}"
+        )
+    declared_mean = _as_float(metadata["mean"])
+    declared_variance = _as_float(metadata["variance"])
+    if not _close_or_same_nonfinite(recomputed_mean, declared_mean) or not _close_or_same_nonfinite(
+        recomputed_variance, declared_variance
+    ):
+        raise TamperedTrajectoryRecordError(
+            "trajectory record mean/variance disagrees with its CSV: "
+            f"declared=({declared_mean!r}, {declared_variance!r}), "
+            f"recomputed=({recomputed_mean!r}, {recomputed_variance!r})"
+        )
+
+    return TrajectoryRecordInspection(
+        record_schema=TRAJECTORY_RECORD_SCHEMA,
+        path=csv_path,
+        metadata_path=metadata_path,
+        observable=str(metadata["observable"]),
+        draw_count=draw_count,
+        walker_count=walker_count,
+        row_count=row_count,
+        mean=declared_mean,
+        variance=declared_variance,
+        csv_sha256=declared_sha256,
+        atomic_configuration_id=str(metadata["atomic_configuration_id"]),
+        physical_context=_V1_PHYSICAL_CONTEXT_UNAVAILABLE,
+    )
+
+
+def _scan_complete_grid(path: Path, *, draw_count: int, walker_count: int) -> tuple[int, float, float]:
+    """Scan a v1 CSV for a complete, non-duplicated draw/walker grid.
+
+    Returns the row count plus the local-energy mean/variance recomputed
+    directly from the CSV, so a caller can cross-check them against the
+    sidecar's own ``mean``/``variance`` without trusting either file alone.
+    """
+
+    if draw_count < 1 or walker_count < 1:
+        raise TamperedTrajectoryRecordError("trajectory record draw_count/walker_count must be positive")
+    seen: set[tuple[int, int]] = set()
+    energies: list[float] = []
+    row_count = 0
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                draw = int(row["draw_index"])
+                walker = int(row["walker_index"])
+                energy = float(row["local_energy"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise TamperedTrajectoryRecordError(f"malformed trajectory record row: {row!r}") from exc
+            if not 0 <= draw < draw_count or not 0 <= walker < walker_count:
+                raise TamperedTrajectoryRecordError(
+                    f"trajectory record row (draw={draw}, walker={walker}) is outside the declared grid"
+                )
+            key = (draw, walker)
+            if key in seen:
+                raise TamperedTrajectoryRecordError(f"duplicate trajectory record row (draw={draw}, walker={walker})")
+            seen.add(key)
+            # Match the writer's reconciliation sum semantics: every row
+            # contributes, finite or not, so a non-finite row propagates
+            # nan/inf into mean/variance rather than being dropped.
+            energies.append(energy)
+            row_count += 1
+    expected_rows = draw_count * walker_count
+    if row_count != expected_rows:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record grid is incomplete: expected {expected_rows} rows, found {row_count}"
+        )
+    # `math.fsum` (exact summation) is the most trustworthy independent
+    # baseline; the tolerance in `_close_or_same_nonfinite` absorbs the
+    # writer's own torch-reduction rounding rather than requiring bit-exact
+    # agreement with this recomputation.
+    mean = math.fsum(energies) / row_count
+    variance = math.fsum(value * value for value in energies) / row_count - mean * mean
+    if math.isfinite(variance) and variance < 0.0:
+        variance = 0.0
+    return row_count, mean, variance
+
+
+def _as_float(value: object) -> float:
+    if isinstance(value, str):
+        if value == "inf":
+            return math.inf
+        if value == "-inf":
+            return -math.inf
+        if value == "nan":
+            return math.nan
+        raise TamperedTrajectoryRecordError(f"trajectory record non-finite field has unknown text {value!r}")
+    if isinstance(value, (int, float)):
+        return float(value)
+    raise TamperedTrajectoryRecordError(f"trajectory record numeric field has unexpected type {type(value).__name__}")
+
+
 def _write_metadata(artifact: TrajectoryRecordArtifact) -> None:
     atoms = artifact.atomic_configuration
     metadata = {
@@ -657,6 +934,20 @@ def _same_float(left: float, right: float) -> bool:
     return left == right or (math.isnan(left) and math.isnan(right))
 
 
+def _close_or_same_nonfinite(left: float, right: float, *, rel_tol: float = 1e-9, abs_tol: float = 1e-9) -> bool:
+    """Compare two floats tolerantly, treating matching non-finite values as equal.
+
+    Used only to cross-check a reader's independent recomputation against a
+    sidecar's declared value; two different summation orders (this module's
+    plain accumulation versus the writer's torch reduction) can legitimately
+    differ in the last few bits without either being tampered.
+    """
+
+    if math.isfinite(left) and math.isfinite(right):
+        return math.isclose(left, right, rel_tol=rel_tol, abs_tol=abs_tol)
+    return _same_float(left, right)
+
+
 def _same_reconciliation(
     left: ObservableTrajectoryReconciliation,
     right: ObservableTrajectoryReconciliation,
@@ -678,10 +969,16 @@ def _same_reconciliation(
 
 __all__ = [
     "TRAJECTORY_RECORD_FILENAME",
+    "TRAJECTORY_RECORD_INSPECTION_SCHEMA",
     "TRAJECTORY_RECORD_METADATA_KEYS",
     "TRAJECTORY_RECORD_ROW_SEMANTICS",
     "TRAJECTORY_RECORD_SCHEMA",
+    "TamperedTrajectoryRecordError",
+    "TrajectoryPhysicalContext",
     "TrajectoryRecordArtifact",
     "TrajectoryRecordBatch",
+    "TrajectoryRecordInspection",
     "TrajectoryRecordStreamWriter",
+    "UnsupportedTrajectoryRecordSchemaError",
+    "inspect_trajectory_record",
 ]
