@@ -242,6 +242,7 @@ def test_science_pipeline_check_train_dispatch_reaches_real_store_reservation(
     captured: dict[str, object] = {}
 
     def _stub_activate(prepared, *, store, **_kwargs):
+        assert captured_plan_sizes == {"n_walkers": 4, "max_steps": 2}
         store_path = Path(store)
         assert not store_path.exists(), "store must still be absent when activation begins -- the fix must not pre-create it"
         allocation_path, worker_path = _real_cli_allocation_and_worker(
