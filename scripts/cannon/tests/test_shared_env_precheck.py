@@ -497,14 +497,20 @@ def test_verify_sh_discovers_all_test_python_vars_and_excludes_owned_names(tmp_p
         "assert_write_path() { :; }\n"
         f"{loop}\n"
         "[[ \"${H_V2_SCIENCE_PYTHON:-}\" == \"$PYTHON\" ]]\n"
-        "[[ -z \"${TPEN_PYTHON+x}\" ]]\n"
-        "[[ -z \"${ROOT_PYTHON+x}\" ]]\n"
     )
-    result = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        ["bash", "-c", probe],
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (run_root / "evidence" / "executor-python-bindings.txt").read_text().splitlines() == [
+    bindings = (run_root / "evidence" / "executor-python-bindings.txt").read_text().splitlines()
+    assert bindings == [
         "H_V2_SCIENCE_PYTHON=/tmp/overlay/bin/python"
     ]
+    assert all(not line.startswith(("TPEN_PYTHON=", "ROOT_PYTHON=")) for line in bindings)
 
 
 def test_verify_sh_executor_resolution_precheck_rejects_outside_clone(tmp_path: Path) -> None:
