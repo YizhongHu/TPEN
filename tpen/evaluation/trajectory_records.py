@@ -1441,12 +1441,26 @@ def _scan_complete_grid(path: Path, *, draw_count: int, walker_count: int) -> tu
         raise TamperedTrajectoryRecordError(
             f"trajectory record grid is incomplete: expected {expected_rows} rows, found {row_count}"
         )
-    # `math.fsum` (exact summation) is the most trustworthy independent
-    # baseline; the tolerance in `_close_or_same_nonfinite` absorbs the
-    # writer's own torch-reduction rounding rather than requiring bit-exact
-    # agreement with this recomputation.
-    mean = math.fsum(energies) / row_count
-    variance = math.fsum(value * value for value in energies) / row_count - mean * mean
+    # Reduce draw-by-draw, matching the writer's torch reductions.  Plain
+    # float addition deliberately propagates mixed infinities as NaN; using
+    # math.fsum here would raise instead and make a legitimate nonfinite
+    # trajectory unreadable.
+    draw_sums: dict[int, float] = {}
+    draw_square_sums: dict[int, float] = {}
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            draw = int(row["draw_index"])
+            energy = float(row["local_energy"])
+            draw_sums[draw] = draw_sums.get(draw, 0.0) + energy
+            draw_square_sums[draw] = draw_square_sums.get(draw, 0.0) + energy * energy
+    total = 0.0
+    total_square = 0.0
+    for draw in range(draw_count):
+        total += draw_sums.get(draw, 0.0)
+        total_square += draw_square_sums.get(draw, 0.0)
+    mean = total / row_count
+    variance = total_square / row_count - mean * mean
     if math.isfinite(variance) and variance < 0.0:
         variance = 0.0
     return row_count, mean, variance
