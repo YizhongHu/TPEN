@@ -54,12 +54,13 @@ class PlannedYield(StatefulCallback[TrainerState]):
         if next_iteration != self.target_iteration:
             return
         self.observed = True
+        callbacks = tuple(getattr(context, "callbacks", ()))
         callback = self.checkpoint or next(
-            (candidate for candidate in context.callbacks if hasattr(candidate, "published_ref")),
+            (candidate for candidate in callbacks if hasattr(candidate, "published_ref")),
             None,
         )
         producer_installed = callback is not None and any(
-            candidate is callback for candidate in context.callbacks
+            candidate is callback for candidate in callbacks
         )
         producer_context_matches = (
             producer_installed

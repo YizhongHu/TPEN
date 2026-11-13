@@ -307,7 +307,7 @@ class Checkpoint(StatefulCallback[TrainerState]):
         next_iteration: int,
         completed_updates: int,
     ) -> None:
-        self._active_context_callbacks = tuple(context.callbacks)
+        self._active_context_callbacks = tuple(getattr(context, "callbacks", ()))
         final_dir = self.output_dir / checkpoint_step_dir_name(next_iteration)
         if is_complete_checkpoint_dir(final_dir):
             self._validate_existing_publication(final_dir)
