@@ -129,11 +129,12 @@ def test_r2_t3_real_worker_kills_owned_group_and_reaps_before_propagation(tmp_pa
         with pytest.raises(error_type) as observed:
             SubprocessWorker().run(environment, args, cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err", timeout=8)
     assert observed.value is cancellation
-    # "killpg" (the owned-group kill), "reaped", then the post-reap
-    # terminate+probe (killpg(SIGKILL) again, now a no-op since the group
-    # is already gone, then the signal-0 probe) that confirms quiescence
-    # before this worker call propagates.
-    assert calls == ["wait", "killpg", "wait", "reaped", "killpg", "probe"], calls
+    # The owned-group kill and leader reap must happen before the P1-1
+    # terminate+probe quiescence check.  The signal-0 probe may repeat while
+    # a descendant is still exiting, so assert the ordering and probe suffix
+    # rather than a timing-sensitive exact list.
+    assert calls[:5] == ["wait", "killpg", "wait", "reaped", "killpg"], calls
+    assert calls[5:] and all(call == "probe" for call in calls[5:]), calls
     assert processes[0].returncode == -signal.SIGKILL
     time.sleep(1.8)
     assert not late.exists(), "owned descendant must not survive to write after cancellation"
