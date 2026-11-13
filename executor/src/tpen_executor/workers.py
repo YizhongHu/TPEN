@@ -382,6 +382,7 @@ class SubprocessWorker:
             spawned_pid = process.pid
             spawned_ticks = _proc_start_ticks(spawned_pid)
             sampler = None
+            group_reaped = False
             cancel_stop = threading.Event()
             watcher: threading.Thread | None = None
             watcher_started = False
@@ -443,12 +444,19 @@ class SubprocessWorker:
                 # An interrupt while waiting must not orphan the isolated
                 # session. Keep the leader unreaped while terminating and
                 # observing its group, then reap it before propagating.
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                _leader_exited_without_reap(spawned_pid)
-                group_reaped = _group_quiescent(spawned_pid)
+                if process.returncode is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        _leader_exited_without_reap(spawned_pid)
+                    except ChildProcessError:
+                        # The leader was already reaped; its PID/PGID is no
+                        # longer an ownership proof, so do not signal it.
+                        group_reaped = False
+                    else:
+                        group_reaped = _group_quiescent(spawned_pid)
                 cleanup_errors: list[BaseException] = []
                 while process.returncode is None:
                     try:
@@ -476,12 +484,6 @@ class SubprocessWorker:
                     watcher.join(timeout=1)
                 if process_handle is not None:
                     process_handle.clear(process)
-        # Normal exit and worker timeout: the leader is reaped.  An observed,
-        # bounded fact, not a default: terminate and confirm no process
-        # remains in this launch's group BEFORE the sampler/lease settle
-        # (review P1-1, B2) -- a clean sampler must never release the
-        # quarantine marker while a science descendant could still be alive.
-        group_reaped = _group_quiescent(spawned_pid)
         interruptions = finish_gpu_sampler(sampler, sampler_output, lease, group_reaped=group_reaped)
         if interruptions:
             raise interruptions[0]

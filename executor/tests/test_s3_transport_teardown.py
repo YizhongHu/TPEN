@@ -592,6 +592,41 @@ def test_group_quiescence_kills_and_probes_before_leader_reap(monkeypatch: pytes
     assert events == ["waitid", ("killpg", signal.SIGKILL), ("killpg", 0)]
 
 
+def test_normal_exit_keeps_quiescence_before_reap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Normal completion must not signal a PGID after its leader is reaped."""
+    events = []
+    request, _parts = _request(tmp_path, timeout=5)
+    output, _core, stdout, stderr, _ev_stdout, _ev_stderr = request.paths()
+    real_waitid = os.waitid
+    real_killpg = os.killpg
+    real_wait = subprocess.Popen.wait
+
+    def waitid(id_type, pid, options):
+        events.append("waitid")
+        return real_waitid(id_type, pid, options)
+
+    def killpg(pid, sig):
+        events.append(("killpg", sig))
+        return real_killpg(pid, sig)
+
+    def wait(process, *args, **kwargs):
+        result = real_wait(process, *args, **kwargs)
+        events.append("reaped")
+        return result
+
+    monkeypatch.setattr(os, "waitid", waitid)
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(subprocess.Popen, "wait", wait)
+    outcome = SubprocessWorker().run(
+        request.environment, ("-c", "pass"), cwd=output,
+        stdout_path=stdout, stderr_path=stderr, timeout=5,
+    )
+    reap_index = events.index("reaped")
+    assert outcome.group_reaped is True
+    assert any(event == ("killpg", signal.SIGKILL) for event in events[:reap_index])
+    assert all(event not in (("killpg", signal.SIGKILL), ("killpg", 0)) for event in events[reap_index + 1:])
+
+
 def test_group_quiescence_skips_signal_after_unconfirmed_reap(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unverified post-reap PID is conservatively not group-quiescent."""
     signals = []
