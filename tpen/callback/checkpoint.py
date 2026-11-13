@@ -22,6 +22,7 @@ from tpen.checkpoint import (
     checkpoint_step_dir_name,
     reconcile_publication,
     save_checkpoint,
+    CheckpointPublicationBoundaryError,
 )
 from tpen.checkpoint.artifact import is_complete_checkpoint_dir
 from tpen.checkpoint.schema import read_manifest
@@ -40,6 +41,16 @@ from .base import StatefulCallback
 from .cadence import StepCadenceGate, SubscriptionGroup, pop_step_cadence
 
 _LOGGER = logging.getLogger("tpen")
+
+
+class CheckpointPublicationError(RuntimeError):
+    """A load-bearing publication step failed after a checkpoint boundary."""
+
+    def __init__(self, error: BaseException, *, next_iteration: int, completed_updates: int) -> None:
+        super().__init__(str(error))
+        self.original = error
+        self.next_iteration = next_iteration
+        self.completed_updates = completed_updates
 
 
 class Checkpoint(StatefulCallback[TrainerState]):
@@ -296,25 +307,26 @@ class Checkpoint(StatefulCallback[TrainerState]):
         model = state.model
         if model is None:
             raise ValueError("Checkpoint callback requires state.model")
-        save_checkpoint(
-            output_dir=self.output_dir,
-            next_iteration=next_iteration,
-            completed_updates=completed_updates,
-            model=model,
-            # The composed payload owns which components are written. Passing
-            # the available state through lets an explicit TrainResume payload
-            # use its defaults (the legacy flags are still honoured by the
-            # saver when they are explicitly set to False).
-            optimizer=state.optimizer,
-            trainer=state.trainer,
-            sampler=state.sampler,
-            context=context,
-            payload=self.payload,
-            save_optimizer=self.save_optimizer,
-            save_trainer=self.save_trainer,
-            save_sampler=self.save_sampler,
-            save_rng=self.save_rng,
-        )
+        try:
+            save_checkpoint(
+                output_dir=self.output_dir,
+                next_iteration=next_iteration,
+                completed_updates=completed_updates,
+                model=model,
+                optimizer=state.optimizer,
+                trainer=state.trainer,
+                sampler=state.sampler,
+                context=context,
+                payload=self.payload,
+                save_optimizer=self.save_optimizer,
+                save_trainer=self.save_trainer,
+                save_sampler=self.save_sampler,
+                save_rng=self.save_rng,
+            )
+        except CheckpointPublicationBoundaryError as exc:
+            raise CheckpointPublicationError(
+                exc.original, next_iteration=next_iteration, completed_updates=completed_updates
+            ) from exc
         self._record_published(final_dir)
 
     def _record_published(self, final_dir: Path) -> None:
@@ -459,4 +471,5 @@ def _payload_label(components: frozenset[str] | None) -> str | None:
 
 __all__ = [
     "Checkpoint",
+    "CheckpointPublicationError",
 ]

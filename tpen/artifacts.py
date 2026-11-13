@@ -341,6 +341,19 @@ class RunResult:
     completed_updates: int | None = None
     target_iterations: int | None = None
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return the JSON-safe public run outcome."""
+        ref = self.checkpoint_ref
+        return {
+            "status": self.status,
+            "run_dir": None if self.run_dir is None else str(self.run_dir),
+            "error": self.error,
+            "checkpoint_ref": None if ref is None else ref.to_dict(),
+            "next_iteration": self.next_iteration,
+            "completed_updates": self.completed_updates,
+            "target_iterations": self.target_iterations,
+        }
+
 
 @dataclass(frozen=True)
 class RunClock:
@@ -1055,6 +1068,13 @@ def write_error_artifact(
     return path
 
 
+def write_run_outcome_artifact(context: RunContext, result: RunResult) -> Path:
+    """Persist the typed public outcome through the active artifact manager."""
+    path = context.path("run-outcome.json")
+    write_json(path, result.to_dict())
+    return path
+
+
 def write_run_start_artifact(context: RunContext) -> None:
     """Write the early run-start breadcrumb before long-running work begins."""
 
@@ -1430,6 +1450,7 @@ __all__ = [
     "write_json",
     "write_artifact_routing_receipt",
     "write_error_artifact",
+    "write_run_outcome_artifact",
     "write_occurrence_artifact",
     "write_typed_event_artifact",
     "write_run_start_artifact",

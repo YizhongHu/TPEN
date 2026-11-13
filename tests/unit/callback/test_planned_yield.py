@@ -171,3 +171,14 @@ def test_s4_yield_at_or_above_h_is_refused(tmp_path: Path) -> None:
     assert result.error == "planned yield must be below the fixed horizon H"
     assert result.checkpoint_ref is checkpoint.published_ref
     assert state.trainer.max_steps == 7
+
+
+def test_s4_stale_publication_is_unknown_at_a_later_boundary(tmp_path: Path) -> None:
+    result, checkpoint, _planned, _state_value, context = _published_yield(tmp_path)
+    assert result.status == "planned_yield"
+    stale = PlannedYield(3, 7, checkpoint=checkpoint)
+    state = _state(root=tmp_path, next_iteration=3, completed_updates=2, max_steps=7)
+    context.callbacks = [checkpoint, stale]
+    with pytest.raises(PlannedYieldSignal) as caught:
+        context.emit(TrainingIterationCompleted(TrainingIteration(2)), state=state)
+    assert caught.value.result.status == "unknown"

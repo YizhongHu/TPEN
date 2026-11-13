@@ -91,6 +91,7 @@ class RunCompleted(Event):
     """
 
     status: str = "completed"
+    result: object | None = None
 
 
 @dataclass(frozen=True)

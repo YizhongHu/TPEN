@@ -28,6 +28,7 @@ from tpen.artifacts import (
     resolve_run_id,
     write_artifact_routing_receipt,
     write_error_artifact,
+    write_run_outcome_artifact,
     write_run_start_artifact,
 )
 from tpen.distributed import (
@@ -43,11 +44,14 @@ from tpen.events import Event as TypedEvent
 from tpen.hi_schema import validate_hi_train_config
 from tpen.run_events import RunCompleted, RunFailed, RunStarted
 from tpen.runner import Runner
-from tpen.callback.planned_yield import PlannedYieldSignal
+from tpen.callback.planned_yield import PlannedYield, PlannedYieldSignal
+from tpen.callback.checkpoint import CheckpointPublicationError
 
 # Register custom OmegaConf resolvers (e.g. tpen.basis_feature_dim) before any
 # config is loaded or resolved on the run path.
 register_resolvers()
+
+PLANNED_YIELD_EXIT_CODE = 2
 
 # Bootstrap diagnostics get their own channel so a run's logging configuration can
 # silence or route fatal pre-context errors independently. Spelled once: the channel
@@ -477,6 +481,9 @@ def run_from_config(
         runner = _instantiate_runner(context)
         if restore_request is not None:
             runner = _apply_operational_restore(context.cfg, runner, restore_request)
+        for callback in context.callbacks:
+            if isinstance(callback, PlannedYield):
+                callback.validate_target(runner)
         result = runner.run(context)
         # The harness owns the whole run lifecycle, including this boundary,
         # which the runners emitted the ``run_end`` string for. See
@@ -488,20 +495,41 @@ def run_from_config(
         # itself while handling this event and would otherwise overwrite a
         # failed suite's status with the boundary's own name.
         status = result.status if isinstance(result, RunResult) else "completed"
-        context.emit(RunCompleted(status=status))
+        if isinstance(result, RunResult):
+            write_run_outcome_artifact(context, result)
+        context.emit(RunCompleted(status=status, result=result if isinstance(result, RunResult) else None))
         if isinstance(result, RunResult):
             context.metadata.status = result.status
         # A failed suite raises nothing -- the runner returned -- but the process
         # must not claim success. Same exit code as the raising path: no caller
         # distinguishes between nonzero codes, and inventing a second one would
         # be a new contract for no consumer.
-        return 0 if status in {"completed", "planned_yield"} else 1
+        return 0 if status == "completed" else 1
     except PlannedYieldSignal as signal:
         result = signal.result
         if context is not None:
             context.metadata.status = result.status
-            context.emit(RunCompleted(status=result.status))
-        return 0 if result.status == "planned_yield" else 1
+            write_run_outcome_artifact(context, result)
+            try:
+                context.emit(RunCompleted(status=result.status, result=result))
+            except Exception as exc:
+                context.metadata.status = "failed"
+                _write_error_if_possible(context, exc, phase="run_completed", traceback_text=traceback.format_exc())
+                _emit_typed_event_if_possible(
+                    context, RunFailed(type(exc).__name__, str(exc))
+                )
+                return 1
+        return 0 if result.status == "completed" else (PLANNED_YIELD_EXIT_CODE if result.status == "planned_yield" else 1)
+    except CheckpointPublicationError as exc:
+        result = RunResult(
+            status="unknown", error=str(exc.original),
+            next_iteration=exc.next_iteration, completed_updates=exc.completed_updates,
+        )
+        if context is not None:
+            context.metadata.status = result.status
+            write_run_outcome_artifact(context, result)
+            context.emit(RunCompleted(status=result.status, result=result))
+        return 1
     except Exception as exc:
         phase = _failure_phase(exc, context=context, runner=runner)
         traceback_text = traceback.format_exc()
@@ -638,6 +666,7 @@ _SINK_FREE_TYPES: frozenset[str] = frozenset(
         "tpen.callback.timing.run_timing.RunTiming",
         "tpen.callback.timing.train_phase_timing.TrainPhaseTiming",
         "tpen.callback.timing.train_step_timing.TrainStepTiming",
+        "tpen.callback.planned_yield.PlannedYield",
     }
 )
 

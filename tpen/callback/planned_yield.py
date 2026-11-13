@@ -38,6 +38,7 @@ class PlannedYield(StatefulCallback[TrainerState]):
         self.target_iterations = target_iterations
         self.checkpoint = checkpoint
         self.observed = False
+        self._published_context: object = None
         super().__init__(
             typed_groups=(
                 SubscriptionGroup(selectors=(Subscription.of(TrainingIterationCompleted),)),
@@ -58,7 +59,21 @@ class PlannedYield(StatefulCallback[TrainerState]):
         ref = getattr(callback, "published_ref", None)
         profile = getattr(callback, "published_payload_profile", None)
         completed_updates = int(getattr(state.trainer, "completed_updates"))
-        if not isinstance(ref, CheckpointRef) or profile != "train_resume":
+        if self._published_context is not context:
+            self._published_context = context
+            self._published_ref = None
+            self._published_profile = None
+        if isinstance(ref, CheckpointRef) and profile == "train_resume":
+            self._published_ref = ref
+            self._published_profile = profile
+        ref = getattr(self, "_published_ref", None)
+        profile = getattr(self, "_published_profile", None)
+        if (
+            not isinstance(ref, CheckpointRef)
+            or profile != "train_resume"
+            or ref.next_iteration != next_iteration
+            or ref.completed_updates != completed_updates
+        ):
             raise PlannedYieldSignal(RunResult(
                 status="unknown", error="planned yield boundary lacks a published full-state checkpoint",
                 next_iteration=next_iteration, completed_updates=completed_updates,
@@ -74,6 +89,30 @@ class PlannedYield(StatefulCallback[TrainerState]):
             status="planned_yield", checkpoint_ref=ref, next_iteration=next_iteration,
             completed_updates=completed_updates, target_iterations=self.target_iterations,
         ))
+
+    def validate_target(self, runner: object) -> None:
+        """Refuse a target that is not below the live trainer horizon."""
+        live_h = getattr(getattr(runner, "trainer", None), "max_steps", None)
+        binding = getattr(runner, "restore_binding", None)
+        bound_h = getattr(binding, "target_iterations", None)
+        if live_h != self.target_iterations or (bound_h is not None and bound_h != self.target_iterations):
+            raise PlannedYieldSignal(RunResult(
+                status="refused",
+                error=("planned yield target does not match the live trainer "
+                       "max_steps or restore binding"),
+                target_iterations=self.target_iterations,
+            ))
+        if self.target_iteration >= live_h:
+            raise PlannedYieldSignal(RunResult(
+                status="refused",
+                error="planned yield must be below the fixed horizon H",
+                target_iterations=self.target_iterations,
+            ))
+
+    def _reset_typed_state(self) -> None:
+        self._published_context = None
+        self._published_ref = None
+        self._published_profile = None
 
 
 __all__ = ["PlannedYield", "PlannedYieldSignal"]

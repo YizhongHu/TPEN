@@ -24,6 +24,14 @@ from .reference import CheckpointRef
 from .rng import rng_state_dict, runtime_device
 
 
+class CheckpointPublicationBoundaryError(RuntimeError):
+    """A load-bearing rename/catalog/latest publication call failed."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__(str(error))
+        self.original = error
+
+
 def save_checkpoint(
     *,
     output_dir: str | Path,
@@ -208,7 +216,10 @@ def save_checkpoint(
         )
         manifest.write(tmp_dir / "manifest.json")
         (tmp_dir / "COMPLETE").write_text("complete\n", encoding="utf-8")
-        tmp_dir.rename(final_dir)
+        try:
+            tmp_dir.rename(final_dir)
+        except BaseException as exc:
+            raise CheckpointPublicationBoundaryError(exc) from exc
         write_end = time.perf_counter()
         # The rename is the checkpoint commit.  Publication is deliberately
         # after it, so a catalog can never name a tmp or partially written
@@ -223,10 +234,16 @@ def save_checkpoint(
                 else publication_catalog
             )
         )
-        catalog.publish(ref)
+        try:
+            catalog.publish(ref)
+        except BaseException as exc:
+            raise CheckpointPublicationBoundaryError(exc) from exc
         # `latest.json` stays minimal: a pointer plus the directory's own step
         # number. The manifest is the place that carries both counters.
-        write_latest(root, final_dir, step=int(next_iteration), created_at_unix=created_at)
+        try:
+            write_latest(root, final_dir, step=int(next_iteration), created_at_unix=created_at)
+        except BaseException as exc:
+            raise CheckpointPublicationBoundaryError(exc) from exc
         publish_end = time.perf_counter()
         # Additive last step: appends a new index entry after the existing
         # rename -> publish -> write_latest sequence without altering it.
