@@ -244,7 +244,9 @@ def test_logging_is_an_optional_module_not_an_always_on_core_metric() -> None:
     assert "amplitude_risk_fraction" in module_names
     assert "raw_training_batch_recorder" in module_names
     held = [m for m in logging_block["modules"] if m["name"] == "amplitude_risk_fraction"]
-    assert held[0]["status"] == "thresholds_frozen_implementation_pending"
+    assert held[0]["status"] == "implemented"
+    assert held[0]["scope"] == "science_only"
+    assert held[0]["metrics_namespace"] == "train/amplitude_risk"
     kinds = {"training_callback", "evaluation_generator", "one_shot_callback"}
     assert all(module["kind"] in kinds for module in logging_block["modules"])
 

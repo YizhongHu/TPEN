@@ -94,6 +94,13 @@ PILOT_PAYLOAD_OVERLAY_KEYS = frozenset(
 #: GradientStats every 1").
 PILOT_A1_CADENCE = 1
 
+#: Measured science-scale AmplitudeRiskFraction cadence.  The acceptance
+#: contract selects every 100 updates: the MIG timing comparison measured
+#: 7.952% overhead at every update, which is about 0.08% under a linear
+#: cadence assumption; a 1000-update cadence can miss short variance spikes
+#: and align with checkpoint boundaries.
+AMPLITUDE_RISK_CADENCE = 100
+
 HEALTH_CALLBACK_CADENCE = 1
 TRAINING_BATCH_RECORDER_CADENCE = 50
 TRAINING_HISTORY_PARTITION_SIZE = 1000
@@ -113,6 +120,7 @@ A1_TRAINING_MODULE_CANDIDATES: tuple[str, ...] = (
     "tpen.callback.GradientStats",
     "tpen.callback.SamplerHealth",
     "tpen.callback.FactorScalars",
+    "tpen.callback.AmplitudeRiskFraction",
     "tpen.callback.ModuleNorms",
     "tpen.callback.OptimizerState",
     "tpen.callback.RawTrainingBatchRecorder",
@@ -141,6 +149,7 @@ _A1_LOGGING_MODULES = frozenset(
     {
         "tpen.callback.SamplerHealth",
         "tpen.callback.FactorScalars",
+        "tpen.callback.AmplitudeRiskFraction",
         "tpen.callback.ModuleNorms",
         "tpen.callback.OptimizerState",
         "tpen.callback.RawTrainingBatchRecorder",
@@ -334,6 +343,13 @@ def _build_candidate_callback(target: str) -> dict[str, Any]:
         return {"_target_": target, "every_n_steps": HEALTH_CALLBACK_CADENCE, "fail_fast": False}
     if target == "tpen.callback.FactorScalars":
         return {"_target_": target, "every_n_steps": HEALTH_CALLBACK_CADENCE, "fail_fast": False}
+    if target == "tpen.callback.AmplitudeRiskFraction":
+        entry = load_yaml(ROOT / "configs" / "amplitude_risk_module.yaml")["amplitude_risk_callback"]
+        if entry.get("_target_") != target:
+            raise ValueError("H-v2 amplitude-risk config target drifted")
+        if list(entry.get("thresholds", ())) != list(AMPLITUDE_RISK_THRESHOLDS):
+            raise ValueError("H-v2 amplitude-risk config thresholds drifted")
+        return {**entry, "every_n_steps": AMPLITUDE_RISK_CADENCE}
     if target == "tpen.callback.RawTrainingBatchRecorder":
         return {
             "_target_": target,
@@ -373,13 +389,19 @@ def module_norm_groups(config: Mapping[str, Any] | None = None) -> dict[str, tup
     return groups
 
 
-def candidate_modules_to_append() -> tuple[str, ...]:
-    """Return the A1 training-side module candidates not already in ``train.yaml``."""
+def candidate_modules_to_append(*, include_amplitude_risk: bool = True) -> tuple[str, ...]:
+    """Return A1 candidates not already in ``train.yaml``.
+
+    Pilot payloads deliberately omit AmplitudeRiskFraction because their
+    admission contract predates the science-scale overhead measurement.  The
+    science route uses the default, complete candidate set.
+    """
 
     return tuple(
         target
         for target in A1_TRAINING_MODULE_CANDIDATES
         if target not in _A1_CANDIDATES_PRESENT_IN_BASE_CONFIG
+        and (include_amplitude_risk or target != "tpen.callback.AmplitudeRiskFraction")
     )
 
 
@@ -999,7 +1021,8 @@ def select_final_basin_ordinal(c1: int, pooled01_w_by_ordinal: Mapping[int, floa
 
 
 def assert_hydrogen_contract(
-    config: dict[str, Any], *, evaluation: bool = False, allow_incomplete_a1: bool = False
+    config: dict[str, Any], *, evaluation: bool = False, allow_incomplete_a1: bool = False,
+    allow_missing_amplitude_risk: bool = False,
 ) -> None:
     """Refuse configs that drift from one-electron, charge-one hydrogen."""
 
@@ -1048,11 +1071,23 @@ def assert_hydrogen_contract(
         if "optimizer" in config or "trainer" in config:
             raise ValueError("fresh evaluation must not carry training state")
     else:
-        _assert_a1_callbacks(config, allow_incomplete=allow_incomplete_a1)
-    assert_amplitude_risk_thresholds(config)
+        # Check the frozen amplitude-risk payload before the broader A1
+        # contract so a threshold mutation cannot be masked by another
+        # assembly error.
+        assert_amplitude_risk_thresholds(config)
+        _assert_a1_callbacks(
+            config,
+            allow_incomplete=allow_incomplete_a1,
+            allow_missing_amplitude_risk=allow_missing_amplitude_risk,
+        )
+    if evaluation:
+        assert_amplitude_risk_thresholds(config)
 
 
-def _assert_a1_callbacks(config: Mapping[str, Any], *, allow_incomplete: bool = False) -> None:
+def _assert_a1_callbacks(
+    config: Mapping[str, Any], *, allow_incomplete: bool = False,
+    allow_missing_amplitude_risk: bool = False,
+) -> None:
     """Validate the complete appended A1 callback set and its ordering."""
 
     callbacks = [entry for entry in config.get("callbacks", ()) if isinstance(entry, Mapping)]
@@ -1070,6 +1105,8 @@ def _assert_a1_callbacks(config: Mapping[str, Any], *, allow_incomplete: bool = 
     if config.get("trainer", {}).get("log_every_n_steps") != PILOT_A1_CADENCE:
         raise ValueError("H-v2 trainer scalar logging must be every update")
     missing = set(A1_TRAINING_MODULE_CANDIDATES) - set(present)
+    if allow_missing_amplitude_risk:
+        missing.discard("tpen.callback.AmplitudeRiskFraction")
     if missing:
         raise ValueError(f"H-v2 A1 callback set is missing {sorted(missing)!r}")
     checkpoint = present.index("tpen.callback.Checkpoint")
@@ -1096,6 +1133,11 @@ def _assert_a1_callbacks(config: Mapping[str, Any], *, allow_incomplete: bool = 
         if target in {"tpen.callback.SamplerHealth", "tpen.callback.FactorScalars"}:
             if entry.get("every_n_steps") != HEALTH_CALLBACK_CADENCE:
                 raise ValueError(f"H-v2 {target.rsplit('.', 1)[-1]} cadence must be every update")
+        if target == "tpen.callback.AmplitudeRiskFraction":
+            if entry.get("every_n_steps") != AMPLITUDE_RISK_CADENCE:
+                raise ValueError("H-v2 AmplitudeRiskFraction cadence must be every 100 updates")
+            if entry.get("start_step", 0) != 0:
+                raise ValueError("H-v2 AmplitudeRiskFraction start_step must be omitted or 0")
         if target == "tpen.callback.ElectronNucleusDistanceQuantiles":
             if entry.get("every_n_steps") != PILOT_A1_CADENCE:
                 raise ValueError("H-v2 ENDQ cadence must be every update")
@@ -1138,6 +1180,7 @@ __all__ = [
     "AMPLITUDE_RISK_LABELS",
     "AMPLITUDE_RISK_PRIMARY_THRESHOLD",
     "AMPLITUDE_RISK_THRESHOLDS",
+    "AMPLITUDE_RISK_CADENCE",
     "CONTRACT_INPUTS_PATH",
     "CONTRACT_NUCLEAR_LAW",
     "ENDQ_A1_QUANTILES",

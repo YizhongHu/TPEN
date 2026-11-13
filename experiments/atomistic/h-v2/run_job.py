@@ -693,7 +693,7 @@ def run(
         probe_path.parent.mkdir(parents=True, exist_ok=True)
         enabled_modules, skipped_not_admitted = attached.probe_admitted_a1_modules(
             config,
-            protocol.candidate_modules_to_append(),
+            protocol.candidate_modules_to_append(include_amplitude_risk=False),
             science_python=science_python,
             probe_config_path=probe_path,
             cwd=run_root / "checkout",

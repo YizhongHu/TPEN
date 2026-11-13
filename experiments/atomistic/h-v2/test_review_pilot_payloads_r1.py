@@ -146,7 +146,7 @@ def test_contract_rejects_fully_assembled_config_with_all_new_logging_modules_re
     """Legacy callbacks alone must not bypass the complete A1 set check."""
 
     config, _ = protocol.pilot_training_config("capacity-pilot")
-    for target in protocol.candidate_modules_to_append():
+    for target in protocol.candidate_modules_to_append(include_amplitude_risk=False):
         protocol.append_candidate_module(config, target)
     for target in {
         "tpen.callback.SamplerHealth",
@@ -188,13 +188,15 @@ def test_final_train_dispatch_refuses_an_incomplete_a1_set(tmp_path):
 
 def _fully_assembled_capacity_config():
     config, _ = protocol.pilot_training_config("capacity-pilot")
-    for target in protocol.candidate_modules_to_append():
+    for target in protocol.candidate_modules_to_append(include_amplitude_risk=False):
         protocol.append_candidate_module(config, target)
     return config
 
 
 def test_fully_assembled_capacity_config_is_a_valid_contract_control():
-    protocol.assert_hydrogen_contract(_fully_assembled_capacity_config())
+    protocol.assert_hydrogen_contract(
+        _fully_assembled_capacity_config(), allow_missing_amplitude_risk=True
+    )
 
 
 @pytest.mark.parametrize(
@@ -222,7 +224,7 @@ def test_contract_rejects_logging_cadence_and_sampling_mutants(target, mutation,
     mutation(entry)
 
     with pytest.raises(ValueError, match="cadence|quantile|recorder|drifted"):
-        protocol.assert_hydrogen_contract(config)
+        protocol.assert_hydrogen_contract(config, allow_missing_amplitude_risk=True)
 
 
 @pytest.mark.parametrize("code", ["profile-unavailable", "profile-mismatch", "malformed-json"])
@@ -237,7 +239,7 @@ def test_probe_propagates_checker_failures(tmp_path, monkeypatch, code):
     monkeypatch.setattr(attached, "check_profile", fail)
     with pytest.raises(attached.ActivationRefusal) as caught:
         attached.probe_admitted_a1_modules(
-            config, protocol.candidate_modules_to_append(), science_python=sys.executable,
+            config, protocol.candidate_modules_to_append(include_amplitude_risk=False), science_python=sys.executable,
             probe_config_path=tmp_path / "probe.yaml",
         )
     assert caught.value is failure
@@ -400,7 +402,7 @@ def real_pilot_receipt(request, tmp_path_factory):
     config["sampler"].update(n_walkers=4, burn_in=1, n_steps=1)
     config["trainer"]["max_steps"] = 2
     enabled, skipped = attached.probe_admitted_a1_modules(
-        config, protocol.candidate_modules_to_append(), science_python=science_python,
+        config, protocol.candidate_modules_to_append(include_amplitude_risk=False), science_python=science_python,
         probe_config_path=root / "probe.yaml", cwd=REPO_ROOT,
     )
     plan, overrides, config = attached.build_h_v2_train_plan(

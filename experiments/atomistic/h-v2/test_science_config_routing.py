@@ -105,6 +105,22 @@ def test_science_config_carries_the_complete_a1_logging_cadence() -> None:
             assert callback["every_n_steps"] == protocol.PILOT_A1_CADENCE
 
 
+def test_contract_amplitude_risk_cadence_matches_resolved_science_callback() -> None:
+    contract = json.loads((HERE / "contract_inputs.json").read_text(encoding="utf-8"))
+    science, _ = protocol.science_training_config("L1", 0)
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(science, target)
+
+    amplitude = next(
+        callback
+        for callback in science["callbacks"]
+        if callback["_target_"] == "tpen.callback.AmplitudeRiskFraction"
+    )
+    cadence = contract["logging"]["cadence"]["amplitude_risk"]
+    assert amplitude["every_n_steps"] == cadence["every_n_steps"]
+    assert amplitude.get("start_step", 0) == cadence["start_step"]
+
+
 def test_science_config_carries_no_pipeline_default_values() -> None:
     config, _ = protocol.science_training_config("L1", 0)
     assert config["sampler"]["n_walkers"] != _PIPELINE_WALKERS

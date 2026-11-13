@@ -89,6 +89,10 @@ def test_pilot_training_config_matches_a1_field_by_field(payload: str, max_steps
     # Payload overlay: only trainer.max_steps and A1 cadence differ by payload.
     assert config["trainer"]["max_steps"] == max_steps
     assert config["trainer"]["log_every_n_steps"] == protocol.PILOT_A1_CADENCE
+    assert not any(
+        callback.get("_target_") == "tpen.callback.AmplitudeRiskFraction"
+        for callback in config["callbacks"]
+    )
     data_integrity = next(cb for cb in config["callbacks"] if cb["_target_"] == "tpen.callback.DataIntegrity")
     gradient_stats = next(cb for cb in config["callbacks"] if cb["_target_"] == "tpen.callback.GradientStats")
     assert data_integrity["every_n_steps"] == protocol.PILOT_A1_CADENCE
@@ -173,6 +177,52 @@ def test_candidate_modules_to_append_excludes_base_config_leaves() -> None:
     assert "tpen.callback.SamplerHealth" in candidates
     assert "tpen.callback.FactorScalars" in candidates
     assert "tpen.callback.RawTrainingBatchRecorder" in candidates
+    assert "tpen.callback.AmplitudeRiskFraction" in candidates
+    assert "tpen.callback.AmplitudeRiskFraction" not in protocol.candidate_modules_to_append(
+        include_amplitude_risk=False
+    )
+
+
+def test_amplitude_risk_candidate_copies_frozen_entry_and_measured_cadence() -> None:
+    entry = protocol._build_candidate_callback("tpen.callback.AmplitudeRiskFraction")
+    assert entry == {
+        "_target_": "tpen.callback.AmplitudeRiskFraction",
+        "thresholds": [-3, -4, -5, -7, -10],
+        "every_n_steps": 100,
+    }
+    assert "start_step" not in entry
+
+
+def test_science_candidate_set_requires_amplitude_risk_module() -> None:
+    config, _ = protocol.science_training_config("L1", 0)
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
+    protocol.assert_hydrogen_contract(config)
+    amplitude = next(
+        callback for callback in config["callbacks"]
+        if callback["_target_"] == "tpen.callback.AmplitudeRiskFraction"
+    )
+    assert amplitude["thresholds"] == list(protocol.AMPLITUDE_RISK_THRESHOLDS)
+    assert amplitude["every_n_steps"] == protocol.AMPLITUDE_RISK_CADENCE
+
+    protocol.remove_candidate_module(config, "tpen.callback.AmplitudeRiskFraction")
+    with pytest.raises(ValueError, match="AmplitudeRiskFraction"):
+        protocol.assert_hydrogen_contract(config)
+
+
+def test_science_contract_rejects_nonzero_amplitude_risk_start_step() -> None:
+    config, _ = protocol.science_training_config("L1", 0)
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
+    amplitude = next(
+        callback
+        for callback in config["callbacks"]
+        if callback["_target_"] == "tpen.callback.AmplitudeRiskFraction"
+    )
+    amplitude["start_step"] = 100_000
+
+    with pytest.raises(ValueError, match="start_step"):
+        protocol.assert_hydrogen_contract(config)
 
 
 def test_endq_candidate_carries_quantiles_not_output_path() -> None:
@@ -205,9 +255,9 @@ def test_h_v2_logging_builders_pin_cadences_and_groups() -> None:
 
 def test_health_and_abort_callbacks_precede_checkpoint() -> None:
     config, _ = protocol.pilot_training_config("gpu-route-g")
-    for target in protocol.candidate_modules_to_append():
+    for target in protocol.candidate_modules_to_append(include_amplitude_risk=False):
         protocol.append_candidate_module(config, target)
-    protocol.assert_hydrogen_contract(config)
+    protocol.assert_hydrogen_contract(config, allow_missing_amplitude_risk=True)
     targets = [entry["_target_"] for entry in config["callbacks"]]
     checkpoint = targets.index("tpen.callback.Checkpoint")
     for target in {
@@ -222,13 +272,13 @@ def test_health_and_abort_callbacks_precede_checkpoint() -> None:
 
 def test_contract_rejects_logging_mutants() -> None:
     config, _ = protocol.pilot_training_config("gpu-route-g")
-    for target in protocol.candidate_modules_to_append():
+    for target in protocol.candidate_modules_to_append(include_amplitude_risk=False):
         protocol.append_candidate_module(config, target)
     for entry in config["callbacks"]:
         if entry["_target_"] == "tpen.callback.RawTrainingBatchRecorder":
             entry["every_n_steps"] = 10
     with pytest.raises(ValueError, match="cadence"):
-        protocol.assert_hydrogen_contract(config)
+        protocol.assert_hydrogen_contract(config, allow_missing_amplitude_risk=True)
 
 
 def test_short_run_from_config_writes_logging_outputs(tmp_path: Path) -> None:
@@ -237,7 +287,7 @@ def test_short_run_from_config_writes_logging_outputs(tmp_path: Path) -> None:
     from tpen.run import run_from_config
 
     config = protocol.training_config()
-    for target in protocol.candidate_modules_to_append():
+    for target in protocol.candidate_modules_to_append(include_amplitude_risk=False):
         protocol.append_candidate_module(config, target)
     config["run"].update(root=str(tmp_path / "runs"), run_id="h-v2-log-check")
     config["runtime"].update(device="cpu")
@@ -282,7 +332,7 @@ def test_pilot_payload_100k_real_cpu_run_generalizes_the_checkpoint_inventory(tm
     from tpen.run import run_from_config
 
     config, _ = protocol.pilot_training_config("capacity-pilot-100k")
-    for target in protocol.candidate_modules_to_append():
+    for target in protocol.candidate_modules_to_append(include_amplitude_risk=False):
         protocol.append_candidate_module(config, target)
     config["run"].update(root=str(tmp_path / "runs"), run_id="h-v2-100k-inventory-check")
     config["runtime"].update(device="cpu")
@@ -435,12 +485,12 @@ def test_probe_admitted_a1_modules_keeps_only_admitted_candidates(
     monkeypatch.setattr(attached, "assert_candidate_instantiates", lambda *args, **kwargs: None)
     enabled, skipped = attached.probe_admitted_a1_modules(
         config,
-        protocol.candidate_modules_to_append(),
+        protocol.candidate_modules_to_append(include_amplitude_risk=False),
         science_python=sys.executable,
         probe_config_path=tmp_path / "probe.yaml",
     )
     assert set(enabled) == admitted
-    assert set(skipped) == set(protocol.candidate_modules_to_append()) - admitted
+    assert set(skipped) == set(protocol.candidate_modules_to_append(include_amplitude_risk=False)) - admitted
     targets_in_config = {cb["_target_"] for cb in config["callbacks"]}
     assert admitted <= targets_in_config
     assert not (set(skipped) & targets_in_config)
@@ -469,12 +519,12 @@ def test_probe_admitted_a1_modules_admits_none(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(attached, "check_profile", _refuse_added_candidates)
     enabled, skipped = attached.probe_admitted_a1_modules(
         config,
-        protocol.candidate_modules_to_append(),
+        protocol.candidate_modules_to_append(include_amplitude_risk=False),
         science_python=sys.executable,
         probe_config_path=tmp_path / "probe.yaml",
     )
     assert enabled == []
-    assert set(skipped) == set(protocol.candidate_modules_to_append())
+    assert set(skipped) == set(protocol.candidate_modules_to_append(include_amplitude_risk=False))
 
 
 def test_probe_propagates_non_refusal_error_from_a_later_candidate(
@@ -492,7 +542,7 @@ def test_probe_propagates_non_refusal_error_from_a_later_candidate(
     """
 
     config, _ = protocol.pilot_training_config("gpu-route-g")
-    candidates = protocol.candidate_modules_to_append()
+    candidates = protocol.candidate_modules_to_append(include_amplitude_risk=False)
     failure = attached.ActivationRefusal("profile-unavailable", "malformed checker response")
     calls = {"count": 0}
 
@@ -555,7 +605,7 @@ def test_probe_raises_on_instantiation_failure_not_swallowed_as_skip(
     with pytest.raises(attached.HV2ReceiptRefusal) as excinfo:
         attached.probe_admitted_a1_modules(
             config,
-            protocol.candidate_modules_to_append(),
+            protocol.candidate_modules_to_append(include_amplitude_risk=False),
             science_python=sys.executable,
             probe_config_path=tmp_path / "probe.yaml",
         )
