@@ -37,6 +37,7 @@ from tpen.execution.recovery import (
     train_resume_load_overlay,
 )
 from tpen.run import _apply_operational_restore
+from tpen.runner.base import Runner
 
 _TARGET_ITERATIONS = 10
 
@@ -88,11 +89,17 @@ def _recovery_decision(tmp_path: Path, *, ref=None, **overrides) -> RecoveryDeci
     return RecoveryDecision(**fields)
 
 
-class _LoadableRunner:
-    """Duck-typed stand-in for ``tpen.runner.train.Train``: exposes ``load``/``trainer``."""
+class _LoadableRunner(Runner):
+    """Minimal typed runner fixture exposing the restore boundary attributes."""
 
     def __init__(self, load=None, *, max_steps=_TARGET_ITERATIONS) -> None:
         self.load = load
+        self.trainer = SimpleNamespace(max_steps=max_steps)
+
+class _RunnerWithoutLoad(Runner):
+    """Typed runner fixture used to verify that a missing ``load`` is refused."""
+
+    def __init__(self, *, max_steps=_TARGET_ITERATIONS) -> None:
         self.trainer = SimpleNamespace(max_steps=max_steps)
 
 
@@ -418,7 +425,7 @@ def test_supported_no_load_forms_are_treated_as_unconfigured(tmp_path, unconfigu
 
 def test_runner_without_a_load_attribute_is_refused(tmp_path):
     cfg = OmegaConf.create({"runner": {}})
-    runner = SimpleNamespace(trainer=SimpleNamespace(max_steps=_TARGET_ITERATIONS))
+    runner = _RunnerWithoutLoad()
     request = OperationalRestoreRequest(decision=_recovery_decision(tmp_path))
 
     with pytest.raises(TypeError):
