@@ -452,7 +452,7 @@ def test_science_eval_seed_formula_matches_ci(tmp_path):
         )[0]
     )
     for lineage_index in range(3):
-        for ordinal in range(27):
+        for ordinal in range(len(protocol.science_evaluated_checkpoint_updates())):
             for stream in range(4):
                 expected = base + lineage_coeff * lineage_index + ordinal_coeff * ordinal + stream
                 assert protocol.science_eval_seed(lineage_index, ordinal, stream) == expected

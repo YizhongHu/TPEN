@@ -688,6 +688,16 @@ def test_build_checkpoint_inventory_lists_every_committed_checkpoint_with_sha256
         assert entry["files"]["model.pt"] == expected
 
 
+def test_build_checkpoint_inventory_carries_the_100k_science_roster(tmp_path: Path) -> None:
+    root = tmp_path / "checkpoints"
+    for update in range(0, 100001, 1000):
+        _write_fake_checkpoint(root, update)
+
+    inventory = attached.build_checkpoint_inventory(root)
+    assert len(inventory) == 101
+    assert [entry["update"] for entry in inventory] == list(range(0, 100001, 1000))
+
+
 def test_build_checkpoint_inventory_omits_an_incomplete_checkpoint_mutant(tmp_path: Path) -> None:
     """Mutant: inventory omits a checkpoint (here: a checkpoint missing COMPLETE is correctly excluded)."""
 
@@ -864,11 +874,11 @@ def test_gpu_test_resources_carry_no_a100_constraint_and_the_gpu_test_partition(
 
 
 def test_capacity_pilot_uses_the_approved_a100_resources() -> None:
-    assert launch_config.PILOT_PAYLOAD_RESOURCES["capacity-pilot"] is launch_config.RESOURCES
+    assert launch_config.PILOT_PAYLOAD_RESOURCES["capacity-pilot"] is launch_config.PILOT_RESOURCES
 
 
 def test_capacity_pilot_100k_uses_the_approved_a100_resources_and_12_hour_cap() -> None:
-    assert launch_config.PILOT_PAYLOAD_RESOURCES["capacity-pilot-100k"] is launch_config.RESOURCES
+    assert launch_config.PILOT_PAYLOAD_RESOURCES["capacity-pilot-100k"] is launch_config.PILOT_RESOURCES
     assert launch_config.PILOT_PAYLOAD_LINEAGES["capacity-pilot-100k"] == "P"
     assert launch_config.PILOT_PAYLOAD_GPU_STRATA["capacity-pilot-100k"] == launch_config.APPROVED_GPU_STRATUM
     assert launch_config.PILOT_PAYLOAD_MAX_WALL_SECONDS["capacity-pilot-100k"] == 12 * 60 * 60

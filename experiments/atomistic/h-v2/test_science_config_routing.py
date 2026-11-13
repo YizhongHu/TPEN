@@ -45,7 +45,7 @@ run_job = _h_v2_module("run_job")
 _EXPECTED_SCIENCE_NON_SEED = {
     "runtime": {"device": "cuda", "dtype": "float64"},
     "sampler": {"n_walkers": 4096, "burn_in": 100, "n_steps": 10, "proposal_scale": 0.5},
-    "trainer": {"max_steps": 50000, "return_terms": True},
+    "trainer": {"max_steps": 100000, "return_terms": True},
     "model_embedding": {"out_channels": 32, "hidden_channels": 128},
     "model_mixing_channels": 32,
     "model_path_aggregation_channels": 32,
@@ -116,6 +116,21 @@ def test_science_config_carries_no_pipeline_default_values() -> None:
     assert config["model"]["readout"]["channels"] != _PIPELINE_CHANNELS
     assert config["runtime"]["seed"] not in _PIPELINE_SEEDS
     assert config["sampler"]["seed"] not in _PIPELINE_SEEDS
+
+
+def test_science_evaluation_roster_is_single_contract_parameter() -> None:
+    expected = tuple(range(0, 20001, 1000)) + tuple(range(25000, 100001, 5000))
+    updates = protocol.science_evaluated_checkpoint_updates()
+    assert updates == expected
+    assert len(updates) == 37
+    assert protocol.science_eval_seed(2, len(updates) - 1, 3) == 1_000_000 + 20_000 + 360 + 3
+
+
+def test_science_and_pilot_partition_parameters_are_separate() -> None:
+    assert launch_config.RESOURCES.partition == "seas_gpu,kozinsky_gpu,gpu"
+    assert launch_config.RESOURCES.constraint == "a100"
+    assert launch_config.PILOT_RESOURCES.partition == "seas_gpu,kozinsky_gpu"
+    assert launch_config.PILOT_PAYLOAD_RESOURCES["capacity-pilot"] is launch_config.PILOT_RESOURCES
 
 
 def test_science_scale_overlay_key_set_equals_allowlist_exactly() -> None:

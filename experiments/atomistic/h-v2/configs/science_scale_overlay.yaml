@@ -18,7 +18,7 @@
 # checked for exact equality before it is ever applied.
 runtime.device: cuda
 sampler.n_walkers: 4096
-trainer.max_steps: 50000
+trainer.max_steps: 100000
 model.embedding.out_channels: 32
 model.embedding.hidden_channels: 128
 model.layers.0.mixing.channels: 32

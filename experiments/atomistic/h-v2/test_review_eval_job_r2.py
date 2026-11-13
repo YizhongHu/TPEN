@@ -256,7 +256,7 @@ _FROZEN_629_SCIENCE_L1_TRAIN_COMMAND = [
     "sbatch",
     "--parsable",
     "--job-name=h-v2-science-L1-train",
-    "--partition=seas_gpu,kozinsky_gpu",
+    "--partition=seas_gpu,kozinsky_gpu,gpu",
     "--constraint=a100",
     "--gres=gpu:1",
     "--nodes=1",

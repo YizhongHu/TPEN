@@ -474,9 +474,9 @@ def resolve_checkpoint(
 
 
 def science_fanout(*, lineage_index: int) -> tuple[dict[str, Any], ...]:
-    """Return science's 27x4=108 fan-out generations (design target C2).
+    """Return the contract-sized science fan-out generations (design target C2).
 
-    Each entry: ``{"ordinal", "update", "stream", "seed"}``, ordinal 0..26
+    Each entry: ``{"ordinal", "update", "stream", "seed"}``, with ordinal
     indexing ``protocol.science_evaluated_checkpoint_updates()``, stream
     0..3, seed from ``protocol.science_eval_seed``.
     """

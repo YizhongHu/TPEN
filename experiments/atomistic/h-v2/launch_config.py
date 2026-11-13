@@ -62,6 +62,20 @@ def packed_eval_resources(base: JobResources, pack_k: int) -> JobResources:
 #: stage, and that is supplied per submission (T_WALL/E_WALL, section C3),
 #: not carried here.
 RESOURCES = JobResources(
+    partition="seas_gpu,kozinsky_gpu,gpu",
+    constraint="a100",
+    gpus=1,
+    nodes=1,
+    ntasks=1,
+    cpus_per_task=4,
+    mem="32G",
+)
+
+# Pilot payloads retain their historical scheduler request bytes.  The science
+# resource profile above is the single operator-facing partition parameter;
+# pilots intentionally use this separate profile so the science expansion does
+# not alter pilot payloads.
+PILOT_RESOURCES = JobResources(
     partition="seas_gpu,kozinsky_gpu",
     constraint="a100",
     gpus=1,
@@ -135,8 +149,8 @@ APPROVED_GPU_TEST_STRATUM = "NVIDIA A100-SXM4-40GB MIG 3g.20gb"
 #: lineage instead.
 PILOT_PAYLOAD_RESOURCES: dict[str, JobResources] = {
     "gpu-route-g": GPU_TEST_RESOURCES,
-    "capacity-pilot": RESOURCES,
-    "capacity-pilot-100k": RESOURCES,
+    "capacity-pilot": PILOT_RESOURCES,
+    "capacity-pilot-100k": PILOT_RESOURCES,
 }
 PILOT_PAYLOAD_LINEAGES: dict[str, str] = {
     "gpu-route-g": "G",
@@ -176,6 +190,7 @@ __all__ = [
     "PILOT_PAYLOAD_LINEAGES",
     "PILOT_PAYLOAD_MAX_WALL_SECONDS",
     "PILOT_PAYLOAD_RESOURCES",
+    "PILOT_RESOURCES",
     "PILOT_RUN_ROOT_PREFIX_ENV",
     "RESOURCES",
     "packed_eval_resources",

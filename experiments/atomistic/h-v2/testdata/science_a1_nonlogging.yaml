@@ -107,5 +107,5 @@ optimizer:
 
 trainer:
   _target_: tpen.training.trainer.VMCTrainer
-  max_steps: 50000
+  max_steps: 100000
   return_terms: true
