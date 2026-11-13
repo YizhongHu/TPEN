@@ -95,46 +95,55 @@ def test_r2_t3_real_worker_kills_owned_group_and_reaps_before_propagation(tmp_pa
         environment = PreparedPythonEnvironment(sys.executable, SourceScript(str(setup)))
         args = ("-c", "pass")
     original_wait = subprocess.Popen.wait
+    original_waitid = os.waitid
     original_killpg = os.killpg
     calls = []
     processes = []
+    pids = []
     cancellation = error_type("review wait interruption")
 
-    def wait(process, *a, **kw):
-        calls.append("wait")
-        if not processes:
-            processes.append(process)
+    def waitid(id_type, pid, options):
+        calls.append("waitid")
+        pids.append(pid)
+        if len(pids) == 1:
             deadline = time.monotonic() + 5
             while not ready.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
             assert ready.exists(), "bounded child must reach readiness before injected cancellation"
             raise cancellation
+        return original_waitid(id_type, pid, options)
+
+    def wait(process, *a, **kw):
+        calls.append("wait")
+        processes.append(process)
         result = original_wait(process, *a, **kw)
         calls.append("reaped")
         return result
 
     def killpg(pid, sig):
-        assert processes and pid == processes[0].pid
-        # review P1-1 residual: after reaping, the worker also terminates
-        # and bounded-probes its own group (killpg(SIGKILL) then
-        # killpg(0)), so a kill signal and a signal-0 probe are both
-        # legitimate here now.
+        assert pids and pid == pids[0]
+        # The worker terminates and bounded-probes its still-pinned group
+        # (killpg(SIGKILL) then killpg(0)) before the leader is reaped, so a
+        # kill signal and a signal-0 probe are both legitimate here.
         assert sig in (signal.SIGKILL, 0)
         calls.append("killpg" if sig == signal.SIGKILL else "probe")
         return original_killpg(pid, sig)
 
     with monkeypatch.context() as patch:
+        patch.setattr(os, "waitid", waitid)
         patch.setattr(subprocess.Popen, "wait", wait)
         patch.setattr(os, "killpg", killpg)
         with pytest.raises(error_type) as observed:
             SubprocessWorker().run(environment, args, cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err", timeout=8)
     assert observed.value is cancellation
-    # The owned-group kill and leader reap must happen before the P1-1
-    # terminate+probe quiescence check.  The signal-0 probe may repeat while
-    # a descendant is still exiting, so assert the ordering and probe suffix
-    # rather than a timing-sensitive exact list.
-    assert calls[:5] == ["wait", "killpg", "wait", "reaped", "killpg"], calls
-    assert calls[5:] and all(call == "probe" for call in calls[5:]), calls
+    # The leader is observed with WNOWAIT, the owned group is terminated and
+    # probed while its PGID is pinned, and only then is the leader reaped.
+    assert calls[:4] == ["waitid", "killpg", "waitid", "killpg"], calls
+    probe_start = 4
+    reap_start = next(index for index, call in enumerate(calls) if call == "wait")
+    assert reap_start > probe_start
+    assert calls[probe_start:reap_start] and all(call == "probe" for call in calls[probe_start:reap_start]), calls
+    assert calls[reap_start:] == ["wait", "reaped"], calls
     assert processes[0].returncode == -signal.SIGKILL
     time.sleep(1.8)
     assert not late.exists(), "owned descendant must not survive to write after cancellation"

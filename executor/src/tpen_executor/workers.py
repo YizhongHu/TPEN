@@ -52,7 +52,14 @@ def _proc_start_ticks(pid: int) -> int | None:
     return ticks if ticks >= 0 else None
 
 
-def _group_quiescent(pid: int, *, bound: float = 1.0, interval: float = 0.02) -> bool:
+def _group_quiescent(
+    pid: int,
+    *,
+    bound: float = 1.0,
+    interval: float = 0.02,
+    leader_reaped: bool = False,
+    spawned_ticks: int | None = None,
+) -> bool:
     """Terminate, then bounded-observe, that no process remains in ``pid``'s group.
 
     ``start_new_session=True`` makes this worker's process group id equal to
@@ -66,6 +73,11 @@ def _group_quiescent(pid: int, *, bound: float = 1.0, interval: float = 0.02) ->
     process outside the group it itself started.
     """
 
+    if leader_reaped and (spawned_ticks is None or _proc_start_ticks(pid) != spawned_ticks):
+        # Once the leader is reaped, a bare PID is no longer an ownership
+        # proof.  Retain quarantine rather than risking a reused process
+        # group; callers must not signal without this identity check.
+        return False
     try:
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -79,6 +91,25 @@ def _group_quiescent(pid: int, *, bound: float = 1.0, interval: float = 0.02) ->
         except PermissionError:
             return False
         if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def _leader_exited_without_reap(pid: int, *, bound: float | None = None, interval: float = 0.02) -> bool:
+    """Observe a child exit while retaining its PID/PGID ownership proof.
+
+    ``WNOWAIT`` leaves the leader as a zombie, keeping its process-group id
+    pinned while :func:`_group_quiescent` terminates and observes descendants.
+    The caller must reap the leader with ``Popen.wait`` afterwards.
+    """
+
+    flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+    deadline = None if bound is None else time.monotonic() + bound
+    while True:
+        result = os.waitid(os.P_PID, pid, flags)
+        if result is not None and result.si_pid == pid:
+            return True
+        if deadline is not None and time.monotonic() >= deadline:
             return False
         time.sleep(interval)
 
@@ -394,7 +425,10 @@ class SubprocessWorker:
                     sampler = GpuSampler.from_environment(spawned_pid, child_env)
                     sampler.start()
                 try:
-                    returncode = process.wait(timeout=timeout)
+                    if not _leader_exited_without_reap(spawned_pid, bound=timeout):
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    group_reaped = _group_quiescent(spawned_pid)
+                    returncode = process.wait()
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     # Kill the isolated session so setup/science descendants stop too.
@@ -402,14 +436,19 @@ class SubprocessWorker:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+                    _leader_exited_without_reap(spawned_pid)
+                    group_reaped = _group_quiescent(spawned_pid)
                     returncode = process.wait()
             except BaseException as original:
                 # An interrupt while waiting must not orphan the isolated
-                # session. Reap the leader before propagating cancellation.
+                # session. Keep the leader unreaped while terminating and
+                # observing its group, then reap it before propagating.
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                _leader_exited_without_reap(spawned_pid)
+                group_reaped = _group_quiescent(spawned_pid)
                 cleanup_errors: list[BaseException] = []
                 while process.returncode is None:
                     try:
@@ -424,7 +463,6 @@ class SubprocessWorker:
                 # lease settles (review B2): a sampler whose own commands are
                 # clean must never release the quarantine marker while a
                 # science descendant could still be alive.
-                group_reaped = _group_quiescent(spawned_pid)
                 try:
                     cleanup_errors.extend(finish_gpu_sampler(sampler, sampler_output, lease, group_reaped=group_reaped))
                 except BaseException as finish_error:

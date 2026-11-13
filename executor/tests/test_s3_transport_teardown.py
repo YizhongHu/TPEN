@@ -16,9 +16,11 @@ from concurrent.futures import Future
 import dataclasses
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -40,6 +42,7 @@ from tpen_executor.placement import AllocationSlot
 from tpen_executor.storage import DirectoryStore
 from tpen_executor.allocations import ConfiguredAllocation
 from tpen_executor.workers import SubprocessWorker
+from tpen_executor import workers as workers_module
 
 from test_s3_transport_parsl import BINDING, _Parsl, _group, _lifecycle, _runs, _transport, _worker, fake_parsl
 from test_s3_transport_wire import _request, _synthetic_result
@@ -564,6 +567,38 @@ def test_group_quiescent_terminates_a_surviving_descendant(tmp_path: Path) -> No
     descendant_pid = int(descendant_pid_file.read_text().strip())
     with pytest.raises(ProcessLookupError):
         os.kill(descendant_pid, 0)
+
+
+def test_group_quiescence_kills_and_probes_before_leader_reap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The PGID kill is ordered after WNOWAIT and before any reap."""
+    events = []
+    pid = 1234
+
+    def waitid(id_type, observed_pid, options):
+        assert id_type == os.P_PID and observed_pid == pid
+        events.append("waitid")
+        return SimpleNamespace(si_pid=pid)
+
+    def killpg(observed_pid, sig):
+        assert observed_pid == pid
+        events.append(("killpg", sig))
+        if sig == 0:
+            raise ProcessLookupError()
+
+    monkeypatch.setattr(os, "waitid", waitid)
+    monkeypatch.setattr(os, "killpg", killpg)
+    assert workers_module._leader_exited_without_reap(pid) is True
+    assert workers_module._group_quiescent(pid) is True
+    assert events == ["waitid", ("killpg", signal.SIGKILL), ("killpg", 0)]
+
+
+def test_group_quiescence_skips_signal_after_unconfirmed_reap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unverified post-reap PID is conservatively not group-quiescent."""
+    signals = []
+    monkeypatch.setattr(workers_module, "_proc_start_ticks", lambda pid: None)
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    assert workers_module._group_quiescent(1234, leader_reaped=True, spawned_ticks=77) is False
+    assert signals == []
 
 
 def test_watcher_start_failure_reaps_the_child_as_an_uncertain_exit(
