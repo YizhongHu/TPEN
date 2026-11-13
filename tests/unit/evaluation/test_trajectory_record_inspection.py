@@ -229,7 +229,7 @@ def test_duplicate_grid_row_is_rejected(tmp_path: Path) -> None:
         inspect_trajectory_record(artifact.metadata_path)
 
 
-def test_incomplete_grid_row_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_incomplete_grid_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     artifact = _write_v1_artifact(tmp_path, VALUES)
     # The scanner independently rejects a physically incomplete CSV grid. To
     # isolate the reader's binding of its reported row_count to the sidecar,
