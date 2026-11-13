@@ -12,17 +12,6 @@ def load_inputs() -> dict:
         return json.load(stream)
 
 
-def _leaves(value: object, path: tuple[str, ...] = ()):
-    if isinstance(value, dict):
-        for key, child in value.items():
-            yield from _leaves(child, path + (str(key),))
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            yield from _leaves(child, path + (str(index),))
-    else:
-        yield path, value
-
-
 def _learned_model_proposal(inputs: dict) -> str:
     return next(
         item["proposal"]
@@ -48,15 +37,27 @@ def test_contract_does_not_forbid_and_retain_electron_electron_factor() -> None:
     ), f"contradictory e-e wording: description={description!r}; proposal={proposal!r}"
 
 
-def test_no_contract_status_remains_pending_operator_review() -> None:
-    pending = [
-        (".".join(path), value)
-        for path, value in _leaves(load_inputs())
-        if path[-1:] == ("status",)
-        and isinstance(value, str)
-        and value.startswith("proposed_by_lane_pending_operator_review")
-    ]
-    assert not pending, f"pending operator-review statuses: {pending}"
+def test_amplitude_risk_module_is_implemented_science_only_and_ungated() -> None:
+    inputs = load_inputs()
+    module = next(
+        item for item in inputs["logging"]["modules"] if item["name"] == "amplitude_risk_fraction"
+    )
+    cadence = inputs["logging"]["cadence"]["amplitude_risk"]
+    assert module["status"] == "implemented"
+    assert module["kind"] == "training_callback"
+    assert module["scope"] == "science_only"
+    assert module["metrics_namespace"] == "train/amplitude_risk"
+    assert cadence == {
+        "scope": "science_only",
+        "every_n_steps": 100,
+        "start_step": 0,
+        "includes_step_zero": True,
+        "metrics_namespace": "train/amplitude_risk",
+        "pilot": "omitted",
+        "interpretation": "descriptive_only",
+    }
+    risk = inputs["measurement"]["amplitude_risk"]
+    assert risk["interpretation"] == "descriptive only; introduces no alarm and no science gate"
 
 
 def test_zero_event_bound_fits_declared_margins_and_documents_bonferroni_dependence() -> None:

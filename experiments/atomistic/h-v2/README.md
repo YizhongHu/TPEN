@@ -537,6 +537,15 @@ a core metric that always gets logged. This is an old, established design.").
 The modules, and the stack layer that provides each one, are listed
 machine-readably in `contract_inputs.json` under `logging.modules`.
 
+`AmplitudeRiskFraction` is implemented in the science TRAIN route only. It
+fires every 100 completed iteration steps with `start_step` omitted (equivalent
+to zero), so step 0 is included, and writes descriptive metrics to
+`metrics.jsonl` under the `train/amplitude_risk` namespace. Pilot TRAIN
+payloads omit this callback. The statistic is descriptive only: it raises no
+alarm and is not a science gate. The measured serial A100-SXM4-40GB MIG
+comparison found 7.952% overhead at every update; under a linear cadence
+assumption, cadence 100 is approximately 0.08% overhead.
+
 Cadence: scalar diagnostics log every completed update. Raw training batches
 are captured on the iteration-step coordinate, every 50th step including step
 0 (operator: "50 makes more sense here"), in partitions of 1,000 iteration
@@ -669,9 +678,9 @@ unmeasured at the contract's 4096 x 256", and `-10` is "rare or unresolved; a
 zero is not a healthy zero". The
 spike found the exact, imperfect, untrained and trained states all fall in
 the same narrow band, confirming the module cannot classify state quality.
-It remains descriptive only: no alarm and no science gate. Implementation
-(layer `fa3c35a8`) and independent verification against the frozen list
-still remain.
+It remains descriptive only: no alarm and no science gate. The implementation
+is present in the science TRAIN route at the documented cadence, while pilot
+TRAIN remains unchanged.
 
 Every `lane_proposals` entry is now decided (2026-11-07 operator review; see
 "Lane proposals: operator-reviewed 2026-11-07" above). That does not lift the

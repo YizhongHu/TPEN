@@ -89,6 +89,10 @@ def test_pilot_training_config_matches_a1_field_by_field(payload: str, max_steps
     # Payload overlay: only trainer.max_steps and A1 cadence differ by payload.
     assert config["trainer"]["max_steps"] == max_steps
     assert config["trainer"]["log_every_n_steps"] == protocol.PILOT_A1_CADENCE
+    assert not any(
+        callback.get("_target_") == "tpen.callback.AmplitudeRiskFraction"
+        for callback in config["callbacks"]
+    )
     data_integrity = next(cb for cb in config["callbacks"] if cb["_target_"] == "tpen.callback.DataIntegrity")
     gradient_stats = next(cb for cb in config["callbacks"] if cb["_target_"] == "tpen.callback.GradientStats")
     assert data_integrity["every_n_steps"] == protocol.PILOT_A1_CADENCE
@@ -186,6 +190,7 @@ def test_amplitude_risk_candidate_copies_frozen_entry_and_measured_cadence() -> 
         "thresholds": [-3, -4, -5, -7, -10],
         "every_n_steps": 100,
     }
+    assert "start_step" not in entry
 
 
 def test_science_candidate_set_requires_amplitude_risk_module() -> None:
@@ -202,6 +207,21 @@ def test_science_candidate_set_requires_amplitude_risk_module() -> None:
 
     protocol.remove_candidate_module(config, "tpen.callback.AmplitudeRiskFraction")
     with pytest.raises(ValueError, match="AmplitudeRiskFraction"):
+        protocol.assert_hydrogen_contract(config)
+
+
+def test_science_contract_rejects_nonzero_amplitude_risk_start_step() -> None:
+    config, _ = protocol.science_training_config("L1", 0)
+    for target in protocol.candidate_modules_to_append():
+        protocol.append_candidate_module(config, target)
+    amplitude = next(
+        callback
+        for callback in config["callbacks"]
+        if callback["_target_"] == "tpen.callback.AmplitudeRiskFraction"
+    )
+    amplitude["start_step"] = 100_000
+
+    with pytest.raises(ValueError, match="start_step"):
         protocol.assert_hydrogen_contract(config)
 
 
