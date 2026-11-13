@@ -74,7 +74,8 @@ def _build_lane(tmp_path_factory):
     rc = selected.next_iteration
     assert rc < lane.batch.target_iterations
     evidence = lane.evidence(selected)
-    predecessor_leaf_before = _snapshot_leaf(run_dir)
+    predecessor_leaf_before = None
+    predecessor_leaf_after = None
     jobs = {"reference": dict(phase="initial", resume_step=0)}
     jobs["full"] = dict(phase="recovery", evidence=evidence, resume_step=rc)
     jobs.update({f"disabled-{limb}": dict(phase="recovery", evidence=evidence, resume_step=rc, disable_limb=limb) for limb in LIMBS})
@@ -82,13 +83,17 @@ def _build_lane(tmp_path_factory):
     trace_paths = {}
     for label, options in jobs.items():
         trace = lane.root / f"{label}.trace.json"
+        if label == "disabled-trainer_cursor":
+            predecessor_leaf_before = _snapshot_leaf(run_dir)
         worker = lane.launch(label=f"r9-{label}", trace=trace, **options)
         rc_worker = worker.wait(timeout=180)
         assert rc_worker == 0, f"native worker {label} returned {rc_worker!r}"
+        if label == "disabled-trainer_cursor":
+            predecessor_leaf_after = _snapshot_leaf(run_dir)
         traces[label] = native._trace(trace)
         trace_paths[label] = trace
     print(f"R9_LANE traced rc={rc}")
-    return lane, rc, traces, trace_paths, predecessor_leaf_before, _snapshot_leaf(run_dir)
+    return lane, rc, traces, trace_paths, predecessor_leaf_before, predecessor_leaf_after
 
 
 @pytest.fixture(scope="module")

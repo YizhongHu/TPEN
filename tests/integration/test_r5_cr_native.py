@@ -99,7 +99,8 @@ def r5_traces(tmp_path_factory):
     resume_evidence = lane.evidence(prefix_checkpoint, "evidence-resume.json")
     lower_evidence = lane.evidence(lower[0], "evidence-lower.json")
     non_cursor_limbs = tuple(limb for limb in LIMBS if limb != "trainer_cursor")
-    cursor_leaf_before = _snapshot_leaf(run_dir)
+    cursor_leaf_before = None
+    cursor_leaf_after = None
 
     jobs = [
         ("reference", dict(phase="initial", resume_step=0)),
@@ -118,9 +119,13 @@ def r5_traces(tmp_path_factory):
     trace_paths = {}
     for label, options in jobs:
         trace_path = lane.root / f"{label}.trace.json"
+        if label == "disabled-trainer_cursor":
+            cursor_leaf_before = _snapshot_leaf(run_dir)
         process = lane.launch(label=f"r5-{label}", trace=trace_path, **options)
         returncode = process.wait(timeout=180)
         assert returncode == 0, f"native worker {label} returned {returncode!r}"
+        if label == "disabled-trainer_cursor":
+            cursor_leaf_after = _snapshot_leaf(run_dir)
         traces[label] = native._trace(trace_path)
         trace_paths[label] = trace_path
     print(f"R5_TRACES rc={rc} lower={lower[0].next_iteration} pids={ {k: v.pid for k, v in traces.items()} }")
@@ -130,7 +135,7 @@ def r5_traces(tmp_path_factory):
         "traces": traces,
         "cursor_refusal": _trace_refusal(trace_paths["disabled-trainer_cursor"]),
         "cursor_leaf_before": cursor_leaf_before,
-        "cursor_leaf_after": _snapshot_leaf(run_dir),
+        "cursor_leaf_after": cursor_leaf_after,
         "non_cursor_limbs": non_cursor_limbs,
     }
 

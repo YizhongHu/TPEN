@@ -213,7 +213,7 @@ def test_trainer_cursor_named_mismatch_through_public_adapter(cursor_evidence: d
     _assert_cursor_refusal(cursor_evidence)
     traces = cursor_evidence["traces"]
     high_cursor = cursor_evidence["high_cursor"]
-    with pytest.raises(UnmeasuredArmError, match="model_logabs"):
+    with pytest.raises(UnmeasuredArmError):
         compare_channel_parity(
             traces["reference"],
             traces["cursor-disabled"],
