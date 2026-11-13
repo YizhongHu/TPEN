@@ -38,6 +38,7 @@ from tpen.physics.operators import (
     register_operator_geometry,
     register_operator,
 )
+from tpen.physics.system import HamiltonianTermDescriptor
 
 
 @register_operator(HARMONIC_TRAP)
@@ -64,6 +65,15 @@ class HarmonicTrap:
         if value.shape != (positions.shape[0],):
             raise ValueError(f"harmonic-trap energy must have shape {(positions.shape[0],)}, got {tuple(value.shape)}")
         return LocalEnergyResult(total=value, terms={self.name: value})
+
+    def describe_physical_operator(self) -> HamiltonianTermDescriptor:
+        """Declare the configured trap frequency; no nuclear resource."""
+
+        return HamiltonianTermDescriptor(
+            operator_id=self.operator_id,
+            slot=self.name,
+            parameters={"omega": float(self.omega)},
+        )
 
 
 @register_operator(ELECTRON_ELECTRON_COULOMB)
@@ -111,6 +121,15 @@ class ElectronElectronInteraction:
         if value.shape != (positions.shape[0],):
             raise ValueError(f"electron-electron energy must have shape {(positions.shape[0],)}, got {tuple(value.shape)}")
         return LocalEnergyResult(total=value, terms={self.name: value})
+
+    def describe_physical_operator(self) -> HamiltonianTermDescriptor:
+        """Declare the configured distance floor; no nuclear resource."""
+
+        return HamiltonianTermDescriptor(
+            operator_id=self.operator_id,
+            slot=self.name,
+            parameters={"eps": float(self.eps)},
+        )
 
 
 @register_operator(ELECTRON_NUCLEUS_COULOMB)
@@ -314,6 +333,17 @@ class ElectronNucleusPotential:
             raise ValueError(f"electron-nucleus energy must have shape {(positions.shape[0],)}, got {tuple(value.shape)}")
         return LocalEnergyResult(total=value, terms={self.name: value})
 
+    def describe_physical_operator(self) -> HamiltonianTermDescriptor:
+        """Declare the distance floor and the construction-time nuclear resource."""
+
+        return HamiltonianTermDescriptor(
+            operator_id=self.operator_id,
+            slot=self.name,
+            parameters={"eps": float(self.eps)},
+            resource_id=self.atoms.content_id(),
+            resource=self.atoms,
+        )
+
 
 register_operator_geometry(
     ElectronNucleusInteraction,
@@ -360,6 +390,16 @@ class NucleusNucleusPotential:
         )[0]
         value = pair_sum.expand(flat.batch_size)
         return LocalEnergyResult(total=value, terms={self.name: value})
+
+    def describe_physical_operator(self) -> HamiltonianTermDescriptor:
+        """Declare the construction-time nuclear resource; no free parameters."""
+
+        return HamiltonianTermDescriptor(
+            operator_id=self.operator_id,
+            slot=self.name,
+            resource_id=self.atoms.content_id(),
+            resource=self.atoms,
+        )
 
 
 def _electron_nucleus_coulomb_potential(distances: torch.Tensor, charges: torch.Tensor) -> torch.Tensor:
