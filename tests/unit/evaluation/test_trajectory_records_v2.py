@@ -17,16 +17,19 @@ import pytest
 import torch
 
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
+from tpen.data.atomic_configuration import AtomicConfiguration
 from tpen.evaluation.bundle import EvaluationBundle, GeneratedConfigurations, LocalEnergyValues
 from tpen.evaluation.calculators import LocalEnergyCalculator
 from tpen.evaluation.generators import TrajectoryMCMCGenerator
 from tpen.evaluation.protocols import EvaluationContext
 from tpen.evaluation.trajectory_records import (
     TRAJECTORY_RECORD_METADATA_KEYS_V2,
+    TRAJECTORY_RECORD_SCHEMA,
     TRAJECTORY_RECORD_SCHEMA_V2,
     TamperedTrajectoryRecordError,
     TrajectoryRecordArtifactV2,
     TrajectoryRecordBatch,
+    TrajectoryRecordArtifact,
     TrajectoryRecordStreamWriter,
     inspect_trajectory_record,
 )
@@ -111,8 +114,6 @@ def test_v2_sidecar_key_set_equals_declared_constant(tmp_path: Path) -> None:
 
 
 def test_v1_and_v2_cannot_both_be_selected(tmp_path: Path) -> None:
-    from tpen.data.atomic_configuration import AtomicConfiguration
-
     system = _system()
     receipt = _receipt(system)
     draw = TrajectoryRecordBatch(
@@ -139,6 +140,42 @@ def test_v1_and_v2_cannot_both_be_selected(tmp_path: Path) -> None:
             execution_receipt=receipt,
             first_draw=draw,
         )
+
+
+def test_v2_is_selected_only_explicitly_and_default_remains_v1(tmp_path: Path) -> None:
+    draw = TrajectoryRecordBatch(
+        draw_index=torch.zeros(1, dtype=torch.int64),
+        walker_index=torch.zeros(1, dtype=torch.int64),
+        positions=torch.zeros(1, 1, 3, dtype=torch.float64),
+        local_energy=torch.tensor([1.0]),
+        term_energies={"kinetic": torch.tensor([0.5]), "trap": torch.tensor([0.5])},
+        logabs=torch.tensor([-1.0]),
+        sign=torch.tensor([1.0]),
+        finite_mask=torch.tensor([True]),
+    )
+    artifact = TrajectoryRecordStreamWriter(
+        tmp_path / "default.csv",
+        observable="local_energy",
+        n_draws=1,
+        n_walkers=1,
+        term_names=("kinetic", "trap"),
+        atomic_configuration=AtomicConfiguration(
+            positions=torch.zeros(1, 3, dtype=torch.float64),
+            charges=torch.ones(1, dtype=torch.float64),
+        ),
+        first_draw=draw,
+    ).finalize(
+        ObservableTrajectory(
+            observable="local_energy",
+            values=torch.tensor([[1.0]], dtype=torch.float64),
+            draw_stride=1,
+            burn_in_draws=0,
+        )
+    )
+    assert isinstance(artifact, TrajectoryRecordArtifact)
+    metadata = artifact.metadata_path.read_text(encoding="utf-8")
+    assert f'"schema": "{TRAJECTORY_RECORD_SCHEMA}"' in metadata
+    assert TRAJECTORY_RECORD_SCHEMA_V2 not in metadata
 
 
 def test_inspect_decodes_v2_and_reports_available_physical_context(tmp_path: Path) -> None:
