@@ -237,7 +237,7 @@ def test_health_and_abort_callbacks_precede_checkpoint() -> None:
     config, _ = protocol.pilot_training_config("gpu-route-g")
     for target in protocol.candidate_modules_to_append(include_amplitude_risk=False):
         protocol.append_candidate_module(config, target)
-    protocol.assert_hydrogen_contract(config)
+    protocol.assert_hydrogen_contract(config, allow_missing_amplitude_risk=True)
     targets = [entry["_target_"] for entry in config["callbacks"]]
     checkpoint = targets.index("tpen.callback.Checkpoint")
     for target in {
@@ -258,7 +258,7 @@ def test_contract_rejects_logging_mutants() -> None:
         if entry["_target_"] == "tpen.callback.RawTrainingBatchRecorder":
             entry["every_n_steps"] = 10
     with pytest.raises(ValueError, match="cadence"):
-        protocol.assert_hydrogen_contract(config)
+        protocol.assert_hydrogen_contract(config, allow_missing_amplitude_risk=True)
 
 
 def test_short_run_from_config_writes_logging_outputs(tmp_path: Path) -> None:

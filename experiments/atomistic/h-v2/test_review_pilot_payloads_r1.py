@@ -194,7 +194,9 @@ def _fully_assembled_capacity_config():
 
 
 def test_fully_assembled_capacity_config_is_a_valid_contract_control():
-    protocol.assert_hydrogen_contract(_fully_assembled_capacity_config())
+    protocol.assert_hydrogen_contract(
+        _fully_assembled_capacity_config(), allow_missing_amplitude_risk=True
+    )
 
 
 @pytest.mark.parametrize(
@@ -222,7 +224,7 @@ def test_contract_rejects_logging_cadence_and_sampling_mutants(target, mutation,
     mutation(entry)
 
     with pytest.raises(ValueError, match="cadence|quantile|recorder|drifted"):
-        protocol.assert_hydrogen_contract(config)
+        protocol.assert_hydrogen_contract(config, allow_missing_amplitude_risk=True)
 
 
 @pytest.mark.parametrize("code", ["profile-unavailable", "profile-mismatch", "malformed-json"])
