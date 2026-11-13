@@ -12,6 +12,17 @@ def load_inputs() -> dict:
         return json.load(stream)
 
 
+def _leaves(value: object, path: tuple[str, ...] = ()):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield from _leaves(child, path + (str(key),))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _leaves(child, path + (str(index),))
+    else:
+        yield path, value
+
+
 def _learned_model_proposal(inputs: dict) -> str:
     return next(
         item["proposal"]
@@ -35,6 +46,17 @@ def test_contract_does_not_forbid_and_retain_electron_electron_factor() -> None:
         "no electron-electron term/factor" in description
         and "retained as a declared factor" in proposal
     ), f"contradictory e-e wording: description={description!r}; proposal={proposal!r}"
+
+
+def test_no_contract_status_remains_pending_operator_review() -> None:
+    pending = [
+        (".".join(path), value)
+        for path, value in _leaves(load_inputs())
+        if path[-1:] == ("status",)
+        and isinstance(value, str)
+        and value.startswith("proposed_by_lane_pending_operator_review")
+    ]
+    assert not pending, f"pending operator-review statuses: {pending}"
 
 
 def test_amplitude_risk_module_is_implemented_science_only_and_ungated() -> None:
