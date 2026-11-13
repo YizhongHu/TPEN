@@ -460,7 +460,7 @@ def test_verify_sh_write_path_roots_exclude_shared_env_prefix() -> None:
     assert "SHARED_ENV" not in roots_line, roots_line
 
 
-def test_verify_sh_discovers_all_test_python_vars_and_excludes_owned_names() -> None:
+def test_verify_sh_discovers_all_test_python_vars_and_excludes_owned_names(tmp_path: Path) -> None:
     source = VERIFY.read_text()
     discovery_line = next(line for line in source.splitlines() if "grep -rhoE" in line and "_PYTHON" in line)
 
@@ -469,10 +469,42 @@ def test_verify_sh_discovers_all_test_python_vars_and_excludes_owned_names() -> 
     discovery = re.compile(pattern.group(1))
     for name in ("H_V2_SCIENCE_PYTHON", "P9C_EXECUTOR_PYTHON"):
         assert discovery.fullmatch(name)
-    for name in ("PYTHON", "TPEN_PYTHON", "ROOT_PYTHON"):
-        assert not discovery.fullmatch(name)
-    deny_block = source[source.index('case "$executor_var" in'):source.index('esac', source.index('case "$executor_var" in'))]
-    assert all(name in deny_block for name in ("PYTHON", "TPEN_PYTHON", "ROOT_PYTHON"))
+    deny_match = re.search(r'case "\$executor_var" in\n\s*([^)]*)\)', source)
+    assert deny_match is not None
+    assert set(deny_match.group(1).split("|")) == {"PYTHON", "TPEN_PYTHON", "ROOT_PYTHON"}
+
+    loop_start = source.index("mapfile -t EXECUTOR_PYTHON_VARS")
+    loop_end = source.index("\ndone", loop_start) + len("\ndone")
+    loop = source[loop_start:loop_end]
+    # macOS's system Bash lacks mapfile; retain the production grep and
+    # binding loop while using an equivalent array fill for this probe.
+    loop = loop.replace(
+        "mapfile -t EXECUTOR_PYTHON_VARS < <(",
+        "EXECUTOR_PYTHON_VARS=(); while IFS= read -r executor_var; do EXECUTOR_PYTHON_VARS+=(\"$executor_var\"); done < <(",
+    )
+    clone = tmp_path / "clone"
+    (clone / "tests").mkdir(parents=True)
+    (clone / "tests" / "vars.py").write_text(
+        "H_V2_SCIENCE_PYTHON TPEN_PYTHON ROOT_PYTHON\n"
+    )
+    run_root = tmp_path / "run"
+    (run_root / "evidence").mkdir(parents=True)
+    probe = (
+        "set -Eeuo pipefail\n"
+        f"CLONE=\"{clone}\"\n"
+        "PYTHON=/tmp/overlay/bin/python\n"
+        f"RUN_ROOT=\"{run_root}\"\n"
+        "assert_write_path() { :; }\n"
+        f"{loop}\n"
+        "[[ \"${H_V2_SCIENCE_PYTHON:-}\" == \"$PYTHON\" ]]\n"
+        "[[ -z \"${TPEN_PYTHON+x}\" ]]\n"
+        "[[ -z \"${ROOT_PYTHON+x}\" ]]\n"
+    )
+    result = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (run_root / "evidence" / "executor-python-bindings.txt").read_text().splitlines() == [
+        "H_V2_SCIENCE_PYTHON=/tmp/overlay/bin/python"
+    ]
 
 
 def test_verify_sh_executor_resolution_precheck_rejects_outside_clone(tmp_path: Path) -> None:

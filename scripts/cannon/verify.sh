@@ -186,9 +186,9 @@ executor_resolution_precheck() {
   assert_write_path "$resolution_file"
   if ! {
     printf 'normal='
-    env -u PYTHONPATH "$PYTHON" -c 'import os, sys, tpen_executor; path = os.path.realpath(tpen_executor.__file__); print(path); raise SystemExit(not path.startswith(os.path.realpath(sys.argv[1]) + os.sep))' "$executor_root"
+    env -u PYTHONPATH "$PYTHON" -B -c 'import os, sys, tpen_executor; path = os.path.realpath(tpen_executor.__file__); print(path); raise SystemExit(not path.startswith(os.path.realpath(sys.argv[1]) + os.sep))' "$executor_root"
     printf 'isolated='
-    env -u PYTHONPATH "$PYTHON" -I -c 'import os, sys, tpen_executor; path = os.path.realpath(tpen_executor.__file__); print(path); raise SystemExit(not path.startswith(os.path.realpath(sys.argv[1]) + os.sep))' "$executor_root"
+    env -u PYTHONPATH "$PYTHON" -I -B -c 'import os, sys, tpen_executor; path = os.path.realpath(tpen_executor.__file__); print(path); raise SystemExit(not path.startswith(os.path.realpath(sys.argv[1]) + os.sep))' "$executor_root"
   } > "$resolution_file" 2>&1; then
     fail_precheck "tpen_executor resolution failed outside exact-SHA clone executor"
   fi
