@@ -33,6 +33,17 @@ _EXPECTED_ROW_COUNT = _N_DRAWS * _N_WALKERS
 _EXPECTED_MEAN = sum(_VALUES) / _EXPECTED_ROW_COUNT
 _EXPECTED_VARIANCE = sum(value * value for value in _VALUES) / _EXPECTED_ROW_COUNT - _EXPECTED_MEAN**2
 
+_LITERAL_ARTIFACT_SHA256 = {
+    "h_like_frozen_main": {
+        "sampled_eval_table.csv": "3c42647fa2e7802fea68e36d2d89124f308fc29c619f47991dcf78b5edb72988",
+        "sampled_eval_table.metadata.json": "7b29dc52aa06b47f255fbf6a497d35e48bc0cade9631f5c6b5d89c36ef1590e9",
+    },
+    "he_like_frozen_main": {
+        "sampled_eval_table.csv": "05f17a98e0e3d3f668484d1dc59da337d0fee589ede27f3a705f54b8290861ee",
+        "sampled_eval_table.metadata.json": "edf80b463a229decec776bb7ab88036e28744654e8f3add9d3da3fe4a57befeb",
+    },
+}
+
 
 def _fixture_dir(name: str) -> Path:
     directory = _FIXTURES_ROOT / name
@@ -107,6 +118,8 @@ def test_frozen_fixture_provenance_matches_committed_bytes(name: str) -> None:
     assert provenance["metadata_sha256"] == hashlib.sha256(metadata_path.read_bytes()).hexdigest()
     csv_path = directory / "sampled_eval_table.csv"
     assert provenance["csv_sha256"] == hashlib.sha256(csv_path.read_bytes()).hexdigest()
+    assert hashlib.sha256(csv_path.read_bytes()).hexdigest() == _LITERAL_ARTIFACT_SHA256[name][csv_path.name]
+    assert hashlib.sha256(metadata_path.read_bytes()).hexdigest() == _LITERAL_ARTIFACT_SHA256[name][metadata_path.name]
 
     # Reproducible generator/input pinning: source, exact command, and a
     # config/environment hash, so a replay has everything needed to
