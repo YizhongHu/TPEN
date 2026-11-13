@@ -94,6 +94,7 @@ The executor mirrors the same closed shape and invariants
 (`executor/src/tpen_executor/runners.py:163-196,211-253`). Unknown schema
 versions and unknown/extra fields are refused. A completed record requires a
 checkpoint; a refused record requires a refusal and cannot carry a checkpoint.
+The refusal `reason` embeds the Python JSON parser message, so fixture parity is pinned to project Python 3.12 (a later slice may compare the reason by prefix if this wording proves version-fragile).
 
 **PROPOSED, not current:** a v3 record carrying a typed outcome
 `completed | planned_yield | failed | unknown | refused`, a complete
