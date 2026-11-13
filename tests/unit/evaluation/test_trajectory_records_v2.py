@@ -188,6 +188,11 @@ def test_inspect_decodes_v2_and_reports_available_physical_context(tmp_path: Pat
     assert inspection.physical_context.system_id == system.system_id()
     assert inspection.observable_values_digest.available is True
     assert inspection.observable_values_digest.content_id == artifact.observable_values_content_id
+    metadata = _read_metadata(artifact)
+    metadata["observable_values_content_id"] = "0" * 64
+    _rewrite_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError, match="observable_values_content_id"):
+        inspect_trajectory_record(artifact.metadata_path)
 
 
 @pytest.mark.parametrize("key", ["system_descriptor", "system_descriptor_id"])
@@ -300,16 +305,19 @@ def test_fused_column_manifest_must_cover_exactly_the_declared_operators(
 def test_v2_reader_rejects_a_missing_resource_payload(tmp_path: Path) -> None:
     artifact = _v2_artifact(tmp_path, FINITE)
     metadata = _read_metadata(artifact)
-    metadata["system_descriptor"]["resources"] = {"missing": {}}
+    metadata["system_descriptor"]["terms"][0]["resource_id"] = "missing"
+    metadata["system_descriptor"]["resources"] = {}
     _rewrite_metadata(artifact, metadata)
-    with pytest.raises(TamperedTrajectoryRecordError, match="system_descriptor"):
+    with pytest.raises(TamperedTrajectoryRecordError, match="no resource payload"):
         inspect_trajectory_record(artifact.metadata_path)
 
 
 def test_v2_reader_propagates_mixed_nonfinite_rows_from_real_writer(tmp_path: Path) -> None:
     artifact = _v2_artifact(
         tmp_path,
-        torch.tensor([[float("inf"), float("-inf")], [float("nan"), 1.0]]),
+        torch.tensor(
+            [[float("inf"), 1.0], [float("-inf"), 2.0], [float("nan"), 3.0]]
+        ),
     )
     inspection = inspect_trajectory_record(artifact.metadata_path)
     assert math.isnan(inspection.mean)
