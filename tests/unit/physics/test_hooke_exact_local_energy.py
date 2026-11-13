@@ -79,7 +79,9 @@ def test_one_electron_local_energy_is_constant_at_three_omega_over_two() -> None
 
 def test_one_electron_gaussian_imperfect_width_is_position_dependent() -> None:
     wf = OneElectronHookeExact(omega=0.4)
-    positions = _one_electron_positions()
+    positions = torch.tensor(
+        [[[0.0, 0.0, 0.0]], [[0.5, 0.0, 0.0]], [[1.0, 0.0, 0.0]]], dtype=DTYPE
+    )
     result = local_energy(
         {"kinetic": KineticEnergy(), "harmonic_trap": HarmonicTrap(omega=0.5)},
         wf,
@@ -87,6 +89,8 @@ def test_one_electron_gaussian_imperfect_width_is_position_dependent() -> None:
     )
 
     assert isinstance(result, torch.Tensor)
+    expected = 1.5 * wf.omega + (0.5**2 - wf.omega**2) * positions.square().sum(dim=(1, 2)) / 2
+    assert torch.allclose(result, expected, atol=ENERGY_ATOL, rtol=ENERGY_RTOL)
     assert result.std().item() > 1e-3
 
 
