@@ -559,7 +559,7 @@
     {
       "id": "horizon_and_checkpoints",
       "status": "decided_2026-11-07",
-      "decided_by": "checkpoint counts amended by the approved 100000-update science horizon plan; horizon decision remains operator-reviewed",
+      "decided_by": "operator-review-contract-proposals-20261107 item 6; checkpoint counts amended by the approved 100000-update science horizon plan",
       "proposal": "100,000 updates, retain 0..100000 every 1000, evaluate the explicit 37-checkpoint set",
       "rationale": "Dense retention prevents loss of an early basin while the smaller evaluated set controls fresh-evaluation cost.",
       "alternatives": [
