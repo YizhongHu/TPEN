@@ -95,7 +95,14 @@ def _group_quiescent(
         time.sleep(interval)
 
 
-def _leader_exited_without_reap(pid: int, *, bound: float | None = None, interval: float = 0.02) -> bool:
+def _leader_exited_without_reap(
+    pid: int,
+    *,
+    bound: float | None = None,
+    interval: float = 0.02,
+    cancel_requested: threading.Event | None = None,
+    terminate: Callable[[], None] | None = None,
+) -> bool:
     """Observe a child exit while retaining its PID/PGID ownership proof.
 
     ``WNOWAIT`` leaves the leader as a zombie, keeping its process-group id
@@ -109,6 +116,9 @@ def _leader_exited_without_reap(pid: int, *, bound: float | None = None, interva
         result = os.waitid(os.P_PID, pid, flags)
         if result is not None and result.si_pid == pid:
             return True
+        if cancel_requested is not None and cancel_requested.is_set() and terminate is not None:
+            terminate()
+            cancel_requested.clear()
         if deadline is not None and time.monotonic() >= deadline:
             return False
         time.sleep(interval)
@@ -384,6 +394,7 @@ class SubprocessWorker:
             sampler = None
             group_reaped = False
             cancel_stop = threading.Event()
+            cancel_requested = threading.Event()
             watcher: threading.Thread | None = None
             watcher_started = False
             if cancel_path is not None:
@@ -391,7 +402,7 @@ class SubprocessWorker:
                 expected_marker = dict(cancel_identity or {})
 
                 def watch_cancel_marker() -> None:
-                    """Let the leaf, never the controller, reap its group."""
+                    """Notify the owner thread that leaf cancellation was requested."""
                     while not cancel_stop.wait(0.01):
                         try:
                             marker = decode_json(Path(marker_path).read_bytes())
@@ -399,12 +410,7 @@ class SubprocessWorker:
                             continue
                         if not isinstance(marker, dict) or any(marker.get(key) != value for key, value in expected_marker.items()):
                             continue
-                        if process.poll() is not None:
-                            return
-                        try:
-                            os.killpg(process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+                        cancel_requested.set()
                         return
 
                 watcher = threading.Thread(target=watch_cancel_marker, daemon=True)
@@ -425,19 +431,33 @@ class SubprocessWorker:
                     # leaves this worker owning its cleanup (review E1).
                     sampler = GpuSampler.from_environment(spawned_pid, child_env)
                     sampler.start()
-                try:
-                    if not _leader_exited_without_reap(spawned_pid, bound=timeout):
-                        raise subprocess.TimeoutExpired(command, timeout)
-                    group_reaped = _group_quiescent(spawned_pid)
-                    returncode = process.wait()
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    # Kill the isolated session so setup/science descendants stop too.
+
+                def terminate_owned_group() -> None:
+                    """Signal the still-pinned group from the owner thread."""
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                    _leader_exited_without_reap(spawned_pid)
+
+                try:
+                    leader_exited = _leader_exited_without_reap(
+                        spawned_pid, bound=timeout, cancel_requested=cancel_requested,
+                        terminate=terminate_owned_group,
+                    )
+                except ChildProcessError:
+                    group_reaped = False
+                    returncode = process.returncode
+                else:
+                    if not leader_exited:
+                        timed_out = True
+                        # The WNOWAIT bound expired while the leader was
+                        # unreaped, so this owner-thread kill remains
+                        # pinned and cannot race another reaper.
+                        terminate_owned_group()
+                        _leader_exited_without_reap(
+                            spawned_pid, cancel_requested=cancel_requested,
+                            terminate=terminate_owned_group,
+                        )
                     group_reaped = _group_quiescent(spawned_pid)
                     returncode = process.wait()
             except BaseException as original:
@@ -445,22 +465,30 @@ class SubprocessWorker:
                 # session. Keep the leader unreaped while terminating and
                 # observing its group, then reap it before propagating.
                 if process.returncode is None:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        _leader_exited_without_reap(spawned_pid)
-                    except ChildProcessError:
-                        # The leader was already reaped; its PID/PGID is no
-                        # longer an ownership proof, so do not signal it.
+                    if isinstance(original, ChildProcessError):
+                        # An already-reaped leader is no longer an ownership
+                        # proof; do not signal a possibly reused process group.
                         group_reaped = False
                     else:
-                        group_reaped = _group_quiescent(spawned_pid)
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            _leader_exited_without_reap(spawned_pid)
+                        except ChildProcessError:
+                            # The leader was already reaped; its PID/PGID is
+                            # no longer an ownership proof, so do not signal it.
+                            group_reaped = False
+                        else:
+                            group_reaped = _group_quiescent(spawned_pid)
                 cleanup_errors: list[BaseException] = []
                 while process.returncode is None:
                     try:
                         process.wait()
+                    except ChildProcessError:
+                        group_reaped = False
+                        break
                     except BaseException as cleanup_error:
                         cleanup_errors.append(cleanup_error)
                 # The cancelled child is reaped; drain the sampler's command

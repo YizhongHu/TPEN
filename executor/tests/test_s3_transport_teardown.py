@@ -216,7 +216,7 @@ def test_remote_leaf_request_cancel_creates_identity_bound_marker(tmp_path: Path
     assert request.task_id in marker and request.attempt_id in marker
 
 
-def test_cancel_during_science_reaps_local_child_group(tmp_path: Path) -> None:
+def test_cancel_during_science_reaps_local_child_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     request, _ = _request(tmp_path, timeout=5)
     output, _core, stdout, stderr, _ev_stdout, _ev_stderr = request.paths()
     result: list = []
@@ -224,8 +224,37 @@ def test_cancel_during_science_reaps_local_child_group(tmp_path: Path) -> None:
     # spawn can miss the anchor under load): wait for the child's own
     # evidence that it has actually started before requesting cancellation.
     started = Path(output) / "started.marker"
+    owner_ident: dict[str, int] = {}
+    events: list[tuple[int, object]] = []
+    real_waitid = os.waitid
+    real_killpg = os.killpg
+    real_wait = subprocess.Popen.wait
+    real_poll = subprocess.Popen.poll
+
+    def waitid(id_type, pid, options):
+        events.append((threading.get_ident(), "waitid"))
+        return real_waitid(id_type, pid, options)
+
+    def killpg(pid, sig):
+        events.append((threading.get_ident(), ("killpg", sig)))
+        return real_killpg(pid, sig)
+
+    def wait(process, *args, **kwargs):
+        result = real_wait(process, *args, **kwargs)
+        events.append((threading.get_ident(), "reaped"))
+        return result
+
+    def poll(process):
+        events.append((threading.get_ident(), "poll"))
+        return real_poll(process)
+
+    monkeypatch.setattr(os, "waitid", waitid)
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(subprocess.Popen, "wait", wait)
+    monkeypatch.setattr(subprocess.Popen, "poll", poll)
 
     def run_child() -> None:
+        owner_ident["value"] = threading.get_ident()
         result.append(SubprocessWorker().run(
             request.environment,
             ("-c", f"import pathlib, time; pathlib.Path({str(started)!r}).write_text('1'); time.sleep(60)"),
@@ -245,6 +274,12 @@ def test_cancel_during_science_reaps_local_child_group(tmp_path: Path) -> None:
     _RemoteLeaf(request).request_cancel()
     thread.join(2)
     assert not thread.is_alive() and result and result[0].pid is not None
+    assert all(kind != "poll" for _ident, kind in events)
+    assert all(ident == owner_ident["value"] for ident, _kind in events)
+    reap_index = next(index for index, (_ident, kind) in enumerate(events) if kind == "reaped")
+    assert any(kind == ("killpg", signal.SIGKILL) for _ident, kind in events[:reap_index])
+    assert any(kind == ("killpg", 0) for _ident, kind in events[:reap_index])
+    assert all(kind not in (("killpg", signal.SIGKILL), ("killpg", 0)) for _ident, kind in events[reap_index + 1:])
     if sys.platform.startswith("linux"):
         assert not Path(f"/proc/{result[0].pid}").exists()
 
@@ -625,6 +660,35 @@ def test_normal_exit_keeps_quiescence_before_reap(monkeypatch: pytest.MonkeyPatc
     assert outcome.group_reaped is True
     assert any(event == ("killpg", signal.SIGKILL) for event in events[:reap_index])
     assert all(event not in (("killpg", signal.SIGKILL), ("killpg", 0)) for event in events[reap_index + 1:])
+
+
+def test_normal_observation_childprocesserror_is_uncertain_without_signal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An already-reaped leader returns an uncertain outcome, not a crash."""
+    class AlreadyReaped:
+        pid = 1234
+        returncode = -signal.SIGKILL
+
+        def wait(self, *args, **kwargs):
+            raise AssertionError("already-reaped child must not be waited again")
+
+    child = AlreadyReaped()
+    signals = []
+
+    def already_reaped(*args, **kwargs):
+        raise ChildProcessError()
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: child)
+    monkeypatch.setattr(workers_module, "_leader_exited_without_reap", already_reaped)
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    outcome = SubprocessWorker().run(
+        PreparedPythonEnvironment(sys.executable), ("-c", "pass"), cwd=tmp_path,
+        stdout_path=tmp_path / "out", stderr_path=tmp_path / "err", timeout=5,
+    )
+    assert outcome.returncode == child.returncode
+    assert outcome.group_reaped is False
+    assert signals == []
 
 
 def test_group_quiescence_skips_signal_after_unconfirmed_reap(monkeypatch: pytest.MonkeyPatch) -> None:
