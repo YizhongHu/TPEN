@@ -41,6 +41,7 @@ from tpen.physics.receipt import ExecutionReceipt
 from tpen.physics.system import ParticleSpec, build_system_descriptor
 from tpen.sampling.metropolis import MetropolisSampler
 from tpen.statistics.trajectory import ObservableTrajectory
+from tests.unit.evaluation.test_trajectory_record_inspection import _write_v1_artifact
 
 _TERMS = {"kinetic": KineticEnergy(), "trap": HarmonicTrap(omega=0.5)}
 _PARTICLE = ParticleSpec(n_electrons=1, n_spin_up=1, n_spin_down=0, spatial_dim=3)
@@ -324,6 +325,15 @@ def test_v2_reader_propagates_mixed_nonfinite_rows_from_real_writer(tmp_path: Pa
     assert math.isnan(inspection.variance)
     assert inspection.observable_values_digest.available is True
     assert inspection.observable_values_digest.content_id == artifact.observable_values_content_id
+
+    # The public reader shares this non-finite reduction contract with the
+    # historical v1 CSV path; keep the named survivor killer on that path too.
+    v1_dir = tmp_path / "v1"
+    v1_dir.mkdir()
+    v1_artifact = _write_v1_artifact(v1_dir, torch.tensor([[math.inf, -math.inf], [1.0, 2.0]]))
+    v1_inspection = inspect_trajectory_record(v1_artifact.metadata_path)
+    assert math.isnan(v1_inspection.mean)
+    assert math.isnan(v1_inspection.variance)
 
 
 class _GaussianModel(torch.nn.Module):
