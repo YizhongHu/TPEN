@@ -308,7 +308,9 @@ def test_v2_reader_rejects_a_missing_resource_payload(tmp_path: Path) -> None:
     metadata["system_descriptor"]["terms"][0]["resource_id"] = "missing"
     metadata["system_descriptor"]["resources"] = {}
     _rewrite_metadata(artifact, metadata)
-    with pytest.raises(TamperedTrajectoryRecordError, match="no resource payload"):
+    with pytest.raises(
+        TamperedTrajectoryRecordError, match="resource_id and resource must be provided together"
+    ):
         inspect_trajectory_record(artifact.metadata_path)
 
 
