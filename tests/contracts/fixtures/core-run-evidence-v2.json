@@ -1,0 +1,17 @@
+{
+  "checkpoint": {
+    "checkpoint_dir": "/normalized/core/checkpoints/step_000007",
+    "completed_updates": 5,
+    "next_iteration": 7,
+    "schema_version": 2
+  },
+  "refusal": null,
+  "resolved_config_identity": {
+    "schema": "tpen-config-identity-v1",
+    "sha256": "661fc7bc438cc401659b5091120275d4efa4883853320dc155f10808d929397b"
+  },
+  "run_dir": "/normalized/core",
+  "run_status": "completed",
+  "schema": "tpen.run-evidence/v2",
+  "verdict": "completed"
+}
