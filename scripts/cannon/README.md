@@ -266,13 +266,22 @@ scripts/cannon/submit-lint.sh \
   --sbatch /absolute/canonical/path/to/generated.sbatch \
   --manifest /absolute/path/to/generated.manifest \
   --allowed-root <facility stage/run prefix> [--allowed-root <prefix> ...] \
-  --shared-env-root <facility shared-env root> \
+  --shared-env-prefix <exact reuse-only shared-envs root> \
   [--home "$HOME"] \
   [--submit-helper /path/to/the/sbatch-invoking/helper] \
   [--staging-root <local staging prefix>=<final facility prefix> ...] \
   [--real-env /path/to/real-run.env --dry-env /path/to/dry-run.env \
    --dry-only-keys DRY_RUN]
 ```
+
+`--shared-env-prefix` is the exact reuse-only shared-envs root (the same
+`SHARED_ENV_PREFIX` `verify.sh`/`shared-env-precheck.sh` consume, see "Shared
+environment: reuse-only" above) — never a facility stage/run prefix. It is
+refused up front (`LINT_FAIL`, before any manifest/sbatch check runs) if it
+equals, contains, or is contained by any `--allowed-root` or any
+`--staging-root` *FINAL*: the prefix split, mirroring `verify.sh`'s own
+disjointness contract, using the same root-aware `path_contains` helper from
+`shared-env-manifest.sh` (sourced from this script's own `SCRIPT_DIR`).
 
 `--staging-root LOCAL=FINAL` declares that a path canonically under `LOCAL`
 is, for containment purposes only, the same path it will be once staged
@@ -299,12 +308,14 @@ Checks performed (exit 0 on `LINT_PASS`, non-zero on `LINT_FAIL`):
 | 1 | `HEAD_SHA` is exactly 40 hex characters |
 | 2 | `JOB_NAME` contains `HEAD_SHA[:12]` |
 | 3 | sbatch path is absolute, canonical, and inside a declared `--allowed-root` |
-| 4 | critical exports (`HEAD_SHA`, `JOB_NAME`, `TASK_ROOT`, `RUN_ROOT`, `DRY_RUN`, `PYTHON`) match exactly between the manifest and the job's effective exported environment — no stale, missing, or extra values; `HEAD_SHA`/`JOB_NAME`/`TASK_ROOT`/`RUN_ROOT`/`DRY_RUN` must additionally be present and nonempty in both files (a field absent from both passes the match test but is still rejected), and `PYTHON` is required the same way whenever `DRY_RUN=1`. The effective environment is computed by a deliberately narrow shell subset (documented in full at the top of the parser in `submit-lint.sh`), never by running anything and never from the manifest: it is SEEDED from the submit helper's own `sbatch ... --export=SPEC <job>` line when `--submit-helper` has one (a command-line option overrides the directive, as in Slurm), else from the last `#SBATCH --export=SPEC` directive in the leading comment block; SPEC must be literal `NAME=VALUE,...` (a bare `NAME` there is unknown). Then `export` and plain `NAME=VALUE` statements apply in file order: a bare `export NAME` keeps NAME's CURRENT value; `$NAME`/`${NAME}`/`${NAME:-DEFAULT}` expand against the current value; single quotes are literal; an unquoted `#` starts a comment; a `NAME=VALUE cmd` prefix does not change the job environment. Unsupported syntax (command substitution, other expansions, unquoted globs/tilde/operators, an unterminated quote, `unset`/`declare` on a critical key) is a LINT_FAIL when the statement could set a critical key, and a critical key exported with a value the linter cannot determine is a LINT_FAIL; it never guesses. Not modelled: control flow, functions, heredoc bodies, `source` |
+| 4 | critical exports (`HEAD_SHA`, `JOB_NAME`, `TASK_ROOT`, `RUN_ROOT`, `DRY_RUN`, `PYTHON`, `SHARED_ENV_PREFIX`) match exactly between the manifest and the job's effective exported environment — no stale, missing, or extra values; `HEAD_SHA`/`JOB_NAME`/`TASK_ROOT`/`RUN_ROOT`/`DRY_RUN` must additionally be present and nonempty in both files (a field absent from both passes the match test but is still rejected), and `PYTHON` is required the same way whenever `DRY_RUN=1`. The effective environment is computed by a deliberately narrow shell subset (documented in full at the top of the parser in `submit-lint.sh`), never by running anything and never from the manifest: it is SEEDED from the submit helper's own `sbatch ... --export=SPEC <job>` line when `--submit-helper` has one (a command-line option overrides the directive, as in Slurm), else from the last `#SBATCH --export=SPEC` directive in the leading comment block; SPEC must be literal `NAME=VALUE,...` (a bare `NAME` there is unknown). Then `export` and plain `NAME=VALUE` statements apply in file order: a bare `export NAME` keeps NAME's CURRENT value; `$NAME`/`${NAME}`/`${NAME:-DEFAULT}` expand against the current value; single quotes are literal; an unquoted `#` starts a comment; a `NAME=VALUE cmd` prefix does not change the job environment. Unsupported syntax (command substitution, other expansions, unquoted globs/tilde/operators, an unterminated quote, `unset`/`declare` on a critical key) is a LINT_FAIL when the statement could set a critical key, and a critical key exported with a value the linter cannot determine is a LINT_FAIL; it never guesses. `SHARED_ENV_PREFIX` is optional (a job that never mentions it is genuinely absent on both sides, which passes), but a bare `export SHARED_ENV_PREFIX` with no prior assignment leaves it exported with no determined value, which this check also rejects rather than silently treating as absent. Not modelled: control flow, functions, heredoc bodies, `source` |
 | 5 | `TASK_ROOT`/`RUN_ROOT` are not staged under `$HOME`, literally or after canonicalization (catches a symlink into `$HOME`) |
 | 6 | `TASK_ROOT`/`RUN_ROOT` stay inside a declared `--allowed-root` (facility-root escape) |
-| 7 | when `DRY_RUN=1`, `PYTHON` resolves under `--shared-env-root` |
+| 7 | when `DRY_RUN=1`, `PYTHON` resolves under `--shared-env-prefix` (reused directly) — never merely any `--allowed-root`, which would admit an unrelated interpreter; overlay acceptance is deferred until the verifier's work-root contract can be modelled explicitly |
 | 8 | every `ssh`/`scp`/`rsync` invocation in `--submit-helper` passes `-o BatchMode=yes` (for `rsync`, via `-e "ssh -o BatchMode=yes"`), checked per logical invocation (backslash continuations joined, comments dropped, split on `;`/`&&`/`\|\|`/`\|`) rather than per physical line or whole-file substring; the command is matched as a WORD anywhere in the segment (`timeout 30 ssh ...`, `x=$(ssh ...)`, `rsync -e ssh ...`), not only when the segment starts with it, while still excluding substrings like `sshd_config`/`rsync_log` |
 | 9 | with `--real-env`/`--dry-env`, every exported key matches between a real and a dry run except the `--dry-only-keys` list; a key present on only one side is a delta even if the other side's value happens to look like an "absent" placeholder |
+| 10 | `--shared-env-prefix` itself, and the manifest's `SHARED_ENV_PREFIX`/`SHARED_ENV_PATH` keys when present, must be absolute and already spelled canonically (no trailing slash, `.`/`..`, relative path, or unresolved symlink — compared against `realpath -m`, with no existence requirement); if the manifest carries a `SHARED_ENV_PREFIX` key (mirroring `verify.sh`'s own input), it must canonicalize to exactly the CLI `--shared-env-prefix`; if it carries a `SHARED_ENV_PATH` key (mirroring `verify.sh`'s own resolved output), its canonical parent must be exactly the CLI `--shared-env-prefix` (a direct child, same as `shared-env-precheck.sh resolve`'s own parent check); either key, if present, must also not resolve under any `--allowed-root` |
+| 11 | `TASK_ROOT`/`RUN_ROOT` must not resolve under `--shared-env-prefix` (alongside check 6's facility-root containment): a run's own writable/staged root must never alias into the reuse-only shared-envs tree |
 
 `--real-env` and `--dry-env` must be given together or not at all; supplying
 only one is `LINT_FAIL`. The linter also probes up front that `realpath`

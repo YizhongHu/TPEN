@@ -286,6 +286,26 @@ def test_paths_refuses_when_work_root_is_a_symlink_alias_into_shared_prefix(
     assert "--work-root" in result.stderr and "disjoint" in result.stderr
 
 
+def test_paths_refuses_when_work_root_is_filesystem_root(shared_prefix: Path, facility_prefix: Path) -> None:
+    """DT1 (B1 delta review, carried to this item's carried-follow-ups note):
+    WORK_ROOT='/' exercises path_contains' own '/' special case directly as
+    its first argument (not merely as the thing being contained), which
+    verify.sh's own call site can never reach since WORK_ROOT is always the
+    exact job scratch, never '/'. Kills mutant m3 (drop that branch) without
+    relying on check_shared_env_prefix's separate '/' refusal, which only
+    ever sees SHARED_ENV_PREFIX/FACILITY_RUN_PREFIX, never WORK_ROOT. The
+    normal disjoint case stays green via
+    test_paths_accepts_work_root_disjoint_from_shared_prefix."""
+    result = run_paths(
+        shared_prefix=shared_prefix,
+        facility_prefix=facility_prefix,
+        run_root=facility_prefix / "job-123",
+        work_root=Path("/"),
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "--work-root" in result.stderr and "disjoint" in result.stderr
+
+
 def test_verify_sh_runs_shared_env_paths_precheck_before_any_mkdir_or_clone() -> None:
     # The paths precheck (shared prefix vs facility/run/work-root
     # disjointness) must run before any write -- safe_mkdir, the EXIT-trap
