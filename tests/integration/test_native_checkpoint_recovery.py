@@ -7,6 +7,7 @@ allocation loss, and never supplies a live backend object to a worker.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
