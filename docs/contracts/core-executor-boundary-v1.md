@@ -32,6 +32,12 @@ overrides. Core parses exactly that shape in `tpen/run.py:58-103`; `main`
 delegates to `run_from_config` at `tpen/run.py:58-80`. The executor constructs
 the command in `executor/src/tpen_executor/runners.py:257-291`.
 
+The command configuration must be an absolute path. `TPENCommand` rejects a
+relative or non-string `config` before the child is launched
+(`executor/src/tpen_executor/runners.py:278-291`). This precondition is part of
+the launch contract; an equivalent launcher must resolve and validate the
+configuration path before constructing the command.
+
 The executor must append the fenced overrides
 `run.root=<attempt-output> run.layout=flat run.run_id=core`, as implemented at
 `executor/src/tpen_executor/dispatch/contract.py:1070-1076`. Direct
@@ -75,8 +81,14 @@ The current closed records are `tpen.run-evidence/v1` and
 
 V2 adds the required non-null `resolved_config_identity` object with exactly
 `schema=tpen-config-identity-v1` and a lower-case 64-character SHA-256 digest.
-The producer selects v2 when the run-start identity sidecar is present
-(`tpen/inspection.py:227-254`), and `RunEvidence.from_mapping` enforces the
+The exact v2 selection rule is: a successfully read, non-null
+`resolved_config_identity` from the run-start sidecar, on a result that is not
+a refusal. The producer selects the schema only after reading and validating
+that identity (`tpen/inspection.py:227-254`). Any refusal always returns v1
+without identity because the refusal branch calls `_evidence_schema(None)`
+(`tpen/inspection.py:216-224`); a readable sidecar that lacks the identity
+also leaves the identity null and therefore does not select v2
+(`tpen/inspection.py:233-253`). `RunEvidence.from_mapping` enforces the
 version-specific top-level and nested key sets (`tpen/inspection.py:104-143`).
 The executor mirrors the same closed shape and invariants
 (`executor/src/tpen_executor/runners.py:163-196,211-253`). Unknown schema
@@ -95,6 +107,14 @@ the current producer and executor must not decode or emit it.
 Core publishes checkpoint directories, catalog rows, pointers, and receipts
 through the checkpoint package (`tpen/checkpoint/save.py:87-106,209-241`,
 `tpen/checkpoint/catalog.py:25-100`, `tpen/checkpoint/artifact.py:50-89`).
+Publication is ordered: component files are written to a temporary directory,
+the manifest and `COMPLETE` marker are written last, and rename commits the
+checkpoint. Core then appends the catalog row, atomically updates
+`latest.json`, and finally appends the publication receipt
+(`tpen/checkpoint/save.py:87-110`). Catalog and pointer failures are load
+bearing; the receipt append is best effort and can be reconciled later. A
+receipt therefore proves publication bookkeeping only when present and must
+not be inferred from the checkpoint summary exposed at this boundary.
 Inspection selects the newest valid train-resume checkpoint and exposes only
 the v2 summary fields (`tpen/inspection.py:276-356`). The checkpoint directory
 is a location; the underlying `CheckpointRef` is the core-owned content
@@ -113,7 +133,9 @@ Current `AcceptedSegment` is a fresh-start operational record. It requires
 core evidence with a checkpoint and an executor outcome whose status is
 `completed` (`executor/src/tpen_executor/storage.py:434-498`). Current
 invocation/recovery code can discover a published predecessor read-only, but
-there is no end-to-end executor successor launch contract.
+only the allocation that still owns the run leaf may reconcile a missing
+publication index (`tpen/execution/invocation.py:685-705`). There is no
+end-to-end executor successor launch contract.
 
 **PROPOSED:** continuation must consume a typed v3 planned-yield result and a
 full, publication-bound checkpoint reference. It must not reuse
@@ -127,6 +149,11 @@ decisions.
 The executor owns process groups, placement receipts, attempt fences, and
 operational outcome receipts. The dispatch path launches the fenced command
 and collects inspection evidence after the child (`executor/src/tpen_executor/dispatch/contract.py:1062-1079`).
+An existing slot is quarantined before a sampled launch and remains quarantined
+until sampler cleanup is confirmed; any non-inspection launch carrying that
+slot id is refused while the quarantine exists
+(`executor/src/tpen_executor/workers.py:120-137`). This is the current local
+slot-quarantine contract, not a remote-quiescence guarantee.
 Core does not consume executor teardown or placement records. A scheduler or
 process exit alone is not core completion; completion is the durable core
 status plus admissible checkpoint evidence (`tpen/run.py:475-497`,
@@ -151,14 +178,19 @@ normalizes only absolute run paths.
 | Producer record | Consumer v1 | Consumer v2 | Consumer v3 |
 |---|---|---|---|
 | v1 | decode | decode read-only (identity absent) | refuse/unsupported until v3 policy |
-| v2 | decode read-only only if identity is not required by the operation | decode | refuse/unsupported until v3 policy |
+| v2 | refuse (closed v1 key set; no operation-dependent downgrade) | decode | refuse/unsupported until v3 policy |
 | v3 (PROPOSED) | refuse | refuse | decode only after CX-01/CX-02 land |
 
-“Read-only” means the consumer may inspect historical facts but must not accept
-the record as proof of a newer continuation or write it back under an older
-schema. The current executor implementation supports v1 and v2 only and
+“Historical decode” means a v2-capable consumer may read a v1 record for
+historical records; it is separate from identity-required acceptance and does
+not upgrade the record. A v1 consumer must refuse v2 because its closed key set
+does not admit the newer record; there is no operation-dependent downgrade.
+The current executor implementation supports v1 and v2 only and
 rejects all other versions and extra fields at
 `executor/src/tpen_executor/runners.py:163-173`.
+
+The proposed remote-quiescence contract tracked by #668 remains PROPOSED and
+is not implemented by this head.
 
 Naming is reserved as follows: `HI-S<n>` identifies the HI-resume execution
 lane, `EX-S3.<letter>` identifies executor transport layers, and `CX-nn`
