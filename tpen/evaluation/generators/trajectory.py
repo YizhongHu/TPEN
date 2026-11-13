@@ -49,7 +49,7 @@ from tpen.physics.hamiltonian import (
     normalize_hamiltonian_terms,
 )
 from tpen.physics.system import SystemDescriptor
-from tpen.physics.receipt import ExecutionReceipt
+from tpen.physics.receipt import ExecutionReceipt, decode_ordered_contribution_sequence
 from tpen.sampling.trajectory import collect_observable_trajectory_with_diagnostics
 
 TRAJECTORY_METADATA_KEY = "observable_trajectory"
@@ -328,15 +328,17 @@ class TrajectoryMCMCGenerator:
                 "trajectory local-energy evaluation did not expose the wavefunction output "
                 "used by its kinetic term; a fallback model pass is forbidden"
             )
-        contribution_names = (
-            tuple(
-                dict.fromkeys(
-                    name for names in result.receipt.manifest.values() for name in names
+        if result.receipt is not None:
+            try:
+                contribution_names = decode_ordered_contribution_sequence(
+                    result.receipt.numerical_policy["contribution_order"]
                 )
-            )
-            if result.receipt is not None
-            else tuple(self.hamiltonian_terms)
-        )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "trajectory local-energy receipt must declare its ordered contribution sequence"
+                ) from exc
+        else:
+            contribution_names = tuple(self.hamiltonian_terms)
         if set(result.terms) != set(contribution_names) or len(result.terms) != len(contribution_names):
             raise ValueError(
                 "trajectory local-energy result contributions disagree with its execution receipt"

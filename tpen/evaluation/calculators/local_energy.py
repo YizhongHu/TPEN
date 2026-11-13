@@ -63,10 +63,6 @@ class LocalEnergyCalculator:
         records = bundle.generated.trajectory_records
         if records is not None:
             records.validate(check_files=False)
-            if tuple(self.hamiltonian_terms) != records.term_names:
-                raise ValueError(
-                    "LocalEnergyCalculator terms disagree with streamed trajectory records"
-                )
             receipt = None
             if isinstance(records, TrajectoryRecordArtifactV2):
                 # Contract 4/5 (trajectory-record v2 writer and active-producer
@@ -90,6 +86,18 @@ class LocalEnergyCalculator:
                 requested_receipt = self.evaluator.describe_execution_receipt(
                     self.hamiltonian_terms, requested_system.system_id()
                 )
+                contribution_names = tuple(
+                    dict.fromkeys(
+                        name
+                        for names in requested_receipt.manifest.values()
+                        for name in names
+                    )
+                )
+                if records.term_names != contribution_names:
+                    raise ValueError(
+                        "LocalEnergyCalculator contribution columns disagree with the "
+                        "requested execution receipt"
+                    )
                 if requested_receipt != records.execution_receipt:
                     raise ValueError(
                         "LocalEnergyCalculator requested a different execution method than the "
@@ -97,6 +105,10 @@ class LocalEnergyCalculator:
                         "mismatch is never silently accepted"
                     )
                 receipt = records.execution_receipt
+            elif tuple(self.hamiltonian_terms) != records.term_names:
+                raise ValueError(
+                    "LocalEnergyCalculator terms disagree with streamed trajectory records"
+                )
             flat = bundle.generated.batch.flatten_samples()
             n_rows = records.validate_snapshot_batch(flat)
             total = records.final_draw.local_energy[:n_rows].to(

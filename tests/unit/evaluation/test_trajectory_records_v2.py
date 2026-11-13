@@ -460,12 +460,18 @@ def test_calculator_reuses_a_valid_fused_v2_contribution(tmp_path: Path) -> None
             term_energies={fused_name: artifact.final_draw.local_energy},
         ),
     )
+
+    class _FusedEvaluator(NaiveLocalEnergyEvaluator):
+        def describe_execution_receipt(self, terms, system_id):
+            del terms
+            return replace(fused_receipt, system_id=system_id)
+
     generated = GeneratedConfigurations(
         batch=ElectronBatch(positions=fused.final_draw.positions[:1]),
         metadata={},
         trajectory_records=fused,
     )
-    calculator = LocalEnergyCalculator(hamiltonian_terms=_TERMS, evaluator=NaiveLocalEnergyEvaluator())
+    calculator = LocalEnergyCalculator(hamiltonian_terms=_TERMS, evaluator=_FusedEvaluator())
     calculated = calculator.calculate(
         model=_GaussianModel(),
         bundle=EvaluationBundle(generated=generated),
