@@ -89,7 +89,7 @@ def test_packed_eval_scales_host_resources_and_passes_pack_k(tmp_path: Path) -> 
         executor_python=sys.executable,
         run_root=tmp_path / "runs" / "h-v2" / "science",
         checkout_root=tmp_path / "checkout",
-        time_value="04:00:00",
+        time_value="08:45:00",
         dependency=None,
         commit=SHA,
         resources=launch_config.RESOURCES,

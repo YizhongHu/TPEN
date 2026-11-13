@@ -159,9 +159,13 @@ def test_packed_comparator_refuses_each_absent_or_null_identity(side, field, rep
 @pytest.mark.parametrize(
     "side,field,value",
     [
-        (side, field, value)
+        (side, "energy", value)
         for side in ("packed", "single")
-        for field in ("energy", "variance")
+        for value in (float("nan"), float("inf"), float("-inf"))
+    ]
+    + [
+        (side, "variance", value)
+        for side in ("packed", "single")
         for value in (float("nan"), float("inf"), float("-inf"), -0.1)
     ],
 )

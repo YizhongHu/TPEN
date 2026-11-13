@@ -88,10 +88,12 @@ def test_packed_validation_uses_calibration_reference_not_selected_single_denomi
         {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.500, "variance": 0.100},
     ]
     tolerance = eval_job.derive_packed_validation_tolerance(repeats)
-    packed = {**repeats[0], "variance": 0.1032}
+    # This is just above the tolerance when incorrectly normalized by the
+    # selected single result (0.100), but just below it when normalized by the
+    # calibrated reference mean (0.100333...).
+    packed = {**repeats[0], "variance": 0.10425}
     single = {**repeats[0], "variance": 0.100}
-    with pytest.raises(eval_job.EvalJobRefusal, match="packed-validation-mismatch"):
-        eval_job.compare_packed_single_stream(packed, single, tolerance=tolerance)
+    eval_job.compare_packed_single_stream(packed, single, tolerance=tolerance)
 
 
 def test_packed_validation_refuses_identity_or_metric_mismatch() -> None:
