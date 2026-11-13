@@ -384,15 +384,18 @@ second electron.
 ### Science venue (item 7)
 
 Cannon, using long jobs, not packed Polaris (operator, "cannon with long
-jobs"). Science submits to both FASRC Cannon production GPU partitions in one
-job: `kozinsky_gpu` (wall limit `7-00:00:00`, `gpu:nvidia_a100-sxm4-80gb:4`)
-and `seas_gpu` (wall limit `2-00:00:00`, mixed `gpu:nvidia_h200:4` and
-`gpu:nvidia_a100-sxm4-80gb:4`), pinned with `--constraint=a100` for a
-comparable stratum, per the Cannon partition-naming policy (node counts as of
-the 2026-08-15 hardware note; they drift -- re-measure with `sinfo` rather
-than citing this date). At most 32
-GPU-hours per lineage fits comfortably inside even the tighter `seas_gpu`
-ceiling. Polaris is not used for H-v2 science. D6/D5 restatement (operator
+jobs"). Science submits to the FASRC Cannon production GPU partition set
+`seas_gpu,kozinsky_gpu,gpu` in one job: `kozinsky_gpu` (wall limit
+`7-00:00:00`, `gpu:nvidia_a100-sxm4-80gb:4`), `seas_gpu` (wall limit
+`2-00:00:00`, mixed `gpu:nvidia_h200:4` and
+`gpu:nvidia_a100-sxm4-80gb:4`), and `gpu`, pinned with `--constraint=a100`
+for the A100-SXM4-80GB stratum, per the Cannon partition-naming policy (node
+counts as of the 2026-08-15 hardware note; they drift -- re-measure with
+`sinfo` rather than citing this date). The existing ceiling remains 96 GPU-h
+total (32 GPU-h per lineage); the new 100k science estimate is approximately
+66 GPU-h. TRAIN is projected at approximately 10.5 h with
+`T_WALL=13:30:00`, and TRAIN plus EVAL at approximately 28.2 h against the
+32 h lineage cap. Polaris is not used for H-v2 science. D6/D5 restatement (operator
 decisions, `operator-decisions-pilot-geometry-design-target-20261107` and
 `operator-answers-design-target-d1-d6-20261107` on `fffc313a`, 2026-11-07):
 the operator, quoted, "Gpu test goes on cannon" -- the pipeline check's
