@@ -206,7 +206,9 @@ def _rows(path: Path) -> list[dict]:
 
 def _write_rows(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
+        writer = csv.DictWriter(
+            handle, fieldnames=fieldnames, lineterminator="\n", extrasaction="ignore"
+        )
         writer.writeheader()
         writer.writerows(rows)
 
