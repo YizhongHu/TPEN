@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from tpen.data.batch import ElectronBatch, WavefunctionOutput
+from tpen.data.batch.walkers import Walkers
 from tpen.data.atomic_configuration import AtomicConfiguration
 from tpen.evaluation.bundle import EvaluationBundle, GeneratedConfigurations, LocalEnergyValues
 from tpen.evaluation.calculators import LocalEnergyCalculator
@@ -33,11 +34,11 @@ from tpen.evaluation.trajectory_records import (
     TrajectoryRecordStreamWriter,
     inspect_trajectory_record,
 )
-from tpen.physics.hamiltonian import NaiveLocalEnergyEvaluator
+from tpen.physics.hamiltonian import LocalEnergyResult, NaiveLocalEnergyEvaluator
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.operators import OperatorId
 from tpen.physics.potential import HarmonicTrap
-from tpen.physics.receipt import ExecutionReceipt
+from tpen.physics.receipt import ExecutionReceipt, encode_ordered_contribution_sequence
 from tpen.physics.system import ParticleSpec, build_system_descriptor
 from tpen.sampling.metropolis import MetropolisSampler
 from tpen.statistics.trajectory import ObservableTrajectory
@@ -436,3 +437,88 @@ def test_calculator_rejects_reuse_under_a_different_requested_method(tmp_path: P
             bundle=EvaluationBundle(generated=generated),
             context=_hooke_context(tmp_path),
         )
+
+
+def test_calculator_reuses_a_valid_fused_v2_contribution(tmp_path: Path) -> None:
+    artifact = _v2_artifact(tmp_path, FINITE)
+    receipt = _receipt(_system())
+    fused_name = "kinetic_plus_trap"
+    fused_receipt = replace(
+        receipt,
+        manifest={operator_id: (fused_name,) for operator_id in receipt.manifest},
+        numerical_policy={
+            **receipt.numerical_policy,
+            "contribution_order": encode_ordered_contribution_sequence((fused_name,)),
+        },
+    )
+    fused = replace(
+        artifact,
+        term_names=(fused_name,),
+        execution_receipt=fused_receipt,
+        final_draw=replace(
+            artifact.final_draw,
+            term_energies={fused_name: artifact.final_draw.local_energy},
+        ),
+    )
+    generated = GeneratedConfigurations(
+        batch=ElectronBatch(positions=fused.final_draw.positions[:1]),
+        metadata={},
+        trajectory_records=fused,
+    )
+    calculator = LocalEnergyCalculator(hamiltonian_terms=_TERMS, evaluator=NaiveLocalEnergyEvaluator())
+    calculated = calculator.calculate(
+        model=_GaussianModel(),
+        bundle=EvaluationBundle(generated=generated),
+        context=_hooke_context(tmp_path),
+    )
+    assert calculated.local_energy is not None
+
+
+class _OrderedContributionEvaluator:
+    def make_context(self, wavefunction: object, batch: ElectronBatch) -> ElectronBatch:
+        del wavefunction
+        return batch
+
+    def evaluate(self, terms, context, *, return_terms: bool = False):
+        del terms, context
+        values = {
+            "a": torch.tensor([1.0e16], dtype=torch.float64),
+            "b": torch.tensor([-1.0e16], dtype=torch.float64),
+            "c": torch.tensor([1.0], dtype=torch.float64),
+        }
+        result = LocalEnergyResult(
+            total=torch.tensor([1.0], dtype=torch.float64),
+            terms=values,
+            wavefunction_output=WavefunctionOutput(
+                logabs=torch.tensor([0.0], dtype=torch.float64),
+                sign=torch.tensor([1.0], dtype=torch.float64),
+            ),
+            receipt=ExecutionReceipt(
+                system_id="ordered-system",
+                implementation="ordered-test",
+                version=1,
+                numerical_policy={
+                    "contribution_order": encode_ordered_contribution_sequence(("a", "b", "c"))
+                },
+                manifest={
+                    OperatorId("test", "a"): ("a",),
+                    OperatorId("test", "c"): ("c",),
+                    OperatorId("test", "b"): ("b",),
+                },
+            ),
+        )
+        return result if return_terms else result.total
+
+
+def test_generator_reconstructs_total_in_receipt_contribution_order() -> None:
+    generator = TrajectoryMCMCGenerator(
+        sampler=object(),
+        hamiltonian_terms=_TERMS,
+        n_draws=1,
+        evaluator=_OrderedContributionEvaluator(),
+    )
+    result = generator._local_energy_per_walker(
+        model=_GaussianModel(),
+        walkers=Walkers(positions=torch.zeros(1, 1, 3, dtype=torch.float64)),
+    )
+    assert torch.equal(result.total, torch.tensor([1.0], dtype=torch.float64))
