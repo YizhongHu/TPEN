@@ -91,7 +91,7 @@ def test_packed_validation_uses_calibration_reference_not_selected_single_denomi
     # This is just above the tolerance when incorrectly normalized by the
     # selected single result (0.100), but just below it when normalized by the
     # calibrated reference mean (0.100333...).
-    packed = {**repeats[0], "variance": 0.10425}
+    packed = {**repeats[0], "variance": 0.104235}
     single = {**repeats[0], "variance": 0.100}
     eval_job.compare_packed_single_stream(packed, single, tolerance=tolerance)
 
