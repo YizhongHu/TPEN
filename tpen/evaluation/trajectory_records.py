@@ -675,6 +675,31 @@ _V1_PHYSICAL_CONTEXT_UNAVAILABLE = TrajectoryPhysicalContext(
 
 
 @dataclass(frozen=True, slots=True)
+class TrajectoryObservableValuesDigest:
+    """A verified observable-value digest, or a typed reconstruction gap."""
+
+    available: bool
+    content_id: str | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.available:
+            if self.content_id is None or self.reason is not None:
+                raise ValueError("available observable digest requires only a content_id")
+        elif self.content_id is not None or self.reason is None:
+            raise ValueError("unavailable observable digest requires only a reason")
+
+
+_V1_OBSERVABLE_DIGEST_UNAVAILABLE = TrajectoryObservableValuesDigest(
+    available=False,
+    reason=(
+        "trajectory_records/v1 serializes NaN values as the text 'nan', so the original "
+        "float64 payload/sign bits cannot be reconstructed for digest verification"
+    ),
+)
+
+
+@dataclass(frozen=True, slots=True)
 class TrajectoryRecordInspection:
     """Version-normalized, read-only view of one trajectory-record artifact.
 
@@ -696,6 +721,7 @@ class TrajectoryRecordInspection:
     csv_sha256: str
     atomic_configuration_id: str | None
     physical_context: TrajectoryPhysicalContext
+    observable_values_digest: TrajectoryObservableValuesDigest
     schema: str = TRAJECTORY_RECORD_INSPECTION_SCHEMA
 
 
@@ -817,7 +843,13 @@ def _inspect_v1(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
             f"declared={scalars.finite_count}, actual={scan.finite_count}"
         )
     declared_values_content_id = metadata["observable_values_content_id"]
-    if scan.values_content_id != declared_values_content_id:
+    if scan.has_nan:
+        observable_values_digest = _V1_OBSERVABLE_DIGEST_UNAVAILABLE
+    else:
+        observable_values_digest = TrajectoryObservableValuesDigest(
+            available=True, content_id=scan.values_content_id
+        )
+    if observable_values_digest.available and scan.values_content_id != declared_values_content_id:
         raise TamperedTrajectoryRecordError(
             "trajectory record observable_values_content_id disagrees with its CSV"
         )
@@ -845,6 +877,7 @@ def _inspect_v1(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
         csv_sha256=declared_sha256,
         atomic_configuration_id=str(declared_atomic_configuration_id),
         physical_context=_V1_PHYSICAL_CONTEXT_UNAVAILABLE,
+        observable_values_digest=observable_values_digest,
     )
 
 
@@ -977,6 +1010,7 @@ class _V1CsvScan(NamedTuple):
     mean: float
     variance: float
     values_content_id: str
+    has_nan: bool
 
 
 def _scan_v1_csv(
@@ -1031,6 +1065,7 @@ def _scan_v1_csv(
     draw_sums: dict[int, float] = {}
     draw_square_sums: dict[int, float] = {}
     draw_values: dict[int, dict[int, float]] = {draw: {} for draw in range(draw_count)}
+    has_nan = False
 
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, restkey=extra_sentinel, restval=None)
@@ -1043,7 +1078,12 @@ def _scan_v1_csv(
                 draw = int(row["draw_index"])
                 walker = int(row["walker_index"])
                 sample_index = int(row["sample_index"])
-                energy = _parse_v1_csv_energy(row["local_energy"])
+                numeric_values = {
+                    key: _parse_v1_csv_numeric(row[key])
+                    for key in expected_fieldnames
+                    if key not in {"sample_index", "draw_index", "walker_index", "finite"}
+                }
+                energy = numeric_values["local_energy"]
             except (KeyError, TypeError, ValueError) as exc:
                 raise TamperedTrajectoryRecordError(f"malformed trajectory record row: {row!r}") from exc
             if row["finite"] not in ("True", "False"):
@@ -1079,6 +1119,7 @@ def _scan_v1_csv(
             if declared_finite:
                 finite_count += 1
             draw_values[draw][walker] = energy
+            has_nan = has_nan or math.isnan(energy)
             row_count += 1
 
     expected_rows = draw_count * walker_count
@@ -1111,6 +1152,7 @@ def _scan_v1_csv(
         mean=mean,
         variance=variance,
         values_content_id=values_digest.hexdigest(),
+        has_nan=has_nan,
     )
 
 
@@ -1128,8 +1170,8 @@ def _as_float(value: object) -> float:
     raise TamperedTrajectoryRecordError(f"trajectory record numeric field has unexpected type {type(value).__name__}")
 
 
-def _parse_v1_csv_energy(text: str) -> float:
-    """Parse one v1 CSV ``local_energy``/term cell, written by `_float_or_text`.
+def _parse_v1_csv_numeric(text: str) -> float:
+    """Parse one v1 CSV numeric cell under the original float/sentinel rules.
 
     Unlike `_as_float` (which only ever sees JSON-typed metadata scalars:
     a finite ``int``/``float`` or one of the three non-finite sentinel
@@ -1267,6 +1309,7 @@ __all__ = [
     "TRAJECTORY_RECORD_SCHEMA",
     "TamperedTrajectoryRecordError",
     "TrajectoryPhysicalContext",
+    "TrajectoryObservableValuesDigest",
     "TrajectoryRecordArtifact",
     "TrajectoryRecordBatch",
     "TrajectoryRecordInspection",
