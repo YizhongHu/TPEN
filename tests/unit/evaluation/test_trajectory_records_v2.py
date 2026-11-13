@@ -186,6 +186,8 @@ def test_inspect_decodes_v2_and_reports_available_physical_context(tmp_path: Pat
     assert inspection.atomic_configuration_id is None
     assert inspection.physical_context.available is True
     assert inspection.physical_context.system_id == system.system_id()
+    assert inspection.observable_values_digest.available is True
+    assert inspection.observable_values_digest.content_id == artifact.observable_values_content_id
 
 
 @pytest.mark.parametrize("key", ["system_descriptor", "system_descriptor_id"])
@@ -312,6 +314,9 @@ def test_v2_reader_propagates_mixed_nonfinite_rows_from_real_writer(tmp_path: Pa
     inspection = inspect_trajectory_record(artifact.metadata_path)
     assert math.isnan(inspection.mean)
     assert math.isnan(inspection.variance)
+    assert inspection.observable_values_digest.available is False
+    assert inspection.observable_values_digest.content_id is None
+    assert inspection.observable_values_digest.reason is not None
 
 
 class _GaussianModel(torch.nn.Module):
@@ -380,6 +385,8 @@ def test_hooke_one_electron_records_v2_with_no_nuclear_resource(tmp_path: Path) 
     inspection = inspect_trajectory_record(records.metadata_path)
     assert inspection.record_schema == TRAJECTORY_RECORD_SCHEMA_V2
     assert inspection.physical_context.system_id == system.system_id()
+    assert inspection.observable_values_digest.available is True
+    assert inspection.observable_values_digest.content_id == records.observable_values_content_id
 
     calculated = LocalEnergyCalculator(hamiltonian_terms=_TERMS, return_terms=True).calculate(
         model=_GaussianModel(),

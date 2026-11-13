@@ -1330,9 +1330,10 @@ def _inspect_v2(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
     draw_count = int(metadata["draw_count"])
     walker_count = int(metadata["walker_count"])
     row_count = int(metadata["row_count"])
-    grid_row_count, recomputed_mean, recomputed_variance = _scan_complete_grid(
+    scan = _scan_complete_grid(
         csv_path, draw_count=draw_count, walker_count=walker_count
     )
+    grid_row_count = scan.row_count
     if grid_row_count != row_count:
         raise TamperedTrajectoryRecordError(
             f"trajectory record row_count disagrees with its CSV grid: "
@@ -1340,8 +1341,8 @@ def _inspect_v2(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
         )
     declared_mean = _as_float(metadata["mean"])
     declared_variance = _as_float(metadata["variance"])
-    if not _close_or_same_nonfinite(recomputed_mean, declared_mean) or not _close_or_same_nonfinite(
-        recomputed_variance, declared_variance
+    if not _close_or_same_nonfinite(scan.mean, declared_mean) or not _close_or_same_nonfinite(
+        scan.variance, declared_variance
     ):
         raise TamperedTrajectoryRecordError(
             "trajectory record mean/variance disagrees with its CSV: "
@@ -1385,6 +1386,20 @@ def _inspect_v2(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
             "declared by system_descriptor"
         )
 
+    if scan.has_nan:
+        observable_values_digest = _V1_OBSERVABLE_DIGEST_UNAVAILABLE
+    else:
+        observable_values_digest = TrajectoryObservableValuesDigest(
+            available=True, content_id=scan.values_content_id
+        )
+    if (
+        observable_values_digest.available
+        and scan.values_content_id != metadata["observable_values_content_id"]
+    ):
+        raise TamperedTrajectoryRecordError(
+            "trajectory record observable_values_content_id disagrees with its CSV"
+        )
+
     return TrajectoryRecordInspection(
         record_schema=TRAJECTORY_RECORD_SCHEMA_V2,
         path=csv_path,
@@ -1398,11 +1413,22 @@ def _inspect_v2(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
         csv_sha256=declared_sha256,
         atomic_configuration_id=None,
         physical_context=TrajectoryPhysicalContext(available=True, system_id=declared_system_id),
+        observable_values_digest=observable_values_digest,
     )
 
 
-def _scan_complete_grid(path: Path, *, draw_count: int, walker_count: int) -> tuple[int, float, float]:
-    """Scan a v1 CSV for a complete, non-duplicated draw/walker grid.
+class _V2CsvScan(NamedTuple):
+    """Values independently recomputed from a v2 CSV's complete grid."""
+
+    row_count: int
+    mean: float
+    variance: float
+    values_content_id: str
+    has_nan: bool
+
+
+def _scan_complete_grid(path: Path, *, draw_count: int, walker_count: int) -> _V2CsvScan:
+    """Scan a v2 CSV for a complete, non-duplicated draw/walker grid.
 
     Returns the row count plus the local-energy mean/variance recomputed
     directly from the CSV, so a caller can cross-check them against the
@@ -1412,7 +1438,8 @@ def _scan_complete_grid(path: Path, *, draw_count: int, walker_count: int) -> tu
     if draw_count < 1 or walker_count < 1:
         raise TamperedTrajectoryRecordError("trajectory record draw_count/walker_count must be positive")
     seen: set[tuple[int, int]] = set()
-    energies: list[float] = []
+    draw_values: dict[int, dict[int, float]] = {draw: {} for draw in range(draw_count)}
+    has_nan = False
     row_count = 0
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -1434,7 +1461,8 @@ def _scan_complete_grid(path: Path, *, draw_count: int, walker_count: int) -> tu
             # Match the writer's reconciliation sum semantics: every row
             # contributes, finite or not, so a non-finite row propagates
             # nan/inf into mean/variance rather than being dropped.
-            energies.append(energy)
+            draw_values[draw][walker] = energy
+            has_nan = has_nan or math.isnan(energy)
             row_count += 1
     expected_rows = draw_count * walker_count
     if row_count != expected_rows:
@@ -1463,7 +1491,21 @@ def _scan_complete_grid(path: Path, *, draw_count: int, walker_count: int) -> tu
     variance = total_square / row_count - mean * mean
     if math.isfinite(variance) and variance < 0.0:
         variance = 0.0
-    return row_count, mean, variance
+    values_digest = hashlib.sha256()
+    values_digest.update(str((draw_count, walker_count)).encode("utf-8"))
+    for draw in range(draw_count):
+        ordered = torch.tensor(
+            [draw_values[draw][walker] for walker in range(walker_count)], dtype=torch.float64
+        )
+        values_digest.update(ordered.contiguous().numpy().astype("<f8", copy=False).tobytes())
+
+    return _V2CsvScan(
+        row_count=row_count,
+        mean=mean,
+        variance=variance,
+        values_content_id=values_digest.hexdigest(),
+        has_nan=has_nan,
+    )
 
 
 class _V1ScalarMetadata(NamedTuple):
