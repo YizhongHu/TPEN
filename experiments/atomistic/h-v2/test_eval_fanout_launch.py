@@ -94,6 +94,8 @@ def test_packed_eval_scales_host_resources_and_passes_pack_k(tmp_path: Path) -> 
         commit=SHA,
         resources=launch_config.RESOURCES,
         pack_k=3,
+        eval_count=101,
+        measured_batch_time="00:15:00",
     )
     assert "--cpus-per-task=12" in command
     assert "--mem=96G" in command
@@ -117,6 +119,23 @@ def test_packed_eval_rejects_out_of_range_pack_k(tmp_path: Path) -> None:
             resources=launch_config.RESOURCES,
             pack_k=7,
         )
+
+
+def test_packed_eval_submitted_time_scales_with_the_101_generation_roster(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_root = tmp_path / "runs" / "h-v2" / "capacity-pilot-100k" / "P"
+    code = launch.main(
+        [
+            "--run-root", str(run_root), "--run-root-prefix", str(tmp_path / "runs"),
+            "--commit", SHA, "--payload", "capacity-pilot-100k", "--stage", "eval", "--pilot-stage", "1",
+            "--expected-train-commit", TRAIN_SHA, "--pack-k", "6", "--eval-count", "101",
+            "--measured-batch-time", "00:15:00", "--science-python", sys.executable,
+            "--executor-python", sys.executable, "--dry-run",
+        ]
+    )
+    assert code == 0
+    assert "--time=04:30:00" in capsys.readouterr().out
 
 
 def test_science_stage_train_dry_run_is_exactly_three_lines_no_eval(
@@ -240,6 +259,8 @@ def test_submit_lineage_forwards_pack_k_on_the_submitted_eval_line(tmp_path: Pat
         e_wall="24:00:00",
         commit=SHA,
         pack_k=3,
+        eval_count=101,
+        measured_batch_time="00:15:00",
         runner=_runner(calls, ["train-1", "eval-1"]),
     )
 
@@ -263,6 +284,8 @@ def test_submit_all_forwards_pack_k_on_each_submitted_eval_line(tmp_path: Path) 
         commit=SHA,
         lineages=("L1",),
         pack_k=4,
+        eval_count=101,
+        measured_batch_time="00:15:00",
         runner=_runner(calls, ["train-1", "eval-1"]),
     )
 

@@ -59,6 +59,7 @@ import argparse
 import base64
 import importlib.util
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -617,6 +618,8 @@ def build_eval_fanout_sbatch_command(
     commit: str,
     resources: launch_config.JobResources,
     pack_k: int = 1,
+    eval_count: int | None = None,
+    measured_batch_time: str | None = None,
 ) -> list[str]:
     """Return the exact ``sbatch`` argv for one EVAL fan-out job (item E).
 
@@ -662,8 +665,12 @@ def build_eval_fanout_sbatch_command(
     except ValueError as error:
         raise LaunchError(str(error)) from error
     _validate_single_stage_wall_seconds(time_value, label="--time")
-    if pack_k > 1 and _parse_wall_seconds(time_value) < _parse_wall_seconds(derive_packed_eval_time(pack_k)):
-        raise LaunchError(f"--time={time_value} is shorter than packed formula {derive_packed_eval_time(pack_k)}")
+    if pack_k > 1:
+        if eval_count is None or measured_batch_time is None:
+            raise LaunchError("eval_count and measured_batch_time are required when --pack-k is greater than 1")
+        derived_time = derive_packed_eval_time(pack_k, n=eval_count, measured_batch_time=measured_batch_time)
+        if _parse_wall_seconds(time_value) < _parse_wall_seconds(derived_time):
+            raise LaunchError(f"--time={time_value} is shorter than packed formula {derived_time}")
     if payload in PILOT_PAYLOADS:
         job_lineage = launch_config.PILOT_PAYLOAD_LINEAGES[payload]
     else:
@@ -873,23 +880,34 @@ PACKED_EVAL_MINUTES_PER_ARM = 15
 PACKED_EVAL_MARGIN_MINUTES = 15
 
 
-def derive_packed_eval_time(pack_k: int) -> str:
+def derive_packed_eval_time(pack_k: int, *, n: int, measured_batch_time: str) -> str:
     """Return the documented packed-EVAL wall-time formula.
 
-    The estimate is one 15-minute arm per concurrent stream plus a 15-minute
-    orchestration margin. It is deliberately conservative and independently
-    validated against the facility caps by callers.
+    ``measured_batch_time * ceil(n / pack_k) + margin``.  The batch duration
+    is an input from the GPU validation, never a hard-coded per-stream guess.
     """
 
     if not 1 <= pack_k <= 6:
         raise LaunchError(f"--pack-k must be between 1 and 6, got {pack_k}")
-    return _format_wall_seconds((PACKED_EVAL_MINUTES_PER_ARM * pack_k + PACKED_EVAL_MARGIN_MINUTES) * 60)
+    if n <= 0:
+        raise LaunchError(f"eval roster size must be positive, got {n}")
+    measured_seconds = _parse_wall_seconds(measured_batch_time)
+    batches = math.ceil(n / pack_k)
+    return _format_wall_seconds(measured_seconds * batches + PACKED_EVAL_MARGIN_MINUTES * 60)
 
 
-def resolve_packed_eval_time(time_value: str | None, *, pack_k: int) -> str:
-    """Derive a packed time when omitted, or refuse a shorter explicit value."""
+def resolve_packed_eval_time(
+    time_value: str | None, *, pack_k: int, n: int | None = None, measured_batch_time: str | None = None
+) -> str:
+    """Resolve packed time, preserving the original explicit ``k=1`` route."""
 
-    derived = derive_packed_eval_time(pack_k)
+    if pack_k == 1:
+        if time_value is None:
+            raise LaunchError("--time is required for single-stream EVAL")
+        return time_value
+    if n is None or measured_batch_time is None:
+        raise LaunchError("eval_count and measured_batch_time are required when --pack-k is greater than 1")
+    derived = derive_packed_eval_time(pack_k, n=n, measured_batch_time=measured_batch_time)
     if time_value is None:
         return derived
     if _parse_wall_seconds(time_value) < _parse_wall_seconds(derived):
@@ -909,6 +927,8 @@ def submit_lineage(
     runner: Runner = _default_runner,
     dry_run: bool = False,
     pack_k: int = 1,
+    eval_count: int | None = None,
+    measured_batch_time: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Submit one lineage's train job, then its eval job chained on it.
 
@@ -967,6 +987,8 @@ def submit_lineage(
                 commit=expected_commit,
                 resources=launch_config.RESOURCES,
                 pack_k=pack_k,
+                eval_count=eval_count,
+                measured_batch_time=measured_batch_time,
             )
         return build_sbatch_command(
             "eval",
@@ -1142,6 +1164,8 @@ def submit_all(
     runner: Runner = _default_runner,
     dry_run: bool = False,
     pack_k: int = 1,
+    eval_count: int | None = None,
+    measured_batch_time: str | None = None,
 ) -> dict[str, tuple[str | None, str | None]]:
     """Submit every lineage's two jobs in order; abort on the first failure.
 
@@ -1181,6 +1205,8 @@ def submit_all(
             runner=runner,
             dry_run=dry_run,
             pack_k=pack_k,
+            eval_count=eval_count,
+            measured_batch_time=measured_batch_time,
         )
     return results
 
@@ -1249,9 +1275,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--time",
         default=None,
         help=(
-            "Optional with packed --stage eval: omitted time is derived as 15 minutes per "
-            "stream plus a 15-minute margin; an explicit value must meet that formula."
+            "Required for single-stream --stage eval. For packed eval, the value must meet "
+            "measured-batch-time x ceil(eval-count / pack-k) plus the margin."
         ),
+    )
+    parser.add_argument(
+        "--eval-count",
+        type=int,
+        default=None,
+        help="Packed EVAL roster size n used in the wall-time formula.",
+    )
+    parser.add_argument(
+        "--measured-batch-time",
+        default=None,
+        help="Measured wall time for one packed batch, as a Slurm duration (for example 00:15:00).",
     )
     parser.add_argument(
         "--run-root-prefix",
@@ -1338,9 +1375,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         # sbatch call, never auto-chained after another stage.
         if not args.expected_train_commit:
             raise LaunchError("--expected-train-commit is required for --stage eval")
-        if not args.time:
-            raise LaunchError("--time is required for --stage eval")
-        eval_time = resolve_packed_eval_time(args.time, pack_k=args.pack_k)
+        if not args.time and args.pack_k == 1:
+            raise LaunchError("--time is required for --stage eval when --pack-k is 1")
+        eval_time = resolve_packed_eval_time(
+            args.time,
+            pack_k=args.pack_k,
+            n=args.eval_count,
+            measured_batch_time=args.measured_batch_time,
+        )
         # F5/D6 (review r2 delta): the pilot/part-(g) EVAL route must pass
         # the same run-root containment guard --stage train already
         # enforces, on EVERY submission path, before any sbatch call -- an
@@ -1378,6 +1420,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             commit=args.commit,
             resources=launch_config.PILOT_PAYLOAD_RESOURCES[args.payload],
             pack_k=args.pack_k,
+            eval_count=args.eval_count,
+            measured_batch_time=args.measured_batch_time,
         )
         if args.dry_run:
             print(shlex.join(eval_command))
@@ -1425,9 +1469,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise LaunchError(f"--pilot-stage is not supported for payload {args.payload!r}")
         if not args.expected_train_commit:
             raise LaunchError("--expected-train-commit is required for --stage eval")
-        if not args.time:
-            raise LaunchError("--time is required for --stage eval")
-        eval_time = resolve_packed_eval_time(args.time, pack_k=args.pack_k)
+        if not args.time and args.pack_k == 1:
+            raise LaunchError("--time is required for --stage eval when --pack-k is 1")
+        eval_time = resolve_packed_eval_time(
+            args.time,
+            pack_k=args.pack_k,
+            n=args.eval_count,
+            measured_batch_time=args.measured_batch_time,
+        )
         # F5/D6: same single-stage wall-budget and MANDATORY run-root
         # containment checks as --stage train, applied to the standalone
         # EVAL route.
@@ -1448,6 +1497,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 checkout_root=checkout_root, time_value=eval_time, dependency=None, commit=args.commit,
                 resources=launch_config.RESOURCES,
                 pack_k=args.pack_k,
+                eval_count=args.eval_count,
+                measured_batch_time=args.measured_batch_time,
             )
             if args.dry_run:
                 print(shlex.join(command))
@@ -1491,6 +1542,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         commit=args.commit,
         dry_run=args.dry_run,
         pack_k=args.pack_k,
+        eval_count=args.eval_count,
+        measured_batch_time=args.measured_batch_time,
     )
     for lineage, (train_id, eval_id) in results.items():
         print(f"[h-v2] {lineage}: train={train_id} eval={eval_id}")

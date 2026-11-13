@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import csv
 import os
 import subprocess
 import sys
@@ -129,19 +130,61 @@ def _fake_completed_run(config: dict) -> dict:
     }
 
 
-@pytest.mark.parametrize(
-    "packed,single,tolerance",
-    [
-        ({"energy": -0.5, "variance": 0.1}, {"energy": -0.5, "variance": 0.1}, {"energy_abs": 1.0, "variance_relative": 1.0}),
-        ({"seed": 7, "checkpoint": 1, "checkpoint_sha256": "ck", "lineage": "L1", "energy": float("nan"), "variance": 0.1}, {"seed": 7, "checkpoint": 1, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5, "variance": 0.1}, {"energy_abs": 1.0, "variance_relative": 1.0}),
-        ({"seed": 7, "checkpoint": 1, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5, "variance": 0.1}, {"seed": 7, "checkpoint": 1, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5, "variance": 0.1}, {"energy_abs": float("nan"), "variance_relative": 1.0}),
-    ],
-    ids=["missing-identity", "nan-metric", "nan-tolerance"],
-)
-def test_packed_comparator_refuses_nonfinite_or_missing_inputs(packed, single, tolerance):
-    """The comparator must not let NaN or two missing identity fields compare equal."""
+def _validation_pair() -> tuple[dict, dict, dict]:
+    record = {
+        "seed": 7,
+        "checkpoint": 1,
+        "checkpoint_sha256": "ck",
+        "lineage": "L1",
+        "energy": -0.5,
+        "variance": 0.1,
+    }
+    return dict(record), dict(record), {"energy_abs": 1.0, "variance_relative": 1.0, "variance_reference": 0.1}
 
+
+@pytest.mark.parametrize("side", ["packed", "single"])
+@pytest.mark.parametrize("field", ["seed", "checkpoint", "checkpoint_sha256", "lineage"])
+@pytest.mark.parametrize("representation", ["absent", "null"])
+def test_packed_comparator_refuses_each_absent_or_null_identity(side, field, representation):
+    packed, single, tolerance = _validation_pair()
+    target = packed if side == "packed" else single
+    if representation == "absent":
+        target.pop(field)
+    else:
+        target[field] = None
+    with pytest.raises(eval_job.EvalJobRefusal, match="packed-validation-identity"):
+        eval_job.compare_packed_single_stream(packed, single, tolerance=tolerance)
+
+
+@pytest.mark.parametrize(
+    "side,field,value",
+    [
+        (side, field, value)
+        for side in ("packed", "single")
+        for field in ("energy", "variance")
+        for value in (float("nan"), float("inf"), float("-inf"), -0.1)
+    ],
+)
+def test_packed_comparator_refuses_nonfinite_or_negative_metrics(side, field, value):
+    packed, single, tolerance = _validation_pair()
+    (packed if side == "packed" else single)[field] = value
     with pytest.raises(eval_job.EvalJobRefusal):
+        eval_job.compare_packed_single_stream(packed, single, tolerance=tolerance)
+
+
+@pytest.mark.parametrize("field,value", [("energy_abs", float("nan")), ("energy_abs", float("inf")), ("variance_relative", float("-inf")), ("variance_reference", float("nan"))])
+def test_packed_comparator_refuses_nonfinite_thresholds(field, value):
+    packed, single, tolerance = _validation_pair()
+    tolerance[field] = value
+    with pytest.raises(eval_job.EvalJobRefusal, match="packed-validation"):
+        eval_job.compare_packed_single_stream(packed, single, tolerance=tolerance)
+
+
+@pytest.mark.parametrize("field", ["checkpoint_sha256", "lineage"])
+def test_packed_comparator_refuses_single_identity_field_mismatch(field):
+    packed, single, tolerance = _validation_pair()
+    single[field] = "different"
+    with pytest.raises(eval_job.EvalJobRefusal, match="packed-validation-identity"):
         eval_job.compare_packed_single_stream(packed, single, tolerance=tolerance)
 
 
@@ -149,17 +192,68 @@ def test_packed_comparator_accepts_finite_identical_pair() -> None:
     eval_job.compare_packed_single_stream(
         {"seed": 7, "checkpoint": 1, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5, "variance": 0.1},
         {"seed": 7, "checkpoint": 1, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5, "variance": 0.1},
-        tolerance={"energy_abs": 0.0, "variance_relative": 0.0},
+        tolerance={"energy_abs": 0.0, "variance_relative": 0.0, "variance_reference": 0.1},
     )
 
 
 def test_packed_time_formula_is_derived_or_refused_when_short() -> None:
-    assert launch.derive_packed_eval_time(6) == "01:45:00"
-    assert launch.resolve_packed_eval_time(None, pack_k=6) == "01:45:00"
+    assert launch.derive_packed_eval_time(6, n=6, measured_batch_time="00:15:00") == "00:30:00"
+    assert launch.derive_packed_eval_time(6, n=7, measured_batch_time="00:15:00") == "00:45:00"
+    assert launch.derive_packed_eval_time(6, n=101, measured_batch_time="00:15:00") == "04:30:00"
+    assert launch.resolve_packed_eval_time(None, pack_k=6, n=101, measured_batch_time="00:15:00") == "04:30:00"
     with pytest.raises(launch.LaunchError, match="shorter"):
-        launch.resolve_packed_eval_time("01:44:59", pack_k=6)
+        launch.resolve_packed_eval_time("04:29:59", pack_k=6, n=101, measured_batch_time="00:15:00")
 
 
+def test_single_stream_time_does_not_apply_packed_minimum_on_both_routes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    prefix = tmp_path / "runs"
+    pilot_root = prefix / "h-v2" / "gpu-route-g" / "G"
+    common = [
+        "--run-root", str(pilot_root), "--run-root-prefix", str(prefix),
+        "--commit", "a" * 40, "--expected-train-commit", "b" * 40,
+        "--time", "00:10:00", "--science-python", sys.executable, "--executor-python", sys.executable, "--dry-run",
+    ]
+    assert launch.main(common + ["--payload", "gpu-route-g", "--stage", "eval"]) == 0
+    assert "--time=00:10:00" in capsys.readouterr().out
+    pilot_root = prefix / "h-v2" / "capacity-pilot" / "P"
+    common[common.index("--run-root") + 1] = str(pilot_root)
+    assert launch.main(common + ["--payload", "capacity-pilot", "--stage", "eval", "--pilot-stage", "1"]) == 0
+    assert "--time=00:10:00" in capsys.readouterr().out
+
+
+def test_readme_validation_recipe_walks_tiny_fixture(tmp_path: Path) -> None:
+    readme = (HERE / "README.md").read_text(encoding="utf-8")
+    for required in ("repeat-1", "repeat-2", "repeat-3", "local_energy", ".metadata.json", "--eval-count 101", "--measured-batch-time"):
+        assert required in readme
+
+    identity = {"seed": 83001, "checkpoint": 1000, "checkpoint_sha256": "ck-1000", "lineage": "P"}
+    repeats = []
+    for repeat, (energy, variance) in enumerate(((-0.500, 0.100), (-0.499, 0.101), (-0.500, 0.100)), 1):
+        root = tmp_path / "validation" / "ck001000" / "single" / f"repeat-{repeat}"
+        root.mkdir(parents=True)
+        csv_path = root / "sampled_eval_table.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=("local_energy",))
+            writer.writeheader()
+            writer.writerows(({"local_energy": energy - 0.001}, {"local_energy": energy + 0.001}))
+        (root / "sampled_eval_table.metadata.json").write_text(json.dumps({"variance": variance}), encoding="utf-8")
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            values = [float(row["local_energy"]) for row in csv.DictReader(handle)]
+        metadata = json.loads((root / "sampled_eval_table.metadata.json").read_text(encoding="utf-8"))
+        repeats.append({**identity, "energy": sum(values) / len(values), "variance": metadata["variance"]})
+
+    tolerance = eval_job.derive_packed_validation_tolerance(repeats)
+    eval_job.compare_packed_single_stream(
+        {**identity, "energy": -0.4999, "variance": 0.1005},
+        repeats[0],
+        tolerance=tolerance,
+    )
+    with pytest.raises(eval_job.EvalJobRefusal, match="packed-validation-identity"):
+        eval_job.compare_packed_single_stream(
+            {**identity, "checkpoint": 50000, "energy": -0.4999, "variance": 0.1005},
+            repeats[0],
+            tolerance=tolerance,
+        )
 def test_run_eval_fanout_pack_k2_publishes_overlapping_siblings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Enter the production k=2 branch and prove two worker calls overlap.
 
