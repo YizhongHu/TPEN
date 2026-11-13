@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,10 @@ def _fixture(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _plain_mapping_or_none(value: Mapping[str, object] | None) -> dict[str, object] | None:
+    return None if value is None else dict(value)
+
+
 @pytest.mark.parametrize("fixture_path", FIXTURE_PATHS, ids=lambda path: path.stem)
 def test_executor_decodes_each_core_owned_fixture_identically(fixture_path: Path) -> None:
     payload = _fixture(fixture_path)
@@ -29,9 +34,13 @@ def test_executor_decodes_each_core_owned_fixture_identically(fixture_path: Path
     assert evidence.run_dir == payload["run_dir"]
     assert evidence.verdict == payload["verdict"]
     assert evidence.run_status == payload["run_status"]
-    assert dict(evidence.checkpoint or {}) == payload["checkpoint"]
-    assert evidence.refusal == payload["refusal"]
-    assert dict(evidence.resolved_config_identity or {}) == payload["resolved_config_identity"]
+    assert (evidence.checkpoint is None) is (payload["checkpoint"] is None)
+    assert _plain_mapping_or_none(evidence.checkpoint) == payload["checkpoint"]
+    assert _plain_mapping_or_none(evidence.refusal) == payload["refusal"]
+    assert (evidence.resolved_config_identity is None) is (
+        payload["resolved_config_identity"] is None
+    )
+    assert _plain_mapping_or_none(evidence.resolved_config_identity) == payload["resolved_config_identity"]
 
 
 @pytest.mark.parametrize(
