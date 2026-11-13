@@ -28,6 +28,7 @@ from tpen.artifacts import (
     resolve_run_id,
     write_artifact_routing_receipt,
     write_error_artifact,
+    write_run_outcome_artifact,
     write_run_start_artifact,
 )
 from tpen.distributed import (
@@ -43,10 +44,28 @@ from tpen.events import Event as TypedEvent
 from tpen.hi_schema import validate_hi_train_config
 from tpen.run_events import RunCompleted, RunFailed, RunStarted
 from tpen.runner import Runner
+from tpen.callback.planned_yield import PlannedYield, PlannedYieldSignal
+from tpen.callback.checkpoint import CheckpointPublicationError
 
 # Register custom OmegaConf resolvers (e.g. tpen.basis_feature_dim) before any
 # config is loaded or resolved on the run path.
 register_resolvers()
+
+PLANNED_YIELD_EXIT_CODE = 2
+
+
+def _status_to_exit_code(status: str) -> int:
+    """Map a public run status to the documented process exit code.
+
+    ``completed`` is 0, ``planned_yield`` is 2, and every refusal, unknown,
+    or failure is 1.  The mapping is shared by returned and signalled results.
+    """
+
+    if status == "completed":
+        return 0
+    if status == "planned_yield":
+        return PLANNED_YIELD_EXIT_CODE
+    return 1
 
 # Bootstrap diagnostics get their own channel so a run's logging configuration can
 # silence or route fatal pre-context errors independently. Spelled once: the channel
@@ -405,8 +424,8 @@ def run_from_config(
     Returns
     -------
     int
-        ``0`` on success, ``1`` on a handled failure (when
-        ``raise_exceptions=False``). A runner that RETURNS
+        ``0`` on completed, ``2`` on planned yield, and ``1`` on a handled
+        refusal, unknown, or failure (when ``raise_exceptions=False``). A runner that RETURNS
         ``RunResult(status="failed")`` -- an evaluation suite whose tasks
         failed, which raises nothing -- is a handled failure too and also
         returns ``1``. It used to return ``0``, so a failed evaluation exited
@@ -418,6 +437,7 @@ def run_from_config(
     bootstrap = _BootstrapState()
     context: RunContext | None = None
     runner: Runner | None = None
+    evidence_result: RunResult | None = None
     try:
         # PRECONSTRUCTION FIREWALL. This is the first statement in the try on
         # purpose: `prepare_run_context` below already creates the run
@@ -476,7 +496,11 @@ def run_from_config(
         runner = _instantiate_runner(context)
         if restore_request is not None:
             runner = _apply_operational_restore(context.cfg, runner, restore_request)
+        for callback in context.callbacks:
+            if isinstance(callback, PlannedYield):
+                callback.validate_target(runner)
         result = runner.run(context)
+        evidence_result = result if isinstance(result, RunResult) else None
         # The harness owns the whole run lifecycle, including this boundary,
         # which the runners emitted the ``run_end`` string for. See
         # `tpen.run_events` for why one emitter rather than three.
@@ -487,63 +511,143 @@ def run_from_config(
         # itself while handling this event and would otherwise overwrite a
         # failed suite's status with the boundary's own name.
         status = result.status if isinstance(result, RunResult) else "completed"
-        context.emit(RunCompleted(status=status))
+        if isinstance(result, RunResult):
+            write_run_outcome_artifact(context, result)
+        context.emit(RunCompleted(status=status, result=result if isinstance(result, RunResult) else None))
         if isinstance(result, RunResult):
             context.metadata.status = result.status
         # A failed suite raises nothing -- the runner returned -- but the process
         # must not claim success. Same exit code as the raising path: no caller
         # distinguishes between nonzero codes, and inventing a second one would
         # be a new contract for no consumer.
-        return 1 if status == "failed" else 0
-    except Exception as exc:
-        phase = _failure_phase(exc, context=context, runner=runner)
-        traceback_text = traceback.format_exc()
-        payload = {
-            "exception": exc,
-            "exception_type": type(exc).__name__,
-            "exception_message": str(exc),
-            "phase": phase,
-            "traceback": traceback_text,
-        }
+        return _status_to_exit_code(status)
+    except PlannedYieldSignal as signal:
+        result = signal.result
         if context is not None:
-            context.metadata.status = "failed"
-            _write_error_if_possible(context, exc, phase=phase, traceback_text=traceback_text)
-            # ONE typed event for the two legacy strings below, which carry the
-            # same payload and are distinguished by no consumer -- see `RunFailed`.
-            # Guarded exactly as they are: this runs while the context may be
-            # half-constructed, and an emit that raised here would mask the
-            # original exception.
-            _emit_typed_event_if_possible(
-                context,
-                RunFailed(
-                    exception_type=str(payload["exception_type"]),
-                    exception_message=str(payload["exception_message"]),
-                ),
-            )
-        elif bootstrap.run_dir is not None:
-            _write_error_if_possible(
-                bootstrap.run_dir,
-                exc,
-                phase=phase,
-                traceback_text=traceback_text,
-                command=command,
-                config_path=config_path,
-            )
-        _print_fatal(
+            try:
+                context.metadata.status = result.status
+                write_run_outcome_artifact(context, result)
+                context.emit(RunCompleted(status=result.status, result=result))
+            except Exception as exc:
+                return _handle_run_failure(
+                    exc,
+                    context=context,
+                    runner=runner,
+                    bootstrap=bootstrap,
+                    raise_exceptions=raise_exceptions,
+                    evidence=result,
+                    command=command,
+                    config_path=config_path,
+                )
+        return _status_to_exit_code(result.status)
+    except CheckpointPublicationError as exc:
+        result = RunResult(
+            status="unknown", error=str(exc.original),
+            next_iteration=exc.next_iteration, completed_updates=exc.completed_updates,
+            target_iterations=exc.target_iterations,
+            exception_type=type(exc.original).__name__, publication_stage=exc.stage,
+        )
+        if context is not None:
+            try:
+                context.metadata.status = result.status
+                write_run_outcome_artifact(context, result)
+                context.emit(RunCompleted(status=result.status, result=result))
+            except Exception as finalization_error:
+                return _handle_run_failure(
+                    finalization_error,
+                    context=context,
+                    runner=runner,
+                    bootstrap=bootstrap,
+                    raise_exceptions=raise_exceptions,
+                    evidence=result,
+                    command=command,
+                    config_path=config_path,
+                )
+        return _status_to_exit_code(result.status)
+    except Exception as exc:
+        return _handle_run_failure(
             exc,
-            phase=phase,
-            traceback_text=traceback_text,
-            run_dir=context.run_dir if context is not None else bootstrap.run_dir,
+            context=context,
+            runner=runner,
+            bootstrap=bootstrap,
+            raise_exceptions=raise_exceptions,
+            evidence=evidence_result,
             command=command,
             config_path=config_path,
         )
-        if raise_exceptions:
-            raise
-        return 1
     finally:
         if context is not None:
             for logger in context.loggers:
                 logger.finish()
+
+
+def _handle_run_failure(
+    exc: Exception,
+    *,
+    context: RunContext | None,
+    runner: Runner | None,
+    bootstrap: _BootstrapState,
+    raise_exceptions: bool,
+    evidence: RunResult | None = None,
+    command: str | None = None,
+    config_path: str | None = None,
+) -> int:
+    """Apply the one guarded failure finalization path for every new handler."""
+
+    phase = _failure_phase(exc, context=context, runner=runner)
+    traceback_text = traceback.format_exc()
+    exception_type = type(exc).__name__
+    exception_message = str(exc)
+    if context is not None:
+        context.metadata.status = "failed"
+        failed = RunResult(
+            status="failed",
+            error=exception_message,
+            checkpoint_ref=None if evidence is None else evidence.checkpoint_ref,
+            next_iteration=None if evidence is None else evidence.next_iteration,
+            completed_updates=None if evidence is None else evidence.completed_updates,
+            target_iterations=None if evidence is None else evidence.target_iterations,
+            exception_type=exception_type,
+            publication_stage=(None if evidence is None else evidence.publication_stage),
+        )
+        try:
+            write_run_outcome_artifact(context, failed)
+        except Exception as outcome_exc:  # pragma: no cover - injected I/O failure
+            logging.getLogger(_BOOTSTRAP_LOGGER_NAME).error(
+                "FATAL: failed to write failed run outcome: %s: %s",
+                type(outcome_exc).__name__, outcome_exc,
+            )
+        _write_error_if_possible(
+            context,
+            exc,
+            phase=phase,
+            traceback_text=traceback_text,
+            command=command,
+            config_path=config_path,
+        )
+        _emit_typed_event_if_possible(
+            context, RunFailed(exception_type=exception_type, exception_message=exception_message)
+        )
+    elif bootstrap.run_dir is not None:
+        _write_error_if_possible(
+            bootstrap.run_dir,
+            exc,
+            phase=phase,
+            traceback_text=traceback_text,
+            command=command,
+            config_path=config_path,
+        )
+    _print_fatal(
+        exc,
+        phase=phase,
+        traceback_text=traceback_text,
+        run_dir=context.run_dir if context is not None else bootstrap.run_dir,
+        command=command,
+        config_path=config_path,
+    )
+    if raise_exceptions:
+        raise exc
+    return 1
 
 
 def _validate_callbacks(callbacks: list[object]) -> None:
@@ -631,6 +735,7 @@ _SINK_FREE_TYPES: frozenset[str] = frozenset(
         "tpen.callback.timing.run_timing.RunTiming",
         "tpen.callback.timing.train_phase_timing.TrainPhaseTiming",
         "tpen.callback.timing.train_step_timing.TrainStepTiming",
+        "tpen.callback.planned_yield.PlannedYield",
     }
 )
 

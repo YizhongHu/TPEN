@@ -178,6 +178,23 @@ class Train(Runner):
             context=context,
             emit=lambda **_: None,
         )
+        # A planned-yield request is a completion/integrity contract, not an
+        # instruction to bless an arbitrary early return. If the requested
+        # boundary was never observed, leave the run unclassified and do not
+        # emit TrainingCompleted (which would publish a scientific terminal
+        # checkpoint for an exit-0 prefix).
+        planned_requests = [
+            callback for callback in context.callbacks
+            if hasattr(callback, "target_iteration") and hasattr(callback, "observed")
+        ]
+        if planned_requests and not all(request.observed for request in planned_requests):
+            return RunResult(
+                status="unknown",
+                error="planned yield boundary was not observed before trainer return",
+                next_iteration=int(getattr(self.trainer, "next_iteration")),
+                completed_updates=int(getattr(self.trainer, "completed_updates")),
+                target_iterations=int(planned_requests[0].target_iterations),
+            )
         # train_end carries the trained model and the durable resume cursor so
         # lifecycle callbacks can label terminal artifacts consistently. The
         # cursor is a hard requirement on the trainer: guessing it from
