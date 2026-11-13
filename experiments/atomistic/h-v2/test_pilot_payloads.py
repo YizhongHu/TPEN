@@ -184,7 +184,7 @@ def test_amplitude_risk_candidate_copies_frozen_entry_and_measured_cadence() -> 
     assert entry == {
         "_target_": "tpen.callback.AmplitudeRiskFraction",
         "thresholds": [-3, -4, -5, -7, -10],
-        "every_n_steps": 1000,
+        "every_n_steps": 100,
     }
 
 

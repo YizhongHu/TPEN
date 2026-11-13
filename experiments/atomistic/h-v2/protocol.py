@@ -95,9 +95,10 @@ PILOT_PAYLOAD_OVERLAY_KEYS = frozenset(
 PILOT_A1_CADENCE = 1
 
 #: Measured science-scale AmplitudeRiskFraction cadence.  The acceptance
-#: contract selects every 1000 updates because the required gpu_test
-#: measurement exceeded the 5% overhead threshold.
-AMPLITUDE_RISK_CADENCE = 1000
+#: contract selects every 100 updates: the measured overhead extrapolates to
+#: about 0.8% at this cadence, while a 1000-update cadence can miss short
+#: variance spikes and align with checkpoint boundaries.
+AMPLITUDE_RISK_CADENCE = 100
 
 HEALTH_CALLBACK_CADENCE = 1
 TRAINING_BATCH_RECORDER_CADENCE = 50
@@ -1128,7 +1129,7 @@ def _assert_a1_callbacks(
                 raise ValueError(f"H-v2 {target.rsplit('.', 1)[-1]} cadence must be every update")
         if target == "tpen.callback.AmplitudeRiskFraction":
             if entry.get("every_n_steps") != AMPLITUDE_RISK_CADENCE:
-                raise ValueError("H-v2 AmplitudeRiskFraction cadence must be every 1000 updates")
+                raise ValueError("H-v2 AmplitudeRiskFraction cadence must be every 100 updates")
         if target == "tpen.callback.ElectronNucleusDistanceQuantiles":
             if entry.get("every_n_steps") != PILOT_A1_CADENCE:
                 raise ValueError("H-v2 ENDQ cadence must be every update")
