@@ -37,10 +37,18 @@ def test_executor_decodes_each_core_owned_fixture_identically(fixture_path: Path
     assert (evidence.checkpoint is None) is (payload["checkpoint"] is None)
     assert _plain_mapping_or_none(evidence.checkpoint) == payload["checkpoint"]
     assert _plain_mapping_or_none(evidence.refusal) == payload["refusal"]
-    assert (evidence.resolved_config_identity is None) is (
-        payload["resolved_config_identity"] is None
-    )
-    assert _plain_mapping_or_none(evidence.resolved_config_identity) == payload["resolved_config_identity"]
+    if payload["schema"] == "tpen.run-evidence/v2":
+        assert "resolved_config_identity" in payload
+        assert (evidence.resolved_config_identity is None) is (
+            payload["resolved_config_identity"] is None
+        )
+        assert _plain_mapping_or_none(evidence.resolved_config_identity) == payload[
+            "resolved_config_identity"
+        ]
+    else:
+        assert payload["schema"] == "tpen.run-evidence/v1"
+        assert "resolved_config_identity" not in payload
+        assert evidence.resolved_config_identity is None
 
 
 @pytest.mark.parametrize(
