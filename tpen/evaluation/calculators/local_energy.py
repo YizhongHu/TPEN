@@ -23,6 +23,7 @@ from tpen.physics.hamiltonian import (
     evaluate_local_energy_in_chunks,
     normalize_hamiltonian_terms,
 )
+from tpen.physics.system import build_system_descriptor
 
 _DEFAULT_EVALUATOR = NaiveLocalEnergyEvaluator()
 
@@ -81,8 +82,13 @@ class LocalEnergyCalculator:
                         f"evaluator; {type(self.evaluator).__name__} does not implement "
                         "DeclaresExecutionReceipt"
                     )
+                requested_system = build_system_descriptor(
+                    records.system_descriptor.particle,
+                    self.hamiltonian_terms,
+                    units=records.system_descriptor.units,
+                )
                 requested_receipt = self.evaluator.describe_execution_receipt(
-                    self.hamiltonian_terms, records.system_descriptor.system_id()
+                    self.hamiltonian_terms, requested_system.system_id()
                 )
                 if requested_receipt != records.execution_receipt:
                     raise ValueError(

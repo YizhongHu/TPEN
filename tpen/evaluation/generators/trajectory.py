@@ -49,6 +49,7 @@ from tpen.physics.hamiltonian import (
     normalize_hamiltonian_terms,
 )
 from tpen.physics.system import SystemDescriptor
+from tpen.physics.receipt import ExecutionReceipt
 from tpen.sampling.trajectory import collect_observable_trajectory_with_diagnostics
 
 TRAJECTORY_METADATA_KEY = "observable_trajectory"
@@ -184,12 +185,26 @@ class TrajectoryMCMCGenerator:
         evaluation_index = 0
         final_walkers: Walkers | None = None
         record_stream: TrajectoryRecordStreamWriter | None = None
+        first_receipt: ExecutionReceipt | None = None
 
         def observable(walkers: Walkers) -> torch.Tensor:
-            nonlocal evaluation_index, final_walkers, record_stream
+            nonlocal evaluation_index, final_walkers, record_stream, first_receipt
             retained_draw = evaluation_index - self.discard_draws
             evaluation_index += 1
             result = self._local_energy_per_walker(model=model, walkers=walkers)
+            if self.system is not None:
+                if result.receipt is None:
+                    raise ValueError("trajectory_records/v2 requires an execution receipt")
+                if first_receipt is None:
+                    first_receipt = result.receipt
+                elif (
+                    result.receipt.system_id != first_receipt.system_id
+                    or result.receipt.method_id() != first_receipt.method_id()
+                ):
+                    raise ValueError(
+                        "trajectory record execution receipt changed between draws: "
+                        "system_id and method_id must agree with the first draw"
+                    )
             if retained_draw >= 0:
                 final_walkers = walkers.clone().detach()
                 if context.artifact_level == "records":
@@ -217,7 +232,7 @@ class TrajectoryMCMCGenerator:
                                 observable=self.observable_name,
                                 n_draws=self.n_draws,
                                 n_walkers=walkers.batch_size,
-                                term_names=tuple(self.hamiltonian_terms),
+                                term_names=tuple(record.term_energies),
                                 atomic_configuration=atoms,
                                 first_draw=record,
                             )
@@ -232,7 +247,7 @@ class TrajectoryMCMCGenerator:
                                 observable=self.observable_name,
                                 n_draws=self.n_draws,
                                 n_walkers=walkers.batch_size,
-                                term_names=tuple(self.hamiltonian_terms),
+                                term_names=tuple(record.term_energies),
                                 system_descriptor=self.system,
                                 execution_receipt=result.receipt,
                                 first_draw=record,
@@ -313,10 +328,21 @@ class TrajectoryMCMCGenerator:
                 "trajectory local-energy evaluation did not expose the wavefunction output "
                 "used by its kinetic term; a fallback model pass is forbidden"
             )
-        if tuple(result.terms) != tuple(self.hamiltonian_terms):
-            raise ValueError("trajectory local-energy result omitted or reordered configured terms")
+        contribution_names = (
+            tuple(
+                dict.fromkeys(
+                    name for names in result.receipt.manifest.values() for name in names
+                )
+            )
+            if result.receipt is not None
+            else tuple(self.hamiltonian_terms)
+        )
+        if set(result.terms) != set(contribution_names) or len(result.terms) != len(contribution_names):
+            raise ValueError(
+                "trajectory local-energy result contributions disagree with its execution receipt"
+            )
         reconstructed: torch.Tensor | None = None
-        for name in self.hamiltonian_terms:
+        for name in contribution_names:
             value = result.terms[name]
             reconstructed = value if reconstructed is None else reconstructed + value
         if reconstructed is None or not torch.equal(reconstructed, result.total):
