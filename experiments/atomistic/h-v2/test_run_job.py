@@ -220,6 +220,19 @@ def test_science_pipeline_check_train_dispatch_reaches_real_store_reservation(
 
     monkeypatch.setattr(run_job, "check_identity", lambda *a, **kw: None)
 
+    real_build_h_v2_train_plan = attached.build_h_v2_train_plan
+
+    def _stub_build_h_v2_train_plan(**kwargs):
+        # Keep this store-reservation probe small and deterministic. The
+        # default pipeline config is a 256-walker, 1000-step training run,
+        # which can exceed the real executor's 180-second child timeout on
+        # Cannon even though this test does not measure training throughput.
+        kwargs["n_walkers"] = 4
+        kwargs["max_steps"] = 2
+        return real_build_h_v2_train_plan(**kwargs)
+
+    monkeypatch.setattr(attached, "build_h_v2_train_plan", _stub_build_h_v2_train_plan)
+
     real_run_executor_cli = attached.run_executor_cli
     captured: dict[str, object] = {}
 
