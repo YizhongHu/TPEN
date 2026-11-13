@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
+import json
 from datetime import UTC
 from functools import partial
 from pathlib import Path
@@ -15,10 +17,15 @@ from omegaconf import OmegaConf
 from tpen.artifacts import ArtifactManager, RunClock, RunContext, RunMetadata
 from tpen.callback.checkpoint import Checkpoint
 from tpen.callback.planned_yield import PlannedYield, PlannedYieldSignal
-from tpen.checkpoint import TrainResume, read_latest, read_publications
+from tpen.checkpoint import EveryNUpdates, TrainResume, read_latest, read_publications
+from tpen.checkpoint.catalog import CheckpointCatalog
+from tpen.run import PLANNED_YIELD_EXIT_CODE, run_from_config
+from tpen.runner import Train as RealTrain
 from tpen.training.events import TrainingIteration, TrainingIterationCompleted, UpdateCompleted
 from tpen.training.state import TrainerState
 from tpen.runner.train import Train
+
+checkpoint_save = importlib.import_module("tpen.checkpoint.save")
 
 
 class _Trainer:
@@ -182,3 +189,123 @@ def test_s4_stale_publication_is_unknown_at_a_later_boundary(tmp_path: Path) -> 
     with pytest.raises(PlannedYieldSignal) as caught:
         context.emit(TrainingIterationCompleted(TrainingIteration(2)), state=state)
     assert caught.value.result.status == "unknown"
+
+
+def _run_config(tmp_path: Path) -> object:
+    cfg = OmegaConf.load("tests/integration/artifacts/training/vmc_smoke.yaml")
+    cfg.run.root = str(tmp_path)
+    cfg.run.run_id = "run"
+    cfg.trainer.max_steps = 3
+    cfg.sampler.n_walkers = 8
+    cfg.sampler.burn_in = 1
+    cfg.sampler.n_steps = 1
+    for callback in cfg.callbacks:
+        if callback.get("_target_") == "tpen.callback.Checkpoint":
+            callback.schedule.every_n = 1
+    return cfg
+
+
+def test_s4_t1_stale_ref_after_cadence_miss_is_unknown(tmp_path: Path) -> None:
+    checkpoint = Checkpoint(tmp_path / "checkpoints", payload=TrainResume(), terminal=False,
+                            schedule=EveryNUpdates(every_n=2))
+    planned = PlannedYield(2, 7, checkpoint=checkpoint)
+    context = _context(tmp_path, [checkpoint, planned])
+    state = _state(root=tmp_path, next_iteration=2, completed_updates=1, max_steps=7)
+    context.emit(UpdateCompleted(TrainingIteration(1)), state=state)
+    with pytest.raises(PlannedYieldSignal) as caught:
+        context.emit(TrainingIterationCompleted(TrainingIteration(1)), state=state)
+    assert caught.value.result.status == "unknown"
+
+
+def test_s4_t1_stale_ref_after_skipped_update_is_unknown(tmp_path: Path) -> None:
+    checkpoint = Checkpoint(tmp_path / "checkpoints", payload=TrainResume(), terminal=False)
+    context = _context(tmp_path, [checkpoint])
+    first = _state(root=tmp_path, next_iteration=1, completed_updates=1, max_steps=7)
+    context.emit(UpdateCompleted(TrainingIteration(0)), state=first)
+    context.emit(TrainingIterationCompleted(TrainingIteration(0)), state=first)
+    planned = PlannedYield(2, 7, checkpoint=checkpoint)
+    context.callbacks.append(planned)
+    skipped = _state(root=tmp_path, next_iteration=2, completed_updates=1, max_steps=7)
+    with pytest.raises(PlannedYieldSignal) as caught:
+        context.emit(TrainingIterationCompleted(TrainingIteration(1)), state=skipped)
+    assert caught.value.result.status == "unknown"
+
+
+def test_s4_t1_publication_state_resets_across_run_contexts(tmp_path: Path) -> None:
+    result, checkpoint, planned, _state_value, first = _published_yield(tmp_path)
+    assert result.status == "planned_yield"
+    checkpoint.published_ref = None
+    checkpoint.published_payload_profile = None
+    second = _context(tmp_path / "second", [checkpoint, planned])
+    state = _state(root=tmp_path, next_iteration=2, completed_updates=1, max_steps=7)
+    with pytest.raises(PlannedYieldSignal) as caught:
+        second.emit(TrainingIterationCompleted(TrainingIteration(1)), state=state)
+    assert caught.value.result.status == "unknown"
+    assert first is not second
+
+
+def _assert_s4_t4_publication_failure(tmp_path: Path, monkeypatch, failure: str) -> None:
+    cfg = _run_config(tmp_path)
+    planned = PlannedYield(2, 3)
+    if failure == "rename":
+        original = Path.rename
+        def fail_rename(self, target):
+            if self.name.endswith(".tmp"):
+                raise OSError("rename-mutant")
+            return original(self, target)
+        monkeypatch.setattr(Path, "rename", fail_rename)
+    elif failure == "catalog":
+        monkeypatch.setattr(CheckpointCatalog, "publish", lambda self, ref: (_ for _ in ()).throw(OSError("catalog-mutant")))
+    else:
+        monkeypatch.setattr(checkpoint_save, "write_latest", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("latest-mutant")))
+    code = run_from_config(cfg, runtime_callbacks=(planned,), raise_exceptions=False)
+    assert code == 1
+    outcome = json.loads((tmp_path / "vmc_smoke" / "singlet" / "run" / "run-outcome.json").read_text())
+    assert outcome["status"] == "unknown"
+    assert outcome["error"] == f"{failure}-mutant"
+
+
+def test_s4_t4_rename_failure_is_unknown_with_original_error(tmp_path: Path, monkeypatch) -> None:
+    _assert_s4_t4_publication_failure(tmp_path, monkeypatch, "rename")
+
+
+def test_s4_t4_catalog_failure_is_unknown_with_original_error(tmp_path: Path, monkeypatch) -> None:
+    _assert_s4_t4_publication_failure(tmp_path, monkeypatch, "catalog")
+
+
+def test_s4_t4_latest_failure_is_unknown_with_original_error(tmp_path: Path, monkeypatch) -> None:
+    _assert_s4_t4_publication_failure(tmp_path, monkeypatch, "latest")
+
+
+def test_s4_t4_ordinary_training_error_stays_failed(tmp_path: Path, monkeypatch) -> None:
+    cfg = _run_config(tmp_path)
+    monkeypatch.setattr(RealTrain, "run", lambda self, context: (_ for _ in ()).throw(RuntimeError("training-mutant")))
+    assert run_from_config(cfg, raise_exceptions=False) == 1
+    run_dir = tmp_path / "vmc_smoke" / "singlet" / "run"
+    assert json.loads((run_dir / "metadata.json").read_text())["status"] == "failed"
+    assert json.loads((run_dir / "error.json").read_text())["exception_message"] == "training-mutant"
+
+
+def _assert_s4_f4_target_refused_before_fit(tmp_path: Path, monkeypatch, target: int) -> None:
+    cfg = _run_config(tmp_path)
+    planned = PlannedYield(target, 3)
+    fit_called = []
+    monkeypatch.setattr("tpen.training.trainer.VMCTrainer.fit", lambda self, **kwargs: fit_called.append(True))
+    assert run_from_config(cfg, runtime_callbacks=(planned,), raise_exceptions=False) == 1
+    assert not fit_called
+
+
+def test_s4_f4_target_at_h_refused_before_fit(tmp_path: Path, monkeypatch) -> None:
+    _assert_s4_f4_target_refused_before_fit(tmp_path, monkeypatch, 3)
+
+
+def test_s4_f4_target_above_h_refused_before_fit(tmp_path: Path, monkeypatch) -> None:
+    _assert_s4_f4_target_refused_before_fit(tmp_path, monkeypatch, 4)
+
+
+def test_s4_f2_planned_yield_legacy_exit_is_nonzero_and_not_complete(tmp_path: Path) -> None:
+    cfg = _run_config(tmp_path)
+    planned = PlannedYield(2, 3)
+    assert run_from_config(cfg, runtime_callbacks=(planned,), raise_exceptions=False) == PLANNED_YIELD_EXIT_CODE
+    status = json.loads((tmp_path / "vmc_smoke" / "singlet" / "run" / "status.json").read_text())
+    assert status["status"] != "completed"
