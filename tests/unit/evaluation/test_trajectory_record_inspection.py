@@ -358,6 +358,17 @@ def test_public_reader_accepts_v1_mixed_infinities(tmp_path: Path) -> None:
     assert result.physical_context.available is False
 
 
+def test_public_reader_preserves_mixed_infinities_across_draws(tmp_path: Path) -> None:
+    """Reader reduction must match writer semantics for opposite infinite draws."""
+
+    values = torch.tensor([[math.inf, 1.0], [-math.inf, 2.0]], dtype=torch.float64)
+    artifact = _write_v1_artifact(tmp_path, values)
+    artifact.validate()
+    result = inspect_trajectory_record(artifact.metadata_path)
+    assert math.isnan(result.mean)
+    assert math.isnan(result.variance)
+
+
 def test_public_reader_accepts_v1_positive_infinity(tmp_path: Path) -> None:
     values = torch.tensor([[math.inf, 1.0], [2.0, 3.0]], dtype=torch.float64)
     artifact = _write_v1_artifact(tmp_path, values)
@@ -416,6 +427,24 @@ def test_v1_reader_rejects_garbage_or_empty_numeric_cells(tmp_path: Path, field:
     metadata["byte_count"] = artifact.path.stat().st_size
     _write_metadata(artifact, metadata)
     with pytest.raises(TamperedTrajectoryRecordError, match="malformed|numeric"):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
+def test_v1_reader_rejects_garbage_integer_cells(tmp_path: Path) -> None:
+    """Grid indexes are numeric cells too, and malformed text must be rejected."""
+
+    artifact = _write_v1_artifact(tmp_path, VALUES)
+    with artifact.path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    rows[0]["draw_index"] = "garbage"
+    _write_rows(artifact.path, fieldnames, rows)
+    metadata = _read_metadata(artifact)
+    metadata["csv_sha256"] = trajectory_records._file_sha256(artifact.path)
+    metadata["byte_count"] = artifact.path.stat().st_size
+    _write_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError, match="malformed"):
         inspect_trajectory_record(artifact.metadata_path)
 
 
