@@ -23,7 +23,8 @@ import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
+from dataclasses import replace as dataclasses_replace
+from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar, runtime_checkable
 
 import torch
 
@@ -37,6 +38,13 @@ from tpen.physics.operators import (
     declared_operator_geometry,
     is_registered_operator,
 )
+from tpen.physics.receipt import ExecutionReceipt, encode_ordered_contribution_sequence
+
+if TYPE_CHECKING:
+    # tpen.physics.system imports normalize_hamiltonian_terms from this module at
+    # load time; importing it back here at module scope would be circular. See
+    # RecordingLocalEnergyEvaluator, which imports it locally at call time instead.
+    from tpen.physics.system import SystemDescriptor
 
 
 @dataclass
@@ -60,12 +68,19 @@ class LocalEnergyResult:
         [batch, n_electrons]. The aggregate evaluator permits at most one
         producing term and carries it alongside the wavefunction output so
         diagnostics reuse the same differentiated model evaluation.
+    receipt : ExecutionReceipt or None, optional
+        The declared execution receipt of the evaluator that actually
+        produced this result, when that evaluator implements
+        `DeclaresExecutionReceipt` and was wrapped by
+        `RecordingLocalEnergyEvaluator`. ``None`` for an evaluator that does
+        not record a receipt.
     """
 
     total: torch.Tensor
     terms: dict[str, torch.Tensor] = field(default_factory=dict)
     wavefunction_output: WavefunctionOutput | None = None
     per_electron_kinetic: torch.Tensor | None = None
+    receipt: ExecutionReceipt | None = None
 
 
 def normalize_hamiltonian_terms(
@@ -294,6 +309,226 @@ class NaiveLocalEnergyEvaluator(LocalEnergyEvaluator[NaiveLocalEnergyContext]):
                 per_electron_kinetic=per_electron_kinetic,
             )
         return total
+
+    def describe_execution_receipt(
+        self,
+        terms: Mapping[Any, Any] | Sequence[Any],
+        system_id: str,
+    ) -> ExecutionReceipt:
+        """Declare the naive reference's execution receipt for ``terms``.
+
+        Every normalized term with a declared `OperatorId` owns its own
+        single-term contribution in the manifest; a term with no declared
+        identity (an unregistered, protocol-only term) is excluded from the
+        manifest, matching this evaluator's open term protocol.
+        """
+
+        normalized = normalize_hamiltonian_terms(terms)
+        manifest: dict[OperatorId, list[str]] = {}
+        for name, term in normalized.items():
+            operator_id = _declared_operator_id(term)
+            if operator_id is None:
+                continue
+            manifest.setdefault(operator_id, []).append(name)
+        if not manifest:
+            raise ValueError(
+                "naive local-energy execution receipt requires at least one term with a "
+                "declared OperatorId"
+            )
+        return ExecutionReceipt(
+            system_id=system_id,
+            implementation=f"{type(self).__module__}.{type(self).__qualname__}",
+            version=2,
+            numerical_policy={
+                "term_order": "configured_declaration_order",
+                "accumulation": "sequential_sum",
+                # review-r1 finding 1: the manifest above is canonicalized by
+                # OperatorId for method_id, so it cannot carry the actual
+                # evaluated accumulation order -- two Hamiltonians whose terms
+                # are declared in a different order (and therefore accumulate
+                # float64 sums in a different, non-associative order) would
+                # otherwise share a method_id. Bind the real order here.
+                "contribution_order": encode_ordered_contribution_sequence(tuple(normalized)),
+            },
+            manifest={operator_id: tuple(names) for operator_id, names in manifest.items()},
+        )
+
+
+@runtime_checkable
+class DeclaresExecutionReceipt(Protocol):
+    """Protocol for an evaluator that can declare its own execution receipt.
+
+    Declared, never inferred: `RecordingLocalEnergyEvaluator` requires this
+    capability on its delegate, so a requested evaluator that cannot declare
+    a receipt fails loudly at wrap time instead of silently being given
+    another evaluator's receipt.
+    """
+
+    def describe_execution_receipt(
+        self,
+        terms: Mapping[Any, Any] | Sequence[Any],
+        system_id: str,
+    ) -> ExecutionReceipt:
+        """Return this evaluator's declared execution receipt for ``terms``."""
+        ...
+
+
+def _validate_batch_matches_particle(batch: ElectronBatch, particle: object) -> None:
+    """Reject a batch whose actual particle metadata disagrees with ``particle``.
+
+    ``particle`` is a `tpen.physics.system.ParticleSpec` (not imported here
+    to avoid the circular import `RecordingLocalEnergyEvaluator.__init__`
+    already works around); its `n_electrons`, `spatial_dim`, `n_spin_up`,
+    and `n_spin_down` attributes are read directly. The bound `SystemDescriptor`
+    declares an expected particle count, spatial dimension, and spin sector
+    that `build_system_descriptor` never checks against the batch actually
+    supplied to a term's `local_energy` -- it only compares declared term
+    *parameters*. Without this check, a batch with a contradicting electron
+    count, spatial dimension, or spin assignment would still be evaluated and
+    stamped with the bound system's id.
+
+    Spin sector is checked per configuration by *count*, not by a fixed
+    electron ordering: `ElectronBatch.permute` (`electron_batch.py:319-345`)
+    jointly permutes positions and spins, so a batch with `n_spin_up`
+    electrons at `+1` and `n_spin_down` at `-1` is the same physical sector
+    regardless of which electron indices carry which label. A batch with no
+    `spins` declares no spin-sector claim and is not checked here.
+    """
+
+    flat = batch.flatten_samples()
+    if flat.n_electrons != particle.n_electrons:
+        raise ValueError(
+            "RecordingLocalEnergyEvaluator: batch has "
+            f"{flat.n_electrons} electron(s), which disagrees with the bound "
+            f"SystemDescriptor's particle.n_electrons={particle.n_electrons}"
+        )
+    if flat.spatial_dim != particle.spatial_dim:
+        raise ValueError(
+            "RecordingLocalEnergyEvaluator: batch has spatial_dim "
+            f"{flat.spatial_dim}, which disagrees with the bound SystemDescriptor's "
+            f"particle.spatial_dim={particle.spatial_dim}"
+        )
+    if flat.spins is not None:
+        n_up = torch.sum(flat.spins > 0, dim=-1)
+        n_down = torch.sum(flat.spins < 0, dim=-1)
+        if not torch.all(n_up == particle.n_spin_up) or not torch.all(n_down == particle.n_spin_down):
+            raise ValueError(
+                "RecordingLocalEnergyEvaluator: batch spins disagree with the bound "
+                f"SystemDescriptor's particle spin sector (n_spin_up={particle.n_spin_up}, "
+                f"n_spin_down={particle.n_spin_down} per configuration, counted irrespective "
+                "of electron ordering)"
+            )
+
+
+class RecordingLocalEnergyEvaluator(LocalEnergyEvaluator[ContextT]):
+    """Narrow adapter: delegate evaluation unchanged, then attach a receipt.
+
+    Wraps one evaluator that also implements `DeclaresExecutionReceipt`.
+    `make_context`, `validate_for_generator`, and `evaluate` are pure
+    pass-throughs to the delegate; arithmetic, tensor ordering, and
+    decomposition are exactly the delegate's. The only added behavior is
+    binding the delegate's declared `ExecutionReceipt` to a decomposed
+    result. A scalar-tensor result (``return_terms=False``) has no typed
+    place to carry a receipt and is returned unchanged.
+
+    `system` binds this adapter to one `SystemDescriptor` for its lifetime
+    (review-r1 finding 2): a bare caller-supplied ``system_id`` string proved
+    nothing about the physics actually evaluated, so a receipt stamped with
+    the right-looking id could still describe a different system (e.g. a
+    harmonic trap whose frequency had since changed). Every `evaluate` call
+    rebuilds a descriptor from the *actual* `terms` it was given and rejects
+    the result before emitting a complete receipt if that descriptor's
+    content id disagrees with the bound one -- a changed, missing, or
+    undeclared contribution is therefore never silently stamped with the
+    bound system's id.
+
+    review-r2 finding 2: the term-level check above validates *parameters*
+    (for example a trap's declared frequency), not the *particle metadata*
+    an actual batch carries. `make_context` validates the batch's actual
+    electron count, spatial dimension, and spin sector against
+    `system.particle` before the delegate ever builds a context from it, so a
+    batch shaped for a different system is rejected at the boundary instead
+    of being evaluated and stamped with this adapter's system id.
+
+    review-r3 narrow-check finding 2: `make_context` only validates a batch
+    routed through *this* adapter's `make_context`. A context built directly
+    from the delegate's own `make_context` (an already-supported calling
+    pattern, exercised by
+    `test_recording_adapter_preserves_naive_arithmetic_bit_identical`) bypassed
+    that check entirely. `evaluate` therefore re-validates the actual batch
+    carried by whatever context it is given -- every context type used with
+    this adapter exposes a `batch: ElectronBatch` attribute -- so a mismatched
+    batch is rejected for the context actually evaluated, not only for one
+    built through this adapter.
+    """
+
+    def __init__(self, delegate: LocalEnergyEvaluator[ContextT], *, system: SystemDescriptor) -> None:
+        # Local import: tpen.physics.system imports normalize_hamiltonian_terms
+        # from this module at load time, so importing it back at module scope
+        # would be circular.
+        from tpen.physics.system import SystemDescriptor as _SystemDescriptor
+
+        if not isinstance(delegate, DeclaresExecutionReceipt):
+            raise TypeError(
+                f"{type(delegate).__name__} does not implement DeclaresExecutionReceipt; "
+                "a requested evaluator that cannot declare its own execution receipt is "
+                "never wrapped to silently receive another evaluator's receipt"
+            )
+        if not isinstance(system, _SystemDescriptor):
+            raise TypeError(
+                f"RecordingLocalEnergyEvaluator requires a SystemDescriptor, got {type(system).__name__}"
+            )
+        self._delegate = delegate
+        self._system = system
+
+    def make_context(self, wavefunction: object, batch: ElectronBatch) -> ContextT:
+        _validate_batch_matches_particle(batch, self._system.particle)
+        return self._delegate.make_context(wavefunction, batch)
+
+    def validate_for_generator(
+        self,
+        terms: Mapping[Any, Any] | Sequence[Any],
+        wavefunction: object,
+        generator: object,
+    ) -> None:
+        self._delegate.validate_for_generator(terms, wavefunction, generator)
+
+    def evaluate(
+        self,
+        terms: Mapping[Any, Any] | Sequence[Any],
+        context: ContextT,
+        *,
+        return_terms: bool = False,
+    ) -> torch.Tensor | LocalEnergyResult:
+        batch = getattr(context, "batch", None)
+        if not isinstance(batch, ElectronBatch):
+            raise TypeError(
+                f"RecordingLocalEnergyEvaluator.evaluate requires a context exposing a "
+                f"`batch: ElectronBatch` attribute to validate against the bound "
+                f"SystemDescriptor; got {type(context).__name__}"
+            )
+        _validate_batch_matches_particle(batch, self._system.particle)
+        result = self._delegate.evaluate(terms, context, return_terms=return_terms)
+        if not return_terms:
+            return result
+        if not isinstance(result, LocalEnergyResult):
+            raise TypeError(
+                f"{type(self._delegate).__name__}.evaluate(return_terms=True) must return "
+                "LocalEnergyResult"
+            )
+        from tpen.physics.system import build_system_descriptor
+
+        expected_id = self._system.system_id()
+        actual = build_system_descriptor(self._system.particle, terms, units=self._system.units)
+        if actual.system_id() != expected_id:
+            raise ValueError(
+                "RecordingLocalEnergyEvaluator: the terms actually evaluated do not match the "
+                f"bound SystemDescriptor (expected system_id {expected_id!r}, got "
+                f"{actual.system_id()!r}); a changed, missing, or undeclared contribution is "
+                "never stamped with the bound system's id"
+            )
+        receipt = self._delegate.describe_execution_receipt(terms, expected_id)
+        return dataclasses_replace(result, receipt=receipt)
 
 
 class AnalyticCuspEvaluator(LocalEnergyEvaluator[AnalyticCuspContext]):
@@ -610,6 +845,28 @@ class AnalyticCuspEvaluator(LocalEnergyEvaluator[AnalyticCuspContext]):
         return total
 
 
+def _receipts_disagree(left: ExecutionReceipt | None, right: ExecutionReceipt | None) -> bool:
+    """Return whether two chunk receipts declare a different method.
+
+    Compares canonical `method_id()` and `system_id` rather than dataclass
+    equality (review-r1 finding 4): `ExecutionReceipt.numerical_policy`
+    values are typed `JsonScalar` (`bool | int | float | str`), and Python
+    considers ``1``, ``1.0``, and ``True`` equal to each other even though
+    `method_id`'s own `_encode_scalar` gives each a distinct type tag. A
+    producer whose declared policy drifted between these equal-but-distinct
+    types across chunks would therefore pass a dataclass-equality check while
+    actually declaring two different method identities. `None` versus a
+    receipt is still a disagreement, matching the legacy (no fallback)
+    rejection.
+    """
+
+    if (left is None) != (right is None):
+        return True
+    if left is None or right is None:
+        return False
+    return left.method_id() != right.method_id() or left.system_id != right.system_id or left.diagnostics != right.diagnostics
+
+
 _NAIVE_EVALUATOR = NaiveLocalEnergyEvaluator()
 
 
@@ -712,6 +969,8 @@ def evaluate_local_energy_in_chunks(
     term_order: tuple[str, ...] | None = None
     captured_wavefunction = False
     captured_per_electron_kinetic = False
+    captured_receipt: ExecutionReceipt | None = None
+    receipt_captured = False
     selected_evaluator = _NAIVE_EVALUATOR if evaluator is None else evaluator
     for start in range(0, batch_size, size):
         chunk = slice_flat_batch(flat, start, min(start + size, batch_size))
@@ -744,6 +1003,14 @@ def evaluate_local_energy_in_chunks(
                 captured_per_electron_kinetic = True
                 per_electron_kinetic_chunks.append(
                     result.per_electron_kinetic.detach()
+                )
+            if not receipt_captured:
+                captured_receipt = result.receipt
+                receipt_captured = True
+            elif _receipts_disagree(captured_receipt, result.receipt):
+                raise ValueError(
+                    "chunked local-energy execution receipt disagreed between chunks: "
+                    f"{captured_receipt!r} != {result.receipt!r}"
                 )
         else:
             if not isinstance(result, torch.Tensor):
@@ -782,6 +1049,7 @@ def evaluate_local_energy_in_chunks(
         terms={name: torch.cat(chunks, dim=0) for name, chunks in term_chunks.items()},
         wavefunction_output=wavefunction_output,
         per_electron_kinetic=per_electron_kinetic,
+        receipt=captured_receipt,
     )
 
 
@@ -940,12 +1208,14 @@ def _summarize_values(prefix: str, values: torch.Tensor) -> dict[str, Any]:
 
 __all__ = [
     "HamiltonianTerm",
+    "DeclaresExecutionReceipt",
     "LocalEnergyEvaluator",
     "LocalEnergyResult",
     "AnalyticCuspContext",
     "AnalyticCuspEvaluator",
     "NaiveLocalEnergyContext",
     "NaiveLocalEnergyEvaluator",
+    "RecordingLocalEnergyEvaluator",
     "evaluate_local_energy_in_chunks",
     "local_energy",
     "normalize_hamiltonian_terms",
