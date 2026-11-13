@@ -141,6 +141,7 @@ def test_r3_2_an_absolute_checker_name_is_refused_and_predecessor_evidence_is_un
 
     checker = FakeFailingCheckerWithName(name=str(predecessor_dir / "checks"))
     callback = RuntimeEquivariance(checkers=[checker], fail_fast=False, artifact_dir=root)
+    callback.rebind_artifact_dir(root)
 
     with pytest.raises(ArtifactRoutingError):
         _handle(callback, RecordingContext(), step=12)
@@ -157,6 +158,7 @@ def test_r3_2_a_traversal_checker_name_is_refused(tmp_path: Path) -> None:
     root.mkdir()
     checker = FakeFailingCheckerWithName(name="../escape")
     callback = RuntimeEquivariance(checkers=[checker], fail_fast=False, artifact_dir=root)
+    callback.rebind_artifact_dir(root)
 
     with pytest.raises(ArtifactRoutingError):
         _handle(callback, RecordingContext(), step=12)
@@ -178,6 +180,34 @@ def test_r3_2_a_normal_checker_name_still_publishes(tmp_path: Path) -> None:
     artifact_path = root / "custom_checker" / "step_000012" / "failure.json"
     assert artifact_path.exists()
     assert json.loads(artifact_path.read_text())["checker_class"] == "FakeFailingChecker"
+
+
+def test_legacy_no_destination_follows_checker_directory_symlink(tmp_path: Path) -> None:
+    """Legacy callbacks retain their existing directory-layout semantics."""
+
+    root = tmp_path / "artifact_root"
+    root.mkdir()
+    external = tmp_path / "external_storage" / "custom_checker"
+    external.mkdir(parents=True)
+    (root / "custom_checker").symlink_to(external, target_is_directory=True)
+    context = RecordingContext()
+    callback = RuntimeEquivariance(
+        checkers=[FakeFailingCheckerWithName(name="custom_checker")],
+        fail_fast=False,
+        artifact_dir=root,
+    )
+
+    _handle(callback, context, step=12)
+
+    metrics = context.latest("checks/equivariance/custom_checker")
+    artifact_path = Path(metrics["artifact_path"])
+    assert artifact_path == root / "custom_checker" / "step_000012" / "failure.json"
+    assert (external / "step_000012" / "failure.json").exists()
+    assert (
+        json.loads((external / "step_000012" / "failure.json").read_text())["checker_class"]
+        == "FakeFailingChecker"
+    )
+    assert metrics["passed"] is False
 
 
 def test_no_artifact_written_without_artifact_dir() -> None:
