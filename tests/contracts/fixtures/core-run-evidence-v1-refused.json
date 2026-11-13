@@ -1,0 +1,11 @@
+{
+  "checkpoint": null,
+  "refusal": {
+    "code": "corrupt-checkpoint",
+    "reason": "checkpoint is invalid: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"
+  },
+  "run_dir": "/normalized/core",
+  "run_status": "completed",
+  "schema": "tpen.run-evidence/v1",
+  "verdict": "refused"
+}
