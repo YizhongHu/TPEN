@@ -312,6 +312,9 @@ def test_s4_f4_target_above_h_refused_before_fit(tmp_path: Path, monkeypatch) ->
 def test_s4_f2_planned_yield_legacy_exit_is_nonzero_and_not_complete(tmp_path: Path) -> None:
     cfg = _run_config(tmp_path)
     planned = PlannedYield(2, 3)
-    assert run_from_config(cfg, runtime_callbacks=(planned,), raise_exceptions=False) == PLANNED_YIELD_EXIT_CODE
+    rc = run_from_config(cfg, runtime_callbacks=(planned,), raise_exceptions=False)
+    assert rc != 0
+    assert rc != 1
+    assert rc == PLANNED_YIELD_EXIT_CODE
     status = json.loads((tmp_path / "vmc_smoke" / "singlet" / "run" / "status.json").read_text())
     assert status["status"] != "completed"
