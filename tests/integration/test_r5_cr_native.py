@@ -23,6 +23,7 @@ from tpen.execution import BalsamAdapter, InvocationOutcome, WorkerStartGateway
 from tpen.execution.chain_resume import E5_NATIVE_EXPECTED_MISMATCHES, E5_CHANNEL_MAP, assert_fresh_processes, compare_channel_parity
 from tpen.execution.invocation import _committed_checkpoint
 from tpen.execution.recovery import CheckpointEvidence
+from tests.helpers.native_chain_resume_trace import _snapshot_leaf, _trace_refusal
 
 LIMBS = tuple(sorted({spec.limb for spec in E5_CHANNEL_MAP}))
 
@@ -97,6 +98,9 @@ def r5_traces(tmp_path_factory):
     assert lower, f"no observed checkpoint below the selected cursor {rc}"
     resume_evidence = lane.evidence(prefix_checkpoint, "evidence-resume.json")
     lower_evidence = lane.evidence(lower[0], "evidence-lower.json")
+    non_cursor_limbs = tuple(limb for limb in LIMBS if limb != "trainer_cursor")
+    cursor_leaf_before = None
+    cursor_leaf_after = None
 
     jobs = [
         ("reference", dict(phase="initial", resume_step=0)),
@@ -107,19 +111,42 @@ def r5_traces(tmp_path_factory):
         for limb in LIMBS
     ]
     jobs += [
-        ("all-disabled", dict(phase="recovery", evidence=resume_evidence, resume_step=rc, disable_limbs=LIMBS)),
+        ("all-disabled", dict(phase="recovery", evidence=resume_evidence, resume_step=rc, disable_limbs=non_cursor_limbs)),
         # Mutant: restored from the LOWER checkpoint while the trace claims cursor rc.
         ("wrong-cursor", dict(phase="recovery", evidence=lower_evidence, resume_step=rc)),
     ]
     traces = {}
+    trace_paths = {}
     for label, options in jobs:
         trace_path = lane.root / f"{label}.trace.json"
+        if label == "disabled-trainer_cursor":
+            cursor_leaf_before = _snapshot_leaf(run_dir)
         process = lane.launch(label=f"r5-{label}", trace=trace_path, **options)
         returncode = process.wait(timeout=180)
         assert returncode == 0, f"native worker {label} returned {returncode!r}"
+        if label == "disabled-trainer_cursor":
+            cursor_leaf_after = _snapshot_leaf(run_dir)
         traces[label] = native._trace(trace_path)
+        trace_paths[label] = trace_path
     print(f"R5_TRACES rc={rc} lower={lower[0].next_iteration} pids={ {k: v.pid for k, v in traces.items()} }")
-    return {"rc": rc, "lower_cursor": lower[0].next_iteration, "traces": traces}
+    return {
+        "rc": rc,
+        "lower_cursor": lower[0].next_iteration,
+        "traces": traces,
+        "cursor_refusal": _trace_refusal(trace_paths["disabled-trainer_cursor"]),
+        "cursor_leaf_before": cursor_leaf_before,
+        "cursor_leaf_after": cursor_leaf_after,
+        "non_cursor_limbs": non_cursor_limbs,
+    }
+
+
+def _assert_cursor_refusal(r5_traces) -> None:
+    refusal = r5_traces["cursor_refusal"]
+    assert refusal is not None, "trainer_cursor omission did not produce a typed restore refusal"
+    assert refusal["exception_type"] == "ValueError"
+    assert "restored live trainer counters" in refusal["message"]
+    assert r5_traces["traces"]["disabled-trainer_cursor"].events == ()
+    assert r5_traces["cursor_leaf_after"] == r5_traces["cursor_leaf_before"]
 
 
 @pytest.mark.integration
@@ -202,6 +229,9 @@ def test_r5_corrected_cursor_predicate_detects_wrong_cursor_mutant(r5_traces):
 # PREDICTED: GREEN for optimizer and process_rng; RED for model, sampler_mcmc and trainer_cursor at CR (issue 3)
 def test_r5_correct_single_limb_attribution_passes(r5_traces, limb):
     traces = r5_traces["traces"]
+    if limb == "trainer_cursor":
+        _assert_cursor_refusal(r5_traces)
+        return
     try:
         compare_channel_parity(
             traces["reference"],
@@ -218,12 +248,13 @@ def test_r5_correct_single_limb_attribution_passes(r5_traces, limb):
 # PREDICTED: RED at CR (issue 3)
 def test_r5_all_disabled_correct_attribution_passes(r5_traces):
     traces = r5_traces["traces"]
+    non_cursor_limbs = r5_traces["non_cursor_limbs"]
     try:
         compare_channel_parity(
             traces["reference"],
             traces["all-disabled"],
             resume_step=r5_traces["rc"] - 1,
-            disabled_limbs=LIMBS,
+            disabled_limbs=non_cursor_limbs,
             expected_mismatches=E5_NATIVE_EXPECTED_MISMATCHES,
         )
     except Exception as exc:

@@ -51,6 +51,7 @@ from tpen.execution.chain_resume import (
     first_subsequent_event,
 )
 from tpen.execution.chain_resume import E5_CHANNEL_MAP
+from tests.helpers.native_chain_resume_trace import _snapshot_leaf, _trace_refusal
 from tests.helpers.trainable_wavefunctions import TrainableHookeSingletAnsatz
 
 
@@ -305,29 +306,6 @@ def _trace(path: Path) -> ProcessEvidence:
         returncode=0,
         stdout="\n".join(lines),
     )
-
-
-def _trace_refusal(path: Path) -> dict | None:
-    """Read the specific typed restore refusal recorded in a worker's trace, if any.
-
-    Set only by ``tests.helpers.native_chain_resume_trace.install_native_trace``'s
-    ``Train.run`` wrapper, which captures the real R2.3 pre-fit refusal at its
-    raise site (the worker's own exception handling classifies it as a
-    generic parked outcome and does not retain the message).
-    """
-
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return payload.get("refusal")
-
-
-def _snapshot_leaf(root: Path) -> dict[Path, tuple[str, int]]:
-    """Snapshot every file under a leaf: relative path -> (sha256, mtime_ns)."""
-
-    return {
-        path.relative_to(root): (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
-        for path in root.rglob("*")
-        if path.is_file()
-    }
 
 
 def _run_dir(output_path: Path) -> Path:
