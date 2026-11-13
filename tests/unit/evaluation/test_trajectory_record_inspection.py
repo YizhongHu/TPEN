@@ -325,6 +325,15 @@ def test_v1_content_bindings(tmp_path: Path, key: str, bad: object) -> None:
         inspect_trajectory_record(artifact.metadata_path)
 
 
+def test_v1_finite_values_digest_mismatch_is_rejected(tmp_path: Path) -> None:
+    artifact = _write_v1_artifact(tmp_path, VALUES)
+    metadata = _read_metadata(artifact)
+    metadata["observable_values_content_id"] = "0" * 64
+    _write_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError, match="observable_values_content_id"):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
 def test_v1_requires_complete_row_schema(tmp_path: Path) -> None:
     artifact = _write_v1_artifact(tmp_path, VALUES)
     keys = ["draw_index", "walker_index", "local_energy"]

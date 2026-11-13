@@ -140,6 +140,13 @@ def test_frozen_fixture_provenance_matches_committed_bytes(name: str) -> None:
     assert provenance["executed_writer_source_sha256"] == provenance["frozen_commit_writer_source_sha256"]
 
 
+def test_frozen_fixture_literal_hashes_are_independent_pins() -> None:
+    for name, expected in _LITERAL_ARTIFACT_SHA256.items():
+        directory = _fixture_dir(name)
+        for filename, digest in expected.items():
+            assert hashlib.sha256((directory / filename).read_bytes()).hexdigest() == digest
+
+
 @pytest.mark.parametrize(
     ("name", "expected_n_electrons", "expected_charge"),
     [("h_like_frozen_main", 1, 1.0), ("he_like_frozen_main", 2, 2.0)],
