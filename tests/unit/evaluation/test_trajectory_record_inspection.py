@@ -243,6 +243,38 @@ def test_incomplete_grid_row_is_rejected(tmp_path: Path) -> None:
         inspect_trajectory_record(artifact.metadata_path)
 
 
+def test_csv_recomputed_finite_counts_are_bound_to_metadata(tmp_path: Path) -> None:
+    """In-range count tampering must not be hidden by scalar-domain checks."""
+
+    artifact = _write_v1_artifact(tmp_path, VALUES)
+    metadata = _read_metadata(artifact)
+    metadata["finite_count"] = VALUES.numel() - 1
+    metadata["nonfinite_count"] = 1
+    _write_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError, match="finite_count"):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
+@pytest.mark.parametrize("header_edit", ["missing", "duplicate"])
+def test_csv_header_must_match_declared_schema(tmp_path: Path, header_edit: str) -> None:
+    artifact = _write_v1_artifact(tmp_path, VALUES)
+    with artifact.path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    if header_edit == "missing":
+        fieldnames = fieldnames[:-1]
+    else:
+        fieldnames[-1] = fieldnames[0]
+    _write_rows(artifact.path, fieldnames, rows)
+    metadata = _read_metadata(artifact)
+    metadata["csv_sha256"] = trajectory_records._file_sha256(artifact.path)
+    metadata["byte_count"] = artifact.path.stat().st_size
+    _write_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError, match="header"):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
 # Immutable frozen-main fixture compatibility coverage lives in
 # tests/unit/evaluation/test_trajectory_record_history_fixtures.py and
 # experiments/toolkit/test_trajectory_record_inspection_boundary.py, against

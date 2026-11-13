@@ -50,6 +50,14 @@ def _fixture_dir(name: str) -> Path:
     return directory
 
 
+def test_missing_required_fixture_fails_instead_of_skipping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(__name__ + "._FIXTURES_ROOT", tmp_path)
+    with pytest.raises(pytest.fail.Exception, match="not generated"):
+        _fixture_dir("missing_required_fixture")
+
+
 def _provenance(directory: Path) -> dict:
     return json.loads((directory / "PROVENANCE.json").read_text(encoding="utf-8"))
 
@@ -97,6 +105,8 @@ def test_frozen_fixture_provenance_matches_committed_bytes(name: str) -> None:
     # metadata hash.
     assert _is_sha256_hex(provenance.get("metadata_sha256"))
     assert provenance["metadata_sha256"] == hashlib.sha256(metadata_path.read_bytes()).hexdigest()
+    csv_path = directory / "sampled_eval_table.csv"
+    assert provenance["csv_sha256"] == hashlib.sha256(csv_path.read_bytes()).hexdigest()
 
     # Reproducible generator/input pinning: source, exact command, and a
     # config/environment hash, so a replay has everything needed to
