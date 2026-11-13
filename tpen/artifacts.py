@@ -340,6 +340,8 @@ class RunResult:
     next_iteration: int | None = None
     completed_updates: int | None = None
     target_iterations: int | None = None
+    exception_type: str | None = None
+    publication_stage: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-safe public run outcome."""
@@ -352,6 +354,8 @@ class RunResult:
             "next_iteration": self.next_iteration,
             "completed_updates": self.completed_updates,
             "target_iterations": self.target_iterations,
+            "exception_type": self.exception_type,
+            "publication_stage": self.publication_stage,
         }
 
 

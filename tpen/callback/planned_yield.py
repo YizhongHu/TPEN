@@ -39,6 +39,8 @@ class PlannedYield(StatefulCallback[TrainerState]):
         self.checkpoint = checkpoint
         self.observed = False
         self._published_context: object = None
+        self._published_ref: CheckpointRef | None = None
+        self._published_profile: str | None = None
         super().__init__(
             typed_groups=(
                 SubscriptionGroup(selectors=(Subscription.of(TrainingIterationCompleted),)),
@@ -113,6 +115,7 @@ class PlannedYield(StatefulCallback[TrainerState]):
         self._published_context = None
         self._published_ref = None
         self._published_profile = None
+        self.observed = False
 
 
 __all__ = ["PlannedYield", "PlannedYieldSignal"]

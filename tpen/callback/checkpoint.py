@@ -45,11 +45,20 @@ _LOGGER = logging.getLogger("tpen")
 class CheckpointPublicationError(RuntimeError):
     """A load-bearing publication step failed after a checkpoint boundary."""
 
-    def __init__(self, error: BaseException, *, next_iteration: int, completed_updates: int) -> None:
+    def __init__(
+        self,
+        error: Exception,
+        *,
+        next_iteration: int,
+        completed_updates: int,
+        target_iterations: int | None = None,
+    ) -> None:
         super().__init__(str(error))
         self.original = error
         self.next_iteration = next_iteration
         self.completed_updates = completed_updates
+        self.target_iterations = target_iterations
+        self.stage = getattr(error, "tpen_publication_stage", "unknown")
 
 
 class Checkpoint(StatefulCallback[TrainerState]):
@@ -297,10 +306,17 @@ class Checkpoint(StatefulCallback[TrainerState]):
         next_iteration: int,
         completed_updates: int,
     ) -> None:
+        self._active_context_callbacks = tuple(context.callbacks)
         final_dir = self.output_dir / checkpoint_step_dir_name(next_iteration)
         if is_complete_checkpoint_dir(final_dir):
             self._validate_existing_publication(final_dir)
-            reconcile_publication(self.output_dir, final_dir)
+            try:
+                reconcile_publication(self.output_dir, final_dir)
+            except Exception as exc:
+                self._raise_publication_error_if_active(
+                    exc, next_iteration=next_iteration, completed_updates=completed_updates
+                )
+                raise
             self._record_published(final_dir)
             return
         model = state.model
@@ -322,13 +338,37 @@ class Checkpoint(StatefulCallback[TrainerState]):
                 save_sampler=self.save_sampler,
                 save_rng=self.save_rng,
             )
-        except BaseException as exc:
-            if getattr(exc, "tpen_publication_stage", None) is not None:
-                raise CheckpointPublicationError(
-                    exc, next_iteration=next_iteration, completed_updates=completed_updates
-                ) from exc
+        except Exception as exc:
+            self._raise_publication_error_if_active(
+                exc, next_iteration=next_iteration, completed_updates=completed_updates
+            )
             raise
         self._record_published(final_dir)
+
+    def _raise_publication_error_if_active(
+        self, exc: Exception, *, next_iteration: int, completed_updates: int
+    ) -> None:
+        """Convert tagged publication errors only for an admitted yield."""
+
+        if getattr(exc, "tpen_publication_stage", None) is None:
+            return
+        # Import lazily: PlannedYield depends on the callback base and this
+        # callback is part of the public callback import surface.
+        from .planned_yield import PlannedYield
+
+        if not any(type(callback) is PlannedYield for callback in self._context_callbacks):
+            return
+        target = next(
+            callback.target_iterations
+            for callback in self._context_callbacks
+            if type(callback) is PlannedYield
+        )
+        raise CheckpointPublicationError(
+            exc,
+            next_iteration=next_iteration,
+            completed_updates=completed_updates,
+            target_iterations=target,
+        ) from exc
 
     def _record_published(self, final_dir: Path) -> None:
         """Expose a ref only after the complete publication sequence returns."""
@@ -369,6 +409,15 @@ class Checkpoint(StatefulCallback[TrainerState]):
         """Drop the armed update when the owning RunContext identity changes."""
 
         self._updated_iteration_step = None
+        self.published_ref = None
+        self.published_payload_profile = None
+        self._active_context_callbacks = ()
+
+    @property
+    def _context_callbacks(self) -> tuple[object, ...]:
+        """Return callbacks for the active context during publication handling."""
+
+        return getattr(self, "_active_context_callbacks", ())
 
 
 def _trainer_progress(state: TrainerState) -> tuple[int, int]:
