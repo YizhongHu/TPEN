@@ -14,7 +14,7 @@ import torch
 
 from tpen.data.batch import ElectronBatch
 from tpen.physics.hamiltonian import LocalEnergyResult, local_energy
-from tpen.physics.hooke import HookeSingletExact, HookeTripletExact
+from tpen.physics.hooke import HookeSingletExact, HookeTripletExact, OneElectronHookeExact
 from tpen.physics.kinetic import KineticEnergy
 from tpen.physics.potential import ElectronElectronInteraction, HarmonicTrap
 from tpen.physics.terms import summarize_physical_terms
@@ -35,6 +35,11 @@ def _hooke_terms(wf) -> dict:
     }
 
 
+def _hooke_one_electron_terms(wf) -> dict:
+    """Named kinetic + harmonic-trap terms for a one-electron Hooke state."""
+    return {"kinetic": KineticEnergy(), "harmonic_trap": HarmonicTrap(omega=wf.omega)}
+
+
 def _singlet_positions(seed: int = 0) -> torch.Tensor:
     g = torch.Generator()
     g.manual_seed(seed)
@@ -53,6 +58,53 @@ def _triplet_positions(seed: int = 1) -> torch.Tensor:
     # Set z2 = z1 + 0.5 to guarantee |z1 - z2| = 0.5 > min_triplet_node_distance
     pos[:, 1, 2] = pos[:, 0, 2] + 0.5
     return pos
+
+
+def _one_electron_positions(seed: int = 2) -> torch.Tensor:
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return torch.empty(BATCH_SIZE, 1, 3, dtype=DTYPE).normal_(generator=g) * 0.8
+
+
+def test_one_electron_local_energy_is_constant_at_three_omega_over_two() -> None:
+    wf = OneElectronHookeExact()
+    result = local_energy(
+        _hooke_one_electron_terms(wf), wf, ElectronBatch(positions=_one_electron_positions()), return_terms=True
+    )
+
+    assert isinstance(result, LocalEnergyResult)
+    assert torch.allclose(result.total, torch.full_like(result.total, 0.75), atol=ENERGY_ATOL, rtol=ENERGY_RTOL)
+    assert torch.allclose(result.total, torch.full_like(result.total, wf.exact_energy), atol=ENERGY_ATOL)
+
+
+def test_one_electron_gaussian_imperfect_width_is_position_dependent() -> None:
+    wf = OneElectronHookeExact(omega=0.4)
+    positions = torch.tensor(
+        [[[0.0, 0.0, 0.0]], [[0.5, 0.0, 0.0]], [[1.0, 0.0, 0.0]]], dtype=DTYPE
+    )
+    result = local_energy(
+        {"kinetic": KineticEnergy(), "harmonic_trap": HarmonicTrap(omega=0.5)},
+        wf,
+        ElectronBatch(positions=positions),
+    )
+
+    assert isinstance(result, torch.Tensor)
+    expected = 1.5 * wf.omega + (0.5**2 - wf.omega**2) * positions.square().sum(dim=(1, 2)) / 2
+    assert torch.allclose(result, expected, atol=ENERGY_ATOL, rtol=ENERGY_RTOL)
+    assert result.std().item() > 1e-3
+
+
+def test_one_electron_trap_coefficient_control_is_observable() -> None:
+    wf = OneElectronHookeExact()
+    batch = ElectronBatch(positions=_one_electron_positions())
+    exact = local_energy(_hooke_one_electron_terms(wf), wf, batch)
+    wrong_trap = local_energy(
+        {"kinetic": KineticEnergy(), "harmonic_trap": HarmonicTrap(omega=wf.omega * 1.1)}, wf, batch
+    )
+
+    assert isinstance(exact, torch.Tensor)
+    assert isinstance(wrong_trap, torch.Tensor)
+    assert not torch.allclose(wrong_trap, exact)
 
 
 def test_singlet_local_energy_constant_at_exact_energy() -> None:
