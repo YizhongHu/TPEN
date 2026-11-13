@@ -33,6 +33,30 @@ caveats:
     owed before these digits enter a plot or a paper.
 
 systems:
+  - id: hooke_one_electron_omega0.5
+    description: >-
+      One-electron Hooke atom in a 3D isotropic harmonic trap at omega = 1/2.
+      Atomic units are used: the exact oscillator ground-state energy is
+      3*omega/2 = 0.75 hartree.
+    n_up: 1
+    n_down: 0
+    spatial_dim: 3
+    hamiltonian:
+      terms:
+        - term: kinetic
+        - term: harmonic_trap
+          omega: 0.5
+    reference_energy_hartree: 0.75
+    reference_source: >-
+      Analytic three-dimensional harmonic-oscillator ground state in atomic
+      units, psi(r) = exp(-omega |r|^2/2), with E = 3*omega/2 = 0.75 Ha at
+      omega = 0.5; independently encoded by
+      tpen/physics/hooke.py::OneElectronHookeExact.
+    confidence: transcribed
+    notes: >-
+      Exact one-electron reference; this record is distinct from the
+      two-electron Taut-solvable Hooke pair record below.
+
   - id: hooke_pair_singlet_omega0.5
     description: >-
       Two-electron Hooke atom (3D isotropic harmonic trap plus Coulomb

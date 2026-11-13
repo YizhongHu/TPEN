@@ -295,6 +295,15 @@ def test_loader_ids_match_the_document(entries: list[dict[str, Any]]) -> None:
     assert known_system_ids() == frozenset(entry["id"] for entry in entries)
 
 
+def test_hooke_one_electron_reference_is_distinct_from_pair(entries: list[dict[str, Any]]) -> None:
+    """The one-electron analytic reference cannot silently reuse the pair value."""
+
+    by_id = {entry["id"]: entry for entry in entries}
+    assert by_id["hooke_one_electron_omega0.5"]["reference_energy_hartree"] == 0.75
+    assert by_id["hooke_pair_singlet_omega0.5"]["reference_energy_hartree"] == 2.0
+    assert by_id["hooke_one_electron_omega0.5"]["n_up"] + by_id["hooke_one_electron_omega0.5"]["n_down"] == 1
+
+
 def test_loader_covers_every_reproduced_system() -> None:
     """Every system a baseline run has been emitted for is registered.
 
