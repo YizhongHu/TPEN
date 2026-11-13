@@ -6,11 +6,11 @@ import csv
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -54,6 +54,35 @@ TRAJECTORY_RECORD_METADATA_KEYS: tuple[str, ...] = (
 
 TRAJECTORY_RECORD_ROW_SEMANTICS = "complete_draw_walker_grid"
 """Row-ordering convention shared by the writer and the metadata validator."""
+
+
+def _trajectory_record_fieldnames(
+    *, n_electrons: int, spatial_dim: int, term_names: Sequence[str]
+) -> list[str]:
+    """Return the exact CSV column set for one trajectory-record schema shape.
+
+    Shared by the writer (:meth:`TrajectoryRecordStreamWriter._build_fieldnames`)
+    and the strict v1 reader, so a sidecar's declared ``n_electrons``,
+    ``spatial_dim``, and ``term_names`` are bound to the CSV's actual columns
+    rather than only to the metadata key set.
+    """
+
+    coordinates = [
+        f"position/electron_{electron}/axis_{axis}"
+        for electron in range(n_electrons)
+        for axis in range(spatial_dim)
+    ]
+    return [
+        "sample_index",
+        "draw_index",
+        "walker_index",
+        "local_energy",
+        *(f"term/{name}" for name in term_names),
+        "logabs",
+        "sign",
+        "finite",
+        *coordinates,
+    ]
 
 
 @dataclass(frozen=True)
@@ -576,6 +605,588 @@ class TrajectoryRecordStreamWriter:
         return row
 
 
+TRAJECTORY_RECORD_INSPECTION_SCHEMA = "tpen.trajectory-record-inspection/v1"
+"""Schema identifier for the version-aware historical-reader result below.
+
+This is the inspection *result's* own schema, distinct from the
+``schema`` field recorded inside a trajectory-record sidecar
+(``TRAJECTORY_RECORD_SCHEMA`` and friends, e.g. ``trajectory_records/v1``).
+A new inspection-result field would bump this identifier; a new sidecar
+schema (e.g. a future ``trajectory_records/v2``) is handled by adding a
+branch to :func:`inspect_trajectory_record` without changing this one.
+"""
+
+
+class UnsupportedTrajectoryRecordSchemaError(ValueError):
+    """Raised when a sidecar declares a schema this reader does not decode."""
+
+
+class TamperedTrajectoryRecordError(ValueError):
+    """Raised when a sidecar or CSV fails an integrity check against itself."""
+
+
+@dataclass(frozen=True, slots=True)
+class TrajectoryPhysicalContext:
+    """Physical-system identity and method provenance, or its documented absence.
+
+    Historical ``trajectory_records/v1`` sidecars never recorded a physical
+    descriptor or an evaluation-method declaration (see
+    ``system-context-records-design-r1.md`` section 5). Decoding such a
+    sidecar must state that fact explicitly rather than inventing a
+    ``system_id`` from ``atomic_configuration_id`` or from geometry: the two
+    identities are never aliases of one another.
+
+    Parameters
+    ----------
+    available : bool
+        Whether this record carries a verified physical-system identity.
+    system_id : str or None
+        The recorded system content ID, required when ``available`` is
+        true and forbidden otherwise.
+    reason : str or None
+        Human-readable explanation, required when ``available`` is false
+        and forbidden otherwise.
+    """
+
+    available: bool
+    system_id: str | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.available:
+            if self.system_id is None:
+                raise ValueError("available physical context requires a system_id")
+            if self.reason is not None:
+                raise ValueError("available physical context must not carry a reason")
+        else:
+            if self.system_id is not None:
+                raise ValueError("unavailable physical context must not carry a system_id")
+            if self.reason is None:
+                raise ValueError("unavailable physical context requires a reason")
+
+
+_V1_PHYSICAL_CONTEXT_UNAVAILABLE = TrajectoryPhysicalContext(
+    available=False,
+    reason=(
+        "trajectory_records/v1 sidecars record nuclear geometry only; they contain no "
+        "physical-system descriptor and no evaluation-method declaration"
+    ),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TrajectoryObservableValuesDigest:
+    """A verified observable-value digest, or a typed reconstruction gap."""
+
+    available: bool
+    content_id: str | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.available:
+            if self.content_id is None or self.reason is not None:
+                raise ValueError("available observable digest requires only a content_id")
+        elif self.content_id is not None or self.reason is None:
+            raise ValueError("unavailable observable digest requires only a reason")
+
+
+_V1_OBSERVABLE_DIGEST_UNAVAILABLE = TrajectoryObservableValuesDigest(
+    available=False,
+    reason=(
+        "trajectory_records/v1 serializes NaN values as the text 'nan', so the original "
+        "float64 payload/sign bits cannot be reconstructed for digest verification"
+    ),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TrajectoryRecordInspection:
+    """Version-normalized, read-only view of one trajectory-record artifact.
+
+    Returned by :func:`inspect_trajectory_record` for every supported
+    sidecar schema. ``physical_context`` is the single place a caller must
+    check before trusting a ``system_id``; a geometry-only legacy record
+    reports it as unavailable rather than silently omitting the field.
+    """
+
+    record_schema: str
+    path: Path
+    metadata_path: Path
+    observable: str
+    draw_count: int
+    walker_count: int
+    row_count: int
+    mean: float
+    variance: float
+    csv_sha256: str
+    atomic_configuration_id: str | None
+    physical_context: TrajectoryPhysicalContext
+    observable_values_digest: TrajectoryObservableValuesDigest
+    schema: str = TRAJECTORY_RECORD_INSPECTION_SCHEMA
+
+
+def inspect_trajectory_record(metadata_path: str | Path) -> TrajectoryRecordInspection:
+    """Decode one trajectory-record sidecar under its own declared schema.
+
+    Parameters
+    ----------
+    metadata_path : str or pathlib.Path
+        Path to a ``*.metadata.json`` sidecar written by a trajectory-record
+        writer (any supported schema).
+
+    Returns
+    -------
+    TrajectoryRecordInspection
+        A version-normalized view. For ``trajectory_records/v1`` sidecars,
+        ``physical_context.available`` is always false.
+
+    Raises
+    ------
+    UnsupportedTrajectoryRecordSchemaError
+        The sidecar's ``schema`` field is missing or not a schema this
+        reader decodes.
+    TamperedTrajectoryRecordError
+        The sidecar's key set, the CSV hash, or the draw/walker grid
+        disagrees with what the declared schema requires.
+
+    Notes
+    -----
+    This function never infers a physical-system identity from
+    ``atomic_configuration_id`` or from recorded geometry: a v1 sidecar's
+    nuclear positions describe a resource consumed by some term, not a
+    verified complete Hamiltonian. Experiments reach this function only
+    through the read-only ``tpen.inspection`` boundary
+    (``experiments/README.md``), never by importing this module directly.
+    """
+
+    metadata_path = Path(metadata_path)
+    try:
+        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise TamperedTrajectoryRecordError(f"cannot read trajectory record sidecar: {exc}") from exc
+    except ValueError as exc:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record sidecar is not valid JSON: {metadata_path}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise TamperedTrajectoryRecordError("trajectory record sidecar must be a JSON object")
+
+    record_schema = raw.get("schema")
+    if record_schema == TRAJECTORY_RECORD_SCHEMA:
+        return _inspect_v1(metadata_path, raw)
+    raise UnsupportedTrajectoryRecordSchemaError(
+        f"unsupported trajectory record schema {record_schema!r} in {metadata_path}"
+    )
+
+
+def _inspect_v1(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryRecordInspection:
+    declared_keys = set(TRAJECTORY_RECORD_METADATA_KEYS)
+    actual_keys = set(metadata)
+    if actual_keys != declared_keys:
+        missing = sorted(declared_keys - actual_keys)
+        extra = sorted(actual_keys - declared_keys)
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record sidecar key set disagrees with {TRAJECTORY_RECORD_SCHEMA!r}: "
+            f"missing={missing}, extra={extra}"
+        )
+    if metadata.get("row_semantics") != TRAJECTORY_RECORD_ROW_SEMANTICS:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record row_semantics disagrees with {TRAJECTORY_RECORD_ROW_SEMANTICS!r}"
+        )
+
+    scalars = _validate_v1_scalar_types(metadata)
+
+    csv_path = metadata_path.parent / str(metadata["csv_filename"])
+    if not csv_path.is_file():
+        raise TamperedTrajectoryRecordError(f"trajectory record CSV not found: {csv_path}")
+    declared_sha256 = metadata["csv_sha256"]
+    actual_sha256 = _file_sha256(csv_path)
+    if actual_sha256 != declared_sha256:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record csv_sha256 disagrees with {csv_path}: "
+            f"declared={declared_sha256!r}, actual={actual_sha256!r}"
+        )
+    actual_byte_count = csv_path.stat().st_size
+    if actual_byte_count != scalars.byte_count:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record byte_count disagrees with {csv_path}: "
+            f"declared={scalars.byte_count}, actual={actual_byte_count}"
+        )
+
+    atoms = _decode_v1_atomic_configuration(metadata)
+    declared_atomic_configuration_id = metadata["atomic_configuration_id"]
+    if atoms.content_id() != declared_atomic_configuration_id:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record atomic_configuration_id disagrees with its atomic_configuration payload"
+        )
+    if atoms.spatial_dim != scalars.spatial_dim:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record atomic_configuration dimension disagrees with spatial_dim"
+        )
+
+    scan = _scan_v1_csv(
+        csv_path,
+        draw_count=scalars.draw_count,
+        walker_count=scalars.walker_count,
+        n_electrons=scalars.n_electrons,
+        spatial_dim=scalars.spatial_dim,
+        term_names=scalars.term_names,
+    )
+    if scan.row_count != scalars.row_count:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record row_count disagrees with its CSV grid: "
+            f"declared={scalars.row_count}, actual={scan.row_count}"
+        )
+    if scan.finite_count != scalars.finite_count:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record finite_count disagrees with its CSV: "
+            f"declared={scalars.finite_count}, actual={scan.finite_count}"
+        )
+    declared_values_content_id = metadata["observable_values_content_id"]
+    if scan.has_nan:
+        observable_values_digest = _V1_OBSERVABLE_DIGEST_UNAVAILABLE
+    else:
+        observable_values_digest = TrajectoryObservableValuesDigest(
+            available=True, content_id=scan.values_content_id
+        )
+    if observable_values_digest.available and scan.values_content_id != declared_values_content_id:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record observable_values_content_id disagrees with its CSV"
+        )
+    declared_mean = _as_float(metadata["mean"])
+    declared_variance = _as_float(metadata["variance"])
+    if not _close_or_same_nonfinite(scan.mean, declared_mean) or not _close_or_same_nonfinite(
+        scan.variance, declared_variance
+    ):
+        raise TamperedTrajectoryRecordError(
+            "trajectory record mean/variance disagrees with its CSV: "
+            f"declared=({declared_mean!r}, {declared_variance!r}), "
+            f"recomputed=({scan.mean!r}, {scan.variance!r})"
+        )
+
+    return TrajectoryRecordInspection(
+        record_schema=TRAJECTORY_RECORD_SCHEMA,
+        path=csv_path,
+        metadata_path=metadata_path,
+        observable=str(metadata["observable"]),
+        draw_count=scalars.draw_count,
+        walker_count=scalars.walker_count,
+        row_count=scalars.row_count,
+        mean=declared_mean,
+        variance=declared_variance,
+        csv_sha256=declared_sha256,
+        atomic_configuration_id=str(declared_atomic_configuration_id),
+        physical_context=_V1_PHYSICAL_CONTEXT_UNAVAILABLE,
+        observable_values_digest=observable_values_digest,
+    )
+
+
+class _V1ScalarMetadata(NamedTuple):
+    """Type/domain-validated scalar fields of a ``trajectory_records/v1`` sidecar."""
+
+    draw_count: int
+    walker_count: int
+    draw_stride: int
+    burn_in_draws: int
+    n_electrons: int
+    spatial_dim: int
+    row_count: int
+    finite_count: int
+    byte_count: int
+    term_names: tuple[str, ...]
+
+
+def _require_v1_int(metadata: dict[str, Any], key: str, *, minimum: int) -> int:
+    value = metadata[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TamperedTrajectoryRecordError(f"trajectory record {key!r} must be an integer")
+    if value < minimum:
+        raise TamperedTrajectoryRecordError(f"trajectory record {key!r} must be >= {minimum}")
+    return value
+
+
+def _validate_v1_scalar_types(metadata: dict[str, Any]) -> _V1ScalarMetadata:
+    """Validate every v1 scalar field's type/domain and cross-field bindings.
+
+    Catches the exact gaps the strict v1 decoder previously missed: a
+    fractional ``draw_count`` silently truncated by ``int()``, out-of-range
+    ``finite_count``/``nonfinite_count``, and an ``observable``/``term_names``
+    that are not well-formed strings. Row/CSV-grid bindings (geometry, byte
+    count, finite mask, value digest, coordinate/term columns) are checked
+    separately once the CSV has been scanned.
+    """
+
+    draw_count = _require_v1_int(metadata, "draw_count", minimum=1)
+    walker_count = _require_v1_int(metadata, "walker_count", minimum=1)
+    draw_stride = _require_v1_int(metadata, "draw_stride", minimum=1)
+    burn_in_draws = _require_v1_int(metadata, "burn_in_draws", minimum=0)
+    n_electrons = _require_v1_int(metadata, "n_electrons", minimum=1)
+    spatial_dim = _require_v1_int(metadata, "spatial_dim", minimum=1)
+    row_count = _require_v1_int(metadata, "row_count", minimum=0)
+    finite_count = _require_v1_int(metadata, "finite_count", minimum=0)
+    nonfinite_count = _require_v1_int(metadata, "nonfinite_count", minimum=0)
+    byte_count = _require_v1_int(metadata, "byte_count", minimum=1)
+
+    if row_count != draw_count * walker_count:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record row_count disagrees with draw_count*walker_count"
+        )
+    if finite_count > row_count:
+        raise TamperedTrajectoryRecordError("trajectory record finite_count exceeds row_count")
+    if nonfinite_count != row_count - finite_count:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record nonfinite_count disagrees with row_count - finite_count"
+        )
+
+    observable = metadata["observable"]
+    if not isinstance(observable, str) or not observable.strip():
+        raise TamperedTrajectoryRecordError("trajectory record observable must be a non-empty string")
+
+    term_names = metadata["term_names"]
+    if (
+        not isinstance(term_names, list)
+        or not term_names
+        or not all(isinstance(name, str) and name.strip() for name in term_names)
+        or len(set(term_names)) != len(term_names)
+    ):
+        raise TamperedTrajectoryRecordError(
+            "trajectory record term_names must be a non-empty list of unique, non-blank strings"
+        )
+
+    for key in ("observable_values_content_id", "atomic_configuration_id"):
+        value = metadata[key]
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise TamperedTrajectoryRecordError(
+                f"trajectory record {key!r} must be a lowercase sha256 digest"
+            )
+
+    return _V1ScalarMetadata(
+        draw_count=draw_count,
+        walker_count=walker_count,
+        draw_stride=draw_stride,
+        burn_in_draws=burn_in_draws,
+        n_electrons=n_electrons,
+        spatial_dim=spatial_dim,
+        row_count=row_count,
+        finite_count=finite_count,
+        byte_count=byte_count,
+        term_names=tuple(term_names),
+    )
+
+
+def _decode_v1_atomic_configuration(metadata: dict[str, Any]) -> AtomicConfiguration:
+    """Decode and validate the sidecar's nuclear-geometry payload.
+
+    Never infers an identity from the payload beyond what
+    :class:`AtomicConfiguration` itself validates; the caller is responsible
+    for binding the result's ``content_id()`` back to the declared
+    ``atomic_configuration_id``.
+    """
+
+    payload = metadata["atomic_configuration"]
+    if not isinstance(payload, dict) or set(payload) != {"positions", "charges"}:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record atomic_configuration must be a {'positions', 'charges'} payload"
+        )
+    try:
+        positions = torch.tensor(payload["positions"], dtype=torch.float64)
+        charges = torch.tensor(payload["charges"], dtype=torch.float64)
+        return AtomicConfiguration(positions=positions, charges=charges)
+    except (TypeError, ValueError) as exc:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record atomic_configuration is not a valid nuclear geometry: {exc}"
+        ) from exc
+
+
+class _V1CsvScan(NamedTuple):
+    """Values independently recomputed from a v1 CSV's complete grid."""
+
+    row_count: int
+    finite_count: int
+    mean: float
+    variance: float
+    values_content_id: str
+    has_nan: bool
+
+
+def _scan_v1_csv(
+    path: Path,
+    *,
+    draw_count: int,
+    walker_count: int,
+    n_electrons: int,
+    spatial_dim: int,
+    term_names: Sequence[str],
+) -> _V1CsvScan:
+    """Scan a v1 CSV for a complete, non-duplicated draw/walker grid.
+
+    Validates that the header is exactly the column set implied by
+    ``n_electrons``/``spatial_dim``/``term_names`` (binding the declared
+    coordinate/term schema to the actual CSV columns, and rejecting
+    duplicate headers or ragged rows), that every row's ``finite`` flag
+    agrees with its own ``local_energy``, and that ``sample_index`` matches
+    the original ``draw*walker_count + walker`` sample/grid semantics.
+    Returns the row/finite counts plus the local-energy mean, variance, and
+    values-content-id recomputed directly from the CSV using the writer's
+    own per-draw-then-total reduction order, so a caller can cross-check
+    them against the sidecar's declared values without trusting either file
+    alone. Unlike an exact-summation baseline, this reduction order
+    reproduces (rather than crashes on) the writer's own mixed-infinity
+    semantics.
+    """
+
+    expected_fieldnames = _trajectory_record_fieldnames(
+        n_electrons=n_electrons, spatial_dim=spatial_dim, term_names=term_names
+    )
+    expected_fieldname_set = set(expected_fieldnames)
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        header = next(csv.reader(handle), None)
+    if header is None:
+        raise TamperedTrajectoryRecordError("trajectory record CSV has no header row")
+    if len(set(header)) != len(header):
+        raise TamperedTrajectoryRecordError("trajectory record CSV header has duplicate column names")
+    if set(header) != expected_fieldname_set:
+        missing = sorted(expected_fieldname_set - set(header))
+        extra = sorted(set(header) - expected_fieldname_set)
+        raise TamperedTrajectoryRecordError(
+            "trajectory record CSV header disagrees with its declared coordinate/term schema: "
+            f"missing={missing}, extra={extra}"
+        )
+
+    extra_sentinel = "__trajectory_record_extra_columns__"
+    seen: set[tuple[int, int]] = set()
+    row_count = 0
+    finite_count = 0
+    draw_sums: dict[int, float] = {}
+    draw_square_sums: dict[int, float] = {}
+    draw_values: dict[int, dict[int, float]] = {draw: {} for draw in range(draw_count)}
+    has_nan = False
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, restkey=extra_sentinel, restval=None)
+        for row in reader:
+            if row.get(extra_sentinel) is not None:
+                raise TamperedTrajectoryRecordError("trajectory record CSV row has extra columns")
+            if any(row.get(key) is None for key in expected_fieldnames):
+                raise TamperedTrajectoryRecordError("trajectory record CSV row is missing column values")
+            try:
+                draw = int(row["draw_index"])
+                walker = int(row["walker_index"])
+                sample_index = int(row["sample_index"])
+                numeric_values = {
+                    key: _parse_v1_csv_numeric(row[key])
+                    for key in expected_fieldnames
+                    if key not in {"sample_index", "draw_index", "walker_index", "finite"}
+                }
+                energy = numeric_values["local_energy"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise TamperedTrajectoryRecordError(f"malformed trajectory record row: {row!r}") from exc
+            if row["finite"] not in ("True", "False"):
+                raise TamperedTrajectoryRecordError(
+                    f"trajectory record row (draw={draw}, walker={walker}) has a malformed finite flag"
+                )
+            declared_finite = row["finite"] == "True"
+            if declared_finite != math.isfinite(energy):
+                raise TamperedTrajectoryRecordError(
+                    f"trajectory record row (draw={draw}, walker={walker}) finite flag "
+                    "disagrees with its local_energy"
+                )
+            if not 0 <= draw < draw_count or not 0 <= walker < walker_count:
+                raise TamperedTrajectoryRecordError(
+                    f"trajectory record row (draw={draw}, walker={walker}) is outside the declared grid"
+                )
+            key = (draw, walker)
+            if key in seen:
+                raise TamperedTrajectoryRecordError(f"duplicate trajectory record row (draw={draw}, walker={walker})")
+            seen.add(key)
+            if sample_index != draw * walker_count + walker:
+                raise TamperedTrajectoryRecordError(
+                    f"trajectory record row (draw={draw}, walker={walker}) sample_index "
+                    "disagrees with the original sample/grid semantics"
+                )
+
+            # Per-draw-then-total reduction, matching the writer's own
+            # draw_sums/draw_square_sums reconciliation: plain float addition
+            # propagates +/-inf into nan rather than raising, unlike an
+            # exact-summation baseline such as `math.fsum`.
+            draw_sums[draw] = draw_sums.get(draw, 0.0) + energy
+            draw_square_sums[draw] = draw_square_sums.get(draw, 0.0) + energy * energy
+            if declared_finite:
+                finite_count += 1
+            draw_values[draw][walker] = energy
+            has_nan = has_nan or math.isnan(energy)
+            row_count += 1
+
+    expected_rows = draw_count * walker_count
+    if row_count != expected_rows:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record grid is incomplete: expected {expected_rows} rows, found {row_count}"
+        )
+
+    total = 0.0
+    total_square = 0.0
+    for draw in range(draw_count):
+        total += draw_sums.get(draw, 0.0)
+        total_square += draw_square_sums.get(draw, 0.0)
+    mean = total / row_count
+    variance = total_square / row_count - mean * mean
+    if math.isfinite(variance) and variance < 0.0:
+        variance = 0.0
+
+    values_digest = hashlib.sha256()
+    values_digest.update(str((draw_count, walker_count)).encode("utf-8"))
+    for draw in range(draw_count):
+        ordered = torch.tensor(
+            [draw_values[draw][walker] for walker in range(walker_count)], dtype=torch.float64
+        )
+        values_digest.update(ordered.contiguous().numpy().astype("<f8", copy=False).tobytes())
+
+    return _V1CsvScan(
+        row_count=row_count,
+        finite_count=finite_count,
+        mean=mean,
+        variance=variance,
+        values_content_id=values_digest.hexdigest(),
+        has_nan=has_nan,
+    )
+
+
+def _as_float(value: object) -> float:
+    if isinstance(value, str):
+        if value == "inf":
+            return math.inf
+        if value == "-inf":
+            return -math.inf
+        if value == "nan":
+            return math.nan
+        raise TamperedTrajectoryRecordError(f"trajectory record non-finite field has unknown text {value!r}")
+    if isinstance(value, (int, float)):
+        return float(value)
+    raise TamperedTrajectoryRecordError(f"trajectory record numeric field has unexpected type {type(value).__name__}")
+
+
+def _parse_v1_csv_numeric(text: str) -> float:
+    """Parse one v1 CSV numeric cell under the original float/sentinel rules.
+
+    Unlike `_as_float` (which only ever sees JSON-typed metadata scalars:
+    a finite ``int``/``float`` or one of the three non-finite sentinel
+    strings), every CSV cell is plain text, including finite values such as
+    ``"1.0"``.
+    """
+
+    if text in ("inf", "-inf", "nan"):
+        return _as_float(text)
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise TamperedTrajectoryRecordError(f"trajectory record CSV field is not numeric: {text!r}") from exc
+
+
 def _write_metadata(artifact: TrajectoryRecordArtifact) -> None:
     atoms = artifact.atomic_configuration
     metadata = {
@@ -657,6 +1268,20 @@ def _same_float(left: float, right: float) -> bool:
     return left == right or (math.isnan(left) and math.isnan(right))
 
 
+def _close_or_same_nonfinite(left: float, right: float, *, rel_tol: float = 1e-9, abs_tol: float = 1e-9) -> bool:
+    """Compare two floats tolerantly, treating matching non-finite values as equal.
+
+    Used only to cross-check a reader's independent recomputation against a
+    sidecar's declared value; two different summation orders (this module's
+    plain accumulation versus the writer's torch reduction) can legitimately
+    differ in the last few bits without either being tampered.
+    """
+
+    if math.isfinite(left) and math.isfinite(right):
+        return math.isclose(left, right, rel_tol=rel_tol, abs_tol=abs_tol)
+    return _same_float(left, right)
+
+
 def _same_reconciliation(
     left: ObservableTrajectoryReconciliation,
     right: ObservableTrajectoryReconciliation,
@@ -678,10 +1303,17 @@ def _same_reconciliation(
 
 __all__ = [
     "TRAJECTORY_RECORD_FILENAME",
+    "TRAJECTORY_RECORD_INSPECTION_SCHEMA",
     "TRAJECTORY_RECORD_METADATA_KEYS",
     "TRAJECTORY_RECORD_ROW_SEMANTICS",
     "TRAJECTORY_RECORD_SCHEMA",
+    "TamperedTrajectoryRecordError",
+    "TrajectoryPhysicalContext",
+    "TrajectoryObservableValuesDigest",
     "TrajectoryRecordArtifact",
     "TrajectoryRecordBatch",
+    "TrajectoryRecordInspection",
     "TrajectoryRecordStreamWriter",
+    "UnsupportedTrajectoryRecordSchemaError",
+    "inspect_trajectory_record",
 ]
