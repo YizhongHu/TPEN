@@ -22,6 +22,15 @@ from tpen.checkpoint.reference import CheckpointRef
 from tpen.execution import RecoveryDecision, RecoveryOutcome, RecoveryPhase
 from tpen.execution.invocation import run_configured_once
 from tpen.execution.recovery import OperationalRestoreRequest, train_resume_load_overlay
+from tpen.runner.base import Runner
+
+
+class _ConflictingRunner(Runner):
+    """Typed runner fixture for the real restore-boundary conflict check."""
+
+    def __init__(self, *, load, max_steps: int) -> None:
+        self.load = load
+        self.trainer = SimpleNamespace(max_steps=max_steps)
 
 
 def _save_checkpoint(tmp_path: Path, *, step: int = 4, target_iterations: int = 8) -> CheckpointRef:
@@ -167,9 +176,9 @@ def test_conflicting_concrete_configured_load_is_refused_through_the_real_bounda
     cfg.run.root = str(tmp_path / "configured-run-source")
     cfg.trainer.max_steps = 2
     cfg.runner.load = {"mode": "train_resume", "path": "/elsewhere"}
-    conflicting_runner = SimpleNamespace(
+    conflicting_runner = _ConflictingRunner(
         load={"mode": "train_resume", "path": "/elsewhere"},
-        trainer=SimpleNamespace(max_steps=decision.target_iterations),
+        max_steps=decision.target_iterations,
     )
     monkeypatch.setattr(run_module, "_instantiate_runner", lambda context: conflicting_runner)
 
