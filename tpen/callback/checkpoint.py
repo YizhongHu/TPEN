@@ -233,6 +233,7 @@ class Checkpoint(StatefulCallback[TrainerState]):
         self._updated_iteration_step: int | None = None
         self.published_ref: CheckpointRef | None = None
         self.published_payload_profile: str | None = None
+        self.published_context_token: int | None = None
 
     def handle_occurrence_impl(
         self,
@@ -317,7 +318,7 @@ class Checkpoint(StatefulCallback[TrainerState]):
                     exc, next_iteration=next_iteration, completed_updates=completed_updates
                 )
                 raise
-            self._record_published(final_dir)
+            self._record_published(context, final_dir)
             return
         model = state.model
         if model is None:
@@ -343,7 +344,7 @@ class Checkpoint(StatefulCallback[TrainerState]):
                 exc, next_iteration=next_iteration, completed_updates=completed_updates
             )
             raise
-        self._record_published(final_dir)
+        self._record_published(context, final_dir)
 
     def _raise_publication_error_if_active(
         self, exc: Exception, *, next_iteration: int, completed_updates: int
@@ -356,13 +357,13 @@ class Checkpoint(StatefulCallback[TrainerState]):
         # callback is part of the public callback import surface.
         from .planned_yield import PlannedYield
 
-        if not any(type(callback) is PlannedYield for callback in self._context_callbacks):
-            return
-        target = next(
-            callback.target_iterations
-            for callback in self._context_callbacks
-            if type(callback) is PlannedYield
+        planned = next(
+            (callback for callback in self._context_callbacks if type(callback) is PlannedYield),
+            None,
         )
+        target = None if planned is None else planned.target_iterations
+        if planned is None:
+            return
         raise CheckpointPublicationError(
             exc,
             next_iteration=next_iteration,
@@ -370,7 +371,7 @@ class Checkpoint(StatefulCallback[TrainerState]):
             target_iterations=target,
         ) from exc
 
-    def _record_published(self, final_dir: Path) -> None:
+    def _record_published(self, context: RunContext, final_dir: Path) -> None:
         """Expose a ref only after the complete publication sequence returns."""
 
         ref = CheckpointRef.from_directory(final_dir)
@@ -379,6 +380,7 @@ class Checkpoint(StatefulCallback[TrainerState]):
         self.published_payload_profile = (
             None if manifest.payload is None else manifest.payload.get("profile")
         )
+        self.published_context_token = id(context)
 
     def _validate_existing_publication(self, final_dir: Path) -> None:
         """Allow only an equivalent re-publication at this stream root.
@@ -411,6 +413,7 @@ class Checkpoint(StatefulCallback[TrainerState]):
         self._updated_iteration_step = None
         self.published_ref = None
         self.published_payload_profile = None
+        self.published_context_token = None
         self._active_context_callbacks = ()
 
     @property

@@ -58,6 +58,13 @@ class PlannedYield(StatefulCallback[TrainerState]):
             (candidate for candidate in context.callbacks if hasattr(candidate, "published_ref")),
             None,
         )
+        producer_installed = callback is not None and any(
+            candidate is callback for candidate in context.callbacks
+        )
+        producer_context_matches = (
+            producer_installed
+            and getattr(callback, "published_context_token", None) == id(context)
+        )
         ref = getattr(callback, "published_ref", None)
         profile = getattr(callback, "published_payload_profile", None)
         completed_updates = int(getattr(state.trainer, "completed_updates"))
@@ -71,6 +78,8 @@ class PlannedYield(StatefulCallback[TrainerState]):
         ref = getattr(self, "_published_ref", None)
         profile = getattr(self, "_published_profile", None)
         if (
+            not producer_context_matches
+            or
             not isinstance(ref, CheckpointRef)
             or profile != "train_resume"
             or ref.next_iteration != next_iteration

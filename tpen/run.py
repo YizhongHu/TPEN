@@ -536,6 +536,8 @@ def run_from_config(
                     bootstrap=bootstrap,
                     raise_exceptions=raise_exceptions,
                     evidence=result,
+                    command=command,
+                    config_path=config_path,
                 )
         return _status_to_exit_code(result.status)
     except CheckpointPublicationError as exc:
@@ -558,6 +560,8 @@ def run_from_config(
                     bootstrap=bootstrap,
                     raise_exceptions=raise_exceptions,
                     evidence=result,
+                    command=command,
+                    config_path=config_path,
                 )
         return _status_to_exit_code(result.status)
     except Exception as exc:
@@ -568,6 +572,8 @@ def run_from_config(
             bootstrap=bootstrap,
             raise_exceptions=raise_exceptions,
             evidence=evidence_result,
+            command=command,
+            config_path=config_path,
         )
     finally:
         if context is not None:
@@ -583,6 +589,8 @@ def _handle_run_failure(
     bootstrap: _BootstrapState,
     raise_exceptions: bool,
     evidence: RunResult | None = None,
+    command: str | None = None,
+    config_path: str | None = None,
 ) -> int:
     """Apply the one guarded failure finalization path for every new handler."""
 
@@ -609,7 +617,14 @@ def _handle_run_failure(
                 "FATAL: failed to write failed run outcome: %s: %s",
                 type(outcome_exc).__name__, outcome_exc,
             )
-        _write_error_if_possible(context, exc, phase=phase, traceback_text=traceback_text)
+        _write_error_if_possible(
+            context,
+            exc,
+            phase=phase,
+            traceback_text=traceback_text,
+            command=command,
+            config_path=config_path,
+        )
         _emit_typed_event_if_possible(
             context, RunFailed(exception_type=exception_type, exception_message=exception_message)
         )
@@ -619,12 +634,16 @@ def _handle_run_failure(
             exc,
             phase=phase,
             traceback_text=traceback_text,
+            command=command,
+            config_path=config_path,
         )
     _print_fatal(
         exc,
         phase=phase,
         traceback_text=traceback_text,
         run_dir=context.run_dir if context is not None else bootstrap.run_dir,
+        command=command,
+        config_path=config_path,
     )
     if raise_exceptions:
         raise exc
