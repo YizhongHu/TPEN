@@ -8,7 +8,10 @@ Quick mode requires a Slurm allocation, clones the exact SHA with tags,
 resolves and validates a pre-built, reuse-only shared dependency environment
 under `SHARED_ENV_PREFIX` (see "Shared environment: reuse-only" below), creates
 a job-local overlay with venv --without-pip, adds a .pth for the shared
-environment, and installs this checkout editable into the overlay. It runs the
+environment, installs this checkout editable into the overlay, then installs
+`$CLONE/executor` editable with `--no-deps`. The executor's `hydra-core` and
+`omegaconf` dependencies are already root-project dependencies, so the
+separate executor install only adds its editable source path. It runs the
 requested whole test paths with pytest -q, type checking disabled by an addopts
 override. `--parallel` defaults to `serial`: measurement on three heads showed
 xdist gives no speed-up on the small targeted sets this runner is meant for
@@ -17,16 +20,21 @@ only where a measured speed-up justifies it (e.g. the full suite).
 
 `PYTHON`'s overlay interpreter is also exported as `TPEN_PYTHON` and
 `ROOT_PYTHON`, and `$OVERLAY/bin` is prepended to `PATH` so tests that spawn a
-bare `python` subprocess resolve the overlay interpreter. In addition, every
-`*_EXECUTOR_PYTHON` / `*_ROOT_PYTHON` environment variable name referenced
-anywhere in the exact-SHA clone's `.py` files (e.g. `P8_EXECUTOR_PYTHON`,
-`P9C_EXECUTOR_PYTHON`, `P9C_ROOT_PYTHON`, `P10_ROOT_PYTHON`,
-`H_V2_EXECUTOR_PYTHON` as of this writing) is discovered by grep after the
-overlay is built and bound to the same job's interpreter; the resolved list is
-recorded in `executor-python-bindings.txt`. An inherited or unbound one is
-read by these tests as "skip this check", so binding by discovery (not a
-hardcoded name) matters whenever a new `*_EXECUTOR_PYTHON`/`*_ROOT_PYTHON`
-caller is added.
+bare `python` subprocess resolve the overlay interpreter. The runner discovers
+whole-word names matching `[A-Z][A-Z0-9_]*_(EXECUTOR|ROOT|SCIENCE)_PYTHON` in
+the exact-SHA clone's `.py` files and binds those selector variables to the
+same interpreter. This includes `P8_EXECUTOR_PYTHON`, `P9C_ROOT_PYTHON`,
+`P10_ROOT_PYTHON`, `H_V2_EXECUTOR_PYTHON`, and
+`H_V2_SCIENCE_PYTHON`; it excludes compatibility selectors such as
+`TPEN_GUARD_PRE39_PYTHON`, non-selectors such as `UV_PYTHON`, and unbounded
+prefixes such as `XLA_PYTHON_CLIENT_PREALLOCATE`. The script-owned
+`PYTHON|TPEN_PYTHON|ROOT_PYTHON` names remain an explicit deny set. The
+resolved bindings are recorded in `executor-python-bindings.txt`.
+
+After the overlay installs, the runner checks that `tpen_executor.__file__`
+resolves under `$CLONE/executor` with both normal `-B -c` and isolated
+`-I -B -c` interpreters. Both resolved paths are recorded in
+`executor-resolution.txt`; either failure calls `fail_precheck`.
 
 Use --mutants SPEC for a JSON object or list containing 3-6 rows with id,
 target, old, new, and **killer** — the exact pytest node id (or bare id with
@@ -77,7 +85,7 @@ raw-string prefix match.
 Run `scripts/cannon/selftest.sh` to exercise these guarantees locally with
 bash/stdlib only — no Slurm, no pytest, no cluster access. Unlike `verify.sh`
 (which clones its own exact-SHA tree), `selftest.sh` reads the repo it is
-physically sitting inside to find the `*_EXECUTOR_PYTHON`/`*_ROOT_PYTHON`
+physically sitting inside to find the executor/root/science selector
 test family, so it must be run from inside a full repo checkout (a git clone,
 or a `git archive`/`git worktree` extraction at the exact head) with
 `scripts/cannon/selftest.sh` at its normal repo-relative depth — **not** a

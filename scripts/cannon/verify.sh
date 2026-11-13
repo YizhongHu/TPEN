@@ -162,15 +162,16 @@ PYTHON="$OVERLAY/bin/python"
 export PYTHON TPEN_PYTHON="$PYTHON" ROOT_PYTHON="$PYTHON"
 export PATH="$OVERLAY/bin:$PATH"
 [[ -x "$PYTHON" ]] || fail_precheck "overlay interpreter missing after overlay build"
-# Tests read per-caller interpreter env vars ending in _PYTHON (e.g.
-# P8_EXECUTOR_PYTHON, P9C_EXECUTOR_PYTHON, P9C_ROOT_PYTHON, P10_ROOT_PYTHON,
-# H_V2_EXECUTOR_PYTHON, H_V2_SCIENCE_PYTHON) to launch subprocesses; an unbound
-# one is read as "skip" and an inherited one could select an unrelated
-# interpreter. Bind every such name the exact-SHA clone's tests reference,
-# except the script-owned interpreter names, after the overlay exists.
+# Tests read per-caller interpreter selector vars ending in
+# _EXECUTOR_PYTHON, _ROOT_PYTHON, or _SCIENCE_PYTHON (e.g. P8_EXECUTOR_PYTHON,
+# P9C_ROOT_PYTHON, P10_ROOT_PYTHON, H_V2_SCIENCE_PYTHON) to launch
+# subprocesses. Whole-word matching excludes compatibility runtimes,
+# non-selector names, and prefixes such as XLA_PYTHON_CLIENT_PREALLOCATE.
+# Bind only these selector names after the overlay exists; an unbound selector
+# is read as "skip" by its test.
 assert_write_path "$RUN_ROOT/evidence/executor-python-bindings.txt"
 mapfile -t EXECUTOR_PYTHON_VARS < <(
-  grep -rhoE '[A-Z][A-Z0-9_]*_PYTHON' "$CLONE" --include='*.py' 2>/dev/null | sort -u
+  grep -rhoE -w '[A-Z][A-Z0-9_]*_(EXECUTOR|ROOT|SCIENCE)_PYTHON' "$CLONE" --include='*.py' 2>/dev/null | sort -u
 )
 : > "$RUN_ROOT/evidence/executor-python-bindings.txt"
 for executor_var in "${EXECUTOR_PYTHON_VARS[@]:-}"; do
