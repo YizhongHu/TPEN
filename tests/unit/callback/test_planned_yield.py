@@ -17,7 +17,13 @@ from omegaconf import OmegaConf
 from tpen.artifacts import ArtifactManager, RunClock, RunContext, RunMetadata
 from tpen.callback.checkpoint import Checkpoint
 from tpen.callback.planned_yield import PlannedYield, PlannedYieldSignal
-from tpen.checkpoint import EveryNUpdates, TrainResume, read_latest, read_publications
+from tpen.checkpoint import (
+    EveryNUpdates,
+    TrainResume,
+    publication_catalog_path,
+    read_latest,
+    read_publications,
+)
 from tpen.checkpoint.catalog import CheckpointCatalog
 from tpen.run import PLANNED_YIELD_EXIT_CODE, run_from_config
 from tpen.runner import Train as RealTrain
@@ -117,7 +123,7 @@ def test_s4_green_below_h_post_publication_yield_reads_objects_and_preserves_pre
     assert result.target_iterations == 7
     assert state.trainer.max_steps == 7
     assert read_latest(checkpoint.output_dir)["step"] == 2
-    assert read_publications(checkpoint.output_dir)[-1] == checkpoint.published_ref
+    assert read_publications(publication_catalog_path(checkpoint.output_dir))[-1] == checkpoint.published_ref
     assert _leaf_bytes(predecessor) == before
 
 
