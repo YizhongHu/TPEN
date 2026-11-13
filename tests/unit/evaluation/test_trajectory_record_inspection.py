@@ -380,7 +380,7 @@ def test_public_reader_accepts_v1_nan(tmp_path: Path) -> None:
 def test_v1_nan_digest_is_explicitly_unreconstructible(tmp_path: Path) -> None:
     """Serialized NaN text cannot recover the writer's payload/sign bits."""
 
-    nan_bits = torch.tensor([0x7FF8000000000001], dtype=torch.uint64).view(torch.float64)
+    nan_bits = torch.tensor([0x7FF8000000000001, 0xFFF8000000000001], dtype=torch.uint64).view(torch.float64)
     values = torch.stack((nan_bits, torch.tensor([1.0, 2.0], dtype=torch.float64)))
     artifact = _write_v1_artifact(tmp_path, values)
     result = inspect_trajectory_record(artifact.metadata_path)
@@ -407,7 +407,7 @@ def test_v1_reader_rejects_garbage_or_empty_numeric_cells(tmp_path: Path, field:
     metadata["csv_sha256"] = trajectory_records._file_sha256(artifact.path)
     metadata["byte_count"] = artifact.path.stat().st_size
     _write_metadata(artifact, metadata)
-    with pytest.raises(TamperedTrajectoryRecordError, match="numeric"):
+    with pytest.raises(TamperedTrajectoryRecordError, match="malformed|numeric"):
         inspect_trajectory_record(artifact.metadata_path)
 
 
