@@ -19,6 +19,7 @@ from tpen.execution.chain_resume import (
 )
 from tpen.execution.invocation import _committed_checkpoint
 from tpen.execution.recovery import CheckpointEvidence
+from tests.helpers.native_chain_resume_trace import _snapshot_leaf, _trace_refusal
 
 LIMBS = tuple(sorted({spec.limb for spec in E5_CHANNEL_MAP}))
 
@@ -73,18 +74,21 @@ def _build_lane(tmp_path_factory):
     rc = selected.next_iteration
     assert rc < lane.batch.target_iterations
     evidence = lane.evidence(selected)
+    predecessor_leaf_before = _snapshot_leaf(run_dir)
     jobs = {"reference": dict(phase="initial", resume_step=0)}
     jobs["full"] = dict(phase="recovery", evidence=evidence, resume_step=rc)
     jobs.update({f"disabled-{limb}": dict(phase="recovery", evidence=evidence, resume_step=rc, disable_limb=limb) for limb in LIMBS})
     traces = {}
+    trace_paths = {}
     for label, options in jobs.items():
         trace = lane.root / f"{label}.trace.json"
         worker = lane.launch(label=f"r9-{label}", trace=trace, **options)
         rc_worker = worker.wait(timeout=180)
         assert rc_worker == 0, f"native worker {label} returned {rc_worker!r}"
         traces[label] = native._trace(trace)
+        trace_paths[label] = trace
     print(f"R9_LANE traced rc={rc}")
-    return lane, rc, traces
+    return lane, rc, traces, trace_paths, predecessor_leaf_before, _snapshot_leaf(run_dir)
 
 
 @pytest.fixture(scope="module")
@@ -95,14 +99,14 @@ def traced_lane(tmp_path_factory):
 @pytest.mark.integration
 # PREDICTED: GREEN
 def test_r9_traced_full_restore_satisfies_uncoupled_parity(traced_lane):
-    _lane, rc, traces = traced_lane
+    _lane, rc, traces, *_rest = traced_lane
     compare_channel_parity(traces["reference"], traces["full"], resume_step=rc - 1)
 
 
 @pytest.mark.integration
 # PREDICTED: GREEN
 def test_r9_traced_process_rng_omission_is_distinguishable_from_full_restore(traced_lane):
-    _lane, rc, traces = traced_lane
+    _lane, rc, traces, *_rest = traced_lane
     spec = next(s for s in E5_CHANNEL_MAP if s.channel == "process_random")
     full = first_subsequent_event(traces["full"], spec, resume_step=rc - 1)
     omitted = first_subsequent_event(traces["disabled-process_rng"], spec, resume_step=rc - 1)
@@ -112,11 +116,13 @@ def test_r9_traced_process_rng_omission_is_distinguishable_from_full_restore(tra
 def _signatures(rc, traces):
     result = {}
     for limb in LIMBS:
+        if limb == "trainer_cursor":
+            continue
         disabled = traces[f"disabled-{limb}"]
         mismatches = set()
         for spec in E5_CHANNEL_MAP:
             left = first_subsequent_event(traces["reference"], spec, resume_step=rc - 1).value
-            right = first_subsequent_event(disabled, spec, resume_step=-1 if limb == "trainer_cursor" else rc - 1).value
+            right = first_subsequent_event(disabled, spec, resume_step=rc - 1).value
             if left != right:
                 mismatches.add(spec.channel)
         result[limb] = sorted(mismatches)
@@ -126,13 +132,22 @@ def _signatures(rc, traces):
 @pytest.mark.integration
 # PREDICTED: GREEN
 def test_r9_traced_single_omission_signatures(traced_lane):
-    lane, rc, traces = traced_lane
+    lane, rc, traces, trace_paths, leaf_before, leaf_after = traced_lane
+    refusal = _trace_refusal(trace_paths["disabled-trainer_cursor"])
+    assert refusal is not None, "trainer_cursor omission did not produce a typed restore refusal"
+    assert refusal["exception_type"] == "ValueError"
+    assert "restored live trainer counters" in refusal["message"]
+    assert traces["disabled-trainer_cursor"].events == ()
+    assert leaf_after == leaf_before
     observed = _signatures(rc, traces)
     expected = {"model": ["model_logabs", "optimizer_update"], "optimizer": ["optimizer_update"],
-                "process_rng": ["process_random"], "sampler_mcmc": ["model_logabs", "optimizer_update", "sampler_proposal"],
-                "trainer_cursor": ["trainer_cursor"]}
+                "process_rng": ["process_random"], "sampler_mcmc": ["model_logabs", "optimizer_update", "sampler_proposal"]}
     payload = {k: set(v) for k, v in observed.items()}
     (lane.root / "r9-signatures.json").write_text(json.dumps(observed, sort_keys=True), encoding="utf-8")
     print("R9_SIGNATURES=" + json.dumps(observed, sort_keys=True))
     assert payload == {k: set(v) for k, v in expected.items()}
-    assert payload == {k: set(v) for k, v in E5_NATIVE_EXPECTED_MISMATCHES.items()}
+    assert payload == {
+        k: set(v)
+        for k, v in E5_NATIVE_EXPECTED_MISMATCHES.items()
+        if k != "trainer_cursor"
+    }

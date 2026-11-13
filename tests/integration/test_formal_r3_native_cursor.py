@@ -12,8 +12,12 @@ import pytest
 
 from tpen.checkpoint import CheckpointRef, list_complete_checkpoints
 from tpen.execution import BalsamAdapter, WorkerStartGateway
-from tpen.execution.chain_resume import ChannelParityError, compare_channel_parity
+from tpen.execution.chain_resume import (
+    UnmeasuredArmError,
+    compare_channel_parity,
+)
 from tpen.execution.recovery import CheckpointEvidence
+from tests.helpers.native_chain_resume_trace import _snapshot_leaf, _trace_refusal
 from tests.integration.test_native_checkpoint_recovery import (
     FIXTURE,
     QualificationClient,
@@ -101,6 +105,9 @@ def cursor_evidence(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
     low_evidence = _evidence_file(low, "r3-evidence-low.json")
     high_evidence = _evidence_file(high, "r3-evidence-high.json")
+    # The checkpoint paths identify the predecessor run directly; retain its
+    # exact leaf contents around the refusal arm.
+    prefix_run_dir = prefix_dirs[-1].parent.parent
     launches = {
         "reference": dict(phase="initial", evidence=None, resume_step=0, disable=None),
         "resume-high": dict(
@@ -117,8 +124,12 @@ def cursor_evidence(tmp_path_factory: pytest.TempPathFactory) -> dict:
         ),
     }
     traces = {}
+    trace_paths = {}
+    cursor_leaf_before = None
     for label, spec in launches.items():
         trace_path = root / f"r3-{label}.trace.json"
+        if label == "cursor-disabled":
+            cursor_leaf_before = _snapshot_leaf(prefix_run_dir)
         worker = _launch(
             root=root,
             batch_path=batch_path,
@@ -136,9 +147,14 @@ def cursor_evidence(tmp_path_factory: pytest.TempPathFactory) -> dict:
         worker.wait(timeout=240)
         assert worker.returncode == 0, label
         traces[label] = _trace(trace_path)
+        trace_paths[label] = trace_path
 
     return {
         "traces": traces,
+        "trace_paths": trace_paths,
+        "cursor_refusal": _trace_refusal(trace_paths["cursor-disabled"]),
+        "cursor_leaf_before": cursor_leaf_before,
+        "cursor_leaf_after": _snapshot_leaf(prefix_run_dir),
         "low_cursor": low.next_iteration,
         "high_cursor": high.next_iteration,
         "seed": int(batch.items[0].payload["seed"]),
@@ -153,17 +169,26 @@ def _first_cursor_step(trace) -> int:
     )
 
 
+def _assert_cursor_refusal(cursor_evidence: dict) -> None:
+    """Require the cursor omission to be a recorded pre-fit refusal."""
+
+    refusal = cursor_evidence["cursor_refusal"]
+    assert refusal is not None, "trainer_cursor omission did not produce a typed restore refusal"
+    assert refusal["exception_type"] == "ValueError"
+    assert "restored live trainer counters" in refusal["message"]
+    assert cursor_evidence["traces"]["cursor-disabled"].events == ()
+    assert cursor_evidence["cursor_leaf_after"] == cursor_evidence["cursor_leaf_before"]
+
+
 @pytest.mark.integration
 def test_trainer_cursor_omission_is_measurable(cursor_evidence: dict) -> None:
-    """The restore-disabled cursor arm has a measurable own-channel signature."""
+    """The restore-disabled cursor arm records its typed refusal."""
 
+    _assert_cursor_refusal(cursor_evidence)
     traces = cursor_evidence["traces"]
     high_cursor = cursor_evidence["high_cursor"]
     enabled_first = _first_cursor_step(traces["resume-high"])
-    disabled_first = _first_cursor_step(traces["cursor-disabled"])
     assert enabled_first == high_cursor
-    assert disabled_first != high_cursor
-    assert disabled_first == 0
     assert traces["resume-high"].pid != traces["cursor-disabled"].pid
 
 
@@ -183,11 +208,12 @@ def test_trainer_cursor_positive_control_moves_own_channel(cursor_evidence: dict
 
 @pytest.mark.integration
 def test_trainer_cursor_named_mismatch_through_public_adapter(cursor_evidence: dict) -> None:
-    """The public comparator names the cursor restart."""
+    """The public comparator leaves the typed refusal arm unmeasured."""
 
+    _assert_cursor_refusal(cursor_evidence)
     traces = cursor_evidence["traces"]
     high_cursor = cursor_evidence["high_cursor"]
-    with pytest.raises(ChannelParityError, match="trainer_cursor"):
+    with pytest.raises(UnmeasuredArmError, match="model_logabs"):
         compare_channel_parity(
             traces["reference"],
             traces["cursor-disabled"],
