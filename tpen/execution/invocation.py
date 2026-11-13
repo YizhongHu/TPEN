@@ -1029,6 +1029,53 @@ def _config_leaves(value: Any, prefix: str = "") -> dict[str, Any]:
     return {prefix: value}
 
 
+def _select_container_path(container: Any, path: str) -> Any:
+    """Walk ``path`` (dotted) through a plain mapping, or a missing sentinel."""
+
+    node = container
+    for part in path.split("."):
+        if not isinstance(node, Mapping) or part not in node:
+            return _MISSING_CONFIG_VALUE
+        node = node[part]
+    return node
+
+
+def _overlay_node_is_identity(existing: Any, declared: Any) -> bool:
+    """Type-sensitive, node-complete comparison for overlay admission (R3.3).
+
+    An overlay is a no-op only when its declared value is identical to the
+    value it would replace -- not merely ``==`` to it. Two defects in a
+    plain ``==``/flattened-leaf comparison are closed here:
+
+    - ``_config_leaves`` drops empty mappings entirely (nothing to recurse
+      into), so ``declared_overlays={"trainer.max_steps": {}}`` produced no
+      leaves at all and bypassed a flattened-leaf guard outright, while still
+      being applied verbatim -- replacing a scalar with an empty mapping, a
+      real config change. Comparing whole nodes, mapping identity included,
+      catches this: an empty mapping is identical only to another empty
+      mapping, never to a non-mapping existing value.
+    - Python's ``==`` treats ``5 == 5.0`` and ``False == 0`` as true, but
+      replacing an int leaf with an equal float (or a bool with an equal
+      int) still changes the serialized, type-tagged configuration. Both are
+      refused here even though a bare ``==`` would have called them
+      identical.
+    """
+
+    if isinstance(existing, Mapping) or isinstance(declared, Mapping):
+        if not isinstance(existing, Mapping) or not isinstance(declared, Mapping):
+            return False
+        if set(existing) != set(declared):
+            return False
+        return all(
+            _overlay_node_is_identity(existing[key], declared[key]) for key in existing
+        )
+    if isinstance(existing, bool) != isinstance(declared, bool):
+        return False
+    if type(existing) is not type(declared):
+        return False
+    return existing == declared
+
+
 def _is_config_path(path: str, prefixes: frozenset[str]) -> bool:
     """Return whether a leaf is a named path or one of its descendants."""
 
@@ -1063,6 +1110,7 @@ def _materialize_configured_worker_config(
     decision: RecoveryDecision,
     output_path: Path,
     declared_overlays: Mapping[str, Any] | None,
+    artifact_destination: Any | None = None,
 ) -> Any:
     """Build a runner config from captured intent plus explicit worker overlays.
 
@@ -1095,6 +1143,36 @@ def _materialize_configured_worker_config(
     overlay_values = _config_leaves(overlays)
     source_values = _config_leaves(source)
     supplied_values = _config_leaves(supplied)
+    if artifact_destination is not None and overlays:
+        # (C) review-r2 R2.4, type-sensitive and node-complete (review-r3
+        # R3.3): in routed mode, ANY declared overlay that would actually
+        # change the existing node it targets is refused before construction
+        # -- not only the automatic `run.root` overlay this gateway itself
+        # used to apply. `tpen.run`'s own closed artifact routing binds the
+        # physical destination; a declared overlay changing `run.root` or
+        # `trainer.max_steps` here would still change C. Each declared
+        # overlay is compared as a WHOLE node (not flattened leaves, which
+        # silently drop empty mappings) against the existing node at the
+        # same path, so an empty-mapping overlay or an int-to-float/bool
+        # replacement is refused even though a flattened, bare-`==` leaf
+        # comparison would have missed or accepted it (see
+        # :func:`_overlay_node_is_identity`). An overlay whose node already
+        # equals the one it would overwrite is a genuine no-op and stays
+        # permitted.
+        nonidentity: dict[str, Any] = {}
+        for path, declared_value in overlays.items():
+            existing = _select_container_path(source, path)
+            if existing is _MISSING_CONFIG_VALUE:
+                existing = _select_container_path(supplied, path)
+            if existing is _MISSING_CONFIG_VALUE or not _overlay_node_is_identity(
+                existing, declared_value
+            ):
+                nonidentity[path] = declared_value
+        if nonidentity:
+            raise ReceiptBindingError(
+                "routed configured run refuses nonidentity declared_overlays "
+                "before construction: " + ", ".join(sorted(nonidentity))
+            )
     missing_captured = [
         path
         for path in source_values
@@ -1144,7 +1222,8 @@ def _materialize_configured_worker_config(
             OmegaConf.update(worker_cfg, path, value, merge=False, force_add=True)
     for path, value in overlays.items():
         OmegaConf.update(worker_cfg, path, value, merge=False, force_add=True)
-    OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
+    if artifact_destination is None:
+        OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
     return worker_cfg
 
 
@@ -1155,6 +1234,7 @@ def run_bound_configured_once(
     decision: RecoveryDecision,
     output_path: Path,
     declared_overlays: Mapping[str, Any] | None = None,
+    artifact_destination: Any | None = None,
     **kwargs: Any,
 ) -> CoreOutcomeFacts:
     """Run a configured adapter callback through the gateway's intent binding.
@@ -1162,16 +1242,31 @@ def run_bound_configured_once(
     Call this from the ``run_once`` seam of a worker-start gateway, after its
     durable start receipt. Backend adapters share this materialization with
     ``start_configured`` without importing or constructing a science object.
+
+    Parameters
+    ----------
+    artifact_destination : tpen.artifacts.ArtifactDestination or None, optional
+        When supplied (F5), neither this materialization nor
+        `run_configured_once` overlays ``run.root`` with ``output_path``:
+        constant C is preserved and `tpen.run.run_from_config`'s own closed
+        artifact-routing binds the physical leaf instead. ``None`` (the
+        default) preserves the legacy ``run.root`` overlay unchanged.
     """
 
     worker_cfg = _materialize_configured_worker_config(
         cfg, intent=intent, decision=decision, output_path=output_path,
-        declared_overlays=declared_overlays,
+        declared_overlays=declared_overlays, artifact_destination=artifact_destination,
     )
     # The legacy direct entry retains its default; adapter calls must retain
     # the actual core exception for deterministic refusal classification.
     kwargs["raise_exceptions"] = True
-    run_configured_once(worker_cfg, decision=decision, output_path=output_path, **kwargs)
+    run_configured_once(
+        worker_cfg,
+        decision=decision,
+        output_path=output_path,
+        artifact_destination=artifact_destination,
+        **kwargs,
+    )
     return _core_outcome_from_artifacts(output_path, decision=decision)
 
 
@@ -1195,12 +1290,22 @@ def run_configured_once(cfg: Any, *, decision: RecoveryDecision, output_path: Pa
 
     from .recovery import OperationalRestoreRequest
 
+    # F5: in routed mode (an `artifact_destination` kwarg forwarded to
+    # `run_from_config` below), skip the `run.root` overlay entirely -- it
+    # would otherwise change C on every allocation. `run_from_config`'s own
+    # closed artifact-routing binds the physical write location instead, from
+    # the unchanged, constant `run.root`/`run.dir`. Legacy callers (no
+    # destination) are unaffected: they keep overlaying `run.root` exactly as
+    # before.
+    routed = kwargs.get("artifact_destination") is not None
     worker_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
     if decision.load is None:
-        OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
+        if not routed:
+            OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
         return run_from_config(worker_cfg, restore_request=None, **kwargs)
     if dict(decision.load).get("mode") == "train_resume":
-        OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
+        if not routed:
+            OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
         return run_from_config(worker_cfg, restore_request=OperationalRestoreRequest(decision), **kwargs)
 
     # Unchanged legacy path (c3815d0e) for any load mode outside S2's scope
@@ -1214,7 +1319,8 @@ def run_configured_once(cfg: Any, *, decision: RecoveryDecision, output_path: Pa
             effective_runner_load = OmegaConf.to_container(effective_runner_load, resolve=True)
         if effective_runner_load != decision.load:
             raise ValueError("worker overlay did not reach the configured runner.load")
-    OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
+    if not routed:
+        OmegaConf.update(worker_cfg, "run.root", str(output_path), merge=False, force_add=True)
     return run_from_config(worker_cfg, **kwargs)
 
 
