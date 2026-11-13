@@ -336,6 +336,10 @@ class RunResult:
     status: str
     run_dir: Path | None = None
     error: str | None = None
+    checkpoint_ref: Any | None = None
+    next_iteration: int | None = None
+    completed_updates: int | None = None
+    target_iterations: int | None = None
 
 
 @dataclass(frozen=True)

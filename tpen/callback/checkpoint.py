@@ -25,6 +25,7 @@ from tpen.checkpoint import (
 )
 from tpen.checkpoint.artifact import is_complete_checkpoint_dir
 from tpen.checkpoint.schema import read_manifest
+from tpen.checkpoint.reference import CheckpointRef
 from tpen.events import DomainState
 from tpen.events import Event as TypedEvent
 from tpen.events import Occurrence, Subscription
@@ -211,6 +212,8 @@ class Checkpoint(StatefulCallback[TrainerState]):
         # so it is self-clearing: a later iteration that skipped its update
         # simply never matches, and no explicit per-iteration reset is required.
         self._updated_iteration_step: int | None = None
+        self.published_ref: CheckpointRef | None = None
+        self.published_payload_profile: str | None = None
 
     def handle_occurrence_impl(
         self,
@@ -288,6 +291,7 @@ class Checkpoint(StatefulCallback[TrainerState]):
         if is_complete_checkpoint_dir(final_dir):
             self._validate_existing_publication(final_dir)
             reconcile_publication(self.output_dir, final_dir)
+            self._record_published(final_dir)
             return
         model = state.model
         if model is None:
@@ -310,6 +314,17 @@ class Checkpoint(StatefulCallback[TrainerState]):
             save_trainer=self.save_trainer,
             save_sampler=self.save_sampler,
             save_rng=self.save_rng,
+        )
+        self._record_published(final_dir)
+
+    def _record_published(self, final_dir: Path) -> None:
+        """Expose a ref only after the complete publication sequence returns."""
+
+        ref = CheckpointRef.from_directory(final_dir)
+        manifest = read_manifest(final_dir / "manifest.json", mode="model_only")
+        self.published_ref = ref
+        self.published_payload_profile = (
+            None if manifest.payload is None else manifest.payload.get("profile")
         )
 
     def _validate_existing_publication(self, final_dir: Path) -> None:

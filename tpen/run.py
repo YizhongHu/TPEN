@@ -43,6 +43,7 @@ from tpen.events import Event as TypedEvent
 from tpen.hi_schema import validate_hi_train_config
 from tpen.run_events import RunCompleted, RunFailed, RunStarted
 from tpen.runner import Runner
+from tpen.callback.planned_yield import PlannedYieldSignal
 
 # Register custom OmegaConf resolvers (e.g. tpen.basis_feature_dim) before any
 # config is loaded or resolved on the run path.
@@ -494,7 +495,13 @@ def run_from_config(
         # must not claim success. Same exit code as the raising path: no caller
         # distinguishes between nonzero codes, and inventing a second one would
         # be a new contract for no consumer.
-        return 1 if status == "failed" else 0
+        return 0 if status in {"completed", "planned_yield"} else 1
+    except PlannedYieldSignal as signal:
+        result = signal.result
+        if context is not None:
+            context.metadata.status = result.status
+            context.emit(RunCompleted(status=result.status))
+        return 0 if result.status == "planned_yield" else 1
     except Exception as exc:
         phase = _failure_phase(exc, context=context, runner=runner)
         traceback_text = traceback.format_exc()
