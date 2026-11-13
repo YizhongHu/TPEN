@@ -725,7 +725,7 @@ def science_eval_seed(lineage_index: int, checkpoint_ordinal: int, stream_index:
 
 
 def science_evaluated_checkpoint_updates() -> tuple[int, ...]:
-    """Return the 27 contract-frozen evaluated-checkpoint update counts, in order."""
+    """Return the contract-frozen evaluated-checkpoint update counts, in order."""
 
     payload = json.loads(CONTRACT_INPUTS_PATH.read_text(encoding="utf-8"))
     return tuple(payload["measurement"]["evaluated_checkpoints"]["updates"])

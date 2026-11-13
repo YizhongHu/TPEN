@@ -175,7 +175,7 @@ def test_f3_science_lineages_do_not_silently_dispatch_pipeline_defaults(job_env,
         observed = (config["runtime"]["seed"], config["sampler"]["seed"],
                     config["runtime"]["device"], config["trainer"]["max_steps"],
                     config["sampler"]["n_walkers"])
-        assert observed == (73000 + index, 83000 + index, "cuda", 50000, 4096)
+        assert observed == (73000 + index, 83000 + index, "cuda", 100000, 4096)
 
 
 @pytest.mark.parametrize("t_wall,e_wall", [

@@ -35,7 +35,7 @@ def test_evaluation_seed_formula_is_injective_and_disjoint() -> None:
         for ordinal in range(n_ordinals)
         for stream in range(4)
     }
-    assert len(seeds) == 3 * n_ordinals * 4 == 324
+    assert len(seeds) == 3 * n_ordinals * 4
     explicit_seeds = {
         seed
         for value in roster.values()
@@ -50,14 +50,14 @@ def test_evaluation_seed_formula_is_injective_and_disjoint() -> None:
 
 def test_evaluated_set_is_subset_of_retained_set_and_covers_rule_windows() -> None:
     measurement = load_inputs()["measurement"]
-    retained = set(range(0, 50001, 1000))
+    retained = set(range(0, 100001, 1000))
     assert len(retained) == measurement["checkpoint_retention"]["count_per_lineage"]
     evaluated = measurement["evaluated_checkpoints"]["updates"]
     assert evaluated == sorted(set(evaluated))
     assert len(evaluated) == measurement["evaluated_checkpoints"]["count_per_lineage"]
     assert set(evaluated).issubset(retained)
     assert {0, 1000}.issubset(evaluated)
-    assert {40000, 45000, 50000}.issubset(evaluated)
+    assert {90000, 95000, 100000}.issubset(evaluated)
     for centre in range(3000, 19001, 1000):
         assert {centre - 1000, centre, centre + 1000}.issubset(evaluated)
 
@@ -176,7 +176,7 @@ def test_decision_rule_parameters_are_machine_readable() -> None:
     }
     assert parameters["basin_center_updates"] == list(range(3000, 19001, 1000))
     assert parameters["early_updates"] == [0, 1000]
-    assert parameters["late_updates"] == [40000, 45000, 50000]
+    assert parameters["late_updates"] == [90000, 95000, 100000]
     assert parameters["late_required_count"] == 2
     assert parameters["bounded_null_late_count"] == parameters["late_required_count"]
     assert parameters["selection_streams"] == [0, 1]

@@ -273,11 +273,9 @@ to 7 (nuclear curvature, lineage count, model/optimizer/sampler, horizon and
 walker budget, science venue) were decided directly by the operator. Item 8
 (the four-stream design) was decided after one round of clarification.
 
-The science design is 50,000 completed updates, retaining update zero and
-every 1,000 updates (51 retained checkpoints) while fresh-evaluating a
-separate 27-checkpoint set; both the checkpoint counts (2026-11-06, "27 makes
-sense. especially if evaluation is expensive") and the horizon itself
-(2026-11-07, "you already decided") are decided. It uses three independent
+The science design is 100,000 completed updates, retaining update zero and
+every 1,000 updates (101 retained checkpoints) while fresh-evaluating a
+separate 37-checkpoint set. It uses three independent
 lineages (operator, quoted "3") with initialization seeds `73001..73003` and
 sampler seeds `83001..83003`, four fresh streams per evaluated checkpoint,
 4,096 walkers, 256 draws, burn-in 1,000, and stride 20 (operator, "you
@@ -552,10 +550,9 @@ and the partition ranges), the completed-update count after the iteration,
 and whether the update was applied. Skipped updates are recorded, not
 dropped.
 
-All 51 checkpoints per lineage are retained (update 0 and every 1,000 through
-50,000). Fresh evaluation stays at the predeclared 27 per lineage (operator,
-2026-11-06: "27 makes sense. especially if evaluation is expensive"). Both
-counts are now **decided**, not proposed.
+All 101 checkpoints per lineage are retained (update 0 and every 1,000 through
+100,000). Fresh evaluation uses the predeclared 37 per lineage. Both counts
+are now **decided**, not proposed.
 
 Storage lifecycle: the working location is Cannon netscratch, not scratch,
 which is purged after 90 days, so the HPSS archive must be made inside that
@@ -569,17 +566,17 @@ without a Task Orchestrator lifecycle disposition naming the exact paths and
 a passed recovery verification of the archive.
 
 Storage figures, recomputed at the science scale of 4,096 training walkers:
-fresh evaluation is `3 x 27 x 4 x 4,096 x 256 = 339,738,624` rows, about 28.1
+fresh evaluation is `3 x 37 x 4 x 4,096 x 256 = 465,567,744` rows, about 38.6
 GiB compact at 89 bytes per row (the conservative envelope); raw training
-batches, captured every 50th iteration step including step 0 through 50,000
-(1,001 batches per lineage), is `3 x 1,001 x 4,096 = 12,300,288` rows, about
-0.928 GiB compact at 81 primitive bytes per row, before container and
-compression. At 20 batches per 1,000-step partition, 1,001 batches per
-lineage gives 50 full partitions plus one single-batch partition (holding
-only step 50,000), 51 partitions per lineage, `3 x 51 = 153` data objects
-total, not the 150 the storage proposal costed. Both byte-per-row figures and
-their source are recorded in `contract_inputs.json`. Compression ratios are
-unmeasured and are labelled so in `contract_inputs.json`.
+batches, captured every 50th iteration step including step 0 through 100,000
+(2,001 batches per lineage), is `3 x 2,001 x 4,096 = 24,588,288` rows, about
+1.855 GiB compact at 81 primitive bytes per row, before container and
+compression. At 20 batches per 1,000-step partition, 2,001 batches per
+lineage gives 100 full partitions plus one single-batch partition (holding
+only step 100,000), 101 partitions per lineage, `3 x 101 = 303` data objects
+total. Both byte-per-row figures and their source are recorded in
+`contract_inputs.json`. Compression ratios are unmeasured and are labelled so
+in `contract_inputs.json`.
 
 ## Tail characterization
 

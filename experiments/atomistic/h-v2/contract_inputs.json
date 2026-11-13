@@ -114,15 +114,15 @@
     "complete_record_rule": "Every planned draw-by-walker record appears exactly once with finite coordinates and local energy, reconciled source/checkpoint/config/schema identities, and no clipping, filtering, replacement, final-draw shortcut, or pooled partial window.",
     "checkpoint_retention": {
       "status": "decided",
-      "decided_by": "operator-decisions-logging-module-checkpoints-20261106d, 2026-11-06, quoted '27 makes sense. especially if evaluation is expensive' (confirming the 51-retained/27-evaluated split)",
-      "updates": "0 and every 1000 completed optimizer updates through 50000 inclusive",
-      "count_per_lineage": 51,
+      "decided_by": "operator-decisions-logging-module-checkpoints-20261106d, 2026-11-06, amended by the approved 100000-update science horizon plan (confirming the 101-retained/37-evaluated split)",
+      "updates": "0 and every 1000 completed optimizer updates through 100000 inclusive",
+      "count_per_lineage": 101,
       "payload": "full available resume payload and committed publication identity; retention does not authorize resume, retry, or reselection",
       "historical_basis": "TO:bfb2247e operator-recommendations-accepted-and-horizon-2026-09-04 is evidence for the 1000-update target, not a fresh operator quote"
     },
     "evaluated_checkpoints": {
       "status": "decided",
-      "decided_by": "operator-decisions-logging-module-checkpoints-20261106d, 2026-11-06, quoted '27 makes sense. especially if evaluation is expensive'",
+      "decided_by": "operator-decisions-logging-module-checkpoints-20261106d, 2026-11-06, amended by the approved 100000-update science horizon plan",
       "updates": [
         0,
         1000,
@@ -150,9 +150,19 @@
         35000,
         40000,
         45000,
-        50000
+        50000,
+        55000,
+        60000,
+        65000,
+        70000,
+        75000,
+        80000,
+        85000,
+        90000,
+        95000,
+        100000
       ],
-      "count_per_lineage": 27,
+      "count_per_lineage": 37,
       "distinction": "The evaluated set is a subset of the retained set; unevaluated retained checkpoints are not post-result primary selections."
     },
     "tail_rule": {
@@ -206,7 +216,7 @@
         83002,
         83003
       ],
-      "evaluation_stream_seed_formula": "1000000 + 10000*lineage_index + 10*evaluated_checkpoint_ordinal + stream_index, with indices 0..2, 0..26, 0..3",
+      "evaluation_stream_seed_formula": "1000000 + 10000*lineage_index + 10*evaluated_checkpoint_ordinal + stream_index, with indices 0..2, 0..36, 0..3",
       "disjointness": "Pilot/check seeds are excluded from science; no training, sampler, evaluation, or pilot seed may be reused across namespaces.",
       "non_science_seed_namespaces": {
         "pipeline_cpu_learned_e": {
@@ -428,7 +438,7 @@
       "bounded_null",
       "unresolved"
     ],
-    "recurrence": "Complete records and qualified uncertainty exist. Streams 0/1 select the smallest-mean-W consecutive triple centered at 3000..19000 (earliest tie); streams 2/3 re-measure early, basin and late W, and each confirmation stream independently must show early W exceeds basin W by >=2x and >=0.01 Ha, with at least two of 40000/45000/50000 exceeding it by both margins with simultaneous confidence bounds. At least 2 of 3 lineages pass. If two lineages pass and the third is incomplete, the study-level label is unresolved; report recurrence in the two complete lineages only. Tail exceedance safeguards must not contradict the W result, evaluated over the TAIL thresholds only (0.5 Ha, 1 Ha, and the pilot-frozen hydrogen-equivalent threshold in measurement.hydrogen_equivalent_tail_threshold); the tail-threshold safeguard pools streams 2 and 3, n=8192 walkers: a contradiction is (i) W meets the rise rule while none of the three tail thresholds shows an increase of at least its own margin in decision_rules.parameters.exceedance_margins_hartree, where an 'increase of at least its margin' means the simultaneous LOWER confidence bound of the increase reaches the margin, or (ii) W fails the rise rule, or the bounded-null band excludes it, while some fixed exceedance threshold shows an increase of at least its own margin. A bulk-threshold (0.01/0.05/0.1 Ha) decrease that accompanies a W rise is expected, as He-v1's own 25k-to-50k contrast shows, and is not a contradiction; a bulk-threshold exceedance that fails to confirm a W rise is reported as a qualification, never as a contradiction. Directional wording and evidence: operator-review-contract-proposals-20261107 items 1-2 on fffc313a, decided in primary-measure-and-margins-decision-20261107 on 8a67671f from analysis primary-measure-and-margins-analysis-20261107 (FASRC Cannon job 58568904); the tail-threshold restriction and the simultaneous-lower-bound reading are round-1 pre-review findings F4/F5, accepted 2026-11-07.",
+    "recurrence": "Complete records and qualified uncertainty exist. Streams 0/1 select the smallest-mean-W consecutive triple centered at 3000..19000 (earliest tie); streams 2/3 re-measure early, basin and late W, and each confirmation stream independently must show early W exceeds basin W by >=2x and >=0.01 Ha, with at least two of 90000/95000/100000 exceeding it by both margins with simultaneous confidence bounds. At least 2 of 3 lineages pass. If two lineages pass and the third is incomplete, the study-level label is unresolved; report recurrence in the two complete lineages only. Tail exceedance safeguards must not contradict the W result, evaluated over the TAIL thresholds only (0.5 Ha, 1 Ha, and the pilot-frozen hydrogen-equivalent threshold in measurement.hydrogen_equivalent_tail_threshold); the tail-threshold safeguard pools streams 2 and 3, n=8192 walkers: a contradiction is (i) W meets the rise rule while none of the three tail thresholds shows an increase of at least its own margin in decision_rules.parameters.exceedance_margins_hartree, where an 'increase of at least its margin' means the simultaneous LOWER confidence bound of the increase reaches the margin, or (ii) W fails the rise rule, or the bounded-null band excludes it, while some fixed exceedance threshold shows an increase of at least its own margin. A bulk-threshold (0.01/0.05/0.1 Ha) decrease that accompanies a W rise is expected, as He-v1's own 25k-to-50k contrast shows, and is not a contradiction; a bulk-threshold exceedance that fails to confirm a W rise is reported as a qualification, never as a contradiction. Directional wording and evidence: operator-review-contract-proposals-20261107 items 1-2 on fffc313a, decided in primary-measure-and-margins-decision-20261107 on 8a67671f from analysis primary-measure-and-margins-analysis-20261107 (FASRC Cannon job 58568904); the tail-threshold restriction and the simultaneous-lower-bound reading are round-1 pre-review findings F4/F5, accepted 2026-11-07.",
     "bounded_null": "All 3 lineages are complete and pass instrument/sampling gates; simultaneous inference over every predeclared basin, checkpoint, threshold, and window search excludes the W decrease/rise rule. For every reference checkpoint k in bounded_null_reference_updates (the 21 evaluated checkpoints at or below 20,000 updates), the simultaneous band excludes W at bounded_null_late_count or more late checkpoints reaching max(2 W(k), W(k) + 0.01 Ha). Fixed-threshold exceedance bands use all four streams pooled (n=16384 walkers) and the pilot gate; for every reference checkpoint k in bounded_null_reference_updates (the same 21 evaluated checkpoints at or below 20,000 updates) and every late checkpoint, they also exclude an absolute increase from k to that late checkpoint, at every threshold including the pilot-frozen hydrogen-equivalent threshold, of at least that threshold's own margin in decision_rules.parameters.exceedance_margins_hartree (0.002 Ha at the tail thresholds 0.5, 1 Ha and the pilot-frozen hydrogen-equivalent threshold; 0.01 Ha at the bulk thresholds 0.01, 0.05 and 0.1 Ha, where the pilot gate's half-width <= half-margin requirement is otherwise unreachable), where an 'increase of at least its margin' means the simultaneous LOWER confidence bound of the increase reaches the margin. A flat MAD or nonsignificance alone is not equivalence.",
     "unresolved": "Any required record, identity, instrument, dependence/uncertainty qualification, tail safeguard, operator decision, or horizon is absent or inconclusive; a partial lineage result, conflicting streams, unsupported margins, or a tail-only change outside the declared instrument is unresolved.",
     "parameters": {
@@ -465,9 +475,9 @@
         1000
       ],
       "late_updates": [
-        40000,
-        45000,
-        50000
+        90000,
+        95000,
+        100000
       ],
       "late_required_count": 2,
       "bounded_null_reference_updates": [
@@ -549,11 +559,11 @@
     {
       "id": "horizon_and_checkpoints",
       "status": "decided_2026-11-07",
-      "decided_by": "checkpoint counts decided 2026-11-06 (operator-decisions-logging-module-checkpoints-20261106d, '27 makes sense. especially if evaluation is expensive'); horizon decided 2026-11-07 (operator-review-contract-proposals-20261107 item 6, 'you already decided')",
-      "proposal": "50,000 updates, retain 0..50000 every 1000, evaluate the explicit 27-checkpoint set",
+      "decided_by": "checkpoint counts amended by the approved 100000-update science horizon plan; horizon decision remains operator-reviewed",
+      "proposal": "100,000 updates, retain 0..100000 every 1000, evaluate the explicit 37-checkpoint set",
       "rationale": "Dense retention prevents loss of an early basin while the smaller evaluated set controls fresh-evaluation cost.",
       "alternatives": [
-        "use a 100,000-update horizon or a sparse 15-point evaluation set"
+        "use a 50,000-update horizon or a sparse 15-point evaluation set"
       ]
     },
     {
@@ -774,7 +784,7 @@
       "on_failure": "if the pilot gate fails at the hydrogen-equivalent threshold, the F5 stop rule applies (measurement.hydrogen_equivalent_tail_threshold); see decision_rules.parameters.zero_event_bound_pooling and the G5 no-retune rule below"
     },
     "science_lineages": {
-      "scope": "three 50000-update scientific training lineages and their fresh evaluations",
+      "scope": "three 100000-update scientific training lineages and their fresh evaluations",
       "status": "prohibited_until_operator_reviews_science_plan",
       "required_review": "operator review of all lane_proposals with explicit approval",
       "current_status": "prohibited",
@@ -829,8 +839,8 @@
     "design_rule_scope": "the callback/every_n_steps/context.log sentence describes training_callback modules; evaluation_generator modules run during fresh evaluation and one_shot_callback modules fire once, not on a cadence",
     "core_logs_unconditionally": false,
     "checkpoints": {
-      "retained_per_lineage": 51,
-      "evaluated_per_lineage": 27,
+      "retained_per_lineage": 101,
+      "evaluated_per_lineage": 37,
       "status": "decided"
     },
     "storage_lifecycle": {
@@ -847,22 +857,22 @@
     "storage_figures": {
       "scale": {"lineages": 3, "training_walkers": 4096},
       "fresh_evaluation": {
-        "formula": "3 lineages x 27 evaluated checkpoints x 4 streams x 4096 walkers x 256 draws",
-        "rows": 339738624,
-        "compact_gib": 28.1,
+        "formula": "3 lineages x 37 evaluated checkpoints x 4 streams x 4096 walkers x 256 draws",
+        "rows": 465567744,
+        "compact_gib": 38.6,
         "bytes_per_row_compact": 89,
         "bytes_per_row_source": "training-batch-storage-proposal: 89 bytes, the conservative envelope"
       },
       "raw_training_batches": {
-        "formula": "3 lineages x 1001 captured batches (every_n_steps=50, iteration step 0 through 50000 inclusive) x 4096 walkers",
-        "batches_per_lineage": 1001,
-        "rows": 12300288,
-        "compact_gib": 0.928,
+        "formula": "3 lineages x 2001 captured batches (every_n_steps=50, iteration step 0 through 100000 inclusive) x 4096 walkers",
+        "batches_per_lineage": 2001,
+        "rows": 24588288,
+        "compact_gib": 1.855,
         "bytes_per_row_compact": 81,
         "bytes_per_row_source": "training-batch-storage-proposal: 81 primitive bytes",
-        "partitions_per_lineage": 51,
-        "data_objects_total": 153,
-        "partition_note": "20 batches per 1000-step partition gives 50 full partitions plus one single-batch partition (step 50000) per lineage; 3 lineages x 51 partitions = 153 data objects, not the 150 the storage proposal costed"
+        "partitions_per_lineage": 101,
+        "data_objects_total": 303,
+        "partition_note": "20 batches per 1000-step partition gives 100 full partitions plus one single-batch partition (step 100000) per lineage; 3 lineages x 101 partitions = 303 data objects"
       },
       "compression_ratio": "unmeasured; a pilot block must measure it before a Holystore budget promises it"
     }

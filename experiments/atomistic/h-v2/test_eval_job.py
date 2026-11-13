@@ -323,10 +323,10 @@ def test_verify_train_receipt_identity_refuses_an_empty_receipt() -> None:
 # --- seed grids: equal CI exactly ------------------------------------------
 
 
-def test_science_fanout_is_27x4_with_the_frozen_seed_formula() -> None:
+def test_science_fanout_uses_the_contract_roster_and_frozen_seed_formula() -> None:
     generations = eval_job.science_fanout(lineage_index=1)
-    assert len(generations) == 108
     updates = protocol.science_evaluated_checkpoint_updates()
+    assert len(generations) == len(updates) * 4
     assert [g["update"] for g in generations[:4]] == [updates[0]] * 4
     for generation in generations:
         expected_seed = 1_000_000 + 10_000 * 1 + 10 * generation["ordinal"] + generation["stream"]

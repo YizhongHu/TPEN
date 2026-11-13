@@ -23,7 +23,7 @@ never left to whatever the submitting shell happened to export):
     Absolute executor environment Python (``cd executor && uv sync --locked``,
     separate from the science environment).
 
-NOT YET COMPLETE. Section C2 schedules 27 checkpoints x 4 streams (108
+NOT YET COMPLETE. Section C2 schedules the contract checkpoint roster x 4 streams
 evaluations) per lineage EVAL job, run one after another inside the same
 allocation. This script invokes exactly one EVAL generation (stream 0
 against the lineage's single recorded TRAIN checkpoint): ``attached.py``'s
