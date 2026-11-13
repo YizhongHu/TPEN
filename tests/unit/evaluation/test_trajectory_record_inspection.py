@@ -240,7 +240,7 @@ def test_incomplete_grid_row_is_rejected(tmp_path: Path, monkeypatch: pytest.Mon
         return real_scan(*args, **kwargs)._replace(row_count=VALUES.numel() - 1)
 
     monkeypatch.setattr(trajectory_records, "_scan_v1_csv", wrong_declared_row_count)
-    with pytest.raises(TamperedTrajectoryRecordError, match="incomplete"):
+    with pytest.raises(TamperedTrajectoryRecordError, match="row_count"):
         inspect_trajectory_record(artifact.metadata_path)
 
 
