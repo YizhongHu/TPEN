@@ -25,7 +25,7 @@ from tpen.checkpoint.manifest import CheckpointManifest
 from tpen.inspection import RunEvidence, inspect_run
 
 FIXTURE_PATH = Path(__file__).with_name("fixtures") / "core-run-evidence-v2.json"
-NORMALIZED_ROOT = "/normalized/core"
+REFUSED_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "core-run-evidence-v1-refused.json"
 
 
 def _make_run(root: Path) -> Path:
@@ -55,21 +55,62 @@ def _make_run(root: Path) -> Path:
     return run_dir
 
 
-def normalize(evidence: RunEvidence) -> dict[str, Any]:
-    """Normalize only absolute run/checkpoint paths; retain producer values."""
+def _make_refused_run(root: Path) -> Path:
+    run_dir = root / "attempt" / "core"
+    checkpoint = run_dir / "checkpoints" / "step_000007"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "manifest.json").write_text("{not valid json\n", encoding="utf-8")
+    (checkpoint / "COMPLETE").write_text("complete\n", encoding="utf-8")
+    (run_dir / "status.json").write_text('{"status":"completed"}\n', encoding="utf-8")
+    identity = resolved_config_identity({"model": {"name": "fixture"}})
+    (run_dir / "run_start.json").write_text(
+        json.dumps({"resolved_config_identity": identity}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def _normalize_path(path: str, temporary_root: Path) -> str:
+    """Replace one exact temporary prefix while retaining its relative path."""
+
+    try:
+        relative = Path(path).resolve().relative_to(temporary_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"producer path is outside temporary root: {path}") from exc
+    return str(Path("/normalized") / relative)
+
+
+def normalize(evidence: RunEvidence, temporary_root: Path) -> dict[str, Any]:
+    """Normalize only the known temporary prefix; retain producer values."""
 
     data = evidence.to_dict()
-    data["run_dir"] = NORMALIZED_ROOT
+    data["run_dir"] = _normalize_path(data["run_dir"], temporary_root)
     if data["checkpoint"] is not None:
-        data["checkpoint"]["checkpoint_dir"] = f"{NORMALIZED_ROOT}/checkpoints/step_000007"
+        data["checkpoint"]["checkpoint_dir"] = _normalize_path(
+            data["checkpoint"]["checkpoint_dir"], temporary_root
+        )
+    if data["refusal"] is not None:
+        data["refusal"]["reason"] = data["refusal"]["reason"].replace(
+            str(temporary_root.resolve()), "/normalized"
+        )
     return data
 
 
 def regenerate() -> dict[str, Any]:
     """Regenerate from the project environment; never hand-edit the fixture."""
     with tempfile.TemporaryDirectory(prefix="cx00-fixture-") as temporary:
+        temporary_root = Path(temporary) / "attempt"
         evidence = inspect_run(_make_run(Path(temporary)))
-        normalized = normalize(evidence)
+        normalized = normalize(evidence, temporary_root)
+    return normalized
+
+
+def regenerate_refused() -> dict[str, Any]:
+    """Regenerate the v1 refusal fixture from a real corrupt-checkpoint refusal."""
+    with tempfile.TemporaryDirectory(prefix="cx00-fixture-refused-") as temporary:
+        temporary_root = Path(temporary) / "attempt"
+        evidence = inspect_run(_make_refused_run(Path(temporary)))
+        normalized = normalize(evidence, temporary_root)
     return normalized
 
 

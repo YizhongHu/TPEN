@@ -11,15 +11,19 @@ from tpen_executor.runners import CoreRunEvidence, EvidenceUnavailable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FIXTURE_PATH = REPO_ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v2.json"
+FIXTURE_PATHS = (
+    REPO_ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v2.json",
+    REPO_ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v1-refused.json",
+)
 
 
-def _fixture() -> dict:
-    return json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+def _fixture(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def test_executor_decodes_each_core_owned_fixture_identically() -> None:
-    payload = _fixture()
+@pytest.mark.parametrize("fixture_path", FIXTURE_PATHS, ids=lambda path: path.stem)
+def test_executor_decodes_each_core_owned_fixture_identically(fixture_path: Path) -> None:
+    payload = _fixture(fixture_path)
     evidence = CoreRunEvidence.from_mapping(payload)
     assert evidence.schema == payload["schema"]
     assert evidence.run_dir == payload["run_dir"]
@@ -40,4 +44,4 @@ def test_executor_decodes_each_core_owned_fixture_identically() -> None:
 )
 def test_executor_refuses_unknown_schema_and_extra_field(mutate) -> None:
     with pytest.raises(EvidenceUnavailable):
-        CoreRunEvidence.from_mapping(mutate(_fixture()))
+        CoreRunEvidence.from_mapping(mutate(_fixture(FIXTURE_PATHS[0])))
