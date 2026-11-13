@@ -229,18 +229,17 @@ def test_duplicate_grid_row_is_rejected(tmp_path: Path) -> None:
         inspect_trajectory_record(artifact.metadata_path)
 
 
-def test_incomplete_grid_row_is_rejected(tmp_path: Path) -> None:
+def test_incomplete_grid_row_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     artifact = _write_v1_artifact(tmp_path, VALUES)
-    with artifact.path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fieldnames = list(reader.fieldnames or [])
-        rows = list(reader)
-    del rows[-1]
-    _write_rows(artifact.path, fieldnames, rows)
-    metadata = _read_metadata(artifact)
-    metadata["csv_sha256"] = trajectory_records._file_sha256(artifact.path)
-    metadata["byte_count"] = artifact.path.stat().st_size
-    _write_metadata(artifact, metadata)
+    # The scanner independently rejects a physically incomplete CSV grid. To
+    # isolate the reader's binding of its reported row_count to the sidecar,
+    # return an otherwise valid scan with only that field altered.
+    real_scan = trajectory_records._scan_v1_csv
+
+    def wrong_declared_row_count(*args: object, **kwargs: object) -> object:
+        return real_scan(*args, **kwargs)._replace(row_count=VALUES.numel() - 1)
+
+    monkeypatch.setattr(trajectory_records, "_scan_v1_csv", wrong_declared_row_count)
     with pytest.raises(TamperedTrajectoryRecordError, match="incomplete"):
         inspect_trajectory_record(artifact.metadata_path)
 

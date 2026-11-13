@@ -65,6 +65,13 @@ def test_missing_required_fixture_fails_instead_of_skipping(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(__name__ + "._FIXTURES_ROOT", tmp_path)
+
+    def unexpected_skip(*args: object, **kwargs: object) -> None:
+        raise AssertionError("missing required fixture was skipped")
+
+    # Turn the mutant's pytest.skip into an ordinary test failure. Pytest
+    # treats SkipTest as a skip even when it occurs inside this assertion.
+    monkeypatch.setattr(pytest, "skip", unexpected_skip)
     with pytest.raises(pytest.fail.Exception, match="not generated"):
         _fixture_dir("missing_required_fixture")
 
@@ -98,6 +105,10 @@ def _is_sha256_hex(value: object) -> bool:
     )
 
 
+def _assert_literal_csv_pin(name: str, csv_path: Path) -> None:
+    assert hashlib.sha256(csv_path.read_bytes()).hexdigest() == _LITERAL_ARTIFACT_SHA256[name][csv_path.name]
+
+
 @pytest.mark.parametrize("name", ["h_like_frozen_main", "he_like_frozen_main"])
 def test_frozen_fixture_provenance_matches_committed_bytes(name: str) -> None:
     directory = _fixture_dir(name)
@@ -118,7 +129,16 @@ def test_frozen_fixture_provenance_matches_committed_bytes(name: str) -> None:
     assert provenance["metadata_sha256"] == hashlib.sha256(metadata_path.read_bytes()).hexdigest()
     csv_path = directory / "sampled_eval_table.csv"
     assert provenance["csv_sha256"] == hashlib.sha256(csv_path.read_bytes()).hexdigest()
-    assert hashlib.sha256(csv_path.read_bytes()).hexdigest() == _LITERAL_ARTIFACT_SHA256[name][csv_path.name]
+    # Exercise the literal pin with an intentionally wrong expected digest as
+    # well as the real fixture. This makes the test fail if the assertion is
+    # weakened to ``assert True`` while leaving committed bytes untouched.
+    literal_key = _LITERAL_ARTIFACT_SHA256[name][csv_path.name]
+    _LITERAL_ARTIFACT_SHA256[name][csv_path.name] = "0" * 64
+    try:
+        with pytest.raises(AssertionError):
+            _assert_literal_csv_pin(name, csv_path)
+    finally:
+        _LITERAL_ARTIFACT_SHA256[name][csv_path.name] = literal_key
     assert hashlib.sha256(metadata_path.read_bytes()).hexdigest() == _LITERAL_ARTIFACT_SHA256[name][metadata_path.name]
 
     # Reproducible generator/input pinning: source, exact command, and a
