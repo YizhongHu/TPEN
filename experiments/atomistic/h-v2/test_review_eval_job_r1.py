@@ -481,7 +481,7 @@ def test_real_eval_restores_p_and_e_checkpoints(tmp_path, monkeypatch, explicit_
     # exercise the completeness gate with an intentionally incomplete payload.
     job.attached.probe_admitted_a1_modules(
         train,
-        protocol.candidate_modules_to_append(),
+        protocol.candidate_modules_to_append(include_amplitude_risk=False),
         science_python=science_python,
         probe_config_path=tmp_path / "handoff" / "h-v2-train-gpu-route-g.probe.yaml",
         cwd=REPO,

@@ -453,6 +453,9 @@ def build_h_v2_train_plan(
         allow_incomplete_a1=(
             science_config_identity is None and payload_label in {None, "pipeline-check"}
         ),
+        allow_missing_amplitude_risk=(
+            science_config_identity is not None and payload_label in protocol.PILOT_PAYLOADS
+        ),
     )
     task_id = f"h-v2-train-{lineage}"
     result_dir = results / "attached" / task_id
@@ -828,6 +831,7 @@ def prepare_h_v2_run(
         resolved,
         evaluation=(task.stage == EVAL_STAGE),
         allow_incomplete_a1=task.metadata.get("payload") == "pipeline-check",
+        allow_missing_amplitude_risk=task.metadata.get("payload") in protocol.PILOT_PAYLOADS,
     )
     unresolved = _unresolved_bound_config(merged)
     artifact_declarations = _derive_artifact_declarations(unresolved, stage=task.stage)
@@ -962,8 +966,13 @@ def activate_h_v2_run(
         resolved = _resolve_bound_config(
             _merge_config_with_overrides(prepared.effective_config, prepared.overrides)
         )
+        allow_missing_amplitude_risk = prepared.payload in protocol.PILOT_PAYLOADS
         try:
-            protocol._assert_a1_callbacks(resolved, allow_incomplete=False)
+            protocol._assert_a1_callbacks(
+                resolved,
+                allow_incomplete=False,
+                allow_missing_amplitude_risk=allow_missing_amplitude_risk,
+            )
         except ValueError as error:
             reason = str(error)
             _fail("incomplete-a1-callback-set", reason)
@@ -972,6 +981,8 @@ def activate_h_v2_run(
             ) from error
         configured = set(protocol.reconcile_enabled_modules(resolved))
         required = set(protocol.A1_TRAINING_MODULE_CANDIDATES)
+        if allow_missing_amplitude_risk:
+            required.discard("tpen.callback.AmplitudeRiskFraction")
         if configured != required:
             missing = sorted(required - configured)
             reason = f"incomplete-a1-callback-set: final TRAIN config is missing {missing!r}"
