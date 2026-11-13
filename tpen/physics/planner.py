@@ -30,6 +30,7 @@ from tpen.physics.operators import (
     OperatorId,
     is_registered_operator,
 )
+from tpen.physics.receipt import ExecutionReceipt, JsonScalar
 
 
 type EnergyContribution = object
@@ -487,6 +488,103 @@ def _context_key_descriptor(key: ContextKey[object]) -> list[str]:
     return [key.name, _type_sort_key(key.value_type)]
 
 
+#: Sentinel distinguishing a kernel that declares no `method_tokens`
+#: attribute at all from one that declares an explicitly empty mapping.
+#: `emit_receipt` fails closed on the former and accepts the latter.
+_MISSING_METHOD_TOKENS = object()
+
+
+def emit_receipt(plan: LocalEnergyPlan, system_id: str) -> ExecutionReceipt:
+    """Return the `ExecutionReceipt` declared by a planned, executable plan.
+
+    Narrow adapter from `LocalEnergyPlan` to `ExecutionReceipt` (S1-E
+    review-r1 finding 5): `plan.manifest` maps `OperatorId` to the planned
+    *kernel object* itself, not to a contribution-name tuple, and fused names
+    need not match any `normalize_hamiltonian_terms` input name -- so the
+    manifest cannot be copied in directly. `plan.identity` is retained
+    unchanged in `numerical_policy`.
+
+    review-r2 finding 1: `plan.identity` (`_plan_identity`) is a *structural*
+    execution identity -- operator/lowering/kernel types, requirements, and
+    provider/consumption topology -- and deliberately shares identity across
+    parameterized instances of one lowering class (see `_plan_identity`'s
+    docstring); it is not a complete method declaration. Two plans whose
+    kernels are configured differently (for example a derivative step size)
+    but share a class therefore share `plan.identity`. `emit_receipt` cannot
+    recover that gap by introspecting `__dict__`, `repr`, or any other
+    structural scan -- the design explicitly forbids that -- so it instead
+    requires each kernel to *declare* its own immutable semantic method
+    tokens through a `method_tokens: Mapping[str, JsonScalar]` attribute.
+    Every declared token is folded into `numerical_policy`, scoped by the
+    kernel's own stable column name so two different kernels' tokens with
+    the same name never collide. A kernel that does not declare
+    `method_tokens` at all -- not even an empty mapping -- fails closed:
+    this rollout supports only kernels that state a complete method
+    declaration (fixed naive-style kernels with no parameterized settings
+    declare an empty mapping), never a silent, incomplete receipt.
+
+    Every kernel gets one stable, non-stringified result-column name --
+    its position in `plan.kernels` -- shared by every `OperatorId` it claims,
+    so a fused kernel claiming several operators reports one column under
+    all of them rather than inventing a column per operator.
+
+    Parameters
+    ----------
+    plan : LocalEnergyPlan
+        A plan returned by `LocalEnergyPlanner.plan`.
+    system_id : str
+        The physical system identity this plan was executed against, as
+        returned by `tpen.physics.system.SystemDescriptor.system_id`.
+
+    Returns
+    -------
+    ExecutionReceipt
+        Declares `plan.identity` plus every kernel's declared `method_tokens`
+        as the method-affecting settings, and one stable per-kernel column
+        name per claimed `OperatorId`.
+
+    Raises
+    ------
+    ValueError
+        If any kernel in `plan.kernels` does not declare a `method_tokens`
+        attribute.
+    TypeError
+        If a declared `method_tokens` is not a `Mapping`.
+    """
+
+    manifest: dict[OperatorId, list[str]] = {}
+    numerical_policy: dict[str, JsonScalar] = {"plan_identity": plan.identity}
+    for index, kernel in enumerate(plan.kernels):
+        column = f"kernel_{index}"
+        tokens = getattr(kernel, "method_tokens", _MISSING_METHOD_TOKENS)
+        if tokens is _MISSING_METHOD_TOKENS:
+            raise ValueError(
+                f"emit_receipt: {column} ({_type_sort_key(kernel)}) does not declare "
+                "'method_tokens' -- an explicit, immutable Mapping[str, JsonScalar] of any "
+                "method-affecting setting not already captured by plan.identity (operator, "
+                "lowering/kernel class, context requirements, and provider graph; see "
+                "_plan_identity). A kernel with no parameterized settings declares an empty "
+                "mapping; emit_receipt never introspects __dict__/repr to recover an omitted "
+                "declaration, so an undeclared kernel is rejected rather than silently sharing "
+                "a method id with a differently-configured instance of the same class"
+            )
+        if not isinstance(tokens, Mapping):
+            raise TypeError(f"{column}.method_tokens must be a Mapping[str, JsonScalar]")
+        for operator_id in kernel.claimed_operator_ids:
+            manifest.setdefault(operator_id, []).append(column)
+        for token_key, token_value in tokens.items():
+            if not isinstance(token_key, str) or not token_key.strip():
+                raise ValueError(f"{column}.method_tokens keys must be non-empty strings")
+            numerical_policy[f"{column}.{token_key}"] = token_value
+    return ExecutionReceipt(
+        system_id=system_id,
+        implementation=f"{__name__}.{LocalEnergyPlan.__qualname__}",
+        version=2,
+        numerical_policy=numerical_policy,
+        manifest={operator_id: tuple(names) for operator_id, names in manifest.items()},
+    )
+
+
 __all__ = [
     "EnergyContribution",
     "LocalEnergyPlan",
@@ -494,4 +592,5 @@ __all__ = [
     "OperatorKernel",
     "OperatorLowering",
     "OperatorLoweringRegistry",
+    "emit_receipt",
 ]
