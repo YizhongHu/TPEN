@@ -30,6 +30,33 @@ class JobResources:
     gpu_model: str = ""
 
 
+def packed_eval_resources(base: JobResources, pack_k: int) -> JobResources:
+    """Scale host-side concurrency resources for a packed EVAL job.
+
+    The GPU request is intentionally unchanged: the measured pilot budget is
+    about 2.3 GB per stream on one GPU.  CPU and host-memory requests scale
+    with the number of independent evaluator subprocesses.
+    """
+
+    if not 1 <= pack_k <= 6:
+        raise ValueError(f"pack_k must be between 1 and 6, got {pack_k}")
+    if pack_k == 1:
+        return base
+    if not base.mem.endswith("G"):
+        raise ValueError(f"cannot scale non-GiB memory request {base.mem!r}")
+    return JobResources(
+        partition=base.partition,
+        constraint=base.constraint,
+        gpus=base.gpus,
+        nodes=base.nodes,
+        ntasks=base.ntasks,
+        cpus_per_task=base.cpus_per_task * pack_k,
+        mem=f"{int(base.mem[:-1]) * pack_k}G",
+        no_requeue=base.no_requeue,
+        gpu_model=base.gpu_model,
+    )
+
+
 #: Approved for both the TRAIN and EVAL job of every lineage (D1): one A100,
 #: one node, 4 CPU cores, 32 GiB host memory.  Only wall time differs by
 #: stage, and that is supplied per submission (T_WALL/E_WALL, section C3),
@@ -151,4 +178,5 @@ __all__ = [
     "PILOT_PAYLOAD_RESOURCES",
     "PILOT_RUN_ROOT_PREFIX_ENV",
     "RESOURCES",
+    "packed_eval_resources",
 ]

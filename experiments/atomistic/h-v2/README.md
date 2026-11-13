@@ -10,6 +10,76 @@ Hydra configurations, an independent standard-library scalar oracle, strict
 record collection, and tests beside those sources. It does not contain a
 science launcher, science output, or qualification result.
 
+## Packed evaluation validation
+
+The eval-fanout route accepts ``--pack-k 1..6``. ``1`` is the original
+single-stream path; values above one run independent ``run_from_config``
+subprocesses concurrently in one GPU allocation. Each generation has its own
+seed, run directory, verified checkpoint snapshot, and append-on-completion
+receipt entry. A failed generation is isolated, but the job exits non-zero
+after all siblings settle.
+
+For GPU validation, run the same checkpoint/seed roster once with
+``--pack-k 1`` and once with the selected packed value. Compare each pair with
+``eval_job.compare_packed_single_stream``. Calibrate from at least three
+same-seed, same-checkpoint **single-stream** repeats only. The calibration
+population is the consecutive single-minus-single repeat differences; a
+packed-minus-single row is not a calibration input. The helper returns one
+``variance_reference`` denominator and the comparator reuses it. Energy is
+bounded by ``3 x sample_stdev(single-minus-single energy differences)`` and
+relative variance by ``3 x sample_stdev(single-minus-single variance
+differences) / variance_reference``. Record the repeat measurements, derived
+tolerances, GPU model, and both job IDs in the validation receipt; this is
+validation evidence, not science admission.
+
+The executable validation roster is the following. Every repeat has a
+distinct root, and every row extracts metrics only from that run's immutable
+trajectory CSV and metadata sidecar:
+
+| checkpoint | seeds | single-stream roots | packed root | extracted metrics |
+| --- | --- | --- | --- | --- |
+| 1,000 | `83001` | `validation/ck001000/single/repeat-1`, `repeat-2`, `repeat-3` | `validation/ck001000/packed` | mean of `local_energy` in `sampled_eval_table.csv`; variance from and reconciled with `.metadata.json` |
+| 50,000 | `83001` | `validation/ck050000/single/repeat-1`, `repeat-2`, `repeat-3` | `validation/ck050000/packed` | same CSV/sidecar extraction |
+| 100,000 | `83001` | `validation/ck100000/single/repeat-1`, `repeat-2`, `repeat-3` | `validation/ck100000/packed` | same CSV/sidecar extraction |
+
+For the bounded validation, select exactly these records before launching:
+
+```bash
+CHECKPOINTS=(1000 50000 100000)
+SEED=83001
+for repeat in 1 2 3; do
+  for update in "${CHECKPOINTS[@]}"; do
+    ROOT="$VALIDATION_ROOT/single/repeat-$repeat/ck$(printf '%06d' "$update")"
+    mkdir -p "$ROOT"
+    # The producer config binds this checkpoint, seed, lineage, and ROOT;
+    # never glob a checkpoint directory or reuse ROOT for another repeat.
+    "$SCIENCE_PYTHON" -c 'from tpen.run import run_from_config; import sys, yaml; cfg=yaml.safe_load(open(sys.argv[1])); cfg["run"].update(root=sys.argv[2], run_id="repeat-"+sys.argv[3]+"-ck"+sys.argv[4]); raise SystemExit(run_from_config(cfg, config_path=sys.argv[1], command="h-v2 validation single"))' \
+      "$CONFIG_DIR/eval-ck$(printf '%06d' "$update")-seed$SEED.yaml" "$ROOT" "$repeat" "$update"
+  done
+done
+```
+
+The normal bounded packed invocation uses the same three checkpoint/seed
+bindings and a unique packed root; the full 101-generation pilot invocation
+is explicit and therefore cannot silently become a different roster:
+
+```bash
+uv run python "$TPEN_CHECKOUT/experiments/atomistic/h-v2/launch.py" \
+  --run-root "$VALIDATION_ROOT/packed" --run-root-prefix "$VALIDATION_ROOT" \
+  --payload capacity-pilot-100k --stage eval --pilot-stage 1 \
+  --expected-train-commit "$TRAIN_SHA" --commit "$EVAL_SHA" \
+  --pack-k 6 --eval-count 101 --measured-batch-time 00:15:00 \
+  --science-python "$SCIENCE_PYTHON" --executor-python "$EXECUTOR_PY"
+```
+
+The packed wall-time request is ``measured_batch_time x ceil(n / k) + 15
+minutes``. Here ``n=101`` and one measured batch is 15 minutes, so the
+derived minimum is 4:30:00; ``launch.py`` refuses a shorter explicit
+``--time``. For ``k=1`` the packed minimum is not applied and the established
+explicit ``--time`` remains in force. Retain Slurm job IDs, command lines,
+checkpoint and artifact hashes, process intervals, and the comparator receipt
+for every row.
+
 The executable route is the normal TPEN entrypoint (the ``tpen`` console
 script, or ``tpen.run.run_from_config`` from a test). Do not use
 ``python -m tpen.run``: that module has no ``__main__`` guard.

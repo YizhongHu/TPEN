@@ -40,6 +40,77 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def test_packed_validation_tolerance_is_derived_from_repeat_noise() -> None:
+    repeats = [
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5000, "variance": 0.1000},
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.4990, "variance": 0.1010},
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5010, "variance": 0.0990},
+    ]
+    tolerance = eval_job.derive_packed_validation_tolerance(repeats)
+    assert tolerance["energy_abs"] > 0
+    assert tolerance["variance_relative"] > 0
+    eval_job.compare_packed_single_stream(
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5005, "variance": 0.1005},
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5000, "variance": 0.1000},
+        tolerance=tolerance,
+    )
+
+
+def test_packed_validation_calibration_uses_single_minus_single_difference_spread() -> None:
+    tolerance = eval_job.derive_packed_validation_tolerance(
+        [
+            {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.500, "variance": 0.100},
+            {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.499, "variance": 0.101},
+            {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.500, "variance": 0.100},
+        ],
+    )
+    assert tolerance["energy_abs"] == pytest.approx(0.003 * 2**0.5)
+    assert tolerance["variance_reference"] == pytest.approx(0.10033333333333333)
+    assert tolerance["variance_relative"] > 0
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+def test_packed_validation_calibration_refuses_negative_variance(index: int) -> None:
+    repeats = [
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.500, "variance": 0.100},
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.499, "variance": 0.101},
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.501, "variance": 0.099},
+    ]
+    repeats[index]["variance"] = -0.001
+    with pytest.raises(ValueError, match="non-negative"):
+        eval_job.derive_packed_validation_tolerance(repeats)
+
+
+def test_packed_validation_uses_calibration_reference_not_selected_single_denominator() -> None:
+    repeats = [
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.500, "variance": 0.100},
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.500, "variance": 0.101},
+        {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.500, "variance": 0.100},
+    ]
+    tolerance = eval_job.derive_packed_validation_tolerance(repeats)
+    # This is just above the tolerance when incorrectly normalized by the
+    # selected single result (0.100), but just below it when normalized by the
+    # calibrated reference mean (0.100333...).
+    packed = {**repeats[0], "variance": 0.104235}
+    single = {**repeats[0], "variance": 0.100}
+    eval_job.compare_packed_single_stream(packed, single, tolerance=tolerance)
+
+
+def test_packed_validation_refuses_identity_or_metric_mismatch() -> None:
+    with pytest.raises(eval_job.EvalJobRefusal, match="packed-validation-identity"):
+        eval_job.compare_packed_single_stream(
+            {"seed": 8, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5, "variance": 0.1},
+            {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5, "variance": 0.1},
+            tolerance={"energy_abs": 1.0, "variance_relative": 1.0, "variance_reference": 0.1},
+        )
+    with pytest.raises(eval_job.EvalJobRefusal, match="packed-validation-mismatch"):
+        eval_job.compare_packed_single_stream(
+            {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.2, "variance": 0.1},
+            {"seed": 7, "checkpoint": 1000, "checkpoint_sha256": "ck", "lineage": "L1", "energy": -0.5, "variance": 0.1},
+            tolerance={"energy_abs": 0.01, "variance_relative": 1.0, "variance_reference": 0.1},
+        )
+
+
 def _checkpoint_entry(tmp_path: Path, *, update: int, content: bytes = b"model-bytes") -> dict:
     """Return an inventory entry carrying the full load closure (F2).
 

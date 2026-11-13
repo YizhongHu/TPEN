@@ -34,6 +34,7 @@ import json
 import math
 import subprocess
 import sys
+import statistics
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -80,6 +81,99 @@ class EvalJobRefusal(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
+
+
+def derive_packed_validation_tolerance(
+    single_stream_repeats: Sequence[Mapping[str, float]],
+) -> dict[str, float]:
+    """Derive a comparison tolerance from same-seed single-stream repeats.
+
+    The calibration population is deliberately restricted to single-stream
+    observations.  Consecutive same-seed repeat differences are the measured
+    noise population; packed-minus-single rows are not accepted as a
+    calibration input because packed instability must not enlarge its own
+    acceptance threshold.  The returned ``variance_reference`` is carried
+    into :func:`compare_packed_single_stream`, so calibration and comparison
+    use one denominator.
+    """
+
+    if len(single_stream_repeats) < 3:
+        raise ValueError("at least three single-stream repeats are required")
+    energies: list[float] = []
+    variances: list[float] = []
+    identity_fields = ("seed", "checkpoint", "checkpoint_sha256", "lineage")
+    first_identity = {field: single_stream_repeats[0].get(field) for field in identity_fields}
+    for row in single_stream_repeats:
+        if any(row.get(field) is None for field in identity_fields):
+            raise ValueError("single-stream calibration identity is incomplete")
+        if any(row.get(field) != first_identity[field] for field in identity_fields):
+            raise ValueError("single-stream calibration repeats must share identity")
+        try:
+            energy = float(row["energy"])
+            variance = float(row["variance"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("single-stream calibration requires energy and variance") from error
+        if not math.isfinite(energy) or not math.isfinite(variance):
+            raise ValueError("single-stream calibration values must be finite")
+        if variance < 0:
+            raise ValueError("single-stream calibration variance must be non-negative")
+        energies.append(energy)
+        variances.append(variance)
+
+    energy_differences = [right - left for left, right in zip(energies, energies[1:])]
+    variance_differences = [right - left for left, right in zip(variances, variances[1:])]
+    variance_reference = statistics.mean(variances)
+    if variance_reference <= 0:
+        raise ValueError("single-stream repeat variance reference must be positive")
+    return {
+        "energy_abs": 3.0 * statistics.stdev(energy_differences),
+        "variance_relative": 3.0 * statistics.stdev(variance_differences) / variance_reference,
+        "variance_reference": variance_reference,
+    }
+
+
+def compare_packed_single_stream(
+    packed: Mapping[str, float], single_stream: Mapping[str, float], *, tolerance: Mapping[str, float]
+) -> None:
+    """Validate one packed result against the same-seed single-stream result.
+
+    Raises
+    ------
+    EvalJobRefusal
+        Code ``packed-validation-mismatch`` when either metric exceeds the
+        tolerance derived by :func:`derive_packed_validation_tolerance`.
+    """
+
+    identity_fields = ("seed", "checkpoint", "checkpoint_sha256", "lineage")
+    if any(field not in packed or packed[field] is None for field in identity_fields):
+        raise EvalJobRefusal("packed-validation-identity", "packed identity is absent or null")
+    if any(field not in single_stream or single_stream[field] is None for field in identity_fields):
+        raise EvalJobRefusal("packed-validation-identity", "single-stream identity is absent or null")
+    if any(packed[field] != single_stream[field] for field in identity_fields):
+        raise EvalJobRefusal("packed-validation-identity", "packed and single-stream records are not same-seed/checkpoint")
+    metric_values = (packed.get("energy"), single_stream.get("energy"), packed.get("variance"), single_stream.get("variance"))
+    tolerance_values = (
+        tolerance.get("energy_abs"),
+        tolerance.get("variance_relative"),
+        tolerance.get("variance_reference"),
+    )
+    if not all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in (*metric_values, *tolerance_values)):
+        raise EvalJobRefusal("packed-validation-nonfinite", "metrics and tolerances must be finite")
+    if any(float(value) < 0 for value in tolerance_values):
+        raise EvalJobRefusal("packed-validation-tolerance", "tolerances must be non-negative")
+    if float(packed["variance"]) < 0 or float(single_stream["variance"]) < 0:
+        raise EvalJobRefusal("packed-validation-variance", "variance must be non-negative")
+    if float(tolerance["variance_reference"]) <= 0:
+        raise EvalJobRefusal("packed-validation-tolerance", "variance reference must be positive")
+    energy_delta = abs(float(packed["energy"]) - float(single_stream["energy"]))
+    variance_delta = abs(float(packed["variance"]) - float(single_stream["variance"])) / float(
+        tolerance["variance_reference"]
+    )
+    if energy_delta > float(tolerance["energy_abs"]) or variance_delta > float(tolerance["variance_relative"]):
+        raise EvalJobRefusal(
+            "packed-validation-mismatch",
+            f"energy delta={energy_delta:g}, variance relative delta={variance_delta:g}, tolerance={dict(tolerance)!r}",
+        )
 
 
 def _sha256_file(path: Path) -> str:
