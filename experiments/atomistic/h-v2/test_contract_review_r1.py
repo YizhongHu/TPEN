@@ -176,7 +176,10 @@ def test_decision_rule_parameters_are_machine_readable() -> None:
     }
     assert parameters["basin_center_updates"] == list(range(3000, 19001, 1000))
     assert parameters["early_updates"] == [0, 1000]
-    assert parameters["late_updates"] == [90000, 95000, 100000]
+    assert parameters["late_updates"] == [40000, 45000, 50000]
+    assert parameters["secondary_late_updates"] == [90000, 95000, 100000]
+    assert "descriptive-only" in parameters["secondary_late_updates_note"]
+    assert "operator-decision-late-window-20261113" in parameters["secondary_late_updates_note"]
     assert parameters["late_required_count"] == 2
     assert parameters["bounded_null_late_count"] == parameters["late_required_count"]
     assert parameters["selection_streams"] == [0, 1]

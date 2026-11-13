@@ -447,6 +447,14 @@ evaluated reference checkpoint through update 20,000 and excludes the declared
 late count reaching `max(2 W(k), W(k) + 0.01 Ha)`. A flat MAD is not
 equivalence.
 
+The primary late comparison window for both recurrence and bounded-null is
+`40,000 / 45,000 / 50,000` updates (`decision_rules.parameters.late_updates`).
+The `90,000 / 95,000 / 100,000` window is a clearly labelled
+**secondary, descriptive-only look**; it has no role in the primary recurrence
+or bounded-null decision. This follows operator decision
+`operator-decision-late-window-20261113` on item
+`3c13ba74-d052-4482-a510-3b654d965261`.
+
 The gating instrument is W, the high quantiles, and the exceedance
 probabilities, provided complete records and qualified dependence are present.
 Held-out beta survival-slope curvature and calibrated generalized-Pareto `xi`
