@@ -317,7 +317,7 @@ def test_v2_reader_rejects_a_missing_resource_payload(tmp_path: Path) -> None:
 def test_v2_reader_propagates_mixed_nonfinite_rows_from_real_writer(tmp_path: Path) -> None:
     artifact = _v2_artifact(
         tmp_path,
-        torch.tensor([[float("inf"), 1.0], [float("-inf"), 2.0]]),
+        torch.tensor([[float("inf"), float("-inf")], [1.0, 2.0]]),
     )
     inspection = inspect_trajectory_record(artifact.metadata_path)
     assert math.isnan(inspection.mean)
