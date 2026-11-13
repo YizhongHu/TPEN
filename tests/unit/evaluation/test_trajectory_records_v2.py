@@ -9,6 +9,7 @@ by construction, not asserted against a stub.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 
@@ -31,7 +32,9 @@ from tpen.evaluation.trajectory_records import (
 )
 from tpen.physics.hamiltonian import NaiveLocalEnergyEvaluator
 from tpen.physics.kinetic import KineticEnergy
+from tpen.physics.operators import OperatorId
 from tpen.physics.potential import HarmonicTrap
+from tpen.physics.receipt import ExecutionReceipt
 from tpen.physics.system import ParticleSpec, build_system_descriptor
 from tpen.sampling.metropolis import MetropolisSampler
 from tpen.statistics.trajectory import ObservableTrajectory
@@ -198,15 +201,20 @@ def test_edited_csv_is_rejected(tmp_path: Path) -> None:
         inspect_trajectory_record(artifact.metadata_path)
 
 
-def test_fused_column_manifest_must_cover_exactly_the_declared_operators(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_fused_column_manifest_must_cover_exactly_the_declared_operators(
+    tmp_path: Path, mutation: str
+) -> None:
     """A fused contribution's manifest must still claim every operator it covers, once."""
 
     system = _system()
     receipt = _receipt(system)
     bad_manifest = dict(receipt.manifest)
-    (one_operator, names) = next(iter(bad_manifest.items()))
-    del bad_manifest[one_operator]
-    from tpen.physics.receipt import ExecutionReceipt
+    if mutation == "missing":
+        (one_operator, _) = next(iter(bad_manifest.items()))
+        del bad_manifest[one_operator]
+    else:
+        bad_manifest[OperatorId("test.extra", "undeclared")] = ("fused",)
 
     short_receipt = ExecutionReceipt(
         system_id=receipt.system_id,
@@ -248,6 +256,25 @@ def test_fused_column_manifest_must_cover_exactly_the_declared_operators(tmp_pat
     )
     with pytest.raises(ValueError, match="manifest does not cover exactly"):
         artifact.validate(check_files=False)
+
+
+def test_v2_reader_rejects_a_missing_resource_payload(tmp_path: Path) -> None:
+    artifact = _v2_artifact(tmp_path, FINITE)
+    metadata = _read_metadata(artifact)
+    metadata["system_descriptor"]["resources"] = {"missing": {}}
+    _rewrite_metadata(artifact, metadata)
+    with pytest.raises(TamperedTrajectoryRecordError, match="system_descriptor"):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
+def test_v2_reader_propagates_mixed_nonfinite_rows_from_real_writer(tmp_path: Path) -> None:
+    artifact = _v2_artifact(
+        tmp_path,
+        torch.tensor([[float("inf"), float("-inf")], [float("nan"), 1.0]]),
+    )
+    inspection = inspect_trajectory_record(artifact.metadata_path)
+    assert math.isnan(inspection.mean)
+    assert math.isnan(inspection.variance)
 
 
 class _GaussianModel(torch.nn.Module):
