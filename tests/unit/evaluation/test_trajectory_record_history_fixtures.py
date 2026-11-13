@@ -54,7 +54,7 @@ def _fixture_dir(name: str) -> Path:
         # than silently skip it.
         pytest.fail(
             f"fixture {name!r} is not generated in this checkout; run "
-            "generate_v1_fixtures.py inside an authorized Cannon allocation "
+            "generate_v1_fixtures.py inside an authorized cluster test allocation "
             "and commit its output (see tests/integration/artifacts/"
             "trajectory_records/generate_v1_fixtures.py)"
         )

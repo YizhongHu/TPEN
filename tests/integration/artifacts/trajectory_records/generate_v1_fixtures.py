@@ -16,7 +16,7 @@ that digest to the same classes' source as they existed at the fixed, named
 ``_FROZEN_WRITER_COMMIT`` -- so the provenance attests to code this process
 actually ran, not an inferred historical blob.
 
-Usage (inside a Cannon ``test``-partition allocation, exactly this
+Usage (inside a cluster test allocation, exactly this
 invocation -- also recorded verbatim as each fixture's
 ``generation_command``)::
 
