@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -41,6 +42,15 @@ attached = _h_v2_module("attached")
 launch_config = _h_v2_module("launch_config")
 launch = _h_v2_module("launch")
 run_job = _h_v2_module("run_job")
+eval_job = run_job.eval_job
+
+_REVIEW_HELPERS_SPEC = importlib.util.spec_from_file_location(
+    "h_v2_pr673_review_helpers", HERE / "test_review_eval_job_r1.py"
+)
+assert _REVIEW_HELPERS_SPEC is not None and _REVIEW_HELPERS_SPEC.loader is not None
+_review_helpers = importlib.util.module_from_spec(_REVIEW_HELPERS_SPEC)
+sys.modules[_REVIEW_HELPERS_SPEC.name] = _review_helpers
+_REVIEW_HELPERS_SPEC.loader.exec_module(_review_helpers)
 
 _SEED_ROSTER = json.loads((HERE / "contract_inputs.json").read_text(encoding="utf-8"))["measurement"]["seed_roster"]
 _NON_SCIENCE = _SEED_ROSTER["non_science_seed_namespaces"]
@@ -289,6 +299,97 @@ def test_pilot_payload_100k_real_cpu_run_generalizes_the_checkpoint_inventory(tm
     run_dir = next((tmp_path / "runs").rglob("metrics.jsonl")).parent
     inventory = attached.build_checkpoint_inventory(run_dir / "checkpoints")
     assert [entry["update"] for entry in inventory] == [0, 2, 4, 6]
+
+    # Feed the producer's actual inventory to the consumer, including the
+    # terminal update.  The manifest's completed_updates is the scientific
+    # coordinate; next_iteration is only the resume cursor.
+    terminal = eval_job.select_checkpoint(
+        {"checkpoint_inventory": inventory}, update=6
+    )
+    terminal_manifest = json.loads(
+        (Path(terminal["path"]) / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert terminal_manifest["completed_updates"] == 6
+    assert terminal_manifest["next_iteration"] == 6
+    snapshot = eval_job.resolve_checkpoint(
+        {"checkpoint_inventory": inventory},
+        update=6,
+        snapshot_dir=tmp_path / "terminal-snapshot",
+    )
+    assert snapshot.is_dir()
+    for relative, expected_sha256 in terminal["files"].items():
+        copied = snapshot / relative
+        assert copied.is_file()
+        assert hashlib.sha256(copied.read_bytes()).hexdigest() == expected_sha256
+
+
+def test_pilot_100k_real_fanout_receipt_round_trips_through_sel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise the real 101-generation producer loop and its SEL consumer.
+
+    Numerical generation is faked at the established subprocess boundary only:
+    receipt construction, checkpoint selection/snapshotting, artifact hashes,
+    receipt reading, and SEL remain real.  W decreases through ordinal 100, so
+    the generalized 3..99 window selects its upper edge (99), which must not
+    be reported as an interior minimum.
+    """
+
+    _review_helpers._train(tmp_path, payload="capacity-pilot-100k", updates=range(0, 101000, 1000))
+    _review_helpers._fake_compute(monkeypatch)
+    fake_run = eval_job.subprocess.run
+
+    def _fake_decreasing_energy(argv, **kwargs):
+        result = fake_run(argv, **kwargs)
+        config = yaml.safe_load(Path(argv[-1]).read_text(encoding="utf-8"))
+        run_dir = Path(config["run"]["root"]) / config["run"]["run_id"]
+        ordinal = int(re.search(r"ck(\d+)-", config["run"]["run_id"]).group(1)) // 1000
+        width = 101 - ordinal
+        csv_path = next(run_dir.rglob("sampled_eval_table.csv"))
+        csv_path.write_text(f"local_energy\n-{width}\n0\n{width}\n", encoding="utf-8")
+        metadata_path = csv_path.with_name("sampled_eval_table.metadata.json")
+        metadata_path.write_text(
+            json.dumps({"csv_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest()}),
+            encoding="utf-8",
+        )
+        return result
+
+    monkeypatch.setattr(eval_job.subprocess, "run", _fake_decreasing_energy)
+    monkeypatch.setattr(run_job, "check_identity", lambda *args, **kwargs: None)
+    monkeypatch.setenv("RUN", str(tmp_path))
+    monkeypatch.setenv("SHA", _review_helpers.EVAL_SHA)
+    monkeypatch.setenv("SCIENCE_PYTHON", sys.executable)
+
+    run_job.run_eval_fanout(
+        run_root=tmp_path,
+        expected_commit=_review_helpers.EVAL_SHA,
+        science_python=sys.executable,
+        payload="capacity-pilot-100k",
+        lineage="P",
+        expected_train_commit=_review_helpers.TRAIN_SHA,
+        pilot_stage="1",
+    )
+    stage1_path = run_job._eval_receipt_path(tmp_path, "h-v2-eval-capacity-pilot-100k-stage1")
+    receipt, receipt_sha256 = eval_job.read_eval_receipt_with_hash(stage1_path)
+    generations = receipt["generations"]
+    assert len(generations) == 101
+    assert [(g["ordinal"], g["update"], g["stream"]) for g in generations] == [
+        (ordinal, ordinal * 1000, 0) for ordinal in range(101)
+    ]
+    assert [g["seed"] for g in generations] == [
+        protocol.pilot_eval_seed(ordinal, 0) for ordinal in range(101)
+    ]
+    assert generations[-1]["update"] == 100000
+    assert generations[-1]["checkpoint_files"]
+    for generation in generations:
+        trajectory = generation["artifacts"]["trajectory_csv"]
+        assert hashlib.sha256(Path(trajectory["path"]).read_bytes()).hexdigest() == trajectory["sha256"]
+        assert generation["checkpoint_files"]
+
+    run_job.run_pilot_sel(tmp_path, payload="capacity-pilot-100k")
+    selection_path = tmp_path / "attached/receipts/h-v2-eval-capacity-pilot-100k-selection.json"
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    assert selection["b1_eval_receipt_sha256"] == receipt_sha256
+    assert selection["c1"] == 99
+    assert selection["interior_minimum"] is False
 
 
 def test_append_and_remove_candidate_module_round_trips() -> None:
