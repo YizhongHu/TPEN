@@ -66,6 +66,7 @@ def normalize(evidence: RunEvidence) -> dict[str, Any]:
 
 
 def regenerate() -> dict[str, Any]:
+    """Regenerate from the project environment; never hand-edit the fixture."""
     with tempfile.TemporaryDirectory(prefix="cx00-fixture-") as temporary:
         evidence = inspect_run(_make_run(Path(temporary)))
         normalized = normalize(evidence)

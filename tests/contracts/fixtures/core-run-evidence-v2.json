@@ -8,7 +8,7 @@
   "refusal": null,
   "resolved_config_identity": {
     "schema": "tpen-config-identity-v1",
-    "sha256": "661fc7bc438cc401659b5091120275d4efa4883853320dc155f10808d929397b"
+    "sha256": "45ff2a95c341fab208371ca0b4a8d582f4695b289d9af316053450c3207dd91a"
   },
   "run_dir": "/normalized/core",
   "run_status": "completed",
