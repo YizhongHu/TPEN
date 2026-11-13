@@ -481,6 +481,9 @@ def test_calculator_reuses_a_valid_fused_v2_contribution(tmp_path: Path) -> None
 
 
 class _OrderedContributionEvaluator:
+    def validate_for_generator(self, terms, wavefunction, generator) -> None:
+        del terms, wavefunction, generator
+
     def make_context(self, wavefunction: object, batch: ElectronBatch) -> ElectronBatch:
         del wavefunction
         return batch
