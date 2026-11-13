@@ -215,7 +215,7 @@ def _run_config(tmp_path: Path) -> object:
     cfg.sampler.n_steps = 1
     for callback in cfg.callbacks:
         if callback.get("_target_") == "tpen.callback.Checkpoint":
-            callback.schedule.every_n = 1
+            callback.schedule.every_n = 2
     return cfg
 
 
@@ -254,6 +254,30 @@ def test_s4_t1_publication_state_resets_across_run_contexts(tmp_path: Path) -> N
         second.emit(TrainingIterationCompleted(TrainingIteration(1)), state=state)
     assert caught.value.result.status == "unknown"
     assert first is not second
+
+
+def test_s4_r3_detached_old_producer_is_unknown_at_matching_boundary(tmp_path: Path) -> None:
+    result, checkpoint, _planned, _state_value, _first = _published_yield(tmp_path)
+    assert result.status == "planned_yield"
+    planned = PlannedYield(2, 7, checkpoint=checkpoint)
+    second = _context(tmp_path / "second", [planned])
+    state = _state(root=tmp_path, next_iteration=2, completed_updates=1, max_steps=7)
+    with pytest.raises(PlannedYieldSignal) as caught:
+        second.emit(TrainingIterationCompleted(TrainingIteration(1)), state=state)
+    assert caught.value.result.status == "unknown"
+
+
+def test_s4_r3_installed_old_producer_without_new_publication_is_unknown(
+    tmp_path: Path,
+) -> None:
+    result, checkpoint, _planned, _state_value, _first = _published_yield(tmp_path)
+    assert result.status == "planned_yield"
+    planned = PlannedYield(2, 7, checkpoint=checkpoint)
+    second = _context(tmp_path / "second", [checkpoint, planned])
+    state = _state(root=tmp_path, next_iteration=2, completed_updates=1, max_steps=7)
+    with pytest.raises(PlannedYieldSignal) as caught:
+        second.emit(TrainingIterationCompleted(TrainingIteration(1)), state=state)
+    assert caught.value.result.status == "unknown"
 
 
 def test_s4_reused_callbacks_early_return_is_not_completed(tmp_path: Path) -> None:
@@ -298,6 +322,8 @@ def _assert_s4_t4_publication_failure(tmp_path: Path, monkeypatch, failure: str)
     outcome = json.loads((tmp_path / "vmc_smoke" / "singlet" / "run" / "run-outcome.json").read_text())
     assert outcome["status"] == "unknown"
     assert outcome["error"] == f"{failure}-mutant"
+    assert outcome["next_iteration"] == 2
+    assert outcome["completed_updates"] == 2
     checkpoint_root = tmp_path / "vmc_smoke" / "singlet" / "run" / "checkpoints"
     final_dir = checkpoint_root / "step_000002"
     catalog = checkpoint_root / "publications.jsonl"
@@ -306,7 +332,7 @@ def _assert_s4_t4_publication_failure(tmp_path: Path, monkeypatch, failure: str)
     assert catalog.exists() is (failure == "latest")
     assert latest.exists() is False
     if failure == "catalog":
-        assert not catalog.read_text().strip()
+        assert catalog.exists() is False
 
 
 def test_s4_t4_rename_failure_is_unknown_with_original_error(tmp_path: Path, monkeypatch) -> None:
@@ -351,6 +377,7 @@ def test_s4_non_yield_publication_error_stays_failed_and_reraises(
 
 def test_s4_keyboard_interrupt_publication_is_not_converted(tmp_path: Path, monkeypatch) -> None:
     cfg = _run_config(tmp_path)
+    planned = PlannedYield(2, 3)
     original = Path.rename
 
     def interrupt_rename(self, target):
@@ -360,7 +387,7 @@ def test_s4_keyboard_interrupt_publication_is_not_converted(tmp_path: Path, monk
 
     monkeypatch.setattr(Path, "rename", interrupt_rename)
     with pytest.raises(KeyboardInterrupt, match="interrupt-publication"):
-        run_from_config(cfg, raise_exceptions=False)
+        run_from_config(cfg, runtime_callbacks=(planned,), raise_exceptions=False)
 
 
 def test_s4_reconcile_publication_failure_during_yield_is_unknown(
