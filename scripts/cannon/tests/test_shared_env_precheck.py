@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -457,6 +458,62 @@ def test_verify_sh_write_path_roots_exclude_shared_env_prefix() -> None:
     source = VERIFY.read_text()
     roots_line = next(line for line in source.splitlines() if line.strip().startswith('for root in "$CANON_WORK_ROOT"'))
     assert "SHARED_ENV" not in roots_line, roots_line
+
+
+def test_verify_sh_discovers_all_test_python_vars_and_excludes_owned_names() -> None:
+    source = VERIFY.read_text()
+    discovery_line = next(line for line in source.splitlines() if "grep -rhoE" in line and "_PYTHON" in line)
+
+    pattern = re.search(r"'([^']+)'", discovery_line)
+    assert pattern is not None
+    discovery = re.compile(pattern.group(1))
+    for name in ("H_V2_SCIENCE_PYTHON", "P9C_EXECUTOR_PYTHON"):
+        assert discovery.fullmatch(name)
+    for name in ("PYTHON", "TPEN_PYTHON", "ROOT_PYTHON"):
+        assert not discovery.fullmatch(name)
+    deny_block = source[source.index('case "$executor_var" in'):source.index('esac', source.index('case "$executor_var" in'))]
+    assert all(name in deny_block for name in ("PYTHON", "TPEN_PYTHON", "ROOT_PYTHON"))
+
+
+def test_verify_sh_executor_resolution_precheck_rejects_outside_clone(tmp_path: Path) -> None:
+    source = VERIFY.read_text()
+    start = source.index("executor_resolution_precheck() {")
+    end = source.index("\n}\nEXECUTOR_ROOT=", start) + 2
+    function = source[start:end]
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$OUTSIDE/tpen_executor/__init__.py\"\n"
+        "exit 1\n"
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IEXEC)
+    evidence = tmp_path / "executor-resolution.txt"
+    clone_executor = tmp_path / "clone" / "executor"
+    clone_executor.mkdir(parents=True)
+    probe = (
+        "set -Eeuo pipefail\n"
+        "PYTHON=\"$FAKE_PYTHON\"\n"
+        "assert_write_path() { :; }\n"
+        "fail_precheck() { echo \"PRECHECK_FAILED $*\" >&2; exit 2; }\n"
+        f"{function}\n"
+        f"executor_resolution_precheck \"$CLONE_EXECUTOR\" \"$EVIDENCE\"\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", probe],
+        env={
+            "FAKE_PYTHON": str(fake_python),
+            "CLONE_EXECUTOR": str(clone_executor),
+            "EVIDENCE": str(evidence),
+            "OUTSIDE": str(tmp_path / "outside"),
+            "PATH": os.environ["PATH"],
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "tpen_executor resolution failed" in result.stderr
+    assert evidence.exists()
 
 
 # --- T1 (reduced), F1: every isolated interpreter invocation carries -B ------

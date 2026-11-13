@@ -156,27 +156,45 @@ OVERLAY_SITE="$($OVERLAY/bin/python -c 'import sysconfig; print(sysconfig.get_pa
 assert_write_path "$OVERLAY_SITE/_tpen_shared_env.pth"
 printf '%s\n' "$BASE_SITE" > "$OVERLAY_SITE/_tpen_shared_env.pth"
 $UV_BIN pip install --python "$OVERLAY/bin/python" --no-deps -e "$CLONE" >> "$RUN_ROOT/evidence/overlay-build.log" 2>&1
+$UV_BIN pip install --python "$OVERLAY/bin/python" --no-deps -e "$CLONE/executor" >> "$RUN_ROOT/evidence/overlay-build.log" 2>&1
 $UV_BIN pip install --python "$OVERLAY/bin/python" "pytest-xdist==$CANNON_XDIST_VERSION" >> "$RUN_ROOT/evidence/overlay-build.log" 2>&1
 PYTHON="$OVERLAY/bin/python"
 export PYTHON TPEN_PYTHON="$PYTHON" ROOT_PYTHON="$PYTHON"
 export PATH="$OVERLAY/bin:$PATH"
 [[ -x "$PYTHON" ]] || fail_precheck "overlay interpreter missing after overlay build"
-# Tests read per-caller interpreter env vars named *_EXECUTOR_PYTHON /
-# *_ROOT_PYTHON (e.g. P8_EXECUTOR_PYTHON, P9C_EXECUTOR_PYTHON, P9C_ROOT_PYTHON,
-# P10_ROOT_PYTHON, H_V2_EXECUTOR_PYTHON) to launch a subprocess interpreter; an
-# unbound one is read as "skip" and an inherited one could select an unrelated
+# Tests read per-caller interpreter env vars ending in _PYTHON (e.g.
+# P8_EXECUTOR_PYTHON, P9C_EXECUTOR_PYTHON, P9C_ROOT_PYTHON, P10_ROOT_PYTHON,
+# H_V2_EXECUTOR_PYTHON, H_V2_SCIENCE_PYTHON) to launch subprocesses; an unbound
+# one is read as "skip" and an inherited one could select an unrelated
 # interpreter. Bind every such name the exact-SHA clone's tests reference,
-# after the overlay exists, to this same job's interpreter.
+# except the script-owned interpreter names, after the overlay exists.
 assert_write_path "$RUN_ROOT/evidence/executor-python-bindings.txt"
 mapfile -t EXECUTOR_PYTHON_VARS < <(
-  grep -rhoE '[A-Z][A-Z0-9_]*_(EXECUTOR|ROOT)_PYTHON' "$CLONE" --include='*.py' 2>/dev/null | sort -u
+  grep -rhoE '[A-Z][A-Z0-9_]*_PYTHON' "$CLONE" --include='*.py' 2>/dev/null | sort -u
 )
 : > "$RUN_ROOT/evidence/executor-python-bindings.txt"
 for executor_var in "${EXECUTOR_PYTHON_VARS[@]:-}"; do
   [[ -n "$executor_var" ]] || continue
+  case "$executor_var" in
+    PYTHON|TPEN_PYTHON|ROOT_PYTHON) continue ;;
+  esac
   export "${executor_var}=${PYTHON}"
   printf '%s=%s\n' "$executor_var" "$PYTHON" >> "$RUN_ROOT/evidence/executor-python-bindings.txt"
 done
+executor_resolution_precheck() {
+  local executor_root="$1" resolution_file="$2"
+  assert_write_path "$resolution_file"
+  if ! {
+    printf 'normal='
+    env -u PYTHONPATH "$PYTHON" -c 'import os, sys, tpen_executor; path = os.path.realpath(tpen_executor.__file__); print(path); raise SystemExit(not path.startswith(os.path.realpath(sys.argv[1]) + os.sep))' "$executor_root"
+    printf 'isolated='
+    env -u PYTHONPATH "$PYTHON" -I -c 'import os, sys, tpen_executor; path = os.path.realpath(tpen_executor.__file__); print(path); raise SystemExit(not path.startswith(os.path.realpath(sys.argv[1]) + os.sep))' "$executor_root"
+  } > "$resolution_file" 2>&1; then
+    fail_precheck "tpen_executor resolution failed outside exact-SHA clone executor"
+  fi
+}
+EXECUTOR_ROOT="$(canon "$CLONE/executor")"
+executor_resolution_precheck "$EXECUTOR_ROOT" "$RUN_ROOT/evidence/executor-resolution.txt"
 assert_write_path "$RUN_ROOT/evidence/interpreter-identity.txt"
 env -u PYTHONPATH "$PYTHON" - "$CLONE" > "$RUN_ROOT/evidence/interpreter-identity.txt" 2>&1 <<'PYCHECK'
 import importlib, os, sys

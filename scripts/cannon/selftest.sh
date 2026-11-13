@@ -98,7 +98,7 @@ print("ok: purge-before-run observes the mutant; stale-cache scenario reproduced
 PY
 "$PYTHON" "$WORK/f4probe.py" "$F4" "$SCRIPT_DIR"
 
-echo "== F3: *_EXECUTOR_PYTHON / *_ROOT_PYTHON discovery matches the real test family =="
+echo "== F3: *_PYTHON discovery binds test interpreters but excludes script-owned names =="
 # This file must sit at <repo>/scripts/cannon/selftest.sh for this to resolve
 # correctly: a bare file-level stage of scripts/cannon/* (not a full repo
 # checkout) puts "../.." somewhere else entirely -- e.g. straight into a
@@ -111,12 +111,19 @@ if [[ ! -f "$REPO_ROOT/pyproject.toml" ]] || ! grep -q '^name = "tpen"' "$REPO_R
   echo "FAIL: REPO_ROOT ($REPO_ROOT) does not look like a tpen checkout -- selftest.sh must be run from inside a full repo checkout (e.g. a git clone or git-archive extraction at the exact head), not a bare stage of scripts/cannon/* alone" >&2
   exit 1
 fi
-found="$(grep -rhoE '[A-Z][A-Z0-9_]*_(EXECUTOR|ROOT)_PYTHON' "$REPO_ROOT" --include='*.py' 2>/dev/null | sort -u)"
-for expect in P8_EXECUTOR_PYTHON P9C_EXECUTOR_PYTHON P9C_ROOT_PYTHON P10_ROOT_PYTHON H_V2_EXECUTOR_PYTHON; do
+found="$(grep -rhoE '[A-Z][A-Z0-9_]*_PYTHON' "$REPO_ROOT" --include='*.py' 2>/dev/null | sort -u)"
+for expect in P8_EXECUTOR_PYTHON P9C_EXECUTOR_PYTHON P9C_ROOT_PYTHON P10_ROOT_PYTHON H_V2_EXECUTOR_PYTHON H_V2_SCIENCE_PYTHON; do
   if grep -qx "$expect" <<< "$found"; then
     echo "ok: discovery finds $expect"
   else
     echo "FAIL: discovery missed $expect" >&2; fail=1
+  fi
+done
+for deny in PYTHON TPEN_PYTHON ROOT_PYTHON; do
+  if grep -qx "$deny" <<< "$found"; then
+    echo "ok: deny-set candidate $deny is discovered then excluded by verify.sh"
+  else
+    echo "ok: deny-set name $deny is not a test-read *_PYTHON variable"
   fi
 done
 
