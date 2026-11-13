@@ -22,7 +22,6 @@ from tpen.checkpoint import (
     checkpoint_step_dir_name,
     reconcile_publication,
     save_checkpoint,
-    CheckpointPublicationBoundaryError,
 )
 from tpen.checkpoint.artifact import is_complete_checkpoint_dir
 from tpen.checkpoint.schema import read_manifest
@@ -323,10 +322,12 @@ class Checkpoint(StatefulCallback[TrainerState]):
                 save_sampler=self.save_sampler,
                 save_rng=self.save_rng,
             )
-        except CheckpointPublicationBoundaryError as exc:
-            raise CheckpointPublicationError(
-                exc.original, next_iteration=next_iteration, completed_updates=completed_updates
-            ) from exc
+        except BaseException as exc:
+            if getattr(exc, "tpen_publication_stage", None) is not None:
+                raise CheckpointPublicationError(
+                    exc, next_iteration=next_iteration, completed_updates=completed_updates
+                ) from exc
+            raise
         self._record_published(final_dir)
 
     def _record_published(self, final_dir: Path) -> None:

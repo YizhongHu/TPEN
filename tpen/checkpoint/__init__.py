@@ -80,7 +80,7 @@ from .reference import (
     deserialize_checkpoint_ref,
     serialize_checkpoint_ref,
 )
-from .save import CheckpointPublicationBoundaryError, save_checkpoint
+from .save import save_checkpoint
 from .schedule import CheckpointSchedule, EveryNUpdates, ExplicitUpdates, TerminalOnly
 from .profiles import (
     NATIVE_PROFILE,
@@ -113,7 +113,6 @@ __all__ = [
     "CheckpointManifest",
     "CheckpointPayload",
     "CheckpointCatalog",
-    "CheckpointPublicationBoundaryError",
     "CheckpointPublicationReceipt",
     "CheckpointPublished",
     "CheckpointSchedule",
