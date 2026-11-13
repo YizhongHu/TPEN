@@ -1070,12 +1070,17 @@ def assert_hydrogen_contract(
         if "optimizer" in config or "trainer" in config:
             raise ValueError("fresh evaluation must not carry training state")
     else:
+        # Check the frozen amplitude-risk payload before the broader A1
+        # contract so a threshold mutation cannot be masked by another
+        # assembly error.
+        assert_amplitude_risk_thresholds(config)
         _assert_a1_callbacks(
             config,
             allow_incomplete=allow_incomplete_a1,
             allow_missing_amplitude_risk=allow_missing_amplitude_risk,
         )
-    assert_amplitude_risk_thresholds(config)
+    if evaluation:
+        assert_amplitude_risk_thresholds(config)
 
 
 def _assert_a1_callbacks(
