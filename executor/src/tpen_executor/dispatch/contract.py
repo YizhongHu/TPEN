@@ -20,7 +20,7 @@ import re
 from typing import Any
 
 from .._codec import digest
-from ..contracts import ReadyGroup
+from ..contracts import AttemptId, ReadyGroup
 from ..environments import PreparedPythonEnvironment
 from ..lifecycle.attached import AttachedAllocation
 from ..gpu_sampler import (
@@ -34,7 +34,7 @@ from ..gpu_sampler import (
     slot_quarantine_dir,
 )
 from ..gpu_telemetry import not_sampled_sampler
-from ..results import RunManifest, SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3
+from ..results import RunManifest, SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, SuccessorAdmissionRecord
 from ..placement import (
     BindingError,
     ChildPlacementObservation,
@@ -52,6 +52,7 @@ from ..placement import (
     validate_physical_device_entitlements,
 )
 from ..runners import CONTEXT_ENV_KEY_PATTERN, CHILD_CONTEXT_KEYS_ENV, CoreRunEvidence, EvidenceUnavailable
+from ..storage import AttemptFence
 from ..tasks import ConfiguredRun
 
 
@@ -944,6 +945,48 @@ class DispatcherContract:
         """Perform common admission without touching backend or store state."""
 
         self._validate_inputs(group, runs, lifecycle, env, timeout)
+
+    @staticmethod
+    def build_successor_admission_request(
+        lifecycle: AttachedAllocation,
+        fence: AttemptFence,
+        successor_attempt_id: AttemptId,
+        science_input_digest: str,
+        target_iterations: int,
+    ) -> dict[str, Any]:
+        """Build a core admission request after typed outcome persistence.
+
+        The store is the executor-side owner of this bridge.  The returned
+        mapping is handed to the caller, which performs core admission outside
+        the executor package; this method performs no launch or scheduling.
+        """
+
+        if not hasattr(lifecycle, "store") or not callable(getattr(lifecycle.store, "build_successor_admission_request", None)):
+            raise TypeError("lifecycle must expose successor admission storage")
+        return lifecycle.store.build_successor_admission_request(
+            fence, successor_attempt_id, science_input_digest, target_iterations,
+        )
+
+    @staticmethod
+    def record_successor_admission(
+        lifecycle: AttachedAllocation,
+        fence: AttemptFence,
+        request: Mapping[str, Any],
+        core_acceptance_digest: str,
+    ) -> SuccessorAdmissionRecord:
+        """Persist a caller-confirmed core admission without launching work.
+
+        ``core_acceptance_digest`` identifies core's accepted
+        ``OperationalRestoreRequest``.  The dispatcher/integration caller
+        supplies that opaque digest and is responsible for its provenance;
+        the executor does not import ``tpen`` to verify the core decision.
+        """
+
+        if not hasattr(lifecycle, "store") or not callable(getattr(lifecycle.store, "record_successor_admission", None)):
+            raise TypeError("lifecycle must expose successor admission storage")
+        return lifecycle.store.record_successor_admission(
+            fence, request, core_acceptance_digest,
+        )
 
     def _begin_dispatch(
         self,
