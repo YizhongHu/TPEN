@@ -114,3 +114,14 @@ def test_manifest_rejects_placeholder_config_sha256() -> None:
                        checkpoint_sha256={(s, l, 7): SHA256 for s in ("hooke1", "he", "h2")
                                           for l in range(3)},
                        results_root="/external/stage1")
+
+
+def test_manifest_rejects_relative_results_root() -> None:
+    with pytest.raises(ProtocolError, match="results_root must be an absolute"):
+        build_manifest(
+            protocol=STAGE1_PROTOCOL, source_sha=SHA1, config_sha256=SHA256,
+            checkpoints=[7], lineage_seeds=[11, 12, 13],
+            checkpoint_sha256={(s, l, 7): SHA256 for s in ("hooke1", "he", "h2")
+                               for l in range(3)},
+            results_root="relative/stage1",
+        )

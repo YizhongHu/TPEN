@@ -208,6 +208,9 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
         raise ProtocolError("gateway config does not match binding")
     expected = {f"runtime.seed={row['seed']}"}
     if kind == "eval":
+        checkpoint_path = row.get("checkpoint_path")
+        if not isinstance(checkpoint_path, str) or not Path(checkpoint_path).is_absolute():
+            raise ProtocolError("checkpoint_path must be absolute")
         expected.update({
             f"evaluation_sampler.n_walkers={row['walkers']}",
             f"evaluation_tasks.mcmc_energy.generator.n_draws={row['draws']}",

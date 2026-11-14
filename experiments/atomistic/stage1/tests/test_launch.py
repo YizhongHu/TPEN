@@ -198,6 +198,22 @@ def test_gateway_rejects_missing_or_mismatched_checkpoint_file(
         )
 
 
+def test_gateway_rejects_relative_checkpoint_path() -> None:
+    from experiments.atomistic.stage1.launch import _binding_token, row_overrides
+
+    eval_row = {
+        **ROW, "kind": "eval", "draws": 256,
+        "checkpoint_path": "relative/model.pt",
+        "checkpoint_sha256": "d" * 64,
+    }
+    with pytest.raises(ProtocolError, match="checkpoint_path must be absolute"):
+        validate_gateway_binding(
+            binding=_binding_token(eval_row), config=eval_row["config"],
+            overrides=row_overrides(eval_row), kind="eval",
+            expected_checkpoint_sha256="d" * 64,
+        )
+
+
 def test_gateway_rejects_mismatched_checkpoint_expectation() -> None:
     from experiments.atomistic.stage1.launch import _binding_token, row_overrides
 

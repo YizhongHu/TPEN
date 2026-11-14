@@ -4,7 +4,7 @@ This directory owns the system-neutral Stage 1 manifest and guarded Cannon
 launcher. It does not collect trajectory records and does not contain the
 Hooke, He, or H2 system configs; those are separate S1 slices.
 
-Every manifest row carries the exact source SHA, a real resolved-config SHA256,
+Every manifest row carries the exact source SHA, the planned config SHA256,
 and an external results root. Evaluation rows additionally carry the checkpoint
 path and SHA256. The run's own core resolved-config identity is joined by the
 collection slice; this protocol layer does not fabricate one. Evaluation
