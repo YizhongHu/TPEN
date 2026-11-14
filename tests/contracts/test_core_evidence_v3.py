@@ -181,16 +181,20 @@ def test_v3_mapping_rejects_status_outcome_mismatch(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
-    [("profile", "model_only"), ("next_iteration", 99), ("completed_updates", 99)],
+    ("field", "value", "message"),
+    [
+        ("profile", "model_only", "requires a train_resume checkpoint_ref"),
+        ("next_iteration", 99, "does not match checkpoint summary"),
+        ("completed_updates", 99, "does not match checkpoint summary"),
+    ],
 )
 def test_v3_mapping_rejects_unbound_planned_yield(
-    tmp_path: Path, field: str, value: object
+    tmp_path: Path, field: str, value: object, message: str
 ) -> None:
     mapping = _planned_yield_mapping(tmp_path / field)
     mapping["checkpoint_ref"][field] = value
 
-    with pytest.raises(ValueError, match="planned_yield checkpoint_ref"):
+    with pytest.raises(ValueError, match=message):
         RunEvidence.from_mapping(mapping)
 
 
