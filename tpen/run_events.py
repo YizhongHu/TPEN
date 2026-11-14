@@ -103,7 +103,8 @@ class RunOutcome:
             "publication_stage",
         }
         legacy_expected = expected - {"schema"}
-        if set(data) not in {expected, legacy_expected} or (
+        data_keys = set(data)
+        if (data_keys != expected and data_keys != legacy_expected) or (
             "schema" in data and data.get("schema") != RUN_OUTCOME_SCHEMA
         ):
             raise RunOutcomeDecodeError("run outcome has an invalid schema or key set")
