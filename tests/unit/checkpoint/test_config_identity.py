@@ -470,22 +470,19 @@ def test_golden_identity_vector() -> None:
 @pytest.mark.parametrize(
     ("relative_path", "expected_sha256"),
     [
-        # The local worker environment cannot resolve the locked dependency
-        # set.  The orchestrator must replace this sentinel with the exact
-        # base-commit digest from a Cannon probe before independent review.
+        # Cannon test job 60514113 computed this at base fce3de22; the base
+        # and implementation-head digests were identical.
         (
             "experiments/atomistic/he-importance/configs/train.yaml",
-            None,
+            "eca06e9ab1796dca1a192c2cfd3de7fb62cfa07c47eb1020784470060304d713",
         ),
     ],
 )
 def test_he_importance_identity_golden_from_base_commit(
-    relative_path: str, expected_sha256: str | None
+    relative_path: str, expected_sha256: str
 ) -> None:
     """The real He-importance config keeps its v1 identity byte-identical."""
 
-    if expected_sha256 is None:
-        pytest.skip("Cannon must fill the base-commit golden before review")
     config = _guard_config(_REPO_ROOT / relative_path)
     assert resolved_config_identity(config) == {
         "schema": RESOLVED_CONFIG_IDENTITY_SCHEMA,
