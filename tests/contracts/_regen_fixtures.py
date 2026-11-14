@@ -22,10 +22,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tpen.checkpoint.hashing import resolved_config_identity
 from tpen.checkpoint.manifest import CheckpointManifest
+from tpen.artifacts import RunResult
 from tpen.inspection import RunEvidence, inspect_run
 
 FIXTURE_PATH = Path(__file__).with_name("fixtures") / "core-run-evidence-v2.json"
 REFUSED_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "core-run-evidence-v1-refused.json"
+PLANNED_YIELD_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "core-run-evidence-v3-planned-yield.json"
+UNKNOWN_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "core-run-evidence-v3-unknown.json"
 
 
 def _make_run(root: Path) -> Path:
@@ -70,6 +73,56 @@ def _make_refused_run(root: Path) -> Path:
     return run_dir
 
 
+def _make_unknown_run(root: Path) -> Path:
+    """Create a non-eligible run through the typed S4 result producer."""
+
+    run_dir = root / "attempt" / "core"
+    run_dir.mkdir(parents=True)
+    (run_dir / "status.json").write_text('{"status":"unknown"}\n', encoding="utf-8")
+    (run_dir / "run-outcome.json").write_text(
+        json.dumps(RunResult(status="unknown").to_dict(), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    identity = resolved_config_identity({"model": {"name": "fixture"}})
+    (run_dir / "run_start.json").write_text(
+        json.dumps({"resolved_config_identity": identity}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def _make_planned_yield_run(root: Path) -> Path:
+    """Run the small public S4 planned-yield setup and return its physical leaf."""
+
+    from omegaconf import OmegaConf
+
+    from tpen.artifacts import ArtifactDestination
+    from tpen.callback.planned_yield import PlannedYield
+    from tpen.run import PLANNED_YIELD_EXIT_CODE, run_from_config
+
+    config_path = Path(__file__).resolve().parents[1] / "integration" / "artifacts" / "training" / "vmc_smoke.yaml"
+    cfg = OmegaConf.load(config_path)
+    cfg.run.root = str(root / "logical")
+    cfg.run.run_id = "planned-yield"
+    cfg.trainer.max_steps = 3
+    cfg.sampler.n_walkers = 8
+    cfg.sampler.burn_in = 1
+    cfg.sampler.n_steps = 1
+    for callback in cfg.callbacks:
+        if callback.get("_target_") == "tpen.callback.Checkpoint":
+            callback.schedule.every_n = 1
+    destination = ArtifactDestination(root / "physical")
+    code = run_from_config(
+        cfg,
+        artifact_destination=destination,
+        runtime_callbacks=(PlannedYield(2, 3),),
+        raise_exceptions=True,
+    )
+    if code != PLANNED_YIELD_EXIT_CODE:
+        raise RuntimeError(f"planned-yield producer returned unexpected code {code}")
+    return destination.physical_root
+
+
 def _normalize_path(path: str, temporary_root: Path) -> str:
     """Replace one exact temporary prefix while retaining its relative path."""
 
@@ -89,6 +142,13 @@ def normalize(evidence: RunEvidence, temporary_root: Path) -> dict[str, Any]:
         data["checkpoint"]["checkpoint_dir"] = _normalize_path(
             data["checkpoint"]["checkpoint_dir"], temporary_root
         )
+    if data.get("checkpoint_ref") is not None:
+        data["checkpoint_ref"]["checkpoint_dir"] = _normalize_path(
+            data["checkpoint_ref"]["checkpoint_dir"], temporary_root
+        )
+        provenance = data["checkpoint_ref"].get("provenance")
+        if isinstance(provenance, dict) and isinstance(provenance.get("run_dir"), str):
+            provenance["run_dir"] = _normalize_path(provenance["run_dir"], temporary_root)
     if data["refusal"] is not None:
         data["refusal"]["reason"] = data["refusal"]["reason"].replace(
             str(temporary_root.resolve()), "/normalized"
@@ -114,11 +174,41 @@ def regenerate_refused() -> dict[str, Any]:
     return normalized
 
 
+def regenerate_unknown() -> dict[str, Any]:
+    """Regenerate the canonical non-eligible unknown-outcome fixture."""
+
+    with tempfile.TemporaryDirectory(prefix="cx01-fixture-unknown-") as temporary:
+        temporary_root = Path(temporary) / "attempt"
+        evidence = inspect_run(_make_unknown_run(Path(temporary)))
+        normalized = normalize(evidence, temporary_root)
+    return normalized
+
+
+def regenerate_planned_yield() -> dict[str, Any]:
+    """Regenerate v3 from the real small S4 planned-yield public entry."""
+
+    with tempfile.TemporaryDirectory(prefix="cx01-fixture-planned-yield-") as temporary:
+        temporary_root = Path(temporary) / "physical"
+        evidence = inspect_run(_make_planned_yield_run(Path(temporary)))
+        normalized = normalize(evidence, temporary_root)
+    return normalized
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=FIXTURE_PATH)
+    parser.add_argument(
+        "--fixture",
+        choices=("v2", "refused", "unknown", "planned-yield"),
+        default="v2",
+    )
     args = parser.parse_args()
-    payload = regenerate()
+    payload = {
+        "v2": regenerate,
+        "refused": regenerate_refused,
+        "unknown": regenerate_unknown,
+        "planned-yield": regenerate_planned_yield,
+    }[args.fixture]()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
