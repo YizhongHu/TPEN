@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from experiments.atomistic.stage1.protocol import (
+    _encode_seed,
     Protocol,
     ProtocolError,
     STAGE1_PROTOCOL,
@@ -53,7 +54,8 @@ def test_seed_and_row_identity_are_injective_for_non_default_coordinates() -> No
 
 def test_seed_encoding_covers_field_maxima_and_old_collision_boundaries() -> None:
     rows = [
-        ("smoke", system, 0, 0, 0, 0)
+        (kind, system, 0, 0, 0, 0)
+        for kind in ("smoke", "train", "eval")
         for system in ("hooke1", "he", "h2")
     ] + [
         (kind, system, 999_999, 999_999, 999_999, 999_999_999)
@@ -68,6 +70,14 @@ def test_seed_encoding_covers_field_maxima_and_old_collision_boundaries() -> Non
         for kind, system, lineage, checkpoint, stream, lineage_seed in rows
     }
     assert len(seeds) == len(rows)
+    for system in ("hooke1", "he", "h2"):
+        maxima = {
+            _encode_seed(kind=kind, system=system, lineage=999_999,
+                         checkpoint=999_999, stream=999_999,
+                         lineage_seed=999_999_999)
+            for kind in ("smoke", "train", "eval")
+        }
+        assert len(maxima) == 3
     assert evaluation_seed(system="hooke1", lineage=0, checkpoint=400_000, stream=0) != smoke_seed(system="hooke1")
     assert evaluation_seed(system="hooke1", lineage=0, checkpoint=500_000, stream=0) != smoke_seed(system="he")
 
