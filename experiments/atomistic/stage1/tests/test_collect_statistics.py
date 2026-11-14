@@ -91,7 +91,7 @@ def test_stream_aggregate_requires_the_complete_four_stream_set(
             walker_count=2,
             row_count=4,
             finite_count=4,
-            mean=float(index + 1),
+            mean=2.5,
             variance=1.25,
             csv_sha256="d" * 64,
             system_id="he_atom",

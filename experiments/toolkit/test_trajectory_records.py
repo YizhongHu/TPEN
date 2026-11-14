@@ -101,10 +101,6 @@ def test_real_v2_writer_reader_flows_into_stage1_collector(monkeypatch, tmp_path
     system = build_system_descriptor(particle, terms, units="atomic_units")
     receipt = NaiveLocalEnergyEvaluator().describe_execution_receipt(terms, system.system_id())
     identity = {"schema": RESOLVED_CONFIG_IDENTITY_SCHEMA, "sha256": "b" * 64}
-    run_dir = tmp_path / "run-0"
-    task_dir = run_dir / "mcmc_energy"
-    task_dir.mkdir(parents=True)
-
     def draw(index: int) -> TrajectoryRecordBatch:
         row = values[index]
         return TrajectoryRecordBatch(
@@ -115,34 +111,41 @@ def test_real_v2_writer_reader_flows_into_stage1_collector(monkeypatch, tmp_path
             logabs=torch.zeros(2), sign=torch.ones(2), finite_mask=torch.ones(2, dtype=torch.bool),
         )
 
-    writer = TrajectoryRecordStreamWriter(
-        task_dir / "sampled_eval_table.csv", observable="local_energy", n_draws=2,
-        n_walkers=2, term_names=("kinetic", "trap"), system_descriptor=system,
-        execution_receipt=receipt, resolved_config_identity=identity,
-        model_provenance="checkpoint", checkpoint_sha256="c" * 64, first_draw=draw(0),
-    )
-    writer.append(draw(1))
-    artifact = writer.finalize(ObservableTrajectory("local_energy", values, draw_stride=1, burn_in_draws=0))
-    start = {"resolved_config_identity": identity, "git": {"sha": "a" * 40}}
-    (run_dir / "run_start.json").write_text(json.dumps(start), encoding="utf-8")
-    (run_dir / "status.json").write_text(json.dumps({"status": "failed"}), encoding="utf-8")
+    artifacts = []
+    for stream in range(4):
+        run_dir = tmp_path / f"run-{stream}"
+        task_dir = run_dir / "mcmc_energy"
+        task_dir.mkdir(parents=True)
+        writer = TrajectoryRecordStreamWriter(
+            task_dir / "sampled_eval_table.csv", observable="local_energy", n_draws=2,
+            n_walkers=2, term_names=("kinetic", "trap"), system_descriptor=system,
+            execution_receipt=receipt, resolved_config_identity=identity,
+            model_provenance="checkpoint", checkpoint_sha256="c" * 64, first_draw=draw(0),
+        )
+        writer.append(draw(1))
+        artifacts.append(writer.finalize(
+            ObservableTrajectory("local_energy", values, draw_stride=1, burn_in_draws=0)
+        ))
+        start = {"resolved_config_identity": identity, "git": {"sha": "a" * 40}}
+        (run_dir / "run_start.json").write_text(json.dumps(start), encoding="utf-8")
+        (run_dir / "status.json").write_text(json.dumps({"status": "failed"}), encoding="utf-8")
 
-    inspected = trajectory_records.inspect_trajectory_record(artifact.metadata_path,
+    inspected = trajectory_records.inspect_trajectory_record(artifacts[0].metadata_path,
                                                               expected_resolved_config_identity=identity,
                                                               expected_checkpoint_sha256="c" * 64)
     assert inspected.record_schema == "trajectory_records/v2"
     with pytest.raises(trajectory_records.TrajectoryReaderError, match="checkpoint"):
-        trajectory_records.inspect_trajectory_record(artifact.metadata_path,
+        trajectory_records.inspect_trajectory_record(artifacts[0].metadata_path,
                                                      expected_resolved_config_identity=identity,
                                                      expected_checkpoint_sha256="f" * 64)
     monkeypatch.setattr(stage1_collect, "inspect_run", lambda path: {
         "verdict": "completed", "resolved_config_identity": identity, "source_git_sha": "a" * 40,
     })
-    row = {"row_id": "row-0", "kind": "eval", "system_id": system.system_id(), "lineage": 0,
-           "checkpoint": 10, "stream": 0, "results_root": str(tmp_path), "run_id": "run-0",
-           "draws": 2, "walkers": 2, "source_sha": "a" * 40, "checkpoint_sha256": "c" * 64}
-    document = {"schema": "stage1/v2", "rows": [row]}
-    document["manifest_hash"] = manifest_hash([row])
+    rows = [{"row_id": f"row-{stream}", "kind": "eval", "system_id": system.system_id(),
+             "lineage": 0, "checkpoint": 10, "stream": stream, "results_root": str(tmp_path),
+             "run_id": f"run-{stream}", "draws": 2, "walkers": 2, "source_sha": "a" * 40,
+             "checkpoint_sha256": "c" * 64} for stream in range(4)]
+    document = {"schema": "stage1/v2", "rows": rows, "manifest_hash": manifest_hash(rows)}
     monkeypatch.setattr(stage1_collect, "_reference", lambda system_id, registry_path: (-2.9, "transcribed"))
     result = stage1_collect.collect(document)
     assert result["records"][0]["identity"]["record_content_id"] == inspected.record_content_id
