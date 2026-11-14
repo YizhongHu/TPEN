@@ -1,9 +1,9 @@
 """Regenerate canonical core-owned boundary fixtures from real producers.
 
-The temporary run deliberately uses a stable logical path.  The producer still
+The temporary run deliberately uses a stable logical path. The producer still
 resolves and reads the real status, run-start identity, model, and checkpoint
-manifest artifacts; only run-specific absolute paths are normalized before the
-fixture is written.
+manifest artifacts; only structural paths and stable logical identifiers
+survive provenance normalization before the fixture is written.
 """
 
 from __future__ import annotations
@@ -35,7 +35,37 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _CHECKPOINT_REF_PLACEHOLDERS = {
     "content_id": "<sha256:content_id>",
     "manifest_sha256": "<sha256:manifest>",
+    "model_sha256": "<sha256:model>",
 }
+_EXPECTED_PROVENANCE_KEYS = frozenset(
+    {
+        "command",
+        "config_id",
+        "cwd",
+        "git_branch",
+        "git_dirty",
+        "git_sha",
+        "hostname",
+        "python",
+        "python_executable",
+        "run_dir",
+        "run_id",
+        "slurm",
+        "study_name",
+        "tpen_version",
+    }
+)
+_EXPECTED_SLURM_KEYS = frozenset(
+    {
+        "cpus_per_task",
+        "job_id",
+        "job_name",
+        "job_partition",
+        "mem_per_node",
+        "submit_dir",
+    }
+)
+_ENVIRONMENT_PLACEHOLDER = "<env>"
 
 
 def _make_run(root: Path) -> Path:
@@ -145,19 +175,34 @@ def _normalize_path(path: str, temporary_root: Path) -> str:
 
 
 def _normalize_provenance(value: Any, temporary_root: Path) -> Any:
-    """Normalize every temporary-root path nested in checkpoint provenance."""
+    """Normalize structural paths and redact environment-specific metadata."""
 
-    if isinstance(value, dict):
-        return {key: _normalize_provenance(nested, temporary_root) for key, nested in value.items()}
-    if isinstance(value, list):
-        return [_normalize_provenance(nested, temporary_root) for nested in value]
-    if isinstance(value, str) and Path(value).is_absolute():
-        try:
-            return _normalize_path(value, temporary_root)
-        except ValueError:
-            # Prefix-only normalization retains unrelated absolute paths.
-            return value
-    return value
+    if not isinstance(value, dict) or set(value) != _EXPECTED_PROVENANCE_KEYS:
+        raise ValueError(
+            "checkpoint provenance keys changed: "
+            f"expected {_EXPECTED_PROVENANCE_KEYS}, "
+            f"got {set(value) if isinstance(value, dict) else type(value)}"
+        )
+    slurm = value["slurm"]
+    if not isinstance(slurm, dict) or set(slurm) != _EXPECTED_SLURM_KEYS:
+        raise ValueError(
+            "checkpoint provenance slurm keys changed: "
+            f"expected {_EXPECTED_SLURM_KEYS}, "
+            f"got {set(slurm) if isinstance(slurm, dict) else type(slurm)}"
+        )
+    for key in ("cwd", "run_dir"):
+        if not isinstance(value[key], str):
+            raise ValueError(f"checkpoint provenance {key} must be a path string")
+    if not isinstance(value["run_id"], str):
+        raise ValueError("checkpoint provenance run_id must be a string")
+    normalized = {key: _ENVIRONMENT_PLACEHOLDER for key in _EXPECTED_PROVENANCE_KEYS}
+    normalized["run_id"] = value["run_id"]
+    normalized["cwd"] = _normalize_path(value["cwd"], temporary_root)
+    normalized["run_dir"] = _normalize_path(value["run_dir"], temporary_root)
+    normalized["slurm"] = {
+        key: _ENVIRONMENT_PLACEHOLDER for key in _EXPECTED_SLURM_KEYS
+    }
+    return normalized
 
 
 def _placeholder_checkpoint_identity(checkpoint_ref: dict[str, Any]) -> None:

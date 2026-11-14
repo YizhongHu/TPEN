@@ -53,6 +53,7 @@ def test_v3_round_trip_preserves_full_checkpoint_binding() -> None:
     assert fixture["checkpoint_ref"]["schema"] == "tpen.checkpoint-ref/v1"
     assert fixture["checkpoint_ref"]["content_id"] == "<sha256:content_id>"
     assert fixture["checkpoint_ref"]["manifest_sha256"] == "<sha256:manifest>"
+    assert fixture["checkpoint_ref"]["model_sha256"] == "<sha256:model>"
     assert fixture["checkpoint_ref"]["profile"] == "train_resume"
 
 
@@ -135,6 +136,7 @@ def test_live_planned_yield_ref_binds_checkpoint_bytes(tmp_path: Path) -> None:
     live_ref = CheckpointRef.from_directory(evidence.checkpoint_ref["checkpoint_dir"])
     assert evidence.checkpoint_ref["content_id"] == live_ref.content_id
     assert evidence.checkpoint_ref["manifest_sha256"] == live_ref.manifest_sha256
+    assert evidence.checkpoint_ref["model_sha256"] == live_ref.model_sha256
 
 
 def test_pre_cx01_run_outcome_without_schema_marker_is_read_only(tmp_path: Path) -> None:

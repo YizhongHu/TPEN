@@ -207,12 +207,18 @@ one. The fixture generator is `tests/contracts/_regen_fixtures.py`; it creates
 a real status/checkpoint/run-start artifact set, calls `inspect_run`, then
 normalizes only absolute paths under the temporary producer root. Planned-yield
 runs execute with that temporary root as cwd so checkpoint provenance is
-normalized by the same prefix-only rule. The canonical planned-yield fixture
-replaces exactly `checkpoint_ref.content_id` with `<sha256:content_id>` and
-`checkpoint_ref.manifest_sha256` with `<sha256:manifest>`, after asserting each
-producer value is a 64-hex SHA-256 string. Live tests compare those fields with
-`CheckpointRef` computed from the checkpoint bytes; the placeholders are only
-for cross-clone fixture stability and do not change product hashing.
+normalized by the same prefix-only rule. The normalizer asserts the expected
+top-level provenance and `slurm` key sets. It retains only structural
+`run_id`, `run_dir`, and `cwd` (the latter two normalized); all other
+environment/run-specific provenance values, including nested scheduler values,
+become `<env>`. The canonical planned-yield fixture replaces exactly
+`checkpoint_ref.content_id` with `<sha256:content_id>`,
+`checkpoint_ref.manifest_sha256` with `<sha256:manifest>`, and
+`checkpoint_ref.model_sha256` with `<sha256:model>`, after asserting each
+producer value is a 64-hex SHA-256 string. Live tests compare all three fields
+with `CheckpointRef` computed from the checkpoint bytes; the placeholders are
+only for cross-environment fixture stability and do not change product
+hashing.
 
 | Producer record | Consumer v1 | Consumer v2 | Consumer v3 |
 |---|---|---|---|
