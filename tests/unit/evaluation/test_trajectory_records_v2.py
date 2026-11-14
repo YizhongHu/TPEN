@@ -639,6 +639,13 @@ def test_public_decode_rejects_a_wrong_system_id_on_real_helium_output(tmp_path:
     )
     metadata = _read_metadata(records)
     metadata["system_descriptor_id"] = "0" * 64
+    tampered_receipt = replace(
+        records.execution_receipt, system_id=metadata["system_descriptor_id"]
+    )
+    metadata["execution_receipt"] = trajectory_records._serialize_execution_receipt(
+        tampered_receipt
+    )
+    metadata["execution_receipt_method_id"] = tampered_receipt.method_id()
     metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
     _rewrite_metadata(records, metadata)
     with pytest.raises(TamperedTrajectoryRecordError, match="system_descriptor_id"):
