@@ -1,0 +1,53 @@
+{
+  "checkpoint": {
+    "checkpoint_dir": "/normalized/checkpoints/step_000002",
+    "completed_updates": 2,
+    "next_iteration": 2,
+    "schema_version": 2
+  },
+  "checkpoint_ref": {
+    "checkpoint_dir": "/normalized/checkpoints/step_000002",
+    "completed_updates": 2,
+    "content_id": "18e4b182e3b7f42a81704641ec431604d215bb439cd8a015f2d4beb6d9668d52",
+    "kind": "tpen.checkpoint",
+    "manifest_sha256": "11caf936450e93782718b301b397139b018d345ca00aadb51ff239a7ebc687bd",
+    "model_sha256": "b68278a633740c25f2f56dabe3f92948520142064fd710ab1183f575d0f55144",
+    "next_iteration": 2,
+    "profile": "train_resume",
+    "provenance": {
+      "command": "<env>",
+      "config_id": "<env>",
+      "cwd": "/normalized",
+      "git_branch": "<env>",
+      "git_dirty": "<env>",
+      "git_sha": "<env>",
+      "hostname": "<env>",
+      "python": "<env>",
+      "python_executable": "<env>",
+      "run_dir": "/normalized",
+      "run_id": "planned-yield",
+      "slurm": {
+        "cpus_per_task": "<env>",
+        "job_id": "<env>",
+        "job_name": "<env>",
+        "job_partition": "<env>",
+        "mem_per_node": "<env>",
+        "submit_dir": "<env>"
+      },
+      "study_name": "<env>",
+      "tpen_version": "<env>"
+    },
+    "schema": "tpen.checkpoint-ref/v1",
+    "schema_version": 2
+  },
+  "outcome": "planned_yield",
+  "refusal": null,
+  "resolved_config_identity": {
+    "schema": "tpen-config-identity-v1",
+    "sha256": "151a8e3df73c0db54ba7211d991c7d5d01b08090f69b06ce0c32e36c93241a8b"
+  },
+  "run_dir": "/normalized",
+  "run_status": "planned_yield",
+  "schema": "tpen.run-evidence/v3",
+  "verdict": "incomplete"
+}
