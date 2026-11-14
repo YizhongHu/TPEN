@@ -121,7 +121,8 @@ def _make_planned_yield_run(root: Path) -> Path:
     destination = ArtifactDestination(root / "physical")
     # The checkpoint manifest records cwd as provenance. Keep that path under
     # the same temporary prefix as the other producer paths before normalizing.
-    with chdir(root):
+    destination.physical_root.mkdir(parents=True, exist_ok=True)
+    with chdir(destination.physical_root):
         code = run_from_config(
             cfg,
             artifact_destination=destination,
