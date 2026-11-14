@@ -46,8 +46,8 @@ def test_planned_launch_paths_and_real_records_collect_without_compute(tmp_path:
         checkpoints=[7], lineage_seeds=[11, 12, 13], checkpoint_sha256=bindings,
         results_root=str(tmp_path),
     )
-    rows = [row for row in planned if row["system"] == "hooke1" and row["lineage"] == 0
-            and row["checkpoint"] == 7]
+    rows = [row for row in planned if row["kind"] == "eval" and row["system"] == "hooke1"
+            and row["lineage"] == 0 and row["checkpoint"] == 7]
     document = {"schema": "stage1/v2", "manifest_hash": manifest_hash(rows), "rows": rows}
 
     train_row = next(row for row in planned if row["kind"] == "train" and row["system"] == "hooke1"
