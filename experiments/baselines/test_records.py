@@ -286,6 +286,17 @@ def test_collect_rejects_a_record_naming_an_unregistered_system(tmp_path: Path) 
     assert "not_a_registered_system" in reason
 
 
+def test_collect_accepts_a_record_for_hydrogen_atom(tmp_path: Path) -> None:
+    """The collector joins a record to the newly registered hydrogen id."""
+
+    _write_record(tmp_path, "hydrogen", _valid_payload(system_id="h_atom"))
+
+    report = collect(tmp_path)
+
+    assert report.failures == []
+    assert [record.system_id for record in report.records] == ["h_atom"]
+
+
 def test_collect_accepts_the_registered_reproduction_systems(tmp_path: Path) -> None:
     """Every system id the baseline runs actually emit collects cleanly."""
 

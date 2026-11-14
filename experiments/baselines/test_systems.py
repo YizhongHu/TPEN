@@ -304,6 +304,25 @@ def test_hooke_one_electron_reference_is_distinct_from_pair(entries: list[dict[s
     assert by_id["hooke_one_electron_omega0.5"]["n_up"] + by_id["hooke_one_electron_omega0.5"]["n_down"] == 1
 
 
+def test_hydrogen_atom_entry_is_exact_and_distinct(entries: list[dict[str, Any]]) -> None:
+    """The hydrogen baseline pins its analytic energy, spin, and geometry."""
+
+    by_id = {entry["id"]: entry for entry in entries}
+    hydrogen = by_id["h_atom"]
+    assert hydrogen["reference_energy_hartree"] == -0.5
+    assert (hydrogen["n_up"], hydrogen["n_down"]) == (1, 0)
+    assert hydrogen["n_up"] + hydrogen["n_down"] == 1
+    nuclei = _nuclei(hydrogen)
+    assert len(nuclei) == 1
+    assert nuclei[0]["charge"] == 1
+    assert nuclei[0]["position_bohr"] == [0.0, 0.0, 0.0]
+    assert hydrogen["reference_source"].startswith("Analytic hydrogen 1s")
+    assert hydrogen["confidence"] == "transcribed"
+    assert hydrogen["reference_energy_hartree"] != by_id[
+        "hooke_one_electron_omega0.5"
+    ]["reference_energy_hartree"]
+
+
 def test_loader_covers_every_reproduced_system() -> None:
     """Every system a baseline run has been emitted for is registered.
 

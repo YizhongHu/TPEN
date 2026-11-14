@@ -84,6 +84,25 @@ systems:
       Exact, not variational-best-estimate: at the Taut omegas the two-electron
       relative-motion problem is solvable in closed form.
 
+  - id: h_atom
+    description: One-electron hydrogen atom with the nucleus at the origin.
+    n_up: 1
+    n_down: 0
+    spatial_dim: 3
+    hamiltonian:
+      terms:
+        - term: kinetic
+        - term: electron_nucleus
+          nuclei:
+            - element: H
+              charge: 1
+              position_bohr: [0.0, 0.0, 0.0]
+    reference_energy_hartree: -0.5
+    reference_source: >-
+      Analytic hydrogen 1s ground state, E = -Z^2/2 = -0.5 Ha in atomic
+      units; see main.typ Table I, "Hydrogen atom, Exact -0.5 Ha".
+    confidence: transcribed
+
   - id: he_atom
     description: Helium atom, singlet ground state.
     n_up: 1
