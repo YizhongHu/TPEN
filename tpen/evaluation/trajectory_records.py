@@ -555,12 +555,7 @@ class TrajectoryRecordArtifactV2:
             expected_resolved_config_identity=expected_resolved_config_identity,
             expected_checkpoint_sha256=expected_checkpoint_sha256,
         )
-        contribution_order = _decode_v2_contribution_order(self.execution_receipt)
-        if contribution_order != self.term_names:
-            raise ValueError(
-                "trajectory record term_names must match the execution receipt's contribution "
-                "order exactly"
-            )
+        _validate_v2_contribution_binding(self.execution_receipt, self.term_names)
         final_draw = self.final_draw.validate()
         if final_draw.retained_draw_index != self.n_draws - 1:
             raise ValueError("trajectory record final_draw must be the last retained draw")
@@ -1587,14 +1582,9 @@ def _inspect_v2(
             "declared by system_descriptor"
         )
     try:
-        contribution_order = _decode_v2_contribution_order(execution_receipt)
+        _validate_v2_contribution_binding(execution_receipt, scalars.term_names)
     except ValueError as exc:
         raise TamperedTrajectoryRecordError(str(exc)) from exc
-    if contribution_order != scalars.term_names:
-        raise TamperedTrajectoryRecordError(
-            "trajectory record term_names must match the execution receipt's contribution "
-            "order exactly"
-        )
 
     if scan.has_nan:
         observable_values_digest = _V1_OBSERVABLE_DIGEST_UNAVAILABLE
@@ -2239,6 +2229,28 @@ def _decode_v2_contribution_order(receipt: ExecutionReceipt) -> tuple[str, ...]:
         raise ValueError(
             "trajectory record execution receipt must declare a valid contribution order"
         ) from exc
+
+
+def _validate_v2_contribution_binding(
+    receipt: ExecutionReceipt, term_names: Sequence[str]
+) -> None:
+    """Require both ordered and manifest contribution names to bind CSV columns."""
+
+    term_names = tuple(term_names)
+    contribution_order = _decode_v2_contribution_order(receipt)
+    if contribution_order != term_names:
+        raise ValueError(
+            "trajectory record term_names must match the execution receipt's contribution "
+            "order exactly"
+        )
+    contribution_names = tuple(
+        dict.fromkeys(name for names in receipt.manifest.values() for name in names)
+    )
+    if set(contribution_names) != set(term_names) or len(contribution_names) != len(term_names):
+        raise ValueError(
+            "trajectory record execution_receipt manifest contribution names must match "
+            "its CSV columns"
+        )
 
 
 def _record_content_id(metadata: Mapping[str, Any]) -> str:

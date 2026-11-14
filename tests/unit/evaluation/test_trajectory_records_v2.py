@@ -491,7 +491,7 @@ def test_v2_public_reader_rejects_a_tampered_finite_count(tmp_path: Path) -> Non
         inspect_trajectory_record(artifact.metadata_path)
 
 
-def test_v2_public_reader_rejects_receipt_contribution_csv_column_mismatch(
+def test_v2_public_reader_rejects_a_tampered_manifest_contribution_name(
     tmp_path: Path,
 ) -> None:
     artifact = _v2_artifact(tmp_path, FINITE)
@@ -500,17 +500,7 @@ def test_v2_public_reader_rejects_receipt_contribution_csv_column_mismatch(
         operator_id: tuple(f"renamed_{name}" for name in names)
         for operator_id, names in receipt.manifest.items()
     }
-    renamed_names = tuple(
-        dict.fromkeys(name for names in renamed_manifest.values() for name in names)
-    )
-    renamed_receipt = replace(
-        receipt,
-        manifest=renamed_manifest,
-        numerical_policy={
-            **receipt.numerical_policy,
-            "contribution_order": encode_ordered_contribution_sequence(renamed_names),
-        },
-    )
+    renamed_receipt = replace(receipt, manifest=renamed_manifest)
     from tpen.evaluation.trajectory_records import _serialize_execution_receipt
 
     metadata = _read_metadata(artifact)
@@ -521,6 +511,24 @@ def test_v2_public_reader_rejects_receipt_contribution_csv_column_mismatch(
 
     with pytest.raises(TamperedTrajectoryRecordError, match="contribution"):
         inspect_trajectory_record(artifact.metadata_path)
+
+
+def test_v2_typed_validate_rejects_a_tampered_manifest_contribution_name(
+    tmp_path: Path,
+) -> None:
+    artifact = _v2_artifact(tmp_path, FINITE)
+    receipt = _receipt(_system())
+    renamed_manifest = {
+        operator_id: tuple(f"renamed_{name}" for name in names)
+        for operator_id, names in receipt.manifest.items()
+    }
+    tampered = replace(
+        artifact,
+        execution_receipt=replace(receipt, manifest=renamed_manifest),
+    )
+
+    with pytest.raises(ValueError, match="manifest contribution names"):
+        tampered.validate(check_files=False)
 
 
 def test_v2_rejects_reordered_term_names_and_csv_columns(tmp_path: Path) -> None:
