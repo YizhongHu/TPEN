@@ -1625,7 +1625,7 @@ def _inspect_v2(
         physical_context=TrajectoryPhysicalContext(available=True, system_id=declared_system_id),
         observable_values_digest=observable_values_digest,
         execution_method_id=declared_method_id,
-        contribution_names=receipt_contributions,
+        contribution_names=contribution_order,
         resolved_config_identity=dict(metadata["resolved_config_identity"]),
         model_provenance=str(metadata["model_provenance"]),
         checkpoint_sha256=metadata["checkpoint_sha256"],
