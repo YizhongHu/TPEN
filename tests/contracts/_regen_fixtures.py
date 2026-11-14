@@ -9,8 +9,10 @@ fixture is written.
 from __future__ import annotations
 
 import argparse
+from contextlib import chdir
 import hashlib
 import json
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -29,6 +31,11 @@ FIXTURE_PATH = Path(__file__).with_name("fixtures") / "core-run-evidence-v2.json
 REFUSED_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "core-run-evidence-v1-refused.json"
 PLANNED_YIELD_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "core-run-evidence-v3-planned-yield.json"
 UNKNOWN_FIXTURE_PATH = Path(__file__).with_name("fixtures") / "core-run-evidence-v3-unknown.json"
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_CHECKPOINT_REF_PLACEHOLDERS = {
+    "content_id": "<sha256:content_id>",
+    "manifest_sha256": "<sha256:manifest>",
+}
 
 
 def _make_run(root: Path) -> Path:
@@ -112,12 +119,15 @@ def _make_planned_yield_run(root: Path) -> Path:
         if callback.get("_target_") == "tpen.callback.Checkpoint":
             callback.schedule.every_n = 1
     destination = ArtifactDestination(root / "physical")
-    code = run_from_config(
-        cfg,
-        artifact_destination=destination,
-        runtime_callbacks=(PlannedYield(2, 3),),
-        raise_exceptions=True,
-    )
+    # The checkpoint manifest records cwd as provenance. Keep that path under
+    # the same temporary prefix as the other producer paths before normalizing.
+    with chdir(root):
+        code = run_from_config(
+            cfg,
+            artifact_destination=destination,
+            runtime_callbacks=(PlannedYield(2, 3),),
+            raise_exceptions=True,
+        )
     if code != PLANNED_YIELD_EXIT_CODE:
         raise RuntimeError(f"planned-yield producer returned unexpected code {code}")
     return destination.physical_root
@@ -131,6 +141,32 @@ def _normalize_path(path: str, temporary_root: Path) -> str:
     except ValueError as exc:
         raise ValueError(f"producer path is outside temporary root: {path}") from exc
     return str(Path("/normalized") / relative)
+
+
+def _normalize_provenance(value: Any, temporary_root: Path) -> Any:
+    """Normalize every temporary-root path nested in checkpoint provenance."""
+
+    if isinstance(value, dict):
+        return {key: _normalize_provenance(nested, temporary_root) for key, nested in value.items()}
+    if isinstance(value, list):
+        return [_normalize_provenance(nested, temporary_root) for nested in value]
+    if isinstance(value, str) and Path(value).is_absolute():
+        try:
+            return _normalize_path(value, temporary_root)
+        except ValueError:
+            # Prefix-only normalization retains unrelated absolute paths.
+            return value
+    return value
+
+
+def _placeholder_checkpoint_identity(checkpoint_ref: dict[str, Any]) -> None:
+    """Validate and hide path-dependent checkpoint identity hashes."""
+
+    for key, placeholder in _CHECKPOINT_REF_PLACEHOLDERS.items():
+        value = checkpoint_ref.get(key)
+        if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+            raise ValueError(f"checkpoint_ref.{key} is not a 64-hex SHA-256 value")
+        checkpoint_ref[key] = placeholder
 
 
 def normalize(evidence: RunEvidence, temporary_root: Path) -> dict[str, Any]:
@@ -147,8 +183,10 @@ def normalize(evidence: RunEvidence, temporary_root: Path) -> dict[str, Any]:
             data["checkpoint_ref"]["checkpoint_dir"], temporary_root
         )
         provenance = data["checkpoint_ref"].get("provenance")
-        if isinstance(provenance, dict) and isinstance(provenance.get("run_dir"), str):
-            provenance["run_dir"] = _normalize_path(provenance["run_dir"], temporary_root)
+        data["checkpoint_ref"]["provenance"] = _normalize_provenance(
+            provenance, temporary_root
+        )
+        _placeholder_checkpoint_identity(data["checkpoint_ref"])
     if data["refusal"] is not None:
         data["refusal"]["reason"] = data["refusal"]["reason"].replace(
             str(temporary_root.resolve()), "/normalized"
