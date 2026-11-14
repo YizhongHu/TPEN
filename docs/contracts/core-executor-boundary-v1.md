@@ -120,7 +120,8 @@ and path-independent `content_id`, plus the manifest-declared payload
 validate, the ref to appear in the publication catalog, profile
 `train_resume`, and both result counters to equal the ref counters. A
 `model_only` or missing ref is therefore non-eligible even when a checkpoint
-directory exists.
+directory exists. Checkpoint-ref identity fields are closed; `provenance` is an
+open, descriptive mapping that is never used for eligibility.
 
 Continuation eligibility is an explicit rule, not an operational status:
 
