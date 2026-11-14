@@ -48,6 +48,7 @@ def test_happy_path_statistics_and_four_stream_aggregate(monkeypatch, tmp_path: 
         return SimpleNamespace(record_schema="trajectory_records/v2", draw_count=2, walker_count=2,
                                row_count=4, finite_count=4, mean=sum(sum(x) for x in values[index]) / 4,
                                variance=1.25, csv_sha256="d" * 64, system_id="he_atom",
+                               path=Path(f"m-{index}"),
                                execution_method_id="method", resolved_config_identity={"schema": "tpen-config-identity-v1", "sha256": "b" * 64},
                                model_provenance="checkpoint", checkpoint_sha256="c" * 64,
                                record_content_id="e" * 64)

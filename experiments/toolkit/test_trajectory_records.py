@@ -121,6 +121,7 @@ def test_real_v2_writer_reader_flows_into_stage1_collector(monkeypatch, tmp_path
         execution_receipt=receipt, resolved_config_identity=identity,
         model_provenance="checkpoint", checkpoint_sha256="c" * 64, first_draw=draw(0),
     )
+    writer.append(draw(1))
     artifact = writer.finalize(ObservableTrajectory("local_energy", values, draw_stride=1, burn_in_draws=0))
     start = {"resolved_config_identity": identity, "git": {"sha": "a" * 40}}
     (run_dir / "run_start.json").write_text(json.dumps(start), encoding="utf-8")
