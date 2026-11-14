@@ -22,6 +22,7 @@ sys.modules[spec.name] = manifest_module
 spec.loader.exec_module(manifest_module)
 
 _PER_TEST_TIMEOUT_SECONDS = 120
+_FROZEN_ROW_ID_SET_SHA256 = "d18b3ceb95fac95c3249154344a290d3807ea46e8d246b10f699286ba6644c6b"
 
 
 @contextmanager
@@ -65,19 +66,10 @@ def test_committed_manifest_regenerates_byte_identically() -> None:
     committed_hash = hashlib.sha256(committed).hexdigest()
     rendered_hash = hashlib.sha256(rendered).hexdigest()
     if committed_hash != rendered_hash or len(committed) != len(rendered):
-        first_difference = next(
-            (index for index, (left, right) in enumerate(zip(committed, rendered)) if left != right),
-            min(len(committed), len(rendered)),
-        )
-        window_start = max(0, first_difference - 24)
-        window_end = first_difference + 24
         raise AssertionError(
             "manifest bytes differ: "
             f"committed_sha256={committed_hash} rendered_sha256={rendered_hash} "
-            f"committed_length={len(committed)} rendered_length={len(rendered)} "
-            f"first_difference={first_difference} "
-            f"committed_window={committed[window_start:window_end]!r} "
-            f"rendered_window={rendered[window_start:window_end]!r}"
+            f"committed_length={len(committed)} rendered_length={len(rendered)}"
         )
 
 
@@ -91,11 +83,11 @@ def test_manifest_counts_sources_and_admission_reason() -> None:
     }
     assert manifest["provenance"]["design_document"]["sha256"] == manifest_module.DESIGN_DOC_SHA256
     assert manifest["provenance"]["design_document"]["path"] == (
-        "2026-09-04-tpen-helium-importance-scan-consolidated.md"
+        "docs/he-importance-scan-design-20260904.md"
     )
-    assert manifest["provenance"]["design_document"]["tracked"] is False
-    assert manifest["provenance"]["design_document"]["location"] == (
-        "operator checkout (untracked; commit decision pending with operator)"
+    assert manifest["provenance"]["design_document"]["tracked"] is True
+    assert manifest["provenance"]["design_document"]["original_filename"] == (
+        "2026-09-04-tpen-helium-importance-scan-consolidated.md"
     )
     assert manifest["provenance"]["lane_plan_approval"]["citation"] == (
         "TO note operator-approved-materialization-2026-09-05 on 67987933"
@@ -337,6 +329,20 @@ def test_rendered_provenance_distinguishes_relayed_roster_from_inferred_design()
     sources = rendered["provenance"]["coordinate_sources"]
     assert set(sources["optimizer"]["evidence_class"]) == {"RELAYED", "INFERRED"}
     assert sources["context"]["evidence_class"] == "INFERRED"
+
+
+def test_design_document_hash_mismatch_refuses_render(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(manifest_module, "DESIGN_DOC_SHA256", "0" * 64)
+    with pytest.raises(manifest_module.ScanManifestError, match="design document sha256 mismatch"):
+        manifest_module.render_manifest()
+
+
+def test_rendered_row_ids_remain_frozen() -> None:
+    rendered = manifest_module.render_manifest()
+    row_id_set_hash = hashlib.sha256(
+        "\n".join(sorted(row["row_id"] for row in rendered["rows"])).encode()
+    ).hexdigest()
+    assert row_id_set_hash == _FROZEN_ROW_ID_SET_SHA256
 
 
 def test_operational_cadence_changes_packet_not_row_identity(
