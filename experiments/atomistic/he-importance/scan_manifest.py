@@ -12,12 +12,13 @@ from collections.abc import Mapping
 from typing import Any
 
 _HERE = Path(__file__).resolve().parent
-_REPO_ROOT = _HERE.parents[3]
+_REPO_ROOT = _HERE.parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 MANIFEST_SCHEMA = "tpen.hi.scan_manifest.v1"
 MANIFEST_PATH = _HERE / "o1_scan_manifest_v1.json"
 DESIGN_DOC_SHA256 = "76e6b7bcaf5454da120750e353fb268bbce07e6aeda6d2a601c86ddf7cc8046f"
+DESIGN_DOC_PATH = _REPO_ROOT / "docs" / "he-importance-scan-design-20260904.md"
 MANAGER_RULING = "Paseo msg c92c3a08 (2026-11-14): SR/CAD/DOC"
 
 _COORDINATE_SOURCES = {
@@ -62,6 +63,22 @@ def _canonical(value: Any) -> bytes:
 
 def content_hash(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _validate_design_document() -> None:
+    """Require the tracked design-document copy to match its frozen citation."""
+
+    try:
+        actual = hashlib.sha256(DESIGN_DOC_PATH.read_bytes()).hexdigest()
+    except OSError as error:
+        raise ScanManifestError(
+            f"cannot read design document {DESIGN_DOC_PATH}: {error}"
+        ) from error
+    if actual != DESIGN_DOC_SHA256:
+        raise ScanManifestError(
+            "design document sha256 mismatch: "
+            f"expected {DESIGN_DOC_SHA256}, got {actual}"
+        )
 
 
 def _authority_hashes() -> dict[str, str]:
@@ -148,6 +165,7 @@ def _materialized_rows() -> dict[str, Any]:
 def render_manifest() -> dict[str, Any]:
     """Render the complete deterministic O1 manifest from live study authorities."""
 
+    _validate_design_document()
     materialized = _materialized_rows()
     rows = materialized["rows"]
     if len(rows) != 1920:
@@ -161,11 +179,11 @@ def render_manifest() -> dict[str, Any]:
         "checkpoint_cadence": checkpoint_cadence_declaration(),
         "provenance": {
             "design_document": {
-                "path": "2026-09-04-tpen-helium-importance-scan-consolidated.md",
+                "path": "docs/he-importance-scan-design-20260904.md",
                 "sha256": DESIGN_DOC_SHA256,
                 "sections": ["2.7", "2.8", "2.9"],
-                "tracked": False,
-                "location": "operator checkout (untracked; commit decision pending with operator)",
+                "tracked": True,
+                "original_filename": "2026-09-04-tpen-helium-importance-scan-consolidated.md",
             },
             "authority_sha256": _authority_hashes(),
             "manager_ruling": MANAGER_RULING,
