@@ -118,7 +118,7 @@ store.finish_attempt(fence, "failed", "2026-11-14T00:01:00Z")
 store.record_core_outcome(fence, CoreRunEvidence.from_mapping(payload))
 request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
 store.record_successor_admission(fence, request, "b" * 64)
-manifest.write_bytes(store.manifest(group).encode())
+(destination / "manifest.json").write_bytes(store.manifest(group).encode())
 '''
     written = _executor(
         code,
