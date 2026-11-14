@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from experiments.toolkit.run_paths import resolve_run_dir
+
 SYSTEMS = ("hooke1", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
@@ -102,22 +104,6 @@ def _safe_results_root(value: object) -> str:
     if any(part == "experiments" for part in path.parts):
         raise ProtocolError("results_root must not be inside the checkout")
     return value.rstrip("/")
-
-
-def resolve_run_dir(row: Mapping[str, Any]) -> Path:
-    """Resolve one row through TPEN's own artifact-directory implementation."""
-
-    try:
-        from tpen.artifacts import ArtifactManager
-
-        admitted = row.get("run_dir")
-        return ArtifactManager(
-            row["results_root"], row["experiment_name"], row["sector"], row["run_id"],
-            layout=row.get("run_layout", "nested"),
-            logical_run_dir=None if admitted is None else Path(str(admitted)),
-        ).run_dir
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ProtocolError(f"row lacks a valid run-directory binding: {row!r}") from exc
 
 
 def stable_row_id(*, system: str, kind: str, lineage: int = 0,
