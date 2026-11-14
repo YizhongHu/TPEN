@@ -337,6 +337,48 @@ def test_v2_reader_propagates_mixed_nonfinite_rows_from_real_writer(tmp_path: Pa
     assert math.isnan(v1_inspection.variance)
 
 
+def test_v2_public_reader_rejects_a_tampered_finite_count(tmp_path: Path) -> None:
+    artifact = _v2_artifact(tmp_path, FINITE)
+    metadata = _read_metadata(artifact)
+    metadata["finite_count"] -= 1
+    metadata["nonfinite_count"] += 1
+    _rewrite_metadata(artifact, metadata)
+
+    with pytest.raises(TamperedTrajectoryRecordError, match="finite_count"):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
+def test_v2_public_reader_rejects_receipt_contribution_csv_column_mismatch(
+    tmp_path: Path,
+) -> None:
+    artifact = _v2_artifact(tmp_path, FINITE)
+    receipt = _receipt(_system())
+    renamed_manifest = {
+        operator_id: tuple(f"renamed_{name}" for name in names)
+        for operator_id, names in receipt.manifest.items()
+    }
+    renamed_names = tuple(
+        dict.fromkeys(name for names in renamed_manifest.values() for name in names)
+    )
+    renamed_receipt = replace(
+        receipt,
+        manifest=renamed_manifest,
+        numerical_policy={
+            **receipt.numerical_policy,
+            "contribution_order": encode_ordered_contribution_sequence(renamed_names),
+        },
+    )
+    from tpen.evaluation.trajectory_records import _serialize_execution_receipt
+
+    metadata = _read_metadata(artifact)
+    metadata["execution_receipt"] = _serialize_execution_receipt(renamed_receipt)
+    metadata["execution_receipt_method_id"] = renamed_receipt.method_id()
+    _rewrite_metadata(artifact, metadata)
+
+    with pytest.raises(TamperedTrajectoryRecordError, match="contributions"):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
 class _GaussianModel(torch.nn.Module):
     """``log|psi| = -0.5 * alpha * |r|^2``: real, twice-differentiable in positions."""
 
@@ -439,6 +481,24 @@ def test_calculator_rejects_reuse_under_a_different_requested_method(tmp_path: P
         )
 
 
+def test_calculator_rejects_reuse_under_a_different_requested_system(tmp_path: Path) -> None:
+    artifact = _v2_artifact(tmp_path, FINITE)
+    generated = GeneratedConfigurations(
+        batch=ElectronBatch(positions=artifact.final_draw.positions[:1]),
+        metadata={},
+        trajectory_records=artifact,
+    )
+    different_terms = {"kinetic": KineticEnergy(), "trap": HarmonicTrap(omega=0.75)}
+    calculator = LocalEnergyCalculator(hamiltonian_terms=different_terms)
+
+    with pytest.raises(ValueError, match="different execution method"):
+        calculator.calculate(
+            model=_GaussianModel(),
+            bundle=EvaluationBundle(generated=generated),
+            context=_hooke_context(tmp_path),
+        )
+
+
 def test_calculator_reuses_a_valid_fused_v2_contribution(tmp_path: Path) -> None:
     artifact = _v2_artifact(tmp_path, FINITE)
     receipt = _receipt(_system())
@@ -478,6 +538,42 @@ def test_calculator_reuses_a_valid_fused_v2_contribution(tmp_path: Path) -> None
         context=_hooke_context(tmp_path),
     )
     assert calculated.local_energy is not None
+
+
+def test_generator_rejects_a_receipt_change_between_public_draws(tmp_path: Path) -> None:
+    class _ChangingReceiptEvaluator(NaiveLocalEnergyEvaluator):
+        def __init__(self) -> None:
+            super().__init__()
+            self._receipt_calls = 0
+
+        def describe_execution_receipt(self, terms, system_id):
+            self._receipt_calls += 1
+            receipt = super().describe_execution_receipt(terms, system_id)
+            if self._receipt_calls > 1:
+                receipt = replace(receipt, implementation=receipt.implementation + ".changed")
+            return receipt
+
+    system = _system()
+    sampler = MetropolisSampler(
+        n_walkers=2,
+        burn_in=0,
+        n_steps=1,
+        n_electrons=1,
+        spatial_dim=3,
+        seed=11,
+        dtype=torch.float64,
+    )
+    generator = TrajectoryMCMCGenerator(
+        sampler=sampler,
+        hamiltonian_terms=_TERMS,
+        n_draws=2,
+        chunk_size=2,
+        system=system,
+        evaluator=_ChangingReceiptEvaluator(),
+    )
+
+    with pytest.raises(ValueError, match="receipt changed between draws"):
+        generator.generate(model=_GaussianModel(), context=_hooke_context(tmp_path))
 
 
 class _OrderedContributionEvaluator:
