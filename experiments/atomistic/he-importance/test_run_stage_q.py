@@ -787,6 +787,66 @@ def test_roster_design_receipt_is_live_and_names_every_unavailable_arm() -> None
     )
 
 
+# These harness guards are defined below the pre-existing tpen.hi_schema
+# crossing so adding them does not shift its boundary-inventory line.
+from contextlib import contextmanager
+import signal
+import time
+
+_PER_TEST_TIMEOUT_SECONDS = 120
+
+
+@contextmanager
+def _timeout_guard(seconds: int, nodeid: str):
+    """Bound one test without adding a pytest-timeout dependency."""
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_alarm = signal.alarm(0)
+
+    def raise_timeout(_signum: int, _frame: object) -> None:
+        raise TimeoutError(f"per-test timeout ({seconds}s): {nodeid}")
+
+    signal.signal(signal.SIGALRM, raise_timeout)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_alarm:
+            signal.alarm(previous_alarm)
+
+
+@pytest.fixture(autouse=True)
+def _launch_boundary_firewall(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent an unstubbed runner test from entering real training."""
+
+    def refuse_unstubbed_launch(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        raise AssertionError("test crossed the run_from_config launch boundary")
+
+    monkeypatch.setattr(runner.launch, "run_from_config", refuse_unstubbed_launch)
+
+
+@pytest.fixture(autouse=True)
+def _per_test_timeout(request: pytest.FixtureRequest):
+    with _timeout_guard(_PER_TEST_TIMEOUT_SECONDS, request.node.nodeid):
+        yield
+
+
+def test_launch_boundary_firewall_is_active() -> None:
+    """The default test harness must fail closed at the training boundary."""
+
+    with pytest.raises(AssertionError, match="run_from_config launch boundary"):
+        runner.launch.run_from_config(object(), topology={})
+
+
+def test_per_test_timeout_fires() -> None:
+    with pytest.raises(TimeoutError, match="test_per_test_timeout_fires"):
+        with _timeout_guard(1, "test_per_test_timeout_fires"):
+            time.sleep(2)
+
+
 def test_selection_receipt_contains_selected_and_discarded_cells(tmp_path: Path) -> None:
     selected = runner.select_cell(_cells(tmp_path), seed_label=810_001)
     receipt = selected.receipt()
