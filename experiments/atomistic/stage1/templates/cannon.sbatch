@@ -23,12 +23,17 @@ if [[ "$RESULTS_ROOT" != "/n/netscratch/kozinsky_lab/Lab/rhu/"* ]]; then
   echo "STAGE1_GUARD results root outside /n/netscratch/kozinsky_lab/Lab/rhu/" >&2
   exit 2
 fi
-trap 'rm -rf -- "$JOB_ROOT"' EXIT
 [[ "$JOB_ROOT" == "$SCRATCH_BASE/$USER/$SLURM_JOB_ID" ]] || {
   echo "STAGE1_GUARD invalid JOB_ROOT" >&2
   exit 2
 }
-mkdir -p "$JOB_ROOT"
+mkdir -p -- "$SCRATCH_BASE/$USER"
+if [[ -e "$JOB_ROOT" ]]; then
+  echo "STAGE1_GUARD job root already exists" >&2
+  exit 2
+fi
+mkdir -- "$JOB_ROOT"
+trap 'rm -rf -- "$JOB_ROOT"' EXIT
 printf 'job_id=%s host=%s partition=%s head_sha=%s results_root=%s\n' \
   "$SLURM_JOB_ID" "$(hostname)" "$SLURM_JOB_PARTITION" "$HEAD_SHA" "$RESULTS_ROOT"
 __COMMAND__
