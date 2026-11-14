@@ -86,6 +86,15 @@ def test_join_guards_refuse_invalid_record(monkeypatch, tmp_path: Path, changes,
         collector.collect(_install_single_fake(monkeypatch, tmp_path, **changes))
 
 
+@pytest.mark.parametrize("changes", [
+    pytest.param({"mean": 2.6}, id="mean"),
+    pytest.param({"variance": 1.5}, id="variance"),
+])
+def test_inspection_statistics_must_reconcile_with_grid(monkeypatch, tmp_path: Path, changes) -> None:
+    with pytest.raises(collector.CollectionError, match="do not reconcile"):
+        collector.collect(_install_single_fake(monkeypatch, tmp_path, **changes))
+
+
 def test_missing_record_is_refused(monkeypatch, tmp_path: Path) -> None:
     document = _manifest(tmp_path, streams=1)
     monkeypatch.setattr(collector, "inspect_run", lambda path: {
