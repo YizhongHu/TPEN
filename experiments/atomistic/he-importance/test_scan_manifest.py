@@ -78,17 +78,10 @@ def _runner():
 
 @pytest.fixture(autouse=True)
 def _manifest_tests_never_launch(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep manifest selection tests behind an explicit no-training firewall."""
 
-    if not request.node.name.startswith((
-        "test_unavailable_rows",
-        "test_manifest_tamper_stale",
-        "test_manifest_positive",
-        "test_manifest_rejects_explicit",
-    )):
-        return
     runner = _runner()
 
     def fail_launch(*_args, **_kwargs):
@@ -96,6 +89,12 @@ def _manifest_tests_never_launch(
 
     monkeypatch.setattr(runner.launch, "launch_train", fail_launch)
     monkeypatch.setattr(runner.launch, "run_from_config", fail_launch)
+
+
+def test_manifest_launch_firewall_is_active() -> None:
+    runner = _runner()
+    with pytest.raises(AssertionError, match="launch boundary"):
+        runner.launch.launch_train(None, None)
 
 
 def _row(manifest: dict, *, status: str, method: str) -> dict:
