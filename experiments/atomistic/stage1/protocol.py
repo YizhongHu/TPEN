@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from experiments.toolkit.run_paths import resolve_run_dir
+
 SYSTEMS = ("hooke1", "he", "h2")
 KINDS = ("smoke", "train", "eval")
 _SHA1 = re.compile(r"[0-9a-f]{40}\Z")
@@ -206,17 +208,29 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
         raise ProtocolError("binding kind does not match gateway")
     if config != row.get("config"):
         raise ProtocolError("gateway config does not match binding")
-    expected = {f"runtime.seed={row['seed']}"}
+    expected = {
+        f"runtime.seed={row['seed']}",
+        f"run.root={row['results_root']}",
+        f"experiment.name={row['experiment_name']}",
+        f"experiment.sector={row['sector']}",
+        f"run.run_id={row['run_id']}",
+    }
     if kind == "eval":
-        checkpoint_path = row.get("checkpoint_path")
-        if not isinstance(checkpoint_path, str) or not Path(checkpoint_path).is_absolute():
-            raise ProtocolError("checkpoint_path must be absolute")
+        checkpoint_dir = row.get("checkpoint_dir")
+        checkpoint_file = row.get("checkpoint_file")
+        if (not isinstance(checkpoint_dir, str) or not Path(checkpoint_dir).is_absolute()
+                or not isinstance(checkpoint_file, str) or not Path(checkpoint_file).is_absolute()):
+            raise ProtocolError("checkpoint_dir and checkpoint_file must be absolute")
+        try:
+            Path(checkpoint_file).relative_to(Path(checkpoint_dir))
+        except ValueError as exc:
+            raise ProtocolError("checkpoint_file must be inside checkpoint_dir") from exc
         expected.update({
             f"evaluation_sampler.n_walkers={row['walkers']}",
             f"evaluation_tasks.mcmc_energy.generator.n_draws={row['draws']}",
-            f"load.path={row['checkpoint_path']}", "load.mode=model_only",
+            f"load.path={checkpoint_dir}", "load.mode=model_only",
             "load.strict=true",
-            f"trajectory_identity.checkpoint_file={row['checkpoint_path']}",
+            f"trajectory_identity.checkpoint_file={checkpoint_file}",
         })
         if expected_checkpoint_sha256 is None:
             raise ProtocolError("eval requires strict restore and expected checkpoint")
@@ -280,8 +294,9 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
             "row_id": stable_row_id(system=spec.name, kind="smoke"),
             "system": spec.name, "system_id": spec.system_id, "kind": "smoke",
             "seed": seed, "source_sha": source_sha, "config_sha256": config_sha256,
-            "config": f"configs/{spec.name}/smoke.yaml",
-            "results_root": f"{root}/{spec.name}/smoke", "updates": protocol.smoke_updates,
+            "config": f"configs/{spec.name}/smoke.yaml", "results_root": root,
+            "experiment_name": "stage1", "sector": spec.name, "run_id": "smoke",
+            "updates": protocol.smoke_updates,
             "walkers": protocol.smoke_walkers,
         })
         for lineage, seed in enumerate(lineage_seeds):
@@ -294,10 +309,13 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
                 "row_id": train_id, "system": spec.name, "system_id": spec.system_id,
                 "kind": "train", "lineage": lineage, "seed": train_seed,
                 "source_sha": source_sha, "config_sha256": config_sha256,
-                "config": f"configs/{spec.name}/train.yaml",
-                "results_root": f"{root}/{spec.name}/train", "updates": protocol.lineage_updates,
+                "config": f"configs/{spec.name}/train.yaml", "results_root": root,
+                "experiment_name": "stage1", "sector": spec.name,
+                "run_id": f"train-lineage-{lineage}",
+                "updates": protocol.lineage_updates,
                 "walkers": protocol.lineage_walkers,
             })
+            train_row = rows[-1]
             for checkpoint in checkpoints:
                 for stream in range(protocol.eval_streams):
                     key = (spec.name, lineage, checkpoint)
@@ -313,17 +331,18 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
                     row_id = stable_row_id(system=spec.name, kind="eval", lineage=lineage,
                                            checkpoint=checkpoint, stream=stream)
                     eval_id = f"{spec.name}-lineage-{lineage}-checkpoint-{checkpoint}-stream-{stream}"
+                    checkpoint_dir = resolve_run_dir(train_row) / "checkpoints" / f"step_{checkpoint:06d}"
+                    checkpoint_file = checkpoint_dir / "model.pt"
                     rows.append({
                         "row_id": row_id, "system": spec.name, "system_id": spec.system_id,
                         "kind": "eval", "lineage": lineage, "checkpoint": checkpoint,
                         "stream": stream, "seed": eval_seed, "updates": checkpoint,
                         "walkers": protocol.eval_walkers, "draws": protocol.eval_draws,
                         "source_sha": source_sha, "config_sha256": config_sha256,
-                        "config": f"configs/{spec.name}/eval.yaml",
-                        "results_root": f"{root}/{spec.name}/eval", "checkpoint_path":
-                        f"{root}/{spec.name}/train/lineage-{lineage}/checkpoints/step_{checkpoint:06d}/model.pt",
-                        "checkpoint_sha256": checkpoint_digest,
-                        "run_id": eval_id, "depends_on": train_id,
+                        "config": f"configs/{spec.name}/eval.yaml", "results_root": root,
+                        "experiment_name": "stage1", "sector": spec.name, "run_id": eval_id,
+                        "checkpoint_dir": str(checkpoint_dir), "checkpoint_file": str(checkpoint_file),
+                        "checkpoint_sha256": checkpoint_digest, "depends_on": train_id,
                     })
     return rows
 

@@ -14,7 +14,8 @@ def _manifest(tmp_path: Path, streams: int = 4) -> dict:
     for stream in range(streams):
         rows.append({"row_id": f"row-{stream}", "kind": "eval", "system_id": "he_atom",
                      "lineage": 0, "checkpoint": 10, "stream": stream,
-                     "results_root": str(tmp_path), "run_id": f"run-{stream}",
+                     "results_root": str(tmp_path), "experiment_name": "stage1",
+                     "sector": "he", "run_id": f"run-{stream}",
                      "draws": 2, "walkers": 2, "source_sha": "a" * 40,
                      "checkpoint_sha256": "c" * 64})
     return {"schema": "stage1/v2", "manifest_hash": manifest_hash(rows), "rows": rows}
