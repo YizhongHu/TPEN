@@ -1,5 +1,66 @@
 # Release Notes
 
+## v0.5.2 - H-v2 science code, core-executor contract start, Stage 1 records, executor teardown
+
+44 commits since `v0.5.1` (`76c35bc6`), merged into `dev` through 26 pull
+requests and released to `main` by #709 as `14235a0a` (tree identical to dev
+`fce3de22`). The package version is unchanged at `0.5.1` (operator decision:
+no version bump for this release).
+
+```
+git log --format='%H' 76c35bc63bcf2fee0cc2b3dee7587c5f1358b86c..fce3de22ccb88538f704ad329c94ea868b7b2e11 | wc -l
+```
+
+Release gate: full default suite at `fce3de22` on FASRC Cannon (`test`
+partition, typecheck on, executor arms included), job 60478238: 8586 passed,
+0 failed, 0 errors, 20 skipped.
+
+### Changed
+
+- **`scripts/cannon/verify.sh` type-checks by default** (#683). Runs now use
+  typeguard unless `--typecheck off` is passed. The overlay installs the
+  executor as an editable package and binds only the whole-word
+  `*_(EXECUTOR|ROOT|SCIENCE)_PYTHON` interpreter selectors (#696).
+- **Implementation lifecycle** (#705): an item advances to `review` only once
+  its PR is ready for human merge, so `unblockAt: review` fires at ready. The
+  review checklist asks any new test slower than 30 s to state and justify its
+  runtime.
+
+### Added
+
+- **H-v2 science code**: science horizon extended to 100k updates (#687);
+  `AmplitudeRiskFraction` enabled in the science A1 modules every 100 updates
+  (#690); evaluation generations packed per GPU job (#675); 100k pilot
+  consumer probes (#684).
+- **Core-executor contract**: boundary contract document and versioned
+  fixtures (CX-00, #693); published-boundary planned yield for resumable runs
+  (S4, #691).
+- **Executor**: bounded remote teardown acknowledgement (EX-S3.C, #668).
+- **Physics and evaluation (Stage 1)**: physical system descriptor and semantic
+  term declarations (#674); shared local-energy execution receipt and result
+  transport (#677); version-aware historical trajectory reader with immutable
+  v1 fixtures (#678); opt-in `trajectory_records/v2` writer and active-producer
+  binding (#682); one-electron Hooke oracle and reference registry (#695).
+- **Operational artifact routing** with constant science config (S3, #663).
+- **Baselines**: seed-spread summary for collected baseline records (#701).
+- **Cannon submit-lint** shared-environment prefix split (#676).
+
+### Fixed
+
+- `tpen.run` no longer imports `torch.nn` at module import; the planned-yield
+  and checkpoint names load lazily (#703, regression from #691).
+- Baseline rung builder uses checkout imports instead of a hard-coded home
+  path (#700).
+
+### Tests and documentation
+
+- Test-only fixes: S2 restore-test fakes are real `Runner` instances (#688);
+  chain-resume tests treat the R2.3 `trainer_cursor` refusal as an observed
+  outcome (#698); H-v2 store reservation probe stabilised (#685); named skip
+  when review-test interpreters are unset (#697); sampler-draw receipt with a
+  corrupted `transition_count` is refused (#699).
+- README release version set to 0.5.1 (#694).
+
 ## v0.5.1 - H-v2 100k pilot payload, shared Holystore environments, resume and executor layers
 
 33 commits since `v0.5.0` (`db001085`), merged into `dev` through 11 pull
