@@ -4,8 +4,8 @@
 
 44 commits since `v0.5.1` (`76c35bc6`), merged into `dev` through 26 pull
 requests and released to `main` by #709 as `14235a0a` (tree identical to dev
-`fce3de22`). The package version is unchanged at `0.5.1` (operator decision:
-no version bump for this release).
+`fce3de22`). The tagged code still reports package version `0.5.1`; the
+version sources move to `0.5.2` on `dev` in #712.
 
 ```
 git log --format='%H' 76c35bc63bcf2fee0cc2b3dee7587c5f1358b86c..fce3de22ccb88538f704ad329c94ea868b7b2e11 | wc -l
