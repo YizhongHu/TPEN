@@ -17,7 +17,8 @@ def main() -> int:
     parser.add_argument("--binding", required=True)
     parser.add_argument("--kind", choices=("smoke", "train"), required=True)
     args = parser.parse_args()
-    validate_gateway_binding(binding=args.binding, overrides=args.overrides, kind=args.kind)
+    validate_gateway_binding(binding=args.binding, config=args.config,
+                             overrides=args.overrides, kind=args.kind)
     # Config loading remains owned by the installed tpen entrypoint; this
     # wrapper is intentionally only a gateway and does not duplicate Runner.
     from tpen.run import load_config

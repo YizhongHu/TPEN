@@ -146,11 +146,14 @@ def test_gateway_rejects_omitted_or_altered_binding_before_run() -> None:
     from experiments.atomistic.stage1.launch import _binding_token, row_overrides
     token = _binding_token(ROW)
     overrides = row_overrides(ROW)
-    validate_gateway_binding(binding=token, overrides=overrides, kind="train")
+    validate_gateway_binding(binding=token, config=ROW["config"], overrides=overrides, kind="train")
     with pytest.raises(ProtocolError):
-        validate_gateway_binding(binding=token, overrides=overrides[:-1], kind="train")
+        validate_gateway_binding(binding=token, config=ROW["config"], overrides=overrides[:-1], kind="train")
     with pytest.raises(ProtocolError):
-        validate_gateway_binding(binding=token, overrides=[*overrides[:-1], "trainer.max_steps=1"], kind="train")
+        validate_gateway_binding(binding=token, config=ROW["config"], overrides=[*overrides[:-1], "trainer.max_steps=1"], kind="train")
+    with pytest.raises(ProtocolError):
+        validate_gateway_binding(binding=token, config="configs/he/other.yaml",
+                                 overrides=overrides, kind="train")
     eval_row = {
         **ROW, "kind": "eval", "draws": 256,
         "checkpoint_path": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/he/train/model.pt",
@@ -160,11 +163,50 @@ def test_gateway_rejects_omitted_or_altered_binding_before_run() -> None:
     eval_token = _binding_token(eval_row)
     eval_overrides = row_overrides(eval_row)
     identity = _binding_token({"resolved_config_identity": eval_row["resolved_config_identity"]})
-    validate_gateway_binding(binding=eval_token, overrides=eval_overrides, kind="eval",
+    validate_gateway_binding(binding=eval_token, config=eval_row["config"], overrides=eval_overrides, kind="eval",
                              expected_identity=identity, expected_checkpoint_sha256="d" * 64)
     with pytest.raises(ProtocolError):
-        validate_gateway_binding(binding=eval_token, overrides=eval_overrides, kind="eval",
+        validate_gateway_binding(binding=eval_token, config=eval_row["config"], overrides=eval_overrides, kind="eval",
                                  expected_identity=None, expected_checkpoint_sha256="d" * 64)
+
+
+@pytest.mark.parametrize("key", ["load.mode", "load.path", "runtime.seed"])
+def test_gateway_rejects_conflicting_duplicate_override(key: str) -> None:
+    from experiments.atomistic.stage1.launch import _binding_token, row_overrides
+
+    eval_row = {
+        **ROW, "kind": "eval", "draws": 256,
+        "checkpoint_path": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/he/train/model.pt",
+        "checkpoint_sha256": "d" * 64,
+        "resolved_config_identity": {"schema": "resolved-config-identity/v1", "row_id": "he-train-0"},
+    }
+    overrides = row_overrides(eval_row)
+    identity = _binding_token({"resolved_config_identity": eval_row["resolved_config_identity"]})
+    with pytest.raises(ProtocolError):
+        validate_gateway_binding(
+            binding=_binding_token(eval_row), config=eval_row["config"],
+            overrides=[*overrides, f"{key}=conflict"], kind="eval",
+            expected_identity=identity, expected_checkpoint_sha256="d" * 64,
+        )
+
+
+@pytest.mark.parametrize("override", ["++load.mode=full", "+runtime.seed=1", "~load.strict"])
+def test_gateway_rejects_prefixed_override(override: str) -> None:
+    from experiments.atomistic.stage1.launch import _binding_token, row_overrides
+
+    eval_row = {
+        **ROW, "kind": "eval", "draws": 256,
+        "checkpoint_path": "/n/netscratch/kozinsky_lab/Lab/rhu/stage1/he/train/model.pt",
+        "checkpoint_sha256": "d" * 64,
+        "resolved_config_identity": {"schema": "resolved-config-identity/v1", "row_id": "he-train-0"},
+    }
+    identity = _binding_token({"resolved_config_identity": eval_row["resolved_config_identity"]})
+    with pytest.raises(ProtocolError, match="prefixed gateway overrides"):
+        validate_gateway_binding(
+            binding=_binding_token(eval_row), config=eval_row["config"],
+            overrides=[*row_overrides(eval_row), override], kind="eval",
+            expected_identity=identity, expected_checkpoint_sha256="d" * 64,
+        )
 
 
 def test_command_binds_every_kind() -> None:

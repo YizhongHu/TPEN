@@ -200,7 +200,7 @@ def decode_binding(token: str) -> dict[str, Any]:
     return value
 
 
-def validate_gateway_binding(*, binding: str, overrides: list[str], kind: str,
+def validate_gateway_binding(*, binding: str, config: str, overrides: list[str], kind: str,
                              expected_identity: str | None = None,
                              expected_checkpoint_sha256: str | None = None) -> dict[str, Any]:
     """Validate that gateway arguments still match the rendered row binding."""
@@ -208,6 +208,8 @@ def validate_gateway_binding(*, binding: str, overrides: list[str], kind: str,
     row = decode_binding(binding)
     if row.get("kind") != kind:
         raise ProtocolError("binding kind does not match gateway")
+    if config != row.get("config"):
+        raise ProtocolError("gateway config does not match binding")
     expected = {f"runtime.seed={row['seed']}"}
     if kind == "eval":
         expected.update({
@@ -228,9 +230,26 @@ def validate_gateway_binding(*, binding: str, overrides: list[str], kind: str,
     else:
         expected.update({f"sampler.n_walkers={row['walkers']}",
                          f"trainer.max_steps={row['updates']}"})
-    if not expected.issubset(set(overrides)):
-        missing = sorted(expected.difference(overrides))
-        raise ProtocolError(f"binding overrides are incomplete: {missing}")
+    override_map: dict[str, str] = {}
+    for override in overrides:
+        key, separator, value = override.partition("=")
+        if not separator or not key:
+            raise ProtocolError(f"invalid gateway override: {override!r}")
+        if key.startswith(("+", "~")):
+            raise ProtocolError("prefixed gateway overrides are not allowed")
+        if key in override_map:
+            raise ProtocolError(f"duplicate gateway override: {key}")
+        override_map[key] = value
+    expected_map = {entry.partition("=")[0]: entry.partition("=")[2] for entry in expected}
+    missing = sorted(key for key in expected_map if key not in override_map)
+    mismatched = sorted(
+        key for key, value in expected_map.items()
+        if key in override_map and override_map[key] != value
+    )
+    if missing or mismatched:
+        raise ProtocolError(
+            f"binding overrides do not match: missing={missing}, mismatched={mismatched}"
+        )
     return row
 
 

@@ -20,7 +20,7 @@ def main() -> int:
     parser.add_argument("--expected-checkpoint-sha256", required=True)
     args = parser.parse_args()
     validate_gateway_binding(
-        binding=args.binding, overrides=args.overrides, kind=args.kind,
+        binding=args.binding, config=args.config, overrides=args.overrides, kind=args.kind,
         expected_identity=args.expected_resolved_config_identity,
         expected_checkpoint_sha256=args.expected_checkpoint_sha256,
     )
