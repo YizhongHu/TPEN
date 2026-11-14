@@ -75,10 +75,10 @@ def test_missing_or_malformed_run_identity_is_refused(monkeypatch, tmp_path: Pat
 
 
 @pytest.mark.parametrize("changes,needle", [
-    ({"model_provenance": "constructed"}, "provenance"),
-    ({"resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "z" * 64}}, "identity"),
-    ({"draw_count": 3}, "shape"), ({"walker_count": 3}, "shape"),
-    ({"system_id": "other"}, "system"), ({"finite_count": 3}, "non-finite"),
+    pytest.param({"model_provenance": "constructed"}, "provenance", id="provenance"),
+    pytest.param({"resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "z" * 64}}, "identity", id="identity"),
+    pytest.param({"draw_count": 3}, "shape", id="draws"), pytest.param({"walker_count": 3}, "shape", id="walkers"),
+    pytest.param({"system_id": "other"}, "system", id="system"), pytest.param({"finite_count": 3}, "non-finite", id="non-finite"),
 ])
 def test_join_guards_refuse_invalid_record(monkeypatch, tmp_path: Path, changes, needle) -> None:
     with pytest.raises(collector.CollectionError, match=needle):
