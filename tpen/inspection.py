@@ -17,7 +17,7 @@ from tpen.checkpoint import (
     resolve_checkpoint_dir,
 )
 from tpen.checkpoint.manifest import CheckpointManifest
-from tpen.checkpoint.schema import validate_manifest_schema
+from tpen.checkpoint.schema import read_manifest, validate_manifest_schema
 from tpen.checkpoint.hashing import RESOLVED_CONFIG_IDENTITY_SCHEMA, resolved_config_identity
 from tpen.evaluation.trajectory_records import (
     TRAJECTORY_RECORD_INSPECTION_SCHEMA,
@@ -27,13 +27,29 @@ from tpen.evaluation.trajectory_records import (
     UnsupportedTrajectoryRecordSchemaError,
     inspect_trajectory_record,
 )
+from tpen.run_events import RunOutcome, RunOutcomeDecodeError, read_run_outcome
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
 RUN_EVIDENCE_SCHEMA_V2 = "tpen.run-evidence/v2"
+RUN_EVIDENCE_SCHEMA_V3 = "tpen.run-evidence/v3"
 _EVIDENCE_KEYS = {"schema", "run_dir", "verdict", "run_status", "checkpoint", "refusal"}
 _EVIDENCE_V2_KEYS = _EVIDENCE_KEYS | {"resolved_config_identity"}
+_EVIDENCE_V3_KEYS = _EVIDENCE_V2_KEYS | {"outcome", "checkpoint_ref"}
 _CHECKPOINT_KEYS = {"checkpoint_dir", "schema_version", "next_iteration", "completed_updates"}
 _REFUSAL_KEYS = {"code", "reason"}
+_CHECKPOINT_REF_KEYS = {
+    "schema",
+    "checkpoint_dir",
+    "schema_version",
+    "kind",
+    "next_iteration",
+    "completed_updates",
+    "manifest_sha256",
+    "model_sha256",
+    "provenance",
+    "content_id",
+    "profile",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,9 +79,11 @@ class RunEvidence:
     checkpoint: dict[str, Any] | None
     refusal: dict[str, str] | None
     resolved_config_identity: dict[str, str] | None = None
+    outcome: str | None = None
+    checkpoint_ref: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if self.schema not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2}:
+        if self.schema not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2, RUN_EVIDENCE_SCHEMA_V3}:
             raise ValueError(f"unsupported run-evidence schema {self.schema!r}")
         if self.verdict not in {"completed", "incomplete", "failed", "refused"}:
             raise ValueError(f"unsupported run-evidence verdict {self.verdict!r}")
@@ -91,6 +109,22 @@ class RunEvidence:
                 character not in "0123456789abcdef" for character in digest
             ):
                 raise ValueError("resolved config identity has an invalid sha256")
+        if self.schema == RUN_EVIDENCE_SCHEMA_V3:
+            if self.outcome not in {"completed", "planned_yield", "failed", "unknown", "refused"}:
+                raise ValueError(f"unsupported typed outcome {self.outcome!r}")
+            if self.checkpoint_ref is not None:
+                if set(self.checkpoint_ref) != _CHECKPOINT_REF_KEYS:
+                    raise ValueError("checkpoint_ref has an invalid key set")
+                if self.checkpoint_ref["profile"] not in {"train_resume", "model_only"}:
+                    raise ValueError("checkpoint_ref has an invalid payload profile")
+            if (
+                self.outcome == "planned_yield"
+                and self.checkpoint_ref is None
+                and self.verdict != "refused"
+            ):
+                raise ValueError("planned_yield evidence requires a full checkpoint_ref")
+        elif self.outcome is not None or self.checkpoint_ref is not None:
+            raise ValueError("typed outcome fields are only valid in v3 evidence")
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe copy of this evidence."""
@@ -107,7 +141,37 @@ class RunEvidence:
             data["resolved_config_identity"] = (
                 None if self.resolved_config_identity is None else dict(self.resolved_config_identity)
             )
+        elif self.schema == RUN_EVIDENCE_SCHEMA_V3:
+            data["resolved_config_identity"] = (
+                None if self.resolved_config_identity is None else dict(self.resolved_config_identity)
+            )
+            data["outcome"] = self.outcome
+            data["checkpoint_ref"] = (
+                None if self.checkpoint_ref is None else dict(self.checkpoint_ref)
+            )
         return data
+
+    @property
+    def continuation_eligible(self) -> bool:
+        """Return whether this record satisfies the closed continuation rule.
+
+        A record is eligible only when the typed result is planned yield, the
+        ref was accepted as a live published train-resume checkpoint, and the
+        public evidence itself was not refused.
+        """
+
+        return (
+            self.schema == RUN_EVIDENCE_SCHEMA_V3
+            and self.verdict != "refused"
+            and self.refusal is None
+            and self.outcome == "planned_yield"
+            and self.checkpoint is not None
+            and self.checkpoint_ref is not None
+            and self.checkpoint_ref.get("profile") == "train_resume"
+            and self.checkpoint_ref.get("checkpoint_dir") == self.checkpoint.get("checkpoint_dir")
+            and self.checkpoint_ref.get("next_iteration") == self.checkpoint.get("next_iteration")
+            and self.checkpoint_ref.get("completed_updates") == self.checkpoint.get("completed_updates")
+        )
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "RunEvidence":
@@ -116,8 +180,13 @@ class RunEvidence:
         if not isinstance(data, Mapping):
             raise TypeError("run evidence must be a mapping")
         schema = data.get("schema")
-        expected = _EVIDENCE_KEYS if schema == RUN_EVIDENCE_SCHEMA else _EVIDENCE_V2_KEYS
-        if schema not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2} or set(data) != expected:
+        if schema == RUN_EVIDENCE_SCHEMA:
+            expected = _EVIDENCE_KEYS
+        elif schema == RUN_EVIDENCE_SCHEMA_V2:
+            expected = _EVIDENCE_V2_KEYS
+        else:
+            expected = _EVIDENCE_V3_KEYS
+        if schema not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2, RUN_EVIDENCE_SCHEMA_V3} or set(data) != expected:
             missing = sorted(expected - set(data))
             extra = sorted(set(data) - expected)
             raise ValueError(f"run evidence keys differ: missing={missing}, extra={extra}")
@@ -139,6 +208,23 @@ class RunEvidence:
         identity = data.get("resolved_config_identity")
         if identity is not None and not isinstance(identity, Mapping):
             raise TypeError("resolved_config_identity must be a mapping or null")
+        outcome = data.get("outcome")
+        checkpoint_ref = data.get("checkpoint_ref")
+        if schema == RUN_EVIDENCE_SCHEMA_V3:
+            if type(outcome) is not str:
+                raise TypeError("v3 outcome must be a string")
+            if checkpoint_ref is not None:
+                if not isinstance(checkpoint_ref, Mapping):
+                    raise TypeError("v3 checkpoint_ref must be a mapping or null")
+                if set(checkpoint_ref) != _CHECKPOINT_REF_KEYS:
+                    raise ValueError("v3 checkpoint_ref has an invalid key set")
+                from tpen.checkpoint import CheckpointRef
+
+                ref_data = dict(checkpoint_ref)
+                ref_data.pop("profile")
+                # Verify content_id without requiring the normalized fixture
+                # path to exist on this machine.
+                CheckpointRef.from_mapping(ref_data)
         return cls(
             schema=data["schema"],
             run_dir=data["run_dir"],
@@ -147,6 +233,8 @@ class RunEvidence:
             checkpoint=checkpoint,
             refusal=refusal,
             resolved_config_identity=None if identity is None else dict(identity),
+            outcome=outcome,
+            checkpoint_ref=None if checkpoint_ref is None else dict(checkpoint_ref),
         )
 
 
@@ -192,16 +280,30 @@ def inspect_run(path: str | Path) -> RunEvidence:
 
     run_dir = Path(path).resolve()
     run_status: str | None = None
+    outcome: RunOutcome | None = None
+    has_outcome_artifact = False
     try:
         if not run_dir.is_dir():
             raise _InspectionRefusal("missing-run-dir", f"run directory not found: {run_dir}")
         status_path, status = _read_status(run_dir)
         run_dir = status_path.parent.resolve()
+        has_outcome_artifact = (run_dir / "run-outcome.json").is_file()
         identity = _read_run_identity(run_dir)
         raw_status: object = status.get("status")
         if raw_status is not None and not isinstance(raw_status, str):
             raise _InspectionRefusal("malformed-status", f"status value is not a string: {status_path}")
         run_status = raw_status
+        if has_outcome_artifact:
+            try:
+                outcome = read_run_outcome(run_dir / "run-outcome.json")
+            except RunOutcomeDecodeError as exc:
+                raise _InspectionRefusal("malformed-run-outcome", str(exc)) from exc
+            if run_status != outcome.status:
+                raise _InspectionRefusal(
+                    "status-outcome-mismatch",
+                    f"status.json says {run_status!r}, run-outcome.json says {outcome.status!r}",
+                )
+            _validate_typed_outcome_ref(run_dir, outcome)
         checkpoint: dict[str, Any] | None = None
         try:
             checkpoint = _read_checkpoint(run_dir)
@@ -214,6 +316,35 @@ def inspect_run(path: str | Path) -> RunEvidence:
                 checkpoint = None
             elif exc.code != "missing-checkpoint":
                 raise
+        if outcome is not None:
+            bound_ref = _public_checkpoint_ref(outcome.checkpoint_ref)
+            if outcome.status == "planned_yield":
+                if checkpoint is None or bound_ref is None:
+                    raise _InspectionRefusal(
+                        "missing-checkpoint",
+                        "planned_yield has no selected train-resume checkpoint",
+                    )
+                if (
+                    checkpoint["checkpoint_dir"] != bound_ref["checkpoint_dir"]
+                    or checkpoint["next_iteration"] != bound_ref["next_iteration"]
+                    or checkpoint["completed_updates"] != bound_ref["completed_updates"]
+                ):
+                    raise _InspectionRefusal(
+                        "checkpoint-selection-mismatch",
+                        "selected checkpoint summary does not match the typed result ref",
+                    )
+            verdict = _verdict_for_status(run_status)
+            return RunEvidence(
+                RUN_EVIDENCE_SCHEMA_V3,
+                str(run_dir),
+                verdict,
+                run_status,
+                checkpoint,
+                None,
+                identity,
+                outcome.status,
+                bound_ref,
+            )
         if run_status == "failed":
             return RunEvidence(_evidence_schema(identity), str(run_dir), "failed", run_status, checkpoint, None, identity)
         if run_status != "completed":
@@ -222,6 +353,18 @@ def inspect_run(path: str | Path) -> RunEvidence:
             raise _InspectionRefusal("missing-checkpoint", f"no committed checkpoint under {run_dir / 'checkpoints'}")
         return RunEvidence(_evidence_schema(identity), str(run_dir), "completed", run_status, checkpoint, None, identity)
     except _InspectionRefusal as exc:
+        if has_outcome_artifact:
+            return RunEvidence(
+                RUN_EVIDENCE_SCHEMA_V3,
+                str(run_dir),
+                "refused",
+                run_status,
+                None,
+                {"code": exc.code, "reason": exc.reason},
+                locals().get("identity"),
+                "unknown" if outcome is None else outcome.status,
+                None if outcome is None else _safe_public_checkpoint_ref(outcome.checkpoint_ref),
+            )
         return RunEvidence(
             _evidence_schema(None),
             str(run_dir),
@@ -236,6 +379,96 @@ def _evidence_schema(identity: dict[str, str] | None) -> str:
     """Select v2 only for runs that carry the public identity sidecar."""
 
     return RUN_EVIDENCE_SCHEMA_V2 if identity is not None else RUN_EVIDENCE_SCHEMA
+
+
+def _verdict_for_status(status: str | None) -> str:
+    """Map a typed result status to the legacy operational verdict vocabulary."""
+
+    if status == "completed":
+        return "completed"
+    if status == "failed":
+        return "failed"
+    return "incomplete"
+
+
+def _public_checkpoint_ref(ref: Any) -> dict[str, Any] | None:
+    """Return a full ref plus its manifest-declared payload profile."""
+
+    if ref is None:
+        return None
+    manifest_path = Path(ref.checkpoint_dir) / "manifest.json"
+    try:
+        manifest = read_manifest(manifest_path, mode="model_only")
+    except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+        raise _InspectionRefusal("corrupt-checkpoint", f"checkpoint ref manifest is invalid: {exc}") from exc
+    profile = None if manifest.payload is None else manifest.payload.get("profile")
+    if profile not in {"train_resume", "model_only"}:
+        raise _InspectionRefusal(
+            "unknown-checkpoint-profile",
+            f"checkpoint ref has unsupported payload profile {profile!r}",
+        )
+    data = ref.to_dict()
+    data["profile"] = profile
+    return data
+
+
+def _safe_public_checkpoint_ref(ref: Any) -> dict[str, Any] | None:
+    """Best-effort ref projection for a refusal record."""
+
+    try:
+        return _public_checkpoint_ref(ref)
+    except _InspectionRefusal:
+        return None
+
+
+def _validate_typed_outcome_ref(run_dir: Path, outcome: RunOutcome) -> None:
+    """Enforce publication, profile, counter, and live-byte ref consistency."""
+
+    ref = outcome.checkpoint_ref
+    if outcome.status == "planned_yield" and ref is None:
+        raise _InspectionRefusal(
+            "missing-checkpoint-ref",
+            "planned_yield outcome does not name a full checkpoint ref",
+        )
+    if ref is None:
+        return
+    try:
+        ref.validate()
+    except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+        raise _InspectionRefusal("stale-checkpoint-ref", f"checkpoint ref no longer matches its bytes: {exc}") from exc
+    binding = _public_checkpoint_ref(ref)
+    assert binding is not None
+    if outcome.status == "planned_yield":
+        if binding["profile"] != "train_resume":
+            raise _InspectionRefusal(
+                "model-only-checkpoint",
+                "planned_yield requires a train_resume checkpoint profile",
+            )
+        if (
+            outcome.next_iteration != ref.next_iteration
+            or outcome.completed_updates != ref.completed_updates
+        ):
+            raise _InspectionRefusal(
+                "outcome-checkpoint-mismatch",
+                "planned_yield counters do not match the named checkpoint ref",
+            )
+        catalog_path = run_dir / "checkpoints" / PUBLICATION_CATALOG_FILENAME
+        try:
+            publications = read_publications(catalog_path)
+        except (OSError, ValueError, TypeError, KeyError, OverflowError, IncompletePublicationRecordError) as exc:
+            raise _InspectionRefusal(
+                "corrupt-publication-catalog",
+                f"cannot read {catalog_path}: {exc}",
+            ) from exc
+        if not any(
+            candidate.content_id == ref.content_id
+            and candidate.checkpoint_dir.resolve() == ref.checkpoint_dir.resolve()
+            for candidate in publications
+        ):
+            raise _InspectionRefusal(
+                "unpublished-checkpoint-ref",
+                "planned_yield ref is not present in the publication catalog",
+            )
 
 
 def _read_run_identity(run_dir: Path) -> dict[str, str] | None:
@@ -383,6 +616,7 @@ if __name__ == "__main__":  # pragma: no cover - exercised by CLI tests
 __all__ = [
     "RUN_EVIDENCE_SCHEMA",
     "RUN_EVIDENCE_SCHEMA_V2",
+    "RUN_EVIDENCE_SCHEMA_V3",
     "TRAJECTORY_RECORD_INSPECTION_SCHEMA",
     "RunEvidence",
     "TamperedTrajectoryRecordError",
