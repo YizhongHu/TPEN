@@ -6,14 +6,11 @@ import builtins
 import importlib
 import io
 from collections.abc import Sequence
-from contextlib import contextmanager
 import json
 from dataclasses import replace
 import os
 from pathlib import Path
-import signal
 import sys
-import time
 from types import SimpleNamespace
 
 from hydra.utils import instantiate
@@ -25,28 +22,6 @@ stage_coordinate = importlib.import_module("experiments.atomistic.he-importance.
 optimizer_grid = importlib.import_module("experiments.atomistic.he-importance.optimizer_grid")
 runner = importlib.import_module("experiments.atomistic.he-importance.run_stage_q")
 stage = stage_coordinate
-_PER_TEST_TIMEOUT_SECONDS = 120
-
-
-@contextmanager
-def _timeout_guard(seconds: int, nodeid: str):
-    """Bound one test without adding a pytest-timeout dependency."""
-
-    previous_handler = signal.getsignal(signal.SIGALRM)
-    previous_alarm = signal.alarm(0)
-
-    def raise_timeout(_signum: int, _frame: object) -> None:
-        raise TimeoutError(f"per-test timeout ({seconds}s): {nodeid}")
-
-    signal.signal(signal.SIGALRM, raise_timeout)
-    signal.alarm(seconds)
-    try:
-        yield
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, previous_handler)
-        if previous_alarm:
-            signal.alarm(previous_alarm)
 
 
 def _fake_adam(
@@ -71,42 +46,6 @@ def _runtime_torch_signature(monkeypatch: pytest.MonkeyPatch) -> None:
             "torch",
             SimpleNamespace(optim=SimpleNamespace(Adam=_fake_adam)),
         )
-
-
-@pytest.fixture(autouse=True)
-def _launch_boundary_firewall(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Prevent an unstubbed runner test from entering real training.
-
-    Tests that exercise the launch handoff explicitly replace this boundary
-    with their recording or sentinel implementation.  Keeping the default
-    blocked makes a newly added non-dry test fail immediately instead of
-    constructing a model or training on a worker.
-    """
-
-    def refuse_unstubbed_launch(*args: object, **kwargs: object) -> int:
-        del args, kwargs
-        raise AssertionError("test crossed the run_from_config launch boundary")
-
-    monkeypatch.setattr(runner.launch, "run_from_config", refuse_unstubbed_launch)
-
-
-@pytest.fixture(autouse=True)
-def _per_test_timeout(request: pytest.FixtureRequest):
-    with _timeout_guard(_PER_TEST_TIMEOUT_SECONDS, request.node.nodeid):
-        yield
-
-
-def test_launch_boundary_firewall_is_active() -> None:
-    """The default test harness must fail closed at the training boundary."""
-
-    with pytest.raises(AssertionError, match="run_from_config launch boundary"):
-        runner.launch.run_from_config(object(), topology={})
-
-
-def test_per_test_timeout_fires() -> None:
-    with pytest.raises(TimeoutError, match="test_per_test_timeout_fires"):
-        with _timeout_guard(1, "test_per_test_timeout_fires"):
-            time.sleep(2)
 
 
 def _cells(tmp_path: Path, stage_code: str = "Q") -> tuple[object, ...]:
@@ -846,6 +785,66 @@ def test_roster_design_receipt_is_live_and_names_every_unavailable_arm() -> None
     assert receipt["difference"]["intended_count_minus_admitted_method_count"] == (
         intended_count - len(receipt["admitted_methods"])
     )
+
+
+# These harness guards are defined below the pre-existing tpen.hi_schema
+# crossing so adding them does not shift its boundary-inventory line.
+from contextlib import contextmanager
+import signal
+import time
+
+_PER_TEST_TIMEOUT_SECONDS = 120
+
+
+@contextmanager
+def _timeout_guard(seconds: int, nodeid: str):
+    """Bound one test without adding a pytest-timeout dependency."""
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_alarm = signal.alarm(0)
+
+    def raise_timeout(_signum: int, _frame: object) -> None:
+        raise TimeoutError(f"per-test timeout ({seconds}s): {nodeid}")
+
+    signal.signal(signal.SIGALRM, raise_timeout)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_alarm:
+            signal.alarm(previous_alarm)
+
+
+@pytest.fixture(autouse=True)
+def _launch_boundary_firewall(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent an unstubbed runner test from entering real training."""
+
+    def refuse_unstubbed_launch(*args: object, **kwargs: object) -> int:
+        del args, kwargs
+        raise AssertionError("test crossed the run_from_config launch boundary")
+
+    monkeypatch.setattr(runner.launch, "run_from_config", refuse_unstubbed_launch)
+
+
+@pytest.fixture(autouse=True)
+def _per_test_timeout(request: pytest.FixtureRequest):
+    with _timeout_guard(_PER_TEST_TIMEOUT_SECONDS, request.node.nodeid):
+        yield
+
+
+def test_launch_boundary_firewall_is_active() -> None:
+    """The default test harness must fail closed at the training boundary."""
+
+    with pytest.raises(AssertionError, match="run_from_config launch boundary"):
+        runner.launch.run_from_config(object(), topology={})
+
+
+def test_per_test_timeout_fires() -> None:
+    with pytest.raises(TimeoutError, match="test_per_test_timeout_fires"):
+        with _timeout_guard(1, "test_per_test_timeout_fires"):
+            time.sleep(2)
 
 
 def test_selection_receipt_contains_selected_and_discarded_cells(tmp_path: Path) -> None:
