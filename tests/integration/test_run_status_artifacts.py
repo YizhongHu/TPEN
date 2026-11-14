@@ -37,6 +37,7 @@ from pathlib import Path
 import pytest
 from omegaconf import DictConfig, OmegaConf
 
+from tpen.checkpoint import CheckpointRef
 from tpen.inspection import inspect_eval_run, inspect_run
 from tpen.run import run_from_config
 
@@ -214,6 +215,31 @@ def test_eval_evidence_refuses_missing_outcome_identity_and_matching_status(tmp_
     status["status"] = "failed"
     status_path.write_text(json.dumps(status), encoding="utf-8")
     assert inspect_eval_run(status_dir).refusal["code"] == "status-outcome-mismatch"
+
+
+def test_eval_evidence_refuses_a_completed_checkpoint_ref(tmp_path: Path) -> None:
+    """A completed evaluation must not claim a checkpoint, even if the ref is shaped correctly."""
+
+    assert run_from_config(_cfg(tmp_path), config_path="s.yaml", command="pytest") == 0
+    run_dir = _run_dir(tmp_path)
+    outcome_path = run_dir / "run-outcome.json"
+    outcome = json.loads(outcome_path.read_text())
+    outcome["checkpoint_ref"] = CheckpointRef(
+        checkpoint_dir=run_dir / "checkpoints" / "step_000001",
+        schema_version=2,
+        kind="training",
+        next_iteration=1,
+        completed_updates=1,
+        manifest_sha256="a" * 64,
+        model_sha256="b" * 64,
+        provenance={},
+    ).to_dict()
+    outcome_path.write_text(json.dumps(outcome), encoding="utf-8")
+
+    evidence = inspect_eval_run(run_dir)
+    assert evidence.verdict == "refused"
+    assert evidence.refusal is not None
+    assert evidence.refusal["code"] == "unexpected-checkpoint-ref"
 
 
 def test_a_failed_evaluation_suite_returns_nonzero_and_records_failed(tmp_path: Path) -> None:

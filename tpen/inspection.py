@@ -566,7 +566,7 @@ def inspect_eval_run(path: str | Path) -> EvalRunEvidence:
     nor required: a completed evaluation must publish a null checkpoint ref.
     """
 
-    run_dir = Path(path).resolve()
+    run_dir = Path(path).resolve(strict=False)
     run_status: str | None = None
     outcome_status: str | None = None
     identity: dict[str, str] | None = None
@@ -612,7 +612,7 @@ def inspect_eval_run(path: str | Path) -> EvalRunEvidence:
         except RunOutcomeDecodeError as exc:
             return refused("malformed-run-outcome", str(exc))
         outcome_status = outcome.status
-        if run_status != outcome.status:
+        if outcome.status != run_status:
             return refused(
                 "status-outcome-mismatch",
                 f"status.json says {run_status!r}, run-outcome.json says {outcome.status!r}",
