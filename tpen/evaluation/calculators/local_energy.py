@@ -13,7 +13,9 @@ import torch
 from tpen.data.batch import slice_flat_batch
 from tpen.evaluation.bundle import EvaluationBundle, LocalEnergyValues
 from tpen.evaluation.protocols import EvaluationContext
+from tpen.evaluation.trajectory_records import TrajectoryRecordArtifactV2
 from tpen.physics.hamiltonian import (
+    DeclaresExecutionReceipt,
     HamiltonianTerm,
     LocalEnergyEvaluator,
     LocalEnergyResult,
@@ -21,6 +23,7 @@ from tpen.physics.hamiltonian import (
     evaluate_local_energy_in_chunks,
     normalize_hamiltonian_terms,
 )
+from tpen.physics.system import build_system_descriptor
 
 _DEFAULT_EVALUATOR = NaiveLocalEnergyEvaluator()
 
@@ -60,7 +63,49 @@ class LocalEnergyCalculator:
         records = bundle.generated.trajectory_records
         if records is not None:
             records.validate(check_files=False)
-            if tuple(self.hamiltonian_terms) != records.term_names:
+            receipt = None
+            if isinstance(records, TrajectoryRecordArtifactV2):
+                # Contract 4/5 (trajectory-record v2 writer and active-producer
+                # binding): final-draw reuse must bind the same execution
+                # receipt as the energy it reuses, and a calculator configured
+                # for a different declared method must reject reuse outright
+                # rather than silently relabeling another producer's energy as
+                # its own. `describe_execution_receipt` declares what *this*
+                # evaluator would have produced -- no re-evaluation needed.
+                if not isinstance(self.evaluator, DeclaresExecutionReceipt):
+                    raise ValueError(
+                        "reusing a trajectory_records/v2 final draw requires a receipt-capable "
+                        f"evaluator; {type(self.evaluator).__name__} does not implement "
+                        "DeclaresExecutionReceipt"
+                    )
+                requested_system = build_system_descriptor(
+                    records.system_descriptor.particle,
+                    self.hamiltonian_terms,
+                    units=records.system_descriptor.units,
+                )
+                requested_receipt = self.evaluator.describe_execution_receipt(
+                    self.hamiltonian_terms, requested_system.system_id()
+                )
+                contribution_names = tuple(
+                    dict.fromkeys(
+                        name
+                        for names in requested_receipt.manifest.values()
+                        for name in names
+                    )
+                )
+                if records.term_names != contribution_names:
+                    raise ValueError(
+                        "LocalEnergyCalculator contribution columns disagree with the "
+                        "requested execution receipt"
+                    )
+                if requested_receipt != records.execution_receipt:
+                    raise ValueError(
+                        "LocalEnergyCalculator requested a different execution method than the "
+                        "one that produced this trajectory record; reuse across a method "
+                        "mismatch is never silently accepted"
+                    )
+                receipt = records.execution_receipt
+            elif tuple(self.hamiltonian_terms) != records.term_names:
                 raise ValueError(
                     "LocalEnergyCalculator terms disagree with streamed trajectory records"
                 )
@@ -85,6 +130,7 @@ class LocalEnergyCalculator:
                     local_energy=total,
                     finite_mask=torch.isfinite(total),
                     term_energies=terms,
+                    receipt=receipt,
                 ),
             )
 

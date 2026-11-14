@@ -16,6 +16,9 @@ import torch
 
 from tpen.data.atomic_configuration import AtomicConfiguration
 from tpen.data.batch import ElectronBatch
+from tpen.physics.operators import OperatorId
+from tpen.physics.receipt import DiagnosticDeclaration, ExecutionReceipt
+from tpen.physics.system import HamiltonianTermDescriptor, ParticleSpec, SystemDescriptor
 from tpen.statistics.trajectory import (
     ObservableTrajectory,
     ObservableTrajectoryReconciliation,
@@ -26,6 +29,13 @@ TRAJECTORY_RECORD_FILENAME = "sampled_eval_table.csv"
 
 TRAJECTORY_RECORD_SCHEMA = "trajectory_records/v1"
 """Versioned serialized trajectory-record schema."""
+
+TRAJECTORY_RECORD_SCHEMA_V2 = "trajectory_records/v2"
+"""Opt-in schema binding a `SystemDescriptor` and `ExecutionReceipt` instead of a
+mandatory `AtomicConfiguration` -- see ``system-context-records-design-r{1,2,3}.md``.
+Selected only by explicit writer construction (`system_descriptor`/`execution_receipt`
+keywords); `TRAJECTORY_RECORD_SCHEMA` (v1) semantics are unchanged by this addition.
+"""
 
 TRAJECTORY_RECORD_METADATA_KEYS: tuple[str, ...] = (
     "schema",
@@ -51,6 +61,38 @@ TRAJECTORY_RECORD_METADATA_KEYS: tuple[str, ...] = (
     "atomic_configuration",
 )
 """Every key `_write_metadata` emits in the trajectory-record metadata sidecar."""
+
+TRAJECTORY_RECORD_METADATA_KEYS_V2: tuple[str, ...] = (
+    "schema",
+    "row_semantics",
+    "csv_filename",
+    "observable",
+    "draw_count",
+    "walker_count",
+    "draw_stride",
+    "burn_in_draws",
+    "n_electrons",
+    "spatial_dim",
+    "term_names",
+    "row_count",
+    "finite_count",
+    "nonfinite_count",
+    "mean",
+    "variance",
+    "observable_values_content_id",
+    "csv_sha256",
+    "byte_count",
+    "system_descriptor_id",
+    "system_descriptor",
+    "execution_receipt_method_id",
+    "execution_receipt",
+)
+"""Every key `_write_metadata_v2` emits in a ``trajectory_records/v2`` sidecar.
+
+Replaces v1's ``atomic_configuration_id``/``atomic_configuration`` with the
+bound physical-system identity/value and the declared execution receipt; every
+other key is shared verbatim with `TRAJECTORY_RECORD_METADATA_KEYS`.
+"""
 
 TRAJECTORY_RECORD_ROW_SEMANTICS = "complete_draw_walker_grid"
 """Row-ordering convention shared by the writer and the metadata validator."""
@@ -403,8 +445,344 @@ class TrajectoryRecordArtifact:
                 raise ValueError(f"trajectory record metadata {key!r} disagrees with typed manifest")
 
 
+@dataclass(frozen=True)
+class TrajectoryRecordArtifactV2:
+    """Typed manifest for one complete, streamed ``trajectory_records/v2`` artifact.
+
+    Mirrors `TrajectoryRecordArtifact` except that nuclear geometry is not
+    mandatory: `system_descriptor` and `execution_receipt` bind the complete
+    physical-system identity and declared execution method instead of a
+    required `AtomicConfiguration` (see ``system-context-records-design-r1.md``
+    section 5). A term declaring no resource -- for example the one-electron
+    Hooke harmonic trap -- is therefore representable without a fabricated
+    nuclear placeholder.
+    """
+
+    path: Path
+    metadata_path: Path
+    observable: str
+    n_draws: int
+    n_walkers: int
+    draw_stride: int
+    burn_in_draws: int
+    n_electrons: int
+    spatial_dim: int
+    term_names: tuple[str, ...]
+    row_count: int
+    finite_count: int
+    mean: float
+    variance: float
+    observable_values_content_id: str
+    csv_sha256: str
+    byte_count: int
+    system_descriptor: SystemDescriptor
+    execution_receipt: ExecutionReceipt
+    final_draw: TrajectoryRecordBatch
+
+    @property
+    def nonfinite_count(self) -> int:
+        """Return the number of non-finite total-energy rows."""
+
+        return self.row_count - self.finite_count
+
+    def validate(self, *, check_files: bool = True) -> "TrajectoryRecordArtifactV2":
+        """Validate manifest, final-draw, system/receipt binding, and optional file identity."""
+
+        if not self.observable.strip():
+            raise ValueError("trajectory record observable must be non-empty")
+        if self.n_draws < 1 or self.n_walkers < 1:
+            raise ValueError("trajectory record shape must have positive draw and walker axes")
+        if self.row_count != self.n_draws * self.n_walkers:
+            raise ValueError("trajectory record row_count must equal n_draws*n_walkers")
+        if not 0 <= self.finite_count <= self.row_count:
+            raise ValueError("trajectory record finite_count is outside the row count")
+        if self.draw_stride < 1 or self.burn_in_draws < 0:
+            raise ValueError("trajectory record stride/burn-in metadata is invalid")
+        if len(set(self.term_names)) != len(self.term_names) or not self.term_names:
+            raise ValueError("trajectory record term_names must be non-empty and unique")
+        if any(not name.strip() for name in self.term_names):
+            raise ValueError("trajectory record term_names must not contain blanks")
+        if self.execution_receipt.system_id != self.system_descriptor.system_id():
+            raise ValueError(
+                "trajectory record execution_receipt.system_id disagrees with the bound "
+                "system_descriptor"
+            )
+        declared_operator_ids = {term.operator_id for term in self.system_descriptor.terms}
+        manifest_operator_ids = set(self.execution_receipt.manifest)
+        if manifest_operator_ids != declared_operator_ids:
+            raise ValueError(
+                "trajectory record execution_receipt.manifest does not cover exactly the "
+                "operators declared by the bound system_descriptor (a fused contribution must "
+                "still claim every physical operator it covers, once): "
+                f"manifest={sorted(str(o) for o in manifest_operator_ids)}, "
+                f"system={sorted(str(o) for o in declared_operator_ids)}"
+            )
+        contribution_names = tuple(
+            dict.fromkeys(
+                name
+                for names in self.execution_receipt.manifest.values()
+                for name in names
+            )
+        )
+        if set(contribution_names) != set(self.term_names) or len(contribution_names) != len(
+            self.term_names
+        ):
+            raise ValueError(
+                "trajectory record term_names must match the execution receipt's unique "
+                "contribution names exactly"
+            )
+        final_draw = self.final_draw.validate()
+        if final_draw.retained_draw_index != self.n_draws - 1:
+            raise ValueError("trajectory record final_draw must be the last retained draw")
+        if final_draw.row_count != self.n_walkers:
+            raise ValueError("trajectory record final_draw must contain every walker")
+        if final_draw.n_electrons != self.n_electrons or final_draw.spatial_dim != self.spatial_dim:
+            raise ValueError("trajectory record final_draw coordinate shape disagrees with manifest")
+        if tuple(final_draw.term_energies) != self.term_names:
+            raise ValueError("trajectory record final_draw terms disagree with manifest")
+        for name, value in (
+            ("observable_values_content_id", self.observable_values_content_id),
+            ("csv_sha256", self.csv_sha256),
+        ):
+            if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+                raise ValueError(f"trajectory record {name} must be a lowercase sha256 digest")
+        if self.byte_count < 1:
+            raise ValueError("trajectory record byte_count must be positive")
+        if check_files:
+            if not self.path.is_file() or not self.metadata_path.is_file():
+                raise ValueError("trajectory record CSV and metadata sidecar must both exist")
+            if self.path.stat().st_size != self.byte_count:
+                raise ValueError("trajectory record byte_count disagrees with the CSV")
+            if _file_sha256(self.path) != self.csv_sha256:
+                raise ValueError("trajectory record csv_sha256 disagrees with the CSV")
+            self._validate_serialized_metadata()
+        return self
+
+    def reconcile(self, trajectory: ObservableTrajectory) -> None:
+        """Fail loudly unless statistics input and record artifact agree exactly."""
+
+        self.validate()
+        _reconcile_artifact(self, trajectory)
+
+    def validate_snapshot_batch(self, batch: ElectronBatch) -> int:
+        """Validate that a generated batch is a prefix of the final retained draw.
+
+        Unlike `TrajectoryRecordArtifact.validate_snapshot_batch`, this never
+        requires `ElectronBatch.atomic_configuration`: a bound
+        `system_descriptor` with no declared resource (e.g. Hooke) has nothing
+        to compare the batch's nuclear context against. A system that *does*
+        declare a resource still requires the batch to carry a matching one.
+        """
+
+        flat = batch.flatten_samples()
+        n_rows = flat.batch_size
+        if n_rows > self.n_walkers:
+            raise ValueError("final-draw snapshot cannot contain more rows than the trajectory")
+        positions = flat.positions.detach().to(device="cpu", dtype=torch.float64)
+        if not torch.equal(positions, self.final_draw.positions[:n_rows]):
+            raise ValueError("generated snapshot is not the final retained trajectory draw")
+        resources = self.system_descriptor.resources
+        if resources:
+            atoms = flat.atomic_configuration
+            if atoms is None or atoms.content_id() not in resources:
+                raise ValueError(
+                    "generated snapshot nuclear geometry disagrees with the resource(s) "
+                    "declared by the bound system_descriptor"
+                )
+        return n_rows
+
+    def _validate_serialized_metadata(self) -> None:
+        raw = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("trajectory record metadata sidecar must be a JSON object")
+        metadata: dict[str, Any] = raw
+        expected_scalars = {
+            "schema": TRAJECTORY_RECORD_SCHEMA_V2,
+            "row_semantics": TRAJECTORY_RECORD_ROW_SEMANTICS,
+            "csv_filename": self.path.name,
+            "observable": self.observable,
+            "draw_count": self.n_draws,
+            "walker_count": self.n_walkers,
+            "draw_stride": self.draw_stride,
+            "burn_in_draws": self.burn_in_draws,
+            "n_electrons": self.n_electrons,
+            "spatial_dim": self.spatial_dim,
+            "term_names": list(self.term_names),
+            "row_count": self.row_count,
+            "finite_count": self.finite_count,
+            "nonfinite_count": self.nonfinite_count,
+            "mean": _json_float(self.mean),
+            "variance": _json_float(self.variance),
+            "observable_values_content_id": self.observable_values_content_id,
+            "csv_sha256": self.csv_sha256,
+            "byte_count": self.byte_count,
+            "system_descriptor_id": self.system_descriptor.system_id(),
+            "system_descriptor": _serialize_system_descriptor(self.system_descriptor),
+            "execution_receipt_method_id": self.execution_receipt.method_id(),
+            "execution_receipt": _serialize_execution_receipt(self.execution_receipt),
+        }
+        declared_keys = set(TRAJECTORY_RECORD_METADATA_KEYS_V2)
+        if expected_scalars.keys() != declared_keys:
+            missing = sorted(declared_keys - expected_scalars.keys())
+            extra = sorted(expected_scalars.keys() - declared_keys)
+            raise RuntimeError(
+                "trajectory_records.py: expected_scalars and TRAJECTORY_RECORD_METADATA_KEYS_V2 "
+                f"have diverged; update both together (missing={missing}, extra={extra})"
+            )
+        extra_keys = set(metadata) - expected_scalars.keys()
+        if extra_keys:
+            raise ValueError(
+                "trajectory record metadata has undeclared key(s): "
+                + ", ".join(sorted(extra_keys))
+            )
+        for key in TRAJECTORY_RECORD_METADATA_KEYS_V2:
+            if key not in metadata:
+                raise ValueError(f"trajectory record metadata is missing required key {key!r}")
+        for key, expected in expected_scalars.items():
+            if metadata[key] != expected:
+                raise ValueError(f"trajectory record metadata {key!r} disagrees with typed manifest")
+
+
+def _reconcile_artifact(
+    artifact: "TrajectoryRecordArtifact | TrajectoryRecordArtifactV2",
+    trajectory: ObservableTrajectory,
+) -> None:
+    """Shared v1/v2 reconciliation: every field below is version-agnostic."""
+
+    expected = trajectory.reconciliation()
+    mismatches: list[str] = []
+    comparisons = {
+        "observable": (artifact.observable, expected.observable),
+        "draw_count": (artifact.n_draws, expected.draw_count),
+        "walker_count": (artifact.n_walkers, expected.walker_count),
+        "draw_stride": (artifact.draw_stride, expected.draw_stride),
+        "burn_in_draws": (artifact.burn_in_draws, expected.burn_in_draws),
+        "row_count": (artifact.row_count, expected.row_count),
+        "finite_count": (artifact.finite_count, expected.finite_count),
+        "nonfinite_count": (artifact.nonfinite_count, expected.nonfinite_count),
+        "observable_values_content_id": (
+            artifact.observable_values_content_id,
+            expected.values_content_id,
+        ),
+    }
+    for name, (actual, wanted) in comparisons.items():
+        if actual != wanted:
+            mismatches.append(f"{name}: record={actual!r} trajectory={wanted!r}")
+    for name, actual, wanted in (
+        ("mean", artifact.mean, expected.mean),
+        ("variance", artifact.variance, expected.variance),
+    ):
+        if not _same_float(actual, wanted):
+            mismatches.append(f"{name}: record={actual!r} trajectory={wanted!r}")
+    if mismatches:
+        raise ValueError("trajectory record/statistics reconciliation failed: " + "; ".join(mismatches))
+
+
+def _serialize_system_descriptor(system: SystemDescriptor) -> dict[str, Any]:
+    """Return the JSON-safe payload of a `SystemDescriptor` for a v2 sidecar."""
+
+    return {
+        "particle": {
+            "n_electrons": system.particle.n_electrons,
+            "n_spin_up": system.particle.n_spin_up,
+            "n_spin_down": system.particle.n_spin_down,
+            "spatial_dim": system.particle.spatial_dim,
+        },
+        "units": system.units,
+        "terms": [
+            {
+                "namespace": term.operator_id.namespace,
+                "name": term.operator_id.name,
+                "slot": term.slot,
+                "parameters": dict(term.parameters),
+                "resource_id": term.resource_id,
+                "version": term.version,
+            }
+            for term in system.terms
+        ],
+        "resources": {
+            resource_id: _atomic_geometry_payload(resource)
+            for resource_id, resource in system.resources.items()
+        },
+    }
+
+
+def _deserialize_system_descriptor(payload: Mapping[str, Any]) -> SystemDescriptor:
+    """Reconstruct a `SystemDescriptor` from a v2 sidecar's serialized payload."""
+
+    particle = ParticleSpec(**payload["particle"])
+    resource_objects = {
+        resource_id: AtomicConfiguration(
+            torch.tensor(data["positions"], dtype=torch.float64),
+            torch.tensor(data["charges"], dtype=torch.float64),
+        )
+        for resource_id, data in payload["resources"].items()
+    }
+    terms = tuple(
+        HamiltonianTermDescriptor(
+            operator_id=OperatorId(term["namespace"], term["name"]),
+            slot=term["slot"],
+            parameters=term["parameters"],
+            resource_id=term["resource_id"],
+            version=term["version"],
+            resource=resource_objects.get(term["resource_id"]),
+        )
+        for term in payload["terms"]
+    )
+    return SystemDescriptor(particle=particle, units=payload["units"], terms=terms)
+
+
+def _serialize_execution_receipt(receipt: ExecutionReceipt) -> dict[str, Any]:
+    """Return the JSON-safe payload of an `ExecutionReceipt` for a v2 sidecar."""
+
+    return {
+        "system_id": receipt.system_id,
+        "implementation": receipt.implementation,
+        "version": receipt.version,
+        "numerical_policy": dict(receipt.numerical_policy),
+        "manifest": [
+            {"namespace": operator_id.namespace, "name": operator_id.name, "contributions": list(names)}
+            for operator_id, names in receipt.manifest.items()
+        ],
+        "diagnostics": [
+            {"name": d.name, "available": d.available, "derivation": d.derivation}
+            for d in receipt.diagnostics.values()
+        ],
+    }
+
+
+def _deserialize_execution_receipt(payload: Mapping[str, Any]) -> ExecutionReceipt:
+    """Reconstruct an `ExecutionReceipt` from a v2 sidecar's serialized payload."""
+
+    manifest = {
+        OperatorId(entry["namespace"], entry["name"]): tuple(entry["contributions"])
+        for entry in payload["manifest"]
+    }
+    diagnostics = {
+        entry["name"]: DiagnosticDeclaration(
+            name=entry["name"], available=entry["available"], derivation=entry["derivation"]
+        )
+        for entry in payload["diagnostics"]
+    }
+    return ExecutionReceipt(
+        system_id=payload["system_id"],
+        implementation=payload["implementation"],
+        version=payload["version"],
+        numerical_policy=payload["numerical_policy"],
+        manifest=manifest,
+        diagnostics=diagnostics,
+    )
+
+
 class TrajectoryRecordStreamWriter:
-    """Incrementally write complete retained draws without accumulating rows."""
+    """Incrementally write complete retained draws without accumulating rows.
+
+    Selects ``trajectory_records/v1`` when constructed with
+    `atomic_configuration`, or opt-in ``trajectory_records/v2`` when
+    constructed with both `system_descriptor` and `execution_receipt`.
+    Exactly one of those two forms must be supplied; v1's construction, row
+    encoding, and finalized artifact shape are unchanged by this addition.
+    """
 
     def __init__(
         self,
@@ -414,22 +792,69 @@ class TrajectoryRecordStreamWriter:
         n_draws: int,
         n_walkers: int,
         term_names: tuple[str, ...],
-        atomic_configuration: AtomicConfiguration,
         first_draw: TrajectoryRecordBatch,
+        atomic_configuration: AtomicConfiguration | None = None,
+        system_descriptor: SystemDescriptor | None = None,
+        execution_receipt: ExecutionReceipt | None = None,
     ) -> None:
         self.path = Path(path)
         self.observable = str(observable).strip()
         self.n_draws = int(n_draws)
         self.n_walkers = int(n_walkers)
         self.term_names = tuple(term_names)
-        self.atomic_configuration = atomic_configuration
         first_draw.validate()
         if first_draw.row_count != self.n_walkers:
             raise ValueError("first trajectory record draw must contain every walker")
         if tuple(first_draw.term_energies) != self.term_names:
             raise ValueError("first trajectory record draw terms disagree with configured terms")
-        if self.atomic_configuration.spatial_dim != first_draw.spatial_dim:
-            raise ValueError("trajectory record coordinates disagree with AtomicConfiguration")
+
+        v2_selected = system_descriptor is not None or execution_receipt is not None
+        if v2_selected:
+            if atomic_configuration is not None:
+                raise ValueError(
+                    "TrajectoryRecordStreamWriter cannot select both trajectory_records/v1 "
+                    "(atomic_configuration) and trajectory_records/v2 (system_descriptor + "
+                    "execution_receipt)"
+                )
+            if system_descriptor is None or execution_receipt is None:
+                raise ValueError(
+                    "trajectory_records/v2 requires both system_descriptor and execution_receipt"
+                )
+            if execution_receipt.system_id != system_descriptor.system_id():
+                raise ValueError(
+                    "TrajectoryRecordStreamWriter execution_receipt.system_id disagrees with "
+                    "system_descriptor"
+                )
+            contribution_names = tuple(
+                dict.fromkeys(
+                    name
+                    for names in execution_receipt.manifest.values()
+                    for name in names
+                )
+            )
+            if set(contribution_names) != set(self.term_names) or len(contribution_names) != len(
+                self.term_names
+            ):
+                raise ValueError(
+                    "trajectory record term_names must match the execution receipt's unique "
+                    "contribution names exactly"
+                )
+            self.atomic_configuration = None
+            self.system_descriptor = system_descriptor
+            self.execution_receipt = execution_receipt
+            self._schema = TRAJECTORY_RECORD_SCHEMA_V2
+        else:
+            if atomic_configuration is None:
+                raise ValueError(
+                    "TrajectoryRecordStreamWriter requires either atomic_configuration (v1) or "
+                    "system_descriptor + execution_receipt (v2)"
+                )
+            if atomic_configuration.spatial_dim != first_draw.spatial_dim:
+                raise ValueError("trajectory record coordinates disagree with AtomicConfiguration")
+            self.atomic_configuration = atomic_configuration
+            self.system_descriptor = None
+            self.execution_receipt = None
+            self._schema = TRAJECTORY_RECORD_SCHEMA
 
         self.n_electrons = first_draw.n_electrons
         self.spatial_dim = first_draw.spatial_dim
@@ -483,7 +908,7 @@ class TrajectoryRecordStreamWriter:
     def finalize(
         self,
         trajectory: ObservableTrajectory,
-    ) -> TrajectoryRecordArtifact:
+    ) -> "TrajectoryRecordArtifact | TrajectoryRecordArtifactV2":
         """Close the stream, reconcile it, and write one metadata sidecar."""
 
         if self._next_draw != self.n_draws:
@@ -507,7 +932,7 @@ class TrajectoryRecordStreamWriter:
         csv_sha256 = _file_sha256(self.path)
         byte_count = self.path.stat().st_size
         metadata_path = self.path.with_suffix(".metadata.json")
-        artifact = TrajectoryRecordArtifact(
+        common = dict(
             path=self.path,
             metadata_path=metadata_path,
             observable=self.observable,
@@ -525,10 +950,19 @@ class TrajectoryRecordStreamWriter:
             observable_values_content_id=record_reconciliation.values_content_id,
             csv_sha256=csv_sha256,
             byte_count=byte_count,
-            atomic_configuration=self.atomic_configuration,
             final_draw=self._final_draw,
         )
-        _write_metadata(artifact)
+        artifact: TrajectoryRecordArtifact | TrajectoryRecordArtifactV2
+        if self._schema == TRAJECTORY_RECORD_SCHEMA_V2:
+            artifact = TrajectoryRecordArtifactV2(
+                system_descriptor=self.system_descriptor,
+                execution_receipt=self.execution_receipt,
+                **common,
+            )
+            _write_metadata_v2(artifact)
+        else:
+            artifact = TrajectoryRecordArtifact(atomic_configuration=self.atomic_configuration, **common)
+            _write_metadata(artifact)
         artifact.validate()
         artifact.reconcile(trajectory)
         return artifact
@@ -774,6 +1208,8 @@ def inspect_trajectory_record(metadata_path: str | Path) -> TrajectoryRecordInsp
     record_schema = raw.get("schema")
     if record_schema == TRAJECTORY_RECORD_SCHEMA:
         return _inspect_v1(metadata_path, raw)
+    if record_schema == TRAJECTORY_RECORD_SCHEMA_V2:
+        return _inspect_v2(metadata_path, raw)
     raise UnsupportedTrajectoryRecordSchemaError(
         f"unsupported trajectory record schema {record_schema!r} in {metadata_path}"
     )
@@ -881,6 +1317,267 @@ def _inspect_v1(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryReco
     )
 
 
+def _inspect_v2(metadata_path: Path, metadata: dict[str, Any]) -> TrajectoryRecordInspection:
+    """Decode a ``trajectory_records/v2`` sidecar, verifying its system/receipt binding.
+
+    Unlike `_inspect_v1`, this reconstructs the serialized `SystemDescriptor`
+    and `ExecutionReceipt` and recomputes their own canonical content ids
+    (`SystemDescriptor.system_id`, `ExecutionReceipt.method_id`) rather than
+    trusting the declared ``system_descriptor_id``/``execution_receipt_method_id``
+    scalars -- a swapped descriptor or receipt payload is caught by the
+    recomputed id disagreeing with what was declared alongside it, and a
+    swapped *pair* (consistent payload, wrong cross-binding) is caught by the
+    explicit ``execution_receipt.system_id`` cross-check below.
+    """
+
+    declared_keys = set(TRAJECTORY_RECORD_METADATA_KEYS_V2)
+    actual_keys = set(metadata)
+    if actual_keys != declared_keys:
+        missing = sorted(declared_keys - actual_keys)
+        extra = sorted(actual_keys - declared_keys)
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record sidecar key set disagrees with {TRAJECTORY_RECORD_SCHEMA_V2!r}: "
+            f"missing={missing}, extra={extra}"
+        )
+    if metadata.get("row_semantics") != TRAJECTORY_RECORD_ROW_SEMANTICS:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record row_semantics disagrees with {TRAJECTORY_RECORD_ROW_SEMANTICS!r}"
+        )
+
+    scalars = _validate_v2_scalar_types(metadata)
+    if not isinstance(metadata.get("csv_filename"), str) or not metadata["csv_filename"].strip():
+        raise TamperedTrajectoryRecordError(
+            "trajectory record csv_filename must be a non-empty string"
+        )
+
+    csv_path = metadata_path.parent / str(metadata["csv_filename"])
+    if not csv_path.is_file():
+        raise TamperedTrajectoryRecordError(f"trajectory record CSV not found: {csv_path}")
+    declared_sha256 = metadata["csv_sha256"]
+    actual_sha256 = _file_sha256(csv_path)
+    if actual_sha256 != declared_sha256:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record csv_sha256 disagrees with {csv_path}: "
+            f"declared={declared_sha256!r}, actual={actual_sha256!r}"
+        )
+
+    draw_count = scalars.draw_count
+    walker_count = scalars.walker_count
+    row_count = scalars.row_count
+    scan = _scan_v1_csv(
+        csv_path,
+        draw_count=draw_count,
+        walker_count=walker_count,
+        n_electrons=scalars.n_electrons,
+        spatial_dim=scalars.spatial_dim,
+        term_names=scalars.term_names,
+    )
+    grid_row_count = scan.row_count
+    if grid_row_count != row_count:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record row_count disagrees with its CSV grid: "
+            f"declared={row_count}, actual={grid_row_count}"
+        )
+    if scan.finite_count != scalars.finite_count:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record finite_count disagrees with its CSV"
+        )
+    if csv_path.stat().st_size != scalars.byte_count:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record byte_count disagrees with its CSV"
+        )
+    try:
+        declared_mean = _as_float(metadata["mean"])
+        declared_variance = _as_float(metadata["variance"])
+    except (TypeError, ValueError) as exc:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record mean/variance must be finite or valid non-finite sentinels"
+        ) from exc
+    if not _close_or_same_nonfinite(scan.mean, declared_mean) or not _close_or_same_nonfinite(
+        scan.variance, declared_variance
+    ):
+        raise TamperedTrajectoryRecordError(
+            "trajectory record mean/variance disagrees with its CSV: "
+            f"declared=({declared_mean!r}, {declared_variance!r}), "
+            f"recomputed=({scan.mean!r}, {scan.variance!r})"
+        )
+
+    try:
+        system_descriptor = _deserialize_system_descriptor(metadata["system_descriptor"])
+        recomputed_system_id = system_descriptor.system_id()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TamperedTrajectoryRecordError(f"trajectory record system_descriptor is invalid: {exc}") from exc
+    declared_system_id = str(metadata["system_descriptor_id"])
+    if (
+        system_descriptor.particle.n_electrons != scalars.n_electrons
+        or system_descriptor.particle.spatial_dim != scalars.spatial_dim
+    ):
+        raise TamperedTrajectoryRecordError(
+            "trajectory record system_descriptor particle shape disagrees with scalar metadata"
+        )
+    if recomputed_system_id != declared_system_id:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record system_descriptor_id disagrees with its own serialized "
+            f"system_descriptor: declared={declared_system_id!r}, recomputed={recomputed_system_id!r}"
+        )
+
+    try:
+        execution_receipt = _deserialize_execution_receipt(metadata["execution_receipt"])
+        recomputed_method_id = execution_receipt.method_id()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TamperedTrajectoryRecordError(f"trajectory record execution_receipt is invalid: {exc}") from exc
+    declared_method_id = str(metadata["execution_receipt_method_id"])
+    if recomputed_method_id != declared_method_id:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record execution_receipt_method_id disagrees with its own serialized "
+            f"execution_receipt: declared={declared_method_id!r}, recomputed={recomputed_method_id!r}"
+        )
+    if execution_receipt.system_id != declared_system_id:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record execution_receipt.system_id disagrees with system_descriptor_id: "
+            f"receipt={execution_receipt.system_id!r}, system={declared_system_id!r}"
+        )
+    declared_operator_ids = {term.operator_id for term in system_descriptor.terms}
+    manifest_operator_ids = set(execution_receipt.manifest)
+    if manifest_operator_ids != declared_operator_ids:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record execution_receipt.manifest does not cover exactly the operators "
+            "declared by system_descriptor"
+        )
+    receipt_contributions = tuple(
+        dict.fromkeys(
+            name for names in execution_receipt.manifest.values() for name in names
+        )
+    )
+    if set(receipt_contributions) != set(scalars.term_names) or len(receipt_contributions) != len(
+        scalars.term_names
+    ):
+        raise TamperedTrajectoryRecordError(
+            "trajectory record execution_receipt contributions do not match its CSV columns"
+        )
+
+    if scan.has_nan:
+        observable_values_digest = _V1_OBSERVABLE_DIGEST_UNAVAILABLE
+    else:
+        observable_values_digest = TrajectoryObservableValuesDigest(
+            available=True, content_id=scan.values_content_id
+        )
+    if (
+        observable_values_digest.available
+        and scan.values_content_id != metadata["observable_values_content_id"]
+    ):
+        raise TamperedTrajectoryRecordError(
+            "trajectory record observable_values_content_id disagrees with its CSV"
+        )
+
+    return TrajectoryRecordInspection(
+        record_schema=TRAJECTORY_RECORD_SCHEMA_V2,
+        path=csv_path,
+        metadata_path=metadata_path,
+        observable=str(metadata["observable"]),
+        draw_count=draw_count,
+        walker_count=walker_count,
+        row_count=row_count,
+        mean=declared_mean,
+        variance=declared_variance,
+        csv_sha256=declared_sha256,
+        atomic_configuration_id=None,
+        physical_context=TrajectoryPhysicalContext(available=True, system_id=declared_system_id),
+        observable_values_digest=observable_values_digest,
+    )
+
+
+class _V2CsvScan(NamedTuple):
+    """Values independently recomputed from a v2 CSV's complete grid."""
+
+    row_count: int
+    mean: float
+    variance: float
+    values_content_id: str
+    has_nan: bool
+
+
+def _scan_complete_grid(path: Path, *, draw_count: int, walker_count: int) -> _V2CsvScan:
+    """Scan a v2 CSV for a complete, non-duplicated draw/walker grid.
+
+    Returns the row count plus the local-energy mean/variance recomputed
+    directly from the CSV, so a caller can cross-check them against the
+    sidecar's own ``mean``/``variance`` without trusting either file alone.
+    """
+
+    if draw_count < 1 or walker_count < 1:
+        raise TamperedTrajectoryRecordError("trajectory record draw_count/walker_count must be positive")
+    seen: set[tuple[int, int]] = set()
+    draw_values: dict[int, dict[int, float]] = {draw: {} for draw in range(draw_count)}
+    has_nan = False
+    row_count = 0
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                draw = int(row["draw_index"])
+                walker = int(row["walker_index"])
+                energy = float(row["local_energy"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise TamperedTrajectoryRecordError(f"malformed trajectory record row: {row!r}") from exc
+            if not 0 <= draw < draw_count or not 0 <= walker < walker_count:
+                raise TamperedTrajectoryRecordError(
+                    f"trajectory record row (draw={draw}, walker={walker}) is outside the declared grid"
+                )
+            key = (draw, walker)
+            if key in seen:
+                raise TamperedTrajectoryRecordError(f"duplicate trajectory record row (draw={draw}, walker={walker})")
+            seen.add(key)
+            # Match the writer's reconciliation sum semantics: every row
+            # contributes, finite or not, so a non-finite row propagates
+            # nan/inf into mean/variance rather than being dropped.
+            draw_values[draw][walker] = energy
+            has_nan = has_nan or math.isnan(energy)
+            row_count += 1
+    expected_rows = draw_count * walker_count
+    if row_count != expected_rows:
+        raise TamperedTrajectoryRecordError(
+            f"trajectory record grid is incomplete: expected {expected_rows} rows, found {row_count}"
+        )
+    # Reduce draw-by-draw, matching the writer's torch reductions.  Plain
+    # float addition deliberately propagates mixed infinities as NaN; using
+    # math.fsum here would raise instead and make a legitimate nonfinite
+    # trajectory unreadable.
+    draw_sums: dict[int, float] = {}
+    draw_square_sums: dict[int, float] = {}
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            draw = int(row["draw_index"])
+            energy = float(row["local_energy"])
+            draw_sums[draw] = draw_sums.get(draw, 0.0) + energy
+            draw_square_sums[draw] = draw_square_sums.get(draw, 0.0) + energy * energy
+    total = 0.0
+    total_square = 0.0
+    for draw in range(draw_count):
+        total += draw_sums.get(draw, 0.0)
+        total_square += draw_square_sums.get(draw, 0.0)
+    mean = total / row_count
+    variance = total_square / row_count - mean * mean
+    if math.isfinite(variance) and variance < 0.0:
+        variance = 0.0
+    values_digest = hashlib.sha256()
+    values_digest.update(str((draw_count, walker_count)).encode("utf-8"))
+    for draw in range(draw_count):
+        ordered = torch.tensor(
+            [draw_values[draw][walker] for walker in range(walker_count)], dtype=torch.float64
+        )
+        values_digest.update(ordered.contiguous().numpy().astype("<f8", copy=False).tobytes())
+
+    return _V2CsvScan(
+        row_count=row_count,
+        mean=mean,
+        variance=variance,
+        values_content_id=values_digest.hexdigest(),
+        has_nan=has_nan,
+    )
+
+
 class _V1ScalarMetadata(NamedTuple):
     """Type/domain-validated scalar fields of a ``trajectory_records/v1`` sidecar."""
 
@@ -974,6 +1671,77 @@ def _validate_v1_scalar_types(metadata: dict[str, Any]) -> _V1ScalarMetadata:
         row_count=row_count,
         finite_count=finite_count,
         byte_count=byte_count,
+        term_names=tuple(term_names),
+    )
+
+
+def _validate_v2_scalar_types(metadata: dict[str, Any]) -> _V1ScalarMetadata:
+    """Validate v2 scalar/header declarations before decoding its payloads.
+
+    V2 uses the same draw/row/CSV shape contract as v1, but replaces the
+    atomic-configuration digest with system and receipt payloads.  Keep the
+    scalar validation shared in shape and error type without requiring a v1
+    geometry field.
+    """
+
+    values = {
+        key: _require_v1_int(metadata, key, minimum=minimum)
+        for key, minimum in (
+            ("draw_count", 1),
+            ("walker_count", 1),
+            ("draw_stride", 1),
+            ("burn_in_draws", 0),
+            ("n_electrons", 1),
+            ("spatial_dim", 1),
+            ("row_count", 0),
+            ("finite_count", 0),
+            ("byte_count", 1),
+        )
+    }
+    if values["row_count"] != values["draw_count"] * values["walker_count"]:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record row_count disagrees with draw_count*walker_count"
+        )
+    nonfinite_count = _require_v1_int(metadata, "nonfinite_count", minimum=0)
+    if values["finite_count"] > values["row_count"]:
+        raise TamperedTrajectoryRecordError("trajectory record finite_count exceeds row_count")
+    if nonfinite_count != values["row_count"] - values["finite_count"]:
+        raise TamperedTrajectoryRecordError(
+            "trajectory record nonfinite_count disagrees with row_count - finite_count"
+        )
+    observable = metadata["observable"]
+    if not isinstance(observable, str) or not observable.strip():
+        raise TamperedTrajectoryRecordError("trajectory record observable must be a non-empty string")
+    term_names = metadata["term_names"]
+    if (
+        not isinstance(term_names, list)
+        or not term_names
+        or not all(isinstance(name, str) and name.strip() for name in term_names)
+        or len(set(term_names)) != len(term_names)
+    ):
+        raise TamperedTrajectoryRecordError(
+            "trajectory record term_names must be a non-empty list of unique, non-blank strings"
+        )
+    for key in ("observable_values_content_id", "csv_sha256", "system_descriptor_id", "execution_receipt_method_id"):
+        value = metadata[key]
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise TamperedTrajectoryRecordError(
+                f"trajectory record {key!r} must be a lowercase sha256 digest"
+            )
+    return _V1ScalarMetadata(
+        draw_count=values["draw_count"],
+        walker_count=values["walker_count"],
+        draw_stride=values["draw_stride"],
+        burn_in_draws=values["burn_in_draws"],
+        n_electrons=values["n_electrons"],
+        spatial_dim=values["spatial_dim"],
+        row_count=values["row_count"],
+        finite_count=values["finite_count"],
+        byte_count=values["byte_count"],
         term_names=tuple(term_names),
     )
 
@@ -1217,6 +1985,37 @@ def _write_metadata(artifact: TrajectoryRecordArtifact) -> None:
         handle.write("\n")
 
 
+def _write_metadata_v2(artifact: TrajectoryRecordArtifactV2) -> None:
+    metadata = {
+        "schema": TRAJECTORY_RECORD_SCHEMA_V2,
+        "row_semantics": TRAJECTORY_RECORD_ROW_SEMANTICS,
+        "csv_filename": artifact.path.name,
+        "observable": artifact.observable,
+        "draw_count": artifact.n_draws,
+        "walker_count": artifact.n_walkers,
+        "draw_stride": artifact.draw_stride,
+        "burn_in_draws": artifact.burn_in_draws,
+        "row_count": artifact.row_count,
+        "finite_count": artifact.finite_count,
+        "nonfinite_count": artifact.nonfinite_count,
+        "mean": _json_float(artifact.mean),
+        "variance": _json_float(artifact.variance),
+        "term_names": list(artifact.term_names),
+        "n_electrons": artifact.n_electrons,
+        "spatial_dim": artifact.spatial_dim,
+        "observable_values_content_id": artifact.observable_values_content_id,
+        "csv_sha256": artifact.csv_sha256,
+        "byte_count": artifact.byte_count,
+        "system_descriptor_id": artifact.system_descriptor.system_id(),
+        "system_descriptor": _serialize_system_descriptor(artifact.system_descriptor),
+        "execution_receipt_method_id": artifact.execution_receipt.method_id(),
+        "execution_receipt": _serialize_execution_receipt(artifact.execution_receipt),
+    }
+    with artifact.metadata_path.open("x", encoding="utf-8") as handle:
+        json.dump(metadata, handle, sort_keys=True, indent=2, allow_nan=False)
+        handle.write("\n")
+
+
 def _atomic_geometry_payload(atoms: AtomicConfiguration) -> dict[str, list]:
     """Return the JSON-serializable nuclear geometry payload for a sidecar."""
 
@@ -1305,12 +2104,15 @@ __all__ = [
     "TRAJECTORY_RECORD_FILENAME",
     "TRAJECTORY_RECORD_INSPECTION_SCHEMA",
     "TRAJECTORY_RECORD_METADATA_KEYS",
+    "TRAJECTORY_RECORD_METADATA_KEYS_V2",
     "TRAJECTORY_RECORD_ROW_SEMANTICS",
     "TRAJECTORY_RECORD_SCHEMA",
+    "TRAJECTORY_RECORD_SCHEMA_V2",
     "TamperedTrajectoryRecordError",
     "TrajectoryPhysicalContext",
     "TrajectoryObservableValuesDigest",
     "TrajectoryRecordArtifact",
+    "TrajectoryRecordArtifactV2",
     "TrajectoryRecordBatch",
     "TrajectoryRecordInspection",
     "TrajectoryRecordStreamWriter",

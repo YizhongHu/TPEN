@@ -301,6 +301,36 @@ def encode_ordered_contribution_sequence(names: Sequence[str]) -> str:
     return buf.hex()
 
 
+def decode_ordered_contribution_sequence(encoded: str) -> tuple[str, ...]:
+    """Decode an order encoded by :func:`encode_ordered_contribution_sequence`."""
+
+    try:
+        payload = bytes.fromhex(encoded)
+        offset = 0
+        if len(payload) < 8:
+            raise ValueError
+        (count,) = struct.unpack_from(">Q", payload, offset)
+        offset += 8
+        names: list[str] = []
+        for _ in range(count):
+            if len(payload) - offset < 8:
+                raise ValueError
+            (length,) = struct.unpack_from(">Q", payload, offset)
+            offset += 8
+            if length > len(payload) - offset:
+                raise ValueError
+            name = payload[offset : offset + length].decode("utf-8")
+            offset += length
+            if not name.strip():
+                raise ValueError
+            names.append(name)
+        if offset != len(payload):
+            raise ValueError
+        return tuple(names)
+    except (UnicodeDecodeError, ValueError, struct.error) as exc:
+        raise ValueError("invalid ordered contribution sequence encoding") from exc
+
+
 def require_matching_system(receipt: ExecutionReceipt, system_id: str) -> ExecutionReceipt:
     """Return ``receipt`` unchanged if it was bound to ``system_id``, else raise.
 
@@ -330,6 +360,7 @@ __all__ = [
     "DiagnosticDeclaration",
     "ExecutionReceipt",
     "JsonScalar",
+    "decode_ordered_contribution_sequence",
     "encode_ordered_contribution_sequence",
     "require_matching_system",
 ]
