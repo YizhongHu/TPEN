@@ -216,6 +216,39 @@ def test_inspect_decodes_v2_and_reports_available_physical_context(tmp_path: Pat
         inspect_trajectory_record(artifact.metadata_path)
 
 
+def test_v2_typed_validate_checks_expected_run_identity(tmp_path: Path) -> None:
+    artifact = _v2_artifact(tmp_path, FINITE)
+
+    artifact.validate(check_files=False)
+    artifact.validate(
+        check_files=False,
+        expected_resolved_config_identity=_CONFIG_IDENTITY,
+    )
+    with pytest.raises(ValueError, match="resolved_config_identity"):
+        artifact.validate(
+            check_files=False,
+            expected_resolved_config_identity={
+                "schema": RESOLVED_CONFIG_IDENTITY_SCHEMA,
+                "sha256": "b" * 64,
+            },
+        )
+
+    checkpoint_artifact = replace(
+        artifact,
+        model_provenance="checkpoint",
+        checkpoint_sha256="c" * 64,
+    )
+    checkpoint_artifact.validate(
+        check_files=False,
+        expected_checkpoint_sha256="c" * 64,
+    )
+    with pytest.raises(ValueError, match="checkpoint_sha256"):
+        checkpoint_artifact.validate(
+            check_files=False,
+            expected_checkpoint_sha256="d" * 64,
+        )
+
+
 def test_v2_identity_is_digest_bound_and_expected_identity_is_checked(tmp_path: Path) -> None:
     artifact = _v2_artifact(tmp_path, FINITE)
 
@@ -486,8 +519,48 @@ def test_v2_public_reader_rejects_receipt_contribution_csv_column_mismatch(
     metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
     _rewrite_metadata(artifact, metadata)
 
-    with pytest.raises(TamperedTrajectoryRecordError, match="contributions"):
+    with pytest.raises(TamperedTrajectoryRecordError, match="contribution"):
         inspect_trajectory_record(artifact.metadata_path)
+
+
+def test_v2_rejects_reordered_term_names_and_csv_columns(tmp_path: Path) -> None:
+    artifact = _v2_artifact(tmp_path, FINITE)
+    metadata = _read_metadata(artifact)
+    with artifact.path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.reader(handle))
+    kinetic_index = rows[0].index("term/kinetic")
+    trap_index = rows[0].index("term/trap")
+    for row in rows:
+        row[kinetic_index], row[trap_index] = row[trap_index], row[kinetic_index]
+    with artifact.path.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerows(rows)
+
+    metadata["term_names"] = ["trap", "kinetic"]
+    metadata["csv_sha256"] = trajectory_records._file_sha256(artifact.path)
+    metadata["byte_count"] = artifact.path.stat().st_size
+    metadata["record_content_id"] = trajectory_records._record_content_id(metadata)
+    _rewrite_metadata(artifact, metadata)
+
+    with pytest.raises(TamperedTrajectoryRecordError, match="contribution order"):
+        inspect_trajectory_record(artifact.metadata_path)
+
+
+def test_v2_typed_validate_rejects_reordered_term_names(tmp_path: Path) -> None:
+    artifact = _v2_artifact(tmp_path, FINITE)
+    reordered = replace(
+        artifact,
+        term_names=("trap", "kinetic"),
+        final_draw=replace(
+            artifact.final_draw,
+            term_energies={
+                "trap": artifact.final_draw.term_energies["trap"],
+                "kinetic": artifact.final_draw.term_energies["kinetic"],
+            },
+        ),
+    )
+
+    with pytest.raises(ValueError, match="contribution order"):
+        reordered.validate(check_files=False)
 
 
 class _GaussianModel(torch.nn.Module):
