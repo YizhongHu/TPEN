@@ -50,6 +50,7 @@ class SpreadSummary:
     n_seedless: int
     seeds: tuple[int, ...]
     run_ids: tuple[str | None, ...]
+    seedless_run_ids: tuple[str | None, ...]
     mean_hartree: float | None
     min_hartree: float | None
     max_hartree: float | None
@@ -65,6 +66,7 @@ class SpreadSummary:
         result.update({
             "n_records": self.n_records, "n_distinct_seeds": self.n_distinct_seeds,
             "n_seedless": self.n_seedless, "seeds": list(self.seeds), "run_ids": list(self.run_ids),
+            "seedless_run_ids": list(self.seedless_run_ids),
             "mean_hartree": self.mean_hartree, "min_hartree": self.min_hartree,
             "max_hartree": self.max_hartree, "range_hartree": self.range_hartree,
             "sample_std_hartree": self.sample_std_hartree, "sem_hartree": self.sem_hartree,
@@ -96,13 +98,24 @@ def summarize(records: Iterable[BaselineRecord]) -> list[SpreadSummary]:
         groups.setdefault(key, []).append(record)
 
     summaries: list[SpreadSummary] = []
-    for key in sorted(groups):
+    for key in sorted(
+        groups,
+        key=lambda item: (
+            item.system_id,
+            item.code,
+            item.ansatz is not None,
+            item.ansatz or "",
+            item.estimator,
+        ),
+    ):
         group = groups[key]
         seeded: dict[int, BaselineRecord] = {}
         seedless = 0
+        seedless_run_ids: list[str | None] = []
         for record in group:
             if record.seed is None:
                 seedless += 1
+                seedless_run_ids.append(record.run_id)
             elif record.seed in seeded:
                 raise DuplicateSeedError(f"duplicate seed {record.seed} in {key}")
             else:
@@ -113,6 +126,7 @@ def summarize(records: Iterable[BaselineRecord]) -> list[SpreadSummary]:
         summaries.append(SpreadSummary(
             key=key, n_records=len(group), n_distinct_seeds=n, n_seedless=seedless,
             seeds=tuple(sorted(seeded)), run_ids=tuple(record.run_id for record in group),
+            seedless_run_ids=tuple(seedless_run_ids),
             mean_hartree=statistics.fmean(numeric) if numeric else None,
             min_hartree=min(numeric) if numeric else None, max_hartree=max(numeric) if numeric else None,
             range_hartree=(max(numeric) - min(numeric)) if numeric else None,

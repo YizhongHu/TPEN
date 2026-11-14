@@ -338,6 +338,12 @@ with an `insufficient_seeds` flag: the program rule for a seed-spread claim is
 at least three independent seeds. Duplicate seeds are rejected loudly rather
 than averaged, and estimator values are never pooled.
 
+Callers must curate a comparable cohort before interpreting a spread. An
+`insufficient_seeds=False` value certifies the seed-count rule only; it does
+not establish matching configuration or provenance. The reported SEM is the
+run-level SEM across seeds, not a within-run blocking error, and it is not
+combined from `energy_stderr_hartree`.
+
 The input may instead be a run root (`--run-root`); it uses the existing
 collector validation and record reader. The JSON output is suitable for later
 comparison tooling, while `--markdown-output` produces a short review table.
