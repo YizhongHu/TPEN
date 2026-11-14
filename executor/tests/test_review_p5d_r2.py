@@ -122,11 +122,10 @@ def test_r2_t3_real_worker_kills_owned_group_and_reaps_before_propagation(tmp_pa
 
     def killpg(pid, sig):
         assert pids and pid == pids[0]
-        # The worker terminates and bounded-probes its still-pinned group
-        # (killpg(SIGKILL) then killpg(0)) before the leader is reaped, so a
-        # kill signal and a signal-0 probe are both legitimate here.
-        assert sig in (signal.SIGKILL, 0)
-        calls.append("killpg" if sig == signal.SIGKILL else "probe")
+        # The worker terminates its still-pinned group before the leader is
+        # reaped; membership is observed through /proc, not signal 0.
+        assert sig == signal.SIGKILL
+        calls.append("killpg")
         return original_killpg(pid, sig)
 
     with monkeypatch.context() as patch:
@@ -138,12 +137,7 @@ def test_r2_t3_real_worker_kills_owned_group_and_reaps_before_propagation(tmp_pa
     assert observed.value is cancellation
     # The leader is observed with WNOWAIT, the owned group is terminated and
     # probed while its PGID is pinned, and only then is the leader reaped.
-    assert calls[:4] == ["waitid", "killpg", "waitid", "killpg"], calls
-    probe_start = 4
-    reap_start = next(index for index, call in enumerate(calls) if call == "wait")
-    assert reap_start > probe_start
-    assert calls[probe_start:reap_start] and all(call == "probe" for call in calls[probe_start:reap_start]), calls
-    assert calls[reap_start:] == ["wait", "reaped"], calls
+    assert calls == ["waitid", "killpg", "waitid", "killpg", "wait", "reaped"], calls
     assert processes[0].returncode == -signal.SIGKILL
     time.sleep(1.8)
     assert not late.exists(), "owned descendant must not survive to write after cancellation"

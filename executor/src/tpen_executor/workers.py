@@ -52,6 +52,53 @@ def _proc_start_ticks(pid: int) -> int | None:
     return ticks if ticks >= 0 else None
 
 
+def _proc_group_from_stat(stat_text: str) -> int | None:
+    """Parse the pgrp field from one Linux ``/proc/<pid>/stat`` record."""
+
+    close = stat_text.rfind(")")
+    if close < 0:
+        return None
+    fields_after_comm = stat_text[close + 1 :].strip().split()
+    if len(fields_after_comm) <= 2:
+        return None
+    try:
+        return int(fields_after_comm[2])
+    except ValueError:
+        return None
+
+
+def _proc_group_has_members(pgid: int, leader_pid: int) -> bool | None:
+    """Return whether a non-leader process remains in ``pgid``.
+
+    ``None`` means that ``/proc`` was unavailable or an entry could not be
+    read or parsed reliably. A process that vanishes between directory scan
+    and read is harmless and is ignored.
+    """
+
+    proc_root = Path("/proc")
+    try:
+        if not proc_root.joinpath("self", "stat").is_file():
+            return None
+        entries = tuple(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            stat_text = entry.joinpath("stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        group = _proc_group_from_stat(stat_text)
+        if group is None:
+            return None
+        if int(entry.name) != leader_pid and group == pgid:
+            return True
+    return False
+
+
 def _group_quiescent(
     pid: int,
     *,
@@ -66,11 +113,9 @@ def _group_quiescent(
     the session leader's pid, so this worker owns that group whether or not
     the leader itself is still alive: it first ``killpg``\\ s it (review
     P1-1 residual -- a same-group descendant the leader spawned and left
-    behind must be terminated, not merely observed), then probes with
-    signal 0 within the bound.  ``ProcessLookupError`` is returned only
-    once every member has actually exited; this is the only group-level
-    fact this worker can confirm, since it never discovers or signals a
-    process outside the group it itself started.
+    behind must be terminated, not merely observed), then scans ``/proc``
+    for non-leader members within the bound. The pinned zombie leader is
+    deliberately excluded from that scan.
     """
 
     if leader_reaped and (spawned_ticks is None or _proc_start_ticks(pid) != spawned_ticks):
@@ -84,11 +129,10 @@ def _group_quiescent(
         pass
     deadline = time.monotonic() + bound
     while True:
-        try:
-            os.killpg(pid, 0)
-        except ProcessLookupError:
+        has_members = _proc_group_has_members(pid, pid)
+        if has_members is False:
             return True
-        except PermissionError:
+        if has_members is None:
             return False
         if time.monotonic() >= deadline:
             return False

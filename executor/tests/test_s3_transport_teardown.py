@@ -604,6 +604,31 @@ def test_group_quiescent_terminates_a_surviving_descendant(tmp_path: Path) -> No
         os.kill(descendant_pid, 0)
 
 
+@pytest.mark.skipif(not Path("/proc/self/stat").is_file(), reason="Linux /proc process statistics are required")
+def test_real_normal_exit_group_quiescence_is_fast(tmp_path: Path) -> None:
+    request, _parts = _request(tmp_path, timeout=5)
+    output, _core, stdout, stderr, _ev_stdout, _ev_stderr = request.paths()
+    started = time.monotonic()
+    outcome = SubprocessWorker().run(
+        request.environment, ("-c", "pass"), cwd=output,
+        stdout_path=stdout, stderr_path=stderr, timeout=5,
+    )
+    assert outcome.group_reaped is True
+    assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.parametrize(
+    ("stat_text", "expected"),
+    [
+        ("123 (worker with spaces) S 1 77 0 0", 77),
+        ("123 (worker ) with spaces) S 1 88 0 0", 88),
+    ],
+    ids=["spaces", "right-paren"],
+)
+def test_proc_group_parser_handles_comm_text(stat_text: str, expected: int) -> None:
+    assert workers_module._proc_group_from_stat(stat_text) == expected
+
+
 def test_group_quiescence_kills_and_probes_before_leader_reap(monkeypatch: pytest.MonkeyPatch) -> None:
     """The PGID kill is ordered after WNOWAIT and before any reap."""
     events = []
@@ -622,9 +647,10 @@ def test_group_quiescence_kills_and_probes_before_leader_reap(monkeypatch: pytes
 
     monkeypatch.setattr(os, "waitid", waitid)
     monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(workers_module, "_proc_group_has_members", lambda pgid, leader_pid: False)
     assert workers_module._leader_exited_without_reap(pid) is True
     assert workers_module._group_quiescent(pid) is True
-    assert events == ["waitid", ("killpg", signal.SIGKILL), ("killpg", 0)]
+    assert events == ["waitid", ("killpg", signal.SIGKILL)]
 
 
 def test_normal_exit_keeps_quiescence_before_reap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
