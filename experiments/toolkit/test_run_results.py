@@ -11,16 +11,78 @@ backward-compatibility case.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
-from experiments.toolkit.run_results import ManifestRefusal, read
+from experiments.toolkit.run_results import ManifestRefusal, OUTCOME_STATUSES, read
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "run-manifest-v2.json"
 FIXTURE_V1 = Path(__file__).parent / "fixtures" / "run-manifest-v1.json"
 GPU_A = "GPU-12345678-1234-1234-1234-123456789ABC"
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _executor(code: str, *args: Path | str) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ, PYTHONPATH=str(ROOT / "executor" / "src"))
+    python = os.environ.get("P8_EXECUTOR_PYTHON", sys.executable)
+    return subprocess.run(
+        [python, "-c", code, *map(str, args)],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+
+
+def test_outcome_statuses_match_executor_vocabulary() -> None:
+    result = _executor("import json; from tpen_executor.results import OUTCOME_STATUSES; print(json.dumps(sorted(OUTCOME_STATUSES)))")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == sorted(OUTCOME_STATUSES)
+
+
+def test_real_executor_manifest_preserves_remote_quiescence_outcome(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    code = '''import sys
+from pathlib import Path
+from tpen_executor._codec import digest
+from tpen_executor.allocations import ConfiguredAllocation
+from tpen_executor.contracts import AllocationId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
+from tpen_executor.storage import DirectoryStore
+
+destination = Path(sys.argv[1])
+program = ProgramSpecRef({}, digest({}))
+group = ReadyGroup("g", (TaskSpec("task", "task", program, digest("task"), 1, "steps"),), digest("group"))
+store = DirectoryStore(destination / "store")
+fence = store.begin_attempt(
+    group,
+    "task",
+    ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {}),
+    "2026-11-14T00:00:00Z",
+)
+store.finish_attempt(fence, "remote-quiescence-unconfirmed", "2026-11-14T00:01:00Z")
+destination.joinpath("manifest.json").write_bytes(store.manifest(group).encode())
+'''
+    written = _executor(code, tmp_path)
+    assert written.returncode == 0, written.stderr
+
+    result = read(manifest)
+    assert not result.chains
+    assert len(result.preserved_attempts) == 1
+    assert result.preserved_attempts[0].outcome == "remote-quiescence-unconfirmed"
+    assert result.preserved_attempts[0].reason == "failed-or-incomplete"
+
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["attempts"][0]["outcome_receipt"]["status"] = "unknown-status"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestRefusal, match="supported operational status"):
+        read(manifest)
 
 
 def _placement_receipt(output_dir: str = "/runs/group-1/task-a/attempt-1") -> dict[str, object]:
