@@ -1103,12 +1103,12 @@ def select_successor_admission(
         create a successor directory, or write any ledger.
     """
 
-    intent, request, decode_refusal = _request_and_intent(intent, request)
+    resolved_intent, resolved_request, decode_refusal = _request_and_intent(intent, request)
     if decode_refusal is not None:
         checkpoint_profile = decode_refusal.profile
     else:
-        assert request is not None
-        evidence = request.core_evidence
+        assert resolved_request is not None
+        evidence = resolved_request.core_evidence
         if (
             evidence.schema == RUN_EVIDENCE_SCHEMA_V3
             and evidence.outcome == "planned_yield"
@@ -1126,10 +1126,10 @@ def select_successor_admission(
         )
     if decode_refusal is not None:
         return _admission_refusal(decode_refusal.code, decode_refusal.message)
-    assert request is not None
-    predecessor = request.predecessor
-    successor = request.successor
-    evidence = request.core_evidence
+    assert resolved_request is not None
+    predecessor = resolved_request.predecessor
+    successor = resolved_request.successor
+    evidence = resolved_request.core_evidence
 
     if evidence.schema == RUN_EVIDENCE_SCHEMA_V3 and evidence.checkpoint is not None and evidence.checkpoint_ref is not None:
         for key in ("checkpoint_dir", "next_iteration", "completed_updates"):
@@ -1161,12 +1161,12 @@ def select_successor_admission(
             AdmissionRefusalCode.IDENTITY_MISMATCH,
             "request config identity differs from core evidence",
         )
-    if request.science_input_digest != intent.science_input_digest:
+    if resolved_request.science_input_digest != resolved_intent.science_input_digest:
         return _admission_refusal(
             AdmissionRefusalCode.IDENTITY_MISMATCH,
             "request science input digest differs from the supplied intent",
         )
-    if request.target_iterations != intent.target_iterations:
+    if resolved_request.target_iterations != resolved_intent.target_iterations:
         return _admission_refusal(
             AdmissionRefusalCode.IDENTITY_MISMATCH,
             "request target horizon differs from the supplied intent",
@@ -1197,8 +1197,8 @@ def select_successor_admission(
             f"checkpoint bytes no longer match checkpoint ref: {exc}",
         )
     if (
-        ref.next_iteration > request.target_iterations
-        or ref.completed_updates > request.target_iterations
+        ref.next_iteration > resolved_request.target_iterations
+        or ref.completed_updates > resolved_request.target_iterations
     ):
         return _admission_refusal(
             AdmissionRefusalCode.IDENTITY_MISMATCH,
@@ -1232,11 +1232,11 @@ def select_successor_admission(
 
     evidence_binding = CheckpointEvidence.from_ref(
         ref,
-        science_input_digest=request.science_input_digest,
-        target_iterations=request.target_iterations,
+        science_input_digest=resolved_request.science_input_digest,
+        target_iterations=resolved_request.target_iterations,
     )
     decision = select_recovery(
-        intent,
+        resolved_intent,
         phase=RecoveryPhase.RECOVERY,
         evidence=evidence_binding,
     )
