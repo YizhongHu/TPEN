@@ -1582,7 +1582,9 @@ def _inspect_v2(
             "declared by system_descriptor"
         )
     try:
-        _validate_v2_contribution_binding(execution_receipt, scalars.term_names)
+        contribution_order = _validate_v2_contribution_binding(
+            execution_receipt, scalars.term_names
+        )
     except ValueError as exc:
         raise TamperedTrajectoryRecordError(str(exc)) from exc
 
@@ -2233,7 +2235,7 @@ def _decode_v2_contribution_order(receipt: ExecutionReceipt) -> tuple[str, ...]:
 
 def _validate_v2_contribution_binding(
     receipt: ExecutionReceipt, term_names: Sequence[str]
-) -> None:
+) -> tuple[str, ...]:
     """Require both ordered and manifest contribution names to bind CSV columns."""
 
     term_names = tuple(term_names)
@@ -2251,6 +2253,7 @@ def _validate_v2_contribution_binding(
             "trajectory record execution_receipt manifest contribution names must match "
             "its CSV columns"
         )
+    return contribution_order
 
 
 def _record_content_id(metadata: Mapping[str, Any]) -> str:
