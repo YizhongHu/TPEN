@@ -65,6 +65,53 @@ def test_happy_path_statistics_and_four_stream_aggregate(monkeypatch, tmp_path: 
     assert result["aggregates"][0]["mean_of_stream_means"] == 4.0
     assert result["aggregates"][0]["spread_of_stream_means"] == 1.25 ** 0.5
     assert result["records"][0]["reference"]["error"] == pytest.approx(5.4)
+    assert result["records"][0]["identity"]["physical_system_id"] == "he_atom"
+
+
+def _install_multi_fake(monkeypatch, tmp_path: Path, *, physical_ids, registry_ids=None):
+    document = _manifest(tmp_path)
+    if registry_ids is not None:
+        for row, system_id in zip(document["rows"], registry_ids):
+            row["system_id"] = system_id
+        document["manifest_hash"] = manifest_hash(document["rows"])
+    identity = {"schema": "tpen-config-identity-v1", "sha256": "b" * 64}
+    monkeypatch.setattr(collector, "inspect_run", lambda path: {
+        "verdict": "completed", "resolved_config_identity": identity, "source_git_sha": "a" * 40})
+    monkeypatch.setattr(collector, "_record_path", lambda path: path / ("m-" + path.name))
+
+    def inspect(path, **kwargs):
+        index = int(Path(path).name.rsplit("-", 1)[-1])
+        return SimpleNamespace(record_schema="trajectory_records/v2", draw_count=2, walker_count=2,
+                               row_count=4, finite_count=4, mean=2.5, variance=1.25,
+                               csv_sha256="d" * 64, system_id=physical_ids[index],
+                               execution_method_id="method", resolved_config_identity=identity,
+                               model_provenance="checkpoint", checkpoint_sha256="c" * 64,
+                               record_content_id="e" * 64)
+
+    monkeypatch.setattr(collector, "inspect_trajectory_record", inspect)
+    monkeypatch.setattr(collector, "read_energy_grid", lambda record: [[1.0, 2.0], [3.0, 4.0]])
+    monkeypatch.setattr(collector, "_reference", lambda system_id, registry_path: (-2.9, "transcribed"))
+    return document
+
+
+def test_physical_system_id_must_be_consistent_within_registry_id(monkeypatch, tmp_path: Path) -> None:
+    document = _install_multi_fake(monkeypatch, tmp_path, physical_ids=["physical-a", "physical-b", "physical-a", "physical-a"])
+    with pytest.raises(collector.CollectionError, match="physical system"):
+        collector.collect(document)
+
+
+def test_physical_system_id_cannot_be_shared_by_registry_ids(monkeypatch, tmp_path: Path) -> None:
+    document = _install_multi_fake(
+        monkeypatch, tmp_path, physical_ids=["physical-a"] * 4,
+        registry_ids=["he_atom", "h2_molecule", "he_atom", "he_atom"],
+    )
+    with pytest.raises(collector.CollectionError, match="physical system"):
+        collector.collect(document)
+
+
+def test_missing_physical_system_id_is_refused(monkeypatch, tmp_path: Path) -> None:
+    with pytest.raises(collector.CollectionError, match="physical system"):
+        collector.collect(_install_single_fake(monkeypatch, tmp_path, system_id=None))
 
 
 def test_stream_aggregate_requires_the_complete_four_stream_set(
@@ -218,7 +265,7 @@ def test_missing_or_malformed_run_identity_is_refused(monkeypatch, tmp_path: Pat
     pytest.param({"model_provenance": "constructed"}, "provenance", id="provenance"),
     pytest.param({"resolved_config_identity": {"schema": "tpen-config-identity-v1", "sha256": "z" * 64}}, "identity", id="identity"),
     pytest.param({"draw_count": 3}, "shape", id="draws"), pytest.param({"walker_count": 3}, "shape", id="walkers"),
-    pytest.param({"system_id": "other"}, "system", id="system"), pytest.param({"finite_count": 3}, "non-finite", id="non-finite"),
+    pytest.param({"finite_count": 3}, "non-finite", id="non-finite"),
 ])
 def test_join_guards_refuse_invalid_record(monkeypatch, tmp_path: Path, changes, needle) -> None:
     with pytest.raises(collector.CollectionError, match=needle):

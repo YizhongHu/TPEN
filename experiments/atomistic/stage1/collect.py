@@ -79,7 +79,10 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
 
     The public entry point is intentionally small: callers provide the A1
     manifest and receive a JSON-safe document, optionally written atomically
-    by the caller's normal output handling.
+    by the caller's normal output handling.  The manifest carries the
+    registry system ID, while records carry the physical system content ID;
+    this collector cannot pin the expected physical hash because the manifest
+    does not carry it.
     """
     document = _load(manifest)
     rows = document.get("rows")
@@ -93,6 +96,8 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
     eval_rows = [row for row in rows if row.get("kind") == "eval"]
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
+    registry_to_physical: dict[str, str] = {}
+    physical_to_registry: dict[str, str] = {}
     for row in eval_rows:
         row_id = str(row.get("row_id"))
         if row_id in seen:
@@ -123,8 +128,23 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
                 raise CollectionError(f"row {row_id}: incomplete trajectory grid")
             if record.model_provenance != "checkpoint":
                 raise CollectionError(f"row {row_id}: model provenance is not checkpoint")
-            if record.system_id != row.get("system_id"):
-                raise CollectionError(f"row {row_id}: physical system identity mismatch")
+            physical_system_id = record.system_id
+            if not isinstance(physical_system_id, str) or not physical_system_id.strip():
+                raise CollectionError(f"row {row_id}: physical system identity is absent")
+            registry_system_id = row.get("system_id")
+            previous_physical = registry_to_physical.get(registry_system_id)
+            if previous_physical is not None and previous_physical != physical_system_id:
+                raise CollectionError(
+                    f"row {row_id}: registry system {registry_system_id} maps to inconsistent "
+                    "physical system identities"
+                )
+            previous_registry = physical_to_registry.get(physical_system_id)
+            if previous_registry is not None and previous_registry != registry_system_id:
+                raise CollectionError(
+                    f"row {row_id}: distinct registry systems map to the same physical system"
+                )
+            registry_to_physical[registry_system_id] = physical_system_id
+            physical_to_registry[physical_system_id] = registry_system_id
             if not record.execution_method_id:
                 raise CollectionError(f"row {row_id}: execution method identity is absent")
             if run.get("source_git_sha") != row.get("source_sha"):
@@ -161,6 +181,7 @@ def collect(manifest: Mapping[str, Any] | str | Path, *, output: str | Path | No
             "checkpoint": row["checkpoint"], "stream": row["stream"],
             "run_dir": str(run_dir),
             "identity": {"record_content_id": record.record_content_id,
+                         "physical_system_id": physical_system_id,
                          "csv_sha256": record.csv_sha256,
                          "checkpoint_sha256": record.checkpoint_sha256,
                          "resolved_config_identity": record.resolved_config_identity},
