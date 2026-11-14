@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -457,6 +458,163 @@ def test_verify_sh_write_path_roots_exclude_shared_env_prefix() -> None:
     source = VERIFY.read_text()
     roots_line = next(line for line in source.splitlines() if line.strip().startswith('for root in "$CANON_WORK_ROOT"'))
     assert "SHARED_ENV" not in roots_line, roots_line
+
+
+def test_verify_sh_discovers_all_test_python_vars_and_excludes_owned_names(tmp_path: Path) -> None:
+    source = VERIFY.read_text()
+    discovery_line = next(line for line in source.splitlines() if "grep -rhoE" in line and "_PYTHON" in line)
+
+    pattern = re.search(r"'([^']+)'", discovery_line)
+    assert pattern is not None
+    discovery = re.compile(pattern.group(1))
+    for name in ("H_V2_SCIENCE_PYTHON", "P9C_EXECUTOR_PYTHON", "P10_ROOT_PYTHON"):
+        assert discovery.fullmatch(name)
+    deny_match = re.search(r'case "\$executor_var" in\n\s*([^)]*)\)', source)
+    assert deny_match is not None
+    assert set(deny_match.group(1).split("|")) == {"PYTHON", "TPEN_PYTHON", "ROOT_PYTHON"}
+
+    loop_start = source.index("mapfile -t EXECUTOR_PYTHON_VARS")
+    loop_end = source.index("\ndone", loop_start) + len("\ndone")
+    loop = source[loop_start:loop_end]
+    # macOS's system Bash lacks mapfile; retain the production grep and
+    # binding loop while using an equivalent array fill for this probe.
+    loop = loop.replace(
+        "mapfile -t EXECUTOR_PYTHON_VARS < <(",
+        "EXECUTOR_PYTHON_VARS=(); while IFS= read -r executor_var; do EXECUTOR_PYTHON_VARS+=(\"$executor_var\"); done < <(",
+    )
+    clone = tmp_path / "clone"
+    (clone / "tests").mkdir(parents=True)
+    (clone / "tests" / "vars.py").write_text(
+        "import os\n"
+        "H_V2_SCIENCE_PYTHON = os.environ.get(\"H_V2_SCIENCE_PYTHON\")\n"
+        "P9C_EXECUTOR_PYTHON = os.environ.get(\"P9C_EXECUTOR_PYTHON\")\n"
+        "P10_ROOT_PYTHON = os.environ.get(\"P10_ROOT_PYTHON\")\n"
+        "TPEN_GUARD_PRE39_PYTHON = os.environ.get(\"TPEN_GUARD_PRE39_PYTHON\")\n"
+        "UV_PYTHON = os.environ.get(\"UV_PYTHON\")\n"
+        "XLA_PYTHON_CLIENT_PREALLOCATE = os.environ.get(\"XLA_PYTHON_CLIENT_PREALLOCATE\")\n"
+        "TPEN_PYTHON = os.environ.get(\"TPEN_PYTHON\")\n"
+        "ROOT_PYTHON = os.environ.get(\"ROOT_PYTHON\")\n"
+    )
+    run_root = tmp_path / "run"
+    (run_root / "evidence").mkdir(parents=True)
+    probe = (
+        "set -Eeuo pipefail\n"
+        f"CLONE=\"{clone}\"\n"
+        "PYTHON=/tmp/overlay/bin/python\n"
+        f"RUN_ROOT=\"{run_root}\"\n"
+        "assert_write_path() { :; }\n"
+        f"{loop}\n"
+        "[[ \"${H_V2_SCIENCE_PYTHON:-}\" == \"$PYTHON\" ]]\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", probe],
+        env={"PATH": os.environ["PATH"]},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    bindings = (run_root / "evidence" / "executor-python-bindings.txt").read_text().splitlines()
+    assert set(bindings) == {
+        "H_V2_SCIENCE_PYTHON=/tmp/overlay/bin/python",
+        "P10_ROOT_PYTHON=/tmp/overlay/bin/python",
+        "P9C_EXECUTOR_PYTHON=/tmp/overlay/bin/python",
+    }
+    assert len(bindings) == 3
+    assert all(not line.startswith(("TPEN_PYTHON=", "ROOT_PYTHON=")) for line in bindings)
+
+
+def test_verify_sh_executor_install_order_and_flags() -> None:
+    lines = VERIFY.read_text().splitlines()
+    core = next(i for i, line in enumerate(lines) if ' -e "$CLONE" ' in line)
+    executor = next(i for i, line in enumerate(lines) if ' -e "$CLONE/executor" ' in line)
+    xdist = next(i for i, line in enumerate(lines) if 'pytest-xdist==' in line)
+    assert core < executor < xdist
+    assert "--no-deps" in lines[executor]
+
+
+def test_verify_sh_executor_resolution_precheck_rejects_outside_clone(tmp_path: Path) -> None:
+    source = VERIFY.read_text()
+    start = source.index("executor_resolution_precheck() {")
+    end = source.index("\n}\nEXECUTOR_ROOT=", start) + 2
+    function = source[start:end]
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$OUTSIDE/tpen_executor/__init__.py\"\n"
+        "exit 1\n"
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IEXEC)
+    evidence = tmp_path / "executor-resolution.txt"
+    clone_executor = tmp_path / "clone" / "executor"
+    clone_executor.mkdir(parents=True)
+    probe = (
+        "set -Eeuo pipefail\n"
+        "PYTHON=\"$FAKE_PYTHON\"\n"
+        "assert_write_path() { :; }\n"
+        "fail_precheck() { echo \"PRECHECK_FAILED $*\" >&2; exit 2; }\n"
+        f"{function}\n"
+        f"executor_resolution_precheck \"$CLONE_EXECUTOR\" \"$EVIDENCE\"\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", probe],
+        env={
+            "FAKE_PYTHON": str(fake_python),
+            "CLONE_EXECUTOR": str(clone_executor),
+            "EVIDENCE": str(evidence),
+            "OUTSIDE": str(tmp_path / "outside"),
+            "PATH": os.environ["PATH"],
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "tpen_executor resolution failed" in result.stderr
+    assert evidence.exists()
+
+
+def test_verify_sh_executor_resolution_precheck_accepts_normal_and_isolated_symlinked_root(tmp_path: Path) -> None:
+    source = VERIFY.read_text()
+    start = source.index("executor_resolution_precheck() {")
+    end = source.index("\n}\nEXECUTOR_ROOT=", start) + 2
+    function = source[start:end]
+    real_clone = tmp_path / "real-clone"
+    (real_clone / "executor").mkdir(parents=True)
+    symlinked_clone = tmp_path / "symlinked-clone"
+    symlinked_clone.symlink_to(real_clone, target_is_directory=True)
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s\\n' \"$RESOLVED_PATH\"\n"
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IEXEC)
+    evidence = tmp_path / "executor-resolution.txt"
+    probe = (
+        "set -Eeuo pipefail\n"
+        "PYTHON=\"$FAKE_PYTHON\"\n"
+        "assert_write_path() { :; }\n"
+        f"{function}\n"
+        f"executor_resolution_precheck \"$CLONE_EXECUTOR\" \"$EVIDENCE\"\n"
+    )
+    canonical_executor = (real_clone / "executor").resolve()
+    result = subprocess.run(
+        ["bash", "-c", probe],
+        env={
+            "FAKE_PYTHON": str(fake_python),
+            "CLONE_EXECUTOR": str(symlinked_clone / "executor"),
+            "EVIDENCE": str(evidence),
+            "RESOLVED_PATH": str(canonical_executor / "src" / "tpen_executor" / "__init__.py"),
+            "PATH": os.environ["PATH"],
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = evidence.read_text().splitlines()
+    assert lines[0].startswith("normal=")
+    assert lines[1].startswith("isolated=")
 
 
 # --- T1 (reduced), F1: every isolated interpreter invocation carries -B ------
