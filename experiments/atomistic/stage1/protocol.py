@@ -120,6 +120,14 @@ def training_seed(*, system: str, lineage: int, lineage_seed: int) -> int:
             + lineage * 10**9 + lineage_seed)
 
 
+def smoke_seed(*, system: str) -> int:
+    """Derive the dedicated smoke namespace seed for one system."""
+
+    if system not in SYSTEMS:
+        raise ProtocolError("invalid smoke seed system")
+    return SYSTEMS.index(system) * _SYSTEM_SEED_STRIDE + 9 * 10**17
+
+
 def evaluation_seed(*, system: str, lineage: int, checkpoint: int, stream: int) -> int:
     """Derive an injective evaluation seed for arbitrary checkpoint lists."""
 
@@ -174,10 +182,14 @@ def build_manifest(*, protocol: Protocol, source_sha: str, config_sha256: str,
     seen_seeds: set[int] = set()
     for spec in SYSTEM_SPECS:
         spec.validate()
+        seed = smoke_seed(system=spec.name)
+        if seed in seen_seeds:
+            raise ProtocolError("seed collision across Stage-1 rows")
+        seen_seeds.add(seed)
         rows.append({
             "row_id": stable_row_id(system=spec.name, kind="smoke"),
             "system": spec.name, "system_id": spec.system_id, "kind": "smoke",
-            "source_sha": source_sha, "config_sha256": config_sha256,
+            "seed": seed, "source_sha": source_sha, "config_sha256": config_sha256,
             "config": f"configs/{spec.name}/smoke.yaml",
             "results_root": f"{root}/{spec.name}/smoke", "updates": protocol.smoke_updates,
             "walkers": protocol.smoke_walkers,

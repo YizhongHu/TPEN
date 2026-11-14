@@ -52,6 +52,10 @@ def test_seed_and_row_identity_are_injective_for_non_default_coordinates() -> No
 
 def test_manifest_binds_real_identity_and_v2_expectations() -> None:
     rows = _manifest()
+    assert len(rows) == 84
+    assert len({row["row_id"] for row in rows}) == 84
+    assert all("seed" in row for row in rows)
+    assert len({row["seed"] for row in rows}) == 84
     eval_row = next(row for row in rows if row["kind"] == "eval")
     assert eval_row["source_sha"] == SHA1
     assert eval_row["config_sha256"] == SHA256
