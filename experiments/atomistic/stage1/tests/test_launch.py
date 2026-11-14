@@ -74,9 +74,10 @@ def test_guard_fails_without_slurm_job_id(tmp_path: Path) -> None:
 
 def test_rendered_prefix_guard_executes_under_fake_environment(tmp_path: Path) -> None:
     script = _rendered_script().replace(
-        "RESULTS_ROOT='/n/netscratch/kozinsky_lab/Lab/rhu/stage1'",
-        "RESULTS_ROOT='/outside/approved/root'",
+        'RESULTS_ROOT="/n/netscratch/kozinsky_lab/Lab/rhu/stage1"',
+        'RESULTS_ROOT="/outside/approved/root"',
     )
+    assert script != _rendered_script()
     result = _run(script, tmp_path, SLURM_JOB_ID="123", SLURM_JOB_PARTITION="test")
     assert result.returncode == 2
     assert "STAGE1_GUARD results root outside /n/netscratch/kozinsky_lab/Lab/rhu/" in result.stderr
