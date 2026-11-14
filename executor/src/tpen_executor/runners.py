@@ -15,6 +15,15 @@ from .workers import LaunchPurpose, SubprocessWorker
 
 RUN_EVIDENCE_SCHEMA = "tpen.run-evidence/v1"
 RUN_EVIDENCE_SCHEMA_V2 = "tpen.run-evidence/v2"
+RUN_EVIDENCE_SCHEMA_V3 = "tpen.run-evidence/v3"
+RUN_EVIDENCE_OUTCOMES = frozenset({"completed", "planned_yield", "failed", "unknown", "refused"})
+_CHECKPOINT_REF_KEYS = frozenset(
+    {
+        "schema", "checkpoint_dir", "schema_version", "kind", "next_iteration",
+        "completed_updates", "manifest_sha256", "model_sha256", "provenance",
+        "content_id", "profile",
+    }
+)
 CHILD_CONTEXT_KEYS_ENV = "TPEN_EXECUTOR_CONTEXT_ENV_KEYS"
 CHILD_OBSERVATION_FILENAME = "executor-child-observation.json"
 CONTEXT_ENV_KEY_PATTERN = r"^(CUDA_VISIBLE_DEVICES|TPEN_CTX_[A-Z0-9_]{1,64})$"
@@ -130,15 +139,38 @@ class CoreRunEvidence:
     checkpoint: Mapping[str, Any] | None
     refusal: Mapping[str, str] | None
     resolved_config_identity: Mapping[str, str] | None = None
+    outcome: str | None = None
+    checkpoint_ref: Mapping[str, Any] | None = None
 
     SCHEMA: ClassVar[str] = RUN_EVIDENCE_SCHEMA
+    SCHEMA_V2: ClassVar[str] = RUN_EVIDENCE_SCHEMA_V2
+    SCHEMA_V3: ClassVar[str] = RUN_EVIDENCE_SCHEMA_V3
     VERDICTS: ClassVar[frozenset[str]] = frozenset({"completed", "incomplete", "failed", "refused"})
+    OUTCOMES: ClassVar[frozenset[str]] = RUN_EVIDENCE_OUTCOMES
     REFUSAL_CODES: ClassVar[frozenset[str]] = REFUSAL_CODES
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checkpoint", self._checkpoint(self.checkpoint))
         object.__setattr__(self, "refusal", self._refusal(self.refusal))
         object.__setattr__(self, "resolved_config_identity", self._identity(self.resolved_config_identity))
+        object.__setattr__(self, "checkpoint_ref", self._checkpoint_ref(self.checkpoint_ref))
+        if self.schema == RUN_EVIDENCE_SCHEMA_V3:
+            if self.resolved_config_identity is None:
+                raise EvidenceUnavailable("v3 evidence requires a non-null resolved_config_identity")
+            if self.outcome not in self.OUTCOMES:
+                raise EvidenceUnavailable("unknown v3 typed outcome")
+            if self.verdict != "refused" and self.run_status != self.outcome:
+                raise EvidenceUnavailable("v3 run_status must equal outcome")
+            if self.outcome == "planned_yield" and self.verdict != "refused":
+                if self.checkpoint is None or self.checkpoint_ref is None:
+                    raise EvidenceUnavailable("planned_yield evidence requires a checkpoint_ref")
+                if self.checkpoint_ref["profile"] != "train_resume":
+                    raise EvidenceUnavailable("planned_yield evidence requires a train_resume checkpoint_ref")
+                for key in ("checkpoint_dir", "next_iteration", "completed_updates"):
+                    if self.checkpoint_ref[key] != self.checkpoint[key]:
+                        raise EvidenceUnavailable("planned_yield checkpoint_ref does not match checkpoint summary")
+        elif self.outcome is not None or self.checkpoint_ref is not None:
+            raise EvidenceUnavailable("typed outcome fields are only valid in v3 evidence")
 
     @classmethod
     def from_mapping(cls, value: Any) -> "CoreRunEvidence":
@@ -166,11 +198,13 @@ class CoreRunEvidence:
         expected = {"schema", "run_dir", "verdict", "run_status", "checkpoint", "refusal"}
         if schema == RUN_EVIDENCE_SCHEMA_V2:
             expected.add("resolved_config_identity")
-        if schema not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2} or set(value) != expected:
+        elif schema == RUN_EVIDENCE_SCHEMA_V3:
+            expected.update({"resolved_config_identity", "outcome", "checkpoint_ref"})
+        if schema not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2, RUN_EVIDENCE_SCHEMA_V3} or set(value) != expected:
             raise EvidenceUnavailable("evidence has unexpected keys")
-        if schema == RUN_EVIDENCE_SCHEMA_V2 and value.get("resolved_config_identity") is None:
-            raise EvidenceUnavailable("v2 evidence requires a non-null resolved_config_identity")
-        if value["schema"] not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2}:
+        if schema in {RUN_EVIDENCE_SCHEMA_V2, RUN_EVIDENCE_SCHEMA_V3} and value.get("resolved_config_identity") is None:
+            raise EvidenceUnavailable(f"{schema.rsplit('/', 1)[-1]} evidence requires a non-null resolved_config_identity")
+        if value["schema"] not in {RUN_EVIDENCE_SCHEMA, RUN_EVIDENCE_SCHEMA_V2, RUN_EVIDENCE_SCHEMA_V3}:
             raise EvidenceUnavailable("unknown evidence schema")
         if type(value["run_dir"]) is not str or not value["run_dir"]:
             raise EvidenceUnavailable("run_dir must be a non-empty string")
@@ -190,9 +224,16 @@ class CoreRunEvidence:
             raise EvidenceUnavailable("completed evidence requires checkpoint")
         if verdict != "refused" and refusal is not None:
             raise EvidenceUnavailable("non-refused evidence cannot contain refusal")
+        outcome = value.get("outcome")
+        checkpoint_ref = value.get("checkpoint_ref")
+        if schema == RUN_EVIDENCE_SCHEMA_V3:
+            if type(outcome) is not str or outcome not in cls.OUTCOMES:
+                raise EvidenceUnavailable("unknown v3 typed outcome")
+            if checkpoint_ref is not None and not isinstance(checkpoint_ref, Mapping):
+                raise EvidenceUnavailable("v3 checkpoint_ref must be a mapping or null")
         return cls(
             value["schema"], value["run_dir"], verdict, run_status, checkpoint, refusal,
-            value.get("resolved_config_identity"),
+            value.get("resolved_config_identity"), outcome, checkpoint_ref,
         )
 
     def __hash__(self) -> int:
@@ -206,6 +247,8 @@ class CoreRunEvidence:
             "checkpoint": self.checkpoint,
             "refusal": self.refusal,
             "resolved_config_identity": self.resolved_config_identity,
+            "outcome": self.outcome,
+            "checkpoint_ref": self.checkpoint_ref,
         }))
 
     @staticmethod
@@ -251,6 +294,48 @@ class CoreRunEvidence:
         ):
             raise EvidenceUnavailable("resolved_config_identity sha256 is invalid")
         return MappingProxyType({"schema": value["schema"], "sha256": digest})
+
+    @staticmethod
+    def _checkpoint_ref(value: Any) -> MappingProxyType | None:
+        if value is None:
+            return None
+        if not isinstance(value, Mapping) or set(value) != _CHECKPOINT_REF_KEYS:
+            raise EvidenceUnavailable("checkpoint_ref has invalid keys")
+        if value["schema"] != "tpen.checkpoint-ref/v1":
+            raise EvidenceUnavailable("checkpoint_ref has an unsupported schema")
+        if type(value["checkpoint_dir"]) is not str or type(value["kind"]) is not str:
+            raise EvidenceUnavailable("checkpoint_ref paths and kind must be strings")
+        for key in ("schema_version", "next_iteration", "completed_updates"):
+            if type(value[key]) is not int or value[key] < 0:
+                raise EvidenceUnavailable(f"checkpoint_ref {key} must be a non-negative integer")
+        for key in ("manifest_sha256", "model_sha256", "content_id"):
+            digest = value[key]
+            if type(digest) is not str or len(digest) != 64 or digest != digest.lower() or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise EvidenceUnavailable(f"checkpoint_ref {key} must be a 64-hex SHA-256 value")
+        if not isinstance(value["provenance"], Mapping):
+            raise EvidenceUnavailable("checkpoint_ref provenance must be a mapping")
+        if value["profile"] not in {"train_resume", "model_only"}:
+            raise EvidenceUnavailable("checkpoint_ref has an invalid payload profile")
+        return MappingProxyType(dict(value))
+
+    @property
+    def continuation_eligible(self) -> bool:
+        """Whether this v3 record is an explicitly valid continuation leaf."""
+
+        return (
+            self.schema == RUN_EVIDENCE_SCHEMA_V3
+            and self.verdict != "refused"
+            and self.refusal is None
+            and self.outcome == "planned_yield"
+            and self.checkpoint is not None
+            and self.checkpoint_ref is not None
+            and self.checkpoint_ref.get("profile") == "train_resume"
+            and self.checkpoint_ref.get("checkpoint_dir") == self.checkpoint.get("checkpoint_dir")
+            and self.checkpoint_ref.get("next_iteration") == self.checkpoint.get("next_iteration")
+            and self.checkpoint_ref.get("completed_updates") == self.checkpoint.get("completed_updates")
+        )
 
 
 @frozen_record
@@ -384,4 +469,4 @@ class TPENEvidence:
         return CoreRunEvidence.from_mapping(decoded)
 
 
-__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CHILD_OBSERVATION_FILENAME", "CONTEXT_ENV_KEY_PATTERN", "CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "RUN_EVIDENCE_SCHEMA_V2", "TPENCommand", "TPENEvidence"]
+__all__ = ["CHILD_CONTEXT_KEYS_ENV", "CHILD_OBSERVATION_FILENAME", "CONTEXT_ENV_KEY_PATTERN", "CoreRunEvidence", "EvidenceUnavailable", "REFUSAL_CODES", "RUN_EVIDENCE_SCHEMA", "RUN_EVIDENCE_SCHEMA_V2", "RUN_EVIDENCE_SCHEMA_V3", "TPENCommand", "TPENEvidence"]

@@ -91,6 +91,9 @@ def _evidence_payload(evidence: CoreRunEvidence) -> dict[str, Any]:
     }
     if evidence.resolved_config_identity is not None:
         payload["resolved_config_identity"] = evidence.resolved_config_identity
+    if evidence.schema == "tpen.run-evidence/v3":
+        payload["outcome"] = evidence.outcome
+        payload["checkpoint_ref"] = evidence.checkpoint_ref
     return payload
 
 
@@ -1269,6 +1272,11 @@ class DispatcherContract:
                 lifecycle.store.publish_placement(fence, receipt)
             except Exception as placement_error:
                 return placement_error
+        if segment_evidence is not None and segment_evidence.schema == "tpen.run-evidence/v3":
+            try:
+                lifecycle.store.record_core_outcome(fence, segment_evidence)
+            except Exception as outcome_error:
+                return outcome_error
         if inspection_error is not None:
             raise inspection_error
         if (
@@ -1276,6 +1284,7 @@ class DispatcherContract:
             and segment_evidence is not None
             and segment_evidence.verdict in {"completed", "incomplete"}
             and segment_evidence.checkpoint is not None
+            and (segment_evidence.schema != "tpen.run-evidence/v3" or segment_evidence.outcome == "completed")
         ):
             existing_segments = lifecycle.store.manifest(group).segments
             if not any(segment.task_id == fence.task_id for segment in existing_segments):

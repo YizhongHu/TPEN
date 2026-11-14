@@ -16,6 +16,10 @@ FIXTURE_PATHS = (
     REPO_ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v2.json",
     REPO_ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v1-refused.json",
 )
+V3_FIXTURE_PATHS = (
+    REPO_ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v3-planned-yield.json",
+    REPO_ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v3-unknown.json",
+)
 
 
 def _fixture(path: Path) -> dict:
@@ -62,3 +66,36 @@ def test_executor_decodes_each_core_owned_fixture_identically(fixture_path: Path
 def test_executor_refuses_unknown_schema_and_extra_field(mutate) -> None:
     with pytest.raises(EvidenceUnavailable):
         CoreRunEvidence.from_mapping(mutate(_fixture(FIXTURE_PATHS[0])))
+
+
+@pytest.mark.parametrize("fixture_path", V3_FIXTURE_PATHS, ids=lambda path: path.stem)
+def test_executor_decodes_both_core_v3_fixtures(fixture_path: Path) -> None:
+    payload = _fixture(fixture_path)
+    evidence = CoreRunEvidence.from_mapping(payload)
+    assert evidence.schema == "tpen.run-evidence/v3"
+    assert evidence.outcome == payload["outcome"]
+    assert evidence.checkpoint_ref == payload["checkpoint_ref"]
+    assert evidence.continuation_eligible is (payload["outcome"] == "planned_yield")
+
+
+def test_v3_decoder_refuses_status_outcome_mismatch() -> None:
+    payload = _fixture(V3_FIXTURE_PATHS[0])
+    payload["run_status"] = "completed"
+    with pytest.raises(EvidenceUnavailable, match="run_status must equal outcome"):
+        CoreRunEvidence.from_mapping(payload)
+
+
+def test_v3_decoder_refuses_extra_key() -> None:
+    payload = _fixture(V3_FIXTURE_PATHS[0])
+    payload["unexpected"] = True
+    with pytest.raises(EvidenceUnavailable, match="unexpected keys"):
+        CoreRunEvidence.from_mapping(payload)
+
+
+def test_v3_eligibility_requires_planned_yield() -> None:
+    payload = _fixture(V3_FIXTURE_PATHS[0])
+    payload["outcome"] = "completed"
+    payload["run_status"] = "completed"
+    payload["verdict"] = "completed"
+    evidence = CoreRunEvidence.from_mapping(payload)
+    assert evidence.continuation_eligible is False

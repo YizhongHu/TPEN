@@ -6,7 +6,7 @@ from .contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, Re
 from .allocations import ConfiguredAllocation
 from .delivery import PreparedInputBundle
 from .environments import PreparedPythonEnvironment, SourceScript
-from .results import AcceptedSegment, AllocationObservation, ManifestAttempt, OutcomeReceipt, OUTCOME_STATUSES, RunManifest, SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartReceipt, decode_manifest, encode_manifest
+from .results import AcceptedSegment, AllocationObservation, CoreOutcomeRecord, ManifestAttempt, OutcomeReceipt, OUTCOME_STATUSES, RunManifest, SciencePlacementReceipt, SciencePlacementReceiptV2, SciencePlacementReceiptV3, StartReceipt, decode_manifest, encode_manifest
 from .runners import CoreRunEvidence, EvidenceUnavailable, TPENCommand, TPENEvidence
 from .recovery import CoreProfileReference, ProfileCheck, ProfileUnavailable
 from .storage import AttemptFence, DirectoryStore, FenceRejected
@@ -41,7 +41,7 @@ def __getattr__(name: str):
     return value
 
 __all__ = [
-    "__version__", "AcceptedSegment", "AllocationId", "AllocationObservation", "AllocationProgram",
+    "__version__", "AcceptedSegment", "AllocationId", "AllocationObservation", "AllocationProgram", "CoreOutcomeRecord",
     "AttemptId", "AttachedAllocation", "AttemptFence", "BackendJobId", "ConfiguredAllocation", "ConfiguredRun", "CoreRunEvidence", "DirectoryStore", "EvidenceUnavailable", "FenceRejected", "ManifestAttempt", "MaterializedProgram", "OUTCOME_STATUSES", "OutcomeReceipt", "ProcessOutcome",
     "ProgramSpecRef", "ProfileCheck", "ProfileUnavailable", "ReadyGroup", "RunManifest", "SciencePlacementReceipt", "SciencePlacementReceiptV2", "SciencePlacementReceiptV3", "StagedConfig", "StagedHydra", "LocalDispatcher", "ParslDispatcher", "ParslUnavailableError",
     "PreparedInputBundle", "PreparedPythonEnvironment", "SourceScript", "StartReceipt",
