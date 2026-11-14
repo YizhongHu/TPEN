@@ -13,6 +13,11 @@ from typing import Any
 
 from omegaconf import OmegaConf
 
+from tpen.checkpoint.operational_slots import (
+    config_path_fields,
+    non_operational_path_fields,
+)
+
 RESOLVED_CONFIG_HASH_EXCLUSIONS = (
     ("run", "run_id"),
     ("run", "dir"),
@@ -39,84 +44,11 @@ _IDENTITY_RUN_FIELDS = ("root", "run_id", "dir", "layout", "timezone")
 _RUN_INTERPOLATION = re.compile(r"\$\{run(?:\.[^{}]+)?\}")
 _RUN_SENTINEL_MARKER = "__tpen_identity_run_sentinel_7b1e4c93f0a64b9d__"
 
-# Operational slots are schema-bound to the built-in producers.  A user
-# callback/logger with an arbitrary ``output_path`` or ``path`` is not silently
-# removed from a science identity.
-_CALLBACK_OUTPUT_FIELDS = {
-    "tpen.callback.ConfigSnapshot": {"output_path"},
-    "tpen.callback.ResolvedConfigSnapshot": {"output_path"},
-    "tpen.callback.Metadata": {"output_path"},
-    "tpen.callback.Status": {"output_path"},
-    "tpen.callback.Checkpoint": {"output_dir"},
-    "tpen.callback.InitialCheckpoint": {"output_dir"},
-    # ArtifactIndex.path is an optional diagnostics index destination, not a
-    # value consumed by the evaluation model.
-    "tpen.callback.ArtifactIndex": {"path"},
-    # FailureLog.path is an optional diagnostics failure-log destination, not
-    # a value consumed by the evaluation model.
-    "tpen.callback.FailureLog": {"path"},
-    # ParameterActivity.output_path is the run's first-update inventory file,
-    # an observational artifact rather than a science input.
-    "tpen.callback.ParameterActivity": {"output_path"},
-    # RawTrainingBatchRecorder.path is the destination for its immutable
-    # training-history partitions, not a model or sampler input.
-    "tpen.callback.RawTrainingBatchRecorder": {"path"},
-    # The package exports this compatibility alias for the same recorder.
-    "tpen.callback.TrainingBatchRecorder": {"path"},
-    # Producer: ``tpen.callback.RuntimeEquivariance`` writes its diagnostics
-    # below this directory; consumer: ``RuntimeEquivariance.__init__`` and its
-    # artifact writer.  This is an operational destination, not model input.
-    "tpen.callback.RuntimeEquivariance": {"artifact_dir"},
-    # Defining-module targets are also valid Hydra targets for these same
-    # callback implementations; keep their operational slots closed too.
-    "tpen.callback.checkpoint.Checkpoint": {"output_dir"},
-    "tpen.callback.equivariance.RuntimeEquivariance": {"artifact_dir"},
-    "tpen.callback.evaluation.ArtifactIndex": {"path"},
-    "tpen.callback.evaluation.FailureLog": {"path"},
-    "tpen.callback.initial_checkpoint.InitialCheckpoint": {"output_dir"},
-    "tpen.callback.metadata.Metadata": {"output_path"},
-    "tpen.callback.parameter_activity.ParameterActivity": {"output_path"},
-    "tpen.callback.raw_training_batch_recorder.RawTrainingBatchRecorder": {"path"},
-    "tpen.callback.raw_training_batch_recorder.TrainingBatchRecorder": {"path"},
-    "tpen.callback.snapshot.ConfigSnapshot": {"output_path"},
-    "tpen.callback.snapshot.ResolvedConfigSnapshot": {"output_path"},
-    "tpen.callback.status.Status": {"output_path"},
-    # The ``spenn`` study configs use the same callback producers under their
-    # compatibility import prefix.  Keep these exact targets in the closed
-    # table rather than treating arbitrary callback output-like fields as
-    # operational.
-    "spenn.callback.ConfigSnapshot": {"output_path"},
-    "spenn.callback.ResolvedConfigSnapshot": {"output_path"},
-    "spenn.callback.Metadata": {"output_path"},
-    "spenn.callback.Status": {"output_path"},
-    "spenn.callback.Checkpoint": {"output_dir"},
-    "spenn.callback.InitialCheckpoint": {"output_dir"},
-    # Compatibility aliases retain the same operational destinations for the
-    # evaluation diagnostics, parameter inventory, and training history.
-    "spenn.callback.ArtifactIndex": {"path"},
-    "spenn.callback.FailureLog": {"path"},
-    "spenn.callback.ParameterActivity": {"output_path"},
-    "spenn.callback.RawTrainingBatchRecorder": {"path"},
-    "spenn.callback.TrainingBatchRecorder": {"path"},
-    "spenn.callback.RuntimeEquivariance": {"artifact_dir"},
-}
-_LOGGER_PATH_FIELDS = {
-    "tpen.logging.CSV": {"path"},
-    "tpen.logging.JSONL": {"path"},
-    # WandB.dir controls the local dashboard-artifact destination; it is not
-    # part of the science config represented by the logger's metrics.
-    "tpen.logging.WandB": {"dir"},
-    "tpen.logging.csv.CSV": {"path"},
-    "tpen.logging.jsonl.JSONL": {"path"},
-    "tpen.logging.wandb.WandB": {"dir"},
-    "spenn.logging.CSV": {"path"},
-    "spenn.logging.JSONL": {"path"},
-    "spenn.logging.WandB": {"dir"},
-}
-# No callback/logger constructor path-like fields are science inputs on this
-# head. Keep the empty, reason-bearing registry closed so a future exception
-# must be named explicitly instead of being inferred from a parameter name.
-_NON_OPERATIONAL_PATH_FIELDS: dict[str, dict[str, str]] = {}
+# Operational slots are derived from the owner-defined manifest.  A user
+# callback/logger with an arbitrary path-like field is not silently scrubbed.
+_CALLBACK_OUTPUT_FIELDS = config_path_fields("callback")
+_LOGGER_PATH_FIELDS = config_path_fields("logger")
+_NON_OPERATIONAL_PATH_FIELDS = non_operational_path_fields()
 _EVALUATOR_TARGET = "tpen.evaluation.Evaluator"
 
 
