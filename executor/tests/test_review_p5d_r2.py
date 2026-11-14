@@ -166,9 +166,9 @@ def test_r2_t4_interrupted_cleanup_wait_cannot_return_without_reaping(tmp_path, 
     child = Child()
 
     def killpg(pid, sig):
-        # The first SIGKILL is the real, owned-group kill; every call
-        # after that (review P1-1 residual's own terminate-then-probe)
-        # finds nothing left, exactly as a real reaped group would.
+        # The first SIGKILL is the real, owned-group kill; the second is the
+        # owner cleanup's terminate step. Quiescence is observed through
+        # /proc membership, with no signal-0 probe.
         kills.append((pid, sig))
         if len(kills) > 1:
             raise ProcessLookupError()
@@ -179,7 +179,7 @@ def test_r2_t4_interrupted_cleanup_wait_cannot_return_without_reaping(tmp_path, 
         with pytest.raises(KeyboardInterrupt) as observed:
             SubprocessWorker().run(PreparedPythonEnvironment(sys.executable), ("-c", "pass"), cwd=tmp_path, stdout_path=tmp_path / "out", stderr_path=tmp_path / "err")
     assert observed.value is cancellation
-    assert kills == [(child.pid, signal.SIGKILL), (child.pid, signal.SIGKILL), (child.pid, 0)]
+    assert kills == [(child.pid, signal.SIGKILL), (child.pid, signal.SIGKILL)]
     assert child.returncode is not None, ("cleanup returned without confirmed reap", waits, kills)
 
 

@@ -94,6 +94,9 @@ GPU_B = "GPU-12345678-1234-1234-1234-123456789ABD"
 GPU_C = "GPU-12345678-1234-1234-1234-123456789ABE"
 FIXTURES = Path(__file__).parent / "fixtures"
 POSIX_GROUPS = pytest.mark.skipif(not hasattr(os, "killpg"), reason="requires POSIX process groups")
+LINUX_PROC_GROUPS = pytest.mark.skipif(
+    not Path("/proc/self/stat").is_file(), reason="requires Linux /proc process-group visibility",
+)
 LINUX_CHILD = pytest.mark.skipif(
     not sys.platform.startswith("linux") or not hasattr(os, "sched_setaffinity"),
     reason="requires the Linux child affinity contract",
@@ -2210,7 +2213,7 @@ def test_checked_in_v3_reader_fixture_is_executor_valid() -> None:
 # -------------------------------------------- B2: science quiescence gate
 
 
-@POSIX_GROUPS
+@LINUX_PROC_GROUPS
 def test_group_quiescence_confirmed_releases_quarantine_before_next_admission(
     tmp_path: Path, pid_files: list[Path],
 ) -> None:

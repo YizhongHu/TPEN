@@ -72,7 +72,8 @@ def _proc_group_has_members(pgid: int, leader_pid: int) -> bool | None:
 
     ``None`` means that ``/proc`` was unavailable or an entry could not be
     read or parsed reliably. A process that vanishes between directory scan
-    and read is harmless and is ignored.
+    and read is harmless and is ignored. The scan assumes same-UID descendants
+    are visible in the mounted ``/proc`` (including its ``hidepid`` scope).
     """
 
     proc_root = Path("/proc")
@@ -115,7 +116,8 @@ def _group_quiescent(
     P1-1 residual -- a same-group descendant the leader spawned and left
     behind must be terminated, not merely observed), then scans ``/proc``
     for non-leader members within the bound. The pinned zombie leader is
-    deliberately excluded from that scan.
+    deliberately excluded from that scan. Without Linux ``/proc`` visibility,
+    the result is conservatively ``False`` and quarantine is retained.
     """
 
     if leader_reaped and (spawned_ticks is None or _proc_start_ticks(pid) != spawned_ticks):

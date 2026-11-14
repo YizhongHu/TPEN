@@ -54,9 +54,9 @@ def test_r3_t1_repeated_cleanup_interruptions_are_visible_on_original_exception(
     assert observed.value is original
     assert child.returncode == -9
     assert waits == [0, 1, 2, 3, 4]
-    # The first SIGKILL is the owned-group kill; the rest is review P1-1
-    # residual's own terminate-then-probe, finding nothing left.
-    assert kills == [(child.pid, signal.SIGKILL), (child.pid, signal.SIGKILL), (child.pid, 0)]
+    # Both calls are owner-side SIGKILLs: the initial interruption cleanup
+    # and the cleanup quiescence step. Membership observation is signal-free.
+    assert kills == [(child.pid, signal.SIGKILL), (child.pid, signal.SIGKILL)]
     notes = "\n".join(getattr(original, "__notes__", ()))
     for error in later:
         assert type(error).__name__ in notes and str(error) in notes, (error, notes)
@@ -124,6 +124,6 @@ def test_r3_t3_already_reaped_leader_does_not_require_another_wait(tmp_path, mon
     assert observed.value is original
     assert child.returncode == -9
     assert len(waits) == 1
-    # The owned-group kill, then review P1-1 residual's own
-    # terminate-then-probe (both find nothing left, like this fake).
-    assert kills == [(child.pid, signal.SIGKILL), (child.pid, signal.SIGKILL), (child.pid, 0)]
+    # The owned-group kill and the cleanup quiescence step are both SIGKILL;
+    # membership observation is signal-free.
+    assert kills == [(child.pid, signal.SIGKILL), (child.pid, signal.SIGKILL)]

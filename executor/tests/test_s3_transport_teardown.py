@@ -578,6 +578,7 @@ def test_dispatcher_terminal_remote_failure_never_refills_slot_or_publishes_comp
 # ------------------------------------------------------- P1-1 residual
 
 
+@pytest.mark.skipif(not Path("/proc/self/stat").is_file(), reason="requires Linux /proc process-group visibility")
 def test_group_quiescent_terminates_a_surviving_descendant(tmp_path: Path) -> None:
     """P1-1 residual killer: a same-group descendant that outlives its
     leader is TERMINATED by the worker's own group probe, not merely
@@ -603,17 +604,26 @@ def test_group_quiescent_terminates_a_surviving_descendant(tmp_path: Path) -> No
         os.kill(descendant_pid, 0)
 
 
-@pytest.mark.skipif(not Path("/proc/self/stat").is_file(), reason="Linux /proc process statistics are required")
-def test_real_normal_exit_group_quiescence_is_fast(tmp_path: Path) -> None:
+@pytest.mark.skipif(not Path("/proc/self/stat").is_file(), reason="requires Linux /proc process-group visibility")
+def test_real_normal_exit_group_quiescence_is_fast(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     request, _parts = _request(tmp_path, timeout=5)
     output, _core, stdout, stderr, _ev_stdout, _ev_stderr = request.paths()
-    started = time.monotonic()
+    durations = []
+    real_group_quiescent = workers_module._group_quiescent
+
+    def timed_group_quiescent(*args, **kwargs):
+        started = time.monotonic()
+        result = real_group_quiescent(*args, **kwargs)
+        durations.append(time.monotonic() - started)
+        return result
+
+    monkeypatch.setattr(workers_module, "_group_quiescent", timed_group_quiescent)
     outcome = SubprocessWorker().run(
         request.environment, ("-c", "pass"), cwd=output,
         stdout_path=stdout, stderr_path=stderr, timeout=5,
     )
     assert outcome.group_reaped is True
-    assert time.monotonic() - started < 1.0
+    assert durations and durations[0] < 0.5
 
 
 @pytest.mark.parametrize(
@@ -621,8 +631,11 @@ def test_real_normal_exit_group_quiescence_is_fast(tmp_path: Path) -> None:
     [
         ("123 (worker with spaces) S 1 77 0 0", 77),
         ("123 (worker ) with spaces) S 1 88 0 0", 88),
+        ("123 S 1", None),
+        ("123 (worker) S 1", None),
+        ("123 (worker) S 1 nope", None),
     ],
-    ids=["spaces", "right-paren"],
+    ids=["spaces", "right-paren", "missing-comm", "short-suffix", "non-int-pgrp"],
 )
 def test_proc_group_parser_handles_comm_text(stat_text: str, expected: int) -> None:
     assert workers_module._proc_group_from_stat(stat_text) == expected
@@ -641,8 +654,6 @@ def test_group_quiescence_kills_and_probes_before_leader_reap(monkeypatch: pytes
     def killpg(observed_pid, sig):
         assert observed_pid == pid
         events.append(("killpg", sig))
-        if sig == 0:
-            raise ProcessLookupError()
 
     monkeypatch.setattr(os, "waitid", waitid)
     monkeypatch.setattr(os, "killpg", killpg)
@@ -652,6 +663,15 @@ def test_group_quiescence_kills_and_probes_before_leader_reap(monkeypatch: pytes
     assert events == ["waitid", ("killpg", signal.SIGKILL)]
 
 
+def test_group_quiescence_keeps_quarantine_when_proc_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    signals = []
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(workers_module, "_proc_group_has_members", lambda pgid, leader_pid: None)
+    assert workers_module._group_quiescent(1234) is False
+    assert signals == [(1234, signal.SIGKILL)]
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").is_file(), reason="requires Linux /proc process-group visibility")
 def test_normal_exit_keeps_quiescence_before_reap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Normal completion must not signal a PGID after its leader is reaped."""
     events = []
