@@ -139,7 +139,7 @@ store.record_successor_admission(fence, request, "b" * 64)
 
     payload["attempts"][0].pop("core_outcome")
     manifest.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ManifestRefusal, match="requires core_outcome"):
+    with pytest.raises(ManifestRefusal, match="^successor_admission requires core_outcome$"):
         read(manifest)
 
     payload["attempts"][0]["core_outcome"] = original_core_outcome

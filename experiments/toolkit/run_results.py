@@ -1245,7 +1245,11 @@ def _attempt(value: Any, group_digest: str) -> dict[str, Any]:
         if actual not in allowed:
             raise ManifestRefusal("malformed-record", "manifest attempt keys differ")
         record = dict(_fields(value, actual, "manifest attempt"))
-        if record["core_outcome"] is None:
+        if "successor_admission" in record and (
+            "core_outcome" not in record or record["core_outcome"] is None
+        ):
+            raise ManifestRefusal("malformed-record", "successor_admission requires core_outcome")
+        if "core_outcome" not in record or record["core_outcome"] is None:
             raise ManifestRefusal("malformed-record", "manifest-attempt-v2 requires core_outcome")
     else:
         raise ManifestRefusal("unknown-schema", "manifest attempt schema is unsupported")
@@ -1283,8 +1287,6 @@ def _attempt(value: Any, group_digest: str) -> dict[str, Any]:
         raise ManifestRefusal("malformed-record", "planned_yield core outcome cannot have a completed operational receipt")
     record["core_outcome"] = core_outcome
     if "successor_admission" in record:
-        if core_outcome is None:
-            raise ManifestRefusal("malformed-record", "successor_admission requires core_outcome")
         record["successor_admission"] = _successor_admission(record["successor_admission"], record)
     placement = None if "placement_receipt" not in record or record["placement_receipt"] is None else _placement_receipt(record["placement_receipt"], record, start, group_digest)
     record["placement_receipt"] = placement
