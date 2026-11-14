@@ -115,10 +115,11 @@ def test_unknown_and_unsourced_references_are_refused(tmp_path: Path) -> None:
 
 
 def test_preserved_legacy_collectors_are_unchanged() -> None:
-    import hashlib
     import subprocess
-    for path in ("experiments/atomistic/h-v2/collect.py", "experiments/atomistic/he-v1/collect.py"):
-        expected = subprocess.check_output(["git", "rev-parse", f"f0704811:{path}"], text=True).strip()
-        actual = hashlib.sha1(Path(path).read_bytes()).hexdigest()
-        assert expected  # the immutable base blob is present in the exact-head clone
-        assert actual == hashlib.sha1(subprocess.check_output(["git", "show", expected])).hexdigest()
+    expected_blobs = {
+        "experiments/atomistic/h-v2/collect.py": "005bee8a144c7e0ae74338080ae53647a2c12078",
+        "experiments/atomistic/he-v1/collect.py": "8c6f66907949c9a8b116290792753921a1eac222",
+    }
+    for path, expected in expected_blobs.items():
+        actual = subprocess.check_output(["git", "hash-object", path], text=True).strip()
+        assert actual == expected
