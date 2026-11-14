@@ -22,8 +22,19 @@ MANAGER_RULING = "Paseo msg c92c3a08 (2026-11-14): SR/CAD/DOC"
 
 _COORDINATE_SOURCES = {
     "stage": {"citation": "consolidated design sections 2.8 stage table; optimizer_grid_authority.json", "evidence_class": "RELAYED"},
-    "optimizer": {"citation": "consolidated design section 2.7; optimizer_grid_authority.json", "evidence_class": "RELAYED"},
-    "context": {"citation": "consolidated design section 2.8; optimizer_grid_authority.json", "evidence_class": "RELAYED"},
+    "optimizer": {
+        "citation": "consolidated design section 2.7; optimizer_grid_authority.json",
+        "evidence_class": ["RELAYED", "INFERRED"],
+        "evidence_by_component": {"roster": "RELAYED", "tuning_levels": "INFERRED"},
+    },
+    "context": {
+        "citation": "consolidated design section 2.8; optimizer_grid_authority.json",
+        "evidence_class": "INFERRED",
+    },
+    "factorial_design": {
+        "citation": "consolidated design section 2.8; optimizer_grid_authority.json",
+        "evidence_class": "INFERRED",
+    },
     "seed": {"citation": "operator-relayed eight seeds in consolidated design section 2.8; labels implemented in stage_coordinate.seed_labels", "evidence_class": ["RELAYED", "INFERRED"]},
     "horizon": {"citation": "committed stage_coordinate_authority.json payload.updates; consolidated design section 2.8", "evidence_class": "RELAYED"},
     "walkers": {"citation": "operator ruling 2026-10-24, clause 2: 4096 stays the literal control for later scientific stages", "evidence_class": "RELAYED"},
@@ -214,13 +225,19 @@ def find_row(manifest: Mapping[str, Any], row_id: str) -> Mapping[str, Any]:
 
 
 def validate_live_row(manifest: Mapping[str, Any], row_id: str) -> Mapping[str, Any]:
-    """Re-materialize O1 and require the selected row's content identity to remain live."""
+    """Require the supplied file to equal a fresh live-authority render."""
 
     row = find_row(manifest, row_id)
-    live = {candidate["row_id"]: candidate for candidate in _materialized_rows()["rows"]}
-    current = live.get(row_id)
-    if current is None or dict(current) != dict(row):
-        raise ScanManifestError("manifest row identity is stale or tampered")
+    fresh = render_manifest()
+    if dict(manifest) != fresh:
+        differing = next(
+            (key for key in set(manifest) | set(fresh) if manifest.get(key) != fresh.get(key)),
+            "content",
+        )
+        raise ScanManifestError(
+            f"manifest {differing} is stale or tampered for row {row_id!r}"
+        )
+    current = find_row(fresh, row_id)
     if row.get("status") != "available":
         reason = row.get("unavailable_reason", "method not admitted by HI_METHOD_ROSTER")
         raise ScanManifestError(f"manifest row {row_id!r} is unavailable: {reason}")

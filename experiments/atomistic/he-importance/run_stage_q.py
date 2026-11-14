@@ -1506,15 +1506,8 @@ def execute(
             )
         manifest = scan_manifest.load_manifest(Path(manifest_path).expanduser().resolve())
         row = scan_manifest.validate_live_row(manifest, str(row_id))
-        cell = next(
-            cell for cell in manifest["cells"] if cell["cell_id"] == row["cell_id"]
-        )
-        levels = cell["optimizer"]["levels"]
         args.stage = "O1"
         args.context = row["context"]
-        args.optimizer = "adam"
-        args.lr = levels["lr"]
-        args.beta2 = levels["beta2"]
         args.seed_label = row["seed_label"]
         args.walkers = manifest["walkers"]
     else:
@@ -1542,16 +1535,31 @@ def execute(
             availability=optimizer_grid.roster_availability(),
             stages=(args.stage,),
         )
+    live_manifest_cell = None
+    if manifest_path is not None:
+        live_manifest_cell = next(
+            (candidate for candidate in cells if candidate.content_hash == str(row_id)),
+            None,
+        )
+        if live_manifest_cell is None:
+            raise scan_manifest.ScanManifestError(
+                f"live materialized cell for manifest row {row_id!r} is unavailable"
+            )
+        live_levels = live_manifest_cell.manifest["scientific_identity"]["optimizer"]["levels"]
     selection = select_cell(
         cells,
         stage=args.stage,
         context=getattr(args, "context", DEFAULT_CONTEXT),
-        optimizer=args.optimizer,
-        lr=getattr(args, "lr", 0.005),
-        beta2=getattr(args, "beta2", 0.999),
+        optimizer=("adam" if manifest_path is not None else args.optimizer),
+        lr=live_levels["lr"] if manifest_path is not None else getattr(args, "lr", 0.005),
+        beta2=live_levels["beta2"] if manifest_path is not None else getattr(args, "beta2", 0.999),
         seed_label=args.seed_label,
         literal_configuration=getattr(args, "literal_configuration", None),
     )
+    if manifest_path is not None and selection.cell.content_hash != str(row_id):
+        raise scan_manifest.ScanManifestError(
+            f"live materialized cell hash {selection.cell.content_hash!r} does not match row {row_id!r}"
+        )
     declared_walkers = stage_coordinate.sampler_override_values(args.stage, "n_walkers")
     if args.walkers == stage_coordinate.COMMITTED_WALKERS:
         cell = selection.cell
