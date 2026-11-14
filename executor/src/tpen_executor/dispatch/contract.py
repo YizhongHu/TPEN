@@ -974,7 +974,13 @@ class DispatcherContract:
         request: Mapping[str, Any],
         core_acceptance_digest: str,
     ) -> SuccessorAdmissionRecord:
-        """Persist a caller-confirmed core admission without launching work."""
+        """Persist a caller-confirmed core admission without launching work.
+
+        ``core_acceptance_digest`` identifies core's accepted
+        ``OperationalRestoreRequest``.  The dispatcher/integration caller
+        supplies that opaque digest and is responsible for its provenance;
+        the executor does not import ``tpen`` to verify the core decision.
+        """
 
         if not hasattr(lifecycle, "store") or not callable(getattr(lifecycle.store, "record_successor_admission", None)):
             raise TypeError("lifecycle must expose successor admission storage")

@@ -259,9 +259,13 @@ class SuccessorAdmissionRecord:
     """One closed, write-once executor successor-admission ledger record.
 
     The executor records the canonical digest of the request that the caller
-    presented to core.  The caller's core acceptance is intentionally an
-    opaque acknowledgement at this boundary: importing or reimplementing the
-    core decision here would violate the executor/core ownership split.
+    presented to core and the caller-supplied digest of core's accepted
+    ``OperationalRestoreRequest``.  The acceptance is intentionally opaque at
+    this boundary: importing or reimplementing the core decision here would
+    violate the executor/core ownership split.  The caller (the dispatcher or
+    integration owner) is responsible for supplying a digest that actually
+    identifies an accepted request; the executor cannot verify that claim
+    without importing ``tpen``.
     """
 
     schema: ClassVar[str] = "tpen-executor/successor-admission-v1"
@@ -271,6 +275,7 @@ class SuccessorAdmissionRecord:
     successor_task_id: str
     successor_attempt_id: AttemptId
     request_digest: str
+    core_acceptance_digest: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "predecessor_task_id", text(self.predecessor_task_id, "predecessor_task_id"))
@@ -279,6 +284,7 @@ class SuccessorAdmissionRecord:
         object.__setattr__(self, "successor_task_id", text(self.successor_task_id, "successor_task_id"))
         _identity(self.successor_attempt_id, AttemptId, "successor_attempt_id")
         object.__setattr__(self, "request_digest", sha256_text(self.request_digest, "request_digest"))
+        object.__setattr__(self, "core_acceptance_digest", sha256_text(self.core_acceptance_digest, "core_acceptance_digest"))
 
     @property
     def predecessor(self) -> dict[str, Any]:
@@ -302,6 +308,7 @@ class SuccessorAdmissionRecord:
             "predecessor": self.predecessor,
             "successor": self.successor,
             "request_digest": self.request_digest,
+            "core_acceptance_digest": self.core_acceptance_digest,
         }
 
     def encode(self) -> bytes:
@@ -309,13 +316,13 @@ class SuccessorAdmissionRecord:
 
     @classmethod
     def from_mapping(cls, data: Any) -> "SuccessorAdmissionRecord":
-        fields(data, {"schema", "predecessor", "successor", "request_digest"}, cls.schema, cls.__name__)
+        fields(data, {"schema", "predecessor", "successor", "request_digest", "core_acceptance_digest"}, cls.schema, cls.__name__)
         if not isinstance(data["predecessor"], Mapping) or set(data["predecessor"]) != {"task_id", "attempt_id", "content_id"}:
             raise ValueError("SuccessorAdmissionRecord.predecessor keys differ")
         if not isinstance(data["successor"], Mapping) or set(data["successor"]) != {"task_id", "attempt_id"}:
             raise ValueError("SuccessorAdmissionRecord.successor keys differ")
-        if any(type(data[key]) is not str for key in ("request_digest",)):
-            raise TypeError("successor admission request_digest must be text")
+        if any(type(data[key]) is not str for key in ("request_digest", "core_acceptance_digest")):
+            raise TypeError("successor admission digests must be text")
         if any(type(data["predecessor"][key]) is not str for key in ("task_id", "attempt_id", "content_id")):
             raise TypeError("successor admission predecessor fields must be text")
         if any(type(data["successor"][key]) is not str for key in ("task_id", "attempt_id")):
@@ -327,6 +334,7 @@ class SuccessorAdmissionRecord:
             data["successor"]["task_id"],
             AttemptId(data["successor"]["attempt_id"]),
             data["request_digest"],
+            data["core_acceptance_digest"],
         )
 
     @classmethod

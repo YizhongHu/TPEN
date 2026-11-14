@@ -85,6 +85,70 @@ destination.joinpath("manifest.json").write_bytes(store.manifest(group).encode()
         read(manifest)
 
 
+def test_real_executor_successor_admission_manifest_round_trips(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    code = '''import json
+import sys
+from pathlib import Path
+from tpen_executor._codec import digest
+from tpen_executor.allocations import ConfiguredAllocation
+from tpen_executor.contracts import AllocationId, AttemptId, BackendJobId, ProgramSpecRef, ReadyGroup, TaskSpec
+from tpen_executor.runners import CoreRunEvidence
+from tpen_executor.storage import DirectoryStore
+
+destination = Path(sys.argv[1])
+fixture = Path(sys.argv[2])
+program = ProgramSpecRef({}, digest({}))
+group = ReadyGroup("g", (TaskSpec("task", "task", program, digest("task"), 1, "steps"),), digest("group"))
+store = DirectoryStore(destination / "store")
+fence = store.begin_attempt(
+    group,
+    "task",
+    ConfiguredAllocation(AllocationId("allocation"), BackendJobId("job"), {}),
+    "2026-11-14T00:00:00Z",
+)
+core_dir = Path(fence.output_dir) / "core"
+core_dir.mkdir()
+payload = json.loads(fixture.read_text(encoding="utf-8"))
+payload["run_dir"] = str(core_dir)
+checkpoint_dir = str(core_dir / "checkpoints" / "step_000002")
+payload["checkpoint"]["checkpoint_dir"] = checkpoint_dir
+payload["checkpoint_ref"]["checkpoint_dir"] = checkpoint_dir
+store.finish_attempt(fence, "failed", "2026-11-14T00:01:00Z")
+store.record_core_outcome(fence, CoreRunEvidence.from_mapping(payload))
+request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+store.record_successor_admission(fence, request, "b" * 64)
+manifest.write_bytes(store.manifest(group).encode())
+'''
+    written = _executor(
+        code,
+        tmp_path,
+        ROOT / "tests" / "contracts" / "fixtures" / "core-run-evidence-v3-planned-yield.json",
+    )
+    assert written.returncode == 0, written.stderr
+
+    result = read(manifest)
+    assert not result.chains
+    assert len(result.preserved_attempts) == 1
+    assert result.preserved_attempts[0].core_outcome is not None
+
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    original_core_outcome = payload["attempts"][0]["core_outcome"]
+    admission = payload["attempts"][0]["successor_admission"]
+    assert admission["core_acceptance_digest"] == "b" * 64
+
+    payload["attempts"][0].pop("core_outcome")
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestRefusal, match="requires core_outcome"):
+        read(manifest)
+
+    payload["attempts"][0]["core_outcome"] = original_core_outcome
+    payload["attempts"][0]["successor_admission"]["predecessor"]["task_id"] = "foreign"
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ManifestRefusal, match="successor admission predecessor"):
+        read(manifest)
+
+
 def _placement_receipt(output_dir: str = "/runs/group-1/task-a/attempt-1") -> dict[str, object]:
     """Return a valid S2b-1 CPU placement receipt for the checked-in fixture."""
 

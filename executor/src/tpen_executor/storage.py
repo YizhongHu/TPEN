@@ -115,6 +115,7 @@ _SAFE_TASK_ID = re.compile(r"[A-Za-z0-9._:-]+\Z")
 _TASK_LOCK = ".task.lock"
 _SUCCESSOR_ADMISSIONS = "successor-admissions"
 _SUCCESSOR_ADMISSION_FILENAME = "successor-admission.json"
+_SUCCESSOR_ADMISSION_TEMP_PREFIX = ".tmp-admission-"
 _SUCCESSOR_ADMISSION_SCHEMA = "tpen.execution/successor-admission-request-v1"
 
 
@@ -207,11 +208,16 @@ def _task_lock(path: str):
         os.close(fd)
 
 
-def _write_new(path: str, payload: bytes) -> None:
+def _write_new(path: str, payload: bytes, *, temporary_dir: str | None = None) -> None:
     """Write a new file durably, refusing replacement of an existing file."""
     parent = os.path.dirname(path)
     _require_directory(parent, "receipt parent")
-    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=parent)
+    staging_dir = parent if temporary_dir is None else _lexical(temporary_dir)
+    _require_directory(staging_dir, "receipt staging directory")
+    fd, temporary = tempfile.mkstemp(
+        prefix=_SUCCESSOR_ADMISSION_TEMP_PREFIX if temporary_dir is not None else ".tmp-",
+        dir=staging_dir,
+    )
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(payload)
@@ -700,11 +706,12 @@ class DirectoryStore:
     ) -> SuccessorAdmissionRecord:
         """Record a core-accepted successor request exactly once.
 
-        ``core_acceptance_digest`` is an opaque digest supplied by the caller
-        after core's admission decision (for example, a digest of an
-        ``OperationalRestoreRequest``).  It is deliberately not interpreted
-        or persisted as a second wire field; ``request_digest`` is the
-        canonical digest of the closed admission request itself.
+        ``core_acceptance_digest`` is the caller-supplied SHA-256 digest of
+        core's accepted ``OperationalRestoreRequest``.  It is deliberately
+        opaque here: the dispatcher or integration owner is responsible for
+        obtaining and authenticating that acceptance, while the executor
+        cannot verify it without importing ``tpen``.  The digest is persisted
+        and participates in replay/fork comparison alongside ``request_digest``.
         """
 
         if type(core_acceptance_digest) is not str:
@@ -736,6 +743,7 @@ class DirectoryStore:
                 successor["task_id"],
                 AttemptId(successor["attempt_id"]),
                 request_digest,
+                core_acceptance_digest,
             )
             ledger_dir = _lexical(os.path.join(task_dir, _SUCCESSOR_ADMISSIONS))
             _ensure_directory(ledger_dir)
@@ -748,7 +756,11 @@ class DirectoryStore:
             predecessor_dir = _lexical(os.path.join(ledger_dir, start.attempt_id.value))
             _ensure_directory(predecessor_dir)
             try:
-                _write_new(os.path.join(predecessor_dir, _SUCCESSOR_ADMISSION_FILENAME), record.encode())
+                _write_new(
+                    os.path.join(predecessor_dir, _SUCCESSOR_ADMISSION_FILENAME),
+                    record.encode(),
+                    temporary_dir=ledger_dir,
+                )
             except FileExistsError as error:
                 raise AdmissionFork("fork: successor admission ledger already exists") from error
             return record
@@ -764,6 +776,8 @@ class DirectoryStore:
         records: list[SuccessorAdmissionRecord] = []
         seen: set[AttemptId] = set()
         for predecessor_attempt_id in sorted(os.listdir(root)):
+            if predecessor_attempt_id.startswith(_SUCCESSOR_ADMISSION_TEMP_PREFIX):
+                continue
             predecessor_dir = _lexical(os.path.join(root, predecessor_attempt_id))
             _require_directory(predecessor_dir, "successor admission predecessor directory", ValueError)
             if predecessor_attempt_id in {".", ".."}:

@@ -47,11 +47,44 @@ def test_identical_successor_admission_replay_is_idempotent_and_fork_is_rejected
     store, _group, fence = _planned_attempt(tmp_path)
     request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
     first = store.record_successor_admission(fence, request, "b" * 64)
-    assert store.record_successor_admission(fence, request, "c" * 64) == first
+    assert store.record_successor_admission(fence, request, "b" * 64) == first
+    with pytest.raises(AdmissionFork, match="fork"):
+        store.record_successor_admission(fence, request, "c" * 64)
 
     fork_request = store.build_successor_admission_request(fence, AttemptId("successor-2"), "a" * 64, 10)
     with pytest.raises(AdmissionFork, match="fork"):
         store.record_successor_admission(fence, fork_request, "d" * 64)
+
+
+@pytest.mark.parametrize("acceptance", [None, "", "not-a-sha256-digest"])
+def test_missing_or_invalid_core_acceptance_writes_no_ledger(tmp_path: Path, acceptance: object) -> None:
+    store, _group, fence = _planned_attempt(tmp_path)
+    request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    with pytest.raises((TypeError, ValueError)):
+        store.record_successor_admission(fence, request, acceptance)  # type: ignore[arg-type]
+    assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
+
+
+def test_omitted_core_acceptance_writes_no_ledger(tmp_path: Path) -> None:
+    store, _group, fence = _planned_attempt(tmp_path)
+    request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    with pytest.raises(TypeError):
+        store.record_successor_admission(fence, request)  # type: ignore[call-arg]
+    assert not (Path(fence.output_dir).parent / "successor-admissions").exists()
+
+
+def test_manifest_ignores_leftover_admission_temp_but_rejects_unknown_extra(tmp_path: Path) -> None:
+    store, group, fence = _planned_attempt(tmp_path)
+    request = store.build_successor_admission_request(fence, AttemptId("successor-1"), "a" * 64, 10)
+    store.record_successor_admission(fence, request, "b" * 64)
+    ledger_dir = Path(fence.output_dir).parent / "successor-admissions"
+    (ledger_dir / ".tmp-admission-crash-leftover").write_bytes(b"partial")
+    assert store.manifest(group).attempts[0].successor_admission is not None
+
+    predecessor_dir = ledger_dir / fence.attempt_id.value
+    (predecessor_dir / "unexpected-extra").write_bytes(b"unexpected")
+    with pytest.raises(ValueError, match="unexpected entries"):
+        store.manifest(group)
 
 
 def test_manifest_attempt_v2_round_trips_core_only_and_core_plus_admission(tmp_path: Path) -> None:
