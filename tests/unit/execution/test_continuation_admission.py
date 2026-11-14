@@ -174,6 +174,14 @@ def test_missing_catalog_or_receipt_is_missing_publication(tmp_path: Path) -> No
     assert result.refusal.code is AdmissionRefusalCode.MISSING_PUBLICATION
 
 
+def test_missing_receipt_is_missing_publication(tmp_path: Path) -> None:
+    ref = _checkpoint(tmp_path)
+    (ref.checkpoint_dir.parent / "publication_receipts.jsonl").unlink()
+    result = select_successor_admission(_intent(), _request(ref))
+    assert result.refusal is not None
+    assert result.refusal.code is AdmissionRefusalCode.MISSING_PUBLICATION
+
+
 def test_latest_pointer_without_catalog_is_not_publication(tmp_path: Path) -> None:
     ref = _checkpoint(tmp_path)
     (ref.checkpoint_dir.parent / "publications.jsonl").unlink()
