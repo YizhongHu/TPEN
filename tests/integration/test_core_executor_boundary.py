@@ -552,9 +552,17 @@ def test_core_executor_two_leaf_round_trip_and_refusal_controls(
     successor_resolved = successor_root / "resolved_config.yaml"
     assert predecessor_resolved.read_bytes() == successor_resolved.read_bytes(), "node=logical-config-identity"
     assert predecessor.resolved_config_identity == successor.resolved_config_identity, "node=logical-config-identity"
-    assert OmegaConf.load(predecessor_resolved).trainer.max_steps == 3
-    assert OmegaConf.load(successor_resolved).trainer.max_steps == 3
-    assert not Path(predecessor_cfg.run.dir).exists()
+    predecessor_resolved_cfg = OmegaConf.load(predecessor_resolved)
+    successor_resolved_cfg = OmegaConf.load(successor_resolved)
+    assert predecessor_resolved_cfg.trainer.max_steps == 3
+    assert successor_resolved_cfg.trainer.max_steps == 3
+    logical_run_dir = predecessor_resolved_cfg.run.dir
+    assert isinstance(logical_run_dir, str) and logical_run_dir
+    assert logical_run_dir == successor_resolved_cfg.run.dir
+    logical_run_path = Path(logical_run_dir)
+    assert not logical_run_path.exists()
+    assert logical_run_path != predecessor_core
+    assert logical_run_path != successor_root
     assert Path(predecessor.run_dir).is_relative_to(predecessor_core)
     assert Path(successor.run_dir).is_relative_to(successor_root)
     assert Path(predecessor.checkpoint["checkpoint_dir"]).is_relative_to(predecessor_core)
