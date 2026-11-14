@@ -320,6 +320,43 @@ def test_rehashed_frozen_manifest_metadata_drift_refuses_before_output_or_model(
     assert not output_root.exists()
 
 
+def test_rendered_provenance_distinguishes_relayed_roster_from_inferred_design() -> None:
+    """Rendered provenance must preserve the evidence class of each authority."""
+
+    rendered = manifest_module.render_manifest()
+    sources = rendered["provenance"]["coordinate_sources"]
+    assert set(sources["optimizer"]["evidence_class"]) == {"RELAYED", "INFERRED"}
+    assert sources["context"]["evidence_class"] == "INFERRED"
+
+
+def test_operational_cadence_changes_packet_not_row_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changing the operational cadence must not change the frozen row hash."""
+
+    runner = _runner()
+    cells = runner.stage_coordinate.materialize_intended_configurations(
+        tmp_path / "cells",
+        availability=runner.optimizer_grid.roster_availability(),
+        stages=("O1",),
+    )
+    cell = next(
+        candidate
+        for candidate in cells
+        if candidate.manifest["scientific_identity"]["context"]["name"] == "O-raw"
+        and candidate.manifest["scientific_identity"]["optimizer"]["method"] == "adam"
+        and candidate.manifest["seed_identity"]["label"] == 820001
+    )
+    before = runner._training_packet(cell)
+    monkeypatch.setattr(runner, "CHECKPOINT_EVERY_N_UPDATES", 777)
+    after = runner._training_packet(cell)
+
+    assert before.cell.content_hash == after.cell.content_hash == cell.content_hash
+    assert before.checkpoint_cadence.every_n_updates == 1_000
+    assert after.checkpoint_cadence.every_n_updates == 777
+    assert before.checkpoint_cadence.selected_updates != after.checkpoint_cadence.selected_updates
+
+
 def test_every_admitted_manifest_row_consumes_materialized_w4096(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
