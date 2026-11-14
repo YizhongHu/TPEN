@@ -233,10 +233,10 @@ def validate_gateway_binding(*, binding: str, config: str, overrides: list[str],
     override_map: dict[str, str] = {}
     for override in overrides:
         key, separator, value = override.partition("=")
-        if not separator or not key:
-            raise ProtocolError(f"invalid gateway override: {override!r}")
         if key.startswith(("+", "~")):
             raise ProtocolError("prefixed gateway overrides are not allowed")
+        if not separator or not key:
+            raise ProtocolError(f"invalid gateway override: {override!r}")
         if key in override_map:
             raise ProtocolError(f"duplicate gateway override: {key}")
         override_map[key] = value
