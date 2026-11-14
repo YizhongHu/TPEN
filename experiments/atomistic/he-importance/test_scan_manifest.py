@@ -250,13 +250,15 @@ def test_manifest_positive_consumes_same_runner_limbs_and_horizon(
     assert runner.execute(flag_args) == 0
     flag_report_json = json.loads(capsys.readouterr().out)
     assert manifest_report_json["walkers"] == 4096
+    assert manifest_report_json["selection"]["selected"]["content_hash"] == row["row_id"]
+    assert manifest_report_json["train_packet"]["content_hash"] == row["row_id"]
     assert manifest_report_json["resolved_config"]["runner"]["trainer"]["max_steps"] == 50000
     assert manifest_report_json["resolved_config"]["runner"]["sampler"] == flag_report_json["resolved_config"]["runner"]["sampler"]
     assert manifest_report_json["resolved_config"]["runner"]["trainer"] == flag_report_json["resolved_config"]["runner"]["trainer"]
 
 
 def test_rehashed_referenced_cell_optimizer_drift_refuses_before_output_or_model(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A row must not authorize a different optimizer cell under the same cell id."""
 
@@ -277,21 +279,16 @@ def test_rehashed_referenced_cell_optimizer_drift_refuses_before_output_or_model
     path.write_text(json.dumps(forged), encoding="utf-8")
     output_root = tmp_path / "forged-cell-out"
 
-    try:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        runner.train_config,
+        "resolve_train_config",
+        lambda *_args, **_kwargs: calls.append("resolve"),
+    )
+    with pytest.raises(runner.scan_manifest.ScanManifestError) as excinfo:
         runner.execute(_args(runner, path, row["row_id"], output_root))
-    except runner.scan_manifest.ScanManifestError as error:
-        assert "stale or tampered" in str(error)
-    else:
-        report = json.loads(capsys.readouterr().out)
-        pytest.fail(
-            "rehashed cell drift was accepted: "
-            f"requested_row_id={row['row_id']} "
-            f"requested_cell_id={row['cell_id']} "
-            f"selected_content_hash={report['train_packet']['content_hash']} "
-            f"selected_optimizer={report['selection']['selected']['optimizer']} "
-            f"requested_lr={original_lr!r} forged_lr={levels['lr']!r} "
-            f"consumed_lr={report['resolved_config']['optimizer']['lr']!r}"
-        )
+    assert row["row_id"] in str(excinfo.value)
+    assert calls == []
     assert not output_root.exists()
 
 
@@ -299,6 +296,7 @@ def test_rehashed_referenced_cell_optimizer_drift_refuses_before_output_or_model
 def test_rehashed_frozen_manifest_metadata_drift_refuses_before_output_or_model(
     tmp_path: Path,
     mutation: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Frozen scientific metadata must be authenticated beyond the selected row."""
 
@@ -315,10 +313,17 @@ def test_rehashed_frozen_manifest_metadata_drift_refuses_before_output_or_model(
     path.write_text(json.dumps(forged), encoding="utf-8")
     output_root = tmp_path / f"forged-{mutation}-out"
 
+    calls: list[str] = []
+    monkeypatch.setattr(
+        runner.train_config,
+        "resolve_train_config",
+        lambda *_args, **_kwargs: calls.append("resolve"),
+    )
     with pytest.raises(runner.scan_manifest.ScanManifestError) as excinfo:
         runner.execute(_args(runner, path, row["row_id"], output_root))
     assert not output_root.exists()
     assert row["row_id"] in str(excinfo.value)
+    assert calls == []
 
 
 def test_rendered_provenance_distinguishes_relayed_roster_from_inferred_design() -> None:
@@ -383,18 +388,27 @@ def test_every_admitted_manifest_row_consumes_materialized_w4096(
 
     admitted_rows = [row for row in manifest["rows"] if row["status"] == "available"]
     assert len(admitted_rows) == 128
+    materialized_checks = 0
     for row in admitted_rows:
-        if row["context"] != "O-raw" or row["seed_label"] != 820001:
-            continue
         cell = cells_by_row_id[row["row_id"]]
         cell_record = next(candidate for candidate in manifest["cells"] if candidate["cell_id"] == row["cell_id"])
         assert runner.stage_coordinate.walker_count(cell.manifest) == cell_record["walkers"] == 4096
+        materialized_checks += 1
+
+    consumed_checks = 0
+    for row in admitted_rows:
+        if row["seed_label"] != 820001:
+            continue
         assert runner.execute(
             _args(runner, HERE / "o1_scan_manifest_v1.json", row["row_id"], tmp_path / row["row_id"])
         ) == 0
         report = json.loads(capsys.readouterr().out)
         assert report["resolved_config"]["sampler"]["n_walkers"] == 4096
         assert report["resolved_config"]["runner"]["sampler"]["n_walkers"] == 4096
+        consumed_checks += 1
+
+    assert materialized_checks == 128
+    assert consumed_checks == 16
 
 
 @pytest.mark.parametrize("flag", [
