@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -59,7 +60,25 @@ def test_per_test_timeout_fires() -> None:
 def test_committed_manifest_regenerates_byte_identically() -> None:
     path = HERE / "o1_scan_manifest_v1.json"
     assert path.stat().st_size < 1_000_000
-    assert path.read_text(encoding="utf-8") == manifest_module.render_manifest_text()
+    committed = path.read_bytes()
+    rendered = manifest_module.render_manifest_text().encode("utf-8")
+    committed_hash = hashlib.sha256(committed).hexdigest()
+    rendered_hash = hashlib.sha256(rendered).hexdigest()
+    if committed_hash != rendered_hash or len(committed) != len(rendered):
+        first_difference = next(
+            (index for index, (left, right) in enumerate(zip(committed, rendered)) if left != right),
+            min(len(committed), len(rendered)),
+        )
+        window_start = max(0, first_difference - 24)
+        window_end = first_difference + 24
+        raise AssertionError(
+            "manifest bytes differ: "
+            f"committed_sha256={committed_hash} rendered_sha256={rendered_hash} "
+            f"committed_length={len(committed)} rendered_length={len(rendered)} "
+            f"first_difference={first_difference} "
+            f"committed_window={committed[window_start:window_end]!r} "
+            f"rendered_window={rendered[window_start:window_end]!r}"
+        )
 
 
 def test_manifest_counts_sources_and_admission_reason() -> None:
@@ -213,6 +232,42 @@ def test_manifest_positive_consumes_same_runner_limbs_and_horizon(
     assert manifest_report_json["resolved_config"]["runner"]["trainer"]["max_steps"] == 50000
     assert manifest_report_json["resolved_config"]["runner"]["sampler"] == flag_report_json["resolved_config"]["runner"]["sampler"]
     assert manifest_report_json["resolved_config"]["runner"]["trainer"] == flag_report_json["resolved_config"]["runner"]["trainer"]
+
+
+def test_every_admitted_manifest_row_consumes_materialized_w4096(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every admitted row binds its materialized identity and consumed sampler to W=4096."""
+
+    runner = _runner()
+    manifest = manifest_module.load_manifest()
+    cells = runner.stage_coordinate.materialize_intended_configurations(
+        tmp_path / "cells",
+        availability=runner.optimizer_grid.roster_availability(),
+        stages=("O1",),
+    )
+    cells_by_row_id = {cell.content_hash: cell for cell in cells}
+    live_rows = manifest_module._materialized_rows()
+    monkeypatch.setattr(runner.scan_manifest, "_materialized_rows", lambda: live_rows)
+    monkeypatch.setattr(
+        runner.stage_coordinate,
+        "materialize_intended_configurations",
+        lambda *_args, **_kwargs: cells,
+    )
+
+    admitted_rows = [row for row in manifest["rows"] if row["status"] == "available"]
+    assert len(admitted_rows) == 128
+    for row in admitted_rows:
+        cell = cells_by_row_id[row["row_id"]]
+        assert runner.stage_coordinate.walker_count(cell.manifest) == 4096
+        assert runner.execute(
+            _args(runner, HERE / "o1_scan_manifest_v1.json", row["row_id"], tmp_path / row["row_id"])
+        ) == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report["resolved_config"]["sampler"]["n_walkers"] == 4096
+        assert report["resolved_config"]["runner"]["sampler"]["n_walkers"] == 4096
 
 
 @pytest.mark.parametrize("flag", [
