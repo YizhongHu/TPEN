@@ -96,12 +96,44 @@ versions and unknown/extra fields are refused. A completed record requires a
 checkpoint; a refused record requires a refusal and cannot carry a checkpoint.
 The refusal `reason` embeds the Python JSON parser message, so fixture parity is pinned to project Python 3.12 (a later slice may compare the reason by prefix if this wording proves version-fragile).
 
-**PROPOSED, not current:** a v3 record carrying a typed outcome
-`completed | planned_yield | failed | unknown | refused`, a complete
-publication-bound checkpoint reference, and a declared `run-outcome` schema.
-The v3 representation must keep operational outcome separate and must bind
-planned yield to a verified train-resume checkpoint. It awaits #691 / CX-01;
-the current producer and executor must not decode or emit it.
+## 4.1 Core evidence v3
+
+CX-01 defines `tpen.run-evidence/v3` as the v2 object plus `outcome` and
+`checkpoint_ref`. The producer selects v3 when the run has the S4
+`run-outcome.json` artifact and decodes it through `tpen.run_events.read_run_outcome`;
+inspection never infers the typed result from `status.json` or the process exit
+code. The S4 artifact is the closed `tpen.run-outcome/v1` mapping emitted from
+`RunResult.to_dict`; the decoder also accepts the pre-CX-01 byte shape as a
+read-only implicit-v1 record.
+
+`outcome` is exactly one of `completed`, `planned_yield`, `failed`, `unknown`,
+or `refused`. `run_status` remains the operational status written by core and
+must equal the typed result status. A mismatch, malformed artifact, missing
+ref, stale ref, unpublished ref, or unsupported payload profile produces a
+refused v3 evidence record and can never produce `planned_yield` evidence.
+
+When present, `checkpoint_ref` is a complete `tpen.checkpoint-ref/v1` identity:
+the schema, concrete checkpoint directory, manifest schema/kind, both progress
+counters, manifest and model SHA-256 values, immutable manifest provenance,
+and path-independent `content_id`, plus the manifest-declared payload
+`profile`. A planned yield requires the ref's live bytes and content ID to
+validate, the ref to appear in the publication catalog, profile
+`train_resume`, and both result counters to equal the ref counters. A
+`model_only` or missing ref is therefore non-eligible even when a checkpoint
+directory exists.
+
+Continuation eligibility is an explicit rule, not an operational status:
+
+```
+eligible iff outcome == planned_yield
+           and the typed RunResult decoded successfully
+           and checkpoint_ref is a live, published train_resume ref
+           and checkpoint_ref.next_iteration/completed_updates equal the result
+```
+
+`completed`, `failed`, `unknown`, and `refused` are never continuation-eligible.
+The v1/v2 producer and decoder remain read-only and byte unchanged when no
+typed outcome artifact is present.
 
 ## 5. Checkpoint publication and recovery
 
@@ -138,12 +170,11 @@ only the allocation that still owns the run leaf may reconcile a missing
 publication index (`tpen/execution/invocation.py:685-705`). There is no
 end-to-end executor successor launch contract.
 
-**PROPOSED:** continuation must consume a typed v3 planned-yield result and a
-full, publication-bound checkpoint reference. It must not reuse
-`AcceptedSegment` while pretending the operational attempt completed, and it
-must reject failed, unknown, or refused outcomes. The exact successor record,
-fork policy, and cross-allocation result bundle are future CX-01/CX-02/HI-S5
-decisions.
+Continuation must consume a typed v3 planned-yield result and a full,
+publication-bound checkpoint reference. It must not reuse `AcceptedSegment`
+while pretending the operational attempt completed, and it must reject failed,
+unknown, or refused outcomes. The exact successor record, fork policy, and
+cross-allocation result bundle remain future CX-02/HI-S5 decisions.
 
 ## 7. Teardown and placement
 
@@ -180,7 +211,7 @@ normalizes only absolute run paths.
 |---|---|---|---|
 | v1 | decode | decode read-only (identity absent) | refuse/unsupported until v3 policy |
 | v2 | refuse (closed v1 key set; no operation-dependent downgrade) | decode | refuse/unsupported until v3 policy |
-| v3 (PROPOSED) | refuse | refuse | decode only after CX-01/CX-02 land |
+| v3 | refuse | refuse | decode and apply the CX-01 eligibility rule |
 
 “Historical decode” means a v2-capable consumer may read a v1 record for
 historical records; it is separate from identity-required acceptance and does
